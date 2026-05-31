@@ -1,26 +1,178 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-primary: #af4408;
+  --color-primary-light: #d4611a;
+  --color-primary-dark: #8a3506;
+  --color-bg: #FFF8F0;
+  --color-surface: #FFFFFF;
+  --color-surface-hover: #FFF1E3;
+  --color-border: #E8D5C4;
+  --color-border-dark: #D4B896;
+  --color-text: #2D1B0E;
+  --color-text-muted: #6B5744;
+  --color-text-dim: #8B7355;
+  --color-success: #16A34A;
+  --color-warning: #D97706;
+  --color-danger: #DC2626;
+  --color-header: #af4408;
+  --color-sidebar: #1C0F05;
+  --color-sidebar-hover: #2E1A0C;
+  --color-sidebar-border: #3D2614;
+  --color-sidebar-text: #E8D5C4;
+  --color-sidebar-active: #af4408;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+/* Smooth scrollbar styling */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #D4B896 transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: #D4B896;
+  border-radius: 3px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: #B89B78;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: #FFF8F0;
+  color: #2D1B0E;
 }
+
+/* Card utility */
+.card {
+  background-color: #FFFFFF;
+  border: 1px solid #E8D5C4;
+  border-radius: 0.75rem;
+  padding: 1.5rem;
+}
+
+.card-hover {
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.card-hover:hover {
+  border-color: #D4B896;
+  box-shadow: 0 0 0 1px rgba(175, 68, 8, 0.1);
+}
+
+/* Badge utility */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.125rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  border-radius: 9999px;
+  line-height: 1.25rem;
+}
+
+.badge-primary {
+  background-color: rgba(175, 68, 8, 0.12);
+  color: #af4408;
+}
+
+.badge-success {
+  background-color: rgba(22, 163, 74, 0.12);
+  color: #16A34A;
+}
+
+.badge-warning {
+  background-color: rgba(217, 119, 6, 0.12);
+  color: #D97706;
+}
+
+.badge-danger {
+  background-color: rgba(220, 38, 38, 0.12);
+  color: #DC2626;
+}
+
+/* Motion utilities */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.animate-fade-up {
+  animation: fade-up 0.35s ease-out both;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.4s ease-out both;
+}
+
+/* Card hover lift */
+.card-lift {
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.card-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px -8px rgba(175, 68, 8, 0.25);
+  border-color: #D4B896;
+}
+
+/* Auto-lift any bordered white card across the app.
+   Matches the design system: white bg + E8D5C4 border + rounded corners. */
+[class*="bg-white"][class*="border-[#E8D5C4]"][class*="rounded-"] {
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+[class*="bg-white"][class*="border-[#E8D5C4]"][class*="rounded-"]:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px -8px rgba(175, 68, 8, 0.25);
+  border-color: #D4B896;
+}
+
+/* Auto fade-up on first-level grid children inside a main area.
+   This makes every page's KPI tiles and detail cards animate on load. */
+main > div > div.grid > * {
+  animation: fade-up 0.35s ease-out both;
+}
+main > div > div.grid > *:nth-child(1) { animation-delay: 0.00s; }
+main > div > div.grid > *:nth-child(2) { animation-delay: 0.04s; }
+main > div > div.grid > *:nth-child(3) { animation-delay: 0.08s; }
+main > div > div.grid > *:nth-child(4) { animation-delay: 0.12s; }
+main > div > div.grid > *:nth-child(5) { animation-delay: 0.16s; }
+main > div > div.grid > *:nth-child(6) { animation-delay: 0.20s; }
+
+@media (prefers-reduced-motion: reduce) {
+  [class*="bg-white"][class*="border-[#E8D5C4]"][class*="rounded-"] {
+    transition: none !important;
+  }
+  main > div > div.grid > * { animation: none !important; }
+}
+
+/* Reduce motion */
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-up,
+  .animate-fade-in,
+  .card-lift { animation: none !important; transition: none !important; }
+}
+
+/* Stagger helpers for sequential card fade-ins */
+.stagger > * { animation: fade-up 0.35s ease-out both; }
+.stagger > *:nth-child(1) { animation-delay: 0.00s; }
+.stagger > *:nth-child(2) { animation-delay: 0.04s; }
+.stagger > *:nth-child(3) { animation-delay: 0.08s; }
+.stagger > *:nth-child(4) { animation-delay: 0.12s; }
+.stagger > *:nth-child(5) { animation-delay: 0.16s; }
+.stagger > *:nth-child(6) { animation-delay: 0.20s; }
+.stagger > *:nth-child(7) { animation-delay: 0.24s; }
+.stagger > *:nth-child(8) { animation-delay: 0.28s; }

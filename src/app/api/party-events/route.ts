@@ -1,0 +1,161 @@
+import { getDb } from '@/lib/db';
+import { getCurrentOutletId } from '@/lib/auth';
+
+/**
+ * Party Events P&L.
+ *
+ * For each distinct (event_name, event_date) on requisitions where purpose='party':
+ *   COST    = Σ (issued_qty × material avg_price), summed across all requisitions
+ *             tagged with that event
+ *   REVENUE = sum of sales.total_revenue for rows on event_date that look like
+ *             party rows (item ends ' P' OR category in {Party Package, Custom})
+ *
+ * Multiple requisitions can belong to the same event (e.g. one for kitchen, one
+ * for bar). They aggregate by (event_name, event_date).
+ *
+ * GET /api/party-events                       → list all events with summary
+ * GET /api/party-events?event=Sharma...&date=YYYY-MM-DD → drill-down detail
+ */
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
+const PARTY_PREDICATE = `(s.item_name LIKE '% P' OR LOWER(s.category) IN ('party package','custom'))`;
+
+export async function GET(request: Request) {
+  try {
+    const db = getDb();
+    const url = new URL(request.url);
+    const eventName = url.searchParams.get('event');
+    const eventDate = url.searchParams.get('date');
+    const outletId = await getCurrentOutletId();
+
+    // Single event detail
+    if (eventName && eventDate) {
+      const reqs = db.prepare(`
+        SELECT r.*, d.name AS department_name
+        FROM requisitions r
+        JOIN departments d ON d.id = r.department_id
+        WHERE r.purpose = 'party' AND r.event_name = ? AND r.event_date = ?
+        ORDER BY r.created_at
+      `).all(eventName, eventDate) as any[];
+      if (reqs.length === 0) return Response.json({ error: 'Event not found' }, { status: 404 });
+
+      const items = db.prepare(`
+        SELECT ri.*, rm.name AS material_name, rm.sku, rm.unit, rm.average_price,
+               r.req_number, r.id AS req_id
+        FROM requisitions r
+        JOIN requisition_items ri ON ri.req_id = r.id
+        JOIN raw_materials rm ON rm.id = ri.material_id
+        WHERE r.purpose = 'party' AND r.event_name = ? AND r.event_date = ?
+        ORDER BY rm.name
+      `).all(eventName, eventDate) as any[];
+
+      const sales = db.prepare(`
+        SELECT s.item_name,
+               SUM(s.quantity_sold) AS qty,
+               SUM(s.total_revenue) AS revenue,
+               s.category,
+               CASE WHEN s.linked_event_name = ? AND s.linked_event_date = ?
+                    THEN 'manual' ELSE 'auto' END AS link_type
+        FROM sales s
+        WHERE (
+          (s.linked_event_name = ? AND s.linked_event_date = ?)
+          OR
+          (s.date = ? AND ${PARTY_PREDICATE} AND s.linked_event_name IS NULL)
+        )
+        GROUP BY s.item_name, link_type ORDER BY revenue DESC
+      `).all(eventName, eventDate, eventName, eventDate, eventDate) as any[];
+
+      const cost    = items.reduce((s, i) => s + i.quantity_requested * (i.average_price || 0), 0);
+      const revenue = sales.reduce((s, x) => s + (x.revenue || 0), 0);
+      const guests  = reqs[0]?.guest_count || 0;
+
+      return Response.json({
+        event_name: eventName,
+        event_date: eventDate,
+        guest_count: guests,
+        customer:    reqs[0]?.customer || '',
+        notes:       reqs[0]?.event_notes || '',
+        requisitions: reqs.map(r => ({
+          id: r.id, req_number: r.req_number, status: r.status,
+          department: r.department_name,
+        })),
+        items: items.map(i => ({
+          req_number: i.req_number,
+          material:   i.material_name,
+          sku:        i.sku,
+          unit:       i.unit,
+          quantity:   i.quantity_requested,
+          unit_price: Math.round((i.average_price || 0) * 100) / 100,
+          line_cost:  Math.round(i.quantity_requested * (i.average_price || 0) * 100) / 100,
+        })),
+        sales: sales.map(s => ({
+          item_name: s.item_name, qty: s.qty,
+          revenue: Math.round(s.revenue || 0),
+          category: s.category,
+          link_type: s.link_type as 'manual' | 'auto',
+        })),
+        summary: {
+          cost: Math.round(cost * 100) / 100,
+          revenue: Math.round(revenue),
+          profit: Math.round((revenue - cost) * 100) / 100,
+          food_cost_percent: revenue > 0 ? Math.round((cost / revenue) * 10000) / 100 : 0,
+          per_head_cost:     guests > 0 ? Math.round((cost / guests) * 100) / 100 : 0,
+          per_head_revenue:  guests > 0 ? Math.round(revenue / guests) : 0,
+          per_head_profit:   guests > 0 ? Math.round(((revenue - cost) / guests) * 100) / 100 : 0,
+        },
+      });
+    }
+
+    // List view — every distinct event with summary
+    const events = db.prepare(`
+      WITH ev AS (
+        SELECT r.event_name, r.event_date,
+               MAX(r.guest_count) AS guest_count,
+               MAX(r.customer)    AS customer,
+               COUNT(*)           AS req_count,
+               (SELECT COALESCE(SUM(ri.quantity_requested * rm.average_price), 0)
+                  FROM requisitions r2
+                  JOIN requisition_items ri ON ri.req_id = r2.id
+                  JOIN raw_materials rm ON rm.id = ri.material_id
+                  WHERE r2.purpose = 'party'
+                    AND r2.event_name = r.event_name
+                    AND r2.event_date = r.event_date) AS cost,
+               (SELECT COALESCE(SUM(s.total_revenue), 0)
+                  FROM sales s
+                  WHERE (
+                    (s.linked_event_name = r.event_name AND s.linked_event_date = r.event_date)
+                    OR
+                    (s.date = r.event_date AND ${PARTY_PREDICATE} AND s.linked_event_name IS NULL)
+                  )) AS revenue
+        FROM requisitions r
+        WHERE r.purpose = 'party' AND r.event_name != ''
+        GROUP BY r.event_name, r.event_date
+      )
+      SELECT * FROM ev ORDER BY event_date DESC, event_name
+    `).all() as any[];
+
+    return Response.json({
+      events: events.map(e => {
+        const cost = Number(e.cost) || 0;
+        const rev  = Number(e.revenue) || 0;
+        return {
+          event_name: e.event_name,
+          event_date: e.event_date,
+          guest_count: e.guest_count,
+          customer: e.customer,
+          req_count: e.req_count,
+          cost: Math.round(cost * 100) / 100,
+          revenue: Math.round(rev),
+          profit: Math.round((rev - cost) * 100) / 100,
+          food_cost_percent: rev > 0 ? Math.round((cost / rev) * 10000) / 100 : 0,
+          per_head_cost: e.guest_count > 0 ? Math.round((cost / e.guest_count) * 100) / 100 : 0,
+          per_head_revenue: e.guest_count > 0 ? Math.round(rev / e.guest_count) : 0,
+        };
+      }),
+    });
+  } catch (e: any) {
+    console.error('[party-events]', e);
+    return Response.json({ error: e.message }, { status: 500 });
+  }
+}

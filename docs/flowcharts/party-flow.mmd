@@ -1,0 +1,163 @@
+flowchart TD
+
+    %% ============ DISCOVER ============
+    SHEET[(Google Sheet F&P Records<br/>cached in upcoming_parties_cache)]
+    PARTYEVENTS([/party-events page])
+    SHEET -->|"System: 60s poll / 15m fetch"| PARTYEVENTS
+
+    FPGATE{FP status approved?<br/>OR !requireApproval<br/>OR isAdmin}
+    PARTYEVENTS -->|"Sales views row"| FPGATE
+    FPGATE -->|"No: amber Awaiting approval"| WAIT[Wait for FP approval]
+    FPGATE -->|"Yes"| PASTGATE
+
+    PASTGATE{Past day?<br/>allowPastDay + within 3d grace?}
+    PASTGATE -->|"daysAgo>3: locked admin only"| BLOCKED[Blocked - admin only]
+    PASTGATE -->|"Not past, or admin, or grace"| RAISEBTN[Click Raise Req]
+
+    %% ============ RAISE-REQ ============
+    STASH{{System: stashAndRaiseReq<br/>writes sessionStorage prefill}}
+    RAISEBTN -->|"Sales"| STASH
+    PARTYREQ([/party-requisitions page])
+    STASH -->|"router.push ?prefill=1"| PARTYREQ
+
+    DEPTLOCK{canChangeDept?<br/>admin/chef/store/mgr}
+    PARTYREQ -->|"Dept staff fills lines"| DEPTLOCK
+    DEPTLOCK -->|"No: locked dept badge"| FILLITEMS[Add items in own dept only]
+    DEPTLOCK -->|"Yes: dropdown"| FILLITEMS
+
+    POSTREQ[(POST /api/requisitions<br/>insert status=draft, purpose=party)]
+    FILLITEMS -->|"Dept staff: Save & Submit"| POSTREQ
+    SUBMIT[(POST /submit<br/>draft -> submitted<br/>audit: requisition.submit)]
+    POSTREQ -->|"System chains submit"| SUBMIT
+
+    %% ============ CHEF-APPROVE ============
+    CHEFPAGE([/party-approvals page])
+    SUBMIT -->|"System routes to chef inbox"| CHEFPAGE
+
+    CHEFDEC{Chef decision}
+    CHEFPAGE -->|"Head Chef reviews"| CHEFDEC
+
+    CHEFEDIT[Edit qty / reject lines / set notes]
+    CHEFDEC -->|"Head Chef: per-item edits"| CHEFEDIT
+    CHEFEDIT -->|"audit: req_item.chef_edit/reject"| CHEFDEC
+
+    CHEFREJ[(POST /chef-reject<br/>submitted -> chef_rejected<br/>audit: requisition.chef_reject)]
+    CHEFDEC -->|"Head Chef: Reject + reason"| CHEFREJ
+    CHEFREJ --> ENDREJ[End: rejected]
+
+    CHEFAPP[(POST /chef-approve<br/>submitted -> chef_approved<br/>audit: requisition.chef_approve)]
+    CHEFDEC -->|"Head Chef: Approve all"| CHEFAPP
+
+    %% ============ MGMT-APPROVE ============
+    MGMTGATE{Admin / mgmt user?}
+    CHEFAPP -->|"System shows With Mgmt badge"| MGMTGATE
+    MGMTAPP[(POST /mgmt-approve<br/>chef_approved -> mgmt_approved)]
+    MGMTGATE -->|"Mgmt/Admin: Mgmt Approve + note"| MGMTAPP
+    MGMTGATE -->|"Non-admin: view only"| WAITMGMT[Wait for admin]
+    WAITMGMT --> MGMTGATE
+
+    %% ============ STORE-QUEUE ============
+    STOREPAGE([/store-requisitions inbox])
+    MGMTAPP -->|"System: lands in store inbox with PARTY badge"| STOREPAGE
+
+    TABS{Store tab}
+    STOREPAGE -->|"Store Mgr opens"| TABS
+    TABS -->|"Pending Issue"| LINEACT
+    TABS -->|"Deferred"| LINEACT
+    TABS -->|"Fulfilled Today"| LINEACT
+
+    %% ============ STORE-ISSUE ============
+    LINEACT{Per-line action}
+    LINEACT -->|"Store Mgr: Issue Now"| ISSUE[(POST store-issue action=issue<br/>append issue_history<br/>audit: req_item.store_issue)]
+    LINEACT -->|"Store Mgr: Defer"| DEFER[(action=defer<br/>set deferred_until + reason)]
+    LINEACT -->|"Store Mgr: Undo"| UNDO[(action=undo<br/>zero quantity_issued)]
+
+    AUTOADV{{System: every non-rejected<br/>line fully issued?}}
+    ISSUE --> AUTOADV
+    DEFER --> AUTOADV
+    UNDO --> AUTOADV
+    AUTOADV -->|"Partial"| STOREPROC[(mgmt_approved -> store_processed)]
+    AUTOADV -->|"All issued, none deferred"| FULFILLED[(-> fulfilled, fulfilled_at/by)]
+
+    %% ============ PO-OPTIONAL ============
+    STOREMODAL([Store Issue Modal])
+    LINEACT -->|"Store Mgr opens issue modal"| STOREMODAL
+    POCHK{raisePo checkbox ticked?<br/>auto_create_po=true}
+    STOREMODAL -->|"Store Mgr decides"| POCHK
+    POCHK -->|"No: pure issuance"| ISSUE
+    POCHK -->|"Yes: enter Buy/Unit/Vendor"| POCREATE[(Insert purchase_orders PO-YYYY-NNNN<br/>status=pending<br/>+ purchase_order_items)]
+    POCREATE -->|"System: link linked_po_id"| STOREPROC
+
+    PARTYCONS{{System party-purpose branch:<br/>finalStatus=fulfilled<br/>AND purpose=party<br/>AND no prior party_consumption}}
+    FULFILLED --> PARTYCONS
+    PARTYCONSDB[(raw_materials.current_stock -= issued<br/>insert inventory_transactions type=party_consumption<br/>audit: requisition.party_consumption)]
+    PARTYCONS -->|"Yes"| PARTYCONSDB
+    PARTYCONS -->|"Already deducted"| SKIPPED[(audit: party_consumption.skipped)]
+
+    %% ============ PO-APPROVE ============
+    POPAGE([/purchase-orders page])
+    POCREATE -->|"System routes to PO inbox"| POPAGE
+    POADMIN{Admin only?}
+    POPAGE -->|"Admin reviews"| POADMIN
+    POREJ[(POST /reject<br/>pending -> rejected<br/>store rejected_reason)]
+    POADMIN -->|"Admin: Reject + reason"| POREJ
+    POAPP[(POST /approve<br/>pending -> approved<br/>audit: po.approve)]
+    POADMIN -->|"Admin: Approve + note"| POAPP
+
+    %% ============ PO-RECEIVE ============
+    RECVMODAL([Receive PO Modal])
+    POAPP -->|"Store Mgr: Receive btn"| RECVMODAL
+    RECVTXN{{System atomic txn:<br/>auto-generate GRN-YYYY-NNNN}}
+    RECVMODAL -->|"Store Mgr: Confirm Receive"| RECVTXN
+
+    GRNDB[(insert goods_receipt_notes status=received<br/>+ goods_receipt_note_items)]
+    RECVTXN --> GRNDB
+    STOCKDB[(per accepted line:<br/>insert purchases<br/>raw_materials.current_stock +=<br/>last_purchase_price/date<br/>inventory_transactions type=purchase)]
+    GRNDB --> STOCKDB
+
+    PARTIAL{Any line rejected?}
+    STOCKDB --> PARTIAL
+    PARTIAL -->|"Yes"| GRNPART[(GRN: received -> partial)]
+    PARTIAL -->|"No"| POFLIP
+    GRNPART --> POFLIP[(PO: approved -> received<br/>set grn_id, recompute total_cost)]
+
+    WAVG{{System: updateMaterialPrice<br/>weighted-avg + recipe cascade}}
+    POFLIP --> WAVG
+
+    REQCASCADE{{System cascade:<br/>po.requisition_id present?<br/>req.status=store_processed?}}
+    WAVG --> REQCASCADE
+    REQFULFILL[(req: store_processed -> fulfilled<br/>fulfilled_by=po-received-cascade)]
+    REQCASCADE -->|"Yes"| REQFULFILL
+
+    PCBRANCH{{System party branch:<br/>purpose=party AND<br/>no prior party_consumption}}
+    REQFULFILL --> PCBRANCH
+    PCDEDUCT[(decrement current_stock by issued<br/>insert inventory_transactions party_consumption<br/>audit: requisition.party_consumption)]
+    PCBRANCH -->|"Yes"| PCDEDUCT
+    PCBRANCH -->|"Already deducted"| PCSKIP[(audit: party_consumption.skipped)]
+
+    %% ============ BACK-CORRECTION ============
+    GRNPAGE([/grn page])
+    BACKCORR{Back-correction GRN?<br/>admin checkbox}
+    GRNPAGE -->|"Admin: manual GRN"| BACKCORR
+    BACKCORR -->|"Yes: allow negatives"| NEGGRN[(insert GRN with negative qtys<br/>reversal inventory_transactions)]
+    BACKCORR -->|"No: normal GRN"| GRNDB
+
+    END_OK[End: items received, stock updated]
+    PCDEDUCT --> END_OK
+    PCSKIP --> END_OK
+    NEGGRN --> END_OK
+
+    %% ============ STYLES ============
+    classDef chef fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef mgmt fill:#e0e7ff,stroke:#4f46e5,color:#312e81
+    classDef store fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef admin fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef system fill:#f3f4f6,stroke:#6b7280,color:#374151
+    classDef sales fill:#fef3c7,stroke:#d97706,color:#78350f
+
+    class PARTYEVENTS,FPGATE,PASTGATE,RAISEBTN,STASH,PARTYREQ,DEPTLOCK,FILLITEMS,POSTREQ,SUBMIT sales
+    class CHEFPAGE,CHEFDEC,CHEFEDIT,CHEFREJ,CHEFAPP,ENDREJ chef
+    class MGMTGATE,MGMTAPP,WAITMGMT mgmt
+    class STOREPAGE,TABS,LINEACT,ISSUE,DEFER,UNDO,STOREMODAL,POCHK,POCREATE,STOREPROC,FULFILLED,RECVMODAL store
+    class POPAGE,POADMIN,POAPP,POREJ,GRNPAGE,BACKCORR,NEGGRN admin
+    class SHEET,AUTOADV,PARTYCONS,PARTYCONSDB,SKIPPED,RECVTXN,GRNDB,STOCKDB,PARTIAL,GRNPART,POFLIP,WAVG,REQCASCADE,REQFULFILL,PCBRANCH,PCDEDUCT,PCSKIP,WAIT,BLOCKED,END_OK system

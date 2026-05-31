@@ -1,0 +1,23 @@
+[Unit]
+Description=F&B Controller (Next.js production server)
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=0.0.0.0
+ExecStart=/usr/bin/npm run start
+Restart=on-failure
+RestartSec=5
+# Limit memory so a runaway loop can't eat the whole VM
+MemoryMax=1G
+
+# Logging — visible via `journalctl -u fnb-controller`
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

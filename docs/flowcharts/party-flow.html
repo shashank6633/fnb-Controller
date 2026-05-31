@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AKAN F&amp;B Controller — Party Flow (Showing Parties → Receiving Items)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    /* Screen styling — same look as the printable A3/A2 export. */
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 24px;
+      background: #FFF8F0;
+      color: #2D1B0E;
+    }
+    .page {
+      max-width: 1400px;
+      margin: 0 auto;
+      background: white;
+      border: 1px solid #E8D5C4;
+      border-radius: 12px;
+      padding: 32px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.06);
+    }
+    h1 {
+      margin: 0 0 4px 0;
+      font-size: 22px;
+      color: #af4408;
+    }
+    .subtitle {
+      color: #6B5744;
+      font-size: 13px;
+      margin-bottom: 24px;
+    }
+    .toolbar {
+      background: #FFF1E3;
+      border: 1px solid #D4B896;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 24px;
+      font-size: 12px;
+      color: #6B5744;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .toolbar button {
+      background: #af4408;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .toolbar button:hover { background: #8a3506; }
+    .mermaid {
+      text-align: center;
+      margin: 24px 0;
+    }
+    .mermaid svg {
+      max-width: 100%;
+      height: auto !important;
+    }
+    .legend {
+      margin-top: 32px;
+      padding: 16px;
+      background: #FFF8F0;
+      border: 1px solid #E8D5C4;
+      border-radius: 8px;
+    }
+    .legend h3 {
+      margin: 0 0 12px 0;
+      font-size: 14px;
+      color: #2D1B0E;
+    }
+    .legend-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      font-size: 12px;
+    }
+    .role-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-weight: 600;
+      font-size: 11px;
+      margin-right: 6px;
+    }
+    .role-sales { background: #fef3c7; color: #78350f; border: 1px solid #d97706; }
+    .role-chef  { background: #dbeafe; color: #1e3a8a; border: 1px solid #2563eb; }
+    .role-mgmt  { background: #e0e7ff; color: #312e81; border: 1px solid #4f46e5; }
+    .role-store { background: #ede9fe; color: #4c1d95; border: 1px solid #7c3aed; }
+    .role-admin { background: #fee2e2; color: #7f1d1d; border: 1px solid #dc2626; }
+    .role-sys   { background: #f3f4f6; color: #374151; border: 1px solid #6b7280; }
+    .footer {
+      margin-top: 32px;
+      padding-top: 16px;
+      border-top: 1px solid #E8D5C4;
+      font-size: 10px;
+      color: #8B7355;
+      text-align: center;
+    }
+
+    /* Print — landscape A3 fits the whole flowchart on a single page nicely.
+       Falls back to A2 if your printer supports it (cleaner). */
+    @media print {
+      @page { size: A3 landscape; margin: 10mm; }
+      body { background: white; padding: 0; }
+      .page { box-shadow: none; border: none; padding: 0; }
+      .toolbar { display: none; }
+      .footer { color: #999; }
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.0/dist/mermaid.min.js"></script>
+</head>
+<body>
+  <div class="page">
+    <h1>AKAN F&amp;B Controller — Party Flow</h1>
+    <div class="subtitle">
+      End-to-end workflow: Showing Parties (Google Sheet) → Raise → Chef → Mgmt → Store Issue → optional PO → Receive items
+    </div>
+
+    <div class="toolbar">
+      <span>
+        <strong>📄 Save as PDF:</strong> press <kbd>Cmd/Ctrl + P</kbd>, then choose
+        <em>“Save as PDF”</em> as the destination. Landscape A3 gives the cleanest single-page export.
+      </span>
+      <button onclick="window.print()">🖨 Print / Save PDF</button>
+    </div>
+
+    <div class="mermaid">
+flowchart TD
+
+    %% ============ DISCOVER ============
+    SHEET[(Google Sheet F&amp;P Records<br/>cached in upcoming_parties_cache)]
+    PARTYEVENTS([/party-events page])
+    SHEET --&gt;|"System: 60s poll / 15m fetch"| PARTYEVENTS
+
+    FPGATE{FP status approved?<br/>OR !requireApproval<br/>OR isAdmin}
+    PARTYEVENTS --&gt;|"Sales views row"| FPGATE
+    FPGATE --&gt;|"No: amber Awaiting approval"| WAIT[Wait for FP approval]
+    FPGATE --&gt;|"Yes"| PASTGATE
+
+    PASTGATE{Past day?<br/>allowPastDay + within 3d grace?}
+    PASTGATE --&gt;|"daysAgo&gt;3: locked admin only"| BLOCKED[Blocked - admin only]
+    PASTGATE --&gt;|"Not past, or admin, or grace"| RAISEBTN[Click Raise Req]
+
+    %% ============ RAISE-REQ ============
+    STASH{{System: stashAndRaiseReq<br/>writes sessionStorage prefill}}
+    RAISEBTN --&gt;|"Sales"| STASH
+    PARTYREQ([/party-requisitions page])
+    STASH --&gt;|"router.push ?prefill=1"| PARTYREQ
+
+    DEPTLOCK{canChangeDept?<br/>admin/chef/store/mgr}
+    PARTYREQ --&gt;|"Dept staff fills lines"| DEPTLOCK
+    DEPTLOCK --&gt;|"No: locked dept badge"| FILLITEMS[Add items in own dept only]
+    DEPTLOCK --&gt;|"Yes: dropdown"| FILLITEMS
+
+    POSTREQ[(POST /api/requisitions<br/>insert status=draft, purpose=party)]
+    FILLITEMS --&gt;|"Dept staff: Save &amp; Submit"| POSTREQ
+    SUBMIT[(POST /submit<br/>draft -&gt; submitted<br/>audit: requisition.submit)]
+    POSTREQ --&gt;|"System chains submit"| SUBMIT
+
+    %% ============ CHEF-APPROVE ============
+    CHEFPAGE([/party-approvals page])
+    SUBMIT --&gt;|"System routes to chef inbox"| CHEFPAGE
+
+    CHEFDEC{Chef decision}
+    CHEFPAGE --&gt;|"Head Chef reviews"| CHEFDEC
+
+    CHEFEDIT[Edit qty / reject lines / set notes]
+    CHEFDEC --&gt;|"Head Chef: per-item edits"| CHEFEDIT
+    CHEFEDIT --&gt;|"audit: req_item.chef_edit/reject"| CHEFDEC
+
+    CHEFREJ[(POST /chef-reject<br/>submitted -&gt; chef_rejected<br/>audit: requisition.chef_reject)]
+    CHEFDEC --&gt;|"Head Chef: Reject + reason"| CHEFREJ
+    CHEFREJ --&gt; ENDREJ[End: rejected]
+
+    CHEFAPP[(POST /chef-approve<br/>submitted -&gt; chef_approved<br/>audit: requisition.chef_approve)]
+    CHEFDEC --&gt;|"Head Chef: Approve all"| CHEFAPP
+
+    %% ============ MGMT-APPROVE ============
+    MGMTGATE{Admin / mgmt user?}
+    CHEFAPP --&gt;|"System shows With Mgmt badge"| MGMTGATE
+    MGMTAPP[(POST /mgmt-approve<br/>chef_approved -&gt; mgmt_approved)]
+    MGMTGATE --&gt;|"Mgmt/Admin: Mgmt Approve + note"| MGMTAPP
+    MGMTGATE --&gt;|"Non-admin: view only"| WAITMGMT[Wait for admin]
+    WAITMGMT --&gt; MGMTGATE
+
+    %% ============ STORE-QUEUE ============
+    STOREPAGE([/store-requisitions inbox])
+    MGMTAPP --&gt;|"System: lands in store inbox with PARTY badge"| STOREPAGE
+
+    TABS{Store tab}
+    STOREPAGE --&gt;|"Store Mgr opens"| TABS
+    TABS --&gt;|"Pending Issue"| LINEACT
+    TABS --&gt;|"Deferred"| LINEACT
+    TABS --&gt;|"Fulfilled Today"| LINEACT
+
+    %% ============ STORE-ISSUE ============
+    LINEACT{Per-line action}
+    LINEACT --&gt;|"Store Mgr: Issue Now"| ISSUE[(POST store-issue action=issue<br/>append issue_history<br/>audit: req_item.store_issue)]
+    LINEACT --&gt;|"Store Mgr: Defer"| DEFER[(action=defer<br/>set deferred_until + reason)]
+    LINEACT --&gt;|"Store Mgr: Undo"| UNDO[(action=undo<br/>zero quantity_issued)]
+
+    AUTOADV{{System: every non-rejected<br/>line fully issued?}}
+    ISSUE --&gt; AUTOADV
+    DEFER --&gt; AUTOADV
+    UNDO --&gt; AUTOADV
+    AUTOADV --&gt;|"Partial"| STOREPROC[(mgmt_approved -&gt; store_processed)]
+    AUTOADV --&gt;|"All issued, none deferred"| FULFILLED[(-&gt; fulfilled, fulfilled_at/by)]
+
+    %% ============ PO-OPTIONAL ============
+    STOREMODAL([Store Issue Modal])
+    LINEACT --&gt;|"Store Mgr opens issue modal"| STOREMODAL
+    POCHK{raisePo checkbox ticked?<br/>auto_create_po=true}
+    STOREMODAL --&gt;|"Store Mgr decides"| POCHK
+    POCHK --&gt;|"No: pure issuance"| ISSUE
+    POCHK --&gt;|"Yes: enter Buy/Unit/Vendor"| POCREATE[(Insert purchase_orders PO-YYYY-NNNN<br/>status=pending<br/>+ purchase_order_items)]
+    POCREATE --&gt;|"System: link linked_po_id"| STOREPROC
+
+    PARTYCONS{{System party-purpose branch:<br/>finalStatus=fulfilled<br/>AND purpose=party<br/>AND no prior party_consumption}}
+    FULFILLED --&gt; PARTYCONS
+    PARTYCONSDB[(raw_materials.current_stock -= issued<br/>insert inventory_transactions type=party_consumption<br/>audit: requisition.party_consumption)]
+    PARTYCONS --&gt;|"Yes"| PARTYCONSDB
+    PARTYCONS --&gt;|"Already deducted"| SKIPPED[(audit: party_consumption.skipped)]
+
+    %% ============ PO-APPROVE ============
+    POPAGE([/purchase-orders page])
+    POCREATE --&gt;|"System routes to PO inbox"| POPAGE
+    POADMIN{Admin only?}
+    POPAGE --&gt;|"Admin reviews"| POADMIN
+    POREJ[(POST /reject<br/>pending -&gt; rejected<br/>store rejected_reason)]
+    POADMIN --&gt;|"Admin: Reject + reason"| POREJ
+    POAPP[(POST /approve<br/>pending -&gt; approved<br/>audit: po.approve)]
+    POADMIN --&gt;|"Admin: Approve + note"| POAPP
+
+    %% ============ PO-RECEIVE ============
+    RECVMODAL([Receive PO Modal])
+    POAPP --&gt;|"Store Mgr: Receive btn"| RECVMODAL
+    RECVTXN{{System atomic txn:<br/>auto-generate GRN-YYYY-NNNN}}
+    RECVMODAL --&gt;|"Store Mgr: Confirm Receive"| RECVTXN
+
+    GRNDB[(insert goods_receipt_notes status=received<br/>+ goods_receipt_note_items)]
+    RECVTXN --&gt; GRNDB
+    STOCKDB[(per accepted line:<br/>insert purchases<br/>raw_materials.current_stock +=<br/>last_purchase_price/date<br/>inventory_transactions type=purchase)]
+    GRNDB --&gt; STOCKDB
+
+    PARTIAL{Any line rejected?}
+    STOCKDB --&gt; PARTIAL
+    PARTIAL --&gt;|"Yes"| GRNPART[(GRN: received -&gt; partial)]
+    PARTIAL --&gt;|"No"| POFLIP
+    GRNPART --&gt; POFLIP[(PO: approved -&gt; received<br/>set grn_id, recompute total_cost)]
+
+    WAVG{{System: updateMaterialPrice<br/>weighted-avg + recipe cascade}}
+    POFLIP --&gt; WAVG
+
+    REQCASCADE{{System cascade:<br/>po.requisition_id present?<br/>req.status=store_processed?}}
+    WAVG --&gt; REQCASCADE
+    REQFULFILL[(req: store_processed -&gt; fulfilled<br/>fulfilled_by=po-received-cascade)]
+    REQCASCADE --&gt;|"Yes"| REQFULFILL
+
+    PCBRANCH{{System party branch:<br/>purpose=party AND<br/>no prior party_consumption}}
+    REQFULFILL --&gt; PCBRANCH
+    PCDEDUCT[(decrement current_stock by issued<br/>insert inventory_transactions party_consumption<br/>audit: requisition.party_consumption)]
+    PCBRANCH --&gt;|"Yes"| PCDEDUCT
+    PCBRANCH --&gt;|"Already deducted"| PCSKIP[(audit: party_consumption.skipped)]
+
+    %% ============ BACK-CORRECTION ============
+    GRNPAGE([/grn page])
+    BACKCORR{Back-correction GRN?<br/>admin checkbox}
+    GRNPAGE --&gt;|"Admin: manual GRN"| BACKCORR
+    BACKCORR --&gt;|"Yes: allow negatives"| NEGGRN[(insert GRN with negative qtys<br/>reversal inventory_transactions)]
+    BACKCORR --&gt;|"No: normal GRN"| GRNDB
+
+    END_OK[End: items received, stock updated]
+    PCDEDUCT --&gt; END_OK
+    PCSKIP --&gt; END_OK
+    NEGGRN --&gt; END_OK
+
+    %% ============ STYLES ============
+    classDef chef fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef mgmt fill:#e0e7ff,stroke:#4f46e5,color:#312e81
+    classDef store fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef admin fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef system fill:#f3f4f6,stroke:#6b7280,color:#374151
+    classDef sales fill:#fef3c7,stroke:#d97706,color:#78350f
+
+    class PARTYEVENTS,FPGATE,PASTGATE,RAISEBTN,STASH,PARTYREQ,DEPTLOCK,FILLITEMS,POSTREQ,SUBMIT sales
+    class CHEFPAGE,CHEFDEC,CHEFEDIT,CHEFREJ,CHEFAPP,ENDREJ chef
+    class MGMTGATE,MGMTAPP,WAITMGMT mgmt
+    class STOREPAGE,TABS,LINEACT,ISSUE,DEFER,UNDO,STOREMODAL,POCHK,POCREATE,STOREPROC,FULFILLED,RECVMODAL store
+    class POPAGE,POADMIN,POAPP,POREJ,GRNPAGE,BACKCORR,NEGGRN admin
+    class SHEET,AUTOADV,PARTYCONS,PARTYCONSDB,SKIPPED,RECVTXN,GRNDB,STOCKDB,PARTIAL,GRNPART,POFLIP,WAVG,REQCASCADE,REQFULFILL,PCBRANCH,PCDEDUCT,PCSKIP,WAIT,BLOCKED,END_OK system
+    </div>
+
+    <div class="legend">
+      <h3>Legend</h3>
+      <div class="legend-grid">
+        <div><strong>Shapes</strong></div>
+        <div><strong>Roles</strong></div>
+        <div>
+          <code>[Rectangle]</code> — User action<br/>
+          <code>([Stadium])</code> — UI page<br/>
+          <code>{Rhombus}</code> — Decision<br/>
+          <code>{{Hexagon}}</code> — System cascade<br/>
+          <code>[(Cylinder)]</code> — DB write
+        </div>
+        <div>
+          <span class="role-pill role-sales">Sales</span>Show + Raise Req<br/>
+          <span class="role-pill role-chef">Chef</span>Head Chef approval<br/>
+          <span class="role-pill role-mgmt">Mgmt</span>2nd-gate approval<br/>
+          <span class="role-pill role-store">Store</span>Issue + receive<br/>
+          <span class="role-pill role-admin">Admin</span>PO + GRN admin<br/>
+          <span class="role-pill role-sys">System</span>Automated cascades
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      Generated from <code>fnb-controller</code> codebase trace · use Cmd/Ctrl+P → Save as PDF · A3 landscape recommended
+    </div>
+  </div>
+
+  <script>
+    // Initialise Mermaid with a print-safe theme + larger fonts for legibility on paper.
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'default',
+      themeVariables: {
+        fontSize: '14px',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+      },
+      flowchart: {
+        useMaxWidth: true,
+        htmlLabels: true,
+        curve: 'basis',
+      },
+    });
+  </script>
+</body>
+</html>

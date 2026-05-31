@@ -1,0 +1,5 @@
+PROJECT_ID=f-and-b-controller
+ZONE=asia-south1-a
+VM_NAME=fnb-controller
+STATIC_IP=34.14.181.77
+BUCKET_NAME=f-and-b-controller-backups

@@ -39,3 +39,42 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# SQLite databases — these contain real production data (sessions, audit
+# events, requisitions, costs) and MUST NOT be pushed to a public repo.
+*.db
+*.db-shm
+*.db-wal
+*.db.bak*
+*.db.backup*
+*.sqlite
+*.sqlite3
+/backups/
+/data/
+
+# Local-only Claude / IDE config (launch.json carries personal paths)
+/.claude/
+
+# Service account / API key files — defensive even though none live in this
+# tree today, this prevents an accidental future commit.
+**/service-account*.json
+**/google-credentials*.json
+**/credentials.json
+**/*-keyfile.json
+**/secrets/
+*.key
+*.pkcs8
+id_rsa*
+id_ed25519*
+
+# Local override / scratch files
+*.local
+*.local.*
+TODO.md.local
+NOTES.md.local
+
+# Mac / OS noise
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json.example
