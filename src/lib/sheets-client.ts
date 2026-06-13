@@ -45,23 +45,28 @@ function credFingerprint(): string {
   return 'adc';
 }
 
+// Cache the GoogleAuth wrapper too — getCredentials() lives on it and is the
+// reliable way to read the active SA email across all auth modes.
+let cachedAuth: any = null;
+
+function buildAuth(): any {
+  const dbKey = readDbCredJson();
+  if (dbKey) {
+    // Pasted JSON wins — authenticate directly from in-memory creds.
+    const credentials = JSON.parse(dbKey);
+    return new google.auth.GoogleAuth({ scopes: SCOPES, credentials });
+  }
+  const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+  return new google.auth.GoogleAuth(
+    keyFile ? { scopes: SCOPES, keyFile } : { scopes: SCOPES }
+  );
+}
+
 async function getAuthClient() {
   const fp = credFingerprint();
   if (cachedAuthClient && fp === cachedFingerprint) return cachedAuthClient;
-
-  const dbKey = readDbCredJson();
-  let auth: any;
-  if (dbKey) {
-    // Pasted JSON wins — parse and authenticate directly from in-memory creds.
-    const credentials = JSON.parse(dbKey);
-    auth = new google.auth.GoogleAuth({ scopes: SCOPES, credentials });
-  } else {
-    const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim();
-    auth = new google.auth.GoogleAuth(
-      keyFile ? { scopes: SCOPES, keyFile } : { scopes: SCOPES }
-    );
-  }
-  cachedAuthClient = await auth.getClient();
+  cachedAuth = buildAuth();
+  cachedAuthClient = await cachedAuth.getClient();
   cachedFingerprint = fp;
   return cachedAuthClient;
 }
@@ -70,7 +75,24 @@ async function getAuthClient() {
  *  operator saves or clears the SA key in the UI. */
 export function invalidateSheetsAuthCache(): void {
   cachedAuthClient = null;
+  cachedAuth = null;
   cachedFingerprint = '';
+}
+
+/** Resolve the active service-account email via the GCE metadata server.
+ *  Only used as a fallback when getCredentials() doesn't surface it. */
+async function metadataSaEmail(): Promise<string | null> {
+  try {
+    const res = await fetch(
+      'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email',
+      { headers: { 'Metadata-Flavor': 'Google' }, signal: AbortSignal.timeout(1500) },
+    );
+    if (!res.ok) return null;
+    const email = (await res.text()).trim();
+    return email || null;
+  } catch {
+    return null;   // not on GCP, or metadata server unreachable
+  }
 }
 
 /**
@@ -101,9 +123,16 @@ export async function getAuthDiagnostics(): Promise<{
       const raw = JSON.parse(fs.readFileSync(keyFile, 'utf8'));
       return { mode: 'keyfile', service_account_email: raw.client_email || null, key_file_path: keyFile };
     }
-    // 3) ADC / metadata
-    const client: any = await getAuthClient();
-    const email = client?.email || (await client?.getRequestMetadataAsync?.())?.email || null;
+    // 3) ADC / metadata — resolve the SA email reliably:
+    //    a) auth.getCredentials() works for both JSON-ADC and metadata
+    //    b) fall back to a direct metadata-server query on GCE
+    await getAuthClient();                       // ensures cachedAuth is built
+    let email: string | null = null;
+    try {
+      const creds = await cachedAuth?.getCredentials?.();
+      email = creds?.client_email || null;
+    } catch { /* getCredentials can throw off-GCP — fall through */ }
+    if (!email) email = await metadataSaEmail();
     return { mode: 'adc-metadata', service_account_email: email, key_file_path: null };
   } catch {
     return { mode: keyFile ? 'keyfile' : 'unknown', service_account_email: null, key_file_path: keyFile };
