@@ -968,7 +968,7 @@ export default function PurchasesPage() {
                   <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg text-amber-400 text-sm">
                     No materials found.{' '}
                     <Link href="/inventory" className="underline hover:text-amber-300">
-                      Add materials in Inventory
+                      Add materials in Raw Materials
                     </Link>{' '}
                     first.
                   </div>

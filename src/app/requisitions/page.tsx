@@ -455,7 +455,7 @@ function RecahoImportModal({ onClose, onCommitted }: { onClose: () => void; onCo
                         These items appear in the file but aren't in your Materials master. Auto-create them now —
                         unit + category + price will be inferred from the file and each row gets flagged
                         <span className="font-mono mx-1 px-1 py-0.5 bg-amber-100 rounded text-[10px]">auto-discovered</span>
-                        so you can review/correct them in <a href="/inventory" className="underline">Inventory</a>. The import is idempotent — re-uploading later picks up the now-matched lines.
+                        so you can review/correct them in <a href="/inventory" className="underline">Raw Materials</a>. The import is idempotent — re-uploading later picks up the now-matched lines.
                       </div>
                     </div>
                     <button onClick={() => send('materials')} disabled={busy}

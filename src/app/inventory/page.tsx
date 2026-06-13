@@ -665,7 +665,7 @@ export default function InventoryPage() {
         {/* Header */}
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408]">Inventory</h1>
+            <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408]">Raw Materials</h1>
             <p className="text-[#8B7355] text-sm mt-1">Manage raw materials and stock levels</p>
           </div>
           <div className="flex gap-2 flex-wrap">
@@ -687,10 +687,10 @@ export default function InventoryPage() {
               title="Download every material as CSV. Edit in Excel, then re-upload via 'Re-upload Edits'."
             >
               <ClipboardCheck className="w-4 h-4" />
-              Export Inventory CSV
+              Export Raw Materials CSV
             </button>
             <label className={`flex items-center gap-2 px-4 py-2.5 border border-amber-600 text-amber-700 hover:bg-amber-50 rounded-lg text-sm font-medium transition-colors cursor-pointer ${roundtripImporting ? 'opacity-50 pointer-events-none' : ''}`}
-                   title="Upload the edited Inventory CSV (from Export). Rows with an id update existing materials; rows with no id create new ones.">
+                   title="Upload the edited Raw Materials CSV (from Export). Rows with an id update existing materials; rows with no id create new ones.">
               {roundtripImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
               {roundtripImporting ? 'Uploading...' : 'Re-upload Edits'}
               <input type="file" accept=".csv" onChange={handleRoundTripUpload} className="hidden" disabled={roundtripImporting} />

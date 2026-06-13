@@ -325,7 +325,7 @@ export default function ClosingStockByLocationPage() {
           <h1 className="text-xl font-semibold text-[#2D1B0E]">Closing Stock by Location</h1>
           <p className="text-xs text-[#8B7355]">
             Pick a storage area, count the items there, save in one go. Set <code>storage_location</code> per material via{' '}
-            <a href="/inventory" className="text-[#af4408] underline">Inventory</a>.
+            <a href="/inventory" className="text-[#af4408] underline">Raw Materials</a>.
           </p>
         </div>
         <label className="text-xs text-[#6B5744] flex flex-col gap-1">

@@ -2496,7 +2496,7 @@ export default function RecipesPage() {
                               <p className="text-red-500">...and {barResult.ingredients_not_matched.length - 50} more</p>
                             )}
                           </div>
-                          <p className="mt-2 text-[10px] text-red-600">Tip: Add these materials to Inventory manually, then re-import.</p>
+                          <p className="mt-2 text-[10px] text-red-600">Tip: Add these materials to Raw Materials manually, then re-import.</p>
                         </details>
                       )}
                     </>
@@ -2700,7 +2700,7 @@ export default function RecipesPage() {
                               <p className="text-[10px] text-amber-600 mt-1">...and {bulkResult.ingredients_not_found.length - 30} more</p>
                             )}
                           </div>
-                          <p className="text-[10px] text-[#8B7355] mt-1">Add these materials to Inventory first, then re-upload.</p>
+                          <p className="text-[10px] text-[#8B7355] mt-1">Add these materials to Raw Materials first, then re-upload.</p>
                         </div>
                       )}
 

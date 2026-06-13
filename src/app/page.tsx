@@ -10,8 +10,6 @@ import {
   ChefHat,
   ShoppingCart,
   BarChart3,
-  Loader2,
-  Database,
   ClipboardList,
   Flame,
 } from 'lucide-react';
@@ -94,7 +92,6 @@ function LoadingSkeleton() {
 export default function DashboardPage() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [seeding, setSeeding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Inventory module additions
   const [pendingPOs, setPendingPOs] = useState<any[]>([]);
@@ -140,19 +137,6 @@ export default function DashboardPage() {
       setError(msg);
     } finally {
       if (!silent) setLoading(false);
-    }
-  };
-
-  const seedData = async () => {
-    try {
-      setSeeding(true);
-      const res = await api('/api/seed', { method: 'POST' });
-      if (!res.ok) throw new Error('Failed to seed data');
-      await fetchData();
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setSeeding(false);
     }
   };
 
@@ -207,18 +191,6 @@ export default function DashboardPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408]">Dashboard</h1>
             <p className="text-[#8B7355] text-sm mt-1">{today}</p>
           </div>
-          <button
-            onClick={seedData}
-            disabled={seeding}
-            className="flex items-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-800 disabled:opacity-60 text-white rounded-lg text-sm font-medium transition-colors"
-          >
-            {seeding ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <Database className="w-4 h-4" />
-            )}
-            {seeding ? 'Seeding...' : 'Seed Sample Data'}
-          </button>
         </div>
 
         {/* Yesterday's anomalies + tie-out */}
@@ -906,7 +878,7 @@ function DailyTrackedWidget() {
         </div>
         <p className="text-xs text-[#6B5744] mt-2">
           No items configured for <strong>{cadence}</strong> counting yet. Set <code>closing_cadence = "{cadence}"</code> on materials
-          via <a href="/inventory" className="text-[#af4408] underline">Inventory</a> → Edit → Master Fields.
+          via <a href="/inventory" className="text-[#af4408] underline">Raw Materials</a> → Edit → Master Fields.
         </p>
       </div>
     );

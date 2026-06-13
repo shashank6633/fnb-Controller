@@ -144,7 +144,7 @@ export default function CategoryManagerPage() {
         </h1>
         <p className="text-xs text-[#6B5744] mt-0.5">
           Assign every leaf category (Beers, Whisky, Mutton…) to a parent super-category
-          (Bar, Meat…). This grouping drives the optgroup display on Inventory, Unit Audit,
+          (Bar, Meat…). This grouping drives the optgroup display on Raw Materials, Unit Audit,
           and requisition material pickers.
         </p>
       </div>

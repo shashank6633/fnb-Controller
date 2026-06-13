@@ -72,7 +72,7 @@ export async function GET() {
       status: 200,
       headers: {
         'Content-Type': 'text/csv; charset=utf-8',
-        'Content-Disposition': `attachment; filename="inventory-${stamp}.csv"`,
+        'Content-Disposition': `attachment; filename="raw-materials-${stamp}.csv"`,
         'Cache-Control': 'no-store',
       },
     });

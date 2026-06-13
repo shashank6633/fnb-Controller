@@ -103,7 +103,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Vendors",            href: "/vendors",            icon: Building2 },
       { kind: "link", label: "Vendor → Items",     href: "/vendors/materials",  icon: Building2 },
       { kind: "link", label: "Contracts",          href: "/contracts",          icon: FileText },
-      { kind: "link", label: "Inventory",          href: "/inventory",          icon: Package },
+      { kind: "link", label: "Raw Materials",      href: "/inventory",          icon: Package },
       { kind: "link", label: "Unit Audit",         href: "/unit-audit",         icon: ShieldAlert },
       { kind: "link", label: "Unit Registry",      href: "/units",              icon: ShieldAlert },
       { kind: "link", label: "Closing Stock",      href: "/closing-stock",      icon: ClipboardCheck },

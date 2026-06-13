@@ -294,7 +294,7 @@ export default function StoreDashboardPage() {
       </div>
 
       <p className="text-[10px] text-[#8B7355]">
-        Tip: buffer stock (reorder level) is set per item on the <Link href="/inventory" className="underline">Inventory</Link> page.
+        Tip: buffer stock (reorder level) is set per item on the <Link href="/inventory" className="underline">Raw Materials</Link> page.
         Items with buffer = 0 never appear here — set a non-zero buffer to opt-in to alerts.
       </p>
     </div>

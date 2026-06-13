@@ -258,7 +258,7 @@ export default function VarianceReportPage() {
             </div>
           ) : filtered.length === 0 ? (
             <div className="p-6 text-center text-xs text-[#8B7355]">
-              No closing-stock counts in this range. Use Inventory → Closing Stock to record one.
+              No closing-stock counts in this range. Use Raw Materials → Closing Stock to record one.
             </div>
           ) : (
             <div className="overflow-x-auto max-h-[60vh] overflow-y-auto">

@@ -18,9 +18,9 @@ const SCOPES: Array<{ key: string; label: string; description: string }> = [
     description: 'Physical stock counts and variance entries.' },
   { key: 'recipes',          label: 'Recipes (all) + sub-recipes + menu items',
     description: 'Wipes EVERY recipe, sub-recipe, recipe-ingredient link, menu-item, and direct-item-link. Sales/wastage history is kept but unlinked (recipe_id → NULL) so revenue numbers stay intact. Use when re-building the recipe book from scratch. Date range does not apply.' },
-  { key: 'inventory_unused', label: 'Inventory items — unused only (safe cleanup)',
+  { key: 'inventory_unused', label: 'Raw Materials — unused only (safe cleanup)',
     description: 'Deletes only inventory / raw-material items that NOTHING references — no purchases, recipes, requisitions, POs, stock movements, GRNs, wastages or counts use them. Ideal for clearing junk from a bad import without touching anything live. Date range does not apply.' },
-  { key: 'inventory_all',    label: 'Inventory items — ALL (full item-master wipe ⚠)',
+  { key: 'inventory_all',    label: 'Raw Materials — ALL (full item-master wipe ⚠)',
     description: 'Deletes EVERY inventory item across all outlets. Because stock movements, recipe-ingredient links, vendor prices, closing-stock counts, requisition / PO / GRN lines, wastages and butchering records all depend on materials, those are cleared too. Recipes & sub-recipes survive but lose their ingredient lists (costs reset to 0). Vendors, users and outlets stay. Use only to rebuild the item master from scratch. Date range does not apply.' },
 ];
 
@@ -269,7 +269,7 @@ export default function ResetPage() {
               ))}
             </ul>
             <p className="mt-3 text-xs">
-              You can now upload fresh data from <a href="/inventory" className="underline text-[#af4408]">Inventory</a> ·{' '}
+              You can now upload fresh data from <a href="/inventory" className="underline text-[#af4408]">Raw Materials</a> ·{' '}
               <a href="/sales" className="underline text-[#af4408]">Sales</a> ·{' '}
               <a href="/purchases" className="underline text-[#af4408]">Purchases</a> ·{' '}
               <a href="/purchase-orders" className="underline text-[#af4408]">Purchase Orders</a>.

@@ -76,7 +76,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/vendors',             label: 'Vendors' },
       { path: '/vendors/materials',   label: 'Vendor → Items' },
       { path: '/contracts',           label: 'Contracts' },
-      { path: '/inventory',           label: 'Inventory' },
+      { path: '/inventory',           label: 'Raw Materials' },
       { path: '/unit-audit',          label: 'Unit Audit' },
       { path: '/units',               label: 'Unit Registry' },
       { path: '/closing-stock',       label: 'Closing Stock' },
