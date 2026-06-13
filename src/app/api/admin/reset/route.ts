@@ -7,7 +7,10 @@ import { requireRole, getCurrentOutletId } from '@/lib/auth';
  * Body: {
  *   confirm: "RESET",                  // must equal exactly — primitive guardrail
  *   scopes: Array<                     // pick one or more
- *     "sales" | "purchases" | "purchase_orders" | "closing_stock" | "all"
+ *     "sales" | "purchases" | "purchase_orders" | "closing_stock" | "recipes"
+ *     | "inventory_unused"             // delete only materials nothing references
+ *     | "inventory_all"                // delete ALL materials + cascade dependents
+ *     | "all"
  *   >,
  *   from?:  "YYYY-MM-DD",              // optional date range — only delete rows
  *   to?:    "YYYY-MM-DD",              //   whose .date falls in [from, to].
@@ -248,6 +251,80 @@ export async function POST(req: Request) {
       // Parents
       deleted.recipes = db.prepare(`DELETE FROM recipes`).run().changes;
       deleted.sub_recipes = db.prepare(`DELETE FROM sub_recipes`).run().changes;
+    }
+
+    // ---- INVENTORY (raw_materials master) ----
+    // raw_materials is master data (NOT outlet-scoped), so these wipe globally.
+    // Date range doesn't apply — materials aren't date-stamped.
+    //
+    //   inventory_unused → delete only materials NOTHING references (safe: clears
+    //                      junk from a bad import, never corrupts live data).
+    //   inventory_all    → delete EVERY material + clear/NULL all 18 dependents.
+    //
+    // Every table that references raw_materials(id). Keep in sync with db.ts —
+    // if a new FK to raw_materials is added there, add it here too or the wipe
+    // will fail the FK check at commit.
+    const wantsInvUnused = scopes.includes('inventory_unused');
+    const wantsInvAll = scopes.includes('inventory_all');
+    if ((wantsInvUnused || wantsInvAll) && dateRange) {
+      throw new Error('Date range cannot be applied to inventory reset — clear the From/To fields');
+    }
+    if (wantsInvUnused || wantsInvAll) {
+      // { table, fk column, nullable } — nullable rows are UNLINKED (kept), the
+      // rest are DELETEd since they can't exist without their material.
+      const MATERIAL_REFS: Array<{ table: string; col: string; nullable: boolean }> = [
+        { table: 'purchases',                col: 'material_id',        nullable: false },
+        { table: 'sub_recipe_ingredients',   col: 'material_id',        nullable: false },
+        { table: 'recipe_ingredients',       col: 'material_id',        nullable: false },
+        { table: 'inventory_transactions',   col: 'material_id',        nullable: false },
+        { table: 'closing_stock',            col: 'material_id',        nullable: false },
+        { table: 'vendor_contracts',         col: 'material_id',        nullable: false },
+        { table: 'vendor_materials',         col: 'material_id',        nullable: false },
+        { table: 'purchase_order_items',     col: 'material_id',        nullable: false },
+        { table: 'requisition_items',        col: 'material_id',        nullable: false },
+        { table: 'butchering_batches',       col: 'source_material_id', nullable: false },
+        { table: 'butchering_outputs',       col: 'material_id',        nullable: false },
+        { table: 'party_consumption',        col: 'material_id',        nullable: false },
+        { table: 'goods_receipt_note_items', col: 'material_id',        nullable: false },
+        { table: 'wastages',                 col: 'material_id',        nullable: false },
+        // nullable — NULL the link but keep the row (it carries its own name/text)
+        { table: 'party_items',              col: 'material_id',        nullable: true  },
+        { table: 'menu_items',               col: 'material_id',        nullable: true  },
+        { table: 'staff_meal_items',         col: 'material_id',        nullable: true  },
+        { table: 'direct_item_links',        col: 'material_id',        nullable: true  },
+      ];
+      const tableExists = (t: string): boolean => {
+        try { db.prepare(`SELECT 1 FROM ${t} LIMIT 1`).get(); return true; } catch { return false; }
+      };
+
+      if (wantsInvAll) {
+        // Nuclear: clear every dependent ref, then wipe ALL materials.
+        for (const r of MATERIAL_REFS) {
+          if (!tableExists(r.table)) { deleted[`${r.table}_skipped`] = -1; continue; }
+          try {
+            if (r.nullable) {
+              deleted[`${r.table}_unlinked`] = db.prepare(
+                `UPDATE ${r.table} SET ${r.col} = NULL WHERE ${r.col} IS NOT NULL`
+              ).run().changes;
+            } else {
+              deleted[r.table] = db.prepare(`DELETE FROM ${r.table}`).run().changes;
+            }
+          } catch { deleted[`${r.table}_skipped`] = -1; }
+        }
+        // Recipe/sub-recipe costs are meaningless now (ingredients gone) — zero them.
+        try { db.prepare(`UPDATE recipes SET total_cost = 0, food_cost_percent = 0, updated_at = datetime('now')`).run(); } catch {}
+        try { db.prepare(`UPDATE sub_recipes SET total_cost = 0, cost_per_unit = 0, updated_at = datetime('now')`).run(); } catch {}
+        deleted.raw_materials = db.prepare(`DELETE FROM raw_materials`).run().changes;
+      } else {
+        // Safe: delete only materials with ZERO references anywhere.
+        const conds = MATERIAL_REFS
+          .filter(r => tableExists(r.table))
+          .map(r => `id NOT IN (SELECT ${r.col} FROM ${r.table} WHERE ${r.col} IS NOT NULL)`);
+        const where = conds.length ? 'WHERE ' + conds.join('\n          AND ') : '';
+        const before = (db.prepare('SELECT COUNT(*) AS n FROM raw_materials').get() as any).n;
+        deleted.inventory_unused = db.prepare(`DELETE FROM raw_materials ${where}`).run().changes;
+        deleted.inventory_kept_in_use = before - deleted.inventory_unused;
+      }
     }
 
     // ---- PHASE 1 DEPENDENT CLEANUP ----

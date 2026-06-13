@@ -18,6 +18,10 @@ const SCOPES: Array<{ key: string; label: string; description: string }> = [
     description: 'Physical stock counts and variance entries.' },
   { key: 'recipes',          label: 'Recipes (all) + sub-recipes + menu items',
     description: 'Wipes EVERY recipe, sub-recipe, recipe-ingredient link, menu-item, and direct-item-link. Sales/wastage history is kept but unlinked (recipe_id → NULL) so revenue numbers stay intact. Use when re-building the recipe book from scratch. Date range does not apply.' },
+  { key: 'inventory_unused', label: 'Inventory items — unused only (safe cleanup)',
+    description: 'Deletes only inventory / raw-material items that NOTHING references — no purchases, recipes, requisitions, POs, stock movements, GRNs, wastages or counts use them. Ideal for clearing junk from a bad import without touching anything live. Date range does not apply.' },
+  { key: 'inventory_all',    label: 'Inventory items — ALL (full item-master wipe ⚠)',
+    description: 'Deletes EVERY inventory item across all outlets. Because stock movements, recipe-ingredient links, vendor prices, closing-stock counts, requisition / PO / GRN lines, wastages and butchering records all depend on materials, those are cleared too. Recipes & sub-recipes survive but lose their ingredient lists (costs reset to 0). Vendors, users and outlets stay. Use only to rebuild the item master from scratch. Date range does not apply.' },
 ];
 
 export default function ResetPage() {
@@ -81,9 +85,15 @@ export default function ResetPage() {
     ? 'Provide both From and To, or leave both blank for full reset'
     : (from && to && from > to ? '"From" must be on or before "To"' : '');
 
+  // Inventory scopes wipe master data (not date-stamped) — a date range here is
+  // a mistake the server would reject, so block it up-front with a clear message.
+  const invSelected = scopes.has('inventory_unused') || scopes.has('inventory_all');
+  const invDateConflict = invSelected && !!(from || to);
+
   const requirements = [
     { ok: scopes.size > 0,                      msg: 'Pick at least one data type to clear' },
     { ok: !dateError,                            msg: dateError || 'Date range valid' },
+    { ok: !invDateConflict,                      msg: invDateConflict ? 'Inventory reset ignores dates — clear From/To' : 'Date range OK for selection' },
     { ok: confirmText === 'RESET',              msg: 'Type RESET in capital letters' },
     { ok: outletText === outlet?.name,          msg: `Type the outlet name exactly: ${outlet?.name || '?'}` },
   ];
@@ -116,8 +126,8 @@ export default function ResetPage() {
             <ShieldAlert className="w-6 h-6" /> Reset Transactional Data
           </h1>
           <p className="text-[#6B5744] text-sm mt-1">
-            Bulk-delete sales, purchases, POs, or closing-stock counts for the current outlet so you can re-import a clean dataset.
-            Master data (materials, recipes, menu items, vendors, users) stays intact.
+            Bulk-delete sales, purchases, POs or closing-stock counts for the current outlet so you can re-import a clean dataset.
+            Recipes and inventory items can also be cleared with their own options below. Vendors, users and outlets always stay intact.
           </p>
         </div>
 
@@ -259,7 +269,8 @@ export default function ResetPage() {
               ))}
             </ul>
             <p className="mt-3 text-xs">
-              You can now upload fresh data from <a href="/sales" className="underline text-[#af4408]">Sales</a> ·{' '}
+              You can now upload fresh data from <a href="/inventory" className="underline text-[#af4408]">Inventory</a> ·{' '}
+              <a href="/sales" className="underline text-[#af4408]">Sales</a> ·{' '}
               <a href="/purchases" className="underline text-[#af4408]">Purchases</a> ·{' '}
               <a href="/purchase-orders" className="underline text-[#af4408]">Purchase Orders</a>.
             </p>
