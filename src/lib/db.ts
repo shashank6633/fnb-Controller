@@ -1438,6 +1438,12 @@ function initializeSchema(db: Database.Database) {
     // Operational fields — where it lives + how long it lasts
     if (!has('storage_location'))       db.exec(`ALTER TABLE raw_materials ADD COLUMN storage_location TEXT DEFAULT ''`);
     if (!has('shelf_life_days'))        db.exec(`ALTER TABLE raw_materials ADD COLUMN shelf_life_days INTEGER NOT NULL DEFAULT 0`);
+    // Soft-delete flag for round-trip CSV re-upload: "deactivate missing" sets
+    // is_active=0 instead of hard-deleting (FK references from purchases/recipes/
+    // requisitions would otherwise cascade-break). DEFAULT 1 → every existing
+    // material stays active. Without this column the re-upload route throws
+    // "no such column: is_active" (long-standing gap — the route always assumed it).
+    if (!has('is_active'))              db.exec(`ALTER TABLE raw_materials ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1`);
     // One-shot backfills — only run once, idempotent via the settings flag.
     const phase1Backfilled = db.prepare("SELECT value FROM settings WHERE key='phase1_master_backfill_v1'").get() as any;
     if (!phase1Backfilled) {
