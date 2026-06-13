@@ -546,9 +546,11 @@ export default function InventoryPage() {
         defaultPurchaseRate: parseFloat(row['Default Purchase Rate']) || 0,
       })).filter((m) => m.name.trim() !== '');
 
+      // Additive import — never clears existing data. The route skips materials
+      // that already exist (matched by name) and only inserts genuinely new rows.
       const res = await api('/api/import-materials', {
         method: 'POST',
-        body: { materials, clearExisting: true },
+        body: { materials },
       });
 
       const result = await res.json();
@@ -676,7 +678,9 @@ export default function InventoryPage() {
               <ClipboardCheck className="w-4 h-4" />
               Closing Stock
             </button>
-            <label className={`flex items-center gap-2 px-4 py-2.5 border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium transition-colors cursor-pointer ${importing ? 'opacity-50 pointer-events-none' : ''}`}>
+            <label
+              title="Adds new materials from the CSV. Items that already exist (matched by name) are skipped — existing data is never deleted or overwritten."
+              className={`flex items-center gap-2 px-4 py-2.5 border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium transition-colors cursor-pointer ${importing ? 'opacity-50 pointer-events-none' : ''}`}>
               {importing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
               {importing ? 'Importing...' : 'Import POS CSV'}
               <input type="file" accept=".csv" onChange={handleCSVImport} className="hidden" disabled={importing} />

@@ -180,12 +180,31 @@ export async function POST(request: Request) {
         VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'))
       `);
 
+      // Additive-by-default dedup: unless the caller EXPLICITLY asked to clear,
+      // skip any material whose name already exists (in the DB, or duplicated
+      // earlier in this same file). An import therefore NEVER deletes or
+      // overwrites existing data — it only ADDS genuinely new items.
+      const existingNames = new Set<string>();
+      if (!clearExisting) {
+        for (const row of db.prepare(`SELECT name FROM raw_materials`).all() as any[]) {
+          existingNames.add(String(row.name || '').trim().toLowerCase());
+        }
+      }
+      const seenInFile = new Set<string>();
+
       let imported = 0;
-      let skipped = 0;
+      let skipped = 0;          // rows with no usable name
+      let skippedExisting = 0;  // rows skipped because the material already exists
 
       for (const mat of materials) {
         const name = mat.name?.trim();
         if (!name) { skipped++; continue; }
+        const dedupKey = name.toLowerCase();
+        if (!clearExisting && (existingNames.has(dedupKey) || seenInFile.has(dedupKey))) {
+          skippedExisting++;
+          continue;
+        }
+        seenInFile.add(dedupKey);
 
         const category = mapCategory(mat.category || 'other');
         // Recipe unit comes from the CONSUMPTION column (what recipes deduct in),
@@ -233,13 +252,20 @@ export async function POST(request: Request) {
         imported++;
       }
 
-      return { imported, skipped };
+      return { imported, skipped, skippedExisting };
     })();
 
+    const message = clearExisting
+      ? `Replaced all data — imported ${result.imported} materials.`
+      : `Added ${result.imported} new material${result.imported === 1 ? '' : 's'}` +
+        ` · ${result.skippedExisting} already existed (skipped — no duplicates)` +
+        `${result.skipped ? ` · ${result.skipped} had no name` : ''} · nothing deleted.`;
     return Response.json({
-      message: `Successfully imported ${result.imported} materials (${result.skipped} skipped)`,
+      message,
       imported: result.imported,
       skipped: result.skipped,
+      skipped_existing: result.skippedExisting,
+      cleared: !!clearExisting,
     }, { status: 201 });
 
   } catch (error: any) {
