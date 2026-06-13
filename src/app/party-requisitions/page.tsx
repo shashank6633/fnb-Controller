@@ -47,6 +47,9 @@ interface Requisition {
 
 interface ParsedFP {
   fp_number?: string;
+  /** Sheet party id — carried so a raised requisition can be matched back to
+   *  the live upcoming-parties cache (Customer Name / Column P refresh). */
+  party_unique_id?: string;
   event_name?: string;
   event_date?: string;
   event_time?: string;

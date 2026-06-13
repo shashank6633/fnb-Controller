@@ -115,13 +115,29 @@ export default function DashboardPage() {
     try {
       if (!silent) setLoading(true);
       setError(null);
-      const res = await fetch('/api/analytics');
-      if (!res.ok) throw new Error('Failed to fetch analytics');
+      const res = await fetch('/api/analytics', { credentials: 'same-origin' });
+      // 401 = session expired or never authenticated. Redirect to login
+      // instead of showing a generic "Failed to fetch" — that error was
+      // confusing users who needed to re-login (especially after a deploy
+      // that invalidated their cookie).
+      if (res.status === 401) {
+        if (typeof window !== 'undefined') {
+          window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`;
+        }
+        return;
+      }
+      if (!res.ok) {
+        // Surface the actual server error if present so we don't hide real bugs.
+        const j = await res.json().catch(() => ({} as any));
+        throw new Error(j.error || `Analytics failed (HTTP ${res.status})`);
+      }
       const json = await res.json();
       setData(json);
       fetchExtras();
     } catch (err: any) {
-      setError(err.message);
+      // Network failure (offline, server down) lands here too. Friendlier copy.
+      const msg = err?.name === 'TypeError' ? 'Network error — check your connection or try again.' : (err?.message || 'Failed to load dashboard.');
+      setError(msg);
     } finally {
       if (!silent) setLoading(false);
     }

@@ -1,0 +1,94 @@
+---
+title: Store Manager — Issue Material, Raise PO, Approve & Receive
+---
+flowchart TD
+    %% ===== Stage 1: Store Inbox =====
+    A([UI: /store-requisitions · Store Inbox]) -->|"Store Mgr opens · GET ?inbox=store"| B{Requisition type?}
+    B -->|"Internal · chef_approved · INTERNAL badge"| C([Pending Issue tab])
+    B -->|"Party · mgmt_approved · PARTY badge"| C
+    C -->|"Store Mgr: Issue to Department"| D[Open Issue modal]
+
+    %% ===== Stage 2: Issue Modal + negative-stock guard =====
+    D --> E[Effective qty = chef-approved qty else requested]
+    E --> F[Issuable = min of effective and max-0-stock]
+    F --> G{System stock negative?}
+    G -->|"yes · input disabled · row red"| H[Red banner: 'Raise PO ASAP' + link]
+    G -->|"no"| I[Enter qty handed over per line]
+    H --> I
+
+    %% ===== Stage 3: Optional raise-PO =====
+    I --> J{Tick 'Also raise vendor PO'? default OFF}
+    J -->|"no · pure issuance"| Q{Issue mode}
+    J -->|"yes · show Buy / Unit / Vendor cols"| K[Pick vendor from dropdown - mapped first, then all active]
+    K --> L[Enter Buy qty + price · auto unit conversion BTL/PKT vs recipe unit]
+    L --> M[Validate: ≥1 Buy line · price greater than 0 · vendor picked]
+    M --> Q
+
+    %% ===== Stage 4: Status transitions =====
+    Q -->|"no PO raised"| T[(store-process · approved -> fulfilled)]
+    Q -->|"PO raised · auto_create_po"| U[(store-process · approved -> store_processed · links PO)]
+    Q -->|"partial per-line issue"| S{All lines issued, none deferred?}
+    S -->|"yes"| V[(store-issue auto-advance -> fulfilled)]
+    S -->|"no - still open"| W[(store-issue -> store_processed · logs issue_history)]
+
+    T --> PARTY1{Party requisition?}
+    PARTY1 -->|"yes · deduct stock · party_consumption"| X[[party_consumption cascade]]
+    PARTY1 -->|"no · internal audit-only · stock untouched"| END_FUL([End: Fulfilled])
+    X --> END_FUL
+    V --> END_FUL
+
+    %% ===== Stage 5: PO admin approve/reject =====
+    U --> PO1[(Auto-PO created · status = pending)]
+    W --> PO1
+    PO1 --> PO2([UI: /purchase-orders · admin only])
+    PO2 --> PO3{Admin decision?}
+    PO3 -->|"Reject + reason · pending -> rejected · audit po.reject"| END_REJ([End: PO Rejected])
+    PO3 -->|"Approve + note · pending -> approved · audit po.approve"| PO4[(PO -> approved)]
+
+    %% ===== Stage 6: Receive PO =====
+    PO4 --> RC1([Store Mgr: Receive PO modal · units shown per line])
+    RC1 --> RC2[Edit Received Qty + Accepted + Actual price · min 0]
+    RC2 --> RC3{Server: PO approved AND no negative qty/price?}
+    RC3 -->|"negative · blocked"| GRN1
+    RC3 -->|"ok · atomic txn"| SYS1
+
+    %% ===== Stage 7: auto-GRN + stock + weighted-avg =====
+    SYS1[[Auto-create GRN · write GRN items]] --> SYS3[(Insert purchases · stock += accepted · inventory_transactions)]
+    SYS3 --> SYS5{Any line rejected at QC?}
+    SYS5 -->|"yes"| SYS5a[(GRN status received -> partial)]
+    SYS5 -->|"no"| SYS6
+    SYS5a --> SYS6[(PO approved -> received · sets grn_id · total_cost)]
+    SYS6 --> SYS7[[updateMaterialPrice · weighted-avg + recipe cost cascade]]
+
+    %% ===== Stage 8: Excess detection =====
+    SYS7 --> EX1{Any line accepted greater than ordered?}
+    EX1 -->|"yes"| EX2[[Notify admin: audit po.received_excess + in-app + Slack]]
+    EX1 -->|"no"| RQ1
+    EX2 --> RQ1{Linked requisition?}
+
+    %% ===== Stage 9: Requisition fulfilled cascade =====
+    RQ1 -->|"yes · store_processed -> fulfilled"| RQ2[(Requisition -> fulfilled)]
+    RQ1 -->|"no - ad-hoc PO"| END_RCV([End: PO Received, stock updated])
+    RQ2 --> RQ3{Party requisition?}
+    RQ3 -->|"yes · deduct + party_consumption"| RQ4[[party_consumption cascade]]
+    RQ3 -->|"no"| END_FUL2([End: Fulfilled])
+    RQ4 --> END_FUL2
+
+    %% ===== Back-correction GRN branch =====
+    GRN1([UI: /grn · Ad-hoc GRN · back-correction]) --> GRN2[Tick 'back-correction' · allow negatives · ref required]
+    GRN2 --> GRN3{Received + accepted same sign?}
+    GRN3 -->|"no"| GRN2
+    GRN3 -->|"yes · no PO link"| GRN4[(Insert purchases tagged · stock may reduce)]
+    GRN4 --> GRN5[[updateMaterialPrice · recompute either sign]]
+    GRN5 --> END_BC([End: Back-correction posted])
+
+    %% ===== Styling =====
+    classDef store fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef admin fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef system fill:#f3f4f6,stroke:#6b7280,color:#374151
+    classDef endNode fill:#dcfce7,stroke:#16a34a,color:#14532d
+
+    class A,B,C,D,E,F,G,H,I,J,K,L,M,Q,T,U,V,W,S,PO1,RC1,RC2,RC3,GRN1,GRN2,GRN3,GRN4 store
+    class PO2,PO3,PO4 admin
+    class PARTY1,SYS1,SYS3,SYS5,SYS5a,SYS6,SYS7,EX1,EX2,RQ1,RQ2,RQ3,X,RQ4,GRN5 system
+    class END_FUL,END_FUL2,END_RCV,END_BC,END_REJ endNode

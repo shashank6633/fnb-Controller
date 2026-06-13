@@ -1,4 +1,4 @@
-import { readSheet } from '@/lib/sheets-client';
+import { readSheet, getAuthDiagnostics } from '@/lib/sheets-client';
 import { mapRowToUpcomingParty, UpcomingParty } from '@/lib/fp-records-mapper';
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
@@ -44,15 +44,23 @@ export async function GET(request: Request) {
     return Response.json(await fetchLiveAndCache());
   } catch (e: any) {
     console.error('[upcoming-parties GET]', e);
+    // Diagnose WHICH identity the app tried to authenticate as — the operator
+    // must share the sheet with exactly this email. On AWS this is the JSON-key
+    // SA; on GCP it's the metadata SA. Surfacing it makes the fix unambiguous.
+    const diag = await getAuthDiagnostics().catch(() => null);
     // On auth failure, fall back to last cached snapshot if we have one
     const cached = readCache();
     if (cached.parties.length > 0) {
       return Response.json({
         ...cached,
         warning: `Live fetch failed (${e.message || 'unknown'}). Showing cached snapshot.`,
+        auth: diag,
       });
     }
-    return Response.json({ error: e.message || 'Failed to fetch sheet' }, { status: 500 });
+    return Response.json({
+      error: e.message || 'Failed to fetch sheet',
+      auth: diag,
+    }, { status: 500 });
   }
 }
 

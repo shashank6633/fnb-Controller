@@ -529,6 +529,10 @@ function UpcomingPartiesPanel() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Auth diagnostics from the API — which Google service account the server
+  // tried to use. Drives an accurate "share the sheet with THIS email" hint
+  // (the account differs between GCP metadata SA and AWS JSON-key SA).
+  const [authDiag, setAuthDiag] = useState<{ mode?: string; service_account_email?: string | null; key_file_path?: string | null } | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
   const [fetchedAt, setFetchedAt] = useState<string>('');
   // Role check — admins bypass the approval gate (covers "just approved but
@@ -597,6 +601,7 @@ function UpcomingPartiesPanel() {
         method: force ? 'GET' : 'GET',
       });
       const j = await r.json();
+      if (j.auth) setAuthDiag(j.auth);           // capture even on success (warning path)
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
       setParties(j.parties || []);
       setFetchedAt(j.fetched_at || '');
@@ -690,9 +695,29 @@ function UpcomingPartiesPanel() {
           <div>
             <div className="font-semibold">Could not fetch upcoming parties</div>
             <div className="text-xs mt-1">{error}</div>
-            <div className="text-xs mt-1 text-[#6B5744]">
-              Check that <code className="bg-white px-1 rounded">611721445847-compute@developer.gserviceaccount.com</code> has Viewer access to the AKAN Party Manager sheet.
-            </div>
+            {/* Show the ACTUAL service account the server is using (dynamic), so
+                the operator shares the sheet with the right email. Falls back to
+                env-var guidance when the JSON key isn't configured at all. */}
+            {authDiag?.service_account_email ? (
+              <div className="text-xs mt-1 text-[#6B5744]">
+                Share the AKAN Party Manager sheet (Viewer) with:{' '}
+                <code className="bg-white px-1 rounded">{authDiag.service_account_email}</code>
+                {authDiag.mode === 'keyfile' && authDiag.key_file_path && (
+                  <span className="block mt-0.5 text-[10px] text-[#8B7355]">
+                    Using JSON key at <code className="bg-white px-1 rounded">{authDiag.key_file_path}</code>
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div className="text-xs mt-1 text-[#6B5744]">
+                No Google credentials found on the server. On AWS, set{' '}
+                <code className="bg-white px-1 rounded">GOOGLE_APPLICATION_CREDENTIALS</code>{' '}
+                to a service-account JSON key path and share the sheet with that account&apos;s email.
+                <span className="block mt-0.5 text-[10px] text-[#8B7355]">
+                  See deploy/aws/RUNBOOK.md §3.
+                </span>
+              </div>
+            )}
           </div>
         </div>
       ) : visible.length === 0 ? (

@@ -1,0 +1,74 @@
+---
+title: Kitchen Staff — Party Material Requisition & Head Chef Approval
+---
+flowchart TD
+%% ===== Stage 1: Party Events FP gate =====
+A([UI: /party-events page]) -->|"loads upcoming parties + party-rules"| B[Render party row - FP#, Contact, Company, Pax, Status]
+B --> C{Has /party-requisitions access?}
+C -->|"no"| C1[End: Locked - shows 'No access' lock]
+C -->|"yes"| D{FP approved? OR gate off OR admin}
+D -->|"no"| D1[End: 'Awaiting approval' badge + refresh status]
+D -->|"yes"| E{Past day? within 3-day grace + admin enabled?}
+E -->|"older than 3 days"| E1[End: 'Too old - admin only']
+E -->|"past but gate off"| E2[End: 'Past day - admin must enable']
+E -->|"allowed"| F[Staff: click 'Raise Req' / 'Raise more']
+
+%% ===== Stage 2: Prefill + modal =====
+F -->|"Kitchen Staff: stash prefill to sessionStorage"| G([UI: /party-requisitions])
+G -->|"reads stash one-shot, builds prefill"| H([UI: New Party Requisition modal - Customer, Company, date, guests])
+H -->|"dept auto-locked to staff role"| I[Requesting Dept locked - no dropdown]
+I --> J[Staff: add materials via typeahead search]
+J -->|"auto-add blank line on entry"| K{Line unit is a registered unit? recipe + purchase}
+K -->|"no"| K1[End: client blocks save - unit error]
+K -->|"yes"| L[Staff: click 'Save and Submit to Chef']
+
+%% ===== Stage 3: Persist + submit =====
+L -->|"Kitchen Staff: POST /api/requisitions"| M{Items belong to staff own department?}
+M -->|"no - non-privileged"| M1[End: 403 - own department only]
+M -->|"yes"| N[(DB: create requisition · status = draft · qty in recipe units)]
+N -->|"sheet truth re-asserted for non-admins"| O[Staff: POST /submit]
+O --> P{Inside submission window OR admin override?}
+P -->|"outside window"| P1[End: 400 - submission window closed]
+P -->|"inside / forced"| Q[(DB: status draft -> submitted)]
+Q -->|"audit: requisition.submit"| R{{System: lands in Head Chef inbox}}
+
+%% ===== Stage 4: Head Chef per-item review =====
+R --> S([UI: /party-approvals page])
+S -->|"grouped by event name + date"| T[Head Chef: expand req, review each item]
+T -->|"per-item: edit approved qty / reject line / add note · audit req_item.*"| U{Head Chef decision}
+
+%% ===== Stage 5: Three outcomes =====
+U -->|"Approve all"| V{Every line rejected?}
+U -->|"Reject whole requisition"| W{Reason entered?}
+V -->|"all rejected"| W2[Reroute: must Reject instead]
+W2 --> W
+V -->|"has live lines"| X[(DB: POST chef-approve · submitted -> chef_approved)]
+W -->|"empty"| W1[Re-prompt until reason given]
+W1 --> W
+W -->|"reason given"| Y[(DB: POST chef-reject · submitted -> chef_rejected · stores reason)]
+Y --> Y1[End: Rejected by Chef - back to dept]
+
+%% ===== Stage 6: Optional Mgmt gate -> Store =====
+X --> Z{Mgmt-approval gate ON?}
+Z -->|"OFF - default"| AA{{System: chef_approved goes straight to Store - 'With Store'}}
+Z -->|"ON - admin only"| AB[Admin: click 'Mgmt Approve']
+AB -->|"POST mgmt-approve"| AC[(DB: chef_approved -> mgmt_approved)]
+AC --> AD{{System: mgmt_approved goes to Store - 'With Store'}}
+AA --> AE([Store Issue queue])
+AD --> AE
+AE --> AF[End: in Store queue - onward to fulfilled]
+
+%% ===== Styling =====
+classDef staff fill:#fef3c7,stroke:#d97706,color:#78350f
+classDef chef fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+classDef mgmt fill:#e0e7ff,stroke:#4f46e5,color:#312e81
+classDef store fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+classDef admin fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+classDef system fill:#f3f4f6,stroke:#6b7280,color:#374151
+classDef endNode fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+
+class A,B,C,C1,D,D1,E,E1,E2,F,G,H,I,J,K,K1,L,M,M1,N,O,P,P1,Q staff
+class R,AA,AD,AF system
+class S,T,U,V,W,W1,W2,X,Y,Y1 chef
+class Z,AB,AC admin
+class AE store

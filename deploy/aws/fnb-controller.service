@@ -1,0 +1,33 @@
+[Unit]
+Description=F&B Controller (Next.js production server)
+After=network.target
+
+[Service]
+Type=simple
+# Ubuntu EC2 default login user is 'ubuntu'. Change if you deploy under another user.
+User=ubuntu
+WorkingDirectory=/opt/fnb-controller
+
+# Secrets + config live in this env file (root-owned, chmod 600).
+# It must define GOOGLE_APPLICATION_CREDENTIALS and may define CRON_TOKEN etc.
+EnvironmentFile=/etc/fnb-controller.env
+
+# Sane defaults — the env file can override these.
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=0.0.0.0
+
+ExecStart=/usr/bin/npm run start
+Restart=on-failure
+RestartSec=5
+
+# Cap memory so a runaway loop can't take down the box. Raise on a bigger
+# instance if you start serving multiple outlets.
+MemoryMax=1G
+
+# Logs → journalctl -u fnb-controller
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -49,7 +49,9 @@ export default function UserBar() {
   const currentOutlet = outlets.find(o => o.id === currentOutletId);
 
   return (
-    <div className="fixed top-3 right-4 z-30 flex items-center gap-2 bg-white border border-[#E8D5C4] rounded-full pl-3 pr-1 py-1 shadow-sm">
+    // Desktop-only chrome (hidden on mobile — folded into <MobileTopBar />).
+    // On small screens the floating pill collided with page headings.
+    <div className="hidden lg:flex fixed top-3 right-4 z-30 items-center gap-2 bg-white border border-[#E8D5C4] rounded-full pl-3 pr-1 py-1 shadow-sm">
       {/* Outlet picker — only show if more than one outlet */}
       {outlets.length > 1 ? (
         <label className="inline-flex items-center gap-1 text-[#6B5744]" title="Current outlet">

@@ -176,3 +176,96 @@ main > div > div.grid > *:nth-child(6) { animation-delay: 0.20s; }
 .stagger > *:nth-child(6) { animation-delay: 0.20s; }
 .stagger > *:nth-child(7) { animation-delay: 0.24s; }
 .stagger > *:nth-child(8) { animation-delay: 0.28s; }
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Mobile-friendliness sweep (≤ 1023px / below lg:).
+ *
+ * Goal: every page in the app — regardless of which one — gets sensible
+ * defaults on phones without each component having to be touched. Rules
+ * are scoped to inside `main` so they don't affect the sidebar / login.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/* 1. Prevent sideways page scroll on phones — but ONLY on mobile, and ONLY on
+ *    the <main> content column, NOT on html/body.
+ *
+ *    CRITICAL: setting `overflow-x: hidden` on html/body forces overflow-y to
+ *    compute as `auto`, which changes the scroll container for the whole
+ *    document and BREAKS `position: sticky` on the desktop sidebar (it stops
+ *    pinning and scrolls away). So we scope the clamp to <main> on mobile only.
+ *    Desktop keeps html/body overflow visible → sticky sidebar works. */
+@media (max-width: 1023.98px) {
+  main { overflow-x: hidden; max-width: 100vw; }
+}
+
+@media (max-width: 1023.98px) {
+  /* 2. Tame oversized page headings on phones so they don't wrap into 3
+   *    lines and push the action buttons below the fold. */
+  main h1 { font-size: 1.25rem !important; line-height: 1.5rem !important; }
+  main h2 { font-size: 1.05rem !important; line-height: 1.4rem !important; }
+
+  /* 3. Tables already wrapped in .overflow-x-auto behave correctly on
+   *    phones (horizontal scroll within their container). We deliberately
+   *    DO NOT force display:table; width:max-content on every table — that
+   *    would let tables without a scroll wrapper escape the viewport. */
+  main .overflow-x-auto { -webkit-overflow-scrolling: touch; }
+  main .overflow-x-auto > table { min-width: 100%; }
+
+  /* 4. Reduce big page-container padding so cards don't have wasted edges.
+   *    Many pages use `p-6 max-w-7xl mx-auto space-y-4` — the AppShell
+   *    already pads the outer column on mobile, so an inner p-6 doubles up.
+   *    Only touches the FIRST-LEVEL .p-6 inside main; nested .p-6 (cards,
+   *    modals) stay untouched. */
+  main > div > .p-6 { padding: 0.5rem !important; }
+
+  /* 5. Modals — make sure even modals authored with a max-w-Xxl scale down
+   *    to the viewport. The fixed.inset-0 wrapper's p-4 padding was eating
+   *    width on phones; we keep the padding but cap the inner card. */
+  .fixed.inset-0 > div:not([class*="absolute"]) {
+    max-height: calc(100vh - 1rem);
+    max-width: calc(100vw - 1rem);
+  }
+
+  /* 6. Tappable button minimum height (Material Design minimum is 36px). */
+  main button { min-height: 36px; }
+
+  /* 7. Inputs collapse to viewport width instead of overflowing because of
+   *    fixed w-32 / w-48 sizing on phones. */
+  main input[type="text"],
+  main input[type="email"],
+  main input[type="search"],
+  main input[type="date"],
+  main input[type="datetime-local"],
+  main input[type="number"],
+  main textarea,
+  main select {
+    max-width: 100%;
+  }
+
+  /* 8. Embedded charts / SVGs / iframes never break out. */
+  main iframe, main canvas, main svg { max-width: 100%; height: auto; }
+
+  /* 9. The .flex utility on toolbar containers wraps onto multiple rows so
+   *    chips don't squish. Excludes flex-nowrap (explicit opt-out) AND
+   *    flex-col / flex-row-reverse / display-only flex inside small inline
+   *    buttons (filtered by .gap-* — toolbars almost always use gap-2/3/4). */
+  main .flex.gap-2:not(.flex-nowrap):not(.flex-col),
+  main .flex.gap-3:not(.flex-nowrap):not(.flex-col),
+  main .flex.gap-4:not(.flex-nowrap):not(.flex-col) {
+    flex-wrap: wrap;
+  }
+}
+
+/* 10. iOS Safari momentum scrolling for any overflow container. */
+.overflow-x-auto, .overflow-y-auto, .overflow-auto {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 11. Disable hover-lift on touch devices — the "hover" sticks until next
+ *     tap on iOS, which makes cards look perpetually shifted. */
+@media (hover: none) {
+  [class*="bg-white"][class*="border-[#E8D5C4]"][class*="rounded-"]:hover,
+  .card-lift:hover {
+    transform: none;
+    box-shadow: none;
+  }
+}

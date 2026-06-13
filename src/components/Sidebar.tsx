@@ -139,6 +139,21 @@ export default function Sidebar() {
   const pathname = usePathname();
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+
+  // MobileTopBar dispatches 'fnb:open-sidebar' on hamburger tap. Listen here
+  // so the floating hamburger button doesn't need to live inside this file
+  // (cleaner separation — the top bar owns the visible mobile chrome).
+  useEffect(() => {
+    const onOpen = () => setMobileOpen(true);
+    window.addEventListener('fnb:open-sidebar', onOpen);
+    return () => window.removeEventListener('fnb:open-sidebar', onOpen);
+  }, []);
+
+  // Auto-close the mobile drawer whenever the route changes — without this,
+  // tapping a nav link would leave the drawer covering the page on small
+  // screens (visited links closed correctly via onClick, but back/forward
+  // navigation didn't).
+  useEffect(() => { setMobileOpen(false); }, [pathname]);
   // Current user — used to filter nav links by the per-user page_access map.
   const [me, setMe] = useState<{ role?: string; page_access?: string | null } | null>(null);
   useEffect(() => {
@@ -308,14 +323,9 @@ export default function Sidebar() {
 
   return (
     <>
-      {/* Mobile hamburger button */}
-      <button
-        onClick={() => setMobileOpen(true)}
-        className="fixed top-4 left-4 z-50 lg:hidden flex items-center justify-center w-10 h-10 rounded-lg bg-white border border-[#E8D5C4] text-[#6B5744] hover:text-[#af4408] transition-colors shadow-sm"
-        aria-label="Open menu"
-      >
-        <Menu size={20} />
-      </button>
+      {/* Mobile hamburger moved to <MobileTopBar /> — it's the canonical
+          mobile chrome and dispatches the 'fnb:open-sidebar' event listened
+          above. Keeping it here would double the hamburger on small screens. */}
 
       {/* Mobile overlay */}
       {mobileOpen && (

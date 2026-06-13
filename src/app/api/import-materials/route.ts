@@ -50,25 +50,75 @@ function mapCategory(posCategory: string): string {
   return 'other';
 }
 
-// Map POS purchase unit to our system units
-function mapUnit(posUnit: string): string {
-  const u = posUnit.trim().toUpperCase();
-
-  if (u === 'KG' || u.includes('KG')) return 'kg';
-  if (u === 'GMS' || u.includes('GMS') || u.includes('GM')) return 'g';
-  if (u === 'LTR' || u.includes('LTR')) return 'l';
+// Map a CONSUMPTION/recipe unit string → canonical recipe unit (kg/g/L/ml/pcs).
+// This is what recipes deduct in. POS gives "GMS", "ML", "PC", "PKT (50PC)" etc.
+function mapRecipeUnit(posUnit: string): string {
+  const u = (posUnit || '').trim().toUpperCase();
+  if (!u) return 'pcs';
+  if (u === 'GMS' || u === 'GM' || u === 'GRAMS' || u === 'G') return 'g';
+  if (u === 'KG' || u === 'KGS') return 'kg';
+  if (u === 'ML') return 'ml';
+  if (u === 'LTR' || u === 'LITRE' || u === 'L') return 'L';
+  if (u === 'PC' || u === 'PCS' || u === 'PIECE' || u === 'PIECES') return 'pcs';
+  // "PKT (50PC)" / "BTL (750ML)" — consumed by the piece unless inner unit says otherwise
   if (u.includes('ML')) return 'ml';
-  if (u === 'PC' || u === 'PCS') return 'pcs';
-  if (u.includes('BTL')) return 'bottle';
-  if (u.includes('PKT')) return 'pcs';
-  if (u.includes('TIN')) return 'pcs';
-  if (u.includes('BOX')) return 'pcs';
-  if (u.includes('CAN')) return 'pcs';
-  if (u.includes('BAG')) return 'kg';
-  if (u.includes('DOZEN') || u.includes('DZN')) return 'dozen';
-  if (u.includes('BUNCH')) return 'bunch';
-
+  if (u.includes('GM')) return 'g';
   return 'pcs';
+}
+
+// Normalize a PURCHASE unit string → clean vendor-facing token (KG/L/BTL/PKT/…).
+// Strips any "(750ML)" / "(50PC)" suffix — that detail becomes pack_size.
+function cleanPurchaseUnit(posUnit: string): string {
+  const raw = (posUnit || '').trim().toUpperCase();
+  const head = raw.split('(')[0].trim();   // "BTL (750ML)" → "BTL"
+  if (head === 'KG' || head === 'KGS') return 'kg';
+  if (head === 'GMS' || head === 'GM' || head === 'G') return 'g';
+  if (head === 'LTR' || head === 'LITRE' || head === 'L') return 'L';
+  if (head === 'ML') return 'ml';
+  if (head === 'PC' || head === 'PCS') return 'pcs';
+  if (head === 'BTL' || head === 'BOTTLE') return 'BTL';
+  if (head === 'PKT' || head === 'PACKET') return 'PKT';
+  if (head === 'TIN') return 'TIN';
+  if (head === 'CAN') return 'CAN';
+  if (head === 'BOX') return 'BOX';
+  if (head === 'BAG') return 'BAG';
+  if (head === 'JAR') return 'JAR';
+  if (head === 'CASE') return 'CASE';
+  if (head === 'BUNCH') return 'BUNCH';
+  if (head === 'DOZEN' || head === 'DZN') return 'DOZEN';
+  return head || 'pcs';
+}
+
+// Compute pack_size = how many RECIPE units are in one PURCHASE unit.
+//   "BTL (750ML)" + consume "ML"  → 750
+//   "PKT (50PC)"  + consume "PC"  → 50
+//   "KG"          + consume "GMS" → 1000   (weight conversion)
+//   "LTR"         + consume "ML"  → 1000   (volume conversion)
+//   "KG"          + consume "KG"  → 1      (same unit)
+function computePackSize(purchaseRaw: string, recipeUnit: string): number {
+  const pu = (purchaseRaw || '').trim().toUpperCase();
+  // 1) Explicit "(NNN UNIT)" inside the purchase unit wins.
+  const m = pu.match(/\(\s*(\d+(?:\.\d+)?)\s*([A-Z]+)\s*\)/);
+  if (m) {
+    const qty = parseFloat(m[1]);
+    if (Number.isFinite(qty) && qty > 0) return qty;
+  }
+  // 2) Weight / volume conversion when buy-unit is bigger than recipe-unit.
+  const head = pu.split('(')[0].trim();
+  if ((head === 'KG' || head === 'KGS') && recipeUnit === 'g')  return 1000;
+  if ((head === 'LTR' || head === 'L' || head === 'LITRE') && recipeUnit === 'ml') return 1000;
+  // 3) Same unit (KG↔kg, PKT↔pcs both-pieces, etc.) → 1.
+  return 1;
+}
+
+// Next gapless MAT-NNNNN SKU — mirrors the generator in /api/inventory.
+function nextSku(db: any): number {
+  const row = db.prepare(`
+    SELECT sku FROM raw_materials
+    WHERE sku LIKE 'MAT-%' AND sku GLOB 'MAT-[0-9]*'
+    ORDER BY CAST(REPLACE(sku, 'MAT-', '') AS INTEGER) DESC LIMIT 1
+  `).get() as { sku?: string } | undefined;
+  return row?.sku ? (parseInt(row.sku.replace('MAT-', ''), 10) || 0) : 0;
 }
 
 export async function POST(request: Request) {
@@ -111,9 +161,14 @@ export async function POST(request: Request) {
       }
 
       const insertMaterial = db.prepare(`
-        INSERT OR REPLACE INTO raw_materials (id, name, category, unit, current_stock, reorder_level, costing_method, average_price, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'average', ?, datetime('now'), datetime('now'))
+        INSERT OR REPLACE INTO raw_materials
+          (id, sku, name, category, unit, purchase_unit, pack_size, case_size,
+           current_stock, reorder_level, costing_method, average_price,
+           created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'average', ?, datetime('now'), datetime('now'))
       `);
+      // Seed the SKU counter once; increment in JS so we don't re-query per row.
+      let skuCounter = nextSku(db);
 
       const insertPurchase = db.prepare(`
         INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, created_at)
@@ -133,20 +188,40 @@ export async function POST(request: Request) {
         if (!name) { skipped++; continue; }
 
         const category = mapCategory(mat.category || 'other');
-        const unit = mapUnit(mat.purchaseUnit || 'pcs');
-        const stock = parseFloat(String(mat.usableInventory)) || 0;
-        const reorderLevel = parseFloat(String(mat.minimumStockLevel)) || 0;
-        const price = parseFloat(String(mat.defaultPurchaseRate)) || 0;
+        // Recipe unit comes from the CONSUMPTION column (what recipes deduct in),
+        // falling back to a sensible map of the purchase unit if consumption is blank.
+        const recipeUnit   = mat.consumptionUnit?.trim()
+          ? mapRecipeUnit(mat.consumptionUnit)
+          : mapRecipeUnit(mat.purchaseUnit || 'pcs');
+        const purchaseUnit = cleanPurchaseUnit(mat.purchaseUnit || recipeUnit);
+        const packSize     = computePackSize(mat.purchaseUnit || '', recipeUnit);
+        // The CSV gives stock / reorder in PURCHASE units and rate per PURCHASE
+        // unit (e.g. 20 KG @ ₹141.75/KG). The app stores everything in RECIPE
+        // units (g/ml/pcs), so convert via pack_size:
+        //   stock_recipe = stock_purchase × pack_size
+        //   price_recipe = rate_purchase  ÷ pack_size
+        // Net stock VALUE (stock × price) is preserved either way.
+        const purchaseStock = parseFloat(String(mat.usableInventory)) || 0;
+        const purchaseReorder = parseFloat(String(mat.minimumStockLevel)) || 0;
+        const purchaseRate = parseFloat(String(mat.defaultPurchaseRate)) || 0;
+        const stock        = purchaseStock   * packSize;     // recipe units
+        const reorderLevel = purchaseReorder * packSize;     // recipe units
+        const price        = packSize > 0 ? purchaseRate / packSize : purchaseRate;  // per recipe unit
         const materialId = mat.id || generateId();
+        // Auto-SKU: only mint a new one when the row didn't carry an existing SKU.
+        const sku = (mat as any).sku?.trim() || `MAT-${String(++skuCounter).padStart(5, '0')}`;
 
-        // Insert raw material
-        insertMaterial.run(materialId, name, category, unit, stock, reorderLevel, price);
+        // Insert raw material — now with purchase_unit, pack_size + SKU.
+        insertMaterial.run(
+          materialId, sku, name, category, recipeUnit, purchaseUnit, packSize,
+          stock, reorderLevel, price
+        );
 
-        // Create initial purchase record if there's stock and price
+        // Create initial purchase record if there's stock and price (recipe units).
         if (stock > 0 && price > 0) {
           const purchaseId = generateId();
           insertPurchase.run(
-            purchaseId, materialId, 'POS Import', 'Default', stock, price, stock * price,
+            purchaseId, materialId, 'POS Import', 'Default', stock, price, Math.round(stock * price * 100) / 100,
             '2026-04-06', 'Initial stock from POS system import'
           );
 
