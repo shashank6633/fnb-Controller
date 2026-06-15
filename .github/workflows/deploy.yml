@@ -1,0 +1,28 @@
+name: Deploy FNB Controller
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to Lightsail
+        uses: appleboy/ssh-action@v1.0.3
+
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+
+          script: |
+            cd /var/www/fnb-controller
+
+            git pull origin main
+
+            mvn clean package -DskipTests
+
+            pm2 restart fnb-controller
+
+            pm2 save
