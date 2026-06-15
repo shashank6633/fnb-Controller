@@ -170,16 +170,6 @@ export async function POST(request: Request) {
       // Seed the SKU counter once; increment in JS so we don't re-query per row.
       let skuCounter = nextSku(db);
 
-      const insertPurchase = db.prepare(`
-        INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      `);
-
-      const insertTransaction = db.prepare(`
-        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-        VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'))
-      `);
-
       // Additive-by-default dedup: unless the caller EXPLICITLY asked to clear,
       // skip any material whose name already exists (in the DB, or duplicated
       // earlier in this same file). An import therefore NEVER deletes or
@@ -214,40 +204,27 @@ export async function POST(request: Request) {
           : mapRecipeUnit(mat.purchaseUnit || 'pcs');
         const purchaseUnit = cleanPurchaseUnit(mat.purchaseUnit || recipeUnit);
         const packSize     = computePackSize(mat.purchaseUnit || '', recipeUnit);
-        // The CSV gives stock / reorder in PURCHASE units and rate per PURCHASE
-        // unit (e.g. 20 KG @ ₹141.75/KG). The app stores everything in RECIPE
-        // units (g/ml/pcs), so convert via pack_size:
-        //   stock_recipe = stock_purchase × pack_size
-        //   price_recipe = rate_purchase  ÷ pack_size
-        // Net stock VALUE (stock × price) is preserved either way.
-        const purchaseStock = parseFloat(String(mat.usableInventory)) || 0;
+        // The CSV's rate is per PURCHASE unit (e.g. ₹141.75/KG). Prices are
+        // stored in RECIPE units (g/ml/pcs), so: price_recipe = rate ÷ pack_size.
+        // OPENING STOCK IS NOT IMPORTED — the CSV's "Usable Inventory" column is
+        // ignored on purpose. Every item starts at current_stock = 0; real stock
+        // is established only via Purchases / Closing Stock from go-live day.
         const purchaseReorder = parseFloat(String(mat.minimumStockLevel)) || 0;
         const purchaseRate = parseFloat(String(mat.defaultPurchaseRate)) || 0;
-        const stock        = purchaseStock   * packSize;     // recipe units
-        const reorderLevel = purchaseReorder * packSize;     // recipe units
+        const stock        = 0;                              // never seed stock from the CSV
+        const reorderLevel = purchaseReorder * packSize;     // buffer threshold, not stock on hand
         const price        = packSize > 0 ? purchaseRate / packSize : purchaseRate;  // per recipe unit
         const materialId = mat.id || generateId();
         // Auto-SKU: only mint a new one when the row didn't carry an existing SKU.
         const sku = (mat as any).sku?.trim() || `MAT-${String(++skuCounter).padStart(5, '0')}`;
 
-        // Insert raw material — now with purchase_unit, pack_size + SKU.
+        // Insert raw material — MASTER DATA ONLY (name, SKU, units, pack size,
+        // reorder threshold, reference price). No opening stock and no purchase
+        // record: current_stock stays 0 until real purchases / counts are entered.
         insertMaterial.run(
           materialId, sku, name, category, recipeUnit, purchaseUnit, packSize,
           stock, reorderLevel, price
         );
-
-        // Create initial purchase record if there's stock and price (recipe units).
-        if (stock > 0 && price > 0) {
-          const purchaseId = generateId();
-          insertPurchase.run(
-            purchaseId, materialId, 'POS Import', 'Default', stock, price, Math.round(stock * price * 100) / 100,
-            '2026-04-06', 'Initial stock from POS system import'
-          );
-
-          insertTransaction.run(
-            generateId(), materialId, stock, purchaseId, 'POS import initial stock'
-          );
-        }
 
         imported++;
       }
