@@ -25,6 +25,6 @@ jobs:
 
             npm run build
 
-            pm2 restart fnb-controller
+            sudo pm2 restart fnb-controller
 
-            pm2 save
+            sudo pm2 save
