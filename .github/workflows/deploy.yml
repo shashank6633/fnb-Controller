@@ -21,7 +21,9 @@ jobs:
 
             git pull origin main
 
-            mvn clean package -DskipTests
+            npm install
+
+            npm run build
 
             pm2 restart fnb-controller
 
