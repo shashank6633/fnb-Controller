@@ -66,10 +66,9 @@ function LoginForm() {
           </button>
         </form>
 
-        <div className="text-[10px] text-[#8B7355] bg-[#FFF1E3] border border-[#E8D5C4] rounded p-2 text-center">
-          First time? Default account: <code className="font-mono">admin@local</code> / <code className="font-mono">admin123</code><br />
-          <span className="text-amber-700">Change the password immediately from Users.</span>
-        </div>
+        <p className="text-center text-[11px] text-[#8B7355] italic tracking-wide pt-1 border-t border-[#F0E2D2]">
+          <span className="block pt-3">From purchase to plate — fully in control.</span>
+        </p>
       </div>
     </div>
   );
