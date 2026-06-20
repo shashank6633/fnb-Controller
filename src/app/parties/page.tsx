@@ -19,6 +19,7 @@
 
 import { useEffect, useState } from 'react';
 import { TrendingUp, Loader2, RefreshCw, AlertTriangle, ShieldAlert } from 'lucide-react';
+import { api } from '@/lib/api';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 
@@ -69,7 +70,7 @@ export default function PartyPnLAdminPage() {
   const refresh = async () => {
     setRefreshing(true); setError(null);
     try {
-      await fetch('/api/party-bookings', { method: 'POST' });
+      await api('/api/party-bookings', { method: 'POST' });
       await load();
     } catch (e: any) {
       setError(e?.message || 'Failed');

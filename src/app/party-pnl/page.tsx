@@ -15,6 +15,7 @@
 import { useEffect, useState } from 'react';
 import { Wine, Loader2, RefreshCw, AlertTriangle, Plus, X } from 'lucide-react';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
+import { api } from '@/lib/api';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 
@@ -62,7 +63,7 @@ export default function PartyPnLPage() {
   const refresh = async () => {
     setRefreshing(true); setError(null);
     try {
-      await fetch('/api/party-bookings', { method: 'POST' });
+      await api('/api/party-bookings', { method: 'POST' });
       await load();
     } catch (e: any) {
       setError(e?.message || 'Failed');
@@ -205,16 +206,15 @@ function RecordConsumptionModal({ target, onClose, onSaved }: {
     if (cleaned.length === 0) { setError('Add at least one item with qty > 0'); return; }
     setSaving(true); setError(null);
     try {
-      const r = await fetch('/api/party-consumption', {
+      const r = await api('/api/party-consumption', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: {
           party_unique_id: target.party_unique_id,
           fp_id: target.fp_id,
           event_name: target.event_name,
           event_date: target.event_date,
           items: cleaned.map(l => ({ material_id: l.material_id, qty: Number(l.qty), notes: l.notes })),
-        }),
+        },
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
