@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Wine, Loader2, RefreshCw, AlertTriangle, Plus, X } from 'lucide-react';
+import { Wine, Loader2, RefreshCw, AlertTriangle, Plus, X, Trash2 } from 'lucide-react';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import { api } from '@/lib/api';
 
@@ -145,15 +145,16 @@ export default function PartyPnLPage() {
                     <td className="py-1.5 px-3 text-right font-mono">{r.pax || '—'}</td>
                     <td className="py-1.5 px-3">
                       {r.has_liquor_recorded
-                        ? <span className="inline-flex items-center gap-1 text-emerald-700">
+                        ? <button onClick={() => setRecordFor(r)} title="View / edit recorded items"
+                                  className="inline-flex items-center gap-1 text-emerald-700 hover:underline">
                             ✓ {r.liquor_items} item{r.liquor_items === 1 ? '' : 's'} recorded
-                          </span>
+                          </button>
                         : <span className="text-amber-700 text-[10px]">not recorded yet</span>}
                     </td>
                     <td className="py-1.5 px-3 text-right">
                       <button onClick={() => setRecordFor(r)}
                               className="inline-flex items-center gap-1 text-xs text-white bg-[#af4408] hover:bg-[#933807] px-2.5 py-1 rounded whitespace-nowrap">
-                        <Plus size={11} /> {r.has_liquor_recorded ? 'Add more' : 'Record liquor'}
+                        {r.has_liquor_recorded ? <><Wine size={11} /> View / Add</> : <><Plus size={11} /> Record liquor</>}
                       </button>
                     </td>
                   </tr>
@@ -168,27 +169,59 @@ export default function PartyPnLPage() {
         <RecordConsumptionModal
           target={recordFor}
           onClose={() => setRecordFor(null)}
-          onSaved={() => { setRecordFor(null); load(); }}
+          onChanged={load}
         />
       )}
     </div>
   );
 }
 
-function RecordConsumptionModal({ target, onClose, onSaved }: {
+interface ConsumptionEntry {
+  id: string;
+  material_id: string;
+  material_name: string;
+  material_unit: string;
+  qty_consumed: number;
+  cost_at_time: number;
+  notes?: string;
+  recorded_by?: string;
+}
+
+function RecordConsumptionModal({ target, onClose, onChanged }: {
   target: PnLRow;
   onClose: () => void;
-  onSaved: () => void;
+  onChanged: () => void;
 }) {
   const [materials, setMaterials] = useState<any[]>([]);
+  const [existing, setExisting] = useState<ConsumptionEntry[]>([]);
+  const [loadingExisting, setLoadingExisting] = useState(true);
   const [lines, setLines] = useState<{ material_id: string; qty: string; notes: string }[]>([
     { material_id: '', qty: '', notes: '' },
   ]);
   const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [ok, setOk] = useState<string | null>(null);
+
+  // Fetch what's already recorded for THIS event so the user sees it before
+  // adding more — prevents punching the same bottle twice.
+  const existingQs = target.party_unique_id
+    ? `party_unique_id=${encodeURIComponent(target.party_unique_id)}`
+    : `event_name=${encodeURIComponent(target.event_name)}&event_date=${encodeURIComponent(target.event_date)}`;
+
+  const loadExisting = () => {
+    setLoadingExisting(true);
+    fetch(`/api/party-consumption?${existingQs}`)
+      .then(r => r.json())
+      .then(d => setExisting(d.entries || []))
+      .catch(() => {})
+      .finally(() => setLoadingExisting(false));
+  };
 
   useEffect(() => {
     fetch('/api/inventory').then(r => r.json()).then(d => setMaterials(d.materials || d || []));
+    loadExisting();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const addLine = () => setLines(p => [...p, { material_id: '', qty: '', notes: '' }]);
@@ -201,10 +234,13 @@ function RecordConsumptionModal({ target, onClose, onSaved }: {
     return acc + q * (m?.average_price || 0);
   }, 0);
 
+  const existingTotal = existing.reduce((a, e) => a + (e.cost_at_time || 0), 0);
+  const recordedMaterialIds = new Set(existing.map(e => e.material_id));
+
   const submit = async () => {
     const cleaned = lines.filter(l => l.material_id && Number(l.qty) > 0);
     if (cleaned.length === 0) { setError('Add at least one item with qty > 0'); return; }
-    setSaving(true); setError(null);
+    setSaving(true); setError(null); setOk(null);
     try {
       const r = await api('/api/party-consumption', {
         method: 'POST',
@@ -218,8 +254,23 @@ function RecordConsumptionModal({ target, onClose, onSaved }: {
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
-      onSaved();
+      setLines([{ material_id: '', qty: '', notes: '' }]);
+      setOk(`Recorded ${cleaned.length} item${cleaned.length === 1 ? '' : 's'} — see "Already recorded" above.`);
+      loadExisting();
+      onChanged();
     } finally { setSaving(false); }
+  };
+
+  const deleteEntry = async (id: string) => {
+    if (typeof window !== 'undefined' && !window.confirm('Remove this recorded item? This updates the liquor cost on the P&L.')) return;
+    setDeletingId(id); setError(null); setOk(null);
+    try {
+      const r = await api(`/api/party-consumption?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
+      loadExisting();
+      onChanged();
+    } finally { setDeletingId(null); }
   };
 
   return (
@@ -229,7 +280,7 @@ function RecordConsumptionModal({ target, onClose, onSaved }: {
            onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4] shrink-0">
           <div>
-            <h2 className="text-lg font-semibold text-[#2D1B0E]">Record Post-Party Consumption</h2>
+            <h2 className="text-lg font-semibold text-[#2D1B0E]">Party Liquor Consumption</h2>
             <div className="text-xs text-[#8B7355] mt-0.5">
               {target.event_name} · {target.event_date} {target.fp_id && <span className="font-mono text-[#af4408]">· {target.fp_id}</span>}
             </div>
@@ -238,6 +289,59 @@ function RecordConsumptionModal({ target, onClose, onSaved }: {
         </div>
 
         <div className="px-6 py-4 space-y-3 overflow-y-auto flex-1">
+          {/* Already recorded — so you can see what's punched and avoid duplicates */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide">Already recorded</h3>
+              {!loadingExisting && existing.length > 0 && (
+                <span className="text-[11px] text-[#8B7355]">{existing.length} item{existing.length === 1 ? '' : 's'} · {fmt(existingTotal)}</span>
+              )}
+            </div>
+            {loadingExisting ? (
+              <div className="text-xs text-[#8B7355] py-2"><Loader2 size={12} className="inline animate-spin mr-1" /> Loading…</div>
+            ) : existing.length === 0 ? (
+              <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">Nothing recorded for this event yet.</div>
+            ) : (
+              <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
+                <table className="w-full text-xs">
+                  <thead className="bg-[#FFF1E3] text-[#6B5744]">
+                    <tr>
+                      <th className="text-left py-1.5 px-2 font-medium">Item</th>
+                      <th className="text-right py-1.5 px-2 font-medium">Qty</th>
+                      <th className="text-right py-1.5 px-2 font-medium">Cost</th>
+                      <th className="text-left py-1.5 px-2 font-medium">By</th>
+                      <th className="py-1.5 px-2"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {existing.map(e => (
+                      <tr key={e.id} className="border-t border-[#E8D5C4]/50">
+                        <td className="py-1.5 px-2">
+                          <div className="text-[#2D1B0E]">{e.material_name}</div>
+                          {e.notes && <div className="text-[10px] text-[#8B7355]">{e.notes}</div>}
+                        </td>
+                        <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{e.qty_consumed} {e.material_unit}</td>
+                        <td className="py-1.5 px-2 text-right font-mono">{fmt(e.cost_at_time)}</td>
+                        <td className="py-1.5 px-2 text-[10px] text-[#8B7355] whitespace-nowrap">{(e.recorded_by || '').split('@')[0]}</td>
+                        <td className="py-1.5 px-2 text-right">
+                          <button type="button" onClick={() => deleteEntry(e.id)} disabled={deletingId === e.id}
+                                  title="Remove this entry"
+                                  className="text-red-600 hover:text-red-700 disabled:opacity-40">
+                            {deletingId === e.id ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className="border-t border-[#E8D5C4] pt-3">
+            <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide">Add items</h3>
+          </div>
+
           <div className="text-xs text-[#6B5744] bg-amber-50 border border-amber-200 rounded p-2">
             Enter bottle / unit counts consumed at this event. Cost auto-pulls from each material's average purchase price.
             Save to lock in liquor cost on the P&amp;L.
@@ -262,6 +366,9 @@ function RecordConsumptionModal({ target, onClose, onSaved }: {
                     onPick={(id: string) => update(i, { material_id: id })}
                     excludeIds={lines.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                   />
+                  {l.material_id && recordedMaterialIds.has(l.material_id) && (
+                    <div className="text-[10px] text-amber-700 mt-0.5">⚠ Already recorded above — saving will add to it.</div>
+                  )}
                 </div>
                 <input type="number" step="any" value={l.qty}
                        onChange={e => update(i, { qty: e.target.value })}
@@ -289,15 +396,16 @@ function RecordConsumptionModal({ target, onClose, onSaved }: {
           </button>
 
           <div className="bg-[#FFF1E3] border border-[#D4B896] rounded-lg p-3 flex items-center justify-between">
-            <div className="text-xs text-[#8B7355]">Total liquor cost being recorded</div>
+            <div className="text-xs text-[#8B7355]">New items being added</div>
             <div className="text-lg font-bold text-[#2D1B0E]">{fmt(totalCost)}</div>
           </div>
 
+          {ok && <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded p-2 text-xs">{ok}</div>}
           {error && <div className="bg-red-50 border border-red-200 text-red-700 rounded p-2 text-xs">{error}</div>}
         </div>
 
         <div className="flex justify-end gap-2 px-6 py-3 border-t border-[#E8D5C4] shrink-0">
-          <button onClick={onClose} className="px-4 py-2 text-sm text-[#6B5744] hover:bg-[#FFF1E3] rounded">Cancel</button>
+          <button onClick={onClose} className="px-4 py-2 text-sm text-[#6B5744] hover:bg-[#FFF1E3] rounded">Close</button>
           <button onClick={submit} disabled={saving}
                   className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#af4408] hover:bg-[#933807] text-white rounded text-sm disabled:opacity-50">
             {saving ? <Loader2 className="animate-spin" size={14} /> : <Plus size={14} />}
