@@ -19,6 +19,33 @@ import { api } from '@/lib/api';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 
+// Per-line unit switching for the consumption recorder. The material's base
+// recipe unit (and its average_price) stay canonical; these helpers just let
+// the bar manager enter/read in a friendlier unit (e.g. L instead of 17820 ml).
+function unitOptions(base?: string): string[] {
+  const b = (base || '').toLowerCase();
+  if (b === 'ml' || b === 'l') return ['ml', 'L'];
+  if (b === 'g'  || b === 'kg') return ['g', 'kg'];
+  return [base || 'pcs'];
+}
+// Convert a qty typed in `display` unit back to the material's `base` unit.
+function toBaseQty(qty: number, display?: string, base?: string): number {
+  const d = (display || '').toLowerCase(), b = (base || '').toLowerCase();
+  if (!d || d === b) return qty;
+  if (d === 'l'  && b === 'ml') return qty * 1000;
+  if (d === 'ml' && b === 'l')  return qty / 1000;
+  if (d === 'kg' && b === 'g')  return qty * 1000;
+  if (d === 'g'  && b === 'kg') return qty / 1000;
+  return qty;
+}
+// Friendly read-only display: 17820 ml → "17.82 L", 2500 g → "2.5 kg".
+function prettyQty(qty: number, unit?: string): string {
+  const u = (unit || '').toLowerCase();
+  if (u === 'ml' && Math.abs(qty) >= 1000) return (qty / 1000).toLocaleString('en-IN', { maximumFractionDigits: 2 }) + ' L';
+  if (u === 'g'  && Math.abs(qty) >= 1000) return (qty / 1000).toLocaleString('en-IN', { maximumFractionDigits: 2 }) + ' kg';
+  return qty.toLocaleString('en-IN', { maximumFractionDigits: 2 }) + ' ' + (unit || '');
+}
+
 interface PnLRow {
   party_unique_id?: string;
   fp_id?: string;
@@ -195,8 +222,8 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
   const [materials, setMaterials] = useState<any[]>([]);
   const [existing, setExisting] = useState<ConsumptionEntry[]>([]);
   const [loadingExisting, setLoadingExisting] = useState(true);
-  const [lines, setLines] = useState<{ material_id: string; qty: string; notes: string }[]>([
-    { material_id: '', qty: '', notes: '' },
+  const [lines, setLines] = useState<{ material_id: string; qty: string; notes: string; unit: string }[]>([
+    { material_id: '', qty: '', notes: '', unit: '' },
   ]);
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -224,14 +251,14 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const addLine = () => setLines(p => [...p, { material_id: '', qty: '', notes: '' }]);
+  const addLine = () => setLines(p => [...p, { material_id: '', qty: '', notes: '', unit: '' }]);
   const removeLine = (i: number) => setLines(p => p.filter((_, idx) => idx !== i));
   const update = (i: number, patch: any) => setLines(p => p.map((it, idx) => idx === i ? { ...it, ...patch } : it));
 
   const totalCost = lines.reduce((acc, l) => {
     const m = materials.find(x => x.id === l.material_id);
-    const q = Number(l.qty) || 0;
-    return acc + q * (m?.average_price || 0);
+    const baseQty = toBaseQty(Number(l.qty) || 0, l.unit || m?.unit, m?.unit);
+    return acc + baseQty * (m?.average_price || 0);
   }, 0);
 
   const existingTotal = existing.reduce((a, e) => a + (e.cost_at_time || 0), 0);
@@ -249,12 +276,15 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
           fp_id: target.fp_id,
           event_name: target.event_name,
           event_date: target.event_date,
-          items: cleaned.map(l => ({ material_id: l.material_id, qty: Number(l.qty), notes: l.notes })),
+          items: cleaned.map(l => {
+            const m = materials.find(x => x.id === l.material_id);
+            return { material_id: l.material_id, qty: toBaseQty(Number(l.qty), l.unit || m?.unit, m?.unit), notes: l.notes };
+          }),
         },
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
-      setLines([{ material_id: '', qty: '', notes: '' }]);
+      setLines([{ material_id: '', qty: '', notes: '', unit: '' }]);
       setOk(`Recorded ${cleaned.length} item${cleaned.length === 1 ? '' : 's'} — see "Already recorded" above.`);
       loadExisting();
       onChanged();
@@ -320,7 +350,7 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                           <div className="text-[#2D1B0E]">{e.material_name}</div>
                           {e.notes && <div className="text-[10px] text-[#8B7355]">{e.notes}</div>}
                         </td>
-                        <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{e.qty_consumed} {e.material_unit}</td>
+                        <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{prettyQty(e.qty_consumed, e.material_unit)}</td>
                         <td className="py-1.5 px-2 text-right font-mono">{fmt(e.cost_at_time)}</td>
                         <td className="py-1.5 px-2 text-[10px] text-[#8B7355] whitespace-nowrap">{(e.recorded_by || '').split('@')[0]}</td>
                         <td className="py-1.5 px-2 text-right">
@@ -356,14 +386,16 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 
           {lines.map((l, i) => {
             const m = materials.find(x => x.id === l.material_id);
-            const cost = (Number(l.qty) || 0) * (m?.average_price || 0);
+            const dispUnit = l.unit || m?.unit || '';
+            const opts = unitOptions(m?.unit);
+            const cost = toBaseQty(Number(l.qty) || 0, dispUnit, m?.unit) * (m?.average_price || 0);
             return (
               <div key={i} className="grid grid-cols-12 gap-2 items-start">
                 <div className="col-span-6">
                   <MaterialTypeahead
                     materials={materials as any}
                     value={l.material_id}
-                    onPick={(id: string) => update(i, { material_id: id })}
+                    onPick={(id: string) => { const mat = materials.find(x => x.id === id); update(i, { material_id: id, unit: mat?.unit || '' }); }}
                     excludeIds={lines.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                   />
                   {l.material_id && recordedMaterialIds.has(l.material_id) && (
@@ -374,7 +406,16 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                        onChange={e => update(i, { qty: e.target.value })}
                        placeholder="Qty"
                        className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
-                <span className="col-span-1 text-xs text-[#8B7355] py-2">{m?.unit || ''}</span>
+                {opts.length > 1 ? (
+                  <select value={dispUnit} onChange={e => update(i, { unit: e.target.value })}
+                          disabled={!l.material_id}
+                          className="col-span-1 text-xs border border-[#D4B896] rounded bg-white py-1.5 px-1 disabled:opacity-50"
+                          title="Switch the unit you enter the quantity in — cost stays the same">
+                    {opts.map(u => <option key={u} value={u}>{u}</option>)}
+                  </select>
+                ) : (
+                  <span className="col-span-1 text-xs text-[#8B7355] py-2">{m?.unit || ''}</span>
+                )}
                 <div className="col-span-2 flex items-center justify-end gap-1">
                   <span className="text-xs font-mono text-[#6B5744]"
                         title={m?.average_price ? `₹${m.average_price}/${m.unit}` : ''}>
