@@ -164,6 +164,10 @@ function initializeSchema(db: Database.Database) {
     INSERT OR IGNORE INTO settings (key, value) VALUES ('costing_method', 'average');
     INSERT OR IGNORE INTO settings (key, value) VALUES ('currency', 'INR');
     INSERT OR IGNORE INTO settings (key, value) VALUES ('business_name', 'My Restaurant & Pub');
+    -- Target food-cost %, stored as a fraction (0.30 = 30%). Drives the Recipes
+    -- "Menu Price @ Target" suggestion and the high-FC flag. Overwritten on
+    -- recipe-workbook import from the workbook's own target cell.
+    INSERT OR IGNORE INTO settings (key, value) VALUES ('target_food_cost_pct', '0.30');
 
     -- Parties (Events / Functions)
     CREATE TABLE IF NOT EXISTS parties (
@@ -491,6 +495,16 @@ function initializeSchema(db: Database.Database) {
       WHERE last_purchase_price IS NULL OR last_purchase_price = 0
     `);
   } catch (e) { console.error('raw_materials extension migration failed:', e); }
+
+  // Migration: recipes carry a yield (e.g. "220 g" per batch) — needed to round-trip
+  // the food-costing workbook and to optionally show cost-per-yield-unit. Additive &
+  // defaulted; does NOT change recalculateRecipeCost (recipe cost stays batch cost).
+  try {
+    const cols = db.prepare("PRAGMA table_info(recipes)").all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    if (!has('yield_quantity')) db.exec(`ALTER TABLE recipes ADD COLUMN yield_quantity REAL DEFAULT 0`);
+    if (!has('yield_unit'))     db.exec(`ALTER TABLE recipes ADD COLUMN yield_unit TEXT DEFAULT 'g'`);
+  } catch (e) { console.error('recipes yield migration failed:', e); }
 
   // ============================================================
   // MULTI-OUTLET SUPPORT

@@ -24,6 +24,7 @@ import {
   CheckCircle2,
   RefreshCw,
   Copy,
+  Tags,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
@@ -126,18 +127,19 @@ function parseMaterialVolumeMl(name?: string | null): number | null {
 }
 
 // Convert a recipe ingredient qty into the material's stock unit (so cost = qty × price holds).
+// packSize (recipe-units per purchase-unit) takes precedence over the name regex, matching the
+// server engine's convertToMaterialUnit — keeps the live preview === the saved cost.
 function convertQtyToMaterialUnit(qty: number, recipeUnit: string | null | undefined,
-                                   materialUnit: string, materialName?: string): number {
+                                   materialUnit: string, materialName?: string, packSize?: number | null): number {
   const r = (recipeUnit || materialUnit || '').toLowerCase().trim();
   const m = (materialUnit || '').toLowerCase().trim();
   if (!r || r === m) return qty;
+  const pack = packSize && packSize > 1 ? packSize : parseMaterialVolumeMl(materialName);
   if (r === 'pcs' && (m === 'ml' || m === 'l')) {
-    const packMl = parseMaterialVolumeMl(materialName);
-    if (packMl) return m === 'l' ? (qty * packMl) / 1000 : qty * packMl;
+    if (pack) return m === 'l' ? (qty * pack) / 1000 : qty * pack;
   }
   if ((r === 'ml' || r === 'l') && m === 'pcs') {
-    const packMl = parseMaterialVolumeMl(materialName);
-    if (packMl) return (r === 'l' ? qty * 1000 : qty) / packMl;
+    if (pack) return (r === 'l' ? qty * 1000 : qty) / pack;
   }
   if (r === 'l'  && m === 'ml') return qty * 1000;
   if (r === 'ml' && m === 'l')  return qty / 1000;
@@ -152,12 +154,13 @@ function computeIngredientCost(ing: {
   unit?: string | null;
   material_unit?: string | null;
   material_name?: string | null;
+  pack_size?: number | null;
 }): number {
   const price = ing.average_price ?? (ing as any).price ?? 0;
   const effectiveYield = (ing.yield_percent || 100) / 100;
   const wastage = (ing.wastage_percent || 0) / 100;
   const matUnit = ing.material_unit || ing.unit || '';
-  const qtyInMatUnit = convertQtyToMaterialUnit(ing.quantity, ing.unit, matUnit, ing.material_name || undefined);
+  const qtyInMatUnit = convertQtyToMaterialUnit(ing.quantity, ing.unit, matUnit, ing.material_name || undefined, ing.pack_size);
   return (qtyInMatUnit * price * (1 + wastage)) / effectiveYield;
 }
 
@@ -176,6 +179,8 @@ export default function RecipesPage() {
   const [activeTab, setActiveTab] = useState<'main' | 'sub' | 'direct'>('main');
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
+  type SortKey = 'category' | 'name' | 'fcAsc' | 'fcDesc' | 'costDesc' | 'priceDesc';
+  const [sortBy, setSortBy] = useState<SortKey>('category');
   const [selectedRecipe, setSelectedRecipe] = useState<Recipe | null>(null);
   const [selectedSubRecipe, setSelectedSubRecipe] = useState<SubRecipe | null>(null);
 
@@ -231,6 +236,20 @@ export default function RecipesPage() {
   const [barOverwrite, setBarOverwrite] = useState(true);
   const [barResult, setBarResult] = useState<any>(null);
   const barFileRef = useRef<HTMLInputElement>(null);
+
+  // --- Food-Costing workbook import (Purchase Rates / Sub-Recipe Cards / Recipe Cost Cards) ---
+  const [wbModalOpen, setWbModalOpen] = useState(false);
+  const [wbFile, setWbFile] = useState<File | null>(null);
+  const [wbFileName, setWbFileName] = useState<string | null>(null);
+  const [wbPreview, setWbPreview] = useState<any>(null);
+  const [wbPreviewing, setWbPreviewing] = useState(false);
+  const [wbImporting, setWbImporting] = useState(false);
+  const [wbOverwrite, setWbOverwrite] = useState(true);
+  const [wbResult, setWbResult] = useState<any>(null);
+  const wbFileRef = useRef<HTMLInputElement>(null);
+
+  // --- Target food-cost % (fraction, e.g. 0.30). Drives "Menu Price @ Target". ---
+  const [targetFcPct, setTargetFcPct] = useState<number>(0.30);
 
   // --- sub-recipe form ---
   const [srFormName, setSrFormName] = useState('');
@@ -288,14 +307,24 @@ export default function RecipesPage() {
       .finally(() => setLoading(false));
   }, [fetchRecipes, fetchSubRecipes, fetchMaterials, fetchMenuItems]);
 
+  // Load the persisted Target Food-Cost % (fraction) once.
+  useEffect(() => {
+    fetch('/api/settings?key=target_food_cost_pct')
+      .then((r) => r.json())
+      .then((d) => { const v = Number(d?.value); if (v > 0) setTargetFcPct(v); })
+      .catch(() => {});
+  }, []);
+
   // -------------------------------------------------------------------------
   // Computed / filtered
   // -------------------------------------------------------------------------
 
+  const UNCAT = '__uncat__';
   const filteredRecipes = useMemo(() => {
-    return recipes.filter((r) => {
+    const filtered = recipes.filter((r) => {
       const matchSearch = !searchQuery || r.name.toLowerCase().includes(searchQuery.toLowerCase());
-      const matchCategory = !categoryFilter || r.category === categoryFilter;
+      const matchCategory = !categoryFilter
+        || (categoryFilter === UNCAT ? !r.category || r.category.trim() === '' : r.category === categoryFilter);
 
       // Apply health issue filter if set
       let matchIssue = true;
@@ -317,7 +346,19 @@ export default function RecipesPage() {
 
       return matchSearch && matchCategory && matchIssue;
     });
-  }, [recipes, searchQuery, categoryFilter, issueFilter]);
+
+    const catOf = (r: any) => (r.category && r.category.trim()) || 'zzz_Uncategorised';
+    const sorted = [...filtered];
+    switch (sortBy) {
+      case 'category':  sorted.sort((a, b) => catOf(a).localeCompare(catOf(b)) || a.name.localeCompare(b.name)); break;
+      case 'name':      sorted.sort((a, b) => a.name.localeCompare(b.name)); break;
+      case 'fcAsc':     sorted.sort((a, b) => (a.food_cost_percent || 0) - (b.food_cost_percent || 0)); break;
+      case 'fcDesc':    sorted.sort((a, b) => (b.food_cost_percent || 0) - (a.food_cost_percent || 0)); break;
+      case 'costDesc':  sorted.sort((a, b) => (b.total_cost || 0) - (a.total_cost || 0)); break;
+      case 'priceDesc': sorted.sort((a, b) => (b.selling_price || 0) - (a.selling_price || 0)); break;
+    }
+    return sorted;
+  }, [recipes, searchQuery, categoryFilter, issueFilter, sortBy]);
 
   const filteredSubRecipes = useMemo(() => {
     return subRecipes.filter((sr) => {
@@ -749,6 +790,93 @@ export default function RecipesPage() {
       setBarResult({ error: err.message });
     } finally {
       setBarImporting(false);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Food-Costing workbook importer (Purchase Rates → Sub-Recipes → Recipes)
+  // Server-side parse: upload to /preview, then /commit. Uses the shared parser.
+  // -------------------------------------------------------------------------
+
+  function openWorkbookModal() {
+    setWbModalOpen(true);
+    setWbFile(null);
+    setWbFileName(null);
+    setWbPreview(null);
+    setWbResult(null);
+  }
+
+  async function handleWorkbookFile(file: File) {
+    setWbResult(null);
+    setWbPreview(null);
+    setWbFile(file);
+    setWbFileName(file.name);
+    setWbPreviewing(true);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await api('/api/recipe-workbook-import/preview', { method: 'POST', body: fd });
+      const json = await res.json();
+      if (!res.ok || json.error) setWbResult({ error: json.error || 'Failed to parse file' });
+      else setWbPreview(json);
+    } catch (err: any) {
+      setWbResult({ error: err.message });
+    } finally {
+      setWbPreviewing(false);
+    }
+  }
+
+  async function submitWorkbookImport() {
+    if (!wbFile) return;
+    setWbImporting(true);
+    setWbResult(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', wbFile);
+      fd.append('overwrite', wbOverwrite ? '1' : '0');
+      const res = await api('/api/recipe-workbook-import/commit', { method: 'POST', body: fd });
+      const json = await res.json();
+      setWbResult(json);
+      if (!json.error) {
+        // Pull the workbook's target FC% into the UI and refresh everything that changed.
+        if (wbPreview?.target_food_cost_pct) setTargetFcPct(Number(wbPreview.target_food_cost_pct));
+        await Promise.all([fetchRecipes(), fetchSubRecipes(), fetchMaterials()]);
+      }
+    } catch (err: any) {
+      setWbResult({ error: err.message });
+    } finally {
+      setWbImporting(false);
+    }
+  }
+
+  // Persist the Target Food-Cost % (stored as a fraction string in settings).
+  async function saveTargetFcPct(pctFraction: number) {
+    setTargetFcPct(pctFraction);
+    try {
+      await api('/api/settings', { method: 'PUT', body: { key: 'target_food_cost_pct', value: String(pctFraction) } });
+    } catch (e) {
+      console.error('Failed to save target FC%', e);
+    }
+  }
+
+  // Auto-assign categories from recipe names for any recipe that has none.
+  const [categorizing, setCategorizing] = useState(false);
+  async function autoCategorize() {
+    if (!confirm('Auto-assign categories to recipes that have none (from their names)?\nManually-set categories are left untouched.')) return;
+    setCategorizing(true);
+    try {
+      const res = await api('/api/recipes/auto-categorize', { method: 'POST', body: {} });
+      const json = await res.json();
+      if (json.error) alert('Failed: ' + json.error);
+      else {
+        await fetchRecipes();
+        const dist = Object.entries(json.distribution || {}).map(([c, n]) => `${c}: ${n}`).join('\n');
+        alert(`Categorised ${json.updated} recipe(s).\n\n${dist}`);
+      }
+    } catch (e: any) {
+      alert('Failed: ' + e.message);
+    } finally {
+      setCategorizing(false);
     }
   }
 
@@ -1375,6 +1503,14 @@ export default function RecipesPage() {
           {activeTab === 'main' && (
             <>
               <button
+                onClick={openWorkbookModal}
+                className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
+                title="Import Food-Costing workbook (Purchase Rates, Sub-Recipe Cards, Recipe Cost Cards, Recipe Summary)"
+              >
+                <FileSpreadsheet size={18} />
+                Import Recipe Workbook
+              </button>
+              <button
                 onClick={openBarModal}
                 className="flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
                 title="Import Bar Costing Excel (3-sheet format: Liquor Raw, Receipe, BAR PRODUCTS)"
@@ -1382,6 +1518,18 @@ export default function RecipesPage() {
                 <FileSpreadsheet size={18} />
                 Import Bar Costing Excel
               </button>
+              <label
+                className="flex items-center gap-2 border border-[#D4B896] text-[#6B5744] px-3 py-2.5 rounded-lg text-sm font-medium"
+                title="Target food-cost %. Drives the suggested 'Menu Price @ Target' and the high-FC flag."
+              >
+                Target FC%
+                <input
+                  type="number" min={1} max={99} step={1}
+                  value={Math.round(targetFcPct * 100)}
+                  onChange={(e) => { const p = Number(e.target.value); if (p > 0 && p < 100) saveTargetFcPct(p / 100); }}
+                  className="w-16 px-2 py-1 border border-[#E8D5C4] rounded text-sm text-right"
+                />
+              </label>
               <button
                 onClick={exportAllRecipes}
                 className="flex items-center gap-2 border border-blue-600 text-blue-700 hover:bg-blue-50 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
@@ -1415,6 +1563,15 @@ export default function RecipesPage() {
               >
                 <Download size={18} />
                 Download Template
+              </button>
+              <button
+                onClick={autoCategorize}
+                disabled={categorizing}
+                className="flex items-center gap-2 border border-indigo-600 text-indigo-700 hover:bg-indigo-50 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                title="Auto-assign categories from recipe names for recipes that have none (manual categories are kept)"
+              >
+                {categorizing ? <Loader2 size={18} className="animate-spin" /> : <Tags size={18} />}
+                {categorizing ? 'Categorising…' : 'Auto-categorise'}
               </button>
               <button
                 onClick={openBulkModal}
@@ -1629,7 +1786,7 @@ export default function RecipesPage() {
         </>
       )}
 
-      {/* Search + Filter */}
+      {/* Search + Filter + Sort */}
       <div className="flex flex-col sm:flex-row gap-3 mb-6">
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-[#8B7355]" size={18} />
@@ -1641,10 +1798,39 @@ export default function RecipesPage() {
             onChange={(e) => setSearchQuery(e.target.value)}
           />
         </div>
+        {activeTab === 'main' && (
+          <>
+            {/* Category filter dropdown — works even when chips are too many */}
+            <select
+              value={categoryFilter}
+              onChange={(e) => setCategoryFilter(e.target.value)}
+              className="bg-white border border-[#E8D5C4] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408] transition-colors"
+              title="Filter by category"
+            >
+              <option value="">All categories</option>
+              {recipeCategories.map((c) => <option key={c} value={c}>{c}</option>)}
+              {recipes.some((r) => !r.category || !r.category.trim()) && <option value={UNCAT}>Uncategorised</option>}
+            </select>
+            {/* Sort */}
+            <select
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as SortKey)}
+              className="bg-white border border-[#E8D5C4] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408] transition-colors"
+              title="Sort recipes"
+            >
+              <option value="category">Sort: Category (A–Z)</option>
+              <option value="name">Sort: Name (A–Z)</option>
+              <option value="fcDesc">Sort: Food Cost % (high → low)</option>
+              <option value="fcAsc">Sort: Food Cost % (low → high)</option>
+              <option value="costDesc">Sort: Cost (high → low)</option>
+              <option value="priceDesc">Sort: Price (high → low)</option>
+            </select>
+          </>
+        )}
       </div>
 
       {/* Category chips — always visible, click to filter, counts live-update with search */}
-      {activeTab === 'main' && recipeCategories.length > 0 && (() => {
+      {activeTab === 'main' && recipes.length > 0 && (() => {
         // Compute counts respecting the current text search but ignoring the active category
         const baseList = recipes.filter((r) => {
           const matchSearch = !searchQuery ||
@@ -1685,6 +1871,18 @@ export default function RecipesPage() {
                 </button>
               );
             })}
+            {countByCat['Uncategorised'] > 0 && (() => {
+              const active = categoryFilter === UNCAT;
+              return (
+                <button
+                  onClick={() => setCategoryFilter(active ? '' : UNCAT)}
+                  className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
+                    active ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'
+                  }`}>
+                  Uncategorised <span className="opacity-70">({countByCat['Uncategorised']})</span>
+                </button>
+              );
+            })()}
           </div>
         );
       })()}
@@ -1929,11 +2127,16 @@ export default function RecipesPage() {
                   <label className="block text-sm text-[#6B5744] mb-1">Category</label>
                   <input
                     type="text"
+                    list="recipe-category-options"
                     className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
                     value={formCategory}
                     onChange={(e) => setFormCategory(e.target.value)}
-                    placeholder="e.g. Main Course"
+                    placeholder="Pick or type a category"
                   />
+                  <datalist id="recipe-category-options">
+                    {recipeCategories.map((c) => <option key={c} value={c} />)}
+                  </datalist>
+                  <p className="mt-1 text-[11px] text-[#8B7355]">Pick an existing category to keep filters tidy, or type a new one.</p>
                 </div>
                 <div>
                   <label className="block text-sm text-[#6B5744] mb-1">Selling Price (&#8377;)</label>
@@ -2085,11 +2288,35 @@ export default function RecipesPage() {
                         {formSellingPrice > 0 ? gpm.toFixed(1) + '%' : '—'}
                       </p>;
                     })()}
-                    {formSellingPrice > 0 && liveRecipeCost.foodCostPct > 35 && (
-                      <p className="text-[10px] text-red-600 mt-0.5">⚠ Below 65% target</p>
+                    {formSellingPrice > 0 && liveRecipeCost.foodCostPct > targetFcPct * 100 && (
+                      <p className="text-[10px] text-red-600 mt-0.5">⚠ Above {Math.round(targetFcPct * 100)}% target</p>
                     )}
                   </div>
                 </div>
+
+                {/* Suggested menu price at the target food-cost % (like the workbook's "Menu Price @ Target") */}
+                {liveRecipeCost.totalCost > 0 && (
+                  <div className="mt-3 pt-3 border-t border-[#D4B896] flex flex-wrap items-center justify-between gap-2 text-sm">
+                    <span className="text-[#6B5744]">
+                      Menu Price @ {Math.round(targetFcPct * 100)}% target:{' '}
+                      <strong className="text-[#af4408]">{formatCurrency(liveRecipeCost.totalCost / targetFcPct)}</strong>
+                    </span>
+                    {formSellingPrice > 0 && liveRecipeCost.totalCost > formSellingPrice && (
+                      <span className="text-[11px] font-medium text-red-600 bg-red-500/10 px-2 py-0.5 rounded">
+                        ⚠ Loss-making — cost exceeds menu price
+                      </span>
+                    )}
+                    {formSellingPrice === 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setFormSellingPrice(Math.round(liveRecipeCost.totalCost / targetFcPct))}
+                        className="text-[11px] font-medium text-[#af4408] hover:underline"
+                      >
+                        Use suggested price →
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -2244,11 +2471,15 @@ export default function RecipesPage() {
                   <label className="block text-sm text-[#6B5744] mb-1">Category</label>
                   <input
                     type="text"
+                    list="subrecipe-category-options"
                     className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
                     value={srFormCategory}
                     onChange={(e) => setSrFormCategory(e.target.value)}
-                    placeholder="e.g. Base Sauce"
+                    placeholder="Pick or type a category"
                   />
+                  <datalist id="subrecipe-category-options">
+                    {[...new Set(subRecipes.map((s) => s.category).filter(Boolean))].sort().map((c) => <option key={c} value={c} />)}
+                  </datalist>
                 </div>
                 <div>
                   <label className="block text-sm text-[#6B5744] mb-1">Yield Quantity</label>
@@ -2502,6 +2733,178 @@ export default function RecipesPage() {
                     </>
                   )}
                   <button onClick={() => setBarResult(null)} className="text-xs text-[#8B7355] hover:text-[#2D1B0E]">Dismiss</button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================= */}
+      {/* FOOD-COSTING WORKBOOK IMPORT MODAL                        */}
+      {/* ========================================================= */}
+      {wbModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-6 pb-6 overflow-y-auto">
+          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setWbModalOpen(false)} />
+          <div className="relative w-full max-w-5xl bg-white rounded-2xl shadow-xl border border-[#E8D5C4] mx-4">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4] sticky top-0 bg-white rounded-t-2xl z-20">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-[#af4408]/10">
+                  <FileSpreadsheet className="w-5 h-5 text-[#af4408]" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-semibold text-[#2D1B0E]">Import Recipe Workbook</h2>
+                  <p className="text-xs text-[#8B7355]">Purchase Rates → Sub-Recipe Cards → Recipe Cost Cards → Recipe Summary</p>
+                </div>
+              </div>
+              <button onClick={() => setWbModalOpen(false)} className="p-1 text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+            </div>
+
+            <div className="px-6 py-5 space-y-4">
+              <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4 text-sm">
+                <p className="font-medium text-[#6B5744] mb-2">This importer will:</p>
+                <ul className="list-disc list-inside space-y-1 text-[#6B5744] text-xs">
+                  <li><strong>Purchase Rates</strong> → create/update raw materials (₹ per base unit g/ml/pcs)</li>
+                  <li><strong>Sub-Recipe Cards</strong> → sub-recipes with ingredients + cost/gram</li>
+                  <li><strong>Recipe Cost Cards</strong> → recipes with ingredient lines and sub-recipe references</li>
+                  <li><strong>Recipe Summary</strong> → menu price + target food-cost %</li>
+                  <li>Recomputes every cost and validates against the workbook&apos;s food-cost column</li>
+                </ul>
+              </div>
+
+              <div
+                onClick={() => wbFileRef.current?.click()}
+                className="border-2 border-dashed border-[#D4B896] hover:border-[#af4408] hover:bg-[#af4408]/5 rounded-xl p-8 text-center cursor-pointer transition-colors"
+              >
+                <FileSpreadsheet className="w-10 h-10 text-[#af4408] mx-auto mb-3" />
+                <p className="text-[#6B5744] font-medium">{wbFileName || 'Click to select the Food-Costing .xlsx'}</p>
+                <p className="text-xs text-[#8B7355] mt-1">{wbPreviewing ? 'Parsing…' : 'Sheets: Purchase Rates, Sub-Recipe Cards, Recipe Cost Cards, Recipe Summary'}</p>
+                <input
+                  ref={wbFileRef}
+                  type="file"
+                  accept=".xlsx,.xls"
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) handleWorkbookFile(f); }}
+                  className="hidden"
+                />
+              </div>
+
+              {/* Preview */}
+              {wbPreview && wbPreview.counts && (
+                <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
+                  <h3 className="text-sm font-semibold text-[#2D1B0E]">File Parsed Successfully ✓ · Target FC {wbPreview.target_food_cost_pct ? Math.round(wbPreview.target_food_cost_pct * 100) + '%' : '—'}</h3>
+                  <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
+                    <StatBlock label="Materials (new)" value={wbPreview.counts.materials_new} color="text-[#af4408]" />
+                    <StatBlock label="Sub-Recipes" value={wbPreview.counts.sub_recipes} color="text-purple-600" />
+                    <StatBlock label="Recipes" value={wbPreview.counts.recipes} color="text-blue-600" />
+                    <StatBlock label="Recipe Lines" value={wbPreview.counts.recipe_lines} color="text-blue-500" />
+                    <StatBlock label="Matched" value={wbPreview.counts.ingredients_matched} color="text-green-600" />
+                    <StatBlock label="Unmatched" value={wbPreview.counts.ingredients_unmatched} color="text-red-500" />
+                  </div>
+
+                  {wbPreview.counts.sub_in_sub_skipped > 0 && (
+                    <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                      <span><strong>{wbPreview.counts.sub_in_sub_skipped}</strong> sub-recipe-within-sub-recipe references can&apos;t be modeled and will be skipped (those sub-recipes&apos; cost may be slightly low).</span>
+                    </div>
+                  )}
+
+                  {wbPreview.unmatched_ingredients?.length > 0 && (
+                    <details className="bg-red-50 border border-red-200 rounded-lg p-3 text-xs">
+                      <summary className="cursor-pointer font-medium text-red-800">⚠️ {wbPreview.counts.ingredients_unmatched} ingredient(s) won&apos;t cost until matched (click to expand)</summary>
+                      <div className="mt-2 max-h-40 overflow-y-auto bg-white rounded p-2 space-y-1">
+                        {wbPreview.unmatched_ingredients.map((n: string, i: number) => <p key={i} className="text-red-700">{n}</p>)}
+                      </div>
+                    </details>
+                  )}
+
+                  <label className="flex items-center gap-2 text-xs cursor-pointer">
+                    <input type="checkbox" checked={wbOverwrite} onChange={(e) => setWbOverwrite(e.target.checked)} className="accent-[#af4408] w-4 h-4" />
+                    <span className="text-[#6B5744]">Overwrite existing recipes / sub-recipes / prices with same name (recommended for re-import)</span>
+                  </label>
+
+                  <div className="flex gap-3">
+                    <button
+                      onClick={submitWorkbookImport}
+                      disabled={wbImporting}
+                      className="flex items-center gap-2 px-5 py-2.5 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+                    >
+                      {wbImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                      {wbImporting ? 'Importing…' : `Import ${wbPreview.counts.recipes} Recipes + ${wbPreview.counts.sub_recipes} Sub-Recipes`}
+                    </button>
+                    <button
+                      onClick={() => { setWbPreview(null); setWbFile(null); setWbFileName(null); }}
+                      className="px-4 py-2.5 bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm hover:bg-[#E8D5C4] transition-colors"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Result */}
+              {wbResult && (
+                <div className="space-y-3">
+                  {wbResult.error ? (
+                    <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2">
+                      <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+                      <div>
+                        <p className="text-red-700 font-medium">Import failed</p>
+                        <p className="text-red-600 text-xs mt-1">{wbResult.error}</p>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="p-4 bg-green-50 border border-green-200 rounded-lg">
+                        <div className="flex items-start gap-2 mb-2">
+                          <CheckCircle className="w-5 h-5 text-green-600 shrink-0" />
+                          <p className="text-green-700 font-medium">Import complete!</p>
+                        </div>
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                          {wbResult.materials_created > 0 && <StatBlock label="Materials Created" value={wbResult.materials_created} color="text-green-600" />}
+                          {wbResult.materials_price_updated > 0 && <StatBlock label="Prices Updated" value={wbResult.materials_price_updated} color="text-blue-600" />}
+                          {(wbResult.sub_recipes_created > 0 || wbResult.sub_recipes_updated > 0) && <StatBlock label="Sub-Recipes" value={wbResult.sub_recipes_created + wbResult.sub_recipes_updated} color="text-purple-600" />}
+                          {(wbResult.recipes_created > 0 || wbResult.recipes_updated > 0) && <StatBlock label="Recipes" value={wbResult.recipes_created + wbResult.recipes_updated} color="text-green-600" />}
+                        </div>
+                      </div>
+
+                      {wbResult.validation_summary && (
+                        <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 text-xs text-[#6B5744]">
+                          <strong className="text-[#2D1B0E]">Food-cost check:</strong>{' '}
+                          {wbResult.validation_summary.within_tolerance}/{wbResult.validation_summary.total} recipes match the workbook within ±₹0.50 / ±2%.
+                          {wbResult.validation_summary.offenders?.length > 0 && (
+                            <details className="mt-2">
+                              <summary className="cursor-pointer font-medium text-amber-700">{wbResult.validation_summary.offenders.length} larger difference(s) — usually an unmatched ingredient</summary>
+                              <div className="mt-2 max-h-40 overflow-y-auto bg-white rounded p-2 space-y-1">
+                                {wbResult.validation_summary.offenders.map((o: any, i: number) => (
+                                  <p key={i} className="text-[#6B5744]">{o.recipe}: computed ₹{o.computed} vs workbook ₹{o.workbook} (Δ {o.delta})</p>
+                                ))}
+                              </div>
+                            </details>
+                          )}
+                        </div>
+                      )}
+
+                      {wbResult.ingredients_not_matched?.length > 0 && (
+                        <details className="bg-red-50 border border-red-200 rounded-lg p-3 text-xs">
+                          <summary className="cursor-pointer font-medium text-red-800">⚠️ {wbResult.ingredients_not_matched.length} ingredient(s) not matched</summary>
+                          <div className="mt-2 max-h-40 overflow-y-auto bg-white rounded p-2 space-y-1">
+                            {wbResult.ingredients_not_matched.slice(0, 80).map((s: string, i: number) => <p key={i} className="text-red-700">{s}</p>)}
+                          </div>
+                        </details>
+                      )}
+
+                      {wbResult.sub_in_sub_not_imported?.length > 0 && (
+                        <details className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs">
+                          <summary className="cursor-pointer font-medium text-amber-800">{wbResult.sub_in_sub_not_imported.length} sub-in-sub reference(s) skipped</summary>
+                          <div className="mt-2 max-h-40 overflow-y-auto bg-white rounded p-2 space-y-1">
+                            {wbResult.sub_in_sub_not_imported.map((s: string, i: number) => <p key={i} className="text-amber-700">{s}</p>)}
+                          </div>
+                        </details>
+                      )}
+
+                      <button onClick={() => setWbResult(null)} className="text-xs text-[#8B7355] hover:text-[#2D1B0E]">Dismiss</button>
+                    </>
+                  )}
                 </div>
               )}
             </div>
