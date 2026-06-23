@@ -57,6 +57,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/admin',               // admin destructive operations
   '/api/cron',                // manual cron trigger (admin or x-cron-token bypass)
   '/api/inward-import',       // bulk inward report upload (preview + commit)
+  '/api/recipe-workbook-import', // bulk recipe-costing workbook upload (preview + commit)
   '/api/butchering',          // carcass breakdown batches + seed
   '/api/party-consumption',   // post-party liquor consumption recording
   '/api/party-bookings',      // sheet refresh (POST forces live fetch)

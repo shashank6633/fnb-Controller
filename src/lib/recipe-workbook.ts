@@ -109,13 +109,23 @@ const num = (v: any): number => {
   return isFinite(n) ? n : 0;
 };
 
-/** Normalize a workbook base unit (g/ml/pc/...) to the app's canonical units. */
+/** Normalize a workbook base unit (g/ml/pc/...) to the app's canonical units.
+ *  kg→g and L→ml normalize the UNIT here; the quantity is scaled separately by
+ *  baseQtyFactor() so the amount lands in the canonical base unit. */
 function normBaseUnit(u: any): string {
   const s = String(u ?? '').trim().toLowerCase();
   if (s === 'pc' || s === 'pcs' || s === 'pce' || s === 'no' || s === 'nos') return 'pcs';
-  if (s === 'ml' || s === 'l' || s === 'ltr') return s === 'ml' ? 'ml' : 'ml';
+  if (s === 'ml' || s === 'l' || s === 'ltr') return 'ml';
   if (s === 'g' || s === 'gm' || s === 'gms' || s === 'kg') return 'g';
   return s;
+}
+
+/** Multiplier to convert a workbook quantity into the canonical base unit:
+ *  kg→g and L/LTR→ml are ×1000; everything else ×1. Without this an ingredient
+ *  listed in kg or L is costed 1000× too low. */
+function baseQtyFactor(u: any): number {
+  const s = String(u ?? '').trim().toLowerCase();
+  return (s === 'kg' || s === 'l' || s === 'ltr') ? 1000 : 1;
 }
 
 const sheetRows = (xlsx: typeof XLSX, wb: XLSX.WorkBook, name: string): any[][] => {
@@ -208,7 +218,7 @@ function parseSubRecipes(rows: any[][]): ParsedWBSubRecipe[] {
       if (rawUnit === 'sub') { subRefLines.push(ingredientName); continue; }   // sub-in-sub: not modelable
       const baseUnit = normBaseUnit(rawUnit);
       if (!isCostableRaw(baseUnit)) { noCostSkipped++; continue; }              // "?" / blank placeholders
-      lines.push({ ingredientName, qty: num(r[1]), baseUnit, lineCost: num(r[3]) });
+      lines.push({ ingredientName, qty: num(r[1]) * baseQtyFactor(rawUnit), baseUnit, lineCost: num(r[3]) });
     }
     return { code: b.code, name, source, batchYieldG, lines, subRefLines, workbookBatchCost, noCostSkipped };
   }).filter((s) => s.name);
@@ -233,7 +243,7 @@ function parseRecipes(rows: any[][]): ParsedWBRecipe[] {
       const isSubRef = rawUnit === 'sub';
       const baseUnit = isSubRef ? 'sub' : normBaseUnit(rawUnit);
       if (!isSubRef && !isCostableRaw(baseUnit)) { noCostSkipped++; continue; } // "?" / blank placeholders
-      lines.push({ name: lineName, qty: num(r[1]), baseUnit, lineCost: num(r[3]), isSubRef });
+      lines.push({ name: lineName, qty: num(r[1]) * baseQtyFactor(rawUnit), baseUnit, lineCost: num(r[3]), isSubRef });
     }
     return { code: b.code, name, yieldQty, yieldUnit: 'g', lines, workbookFoodCost, noCostSkipped };
   }).filter((r) => r.name);
