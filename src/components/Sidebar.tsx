@@ -76,6 +76,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Party Events",                href: "/party-events",       icon: PartyPopper },
       { kind: "link", label: "Party Requisitions",          href: "/party-requisitions", icon: ListChecks },
       { kind: "link", label: "Party Approvals",             href: "/party-approvals",    icon: ChefHat },
+      { kind: "link", label: "Food Consumption",            href: "/food-consumption",   icon: Utensils },
       { kind: "link", label: "Party Liquor Consumption",    href: "/party-pnl",          icon: PartyPopper },
       { kind: "link", label: "Party P&L",                   href: "/parties",            icon: BarChart3 },
       { kind: "link", label: "Reports",                     href: "/reports?segment=PARTY", icon: BarChart3 },

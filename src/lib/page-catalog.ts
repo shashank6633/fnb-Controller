@@ -52,6 +52,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/party-events',        label: 'Party Events' },
       { path: '/party-requisitions',  label: 'Party Requisitions' },
       { path: '/party-approvals',     label: 'Party Approvals' },
+      { path: '/food-consumption',    label: 'Food Consumption' },
       { path: '/party-pnl',           label: 'Party Liquor Consumption' },
       { path: '/parties',             label: 'Party P&L (admin)' },
     ],
