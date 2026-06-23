@@ -10,6 +10,7 @@ import { requireRole, getCurrentOutletId } from '@/lib/auth';
  *     "sales" | "purchases" | "purchase_orders" | "closing_stock" | "recipes"
  *     | "inventory_unused"             // delete only materials nothing references
  *     | "inventory_all"                // delete ALL materials + cascade dependents
+ *     | "stock_only"                   // set current_stock = 0 on all (keep master)
  *     | "all"
  *   >,
  *   from?:  "YYYY-MM-DD",              // optional date range — only delete rows
@@ -325,6 +326,17 @@ export async function POST(req: Request) {
         deleted.inventory_unused = db.prepare(`DELETE FROM raw_materials ${where}`).run().changes;
         deleted.inventory_kept_in_use = before - deleted.inventory_unused;
       }
+    }
+
+    // ---- STOCK LEVELS ONLY (zero on-hand, keep the material master) ----
+    // Sets current_stock = 0 for every material WITHOUT touching name, SKU, units,
+    // pack/case conversions, price, category, recipes, purchases or history. Use to
+    // re-baseline on-hand for go-live, then re-establish it via Purchases / Closing
+    // Stock. raw_materials is master data (not outlet-scoped) so this zeros globally.
+    if (scopes.includes('stock_only')) {
+      deleted.stock_zeroed = db.prepare(
+        `UPDATE raw_materials SET current_stock = 0, updated_at = datetime('now')`
+      ).run().changes;
     }
 
     // ---- PHASE 1 DEPENDENT CLEANUP ----

@@ -18,6 +18,8 @@ const SCOPES: Array<{ key: string; label: string; description: string }> = [
     description: 'Physical stock counts and variance entries.' },
   { key: 'recipes',          label: 'Recipes (all) + sub-recipes + menu items',
     description: 'Wipes EVERY recipe, sub-recipe, recipe-ingredient link, menu-item, and direct-item-link. Sales/wastage history is kept but unlinked (recipe_id → NULL) so revenue numbers stay intact. Use when re-building the recipe book from scratch. Date range does not apply.' },
+  { key: 'stock_only',       label: 'Stock levels only — set all to 0 (keep items) · safest',
+    description: 'Sets every material\'s current stock to 0 WITHOUT changing the item itself — name, SKU, units, pack/case conversions and price are all kept, and NOTHING is deleted. Use this to re-baseline on-hand stock for go-live, then re-enter it via Purchases / Closing Stock. Date range does not apply.' },
   { key: 'inventory_unused', label: 'Raw Materials — unused only (safe cleanup)',
     description: 'Deletes only inventory / raw-material items that NOTHING references — no purchases, recipes, requisitions, POs, stock movements, GRNs, wastages or counts use them. Ideal for clearing junk from a bad import without touching anything live. Date range does not apply.' },
   { key: 'inventory_all',    label: 'Raw Materials — ALL (full item-master wipe ⚠)',
@@ -87,7 +89,7 @@ export default function ResetPage() {
 
   // Inventory scopes wipe master data (not date-stamped) — a date range here is
   // a mistake the server would reject, so block it up-front with a clear message.
-  const invSelected = scopes.has('inventory_unused') || scopes.has('inventory_all');
+  const invSelected = scopes.has('inventory_unused') || scopes.has('inventory_all') || scopes.has('stock_only');
   const invDateConflict = invSelected && !!(from || to);
 
   const requirements = [
