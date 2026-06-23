@@ -157,6 +157,7 @@ export default function PartyPnLPage() {
                   <th className="text-left  py-2 px-3 font-medium">Event</th>
                   <th className="text-right py-2 px-3 font-medium">Pax</th>
                   <th className="text-left  py-2 px-3 font-medium">Liquor recorded</th>
+                  <th className="text-right py-2 px-3 font-medium">Liquor cost</th>
                   <th className="text-right py-2 px-3 font-medium">Action</th>
                 </tr>
               </thead>
@@ -177,6 +178,11 @@ export default function PartyPnLPage() {
                             ✓ {r.liquor_items} item{r.liquor_items === 1 ? '' : 's'} recorded
                           </button>
                         : <span className="text-amber-700 text-[10px]">not recorded yet</span>}
+                    </td>
+                    <td className="py-1.5 px-3 text-right font-mono whitespace-nowrap">
+                      {r.has_liquor_recorded
+                        ? <span className="font-semibold text-[#2D1B0E]">{fmt(r.liquor_cost)}</span>
+                        : <span className="text-[#8B7355]">—</span>}
                     </td>
                     <td className="py-1.5 px-3 text-right">
                       <button onClick={() => setRecordFor(r)}
