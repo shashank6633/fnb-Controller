@@ -34,6 +34,12 @@ export const revalidate = 0;
 
 const KNOWN_UNITS = new Set(['kg', 'g', 'L', 'ml', 'pcs', 'unit', 'pc', 'each', 'l']);
 
+// Purchase containers that hold exactly ONE sellable piece. Buying one of these
+// and selling it whole (recipe unit = pcs) is a legitimate 1:1 conversion, so
+// pack_size = 1 is correct — e.g. 1 BTL of Budweiser = 1 bottle sold to a guest.
+// (CASE / BOX / PKT / BAG are intentionally excluded: they usually hold many.)
+const SINGLE_ITEM_CONTAINERS = new Set(['btl', 'bottle', 'can', 'jar', 'tin', 'pc', 'pcs', 'each', 'unit', 'piece']);
+
 const HIGH = new Set(['volume_in_name_not_pcs', 'pack_in_name_not_pcs', 'recipe_unit_mismatch', 'zero_price_with_stock', 'missing_pack_size', 'purchase_unit_same_as_recipe']);
 const MEDIUM = new Set(['auto_discovered', 'no_purchase_history']);
 
@@ -63,8 +69,11 @@ function detectFlags(m: any, recipeUses: any[]): { flags: string[]; severity: 'h
   if (unit && !KNOWN_UNITS.has(unit))    flags.push('suspicious_unit');
   if (recipeUses.some(r => String(r.recipe_unit || '').toLowerCase() !== unit))
                                           flags.push('recipe_unit_mismatch');
-  // Different purchase / recipe units AND no pack_size set → conversion will fail or wrong
-  if (purchaseUnit && purchaseUnit !== unit && packSize === 1) {
+  // Different purchase / recipe units AND no pack_size set → conversion will fail or wrong.
+  // EXCEPT a true 1:1 count: selling a whole single-item container (BTL/CAN/JAR…) by
+  // the piece — there pack_size = 1 is correct (1 BTL = 1 pcs), so don't flag it.
+  const oneToOneCount = unit === 'pcs' && SINGLE_ITEM_CONTAINERS.has(purchaseUnit);
+  if (purchaseUnit && purchaseUnit !== unit && packSize === 1 && !oneToOneCount) {
     flags.push('missing_pack_size');
   }
   // Pack-size > 1 means each purchase-unit holds multiple recipe-units (e.g. 1 BTL = 750 ml).
