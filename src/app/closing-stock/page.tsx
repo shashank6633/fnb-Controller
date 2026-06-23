@@ -18,7 +18,7 @@ const today = () => new Date().toISOString().slice(0, 10);
 
 interface LocSummary { location: string; items: number; counted_today: number; low_stock: number; }
 interface Item {
-  id: string; sku?: string; name: string; unit: string; purchase_unit?: string; pack_size?: number;
+  id: string; sku?: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; case_size?: number;
   current_stock: number; average_price: number; reorder_level?: number;
   super_category?: string; category?: string; closing_cadence?: string; shelf_life_days?: number;
   today_count: number | null; today_variance: number | null; today_by?: string;
@@ -41,9 +41,12 @@ export default function ClosingStockByLocationPage() {
   const [items, setItems] = useState<Item[]>([]);
   const [itemsLoading, setItemsLoading] = useState(false);
   const [entries, setEntries] = useState<Record<string, string>>({});
-  // Loose / open units counted in the RECIPE unit, on top of full packs — lets an
-  // item bought by the case (pack_size > 1) be counted as "2 cases + 9 bottles"
-  // instead of an awkward 2.75 cases.
+  // Three count levels so liquor can be entered the way it's physically counted:
+  //   cases   → full outer cases (case_size bottles each)
+  //   entries → individual bottles / purchase units (pack_size recipe-units each)
+  //   loose   → loose / open recipe units (e.g. 450 ml left in an open bottle)
+  // e.g. whisky 2 cases + 9 bottles + 450 ml = 2×12×750 + 9×750 + 450 = 25,200 ml.
+  const [cases, setCases] = useState<Record<string, string>>({});
   const [loose, setLoose] = useState<Record<string, string>>({});
   const [adjustStock, setAdjustStock] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -68,6 +71,7 @@ export default function ClosingStockByLocationPage() {
     setActive(loc);
     setItemsLoading(true);
     setEntries({});
+    setCases({});
     setLoose({});
     setSavedFlash('');
     const qs = new URLSearchParams({ date, location: loc === '— Unassigned —' ? '__unassigned__' : loc });
@@ -105,24 +109,26 @@ export default function ClosingStockByLocationPage() {
     });
   }, [items, filterUncountedOnly, categoryFilter, itemSearch]);
 
-  // Total physical count in RECIPE units = full packs × pack_size + loose units.
-  const physicalFor = (it: Item, packsRaw?: string, looseRaw?: string): number | null => {
-    const mult = it.pack_size && it.pack_size > 1 ? it.pack_size : 1;
-    const hasPacks = packsRaw != null && packsRaw !== '' && !isNaN(Number(packsRaw));
-    const hasLoose = looseRaw != null && looseRaw !== '' && !isNaN(Number(looseRaw));
-    if (!hasPacks && !hasLoose) return null;
-    return (hasPacks ? Number(packsRaw) : 0) * mult + (hasLoose ? Number(looseRaw) : 0);
+  // Total physical count in RECIPE units:
+  //   cases × (case_size × pack_size) + bottles × pack_size + loose units.
+  const physicalFor = (it: Item, casesRaw?: string, bottlesRaw?: string, looseRaw?: string): number | null => {
+    const packSize = it.pack_size && it.pack_size > 1 ? it.pack_size : 1;
+    const caseSize = it.case_size && it.case_size > 1 ? it.case_size : 1;
+    const num = (s?: string) => (s != null && s !== '' && !isNaN(Number(s))) ? Number(s) : null;
+    const c = num(casesRaw), b = num(bottlesRaw), l = num(looseRaw);
+    if (c == null && b == null && l == null) return null;
+    return (c ?? 0) * caseSize * packSize + (b ?? 0) * packSize + (l ?? 0);
   };
 
   const pendingEntries = useMemo(() => {
     const out: { material_id: string; physical: number }[] = [];
     for (const it of items) {
-      const phys = physicalFor(it, entries[it.id], loose[it.id]);
+      const phys = physicalFor(it, cases[it.id], entries[it.id], loose[it.id]);
       if (phys != null) out.push({ material_id: it.id, physical: phys });
     }
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items, entries, loose]);
+  }, [items, cases, entries, loose]);
 
   const saveAll = async () => {
     if (pendingEntries.length === 0) return;
@@ -139,6 +145,7 @@ export default function ClosingStockByLocationPage() {
       } else {
         setSavedFlash(`✓ Saved ${j.success} count${j.success === 1 ? '' : 's'} for "${active}"`);
         setEntries({});
+        setCases({});
         setLoose({});
         // Refresh both detail and the location summary
         await openLocation(active!);
@@ -282,43 +289,62 @@ export default function ClosingStockByLocationPage() {
                         </td>
                         <td className="py-1.5 px-3 text-right font-mono">{sysDisplay}</td>
                         <td className="py-1.5 px-3">
-                          {inPurchase ? (
-                            // Pack item — count full packs/cases + loose units separately.
-                            // e.g. 2 CASE + 9 pcs = 2×12 + 9 = 33 pcs.
-                            <div className="flex items-center gap-1 flex-wrap">
-                              <input type="number" step="any" min={0}
-                                     value={entries[it.id] ?? ''}
-                                     onChange={e => setEntries(p => ({ ...p, [it.id]: e.target.value }))}
-                                     placeholder="0"
-                                     title={`Full ${it.purchase_unit} — each holds ${it.pack_size} ${it.unit}`}
-                                     className="w-14 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
-                              <span className="text-[10px] text-[#8B7355]">{it.purchase_unit}</span>
-                              <span className="text-[10px] text-[#8B7355]">+</span>
-                              <input type="number" step="any" min={0}
-                                     value={loose[it.id] ?? ''}
-                                     onChange={e => setLoose(p => ({ ...p, [it.id]: e.target.value }))}
-                                     placeholder="0"
-                                     title={`Loose / open ${it.unit} on top of the full ${it.purchase_unit}`}
-                                     className="w-14 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
-                              <span className="text-[10px] text-[#8B7355]">{it.unit}</span>
-                              {physicalFor(it, entries[it.id], loose[it.id]) != null && (
-                                <span className="text-[10px] font-mono text-[#af4408] whitespace-nowrap">= {physicalFor(it, entries[it.id], loose[it.id])} {it.unit}</span>
-                              )}
-                            </div>
-                          ) : (
-                            <div className="flex items-center gap-1">
-                              <input type="number" step="any" min={0}
-                                     value={entries[it.id] ?? (it.today_count != null ? String(it.today_count) : '')}
-                                     onChange={e => setEntries(p => ({ ...p, [it.id]: e.target.value }))}
-                                     placeholder={`count in ${it.unit}`}
-                                     className="w-32 px-2 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
-                              <span className="text-[10px] text-[#8B7355]">{it.unit}</span>
-                            </div>
-                          )}
+                          {(() => {
+                            const packSize = it.pack_size && it.pack_size > 1 ? it.pack_size : 1;
+                            const caseSize = it.case_size && it.case_size > 1 ? it.case_size : 1;
+                            const showCases = caseSize > 1;   // outer case of bottles
+                            const showLoose = packSize > 1;   // open/partial bottle (ml/g)
+                            const box = "w-12 px-1 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]";
+                            // Simple item (no case, no pack) — one box in the recipe unit.
+                            if (!showCases && !showLoose) {
+                              return (
+                                <div className="flex items-center gap-1">
+                                  <input type="number" step="any" min={0}
+                                         value={entries[it.id] ?? (it.today_count != null ? String(it.today_count) : '')}
+                                         onChange={e => setEntries(p => ({ ...p, [it.id]: e.target.value }))}
+                                         placeholder={`count in ${it.unit}`}
+                                         className="w-32 px-2 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                                  <span className="text-[10px] text-[#8B7355]">{it.unit}</span>
+                                </div>
+                              );
+                            }
+                            const total = physicalFor(it, cases[it.id], entries[it.id], loose[it.id]);
+                            return (
+                              <div className="flex items-center gap-1 flex-wrap">
+                                {showCases && (<>
+                                  <input type="number" step="any" min={0} value={cases[it.id] ?? ''}
+                                         onChange={e => setCases(p => ({ ...p, [it.id]: e.target.value }))}
+                                         placeholder="0"
+                                         title={`Full cases — 1 case = ${caseSize} ${it.purchase_unit || 'unit'} = ${caseSize * packSize} ${it.unit}`}
+                                         className={box} />
+                                  <span className="text-[10px] text-[#8B7355]">case</span>
+                                  <span className="text-[10px] text-[#8B7355]">+</span>
+                                </>)}
+                                <input type="number" step="any" min={0} value={entries[it.id] ?? ''}
+                                       onChange={e => setEntries(p => ({ ...p, [it.id]: e.target.value }))}
+                                       placeholder="0"
+                                       title={`${it.purchase_unit || 'unit'} — 1 = ${packSize} ${it.unit}`}
+                                       className={box} />
+                                <span className="text-[10px] text-[#8B7355]">{it.purchase_unit || it.unit}</span>
+                                {showLoose && (<>
+                                  <span className="text-[10px] text-[#8B7355]">+</span>
+                                  <input type="number" step="any" min={0} value={loose[it.id] ?? ''}
+                                         onChange={e => setLoose(p => ({ ...p, [it.id]: e.target.value }))}
+                                         placeholder="0"
+                                         title={`Loose / open ${it.unit}`}
+                                         className={box} />
+                                  <span className="text-[10px] text-[#8B7355]">{it.unit}</span>
+                                </>)}
+                                {total != null && (
+                                  <span className="text-[10px] font-mono text-[#af4408] whitespace-nowrap">= {total} {it.unit}</span>
+                                )}
+                              </div>
+                            );
+                          })()}
                         </td>
                         <td className="py-1.5 px-3 text-right font-mono">
                           {(() => {
-                            const phys = physicalFor(it, entries[it.id], loose[it.id]) ?? it.today_count;
+                            const phys = physicalFor(it, cases[it.id], entries[it.id], loose[it.id]) ?? it.today_count;
                             if (phys == null) return <span className="text-[#8B7355]">—</span>;
                             const v = Math.round((phys - it.current_stock) * 1000) / 1000;
                             const tone = v < 0 ? 'text-amber-800' : v > 0 ? 'text-blue-800' : 'text-emerald-700';
@@ -331,7 +357,7 @@ export default function ClosingStockByLocationPage() {
                                   title={it.today_by ? `By ${it.today_by}` : ''}>
                               ✓ counted: {todayDisplay}
                             </span>
-                          ) : (entries[it.id] || loose[it.id]) ? (
+                          ) : (cases[it.id] || entries[it.id] || loose[it.id]) ? (
                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">↻ unsaved</span>
                           ) : (
                             <span className="text-[10px] text-[#8B7355]">pending</span>

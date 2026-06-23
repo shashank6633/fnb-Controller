@@ -25,6 +25,7 @@ export async function GET(request: Request) {
 
     const rows = db.prepare(`
       SELECT rm.id, rm.sku, rm.name, rm.unit, rm.purchase_unit, rm.pack_size,
+             COALESCE(rm.case_size, 1) AS case_size,
              rm.current_stock, rm.average_price, rm.reorder_level,
              rm.super_category, rm.category, rm.closing_cadence, rm.shelf_life_days,
              cs.physical_stock AS today_count,
