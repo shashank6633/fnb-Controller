@@ -25,6 +25,7 @@ import {
   RefreshCw,
   Copy,
   Tags,
+  Pencil,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
@@ -859,6 +860,26 @@ export default function RecipesPage() {
     }
   }
 
+  // --- Category manager (rename / merge) ---
+  const [catModalOpen, setCatModalOpen] = useState(false);
+  const [catRenaming, setCatRenaming] = useState<string | null>(null);
+  async function renameCategory(from: string, to: string) {
+    const toC = to.trim();
+    if (!toC || toC === from) return;
+    setCatRenaming(from);
+    try {
+      const res = await api('/api/recipes/rename-category', { method: 'POST', body: { from, to: toC } });
+      const json = await res.json();
+      if (json.error) { alert('Failed: ' + json.error); return; }
+      await fetchRecipes();
+      setCategoryFilter((cf) => (cf === from ? toC : cf));   // keep the active filter pointed at the renamed category
+    } catch (e: any) {
+      alert('Failed: ' + e.message);
+    } finally {
+      setCatRenaming(null);
+    }
+  }
+
   // Auto-assign categories from recipe names for any recipe that has none.
   const [categorizing, setCategorizing] = useState(false);
   async function autoCategorize() {
@@ -1572,6 +1593,14 @@ export default function RecipesPage() {
               >
                 {categorizing ? <Loader2 size={18} className="animate-spin" /> : <Tags size={18} />}
                 {categorizing ? 'Categorising…' : 'Auto-categorise'}
+              </button>
+              <button
+                onClick={() => setCatModalOpen(true)}
+                className="flex items-center gap-2 border border-indigo-600 text-indigo-700 hover:bg-indigo-50 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
+                title="Rename or merge recipe categories across all recipes at once"
+              >
+                <Pencil size={18} />
+                Manage Categories
               </button>
               <button
                 onClick={openBulkModal}
@@ -2913,6 +2942,19 @@ export default function RecipesPage() {
       )}
 
       {/* ========================================================= */}
+      {/* CATEGORY MANAGER MODAL (rename / merge)                   */}
+      {/* ========================================================= */}
+      {catModalOpen && (
+        <RecipeCategoryManager
+          key={recipeCategories.join('|')}
+          items={recipeCategories.map((c) => ({ name: c, count: recipes.filter((r) => r.category === c).length }))}
+          renaming={catRenaming}
+          onRename={renameCategory}
+          onClose={() => setCatModalOpen(false)}
+        />
+      )}
+
+      {/* ========================================================= */}
       {/* BULK UPLOAD MODAL                                         */}
       {/* ========================================================= */}
       {bulkModalOpen && (
@@ -3135,6 +3177,71 @@ function StatBlock({ label, value, color }: { label: string; value: number | str
     <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2 text-center">
       <p className="text-[10px] text-[#8B7355] uppercase tracking-wide">{label}</p>
       <p className={`text-lg font-bold ${color}`}>{value}</p>
+    </div>
+  );
+}
+
+
+/** Rename / merge recipe categories across all recipes. */
+function RecipeCategoryManager({ items, renaming, onRename, onClose }: {
+  items: { name: string; count: number }[];
+  renaming: string | null;
+  onRename: (from: string, to: string) => void;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState<Record<string, string>>(
+    () => Object.fromEntries(items.map((i) => [i.name, i.name])),
+  );
+  const existingNames = new Set(items.map((i) => i.name));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center pt-10 pb-6 overflow-y-auto">
+      <div className="fixed inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative w-full max-w-lg bg-white rounded-2xl shadow-xl border border-[#E8D5C4] mx-4">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4]">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-indigo-100"><Pencil className="w-5 h-5 text-indigo-600" /></div>
+            <div>
+              <h2 className="text-lg font-semibold text-[#2D1B0E]">Manage Categories</h2>
+              <p className="text-xs text-[#8B7355]">Rename a category to update every recipe in it. Renaming to an existing name merges them.</p>
+            </div>
+          </div>
+          <button onClick={onClose} className="p-1 text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="px-6 py-4 space-y-2 max-h-[60vh] overflow-y-auto">
+          {items.length === 0 ? (
+            <p className="text-sm text-[#8B7355] text-center py-6">No categories yet. Add one by typing it into a recipe&apos;s Category field.</p>
+          ) : items.map((it) => {
+            const val = draft[it.name] ?? it.name;
+            const changed = val.trim() !== '' && val.trim() !== it.name;
+            const willMerge = changed && existingNames.has(val.trim());
+            return (
+              <div key={it.name} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={val}
+                  onChange={(e) => setDraft((d) => ({ ...d, [it.name]: e.target.value }))}
+                  className="flex-1 bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
+                />
+                <span className="text-xs text-[#8B7355] w-14 text-right shrink-0">{it.count} item{it.count === 1 ? '' : 's'}</span>
+                <button
+                  onClick={() => onRename(it.name, val)}
+                  disabled={!changed || renaming === it.name}
+                  className="px-3 py-2 rounded-lg text-xs font-medium transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed bg-indigo-600 hover:bg-indigo-700 text-white"
+                  title={willMerge ? `Merge into existing "${val.trim()}"` : 'Rename across all recipes'}
+                >
+                  {renaming === it.name ? <Loader2 className="w-4 h-4 animate-spin" /> : willMerge ? 'Merge' : 'Rename'}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="px-6 py-3 border-t border-[#E8D5C4] flex justify-end">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-[#8B7355] hover:text-[#3D2614]">Done</button>
+        </div>
+      </div>
     </div>
   );
 }
