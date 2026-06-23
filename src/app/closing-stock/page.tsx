@@ -41,6 +41,10 @@ export default function ClosingStockByLocationPage() {
   const [items, setItems] = useState<Item[]>([]);
   const [itemsLoading, setItemsLoading] = useState(false);
   const [entries, setEntries] = useState<Record<string, string>>({});
+  // Loose / open units counted in the RECIPE unit, on top of full packs — lets an
+  // item bought by the case (pack_size > 1) be counted as "2 cases + 9 bottles"
+  // instead of an awkward 2.75 cases.
+  const [loose, setLoose] = useState<Record<string, string>>({});
   const [adjustStock, setAdjustStock] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savedFlash, setSavedFlash] = useState('');
@@ -64,6 +68,7 @@ export default function ClosingStockByLocationPage() {
     setActive(loc);
     setItemsLoading(true);
     setEntries({});
+    setLoose({});
     setSavedFlash('');
     const qs = new URLSearchParams({ date, location: loc === '— Unassigned —' ? '__unassigned__' : loc });
     const d = await fetch(`/api/closing-stock/by-location?${qs}`).then(r => r.json());
@@ -100,21 +105,30 @@ export default function ClosingStockByLocationPage() {
     });
   }, [items, filterUncountedOnly, categoryFilter, itemSearch]);
 
-  const pendingEntries = useMemo(
-    () => Object.entries(entries).filter(([, v]) => v !== '' && !isNaN(Number(v))),
-    [entries]
-  );
+  // Total physical count in RECIPE units = full packs × pack_size + loose units.
+  const physicalFor = (it: Item, packsRaw?: string, looseRaw?: string): number | null => {
+    const mult = it.pack_size && it.pack_size > 1 ? it.pack_size : 1;
+    const hasPacks = packsRaw != null && packsRaw !== '' && !isNaN(Number(packsRaw));
+    const hasLoose = looseRaw != null && looseRaw !== '' && !isNaN(Number(looseRaw));
+    if (!hasPacks && !hasLoose) return null;
+    return (hasPacks ? Number(packsRaw) : 0) * mult + (hasLoose ? Number(looseRaw) : 0);
+  };
+
+  const pendingEntries = useMemo(() => {
+    const out: { material_id: string; physical: number }[] = [];
+    for (const it of items) {
+      const phys = physicalFor(it, entries[it.id], loose[it.id]);
+      if (phys != null) out.push({ material_id: it.id, physical: phys });
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, entries, loose]);
 
   const saveAll = async () => {
     if (pendingEntries.length === 0) return;
     setSaving(true);
     try {
-      const payload = pendingEntries.map(([material_id, raw]) => {
-        const it = items.find(x => x.id === material_id);
-        // Convert from purchase units → recipe units when pack_size > 1
-        const physical = Number(raw) * (it && it.pack_size && it.pack_size > 1 ? it.pack_size : 1);
-        return { material_id, physical_stock: physical };
-      });
+      const payload = pendingEntries.map(({ material_id, physical }) => ({ material_id, physical_stock: physical }));
       const r = await api('/api/closing-stock', {
         method: 'POST',
         body: { date, items: payload, adjust_stock: adjustStock },
@@ -125,6 +139,7 @@ export default function ClosingStockByLocationPage() {
       } else {
         setSavedFlash(`✓ Saved ${j.success} count${j.success === 1 ? '' : 's'} for "${active}"`);
         setEntries({});
+        setLoose({});
         // Refresh both detail and the location summary
         await openLocation(active!);
         await reloadLocations();
@@ -232,7 +247,7 @@ export default function ClosingStockByLocationPage() {
                     <th className="text-left  py-2 px-3 font-medium">Material</th>
                     <th className="text-left  py-2 px-3 font-medium">Category</th>
                     <th className="text-right py-2 px-3 font-medium">System</th>
-                    <th className="text-left  py-2 px-3 font-medium w-[200px]">Physical count</th>
+                    <th className="text-left  py-2 px-3 font-medium w-[280px]">Physical count <span className="font-normal text-[9px] text-[#8B7355]">(packs + loose)</span></th>
                     <th className="text-right py-2 px-3 font-medium">Variance</th>
                     <th className="text-left  py-2 px-3 font-medium">Status</th>
                   </tr>
@@ -267,25 +282,43 @@ export default function ClosingStockByLocationPage() {
                         </td>
                         <td className="py-1.5 px-3 text-right font-mono">{sysDisplay}</td>
                         <td className="py-1.5 px-3">
-                          <div className="flex items-center gap-1">
-                            <input
-                              type="number" step="any" min={0}
-                              value={entries[it.id] ?? (it.today_count != null
-                                ? (inPurchase ? (it.today_count / it.pack_size!).toFixed(2) : String(it.today_count))
-                                : '')}
-                              onChange={e => setEntries(p => ({ ...p, [it.id]: e.target.value }))}
-                              placeholder={inPurchase ? `count in ${it.purchase_unit}` : `count in ${it.unit}`}
-                              className="w-32 px-2 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]"
-                            />
-                            <span className="text-[10px] text-[#8B7355]">{inPurchase ? it.purchase_unit : it.unit}</span>
-                          </div>
+                          {inPurchase ? (
+                            // Pack item — count full packs/cases + loose units separately.
+                            // e.g. 2 CASE + 9 pcs = 2×12 + 9 = 33 pcs.
+                            <div className="flex items-center gap-1 flex-wrap">
+                              <input type="number" step="any" min={0}
+                                     value={entries[it.id] ?? ''}
+                                     onChange={e => setEntries(p => ({ ...p, [it.id]: e.target.value }))}
+                                     placeholder="0"
+                                     title={`Full ${it.purchase_unit} — each holds ${it.pack_size} ${it.unit}`}
+                                     className="w-14 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                              <span className="text-[10px] text-[#8B7355]">{it.purchase_unit}</span>
+                              <span className="text-[10px] text-[#8B7355]">+</span>
+                              <input type="number" step="any" min={0}
+                                     value={loose[it.id] ?? ''}
+                                     onChange={e => setLoose(p => ({ ...p, [it.id]: e.target.value }))}
+                                     placeholder="0"
+                                     title={`Loose / open ${it.unit} on top of the full ${it.purchase_unit}`}
+                                     className="w-14 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                              <span className="text-[10px] text-[#8B7355]">{it.unit}</span>
+                              {physicalFor(it, entries[it.id], loose[it.id]) != null && (
+                                <span className="text-[10px] font-mono text-[#af4408] whitespace-nowrap">= {physicalFor(it, entries[it.id], loose[it.id])} {it.unit}</span>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-1">
+                              <input type="number" step="any" min={0}
+                                     value={entries[it.id] ?? (it.today_count != null ? String(it.today_count) : '')}
+                                     onChange={e => setEntries(p => ({ ...p, [it.id]: e.target.value }))}
+                                     placeholder={`count in ${it.unit}`}
+                                     className="w-32 px-2 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                              <span className="text-[10px] text-[#8B7355]">{it.unit}</span>
+                            </div>
+                          )}
                         </td>
                         <td className="py-1.5 px-3 text-right font-mono">
                           {(() => {
-                            const raw = entries[it.id];
-                            const phys = raw !== undefined && raw !== '' && !isNaN(Number(raw))
-                              ? Number(raw) * (inPurchase ? it.pack_size! : 1)
-                              : it.today_count;
+                            const phys = physicalFor(it, entries[it.id], loose[it.id]) ?? it.today_count;
                             if (phys == null) return <span className="text-[#8B7355]">—</span>;
                             const v = Math.round((phys - it.current_stock) * 1000) / 1000;
                             const tone = v < 0 ? 'text-amber-800' : v > 0 ? 'text-blue-800' : 'text-emerald-700';
@@ -298,7 +331,7 @@ export default function ClosingStockByLocationPage() {
                                   title={it.today_by ? `By ${it.today_by}` : ''}>
                               ✓ counted: {todayDisplay}
                             </span>
-                          ) : entries[it.id] ? (
+                          ) : (entries[it.id] || loose[it.id]) ? (
                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">↻ unsaved</span>
                           ) : (
                             <span className="text-[10px] text-[#8B7355]">pending</span>
