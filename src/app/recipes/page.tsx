@@ -1611,13 +1611,18 @@ export default function RecipesPage() {
               </button>
             </>
           )}
-          <button
-            onClick={activeTab === 'main' ? openAddRecipe : openAddSubRecipe}
-            className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
-          >
-            <Plus size={18} />
-            {activeTab === 'main' ? 'Add Recipe' : 'Add Sub-Recipe'}
-          </button>
+          {/* Direct items aren't created manually — they're auto-discovered from
+              sales and linked to a raw material in the panel below. So only show
+              the Add button on the Recipes / Sub-Recipes tabs. */}
+          {activeTab !== 'direct' && (
+            <button
+              onClick={activeTab === 'main' ? openAddRecipe : openAddSubRecipe}
+              className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
+            >
+              <Plus size={18} />
+              {activeTab === 'main' ? 'Add Recipe' : 'Add Sub-Recipe'}
+            </button>
+          )}
         </div>
       </div>
 
