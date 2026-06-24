@@ -358,6 +358,44 @@ export async function GET(request: Request) {
       if (results.length >= limit) break;
     }
 
+    // ── Manually-added direct items ───────────────────────────────────────
+    // A direct_item_links row linked to a material but with NO sales yet won't
+    // have come through the sales loop above (which starts FROM sales). Surface
+    // those as finalized rows so a user who pre-registers a direct item (before
+    // it's ever sold) can actually see what they added.
+    {
+      const seen = new Set(results.map(r => String(r.item_name).toLowerCase().trim()));
+      const matById = new Map(materials.map(m => [m.id, m]));
+      const links = db.prepare(`
+        SELECT item_name, material_id, COALESCE(dismissed, 0) AS dismissed
+        FROM direct_item_links WHERE material_id IS NOT NULL
+      `).all() as any[];
+      for (const dl of links) {
+        if (results.length >= limit) break;
+        if (seen.has(String(dl.item_name).toLowerCase().trim())) continue;  // already shown via sales
+        if (!includeDismissed && dl.dismissed) continue;
+        const m = matById.get(dl.material_id);
+        if (!m) continue;
+        results.push({
+          item_name: dl.item_name, category: null,
+          qty_sold: 0, revenue: 0, line_count: 0, nc_qty: 0, nc_cost: 0,
+          sold_per_unit_ml: null,
+          matched: {
+            material_id: m.id, material_name: m.name, unit: m.unit, per_unit_ml: null,
+            avg_price: m.average_price || 0, current_stock: m.current_stock || 0,
+            purchased_qty: m.purchased_qty || 0, purchase_count: m.purchase_count || 0, score: 1,
+          },
+          sold_in_mat_unit: 0, conversion_note: 'manual — no sales yet',
+          diff_qty: 0, diff_value: 0, status: 'reconciled',
+          leakage_qty: 0, leakage_value: 0,
+          purchased_in_sold_unit: 0, stock_in_sold_unit: m.current_stock || 0,
+          diff_in_sold_unit: 0, leakage_in_sold_unit: 0, sold_unit_label: m.unit || 'units',
+          finalized: !dl.dismissed, linked_material_id: dl.material_id, department: 'Manual',
+          reviewed: true, dismissed: !!dl.dismissed, qty_per_unit: 1, manual: true,
+        });
+      }
+    }
+
     // Summary totals
     const totalLeakageValue = results.reduce((a, r) => a + (r.leakage_value || 0), 0);
     const matched = results.filter(r => r.matched).length;

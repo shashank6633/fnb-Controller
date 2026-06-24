@@ -3330,6 +3330,12 @@ function DirectItemsPanel({
   const [minSold, setMinSold] = useState(20);
   const [filter, setFilter] = useState<'pending' | 'finalized' | 'dismissed' | 'unmatched' | 'all'>('pending');
   const [savingItem, setSavingItem] = useState<string | null>(null);
+  // Manual "Add Direct Item" form — register a sold-item name → raw material link.
+  const [showAdd, setShowAdd] = useState(false);
+  const [addName, setAddName] = useState('');
+  const [addMatId, setAddMatId] = useState('');
+  const [addMatText, setAddMatText] = useState('');
+  const [adding, setAdding] = useState(false);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -3349,6 +3355,23 @@ function DirectItemsPanel({
   }, [minSold]);
 
   useEffect(() => { load(); }, [load]);
+
+  // Manually register a direct item: link a sold-item name → raw material, even
+  // before it has ever sold. The GET surfaces it as a finalized row.
+  const addDirectItem = async () => {
+    const name = addName.trim();
+    if (!name || !addMatId) { setError('Enter an item name and pick a raw material.'); return; }
+    setAdding(true); setError(null);
+    try {
+      const res = await api('/api/direct-items', { method: 'POST', body: { item_name: name, material_id: addMatId } });
+      if (!res.ok) throw new Error(await res.text());
+      setAddName(''); setAddMatId(''); setAddMatText(''); setShowAdd(false);
+      setFilter('finalized');
+      await load();
+    } catch (e: any) {
+      setError(e.message || 'Failed to add');
+    } finally { setAdding(false); }
+  };
 
   /**
    * Save a link decision for a direct item.
@@ -3464,7 +3487,45 @@ function DirectItemsPanel({
         <button onClick={() => load()} className="text-xs text-[#6B5744] hover:text-[#af4408] flex items-center gap-1">
           <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} /> Refresh
         </button>
+        <button onClick={() => setShowAdd(v => !v)}
+                className="text-xs text-white bg-[#af4408] hover:bg-[#8a3506] px-2.5 py-1.5 rounded-lg flex items-center gap-1">
+          <Plus className="w-3 h-3" /> Add Direct Item
+        </button>
       </div>
+
+      {/* Manual add: register a direct item (sold-name -> raw material) before it ever sells */}
+      {showAdd && (
+        <div className="bg-white border border-[#af4408]/40 rounded-xl p-3 shadow flex flex-wrap items-end gap-3">
+          <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+            Item name (as sold)
+            <input value={addName} onChange={e => setAddName(e.target.value)}
+                   placeholder="e.g. BUDWEISER (330ML)"
+                   className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm w-56" />
+          </label>
+          <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+            Raw material
+            <input list="di-mat-list" value={addMatText}
+                   onChange={e => {
+                     const v = e.target.value;
+                     setAddMatText(v);
+                     const m = materials.find(x => x.name.toLowerCase() === v.toLowerCase());
+                     setAddMatId(m?.id || '');
+                   }}
+                   placeholder="type to search materials..."
+                   className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm w-64" />
+            <datalist id="di-mat-list">
+              {materials.map(m => <option key={m.id} value={m.name} />)}
+            </datalist>
+          </label>
+          <button onClick={addDirectItem} disabled={adding || !addName.trim() || !addMatId}
+                  className="text-sm text-white bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-40 px-4 py-2 rounded-lg flex items-center gap-1.5">
+            {adding ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} Save
+          </button>
+          <button onClick={() => { setShowAdd(false); setAddName(''); setAddMatId(''); setAddMatText(''); }}
+                  className="text-sm text-[#6B5744] hover:bg-[#FFF1E3] px-3 py-2 rounded-lg">Cancel</button>
+          {addMatText && !addMatId && <span className="text-[11px] text-amber-700 self-center">pick a material from the list</span>}
+        </div>
+      )}
 
       {/* List */}
       {loading ? (
