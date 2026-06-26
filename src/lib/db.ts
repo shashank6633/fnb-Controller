@@ -1333,6 +1333,72 @@ function initializeSchema(db: Database.Database) {
     if (!hasG('qc_invoice_match')) db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN qc_invoice_match INTEGER NOT NULL DEFAULT 0`);
   } catch (e) { console.error('GRN schema failed:', e); }
 
+  // POS Phase 1 — front-of-house order backbone: tables → order → settle → sale.
+  // An order is opened on a table, items are added (priced from menu_items), and
+  // settling writes one `sales` row per line + deducts inventory (see recordSale).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS restaurant_tables (
+        id            TEXT PRIMARY KEY,
+        outlet_id     TEXT,
+        table_number  TEXT NOT NULL,
+        zone          TEXT DEFAULT '',
+        seats         INTEGER NOT NULL DEFAULT 2,
+        qr_token      TEXT,
+        is_active     INTEGER NOT NULL DEFAULT 1,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_rtables_outlet ON restaurant_tables(outlet_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_rtables_qr ON restaurant_tables(qr_token);
+
+      CREATE TABLE IF NOT EXISTS orders (
+        id             TEXT PRIMARY KEY,
+        outlet_id      TEXT,
+        order_number   INTEGER NOT NULL DEFAULT 0,
+        table_id       TEXT,
+        status         TEXT NOT NULL DEFAULT 'open',      -- open | settled | void
+        order_type     TEXT NOT NULL DEFAULT 'dine-in',   -- dine-in | takeaway | delivery
+        bill_type      TEXT NOT NULL DEFAULT 'normal',    -- maps to sales.bill_type
+        covers         INTEGER NOT NULL DEFAULT 0,
+        server_id      TEXT DEFAULT '',
+        server_name    TEXT DEFAULT '',
+        subtotal       REAL NOT NULL DEFAULT 0,
+        tax_total      REAL NOT NULL DEFAULT 0,
+        discount       REAL NOT NULL DEFAULT 0,
+        total          REAL NOT NULL DEFAULT 0,
+        payment_method TEXT DEFAULT '',                   -- cash | upi | card (set on settle)
+        settled_at     TEXT DEFAULT NULL,
+        voided_at      TEXT DEFAULT NULL,
+        notes          TEXT DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (table_id) REFERENCES restaurant_tables(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_orders_outlet ON orders(outlet_id);
+      CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+      CREATE INDEX IF NOT EXISTS idx_orders_table  ON orders(table_id);
+
+      CREATE TABLE IF NOT EXISTS order_items (
+        id            TEXT PRIMARY KEY,
+        order_id      TEXT NOT NULL,
+        menu_item_id  TEXT,
+        recipe_id     TEXT,                               -- snapshot for costing/deduction
+        name          TEXT NOT NULL,                      -- snapshot
+        station       TEXT DEFAULT '',                    -- snapshot (Phase 2 KOT routing)
+        quantity      REAL NOT NULL DEFAULT 1,
+        unit_price    REAL NOT NULL DEFAULT 0,            -- snapshot of menu price
+        tax_value     REAL NOT NULL DEFAULT 0,            -- snapshot tax % at add time
+        line_total    REAL NOT NULL DEFAULT 0,
+        status        TEXT NOT NULL DEFAULT 'pending',    -- Phase 2: new|preparing|ready|served
+        notes         TEXT DEFAULT '',
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
+    `);
+  } catch (e) { console.error('POS orders schema failed:', e); }
+
   // Phase 1 §6: wastages — items thrown away (spoilage / expiry / damage / overcooked / spillage).
   // Writes to inventory_transactions(type='wastage') so it shows up in consumption math.
   try {
@@ -1854,4 +1920,67 @@ export function deductInventoryForSale(db: Database.Database, recipeId: string, 
       `).run(generateId(), ing.material_id, txType, -totalDeduct, saleId, `Sub-recipe usage for sale`);
     }
   }
+}
+
+export interface SaleInput {
+  item_name: string;
+  recipe_id?: string | null;
+  quantity_sold: number;
+  bill_type?: string;              // 'normal' | 'nc' | 'comp'
+  selling_price?: number;
+  date: string;                    // YYYY-MM-DD
+  sale_time?: string | null;
+  order_id?: string | null;
+  category?: string | null;
+  server?: string | null;
+  order_type?: string | null;
+  pos_item_id?: string | null;
+  pos_item_name?: string | null;
+  variant_name?: string | null;
+  outlet_id?: string | null;
+}
+
+/**
+ * Record one sale row and deduct its inventory. This is the canonical path that
+ * POS settle and /api/sales both use: cost comes from the recipe, revenue is 0
+ * for non-`normal` bills, and inventory is deducted only when a recipe is linked.
+ * Call inside a db.transaction() to keep a multi-line settle atomic.
+ * Returns the new sale id.
+ */
+export function recordSale(db: Database.Database, s: SaleInput): string {
+  if (!s.item_name || !s.quantity_sold || !s.date) {
+    throw new Error('item_name, quantity_sold, and date are required');
+  }
+  const billType = s.bill_type || 'normal';
+
+  let recipeCost = 0;
+  if (s.recipe_id) {
+    const recipe = db.prepare('SELECT total_cost FROM recipes WHERE id = ?').get(s.recipe_id) as any;
+    if (recipe) recipeCost = recipe.total_cost;
+  }
+  const total_cost = Math.round(recipeCost * s.quantity_sold * 100) / 100;
+  const total_revenue = billType === 'normal'
+    ? Math.round((s.selling_price || 0) * s.quantity_sold * 100) / 100
+    : 0;
+
+  const id = generateId();
+  db.prepare(`
+    INSERT INTO sales (id, item_name, recipe_id, quantity_sold, bill_type, selling_price,
+                       total_revenue, total_cost, date, created_at,
+                       sale_time, order_id, category, server, order_type,
+                       pos_item_id, pos_item_name, variant_name, outlet_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'),
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?)
+  `).run(
+    id, s.item_name, s.recipe_id || null, s.quantity_sold, billType,
+    s.selling_price || 0, total_revenue, total_cost, s.date,
+    s.sale_time || null, s.order_id || null, s.category || null, s.server || null, s.order_type || null,
+    s.pos_item_id || null, s.pos_item_name || null, s.variant_name || null, s.outlet_id || null,
+  );
+
+  if (s.recipe_id) {
+    deductInventoryForSale(db, s.recipe_id, s.quantity_sold, id, billType);
+  }
+  return id;
 }

@@ -61,6 +61,8 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/butchering',          // carcass breakdown batches + seed
   '/api/party-consumption',   // post-party liquor consumption recording
   '/api/party-bookings',      // sheet refresh (POST forces live fetch)
+  '/api/dine-in/tables',      // POS table management (create/edit/delete)
+  '/api/dine-in/orders',      // POS orders: open, add items, settle, void
 ];
 
 function isPublic(pathname: string): boolean {

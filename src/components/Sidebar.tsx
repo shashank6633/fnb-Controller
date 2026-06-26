@@ -56,6 +56,8 @@ const navTree: NavEntry[] = [
     label: "Dine-In",
     icon: UtensilsCrossed,
     items: [
+      { kind: "link", label: "Order Floor",        href: "/dine-in/floor",             icon: ShoppingCart },
+      { kind: "link", label: "Tables",             href: "/dine-in/tables",            icon: Utensils },
       { kind: "link", label: "Menu Items",         href: "/menu-items",                icon: BookOpen },
       { kind: "link", label: "Recipes",            href: "/recipes",                   icon: ChefHat },
       { kind: "link", label: "Direct Items",       href: "/direct-items",              icon: Link2 },
