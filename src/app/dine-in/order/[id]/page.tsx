@@ -3,10 +3,10 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
-import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search } from 'lucide-react';
+import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search, Send } from 'lucide-react';
 
 interface MenuItem { id: string; name: string; category: string; station: string; selling_price: number; recipe_id: string | null; is_active: number; }
-interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; }
+interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; }
 interface Order {
   id: string; order_number: number; status: string; order_type: string;
   table_number: string | null; zone: string | null;
@@ -127,13 +127,16 @@ export default function OrderTerminalPage() {
             <div className="space-y-2 max-h-[42vh] overflow-y-auto mb-3">
               {order.items.length === 0 ? (
                 <p className="text-sm text-[#8B7355] text-center py-6">No items yet — tap the menu to add.</p>
-              ) : order.items.map((it) => (
+              ) : order.items.map((it) => {
+                const editable = !settled && it.status === 'pending';
+                return (
                 <div key={it.id} className="flex items-center gap-2">
                   <div className="flex-1 min-w-0">
                     <p className="text-sm text-[#2D1B0E] truncate">{it.name}</p>
-                    <p className="text-[11px] text-[#8B7355]">{rupee(it.unit_price)} each</p>
+                    <p className="text-[11px] text-[#8B7355]">{rupee(it.unit_price)} each
+                      {it.status === 'fired' && <span className="ml-1 text-green-600">· sent</span>}</p>
                   </div>
-                  {!settled && (
+                  {editable ? (
                     <div className="flex items-center gap-1">
                       <button onClick={() => patch({ action: 'set_qty', item_id: it.id, quantity: it.quantity - 1 }, it.id)}
                         className="p-1 rounded bg-[#FFF1E3] hover:bg-[#E8D5C4]"><Minus size={12} /></button>
@@ -141,11 +144,12 @@ export default function OrderTerminalPage() {
                       <button onClick={() => patch({ action: 'set_qty', item_id: it.id, quantity: it.quantity + 1 }, it.id)}
                         className="p-1 rounded bg-[#FFF1E3] hover:bg-[#E8D5C4]"><Plus size={12} /></button>
                     </div>
-                  )}
+                  ) : <span className="text-sm text-[#8B7355]">×{it.quantity}</span>}
                   <span className="w-16 text-right text-sm font-medium text-[#2D1B0E]">{rupee(it.line_total)}</span>
-                  {!settled && <button onClick={() => patch({ action: 'remove_item', item_id: it.id }, it.id)} className="text-red-400 hover:text-red-600"><Trash2 size={14} /></button>}
+                  {editable && <button onClick={() => patch({ action: 'remove_item', item_id: it.id }, it.id)} className="text-red-400 hover:text-red-600"><Trash2 size={14} /></button>}
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className="border-t border-[#E8D5C4] pt-3 space-y-1 text-sm">
@@ -155,9 +159,15 @@ export default function OrderTerminalPage() {
               <div className="flex justify-between font-bold text-[#2D1B0E] text-base pt-1"><span>Total</span><span>{rupee(order.total)}</span></div>
             </div>
 
+            {!settled && order.items.some((i) => i.status === 'pending') && (
+              <button onClick={() => patch({ action: 'fire' }, 'fire')} disabled={pending === 'fire'}
+                className="w-full mt-3 bg-[#FF6B35] hover:bg-[#e85a28] disabled:opacity-50 text-white py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-2">
+                {pending === 'fire' ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />} Send to kitchen
+              </button>
+            )}
             {!settled && (
               <button onClick={() => setSettleOpen(true)} disabled={order.items.length === 0}
-                className="w-full mt-4 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white py-2.5 rounded-lg text-sm font-medium">
+                className="w-full mt-3 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white py-2.5 rounded-lg text-sm font-medium">
                 Settle {rupee(order.total)}
               </button>
             )}

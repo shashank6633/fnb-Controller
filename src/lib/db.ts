@@ -1396,7 +1396,31 @@ function initializeSchema(db: Database.Database) {
         FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
+
+      -- POS Phase 2 — Kitchen Order Tickets. Firing an order groups its pending
+      -- items by station into one KOT per station; the KDS bumps the whole ticket
+      -- through new → preparing → ready → served.
+      CREATE TABLE IF NOT EXISTS kots (
+        id           TEXT PRIMARY KEY,
+        outlet_id    TEXT,
+        order_id     TEXT NOT NULL,
+        kot_number   INTEGER NOT NULL DEFAULT 0,
+        station      TEXT NOT NULL DEFAULT 'kitchen',
+        status       TEXT NOT NULL DEFAULT 'new',   -- new | preparing | ready | served
+        notes        TEXT DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_kots_order   ON kots(order_id);
+      CREATE INDEX IF NOT EXISTS idx_kots_station ON kots(station);
+      CREATE INDEX IF NOT EXISTS idx_kots_status  ON kots(status);
     `);
+    // order_items gains a kot_id once it is fired to the kitchen (Phase 2).
+    const oiCols = db.prepare("PRAGMA table_info(order_items)").all() as any[];
+    if (!oiCols.some((c: any) => c.name === 'kot_id')) {
+      db.exec(`ALTER TABLE order_items ADD COLUMN kot_id TEXT`);
+    }
   } catch (e) { console.error('POS orders schema failed:', e); }
 
   // Phase 1 §6: wastages — items thrown away (spoilage / expiry / damage / overcooked / spillage).

@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { emitKds } from '@/lib/kds-bus';
 import type Database from 'better-sqlite3';
 
 /** Recompute and persist order totals from its line items + discount. */
@@ -59,6 +60,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     const b = await req.json();
     const action = b.action;
 
+    const firedKots: any[] = [];   // populated by 'fire', emitted after commit
     const run = db.transaction(() => {
       switch (action) {
         case 'add_item': {
@@ -85,14 +87,49 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
           const qty = Number(b.quantity);
           const item = db.prepare('SELECT * FROM order_items WHERE id = ? AND order_id = ?').get(b.item_id, id) as any;
           if (!item) throw new Error('Line item not found');
+          if (item.status !== 'pending') throw new Error('Item already sent to kitchen — cannot change it');
           if (qty <= 0) db.prepare('DELETE FROM order_items WHERE id = ?').run(b.item_id);
           else db.prepare('UPDATE order_items SET quantity = ?, line_total = ? WHERE id = ?')
             .run(qty, Math.round(item.unit_price * qty * 100) / 100, b.item_id);
           break;
         }
         case 'remove_item':
-          db.prepare('DELETE FROM order_items WHERE id = ? AND order_id = ?').run(b.item_id, id);
+          db.prepare("DELETE FROM order_items WHERE id = ? AND order_id = ? AND status = 'pending'").run(b.item_id, id);
           break;
+        case 'fire': {
+          const pending = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status = 'pending'").all(id) as any[];
+          if (pending.length === 0) throw new Error('No new items to send to the kitchen');
+          const tableRow = order.table_id
+            ? db.prepare('SELECT table_number, zone FROM restaurant_tables WHERE id = ?').get(order.table_id) as any
+            : null;
+          // Group pending items by station — one KOT per station.
+          const byStation: Record<string, any[]> = {};
+          for (const it of pending) {
+            const st = (it.station && it.station.trim()) || 'kitchen';
+            (byStation[st] ||= []).push(it);
+          }
+          const setKot = db.prepare("UPDATE order_items SET kot_id = ?, status = 'fired' WHERE id = ?");
+          for (const [station, its] of Object.entries(byStation)) {
+            const seq = db.prepare(`
+              SELECT COALESCE(MAX(kot_number), 0) + 1 AS n FROM kots
+              WHERE (outlet_id = ? OR outlet_id IS NULL) AND date(created_at) = date('now')
+            `).get(order.outlet_id) as any;
+            const kotId = generateId();
+            db.prepare(`
+              INSERT INTO kots (id, outlet_id, order_id, kot_number, station, status, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, 'new', datetime('now'), datetime('now'))
+            `).run(kotId, order.outlet_id, id, seq.n, station);
+            for (const it of its) setKot.run(kotId, it.id);
+            firedKots.push({
+              id: kotId, outlet_id: order.outlet_id, order_id: id, kot_number: seq.n, station, status: 'new',
+              order_number: order.order_number, order_type: order.order_type,
+              table_number: tableRow?.table_number || null, zone: tableRow?.zone || null,
+              items: its.map((x) => ({ name: x.name, quantity: x.quantity, notes: x.notes })),
+            });
+          }
+          // TODO Phase 2.1: socket-print each fired KOT to its station's LAN ESC/POS printer here.
+          break;
+        }
         case 'set_meta':
           db.prepare(`UPDATE orders SET covers = ?, discount = ?, notes = ?, updated_at = datetime('now') WHERE id = ?`)
             .run(b.covers === undefined ? order.covers : Number(b.covers) || 0,
@@ -105,6 +142,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
       recomputeTotals(db, id);
     });
     run();
+
+    // Notify the KDS after the data is committed.
+    for (const k of firedKots) emitKds({ type: 'kot.new', outlet_id: k.outlet_id, station: k.station, kot: k });
 
     return Response.json({ order: loadOrder(db, id) });
   } catch (e: any) {

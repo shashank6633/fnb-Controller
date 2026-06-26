@@ -62,7 +62,8 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/party-consumption',   // post-party liquor consumption recording
   '/api/party-bookings',      // sheet refresh (POST forces live fetch)
   '/api/dine-in/tables',      // POS table management (create/edit/delete)
-  '/api/dine-in/orders',      // POS orders: open, add items, settle, void
+  '/api/dine-in/orders',      // POS orders: open, add items, fire, settle, void
+  '/api/dine-in/kds',         // KDS bump (the SSE stream is GET, exempt)
 ];
 
 function isPublic(pathname: string): boolean {
