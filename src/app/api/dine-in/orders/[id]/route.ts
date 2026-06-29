@@ -146,7 +146,9 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // Notify the KDS after the data is committed.
     for (const k of firedKots) emitKds({ type: 'kot.new', outlet_id: k.outlet_id, station: k.station, kot: k });
 
-    return Response.json({ order: loadOrder(db, id) });
+    // fired_kots lets the client print each KOT via the local bridge (offline
+    // printing). Empty for non-fire actions; existing callers ignore it.
+    return Response.json({ order: loadOrder(db, id), fired_kots: firedKots });
   } catch (e: any) {
     console.error('[/api/dine-in/orders/[id] PATCH]', e);
     return Response.json({ error: e.message }, { status: 400 });

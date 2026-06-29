@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
 import { probeBridge, bridgePrint, getBridgeUrl, setBridgeUrl, type BridgeHealth } from '@/lib/offline-print/bridge-client';
+import { counts as outboxCounts, retryFailed, drainOutbox, ensureDrainLoop } from '@/lib/offline-print/outbox';
 import {
   Printer, Plus, Trash2, Loader2, X, Wifi, WifiOff, RefreshCw, Save,
   CheckCircle2, XCircle, FlaskConical, ChevronDown, ChevronRight,
@@ -38,6 +39,7 @@ export default function OfflinePrintPage() {
   const [saving, setSaving] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [showHelp, setShowHelp] = useState(false);
+  const [queue, setQueue] = useState({ pending: 0, failed: 0, printed: 0 });
   const [toast, setToast] = useState<{ ok: boolean; msg: string } | null>(null);
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 4000); };
@@ -55,11 +57,22 @@ export default function OfflinePrintPage() {
     setHealth(await probeBridge());
     setProbing(false);
   }, []);
+  const refreshQueue = useCallback(async () => { try { setQueue(await outboxCounts()); } catch { /* idb unavailable */ } }, []);
 
   useEffect(() => {
     setBridgeUrlState(getBridgeUrl());
-    loadStations(); loadJobs(); checkBridge();
-  }, [loadStations, loadJobs, checkBridge]);
+    loadStations(); loadJobs(); checkBridge(); refreshQueue();
+    ensureDrainLoop();
+    const t = setInterval(refreshQueue, 5000);
+    return () => clearInterval(t);
+  }, [loadStations, loadJobs, checkBridge, refreshQueue]);
+
+  const retryQueue = async () => {
+    await retryFailed();
+    const r = await drainOutbox();
+    await refreshQueue(); await loadJobs();
+    flash(r.printed > 0, r.printed > 0 ? `Retried — ${r.printed} printed.` : 'Nothing printed (printer/bridge still unreachable).');
+  };
 
   const saveBridgeUrl = () => { setBridgeUrl(bridgeUrl); checkBridge(); flash(true, 'Bridge address saved.'); };
 
@@ -174,6 +187,27 @@ export default function OfflinePrintPage() {
           <input value={bridgeUrl} onChange={(e) => setBridgeUrlState(e.target.value)} placeholder="http://localhost:9920" className={`${inputCls} flex-1`} />
           <button onClick={saveBridgeUrl} className="flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-3 py-2 rounded-lg text-sm font-medium"><Save className="w-4 h-4" /> Set</button>
         </div>
+      </div>
+
+      {/* Print queue (offline outbox) */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-5 flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <p className="font-semibold text-[#2D1B0E]">Print queue</p>
+          <p className="text-xs text-[#8B7355]">
+            {queue.pending === 0 && queue.failed === 0
+              ? 'Nothing waiting — all prints went through.'
+              : <>
+                  {queue.pending > 0 && <span className="text-amber-600 font-medium">{queue.pending} waiting</span>}
+                  {queue.pending > 0 && queue.failed > 0 && ' · '}
+                  {queue.failed > 0 && <span className="text-red-600 font-medium">{queue.failed} failed</span>}
+                  {' '}— queued prints retry automatically.
+                </>}
+          </p>
+        </div>
+        <button onClick={retryQueue} disabled={queue.pending === 0 && queue.failed === 0}
+          className="flex items-center gap-2 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 disabled:opacity-40 px-3 py-2 rounded-lg text-sm font-medium">
+          <RefreshCw className="w-4 h-4" /> Retry now
+        </button>
       </div>
 
       {/* Setup help */}

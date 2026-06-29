@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search, Send } from 'lucide-react';
+import { printFiredKots, printBill } from '@/lib/offline-print/print';
 
 interface MenuItem { id: string; name: string; category: string; station: string; selling_price: number; recipe_id: string | null; is_active: number; }
 interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; }
@@ -49,7 +50,14 @@ export default function OrderTerminalPage() {
       const r = await api(`/api/dine-in/orders/${id}`, { method: 'PATCH', body });
       const j = await r.json();
       if (j.error) alert(j.error);
-      else if (j.order) setOrder(j.order);
+      else if (j.order) {
+        setOrder(j.order);
+        // Auto-print the just-fired KOTs via the local bridge (resilient: the
+        // outbox queues + retries if a printer/bridge is briefly unreachable).
+        if (Array.isArray(j.fired_kots) && j.fired_kots.length) {
+          printFiredKots(j.fired_kots).catch(() => { /* outbox will retry */ });
+        }
+      }
     } finally { setPending(null); }
   }
 
@@ -59,6 +67,8 @@ export default function OrderTerminalPage() {
       const r = await api(`/api/dine-in/orders/${id}/settle`, { method: 'POST', body: { payment_method: method } });
       const j = await r.json();
       if (j.error) { alert(j.error); return; }
+      // Print the bill via the local bridge (best-effort; never blocks settle).
+      if (order) printBill({ ...order, payment_method: method }).catch(() => {});
       router.push('/dine-in/floor');
     } finally { setSettling(false); }
   }
