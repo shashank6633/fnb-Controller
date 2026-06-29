@@ -159,6 +159,9 @@ export default function PurchasesPage() {
   const [bulkResult, setBulkResult] = useState<{ success: number; skipped: number; errors: string[] } | null>(null);
   const [bulkDragOver, setBulkDragOver] = useState(false);
   const bulkFileInputRef = useRef<HTMLInputElement>(null);
+  // Opening-stock import (natural purchase units → base units via pack_size)
+  const [openingBusy, setOpeningBusy] = useState(false);
+  const openingFileRef = useRef<HTMLInputElement>(null);
 
   // Pagination
   const [page, setPage] = useState(1);
@@ -593,6 +596,60 @@ export default function PurchasesPage() {
     }
   };
 
+  // ---- Opening Stock: template download + pack-aware upload ----
+  const downloadOpeningTemplate = async () => {
+    const XLSX = await import('xlsx');
+    const rows = [...materials]
+      .sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)))
+      .map((m: any) => ({
+        sku: m.sku || '',
+        name: m.name || '',
+        purchase_unit: m.purchase_unit || m.unit || '',
+        pack_size: m.pack_size || 1,
+        qty: '',
+        rate: '',
+        date: '',
+      }));
+    const ws = XLSX.utils.json_to_sheet(rows, { header: ['sku', 'name', 'purchase_unit', 'pack_size', 'qty', 'rate', 'date'] });
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Opening Stock');
+    XLSX.writeFile(wb, `opening-stock-template-${todayString()}.xlsx`);
+  };
+
+  const handleOpeningFile = async (file: File) => {
+    setOpeningBusy(true);
+    try {
+      let rows: any[] = [];
+      if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+        const XLSX = await import('xlsx');
+        const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+        rows = XLSX.utils.sheet_to_json<any>(wb.Sheets[wb.SheetNames[0]]);
+      } else {
+        rows = await new Promise<any[]>((resolve) => {
+          Papa.parse(file, { header: true, skipEmptyLines: true, complete: (r) => resolve(r.data as any[]) });
+        });
+      }
+      const mapped = rows.map((r: any) => ({
+        sku:  r.sku  ?? r.SKU  ?? '',
+        name: r.name ?? r.Name ?? r.item_name ?? r['Item Name'] ?? '',
+        qty:  r.qty  ?? r.quantity ?? r.Qty ?? r.Quantity ?? r['INWARD QTY'] ?? '',
+        rate: r.rate ?? r.Rate ?? r.unit_price ?? r.price ?? r.Price ?? '',
+        date: r.date ?? r.Date ?? '',
+      }));
+      const res = await api('/api/purchases/opening-stock', { method: 'POST', body: { rows: mapped } });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { alert(j.error || 'Upload failed'); return; }
+      if (j.skipped_rows?.length) console.warn('[opening-stock] skipped rows:', j.skipped_rows);
+      alert(`${j.message}${j.skipped ? '\n\nSkipped rows are logged in the browser console (F12).' : ''}`);
+      await Promise.all([fetchPurchases(appliedFilters), fetchMaterials()]);
+    } catch (e: any) {
+      alert('Failed: ' + e.message);
+    } finally {
+      setOpeningBusy(false);
+      if (openingFileRef.current) openingFileRef.current.value = '';
+    }
+  };
+
   const toggleSort = () => {
     setSortDir((prev) => (prev === 'desc' ? 'asc' : 'desc'));
   };
@@ -662,6 +719,25 @@ export default function PurchasesPage() {
               <Upload className="w-4 h-4" />
               Generic CSV Upload
             </button>
+            <button
+              onClick={downloadOpeningTemplate}
+              className="flex items-center gap-2 px-4 py-2.5 border border-blue-600 text-blue-700 hover:bg-blue-50 rounded-lg text-sm font-medium transition-colors"
+              title="Download an Excel of every material to fill opening qty + rate (in purchase units like kg / BTL), then upload as opening stock"
+            >
+              <FileSpreadsheet className="w-4 h-4" />
+              Opening Stock Template
+            </button>
+            <button
+              onClick={() => openingFileRef.current?.click()}
+              disabled={openingBusy}
+              className="flex items-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+              title="Upload the filled Opening Stock template — converts qty/rate by pack size and seeds stock + average cost"
+            >
+              <Upload className="w-4 h-4" />
+              {openingBusy ? 'Uploading…' : 'Upload Opening Stock'}
+            </button>
+            <input ref={openingFileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden"
+                   onChange={(e) => { const f = e.target.files?.[0]; if (f) handleOpeningFile(f); }} />
             <button
               onClick={openBillModal}
               className="flex items-center gap-2 px-4 py-2.5 border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium transition-colors"
