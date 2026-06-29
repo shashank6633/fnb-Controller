@@ -44,6 +44,7 @@ export default function OfflinePrintPage() {
   const [queue, setQueue] = useState({ pending: 0, failed: 0, printed: 0 });
   const [pstatus, setPstatus] = useState<Record<string, PrinterStatus | null>>({});
   const [checkingPrinters, setCheckingPrinters] = useState(false);
+  const [menuStations, setMenuStations] = useState<{ station: string; item_count: number; has_printer: boolean; printer_name: string | null }[]>([]);
   const [toast, setToast] = useState<{ ok: boolean; msg: string } | null>(null);
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 4000); };
@@ -56,6 +57,10 @@ export default function OfflinePrintPage() {
     const r = await api('/api/dine-in/offline-print/jobs?limit=20');
     if (r.ok) setJobs((await r.json()).jobs || []);
   }, []);
+  const loadMenuStations = useCallback(async () => {
+    const r = await api('/api/dine-in/offline-print/menu-stations');
+    if (r.ok) setMenuStations((await r.json()).stations || []);
+  }, []);
   const checkBridge = useCallback(async () => {
     setProbing(true);
     setHealth(await probeBridge());
@@ -65,11 +70,11 @@ export default function OfflinePrintPage() {
 
   useEffect(() => {
     setBridgeUrlState(getBridgeUrl());
-    loadStations(); loadJobs(); checkBridge(); refreshQueue();
+    loadStations(); loadJobs(); loadMenuStations(); checkBridge(); refreshQueue();
     ensureDrainLoop();
     const t = setInterval(refreshQueue, 5000);
     return () => clearInterval(t);
-  }, [loadStations, loadJobs, checkBridge, refreshQueue]);
+  }, [loadStations, loadJobs, loadMenuStations, checkBridge, refreshQueue]);
 
   const retryQueue = async () => {
     await retryFailed();
@@ -94,6 +99,11 @@ export default function OfflinePrintPage() {
   const saveBridgeUrl = () => { setBridgeUrl(bridgeUrl); checkBridge(); flash(true, 'Bridge address saved.'); };
 
   const openNew = () => { setForm(blankForm); setShowForm(true); };
+  const openNewForStation = (station: string) => {
+    setForm({ ...blankForm, role: 'kot', station, name: `${station.charAt(0).toUpperCase() + station.slice(1)} printer` });
+    setShowForm(true);
+    if (typeof window !== 'undefined') window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
   const openEdit = (s: Station) => {
     setForm({ id: s.id, name: s.name, role: s.role, station: s.station || '', transport: s.transport, target: s.target, paper_width: s.paper_width, copies: s.copies, floor: (s as any).floor || '', backup_target: (s as any).backup_target || '' });
     setShowForm(true);
@@ -109,7 +119,7 @@ export default function OfflinePrintPage() {
         ? await api(`/api/dine-in/offline-print/stations/${form.id}`, { method: 'PATCH', body })
         : await api('/api/dine-in/offline-print/stations', { method: 'POST', body });
       if (!r.ok) throw new Error((await r.json().catch(() => ({})))?.error || 'Save failed');
-      setShowForm(false); setForm(blankForm); await loadStations();
+      setShowForm(false); setForm(blankForm); await loadStations(); await loadMenuStations();
       flash(true, 'Printer saved.');
     } catch (e: any) { flash(false, e.message); }
     finally { setSaving(false); }
@@ -118,7 +128,7 @@ export default function OfflinePrintPage() {
   const deleteStation = async (s: Station) => {
     if (!confirm(`Delete printer "${s.name}"?`)) return;
     const r = await api(`/api/dine-in/offline-print/stations/${s.id}`, { method: 'DELETE' });
-    if (r.ok) { await loadStations(); flash(true, 'Deleted.'); } else flash(false, 'Delete failed.');
+    if (r.ok) { await loadStations(); await loadMenuStations(); flash(true, 'Deleted.'); } else flash(false, 'Delete failed.');
   };
 
   const sampleDoc = (s: Station) => {
@@ -260,6 +270,36 @@ export default function OfflinePrintPage() {
         )}
       </div>
 
+      {/* Kitchen/bar stations from the menu → printer mapping */}
+      {menuStations.length > 0 && (
+        <div className="bg-white border border-[#E8D5C4] rounded-xl p-5">
+          <div className="flex items-center justify-between mb-1">
+            <h2 className="font-semibold text-[#2D1B0E]">Kitchen &amp; bar stations</h2>
+            {menuStations.some((s) => !s.has_printer)
+              ? <span className="text-xs text-amber-600 font-medium">{menuStations.filter((s) => !s.has_printer).length} need a printer</span>
+              : <span className="text-xs text-green-600 font-medium">all mapped ✓</span>}
+          </div>
+          <p className="text-xs text-[#8B7355] mb-3">Every station on your menu must point to a KOT printer so a punched item prints there. Green = mapped to a printer.</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {menuStations.map((s) => (
+              <div key={s.station} className="flex items-center justify-between gap-2 border border-[#E8D5C4] rounded-lg px-3 py-2">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className={`inline-block w-2 h-2 rounded-full ${s.has_printer ? 'bg-green-500' : 'bg-amber-400'}`}></span>
+                    <span className="font-medium text-[#2D1B0E] capitalize">{s.station}</span>
+                    <span className="text-xs text-[#8B7355]">· {s.item_count} item{s.item_count === 1 ? '' : 's'}</span>
+                  </div>
+                  <p className="text-[11px] text-[#8B7355] mt-0.5 truncate">{s.has_printer ? `→ ${s.printer_name}` : 'no printer — items fall back to your default KOT printer'}</p>
+                </div>
+                {!s.has_printer && (
+                  <button onClick={() => openNewForStation(s.station)} className="shrink-0 flex items-center gap-1 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-2.5 py-1 rounded-lg text-xs font-medium"><Plus className="w-3.5 h-3.5" /> Printer</button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Stations */}
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-5">
         <div className="flex items-center justify-between mb-4">
@@ -298,8 +338,9 @@ export default function OfflinePrintPage() {
                 <input value={form.target} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder={form.transport === 'ip' ? '192.168.1.50:9100' : 'POS-80  or  \\localhost\\POS80'} className={inputCls} />
               </label>
               {form.role === 'kot' && (
-                <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Kitchen station (optional)
-                  <input value={form.station} onChange={(e) => setForm({ ...form, station: e.target.value })} placeholder="Tandoor / Bar / Chinese" className={inputCls} />
+                <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Kitchen station (must match the menu)
+                  <input value={form.station} list="menu-stations" onChange={(e) => setForm({ ...form, station: e.target.value })} placeholder="tandoor / bar / pan-asian" className={inputCls} />
+                  <datalist id="menu-stations">{menuStations.map((s) => <option key={s.station} value={s.station} />)}</datalist>
                 </label>
               )}
               <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Paper width
