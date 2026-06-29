@@ -1470,6 +1470,47 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('audit_events schema failed:', e); }
 
+  // Offline KOT + Bill printing (ADDITIVE — touches no existing table/data).
+  // print_stations maps a logical role (a customer "bill" printer, or a kitchen
+  // "kot" station) to a physical printer the local print bridge can reach over
+  // IP (raw TCP :9100) or USB (OS raw spool). print_jobs is an audit journal of
+  // print attempts so failures are visible during/after an outage.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS print_stations (
+        id          TEXT PRIMARY KEY,
+        outlet_id   TEXT,
+        name        TEXT NOT NULL,
+        role        TEXT NOT NULL DEFAULT 'kot',    -- 'bill' | 'kot'
+        station     TEXT DEFAULT '',                 -- kitchen station label this maps to (kot)
+        transport   TEXT NOT NULL DEFAULT 'ip',      -- 'ip' | 'usb'
+        target      TEXT NOT NULL DEFAULT '',        -- "ip:port" (ip) or OS printer/share name (usb)
+        paper_width INTEGER NOT NULL DEFAULT 48,     -- 48 = 80mm, 32 = 58mm
+        copies      INTEGER NOT NULL DEFAULT 1,
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_print_stations_role ON print_stations(role);
+
+      CREATE TABLE IF NOT EXISTS print_jobs (
+        id          TEXT PRIMARY KEY,
+        outlet_id   TEXT,
+        station_id  TEXT,
+        doc_type    TEXT NOT NULL DEFAULT 'kot',     -- 'kot' | 'bill'
+        source      TEXT NOT NULL DEFAULT 'test',    -- 'test' | 'fire' | 'bill' | 'reprint'
+        ref_id      TEXT,                             -- order_id / kot_id / etc.
+        status      TEXT NOT NULL DEFAULT 'queued',  -- 'queued' | 'printed' | 'failed'
+        attempts    INTEGER NOT NULL DEFAULT 0,
+        last_error  TEXT DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        printed_at  TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_print_jobs_created ON print_jobs(created_at DESC);
+    `);
+  } catch (e) { console.error('print_stations/print_jobs schema failed:', e); }
+
   // Phase 1 §2: add Mgmt approval columns to requisitions (idempotent)
   try {
     const cols = db.prepare("PRAGMA table_info(requisitions)").all() as any[];

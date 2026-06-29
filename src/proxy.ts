@@ -64,6 +64,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/dine-in/tables',      // POS table management (create/edit/delete)
   '/api/dine-in/orders',      // POS orders: open, add items, fire, settle, void
   '/api/dine-in/kds',         // KDS bump (the SSE stream is GET, exempt)
+  '/api/dine-in/offline-print', // print-station config + print-job journal
 ];
 
 function isPublic(pathname: string): boolean {
