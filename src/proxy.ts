@@ -77,7 +77,7 @@ function isPublic(pathname: string): boolean {
   if (pathname === '/manifest.json') return true;
   if (pathname === '/sw.js') return true;
   if (pathname === '/offline.html') return true;
-  if (pathname.match(/\.(png|jpg|jpeg|svg|ico|webp|gif|css|js|map|json|txt|woff2?|ttf)$/)) return true;
+  if (pathname.match(/\.(png|jpg|jpeg|svg|ico|webp|gif|css|js|mjs|map|json|txt|woff2?|ttf|bat|ps1)$/)) return true;
   return false;
 }
 
