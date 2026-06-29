@@ -885,24 +885,26 @@ export default function PurchasesPage() {
                     <td className="py-3 px-4 text-[#6B5744]">{p.brand || '-'}</td>
                     <td className="py-3 px-4 text-right text-[#3D2614] font-mono">
                       {(() => {
-                        // Display quantity in purchase unit when pack_size > 1
-                        // (e.g. 12 BTL instead of 12,000 ml). Falls back to recipe-unit qty.
-                        const pq = (p as any).purchase_qty;
+                        // p.quantity is stored in PURCHASE units (e.g. 20 kg, 12 BTL),
+                        // so purchase_qty == quantity. recipe_qty is the recipe-unit
+                        // equivalent (e.g. 20,000 g) and is shown as a secondary hint
+                        // only when it actually differs (kg→g, L→ml, BTL→ml).
+                        const pq = (p as any).purchase_qty ?? p.quantity;
+                        const rq = (p as any).recipe_qty;
                         const pu = (p as any).material_purchase_unit;
-                        const ps = (p as any).material_pack_size;
                         const ru = (p as any).material_unit;
-                        if (pq != null && ps && ps > 1) {
+                        if (rq != null && Number(rq) !== Number(pq)) {
                           return (
                             <>
                               <span>{Number(pq).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
                               <span className="ml-1 text-[10px] text-[#8B7355]">{pu || ru}</span>
                               <div className="text-[10px] text-[#8B7355]">
-                                = {Number(p.quantity).toLocaleString('en-IN')} {ru}
+                                = {Number(rq).toLocaleString('en-IN')} {ru}
                               </div>
                             </>
                           );
                         }
-                        return <>{Number(p.quantity).toLocaleString('en-IN')} <span className="text-[10px] text-[#8B7355]">{ru || ''}</span></>;
+                        return <>{Number(pq).toLocaleString('en-IN')} <span className="text-[10px] text-[#8B7355]">{pu || ru || ''}</span></>;
                       })()}
                     </td>
                     <td className="py-3 px-4 text-right text-[#3D2614] font-mono">

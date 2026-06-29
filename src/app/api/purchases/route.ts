@@ -8,23 +8,22 @@ export async function GET(request: Request) {
     const from = url.searchParams.get('from');
     const to = url.searchParams.get('to');
 
-    // We store p.quantity in the recipe / stock unit (e.g. ml). For display we
-    // also expose a "purchase_qty" + "purchase_unit_price" computed via pack_size
-    // so the user sees realistic numbers (e.g. 12 BTL @ ₹88/BTL instead of 12000 ml @ ₹0.0866/ml).
-    // total_price is the invoice amount and stays unchanged.
+    // p.quantity is stored in PURCHASE units (kg, BTL) and p.unit_price per
+    // purchase unit, so they ARE the natural display values. recipe_qty is the
+    // recipe-unit equivalent (× pack_size when recipe_unit ≠ purchase_unit) for
+    // the secondary "= 20,000 g" hint. total_price is the invoice amount.
     let query = `
       SELECT p.*, rm.name as material_name,
              rm.unit          AS material_unit,
              rm.purchase_unit AS material_purchase_unit,
              COALESCE(rm.pack_size, 1) AS material_pack_size,
+             p.quantity   AS purchase_qty,
+             p.unit_price AS purchase_unit_price,
              CASE WHEN COALESCE(rm.pack_size, 1) > 1
-                  THEN p.quantity / rm.pack_size
+                       AND LOWER(rm.unit) <> LOWER(COALESCE(rm.purchase_unit, rm.unit))
+                  THEN p.quantity * rm.pack_size
                   ELSE p.quantity
-             END AS purchase_qty,
-             CASE WHEN COALESCE(rm.pack_size, 1) > 1 AND p.quantity > 0
-                  THEN p.total_price / (p.quantity / rm.pack_size)
-                  ELSE p.unit_price
-             END AS purchase_unit_price
+             END AS recipe_qty
       FROM purchases p
       JOIN raw_materials rm ON p.material_id = rm.id
       WHERE 1=1
@@ -81,16 +80,24 @@ export async function POST(request: Request) {
       `).run(id, material_id, vendor || '', brand || '', quantity, unit_price, total_price, date, notes || '',
               is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '');
 
+      // Stock is kept in RECIPE units (sales deduction, closing-stock variance
+      // × average_price). quantity is entered in PURCHASE units, so multiply by
+      // pack_size when recipe_unit ≠ purchase_unit — mirroring updateMaterialPrice().
+      const packSize = Number(material.pack_size) || 1;
+      const ru = String(material.unit || '').toLowerCase().trim();
+      const pu = String(material.purchase_unit || material.unit || '').toLowerCase().trim();
+      const stockQty = (packSize > 1 && ru !== pu) ? quantity * packSize : quantity;
+
       // Update stock
       db.prepare(`
         UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?
-      `).run(quantity, material_id);
+      `).run(stockQty, material_id);
 
       // Create inventory transaction
       db.prepare(`
         INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
         VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'))
-      `).run(generateId(), material_id, quantity, id, `Purchase from ${vendor || 'unknown'}`);
+      `).run(generateId(), material_id, stockQty, id, `Purchase from ${vendor || 'unknown'}`);
 
       // Update material price and cascade
       updateMaterialPrice(db, material_id);

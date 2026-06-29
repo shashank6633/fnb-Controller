@@ -22,12 +22,23 @@ export async function POST(request: Request) {
       return Response.json({ error: 'purchases array is required' }, { status: 400 });
     }
 
-    // Load all materials for name matching
-    const allMaterials = db.prepare('SELECT id, name FROM raw_materials').all() as { id: string; name: string }[];
-    const materialMap = new Map<string, string>();
+    // Load all materials for name matching (with units so we can convert
+    // purchase-unit quantities → recipe units for the stock increment).
+    const allMaterials = db.prepare('SELECT id, name, unit, purchase_unit, pack_size FROM raw_materials').all() as any[];
+    const materialMap = new Map<string, any>();
     for (const m of allMaterials) {
-      materialMap.set(m.name.toLowerCase().trim(), m.id);
+      materialMap.set(m.name.toLowerCase().trim(), m);
     }
+    // Stock is kept in RECIPE units everywhere (sales deduction, closing-stock
+    // variance × average_price). The CSV quantity is in PURCHASE units, so
+    // multiply by pack_size when recipe_unit ≠ purchase_unit — mirroring
+    // updateMaterialPrice()'s guard so price (÷pack) and stock (×pack) stay aligned.
+    const toStockQty = (m: any, qty: number) => {
+      const packSize = Number(m.pack_size) || 1;
+      const ru = String(m.unit || '').toLowerCase().trim();
+      const pu = String(m.purchase_unit || m.unit || '').toLowerCase().trim();
+      return (packSize > 1 && ru !== pu) ? qty * packSize : qty;
+    };
 
     const results: { success: number; skipped: number; errors: string[] } = {
       success: 0,
@@ -62,12 +73,13 @@ export async function POST(request: Request) {
         }
 
         // Match material by name (case-insensitive)
-        const materialId = materialMap.get(item.item_name.toLowerCase().trim());
-        if (!materialId) {
+        const mat = materialMap.get(item.item_name.toLowerCase().trim());
+        if (!mat) {
           results.errors.push(`Row ${rowNum}: Material not found: "${item.item_name}"`);
           results.skipped++;
           continue;
         }
+        const materialId = mat.id;
 
         let quantity = Number(item.quantity) || 0;
         let unitPrice = Number(item.unit_price) || 0;
@@ -99,10 +111,11 @@ export async function POST(request: Request) {
           quantity, unitPrice, totalPrice, item.date, item.notes || ''
         );
 
-        updateStock.run(quantity, materialId);
+        const stockQty = toStockQty(mat, quantity);   // recipe/stock units
+        updateStock.run(stockQty, materialId);
 
         insertTransaction.run(
-          generateId(), materialId, quantity, id,
+          generateId(), materialId, stockQty, id,
           `Bulk import: ${item.vendor || 'unknown'}`
         );
 
@@ -115,8 +128,8 @@ export async function POST(request: Request) {
     // Update prices for all affected materials (batch at end for performance)
     const affectedMaterials = new Set<string>();
     for (const item of purchases) {
-      const materialId = materialMap.get(item.item_name.toLowerCase().trim());
-      if (materialId) affectedMaterials.add(materialId);
+      const mat = materialMap.get(item.item_name.toLowerCase().trim());
+      if (mat) affectedMaterials.add(mat.id);
     }
     for (const materialId of affectedMaterials) {
       updateMaterialPrice(db, materialId);
