@@ -24,6 +24,8 @@ export interface PrintJob {
   lastError: string;
   createdAt: number;
   printer: PrinterTarget;
+  backup?: string;        // failover printer "ip:port" (PrintStation.backup_target)
+  usedBackup?: boolean;   // true once we've switched to the backup printer
   doc: PrintDoc;
   meta: { stationId?: string; stationName?: string; docType: 'kot' | 'bill'; source: string; refId?: string };
 }
@@ -98,7 +100,40 @@ export async function retryFailed(): Promise<void> {
 
 let draining = false;
 
-/** Try to send every pending job to the bridge. Safe to call often. */
+// Print one job: bridgePrint, update status, fail over to the backup printer
+// after 2 failed attempts on the primary. Returns the resulting status.
+async function tryPrintJob(job: PrintJob): Promise<'printed' | 'pending' | 'failed'> {
+  let res: { ok: boolean; error?: string };
+  try { res = await bridgePrint({ jobId: job.id, printer: job.printer, doc: job.doc }); }
+  catch (e: any) { res = { ok: false, error: e?.message || 'print failed' }; }
+
+  if (res.ok) {
+    job.status = 'printed'; job.lastError = ''; await put(job);
+    logJobResult(job, 'printed').catch(() => {});
+    return 'printed';
+  }
+  job.attempts += 1; job.lastError = res.error || 'unknown';
+  // Failover: after a couple of failed tries on the primary, switch to the
+  // configured backup printer (e.g. another bar/kitchen printer on the floor).
+  if (job.backup && !job.usedBackup && job.attempts >= 2) {
+    job.usedBackup = true; job.attempts = 0;
+    job.printer = { ...job.printer, target: job.backup };
+    job.lastError = `primary failed, failing over to backup ${job.backup}`;
+    await put(job); logJobResult(job, 'queued').catch(() => {});
+    return 'pending';
+  }
+  if (job.attempts >= MAX_ATTEMPTS) job.status = 'failed';
+  await put(job);
+  logJobResult(job, job.status === 'failed' ? 'failed' : 'queued').catch(() => {});
+  return job.status === 'failed' ? 'failed' : 'pending';
+}
+
+/**
+ * Try to send every pending job to the bridge. Jobs are grouped by printer:
+ * one serial chain PER printer (so bytes never interleave on a single printer)
+ * but ALL printers run in PARALLEL — so a table that fires tandoor+chinese+bar
+ * prints in ~1× network time, not N×. Safe to call often.
+ */
 export async function drainOutbox(): Promise<{ printed: number; stillPending: number }> {
   if (draining) return { printed: 0, stillPending: 0 };
   draining = true;
@@ -106,22 +141,20 @@ export async function drainOutbox(): Promise<{ printed: number; stillPending: nu
   try {
     const all = await allJobs();
     const pending = all.filter((j) => j.status === 'pending').sort((a, b) => a.createdAt - b.createdAt);
-    for (const job of pending) {
-      let res: { ok: boolean; error?: string };
-      try { res = await bridgePrint({ jobId: job.id, printer: job.printer, doc: job.doc }); }
-      catch (e: any) { res = { ok: false, error: e?.message || 'print failed' }; }
-
-      if (res.ok) {
-        job.status = 'printed'; job.lastError = ''; await put(job); printed++;
-        logJobResult(job, 'printed').catch(() => {});
-      } else {
-        job.attempts += 1; job.lastError = res.error || 'unknown';
-        if (job.attempts >= MAX_ATTEMPTS) job.status = 'failed';
-        await put(job);
-        if (job.status !== 'failed') stillPending++;
-        logJobResult(job, job.status === 'failed' ? 'failed' : 'queued').catch(() => {});
-      }
+    const groups = new Map<string, PrintJob[]>();
+    for (const j of pending) {
+      const key = `${j.printer.transport}:${j.printer.target}`;
+      (groups.get(key) || groups.set(key, []).get(key)!).push(j);
     }
+    const perPrinter = await Promise.allSettled([...groups.values()].map(async (jobs) => {
+      let p = 0, sp = 0;
+      for (const job of jobs) {            // serial within one printer
+        const r = await tryPrintJob(job);
+        if (r === 'printed') p++; else if (r === 'pending') sp++;
+      }
+      return { p, sp };
+    }));
+    for (const r of perPrinter) if (r.status === 'fulfilled') { printed += r.value.p; stillPending += r.value.sp; }
   } finally { draining = false; }
   return { printed, stillPending };
 }

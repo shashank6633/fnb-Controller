@@ -15,7 +15,20 @@ Browser (POS)  ──HTTP──▶  print-bridge (localhost:9920)  ──▶  pr
 
 Everything is on-site, so a 5‑minute internet drop never stops a ticket.
 
-## Run it
+## Production: install as an always-on Windows Service (recommended)
+On each counter PC, run **once** as Administrator — it auto-starts at boot,
+self-heals on crash, needs no Node pre-installed, and the cashier never touches
+a launcher again:
+
+```powershell
+# one-liner (downloads + installs the service + a daily auto-updater)
+powershell -ExecutionPolicy Bypass -Command "irm https://fnb.akanhyd.com/install-bridge-service.ps1 -OutFile $env:TEMP\i.ps1; & $env:TEMP\i.ps1"
+```
+
+The service is named `AKANPrintBridge`. Manage it with the bundled NSSM:
+`C:\AKAN\bridge\nssm.exe [start|stop|restart|status] AKANPrintBridge`.
+
+## Dev / manual run
 Needs **Node.js 18+**. Copy `print-bridge.mjs` to the counter PC and run:
 
 ```bash

@@ -43,6 +43,20 @@ export async function probeBridge(timeoutMs = 2500): Promise<BridgeHealth | null
   } catch { return null; }
 }
 
+export type PrinterStatus = { reachable: boolean; supported: boolean; paperOut: boolean; paperLow: boolean; coverOpen: boolean; error: boolean };
+
+/** Live status of a network printer via the bridge (paper/cover/reachable). null if the bridge itself is unreachable. */
+export async function bridgeStatus(target: string, timeoutMs = 3000): Promise<PrinterStatus | null> {
+  try {
+    return await withTimeout(async (signal) => {
+      const r = await fetch(`${getBridgeUrl()}/printer-status?target=${encodeURIComponent(target)}`, { signal, cache: 'no-store' });
+      if (!r.ok) return null;
+      const j = await r.json();
+      return { reachable: !!j.reachable, supported: !!j.supported, paperOut: !!j.paperOut, paperLow: !!j.paperLow, coverOpen: !!j.coverOpen, error: !!j.error };
+    }, timeoutMs);
+  } catch { return null; }
+}
+
 export type PrinterTarget = { transport: 'ip' | 'usb' | 'file'; target: string; width?: 32 | 48 };
 export type PrintDoc = Record<string, any> & { type: 'kot' | 'bill' };
 export type PrintResult = { ok: boolean; jobId: string; bytes?: number; error?: string };

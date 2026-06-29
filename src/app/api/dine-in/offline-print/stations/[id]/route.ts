@@ -4,7 +4,7 @@ import { getCurrentUser } from '@/lib/auth';
 /** Update / delete a single print station. Additive config only. */
 export const dynamic = 'force-dynamic';
 
-const FIELDS = ['name', 'role', 'station', 'transport', 'target', 'paper_width', 'copies', 'is_active', 'sort_order'] as const;
+const FIELDS = ['name', 'role', 'station', 'transport', 'target', 'paper_width', 'copies', 'floor', 'backup_target', 'is_active', 'sort_order'] as const;
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {

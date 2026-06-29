@@ -1487,6 +1487,8 @@ function initializeSchema(db: Database.Database) {
         target      TEXT NOT NULL DEFAULT '',        -- "ip:port" (ip) or OS printer/share name (usb)
         paper_width INTEGER NOT NULL DEFAULT 48,     -- 48 = 80mm, 32 = 58mm
         copies      INTEGER NOT NULL DEFAULT 1,
+        floor       TEXT DEFAULT '',                  -- floor/zone label (multi-floor venues)
+        backup_target TEXT DEFAULT '',                -- failover printer "ip:port" if primary is down
         is_active   INTEGER NOT NULL DEFAULT 1,
         sort_order  INTEGER NOT NULL DEFAULT 0,
         created_at  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1509,6 +1511,10 @@ function initializeSchema(db: Database.Database) {
       );
       CREATE INDEX IF NOT EXISTS idx_print_jobs_created ON print_jobs(created_at DESC);
     `);
+    // Add fleet columns to print_stations if an older deployment created it first.
+    const psCols = db.prepare("PRAGMA table_info(print_stations)").all() as any[];
+    if (!psCols.some((c: any) => c.name === 'floor'))         db.exec(`ALTER TABLE print_stations ADD COLUMN floor TEXT DEFAULT ''`);
+    if (!psCols.some((c: any) => c.name === 'backup_target')) db.exec(`ALTER TABLE print_stations ADD COLUMN backup_target TEXT DEFAULT ''`);
   } catch (e) { console.error('print_stations/print_jobs schema failed:', e); }
 
   // Phase 1 §2: add Mgmt approval columns to requisitions (idempotent)

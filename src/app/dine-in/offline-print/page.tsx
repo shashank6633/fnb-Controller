@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
-import { probeBridge, bridgePrint, getBridgeUrl, setBridgeUrl, type BridgeHealth } from '@/lib/offline-print/bridge-client';
+import { probeBridge, bridgePrint, bridgeStatus, getBridgeUrl, setBridgeUrl, type BridgeHealth, type PrinterStatus } from '@/lib/offline-print/bridge-client';
 import { counts as outboxCounts, retryFailed, drainOutbox, ensureDrainLoop } from '@/lib/offline-print/outbox';
 import {
   Printer, Plus, Trash2, Loader2, X, Wifi, WifiOff, RefreshCw, Save,
@@ -19,6 +19,8 @@ interface Station {
   paper_width: number;
   copies: number;
   is_active: number;
+  floor?: string;
+  backup_target?: string;
 }
 
 interface Job {
@@ -26,7 +28,7 @@ interface Job {
   status: string; last_error?: string; created_at: string;
 }
 
-const blankForm = { id: '', name: '', role: 'kot' as 'kot' | 'bill', station: '', transport: 'ip' as 'ip' | 'usb', target: '', paper_width: 48, copies: 1 };
+const blankForm = { id: '', name: '', role: 'kot' as 'kot' | 'bill', station: '', transport: 'ip' as 'ip' | 'usb', target: '', paper_width: 48, copies: 1, floor: '', backup_target: '' };
 
 export default function OfflinePrintPage() {
   const [stations, setStations] = useState<Station[]>([]);
@@ -40,6 +42,8 @@ export default function OfflinePrintPage() {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [showHelp, setShowHelp] = useState(false);
   const [queue, setQueue] = useState({ pending: 0, failed: 0, printed: 0 });
+  const [pstatus, setPstatus] = useState<Record<string, PrinterStatus | null>>({});
+  const [checkingPrinters, setCheckingPrinters] = useState(false);
   const [toast, setToast] = useState<{ ok: boolean; msg: string } | null>(null);
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 4000); };
@@ -74,11 +78,24 @@ export default function OfflinePrintPage() {
     flash(r.printed > 0, r.printed > 0 ? `Retried — ${r.printed} printed.` : 'Nothing printed (printer/bridge still unreachable).');
   };
 
+  // Auto-check printer status once the bridge is connected and stations are loaded.
+  useEffect(() => { if (health && stations.length) checkPrinters(stations); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [health, stations.length]);
+
+  // Live status of every IP printer (paper/cover/reachable) via the local bridge.
+  const checkPrinters = useCallback(async (rows?: Station[]) => {
+    const list = (rows || stations).filter((s) => s.transport === 'ip' && s.is_active);
+    if (list.length === 0) return;
+    setCheckingPrinters(true);
+    const entries = await Promise.all(list.map(async (s) => [s.id, await bridgeStatus(s.target)] as const));
+    setPstatus((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
+    setCheckingPrinters(false);
+  }, [stations]);
+
   const saveBridgeUrl = () => { setBridgeUrl(bridgeUrl); checkBridge(); flash(true, 'Bridge address saved.'); };
 
   const openNew = () => { setForm(blankForm); setShowForm(true); };
   const openEdit = (s: Station) => {
-    setForm({ id: s.id, name: s.name, role: s.role, station: s.station || '', transport: s.transport, target: s.target, paper_width: s.paper_width, copies: s.copies });
+    setForm({ id: s.id, name: s.name, role: s.role, station: s.station || '', transport: s.transport, target: s.target, paper_width: s.paper_width, copies: s.copies, floor: (s as any).floor || '', backup_target: (s as any).backup_target || '' });
     setShowForm(true);
   };
 
@@ -87,7 +104,7 @@ export default function OfflinePrintPage() {
     if (!form.target.trim()) return flash(false, 'Printer target (IP or printer name) is required.');
     setSaving(true);
     try {
-      const body = { name: form.name, role: form.role, station: form.station, transport: form.transport, target: form.target, paper_width: form.paper_width, copies: form.copies };
+      const body = { name: form.name, role: form.role, station: form.station, transport: form.transport, target: form.target, paper_width: form.paper_width, copies: form.copies, floor: form.floor, backup_target: form.backup_target };
       const r = form.id
         ? await api(`/api/dine-in/offline-print/stations/${form.id}`, { method: 'PATCH', body })
         : await api('/api/dine-in/offline-print/stations', { method: 'POST', body });
@@ -218,12 +235,19 @@ export default function OfflinePrintPage() {
         </button>
         {showHelp && (
           <div className="px-4 pb-4 text-sm text-[#6B5744] space-y-2">
-            <p>The bridge is a tiny program that runs on the billing-counter computer (the one with the bill printer on USB and on the same network as the kitchen printers). It needs <b>Node.js</b> installed.</p>
+            <p>The bridge is a tiny program that runs on the billing-counter computer (the one with the bill printer on USB and on the same network as the kitchen printers).</p>
+
+            <p className="font-medium text-[#2D1B0E]">Recommended — install once as an always-on service</p>
+            <p>Run this <b>once per counter PC</b> in PowerShell <b>(as Administrator)</b>. It auto-starts at every boot, restarts itself if it crashes, and the cashier never launches anything again:</p>
+            <pre className="bg-[#2D1B0E] text-[#F5E9DC] text-[11px] rounded-lg p-2 overflow-x-auto whitespace-pre-wrap">{`powershell -ExecutionPolicy Bypass -Command "irm ${typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`}</pre>
+            <p className="text-xs text-[#8B7355]">It installs Node (if missing), the service, and a daily auto-updater. After it says HEALTHY, click <b>Refresh</b> above → green.</p>
+
+            <p className="font-medium text-[#2D1B0E] mt-3">Or run it manually (for a quick test)</p>
             <div className="flex flex-wrap gap-2 my-2">
               <a href="/print-bridge.bat" download className="inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-3 py-2 rounded-lg text-xs font-medium no-underline"><Download className="w-4 h-4" /> Download launcher (.bat)</a>
               <a href="/print-bridge.mjs" download className="inline-flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-2 rounded-lg text-xs font-medium no-underline"><Download className="w-4 h-4" /> Download bridge (.mjs)</a>
             </div>
-            <p className="font-medium text-[#2D1B0E]">Windows (counter PC):</p>
+            <p className="font-medium text-[#2D1B0E]">Manual steps (Windows counter PC):</p>
             <ol className="list-decimal ml-5 space-y-1">
               <li>Install <b>Node.js</b> — get the <b>LTS</b> installer from <code className="bg-[#FFF1E3] px-1 rounded">nodejs.org</code> and click through the defaults.</li>
               <li>On <i>this PC</i>, download <b>both</b> files above into one folder (e.g. <code className="bg-[#FFF1E3] px-1 rounded">C:\fnb-bridge\</code>).</li>
@@ -240,7 +264,12 @@ export default function OfflinePrintPage() {
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-5">
         <div className="flex items-center justify-between mb-4">
           <h2 className="font-semibold text-[#2D1B0E]">Printers</h2>
-          <button onClick={openNew} className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2 rounded-lg text-sm font-medium"><Plus className="w-4 h-4" /> Add printer</button>
+          <div className="flex items-center gap-2">
+            <button onClick={() => checkPrinters()} disabled={checkingPrinters} className="flex items-center gap-2 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 disabled:opacity-50 px-3 py-2 rounded-lg text-sm font-medium">
+              {checkingPrinters ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Check status
+            </button>
+            <button onClick={openNew} className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2 rounded-lg text-sm font-medium"><Plus className="w-4 h-4" /> Add printer</button>
+          </div>
         </div>
 
         {showForm && (
@@ -279,6 +308,12 @@ export default function OfflinePrintPage() {
                   <option value={32}>58mm</option>
                 </select>
               </label>
+              <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Floor / zone (optional)
+                <input value={form.floor} onChange={(e) => setForm({ ...form, floor: e.target.value })} placeholder="Ground / 1 / Rooftop" className={inputCls} />
+              </label>
+              <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Backup printer (optional, IP)
+                <input value={form.backup_target} onChange={(e) => setForm({ ...form, backup_target: e.target.value })} placeholder="192.168.1.51:9100 — used if primary is down" className={inputCls} />
+              </label>
             </div>
             <div className="flex gap-2">
               <button onClick={saveStation} disabled={saving} className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium">
@@ -293,15 +328,29 @@ export default function OfflinePrintPage() {
           <p className="text-sm text-[#8B7355] py-6 text-center">No printers yet. Add your bill printer and kitchen KOT printers above.</p>
         ) : (
           <div className="space-y-2">
-            {stations.map((s) => (
+            {stations.map((s) => {
+              const ps = pstatus[s.id];
+              const st = s.transport !== 'ip'
+                ? { color: 'bg-gray-300', label: 'USB' }
+                : !ps ? { color: 'bg-gray-300', label: '—' }
+                : !ps.reachable ? { color: 'bg-red-500', label: 'offline' }
+                : ps.paperOut ? { color: 'bg-red-500', label: 'paper out' }
+                : ps.coverOpen ? { color: 'bg-red-500', label: 'cover open' }
+                : ps.error ? { color: 'bg-red-500', label: 'error' }
+                : ps.paperLow ? { color: 'bg-amber-400', label: 'paper low' }
+                : { color: 'bg-green-500', label: 'ready' };
+              return (
               <div key={s.id} className="flex items-center justify-between gap-3 border border-[#E8D5C4] rounded-lg px-4 py-3 flex-wrap">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
+                    <span title={st.label} className={`inline-block w-2.5 h-2.5 rounded-full ${st.color}`}></span>
                     <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${s.role === 'bill' ? 'bg-emerald-100 text-emerald-700' : 'bg-[#af4408]/10 text-[#af4408]'}`}>{s.role.toUpperCase()}</span>
                     <span className="font-medium text-[#2D1B0E]">{s.name}</span>
                     {s.station ? <span className="text-xs text-[#8B7355]">· {s.station}</span> : null}
+                    {s.floor ? <span className="text-xs text-[#8B7355]">· floor {s.floor}</span> : null}
+                    <span className="text-[10px] text-[#8B7355]">{st.label}</span>
                   </div>
-                  <p className="text-xs text-[#8B7355] mt-0.5">{s.transport === 'ip' ? 'Network' : 'USB'} · {s.target} · {s.paper_width === 32 ? '58mm' : '80mm'}</p>
+                  <p className="text-xs text-[#8B7355] mt-0.5">{s.transport === 'ip' ? 'Network' : 'USB'} · {s.target} · {s.paper_width === 32 ? '58mm' : '80mm'}{s.backup_target ? ` · backup ${s.backup_target}` : ''}</p>
                 </div>
                 <div className="flex items-center gap-2">
                   <button onClick={() => testPrint(s)} disabled={testingId === s.id} className="flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 disabled:opacity-50 px-3 py-1.5 rounded-lg text-xs font-medium">
@@ -311,7 +360,7 @@ export default function OfflinePrintPage() {
                   <button onClick={() => deleteStation(s)} className="text-red-500 hover:bg-red-50 p-1.5 rounded-lg"><Trash2 className="w-4 h-4" /></button>
                 </div>
               </div>
-            ))}
+            ); })}
           </div>
         )}
       </div>

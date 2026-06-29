@@ -45,12 +45,14 @@ export async function POST(request: Request) {
     const paperWidth = Number(b.paper_width) === 32 ? 32 : 48;
     const copies = Math.max(1, Math.min(5, Number(b.copies) || 1));
     const station = String(b.station || '').trim();
+    const floor = String(b.floor || '').trim();
+    const backupTarget = String(b.backup_target || '').trim();
 
     const id = generateId();
     db.prepare(
-      `INSERT INTO print_stations (id, outlet_id, name, role, station, transport, target, paper_width, copies, is_active, sort_order)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
-    ).run(id, outletId, name, role, station, transport, target, paperWidth, copies, Number(b.sort_order) || 0);
+      `INSERT INTO print_stations (id, outlet_id, name, role, station, transport, target, paper_width, copies, floor, backup_target, is_active, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
+    ).run(id, outletId, name, role, station, transport, target, paperWidth, copies, floor, backupTarget, Number(b.sort_order) || 0);
 
     const created = db.prepare('SELECT * FROM print_stations WHERE id = ?').get(id);
     return Response.json({ station: created }, { status: 201 });

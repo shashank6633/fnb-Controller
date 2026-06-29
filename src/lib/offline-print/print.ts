@@ -13,6 +13,7 @@ import type { PrinterTarget } from './bridge-client';
 export interface PrintStation {
   id: string; name: string; role: 'bill' | 'kot'; station: string;
   transport: 'ip' | 'usb'; target: string; paper_width: number; copies: number; is_active: number;
+  floor?: string; backup_target?: string;
 }
 
 let stationCache: { at: number; rows: PrintStation[] } | null = null;
@@ -72,11 +73,14 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       time: new Date().toISOString(),
       items: (k.items || []).map((it) => ({ qty: it.quantity, name: it.name, notes: it.notes || undefined })),
     };
-    await enqueue({
-      id: `kot_${k.id}`,                       // stable per KOT → dedup, never double-prints
-      printer: targetOf(st), doc,
-      meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
-    });
+    const copies = Math.max(1, Math.min(5, Number(st.copies) || 1));
+    for (let c = 0; c < copies; c++) {
+      await enqueue({
+        id: copies > 1 ? `kot_${k.id}_c${c}` : `kot_${k.id}`,  // stable per KOT(+copy) → dedup
+        printer: targetOf(st), backup: st.backup_target || undefined, doc,
+        meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
+      });
+    }
   }
   await drainOutbox();
 }
@@ -124,7 +128,7 @@ export async function printBill(order: BillOrder): Promise<{ ok: boolean; reason
   };
   await enqueue({
     id: `bill_${order.id}`,                     // stable per order → never double-prints
-    printer: targetOf(st), doc,
+    printer: targetOf(st), backup: st.backup_target || undefined, doc,
     meta: { stationId: st.id, stationName: st.name, docType: 'bill', source: 'bill', refId: order.id },
   });
   await drainOutbox();
