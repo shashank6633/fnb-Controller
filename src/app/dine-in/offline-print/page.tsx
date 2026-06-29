@@ -6,7 +6,7 @@ import { probeBridge, bridgePrint, getBridgeUrl, setBridgeUrl, type BridgeHealth
 import { counts as outboxCounts, retryFailed, drainOutbox, ensureDrainLoop } from '@/lib/offline-print/outbox';
 import {
   Printer, Plus, Trash2, Loader2, X, Wifi, WifiOff, RefreshCw, Save,
-  CheckCircle2, XCircle, FlaskConical, ChevronDown, ChevronRight,
+  CheckCircle2, XCircle, FlaskConical, ChevronDown, ChevronRight, Download,
 } from 'lucide-react';
 
 interface Station {
@@ -219,13 +219,19 @@ export default function OfflinePrintPage() {
         {showHelp && (
           <div className="px-4 pb-4 text-sm text-[#6B5744] space-y-2">
             <p>The bridge is a tiny program that runs on the billing-counter computer (the one with the bill printer on USB and on the same network as the kitchen printers). It needs <b>Node.js</b> installed.</p>
+            <div className="flex flex-wrap gap-2 my-2">
+              <a href="/print-bridge.bat" download className="inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-3 py-2 rounded-lg text-xs font-medium no-underline"><Download className="w-4 h-4" /> Download launcher (.bat)</a>
+              <a href="/print-bridge.mjs" download className="inline-flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-2 rounded-lg text-xs font-medium no-underline"><Download className="w-4 h-4" /> Download bridge (.mjs)</a>
+            </div>
+            <p className="font-medium text-[#2D1B0E]">Windows (counter PC):</p>
             <ol className="list-decimal ml-5 space-y-1">
-              <li>Copy <code className="bg-[#FFF1E3] px-1 rounded">scripts/print-bridge.mjs</code> to the counter PC.</li>
-              <li>Open a terminal there and run: <code className="bg-[#FFF1E3] px-1 rounded">node print-bridge.mjs</code></li>
-              <li>Leave that window open. Come back here and click <b>Refresh</b> — the status should turn green.</li>
-              <li>Add your printers below. For <b>network (IP)</b> printers enter <code className="bg-[#FFF1E3] px-1 rounded">192.168.1.50:9100</code>. For <b>USB</b> printers enter the OS printer name (macOS/Linux) or shared name like <code className="bg-[#FFF1E3] px-1 rounded">\\localhost\POS80</code> (Windows).</li>
+              <li>Install <b>Node.js</b> — get the <b>LTS</b> installer from <code className="bg-[#FFF1E3] px-1 rounded">nodejs.org</code> and click through the defaults.</li>
+              <li>On <i>this PC</i>, download <b>both</b> files above into one folder (e.g. <code className="bg-[#FFF1E3] px-1 rounded">C:\fnb-bridge\</code>).</li>
+              <li>Double-click <code className="bg-[#FFF1E3] px-1 rounded">print-bridge.bat</code>. A black window opens saying it&apos;s listening — <b>keep it open</b>.</li>
+              <li>Come back here and click <b>Refresh</b> — the status turns green.</li>
+              <li>Add your printers below. <b>USB</b>: share the printer in Windows and enter <code className="bg-[#FFF1E3] px-1 rounded">\\localhost\POS80</code>. <b>Network (IP)</b>: enter <code className="bg-[#FFF1E3] px-1 rounded">192.168.1.50:9100</code>.</li>
             </ol>
-            <p className="text-xs text-[#8B7355]">Because the bridge and printers are all on-site, printing keeps working even if the internet drops.</p>
+            <p className="text-xs text-[#8B7355]">Prefer a terminal? In Command Prompt: <code className="bg-[#FFF1E3] px-1 rounded">cd C:\fnb-bridge</code> then <code className="bg-[#FFF1E3] px-1 rounded">node print-bridge.mjs</code>. No PowerShell policy change is needed. Because the bridge and printers are all on-site, printing keeps working even if the internet drops.</p>
           </div>
         )}
       </div>
