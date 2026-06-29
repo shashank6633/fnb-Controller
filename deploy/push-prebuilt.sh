@@ -39,7 +39,8 @@ NODE_OPTIONS="--max-old-space-size=4096" npm run build
 
 echo ""
 echo "▶ Packing .next + source…"
-tar czf "$TARBALL" .next src package.json package-lock.json next.config.ts
+# public/ holds static downloads (the print-bridge files) + sw.js, icons, manifest.
+tar czf "$TARBALL" .next public src package.json package-lock.json next.config.ts
 SIZE=$(ls -lh "$TARBALL" | awk '{print $5}')
 echo "  tarball size: $SIZE"
 
