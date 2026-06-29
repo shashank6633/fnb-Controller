@@ -1,4 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
+import { buildRecipeMatcher } from '@/lib/recipe-matcher';
 
 interface ImportRow {
   category?: string;
@@ -57,13 +58,18 @@ export async function POST(request: Request) {
   try {
     const db = getDb();
     const body = await request.json();
-    const { rows, overwrite_existing = false, fix_typos = true, strip_spaces = true, skip_inactive = false, skip_zero_price = false } = body as {
+    const { rows, overwrite_existing = false, fix_typos = true, strip_spaces = true, skip_inactive = false, skip_zero_price = false, link_materials = true } = body as {
       rows: ImportRow[];
       overwrite_existing?: boolean;
       fix_typos?: boolean;
       strip_spaces?: boolean;
       skip_inactive?: boolean;
       skip_zero_price?: boolean;
+      // Auto-link unmatched items to a raw material by name prefix. Right for the
+      // POS/liquor import (BUDWEISER → material), but wrong for a food menu where
+      // every item should be a recipe — a food menu sends link_materials=false so
+      // a soup never links to "TOMATO KETCHUP".
+      link_materials?: boolean;
     };
 
     if (!rows || !Array.isArray(rows) || rows.length === 0) {
@@ -78,9 +84,12 @@ export async function POST(request: Request) {
       items_skipped_duplicate: 0,
       items_linked_to_recipe: 0,
       items_linked_to_material: 0,
+      items_unlinked: 0,
       typos_fixed: [] as string[],
       spaces_fixed: 0,
       duplicates_found: [] as string[],
+      recipe_links: [] as { item: string; recipe: string; score: number }[],
+      unlinked_items: [] as string[],
       errors: [] as string[],
     };
 
@@ -90,8 +99,10 @@ export async function POST(request: Request) {
     for (const m of existingItems) existingMap.set(m.name.toLowerCase().trim(), m);
 
     const recipes = db.prepare('SELECT id, name FROM recipes WHERE is_active = 1').all() as any[];
-    const recipeMap = new Map<string, string>();
-    for (const r of recipes) recipeMap.set(r.name.toLowerCase().trim(), r.id);
+    // Fuzzy matcher: menu names are worded differently from recipe names
+    // ("Veg Manchow Soup" → "MANCHOW SOUP VEG / NONVEG"). Tuned for precision —
+    // it links only confident matches and leaves the rest for manual linking.
+    const matchRecipe = buildRecipeMatcher(recipes);
 
     const materials = db.prepare('SELECT id, name FROM raw_materials').all() as any[];
     const materialMap = new Map<string, string>();
@@ -151,13 +162,17 @@ export async function POST(request: Request) {
           report.duplicates_found.push(normalized);
         }
 
-        // Link to recipe if name matches
-        let recipeId: string | null = recipeMap.get(nameKey) || null;
-        if (recipeId) report.items_linked_to_recipe++;
+        // Link to recipe by fuzzy name match
+        const rm = matchRecipe(normalized);
+        let recipeId: string | null = rm ? rm.id : null;
+        if (recipeId && rm) {
+          report.items_linked_to_recipe++;
+          report.recipe_links.push({ item: normalized, recipe: rm.name, score: rm.score });
+        }
 
         // Link to material for direct-sale items (beer/wine/bottles)
         let materialId: string | null = null;
-        if (!recipeId) {
+        if (!recipeId && link_materials) {
           // Try exact match first
           materialId = materialMap.get(nameKey) || null;
           // Try matching first few words (e.g., "BUDWEISER 330 ML" → "BUDWEISER (330ML)")
@@ -171,6 +186,11 @@ export async function POST(request: Request) {
             }
           }
           if (materialId) report.items_linked_to_material++;
+        }
+
+        if (!recipeId && !materialId) {
+          report.items_unlinked++;
+          report.unlinked_items.push(normalized);
         }
 
         // Existing item?
@@ -206,6 +226,7 @@ export async function POST(request: Request) {
     // Dedupe typos list
     report.typos_fixed = [...new Set(report.typos_fixed)];
     report.duplicates_found = [...new Set(report.duplicates_found)];
+    report.unlinked_items = [...new Set(report.unlinked_items)];
 
     return Response.json(report);
   } catch (error: any) {

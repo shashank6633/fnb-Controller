@@ -165,7 +165,7 @@ export default function MenuItemsPage() {
       for (let i = 0; i < Math.min(5, rows.length); i++) {
         const r = rows[i];
         if (!r) continue;
-        const hasName = r.some((c: any) => c && /^(menu\s*item|product\s*name|name|category\s*name)$/i.test(String(c).trim()));
+        const hasName = r.some((c: any) => c && /^(menu\s*item|item\s*name|product\s*name|name|category\s*name)$/i.test(String(c).trim()));
         if (hasName) { headerRowIdx = i; break; }
       }
 
@@ -177,7 +177,7 @@ export default function MenuItemsPage() {
         // Category column — "Category Name" (POS) or "Category" (template)
         if ((key === 'category name' || key === 'category') && colIdx.category === undefined) colIdx.category = i;
         // Name column — "Product Name" (POS) or "Menu Item" (template)
-        else if ((key === 'product name' || key === 'menu item' || key === 'name') && colIdx.name === undefined) colIdx.name = i;
+        else if ((key === 'product name' || key === 'menu item' || key === 'item name' || key === 'name') && colIdx.name === undefined) colIdx.name = i;
         else if (key === 'selling price' || key === 'selling price (₹)' || key === 'price') colIdx.sellingPrice = i;
         else if (key === 'listing price') colIdx.listingPrice = i;
         else if (key === 'master status' || key === 'status') colIdx.masterStatus = i;
@@ -189,8 +189,8 @@ export default function MenuItemsPage() {
         else if (key === 'cuisine') colIdx.cuisine = i;
       });
 
-      // If template format detected (has "cuisine" or "menu item"), apply category → station mapping
-      const isTemplate = colIdx.cuisine !== undefined || /menu\s*item/i.test(String(header[colIdx.name || 0] || ''));
+      // If template format detected (has "cuisine", "menu item", or "item name"), apply category → station mapping
+      const isTemplate = colIdx.cuisine !== undefined || /menu\s*item|item\s*name/i.test(String(header[colIdx.name ?? 0] || ''));
       const stationMap: Record<string, string> = {
         'Bar Bites': 'bar', 'Burgers / Sandwiches': 'continental', 'Desserts': 'bakery',
         'Dimsums/Baos': 'pan-asian', 'Grills': 'tandoor', 'Live Grills': 'terracegrill',
@@ -199,6 +199,10 @@ export default function MenuItemsPage() {
         'Small Plates - Veg': 'tandoor', 'Soups': 'continental', 'Starters Non-Veg': 'tandoor',
         'Sushi': 'sushi', 'Veg - Main Course': 'indian',
       };
+      // Case-insensitive station lookup — this sheet's categories are UPPERCASE.
+      const stationLower: Record<string, string> = {};
+      for (const [k, v] of Object.entries(stationMap)) stationLower[k.toLowerCase()] = v;
+      const stationFor = (cat: string) => stationMap[cat] || stationLower[cat.toLowerCase()] || '';
       const vegNormalize = (v: any): string => {
         if (!v) return '';
         const s = String(v).toUpperCase().trim();
@@ -207,6 +211,17 @@ export default function MenuItemsPage() {
         if (s === 'EGG') return 'Egg';
         if (s.includes('VEG') && s.includes('NON')) return 'Non-Veg';
         return String(v).trim();
+      };
+      // When the sheet has no dietary column, infer from the item name first, then
+      // the category (e.g. "NON-VEG MAIN COURSE", "SMALL PLATES - VEG").
+      const deriveDietary = (cat: string, name: string): string => {
+        const n = name.toLowerCase();
+        if (/\b(chicken|mutton|lamb|fish|prawn|prawns|crab|seafood|keema|kheema)\b/.test(n)) return 'Non-Veg';
+        if (/\begg\b/.test(n)) return 'Egg';
+        const c = cat.toUpperCase();
+        if (c.includes('NON-VEG') || c.includes('NON VEG')) return 'Non-Veg';
+        if (c.includes('VEG')) return 'Veg';
+        return '';
       };
       const slugify = (c: string) => c.toLowerCase().replace(/\s*\/\s*/g, '-').replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
 
@@ -229,8 +244,8 @@ export default function MenuItemsPage() {
           item_type: String(r[colIdx.itemType] || 'foods').trim() || 'foods',
           tax_value: Number(r[colIdx.taxValue]) || (isTemplate ? 5 : 0),
           item_code: String(r[colIdx.itemCode] || '').trim() || (isTemplate ? name.split(' ').map((w: string) => w[0] || '').join('').toUpperCase().slice(0, 5) : ''),
-          station: String(r[colIdx.station] || '').trim() || (isTemplate ? stationMap[rawCategory] || '' : ''),
-          dietary_tag: vegNormalize(r[colIdx.dietaryTag]),
+          station: String(r[colIdx.station] || '').trim() || (isTemplate ? stationFor(rawCategory) : ''),
+          dietary_tag: vegNormalize(r[colIdx.dietaryTag]) || deriveDietary(rawCategory, name),
           notes: isTemplate && cuisine ? `Cuisine: ${cuisine}` : '',
         });
       }
@@ -257,7 +272,7 @@ export default function MenuItemsPage() {
         zeroPrice: withZeroPrice, foodsNoTag, duplicates: dupes,
         categories: [...new Set(parsedRows.map(r => r.category).filter(Boolean))].length,
       });
-      setImportPayload({ rows: parsedRows });
+      setImportPayload({ rows: parsedRows, isTemplate });
     } catch (err: any) {
       setImportResult({ error: err.message });
     }
@@ -277,6 +292,9 @@ export default function MenuItemsPage() {
           strip_spaces: true,
           skip_inactive: importSkipInactive,
           skip_zero_price: importSkipZero,
+          // Food menus (template format) link to recipes only — never auto-link a
+          // dish to a raw material by prefix (a soup must not become "TOMATO KETCHUP").
+          link_materials: !importPayload.isTemplate,
         },
       });
       const json = await res.json();
