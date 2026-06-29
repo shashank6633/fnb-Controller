@@ -38,6 +38,10 @@ export const PAGE_CATALOG: PageSection[] = [
   {
     label: 'Dine-In',
     pages: [
+      { path: '/dine-in/floor',       label: 'Order Floor' },
+      { path: '/dine-in/kitchen',     label: 'Kitchen Display' },
+      { path: '/dine-in/tables',      label: 'Tables' },
+      { path: '/dine-in/order',       label: 'Order Terminal' },
       { path: '/menu-items',          label: 'Menu Items' },
       { path: '/recipes',             label: 'Recipes' },
       { path: '/direct-items',        label: 'Direct Items' },
