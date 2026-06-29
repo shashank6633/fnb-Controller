@@ -46,7 +46,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-const VERSION = '1.1.0';
+const VERSION = '2.0.0';
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -182,16 +182,83 @@ function render(doc, width) {
 }
 
 // ── Transports: byte buffer → physical printer ───────────────────────────────
-function printIp(target, payload) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Query a network printer's real-time status via ESC/POS DLE EOT so we can tell
+ * PAPER-OUT / COVER-OPEN / ERROR apart from merely "reachable". Never rejects —
+ * resolves { reachable, supported, paperOut, paperLow, coverOpen, error }. A
+ * printer that doesn't answer DLE EOT is reported supported:false (we then treat
+ * it as printable, best-effort). Used by /printer-status (dashboard).
+ */
+function queryIpStatus(target, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const [host, portStr] = String(target).split(':');
+    const port = Number(portStr) || 9100;
+    const out = { reachable: false, supported: false, paperOut: false, paperLow: false, coverOpen: false, error: false };
+    const bytes = [];
+    let done = false;
+    const sock = net.createConnection({ host, port, timeout: timeoutMs });
+    const finish = () => {
+      if (done) return; done = true; try { sock.destroy(); } catch {}
+      if (bytes.length) {
+        out.supported = true;
+        const paper = bytes[0], offline = bytes[1];
+        if (paper != null) { out.paperOut = (paper & 0x60) === 0x60; out.paperLow = (paper & 0x0c) !== 0; }
+        if (offline != null) { out.coverOpen = (offline & 0x04) !== 0; if (offline & 0x20) out.paperOut = true; out.error = (offline & 0x40) !== 0; }
+      }
+      resolve(out);
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    sock.on('connect', () => { out.reachable = true; sock.write(Buffer.from([0x10, 0x04, 0x04])); sock.write(Buffer.from([0x10, 0x04, 0x02])); });
+    sock.on('data', (d) => { for (const b of d) bytes.push(b); if (bytes.length >= 2) { clearTimeout(timer); finish(); } });
+    sock.on('error', () => { clearTimeout(timer); finish(); });
+    sock.on('timeout', () => { clearTimeout(timer); finish(); });
+  });
+}
+
+/**
+ * Print to a network ESC/POS printer over raw TCP :9100. Before sending bytes we
+ * ask the printer's status on the SAME connection — if it is OUT OF PAPER /
+ * COVER OPEN / ERROR we REJECT (so the job stays queued + the dashboard flags
+ * it) instead of silently "succeeding" when no paper comes out. Printers that
+ * don't support DLE EOT just print (best-effort) after a short status wait.
+ */
+function printIp(target, payload, opts = {}) {
   return new Promise((resolve, reject) => {
     const [host, portStr] = String(target).split(':');
     const port = Number(portStr) || 9100;
-    const sock = net.createConnection({ host, port, timeout: 6000 }, () => {
-      sock.write(payload, () => sock.end());
+    const gate = opts.gate !== false;
+    const statusWait = opts.statusTimeout || 350;
+    let phase = 'connect';
+    const bytes = [];
+    let timer = null;
+    const sock = net.createConnection({ host, port, timeout: 6000 });
+    const fail = (msg) => { if (timer) clearTimeout(timer); try { sock.destroy(); } catch {} reject(new Error(`printer ${host}:${port} — ${msg}`)); };
+    const writePayload = () => { phase = 'print'; sock.write(payload, () => sock.end()); };
+    const evaluate = () => {
+      if (phase !== 'status') return;
+      if (timer) clearTimeout(timer);
+      const paper = bytes[0], offline = bytes[1];
+      if (paper != null && (paper & 0x60) === 0x60) return fail('OUT OF PAPER');
+      if (offline != null) {
+        if (offline & 0x04) return fail('cover open');
+        if (offline & 0x20) return fail('out of paper');
+        if (offline & 0x40) return fail('printer error');
+      }
+      writePayload();
+    };
+    sock.on('connect', () => {
+      if (!gate) return writePayload();
+      phase = 'status';
+      sock.write(Buffer.from([0x10, 0x04, 0x04]));   // DLE EOT 4 — paper sensor
+      sock.write(Buffer.from([0x10, 0x04, 0x02]));   // DLE EOT 2 — offline cause
+      timer = setTimeout(evaluate, statusWait);       // no/partial reply → print anyway
     });
-    sock.on('error', (e) => reject(new Error(`printer ${host}:${port} — ${e.message}`)));
-    sock.on('timeout', () => { sock.destroy(); reject(new Error(`printer ${host}:${port} timed out`)); });
-    sock.on('close', () => resolve());
+    sock.on('data', (d) => { if (phase !== 'status') return; for (const b of d) bytes.push(b); if (bytes.length >= 2) evaluate(); });
+    sock.on('error', (e) => { if (timer) clearTimeout(timer); reject(new Error(`printer ${host}:${port} — ${e.message}`)); });
+    sock.on('timeout', () => { if (timer) clearTimeout(timer); try { sock.destroy(); } catch {} reject(new Error(`printer ${host}:${port} timed out`)); });
+    sock.on('close', () => { if (phase === 'print') resolve(); });
   });
 }
 
@@ -229,9 +296,25 @@ function printFile(target, payload) {            // for testing without a printe
   return fs.promises.writeFile(String(target || path.join(os.tmpdir(), 'fnb-print.bin')), payload);
 }
 
+// Retry connection-level failures (e.g. two counters hitting one printer at the
+// same instant → busy/refused) with jitter. Definitive failures like OUT OF
+// PAPER / cover open are NOT retried — they surface immediately to the queue.
+async function withRetry(fn, attempts = 3) {
+  let last;
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); }
+    catch (e) {
+      last = e;
+      if (!/refused|timed out|ECONNREFUSED|EADDRINUSE|EHOSTUNREACH|ENETUNREACH|reset|EPIPE/i.test(e.message)) throw e;
+      await sleep(60 + Math.floor(Math.random() * 140));
+    }
+  }
+  throw last;
+}
+
 async function printTo(printer, payload) {
   const t = (printer && printer.transport) || 'ip';
-  if (t === 'ip')   return printIp(printer.target, payload);
+  if (t === 'ip')   return withRetry(() => printIp(printer.target, payload, printer), 3);
   if (t === 'usb')  return printUsb(printer.target, payload);
   if (t === 'file') return printFile(printer.target, payload);
   throw new Error(`unknown transport "${t}"`);
@@ -260,6 +343,40 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/health') {
     return sendJson(res, 200, { ok: true, version: VERSION, platform: os.platform(), uptimeSec: Math.round((Date.now() - startedAt) / 1000) });
+  }
+
+  // Live printer status for the dashboard: GET /printer-status?target=ip:9100
+  if (req.method === 'GET' && url.pathname === '/printer-status') {
+    const target = url.searchParams.get('target');
+    if (!target) return sendJson(res, 400, { ok: false, error: 'target required' });
+    queryIpStatus(target).then((s) => sendJson(res, 200, { ok: true, target, ...s }))
+      .catch((e) => sendJson(res, 200, { ok: false, target, reachable: false, error: String(e.message) }));
+    return;
+  }
+
+  // Batch print — fan out a whole table's KOTs in PARALLEL (sub-second). Body:
+  // { jobs: [{ jobId?, printer, doc }] } → { results: [{ jobId, ok, bytes?, error? }] }
+  if (req.method === 'POST' && url.pathname === '/print-batch') {
+    let raw = '';
+    req.on('data', (c) => { raw += c; if (raw.length > 4_000_000) req.destroy(); });
+    req.on('end', async () => {
+      let body;
+      try { body = JSON.parse(raw || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'invalid JSON' }); }
+      const jobs = Array.isArray(body.jobs) ? body.jobs : [];
+      const settled = await Promise.allSettled(jobs.map(async (j) => {
+        const jobId = j.jobId || `job_${Date.now()}_${Math.round(Math.random() * 1e6)}`;
+        const payload = render(j.doc || {}, j.printer && j.printer.width);
+        await printTo(j.printer || {}, payload);
+        return { jobId, ok: true, bytes: payload.length };
+      }));
+      const results = settled.map((r, i) => r.status === 'fulfilled'
+        ? r.value
+        : { jobId: jobs[i]?.jobId || null, ok: false, error: String(r.reason?.message || r.reason) });
+      const okCount = results.filter((r) => r.ok).length;
+      console.log(`[bridge] batch: ${okCount}/${results.length} printed`);
+      return sendJson(res, 200, { ok: okCount === results.length, results });
+    });
+    return;
   }
 
   if (req.method === 'POST' && url.pathname === '/print') {
