@@ -61,8 +61,9 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
   ensureDrainLoop();
   const stations = await getStations();
   const time = new Date().toISOString();
-  // Items accumulated per kind (food/bar) for the MASTER/expediter copy.
-  const byKind: Record<string, Array<{ qty: number; name: string; notes?: string }>> = {};
+  // Items accumulated per kind (food/bar) for the MASTER/expediter copy; each
+  // carries its station's floor so a floor-scoped master takes only its floor.
+  const byKind: Record<string, Array<{ qty: number; name: string; notes?: string; floor: string }>> = {};
 
   for (const k of firedKots) {
     const st = resolveKotStation(stations, k.station);
@@ -96,9 +97,10 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       // back to the station printer's kind if unknown.
       const stationKind = st.kind === 'bar' ? 'bar' : 'food';
       const label = (k.station || st.name || '').toUpperCase();
+      const stFloor = String(st.floor || '').trim().toLowerCase();
       for (const it of (k.items || [])) {
         const kind = it.item_type ? (it.item_type === 'foods' ? 'food' : 'bar') : stationKind;
-        (byKind[kind] ||= []).push({ qty: it.quantity, name: label ? `[${label}] ${it.name}` : it.name, notes: it.notes || undefined });
+        (byKind[kind] ||= []).push({ qty: it.quantity, name: label ? `[${label}] ${it.name}` : it.name, notes: it.notes || undefined, floor: stFloor });
       }
     }
   }
@@ -111,8 +113,12 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
   const k0 = firedKots[0];
   for (const m of masters) {
     const kind = m.kind === 'bar' ? 'bar' : 'food';
-    const items = byKind[kind];
-    if (!items || !items.length) continue;
+    const mFloor = String(m.floor || '').trim().toLowerCase();
+    // A master with a floor set takes only that floor's stations; a master with
+    // no floor is global (all floors of its kind).
+    const pool = byKind[kind] || [];
+    const items = (mFloor ? pool.filter((x) => x.floor === mFloor) : pool).map(({ floor, ...rest }) => rest);
+    if (!items.length) continue;
     const doc = {
       type: 'kot' as const,
       station: m.name || (kind === 'bar' ? 'MAIN BAR' : 'MAIN KITCHEN'),
