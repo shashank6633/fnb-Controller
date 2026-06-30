@@ -44,3 +44,8 @@ export function subscribeKds(handler: (evt: KdsEvent) => void): () => void {
   e.on(CHANNEL, handler);
   return () => e.off(CHANNEL, handler);
 }
+
+/** How many live SSE streams are currently subscribed on THIS worker (diagnostics). */
+export function kdsSubscriberCount(): number {
+  return getEmitter().listenerCount(CHANNEL);
+}
