@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
-import { Loader2, RefreshCw, Plus, ChefHat, Download } from 'lucide-react';
+import { Loader2, RefreshCw, Plus, ChefHat, Download, MoreVertical, LayoutDashboard, LogOut } from 'lucide-react';
 
 interface TableTile {
   id: string;
@@ -24,6 +24,12 @@ export default function CaptainHome() {
   const [floor, setFloor] = useState<string>('All');
   // PWA install: stash the browser's install event so we can show our own button.
   const [installEvt, setInstallEvt] = useState<any>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  async function signOut() {
+    try { await api('/api/auth/logout', { method: 'POST', body: {} }); } catch {}
+    window.location.href = '/login';
+  }
 
   const load = useCallback(async () => {
     try {
@@ -110,7 +116,25 @@ export default function CaptainHome() {
             </button>
           )}
           <span className="text-white/70">{occupiedCount}/{tables.length} tables</span>
-          <button onClick={load} className="p-2 -mr-2 active:scale-95"><RefreshCw className="w-5 h-5" /></button>
+          <button onClick={load} className="p-2 active:scale-95"><RefreshCw className="w-5 h-5" /></button>
+          <div className="relative">
+            <button onClick={() => setMenuOpen((o) => !o)} className="p-2 -mr-2 active:scale-95"><MoreVertical className="w-5 h-5" /></button>
+            {menuOpen && (
+              <>
+                <div className="fixed inset-0 z-20" onClick={() => setMenuOpen(false)} />
+                <div className="absolute right-0 mt-1 z-30 w-48 bg-white text-[#2D1B0E] rounded-xl shadow-lg border border-[#E8D5C4] overflow-hidden">
+                  <button onClick={() => { setMenuOpen(false); router.push('/'); }}
+                    className="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-[#FFF1E3] text-left">
+                    <LayoutDashboard className="w-4 h-4 text-[#8B7355]" /> Back to dashboard
+                  </button>
+                  <button onClick={signOut}
+                    className="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-red-50 text-red-600 text-left border-t border-[#F0E4D6]">
+                    <LogOut className="w-4 h-4" /> Sign out
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </header>
 
