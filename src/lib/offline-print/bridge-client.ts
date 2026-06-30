@@ -65,19 +65,44 @@ export type BatchJob = { jobId: string; printer: PrinterTarget; doc: PrintDoc };
 export type BatchResult = { ok: boolean; results: Array<{ jobId: string; ok: boolean; error?: string }> };
 
 /**
- * Send many jobs in ONE call. The bridge groups them by printer and prints each
- * printer's tickets on a single connection (back-to-back, no reconnect gap),
- * while different printers print in parallel. Resolves per-job ok/error.
+ * Send many jobs in ONE call. On a v2.0.0+ bridge the bridge groups them by
+ * printer and prints each printer's tickets on a single connection (back-to-back,
+ * no reconnect gap), printers in parallel.
+ *
+ * COMPATIBILITY: an OLD bridge (≤ v1.x) has no /print-batch and answers 404. That
+ * 404 means nothing was printed, so we transparently FALL BACK to per-job /print
+ * (which every bridge has) — printing keeps working without updating the counter
+ * PC, just without the no-gap batching. We do NOT fall back on a network
+ * error/timeout (the batch may have already printed on a new bridge → would
+ * double-print); those just fail and the outbox retries.
  */
 export async function bridgePrintBatch(jobs: BatchJob[], timeoutMs = 20000): Promise<BatchResult> {
-  return withTimeout(async (signal) => {
-    const r = await fetch(`${getBridgeUrl()}/print-batch`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jobs }), signal,
-    });
-    const j = await r.json().catch(() => ({ ok: false, results: [] }));
-    return { ok: !!j.ok, results: Array.isArray(j.results) ? j.results : [] };
-  }, timeoutMs);
+  let endpointMissing = false;
+  try {
+    const res = await withTimeout(async (signal) => {
+      const r = await fetch(`${getBridgeUrl()}/print-batch`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobs }), signal,
+      });
+      if (r.status === 404 || r.status === 405) { endpointMissing = true; return null; } // old bridge
+      const j = await r.json().catch(() => ({ ok: false, results: [] }));
+      return { ok: !!j.ok, results: Array.isArray(j.results) ? j.results : [] } as BatchResult;
+    }, timeoutMs);
+    if (res) return res;
+  } catch {
+    if (!endpointMissing) return { ok: false, results: jobs.map((j) => ({ jobId: j.jobId, ok: false, error: 'bridge unreachable' })) };
+  }
+  // Fallback: old bridge without /print-batch → send each job via /print.
+  const results: BatchResult['results'] = [];
+  for (const j of jobs) {
+    try {
+      const r = await bridgePrint({ jobId: j.jobId, printer: j.printer, doc: j.doc });
+      results.push({ jobId: j.jobId, ok: r.ok, error: r.error });
+    } catch (e: any) {
+      results.push({ jobId: j.jobId, ok: false, error: e?.message || 'print failed' });
+    }
+  }
+  return { ok: results.every((r) => r.ok), results };
 }
 
 /** Send a document to a printer via the bridge. Resolves with the bridge's result. */
