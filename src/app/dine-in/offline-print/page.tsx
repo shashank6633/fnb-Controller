@@ -21,6 +21,8 @@ interface Station {
   is_active: number;
   floor?: string;
   backup_target?: string;
+  kind?: 'food' | 'bar';
+  is_master?: number;
 }
 
 interface Job {
@@ -28,7 +30,7 @@ interface Job {
   status: string; last_error?: string; created_at: string;
 }
 
-const blankForm = { id: '', name: '', role: 'kot' as 'kot' | 'bill', station: '', transport: 'ip' as 'ip' | 'usb', target: '', paper_width: 48, copies: 1, floor: '', backup_target: '' };
+const blankForm = { id: '', name: '', role: 'kot' as 'kot' | 'bill', station: '', transport: 'ip' as 'ip' | 'usb', target: '', paper_width: 48, copies: 1, floor: '', backup_target: '', kind: 'food' as 'food' | 'bar', is_master: false };
 
 export default function OfflinePrintPage() {
   const [stations, setStations] = useState<Station[]>([]);
@@ -105,7 +107,7 @@ export default function OfflinePrintPage() {
     if (typeof window !== 'undefined') window.scrollTo({ top: 0, behavior: 'smooth' });
   };
   const openEdit = (s: Station) => {
-    setForm({ id: s.id, name: s.name, role: s.role, station: s.station || '', transport: s.transport, target: s.target, paper_width: s.paper_width, copies: s.copies, floor: (s as any).floor || '', backup_target: (s as any).backup_target || '' });
+    setForm({ id: s.id, name: s.name, role: s.role, station: s.station || '', transport: s.transport, target: s.target, paper_width: s.paper_width, copies: s.copies, floor: (s as any).floor || '', backup_target: (s as any).backup_target || '', kind: ((s as any).kind === 'bar' ? 'bar' : 'food'), is_master: !!(s as any).is_master });
     setShowForm(true);
   };
 
@@ -114,7 +116,7 @@ export default function OfflinePrintPage() {
     if (!form.target.trim()) return flash(false, 'Printer target (IP or printer name) is required.');
     setSaving(true);
     try {
-      const body = { name: form.name, role: form.role, station: form.station, transport: form.transport, target: form.target, paper_width: form.paper_width, copies: form.copies, floor: form.floor, backup_target: form.backup_target };
+      const body = { name: form.name, role: form.role, station: form.station, transport: form.transport, target: form.target, paper_width: form.paper_width, copies: form.copies, floor: form.floor, backup_target: form.backup_target, kind: form.kind, is_master: form.is_master };
       const r = form.id
         ? await api(`/api/dine-in/offline-print/stations/${form.id}`, { method: 'PATCH', body })
         : await api('/api/dine-in/offline-print/stations', { method: 'POST', body });
@@ -355,7 +357,21 @@ export default function OfflinePrintPage() {
               <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Backup printer (optional, IP)
                 <input value={form.backup_target} onChange={(e) => setForm({ ...form, backup_target: e.target.value })} placeholder="192.168.1.51:9100 — used if primary is down" className={inputCls} />
               </label>
+              {form.role === 'kot' && (
+                <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Group
+                  <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value as 'food' | 'bar' })} className={inputCls}>
+                    <option value="food">Food (kitchen)</option>
+                    <option value="bar">Bar (drinks)</option>
+                  </select>
+                </label>
+              )}
             </div>
+            {form.role === 'kot' && (
+              <label className="flex items-start gap-2 text-xs text-[#6B5744] bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2">
+                <input type="checkbox" checked={form.is_master} onChange={(e) => setForm({ ...form, is_master: e.target.checked })} className="mt-0.5" />
+                <span><b>Main / expediter printer</b> (kitchen counter) — also prints <b>one consolidated ticket of every {form.kind === 'bar' ? 'drink' : 'food'} item</b> here for cross-checking, in addition to each sub-station printer. Leave the <i>Kitchen station</i> blank for this one.</span>
+              </label>
+            )}
             <div className="flex gap-2">
               <button onClick={saveStation} disabled={saving} className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium">
                 {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
@@ -386,6 +402,7 @@ export default function OfflinePrintPage() {
                   <div className="flex items-center gap-2">
                     <span title={st.label} className={`inline-block w-2.5 h-2.5 rounded-full ${st.color}`}></span>
                     <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${s.role === 'bill' ? 'bg-emerald-100 text-emerald-700' : 'bg-[#af4408]/10 text-[#af4408]'}`}>{s.role.toUpperCase()}</span>
+                    {s.is_master ? <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-purple-100 text-purple-700">MAIN · {s.kind === 'bar' ? 'BAR' : 'KITCHEN'}</span> : null}
                     <span className="font-medium text-[#2D1B0E]">{s.name}</span>
                     {s.station ? <span className="text-xs text-[#8B7355]">· {s.station}</span> : null}
                     {s.floor ? <span className="text-xs text-[#8B7355]">· floor {s.floor}</span> : null}

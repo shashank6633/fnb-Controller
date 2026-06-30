@@ -13,7 +13,7 @@ import type { PrinterTarget } from './bridge-client';
 export interface PrintStation {
   id: string; name: string; role: 'bill' | 'kot'; station: string;
   transport: 'ip' | 'usb'; target: string; paper_width: number; copies: number; is_active: number;
-  floor?: string; backup_target?: string;
+  floor?: string; backup_target?: string; kind?: 'food' | 'bar'; is_master?: number;
 }
 
 let stationCache: { at: number; rows: PrintStation[] } | null = null;
@@ -60,6 +60,10 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
   if (!firedKots?.length) return;
   ensureDrainLoop();
   const stations = await getStations();
+  const time = new Date().toISOString();
+  // Items accumulated per kind (food/bar) for the MASTER/expediter copy.
+  const byKind: Record<string, Array<{ qty: number; name: string; notes?: string }>> = {};
+
   for (const k of firedKots) {
     const st = resolveKotStation(stations, k.station);
     if (!st) continue; // no KOT printer configured — skip silently
@@ -70,7 +74,7 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       table: k.table_number || undefined,
       orderType: k.order_type,
       orderRef: k.order_number != null ? String(k.order_number) : undefined,
-      time: new Date().toISOString(),
+      time,
       items: (k.items || []).map((it) => ({ qty: it.quantity, name: it.name, notes: it.notes || undefined })),
     };
     const copies = Math.max(1, Math.min(5, Number(st.copies) || 1));
@@ -81,7 +85,43 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
         meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
       });
     }
+    // For the expediter ticket: tag each item with its station so the kitchen
+    // counter can cross-check what each sub-station should send out.
+    const kind = st.kind === 'bar' ? 'bar' : 'food';
+    const label = (k.station || st.name || '').toUpperCase();
+    (byKind[kind] ||= []).push(...(k.items || []).map((it) => ({
+      qty: it.quantity, name: label ? `[${label}] ${it.name}` : it.name, notes: it.notes || undefined,
+    })));
   }
+
+  // MASTER / expediter: one consolidated ticket of all fired items of a kind,
+  // printed at every printer flagged is_master for that kind (e.g. the Main
+  // Kitchen counter printer). Stable id per fire → never double-prints.
+  const masters = stations.filter((s) => s.role === 'kot' && s.is_active && Number(s.is_master) === 1);
+  const fireKey = firedKots.map((k) => k.id).filter(Boolean).sort()[0] || String(Date.now());
+  const k0 = firedKots[0];
+  for (const m of masters) {
+    const kind = m.kind === 'bar' ? 'bar' : 'food';
+    const items = byKind[kind];
+    if (!items || !items.length) continue;
+    const doc = {
+      type: 'kot' as const,
+      station: m.name || (kind === 'bar' ? 'MAIN BAR' : 'MAIN KITCHEN'),
+      kotNumber: k0?.kot_number,
+      table: k0?.table_number || undefined,
+      orderType: k0?.order_type,
+      orderRef: k0?.order_number != null ? String(k0.order_number) : undefined,
+      time,
+      items,
+      note: 'EXPEDITER — CROSS-CHECK',
+    };
+    await enqueue({
+      id: `master_${m.id}_${fireKey}`,
+      printer: targetOf(m), backup: m.backup_target || undefined, doc,
+      meta: { stationId: m.id, stationName: m.name, docType: 'kot', source: 'fire', refId: fireKey },
+    });
+  }
+
   await drainOutbox();
 }
 

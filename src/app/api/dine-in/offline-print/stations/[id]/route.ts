@@ -4,7 +4,7 @@ import { getCurrentUser } from '@/lib/auth';
 /** Update / delete a single print station. Additive config only. */
 export const dynamic = 'force-dynamic';
 
-const FIELDS = ['name', 'role', 'station', 'transport', 'target', 'paper_width', 'copies', 'floor', 'backup_target', 'is_active', 'sort_order'] as const;
+const FIELDS = ['name', 'role', 'station', 'transport', 'target', 'paper_width', 'copies', 'floor', 'backup_target', 'kind', 'is_master', 'is_active', 'sort_order'] as const;
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -29,6 +29,8 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
       else if (f === 'paper_width') v = Number(v) === 32 ? 32 : 48;
       else if (f === 'copies') v = Math.max(1, Math.min(5, Number(v) || 1));
       else if (f === 'is_active') v = v ? 1 : 0;
+      else if (f === 'is_master') v = v ? 1 : 0;
+      else if (f === 'kind') v = v === 'bar' ? 'bar' : 'food';
       else if (f === 'sort_order') v = Number(v) || 0;
       else v = String(v ?? '').trim();
       sets.push(`${f} = ?`);
