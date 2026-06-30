@@ -24,6 +24,11 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
       LEFT JOIN restaurant_tables t ON o.table_id = t.id WHERE o.id = ?
     `).get(id) as any;
     if (!order) return Response.json({ error: 'Order not found' }, { status: 404 });
+    // Don't print bills for orders that were merged away or voided (open or
+    // already-settled — for a reprint — are fine).
+    if (order.status === 'merged' || order.status === 'void') {
+      return Response.json({ error: `This order was ${order.status} — no bill to print` }, { status: 409 });
+    }
     const items = db.prepare(
       'SELECT name, quantity, unit_price, line_total FROM order_items WHERE order_id = ? ORDER BY created_at ASC'
     ).all(id) as any[];

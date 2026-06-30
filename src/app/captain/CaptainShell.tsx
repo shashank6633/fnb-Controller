@@ -10,7 +10,7 @@ import { useEffect, useState, useCallback, useMemo, createContext } from 'react'
 import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
 import {
-  ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search,
+  ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search, Loader2,
 } from 'lucide-react';
 
 /** Lets the routed pages open the tables sidebar/drawer (the ☰ in their headers). */
@@ -29,6 +29,7 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [tkBusy, setTkBusy] = useState(false);
   const [onlyOpen, setOnlyOpen] = useState(false);
   const [q, setQ] = useState('');
   const [installEvt, setInstallEvt] = useState<any>(null);
@@ -72,10 +73,15 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
     } finally { setBusy(null); }
   }
   async function newTakeaway() {
-    const r = await api('/api/dine-in/orders', { method: 'POST', body: { order_type: 'takeaway' } });
-    const j = await r.json();
-    if (j.error) { alert(j.error); return; }
-    router.push(`/captain/order/${j.id}`);
+    if (tkBusy) return;                       // guard against double-tap → duplicate orders
+    setTkBusy(true);
+    try {
+      const r = await api('/api/dine-in/orders', { method: 'POST', body: { order_type: 'takeaway' } });
+      const j = await r.json();
+      if (j.error) { alert(j.error); return; }
+      router.push(`/captain/order/${j.id}`);
+    } catch { alert('Could not start a takeaway — check the connection and try again.'); }
+    finally { setTkBusy(false); }
   }
   async function signOut() { try { await api('/api/auth/logout', { method: 'POST', body: {} }); } catch {} window.location.href = '/login'; }
   async function installApp() { if (!installEvt) return; installEvt.prompt(); try { await installEvt.userChoice; } catch {} setInstallEvt(null); }
@@ -152,8 +158,8 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
 
       {/* Takeaway */}
       <div className="p-3 border-t border-white/10">
-        <button onClick={newTakeaway} className="w-full flex items-center justify-center gap-2 bg-[#af4408] py-2.5 rounded-lg text-sm font-semibold active:scale-95">
-          <Plus className="w-4 h-4" /> Takeaway / Parcel
+        <button onClick={newTakeaway} disabled={tkBusy} className="w-full flex items-center justify-center gap-2 bg-[#af4408] py-2.5 rounded-lg text-sm font-semibold active:scale-95 disabled:opacity-60">
+          {tkBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} Takeaway / Parcel
         </button>
         {installEvt && (
           <button onClick={installApp} className="w-full flex items-center justify-center gap-2 mt-2 bg-white/10 py-2 rounded-lg text-xs font-medium active:scale-95">

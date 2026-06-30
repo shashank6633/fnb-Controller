@@ -80,9 +80,13 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
            s.expires_at
     FROM sessions s JOIN users u ON u.id = s.user_id
-    LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
+    LEFT JOIN roles r ON r.id = u.role_id
     WHERE s.token = ? AND u.is_active = 1
   `).get(token) as any;
+  // NOTE: we resolve access from the assigned role even if it's been deactivated
+  // (is_active=0) — a deactivated role keeps governing its users' pages/tier until
+  // they're reassigned. Otherwise a role-based user would fall back to a null
+  // page_access = ALL pages (privilege escalation). Roles in use can't be deleted.
   if (!row) return null;
   if (new Date(row.expires_at) < new Date()) {
     destroySession(token);

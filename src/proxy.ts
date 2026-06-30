@@ -127,7 +127,7 @@ export function proxy(req: NextRequest) {
         SELECT u.role, u.page_access, u.role_id,
                r.base_role AS role_base, r.page_access AS role_page_access
         FROM sessions s JOIN users u ON u.id = s.user_id
-        LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
+        LEFT JOIN roles r ON r.id = u.role_id
         WHERE s.token = ? AND u.is_active = 1 AND s.expires_at > datetime('now')
       `).get(session) as any;
       const user = row ? {

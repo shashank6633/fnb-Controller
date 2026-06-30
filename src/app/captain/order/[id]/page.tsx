@@ -298,15 +298,19 @@ export default function CaptainOrder() {
 
       {/* Bottom action bar */}
       {order.status === 'open' && (
-        <div className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-3xl bg-white border-t border-[#E8D5C4] px-3 py-2.5 flex items-center gap-2">
-          <button onClick={() => setSettleOpen(true)} className="flex items-center gap-1.5 border border-[#af4408] text-[#af4408] px-4 py-3 rounded-xl text-sm font-semibold active:scale-95">
-            <Receipt className="w-4 h-4" /> Bill
-          </button>
-          <button onClick={sendKot} disabled={firing || pendingCount === 0}
-            className="flex-1 flex items-center justify-center gap-2 bg-[#FF6B35] disabled:opacity-40 text-white py-3 rounded-xl text-sm font-bold active:scale-95">
-            {firing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
-            Send KOT{pendingCount > 0 ? ` (${pendingCount})` : ''}
-          </button>
+        // Anchored to the main column: full width on phones, offset by the sidebar
+        // (w-72 = 18rem) on md+ so it never sits over the sidebar.
+        <div className="fixed bottom-0 left-0 right-0 md:left-72 bg-white border-t border-[#E8D5C4] px-3 py-2.5 z-10">
+          <div className="max-w-3xl mx-auto flex items-center gap-2">
+            <button onClick={() => setSettleOpen(true)} className="flex items-center gap-1.5 border border-[#af4408] text-[#af4408] px-4 py-3 rounded-xl text-sm font-semibold active:scale-95">
+              <Receipt className="w-4 h-4" /> Bill
+            </button>
+            <button onClick={sendKot} disabled={firing || pendingCount === 0}
+              className="flex-1 flex items-center justify-center gap-2 bg-[#FF6B35] disabled:opacity-40 text-white py-3 rounded-xl text-sm font-bold active:scale-95">
+              {firing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
+              Send KOT{pendingCount > 0 ? ` (${pendingCount})` : ''}
+            </button>
+          </div>
         </div>
       )}
 
@@ -320,7 +324,7 @@ export default function CaptainOrder() {
                 <p className="font-bold text-lg text-[#2D1B0E]">{sheet.name}</p>
                 <p className="text-sm text-[#8B7355]">₹{sheet.selling_price} · {sheet.station || sheet.category}</p>
               </div>
-              <button onClick={() => setSheet(null)} className="p-1"><X className="w-5 h-5 text-[#8B7355]" /></button>
+              <button onClick={() => setSheet(null)} className="p-2.5 -m-1"><X className="w-5 h-5 text-[#8B7355]" /></button>
             </div>
 
             <p className="text-xs font-semibold text-[#8B7355] mb-1.5">Portion</p>
@@ -365,7 +369,7 @@ export default function CaptainOrder() {
           <div onClick={(e) => e.stopPropagation()} className="relative w-full max-w-3xl mx-auto bg-white rounded-t-3xl p-4 pb-6 max-h-[85vh] overflow-y-auto">
             <div className="flex items-center justify-between mb-3">
               <p className="font-bold text-lg text-[#2D1B0E]">Table actions</p>
-              <button onClick={() => setTableAction(null)} className="p-1"><X className="w-5 h-5 text-[#8B7355]" /></button>
+              <button onClick={() => setTableAction(null)} className="p-2.5 -m-1"><X className="w-5 h-5 text-[#8B7355]" /></button>
             </div>
             <div className="flex bg-[#FFF1E3] rounded-lg p-0.5 text-sm mb-3">
               {(['move', 'merge'] as const).map((m) => (
