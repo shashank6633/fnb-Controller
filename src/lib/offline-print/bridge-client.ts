@@ -61,6 +61,25 @@ export type PrinterTarget = { transport: 'ip' | 'usb' | 'file'; target: string; 
 export type PrintDoc = Record<string, any> & { type: 'kot' | 'bill' };
 export type PrintResult = { ok: boolean; jobId: string; bytes?: number; error?: string };
 
+export type BatchJob = { jobId: string; printer: PrinterTarget; doc: PrintDoc };
+export type BatchResult = { ok: boolean; results: Array<{ jobId: string; ok: boolean; error?: string }> };
+
+/**
+ * Send many jobs in ONE call. The bridge groups them by printer and prints each
+ * printer's tickets on a single connection (back-to-back, no reconnect gap),
+ * while different printers print in parallel. Resolves per-job ok/error.
+ */
+export async function bridgePrintBatch(jobs: BatchJob[], timeoutMs = 20000): Promise<BatchResult> {
+  return withTimeout(async (signal) => {
+    const r = await fetch(`${getBridgeUrl()}/print-batch`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobs }), signal,
+    });
+    const j = await r.json().catch(() => ({ ok: false, results: [] }));
+    return { ok: !!j.ok, results: Array.isArray(j.results) ? j.results : [] };
+  }, timeoutMs);
+}
+
 /** Send a document to a printer via the bridge. Resolves with the bridge's result. */
 export async function bridgePrint(opts: { printer: PrinterTarget; doc: PrintDoc; jobId?: string }, timeoutMs = 8000): Promise<PrintResult> {
   return withTimeout(async (signal) => {

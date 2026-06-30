@@ -381,17 +381,36 @@ const server = http.createServer((req, res) => {
       let body;
       try { body = JSON.parse(raw || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'invalid JSON' }); }
       const jobs = Array.isArray(body.jobs) ? body.jobs : [];
-      const settled = await Promise.allSettled(jobs.map(async (j) => {
+      const results = [];
+      // Render each ticket, then GROUP BY PRINTER so every printer prints all its
+      // tickets on ONE connection — concatenated bytes (each ticket already ends
+      // with a cut). This removes the per-ticket reconnect gap (e.g. the tandoor
+      // ticket coming out 2s after the first). Different printers still run in
+      // parallel, so a 3-station order prints in ~1× time, not 3×.
+      const groups = new Map();
+      for (const j of jobs) {
         const jobId = j.jobId || `job_${Date.now()}_${Math.round(Math.random() * 1e6)}`;
-        const payload = render(j.doc || {}, j.printer && j.printer.width);
-        await printTo(j.printer || {}, payload);
-        return { jobId, ok: true, bytes: payload.length };
+        const printer = j.printer || {};
+        try {
+          const payload = render(j.doc || {}, printer.width);
+          const key = `${printer.transport || 'ip'}:${printer.target || ''}`;
+          if (!groups.has(key)) groups.set(key, { printer, items: [] });
+          groups.get(key).items.push({ jobId, payload });
+        } catch (e) {
+          results.push({ jobId, ok: false, error: 'render: ' + (e.message || e) });
+        }
+      }
+      await Promise.allSettled([...groups.values()].map(async (g) => {
+        const buf = Buffer.concat(g.items.map((it) => it.payload));   // all tickets, one stream
+        try {
+          await printTo(g.printer, buf);
+          for (const it of g.items) results.push({ jobId: it.jobId, ok: true, bytes: it.payload.length });
+        } catch (e) {
+          for (const it of g.items) results.push({ jobId: it.jobId, ok: false, error: String(e.message || e) });
+        }
       }));
-      const results = settled.map((r, i) => r.status === 'fulfilled'
-        ? r.value
-        : { jobId: jobs[i]?.jobId || null, ok: false, error: String(r.reason?.message || r.reason) });
       const okCount = results.filter((r) => r.ok).length;
-      console.log(`[bridge] batch: ${okCount}/${results.length} printed`);
+      console.log(`[bridge] batch: ${okCount}/${results.length} printed across ${groups.size} printer(s), 1 connection each`);
       return sendJson(res, 200, { ok: okCount === results.length, results });
     });
     return;

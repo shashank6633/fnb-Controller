@@ -11,7 +11,7 @@
  * No service worker is involved (the app disables those); this is plain
  * IndexedDB + a setInterval drain loop that lives for the browser session.
  */
-import { bridgePrint, type PrinterTarget, type PrintDoc } from './bridge-client';
+import { bridgePrintBatch, type PrinterTarget, type PrintDoc } from './bridge-client';
 
 const DB_NAME = 'fnb-print';
 const STORE = 'jobs';
@@ -100,19 +100,15 @@ export async function retryFailed(): Promise<void> {
 
 let draining = false;
 
-// Print one job: bridgePrint, update status, fail over to the backup printer
+// Apply a print result to a job: mark printed, or fail over to the backup printer
 // after 2 failed attempts on the primary. Returns the resulting status.
-async function tryPrintJob(job: PrintJob): Promise<'printed' | 'pending' | 'failed'> {
-  let res: { ok: boolean; error?: string };
-  try { res = await bridgePrint({ jobId: job.id, printer: job.printer, doc: job.doc }); }
-  catch (e: any) { res = { ok: false, error: e?.message || 'print failed' }; }
-
-  if (res.ok) {
+async function applyResult(job: PrintJob, ok: boolean, error?: string): Promise<'printed' | 'pending' | 'failed'> {
+  if (ok) {
     job.status = 'printed'; job.lastError = ''; await put(job);
     logJobResult(job, 'printed').catch(() => {});
     return 'printed';
   }
-  job.attempts += 1; job.lastError = res.error || 'unknown';
+  job.attempts += 1; job.lastError = error || 'unknown';
   // Failover: after a couple of failed tries on the primary, switch to the
   // configured backup printer (e.g. another bar/kitchen printer on the floor).
   if (job.backup && !job.usedBackup && job.attempts >= 2) {
@@ -129,10 +125,11 @@ async function tryPrintJob(job: PrintJob): Promise<'printed' | 'pending' | 'fail
 }
 
 /**
- * Try to send every pending job to the bridge. Jobs are grouped by printer:
- * one serial chain PER printer (so bytes never interleave on a single printer)
- * but ALL printers run in PARALLEL — so a table that fires tandoor+chinese+bar
- * prints in ~1× network time, not N×. Safe to call often.
+ * Send every pending job to the bridge. Jobs are grouped by printer and each
+ * printer's batch is sent in ONE call → the bridge prints that printer's tickets
+ * on a single connection, back-to-back (no per-ticket reconnect gap, e.g. the
+ * tandoor ticket lagging the first by ~2s). Different printers run in PARALLEL,
+ * so a table that fires tandoor+chinese+bar prints in ~1× time, not N×.
  */
 export async function drainOutbox(): Promise<{ printed: number; stillPending: number }> {
   if (draining) return { printed: 0, stillPending: 0 };
@@ -141,16 +138,22 @@ export async function drainOutbox(): Promise<{ printed: number; stillPending: nu
   try {
     const all = await allJobs();
     const pending = all.filter((j) => j.status === 'pending').sort((a, b) => a.createdAt - b.createdAt);
+    if (pending.length === 0) return { printed: 0, stillPending: 0 };
     const groups = new Map<string, PrintJob[]>();
     for (const j of pending) {
       const key = `${j.printer.transport}:${j.printer.target}`;
       (groups.get(key) || groups.set(key, []).get(key)!).push(j);
     }
     const perPrinter = await Promise.allSettled([...groups.values()].map(async (jobs) => {
+      let batch: { ok: boolean; results: Array<{ jobId: string; ok: boolean; error?: string }> };
+      try { batch = await bridgePrintBatch(jobs.map((j) => ({ jobId: j.id, printer: j.printer, doc: j.doc }))); }
+      catch { batch = { ok: false, results: [] }; }
+      const byId = new Map(batch.results.map((r) => [r.jobId, r]));
       let p = 0, sp = 0;
-      for (const job of jobs) {            // serial within one printer
-        const r = await tryPrintJob(job);
-        if (r === 'printed') p++; else if (r === 'pending') sp++;
+      for (const job of jobs) {            // tickets for this printer went out on one connection
+        const r = byId.get(job.id);
+        const status = await applyResult(job, !!r?.ok, r ? r.error : 'bridge unreachable');
+        if (status === 'printed') p++; else if (status === 'pending') sp++;
       }
       return { p, sp };
     }));
