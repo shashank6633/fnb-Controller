@@ -34,11 +34,30 @@ export async function getStations(force = false): Promise<PrintStation[]> {
 function norm(s: string) { return String(s || '').toLowerCase().trim(); }
 
 /** Pick the printer for a KOT station (exact station match → any KOT printer). */
-function resolveKotStation(stations: PrintStation[], stationName: string): PrintStation | null {
-  const kots = stations.filter((s) => s.role === 'kot' && s.is_active);
+/**
+ * Pick the printer for a fired KOT, FLOOR-AWARE (the table's zone = its floor):
+ *  1. a printer mapped to this station on the SAME floor,
+ *  2. a printer mapped to this station with no floor (global),
+ *  3. any printer mapped to this station,
+ *  4. no station printer → route by floor + kind: DRINKS (mocktail/cocktail/
+ *     liquor) go to that floor's BAR; food to that floor's kitchen printer,
+ *  5. the first KOT printer (last resort).
+ * So drinks from a Floor-2 table land on the Floor-2 Bar without needing a
+ * separate printer per drink station.
+ */
+function resolveKotPrinter(stations: PrintStation[], k: FiredKot): PrintStation | null {
+  const kots = stations.filter((s) => s.role === 'kot' && s.is_active && Number(s.is_master) !== 1);
   if (kots.length === 0) return null;
-  const exact = kots.find((s) => norm(s.station) === norm(stationName) || norm(s.name) === norm(stationName));
-  return exact || kots[0];
+  const fl = norm(k.zone || '');
+  const matchStation = (s: PrintStation) => norm(s.station) === norm(k.station) || norm(s.name) === norm(k.station);
+  let m = (fl ? kots.find((s) => matchStation(s) && norm(s.floor || '') === fl) : null)
+       || kots.find((s) => matchStation(s) && !norm(s.floor || ''))
+       || kots.find(matchStation);
+  if (m) return m;
+  const isDrink = (k.items || []).some((it) => it.item_type && it.item_type !== 'foods');
+  const pool = kots.filter((s) => (s.kind === 'bar') === isDrink);
+  m = (fl ? pool.find((s) => norm(s.floor || '') === fl) : null) || pool.find((s) => !norm(s.floor || '')) || pool[0];
+  return m || kots[0];
 }
 
 function resolveBillStation(stations: PrintStation[]): PrintStation | null {
@@ -53,6 +72,7 @@ function targetOf(s: PrintStation): PrinterTarget {
 export interface FiredKot {
   id: string; station: string; kot_number?: number;
   order_number?: number | string; order_type?: string; table_number?: string | null;
+  zone?: string | null;   // the table's zone = its floor (drives floor-aware routing)
   items: Array<{ name: string; quantity: number; notes?: string; item_type?: string }>;
 }
 
@@ -66,7 +86,7 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
   const byKind: Record<string, Array<{ qty: number; name: string; notes?: string; floor: string }>> = {};
 
   for (const k of firedKots) {
-    const st = resolveKotStation(stations, k.station);
+    const st = resolveKotPrinter(stations, k);
     if (!st) continue; // no KOT printer configured — skip silently
     const doc = {
       type: 'kot' as const,
@@ -97,7 +117,9 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       // back to the station printer's kind if unknown.
       const stationKind = st.kind === 'bar' ? 'bar' : 'food';
       const label = (k.station || st.name || '').toUpperCase();
-      const stFloor = String(st.floor || '').trim().toLowerCase();
+      // Master floor scoping follows the TABLE's floor (where the order is),
+      // falling back to the resolved printer's floor.
+      const stFloor = String(k.zone || st.floor || '').trim().toLowerCase();
       for (const it of (k.items || [])) {
         const kind = it.item_type ? (it.item_type === 'foods' ? 'food' : 'bar') : stationKind;
         (byKind[kind] ||= []).push({ qty: it.quantity, name: label ? `[${label}] ${it.name}` : it.name, notes: it.notes || undefined, floor: stFloor });
