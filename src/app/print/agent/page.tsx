@@ -11,10 +11,11 @@
  * outbox, so a reconnect/replay never double-prints.
  */
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { printFiredKots, printBill } from '@/lib/offline-print/print';
+import { printFiredKots, printBill, copyLabel } from '@/lib/offline-print/print';
+import { api } from '@/lib/api';
 import { probeBridge, getBridgeUrl, setBridgeUrl, type BridgeHealth } from '@/lib/offline-print/bridge-client';
 import { ensureDrainLoop, drainOutbox, counts, retryFailed, prunePrinted } from '@/lib/offline-print/outbox';
-import { Printer, Wifi, WifiOff, CheckCircle2, AlertTriangle, RefreshCw, Receipt, ChefHat, Settings, ArrowLeft } from 'lucide-react';
+import { Printer, Wifi, WifiOff, CheckCircle2, AlertTriangle, RefreshCw, Receipt, ChefHat, Settings, ArrowLeft, Copy } from 'lucide-react';
 
 interface LogRow { id: string; at: string; kind: 'KOT' | 'BILL'; label: string; detail: string; }
 
@@ -99,6 +100,20 @@ export default function PrintAgent() {
   }, [refreshQueue]);
 
   async function onRetry() { await retryFailed(); await drainOutbox(); refreshQueue(); }
+
+  // Reprint a KOT → prints a DUPLICATE (then DUPLICATE 2…). Bumps the count
+  // server-side and prints with a fresh outbox id so it actually reprints.
+  async function reprint(kotId: string) {
+    try {
+      const r = await api(`/api/dine-in/kds/${kotId}/reprint`, { method: 'POST', body: {} });
+      const j = await r.json();
+      if (j.error) { alert(j.error); return; }
+      await printFiredKots([j.kot]).catch(() => {});
+      pushLog({ id: j.kot.id, kind: 'KOT', label: `KOT #${j.kot.kot_number ?? '—'} · ${copyLabel(j.kot.reprint_count)}`,
+        detail: `${j.kot.table_number ? `Table ${j.kot.table_number}` : ''} · reprinted` });
+      refreshQueue();
+    } catch { alert('Reprint failed — check the connection.'); }
+  }
   function saveUrl() { setBridgeUrl(urlInput); setShowCfg(false); probeBridge().then(setHealth); }
 
   const bridgeOk = !!health?.ok;
@@ -178,6 +193,12 @@ export default function PrintAgent() {
                     <p className="text-sm font-medium truncate">{r.label}</p>
                     <p className="text-[11px] text-white/40">{r.detail}</p>
                   </div>
+                  {r.kind === 'KOT' && (
+                    <button onClick={() => reprint(r.id)} title="Reprint as DUPLICATE"
+                      className="flex items-center gap-1 text-[11px] text-white/60 hover:text-white border border-white/15 rounded-lg px-2 py-1 active:scale-95">
+                      <Copy className="w-3 h-3" /> Reprint
+                    </button>
+                  )}
                   <span className="text-[11px] text-white/30 tabular-nums">{r.at}</span>
                 </li>
               ))}

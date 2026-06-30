@@ -155,15 +155,19 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
               WHERE (outlet_id = ? OR outlet_id IS NULL) AND date(created_at) = date('now')
             `).get(order.outlet_id) as any;
             const kotId = generateId();
+            const firedBy = me.name || me.email;   // the captain who punched THIS KOT
             db.prepare(`
-              INSERT INTO kots (id, outlet_id, order_id, kot_number, station, status, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, 'new', datetime('now'), datetime('now'))
-            `).run(kotId, order.outlet_id, id, seq.n, station);
+              INSERT INTO kots (id, outlet_id, order_id, kot_number, station, status, fired_by, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, 'new', ?, datetime('now'), datetime('now'))
+            `).run(kotId, order.outlet_id, id, seq.n, station, firedBy);
             for (const it of its) setKot.run(kotId, it.id);
             firedKots.push({
               id: kotId, outlet_id: order.outlet_id, order_id: id, kot_number: seq.n, station, status: 'new',
               order_number: order.order_number, order_type: order.order_type,
               table_number: tableRow?.table_number || null, zone: tableRow?.zone || null,
+              captain: order.server_name || null,   // captain who opened the table (1st captain)
+              fired_by: firedBy,                     // captain who punched this KOT
+              reprint_count: 0,                      // 0 = ORIGINAL
               items: its.map((x) => ({ name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),
             });
           }

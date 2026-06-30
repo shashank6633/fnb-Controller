@@ -98,27 +98,44 @@ function buildKot(doc, cols, doCut) {
   const rule = () => line('-'.repeat(cols));
 
   push(CMD.init);
+
+  // 1) Table number — on top of all, large + bold (TAKEAWAY/PARCEL when no table)
   push(CMD.alignCenter); push(CMD.boldOn); push(CMD.dblOn);
-  line((doc.station || 'KITCHEN').toUpperCase());
+  line(doc.table ? `TABLE ${doc.table}` : String(doc.orderType || 'ORDER').toUpperCase());
   push(CMD.dblOff);
-  line('KOT' + (doc.kotNumber ? ` #${doc.kotNumber}` : '') + (doc.reprint ? ' (REPRINT)' : ''));
+  // 2) Outlet name + 3) Floor (below outlet)
+  if (doc.outletName) line(String(doc.outletName).toUpperCase());
+  push(CMD.boldOff);
+  if (doc.floor) line(`Floor: ${doc.floor}`);
+  // 4) KOT no (+ station) and 5) ORIGINAL / DUPLICATE N
+  push(CMD.boldOn);
+  line(`KOT${doc.kotNumber ? ` #${doc.kotNumber}` : ''}${doc.station ? ` - ${String(doc.station).toUpperCase()}` : ''}`);
+  if (doc.copyLabel) { push(CMD.dblOn); line(doc.copyLabel); push(CMD.dblOff); }
   push(CMD.boldOff); push(CMD.alignLeft);
   rule();
-  line(twoCol(doc.table ? `Table ${doc.table}` : (doc.orderType || 'Order'), doc.orderRef ? `#${doc.orderRef}` : '', cols));
-  line(twoCol(fmtTime(doc.time), doc.server ? `Server: ${doc.server}` : '', cols));
-  if (doc.covers) line(`Covers: ${doc.covers}`);
+  // 6) Captains — table's captain, then the captain who punched (if different)
+  if (doc.captain) line(`Captain: ${doc.captain}`);
+  if (doc.firedBy && doc.firedBy !== doc.captain) line(`Punched by: ${doc.firedBy}`);
+  // 7) Date & time (+ order ref)
+  line(twoCol(fmtTime(doc.time), doc.orderRef ? `#${doc.orderRef}` : '', cols));
+  if (doc.headerNote) line(`* ${doc.headerNote} *`);
   rule();
+  // 8) Items — name LEFT, qty RIGHT
+  const big = doc.fontScale === 'large';
+  const icols = big ? Math.floor(cols / 2) : cols;
   for (const it of (doc.items || [])) {
-    push(CMD.boldOn);
-    line(`${it.qty ?? 1} x ${it.name || ''}`);
+    push(CMD.boldOn); if (big) push(CMD.dblOn);
+    line(twoCol(it.name || '', `x${it.qty ?? 1}`, icols));
+    if (big) push(CMD.dblOff);
     push(CMD.boldOff);
     for (const m of (it.mods || it.modifiers || [])) line(`    + ${m}`);
     if (it.notes) line(`    - ${it.notes}`);
   }
   rule();
   const count = (doc.items || []).reduce((s, it) => s + (Number(it.qty) || 1), 0);
-  line(`Items: ${count}    (no prices on a KOT)`);
-  if (doc.note) { line(''); line(`** ${doc.note} **`); }
+  line(`Total items: ${count}`);
+  if (doc.note) { line(''); push(CMD.alignCenter); push(CMD.boldOn); line(`** ${doc.note} **`); push(CMD.boldOff); push(CMD.alignLeft); }
+  if (doc.footerNote) { line(''); push(CMD.alignCenter); line(doc.footerNote); push(CMD.alignLeft); }
   push(CMD.feed3);
   if (doCut) push(CMD.cut);
   return Buffer.concat(chunks);
@@ -142,6 +159,7 @@ function buildBill(doc, cols, doCut) {
   if (doc.address) line(doc.address);
   if (doc.gstin) line(`GSTIN: ${doc.gstin}`);
   if (doc.phone) line(`Ph: ${doc.phone}`);
+  if (doc.headerNote) line(doc.headerNote);
   push(CMD.alignLeft);
   rule();
   line(twoCol(doc.billNo ? `Bill #${doc.billNo}` : 'Bill', doc.table ? `Table ${doc.table}` : '', cols));

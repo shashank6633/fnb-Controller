@@ -108,6 +108,7 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/users',               label: 'Users' },
       { path: '/settings/roles',      label: 'Settings — Roles' },
+      { path: '/settings/print-design', label: 'Settings — Print Design' },
       { path: '/settings/categories', label: 'Settings — Category Manager' },
       { path: '/settings/page-access', label: 'Settings — Page Access' },
       { path: '/settings/integrations', label: 'Settings — Integrations' },

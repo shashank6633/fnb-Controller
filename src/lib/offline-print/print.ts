@@ -81,11 +81,43 @@ function targetOf(s: PrintStation): PrinterTarget {
   return { transport: s.transport, target: s.target, width: (s.paper_width === 32 ? 32 : 48) as 32 | 48 };
 }
 
+// ── KOT print design (Settings → Print Design). null fetch → sensible defaults. ─
+export interface KotDesign {
+  showOutlet: boolean; outletName: string; showFloor: boolean; showTable: boolean;
+  showKotNo: boolean; showCopyLabel: boolean; showCaptain: boolean; showDateTime: boolean;
+  headerNote: string; footerNote: string; fontScale: 'normal' | 'large';
+}
+export const DEFAULT_KOT_DESIGN: KotDesign = {
+  showOutlet: true, outletName: '', showFloor: true, showTable: true,
+  showKotNo: true, showCopyLabel: true, showCaptain: true, showDateTime: true,
+  headerNote: '', footerNote: '', fontScale: 'normal',
+};
+let designCache: { at: number; d: KotDesign } | null = null;
+export async function getKotDesign(force = false): Promise<KotDesign> {
+  if (!force && designCache && Date.now() - designCache.at < 30000) return designCache.d;
+  try {
+    const r = await api('/api/settings?key=kot_design');
+    const v = r.ok ? (await r.json()).value : null;
+    const d = v ? { ...DEFAULT_KOT_DESIGN, ...JSON.parse(v) } : DEFAULT_KOT_DESIGN;
+    designCache = { at: Date.now(), d };
+    return d;
+  } catch { return designCache?.d || DEFAULT_KOT_DESIGN; }
+}
+
+/** ORIGINAL / DUPLICATE / DUPLICATE N from a reprint count (0 = original). */
+export function copyLabel(reprintCount?: number): string {
+  const n = Number(reprintCount) || 0;
+  return n <= 0 ? 'ORIGINAL' : n === 1 ? 'DUPLICATE' : `DUPLICATE ${n}`;
+}
+
 // ── KOT (from a fired_kot returned by the order fire action) ──────────────────
 export interface FiredKot {
   id: string; station: string; kot_number?: number;
   order_number?: number | string; order_type?: string; table_number?: string | null;
   zone?: string | null;   // the table's zone = its floor (drives floor-aware routing)
+  captain?: string | null;        // 1st captain — who opened the table
+  fired_by?: string | null;       // captain who punched this KOT
+  reprint_count?: number;         // 0 = ORIGINAL, ≥1 = DUPLICATE N
   items: Array<{ name: string; quantity: number; notes?: string; item_type?: string }>;
 }
 
@@ -93,6 +125,8 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
   if (!firedKots?.length) return;
   ensureDrainLoop();
   const stations = await getStations();
+  const design = await getKotDesign();
+  const shop = await getShop();
   const time = new Date().toISOString();
   // Items accumulated per kind (food/bar) for the MASTER/expediter copy; each
   // carries its station's floor so a floor-scoped master takes only its floor.
@@ -104,17 +138,29 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
     const doc = {
       type: 'kot' as const,
       station: k.station || st.name,
-      kotNumber: k.kot_number,
-      table: k.table_number || undefined,
+      outletName: design.showOutlet ? (design.outletName || shop.name) : undefined,
+      floor: design.showFloor ? (k.zone || undefined) : undefined,
+      table: design.showTable ? (k.table_number || undefined) : undefined,
+      kotNumber: design.showKotNo ? k.kot_number : undefined,
+      copyLabel: design.showCopyLabel ? copyLabel(k.reprint_count) : undefined,
+      captain: design.showCaptain ? (k.captain || undefined) : undefined,
+      firedBy: design.showCaptain ? (k.fired_by || undefined) : undefined,
       orderType: k.order_type,
       orderRef: k.order_number != null ? String(k.order_number) : undefined,
-      time,
+      time: design.showDateTime ? time : undefined,
+      headerNote: design.headerNote || undefined,
+      footerNote: design.footerNote || undefined,
+      fontScale: design.fontScale,
       items: (k.items || []).map((it) => ({ qty: it.quantity, name: it.name, notes: it.notes || undefined })),
     };
     const copies = Math.max(1, Math.min(5, Number(st.copies) || 1));
+    // Reprints get a distinct id (…_r1, _r2) so the outbox actually prints them
+    // again; the original (reprint_count 0) keeps its stable id → never doubles.
+    const rc = Number(k.reprint_count) || 0;
+    const baseId = rc > 0 ? `kot_${k.id}_r${rc}` : `kot_${k.id}`;
     for (let c = 0; c < copies; c++) {
       await enqueue({
-        id: copies > 1 ? `kot_${k.id}_c${c}` : `kot_${k.id}`,  // stable per KOT(+copy) → dedup
+        id: copies > 1 ? `${baseId}_c${c}` : baseId,  // stable per KOT(+reprint+copy) → dedup
         printer: targetOf(st), backup: st.backup_target || undefined, doc,
         meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
       });
@@ -185,15 +231,29 @@ export interface BillOrder {
 }
 
 let shopCache: { name: string; gstin: string } | null = null;
+/** Read settings (which is an ARRAY of {key,value}) → business_name + gstin. */
 async function getShop(): Promise<{ name: string; gstin: string }> {
   if (shopCache) return shopCache;
   try {
     const r = await api('/api/settings');
-    const s = r.ok ? await r.json() : {};
-    const map = s.settings || s || {};
-    shopCache = { name: map.business_name || 'Restaurant', gstin: map.gstin || '' };
+    const arr: any[] = r.ok ? ((await r.json()).settings || []) : [];
+    const get = (k: string) => arr.find((x) => x.key === k)?.value;
+    shopCache = { name: get('business_name') || 'Restaurant', gstin: get('gstin') || '' };
   } catch { shopCache = { name: 'Restaurant', gstin: '' }; }
   return shopCache;
+}
+
+let billDesignCache: { at: number; d: any } | null = null;
+async function getBillDesign(): Promise<any> {
+  const DEF = { shopName: '', showGstin: true, showServer: true, headerNote: '', footerNote: '', fontScale: 'normal' };
+  if (billDesignCache && Date.now() - billDesignCache.at < 30000) return billDesignCache.d;
+  try {
+    const r = await api('/api/settings?key=bill_design');
+    const v = r.ok ? (await r.json()).value : null;
+    const d = v ? { ...DEF, ...JSON.parse(v) } : DEF;
+    billDesignCache = { at: Date.now(), d };
+    return d;
+  } catch { return billDesignCache?.d || DEF; }
 }
 
 export async function printBill(order: BillOrder): Promise<{ ok: boolean; reason?: string }> {
@@ -202,20 +262,24 @@ export async function printBill(order: BillOrder): Promise<{ ok: boolean; reason
   const st = resolveBillStation(stations, order.zone);
   if (!st) return { ok: false, reason: 'No bill printer configured' };
   const shop = await getShop();
+  const design = await getBillDesign();
   const tax = Number(order.tax_total) > 0 ? [{ label: 'Tax', amount: Number(order.tax_total) }] : [];
   const doc = {
     type: 'bill' as const,
-    shopName: shop.name, gstin: shop.gstin || undefined,
+    shopName: design.shopName || shop.name,
+    gstin: design.showGstin ? (shop.gstin || undefined) : undefined,
+    headerNote: design.headerNote || undefined,
     billNo: order.order_number != null ? String(order.order_number) : undefined,
     table: order.table_number || undefined,
-    server: order.server_name || undefined,
+    server: design.showServer ? (order.server_name || undefined) : undefined,
     date: new Date().toISOString(),
+    fontScale: design.fontScale,
     items: (order.items || []).map((it) => ({ name: it.name, qty: it.quantity, price: it.unit_price, amount: it.line_total })),
     subtotal: Number(order.subtotal) || 0,
     discount: Number(order.discount) || 0,
     tax,
     total: Number(order.total) || 0,
-    footer: order.payment_method ? `Paid by ${order.payment_method.toUpperCase()} — thank you!` : 'Thank you! Visit again.',
+    footer: design.footerNote || (order.payment_method ? `Paid by ${order.payment_method.toUpperCase()} — thank you!` : 'Thank you! Visit again.'),
   };
   await enqueue({
     id: `bill_${order.id}`,                     // stable per order → never double-prints

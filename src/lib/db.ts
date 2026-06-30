@@ -1469,6 +1469,11 @@ function initializeSchema(db: Database.Database) {
     if (!oiCols.some((c: any) => c.name === 'kot_id')) {
       db.exec(`ALTER TABLE order_items ADD COLUMN kot_id TEXT`);
     }
+    // KOT print metadata: who fired it (the punching captain) + how many times
+    // it's been printed (0 = original; each reprint increments → DUPLICATE N).
+    const kCols = db.prepare("PRAGMA table_info(kots)").all() as any[];
+    if (!kCols.some((c: any) => c.name === 'fired_by'))      db.exec(`ALTER TABLE kots ADD COLUMN fired_by TEXT DEFAULT ''`);
+    if (!kCols.some((c: any) => c.name === 'reprint_count')) db.exec(`ALTER TABLE kots ADD COLUMN reprint_count INTEGER NOT NULL DEFAULT 0`);
   } catch (e) { console.error('POS orders schema failed:', e); }
 
   // Phase 1 §6: wastages — items thrown away (spoilage / expiry / damage / overcooked / spillage).
