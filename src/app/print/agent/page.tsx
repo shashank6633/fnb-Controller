@@ -35,10 +35,25 @@ export default function PrintAgent() {
 
   const refreshQueue = useCallback(async () => { try { setQueue(await counts()); } catch {} }, []);
 
-  // SSE: print each fired KOT / requested bill as it arrives.
+  // Print a KOT once. Both the live stream and the backup poll call this; the
+  // `seen` set (this session) + the outbox (stable id, persisted) dedup, so a
+  // KOT never prints twice no matter how many times it's delivered.
+  const printKot = useCallback(async (k: any) => {
+    if (!k || seen.current.has(`kot:${k.id}`)) return;
+    seen.current.add(`kot:${k.id}`);
+    await printFiredKots([k]).catch(() => {});
+    pushLog({ id: k.id, kind: 'KOT', label: `KOT #${k.kot_number ?? '—'} · ${k.station || 'kitchen'}`,
+      detail: `${k.table_number ? `Table ${k.table_number}` : k.order_type || ''} · ${(k.items || []).reduce((s: number, i: any) => s + (i.quantity || 0), 0)} items` });
+    refreshQueue();
+  }, [pushLog, refreshQueue]);
+
+  // Live stream (instant) + a backup poll (catches anything the stream misses —
+  // nginx buffering, pm2 cluster, a dropped connection, or the agent opening
+  // mid-service). This makes printing work even when SSE doesn't reach us.
   useEffect(() => {
     ensureDrainLoop();
     setUrlInput(getBridgeUrl());
+
     const es = new EventSource('/api/dine-in/kds/stream?station=all');
     es.onopen = () => setLive(true);
     es.onerror = () => setLive(false);
@@ -46,13 +61,7 @@ export default function PrintAgent() {
       let evt: any;
       try { evt = JSON.parse(e.data); } catch { return; }
       if (evt?.type === 'kot.new' && evt.kot) {
-        const k = evt.kot;
-        if (seen.current.has(`kot:${k.id}`)) return;   // belt-and-braces; outbox also dedups
-        seen.current.add(`kot:${k.id}`);
-        await printFiredKots([k]).catch(() => {});
-        pushLog({ id: k.id, kind: 'KOT', label: `KOT #${k.kot_number ?? '—'} · ${k.station || 'kitchen'}`,
-          detail: `${k.table_number ? `Table ${k.table_number}` : k.order_type || ''} · ${(k.items || []).reduce((s: number, i: any) => s + (i.quantity || 0), 0)} items` });
-        refreshQueue();
+        printKot(evt.kot);
       } else if (evt?.type === 'bill.print' && evt.bill) {
         const bl = evt.bill;
         const key = `bill:${bl.id}:${bl.total}`;
@@ -65,8 +74,21 @@ export default function PrintAgent() {
       }
     };
     esRef.current = es;
-    return () => es.close();
-  }, [pushLog, refreshQueue]);
+
+    // Backup poll every 9s — fetch active KOTs and print any not yet seen.
+    const poll = async () => {
+      try {
+        const r = await fetch('/api/dine-in/kds?station=all', { cache: 'no-store' });
+        if (!r.ok) return;
+        const j = await r.json();
+        for (const k of (j.items || [])) await printKot(k);
+      } catch { /* offline — try again next tick */ }
+    };
+    poll();
+    const pollTimer = setInterval(poll, 9000);
+
+    return () => { es.close(); clearInterval(pollTimer); };
+  }, [printKot, pushLog, refreshQueue]);
 
   // Poll bridge health + queue + housekeeping.
   useEffect(() => {

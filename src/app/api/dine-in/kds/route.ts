@@ -28,7 +28,11 @@ export async function GET(request: Request) {
       ORDER BY k.created_at ASC
     `).all(...params) as any[];
 
-    const itemStmt = db.prepare('SELECT name, quantity, notes, status FROM order_items WHERE kot_id = ? ORDER BY created_at ASC');
+    const itemStmt = db.prepare(`
+      SELECT oi.name, oi.quantity, oi.notes, oi.status, mi.item_type
+      FROM order_items oi LEFT JOIN menu_items mi ON oi.menu_item_id = mi.id
+      WHERE oi.kot_id = ? ORDER BY oi.created_at ASC
+    `);
     const result = kots.map((k) => ({ ...k, items: itemStmt.all(k.id) }));
 
     // Distinct stations (for the KDS station picker).
