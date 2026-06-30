@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useContext } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
-import { Loader2, Utensils, ChevronRight, Receipt } from 'lucide-react';
+import { Loader2, Utensils, ChevronRight, Receipt, Menu } from 'lucide-react';
+import { CaptainUI } from './CaptainShell';
 
 interface TableTile {
   id: string; table_number: string; zone: string; seats: number;
@@ -14,6 +15,7 @@ interface TableTile {
  *  selector lives in the shell sidebar (or the "Tables" drawer on phones). */
 export default function CaptainHome() {
   const router = useRouter();
+  const { openTables } = useContext(CaptainUI);
   const [tables, setTables] = useState<TableTile[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -30,7 +32,12 @@ export default function CaptainHome() {
   return (
     <div className="p-4 sm:p-6 pb-24 lg:pb-6 max-w-4xl">
       <div className="flex items-center justify-between mb-4">
-        <h1 className="text-xl sm:text-2xl font-bold text-[#2D1B0E]">Running tables</h1>
+        <div className="flex items-center gap-2">
+          <button onClick={openTables} className="md:hidden p-2 -ml-2 rounded-lg bg-[#1C0F05] text-white active:scale-95" aria-label="Open tables">
+            <Menu className="w-5 h-5" />
+          </button>
+          <h1 className="text-xl sm:text-2xl font-bold text-[#2D1B0E]">Running tables</h1>
+        </div>
         <div className="text-right">
           <p className="text-[11px] text-[#8B7355] leading-none">Live sales</p>
           <p className="font-extrabold text-[#af4408] text-lg leading-tight">₹{Math.round(liveTotal)}</p>

@@ -6,12 +6,15 @@
  * the routed page in the main area. The sidebar is the table selector and
  * quick-switcher; it polls live status and highlights the open table.
  */
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, createContext } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
 import {
-  ChefHat, RefreshCw, Plus, Menu, X, MoreVertical, LayoutDashboard, LogOut, Download, Search,
+  ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search,
 } from 'lucide-react';
+
+/** Lets the routed pages open the tables sidebar/drawer (the ☰ in their headers). */
+export const CaptainUI = createContext<{ openTables: () => void }>({ openTables: () => {} });
 
 interface TableTile {
   id: string; table_number: string; zone: string; seats: number;
@@ -102,7 +105,7 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
               </>
             )}
           </div>
-          <button onClick={() => setDrawer(false)} className="p-2 text-white/60 hover:text-white lg:hidden"><X className="w-5 h-5" /></button>
+          <button onClick={() => setDrawer(false)} className="p-2 text-white/60 hover:text-white md:hidden"><X className="w-5 h-5" /></button>
         </div>
       </div>
 
@@ -162,26 +165,20 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   );
 
   return (
-    <div className="lg:flex min-h-screen">
-      {/* Persistent sidebar (lg+) */}
-      <aside className="hidden lg:block shrink-0 h-screen sticky top-0">{sidebar}</aside>
+    <CaptainUI.Provider value={{ openTables: () => setDrawer(true) }}>
+    <div className="md:flex min-h-screen">
+      {/* Persistent sidebar (tablet/desktop, md+) */}
+      <aside className="hidden md:block shrink-0 h-screen sticky top-0">{sidebar}</aside>
 
-      {/* Mobile drawer */}
-      {drawer && <div className="fixed inset-0 bg-black/50 z-40 lg:hidden" onClick={() => setDrawer(false)} />}
-      <aside className={`fixed inset-y-0 left-0 z-50 lg:hidden transform transition-transform ${drawer ? 'translate-x-0' : '-translate-x-full'}`}>{sidebar}</aside>
+      {/* Drawer (phones / portrait, < md) — opened by the ☰ in each page header */}
+      {drawer && <div className="fixed inset-0 bg-black/50 z-40 md:hidden" onClick={() => setDrawer(false)} />}
+      <aside className={`fixed inset-y-0 left-0 z-50 md:hidden transform transition-transform ${drawer ? 'translate-x-0' : '-translate-x-full'}`}>{sidebar}</aside>
 
       {/* Main */}
       <main className="flex-1 min-w-0 relative">
-        {/* Mobile toggle to open the tables drawer — hidden on the order screen
-            (which has its own bottom action bar + back + move/merge). */}
-        {!currentOrderId && (
-          <button onClick={() => setDrawer(true)}
-            className="lg:hidden fixed bottom-5 left-4 z-30 flex items-center gap-2 bg-[#1C0F05] text-white px-4 py-2.5 rounded-full shadow-lg text-sm font-semibold active:scale-95">
-            <Menu className="w-4 h-4" /> Tables
-          </button>
-        )}
         {children}
       </main>
     </div>
+    </CaptainUI.Provider>
   );
 }

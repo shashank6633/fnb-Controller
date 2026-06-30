@@ -1,12 +1,13 @@
 'use client';
 
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useContext } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
-  ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2,
+  ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu,
 } from 'lucide-react';
+import { CaptainUI } from '../../CaptainShell';
 
 interface MenuItem { id: string; name: string; category: string; station: string; item_type: string; dietary_tag: string; selling_price: number; is_active: number; recipe_id: string | null; }
 interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; notes: string; kot_status?: string | null; }
@@ -36,6 +37,7 @@ const vegColor = (tag: string) => /non/i.test(tag) ? 'border-red-500' : /egg/i.t
 
 export default function CaptainOrder() {
   const router = useRouter();
+  const { openTables } = useContext(CaptainUI);
   const { id } = useParams<{ id: string }>();
   const [order, setOrder] = useState<Order | null>(null);
   const [menu, setMenu] = useState<MenuItem[]>([]);
@@ -183,7 +185,8 @@ export default function CaptainOrder() {
     <div className="flex flex-col min-h-screen">
       {/* Header */}
       <header className="sticky top-0 z-20 bg-[#1C0F05] text-white px-3 py-2.5 flex items-center gap-3">
-        <button onClick={() => router.push('/captain')} className="p-2 -ml-1 active:scale-95"><ArrowLeft className="w-5 h-5" /></button>
+        <button onClick={openTables} className="md:hidden p-2 -ml-1 active:scale-95" aria-label="Open tables"><Menu className="w-5 h-5" /></button>
+        <button onClick={() => router.push('/captain')} className="p-2 active:scale-95"><ArrowLeft className="w-5 h-5" /></button>
         <div className="flex-1 min-w-0">
           <p className="font-bold leading-tight">{order.table_number ? `Table ${order.table_number}` : 'Takeaway'} · #{order.order_number}</p>
           <p className="text-[11px] text-white/60 leading-tight">{order.zone || order.order_type}{order.status !== 'open' ? ` · ${order.status}` : ''}</p>
