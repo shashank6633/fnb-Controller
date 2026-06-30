@@ -46,7 +46,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';   // 2.1.0 = per-line ordered KOT layout + Food/Liquor band + sized lines
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -91,51 +91,103 @@ function twoCol(left, right, cols) {
 }
 
 // ── Renderers: structured doc → ESC/POS byte buffer ──────────────────────────
+
+// GS ! n character sizer: low nibble = height mult-1, high nibble = width mult-1.
+// m=1 → 1x (0x00), m=2 → 2x (0x11), m=3 → 3x (0x22). Clamped to 1..4.
+function sizeCmd(m) {
+  const k = Math.max(1, Math.min(4, Math.round(m))) - 1;
+  return [GS, 0x21, ((k << 4) | k) & 0xff];
+}
+const SIZE_MULT = { normal: 1, large: 2, xlarge: 3 };
+const mult = (size) => SIZE_MULT[size] || 1;
+
+// Default KOT line order (mirrors DEFAULT_KOT_LINES in src/lib/offline-print/
+// print.ts) — used when a doc carries no `lines` (e.g. the master/expediter
+// ticket) so an un-designed doc still prints the standard layout.
+const DEFAULT_KOT_LINES = [
+  { key: 'table', enabled: true, size: 'xlarge' },
+  { key: 'outlet', enabled: true, size: 'large' },
+  { key: 'floor', enabled: true, size: 'normal' },
+  { key: 'kotNo', enabled: true, size: 'normal' },
+  { key: 'copyLabel', enabled: true, size: 'large' },
+  { key: 'foodLiquor', enabled: true, size: 'large' },
+  { key: 'captain', enabled: true, size: 'normal' },
+  { key: 'puncher', enabled: true, size: 'normal' },
+  { key: 'dateTime', enabled: true, size: 'normal' },
+  { key: 'headerNote', enabled: false, size: 'normal' },
+  { key: 'items', enabled: true, size: 'normal' },
+  { key: 'totalItems', enabled: true, size: 'normal' },
+  { key: 'footerNote', enabled: false, size: 'normal' },
+];
+
 function buildKot(doc, cols, doCut) {
   const chunks = [];
   const push = (b) => chunks.push(Buffer.from(b));
   const line = (s = '') => chunks.push(Buffer.from(String(s) + '\n', 'ascii'));
   const rule = () => line('-'.repeat(cols));
+  // Centered (optionally bold) line at size multiplier m.
+  const center = (s, m, bold = true) => {
+    push(CMD.alignCenter); if (bold) push(CMD.boldOn);
+    if (m > 1) push(sizeCmd(m));
+    line(s);
+    if (m > 1) push(sizeCmd(1));
+    if (bold) push(CMD.boldOff); push(CMD.alignLeft);
+  };
+  // Left-aligned line at size multiplier m.
+  const left = (s, m, bold = false) => {
+    if (bold) push(CMD.boldOn);
+    if (m > 1) push(sizeCmd(m));
+    line(s);
+    if (m > 1) push(sizeCmd(1));
+    if (bold) push(CMD.boldOff);
+  };
 
   push(CMD.init);
 
-  // 1) Table number — on top of all, large + bold (TAKEAWAY/PARCEL when no table)
-  push(CMD.alignCenter); push(CMD.boldOn); push(CMD.dblOn);
-  line(doc.table ? `TABLE ${doc.table}` : String(doc.orderType || 'ORDER').toUpperCase());
-  push(CMD.dblOff);
-  // 2) Outlet name + 3) Floor (below outlet)
-  if (doc.outletName) line(String(doc.outletName).toUpperCase());
-  push(CMD.boldOff);
-  if (doc.floor) line(`Floor: ${doc.floor}`);
-  // 4) KOT no (+ station) and 5) ORIGINAL / DUPLICATE N
-  push(CMD.boldOn);
-  line(`KOT${doc.kotNumber ? ` #${doc.kotNumber}` : ''}${doc.station ? ` - ${String(doc.station).toUpperCase()}` : ''}`);
-  if (doc.copyLabel) { push(CMD.dblOn); line(doc.copyLabel); push(CMD.dblOff); }
-  push(CMD.boldOff); push(CMD.alignLeft);
-  rule();
-  // 6) Captains — table's captain, then the captain who punched (if different)
-  if (doc.captain) line(`Captain: ${doc.captain}`);
-  if (doc.firedBy && doc.firedBy !== doc.captain) line(`Punched by: ${doc.firedBy}`);
-  // 7) Date & time (+ order ref)
-  line(twoCol(fmtTime(doc.time), doc.orderRef ? `#${doc.orderRef}` : '', cols));
-  if (doc.headerNote) line(`* ${doc.headerNote} *`);
-  rule();
-  // 8) Items — name LEFT, qty RIGHT
-  const big = doc.fontScale === 'large';
-  const icols = big ? Math.floor(cols / 2) : cols;
-  for (const it of (doc.items || [])) {
-    push(CMD.boldOn); if (big) push(CMD.dblOn);
-    line(twoCol(it.name || '', `x${it.qty ?? 1}`, icols));
-    if (big) push(CMD.dblOff);
-    push(CMD.boldOff);
-    for (const m of (it.mods || it.modifiers || [])) line(`    + ${m}`);
-    if (it.notes) line(`    - ${it.notes}`);
+  const cap = String(doc.captain || '').trim();
+  const fb = String(doc.firedBy || '').trim();
+
+  // One renderer per line key; each pulls its value off the doc and respects
+  // the per-line size. Conditional lines no-op when their value is absent.
+  const SECTIONS = {
+    table:      (m) => center(doc.table ? `TABLE ${doc.table}` : String(doc.orderType || 'ORDER').toUpperCase(), m),
+    outlet:     (m) => { if (doc.outletName) center(String(doc.outletName).toUpperCase(), m); },
+    floor:      (m) => { if (doc.floor) center(`Floor: ${doc.floor}`, m, false); },
+    kotNo:      (m) => center(`KOT${doc.kotNumber ? ` #${doc.kotNumber}` : ''}${doc.station ? ` - ${String(doc.station).toUpperCase()}` : ''}`, m),
+    copyLabel:  (m) => { if (doc.copyLabel) center(doc.copyLabel, m); },
+    foodLiquor: (m) => { if (doc.foodLiquor) center(`*** ${String(doc.foodLiquor).toUpperCase()} ***`, m); },
+    captain:    (m) => { if (cap) left(`Captain: ${cap}`, m); },
+    // Show the puncher ONLY when a DIFFERENT captain punched (case/space-insensitive).
+    puncher:    (m) => { if (fb && fb.toLowerCase() !== cap.toLowerCase()) left(`Punched by: ${fb}`, m); },
+    dateTime:   (m) => { if (doc.time != null) left(twoCol(fmtTime(doc.time), doc.orderRef ? `#${doc.orderRef}` : '', cols), m); },
+    headerNote: (m) => { if (doc.headerNote) left(`* ${doc.headerNote} *`, m); },
+    items:      (m) => {
+      rule();
+      const icols = Math.max(8, Math.floor(cols / Math.max(1, m)));
+      for (const it of (doc.items || [])) {
+        push(CMD.boldOn); if (m > 1) push(sizeCmd(m));
+        line(twoCol(it.name || '', `x${it.qty ?? 1}`, icols));
+        if (m > 1) push(sizeCmd(1));
+        push(CMD.boldOff);
+        for (const mo of (it.mods || it.modifiers || [])) line(`    + ${mo}`);
+        if (it.notes) line(`    - ${it.notes}`);
+      }
+      rule();
+    },
+    totalItems: (m) => left(`Total items: ${(doc.items || []).reduce((s, it) => s + (Number(it.qty) || 1), 0)}`, m),
+    footerNote: (m) => { if (doc.footerNote) { line(''); center(doc.footerNote, m, false); } },
+  };
+
+  const order = Array.isArray(doc.lines) && doc.lines.length ? doc.lines : DEFAULT_KOT_LINES;
+  for (const ln of order) {
+    const key = (ln && ln.key) || ln;            // tolerate {key,enabled,size} or a bare string
+    if (ln && ln.enabled === false) continue;
+    const fn = SECTIONS[key];
+    if (fn) fn(mult((ln && ln.size) || 'normal'));
   }
-  rule();
-  const count = (doc.items || []).reduce((s, it) => s + (Number(it.qty) || 1), 0);
-  line(`Total items: ${count}`);
+
+  // Internal expediter banner (master ticket) — not user-configurable.
   if (doc.note) { line(''); push(CMD.alignCenter); push(CMD.boldOn); line(`** ${doc.note} **`); push(CMD.boldOff); push(CMD.alignLeft); }
-  if (doc.footerNote) { line(''); push(CMD.alignCenter); line(doc.footerNote); push(CMD.alignLeft); }
   push(CMD.feed3);
   if (doCut) push(CMD.cut);
   return Buffer.concat(chunks);

@@ -6,9 +6,13 @@ import MobileTopBar from '@/components/MobileTopBar';
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  // Login, print, and the mobile Captain app render full-screen (no desktop
-  // sidebar/userbar chrome) — the Captain app has its own touch-first shell.
-  const bare = pathname === '/login' || pathname.includes('/print') || pathname.startsWith('/captain');
+  // Login, the dedicated full-screen PRINT views, and the mobile Captain app
+  // render chrome-less (no sidebar/userbar). Match a real `/print` path SEGMENT
+  // (/print/agent, /grn/print/[id], /purchase-orders/[id]/print) — NOT the bare
+  // substring, which wrongly stripped /settings/print-design and
+  // /dine-in/offline-print of their sidebar + back nav.
+  const isPrintView = /\/print(\/|$)/.test(pathname);
+  const bare = pathname === '/login' || isPrintView || pathname.startsWith('/captain');
 
   if (bare) return <>{children}</>;
 

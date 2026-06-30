@@ -81,24 +81,121 @@ function targetOf(s: PrintStation): PrinterTarget {
   return { transport: s.transport, target: s.target, width: (s.paper_width === 32 ? 32 : 48) as 32 | 48 };
 }
 
-// ── KOT print design (Settings → Print Design). null fetch → sensible defaults. ─
+// ── KOT print design (Settings → Print Design) ───────────────────────────────
+// The KOT layout is an ORDERED list of line-elements, each independently
+// enabled and sized. The bridge renders enabled lines top-to-bottom at their
+// size; the Settings page edits this list (drag to reorder, per-line A/A+/A++).
+// Fewer lines + smaller sizes = less paper.
+export type KotLineKey =
+  | 'table' | 'outlet' | 'floor' | 'kotNo' | 'copyLabel' | 'foodLiquor'
+  | 'captain' | 'puncher' | 'dateTime' | 'headerNote'
+  | 'items' | 'totalItems' | 'footerNote';
+export type KotLineSize = 'normal' | 'large' | 'xlarge';
+export interface KotLine { key: KotLineKey; enabled: boolean; size: KotLineSize; }
+
+export const KOT_LINE_LABELS: Record<KotLineKey, string> = {
+  table: 'Table number', outlet: 'Outlet name', floor: 'Floor',
+  kotNo: 'KOT number + station', copyLabel: 'Original / Duplicate',
+  foodLiquor: 'Food / Liquor band', captain: 'Captain',
+  puncher: 'Punched by (only if another captain punches)', dateTime: 'Date & time',
+  headerNote: 'Header note', items: 'Items', totalItems: 'Total items', footerNote: 'Footer note',
+};
+
+export const DEFAULT_KOT_LINES: KotLine[] = [
+  { key: 'table',      enabled: true,  size: 'xlarge' },
+  { key: 'outlet',     enabled: true,  size: 'large' },
+  { key: 'floor',      enabled: true,  size: 'normal' },
+  { key: 'kotNo',      enabled: true,  size: 'normal' },
+  { key: 'copyLabel',  enabled: true,  size: 'large' },
+  { key: 'foodLiquor', enabled: true,  size: 'large' },
+  { key: 'captain',    enabled: true,  size: 'normal' },
+  { key: 'puncher',    enabled: true,  size: 'normal' },
+  { key: 'dateTime',   enabled: true,  size: 'normal' },
+  { key: 'headerNote', enabled: false, size: 'normal' },
+  { key: 'items',      enabled: true,  size: 'normal' },
+  { key: 'totalItems', enabled: true,  size: 'normal' },
+  { key: 'footerNote', enabled: false, size: 'normal' },
+];
+
 export interface KotDesign {
-  showOutlet: boolean; outletName: string; showFloor: boolean; showTable: boolean;
-  showKotNo: boolean; showCopyLabel: boolean; showCaptain: boolean; showDateTime: boolean;
-  headerNote: string; footerNote: string; fontScale: 'normal' | 'large';
+  lines: KotLine[];
+  outletName: string;
+  headerNote: string;
+  footerNote: string;
 }
 export const DEFAULT_KOT_DESIGN: KotDesign = {
-  showOutlet: true, outletName: '', showFloor: true, showTable: true,
-  showKotNo: true, showCopyLabel: true, showCaptain: true, showDateTime: true,
-  headerNote: '', footerNote: '', fontScale: 'normal',
+  lines: DEFAULT_KOT_LINES, outletName: '', headerNote: '', footerNote: '',
 };
+
+const VALID_KOT_KEYS = new Set<string>(DEFAULT_KOT_LINES.map((l) => l.key));
+
+// Map a LEGACY flat design (showOutlet/showFloor/… + fontScale, from before the
+// lines[] model) onto the line list so an older saved config keeps the user's
+// hidden lines and big-item choice instead of silently resetting to defaults.
+function legacyLines(src: any): KotLine[] {
+  const flag: Partial<Record<KotLineKey, string>> = {
+    outlet: 'showOutlet', floor: 'showFloor', table: 'showTable', kotNo: 'showKotNo',
+    copyLabel: 'showCopyLabel', captain: 'showCaptain', puncher: 'showCaptain', dateTime: 'showDateTime',
+  };
+  const itemSize: KotLineSize = src.fontScale === 'large' ? 'large' : 'normal';
+  return DEFAULT_KOT_LINES.map((def) => {
+    const f = flag[def.key];
+    const enabled = f && typeof src[f] === 'boolean' ? src[f]
+      : def.key === 'headerNote' ? !!src.headerNote
+      : def.key === 'footerNote' ? !!src.footerNote
+      : def.enabled;
+    return { key: def.key, enabled, size: def.key === 'items' ? itemSize : def.size };
+  });
+}
+
+/**
+ * Merge a saved (possibly older/partial/hostile) design over the defaults,
+ * GUARANTEEING a complete, valid lines[]: every known key present exactly once,
+ * kept in saved order, unknown keys dropped, missing keys (e.g. a newly-added
+ * `foodLiquor`) appended. Inherited Object.prototype names ('constructor',
+ * '__proto__', …) can't slip through — membership is a Set, not a bracket
+ * lookup. Used by both the Settings page and the printer so the preview and the
+ * real ticket can never disagree.
+ */
+export function normalizeKotDesign(raw: any): KotDesign {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const d: KotDesign = {
+    lines: DEFAULT_KOT_LINES,
+    outletName: typeof src.outletName === 'string' ? src.outletName : '',
+    headerNote: typeof src.headerNote === 'string' ? src.headerNote : '',
+    footerNote: typeof src.footerNote === 'string' ? src.footerNote : '',
+  };
+  // Legacy flat design (no lines[]) → map the old show* booleans onto lines.
+  if (!Array.isArray(src.lines) && (src.showOutlet !== undefined || src.showTable !== undefined || src.fontScale !== undefined)) {
+    d.lines = legacyLines(src);
+    return d;
+  }
+  const ordered: KotLine[] = [];
+  const seen = new Set<string>();
+  for (const l of Array.isArray(src.lines) ? src.lines : []) {
+    const key = l && typeof l.key === 'string' ? l.key : '';
+    if (!key || seen.has(key) || !VALID_KOT_KEYS.has(key)) continue;
+    const def = DEFAULT_KOT_LINES.find((x) => x.key === key);
+    if (!def) continue;
+    ordered.push({
+      key: key as KotLineKey,
+      enabled: typeof l.enabled === 'boolean' ? l.enabled : def.enabled,
+      size: (['normal', 'large', 'xlarge'].includes(l.size) ? l.size : def.size) as KotLineSize,
+    });
+    seen.add(key);
+  }
+  for (const def of DEFAULT_KOT_LINES) if (!seen.has(def.key)) ordered.push({ ...def });
+  d.lines = ordered;
+  return d;
+}
+
 let designCache: { at: number; d: KotDesign } | null = null;
 export async function getKotDesign(force = false): Promise<KotDesign> {
   if (!force && designCache && Date.now() - designCache.at < 30000) return designCache.d;
   try {
     const r = await api('/api/settings?key=kot_design');
     const v = r.ok ? (await r.json()).value : null;
-    const d = v ? { ...DEFAULT_KOT_DESIGN, ...JSON.parse(v) } : DEFAULT_KOT_DESIGN;
+    const d = v ? normalizeKotDesign(JSON.parse(v)) : DEFAULT_KOT_DESIGN;
     designCache = { at: Date.now(), d };
     return d;
   } catch { return designCache?.d || DEFAULT_KOT_DESIGN; }
@@ -135,22 +232,31 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
   for (const k of firedKots) {
     const st = resolveKotPrinter(stations, k);
     if (!st) continue; // no KOT printer configured — skip silently
+    // FOOD vs LIQUOR band for this KOT: any non-food line (liquors/beverages)
+    // → LIQUOR; all-food → FOOD; no item_type at all → fall back to the
+    // resolved station's kind (also used by the master per-item split; note the
+    // floor/kind routing in resolveKotPrinter treats all-NULL as food).
+    const types = (k.items || []).map((it) => it.item_type).filter(Boolean) as string[];
+    const kotKind = types.length === 0
+      ? (st.kind === 'bar' ? 'bar' : 'food')
+      : (types.some((t) => t !== 'foods') ? 'bar' : 'food');
     const doc = {
       type: 'kot' as const,
       station: k.station || st.name,
-      outletName: design.showOutlet ? (design.outletName || shop.name) : undefined,
-      floor: design.showFloor ? (k.zone || undefined) : undefined,
-      table: design.showTable ? (k.table_number || undefined) : undefined,
-      kotNumber: design.showKotNo ? k.kot_number : undefined,
-      copyLabel: design.showCopyLabel ? copyLabel(k.reprint_count) : undefined,
-      captain: design.showCaptain ? (k.captain || undefined) : undefined,
-      firedBy: design.showCaptain ? (k.fired_by || undefined) : undefined,
+      lines: design.lines,                                 // ordered, per-line enable + size
+      outletName: design.outletName || shop.name,
+      floor: k.zone || undefined,
+      table: k.table_number || undefined,
+      kotNumber: k.kot_number,
+      copyLabel: copyLabel(k.reprint_count),
+      foodLiquor: kotKind === 'bar' ? 'LIQUOR' : 'FOOD',
+      captain: k.captain || undefined,
+      firedBy: k.fired_by || undefined,                    // bridge shows "Punched by" only if it differs
       orderType: k.order_type,
       orderRef: k.order_number != null ? String(k.order_number) : undefined,
-      time: design.showDateTime ? time : undefined,
+      time,
       headerNote: design.headerNote || undefined,
       footerNote: design.footerNote || undefined,
-      fontScale: design.fontScale,
       items: (k.items || []).map((it) => ({ qty: it.quantity, name: it.name, notes: it.notes || undefined })),
     };
     const copies = Math.max(1, Math.min(5, Number(st.copies) || 1));
@@ -205,11 +311,12 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       station: m.name || (kind === 'bar' ? 'MAIN BAR' : 'MAIN KITCHEN'),
       kotNumber: k0?.kot_number,
       table: k0?.table_number || undefined,
+      foodLiquor: kind === 'bar' ? 'LIQUOR' : 'FOOD',
       orderType: k0?.order_type,
       orderRef: k0?.order_number != null ? String(k0.order_number) : undefined,
       time,
-      items,
-      note: 'EXPEDITER — CROSS-CHECK',
+      items,                          // no `lines` → bridge uses its default order
+      note: 'EXPEDITER - CROSS-CHECK',   // ASCII '-' (line() encodes ascii; an em-dash prints as a stray byte)
     };
     await enqueue({
       id: `master_${m.id}_${fireKey}`,
@@ -243,9 +350,13 @@ async function getShop(): Promise<{ name: string; gstin: string }> {
   return shopCache;
 }
 
+/** Drop the in-memory design caches so the very NEXT print re-fetches — called
+ *  right after a save so a new layout applies immediately, not up to 30s later. */
+export function invalidateDesignCache(): void { designCache = null; billDesignCache = null; }
+
 let billDesignCache: { at: number; d: any } | null = null;
 async function getBillDesign(): Promise<any> {
-  const DEF = { shopName: '', showGstin: true, showServer: true, headerNote: '', footerNote: '', fontScale: 'normal' };
+  const DEF = { shopName: '', showGstin: true, showServer: true, headerNote: '', footerNote: '' };
   if (billDesignCache && Date.now() - billDesignCache.at < 30000) return billDesignCache.d;
   try {
     const r = await api('/api/settings?key=bill_design');
@@ -273,7 +384,6 @@ export async function printBill(order: BillOrder): Promise<{ ok: boolean; reason
     table: order.table_number || undefined,
     server: design.showServer ? (order.server_name || undefined) : undefined,
     date: new Date().toISOString(),
-    fontScale: design.fontScale,
     items: (order.items || []).map((it) => ({ name: it.name, qty: it.quantity, price: it.unit_price, amount: it.line_total })),
     subtotal: Number(order.subtotal) || 0,
     discount: Number(order.discount) || 0,

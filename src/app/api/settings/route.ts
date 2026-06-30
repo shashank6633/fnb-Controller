@@ -19,3 +19,8 @@ export async function PUT(req: Request) {
   db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, String(value ?? ''));
   return Response.json({ key, value });
 }
+
+// Accept POST as an alias for PUT — the upsert is idempotent (settings.key is a
+// PRIMARY KEY) and some callers (e.g. Print Design) POST. Without this a POST
+// would 405 silently and the save would appear to succeed but persist nothing.
+export const POST = PUT;
