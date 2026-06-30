@@ -20,7 +20,8 @@ export async function GET() {
     const outletId = await getCurrentOutletId();
     const tables = db.prepare(`
       SELECT t.*,
-             o.id AS open_order_id, o.order_number AS open_order_number, o.total AS open_order_total
+             o.id AS open_order_id, o.order_number AS open_order_number, o.total AS open_order_total,
+             o.server_id AS open_order_server_id, o.server_name AS open_order_captain
       FROM restaurant_tables t
       LEFT JOIN orders o ON o.table_id = t.id AND o.status = 'open'
       WHERE t.is_active = 1 AND (t.outlet_id = ? OR t.outlet_id IS NULL)

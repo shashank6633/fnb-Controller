@@ -24,9 +24,13 @@ jobs:
 
             npm install
 
-            # Clear any stale/root-owned .next so `next build` can clean it
-            # (a leftover root-owned file here caused an EACCES build failure → 502).
-            sudo rm -rf .next
+            # The app runs as root (sudo pm2), so the running server leaves
+            # root-owned files inside .next that a user-run `next build` can't
+            # overwrite → EACCES build failure (favicon.ico.body, *.rsc, ...).
+            # Take ownership FIRST, then remove, so the build user can always
+            # clean and recreate .next. This breaks the recurring-EACCES cycle.
+            sudo chown -R "$(whoami)" .next 2>/dev/null || true
+            rm -rf .next
 
             npm run build                            # if this fails, set -e stops here (no broken restart)
 
