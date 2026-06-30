@@ -5,7 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
-  ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu,
+  ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu, Filter, ChevronDown,
 } from 'lucide-react';
 import { CaptainUI } from '../../CaptainShell';
 
@@ -43,6 +43,8 @@ export default function CaptainOrder() {
   const [menu, setMenu] = useState<MenuItem[]>([]);
   const [cats, setCats] = useState<string[]>([]);
   const [cat, setCat] = useState('All');
+  const [catPickerOpen, setCatPickerOpen] = useState(false);
+  const [catSearch, setCatSearch] = useState('');
   const [q, setQ] = useState('');
   const [tab, setTab] = useState<'menu' | 'cart'>('menu');
   const [pending, setPending] = useState<string | null>(null);
@@ -77,6 +79,12 @@ export default function CaptainOrder() {
 
   const visibleMenu = useMemo(() => menu.filter((m) =>
     (cat === 'All' || m.category === cat) && (!q || m.name.toLowerCase().includes(q.toLowerCase()))), [menu, cat, q]);
+  // Item count per category (for the picker).
+  const catCounts = useMemo(() => {
+    const m: Record<string, number> = {};
+    for (const it of menu) m[it.category] = (m[it.category] || 0) + 1;
+    return m;
+  }, [menu]);
 
   const pendingCount = order?.items.filter((i) => i.status === 'pending').length || 0;
   const cartCount = order?.items.reduce((s, i) => s + i.quantity, 0) || 0;
@@ -221,12 +229,22 @@ export default function CaptainOrder() {
               <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search dishes…"
                 className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-xl pl-9 pr-3 py-2.5 text-sm" />
             </div>
-            <div className="flex gap-2 overflow-x-auto mt-2 no-scrollbar">
-              {cats.map((c) => (
-                <button key={c} onClick={() => setCat(c)}
-                  className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-medium ${cat === c ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] border border-[#E8D5C4]'}`}>{c}</button>
-              ))}
-            </div>
+            {/* Few categories → quick chips. Many → a searchable picker so the
+                bar doesn't turn into an endless horizontal scroll. */}
+            {cats.length > 9 ? (
+              <button onClick={() => { setCatPickerOpen(true); setCatSearch(''); }}
+                className="w-full flex items-center justify-between gap-2 mt-2 bg-[#FFF1E3] border border-[#D4B896] rounded-xl px-3 py-2.5 text-sm active:scale-[0.99]">
+                <span className="flex items-center gap-2 text-[#6B5744] truncate"><Filter className="w-4 h-4 shrink-0" /> {cat === 'All' ? 'All categories' : cat}</span>
+                <ChevronDown className="w-4 h-4 text-[#8B7355] shrink-0" />
+              </button>
+            ) : (
+              <div className="flex gap-2 overflow-x-auto mt-2 no-scrollbar">
+                {cats.map((c) => (
+                  <button key={c} onClick={() => setCat(c)}
+                    className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-medium ${cat === c ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] border border-[#E8D5C4]'}`}>{c}</button>
+                ))}
+              </div>
+            )}
           </div>
           {/* Menu list */}
           <main className="flex-1 px-3 py-2 pb-24">
@@ -357,6 +375,33 @@ export default function CaptainOrder() {
                 className="flex-1 flex items-center justify-center gap-2 bg-[#af4408] text-white py-3.5 rounded-xl font-bold active:scale-95 disabled:opacity-50">
                 {pending === 'add' ? <Loader2 className="w-5 h-5 animate-spin" /> : <Plus className="w-5 h-5" />} Add · ₹{sheet.selling_price * mQty}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Category picker (for menus with many categories) */}
+      {catPickerOpen && (
+        <div className="fixed inset-0 z-40 flex items-end" onClick={() => setCatPickerOpen(false)}>
+          <div className="absolute inset-0 bg-black/40" />
+          <div onClick={(e) => e.stopPropagation()} className="relative w-full max-w-3xl mx-auto bg-white rounded-t-3xl p-4 pb-6 max-h-[80vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-3">
+              <p className="font-bold text-lg text-[#2D1B0E]">Choose category</p>
+              <button onClick={() => setCatPickerOpen(false)} className="p-2.5 -m-1"><X className="w-5 h-5 text-[#8B7355]" /></button>
+            </div>
+            <div className="relative mb-3">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />
+              <input value={catSearch} onChange={(e) => setCatSearch(e.target.value)} placeholder="Filter categories…"
+                className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-xl pl-9 pr-3 py-2.5 text-sm" />
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              {cats.filter((c) => c === 'All' || c.toLowerCase().includes(catSearch.toLowerCase())).map((c) => (
+                <button key={c} onClick={() => { setCat(c); setCatPickerOpen(false); }}
+                  className={`flex items-center justify-between gap-2 px-3 py-3 rounded-xl border text-sm text-left active:scale-95 ${cat === c ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-[#FFF1E3] text-[#2D1B0E] border-[#E8D5C4]'}`}>
+                  <span className="truncate">{c === 'All' ? 'All categories' : c}</span>
+                  <span className={`text-[10px] shrink-0 ${cat === c ? 'text-white/80' : 'text-[#8B7355]'}`}>{c === 'All' ? menu.length : (catCounts[c] || 0)}</span>
+                </button>
+              ))}
             </div>
           </div>
         </div>

@@ -604,13 +604,14 @@ export default function PurchasesPage() {
       .map((m: any) => ({
         sku: m.sku || '',
         name: m.name || '',
+        category: m.category || '',     // prefilled so the store manager can scan/sort by section
         purchase_unit: m.purchase_unit || m.unit || '',
         pack_size: m.pack_size || 1,
         qty: '',
         rate: '',
         date: '',
       }));
-    const ws = XLSX.utils.json_to_sheet(rows, { header: ['sku', 'name', 'purchase_unit', 'pack_size', 'qty', 'rate', 'date'] });
+    const ws = XLSX.utils.json_to_sheet(rows, { header: ['sku', 'name', 'category', 'purchase_unit', 'pack_size', 'qty', 'rate', 'date'] });
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Opening Stock');
     XLSX.writeFile(wb, `opening-stock-template-${todayString()}.xlsx`);
