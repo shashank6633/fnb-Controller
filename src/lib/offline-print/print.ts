@@ -13,7 +13,7 @@ import type { PrinterTarget } from './bridge-client';
 export interface PrintStation {
   id: string; name: string; role: 'bill' | 'kot'; station: string;
   transport: 'ip' | 'usb'; target: string; paper_width: number; copies: number; is_active: number;
-  floor?: string; backup_target?: string; kind?: 'food' | 'bar'; is_master?: number;
+  floor?: string; backup_target?: string; kind?: 'food' | 'bar'; is_master?: number; mirror_to_master?: number;
 }
 
 let stationCache: { at: number; rows: PrintStation[] } | null = null;
@@ -85,16 +85,21 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
         meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
       });
     }
-    // For the expediter ticket: tag each item with its station so the kitchen
-    // counter can cross-check what each sub-station should send out. Classify
-    // each item food/bar by its MENU item_type (foods → food; liquors/beverages
-    // → bar) so the Main Kitchen stays strictly food even if a station printer's
-    // Group is mis-set; fall back to the station printer's kind if unknown.
-    const stationKind = st.kind === 'bar' ? 'bar' : 'food';
-    const label = (k.station || st.name || '').toUpperCase();
-    for (const it of (k.items || [])) {
-      const kind = it.item_type ? (it.item_type === 'foods' ? 'food' : 'bar') : stationKind;
-      (byKind[kind] ||= []).push({ qty: it.quantity, name: label ? `[${label}] ${it.name}` : it.name, notes: it.notes || undefined });
+    // Expediter copy — ONLY if this station is configured to mirror to the Main
+    // printer ("Send duplicate KOT to Main Kitchen"). Stations on other floors /
+    // separate kitchens (e.g. Pizza, Tandoor) can be excluded per-station.
+    const mirrors = st.mirror_to_master === undefined ? true : Number(st.mirror_to_master) !== 0;
+    if (mirrors) {
+      // Tag each item with its station for cross-checking. Classify food/bar by
+      // the MENU item_type (foods → food; liquors/beverages → bar) so the Main
+      // Kitchen stays strictly food even if a station's Group is mis-set; fall
+      // back to the station printer's kind if unknown.
+      const stationKind = st.kind === 'bar' ? 'bar' : 'food';
+      const label = (k.station || st.name || '').toUpperCase();
+      for (const it of (k.items || [])) {
+        const kind = it.item_type ? (it.item_type === 'foods' ? 'food' : 'bar') : stationKind;
+        (byKind[kind] ||= []).push({ qty: it.quantity, name: label ? `[${label}] ${it.name}` : it.name, notes: it.notes || undefined });
+      }
     }
   }
 

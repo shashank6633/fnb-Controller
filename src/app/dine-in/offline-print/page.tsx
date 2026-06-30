@@ -30,7 +30,7 @@ interface Job {
   status: string; last_error?: string; created_at: string;
 }
 
-const blankForm = { id: '', name: '', role: 'kot' as 'kot' | 'bill', station: '', transport: 'ip' as 'ip' | 'usb', target: '', paper_width: 48, copies: 1, floor: '', backup_target: '', kind: 'food' as 'food' | 'bar', is_master: false };
+const blankForm = { id: '', name: '', role: 'kot' as 'kot' | 'bill', station: '', transport: 'ip' as 'ip' | 'usb', target: '', paper_width: 48, copies: 1, floor: '', backup_target: '', kind: 'food' as 'food' | 'bar', is_master: false, mirror_to_master: true };
 
 export default function OfflinePrintPage() {
   const [stations, setStations] = useState<Station[]>([]);
@@ -46,7 +46,7 @@ export default function OfflinePrintPage() {
   const [queue, setQueue] = useState({ pending: 0, failed: 0, printed: 0 });
   const [pstatus, setPstatus] = useState<Record<string, PrinterStatus | null>>({});
   const [checkingPrinters, setCheckingPrinters] = useState(false);
-  const [menuStations, setMenuStations] = useState<{ station: string; item_count: number; has_printer: boolean; printer_name: string | null }[]>([]);
+  const [menuStations, setMenuStations] = useState<{ station: string; item_count: number; has_printer: boolean; printer_id: string | null; printer_name: string | null; kind: string; mirror: boolean }[]>([]);
   const [toast, setToast] = useState<{ ok: boolean; msg: string } | null>(null);
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 4000); };
@@ -63,6 +63,10 @@ export default function OfflinePrintPage() {
     const r = await api('/api/dine-in/offline-print/menu-stations');
     if (r.ok) setMenuStations((await r.json()).stations || []);
   }, []);
+  const toggleMirror = async (printerId: string, next: boolean) => {
+    await api(`/api/dine-in/offline-print/stations/${printerId}`, { method: 'PATCH', body: { mirror_to_master: next } });
+    await loadMenuStations(); await loadStations();
+  };
   const checkBridge = useCallback(async () => {
     setProbing(true);
     setHealth(await probeBridge());
@@ -107,7 +111,7 @@ export default function OfflinePrintPage() {
     if (typeof window !== 'undefined') window.scrollTo({ top: 0, behavior: 'smooth' });
   };
   const openEdit = (s: Station) => {
-    setForm({ id: s.id, name: s.name, role: s.role, station: s.station || '', transport: s.transport, target: s.target, paper_width: s.paper_width, copies: s.copies, floor: (s as any).floor || '', backup_target: (s as any).backup_target || '', kind: ((s as any).kind === 'bar' ? 'bar' : 'food'), is_master: !!(s as any).is_master });
+    setForm({ id: s.id, name: s.name, role: s.role, station: s.station || '', transport: s.transport, target: s.target, paper_width: s.paper_width, copies: s.copies, floor: (s as any).floor || '', backup_target: (s as any).backup_target || '', kind: ((s as any).kind === 'bar' ? 'bar' : 'food'), is_master: !!(s as any).is_master, mirror_to_master: (s as any).mirror_to_master === undefined ? true : !!(s as any).mirror_to_master });
     setShowForm(true);
   };
 
@@ -116,7 +120,7 @@ export default function OfflinePrintPage() {
     if (!form.target.trim()) return flash(false, 'Printer target (IP or printer name) is required.');
     setSaving(true);
     try {
-      const body = { name: form.name, role: form.role, station: form.station, transport: form.transport, target: form.target, paper_width: form.paper_width, copies: form.copies, floor: form.floor, backup_target: form.backup_target, kind: form.kind, is_master: form.is_master };
+      const body = { name: form.name, role: form.role, station: form.station, transport: form.transport, target: form.target, paper_width: form.paper_width, copies: form.copies, floor: form.floor, backup_target: form.backup_target, kind: form.kind, is_master: form.is_master, mirror_to_master: form.mirror_to_master };
       const r = form.id
         ? await api(`/api/dine-in/offline-print/stations/${form.id}`, { method: 'PATCH', body })
         : await api('/api/dine-in/offline-print/stations', { method: 'POST', body });
@@ -293,7 +297,14 @@ export default function OfflinePrintPage() {
                   </div>
                   <p className="text-[11px] text-[#8B7355] mt-0.5 truncate">{s.has_printer ? `→ ${s.printer_name}` : 'no printer — items fall back to your default KOT printer'}</p>
                 </div>
-                {!s.has_printer && (
+                {s.has_printer ? (
+                  <button
+                    onClick={() => s.printer_id && toggleMirror(s.printer_id, !s.mirror)}
+                    title={s.mirror ? 'Also prints to Main Kitchen — click to stop' : 'Not sent to Main Kitchen — click to enable'}
+                    className={`shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium border ${s.mirror ? 'bg-purple-100 text-purple-700 border-purple-200' : 'text-[#8B7355] border-[#E8D5C4] hover:bg-[#FFF1E3]'}`}>
+                    {s.mirror ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />} Main
+                  </button>
+                ) : (
                   <button onClick={() => openNewForStation(s.station)} className="shrink-0 flex items-center gap-1 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-2.5 py-1 rounded-lg text-xs font-medium"><Plus className="w-3.5 h-3.5" /> Printer</button>
                 )}
               </div>
@@ -370,6 +381,12 @@ export default function OfflinePrintPage() {
               <label className="flex items-start gap-2 text-xs text-[#6B5744] bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2">
                 <input type="checkbox" checked={form.is_master} onChange={(e) => setForm({ ...form, is_master: e.target.checked })} className="mt-0.5" />
                 <span><b>Main / expediter printer</b> (kitchen counter) — also prints <b>one consolidated ticket of every {form.kind === 'bar' ? 'drink' : 'food'} item</b> here for cross-checking, in addition to each sub-station printer. Leave the <i>Kitchen station</i> blank for this one.</span>
+              </label>
+            )}
+            {form.role === 'kot' && !form.is_master && (
+              <label className="flex items-start gap-2 text-xs text-[#6B5744] bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2">
+                <input type="checkbox" checked={form.mirror_to_master} onChange={(e) => setForm({ ...form, mirror_to_master: e.target.checked })} className="mt-0.5" />
+                <span><b>Send duplicate KOT to Main Kitchen</b> — this station&apos;s tickets are also mirrored to the Main/expediter printer. <b>Turn this OFF</b> for stations on other floors or separate kitchens (e.g. a rooftop Pizza or Tandoor) that shouldn&apos;t show at the main counter.</span>
               </label>
             )}
             <div className="flex gap-2">

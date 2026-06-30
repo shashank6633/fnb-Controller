@@ -1491,6 +1491,7 @@ function initializeSchema(db: Database.Database) {
         backup_target TEXT DEFAULT '',                -- failover printer "ip:port" if primary is down
         kind        TEXT DEFAULT 'food',              -- KOT group: 'food' (kitchen) | 'bar'
         is_master   INTEGER NOT NULL DEFAULT 0,       -- 1 = expediter: gets a consolidated copy of all KOTs of its kind
+        mirror_to_master INTEGER NOT NULL DEFAULT 1,  -- 1 = this station's KOTs are duplicated to the Main (master) printer
         is_active   INTEGER NOT NULL DEFAULT 1,
         sort_order  INTEGER NOT NULL DEFAULT 0,
         created_at  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1519,6 +1520,7 @@ function initializeSchema(db: Database.Database) {
     if (!psCols.some((c: any) => c.name === 'backup_target')) db.exec(`ALTER TABLE print_stations ADD COLUMN backup_target TEXT DEFAULT ''`);
     if (!psCols.some((c: any) => c.name === 'kind'))          db.exec(`ALTER TABLE print_stations ADD COLUMN kind TEXT DEFAULT 'food'`);
     if (!psCols.some((c: any) => c.name === 'is_master'))     db.exec(`ALTER TABLE print_stations ADD COLUMN is_master INTEGER NOT NULL DEFAULT 0`);
+    if (!psCols.some((c: any) => c.name === 'mirror_to_master')) db.exec(`ALTER TABLE print_stations ADD COLUMN mirror_to_master INTEGER NOT NULL DEFAULT 1`);
   } catch (e) { console.error('print_stations/print_jobs schema failed:', e); }
 
   // Phase 1 §2: add Mgmt approval columns to requisitions (idempotent)
