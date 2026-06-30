@@ -63,6 +63,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "KOT & Bill Printers", href: "/dine-in/offline-print",    icon: Printer },
       { kind: "link", label: "Captain (Tablet)",   href: "/captain",                   icon: Smartphone },
       { kind: "link", label: "Print Agent",        href: "/print/agent",               icon: Printer },
+      { kind: "link", label: "KOT Data Points",    href: "/dine-in/kot-analytics",     icon: BarChart3 },
       { kind: "link", label: "Tables",             href: "/dine-in/tables",            icon: Utensils },
       { kind: "link", label: "Menu Items",         href: "/menu-items",                icon: BookOpen },
       { kind: "link", label: "Recipes",            href: "/recipes",                   icon: ChefHat },
