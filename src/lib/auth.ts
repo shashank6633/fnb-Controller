@@ -123,6 +123,43 @@ export function canApproveAsMgmt(user: SessionUser): boolean {
   return user.role === 'admin';
 }
 
+/** Who may authorize table operations (transfer / merge): Cashier, any Manager, or Admin. */
+export function canApproveTableOp(user: { role?: string; role_name?: string | null } | null): boolean {
+  if (!user) return false;
+  return user.role === 'admin' || user.role === 'manager' || user.role_name === 'Cashier';
+}
+
+/**
+ * Verify an approver's login (email + password) for an on-the-spot manager/cashier
+ * override. Returns the resolved user (with effective tier + role_name) if the
+ * credentials are valid, else null. The caller still checks canApproveTableOp().
+ */
+export async function verifyApprover(email: string, password: string): Promise<SessionUser | null> {
+  if (!email || !password) return null;
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT u.id, u.email, u.name, u.role, u.position, u.department_id, u.password_hash,
+           u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids, u.role_id,
+           r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
+           r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store
+    FROM users u LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
+    WHERE lower(u.email) = lower(?) AND u.is_active = 1
+  `).get(email) as any;
+  if (!row) return null;
+  if (!(await verifyPassword(password, row.password_hash))) return null;
+  const hasRole = !!row.role_id && !!row.role_base;
+  return {
+    id: row.id, email: row.email, name: row.name,
+    role: ((hasRole ? row.role_base : row.role) as UserRole) || 'staff',
+    role_id: row.role_id || null, role_name: row.role_name || null,
+    position: row.position || '', department_id: row.department_id || null,
+    is_head_chef: !!row.is_head_chef || (hasRole && !!row.role_head_chef),
+    is_store_manager: !!row.is_store_manager || (hasRole && !!row.role_store),
+    page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
+    visible_department_ids: row.visible_department_ids || null,
+  };
+}
+
 /** Server-side role check used by gated API routes. */
 export async function requireRole(role: 'admin' | 'manager'): Promise<{ ok: true; user: SessionUser } | { ok: false; status: number; message: string }> {
   const user = await getCurrentUser();

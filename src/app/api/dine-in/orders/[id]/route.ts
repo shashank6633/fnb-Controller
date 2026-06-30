@@ -1,5 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
+import { getCurrentUser, canApproveTableOp, verifyApprover } from '@/lib/auth';
 import { emitKds } from '@/lib/kds-bus';
 import type Database from 'better-sqlite3';
 
@@ -26,7 +26,14 @@ function loadOrder(db: Database.Database, id: string) {
     LEFT JOIN restaurant_tables t ON o.table_id = t.id WHERE o.id = ?
   `).get(id) as any;
   if (!order) return null;
-  const items = db.prepare('SELECT * FROM order_items WHERE order_id = ? ORDER BY created_at ASC').all(id);
+  // Join the KOT so the captain can see each item's kitchen state
+  // (pending → new/preparing/ready/served).
+  const items = db.prepare(`
+    SELECT oi.*, k.status AS kot_status
+    FROM order_items oi
+    LEFT JOIN kots k ON k.id = oi.kot_id
+    WHERE oi.order_id = ? ORDER BY oi.created_at ASC
+  `).all(id);
   return { ...order, items };
 }
 
@@ -59,6 +66,25 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
 
     const b = await req.json();
     const action = b.action;
+
+    // Transfer + Merge are supervised: a Cashier/Manager/Admin must authorize.
+    // If the signed-in captain can't, they pass an approver's login for an
+    // on-the-spot override; we verify it server-side and record who approved.
+    let approvedBy: string | null = null;
+    if (action === 'transfer' || action === 'merge') {
+      if (canApproveTableOp(me)) {
+        approvedBy = me.email;
+      } else {
+        const approver = await verifyApprover(b.approver_email, b.approver_password);
+        if (!approver || !canApproveTableOp(approver)) {
+          return Response.json(
+            { error: 'A Cashier or Manager must approve this. Enter their login to continue.', needs_approval: true },
+            { status: 403 },
+          );
+        }
+        approvedBy = approver.email;
+      }
+    }
 
     const firedKots: any[] = [];   // populated by 'fire', emitted after commit
     const run = db.transaction(() => {
@@ -150,6 +176,31 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                  b.discount === undefined ? order.discount : Math.max(0, Number(b.discount) || 0),
                  b.notes === undefined ? order.notes : String(b.notes), id);
           break;
+        case 'transfer': {
+          // Move this open order to a different (free) table. Authorization was
+          // already checked above (approvedBy is set).
+          const targetId = b.target_table_id;
+          if (!targetId) throw new Error('Pick a table to move to');
+          const target = db.prepare('SELECT id, table_number FROM restaurant_tables WHERE id = ? AND is_active = 1').get(targetId) as any;
+          if (!target) throw new Error('Target table not found');
+          if (targetId === order.table_id) throw new Error('Order is already on that table');
+          const busy = db.prepare("SELECT id FROM orders WHERE table_id = ? AND status = 'open' AND id != ?").get(targetId, id);
+          if (busy) throw new Error('That table already has an open order — use Merge instead');
+          db.prepare(`UPDATE orders SET table_id = ?, updated_at = datetime('now') WHERE id = ?`).run(targetId, id);
+          break;
+        }
+        case 'merge': {
+          // Pull another open order's items (and KOTs) into this one, then close
+          // the source. Authorization already checked above.
+          const srcId = b.source_order_id;
+          if (!srcId || srcId === id) throw new Error('Pick another table to merge in');
+          const src = db.prepare("SELECT * FROM orders WHERE id = ? AND status = 'open'").get(srcId) as any;
+          if (!src) throw new Error('That order is not open');
+          db.prepare('UPDATE order_items SET order_id = ? WHERE order_id = ?').run(id, srcId);
+          db.prepare('UPDATE kots SET order_id = ? WHERE order_id = ?').run(id, srcId);
+          db.prepare(`UPDATE orders SET status = 'merged', settled_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(srcId);
+          break;
+        }
         default:
           throw new Error(`Unknown action: ${action}`);
       }
@@ -162,7 +213,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
 
     // fired_kots lets the client print each KOT via the local bridge (offline
     // printing). Empty for non-fire actions; existing callers ignore it.
-    return Response.json({ order: loadOrder(db, id), fired_kots: firedKots });
+    return Response.json({ order: loadOrder(db, id), fired_kots: firedKots, approved_by: approvedBy });
   } catch (e: any) {
     console.error('[/api/dine-in/orders/[id] PATCH]', e);
     return Response.json({ error: e.message }, { status: 400 });

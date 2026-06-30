@@ -5,10 +5,22 @@ import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
+  ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2,
 } from 'lucide-react';
 
 interface MenuItem { id: string; name: string; category: string; station: string; item_type: string; dietary_tag: string; selling_price: number; is_active: number; recipe_id: string | null; }
-interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; notes: string; }
+interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; notes: string; kot_status?: string | null; }
+interface TableLite { id: string; table_number: string; zone: string; open_order_id: string | null; open_order_number: number | null; open_order_total: number | null; }
+
+// Per-item kitchen state badge from order_items.status + the KOT status.
+function itemState(it: OrderItem): { label: string; cls: string; Icon: any } | null {
+  if (it.status === 'pending') return { label: 'New', cls: 'text-[#8B7355] bg-[#FFF1E3]', Icon: Plus };
+  const k = it.kot_status;
+  if (k === 'ready') return { label: 'Ready', cls: 'text-green-700 bg-green-100', Icon: CheckCircle2 };
+  if (k === 'preparing') return { label: 'Cooking', cls: 'text-amber-700 bg-amber-100', Icon: Flame };
+  if (k === 'served') return { label: 'Served', cls: 'text-[#6B5744] bg-gray-100', Icon: CheckCircle2 };
+  return { label: 'Sent', cls: 'text-blue-700 bg-blue-100', Icon: ChefHat };
+}
 interface Order {
   id: string; order_number: number; status: string; order_type: string;
   table_number: string | null; zone: string | null;
@@ -111,6 +123,39 @@ export default function CaptainOrder() {
     } finally { setFiring(false); }
   }
 
+  // ── Table actions (move / merge) with Cashier/Manager approval ──────────────
+  const [tableAction, setTableAction] = useState<'move' | 'merge' | null>(null);
+  const [tablesList, setTablesList] = useState<TableLite[]>([]);
+  const [targetId, setTargetId] = useState<string>('');
+  const [appEmail, setAppEmail] = useState('');
+  const [appPass, setAppPass] = useState('');
+  const [needsApproval, setNeedsApproval] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
+  const [actionErr, setActionErr] = useState<string | null>(null);
+
+  async function openTableAction(mode: 'move' | 'merge') {
+    setTableAction(mode); setTargetId(''); setAppEmail(''); setAppPass(''); setNeedsApproval(false); setActionErr(null);
+    try { const r = await api('/api/dine-in/tables'); const j = await r.json(); setTablesList(j.items || []); } catch {}
+  }
+
+  async function doTableAction() {
+    if (!tableAction || !targetId) { setActionErr('Pick a table'); return; }
+    setActionBusy(true); setActionErr(null);
+    try {
+      const body: any = tableAction === 'move'
+        ? { action: 'transfer', target_table_id: targetId }
+        : { action: 'merge', source_order_id: targetId };
+      if (needsApproval) { body.approver_email = appEmail; body.approver_password = appPass; }
+      const r = await api(`/api/dine-in/orders/${id}`, { method: 'PATCH', body });
+      const j = await r.json();
+      if (r.status === 403 && j.needs_approval) { setNeedsApproval(true); setActionErr('A Cashier or Manager must approve — enter their login.'); return; }
+      if (j.error) { setActionErr(j.error); return; }
+      if (j.order) setOrder(j.order);
+      setTableAction(null);
+      flash(tableAction === 'move' ? 'Table moved ✓' : 'Tables merged ✓');
+    } finally { setActionBusy(false); }
+  }
+
   // Ask the counter print-agent to print the bill (tablet can't reach the bridge).
   async function printBillNow() {
     setPrintingBill(true);
@@ -143,6 +188,10 @@ export default function CaptainOrder() {
           <p className="font-bold leading-tight">{order.table_number ? `Table ${order.table_number}` : 'Takeaway'} · #{order.order_number}</p>
           <p className="text-[11px] text-white/60 leading-tight">{order.zone || order.order_type}{order.status !== 'open' ? ` · ${order.status}` : ''}</p>
         </div>
+        {order.status === 'open' && order.table_number && (
+          <button onClick={() => openTableAction('move')} title="Move / merge table"
+            className="p-2 text-white/70 hover:text-white active:scale-95"><ArrowLeftRight className="w-5 h-5" /></button>
+        )}
         <div className="text-right">
           <p className="text-[10px] text-white/60 leading-none">Total</p>
           <p className="font-extrabold text-[#FF8A4C]">₹{Math.round(order.total)}</p>
@@ -209,8 +258,10 @@ export default function CaptainOrder() {
               <div key={it.id} className="bg-white border border-[#E8D5C4] rounded-xl px-3 py-2.5 mb-2">
                 <div className="flex items-start gap-2">
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-[#2D1B0E]">{it.name}
-                      {it.status === 'fired' && <span className="ml-2 text-[10px] text-green-600 font-semibold">· SENT</span>}</p>
+                    <p className="font-medium text-[#2D1B0E] flex items-center gap-2 flex-wrap">
+                      <span>{it.name}</span>
+                      {(() => { const s = itemState(it); return s ? <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${s.cls}`}><s.Icon className="w-3 h-3" />{s.label}</span> : null; })()}
+                    </p>
                     {it.notes && <p className="text-[11px] text-[#af4408] mt-0.5">{it.notes}</p>}
                   </div>
                   <p className="font-semibold text-[#2D1B0E]">₹{Math.round(it.line_total)}</p>
@@ -300,6 +351,65 @@ export default function CaptainOrder() {
                 {pending === 'add' ? <Loader2 className="w-5 h-5 animate-spin" /> : <Plus className="w-5 h-5" />} Add · ₹{sheet.selling_price * mQty}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Move / Merge table sheet */}
+      {tableAction && (
+        <div className="fixed inset-0 z-40 flex items-end" onClick={() => setTableAction(null)}>
+          <div className="absolute inset-0 bg-black/40" />
+          <div onClick={(e) => e.stopPropagation()} className="relative w-full max-w-3xl mx-auto bg-white rounded-t-3xl p-4 pb-6 max-h-[85vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-3">
+              <p className="font-bold text-lg text-[#2D1B0E]">Table actions</p>
+              <button onClick={() => setTableAction(null)} className="p-1"><X className="w-5 h-5 text-[#8B7355]" /></button>
+            </div>
+            <div className="flex bg-[#FFF1E3] rounded-lg p-0.5 text-sm mb-3">
+              {(['move', 'merge'] as const).map((m) => (
+                <button key={m} onClick={() => { setTableAction(m); setTargetId(''); setNeedsApproval(false); setActionErr(null); }}
+                  className={`flex-1 py-2 rounded-md font-medium ${tableAction === m ? 'bg-[#af4408] text-white' : 'text-[#6B5744]'}`}>
+                  {m === 'move' ? 'Move to free table' : 'Merge another table'}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-[#8B7355] mb-2">
+              {tableAction === 'move' ? 'Pick an empty table to move this order to.' : 'Pick another open table to merge into this one (that table then closes).'}
+            </p>
+            {(() => {
+              const opts = tableAction === 'move'
+                ? tablesList.filter((t) => !t.open_order_id)
+                : tablesList.filter((t) => t.open_order_id && t.open_order_id !== id);
+              if (opts.length === 0) return <p className="text-center text-sm text-[#8B7355] py-4">{tableAction === 'move' ? 'No free tables available' : 'No other open tables'}</p>;
+              return (
+                <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 mb-3">
+                  {opts.map((t) => {
+                    const val = tableAction === 'move' ? t.id : (t.open_order_id as string);
+                    return (
+                      <button key={t.id} onClick={() => setTargetId(val)}
+                        className={`rounded-xl p-3 border text-center ${targetId === val ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-[#FFF1E3] border-[#E8D5C4] text-[#2D1B0E]'}`}>
+                        <p className="font-bold leading-none">{t.table_number}</p>
+                        <p className="text-[10px] opacity-80 mt-1 leading-none">{t.zone || 'Floor'}{t.open_order_id ? ` · ₹${Math.round(t.open_order_total || 0)}` : ''}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+            {needsApproval && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-3 space-y-2">
+                <p className="text-xs font-semibold text-amber-800">Cashier / Manager approval required</p>
+                <input value={appEmail} onChange={(e) => setAppEmail(e.target.value)} placeholder="Approver email"
+                  className="w-full border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+                <input type="password" value={appPass} onChange={(e) => setAppPass(e.target.value)} placeholder="Approver password"
+                  className="w-full border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+              </div>
+            )}
+            {actionErr && <p className="text-sm text-red-600 mb-2">{actionErr}</p>}
+            <button onClick={doTableAction} disabled={actionBusy || !targetId}
+              className="w-full flex items-center justify-center gap-2 bg-[#af4408] text-white py-3 rounded-xl font-bold active:scale-95 disabled:opacity-50">
+              {actionBusy ? <Loader2 className="w-5 h-5 animate-spin" /> : tableAction === 'move' ? <ArrowLeftRight className="w-5 h-5" /> : <GitMerge className="w-5 h-5" />}
+              {tableAction === 'move' ? 'Move order here' : 'Merge into this table'}
+            </button>
           </div>
         </div>
       )}

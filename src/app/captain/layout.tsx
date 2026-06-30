@@ -26,10 +26,12 @@ export const viewport: Viewport = {
   userScalable: false,
 };
 
+import CaptainShell from './CaptainShell';
+
 export default function CaptainLayout({ children }: { children: React.ReactNode }) {
   return (
     <div className="min-h-screen bg-[#FBF6F0] text-[#2D1B0E] select-none">
-      <div className="mx-auto w-full max-w-3xl min-h-screen flex flex-col">{children}</div>
+      <CaptainShell>{children}</CaptainShell>
     </div>
   );
 }
