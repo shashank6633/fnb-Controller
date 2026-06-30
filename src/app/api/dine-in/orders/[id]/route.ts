@@ -97,7 +97,14 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
           db.prepare("DELETE FROM order_items WHERE id = ? AND order_id = ? AND status = 'pending'").run(b.item_id, id);
           break;
         case 'fire': {
-          const pending = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status = 'pending'").all(id) as any[];
+          // Pull item_type from the menu so the expediter copy can keep the Main
+          // KITCHEN strictly food and the Main BAR strictly drinks, regardless of
+          // how a station printer's Group is set.
+          const pending = db.prepare(`
+            SELECT oi.*, mi.item_type AS item_type
+            FROM order_items oi LEFT JOIN menu_items mi ON oi.menu_item_id = mi.id
+            WHERE oi.order_id = ? AND oi.status = 'pending'
+          `).all(id) as any[];
           if (pending.length === 0) throw new Error('No new items to send to the kitchen');
           const tableRow = order.table_id
             ? db.prepare('SELECT table_number, zone FROM restaurant_tables WHERE id = ?').get(order.table_id) as any
@@ -124,7 +131,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
               id: kotId, outlet_id: order.outlet_id, order_id: id, kot_number: seq.n, station, status: 'new',
               order_number: order.order_number, order_type: order.order_type,
               table_number: tableRow?.table_number || null, zone: tableRow?.zone || null,
-              items: its.map((x) => ({ name: x.name, quantity: x.quantity, notes: x.notes })),
+              items: its.map((x) => ({ name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),
             });
           }
           // TODO Phase 2.1: socket-print each fired KOT to its station's LAN ESC/POS printer here.

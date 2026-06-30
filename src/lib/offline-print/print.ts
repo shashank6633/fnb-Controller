@@ -53,7 +53,7 @@ function targetOf(s: PrintStation): PrinterTarget {
 export interface FiredKot {
   id: string; station: string; kot_number?: number;
   order_number?: number | string; order_type?: string; table_number?: string | null;
-  items: Array<{ name: string; quantity: number; notes?: string }>;
+  items: Array<{ name: string; quantity: number; notes?: string; item_type?: string }>;
 }
 
 export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
@@ -86,12 +86,16 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       });
     }
     // For the expediter ticket: tag each item with its station so the kitchen
-    // counter can cross-check what each sub-station should send out.
-    const kind = st.kind === 'bar' ? 'bar' : 'food';
+    // counter can cross-check what each sub-station should send out. Classify
+    // each item food/bar by its MENU item_type (foods → food; liquors/beverages
+    // → bar) so the Main Kitchen stays strictly food even if a station printer's
+    // Group is mis-set; fall back to the station printer's kind if unknown.
+    const stationKind = st.kind === 'bar' ? 'bar' : 'food';
     const label = (k.station || st.name || '').toUpperCase();
-    (byKind[kind] ||= []).push(...(k.items || []).map((it) => ({
-      qty: it.quantity, name: label ? `[${label}] ${it.name}` : it.name, notes: it.notes || undefined,
-    })));
+    for (const it of (k.items || [])) {
+      const kind = it.item_type ? (it.item_type === 'foods' ? 'food' : 'bar') : stationKind;
+      (byKind[kind] ||= []).push({ qty: it.quantity, name: label ? `[${label}] ${it.name}` : it.name, notes: it.notes || undefined });
+    }
   }
 
   // MASTER / expediter: one consolidated ticket of all fired items of a kind,
