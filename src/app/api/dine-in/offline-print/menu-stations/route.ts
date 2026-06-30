@@ -45,7 +45,16 @@ export async function GET() {
     });
 
     const unmapped = stations.filter((s) => !s.has_printer).length;
-    return Response.json({ stations, unmapped });
+
+    // Distinct table zones (= floors) so the printer Floor field can be a
+    // dropdown that always matches a real table zone (no typos / mismatches).
+    const zones = (db.prepare(
+      `SELECT DISTINCT TRIM(zone) AS zone FROM restaurant_tables
+       WHERE TRIM(COALESCE(zone, '')) <> '' AND (outlet_id = ? OR outlet_id IS NULL)
+       ORDER BY zone`
+    ).all(outletId) as any[]).map((r) => r.zone);
+
+    return Response.json({ stations, unmapped, zones });
   } catch (e: any) {
     console.error('[/api/dine-in/offline-print/menu-stations]', e);
     return Response.json({ error: e.message }, { status: 500 });

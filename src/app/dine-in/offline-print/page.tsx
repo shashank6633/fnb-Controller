@@ -47,6 +47,7 @@ export default function OfflinePrintPage() {
   const [pstatus, setPstatus] = useState<Record<string, PrinterStatus | null>>({});
   const [checkingPrinters, setCheckingPrinters] = useState(false);
   const [menuStations, setMenuStations] = useState<{ station: string; item_count: number; has_printer: boolean; printer_id: string | null; printer_name: string | null; kind: string; mirror: boolean }[]>([]);
+  const [tableZones, setTableZones] = useState<string[]>([]);
   const [toast, setToast] = useState<{ ok: boolean; msg: string } | null>(null);
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 4000); };
@@ -61,7 +62,7 @@ export default function OfflinePrintPage() {
   }, []);
   const loadMenuStations = useCallback(async () => {
     const r = await api('/api/dine-in/offline-print/menu-stations');
-    if (r.ok) setMenuStations((await r.json()).stations || []);
+    if (r.ok) { const j = await r.json(); setMenuStations(j.stations || []); setTableZones(j.zones || []); }
   }, []);
   const toggleMirror = async (printerId: string, next: boolean) => {
     await api(`/api/dine-in/offline-print/stations/${printerId}`, { method: 'PATCH', body: { mirror_to_master: next } });
@@ -362,8 +363,12 @@ export default function OfflinePrintPage() {
                   <option value={32}>58mm</option>
                 </select>
               </label>
-              <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Floor / zone (optional)
-                <input value={form.floor} onChange={(e) => setForm({ ...form, floor: e.target.value })} placeholder="Ground / 1 / Rooftop" className={inputCls} />
+              <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Floor (from your table zones)
+                <select value={form.floor} onChange={(e) => setForm({ ...form, floor: e.target.value })} className={inputCls}>
+                  <option value="">All floors / none</option>
+                  {tableZones.map((z) => <option key={z} value={z}>{z}</option>)}
+                  {form.floor && !tableZones.includes(form.floor) && <option value={form.floor}>{form.floor} (not a table zone)</option>}
+                </select>
               </label>
               <label className="flex flex-col gap-1 text-xs text-[#8B7355]">Backup printer (optional, IP)
                 <input value={form.backup_target} onChange={(e) => setForm({ ...form, backup_target: e.target.value })} placeholder="192.168.1.51:9100 — used if primary is down" className={inputCls} />
