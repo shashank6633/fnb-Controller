@@ -17,14 +17,18 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
 
           script: |
+            set -e                                   # abort on any error — never restart on a failed build
             cd /var/www/fnb-controller
 
             git pull origin main
 
             npm install
 
-            npm run build
+            # Clear any stale/root-owned .next so `next build` can clean it
+            # (a leftover root-owned file here caused an EACCES build failure → 502).
+            sudo rm -rf .next
 
-            sudo pm2 restart fnb-controller
+            npm run build                            # if this fails, set -e stops here (no broken restart)
 
+            sudo pm2 restart fnb-controller --update-env
             sudo pm2 save
