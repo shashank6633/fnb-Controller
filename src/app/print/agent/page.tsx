@@ -14,7 +14,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { printFiredKots, printBill } from '@/lib/offline-print/print';
 import { probeBridge, getBridgeUrl, setBridgeUrl, type BridgeHealth } from '@/lib/offline-print/bridge-client';
 import { ensureDrainLoop, drainOutbox, counts, retryFailed, prunePrinted } from '@/lib/offline-print/outbox';
-import { Printer, Wifi, WifiOff, CheckCircle2, AlertTriangle, RefreshCw, Receipt, ChefHat, Settings } from 'lucide-react';
+import { Printer, Wifi, WifiOff, CheckCircle2, AlertTriangle, RefreshCw, Receipt, ChefHat, Settings, ArrowLeft } from 'lucide-react';
 
 interface LogRow { id: string; at: string; kind: 'KOT' | 'BILL'; label: string; detail: string; }
 
@@ -93,7 +93,12 @@ export default function PrintAgent() {
               <p className="text-[11px] text-white/50 leading-tight">Keep open on the counter PC — prints captain KOTs &amp; bills</p>
             </div>
           </div>
-          <button onClick={() => setShowCfg((s) => !s)} className="p-2 text-white/60 hover:text-white"><Settings className="w-5 h-5" /></button>
+          <div className="flex items-center gap-1">
+            <a href="/" className="flex items-center gap-1.5 px-3 py-2 text-sm text-white/70 hover:text-white hover:bg-white/10 rounded-lg">
+              <ArrowLeft className="w-4 h-4" /> Back to app
+            </a>
+            <button onClick={() => setShowCfg((s) => !s)} className="p-2 text-white/60 hover:text-white"><Settings className="w-5 h-5" /></button>
+          </div>
         </header>
 
         {/* Status cards */}
