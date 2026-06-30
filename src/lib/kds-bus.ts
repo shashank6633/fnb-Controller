@@ -17,10 +17,11 @@ declare global {
 const CHANNEL = 'kds';
 
 export interface KdsEvent {
-  type: 'kot.new' | 'kot.bumped';
+  type: 'kot.new' | 'kot.bumped' | 'bill.print';
   outlet_id: string | null;
   station: string;
-  kot: any;            // the KOT row (+ items/order context for kot.new)
+  kot?: any;           // the KOT row (+ items/order context for kot.new / kot.bumped)
+  bill?: any;          // the bill payload (BillOrder shape) for bill.print
 }
 
 function getEmitter(): EventEmitter {

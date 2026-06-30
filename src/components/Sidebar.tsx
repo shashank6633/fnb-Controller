@@ -35,6 +35,7 @@ import {
   Boxes,
   Scissors,
   Printer,
+  Smartphone,
   type LucideIcon,
 } from "lucide-react";
 
@@ -60,6 +61,8 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Order Floor",        href: "/dine-in/floor",             icon: ShoppingCart },
       { kind: "link", label: "Kitchen Display",    href: "/dine-in/kitchen",           icon: ChefHat },
       { kind: "link", label: "KOT & Bill Printers", href: "/dine-in/offline-print",    icon: Printer },
+      { kind: "link", label: "Captain (Tablet)",   href: "/captain",                   icon: Smartphone },
+      { kind: "link", label: "Print Agent",        href: "/print/agent",               icon: Printer },
       { kind: "link", label: "Tables",             href: "/dine-in/tables",            icon: Utensils },
       { kind: "link", label: "Menu Items",         href: "/menu-items",                icon: BookOpen },
       { kind: "link", label: "Recipes",            href: "/recipes",                   icon: ChefHat },

@@ -6,8 +6,9 @@ import MobileTopBar from '@/components/MobileTopBar';
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  // Login + print pages render full-screen without sidebar/userbar chrome.
-  const bare = pathname === '/login' || pathname.includes('/print');
+  // Login, print, and the mobile Captain app render full-screen (no desktop
+  // sidebar/userbar chrome) — the Captain app has its own touch-first shell.
+  const bare = pathname === '/login' || pathname.includes('/print') || pathname.startsWith('/captain');
 
   if (bare) return <>{children}</>;
 

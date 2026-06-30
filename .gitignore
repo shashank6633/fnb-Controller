@@ -79,3 +79,17 @@ Thumbs.db
 .vscode/*
 !.vscode/settings.json.example
 /aws-migration/
+
+# ── Captain Android (TWA) build ───────────────────────────────────────────
+# NEVER commit the signing keystore or its password — losing/leaking it means
+# you can't ship app updates and anyone could sign as you.
+captain-android/android.keystore
+captain-android/KEYSTORE_README.txt
+# Build outputs (large binaries; distribute the APK out-of-band, not via git)
+captain-android/*.apk
+captain-android/*.aab
+captain-android/app/build/
+captain-android/.gradle/
+captain-android/build/
+captain-android/*.idsig
+captain-android/local.properties

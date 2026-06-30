@@ -68,18 +68,25 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
           if (!mi) throw new Error('Menu item not found');
           if (!(mi.selling_price > 0)) throw new Error(`"${mi.name}" has no price — set it on the Menu Items page first`);
           const qty = Number(b.quantity) > 0 ? Number(b.quantity) : 1;
-          // If the same item already exists on the order, bump its quantity.
-          const existing = db.prepare('SELECT * FROM order_items WHERE order_id = ? AND menu_item_id = ?').get(id, mi.id) as any;
+          // notes carries the captain's modifiers + cooking instructions (e.g.
+          // "Less spicy · Extra gravy · No onion"). Merge only an identical
+          // PENDING line (same item AND same notes) so two of the same dish with
+          // different modifiers stay separate. Desktop callers send no notes →
+          // behave as before (merge by item).
+          const notes = String(b.notes || '').trim();
+          const existing = db.prepare(
+            "SELECT * FROM order_items WHERE order_id = ? AND menu_item_id = ? AND COALESCE(notes,'') = ? AND status = 'pending'"
+          ).get(id, mi.id, notes) as any;
           if (existing) {
             const newQty = existing.quantity + qty;
             db.prepare('UPDATE order_items SET quantity = ?, line_total = ? WHERE id = ?')
               .run(newQty, Math.round(existing.unit_price * newQty * 100) / 100, existing.id);
           } else {
             db.prepare(`
-              INSERT INTO order_items (id, order_id, menu_item_id, recipe_id, name, station, quantity, unit_price, tax_value, line_total, status, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))
+              INSERT INTO order_items (id, order_id, menu_item_id, recipe_id, name, station, quantity, unit_price, tax_value, line_total, status, notes, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, datetime('now'))
             `).run(generateId(), id, mi.id, mi.recipe_id || null, mi.name, mi.station || '', qty,
-                   mi.selling_price, mi.tax_value || 0, Math.round(mi.selling_price * qty * 100) / 100);
+                   mi.selling_price, mi.tax_value || 0, Math.round(mi.selling_price * qty * 100) / 100, notes);
           }
           break;
         }

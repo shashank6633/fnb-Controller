@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.akanhyd.fnb.captainapp",
+      "sha256_cert_fingerprints": [
+        "2E:8C:6F:16:22:9A:FF:E2:C1:AE:CB:04:42:4C:DA:64:E4:45:C8:FB:03:C8:F0:AC:12:67:8B:B6:60:F2:F5:48"
+      ]
+    }
+  }
+]
