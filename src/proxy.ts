@@ -120,11 +120,20 @@ export function proxy(req: NextRequest) {
   if (!isApi) {
     try {
       const db = getDb();
-      const user = db.prepare(`
-        SELECT u.role, u.page_access
+      // Resolve the EFFECTIVE tier + page set from the assigned named role (if any),
+      // mirroring getCurrentUser(): a role-based user's page_access lives on the
+      // role, not the user row — read it here or page gating fails open.
+      const row = db.prepare(`
+        SELECT u.role, u.page_access, u.role_id,
+               r.base_role AS role_base, r.page_access AS role_page_access
         FROM sessions s JOIN users u ON u.id = s.user_id
+        LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
         WHERE s.token = ? AND u.is_active = 1 AND s.expires_at > datetime('now')
-      `).get(session) as { role?: string; page_access?: string | null } | undefined;
+      `).get(session) as any;
+      const user = row ? {
+        role: (row.role_id && row.role_base) ? row.role_base : row.role,
+        page_access: row.page_access != null ? row.page_access : (row.role_id ? (row.role_page_access ?? null) : null),
+      } : undefined;
       if (user && !canAccessPage(pathname, user)) {
         // Dashboard `/` is no longer ALWAYS_ALLOWED — so a user without
         // dashboard access who hits `/` would be told to go to... `/` again,

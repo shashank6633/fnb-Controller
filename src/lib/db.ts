@@ -1198,6 +1198,54 @@ function initializeSchema(db: Database.Database) {
     if (!has('visible_department_ids')) db.exec(`ALTER TABLE users ADD COLUMN visible_department_ids TEXT`);
   } catch (e) { console.error('users role-flags migration failed:', e); }
 
+  // ── Named roles (Floor Manager, Captain, Cashier, Bar Manager …) ───────────
+  // A role bundles a privilege TIER (base_role: admin|manager|staff — drives the
+  // existing API permission gates) with a default page-access set. Assigning a
+  // role to a user (users.role_id) drives both; a per-user page_access still
+  // overrides the role default. getCurrentUser() resolves the effective tier +
+  // pages, so no enforcement site needs to change. is_system roles can't be
+  // deleted. Seeded once, idempotent by unique name; admins edit them in the UI.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS roles (
+        id               TEXT PRIMARY KEY,
+        name             TEXT NOT NULL UNIQUE,
+        base_role        TEXT NOT NULL DEFAULT 'staff',   -- admin | manager | staff
+        page_access      TEXT,                            -- JSON array of paths; NULL = all pages
+        is_head_chef     INTEGER NOT NULL DEFAULT 0,
+        is_store_manager INTEGER NOT NULL DEFAULT 0,
+        is_system        INTEGER NOT NULL DEFAULT 0,
+        is_active        INTEGER NOT NULL DEFAULT 1,
+        sort_order       INTEGER NOT NULL DEFAULT 0,
+        description      TEXT DEFAULT '',
+        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_roles_active ON roles(is_active);
+    `);
+    const ucols = db.prepare("PRAGMA table_info(users)").all() as any[];
+    if (!ucols.some((c: any) => c.name === 'role_id')) db.exec(`ALTER TABLE users ADD COLUMN role_id TEXT`);
+
+    const seedRole = db.prepare(`
+      INSERT OR IGNORE INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, is_system, sort_order, description)
+      VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const J = (a: string[]) => JSON.stringify(a);
+    // [name, base_role, page_access(JSON|null), is_head_chef, is_store_manager, is_system, sort_order, description]
+    const seeds: Array<[string, string, string | null, number, number, number, number, string]> = [
+      ['Administrator', 'admin',   null, 0, 0, 1, 0, 'Full access to everything'],
+      ['Manager',       'manager', null, 0, 0, 1, 1, 'Full access; runs operations'],
+      ['Staff',         'staff',   J(['/requisitions']), 0, 0, 1, 2, 'Raises requisitions only'],
+      ['Floor Manager', 'manager', J(['/', '/dine-in/floor', '/dine-in/tables', '/dine-in/kitchen', '/dine-in/order', '/dine-in/reconciliation', '/captain', '/print/agent', '/reports']), 0, 0, 0, 10, 'Runs the dining floor'],
+      ['Captain',       'staff',   J(['/captain']), 0, 0, 0, 11, 'Takes table orders on a tablet'],
+      ['Cashier',       'staff',   J(['/dine-in/floor', '/dine-in/tables', '/dine-in/order', '/captain']), 0, 0, 0, 12, 'Takes orders and settles bills'],
+      ['Bar Manager',   'manager', J(['/dine-in/floor', '/dine-in/tables', '/dine-in/kitchen', '/dine-in/offline-print', '/print/agent', '/reports']), 0, 0, 0, 13, 'Runs the bar and its printers'],
+      ['Head Chef',     'manager', J(['/dine-in/kitchen', '/requisitions', '/menu-items', '/recipes', '/department-consumption']), 1, 0, 0, 14, 'Runs the kitchen; approves requisitions'],
+      ['Store Manager', 'manager', J(['/store-dashboard', '/store-requisitions', '/purchases', '/purchase-orders', '/grn', '/inventory', '/closing-stock', '/wastage', '/departments', '/vendors']), 0, 1, 0, 15, 'Runs the store; issues inventory'],
+    ];
+    for (const s of seeds) seedRole.run(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+  } catch (e) { console.error('roles schema/seed migration failed:', e); }
+
   // Mark the linked_po_id column on purchase_orders so we can navigate from PO → Requisition
   try {
     const cols = db.prepare("PRAGMA table_info(purchase_orders)").all() as any[];

@@ -9,6 +9,9 @@ type UserRole = 'admin' | 'manager' | 'staff';
 interface AppUser {
   id: string; email: string; name: string;
   role: UserRole;
+  /** Assigned named role (roles table) + its display name. */
+  role_id?: string | null;
+  role_name?: string | null;
   position?: string;
   is_active: number;
   department_id?: string | null;
@@ -22,6 +25,7 @@ interface AppUser {
   last_login_at?: string; created_at?: string;
 }
 interface Department { id: string; name: string; code?: string; is_active: number; }
+interface Role { id: string; name: string; base_role: UserRole; is_head_chef: number; is_store_manager: number; description?: string; }
 
 /**
  * Position templates — picking one auto-suggests the approval flags.
@@ -77,6 +81,7 @@ export default function UsersPage() {
   const router = useRouter();
   const [list, setList] = useState<AppUser[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
+  const [roles, setRoles] = useState<Role[]>([]);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<Partial<AppUser> & { password?: string } | null>(null);
   const [me, setMe] = useState<AppUser | null>(null);
@@ -91,9 +96,10 @@ export default function UsersPage() {
       setLoading(false);
       return;
     }
-    const [r, dRes] = await Promise.all([
+    const [r, dRes, roleRes] = await Promise.all([
       fetch('/api/auth/users'),
       fetch('/api/departments').then(r => r.json()).catch(() => ({ departments: [] })),
+      fetch('/api/auth/roles').then(r => r.ok ? r.json() : { roles: [] }).catch(() => ({ roles: [] })),
     ]);
     if (r.ok) {
       const d = await r.json();
@@ -102,6 +108,7 @@ export default function UsersPage() {
       setError((await r.json()).error || 'Failed to load users');
     }
     setDepartments((dRes.departments || []).filter((d: Department) => d.is_active));
+    setRoles(roleRes.roles || []);
     setLoading(false);
   };
   useEffect(() => { load(); }, []);
@@ -141,7 +148,7 @@ export default function UsersPage() {
             <p className="text-[#8B7355] text-sm mt-1">Admin can create users and gate Approve actions on Purchase Orders.</p>
           </div>
           <button onClick={() => setEditing({
-            role: 'staff', is_active: 1, name: '', email: '', password: '',
+            role: 'staff', role_id: null, is_active: 1, name: '', email: '', password: '',
             position: '',
             department_id: null, is_head_chef: 0, is_store_manager: 0,
           })}
@@ -178,6 +185,7 @@ export default function UsersPage() {
                         : <span className="text-[#8B7355] italic">—</span>}
                     </td>
                     <td className="py-2 px-3">
+                      {u.role_name && <div className="text-xs font-semibold text-[#2D1B0E] mb-0.5">{u.role_name}</div>}
                       <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
                         u.role === 'admin'   ? 'bg-[#af4408] text-white' :
                         u.role === 'manager' ? 'bg-blue-100 text-blue-700' :
@@ -220,7 +228,7 @@ export default function UsersPage() {
                     <td className="py-2 px-3 text-right">
                       <button onClick={() => setEditing({
                                 id: u.id, name: u.name, email: u.email,
-                                role: u.role, is_active: u.is_active, password: '',
+                                role: u.role, role_id: u.role_id ?? null, is_active: u.is_active, password: '',
                                 position: u.position || '',
                                 department_id: u.department_id ?? null,
                                 is_head_chef: u.is_head_chef ?? 0,
@@ -265,7 +273,9 @@ export default function UsersPage() {
                             // We don't override role=admin (admins are admin regardless of position template).
                             setEditing(prev => ({
                               ...prev!, position: v,
-                              ...(tpl && prev?.role !== 'admin' ? {
+                              // Don't let the position template clobber tier/flags when a
+                              // named role is driving them.
+                              ...(tpl && !prev?.role_id && prev?.role !== 'admin' ? {
                                 role: tpl.defaults.role,
                                 is_head_chef: tpl.defaults.is_head_chef,
                                 is_store_manager: tpl.defaults.is_store_manager,
@@ -283,13 +293,38 @@ export default function UsersPage() {
                   })()}
                 </label>
 
-                <label className="block text-xs text-[#6B5744]">Base Role
-                  <select value={editing.role} onChange={e => setEditing({ ...editing, role: e.target.value as any })}
-                          className="w-full mt-1 px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
+                <label className="block text-xs text-[#6B5744]">Role
+                  <select value={editing.role_id || ''}
+                          onChange={e => {
+                            const rid = e.target.value;
+                            if (!rid) { setEditing({ ...editing, role_id: null }); return; }
+                            const r = roles.find(x => x.id === rid);
+                            if (!r) return;
+                            // A named role drives the tier + flags + (default) pages.
+                            setEditing({ ...editing!, role_id: rid, role: r.base_role,
+                              is_head_chef: r.is_head_chef ? 1 : 0, is_store_manager: r.is_store_manager ? 1 : 0,
+                              page_access: null });
+                          }}
+                          className="w-full mt-1 px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm font-medium">
+                    <option value="">— Custom (set tier + pages manually) —</option>
+                    {roles.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+                  </select>
+                  <span className="block text-[10px] text-[#8B7355] mt-0.5">
+                    {editing.role_id
+                      ? 'This role sets what they can do + which pages they see. Edit roles in Settings → Roles. Per-user page overrides below still apply.'
+                      : 'Pick a named role for a ready preset, or set the tier + pages manually below.'}
+                  </span>
+                </label>
+
+                <label className="block text-xs text-[#6B5744]">Permission tier
+                  <select value={editing.role} disabled={!!editing.role_id}
+                          onChange={e => setEditing({ ...editing, role: e.target.value as any })}
+                          className="w-full mt-1 px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm disabled:opacity-60">
                     <option value="staff">Staff — raises requisitions only</option>
                     <option value="manager">Manager — can be granted approval permissions (Bar Manager, Sous Chef, Ops Mgr…)</option>
                     <option value="admin">Admin — full access, approves vendor POs</option>
                   </select>
+                  {editing.role_id ? <span className="block text-[10px] text-[#8B7355] mt-0.5">Set by the role above.</span> : null}
                 </label>
 
                 <label className="block text-xs text-[#6B5744]">Department
@@ -313,7 +348,7 @@ export default function UsersPage() {
                 <fieldset className="border border-[#E8D5C4] rounded-lg p-3">
                   <legend className="px-1 text-[10px] uppercase tracking-wide text-[#8B7355]">Approval Permissions</legend>
                   <label className="flex items-start gap-2 text-xs text-[#6B5744] py-1">
-                    <input type="checkbox" className="mt-0.5"
+                    <input type="checkbox" className="mt-0.5" disabled={!!editing.role_id}
                            checked={!!editing.is_head_chef}
                            onChange={e => setEditing({ ...editing, is_head_chef: e.target.checked ? 1 : 0 })} />
                     <span>
@@ -326,7 +361,7 @@ export default function UsersPage() {
                     </span>
                   </label>
                   <label className="flex items-start gap-2 text-xs text-[#6B5744] py-1 border-t border-[#E8D5C4]/50">
-                    <input type="checkbox" className="mt-0.5"
+                    <input type="checkbox" className="mt-0.5" disabled={!!editing.role_id}
                            checked={!!editing.is_store_manager}
                            onChange={e => setEditing({ ...editing, is_store_manager: e.target.checked ? 1 : 0 })} />
                     <span>
@@ -423,10 +458,12 @@ function PageAccessSection({ editing, setEditing, departments }: {
   const summary = isAdmin
     ? 'Admin — always has full access (cannot be restricted)'
     : editing.page_access == null
-      ? 'Full access (no map set — sees every page)'
+      ? (editing.role_id
+          ? "Inherits this role's pages (add an override here to customize)"
+          : 'Full access (no map set — sees every page)')
       : currentPages.size === 0
         ? 'No pages granted — user will be locked out except /login'
-        : `${currentPages.size} page${currentPages.size === 1 ? '' : 's'} granted`;
+        : `${currentPages.size} page${currentPages.size === 1 ? '' : 's'} granted (overrides the role)`;
 
   return (
     <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF8F0]">

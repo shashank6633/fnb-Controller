@@ -20,6 +20,10 @@ export interface SessionUser {
    *   - staff   : raises requisitions for their department; cannot approve.
    */
   role: UserRole;
+  /** Assigned named role id (roles table), or null for a legacy per-user role. */
+  role_id: string | null;
+  /** Display name of the assigned role (e.g. "Floor Manager"), or null. */
+  role_name: string | null;
   /** Optional descriptive title (Bar Manager, Sous Chef, Storekeeper, etc.) */
   position: string;
   /** Department staff are tied to a department; null for admin/store/chef who are cross-cutting. */
@@ -65,10 +69,18 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
   const token = c.get(SESSION_COOKIE)?.value;
   if (!token) return null;
   const db = getDb();
+  // LEFT JOIN the assigned named role (if any, and still active) so we can resolve
+  // the EFFECTIVE privilege tier + page set here — every downstream enforcement
+  // site reads these resolved values, so none of them needs to know about roles.
   const row = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.department_id,
-           u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids, s.expires_at
+           u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
+           u.role_id,
+           r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
+           r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
+           s.expires_at
     FROM sessions s JOIN users u ON u.id = s.user_id
+    LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
     WHERE s.token = ? AND u.is_active = 1
   `).get(token) as any;
   if (!row) return null;
@@ -76,14 +88,22 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     destroySession(token);
     return null;
   }
+  const hasRole = !!row.role_id && !!row.role_base;
   return {
     id: row.id, email: row.email, name: row.name,
-    role: (row.role as UserRole) || 'staff',
+    // Tier: the assigned role's base_role wins (kept correct even if the role's
+    // tier was edited after assignment); falls back to the legacy users.role.
+    role: ((hasRole ? row.role_base : row.role) as UserRole) || 'staff',
+    role_id: row.role_id || null,
+    role_name: row.role_name || null,
     position: row.position || '',
     department_id: row.department_id || null,
-    is_head_chef: !!row.is_head_chef,
-    is_store_manager: !!row.is_store_manager,
-    page_access: row.page_access || null,
+    // Flags: union of the user's own flags and the role's flags.
+    is_head_chef: !!row.is_head_chef || (hasRole && !!row.role_head_chef),
+    is_store_manager: !!row.is_store_manager || (hasRole && !!row.role_store),
+    // Pages: a per-user page_access overrides; else inherit the role's set; else
+    // null = full access (backward compat for users without a role or override).
+    page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
     visible_department_ids: row.visible_department_ids || null,
   };
 }

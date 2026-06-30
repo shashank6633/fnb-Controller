@@ -129,6 +129,7 @@ const navTree: NavEntry[] = [
     icon: ShieldAlert,
     items: [
       { kind: "link", label: "Users",          href: "/users",                  icon: Users },
+      { kind: "link", label: "Roles",          href: "/settings/roles",         icon: Users },
       { kind: "link", label: "Categories",     href: "/settings/categories",    icon: Boxes },
       { kind: "link", label: "Page Access",    href: "/settings/page-access",   icon: ShieldAlert },
       { kind: "link", label: "Integrations",   href: "/settings/integrations",  icon: ShieldAlert },
