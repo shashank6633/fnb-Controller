@@ -1,11 +1,12 @@
 'use client';
 
-import { useEffect, useState, useCallback, useMemo, useContext } from 'react';
+import { useEffect, useState, useCallback, useMemo, useContext, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
   ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu, Filter, ChevronDown,
+  AlertTriangle, Printer,
 } from 'lucide-react';
 import { CaptainUI } from '../../CaptainShell';
 
@@ -22,11 +23,18 @@ function itemState(it: OrderItem): { label: string; cls: string; Icon: any } | n
   if (k === 'served') return { label: 'Served', cls: 'text-[#6B5744] bg-gray-100', Icon: CheckCircle2 };
   return { label: 'Sent', cls: 'text-blue-700 bg-blue-100', Icon: ChefHat };
 }
+interface KotInfo {
+  id: string; kot_number: number; station: string; status: string; created_at: string;
+  reprint_count?: number;
+  print_status: 'printed' | 'failed' | 'queued' | null;   // null = no agent report yet
+  print_error?: string | null;
+}
 interface Order {
   id: string; order_number: number; status: string; order_type: string;
   table_number: string | null; zone: string | null;
   subtotal: number; tax_total: number; discount: number; total: number;
   items: OrderItem[];
+  kots?: KotInfo[];
 }
 
 // Common modifiers offered as quick chips (captain can also type free instructions).
@@ -76,6 +84,47 @@ export default function CaptainOrder() {
       setCats(['All', ...(j.categories || [])]);
     }).catch(() => {});
   }, [loadOrder]);
+
+  // ── KOT print-status watch: warn the captain if a fired ticket didn't reach
+  // the counter printer (failed, or unconfirmed for a while = agent/printer down).
+  const [resending, setResending] = useState<string | null>(null);
+  const printAlerts = useMemo(() => {
+    const now = Date.now();
+    return (order?.kots || []).filter((k) => {
+      if (k.print_status === 'printed') return false;
+      if (k.print_status === 'failed') return true;
+      // queued / no report yet → flag only after a grace period (give it time)
+      const fired = Date.parse((k.created_at || '').replace(' ', 'T') + 'Z');
+      return Number.isFinite(fired) && now - fired > 25000;
+    });
+  }, [order]);
+  const allPrinted = !!order?.kots?.length && (order.kots || []).every((k) => k.print_status === 'printed');
+
+  // Poll while any KOT is still unconfirmed, so the alert surfaces within seconds.
+  useEffect(() => {
+    if (!order || order.status !== 'open') return;
+    if ((order.kots || []).every((k) => k.print_status === 'printed')) return;
+    const t = setInterval(loadOrder, 6000);
+    return () => clearInterval(t);
+  }, [order, loadOrder]);
+
+  // Buzz the tablet when a NEW print problem appears (operations must notice it).
+  const prevAlerts = useRef(0);
+  useEffect(() => {
+    if (printAlerts.length > prevAlerts.current) { try { (navigator as any).vibrate?.([180, 90, 180]); } catch {} }
+    prevAlerts.current = printAlerts.length;
+  }, [printAlerts.length]);
+
+  async function resendKot(kotId: string) {
+    setResending(kotId);
+    try {
+      const r = await api(`/api/dine-in/kds/${kotId}/resend`, { method: 'POST', body: {} });
+      const j = await r.json();
+      if (j.error) { alert(j.error); return; }
+      flash('Re-sent to counter printer ✓');
+      setTimeout(loadOrder, 1500);   // let the agent print + report back
+    } finally { setResending(null); }
+  }
 
   const visibleMenu = useMemo(() => menu.filter((m) =>
     (cat === 'All' || m.category === cat) && (!q || m.name.toLowerCase().includes(q.toLowerCase()))), [menu, cat, q]);
@@ -208,6 +257,30 @@ export default function CaptainOrder() {
           <p className="font-extrabold text-[#FF8A4C]">₹{Math.round(order.total)}</p>
         </div>
       </header>
+
+      {/* Print-failure alert — a fired KOT may not have reached the counter printer */}
+      {printAlerts.length > 0 && (
+        <div className="bg-red-600 text-white sticky top-[52px] z-20">
+          <div className="px-3 py-2 flex items-start gap-2 text-sm font-semibold">
+            <AlertTriangle className="w-5 h-5 shrink-0 animate-pulse mt-0.5" />
+            <span>{printAlerts.length} KOT{printAlerts.length > 1 ? 's' : ''} may not have printed — tell the counter, then re-send below.</span>
+          </div>
+          <div className="px-3 pb-2 flex flex-wrap gap-2">
+            {printAlerts.map((k) => (
+              <button key={k.id} onClick={() => resendKot(k.id)} disabled={resending === k.id}
+                className="bg-white/15 hover:bg-white/25 active:scale-95 rounded-lg px-2.5 py-1.5 text-xs font-medium flex items-center gap-1.5 disabled:opacity-60">
+                {resending === k.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Printer className="w-3.5 h-3.5" />}
+                Re-send KOT #{k.kot_number}{k.station ? ` · ${String(k.station).toUpperCase()}` : ''}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {allPrinted && printAlerts.length === 0 && order.status === 'open' && (
+        <div className="bg-green-50 text-green-800 px-3 py-1.5 text-xs font-medium flex items-center gap-1.5 border-b border-green-100">
+          <CheckCircle2 className="w-3.5 h-3.5" /> All KOTs printed at the counter
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex bg-white border-b border-[#E8D5C4]">

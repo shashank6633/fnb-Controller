@@ -50,7 +50,7 @@ export default function CaptainHome() {
         </div>
         <div className="text-right">
           <p className="text-[11px] text-[#8B7355] leading-none">My sales</p>
-          <p className="font-extrabold text-[#af4408] text-lg leading-tight">₹{Math.round(liveTotal)}</p>
+          <p className="font-extrabold text-[#af4408] text-lg leading-tight">{meId ? `₹${Math.round(liveTotal)}` : '…'}</p>
         </div>
       </div>
 

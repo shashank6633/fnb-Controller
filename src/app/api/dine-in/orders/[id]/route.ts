@@ -34,7 +34,24 @@ function loadOrder(db: Database.Database, id: string) {
     LEFT JOIN kots k ON k.id = oi.kot_id
     WHERE oi.order_id = ? ORDER BY oi.created_at ASC
   `).all(id);
-  return { ...order, items };
+  // Each fired KOT with its PRINT outcome, joined from the print-job journal the
+  // counter's print agent reports back to (ref_id = kot.id). Lets the captain
+  // see whether a ticket actually reached the printer.
+  //   print_status: 'printed' | 'failed' | 'queued' | null(no report yet)
+  const kots = db.prepare(`
+    SELECT k.id, k.kot_number, k.station, k.status, k.created_at, k.reprint_count,
+      (SELECT CASE
+         WHEN COUNT(*) = 0 THEN NULL
+         WHEN SUM(CASE WHEN j.status = 'printed' THEN 1 ELSE 0 END) > 0 THEN 'printed'
+         WHEN SUM(CASE WHEN j.status = 'failed'  THEN 1 ELSE 0 END) > 0 THEN 'failed'
+         ELSE 'queued' END
+       FROM print_jobs j WHERE j.ref_id = k.id AND j.source IN ('fire','reprint')) AS print_status,
+      (SELECT j.last_error FROM print_jobs j
+         WHERE j.ref_id = k.id AND j.source IN ('fire','reprint') AND j.status = 'failed'
+         ORDER BY j.created_at DESC LIMIT 1) AS print_error
+    FROM kots k WHERE k.order_id = ? ORDER BY k.kot_number ASC
+  `).all(id);
+  return { ...order, items, kots };
 }
 
 /** GET — order with its line items. */
