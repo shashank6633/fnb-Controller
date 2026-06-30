@@ -60,8 +60,21 @@ function resolveKotPrinter(stations: PrintStation[], k: FiredKot): PrintStation 
   return m || kots[0];
 }
 
-function resolveBillStation(stations: PrintStation[]): PrintStation | null {
-  return stations.find((s) => s.role === 'bill' && s.is_active) || null;
+/**
+ * Pick the bill printer, FLOOR-AWARE (the table's zone = its floor):
+ *  1. a bill printer on the SAME floor,
+ *  2. a bill printer with no floor (a central/global counter),
+ *  3. the first active bill printer (last resort).
+ * So a Floor-2 table's bill prints on the Floor-2 cashier when one exists, and
+ * still falls back to a single central counter otherwise.
+ */
+function resolveBillStation(stations: PrintStation[], floor?: string | null): PrintStation | null {
+  const bills = stations.filter((s) => s.role === 'bill' && s.is_active);
+  if (bills.length === 0) return null;
+  const fl = norm(floor || '');
+  return (fl ? bills.find((s) => norm(s.floor || '') === fl) : null)
+      || bills.find((s) => !norm(s.floor || ''))
+      || bills[0];
 }
 
 function targetOf(s: PrintStation): PrinterTarget {
@@ -165,6 +178,7 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
 // ── Bill (from the loaded order at settle time) ───────────────────────────────
 export interface BillOrder {
   id: string; order_number?: number | string; table_number?: string | null; order_type?: string;
+  zone?: string | null;   // the table's zone = its floor (drives floor-aware bill routing)
   server_name?: string; subtotal: number; tax_total: number; discount: number; total: number;
   payment_method?: string;
   items: Array<{ name: string; quantity: number; unit_price: number; line_total: number }>;
@@ -185,7 +199,7 @@ async function getShop(): Promise<{ name: string; gstin: string }> {
 export async function printBill(order: BillOrder): Promise<{ ok: boolean; reason?: string }> {
   ensureDrainLoop();
   const stations = await getStations();
-  const st = resolveBillStation(stations);
+  const st = resolveBillStation(stations, order.zone);
   if (!st) return { ok: false, reason: 'No bill printer configured' };
   const shop = await getShop();
   const tax = Number(order.tax_total) > 0 ? [{ label: 'Tax', amount: Number(order.tax_total) }] : [];

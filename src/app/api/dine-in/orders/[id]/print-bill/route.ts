@@ -20,7 +20,7 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
     const { id } = await params;
     const db = getDb();
     const order = db.prepare(`
-      SELECT o.*, t.table_number FROM orders o
+      SELECT o.*, t.table_number, t.zone FROM orders o
       LEFT JOIN restaurant_tables t ON o.table_id = t.id WHERE o.id = ?
     `).get(id) as any;
     if (!order) return Response.json({ error: 'Order not found' }, { status: 404 });
@@ -33,6 +33,7 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
       id: order.id,
       order_number: order.order_number,
       table_number: order.table_number || null,
+      zone: order.zone || null,
       order_type: order.order_type,
       server_name: order.server_name || undefined,
       subtotal: order.subtotal, tax_total: order.tax_total, discount: order.discount, total: order.total,
