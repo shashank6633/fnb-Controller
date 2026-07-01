@@ -214,84 +214,107 @@ function billItemRow(name, qty, rate, amt, cols) {
   return nm + ' '.repeat(cols - nm.length - right.length) + right;
 }
 
+// Default BILL line order (mirrors DEFAULT_BILL_LINES in print.ts) — used when a
+// doc carries no `lines` (backward compat / non-designed bills).
+const DEFAULT_BILL_LINES = [
+  { key: 'brand', enabled: true, size: 'xlarge' }, { key: 'company', enabled: true, size: 'normal' },
+  { key: 'address', enabled: true, size: 'normal' }, { key: 'contact', enabled: true, size: 'normal' },
+  { key: 'email', enabled: true, size: 'normal' }, { key: 'fssai', enabled: true, size: 'normal' },
+  { key: 'gstin', enabled: true, size: 'normal' }, { key: 'orderType', enabled: true, size: 'large' },
+  { key: 'floorTable', enabled: true, size: 'normal' }, { key: 'guestName', enabled: true, size: 'normal' },
+  { key: 'mobile', enabled: true, size: 'normal' }, { key: 'dateTime', enabled: true, size: 'normal' },
+  { key: 'captain', enabled: true, size: 'normal' }, { key: 'guestsOrder', enabled: true, size: 'normal' },
+  { key: 'items', enabled: true, size: 'normal' }, { key: 'subTotal', enabled: true, size: 'normal' },
+  { key: 'serviceCharge', enabled: true, size: 'normal' }, { key: 'cgst', enabled: true, size: 'normal' },
+  { key: 'sgst', enabled: true, size: 'normal' }, { key: 'discount', enabled: true, size: 'normal' },
+  { key: 'total', enabled: true, size: 'large' }, { key: 'grandTotal', enabled: true, size: 'large' },
+  { key: 'payment', enabled: true, size: 'normal' }, { key: 'footer', enabled: false, size: 'normal' },
+  { key: 'printedBy', enabled: true, size: 'normal' }, { key: 'printedOn', enabled: true, size: 'normal' },
+];
+
 function buildBill(doc, cols, doCut) {
   const chunks = [];
   const push = (b) => chunks.push(Buffer.from(b));
   const line = (s = '') => chunks.push(Buffer.from(String(s) + '\n', 'ascii'));
   const rule = () => line('-'.repeat(cols));
-  const center = (s) => { push(CMD.alignCenter); line(s); push(CMD.alignLeft); };
+  const centerS = (s, m, bold = false) => {
+    push(CMD.alignCenter); if (bold) push(CMD.boldOn);
+    if (m > 1) push(sizeCmd(m)); line(s); if (m > 1) push(sizeCmd(1));
+    if (bold) push(CMD.boldOff); push(CMD.alignLeft);
+  };
+  const leftS = (s, m, bold = false) => {
+    if (bold) push(CMD.boldOn);
+    if (m > 1) push(sizeCmd(m)); line(s); if (m > 1) push(sizeCmd(1));
+    if (bold) push(CMD.boldOff);
+  };
+  // Two-column line at size m (double-size halves the usable columns).
+  const twoColS = (l, r, m, bold = false) => {
+    if (bold) push(CMD.boldOn);
+    if (m > 1) push(sizeCmd(m));
+    line(twoCol(l, r, Math.max(8, Math.floor(cols / Math.max(1, m)))));
+    if (m > 1) push(sizeCmd(1));
+    if (bold) push(CMD.boldOff);
+  };
 
   push(CMD.init);
-
-  // ── Header block (all centered) ──────────────────────────────────────────
-  push(CMD.alignCenter); push(CMD.boldOn); push(CMD.dblOn);
-  line(String(doc.brandName || 'RESTAURANT').toUpperCase());
-  push(CMD.dblOff); push(CMD.boldOff);
-  if (doc.companyName) line(String(doc.companyName));
-  if (doc.address) line(String(doc.address));
-  if (doc.contact) line(`Contact no: ${doc.contact}`);
-  if (doc.email) line(`Email: ${doc.email}`);
-  if (doc.fssai) line(`FSSAI no: ${doc.fssai}`);
-  if (doc.gstin) line(`GST no: ${doc.gstin}`);
-  push(CMD.alignLeft);
-  rule();
-
-  // ── Order type + location ────────────────────────────────────────────────
-  push(CMD.alignCenter); push(CMD.boldOn);
-  line(String(doc.orderType || 'DINE-IN').toUpperCase());
-  push(CMD.boldOff); push(CMD.alignLeft);
   const floor = doc.floor ? String(doc.floor) : '';
   const table = doc.table ? String(doc.table) : '';
-  if (floor || table) line(`${floor}${floor && table ? ' : ' : ''}${table}`);
-  rule();
 
-  // ── Guest details ──────────────────────────────────────────────────────────
-  if (doc.guestName)   line(`Guest Name: ${doc.guestName}`);
-  if (doc.guestMobile) line(`Mobile: ${doc.guestMobile}`);
-  line(`Date & Time: ${fmtTime(doc.date)}`);
-  if (doc.captainName) line(`Captain Name: ${doc.captainName}`);
-  rule();
+  // One renderer per bill line key; conditional lines no-op when absent.
+  const SECTIONS = {
+    brand:       (m) => centerS(String(doc.brandName || 'RESTAURANT').toUpperCase(), m, true),
+    company:     (m) => { if (doc.companyName) centerS(String(doc.companyName), m); },
+    address:     (m) => { if (doc.address) centerS(String(doc.address), m); },
+    contact:     (m) => { if (doc.contact) centerS(`Contact no: ${doc.contact}`, m); },
+    email:       (m) => { if (doc.email) centerS(`Email: ${doc.email}`, m); },
+    fssai:       (m) => { if (doc.fssai) centerS(`FSSAI no: ${doc.fssai}`, m); },
+    gstin:       (m) => { if (doc.gstin) centerS(`GST no: ${doc.gstin}`, m); },
+    orderType:   (m) => centerS(String(doc.orderType || 'DINE-IN').toUpperCase(), m, true),
+    floorTable:  (m) => { if (floor || table) leftS(`${floor}${floor && table ? ' : ' : ''}${table}`, m); },
+    guestName:   (m) => { if (doc.guestName) leftS(`Guest Name: ${doc.guestName}`, m); },
+    mobile:      (m) => { if (doc.guestMobile) leftS(`Mobile: ${doc.guestMobile}`, m); },
+    dateTime:    (m) => leftS(`Date & Time: ${fmtTime(doc.date)}`, m),
+    captain:     (m) => { if (doc.captainName) leftS(`Captain Name: ${doc.captainName}`, m); },
+    guestsOrder: (m) => leftS(twoCol(`Number of Guests: ${Number(doc.guests) || 0}`, doc.orderNo ? `Order no: ${doc.orderNo}` : '', cols), m),
+    items:       (m) => {
+      push(CMD.boldOn); line(billItemRow('Item Name', 'Qty', 'Rate', 'Amt', cols)); push(CMD.boldOff);
+      rule();
+      for (const it of (doc.items || [])) {
+        const qty = Number(it.qty) || 1;
+        const rate = Number(it.rate) || 0;
+        const amount = it.amount != null ? Number(it.amount) : qty * rate;
+        line(billItemRow(it.name || '', qty, money(rate), money(amount), cols));
+      }
+    },
+    subTotal:      (m) => twoColS('Sub Total', money(doc.subtotal ?? 0), m),
+    serviceCharge: (m) => { if (Number(doc.serviceCharge)) twoColS('Service Charges', money(doc.serviceCharge), m); },
+    cgst:          (m) => { if (Number(doc.cgst)) twoColS(`CGST@${doc.cgstPct != null ? doc.cgstPct : 2.5}%`, money(doc.cgst), m); },
+    sgst:          (m) => { if (Number(doc.sgst)) twoColS(`SGST@${doc.sgstPct != null ? doc.sgstPct : 2.5}%`, money(doc.sgst), m); },
+    discount:      (m) => { if (Number(doc.discount) > 0) twoColS('Discount', '-' + money(doc.discount), m); },
+    total:         (m) => twoColS('TOTAL', money(doc.total ?? 0), Math.max(2, m), true),
+    grandTotal:    (m) => { if (doc.grandTotal != null) twoColS('Grand Total', money(doc.grandTotal), m, true); },
+    payment:       (m) => { if (doc.paymentMethod) { twoColS(`Paid by ${String(doc.paymentMethod).toUpperCase()}`, money(doc.amountPaid != null ? doc.amountPaid : (doc.grandTotal != null ? doc.grandTotal : doc.total)), m); twoColS('Balance', money(doc.balance != null ? doc.balance : 0), m); } },
+    footer:        (m) => { if (doc.footer) { line(''); centerS(String(doc.footer), m); } },
+    printedBy:     (m) => { if (doc.printedBy) leftS(`Printed by ${doc.printedBy}`, m); },
+    printedOn:     (m) => leftS(`Printed on: ${fmtTime(doc.date)}`, m),
+  };
 
-  // ── Guests + Order no (two columns) ────────────────────────────────────────
-  line(twoCol(`Number of Guests: ${Number(doc.guests) || 0}`, doc.orderNo ? `Order no: ${doc.orderNo}` : '', cols));
-  rule();
-
-  // ── Item table ───────────────────────────────────────────────────────────
-  push(CMD.boldOn);
-  line(billItemRow('Item Name', 'Qty', 'Rate', 'Amt', cols));
-  push(CMD.boldOff);
-  rule();
-  for (const it of (doc.items || [])) {
-    const qty = Number(it.qty) || 1;
-    const rate = Number(it.rate) || 0;
-    const amount = it.amount != null ? Number(it.amount) : qty * rate;
-    line(billItemRow(it.name || '', qty, money(rate), money(amount), cols));
+  // Structural separators travel with their section (reorder-safe). These keys
+  // always render, so their leading rule is never orphaned.
+  const RULE_BEFORE = new Set(['orderType', 'guestsOrder', 'items', 'subTotal']);
+  const order = Array.isArray(doc.lines) && doc.lines.length ? doc.lines : DEFAULT_BILL_LINES;
+  let started = false;
+  for (const ln of order) {
+    const key = (ln && ln.key) || ln;
+    if (ln && ln.enabled === false) continue;
+    const fn = SECTIONS[key];
+    if (!fn) continue;
+    if (started && RULE_BEFORE.has(key)) rule();
+    fn(mult((ln && ln.size) || 'normal'));
+    started = true;
   }
   rule();
 
-  // ── Totals block ─────────────────────────────────────────────────────────
-  line(twoCol('Sub Total', money(doc.subtotal ?? 0), cols));
-  if (Number(doc.serviceCharge)) line(twoCol('Service Charges', money(doc.serviceCharge), cols));
-  if (Number(doc.cgst)) line(twoCol(`CGST@${doc.cgstPct != null ? doc.cgstPct : 2.5}%`, money(doc.cgst), cols));
-  if (Number(doc.sgst)) line(twoCol(`SGST@${doc.sgstPct != null ? doc.sgstPct : 2.5}%`, money(doc.sgst), cols));
-  if (Number(doc.discount) > 0) line(twoCol('Discount', '-' + money(doc.discount), cols));
-
-  push(CMD.boldOn); push(CMD.dblOn);
-  // double-width halves the columns, so render the total on its own emphasized line
-  line(twoCol('TOTAL', money(doc.total ?? 0), Math.floor(cols / 2)));
-  push(CMD.dblOff); push(CMD.boldOff);
-  // Grand Total = final payable (rounded); then the payment line once settled.
-  if (doc.grandTotal != null) { push(CMD.boldOn); line(twoCol('Grand Total', money(doc.grandTotal), cols)); push(CMD.boldOff); }
-  if (doc.paymentMethod) {
-    line(twoCol(`Paid by ${String(doc.paymentMethod).toUpperCase()}`, money(doc.amountPaid != null ? doc.amountPaid : (doc.grandTotal != null ? doc.grandTotal : doc.total)), cols));
-    line(twoCol('Balance', money(doc.balance != null ? doc.balance : 0), cols));
-  }
-  rule();
-
-  // ── Footer ───────────────────────────────────────────────────────────────
-  if (doc.footer) center(String(doc.footer));
-  if (doc.printedBy) line(`Printed by ${doc.printedBy}`);
-  line(`Printed on: ${fmtTime(doc.date)}`);
   push(CMD.feed3);
   if (doCut) push(CMD.cut);
   return Buffer.concat(chunks);

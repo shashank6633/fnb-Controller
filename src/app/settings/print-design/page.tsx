@@ -9,42 +9,11 @@ import {
 } from 'lucide-react';
 import {
   DEFAULT_KOT_DESIGN, normalizeKotDesign, invalidateDesignCache, KOT_LINE_LABELS,
+  DEFAULT_BILL_DESIGN, normalizeBillDesign, BILL_LINE_LABELS,
   type KotDesign, type KotLine, type KotLineSize,
+  type BillDesign, type BillLine,
 } from '@/lib/offline-print/print';
 import { computeBill, round2 } from '@/lib/bill-calc';
-
-const DEFAULT_BILL = {
-  brandName: '', companyName: '', address: '', contact: '', email: '', fssai: '',
-  showGstin: true, showServer: true,
-  serviceChargeOn: false, serviceChargePct: 5,
-  cgstPct: 2.5, sgstPct: 2.5,
-  headerNote: '', footerNote: 'Thank you! Visit again.',
-};
-type BillDesign = typeof DEFAULT_BILL;
-
-// Coerce a loaded/partial bill_design into a complete, correctly-typed BillDesign.
-function normalizeBillDesign(raw: any): BillDesign {
-  const r = raw && typeof raw === 'object' ? raw : {};
-  const str = (v: any, d: string) => (typeof v === 'string' ? v : d);
-  const bool = (v: any, d: boolean) => (typeof v === 'boolean' ? v : d);
-  const num = (v: any, d: number) => (v === '' || v == null || isNaN(Number(v)) ? d : Number(v));
-  return {
-    brandName: str(r.brandName ?? r.shopName, DEFAULT_BILL.brandName),  // migrate legacy shopName
-    companyName: str(r.companyName, DEFAULT_BILL.companyName),
-    address: str(r.address, DEFAULT_BILL.address),
-    contact: str(r.contact, DEFAULT_BILL.contact),
-    email: str(r.email, DEFAULT_BILL.email),
-    fssai: str(r.fssai, DEFAULT_BILL.fssai),
-    showGstin: bool(r.showGstin, DEFAULT_BILL.showGstin),
-    showServer: bool(r.showServer, DEFAULT_BILL.showServer),
-    serviceChargeOn: bool(r.serviceChargeOn, DEFAULT_BILL.serviceChargeOn),
-    serviceChargePct: num(r.serviceChargePct, DEFAULT_BILL.serviceChargePct),
-    cgstPct: num(r.cgstPct, DEFAULT_BILL.cgstPct),
-    sgstPct: num(r.sgstPct, DEFAULT_BILL.sgstPct),
-    headerNote: str(r.headerNote, DEFAULT_BILL.headerNote),
-    footerNote: str(r.footerNote, DEFAULT_BILL.footerNote),
-  };
-}
 
 const SAMPLE_KOT = {
   table: '7', floor: 'Rooftop', kotNumber: 12, station: 'TANDOOR', copyLabel: 'ORIGINAL', foodLiquor: 'FOOD',
@@ -142,6 +111,10 @@ function itemRow(name: string, qty: string, rate: string, amt: string): string {
   return nm + rcol(qty, QTY_W) + rcol(rate, RATE_W) + rcol(amt, AMT_W);
 }
 
+// Per-line size → CSS size for the bill (subtler steps than the KOT, since the
+// bill body is column-based). Mirrors the KOT's SIZE_CLASS approach.
+const BILL_SIZE_CLASS: Record<KotLineSize, string> = { normal: '', large: 'text-[15px]', xlarge: 'text-[19px]' };
+
 function BillPreview({ d, businessName, gstin }: { d: BillDesign; businessName: string; gstin: string }) {
   const s = SAMPLE_BILL;
   const subtotal = round2(s.items.reduce((a, it) => a + it.amount, 0));
@@ -149,51 +122,53 @@ function BillPreview({ d, businessName, gstin }: { d: BillDesign; businessName: 
     { subtotal, serviceRemoved: false, discount_pct: 0, discount: 0 },
     { serviceChargeOn: d.serviceChargeOn, serviceChargePct: d.serviceChargePct, cgstPct: d.cgstPct, sgstPct: d.sgstPct },
   );
-  return (
-    <Ticket>
-      {/* Header block */}
-      <C b cls="text-[15px]">{(d.brandName || businessName || 'RESTAURANT').toUpperCase()}</C>
-      {d.companyName && <C>{d.companyName}</C>}
-      {d.address && <C>{d.address}</C>}
-      {d.contact && <C>Contact no: {d.contact}</C>}
-      {d.email && <C>Email: {d.email}</C>}
-      {d.fssai && <C>FSSAI no: {d.fssai}</C>}
-      {d.showGstin && gstin && <C>GST no: {gstin}</C>}
-      <Rule />
-      <C b>{s.orderType}</C>
-      <L>{s.floor} : {s.table}</L>
-      <Rule />
-      <L>Guest Name: {s.guestName}</L>
-      <L>Mobile: {s.guestMobile}</L>
-      <L>Date &amp; Time: {nowStamp()}</L>
-      <L>Captain Name: {s.captainName}</L>
-      <Rule />
-      <L>{twoCol(`Number of Guests: ${s.guests}`, `Order no: ${s.orderNo}`)}</L>
-      <Rule />
-      {/* Item table: Item Name | Qty | Rate | Amt */}
-      <L>{itemRow('Item Name', 'Qty', 'Rate', 'Amt')}</L>
-      <Rule />
-      {s.items.map((it, i) => (
-        <L key={i}>{itemRow(it.name, String(it.qty), round2(it.rate).toFixed(2), round2(it.amount).toFixed(2))}</L>
-      ))}
-      <Rule />
-      {/* Totals */}
-      <L>{twoCol('Sub Total', billMoney(b.subtotal))}</L>
-      {b.serviceCharge > 0 && <L>{twoCol('Service Charges', billMoney(b.serviceCharge))}</L>}
-      {b.cgst > 0 && <L>{twoCol(`CGST@${d.cgstPct}%`, billMoney(b.cgst))}</L>}
-      {b.sgst > 0 && <L>{twoCol(`SGST@${d.sgstPct}%`, billMoney(b.sgst))}</L>}
-      {b.discount > 0 && <L>{twoCol('Discount', '-' + billMoney(b.discount))}</L>}
-      <L b cls="text-[15px]">{twoCol('TOTAL', 'Rs.' + round2(b.total).toFixed(2), 24)}</L>
-      <L b>{twoCol('Grand Total', 'Rs.' + Math.round(b.total))}</L>
-      <L>{twoCol(`Paid by ${s.paymentMethod.toUpperCase()}`, billMoney(Math.round(b.total)))}</L>
-      <L>{twoCol('Balance', billMoney(0))}</L>
-      <Rule />
-      {/* Footer */}
-      {d.footerNote && <C>{d.footerNote}</C>}
-      <L>Printed by {s.printedBy}</L>
-      <L>Printed on: {nowStamp()}</L>
-    </Ticket>
-  );
+  const renderLine = (ln: BillLine) => {
+    const z = BILL_SIZE_CLASS[ln.size];
+    switch (ln.key) {
+      case 'brand': return <C b cls={z || 'text-[15px]'}>{(d.brandName || businessName || 'RESTAURANT').toUpperCase()}</C>;
+      case 'company': return d.companyName ? <C cls={z}>{d.companyName}</C> : null;
+      case 'address': return d.address ? <C cls={z}>{d.address}</C> : null;
+      case 'contact': return d.contact ? <C cls={z}>Contact no: {d.contact}</C> : null;
+      case 'email': return d.email ? <C cls={z}>Email: {d.email}</C> : null;
+      case 'fssai': return d.fssai ? <C cls={z}>FSSAI no: {d.fssai}</C> : null;
+      case 'gstin': return (d.showGstin && gstin) ? <C cls={z}>GST no: {gstin}</C> : null;
+      case 'orderType': return <><Rule /><C b cls={z}>{s.orderType}</C></>;
+      case 'floorTable': return (s.floor || s.table) ? <L cls={z}>{s.floor}{s.floor && s.table ? ' : ' : ''}{s.table}</L> : null;
+      case 'guestName': return s.guestName ? <L cls={z}>Guest Name: {s.guestName}</L> : null;
+      case 'mobile': return s.guestMobile ? <L cls={z}>Mobile: {s.guestMobile}</L> : null;
+      case 'dateTime': return <L cls={z}>Date &amp; Time: {nowStamp()}</L>;
+      case 'captain': return s.captainName ? <L cls={z}>Captain Name: {s.captainName}</L> : null;
+      case 'guestsOrder': return <><Rule /><L cls={z}>{twoCol(`Number of Guests: ${s.guests}`, `Order no: ${s.orderNo}`)}</L></>;
+      case 'items': return (
+        <>
+          <Rule />
+          <L b cls={z}>{itemRow('Item Name', 'Qty', 'Rate', 'Amt')}</L>
+          <Rule />
+          {s.items.map((it, i) => (
+            <L key={i} cls={z}>{itemRow(it.name, String(it.qty), round2(it.rate).toFixed(2), round2(it.amount).toFixed(2))}</L>
+          ))}
+        </>
+      );
+      case 'subTotal': return <><Rule /><L cls={z}>{twoCol('Sub Total', billMoney(b.subtotal))}</L></>;
+      case 'serviceCharge': return b.serviceCharge > 0 ? <L cls={z}>{twoCol('Service Charges', billMoney(b.serviceCharge))}</L> : null;
+      case 'cgst': return b.cgst > 0 ? <L cls={z}>{twoCol(`CGST@${d.cgstPct}%`, billMoney(b.cgst))}</L> : null;
+      case 'sgst': return b.sgst > 0 ? <L cls={z}>{twoCol(`SGST@${d.sgstPct}%`, billMoney(b.sgst))}</L> : null;
+      case 'discount': return b.discount > 0 ? <L cls={z}>{twoCol('Discount', '-' + billMoney(b.discount))}</L> : null;
+      case 'total': return <L b cls={z || 'text-[15px]'}>{twoCol('TOTAL', 'Rs.' + round2(b.total).toFixed(2), 24)}</L>;
+      case 'grandTotal': return <L b cls={z}>{twoCol('Grand Total', 'Rs.' + Math.round(b.total))}</L>;
+      case 'payment': return (
+        <>
+          <L cls={z}>{twoCol(`Paid by ${s.paymentMethod.toUpperCase()}`, billMoney(Math.round(b.total)))}</L>
+          <L cls={z}>{twoCol('Balance', billMoney(0))}</L>
+        </>
+      );
+      case 'footer': return d.footerNote ? <C cls={z}>{d.footerNote}</C> : null;
+      case 'printedBy': return <L cls={z}>Printed by {s.printedBy}</L>;
+      case 'printedOn': return <L cls={z}>Printed on: {nowStamp()}</L>;
+      default: return null;
+    }
+  };
+  return <Ticket>{d.lines.filter((l) => l.enabled).map((ln) => <div key={ln.key}>{renderLine(ln)}</div>)}</Ticket>;
 }
 
 // ── Small form controls ──────────────────────────────────────────────────────
@@ -228,7 +203,7 @@ export default function PrintDesign() {
   const router = useRouter();
   const [tab, setTab] = useState<'kot' | 'bill'>('kot');
   const [kot, setKot] = useState<KotDesign>(DEFAULT_KOT_DESIGN);
-  const [bill, setBill] = useState<BillDesign>(DEFAULT_BILL);
+  const [bill, setBill] = useState<BillDesign>(DEFAULT_BILL_DESIGN);
   const [businessName, setBusinessName] = useState('');
   const [gstin, setGstin] = useState('');
   const [loading, setLoading] = useState(true);
@@ -237,6 +212,8 @@ export default function PrintDesign() {
   const [error, setError] = useState('');
   const [dragI, setDragI] = useState<number | null>(null);
   const [overI, setOverI] = useState<number | null>(null);
+  const [billDragI, setBillDragI] = useState<number | null>(null);
+  const [billOverI, setBillOverI] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -270,6 +247,15 @@ export default function PrintDesign() {
   };
   const setLine = (i: number, patch: Partial<KotLine>) =>
     setKot({ ...kot, lines: kot.lines.map((l, j) => (j === i ? { ...l, ...patch } : l)) });
+
+  // Bill line-list helpers (same drag/reorder + per-line size/enable as the KOT)
+  const moveBillLine = (from: number, to: number) => {
+    if (to < 0 || to >= bill.lines.length) return;
+    const a = [...bill.lines]; const [x] = a.splice(from, 1); a.splice(to, 0, x);
+    setBill({ ...bill, lines: a });
+  };
+  const setBillLine = (i: number, patch: Partial<BillLine>) =>
+    setBill({ ...bill, lines: bill.lines.map((l, j) => (j === i ? { ...l, ...patch } : l)) });
 
   if (loading) return <div className="py-16 text-center text-[#8B7355]"><Loader2 className="w-6 h-6 animate-spin mx-auto" /></div>;
 
@@ -348,6 +334,38 @@ export default function PrintDesign() {
             </>
           ) : (
             <>
+              <p className="text-xs text-[#8B7355] mb-2">
+                Reorder with the <b>↑ / ↓ arrows</b> (or drag the handle on desktop). <b>A / A+ / A++</b> sets each
+                line's size; toggle to show/hide. Fewer lines &amp; smaller sizes use less paper.
+              </p>
+              <div className="mb-3">
+                {bill.lines.map((ln, i) => (
+                  <div key={ln.key} draggable
+                    onDragStart={() => setBillDragI(i)}
+                    onDragOver={(e) => { e.preventDefault(); setBillOverI(i); }}
+                    onDrop={(e) => { e.preventDefault(); if (billDragI != null && billDragI !== i) moveBillLine(billDragI, i); setBillDragI(null); setBillOverI(null); }}
+                    onDragEnd={() => { setBillDragI(null); setBillOverI(null); }}
+                    className={`flex items-center gap-2 py-1.5 px-2 rounded-lg border mb-1 bg-white cursor-grab active:cursor-grabbing transition-colors
+                      ${billOverI === i ? 'border-[#af4408] bg-[#af4408]/10' : 'border-[#F0E4D6]'} ${billDragI === i ? 'opacity-40' : ''} ${!ln.enabled ? 'opacity-60' : ''}`}>
+                    <GripVertical className="w-4 h-4 text-[#C9B89F] shrink-0" />
+                    <span className="text-sm text-[#2D1B0E] flex-1 truncate">{BILL_LINE_LABELS[ln.key]}</span>
+                    <div className="flex flex-col -my-1 shrink-0">
+                      <button type="button" aria-label="Move up" disabled={i === 0} onClick={() => moveBillLine(i, i - 1)} className="text-[#8B7355] disabled:opacity-25 leading-none"><ChevronUp className="w-3.5 h-3.5" /></button>
+                      <button type="button" aria-label="Move down" disabled={i === bill.lines.length - 1} onClick={() => moveBillLine(i, i + 1)} className="text-[#8B7355] disabled:opacity-25 leading-none"><ChevronDown className="w-3.5 h-3.5" /></button>
+                    </div>
+                    <select value={ln.size} onChange={(e) => setBillLine(i, { size: e.target.value as KotLineSize })}
+                      className="border border-[#D4B896] rounded-lg px-1.5 py-1 text-xs shrink-0" aria-label="Line size">
+                      <option value="normal">A</option>
+                      <option value="large">A+</option>
+                      <option value="xlarge">A++</option>
+                    </select>
+                    <button type="button" onClick={() => setBillLine(i, { enabled: !ln.enabled })} aria-label="Show or hide line"
+                      className={`w-9 h-5 rounded-full relative shrink-0 transition-colors ${ln.enabled ? 'bg-[#af4408]' : 'bg-[#D4B896]'}`}>
+                      <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-all ${ln.enabled ? 'left-[18px]' : 'left-0.5'}`} />
+                    </button>
+                  </div>
+                ))}
+              </div>
               <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-1 mt-1">Header block</p>
               <Text label="Brand name (blank = business name)" value={bill.brandName} set={(v) => setBill({ ...bill, brandName: v })} placeholder={businessName || 'Restaurant'} />
               <Text label="Company name" value={bill.companyName} set={(v) => setBill({ ...bill, companyName: v })} placeholder="e.g. AKAN Foods Pvt Ltd" />

@@ -360,22 +360,101 @@ async function getShop(): Promise<{ name: string; gstin: string }> {
  *  right after a save so a new layout applies immediately, not up to 30s later. */
 export function invalidateDesignCache(): void { designCache = null; billDesignCache = null; }
 
-let billDesignCache: { at: number; d: any } | null = null;
-async function getBillDesign(): Promise<any> {
-  const DEF = {
-    brandName: '', companyName: '', address: '', contact: '', email: '', fssai: '',
-    showGstin: true, showServer: true,
-    serviceChargeOn: false, serviceChargePct: 0, cgstPct: 2.5, sgstPct: 2.5,
-    headerNote: '', footerNote: '',
-  };
+// ── Bill print design — same ordered lines[] model as the KOT: drag to reorder,
+// per-line A/A+/A++ size, show/hide. Content fields (header text, tax %) live
+// alongside; the bridge renders enabled lines in order at their size.
+export type BillLineKey =
+  | 'brand' | 'company' | 'address' | 'contact' | 'email' | 'fssai' | 'gstin'
+  | 'orderType' | 'floorTable' | 'guestName' | 'mobile' | 'dateTime' | 'captain'
+  | 'guestsOrder' | 'items' | 'subTotal' | 'serviceCharge' | 'cgst' | 'sgst'
+  | 'discount' | 'total' | 'grandTotal' | 'payment' | 'footer' | 'printedBy' | 'printedOn';
+export interface BillLine { key: BillLineKey; enabled: boolean; size: KotLineSize; }
+
+export const BILL_LINE_LABELS: Record<BillLineKey, string> = {
+  brand: 'Brand name', company: 'Company name', address: 'Address', contact: 'Contact no',
+  email: 'Email', fssai: 'FSSAI no', gstin: 'GST no', orderType: 'Dine-in / Parcel',
+  floorTable: 'Floor : Table', guestName: 'Guest name', mobile: 'Mobile', dateTime: 'Date & time',
+  captain: 'Captain name', guestsOrder: 'Guests + Order no', items: 'Items table',
+  subTotal: 'Sub Total', serviceCharge: 'Service charges', cgst: 'CGST', sgst: 'SGST',
+  discount: 'Discount', total: 'Total', grandTotal: 'Grand Total', payment: 'Payment (paid / balance)',
+  footer: 'Footer note', printedBy: 'Printed by', printedOn: 'Printed on',
+};
+
+export const DEFAULT_BILL_LINES: BillLine[] = [
+  { key: 'brand', enabled: true, size: 'xlarge' },
+  { key: 'company', enabled: true, size: 'normal' },
+  { key: 'address', enabled: true, size: 'normal' },
+  { key: 'contact', enabled: true, size: 'normal' },
+  { key: 'email', enabled: true, size: 'normal' },
+  { key: 'fssai', enabled: true, size: 'normal' },
+  { key: 'gstin', enabled: true, size: 'normal' },
+  { key: 'orderType', enabled: true, size: 'large' },
+  { key: 'floorTable', enabled: true, size: 'normal' },
+  { key: 'guestName', enabled: true, size: 'normal' },
+  { key: 'mobile', enabled: true, size: 'normal' },
+  { key: 'dateTime', enabled: true, size: 'normal' },
+  { key: 'captain', enabled: true, size: 'normal' },
+  { key: 'guestsOrder', enabled: true, size: 'normal' },
+  { key: 'items', enabled: true, size: 'normal' },
+  { key: 'subTotal', enabled: true, size: 'normal' },
+  { key: 'serviceCharge', enabled: true, size: 'normal' },
+  { key: 'cgst', enabled: true, size: 'normal' },
+  { key: 'sgst', enabled: true, size: 'normal' },
+  { key: 'discount', enabled: true, size: 'normal' },
+  { key: 'total', enabled: true, size: 'large' },
+  { key: 'grandTotal', enabled: true, size: 'large' },
+  { key: 'payment', enabled: true, size: 'normal' },
+  { key: 'footer', enabled: false, size: 'normal' },
+  { key: 'printedBy', enabled: true, size: 'normal' },
+  { key: 'printedOn', enabled: true, size: 'normal' },
+];
+
+export interface BillDesign {
+  lines: BillLine[];
+  brandName: string; companyName: string; address: string; contact: string; email: string; fssai: string;
+  showGstin: boolean; showServer: boolean;
+  serviceChargeOn: boolean; serviceChargePct: number; cgstPct: number; sgstPct: number;
+  headerNote: string; footerNote: string;
+}
+export const DEFAULT_BILL_DESIGN: BillDesign = {
+  lines: DEFAULT_BILL_LINES,
+  brandName: '', companyName: '', address: '', contact: '', email: '', fssai: '',
+  showGstin: true, showServer: true,
+  serviceChargeOn: false, serviceChargePct: 0, cgstPct: 2.5, sgstPct: 2.5,
+  headerNote: '', footerNote: '',
+};
+
+const VALID_BILL_KEYS = new Set<string>(DEFAULT_BILL_LINES.map((l) => l.key));
+/** Merge a saved bill design over defaults, guaranteeing a complete valid lines[]
+ *  (prototype-safe; unknown keys dropped; new keys appended). */
+export function normalizeBillDesign(raw: any): BillDesign {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const d: BillDesign = { ...DEFAULT_BILL_DESIGN, ...src, lines: DEFAULT_BILL_LINES };
+  const ordered: BillLine[] = [];
+  const seen = new Set<string>();
+  for (const l of Array.isArray(src.lines) ? src.lines : []) {
+    const key = l && typeof l.key === 'string' ? l.key : '';
+    if (!key || seen.has(key) || !VALID_BILL_KEYS.has(key)) continue;
+    const def = DEFAULT_BILL_LINES.find((x) => x.key === key);
+    if (!def) continue;
+    ordered.push({ key: key as BillLineKey, enabled: typeof l.enabled === 'boolean' ? l.enabled : def.enabled, size: (['normal', 'large', 'xlarge'].includes(l.size) ? l.size : def.size) as KotLineSize });
+    seen.add(key);
+  }
+  for (const def of DEFAULT_BILL_LINES) if (!seen.has(def.key)) ordered.push({ ...def });
+  d.lines = ordered;
+  return d;
+}
+
+let billDesignCache: { at: number; d: BillDesign } | null = null;
+async function getBillDesign(): Promise<BillDesign> {
   if (billDesignCache && Date.now() - billDesignCache.at < 30000) return billDesignCache.d;
   try {
     const r = await api('/api/settings?key=bill_design');
     const v = r.ok ? (await r.json()).value : null;
-    const d = v ? { ...DEF, ...JSON.parse(v) } : DEF;
+    const d = v ? normalizeBillDesign(JSON.parse(v)) : DEFAULT_BILL_DESIGN;
     billDesignCache = { at: Date.now(), d };
     return d;
-  } catch { return billDesignCache?.d || DEF; }
+  } catch { return billDesignCache?.d || DEFAULT_BILL_DESIGN; }
 }
 
 export async function printBill(order: BillOrder, printedBy?: string): Promise<{ ok: boolean; reason?: string }> {
@@ -404,6 +483,7 @@ export async function printBill(order: BillOrder, printedBy?: string): Promise<{
   );
   const doc = {
     type: 'bill' as const,
+    lines: design.lines,                                    // ordered, per-line enable + size
     brandName: design.brandName || shop.name,
     companyName: design.companyName || undefined,
     address: design.address || undefined,
