@@ -77,6 +77,10 @@ function isPublic(pathname: string): boolean {
   if (pathname === '/manifest.json') return true;
   if (pathname === '/sw.js') return true;
   if (pathname === '/offline.html') return true;
+  // The offline KOT mini-POS page must be downloadable WITHOUT auth so the
+  // counter-PC installer (Invoke-WebRequest) and manual download can fetch it.
+  // It carries no secrets — the menu is loaded from the bridge's /cache at runtime.
+  if (pathname === '/offline-pos.html') return true;
   if (pathname.match(/\.(png|jpg|jpeg|svg|ico|webp|gif|css|js|mjs|map|json|webmanifest|txt|woff2?|ttf|bat|ps1)$/)) return true;
   return false;
 }
