@@ -256,8 +256,8 @@ export default function OfflinePrintPage() {
 
             <p className="font-medium text-[#2D1B0E]">Recommended — install once as an always-on service</p>
             <p>Run this <b>once per counter PC</b> in PowerShell <b>(as Administrator)</b>. It auto-starts at every boot, restarts itself if it crashes, and the cashier never launches anything again:</p>
-            <pre className="bg-[#2D1B0E] text-[#F5E9DC] text-[11px] rounded-lg p-2 overflow-x-auto whitespace-pre-wrap">{`powershell -ExecutionPolicy Bypass -Command "irm ${typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`}</pre>
-            <p className="text-xs text-[#8B7355]">It installs Node (if missing), the service, and a daily auto-updater. After it says HEALTHY, click <b>Refresh</b> above → green.</p>
+            <pre className="bg-[#2D1B0E] text-[#F5E9DC] text-[11px] rounded-lg p-2 overflow-x-auto whitespace-pre-wrap">{`powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm ${typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`}</pre>
+            <p className="text-xs text-[#8B7355]">It installs Node (if missing), the service, and a daily auto-updater. After it says HEALTHY, click <b>Refresh</b> above → green. <b>If it says “Unable to connect to the remote server”</b>, your PowerShell is on an old TLS — the <code>SecurityProtocol=Tls12</code> at the start of this command fixes that.</p>
 
             <p className="font-medium text-[#2D1B0E] mt-3">Or run it manually (for a quick test)</p>
             <div className="flex flex-wrap gap-2 my-2">
