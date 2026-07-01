@@ -45,8 +45,16 @@ import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const VERSION = '2.1.0';   // 2.1.0 = per-line ordered KOT layout + Food/Liquor band + sized lines
+// Directory this script lives in -- cache.json / kot-outbox.json / offline-pos.html
+// all sit next to the script (works whether run from public/ or scripts/).
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const CACHE_FILE  = path.join(SCRIPT_DIR, 'cache.json');
+const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
+const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
+
+const VERSION = '2.2.0';   // 2.2.0 = offline LAN KOT: /cache, /offline, /kot(+pending,+mark-synced); LAN bind default
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -55,7 +63,10 @@ const argVal = (name, def) => {
   return a ? a.split('=').slice(1).join('=') : def;
 };
 const PORT = Number(argVal('port', process.env.BRIDGE_PORT || 9920));
-const HOST = argVal('host', process.env.BRIDGE_HOST || '127.0.0.1');
+// Bind on ALL interfaces by default so captain tablets on the venue WiFi can
+// reach http://<counter-ip>:9920/offline during an internet outage. An explicit
+// --host=... flag or BRIDGE_HOST env still wins (e.g. lock back to 127.0.0.1).
+const HOST = argVal('host', process.env.BRIDGE_HOST || '0.0.0.0');
 const ALLOW_ORIGIN = argVal('origin', process.env.BRIDGE_ALLOW_ORIGIN || '*');
 
 // ── ESC/POS command bytes (same set proven by scripts/print-kot-test.mjs) ──
@@ -492,6 +503,137 @@ function sendJson(res, code, obj) {
   res.end(body);
 }
 
+// -- Offline LAN KOT: cache + outbox persistence (JSON files next to script) --
+//
+// cache.json      : the last CACHE the Print Agent pushed (menu/tables/printers/
+//                   kotDesign). The offline mini-POS page and POST /kot both need
+//                   it, so it must survive a bridge restart mid-outage.
+// kot-outbox.json : { day:'YYYY-MM-DD', seq:n, jobs:[FIRE+localNumber...] }. The
+//                   daily localNumber counter lives here (reset per Asia/Kolkata
+//                   calendar day); jobs are the offline fires the counter Print
+//                   Agent replays to the cloud when the internet returns.
+
+let CACHE = null;                 // in-memory copy of the last CACHE
+let OUTBOX = null;                // in-memory copy of the outbox document
+
+// Today's date as YYYY-MM-DD in Asia/Kolkata (the calendar day the local KOT
+// counter resets on). en-CA gives ISO-style YYYY-MM-DD directly.
+function todayIST() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date());
+}
+
+function readJsonFile(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return null; }
+}
+function writeJsonFile(file, obj) {
+  try { fs.writeFileSync(file, JSON.stringify(obj), 'utf8'); return true; }
+  catch (e) { console.error(`[bridge] failed writing ${path.basename(file)}: ${e.message}`); return false; }
+}
+
+// Load CACHE from memory, falling back to cache.json on cold start.
+function loadCache() {
+  if (CACHE) return CACHE;
+  CACHE = readJsonFile(CACHE_FILE);
+  return CACHE;
+}
+
+// Load the outbox document; create a fresh one if missing/corrupt. Rolls the
+// daily counter over when the stored day is not today (IST).
+function loadOutbox() {
+  if (!OUTBOX) OUTBOX = readJsonFile(OUTBOX_FILE);
+  const day = todayIST();
+  if (!OUTBOX || typeof OUTBOX !== 'object' || !Array.isArray(OUTBOX.jobs)) {
+    OUTBOX = { day, seq: 0, jobs: [] };
+  }
+  if (OUTBOX.day !== day) { OUTBOX.day = day; OUTBOX.seq = 0; }   // new calendar day -> reset seq
+  return OUTBOX;
+}
+
+// Assign the next local KOT number "L" + zero-padded 3-digit daily counter,
+// persisting the bumped seq immediately so a restart never reuses a number.
+function nextLocalNumber() {
+  const box = loadOutbox();
+  box.seq += 1;
+  const n = String(box.seq).padStart(3, '0');
+  return 'L' + n;
+}
+
+// Best-effort primary LAN IPv4 (for the startup log line only).
+function primaryLanIp() {
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const ni of (ifaces[name] || [])) {
+      if (ni && ni.family === 'IPv4' && !ni.internal) return ni.address;
+    }
+  }
+  return '127.0.0.1';
+}
+
+// A tiny fallback page served by GET /offline when offline-pos.html is missing,
+// so a captain who navigates here still sees a clear message (ASCII only).
+const OFFLINE_FALLBACK_HTML =
+  '<!doctype html><html><head><meta charset="utf-8">' +
+  '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+  '<title>Offline POS - not installed</title>' +
+  '<style>body{font-family:system-ui,Arial,sans-serif;margin:2rem;line-height:1.5;color:#222}' +
+  'code{background:#f2f2f2;padding:2px 6px;border-radius:4px}</style></head><body>' +
+  '<h1>Offline POS page is missing</h1>' +
+  '<p>The bridge is running, but <code>offline-pos.html</code> was not found next to ' +
+  'the print bridge script. Ask the counter to open the Print Agent once while online ' +
+  'so the offline page and menu cache are installed.</p>' +
+  '<p>Bridge version ' + VERSION + '.</p></body></html>';
+
+// Build the per-station KOT docs from one FIRE + the cached CACHE, exactly in the
+// shape buildKot consumes. Groups FIRE.items by station; picks the printer per
+// station (station-matched printer, else the default). Returns
+// { docs:[{station,doc,printer}], missingPrinter:bool }.
+function buildOfflineKotDocs(fire, cache, localNumber, nowIso) {
+  const kotDesign = (cache && cache.kotDesign) || {};
+  const lines = Array.isArray(kotDesign.lines) && kotDesign.lines.length ? kotDesign.lines : DEFAULT_KOT_LINES;
+  const table = fire.table || {};
+  const printers = Array.isArray(cache && cache.printers) ? cache.printers : [];
+  const defaultPrinter = cache && cache.defaultPrinter ? cache.defaultPrinter : null;
+
+  // Group items by station (blank/undefined station -> '' bucket, still prints).
+  const byStation = new Map();
+  for (const it of (fire.items || [])) {
+    const st = it.station || '';
+    if (!byStation.has(st)) byStation.set(st, []);
+    byStation.get(st).push(it);
+  }
+
+  const docs = [];
+  let missingPrinter = false;
+  for (const [station, items] of byStation) {
+    // LIQUOR band if ANY item in this station is not 'foods'; else FOOD.
+    const anyLiquor = items.some((i) => i.item_type && i.item_type !== 'foods');
+    const doc = {
+      type: 'kot',
+      station,
+      lines,
+      outletName: cache && cache.outletName ? cache.outletName : undefined,
+      floor: table.zone || undefined,
+      table: table.label || undefined,
+      kotNumber: localNumber,
+      foodLiquor: anyLiquor ? 'LIQUOR' : 'FOOD',
+      captain: fire.captainName,
+      orderType: 'DINE-IN',
+      orderRef: localNumber,
+      time: nowIso,                       // fmtTime() renders this in Asia/Kolkata
+      headerNote: kotDesign.headerNote,
+      footerNote: kotDesign.footerNote,
+      items: items.map((i) => ({ qty: i.qty, name: i.name, notes: i.notes || undefined })),
+    };
+    const printer = printers.find((p) => p.station === station) || defaultPrinter;
+    if (!printer) missingPrinter = true;
+    docs.push({ station, doc, printer });
+  }
+  return { docs, missingPrinter };
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method === 'OPTIONS') return sendJson(res, 204, {});
@@ -574,12 +716,143 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // -- Offline LAN KOT endpoints ---------------------------------------------
+
+  // POST /cache -- Print Agent pushes the latest CACHE (menu/tables/printers/
+  // kotDesign). Store in memory AND write cache.json so it survives a restart.
+  if (req.method === 'POST' && url.pathname === '/cache') {
+    let raw = '';
+    req.on('data', (c) => { raw += c; if (raw.length > 8_000_000) req.destroy(); });
+    req.on('end', () => {
+      let body;
+      try { body = JSON.parse(raw || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'invalid JSON' }); }
+      CACHE = body;
+      writeJsonFile(CACHE_FILE, CACHE);
+      const menuN = Array.isArray(body.menu) ? body.menu.length : 0;
+      const tableN = Array.isArray(body.tables) ? body.tables.length : 0;
+      console.log(`[bridge] cache updated: ${menuN} menu item(s), ${tableN} table(s), ${Array.isArray(body.printers) ? body.printers.length : 0} printer(s)`);
+      return sendJson(res, 200, { ok: true });
+    });
+    return;
+  }
+
+  // GET /cache -- return the last CACHE (memory, else cache.json), or {} if none.
+  if (req.method === 'GET' && url.pathname === '/cache') {
+    return sendJson(res, 200, loadCache() || {});
+  }
+
+  // GET /offline -- serve the self-contained offline mini-POS page from disk next
+  // to the script. If it is missing, serve a tiny fallback that says so.
+  if (req.method === 'GET' && url.pathname === '/offline') {
+    let html;
+    try { html = fs.readFileSync(OFFLINE_HTML_FILE, 'utf8'); }
+    catch { html = OFFLINE_FALLBACK_HTML; }
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Access-Control-Allow-Origin': ALLOW_ORIGIN,
+      'Access-Control-Allow-Private-Network': 'true',
+      'Cache-Control': 'no-store',
+    });
+    res.end(html);
+    return;
+  }
+
+  // POST /kot -- the offline page fires an order. Assign a local KOT number, group
+  // by station, print each station's ticket via the SAME render+send path as
+  // /print-batch, then journal the FIRE to the outbox for later cloud replay.
+  if (req.method === 'POST' && url.pathname === '/kot') {
+    let raw = '';
+    req.on('data', (c) => { raw += c; if (raw.length > 4_000_000) req.destroy(); });
+    req.on('end', async () => {
+      let fire;
+      try { fire = JSON.parse(raw || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'invalid JSON' }); }
+      const cache = loadCache();
+      if (!cache || (!Array.isArray(cache.printers) && !cache.defaultPrinter)) {
+        return sendJson(res, 400, { ok: false, error: 'no printer cached; open the Print Agent once while online' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const localNumber = nextLocalNumber();
+      const { docs, missingPrinter } = buildOfflineKotDocs(fire, cache, localNumber, nowIso);
+      if (missingPrinter && docs.some((d) => !d.printer)) {
+        // At least one station had no station printer AND no default -> cannot print.
+        return sendJson(res, 400, { ok: false, error: 'no printer cached; open the Print Agent once while online' });
+      }
+
+      // Render + group by printer exactly like /print-batch (one connection per
+      // printer, all its station tickets concatenated), then send via printTo.
+      const groups = new Map();
+      const stationsPrinted = [];
+      for (const d of docs) {
+        const printer = d.printer || {};
+        const payload = render(d.doc, printer.width);
+        const key = `${printer.transport || 'ip'}:${printer.target || ''}`;
+        if (!groups.has(key)) groups.set(key, { printer, items: [] });
+        groups.get(key).items.push({ station: d.station, payload });
+      }
+      let anyFailed = false;
+      await Promise.allSettled([...groups.values()].map(async (g) => {
+        const buf = Buffer.concat(g.items.map((it) => it.payload));
+        try {
+          await printTo(g.printer, buf);
+          for (const it of g.items) stationsPrinted.push(it.station);
+        } catch (e) {
+          anyFailed = true;
+          console.error(`[bridge] offline KOT ${localNumber} print failed on ${g.printer.transport}:${g.printer.target} - ${e.message}`);
+        }
+      }));
+
+      // Journal the fire regardless of print outcome -- the kitchen may still have
+      // gotten the paper, and the cloud replay is what makes the order real. The
+      // record carries localNumber + createdAt + syncedAt:null.
+      const box = loadOutbox();
+      const record = { ...fire, localNumber, createdAt: fire.createdAt || nowIso, syncedAt: null };
+      box.jobs.push(record);
+      writeJsonFile(OUTBOX_FILE, box);
+
+      console.log(`[bridge] offline KOT ${localNumber}: ${stationsPrinted.length} station ticket(s) printed${anyFailed ? ' (some failed)' : ''}`);
+      return sendJson(res, 200, { ok: !anyFailed, localNumber, stationsPrinted });
+    });
+    return;
+  }
+
+  // GET /kot/pending -- fires not yet replayed to the cloud (syncedAt == null).
+  if (req.method === 'GET' && url.pathname === '/kot/pending') {
+    const box = loadOutbox();
+    const jobs = box.jobs.filter((j) => j.syncedAt == null);
+    return sendJson(res, 200, { jobs });
+  }
+
+  // POST /kot/mark-synced -- the Print Agent confirms these clientRefs replayed;
+  // stamp syncedAt so they stop appearing in /kot/pending.
+  if (req.method === 'POST' && url.pathname === '/kot/mark-synced') {
+    let raw = '';
+    req.on('data', (c) => { raw += c; if (raw.length > 2_000_000) req.destroy(); });
+    req.on('end', () => {
+      let body;
+      try { body = JSON.parse(raw || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'invalid JSON' }); }
+      const refs = new Set(Array.isArray(body.clientRefs) ? body.clientRefs : []);
+      const now = new Date().toISOString();
+      const box = loadOutbox();
+      let marked = 0;
+      for (const j of box.jobs) {
+        if (j.syncedAt == null && refs.has(j.clientRef)) { j.syncedAt = now; marked += 1; }
+      }
+      if (marked) writeJsonFile(OUTBOX_FILE, box);
+      return sendJson(res, 200, { ok: true, marked });
+    });
+    return;
+  }
+
   sendJson(res, 404, { ok: false, error: 'not found' });
 });
 
 server.listen(PORT, HOST, () => {
+  const lanIp = primaryLanIp();
   console.log(`\n  F&B Controller print bridge v${VERSION}`);
   console.log(`  listening on http://${HOST}:${PORT}   (platform: ${os.platform()})`);
   console.log(`  CORS origin: ${ALLOW_ORIGIN}`);
-  console.log(`  health: curl http://${HOST}:${PORT}/health\n`);
+  console.log(`  health: curl http://${HOST}:${PORT}/health`);
+  // LAN offline URL a captain tablet navigates to during an internet outage.
+  console.log(`  offline POS (share with captains): http://${lanIp}:${PORT}/offline\n`);
 });

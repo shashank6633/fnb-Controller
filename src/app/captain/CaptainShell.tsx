@@ -11,7 +11,7 @@ import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
 import {
   ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search, Loader2,
-  MapPin, ChevronDown, Users,
+  MapPin, ChevronDown, Users, WifiOff,
 } from 'lucide-react';
 
 /** Lets the routed pages open the tables sidebar/drawer (the ☰ in their headers). */
@@ -42,6 +42,10 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   const [loaded, setLoaded] = useState(false);          // first tables fetch has resolved
   const [activeZone, setActiveZone] = useState<string | null>(null); // null = not yet picked
   const [picking, setPicking] = useState(false);        // "switch area" re-opened the picker
+  // Connectivity heartbeat: when the internet drops, captains can't reach the
+  // cloud — but the kitchen can still get KOTs via the counter PC's offline page.
+  const [offline, setOffline] = useState(false);                    // ~2 consecutive heartbeat misses
+  const [counterOfflineUrl, setCounterOfflineUrl] = useState<string | null>(null); // setting, cached once
   // Guest-capture modal state (dine-in open flow).
   const [guestTable, setGuestTable] = useState<TableTile | null>(null);
   const [gName, setGName] = useState('');
@@ -66,6 +70,40 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   // Restore the previously-chosen area (if the captain still has access to it).
   useEffect(() => {
     try { const saved = localStorage.getItem(AREA_KEY); if (saved) setActiveZone(saved); } catch {}
+  }, []);
+
+  // Cache the counter PC's offline address ONCE while we're still online, so the
+  // offline banner's button has a target even after the internet drops.
+  useEffect(() => {
+    fetch('/api/settings?key=counter_offline_url')
+      .then((r) => r.json())
+      .then((d) => { const v = (d?.value || '').trim(); if (v) setCounterOfflineUrl(v); })
+      .catch(() => {});
+  }, []);
+
+  // Connectivity heartbeat — poll a cheap, same-origin, no-auth endpoint every
+  // ~15s with a short timeout. Two consecutive failures ⇒ "offline"; the next
+  // success clears it. During a real internet outage the cloud is unreachable,
+  // so these fetches fail and the offline banner appears.
+  useEffect(() => {
+    let misses = 0;
+    let stopped = false;
+    const ping = async () => {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 5000);
+      try {
+        const r = await fetch('/api/build-info', { cache: 'no-store', signal: ctl.signal });
+        if (!r.ok) throw new Error('bad status');
+        misses = 0;
+        if (!stopped) setOffline(false);
+      } catch {
+        misses += 1;
+        if (!stopped && misses >= 2) setOffline(true);
+      } finally { clearTimeout(timer); }
+    };
+    ping();
+    const t = setInterval(ping, 15000);
+    return () => { stopped = true; clearInterval(t); };
   }, []);
 
   // Close the drawer whenever the route changes (a table was opened).
@@ -159,6 +197,34 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   }
   async function signOut() { try { await api('/api/auth/logout', { method: 'POST', body: {} }); } catch {} window.location.href = '/login'; }
   async function installApp() { if (!installEvt) return; installEvt.prompt(); try { await installEvt.userChoice; } catch {} setInstallEvt(null); }
+
+  // OFFLINE BANNER — a fixed, prominent strip shown only when the heartbeat says
+  // the internet is down. It reassures captains the kitchen can still get KOTs and
+  // links them (top-level navigation, NOT fetch) to the counter PC's offline page.
+  // The plain <a> is deliberate: a top-level navigate escapes the TWA https
+  // mixed-content block that would kill a fetch() to an http:// counter address.
+  const offlineBanner = offline ? (
+    <div className="fixed top-0 inset-x-0 z-[70] bg-red-700 text-white shadow-lg">
+      <div className="max-w-3xl mx-auto px-4 py-2.5 flex items-center gap-3 flex-wrap">
+        <WifiOff className="w-5 h-5 shrink-0" />
+        <p className="text-sm font-semibold leading-tight min-w-0 flex-1">
+          Internet is down — the kitchen can still get your KOTs.
+        </p>
+        {counterOfflineUrl ? (
+          <a
+            href={counterOfflineUrl}
+            className="shrink-0 inline-flex items-center gap-2 bg-white text-red-700 font-bold px-4 py-2 rounded-lg text-sm active:scale-95"
+          >
+            Open Offline Kitchen Mode
+          </a>
+        ) : (
+          <span className="shrink-0 text-xs text-white/80 max-w-[220px]">
+            Ask an admin to set the Counter PC address on the KOT &amp; Bill Printers page.
+          </span>
+        )}
+      </div>
+    </div>
+  ) : null;
 
   const sidebar = (
     <div className="flex flex-col h-full bg-[#1C0F05] text-white w-72">
@@ -266,6 +332,8 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   // Shown after login (no saved pick) or when they tap "switch area" in the sidebar.
   if (needsPicker) {
     return (
+      <>
+      {offlineBanner}
       <div className="min-h-screen bg-[#1C0F05] text-white flex flex-col">
         <div className="flex items-center gap-2 px-5 py-4 border-b border-white/10">
           <ChefHat className="w-6 h-6 text-[#FF8A4C] shrink-0" />
@@ -309,11 +377,13 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
           </div>
         </div>
       </div>
+      </>
     );
   }
 
   return (
     <CaptainUI.Provider value={{ openTables: () => setDrawer(true) }}>
+    {offlineBanner}
     <div className="md:flex min-h-screen">
       {/* Persistent sidebar (tablet/desktop, md+) */}
       <aside className="hidden md:block shrink-0 h-screen sticky top-0">{sidebar}</aside>

@@ -15,6 +15,7 @@ import { printFiredKots, printBill, copyLabel } from '@/lib/offline-print/print'
 import { api } from '@/lib/api';
 import { probeBridge, getBridgeUrl, setBridgeUrl, type BridgeHealth } from '@/lib/offline-print/bridge-client';
 import { ensureDrainLoop, drainOutbox, counts, retryFailed, prunePrinted } from '@/lib/offline-print/outbox';
+import { pushCache, replayOnce } from '@/lib/offline-print/lan-sync';
 import { Printer, Wifi, WifiOff, CheckCircle2, AlertTriangle, RefreshCw, Receipt, ChefHat, Settings, ArrowLeft, Copy } from 'lucide-react';
 
 interface LogRow { id: string; at: string; kind: 'KOT' | 'BILL'; label: string; detail: string; }
@@ -28,6 +29,11 @@ export default function PrintAgent() {
   const [showCfg, setShowCfg] = useState(false);
   const esRef = useRef<EventSource | null>(null);
   const seen = useRef<Set<string>>(new Set());
+  // Cloud-reachable signal for the LAN offline loops. Seeded from the SSE `live`
+  // state and refreshed by a tiny heartbeat, so a replay/cache-push only runs
+  // when the cloud actually answers (not merely when SSE hasn't errored yet).
+  const cloudUp = useRef(false);
+  const replayBusy = useRef(false);
 
   const pushLog = useCallback((row: Omit<LogRow, 'at'>) => {
     const at = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date());
@@ -56,8 +62,8 @@ export default function PrintAgent() {
     setUrlInput(getBridgeUrl());
 
     const es = new EventSource('/api/dine-in/kds/stream?station=all');
-    es.onopen = () => setLive(true);
-    es.onerror = () => setLive(false);
+    es.onopen = () => { setLive(true); cloudUp.current = true; };
+    es.onerror = () => { setLive(false); cloudUp.current = false; };
     es.onmessage = async (e) => {
       let evt: any;
       try { evt = JSON.parse(e.data); } catch { return; }
@@ -98,6 +104,64 @@ export default function PrintAgent() {
     const t = setInterval(tick, 5000);
     return () => clearInterval(t);
   }, [refreshQueue]);
+
+  // ── LAN offline-KOT sync ──────────────────────────────────────────────────
+  // Two background loops that run ONLY while the cloud is reachable; both are
+  // fully defensive (swallow errors, never crash this page) and never disturb
+  // the SSE/poll/print behaviour above.
+  //
+  // Heartbeat — a cheap same-origin ping that confirms the cloud actually
+  // answers, so a replay never fires on a stale-but-not-yet-errored SSE. It only
+  // ever *promotes* reachability optimistically; SSE onopen/onerror stay the
+  // primary signal.
+  useEffect(() => {
+    let alive = true;
+    const heartbeat = async () => {
+      try {
+        const r = await fetch('/api/build-info', { cache: 'no-store' });
+        if (alive) cloudUp.current = r.ok;
+      } catch { if (alive) cloudUp.current = false; }
+    };
+    heartbeat();
+    const t = setInterval(heartbeat, 15000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
+  // (A) CACHE WARMER — snapshot menu/tables/KOT-design/outlet/printers to the
+  // bridge every ~60s (and once on mount) so the offline mini-POS has fresh data
+  // the instant the internet drops.
+  useEffect(() => {
+    let alive = true;
+    const warm = async () => {
+      if (!alive || !cloudUp.current) return;
+      const ok = await pushCache().catch(() => false);
+      if (alive && ok) pushLog({ id: `cache-${Date.now()}`, kind: 'KOT', label: 'Offline cache updated', detail: 'menu · tables · printers cached to bridge' });
+    };
+    warm();
+    const t = setInterval(warm, 60000);
+    return () => { alive = false; clearInterval(t); };
+  }, [pushLog]);
+
+  // (B) REPLAY LOOP — every ~30s, pull the bridge's pending offline KOTs and
+  // replay them to the cloud (idempotent by client_ref), then mark them synced.
+  useEffect(() => {
+    let alive = true;
+    const sync = async () => {
+      if (!alive || !cloudUp.current || replayBusy.current) return;
+      replayBusy.current = true;
+      try {
+        const n = await replayOnce();
+        if (alive && n > 0) {
+          pushLog({ id: `replay-${Date.now()}`, kind: 'KOT', label: `Synced ${n} offline KOT${n === 1 ? '' : 's'}`, detail: 'replayed to cloud from the counter bridge' });
+          refreshQueue();
+        }
+      } catch { /* never crash the page */ }
+      finally { replayBusy.current = false; }
+    };
+    sync();
+    const t = setInterval(sync, 30000);
+    return () => { alive = false; clearInterval(t); };
+  }, [pushLog, refreshQueue]);
 
   async function onRetry() { await retryFailed(); await drainOutbox(); refreshQueue(); }
 

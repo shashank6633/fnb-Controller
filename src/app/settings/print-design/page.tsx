@@ -292,7 +292,7 @@ export default function PrintDesign() {
           {saved ? 'Saved' : 'Save design'}
         </button>
       </div>
-      <p className="text-sm text-[#8B7355] mb-2">Design how the Food KOT and the Bill print. The preview updates live. After saving, the counter PC must run the latest <b>Print Bridge (v2.1.0+)</b> — re-download it from the <b>KOT &amp; Bill Printers</b> page and restart it — for the new KOT layout to print.</p>
+      <p className="text-sm text-[#8B7355] mb-2">Design how the Food KOT and the Bill print. The preview updates live. After saving, the counter PC must run the latest <b>Print Bridge (v2.2.0+)</b> — re-download it from the <b>KOT &amp; Bill Printers</b> page and restart it — for the new KOT layout to print.</p>
       {error && (
         <div className="flex items-center gap-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3">
           <AlertTriangle className="w-4 h-4 shrink-0" /> {error}

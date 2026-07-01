@@ -49,6 +49,10 @@ export default function OfflinePrintPage() {
   const [menuStations, setMenuStations] = useState<{ station: string; item_count: number; has_printer: boolean; printer_id: string | null; printer_name: string | null; kind: string; mirror: boolean }[]>([]);
   const [tableZones, setTableZones] = useState<string[]>([]);
   const [toast, setToast] = useState<{ ok: boolean; msg: string } | null>(null);
+  // Counter PC offline address — captains open this on their tablet during an
+  // internet outage so KOTs still print. Stored in settings under 'counter_offline_url'.
+  const [counterOfflineUrl, setCounterOfflineUrl] = useState('');
+  const [savingOfflineUrl, setSavingOfflineUrl] = useState(false);
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 4000); };
 
@@ -77,6 +81,11 @@ export default function OfflinePrintPage() {
 
   useEffect(() => {
     setBridgeUrlState(getBridgeUrl());
+    // Load the saved counter offline address (settings key 'counter_offline_url').
+    fetch('/api/settings?key=counter_offline_url')
+      .then((r) => r.json())
+      .then((d) => setCounterOfflineUrl(d?.value || ''))
+      .catch(() => {});
     loadStations(); loadJobs(); loadMenuStations(); checkBridge(); refreshQueue();
     ensureDrainLoop();
     // Auto-reconnect: silently re-probe the bridge every 4s (no "Checking…"
@@ -107,6 +116,18 @@ export default function OfflinePrintPage() {
   }, [stations]);
 
   const saveBridgeUrl = () => { setBridgeUrl(bridgeUrl); checkBridge(); flash(true, 'Bridge address saved.'); };
+
+  // Persist the counter offline address via the shared settings API (same
+  // pattern as every other setting on the app).
+  const saveCounterOfflineUrl = async () => {
+    setSavingOfflineUrl(true);
+    try {
+      const r = await api('/api/settings', { method: 'PUT', body: { key: 'counter_offline_url', value: counterOfflineUrl.trim() } });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({})))?.error || `HTTP ${r.status}`);
+      flash(true, 'Counter offline address saved.');
+    } catch (e: any) { flash(false, e.message || 'Save failed.'); }
+    finally { setSavingOfflineUrl(false); }
+  };
 
   const openNew = () => { setForm(blankForm); setShowForm(true); };
   const openNewForStation = (station: string) => {
@@ -177,7 +198,7 @@ export default function OfflinePrintPage() {
     const jobId = `test_${Date.now()}`;
     let result: { ok: boolean; error?: string } = { ok: false, error: 'bridge unreachable' };
     try {
-      result = await bridgePrint({ jobId, printer: { transport: s.transport, target: s.target, width }, doc: doc as any });
+      result = await bridgePrint({ jobId, printer: { transport: s.transport, target: s.target, width: (width === 32 ? 32 : 48) }, doc: doc as any });
     } catch (e: any) { result = { ok: false, error: e.message }; }
     // Log the attempt (best-effort; ignore if server unreachable).
     api('/api/dine-in/offline-print/jobs', {
@@ -226,6 +247,27 @@ export default function OfflinePrintPage() {
         </div>
       </div>
 
+      {/* Counter PC offline address — the LAN URL captains navigate to when the
+          internet is down, so KOTs still print through this counter's bridge. */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-5">
+        <label className="block">
+          <span className="font-semibold text-[#2D1B0E]">Counter PC offline address</span>
+          <p className="text-xs text-[#8B7355] mt-0.5 mb-2">Captains open this on their tablet when the internet is down, so KOTs still print.</p>
+          <div className="flex items-center gap-2">
+            <input
+              value={counterOfflineUrl}
+              onChange={(e) => setCounterOfflineUrl(e.target.value)}
+              placeholder="http://192.168.1.10:9920/offline"
+              className={`${inputCls} flex-1`}
+            />
+            <button onClick={saveCounterOfflineUrl} disabled={savingOfflineUrl}
+              className="flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white px-3 py-2 rounded-lg text-sm font-medium">
+              {savingOfflineUrl ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
+            </button>
+          </div>
+        </label>
+      </div>
+
       {/* Print queue (offline outbox) */}
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-5 flex items-center justify-between flex-wrap gap-3">
         <div>
@@ -270,13 +312,14 @@ export default function OfflinePrintPage() {
             <div className="flex flex-wrap gap-2 my-1">
               <a href="/print-bridge.bat" download className="inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-3 py-2 rounded-lg text-xs font-medium no-underline"><Download className="w-4 h-4" /> Download launcher (.bat)</a>
               <a href="/print-bridge.mjs" download className="inline-flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-2 rounded-lg text-xs font-medium no-underline"><Download className="w-4 h-4" /> Download bridge (.mjs)</a>
+              <a href="/offline-pos.html" download className="inline-flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-2 rounded-lg text-xs font-medium no-underline"><Download className="w-4 h-4" /> Download offline page (.html)</a>
             </div>
-            <p className="text-xs text-[#8B7355]">First time? Install <b>Node.js LTS</b> from <code className="bg-[#FFF1E3] px-1 rounded">nodejs.org</code>, put <b>both</b> files above in one folder (e.g. <code className="bg-[#FFF1E3] px-1 rounded">C:\fnb-bridge\</code>), then double-click the .bat.</p>
+            <p className="text-xs text-[#8B7355]">First time? Install <b>Node.js LTS</b> from <code className="bg-[#FFF1E3] px-1 rounded">nodejs.org</code>, put <b>all three</b> files above in one folder (e.g. <code className="bg-[#FFF1E3] px-1 rounded">C:\fnb-bridge\</code>), then double-click the .bat. <i>The .html is the offline kitchen page — it must sit in the same folder as the bridge.</i> (The PowerShell installer below fetches all of them automatically.)</p>
 
             <p className="font-medium text-[#2D1B0E] mt-2">Make it permanent — auto-start on every boot (recommended)</p>
             <p>Run this <b>once</b> in PowerShell <b>(as Administrator)</b>. It installs Node if missing, runs the bridge as an always-on Windows service, and auto-updates daily — the counter never has to launch anything again:</p>
             <pre className="bg-[#2D1B0E] text-[#F5E9DC] text-[11px] rounded-lg p-2 overflow-x-auto whitespace-pre-wrap">{`powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm ${typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`}</pre>
-            <p className="text-xs text-[#8B7355]"><b>If it says “Unable to connect to the remote server”:</b> let the browser download it instead — open <code className="bg-[#FFF1E3] px-1 rounded break-all">{typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1</code> in this browser (choose <b>Keep</b> if warned), then in an <b>admin</b> PowerShell run <code className="bg-[#FFF1E3] px-1 rounded break-all">{'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install-bridge-service.ps1"'}</code>. Wait for <b>HEALTHY — v2.1.0</b>.</p>
+            <p className="text-xs text-[#8B7355]"><b>If it says “Unable to connect to the remote server”:</b> let the browser download it instead — open <code className="bg-[#FFF1E3] px-1 rounded break-all">{typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1</code> in this browser (choose <b>Keep</b> if warned), then in an <b>admin</b> PowerShell run <code className="bg-[#FFF1E3] px-1 rounded break-all">{'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install-bridge-service.ps1"'}</code>. Wait for <b>HEALTHY — v2.2.0</b>.</p>
 
             <p className="text-xs text-[#8B7355] mt-1">Add printers below. <b>USB</b>: share it in Windows, enter <code className="bg-[#FFF1E3] px-1 rounded">\\localhost\POS80</code>. <b>Network</b>: enter <code className="bg-[#FFF1E3] px-1 rounded">192.168.1.50:9100</code>. Everything is on-site, so printing keeps working even if the internet drops.</p>
           </div>

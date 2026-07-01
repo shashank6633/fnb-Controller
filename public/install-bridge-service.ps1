@@ -74,18 +74,21 @@ Write-Host "[2/5] NSSM ready." -ForegroundColor Green
 # -- 3. Bridge program (latest from the site) ---------------------------------
 Write-Host "[3/5] Downloading latest print-bridge.mjs from $AppUrl ..." -ForegroundColor Yellow
 Invoke-WebRequest -Uri "$AppUrl/print-bridge.mjs" -OutFile "$InstallDir\print-bridge.mjs"
-# Save the updater script next to it
+# The offline mini-POS page the bridge serves at /offline (must sit next to the .mjs)
+Invoke-WebRequest -Uri "$AppUrl/offline-pos.html" -OutFile "$InstallDir\offline-pos.html"
+# Save the updater script next to it (refreshes BOTH the bridge and the offline page)
 @"
 `$ErrorActionPreference='SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 `$cur="$InstallDir\print-bridge.mjs"; `$new="$InstallDir\print-bridge.new"
 Invoke-WebRequest -Uri "$AppUrl/print-bridge.mjs" -OutFile `$new
+Invoke-WebRequest -Uri "$AppUrl/offline-pos.html" -OutFile "$InstallDir\offline-pos.html"
 if((Test-Path `$new) -and ((Get-FileHash `$new).Hash -ne (Get-FileHash `$cur).Hash)){
   Copy-Item `$new `$cur -Force; & "$nssm" restart $ServiceName
 }
 Remove-Item `$new -ErrorAction SilentlyContinue
 "@ | Set-Content -Path "$InstallDir\update-bridge.ps1" -Encoding UTF8
-Write-Host "[3/5] Bridge + updater installed." -ForegroundColor Green
+Write-Host "[3/5] Bridge + offline page + updater installed." -ForegroundColor Green
 
 # -- 4. Register / reconfigure the Windows Service ----------------------------
 Write-Host "[4/5] Registering Windows Service '$ServiceName' ..." -ForegroundColor Yellow

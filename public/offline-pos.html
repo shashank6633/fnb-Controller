@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+<meta name="theme-color" content="#8B5E3C" />
+<title>Offline KOT — Kitchen Only</title>
+<!--
+  Offline mini-POS served by the print bridge at GET /offline.
+  Self-contained: no external CDN / fonts / scripts. Must load with ZERO internet.
+  Talks to the SAME bridge (same-origin) via relative URLs:
+    GET  /cache            -> CACHE object (menu, tables, printers, kotDesign, outletName)
+    GET  /kot/pending      -> { jobs:[ fires where syncedAt==null ] }
+    POST /kot   body=FIRE  -> { ok:true, localNumber:"L007", stationsPrinted:[...] }
+  v1 scope: KOTs ONLY. No billing / no settlement here.
+-->
+<style>
+  :root{
+    --cream:#FDF6EC;
+    --cream-2:#F5E9D6;
+    --brown:#8B5E3C;
+    --brown-d:#6F4A2E;
+    --brown-l:#A9805E;
+    --ink:#3B2A1C;
+    --muted:#8A7963;
+    --line:#E4D3BC;
+    --ok:#2E7D4F;
+    --ok-bg:#E4F3E9;
+    --warn:#B4531F;
+    --warn-bg:#F9E7DA;
+    --white:#FFFDF9;
+    --shadow:0 2px 8px rgba(90,60,35,.12);
+    --radius:14px;
+    --tap:56px;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;padding:0;height:100%;}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--cream);
+    color:var(--ink);
+    font-size:17px;
+    line-height:1.35;
+    -webkit-font-smoothing:antialiased;
+    overscroll-behavior:none;
+  }
+  .visually-hidden{
+    position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;
+    overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0;
+  }
+  button{font-family:inherit;font-size:inherit;cursor:pointer;}
+  /* ---- top bar ---- */
+  .topbar{
+    position:sticky;top:0;z-index:30;
+    background:var(--brown);color:var(--white);
+    padding:10px 14px;
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    box-shadow:var(--shadow);
+    padding-top:calc(10px + env(safe-area-inset-top));
+  }
+  .topbar .brand{font-weight:800;letter-spacing:.3px;font-size:19px;}
+  .topbar .outlet{opacity:.9;font-size:14px;}
+  .topbar .offline-tag{
+    background:var(--warn-bg);color:var(--warn);
+    font-weight:800;font-size:12px;letter-spacing:.5px;
+    padding:4px 9px;border-radius:999px;text-transform:uppercase;
+  }
+  .topbar .spacer{flex:1 1 auto;}
+  .chip{
+    background:rgba(255,255,255,.16);color:var(--white);
+    border:1px solid rgba(255,255,255,.3);
+    padding:6px 11px;border-radius:999px;font-size:13px;font-weight:700;white-space:nowrap;
+  }
+  .chip.sync{background:var(--warn-bg);color:var(--warn);border-color:transparent;}
+  /* ---- step tracker ---- */
+  .steps{
+    display:flex;gap:6px;padding:10px 14px 4px;background:var(--cream);
+    position:sticky;top:52px;z-index:20;
+  }
+  .steps .s{
+    flex:1;text-align:center;font-size:12px;font-weight:700;color:var(--muted);
+    padding:7px 4px;border-radius:10px;background:var(--cream-2);border:1px solid transparent;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .steps .s.active{background:var(--brown);color:var(--white);}
+  .steps .s.done{background:var(--ok-bg);color:var(--ok);border-color:#CDE6D6;}
+  /* ---- layout ---- */
+  .wrap{padding:12px 14px 140px;max-width:1100px;margin:0 auto;}
+  .panel{display:none;}
+  .panel.show{display:block;animation:fade .18s ease;}
+  @keyframes fade{from{opacity:.3;transform:translateY(4px);}to{opacity:1;transform:none;}}
+  h2.sec{font-size:16px;margin:6px 2px 12px;color:var(--brown-d);letter-spacing:.2px;}
+  /* ---- big message (no cache) ---- */
+  .bigmsg{
+    text-align:center;padding:40px 22px;margin:30px auto;max-width:560px;
+    background:var(--white);border-radius:var(--radius);box-shadow:var(--shadow);
+    border:1px solid var(--line);
+  }
+  .bigmsg .ico{font-size:52px;line-height:1;margin-bottom:14px;}
+  .bigmsg h3{margin:0 0 10px;color:var(--brown-d);font-size:22px;}
+  .bigmsg p{margin:0 0 8px;color:var(--muted);font-size:16px;}
+  /* ---- grids of tap targets ---- */
+  .zonegrp{margin-bottom:18px;}
+  .zonegrp .zlabel{
+    font-size:13px;font-weight:800;color:var(--brown);text-transform:uppercase;
+    letter-spacing:.6px;margin:4px 2px 8px;
+  }
+  .tgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:10px;}
+  .tile{
+    min-height:var(--tap);background:var(--white);border:1.5px solid var(--line);
+    border-radius:12px;font-weight:800;color:var(--ink);
+    display:flex;align-items:center;justify-content:center;padding:10px 6px;text-align:center;
+    box-shadow:var(--shadow);transition:transform .05s;
+  }
+  .tile:active{transform:scale(.96);}
+  .tile.sel{background:var(--brown);color:var(--white);border-color:var(--brown-d);}
+  /* ---- forms ---- */
+  .form{background:var(--white);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px;box-shadow:var(--shadow);max-width:560px;}
+  .field{margin-bottom:14px;}
+  .field label{display:block;font-size:13px;font-weight:800;color:var(--brown-d);margin-bottom:6px;}
+  .field .req{color:var(--warn);}
+  .field input{
+    width:100%;min-height:var(--tap);font-size:18px;padding:0 14px;
+    border:1.5px solid var(--line);border-radius:12px;background:var(--cream);color:var(--ink);
+  }
+  .field input:focus{outline:none;border-color:var(--brown);background:var(--white);}
+  .covers{display:flex;align-items:center;gap:12px;}
+  .covers input{text-align:center;max-width:120px;font-weight:800;font-size:22px;}
+  .stepbtn{
+    min-width:var(--tap);min-height:var(--tap);border-radius:12px;border:1.5px solid var(--brown);
+    background:var(--cream-2);color:var(--brown-d);font-size:26px;font-weight:800;line-height:1;
+  }
+  .stepbtn:active{background:var(--brown);color:#fff;}
+  /* ---- menu controls ---- */
+  .controls{position:sticky;top:96px;z-index:15;background:var(--cream);padding:6px 0 10px;}
+  .searchrow{display:flex;gap:8px;margin-bottom:8px;}
+  .searchrow input{
+    flex:1;min-height:48px;font-size:17px;padding:0 14px;border:1.5px solid var(--line);
+    border-radius:12px;background:var(--white);
+  }
+  .searchrow input:focus{outline:none;border-color:var(--brown);}
+  .filters{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;-webkit-overflow-scrolling:touch;}
+  .fbtn{
+    white-space:nowrap;padding:8px 14px;border-radius:999px;border:1.5px solid var(--line);
+    background:var(--white);color:var(--brown-d);font-weight:700;font-size:14px;
+  }
+  .fbtn.on{background:var(--brown);color:#fff;border-color:var(--brown-d);}
+  .fl-seg{display:flex;gap:6px;margin-bottom:8px;}
+  .fl-seg .fbtn{flex:1;text-align:center;}
+  /* ---- menu grid ---- */
+  .mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:4px;}
+  .mcard{
+    background:var(--white);border:1.5px solid var(--line);border-radius:12px;
+    padding:11px 12px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:6px;
+    position:relative;
+  }
+  .mcard .mname{font-weight:800;font-size:15px;color:var(--ink);line-height:1.2;}
+  .mcard .mmeta{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;gap:6px;}
+  .mcard .mstation{
+    display:inline-block;font-size:11px;font-weight:800;color:var(--brown);
+    background:var(--cream-2);padding:2px 7px;border-radius:6px;letter-spacing:.3px;
+  }
+  .mcard .mprice{font-weight:800;color:var(--brown-d);}
+  .mcard .addrow{display:flex;align-items:center;justify-content:space-between;margin-top:2px;}
+  .mcard .qbadge{
+    font-weight:800;color:var(--white);background:var(--ok);min-width:30px;text-align:center;
+    padding:3px 8px;border-radius:8px;font-size:14px;
+  }
+  .miniadd{
+    min-height:44px;padding:0 16px;border-radius:10px;border:none;background:var(--brown);
+    color:#fff;font-weight:800;font-size:15px;
+  }
+  .miniadd:active{background:var(--brown-d);}
+  .qsteppers{display:flex;align-items:center;gap:8px;}
+  .qsteppers .stepbtn{min-width:44px;min-height:44px;font-size:22px;}
+  .empty{color:var(--muted);text-align:center;padding:34px 10px;font-size:16px;}
+  /* ---- cart (docked bottom sheet) ---- */
+  .cartbar{
+    position:fixed;left:0;right:0;bottom:0;z-index:40;
+    background:var(--white);border-top:2px solid var(--line);
+    box-shadow:0 -4px 16px rgba(90,60,35,.14);
+    padding:10px 14px calc(10px + env(safe-area-inset-bottom));
+  }
+  .cartbar .row1{display:flex;align-items:center;gap:12px;}
+  .cartbar .csum{flex:1;font-weight:800;color:var(--brown-d);font-size:15px;}
+  .cartbar .csum small{display:block;font-weight:600;color:var(--muted);font-size:12px;}
+  .btn{
+    min-height:var(--tap);padding:0 20px;border-radius:12px;border:none;font-weight:800;font-size:17px;
+  }
+  .btn-primary{background:var(--brown);color:#fff;}
+  .btn-primary:active{background:var(--brown-d);}
+  .btn-primary:disabled{opacity:.45;}
+  .btn-ghost{background:var(--cream-2);color:var(--brown-d);border:1.5px solid var(--line);}
+  .btn-fire{background:var(--ok);color:#fff;}
+  .btn-fire:active{background:#256B42;}
+  .btn-fire:disabled{opacity:.45;}
+  .cartlist{max-height:34vh;overflow:auto;margin:0 0 8px;padding:0;list-style:none;
+    border-top:1px dashed var(--line);}
+  .cartlist li{
+    display:flex;align-items:center;gap:10px;padding:9px 2px;border-bottom:1px dashed var(--line);
+  }
+  .cartlist .ci-name{flex:1;font-weight:700;font-size:15px;}
+  .cartlist .ci-name small{display:block;color:var(--muted);font-weight:500;font-size:12px;}
+  .cartlist .ci-q{font-weight:800;color:var(--brown-d);min-width:26px;text-align:center;}
+  .cartlist .noteinput{
+    width:100%;min-height:40px;font-size:14px;padding:0 10px;margin-top:5px;
+    border:1px solid var(--line);border-radius:8px;background:var(--cream);
+  }
+  .cart-toggle{background:none;border:none;color:var(--brown);font-weight:800;font-size:13px;padding:6px 0;}
+  /* ---- toast / result ---- */
+  .toast{
+    position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:60;
+    background:var(--ink);color:#fff;padding:12px 18px;border-radius:12px;font-weight:700;
+    box-shadow:var(--shadow);max-width:90vw;text-align:center;display:none;
+  }
+  .toast.err{background:var(--warn);}
+  .toast.show{display:block;animation:pop .2s ease;}
+  @keyframes pop{from{transform:translateX(-50%) scale(.9);opacity:0;}to{transform:translateX(-50%) scale(1);opacity:1;}}
+  /* ---- fired ticket banner ---- */
+  .fired-banner{
+    background:var(--ok-bg);border:1.5px solid #CDE6D6;border-radius:var(--radius);
+    padding:18px;margin-bottom:14px;text-align:center;box-shadow:var(--shadow);
+  }
+  .fired-banner .lbl{color:var(--ok);font-weight:800;font-size:14px;letter-spacing:.4px;text-transform:uppercase;}
+  .fired-banner .num{font-size:40px;font-weight:900;color:var(--brown-d);margin:4px 0;letter-spacing:1px;}
+  .fired-banner .sub{color:var(--muted);font-size:14px;}
+  /* ---- session ticket log ---- */
+  .ticketlog{margin-top:16px;}
+  .ticketlog h3{font-size:14px;color:var(--brown-d);margin:0 0 8px;}
+  .ticketlog ul{list-style:none;margin:0;padding:0;}
+  .ticketlog li{
+    display:flex;align-items:center;gap:10px;background:var(--white);border:1px solid var(--line);
+    border-radius:10px;padding:10px 12px;margin-bottom:7px;box-shadow:var(--shadow);
+  }
+  .ticketlog .tnum{font-weight:900;color:var(--ok);font-size:17px;min-width:52px;}
+  .ticketlog .tmeta{flex:1;font-size:14px;color:var(--ink);}
+  .ticketlog .tmeta small{color:var(--muted);}
+  /* ---- back / nav buttons ---- */
+  .navrow{display:flex;gap:10px;margin-top:16px;}
+  .navrow .btn{flex:1;}
+  @media(max-width:420px){
+    body{font-size:16px;}
+    .mgrid{grid-template-columns:repeat(auto-fill,minmax(46%,1fr));}
+  }
+</style>
+</head>
+<body>
+<h1 class="visually-hidden">Offline kitchen order-ticket entry — fire KOTs to the kitchen during an internet outage</h1>
+
+<div class="topbar">
+  <span class="brand">Offline KOT</span>
+  <span class="outlet" id="outletName"></span>
+  <span class="offline-tag">Kitchen only</span>
+  <span class="spacer"></span>
+  <span class="chip sync" id="syncChip" style="display:none"></span>
+</div>
+
+<div class="steps" id="steps" style="display:none">
+  <div class="s" data-step="table">1 · Table</div>
+  <div class="s" data-step="guest">2 · Guest</div>
+  <div class="s" data-step="menu">3 · Order</div>
+</div>
+
+<div class="wrap">
+
+  <!-- No-cache message -->
+  <div id="noCache" class="bigmsg" style="display:none">
+    <div class="ico">&#128246;</div>
+    <h3>Menu not cached yet</h3>
+    <p>Open the <strong>Print Agent</strong> on the counter PC once while online,</p>
+    <p>then reload this page.</p>
+    <div class="navrow" style="max-width:280px;margin:18px auto 0">
+      <button class="btn btn-primary" onclick="location.reload()">Reload</button>
+    </div>
+  </div>
+
+  <!-- STEP 1: table -->
+  <section id="panel-table" class="panel">
+    <h2 class="sec">Pick a table</h2>
+    <div id="tableZones"></div>
+  </section>
+
+  <!-- STEP 2: guest -->
+  <section id="panel-guest" class="panel">
+    <h2 class="sec">Guest details — <span id="guestTableLbl"></span></h2>
+    <div class="form">
+      <div class="field">
+        <label for="gName">Name <span class="req">*</span></label>
+        <input id="gName" type="text" autocomplete="off" placeholder="Guest name" />
+      </div>
+      <div class="field">
+        <label for="gMobile">Mobile <span style="color:var(--muted);font-weight:600">(optional)</span></label>
+        <input id="gMobile" type="tel" inputmode="numeric" autocomplete="off" placeholder="Phone number" />
+      </div>
+      <div class="field">
+        <label for="gCovers">No. of Guests <span class="req">*</span></label>
+        <div class="covers">
+          <button class="stepbtn" type="button" onclick="bumpCovers(-1)" aria-label="Fewer guests">&minus;</button>
+          <input id="gCovers" type="number" min="1" value="2" inputmode="numeric" />
+          <button class="stepbtn" type="button" onclick="bumpCovers(1)" aria-label="More guests">+</button>
+        </div>
+      </div>
+    </div>
+    <div class="navrow">
+      <button class="btn btn-ghost" onclick="goStep('table')">Back</button>
+      <button class="btn btn-primary" onclick="submitGuest()">Continue to menu</button>
+    </div>
+  </section>
+
+  <!-- STEP 3: menu -->
+  <section id="panel-menu" class="panel">
+    <div class="controls">
+      <div class="searchrow">
+        <input id="search" type="search" placeholder="Search dishes..." autocomplete="off" oninput="renderMenu()" />
+      </div>
+      <div class="fl-seg" id="flSeg">
+        <button class="fbtn on" data-fl="all" onclick="setFL('all')">All</button>
+        <button class="fbtn" data-fl="food" onclick="setFL('food')">Food</button>
+        <button class="fbtn" data-fl="liquor" onclick="setFL('liquor')">Liquor</button>
+      </div>
+      <div class="filters" id="catFilters"></div>
+    </div>
+    <div id="menuGrid" class="mgrid"></div>
+    <div id="menuEmpty" class="empty" style="display:none">No dishes match.</div>
+    <div class="navrow">
+      <button class="btn btn-ghost" onclick="goStep('guest')">Back to guest</button>
+    </div>
+  </section>
+
+  <!-- STEP 4 (post-fire): confirmation + session log -->
+  <section id="panel-done" class="panel">
+    <div id="firedBanner"></div>
+    <div class="navrow">
+      <button class="btn btn-fire" onclick="startNewTicket()">New ticket</button>
+    </div>
+    <div class="ticketlog" id="sessionLogWrap" style="display:none">
+      <h3>Tickets fired this session</h3>
+      <ul id="sessionLog"></ul>
+    </div>
+  </section>
+
+</div>
+
+<!-- Cart docked bar (only on menu step with items) -->
+<div class="cartbar" id="cartbar" style="display:none">
+  <button class="cart-toggle" id="cartToggle" onclick="toggleCart()">Show items ▲</button>
+  <ul class="cartlist" id="cartList" style="display:none"></ul>
+  <div class="row1">
+    <div class="csum" id="cartSummary">0 items<small></small></div>
+    <button class="btn btn-ghost" id="clearBtn" onclick="clearCart()">Clear</button>
+    <button class="btn btn-fire" id="fireBtn" onclick="fireKot()" disabled>Fire to Kitchen</button>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+/* =====================================================================
+   State
+   ===================================================================== */
+var CACHE = null;
+var state = {
+  step: 'table',
+  table: null,            // {id,label,zone}
+  guest: { name:'', mobile:'', covers:2 },
+  cart: {},               // menuId -> { item, qty, notes }
+  fl: 'all',              // all | food | liquor
+  cat: 'ALL',
+  cartExpanded: false,
+  sessionTickets: [],     // { localNumber, tableLabel, itemCount }
+  pendingCount: 0,
+  firing: false,
+};
+
+/* =====================================================================
+   Tiny helpers
+   ===================================================================== */
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+// uuid v4 (crypto if available, else Math.random fallback so it works offline everywhere)
+function uuidv4(){
+  if (window.crypto && crypto.randomUUID) { try { return crypto.randomUUID(); } catch(e){} }
+  var buf;
+  if (window.crypto && crypto.getRandomValues){
+    buf = new Uint8Array(16); crypto.getRandomValues(buf);
+  } else {
+    buf = new Uint8Array(16);
+    for (var i=0;i<16;i++) buf[i] = Math.floor(Math.random()*256);
+  }
+  buf[6] = (buf[6] & 0x0f) | 0x40;
+  buf[8] = (buf[8] & 0x3f) | 0x80;
+  var h = []; for (var j=0;j<256;j++) h[j] = (j+0x100).toString(16).slice(1);
+  return h[buf[0]]+h[buf[1]]+h[buf[2]]+h[buf[3]]+'-'+h[buf[4]]+h[buf[5]]+'-'+
+         h[buf[6]]+h[buf[7]]+'-'+h[buf[8]]+h[buf[9]]+'-'+
+         h[buf[10]]+h[buf[11]]+h[buf[12]]+h[buf[13]]+h[buf[14]]+h[buf[15]];
+}
+
+var toastTimer = null;
+function toast(msg, isErr){
+  var t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (isErr ? ' err' : '');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function(){ t.className = 'toast'; }, isErr ? 5000 : 2600);
+}
+
+function isLiquor(it){ return it.item_type !== 'foods'; }
+function cartCount(){ var n=0; for (var k in state.cart) n += state.cart[k].qty; return n; }
+function cartLines(){ return Object.keys(state.cart).length; }
+
+/* =====================================================================
+   Boot: GET /cache  (same-origin, relative)
+   ===================================================================== */
+function boot(){
+  fetch('/cache', { headers:{'Accept':'application/json'} })
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      if (!data || !data.menu || !data.menu.length || !data.tables) {
+        showNoCache();
+        return;
+      }
+      CACHE = data;
+      $('outletName').textContent = CACHE.outletName || '';
+      $('steps').style.display = 'flex';
+      renderTableZones();
+      goStep('table');
+      loadPending();
+    })
+    .catch(function(){ showNoCache(); });
+}
+function showNoCache(){
+  $('noCache').style.display = 'block';
+  $('steps').style.display = 'none';
+  hideAllPanels();
+}
+
+/* GET /kot/pending -> { jobs:[...] } */
+function loadPending(){
+  fetch('/kot/pending', { headers:{'Accept':'application/json'} })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      var n = (d && d.jobs) ? d.jobs.length : 0;
+      state.pendingCount = n;
+      renderSyncChip();
+    })
+    .catch(function(){ /* offline-of-offline; ignore */ });
+}
+function renderSyncChip(){
+  var c = $('syncChip');
+  if (state.pendingCount > 0){
+    c.style.display = '';
+    c.textContent = state.pendingCount + ' ticket' + (state.pendingCount===1?'':'s') + ' waiting to sync';
+  } else {
+    c.style.display = 'none';
+  }
+}
+
+/* =====================================================================
+   Step navigation
+   ===================================================================== */
+function hideAllPanels(){
+  ['table','guest','menu','done'].forEach(function(s){
+    var p = $('panel-'+s); if (p) p.classList.remove('show');
+  });
+}
+function goStep(step){
+  state.step = step;
+  hideAllPanels();
+  var p = $('panel-'+step); if (p) p.classList.add('show');
+  // step tracker
+  var order = ['table','guest','menu'];
+  var idx = order.indexOf(step);
+  document.querySelectorAll('#steps .s').forEach(function(el){
+    var es = el.getAttribute('data-step');
+    var ei = order.indexOf(es);
+    el.className = 's' + (es===step ? ' active' : (ei>-1 && idx>-1 && ei<idx ? ' done' : ''));
+  });
+  // cart bar only on menu
+  updateCartBar();
+  window.scrollTo(0,0);
+}
+
+/* =====================================================================
+   STEP 1 — Tables grouped by zone ('' -> "Floor")
+   ===================================================================== */
+function renderTableZones(){
+  var groups = {};
+  var order = [];
+  (CACHE.tables||[]).forEach(function(t){
+    var z = (t.zone && String(t.zone).trim()) ? String(t.zone).trim() : 'Floor';
+    if (!groups[z]){ groups[z] = []; order.push(z); }
+    groups[z].push(t);
+  });
+  var html = '';
+  order.forEach(function(z){
+    html += '<div class="zonegrp"><div class="zlabel">'+esc(z)+'</div><div class="tgrid">';
+    groups[z].forEach(function(t){
+      var sel = (state.table && state.table.id===t.id) ? ' sel' : '';
+      html += '<button class="tile'+sel+'" onclick="pickTable('+"'"+esc(String(t.id))+"'"+')">'+
+              esc(t.label || t.id)+'</button>';
+    });
+    html += '</div></div>';
+  });
+  if (!order.length) html = '<div class="empty">No tables cached.</div>';
+  $('tableZones').innerHTML = html;
+}
+function pickTable(id){
+  var t = (CACHE.tables||[]).find(function(x){ return String(x.id)===String(id); });
+  if (!t) return;
+  state.table = { id:t.id, label:t.label, zone:t.zone||'' };
+  renderTableZones();
+  $('guestTableLbl').textContent = t.label || t.id;
+  goStep('guest');
+}
+
+/* =====================================================================
+   STEP 2 — Guest form
+   ===================================================================== */
+function bumpCovers(d){
+  var el = $('gCovers');
+  var v = (parseInt(el.value,10)||0) + d;
+  if (v < 1) v = 1;
+  el.value = v;
+}
+function submitGuest(){
+  var name = $('gName').value.trim();
+  var covers = parseInt($('gCovers').value,10)||0;
+  if (!name){ toast('Guest name is required', true); $('gName').focus(); return; }
+  if (covers < 1){ toast('Enter number of guests', true); $('gCovers').focus(); return; }
+  state.guest = { name:name, mobile:$('gMobile').value.trim(), covers:covers };
+  buildCatFilters();
+  renderMenu();
+  goStep('menu');
+}
+
+/* =====================================================================
+   STEP 3 — Menu grid + filters
+   ===================================================================== */
+function buildCatFilters(){
+  var cats = ['ALL'];
+  (CACHE.menu||[]).forEach(function(m){
+    var c = (m.category && String(m.category).trim()) ? String(m.category).trim() : 'Other';
+    if (cats.indexOf(c) === -1) cats.push(c);
+  });
+  var html = '';
+  cats.forEach(function(c){
+    var on = (state.cat===c) ? ' on' : '';
+    var label = (c==='ALL') ? 'All categories' : c;
+    html += '<button class="fbtn'+on+'" onclick="setCat('+"'"+esc(c)+"'"+')">'+esc(label)+'</button>';
+  });
+  $('catFilters').innerHTML = html;
+}
+function setCat(c){ state.cat = c; buildCatFilters(); renderMenu(); }
+function setFL(v){
+  state.fl = v;
+  document.querySelectorAll('#flSeg .fbtn').forEach(function(b){
+    b.className = 'fbtn' + (b.getAttribute('data-fl')===v ? ' on' : '');
+  });
+  renderMenu();
+}
+function menuMatches(m){
+  // Food/Liquor
+  if (state.fl==='food' && isLiquor(m)) return false;
+  if (state.fl==='liquor' && !isLiquor(m)) return false;
+  // category
+  if (state.cat !== 'ALL'){
+    var c = (m.category && String(m.category).trim()) ? String(m.category).trim() : 'Other';
+    if (c !== state.cat) return false;
+  }
+  // text search
+  var q = $('search').value.trim().toLowerCase();
+  if (q){
+    var hay = (String(m.name||'')+' '+String(m.category||'')+' '+String(m.station||'')).toLowerCase();
+    if (hay.indexOf(q) === -1) return false;
+  }
+  return true;
+}
+function renderMenu(){
+  var list = (CACHE.menu||[]).filter(menuMatches);
+  var html = '';
+  list.forEach(function(m){
+    var inCart = state.cart[m.id];
+    var q = inCart ? inCart.qty : 0;
+    var idAttr = "'"+esc(String(m.id))+"'";
+    var price = (m.price!=null && m.price!=='') ? '&#8377;'+esc(String(m.price)) : '';
+    var addBlock = q > 0
+      ? '<div class="qsteppers">'+
+          '<button class="stepbtn" onclick="chg('+idAttr+',-1)" aria-label="Remove one">&minus;</button>'+
+          '<span class="qbadge">'+q+'</span>'+
+          '<button class="stepbtn" onclick="chg('+idAttr+',1)" aria-label="Add one">+</button>'+
+        '</div>'
+      : '<button class="miniadd" onclick="chg('+idAttr+',1)">Add</button>';
+    html +=
+      '<div class="mcard">'+
+        '<div class="mname">'+esc(m.name)+'</div>'+
+        '<div><span class="mstation">'+esc(m.station||'—')+'</span></div>'+
+        '<div class="mmeta"><span class="mprice">'+price+'</span>'+
+          '<span>'+(isLiquor(m)?'Liquor':'Food')+'</span></div>'+
+        '<div class="addrow">'+addBlock+'</div>'+
+      '</div>';
+  });
+  $('menuGrid').innerHTML = html;
+  $('menuEmpty').style.display = list.length ? 'none' : 'block';
+}
+
+/* =====================================================================
+   Cart
+   ===================================================================== */
+function chg(id, d){
+  var m = (CACHE.menu||[]).find(function(x){ return String(x.id)===String(id); });
+  if (!m) return;
+  var line = state.cart[id];
+  if (!line){ line = { item:m, qty:0, notes:'' }; state.cart[id] = line; }
+  line.qty += d;
+  if (line.qty <= 0) delete state.cart[id];
+  renderMenu();
+  updateCartBar();
+  if (state.cartExpanded) renderCartList();
+}
+function updateCartBar(){
+  var bar = $('cartbar');
+  var count = cartCount();
+  var onMenu = (state.step === 'menu');
+  bar.style.display = (onMenu && count > 0) ? 'block' : 'none';
+  $('cartSummary').innerHTML = count + ' item' + (count===1?'':'s') +
+    '<small>' + cartLines() + ' dish' + (cartLines()===1?'':'es') + ' &middot; Table ' +
+    esc(state.table ? (state.table.label||state.table.id) : '') + '</small>';
+  $('fireBtn').disabled = (count === 0) || state.firing;
+}
+function toggleCart(){
+  state.cartExpanded = !state.cartExpanded;
+  $('cartList').style.display = state.cartExpanded ? 'block' : 'none';
+  $('cartToggle').textContent = state.cartExpanded ? 'Hide items ▼' : 'Show items ▲';
+  if (state.cartExpanded) renderCartList();
+}
+function renderCartList(){
+  var html = '';
+  Object.keys(state.cart).forEach(function(id){
+    var l = state.cart[id];
+    var idAttr = "'"+esc(String(id))+"'";
+    html +=
+      '<li>'+
+        '<button class="stepbtn" style="min-width:40px;min-height:40px;font-size:20px" onclick="chg('+idAttr+',-1)" aria-label="Remove one">&minus;</button>'+
+        '<span class="ci-q">'+l.qty+'</span>'+
+        '<button class="stepbtn" style="min-width:40px;min-height:40px;font-size:20px" onclick="chg('+idAttr+',1)" aria-label="Add one">+</button>'+
+        '<span class="ci-name">'+esc(l.item.name)+
+          '<input class="noteinput" placeholder="Notes (e.g. no onion)" value="'+esc(l.notes)+'" '+
+          'oninput="setNote('+idAttr+',this.value)" />'+
+        '</span>'+
+      '</li>';
+  });
+  $('cartList').innerHTML = html || '<li class="empty">Cart is empty.</li>';
+}
+function setNote(id, val){ if (state.cart[id]) state.cart[id].notes = val; }
+function clearCart(){
+  state.cart = {};
+  state.cartExpanded = false;
+  $('cartList').style.display = 'none';
+  $('cartToggle').textContent = 'Show items ▲';
+  renderMenu();
+  updateCartBar();
+}
+
+/* =====================================================================
+   Fire — POST /kot with FIRE shape
+   ===================================================================== */
+function buildFire(){
+  var items = Object.keys(state.cart).map(function(id){
+    var l = state.cart[id], m = l.item;
+    var fire = {
+      menuId: m.id,
+      name: m.name,
+      qty: l.qty,
+      price: (m.price!=null ? Number(m.price) : 0),
+      station: m.station || '',
+      item_type: m.item_type || 'foods',
+      prep_minutes: (m.prep_minutes!=null ? Number(m.prep_minutes) : 0)
+    };
+    if (l.notes && l.notes.trim()) fire.notes = l.notes.trim();
+    return fire;
+  });
+  return {
+    clientRef: uuidv4(),
+    createdAt: new Date().toISOString(),
+    captainName: getCaptainName(),  // no auth offline: stored operator name or 'Offline Captain'
+    table: { id: state.table.id, label: state.table.label, zone: state.table.zone||'' },
+    guest: { name: state.guest.name, mobile: state.guest.mobile, covers: state.guest.covers },
+    items: items
+  };
+}
+function fireKot(){
+  if (state.firing) return;
+  if (cartCount() === 0){ toast('Cart is empty', true); return; }
+  state.firing = true;
+  $('fireBtn').disabled = true;
+  $('fireBtn').textContent = 'Firing...';
+
+  var fire = buildFire();  // captainName resolved inside buildFire via getCaptainName()
+
+  fetch('/kot', {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json', 'Accept':'application/json' },
+    body: JSON.stringify(fire)
+  })
+  .then(function(r){
+    return r.json().then(function(body){ return { ok:r.ok, status:r.status, body:body }; });
+  })
+  .then(function(res){
+    if (!res.ok || !res.body || res.body.ok === false){
+      var msg = (res.body && res.body.error) ? res.body.error : ('Print failed (HTTP '+res.status+')');
+      throw new Error(msg);
+    }
+    onFired(res.body, fire);
+  })
+  .catch(function(err){
+    toast(err && err.message ? err.message : 'Could not reach the print bridge', true);
+  })
+  .then(function(){
+    state.firing = false;
+    $('fireBtn').textContent = 'Fire to Kitchen';
+    $('fireBtn').disabled = (cartCount()===0);
+  });
+}
+
+function onFired(body, fire){
+  var ln = body.localNumber || 'L—';
+  var itemCount = fire.items.reduce(function(s,i){ return s + (i.qty||0); }, 0);
+  var tableLabel = fire.table.label || fire.table.id;
+  // session log (newest first)
+  state.sessionTickets.unshift({ localNumber:ln, tableLabel:tableLabel, itemCount:itemCount });
+  state.pendingCount += 1;
+  renderSyncChip();
+
+  // confirmation banner
+  var stations = (body.stationsPrinted && body.stationsPrinted.length)
+    ? body.stationsPrinted.join(', ') : '';
+  $('firedBanner').innerHTML =
+    '<div class="fired-banner">'+
+      '<div class="lbl">Sent to kitchen</div>'+
+      '<div class="num">Ticket '+esc(ln)+'</div>'+
+      '<div class="sub">Table '+esc(tableLabel)+' &middot; '+itemCount+' item'+(itemCount===1?'':'s')+
+        (stations ? ' &middot; '+esc(stations) : '')+'</div>'+
+    '</div>';
+  renderSessionLog();
+
+  // reset cart, keep table+guest for convenience, jump to done
+  state.cart = {};
+  state.cartExpanded = false;
+  $('cartList').style.display = 'none';
+  $('cartToggle').textContent = 'Show items ▲';
+  updateCartBar();
+  goStep('done');
+}
+
+function renderSessionLog(){
+  var wrap = $('sessionLogWrap');
+  if (!state.sessionTickets.length){ wrap.style.display='none'; return; }
+  wrap.style.display = 'block';
+  var html = '';
+  state.sessionTickets.forEach(function(t){
+    html +=
+      '<li><span class="tnum">'+esc(t.localNumber)+'</span>'+
+      '<span class="tmeta">Table '+esc(t.tableLabel)+' <small>&middot; '+t.itemCount+
+      ' item'+(t.itemCount===1?'':'s')+'</small></span></li>';
+  });
+  $('sessionLog').innerHTML = html;
+}
+
+function startNewTicket(){
+  // fresh order; go back to table pick so a new table can be chosen
+  state.table = null;
+  state.guest = { name:'', mobile:'', covers:2 };
+  $('gName').value = ''; $('gMobile').value = ''; $('gCovers').value = 2;
+  state.cat = 'ALL'; state.fl = 'all';
+  $('search').value = '';
+  renderTableZones();
+  goStep('table');
+}
+
+/* Captain name: no auth offline. Persist an optional operator name in
+   localStorage so replayed orders carry a server_name; default to a generic
+   label the cloud can display. */
+function getCaptainName(){
+  try {
+    var n = localStorage.getItem('offlineCaptainName');
+    if (n && n.trim()) return n.trim();
+  } catch(e){}
+  return 'Offline Captain';
+}
+
+/* =====================================================================
+   Go
+   ===================================================================== */
+boot();
+</script>
+</body>
+</html>

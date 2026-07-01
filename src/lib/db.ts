@@ -1495,6 +1495,11 @@ function initializeSchema(db: Database.Database) {
     const hasOrd = (n: string) => orCols.some((c: any) => c.name === n);
     if (!hasOrd('guest_name'))            db.exec(`ALTER TABLE orders ADD COLUMN guest_name TEXT DEFAULT ''`);
     if (!hasOrd('guest_mobile'))          db.exec(`ALTER TABLE orders ADD COLUMN guest_mobile TEXT DEFAULT ''`);
+    // Offline LAN KOT replay: client_ref is the idempotency key sent by the
+    // counter's offline mini-POS; origin marks where the order came from
+    // ('cloud' for normal online orders, 'offline' for replayed ones).
+    if (!hasOrd('client_ref'))            db.exec(`ALTER TABLE orders ADD COLUMN client_ref TEXT`);
+    if (!hasOrd('origin'))                db.exec(`ALTER TABLE orders ADD COLUMN origin TEXT DEFAULT 'cloud'`);
     // Bill: service charge amount + why a cashier removed it; discount % + approver.
     if (!hasOrd('service_charge'))        db.exec(`ALTER TABLE orders ADD COLUMN service_charge REAL NOT NULL DEFAULT 0`);
     if (!hasOrd('service_charge_reason')) db.exec(`ALTER TABLE orders ADD COLUMN service_charge_reason TEXT DEFAULT ''`);
