@@ -185,7 +185,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
               INSERT INTO kots (id, outlet_id, order_id, kot_number, station, status, fired_by, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, 'new', ?, datetime('now'), datetime('now'))
             `).run(kotId, order.outlet_id, id, seq.n, station, firedBy);
-            for (const it of its) setKot.run(kotId, Number(it.mi_prep_minutes) || 0, it.id);
+            for (const it of its) setKot.run(kotId, Number(it.mi_prep_minutes) || 15, it.id);   // default 15 min when the dish has no prep time set
             firedKots.push({
               id: kotId, outlet_id: order.outlet_id, order_id: id, kot_number: seq.n, station, status: 'new',
               order_number: order.order_number, order_type: order.order_type,

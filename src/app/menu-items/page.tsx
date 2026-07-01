@@ -367,7 +367,7 @@ export default function MenuItemsPage() {
             <button onClick={openImport} className="flex items-center gap-2 px-4 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium">
               <FileSpreadsheet className="w-4 h-4" />Import from Akan POS
             </button>
-            <button onClick={() => setEditItem({ id: '', name: '', category: '', station: '', item_type: 'foods', dietary_tag: '', selling_price: 0, listing_price: 0, item_code: '', tax_value: 0, prep_minutes: 0, is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '' })} className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
+            <button onClick={() => setEditItem({ id: '', name: '', category: '', station: '', item_type: 'foods', dietary_tag: '', selling_price: 0, listing_price: 0, item_code: '', tax_value: 0, prep_minutes: 15, is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '' })} className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
               <Plus className="w-4 h-4" />New Item
             </button>
           </div>

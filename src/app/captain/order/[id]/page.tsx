@@ -487,7 +487,7 @@ export default function CaptainOrder() {
             const firedMs = parseTs(it.fired_at);
             const isFired = Number.isFinite(firedMs);
             const isDone = !!it.completed_at;
-            const prep = Number(it.prep_minutes || 0);
+            const prep = Number(it.prep_minutes) || 15;   // default 15 min when no per-dish prep time is set
             const elapsed = isDone ? (parseTs(it.completed_at) - firedMs) : (now - firedMs);
             const overdue = isFired && !isDone && prep > 0 && elapsed >= prep * 60_000;
             return (
