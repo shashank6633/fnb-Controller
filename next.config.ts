@@ -1,6 +1,20 @@
 import type { NextConfig } from "next";
+import { execSync } from "node:child_process";
+
+// A STABLE build id (the git SHA) baked into BOTH the client bundle
+// (NEXT_PUBLIC_BUILD_ID) and readable by /api/build-info. This lets a bundle
+// that was served STALE from cache after a deploy detect itself — its baked id
+// won't match the server's current id — and auto-reload. Falls back to '' if
+// git is unavailable, in which case auto-update simply stays off (never loops).
+function resolveBuildId(): string {
+  try { return execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); }
+  catch { return ""; }
+}
+const BUILD_ID = resolveBuildId();
 
 const nextConfig: NextConfig = {
+  env: { NEXT_PUBLIC_BUILD_ID: BUILD_ID },
+
   // Testing deployment skips strict type-check at build time. Pre-existing
   // type errors (recharts Tooltip type narrowing, route-file helper exports)
   // are non-blocking at runtime. Will be cleaned up before production.

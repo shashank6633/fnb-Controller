@@ -18,7 +18,11 @@ const PROCESS_BOOT_ID = Math.random().toString(36).slice(2, 10) + '-' + Date.now
 
 export async function GET() {
   return Response.json({
-    build_id: process.env.NEXT_BUILD_ID || PROCESS_BOOT_ID,
+    // Prefer the STABLE git-SHA build id (the same value the client bundle baked
+    // in via NEXT_PUBLIC_BUILD_ID) so an ALREADY-stale client can compare its own
+    // baked id against this and know it must reload. PROCESS_BOOT_ID is only a
+    // fallback when git wasn't available at build time.
+    build_id: process.env.NEXT_PUBLIC_BUILD_ID || process.env.NEXT_BUILD_ID || PROCESS_BOOT_ID,
     started_at: PROCESS_BOOT_ID.split('-')[1],
   }, {
     headers: { 'Cache-Control': 'no-store' },
