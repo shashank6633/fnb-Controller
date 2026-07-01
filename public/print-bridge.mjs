@@ -98,6 +98,13 @@ function sizeCmd(m) {
   const k = Math.max(1, Math.min(4, Math.round(m))) - 1;
   return [GS, 0x21, ((k << 4) | k) & 0xff];
 }
+// Double-HEIGHT only (normal width). Used for money rows so a long label +
+// big amount keeps the FULL column width and can never run off the paper,
+// while still printing tall/prominent.
+function sizeCmdH(m) {
+  const k = Math.max(1, Math.min(4, Math.round(m))) - 1;
+  return [GS, 0x21, k & 0x0f];
+}
 const SIZE_MULT = { normal: 1, large: 2, xlarge: 3 };
 const mult = (size) => SIZE_MULT[size] || 1;
 
@@ -247,11 +254,13 @@ function buildBill(doc, cols, doCut) {
     if (m > 1) push(sizeCmd(m)); line(s); if (m > 1) push(sizeCmd(1));
     if (bold) push(CMD.boldOff);
   };
-  // Two-column line at size m (double-size halves the usable columns).
+  // Money two-column row. Enlarged rows use double-HEIGHT only (not width) so
+  // "Grand Total" + a big amount always keeps the full column width and never
+  // runs off the 80mm paper — it just prints taller.
   const twoColS = (l, r, m, bold = false) => {
     if (bold) push(CMD.boldOn);
-    if (m > 1) push(sizeCmd(m));
-    line(twoCol(l, r, Math.max(8, Math.floor(cols / Math.max(1, m)))));
+    if (m > 1) push(sizeCmdH(m));
+    line(twoCol(l, r, cols));
     if (m > 1) push(sizeCmd(1));
     if (bold) push(CMD.boldOff);
   };

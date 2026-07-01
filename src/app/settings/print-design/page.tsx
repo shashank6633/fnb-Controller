@@ -40,7 +40,7 @@ function twoCol(left: string, right: string, cols = 48) {   // 80mm = 48 cols (m
 // ── Live preview (monospace, mirrors the bridge buildKot section-by-section) ──
 function Ticket({ children }: { children: React.ReactNode }) {
   return (
-    <div className="bg-white text-black font-mono text-[11px] leading-[1.45] rounded-lg shadow-inner border border-[#E8D5C4] p-3 w-[300px] mx-auto whitespace-pre overflow-x-auto">
+    <div className="bg-white text-black font-mono text-[10px] leading-[1.5] rounded-lg shadow-inner border border-[#E8D5C4] px-2.5 py-3 w-[340px] mx-auto whitespace-pre overflow-x-auto">
       {children}
     </div>
   );
@@ -115,6 +115,23 @@ function itemRow(name: string, qty: string, rate: string, amt: string): string {
 // bill body is column-based). Mirrors the KOT's SIZE_CLASS approach.
 const BILL_SIZE_CLASS: Record<KotLineSize, string> = { normal: '', large: 'text-[15px]', xlarge: 'text-[19px]' };
 
+// Money rows print DOUBLE-HEIGHT ONLY (the bridge uses sizeCmdH), so they grow
+// tall but keep the full 48-col width and never run off the paper. Represent
+// that faithfully in the preview with a vertical scale (never a width change).
+const BILL_MONEY_STYLE: Record<KotLineSize, { scale?: string; lh: string }> = {
+  normal: { lh: '' },
+  large: { scale: 'scaleY(1.7)', lh: 'leading-[1.9]' },
+  xlarge: { scale: 'scaleY(2.4)', lh: 'leading-[2.6]' },
+};
+const MoneyL = ({ children, b, size }: { children: React.ReactNode; b?: boolean; size: KotLineSize }) => {
+  const st = BILL_MONEY_STYLE[size];
+  return (
+    <div className={`${b ? 'font-bold' : ''} ${st.lh}`}>
+      <span className="inline-block origin-center" style={st.scale ? { transform: st.scale } : undefined}>{children}</span>
+    </div>
+  );
+};
+
 function BillPreview({ d, businessName, gstin }: { d: BillDesign; businessName: string; gstin: string }) {
   const s = SAMPLE_BILL;
   const subtotal = round2(s.items.reduce((a, it) => a + it.amount, 0));
@@ -149,17 +166,17 @@ function BillPreview({ d, businessName, gstin }: { d: BillDesign; businessName: 
           ))}
         </>
       );
-      case 'subTotal': return <><Rule /><L cls={z}>{twoCol('Sub Total', billMoney(b.subtotal))}</L></>;
-      case 'serviceCharge': return b.serviceCharge > 0 ? <L cls={z}>{twoCol('Service Charges', billMoney(b.serviceCharge))}</L> : null;
-      case 'cgst': return b.cgst > 0 ? <L cls={z}>{twoCol(`CGST@${d.cgstPct}%`, billMoney(b.cgst))}</L> : null;
-      case 'sgst': return b.sgst > 0 ? <L cls={z}>{twoCol(`SGST@${d.sgstPct}%`, billMoney(b.sgst))}</L> : null;
-      case 'discount': return b.discount > 0 ? <L cls={z}>{twoCol('Discount', '-' + billMoney(b.discount))}</L> : null;
-      case 'total': return <L b cls={z || 'text-[15px]'}>{twoCol('TOTAL', 'Rs.' + round2(b.total).toFixed(2), 24)}</L>;
-      case 'grandTotal': return <L b cls={z}>{twoCol('Grand Total', 'Rs.' + Math.round(b.total))}</L>;
+      case 'subTotal': return <><Rule /><MoneyL size={ln.size}>{twoCol('Sub Total', billMoney(b.subtotal))}</MoneyL></>;
+      case 'serviceCharge': return b.serviceCharge > 0 ? <MoneyL size={ln.size}>{twoCol('Service Charges', billMoney(b.serviceCharge))}</MoneyL> : null;
+      case 'cgst': return b.cgst > 0 ? <MoneyL size={ln.size}>{twoCol(`CGST@${d.cgstPct}%`, billMoney(b.cgst))}</MoneyL> : null;
+      case 'sgst': return b.sgst > 0 ? <MoneyL size={ln.size}>{twoCol(`SGST@${d.sgstPct}%`, billMoney(b.sgst))}</MoneyL> : null;
+      case 'discount': return b.discount > 0 ? <MoneyL size={ln.size}>{twoCol('Discount', '-' + billMoney(b.discount))}</MoneyL> : null;
+      case 'total': return <MoneyL b size={ln.size === 'normal' ? 'large' : ln.size}>{twoCol('TOTAL', billMoney(b.total))}</MoneyL>;
+      case 'grandTotal': return <MoneyL b size={ln.size}>{twoCol('Grand Total', billMoney(Math.round(b.total)))}</MoneyL>;
       case 'payment': return (
         <>
-          <L cls={z}>{twoCol(`Paid by ${s.paymentMethod.toUpperCase()}`, billMoney(Math.round(b.total)))}</L>
-          <L cls={z}>{twoCol('Balance', billMoney(0))}</L>
+          <MoneyL size={ln.size}>{twoCol(`Paid by ${s.paymentMethod.toUpperCase()}`, billMoney(Math.round(b.total)))}</MoneyL>
+          <MoneyL size={ln.size}>{twoCol('Balance', billMoney(0))}</MoneyL>
         </>
       );
       case 'footer': return d.footerNote ? <C cls={z}>{d.footerNote}</C> : null;
