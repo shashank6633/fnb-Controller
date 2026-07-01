@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
-<meta name="theme-color" content="#8B5E3C" />
+<meta name="theme-color" content="#af4408" />
 <title>Offline KOT — Kitchen Only</title>
 <!--
   Offline mini-POS served by the print bridge at GET /offline.
@@ -16,21 +16,27 @@
 -->
 <style>
   :root{
-    --cream:#FDF6EC;
-    --cream-2:#F5E9D6;
-    --brown:#8B5E3C;
-    --brown-d:#6F4A2E;
-    --brown-l:#A9805E;
-    --ink:#3B2A1C;
-    --muted:#8A7963;
-    --line:#E4D3BC;
-    --ok:#2E7D4F;
-    --ok-bg:#E4F3E9;
-    --warn:#B4531F;
-    --warn-bg:#F9E7DA;
-    --white:#FFFDF9;
-    --shadow:0 2px 8px rgba(90,60,35,.12);
-    --radius:14px;
+    /* Matches the webapp theme (src/app/globals.css @theme): burnt-orange
+       primary #af4408 on a warm #FFF8F0 background, Inter-like system sans. */
+    --cream:#FFF8F0;      /* app --color-bg */
+    --cream-2:#FFF1E3;    /* app --color-surface-hover */
+    --brown:#af4408;      /* app --color-primary / header */
+    --brown-d:#8a3506;    /* app --color-primary-dark (button hover/active) */
+    --brown-l:#d4611a;    /* app --color-primary-light */
+    --ink:#2D1B0E;        /* app --color-text */
+    --muted:#6B5744;      /* app --color-text-muted */
+    --line:#E8D5C4;       /* app --color-border */
+    --line-d:#D4B896;     /* app --color-border-dark */
+    --ok:#16A34A;         /* app --color-success */
+    --ok-bg:#E7F5EC;
+    --warn:#B45309;       /* amber, close to app --color-warning #D97706 */
+    --warn-bg:#FBEBD2;
+    --danger:#DC2626;     /* app --color-danger */
+    --fire:#FF6B35;       /* captain app "Send KOT" button colour */
+    --fire-d:#e2551f;
+    --white:#FFFFFF;      /* app --color-surface */
+    --shadow:0 1px 3px rgba(45,27,14,.10);
+    --radius:12px;        /* app cards use 0.75rem; 12px reads the same */
     --tap:56px;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
@@ -199,8 +205,8 @@
   .btn-primary:active{background:var(--brown-d);}
   .btn-primary:disabled{opacity:.45;}
   .btn-ghost{background:var(--cream-2);color:var(--brown-d);border:1.5px solid var(--line);}
-  .btn-fire{background:var(--ok);color:#fff;}
-  .btn-fire:active{background:#256B42;}
+  .btn-fire{background:var(--fire);color:#fff;}
+  .btn-fire:active{background:var(--fire-d);}
   .btn-fire:disabled{opacity:.45;}
   .cartlist{max-height:34vh;overflow:auto;margin:0 0 8px;padding:0;list-style:none;
     border-top:1px dashed var(--line);}
@@ -445,6 +451,7 @@ function boot(){
         return;
       }
       CACHE = data;
+      $('noCache').style.display = 'none';
       $('outletName').textContent = CACHE.outletName || '';
       $('steps').style.display = 'flex';
       renderTableZones();
