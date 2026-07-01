@@ -28,8 +28,11 @@ function loadOrder(db: Database.Database, id: string) {
   if (!order) return null;
   // Join the KOT so the captain can see each item's kitchen state
   // (pending → new/preparing/ready/served).
+  // oi.* already includes prep_minutes, fired_at, completed_at (added to the
+  // schema); list them explicitly so the captain can drive the per-item prep
+  // timer (fired_at + prep_minutes) and completion (completed_at) UI.
   const items = db.prepare(`
-    SELECT oi.*, k.status AS kot_status
+    SELECT oi.*, oi.prep_minutes, oi.fired_at, oi.completed_at, k.status AS kot_status
     FROM order_items oi
     LEFT JOIN kots k ON k.id = oi.kot_id
     WHERE oi.order_id = ? ORDER BY oi.created_at ASC
@@ -151,7 +154,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
           // KITCHEN strictly food and the Main BAR strictly drinks, regardless of
           // how a station printer's Group is set.
           const pending = db.prepare(`
-            SELECT oi.*, mi.item_type AS item_type
+            SELECT oi.*, mi.item_type AS item_type, mi.prep_minutes AS mi_prep_minutes
             FROM order_items oi LEFT JOIN menu_items mi ON oi.menu_item_id = mi.id
             WHERE oi.order_id = ? AND oi.status = 'pending'
           `).all(id) as any[];
@@ -165,7 +168,12 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             const st = (it.station && it.station.trim()) || 'kitchen';
             (byStation[st] ||= []).push(it);
           }
-          const setKot = db.prepare("UPDATE order_items SET kot_id = ?, status = 'fired' WHERE id = ?");
+          // Fire also starts each item's prep timer: stamp fired_at = now and
+          // snapshot the item's current menu prep_minutes onto the order line
+          // (so later menu edits don't retro-change fired tickets).
+          const setKot = db.prepare(
+            "UPDATE order_items SET kot_id = ?, status = 'fired', fired_at = datetime('now'), prep_minutes = ? WHERE id = ?"
+          );
           for (const [station, its] of Object.entries(byStation)) {
             const seq = db.prepare(`
               SELECT COALESCE(MAX(kot_number), 0) + 1 AS n FROM kots
@@ -177,7 +185,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
               INSERT INTO kots (id, outlet_id, order_id, kot_number, station, status, fired_by, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, 'new', ?, datetime('now'), datetime('now'))
             `).run(kotId, order.outlet_id, id, seq.n, station, firedBy);
-            for (const it of its) setKot.run(kotId, it.id);
+            for (const it of its) setKot.run(kotId, Number(it.mi_prep_minutes) || 0, it.id);
             firedKots.push({
               id: kotId, outlet_id: order.outlet_id, order_id: id, kot_number: seq.n, station, status: 'new',
               order_number: order.order_number, order_type: order.order_type,
@@ -197,6 +205,28 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                  b.discount === undefined ? order.discount : Math.max(0, Number(b.discount) || 0),
                  b.notes === undefined ? order.notes : String(b.notes), id);
           break;
+        case 'set_guest':
+          // Captain records who's at the table: name, mobile, and cover count.
+          // Each field only changes when provided; covers coerces to a non-neg int.
+          db.prepare(`UPDATE orders SET guest_name = ?, guest_mobile = ?, covers = ?, updated_at = datetime('now') WHERE id = ?`)
+            .run(b.guest_name === undefined ? (order.guest_name || '') : String(b.guest_name),
+                 b.guest_mobile === undefined ? (order.guest_mobile || '') : String(b.guest_mobile),
+                 b.covers === undefined ? order.covers : Math.max(0, Number(b.covers) || 0), id);
+          break;
+        case 'complete_item': {
+          // Mark a fired line as served/done (stops its prep timer).
+          const item = db.prepare('SELECT id FROM order_items WHERE id = ? AND order_id = ?').get(b.item_id, id) as any;
+          if (!item) throw new Error('Line item not found');
+          db.prepare("UPDATE order_items SET completed_at = datetime('now') WHERE id = ? AND order_id = ?").run(b.item_id, id);
+          break;
+        }
+        case 'uncomplete_item': {
+          // Undo a completion — reopen the item's prep timer.
+          const item = db.prepare('SELECT id FROM order_items WHERE id = ? AND order_id = ?').get(b.item_id, id) as any;
+          if (!item) throw new Error('Line item not found');
+          db.prepare('UPDATE order_items SET completed_at = NULL WHERE id = ? AND order_id = ?').run(b.item_id, id);
+          break;
+        }
         case 'transfer': {
           // Move this open order to a different (free) table. Authorization was
           // already checked above (approvedBy is set).

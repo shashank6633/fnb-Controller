@@ -13,6 +13,7 @@ export async function GET() {
   const users = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.is_active, u.created_at, u.last_login_at,
            u.department_id, u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
+           u.preferred_zones, u.preferred_table_ids,
            u.role_id, r.name AS role_name,
            d.name AS department_name
     FROM users u
@@ -69,7 +70,7 @@ export async function PUT(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
   const b = await req.json();
-  const { id, name, is_active, password, position, department_id, page_access, visible_department_ids } = b;
+  const { id, name, is_active, password, position, department_id, page_access, visible_department_ids, preferred_zones, preferred_table_ids } = b;
   if (!id) return Response.json({ error: 'id required' }, { status: 400 });
   const db = getDb();
   const sets: string[] = [];
@@ -113,6 +114,16 @@ export async function PUT(req: Request) {
     } else if (Array.isArray(visible_department_ids)) {
       sets.push('visible_department_ids = ?'); params.push(JSON.stringify(visible_department_ids));
     }
+  }
+  // Captain area assignment: JSON arrays of allowed zones + table ids. null/[] clears
+  // (= all areas). Only enforced when the captain_area_lock setting is on.
+  if (preferred_zones !== undefined) {
+    if (preferred_zones === null || (Array.isArray(preferred_zones) && preferred_zones.length === 0)) sets.push('preferred_zones = NULL');
+    else if (Array.isArray(preferred_zones)) { sets.push('preferred_zones = ?'); params.push(JSON.stringify(preferred_zones)); }
+  }
+  if (preferred_table_ids !== undefined) {
+    if (preferred_table_ids === null || (Array.isArray(preferred_table_ids) && preferred_table_ids.length === 0)) sets.push('preferred_table_ids = NULL');
+    else if (Array.isArray(preferred_table_ids)) { sets.push('preferred_table_ids = ?'); params.push(JSON.stringify(preferred_table_ids)); }
   }
   if (password)         { sets.push('password_hash = ?'); params.push(await hashPassword(password)); }
   if (sets.length === 0) return Response.json({ error: 'nothing to update' }, { status: 400 });

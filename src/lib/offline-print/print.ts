@@ -7,6 +7,7 @@
  * an order or settling a bill.
  */
 import { api } from '@/lib/api';
+import { computeBill } from '@/lib/bill-calc';
 import { enqueue, drainOutbox, ensureDrainLoop } from './outbox';
 import type { PrinterTarget } from './bridge-client';
 
@@ -332,6 +333,11 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
 export interface BillOrder {
   id: string; order_number?: number | string; table_number?: string | null; order_type?: string;
   zone?: string | null;   // the table's zone = its floor (drives floor-aware bill routing)
+  table_id?: string | null;              // present => DINE-IN, absent => PARCEL
+  covers?: number | null;                // guest count
+  guest_name?: string | null; guest_mobile?: string | null;
+  service_charge_reason?: string | null; // non-empty => cashier removed the service charge
+  discount_pct?: number | null;          // % discount (drives computeBill)
   server_name?: string; subtotal: number; tax_total: number; discount: number; total: number;
   payment_method?: string;
   items: Array<{ name: string; quantity: number; unit_price: number; line_total: number }>;
@@ -356,7 +362,12 @@ export function invalidateDesignCache(): void { designCache = null; billDesignCa
 
 let billDesignCache: { at: number; d: any } | null = null;
 async function getBillDesign(): Promise<any> {
-  const DEF = { shopName: '', showGstin: true, showServer: true, headerNote: '', footerNote: '' };
+  const DEF = {
+    brandName: '', companyName: '', address: '', contact: '', email: '', fssai: '',
+    showGstin: true, showServer: true,
+    serviceChargeOn: false, serviceChargePct: 0, cgstPct: 2.5, sgstPct: 2.5,
+    headerNote: '', footerNote: '',
+  };
   if (billDesignCache && Date.now() - billDesignCache.at < 30000) return billDesignCache.d;
   try {
     const r = await api('/api/settings?key=bill_design');
@@ -367,29 +378,65 @@ async function getBillDesign(): Promise<any> {
   } catch { return billDesignCache?.d || DEF; }
 }
 
-export async function printBill(order: BillOrder): Promise<{ ok: boolean; reason?: string }> {
+export async function printBill(order: BillOrder, printedBy?: string): Promise<{ ok: boolean; reason?: string }> {
   ensureDrainLoop();
   const stations = await getStations();
   const st = resolveBillStation(stations, order.zone);
   if (!st) return { ok: false, reason: 'No bill printer configured' };
   const shop = await getShop();
   const design = await getBillDesign();
-  const tax = Number(order.tax_total) > 0 ? [{ label: 'Tax', amount: Number(order.tax_total) }] : [];
+  // Single source of truth for the money breakdown (same helper the settle route
+  // uses to store the authoritative total) → printed bill can never disagree.
+  const subtotal = Number(order.subtotal) || 0;
+  const b = computeBill(
+    {
+      subtotal,
+      serviceRemoved: !!(order.service_charge_reason && String(order.service_charge_reason).trim()),
+      discount_pct: order.discount_pct == null ? undefined : Number(order.discount_pct),
+      discount: Number(order.discount) || 0,
+    },
+    {
+      serviceChargePct: Number(design.serviceChargePct) || 0,
+      serviceChargeOn: design.serviceChargeOn !== false,
+      cgstPct: Number(design.cgstPct) || 0,
+      sgstPct: Number(design.sgstPct) || 0,
+    },
+  );
   const doc = {
     type: 'bill' as const,
-    shopName: design.shopName || shop.name,
+    brandName: design.brandName || shop.name,
+    companyName: design.companyName || undefined,
+    address: design.address || undefined,
+    contact: design.contact || undefined,
+    email: design.email || undefined,
+    fssai: design.fssai || undefined,
     gstin: design.showGstin ? (shop.gstin || undefined) : undefined,
-    headerNote: design.headerNote || undefined,
-    billNo: order.order_number != null ? String(order.order_number) : undefined,
+    orderType: order.table_id ? 'DINE-IN' : 'PARCEL',
+    floor: order.zone || undefined,
     table: order.table_number || undefined,
-    server: design.showServer ? (order.server_name || undefined) : undefined,
+    guestName: order.guest_name || undefined,
+    guestMobile: order.guest_mobile || undefined,
+    captainName: order.server_name || undefined,
+    orderNo: order.order_number != null ? String(order.order_number) : undefined,
+    guests: Number(order.covers) || 0,
+    items: (order.items || []).map((it) => ({ name: it.name, qty: it.quantity, rate: it.unit_price, amount: it.line_total })),
+    subtotal: b.subtotal,
+    serviceCharge: b.serviceCharge,
+    cgstPct: Number(design.cgstPct) || 0,
+    cgst: b.cgst,
+    sgstPct: Number(design.sgstPct) || 0,
+    sgst: b.sgst,
+    discount: b.discount,
+    discountPct: order.discount_pct == null ? 0 : Number(order.discount_pct) || 0,
+    total: b.total,
+    grandTotal: Math.round(b.total),                        // final payable, rounded
+    // Payment line — only once settled (payment_method set). Full payment => balance 0.
+    paymentMethod: order.payment_method || undefined,
+    amountPaid: order.payment_method ? Math.round(b.total) : undefined,
+    balance: order.payment_method ? 0 : undefined,
+    footer: design.footerNote || undefined,
+    printedBy: printedBy || order.server_name || undefined,
     date: new Date().toISOString(),
-    items: (order.items || []).map((it) => ({ name: it.name, qty: it.quantity, price: it.unit_price, amount: it.line_total })),
-    subtotal: Number(order.subtotal) || 0,
-    discount: Number(order.discount) || 0,
-    tax,
-    total: Number(order.total) || 0,
-    footer: design.footerNote || (order.payment_method ? `Paid by ${order.payment_method.toUpperCase()} — thank you!` : 'Thank you! Visit again.'),
   };
   await enqueue({
     id: `bill_${order.id}`,                     // stable per order → never double-prints

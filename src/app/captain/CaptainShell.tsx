@@ -11,6 +11,7 @@ import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
 import {
   ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search, Loader2,
+  MapPin, ChevronDown, Users,
 } from 'lucide-react';
 
 /** Lets the routed pages open the tables sidebar/drawer (the ☰ in their headers). */
@@ -20,6 +21,11 @@ interface TableTile {
   id: string; table_number: string; zone: string; seats: number;
   open_order_id: string | null; open_order_number: number | null; open_order_total: number | null;
 }
+
+/** localStorage key for the captain's last-chosen serving area/zone. */
+const AREA_KEY = 'captain_active_zone';
+/** Normalize a table's zone to a stable label (matches the sidebar grouping). */
+const zoneOf = (t: TableTile) => t.zone || 'Floor';
 
 export default function CaptainShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -33,9 +39,19 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   const [onlyOpen, setOnlyOpen] = useState(false);
   const [q, setQ] = useState('');
   const [installEvt, setInstallEvt] = useState<any>(null);
+  const [loaded, setLoaded] = useState(false);          // first tables fetch has resolved
+  const [activeZone, setActiveZone] = useState<string | null>(null); // null = not yet picked
+  const [picking, setPicking] = useState(false);        // "switch area" re-opened the picker
+  // Guest-capture modal state (dine-in open flow).
+  const [guestTable, setGuestTable] = useState<TableTile | null>(null);
+  const [gName, setGName] = useState('');
+  const [gMobile, setGMobile] = useState('');
+  const [gCovers, setGCovers] = useState('2');
+  const [gBusy, setGBusy] = useState(false);
 
   const load = useCallback(async () => {
-    try { const r = await api('/api/dine-in/tables'); const j = await r.json(); setTables(j.items || []); } catch {}
+    try { const r = await api('/api/dine-in/tables'); const j = await r.json(); setTables(j.items || []); }
+    catch {} finally { setLoaded(true); }
   }, []);
   useEffect(() => {
     load();
@@ -47,30 +63,88 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
     return () => { clearInterval(t); window.removeEventListener('beforeinstallprompt', onPrompt); };
   }, [load]);
 
+  // Restore the previously-chosen area (if the captain still has access to it).
+  useEffect(() => {
+    try { const saved = localStorage.getItem(AREA_KEY); if (saved) setActiveZone(saved); } catch {}
+  }, []);
+
   // Close the drawer whenever the route changes (a table was opened).
   useEffect(() => { setDrawer(false); }, [pathname]);
 
   const currentOrderId = useMemo(() => pathname.match(/\/captain\/order\/([^/]+)/)?.[1] || null, [pathname]);
   const occupiedCount = tables.filter((t) => t.open_order_id).length;
 
+  /** Distinct zones available to this captain (server already area-filters the list). */
+  const availableZones = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of tables) set.add(zoneOf(t));
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [tables]);
+
+  /** Free/Occupied counts for a given zone (occ = has an open order). */
+  const zoneCounts = useCallback((zone: string) => {
+    const list = tables.filter((t) => zoneOf(t) === zone);
+    const occ = list.filter((t) => t.open_order_id).length;
+    return { free: list.length - occ, occ, total: list.length };
+  }, [tables]);
+
+  // Persist the picked area; auto-clear a stale pick the captain no longer has access to.
+  const chooseZone = useCallback((zone: string) => {
+    setActiveZone(zone); setPicking(false);
+    try { localStorage.setItem(AREA_KEY, zone); } catch {}
+  }, []);
+  useEffect(() => {
+    if (loaded && activeZone && availableZones.length && !availableZones.includes(activeZone)) {
+      setActiveZone(null);
+      try { localStorage.removeItem(AREA_KEY); } catch {}
+    }
+  }, [loaded, activeZone, availableZones]);
+
+  // Whether the full-screen area picker should show: captain has >1 zone and hasn't
+  // settled on one yet (or explicitly asked to switch). One-zone captains skip it.
+  const needsPicker = loaded && availableZones.length > 1 &&
+    (picking || !activeZone || !availableZones.includes(activeZone));
+
   const zones = useMemo(() => {
     const map = new Map<string, TableTile[]>();
     const filtered = tables.filter((t) =>
+      // When an area is active, scope the sidebar to it (search can still probe others via q).
+      (!activeZone || zoneOf(t) === activeZone || (q && zoneOf(t).toLowerCase().includes(q.toLowerCase()))) &&
       (!onlyOpen || t.open_order_id) &&
       (!q || t.table_number.toLowerCase().includes(q.toLowerCase()) || (t.zone || '').toLowerCase().includes(q.toLowerCase())));
-    for (const t of filtered) { const z = t.zone || 'Floor'; (map.get(z) || map.set(z, []).get(z)!).push(t); }
+    for (const t of filtered) { const z = zoneOf(t); (map.get(z) || map.set(z, []).get(z)!).push(t); }
     return [...map.entries()];
-  }, [tables, onlyOpen, q]);
+  }, [tables, onlyOpen, q, activeZone]);
 
-  async function openTable(t: TableTile) {
+  function openTable(t: TableTile) {
+    // Tapping an already-open table jumps straight to its order — no form.
     if (t.open_order_id) { router.push(`/captain/order/${t.open_order_id}`); return; }
-    setBusy(t.id);
+    // A free dine-in table first captures the guest (name + party size) via a modal.
+    setGName(''); setGMobile(''); setGCovers('2');
+    setGuestTable(t);
+  }
+
+  // Party size / name are valid; enables the Start button in the guest modal.
+  const guestValid = gName.trim().length > 0 && (Number(gCovers) || 0) >= 1;
+
+  async function startDineIn() {
+    if (!guestTable || !guestValid || gBusy) return;
+    const t = guestTable;
+    setGBusy(true); setBusy(t.id);
     try {
-      const r = await api('/api/dine-in/orders', { method: 'POST', body: { table_id: t.id, order_type: 'dine-in' } });
+      const r = await api('/api/dine-in/orders', {
+        method: 'POST',
+        body: {
+          table_id: t.id, order_type: 'dine-in',
+          guest_name: gName.trim(), guest_mobile: gMobile.trim(), covers: Number(gCovers) || 1,
+        },
+      });
       const j = await r.json();
       if (j.error) { alert(j.error); return; }
+      setGuestTable(null);
       router.push(`/captain/order/${j.id}`);
-    } finally { setBusy(null); }
+    } catch { alert('Could not open the table — check the connection and try again.'); }
+    finally { setGBusy(false); setBusy(null); }
   }
   async function newTakeaway() {
     if (tkBusy) return;                       // guard against double-tap → duplicate orders
@@ -94,7 +168,19 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
           <ChefHat className="w-5 h-5 text-[#FF8A4C] shrink-0" />
           <div className="min-w-0">
             <p className="font-bold leading-tight">Captain</p>
-            <p className="text-[11px] text-white/50 leading-tight truncate">{me?.name || me?.email || ''}</p>
+            {activeZone && availableZones.length > 1 ? (
+              <button
+                onClick={() => setPicking(true)}
+                className="flex items-center gap-1 text-[11px] text-[#FF8A4C] leading-tight -ml-0.5 active:scale-95"
+                title="Switch area"
+              >
+                <MapPin className="w-3 h-3 shrink-0" />
+                <span className="truncate max-w-[120px]">{activeZone}</span>
+                <ChevronDown className="w-3 h-3 shrink-0" />
+              </button>
+            ) : (
+              <p className="text-[11px] text-white/50 leading-tight truncate">{me?.name || me?.email || ''}</p>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-1">
@@ -132,9 +218,14 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
       <div className="flex-1 overflow-y-auto px-3 pb-3 space-y-3">
         {zones.length === 0 ? (
           <p className="text-center text-white/40 text-sm py-8">{tables.length === 0 ? 'No tables yet. Add them in Dine-In → Tables.' : 'No tables match.'}</p>
-        ) : zones.map(([zone, list]) => (
+        ) : zones.map(([zone, list]) => {
+          const c = zoneCounts(zone);
+          return (
           <div key={zone}>
-            <p className="text-[11px] font-semibold text-white/40 uppercase tracking-wide px-1 mb-1.5">{zone}</p>
+            <p className="text-[11px] font-semibold text-white/40 uppercase tracking-wide px-1 mb-1.5 flex items-center justify-between gap-1">
+              <span className="truncate">{zone}</span>
+              <span className="normal-case tracking-normal shrink-0 text-white/35">(Free {c.free} / Occ {c.occ})</span>
+            </p>
             <div className="grid grid-cols-3 gap-1.5">
               {list.map((t) => {
                 const occupied = !!t.open_order_id;
@@ -153,7 +244,8 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
               })}
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* Takeaway */}
@@ -170,6 +262,56 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
     </div>
   );
 
+  // AREA PICKER — a multi-zone captain chooses their serving area before the shell.
+  // Shown after login (no saved pick) or when they tap "switch area" in the sidebar.
+  if (needsPicker) {
+    return (
+      <div className="min-h-screen bg-[#1C0F05] text-white flex flex-col">
+        <div className="flex items-center gap-2 px-5 py-4 border-b border-white/10">
+          <ChefHat className="w-6 h-6 text-[#FF8A4C] shrink-0" />
+          <div className="min-w-0">
+            <p className="font-bold leading-tight">Captain</p>
+            <p className="text-[11px] text-white/50 leading-tight truncate">{me?.name || me?.email || ''}</p>
+          </div>
+          {picking && activeZone && availableZones.includes(activeZone) && (
+            <button onClick={() => setPicking(false)} className="ml-auto p-2 text-white/50 hover:text-white active:scale-95">
+              <X className="w-5 h-5" />
+            </button>
+          )}
+        </div>
+        <div className="flex-1 overflow-y-auto px-5 py-6">
+          <div className="max-w-2xl mx-auto">
+            <h1 className="text-xl font-bold flex items-center gap-2"><MapPin className="w-5 h-5 text-[#FF8A4C]" /> Choose your area</h1>
+            <p className="text-sm text-white/50 mt-1">Pick the section you are serving. You can switch anytime from the sidebar.</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-6">
+              {availableZones.map((zone) => {
+                const c = zoneCounts(zone);
+                const isActive = zone === activeZone;
+                return (
+                  <button
+                    key={zone}
+                    onClick={() => chooseZone(zone)}
+                    className={`text-left rounded-2xl border p-5 transition active:scale-[0.98] ${
+                      isActive ? 'bg-[#FF6B35] border-[#FF8A4C]' : 'bg-[#2D1B0E] border-white/10 hover:border-[#af4408]'}`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <MapPin className="w-5 h-5 text-[#FF8A4C] shrink-0" />
+                      <span className="font-bold text-lg truncate">{zone}</span>
+                    </div>
+                    <p className={`text-sm mt-2 ${isActive ? 'text-white/90' : 'text-white/60'}`}>
+                      (Free {c.free} / Occ {c.occ})
+                    </p>
+                    <p className={`text-[11px] mt-0.5 ${isActive ? 'text-white/70' : 'text-white/35'}`}>{c.total} table{c.total === 1 ? '' : 's'}</p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <CaptainUI.Provider value={{ openTables: () => setDrawer(true) }}>
     <div className="md:flex min-h-screen">
@@ -184,6 +326,55 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
       <main className="flex-1 min-w-0 relative">
         {children}
       </main>
+
+      {/* GUEST FORM — captures the party before opening a free dine-in table. */}
+      {guestTable && (
+        <div className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center bg-black/60 p-0 sm:p-4"
+             onClick={() => { if (!gBusy) setGuestTable(null); }}>
+          <div className="w-full sm:max-w-sm bg-[#2D1B0E] text-white rounded-t-3xl sm:rounded-3xl border border-white/10 p-5"
+               onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <p className="text-[11px] uppercase tracking-wide text-white/40">Open table</p>
+                <p className="font-bold text-lg leading-tight">Table {guestTable.table_number}
+                  <span className="text-white/40 font-normal text-sm"> · {zoneOf(guestTable)}</span></p>
+              </div>
+              <button onClick={() => { if (!gBusy) setGuestTable(null); }} className="p-2 text-white/50 hover:text-white active:scale-95">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <label className="block mb-3">
+              <span className="text-xs text-white/60">Full name <span className="text-[#FF8A4C]">*</span></span>
+              <input autoFocus value={gName} onChange={(e) => setGName(e.target.value)} placeholder="Guest name"
+                className="mt-1 w-full bg-white/10 rounded-xl px-3 py-3 text-base placeholder:text-white/30 focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
+            </label>
+
+            <label className="block mb-3">
+              <span className="text-xs text-white/60">Mobile <span className="text-white/30">(optional)</span></span>
+              <input value={gMobile} onChange={(e) => setGMobile(e.target.value)} inputMode="tel" placeholder="Phone number"
+                className="mt-1 w-full bg-white/10 rounded-xl px-3 py-3 text-base placeholder:text-white/30 focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
+            </label>
+
+            <label className="block mb-5">
+              <span className="text-xs text-white/60 flex items-center gap-1"><Users className="w-3.5 h-3.5" /> No. of guests <span className="text-[#FF8A4C]">*</span></span>
+              <div className="mt-1 flex items-center gap-2">
+                <button type="button" onClick={() => setGCovers(String(Math.max(1, (Number(gCovers) || 1) - 1)))}
+                  className="w-11 h-11 rounded-xl bg-white/10 text-xl font-bold active:scale-95 shrink-0">−</button>
+                <input value={gCovers} onChange={(e) => setGCovers(e.target.value.replace(/[^0-9]/g, ''))} inputMode="numeric"
+                  className="flex-1 min-w-0 bg-white/10 rounded-xl px-3 py-3 text-base text-center focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
+                <button type="button" onClick={() => setGCovers(String((Number(gCovers) || 0) + 1))}
+                  className="w-11 h-11 rounded-xl bg-white/10 text-xl font-bold active:scale-95 shrink-0">+</button>
+              </div>
+            </label>
+
+            <button onClick={startDineIn} disabled={!guestValid || gBusy}
+              className="w-full flex items-center justify-center gap-2 bg-[#af4408] py-3.5 rounded-xl text-base font-semibold active:scale-95 disabled:opacity-40 disabled:active:scale-100">
+              {gBusy ? <Loader2 className="w-5 h-5 animate-spin" /> : null} Start
+            </button>
+          </div>
+        </div>
+      )}
     </div>
     </CaptainUI.Provider>
   );

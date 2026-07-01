@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Users, Plus, Edit, X, Save, Loader2, ShieldCheck, Shield, ChefHat, Warehouse, Building, ChevronDown, ChevronRight, ShieldAlert } from 'lucide-react';
+import { Users, Plus, Edit, X, Save, Loader2, ShieldCheck, Shield, ChefHat, Warehouse, Building, ChevronDown, ChevronRight, ShieldAlert, MapPin } from 'lucide-react';
 import { api } from '@/lib/api';
 import { PAGE_CATALOG, ALL_PAGE_PATHS } from '@/lib/page-catalog';
 
@@ -22,9 +22,15 @@ interface AppUser {
   page_access?: string | null;
   /** JSON-stringified array of department_ids whose data is visible. NULL = own dept only. */
   visible_department_ids?: string | null;
+  /** JSON-stringified array of floor/zone names a captain is locked to. NULL = all areas. */
+  preferred_zones?: string | null;
+  /** JSON-stringified array of table_ids a captain is locked to. NULL = all tables. */
+  preferred_table_ids?: string | null;
   last_login_at?: string; created_at?: string;
 }
 interface Department { id: string; name: string; code?: string; is_active: number; }
+/** Dine-in table (subset of restaurant_tables) — used for the captain-area picker. */
+interface RestTable { id: string; table_number: string; zone?: string | null; seats?: number; }
 interface Role { id: string; name: string; base_role: UserRole; is_head_chef: number; is_store_manager: number; description?: string; }
 
 /**
@@ -83,6 +89,7 @@ export default function UsersPage() {
   const router = useRouter();
   const [list, setList] = useState<AppUser[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
+  const [tables, setTables] = useState<RestTable[]>([]);
   const [roles, setRoles] = useState<Role[]>([]);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<Partial<AppUser> & { password?: string } | null>(null);
@@ -98,10 +105,11 @@ export default function UsersPage() {
       setLoading(false);
       return;
     }
-    const [r, dRes, roleRes] = await Promise.all([
+    const [r, dRes, roleRes, tRes] = await Promise.all([
       fetch('/api/auth/users'),
       fetch('/api/departments').then(r => r.json()).catch(() => ({ departments: [] })),
       fetch('/api/auth/roles').then(r => r.ok ? r.json() : { roles: [] }).catch(() => ({ roles: [] })),
+      fetch('/api/dine-in/tables').then(r => r.ok ? r.json() : { items: [] }).catch(() => ({ items: [] })),
     ]);
     if (r.ok) {
       const d = await r.json();
@@ -110,6 +118,7 @@ export default function UsersPage() {
       setError((await r.json()).error || 'Failed to load users');
     }
     setDepartments((dRes.departments || []).filter((d: Department) => d.is_active));
+    setTables(tRes.items || []);
     setRoles(roleRes.roles || []);
     setLoading(false);
   };
@@ -130,6 +139,14 @@ export default function UsersPage() {
     if (typeof body.visible_department_ids === 'string') {
       try { body.visible_department_ids = JSON.parse(body.visible_department_ids); }
       catch { body.visible_department_ids = null; }
+    }
+    if (typeof body.preferred_zones === 'string') {
+      try { body.preferred_zones = JSON.parse(body.preferred_zones); }
+      catch { body.preferred_zones = null; }
+    }
+    if (typeof body.preferred_table_ids === 'string') {
+      try { body.preferred_table_ids = JSON.parse(body.preferred_table_ids); }
+      catch { body.preferred_table_ids = null; }
     }
 
     const r = await api('/api/auth/users', { method: isNew ? 'POST' : 'PUT', body });
@@ -237,6 +254,8 @@ export default function UsersPage() {
                                 is_store_manager: u.is_store_manager ?? 0,
                                 page_access: u.page_access ?? null,
                                 visible_department_ids: u.visible_department_ids ?? null,
+                                preferred_zones: u.preferred_zones ?? null,
+                                preferred_table_ids: u.preferred_table_ids ?? null,
                               })}
                               className="p-1 text-[#6B5744] hover:text-[#af4408]"><Edit className="w-3.5 h-3.5" /></button>
                     </td>
@@ -399,6 +418,14 @@ export default function UsersPage() {
                   setEditing={setEditing}
                   departments={departments}
                 />
+
+                {/* Captain Area — restrict this captain to specific floors + tables.
+                    Only enforced when the 'captain_area_lock' setting is on (Settings → Integrations). */}
+                <CaptainAreaSection
+                  editing={editing}
+                  setEditing={setEditing}
+                  tables={tables}
+                />
               </div>
               <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2">
                 <button onClick={() => setEditing(null)} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
@@ -542,6 +569,121 @@ function PageAccessSection({ editing, setEditing, departments }: {
           <div className="text-[10px] text-[#8B7355] italic">
             Empty page list = locked out. Reset (above) clears the map → user gets full access by default.
             Changes apply when you click Save below.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ──────────────── Captain Area section embedded in the user-edit modal ────────────────
+   Locks a captain to specific floors (zones) and/or specific tables. Writes JSON arrays
+   to editing.preferred_zones / editing.preferred_table_ids (mirrors visible_department_ids).
+   Only enforced when the 'captain_area_lock' setting is ON — see Settings → Integrations. */
+
+function CaptainAreaSection({ editing, setEditing, tables }: {
+  editing: any;
+  setEditing: (e: any) => void;
+  tables: RestTable[];
+}) {
+  const [open, setOpen] = useState(false);
+
+  const currentZones = parseArr(editing.preferred_zones);
+  const currentTableIds = parseArr(editing.preferred_table_ids);
+
+  // Distinct floors/areas: unique t.zone (falling back to 'Floor' when blank).
+  const zones = Array.from(new Set(tables.map(t => (t.zone && t.zone.trim()) || 'Floor')));
+
+  const toggleZone = (z: string) => {
+    const next = new Set(currentZones);
+    if (next.has(z)) next.delete(z); else next.add(z);
+    setEditing({ ...editing, preferred_zones: JSON.stringify(Array.from(next)) });
+  };
+  const toggleTable = (id: string) => {
+    const next = new Set(currentTableIds);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setEditing({ ...editing, preferred_table_ids: JSON.stringify(Array.from(next)) });
+  };
+  const clearAll = () => setEditing({ ...editing, preferred_zones: null, preferred_table_ids: null });
+
+  const summary =
+    currentZones.size === 0 && currentTableIds.size === 0
+      ? 'All areas (no restriction)'
+      : [
+          currentZones.size ? `${currentZones.size} floor${currentZones.size === 1 ? '' : 's'}` : '',
+          currentTableIds.size ? `${currentTableIds.size} table${currentTableIds.size === 1 ? '' : 's'}` : '',
+        ].filter(Boolean).join(' · ');
+
+  return (
+    <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF8F0]">
+      <button type="button"
+              onClick={() => setOpen(o => !o)}
+              className="w-full px-3 py-2 flex items-center gap-2 text-left text-xs text-[#6B5744] hover:bg-[#FFF1E3] rounded-t-lg">
+        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        <MapPin size={14} className="text-[#af4408]" />
+        <span className="font-semibold">Captain Area</span>
+        <span className="ml-2 text-[10px] text-[#8B7355] italic flex-1">{summary}</span>
+        {open && (currentZones.size > 0 || currentTableIds.size > 0) && (
+          <span className="text-[10px]" onClick={e => e.stopPropagation()}>
+            <button type="button" onClick={clearAll} className="text-[#af4408] hover:underline">Clear</button>
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="px-3 py-2 space-y-3 border-t border-[#E8D5C4]">
+          <p className="text-[10px] text-[#8B7355] italic">
+            Restrict this captain to the floors / tables below. Only enforced when
+            “Restrict captains to their assigned area” is ON (Settings → Integrations).
+            Leave everything unchecked for no restriction.
+          </p>
+
+          {/* PREFERRED FLOORS / AREAS */}
+          <div className="bg-blue-50/40 border border-blue-200 rounded p-2">
+            <div className="text-[11px] font-semibold text-[#2D1B0E] mb-1">
+              Preferred Floors / Areas
+              <span className="ml-2 text-[10px] font-normal text-[#8B7355]">
+                {currentZones.size === 0 ? 'Any floor' : `${currentZones.size} selected`}
+              </span>
+            </div>
+            {zones.length === 0 ? (
+              <div className="text-[10px] text-[#8B7355] italic">No tables configured yet.</div>
+            ) : (
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-1 text-xs">
+                {zones.map(z => (
+                  <label key={z} className="flex items-center gap-1.5 cursor-pointer hover:bg-white px-1 rounded">
+                    <input type="checkbox" checked={currentZones.has(z)} onChange={() => toggleZone(z)} />
+                    <span className="text-[#2D1B0E]">{z}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* SPECIFIC TABLES */}
+          <div className="bg-amber-50/40 border border-amber-200 rounded p-2">
+            <div className="text-[11px] font-semibold text-[#2D1B0E] mb-1">
+              Specific Tables
+              <span className="ml-2 text-[10px] font-normal text-[#8B7355]">
+                {currentTableIds.size === 0 ? 'Any table' : `${currentTableIds.size} selected`}
+              </span>
+            </div>
+            {tables.length === 0 ? (
+              <div className="text-[10px] text-[#8B7355] italic">No tables configured yet.</div>
+            ) : (
+              <div className="grid grid-cols-3 md:grid-cols-4 gap-1 text-xs max-h-40 overflow-y-auto">
+                {tables.map(t => {
+                  const z = (t.zone && t.zone.trim()) || 'Floor';
+                  return (
+                    <label key={t.id} className="flex items-center gap-1.5 cursor-pointer hover:bg-white px-1 rounded">
+                      <input type="checkbox" checked={currentTableIds.has(t.id)} onChange={() => toggleTable(t.id)} />
+                      <span className="text-[#2D1B0E]">{t.table_number}</span>
+                      <span className="text-[9px] text-[#8B7355] ml-auto">{z}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       )}

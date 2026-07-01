@@ -16,6 +16,9 @@ interface Role {
   sort_order: number;
   description: string;
   user_count: number;
+  /** Bill-discount authority: can this role's users request a discount, and up to what %? */
+  can_request_discount: number;
+  max_discount_pct: number;
 }
 
 const TIERS = [
@@ -34,6 +37,7 @@ function parsePages(pa: string | null): string[] {
 const blankDraft = () => ({
   id: '' as string, name: '', base_role: 'staff' as Role['base_role'], description: '',
   is_head_chef: false, is_store_manager: false, pages: new Set<string>(), is_system: 0,
+  can_request_discount: false, max_discount_pct: 0,
 });
 
 export default function RolesAdmin() {
@@ -59,6 +63,7 @@ export default function RolesAdmin() {
       id: role.id, name: role.name, base_role: role.base_role, description: role.description || '',
       is_head_chef: !!role.is_head_chef, is_store_manager: !!role.is_store_manager,
       pages: new Set(parsePages(role.page_access)), is_system: role.is_system,
+      can_request_discount: !!role.can_request_discount, max_discount_pct: Number(role.max_discount_pct) || 0,
     });
   }
 
@@ -84,6 +89,8 @@ export default function RolesAdmin() {
         name: draft.name.trim(), base_role: draft.base_role, description: draft.description,
         is_head_chef: draft.is_head_chef, is_store_manager: draft.is_store_manager,
         page_access: draft.base_role === 'admin' ? null : Array.from(draft.pages),
+        can_request_discount: draft.can_request_discount,
+        max_discount_pct: draft.can_request_discount ? Number(draft.max_discount_pct) || 0 : 0,
       };
       const r = draft.id
         ? await api('/api/auth/roles', { method: 'PUT', body: { id: draft.id, ...body } })
@@ -196,6 +203,28 @@ export default function RolesAdmin() {
                 <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
                   <input type="checkbox" checked={draft.is_store_manager} onChange={(e) => setDraft({ ...draft, is_store_manager: e.target.checked })} /> Can issue stock as Store Manager
                 </label>
+              </div>
+
+              {/* Bill-discount authority — lets a cashier/captain request a discount on a
+                  running bill (still needs a manager/admin approver at settle time). */}
+              <div className="border border-[#E8D5C4] rounded-xl p-3 bg-[#FFF8F0]">
+                <label className="flex items-center gap-2 text-sm text-[#2D1B0E] font-medium">
+                  <input type="checkbox" checked={draft.can_request_discount}
+                         onChange={(e) => setDraft({ ...draft, can_request_discount: e.target.checked })} />
+                  Can request bill discount
+                </label>
+                <p className="text-[11px] text-[#8B7355] mt-0.5 ml-6">
+                  Users with this role may request a discount on a bill (a manager/admin still approves it).
+                </p>
+                {draft.can_request_discount && (
+                  <label className="flex items-center gap-2 text-sm text-[#2D1B0E] mt-2 ml-6">
+                    Max discount %
+                    <input type="number" min={0} max={100} step={1}
+                           value={draft.max_discount_pct}
+                           onChange={(e) => setDraft({ ...draft, max_discount_pct: Number(e.target.value) })}
+                           className="w-24 border border-[#D4B896] rounded-lg px-3 py-1.5 text-sm" />
+                  </label>
+                )}
               </div>
 
               {draft.base_role === 'admin' ? (

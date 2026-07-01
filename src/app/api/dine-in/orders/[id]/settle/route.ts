@@ -1,8 +1,26 @@
 import { getDb, recordSale } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { todayIST } from '@/lib/format-date';
+import { computeBill } from '@/lib/bill-calc';
 
 const VALID_METHODS = ['cash', 'upi', 'card'];
+
+/**
+ * Read the 'bill_design' setting (JSON) and pull out the numbers computeBill
+ * needs (service charge on/off + pct, cgst/sgst pct). Missing/garbled JSON
+ * falls back to safe defaults so settling never breaks on a bad setting.
+ */
+function loadBillDesign(db: ReturnType<typeof getDb>) {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'bill_design'").get() as any;
+  let d: any = {};
+  if (row?.value) { try { d = JSON.parse(row.value) || {}; } catch { d = {}; } }
+  return {
+    serviceChargeOn: d.serviceChargeOn !== false,
+    serviceChargePct: Number(d.serviceChargePct) || 0,
+    cgstPct: d.cgstPct == null ? 2.5 : Number(d.cgstPct) || 0,
+    sgstPct: d.sgstPct == null ? 2.5 : Number(d.sgstPct) || 0,
+  };
+}
 
 /**
  * Settle an open order: write one `sales` row per line item (deducting inventory
@@ -35,6 +53,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false,
     }).format(new Date());
 
+    // Compute the authoritative bill breakdown (service charge, discount, taxes,
+    // total) from the current order + the bill_design settings, so the stored
+    // totals match exactly what the printed bill renders via the same helper.
+    const billDesign = loadBillDesign(db);
+    const bill = computeBill(
+      {
+        subtotal: order.subtotal,
+        serviceRemoved: !!order.service_charge_reason,
+        discount_pct: order.discount_pct,
+        discount: order.discount,
+      },
+      billDesign,
+    );
+    const taxTotal = Math.round((bill.cgst + bill.sgst) * 100) / 100;
+
     const settle = db.transaction(() => {
       for (const it of items) {
         // pos_id from the menu item (stable link); fall back to none.
@@ -58,14 +91,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           outlet_id: outletId,
         });
       }
+      // Store the computed breakdown before marking settled so the settled row
+      // is the single source of truth for the charged amounts.
       db.prepare(`
-        UPDATE orders SET status = 'settled', payment_method = ?, settled_at = datetime('now'), updated_at = datetime('now')
+        UPDATE orders SET status = 'settled', payment_method = ?,
+          service_charge = ?, discount = ?, tax_total = ?, total = ?,
+          settled_at = datetime('now'), updated_at = datetime('now')
         WHERE id = ?
-      `).run(method, id);
+      `).run(method, bill.serviceCharge, bill.discount, taxTotal, bill.total, id);
     });
     settle();
 
-    return Response.json({ success: true, order_id: id, total: order.total, payment_method: method, lines: items.length });
+    return Response.json({ success: true, order_id: id, total: bill.total, payment_method: method, lines: items.length });
   } catch (e: any) {
     console.error('[/api/dine-in/orders/[id]/settle]', e);
     return Response.json({ error: e.message }, { status: 500 });

@@ -2,13 +2,17 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '@/lib/api';
-import { ChefHat, Clock, Wifi, WifiOff } from 'lucide-react';
+import { ChefHat, Clock, Wifi, WifiOff, AlertTriangle } from 'lucide-react';
 
 interface KotItem { name: string; quantity: number; notes: string; status: string; }
 interface Kot {
   id: string; kot_number: number; station: string; status: string; created_at: string;
   order_number: number; order_type: string; table_number: string | null; zone: string | null;
   items: KotItem[];
+}
+interface KotAlert {
+  id: string; kot_number: number | null; station: string; table_number: string | null;
+  reason: string; created_by: string; created_at: string;
 }
 
 const FLOW: Record<string, { label: string; next: string }> = {
@@ -35,6 +39,7 @@ export default function KitchenPage() {
   const [station, setStation] = useState('all');
   const [live, setLive] = useState(false);
   const [, setTick] = useState(0);
+  const [alerts, setAlerts] = useState<KotAlert[]>([]);
   const esRef = useRef<EventSource | null>(null);
 
   const load = useCallback(async (st: string) => {
@@ -45,6 +50,21 @@ export default function KitchenPage() {
       setStations(j.stations || []);
     } catch (_) {}
   }, []);
+
+  const loadAlerts = useCallback(async () => {
+    try {
+      const r = await api('/api/dine-in/kot-alerts?open=1');
+      const j = await r.json();
+      setAlerts(j.alerts || []);
+    } catch (_) {}
+  }, []);
+
+  async function resolveAlert(id: string) {
+    setAlerts((a) => a.filter((x) => x.id !== id)); // optimistic
+    try { await api('/api/dine-in/kot-alerts', { method: 'POST', body: { id, resolve: true } }); }
+    catch (_) {}
+    loadAlerts();
+  }
 
   // Initial + on station change: load, (re)connect SSE, with a poll safety net.
   useEffect(() => {
@@ -58,6 +78,13 @@ export default function KitchenPage() {
     const poll = setInterval(() => load(station), 10000);
     return () => { es.close(); clearInterval(poll); };
   }, [station, load]);
+
+  // Poll unresolved KOT escalations (~10s) — shown as a red banner above the grid.
+  useEffect(() => {
+    loadAlerts();
+    const t = setInterval(loadAlerts, 10000);
+    return () => clearInterval(t);
+  }, [loadAlerts]);
 
   // Tick every second so the age timers move.
   useEffect(() => { const t = setInterval(() => setTick((n) => n + 1), 1000); return () => clearInterval(t); }, []);
@@ -92,6 +119,35 @@ export default function KitchenPage() {
           </button>
         ))}
       </div>
+
+      {alerts.length > 0 && (
+        <div className="mb-4 rounded-xl border-2 border-red-500 bg-red-600 text-white shadow-lg overflow-hidden">
+          <div className="flex items-center gap-2 px-4 py-2 bg-red-700 font-bold text-sm">
+            <AlertTriangle size={16} className="animate-pulse" />
+            KOT NOT PRINTED — action needed ({alerts.length})
+          </div>
+          <div className="divide-y divide-red-400/40">
+            {alerts.map((a) => (
+              <div key={a.id} className="flex items-center justify-between gap-3 px-4 py-2.5">
+                <div className="text-sm font-medium">
+                  KOT #{a.kot_number ?? '—'}
+                  {' — '}
+                  {a.table_number ? `TABLE ${a.table_number}` : (a.station || 'kitchen').toUpperCase()}
+                  {' — not printed'}
+                  {a.reason ? `: ${a.reason}` : ''}
+                  <span className="block text-[11px] font-normal text-red-100/90">
+                    flagged by {a.created_by || 'captain'}
+                  </span>
+                </div>
+                <button onClick={() => resolveAlert(a.id)}
+                  className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white text-red-700 hover:bg-red-50">
+                  Resolve
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {kots.length === 0 ? (
         <div className="card text-center py-16 text-[#8B7355]">No active tickets. Fired orders appear here instantly.</div>

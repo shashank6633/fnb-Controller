@@ -17,10 +17,19 @@ function cleanPages(input: unknown): string | null {
   return valid.length ? JSON.stringify(valid) : null;
 }
 
+/** Coerce a max-discount-% input to a sane number in [0, 100]. Non-numeric → 0. */
+function clampPct(input: unknown): number {
+  const n = Number(input);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n > 100 ? 100 : n;
+}
+
 export async function GET() {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
   const db = getDb();
+  // r.* already includes can_request_discount + max_discount_pct (schema columns),
+  // but list them explicitly-adjacent via r.* so future SELECTs stay in sync.
   const roles = db.prepare(`
     SELECT r.*, (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id AND u.is_active = 1) AS user_count
     FROM roles r WHERE r.is_active = 1
@@ -32,7 +41,8 @@ export async function GET() {
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
-  const { name, base_role, page_access, is_head_chef, is_store_manager, description, sort_order } = await req.json();
+  const { name, base_role, page_access, is_head_chef, is_store_manager, description, sort_order,
+          can_request_discount, max_discount_pct } = await req.json();
   const nm = String(name || '').trim();
   if (!nm) return Response.json({ error: 'Role name is required' }, { status: 400 });
   if (!VALID_BASE.includes(base_role)) return Response.json({ error: `tier must be one of ${VALID_BASE.join(', ')}` }, { status: 400 });
@@ -41,17 +51,20 @@ export async function POST(req: Request) {
     return Response.json({ error: 'A role with that name already exists' }, { status: 409 });
   }
   const info = db.prepare(`
-    INSERT INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, is_system, sort_order, description)
-    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, 0, ?, ?)
+    INSERT INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, is_system, sort_order, description,
+                       can_request_discount, max_discount_pct)
+    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
   `).run(nm, base_role, cleanPages(page_access), is_head_chef ? 1 : 0, is_store_manager ? 1 : 0,
-         Number(sort_order) || 50, String(description || ''));
+         Number(sort_order) || 50, String(description || ''),
+         can_request_discount ? 1 : 0, clampPct(max_discount_pct));
   return Response.json({ success: true, id: info.lastInsertRowid }, { status: 201 });
 }
 
 export async function PUT(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
-  const { id, name, base_role, page_access, is_head_chef, is_store_manager, description, sort_order } = await req.json();
+  const { id, name, base_role, page_access, is_head_chef, is_store_manager, description, sort_order,
+          can_request_discount, max_discount_pct } = await req.json();
   if (!id) return Response.json({ error: 'id required' }, { status: 400 });
   if (base_role != null && !VALID_BASE.includes(base_role)) {
     return Response.json({ error: `tier must be one of ${VALID_BASE.join(', ')}` }, { status: 400 });
@@ -71,6 +84,8 @@ export async function PUT(req: Request) {
   if (is_store_manager !== undefined)         { sets.push('is_store_manager = ?'); params.push(is_store_manager ? 1 : 0); }
   if (description !== undefined)              { sets.push('description = ?'); params.push(String(description || '')); }
   if (sort_order !== undefined)              { sets.push('sort_order = ?'); params.push(Number(sort_order) || 0); }
+  if (can_request_discount !== undefined)    { sets.push('can_request_discount = ?'); params.push(can_request_discount ? 1 : 0); }
+  if (max_discount_pct !== undefined)        { sets.push('max_discount_pct = ?'); params.push(clampPct(max_discount_pct)); }
   if (sets.length === 0) return Response.json({ error: 'nothing to update' }, { status: 400 });
   sets.push(`updated_at = datetime('now')`);
   params.push(id);

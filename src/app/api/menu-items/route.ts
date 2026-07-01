@@ -64,18 +64,18 @@ export async function POST(request: Request) {
   try {
     const db = getDb();
     const body = await request.json();
-    const { name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, is_active, recipe_id, material_id, notes } = body;
+    const { name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, prep_minutes, is_active, recipe_id, material_id, notes } = body;
 
     if (!name) return Response.json({ error: 'name is required' }, { status: 400 });
 
     const id = generateId();
     db.prepare(`
-      INSERT INTO menu_items (id, name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, is_active, recipe_id, material_id, source, notes, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, datetime('now'), datetime('now'))
+      INSERT INTO menu_items (id, name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, prep_minutes, is_active, recipe_id, material_id, source, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, datetime('now'), datetime('now'))
     `).run(
       id, name, category || '', station || '', item_type || 'foods', dietary_tag || '',
       Number(selling_price) || 0, Number(listing_price) || 0, item_code || '', Number(tax_value) || 0,
-      is_active === false ? 0 : 1, recipe_id || null, material_id || null, notes || ''
+      Number(prep_minutes) || 0, is_active === false ? 0 : 1, recipe_id || null, material_id || null, notes || ''
     );
 
     const item = db.prepare('SELECT * FROM menu_items WHERE id = ?').get(id);
@@ -93,7 +93,7 @@ export async function PUT(request: Request) {
 
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
 
-    const allowed = ['name', 'category', 'station', 'item_type', 'dietary_tag', 'selling_price', 'listing_price', 'item_code', 'tax_value', 'is_active', 'recipe_id', 'material_id', 'notes'];
+    const allowed = ['name', 'category', 'station', 'item_type', 'dietary_tag', 'selling_price', 'listing_price', 'item_code', 'tax_value', 'prep_minutes', 'is_active', 'recipe_id', 'material_id', 'notes'];
     const updates: string[] = [];
     const values: any[] = [];
     for (const key of allowed) {

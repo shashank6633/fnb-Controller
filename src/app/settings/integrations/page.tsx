@@ -12,7 +12,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Send, Save, Loader2, CheckCircle2, AlertTriangle, RefreshCw, FileSpreadsheet, XCircle, KeyRound } from 'lucide-react';
+import { Send, Save, Loader2, CheckCircle2, AlertTriangle, RefreshCw, FileSpreadsheet, XCircle, KeyRound, MapPin } from 'lucide-react';
 import { api } from '@/lib/api';
 
 export default function IntegrationsPage() {
@@ -175,6 +175,9 @@ export default function IntegrationsPage() {
           </ol>
         </details>
       </div>
+
+      {/* Captain area lock — restrict captains to their assigned floors/tables */}
+      <CaptainAreaLockCard onError={setError} onOk={setOkMsg} />
 
       {/* Party rules — global toggle for FP approval requirement */}
       <PartyRulesCard onError={setError} onOk={setOkMsg} />
@@ -363,6 +366,67 @@ function GoogleSheetsCard({ onError, onOk }: { onError: (m: string) => void; onO
           <li>Share the AKAN Party Manager sheet (Viewer) with the <code className="bg-[#FFF1E3] px-1 rounded">client_email</code> shown above</li>
         </ol>
       </details>
+    </div>
+  );
+}
+
+/**
+ * Captain area lock — when ON, a captain only sees / works the floors + tables
+ * assigned to them (set per-user on the Users page). When OFF, every captain can
+ * work any table. Reads/writes the 'captain_area_lock' setting ('1'/'0').
+ */
+function CaptainAreaLockCard({ onError, onOk }: { onError: (m: string) => void; onOk: (m: string) => void }) {
+  const [locked, setLocked] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/settings?key=captain_area_lock')
+      .then(r => r.json())
+      .then(d => { setLocked(d?.value === '1'); setLoaded(true); })
+      .catch(() => setLoaded(true));
+  }, []);
+
+  const toggle = async () => {
+    const next = !locked;
+    setBusy(true); onError(''); onOk('');
+    try {
+      const r = await api('/api/settings', { method: 'PUT', body: { key: 'captain_area_lock', value: next ? '1' : '0' } });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      setLocked(next);
+      onOk(next
+        ? '✓ Captains are now restricted to their assigned floors / tables.'
+        : '✓ Area lock OFF — every captain can work any table.');
+    } finally { setBusy(false); }
+  };
+
+  if (!loaded) return null;
+
+  return (
+    <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <MapPin size={16} className="text-[#af4408]" />
+        <h2 className="text-sm font-semibold text-[#2D1B0E]">Captain area assignment</h2>
+      </div>
+
+      <label className="flex items-start gap-3 cursor-pointer text-sm">
+        <input type="checkbox" checked={locked} onChange={toggle} disabled={busy} className="mt-0.5" />
+        <div className="flex-1">
+          <div className="font-medium text-[#2D1B0E]">
+            Restrict captains to their assigned area
+          </div>
+          <div className="text-[11px] text-[#8B7355] mt-0.5">
+            {locked
+              ? '✓ ON. A captain only sees and can open tables on the floors / specific tables assigned to them (set per-user on the Users page). Managers and admins are never restricted.'
+              : '✓ OFF (default). Every captain can work any table regardless of their assigned floors / tables.'}
+          </div>
+        </div>
+      </label>
+
+      <p className="text-[11px] text-[#8B7355]">
+        Assign each captain their floors and tables under <a href="/users" className="text-[#af4408] underline">Users</a> → edit → Captain Area.
+      </p>
     </div>
   );
 }

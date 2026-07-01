@@ -38,10 +38,16 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
       id: order.id,
       order_number: order.order_number,
       table_number: order.table_number || null,
+      table_id: order.table_id || null,          // present => DINE-IN, absent => PARCEL
       zone: order.zone || null,
       order_type: order.order_type,
+      covers: order.covers || 0,
+      guest_name: order.guest_name || null,
+      guest_mobile: order.guest_mobile || null,
       server_name: order.server_name || undefined,
       subtotal: order.subtotal, tax_total: order.tax_total, discount: order.discount, total: order.total,
+      service_charge_reason: order.service_charge_reason || null,
+      discount_pct: order.discount_pct || 0,
       payment_method: order.payment_method || undefined,
       items,
     };

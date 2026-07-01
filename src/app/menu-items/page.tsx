@@ -38,6 +38,7 @@ interface MenuItem {
   listing_price: number;
   item_code: string;
   tax_value: number;
+  prep_minutes: number;
   is_active: number;
   recipe_id: string | null;
   material_id: string | null;
@@ -366,7 +367,7 @@ export default function MenuItemsPage() {
             <button onClick={openImport} className="flex items-center gap-2 px-4 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium">
               <FileSpreadsheet className="w-4 h-4" />Import from Akan POS
             </button>
-            <button onClick={() => setEditItem({ id: '', name: '', category: '', station: '', item_type: 'foods', dietary_tag: '', selling_price: 0, listing_price: 0, item_code: '', tax_value: 0, is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '' })} className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
+            <button onClick={() => setEditItem({ id: '', name: '', category: '', station: '', item_type: 'foods', dietary_tag: '', selling_price: 0, listing_price: 0, item_code: '', tax_value: 0, prep_minutes: 0, is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '' })} className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
               <Plus className="w-4 h-4" />New Item
             </button>
           </div>
@@ -813,6 +814,12 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
             <div>
               <label className="block text-xs font-medium text-[#6B5744] mb-1">Tax %</label>
               <input type="number" step="0.01" value={form.tax_value} onChange={e => setForm({ ...form, tax_value: Number(e.target.value) })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">Prep time (minutes)</label>
+              <input type="number" step="1" min="0" value={form.prep_minutes ?? 0} onChange={e => setForm({ ...form, prep_minutes: Number(e.target.value) })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
             </div>
           </div>
           <label className="flex items-center gap-2 cursor-pointer">

@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { captainAreaFilter } from '@/lib/captain-area';
 
 // Management (create/edit/delete) is admin-or-manager; listing is any signed-in user.
 async function requireManager() {
@@ -18,15 +19,18 @@ export async function GET() {
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const outletId = await getCurrentOutletId();
+    // Restrict a locked-in captain to their assigned floors/tables (server-side —
+    // never rely on client filtering). null = no restriction.
+    const area = captainAreaFilter(db, me);
     const tables = db.prepare(`
       SELECT t.*,
              o.id AS open_order_id, o.order_number AS open_order_number, o.total AS open_order_total,
              o.server_id AS open_order_server_id, o.server_name AS open_order_captain
       FROM restaurant_tables t
       LEFT JOIN orders o ON o.table_id = t.id AND o.status = 'open'
-      WHERE t.is_active = 1 AND (t.outlet_id = ? OR t.outlet_id IS NULL)
+      WHERE t.is_active = 1 AND (t.outlet_id = ? OR t.outlet_id IS NULL)${area ? ` AND ${area.sql}` : ''}
       ORDER BY t.zone, CAST(t.table_number AS INTEGER), t.table_number
-    `).all(outletId);
+    `).all(outletId, ...(area ? area.params : []));
     return Response.json({ items: tables });
   } catch (e: any) {
     console.error('[/api/dine-in/tables GET]', e);

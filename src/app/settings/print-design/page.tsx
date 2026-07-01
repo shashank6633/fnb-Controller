@@ -11,11 +11,40 @@ import {
   DEFAULT_KOT_DESIGN, normalizeKotDesign, invalidateDesignCache, KOT_LINE_LABELS,
   type KotDesign, type KotLine, type KotLineSize,
 } from '@/lib/offline-print/print';
+import { computeBill, round2 } from '@/lib/bill-calc';
 
 const DEFAULT_BILL = {
-  shopName: '', showGstin: true, showServer: true, headerNote: '', footerNote: 'Thank you! Visit again.',
+  brandName: '', companyName: '', address: '', contact: '', email: '', fssai: '',
+  showGstin: true, showServer: true,
+  serviceChargeOn: false, serviceChargePct: 5,
+  cgstPct: 2.5, sgstPct: 2.5,
+  headerNote: '', footerNote: 'Thank you! Visit again.',
 };
 type BillDesign = typeof DEFAULT_BILL;
+
+// Coerce a loaded/partial bill_design into a complete, correctly-typed BillDesign.
+function normalizeBillDesign(raw: any): BillDesign {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const str = (v: any, d: string) => (typeof v === 'string' ? v : d);
+  const bool = (v: any, d: boolean) => (typeof v === 'boolean' ? v : d);
+  const num = (v: any, d: number) => (v === '' || v == null || isNaN(Number(v)) ? d : Number(v));
+  return {
+    brandName: str(r.brandName ?? r.shopName, DEFAULT_BILL.brandName),  // migrate legacy shopName
+    companyName: str(r.companyName, DEFAULT_BILL.companyName),
+    address: str(r.address, DEFAULT_BILL.address),
+    contact: str(r.contact, DEFAULT_BILL.contact),
+    email: str(r.email, DEFAULT_BILL.email),
+    fssai: str(r.fssai, DEFAULT_BILL.fssai),
+    showGstin: bool(r.showGstin, DEFAULT_BILL.showGstin),
+    showServer: bool(r.showServer, DEFAULT_BILL.showServer),
+    serviceChargeOn: bool(r.serviceChargeOn, DEFAULT_BILL.serviceChargeOn),
+    serviceChargePct: num(r.serviceChargePct, DEFAULT_BILL.serviceChargePct),
+    cgstPct: num(r.cgstPct, DEFAULT_BILL.cgstPct),
+    sgstPct: num(r.sgstPct, DEFAULT_BILL.sgstPct),
+    headerNote: str(r.headerNote, DEFAULT_BILL.headerNote),
+    footerNote: str(r.footerNote, DEFAULT_BILL.footerNote),
+  };
+}
 
 const SAMPLE_KOT = {
   table: '7', floor: 'Rooftop', kotNumber: 12, station: 'TANDOOR', copyLabel: 'ORIGINAL', foodLiquor: 'FOOD',
@@ -23,9 +52,12 @@ const SAMPLE_KOT = {
   items: [{ name: 'Paneer Tikka', qty: 2, notes: 'Less spicy' }, { name: 'Butter Naan', qty: 1 }],
 };
 const SAMPLE_BILL = {
-  billNo: '45', table: '7', server: 'Ramesh',
-  items: [{ name: 'Paneer Tikka', qty: 2, amount: 520 }, { name: 'Butter Naan', qty: 1, amount: 60 }],
-  subtotal: 580, tax: 29, total: 609,
+  orderType: 'DINE-IN', floor: 'Rooftop', table: '7', guests: 4, server: 'Ramesh', printedBy: 'Cashier Anil',
+  guestName: 'Ramesh', guestMobile: '99988 87776', captainName: 'Suresh', orderNo: '45', paymentMethod: 'cash',
+  items: [
+    { name: 'Paneer Tikka', qty: 2, rate: 260, amount: 520 },
+    { name: 'Butter Naan', qty: 1, rate: 60, amount: 60 },
+  ],
 };
 
 function nowStamp() {
@@ -92,24 +124,74 @@ function KotPreview({ d, businessName }: { d: KotDesign; businessName: string })
   return <Ticket>{d.lines.filter((l) => l.enabled).map((ln) => <div key={ln.key}>{renderLine(ln)}</div>)}</Ticket>;
 }
 
+// Bill money — mirrors the bridge's money(): 'Rs ' prefix, 2 decimals, grouped.
+function billMoney(n: number): string {
+  return 'Rs ' + round2(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+// Right-align a value into a fixed-width column (padded left with spaces).
+function rcol(v: string, w: number): string {
+  const s = String(v);
+  return s.length >= w ? s : ' '.repeat(w - s.length) + s;
+}
+// Item row: name on the left (truncated), then Qty/Rate/Amt in fixed right columns,
+// mirroring the bridge's 4-column bill table on 80mm (48 col) paper.
+const QTY_W = 4, RATE_W = 9, AMT_W = 10;                 // right-side column widths
+const NAME_W = 48 - QTY_W - RATE_W - AMT_W;              // remaining left width
+function itemRow(name: string, qty: string, rate: string, amt: string): string {
+  const nm = name.length > NAME_W ? name.slice(0, NAME_W) : name.padEnd(NAME_W);
+  return nm + rcol(qty, QTY_W) + rcol(rate, RATE_W) + rcol(amt, AMT_W);
+}
+
 function BillPreview({ d, businessName, gstin }: { d: BillDesign; businessName: string; gstin: string }) {
   const s = SAMPLE_BILL;
+  const subtotal = round2(s.items.reduce((a, it) => a + it.amount, 0));
+  const b = computeBill(
+    { subtotal, serviceRemoved: false, discount_pct: 0, discount: 0 },
+    { serviceChargeOn: d.serviceChargeOn, serviceChargePct: d.serviceChargePct, cgstPct: d.cgstPct, sgstPct: d.sgstPct },
+  );
   return (
     <Ticket>
-      <C b cls="text-[15px]">{(d.shopName || businessName || 'RESTAURANT').toUpperCase()}</C>
-      {d.showGstin && gstin && <C>GSTIN: {gstin}</C>}
-      {d.headerNote && <C>{d.headerNote}</C>}
+      {/* Header block */}
+      <C b cls="text-[15px]">{(d.brandName || businessName || 'RESTAURANT').toUpperCase()}</C>
+      {d.companyName && <C>{d.companyName}</C>}
+      {d.address && <C>{d.address}</C>}
+      {d.contact && <C>Contact no: {d.contact}</C>}
+      {d.email && <C>Email: {d.email}</C>}
+      {d.fssai && <C>FSSAI no: {d.fssai}</C>}
+      {d.showGstin && gstin && <C>GST no: {gstin}</C>}
       <Rule />
-      <L>{twoCol(`Bill #${s.billNo}`, `Table ${s.table}`)}</L>
-      <L>{twoCol(nowStamp(), d.showServer ? `Server: ${s.server}` : '')}</L>
+      <C b>{s.orderType}</C>
+      <L>{s.floor} : {s.table}</L>
       <Rule />
-      {s.items.map((it, i) => <L key={i}>{twoCol(`${it.qty} x ${it.name}`, `Rs ${it.amount}.00`)}</L>)}
+      <L>Guest Name: {s.guestName}</L>
+      <L>Mobile: {s.guestMobile}</L>
+      <L>Date &amp; Time: {nowStamp()}</L>
+      <L>Captain Name: {s.captainName}</L>
       <Rule />
-      <L>{twoCol('Subtotal', `Rs ${s.subtotal}.00`)}</L>
-      <L>{twoCol('Tax', `Rs ${s.tax}.00`)}</L>
-      <L b>{twoCol('TOTAL', `Rs ${s.total}.00`)}</L>
+      <L>{twoCol(`Number of Guests: ${s.guests}`, `Order no: ${s.orderNo}`)}</L>
       <Rule />
+      {/* Item table: Item Name | Qty | Rate | Amt */}
+      <L>{itemRow('Item Name', 'Qty', 'Rate', 'Amt')}</L>
+      <Rule />
+      {s.items.map((it, i) => (
+        <L key={i}>{itemRow(it.name, String(it.qty), round2(it.rate).toFixed(2), round2(it.amount).toFixed(2))}</L>
+      ))}
+      <Rule />
+      {/* Totals */}
+      <L>{twoCol('Sub Total', billMoney(b.subtotal))}</L>
+      {b.serviceCharge > 0 && <L>{twoCol('Service Charges', billMoney(b.serviceCharge))}</L>}
+      {b.cgst > 0 && <L>{twoCol(`CGST@${d.cgstPct}%`, billMoney(b.cgst))}</L>}
+      {b.sgst > 0 && <L>{twoCol(`SGST@${d.sgstPct}%`, billMoney(b.sgst))}</L>}
+      {b.discount > 0 && <L>{twoCol('Discount', '-' + billMoney(b.discount))}</L>}
+      <L b cls="text-[15px]">{twoCol('TOTAL', 'Rs.' + round2(b.total).toFixed(2), 24)}</L>
+      <L b>{twoCol('Grand Total', 'Rs.' + Math.round(b.total))}</L>
+      <L>{twoCol(`Paid by ${s.paymentMethod.toUpperCase()}`, billMoney(Math.round(b.total)))}</L>
+      <L>{twoCol('Balance', billMoney(0))}</L>
+      <Rule />
+      {/* Footer */}
       {d.footerNote && <C>{d.footerNote}</C>}
+      <L>Printed by {s.printedBy}</L>
+      <L>Printed on: {nowStamp()}</L>
     </Ticket>
   );
 }
@@ -128,6 +210,17 @@ const Text = ({ label, value, set, placeholder }: { label: string; value: string
     <span className="text-xs font-semibold text-[#8B7355]">{label}</span>
     <input value={value} onChange={(e) => set(e.target.value)} placeholder={placeholder}
       className="w-full mt-1 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+  </label>
+);
+const Num = ({ label, value, set, suffix }: { label: string; value: number; set: (v: number) => void; suffix?: string }) => (
+  <label className="block py-2">
+    <span className="text-xs font-semibold text-[#8B7355]">{label}</span>
+    <div className="flex items-center gap-2 mt-1">
+      <input type="number" inputMode="decimal" min={0} step="0.5" value={Number.isFinite(value) ? value : 0}
+        onChange={(e) => set(e.target.value === '' ? 0 : Number(e.target.value))}
+        className="w-full border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+      {suffix && <span className="text-sm text-[#8B7355] shrink-0">{suffix}</span>}
+    </div>
   </label>
 );
 
@@ -152,7 +245,7 @@ export default function PrintDesign() {
       setBusinessName(get('business_name') || '');
       setGstin(get('gstin') || '');
       const kd = get('kot_design'); if (kd) try { setKot(normalizeKotDesign(JSON.parse(kd))); } catch {}
-      const bd = get('bill_design'); if (bd) try { setBill({ ...DEFAULT_BILL, ...JSON.parse(bd) }); } catch {}
+      const bd = get('bill_design'); if (bd) try { setBill(normalizeBillDesign(JSON.parse(bd))); } catch {}
     } finally { setLoading(false); }
   }, []);
   useEffect(() => { load(); }, [load]);
@@ -255,9 +348,23 @@ export default function PrintDesign() {
             </>
           ) : (
             <>
-              <Text label="Shop name (blank = business name)" value={bill.shopName} set={(v) => setBill({ ...bill, shopName: v })} placeholder={businessName || 'Restaurant'} />
-              <Toggle label="Show GSTIN" on={bill.showGstin} set={(v) => setBill({ ...bill, showGstin: v })} />
+              <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-1 mt-1">Header block</p>
+              <Text label="Brand name (blank = business name)" value={bill.brandName} set={(v) => setBill({ ...bill, brandName: v })} placeholder={businessName || 'Restaurant'} />
+              <Text label="Company name" value={bill.companyName} set={(v) => setBill({ ...bill, companyName: v })} placeholder="e.g. AKAN Foods Pvt Ltd" />
+              <Text label="Address" value={bill.address} set={(v) => setBill({ ...bill, address: v })} placeholder="Street, City" />
+              <Text label="Contact no." value={bill.contact} set={(v) => setBill({ ...bill, contact: v })} placeholder="+91 98765 43210" />
+              <Text label="Email" value={bill.email} set={(v) => setBill({ ...bill, email: v })} placeholder="hello@example.com" />
+              <Text label="FSSAI no." value={bill.fssai} set={(v) => setBill({ ...bill, fssai: v })} placeholder="12345678901234" />
+              <Toggle label="Show GST no." on={bill.showGstin} set={(v) => setBill({ ...bill, showGstin: v })} />
               <Toggle label="Show server name" on={bill.showServer} set={(v) => setBill({ ...bill, showServer: v })} />
+
+              <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-1 mt-3">Charges &amp; tax</p>
+              <Toggle label="Apply service charge" on={bill.serviceChargeOn} set={(v) => setBill({ ...bill, serviceChargeOn: v })} />
+              <Num label="Service charge %" value={bill.serviceChargePct} set={(v) => setBill({ ...bill, serviceChargePct: v })} suffix="%" />
+              <Num label="CGST %" value={bill.cgstPct} set={(v) => setBill({ ...bill, cgstPct: v })} suffix="%" />
+              <Num label="SGST %" value={bill.sgstPct} set={(v) => setBill({ ...bill, sgstPct: v })} suffix="%" />
+
+              <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-1 mt-3">Notes</p>
               <Text label="Header note (optional)" value={bill.headerNote} set={(v) => setBill({ ...bill, headerNote: v })} />
               <Text label="Footer note" value={bill.footerNote} set={(v) => setBill({ ...bill, footerNote: v })} />
             </>

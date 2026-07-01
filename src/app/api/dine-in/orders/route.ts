@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { canWorkTable } from '@/lib/captain-area';
 
 /** GET — list orders for the active outlet. ?status=open (default) | settled | all. */
 export async function GET(request: Request) {
@@ -39,6 +40,13 @@ export async function POST(request: Request) {
     const b = await request.json();
     const tableId = b.table_id || null;
     const orderType = String(b.order_type || 'dine-in');
+    const guestName = String(b.guest_name || '').trim();
+    const guestMobile = String(b.guest_mobile || '').trim();
+
+    // Area lock: a restricted captain may only open tables in their assigned area.
+    if (tableId && !canWorkTable(db, me, tableId)) {
+      return Response.json({ error: 'This table is outside your assigned area.' }, { status: 403 });
+    }
 
     // A table can hold only one open order at a time — reuse it if present.
     if (tableId) {
@@ -55,9 +63,9 @@ export async function POST(request: Request) {
     const id = generateId();
     db.prepare(`
       INSERT INTO orders (id, outlet_id, order_number, table_id, status, order_type, bill_type, covers,
-                          server_id, server_name, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'open', ?, 'normal', ?, ?, ?, datetime('now'), datetime('now'))
-    `).run(id, outletId, seq?.n || 1, tableId, orderType, Number(b.covers) || 0, me.id, me.name || me.email);
+                          server_id, server_name, guest_name, guest_mobile, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'open', ?, 'normal', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    `).run(id, outletId, seq?.n || 1, tableId, orderType, Number(b.covers) || 0, me.id, me.name || me.email, guestName, guestMobile);
 
     return Response.json({ id, order_number: seq?.n || 1, success: true }, { status: 201 });
   } catch (e: any) {

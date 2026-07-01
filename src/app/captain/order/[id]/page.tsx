@@ -6,12 +6,12 @@ import { api } from '@/lib/api';
 import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
   ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu, Filter, ChevronDown,
-  AlertTriangle, Printer,
+  AlertTriangle, Printer, Timer, Check, Users, BellRing, BadgePercent, Percent,
 } from 'lucide-react';
 import { CaptainUI } from '../../CaptainShell';
 
 interface MenuItem { id: string; name: string; category: string; station: string; item_type: string; dietary_tag: string; selling_price: number; is_active: number; recipe_id: string | null; }
-interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; notes: string; kot_status?: string | null; }
+interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; notes: string; kot_status?: string | null; prep_minutes?: number | null; fired_at?: string | null; completed_at?: string | null; }
 interface TableLite { id: string; table_number: string; zone: string; open_order_id: string | null; open_order_number: number | null; open_order_total: number | null; }
 
 // Per-item kitchen state badge from order_items.status + the KOT status.
@@ -32,9 +32,33 @@ interface KotInfo {
 interface Order {
   id: string; order_number: number; status: string; order_type: string;
   table_number: string | null; zone: string | null;
+  guest_name: string | null; guest_mobile: string | null; covers: number | null;
+  service_charge_reason?: string | null;
   subtotal: number; tax_total: number; discount: number; total: number;
   items: OrderItem[];
   kots?: KotInfo[];
+}
+
+// Current signed-in user (from /api/auth/me). We only care about the discount
+// flags here; captains lack can_request_discount and never see the control.
+interface Me {
+  id: string; name: string; role: string;
+  can_request_discount?: number | boolean;
+  max_discount_pct?: number | null;
+}
+
+// Parse a SQLite/ISO timestamp (space or 'T' separated) as UTC → ms epoch.
+function parseTs(s?: string | null): number {
+  if (!s) return NaN;
+  const iso = s.includes('T') ? s : s.replace(' ', 'T');
+  const withZ = /[zZ]|[+-]\d{2}:?\d{2}$/.test(iso) ? iso : iso + 'Z';
+  return Date.parse(withZ);
+}
+// mm:ss from a positive millisecond span (clamped at 0).
+function mmss(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 }
 
 // Common modifiers offered as quick chips (captain can also type free instructions).
@@ -62,6 +86,14 @@ export default function CaptainOrder() {
   const [settling, setSettling] = useState(false);
   const [printingBill, setPrintingBill] = useState(false);
 
+  // Signed-in user — drives the cashier-only discount / service-charge controls.
+  const [me, setMe] = useState<Me | null>(null);
+  const canDiscount = !!(me && (me.can_request_discount === 1 || me.can_request_discount === true));
+  const maxDiscountPct = Number(me?.max_discount_pct ?? 0) || 0;
+
+  // 1-second wall clock — re-renders the per-item count-up timers.
+  const [now, setNow] = useState(() => Date.now());
+
   // Modifier sheet
   const [sheet, setSheet] = useState<MenuItem | null>(null);
   const [mQty, setMQty] = useState(1);
@@ -83,7 +115,17 @@ export default function CaptainOrder() {
       setMenu((j.items || []).filter((m: MenuItem) => m.is_active && m.selling_price > 0));
       setCats(['All', ...(j.categories || [])]);
     }).catch(() => {});
+    // Who am I? Only cashiers/managers (can_request_discount) get the bill controls.
+    fetch('/api/auth/me').then((r) => r.json()).then((j) => { if (j.user) setMe(j.user); }).catch(() => {});
   }, [loadOrder]);
+
+  // 1s ticker so every fired-item count-up timer stays live. Only runs while the
+  // order is open (no point ticking on a settled/closed order).
+  useEffect(() => {
+    if (order?.status !== 'open') return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [order?.status]);
 
   // ── KOT print-status watch: warn the captain if a fired ticket didn't reach
   // the counter printer (failed, or unconfirmed for a while = agent/printer down).
@@ -137,6 +179,12 @@ export default function CaptainOrder() {
 
   const pendingCount = order?.items.filter((i) => i.status === 'pending').length || 0;
   const cartCount = order?.items.reduce((s, i) => s + i.quantity, 0) || 0;
+
+  // Bill gating — a fired item (fired_at set) counts as "in the kitchen"; the bill
+  // can only be raised once every such item has been marked completed.
+  const firedItems = useMemo(() => (order?.items || []).filter((i) => !!i.fired_at), [order]);
+  const firedIncomplete = useMemo(() => firedItems.filter((i) => !i.completed_at), [firedItems]);
+  const canBill = firedIncomplete.length === 0;
 
   function openSheet(m: MenuItem) { setSheet(m); setMQty(1); setMPortion('Full'); setMMods([]); setMNote(''); }
   const toggleMod = (mod: string) => setMMods((p) => p.includes(mod) ? p.filter((x) => x !== mod) : [...p, mod]);
@@ -236,6 +284,75 @@ export default function CaptainOrder() {
     } finally { setSettling(false); }
   }
 
+  // Mark a fired item done / un-done (stops or restarts its count-up timer + the
+  // bill gate). Uses the shared PATCH endpoint; key = item id so its row spins.
+  async function toggleComplete(it: OrderItem) {
+    const done = !!it.completed_at;
+    await patch({ action: done ? 'uncomplete_item' : 'complete_item', item_id: it.id }, it.id);
+  }
+
+  // ── KOT escalation — when re-sending a stuck ticket still doesn't reach the
+  // counter printer, page the manager + kitchen so someone acts on it. ─────────
+  const [escalating, setEscalating] = useState<string | null>(null);
+  const [escalated, setEscalated] = useState<Record<string, boolean>>({});
+  async function escalateKot(kotId: string) {
+    setEscalating(kotId);
+    try {
+      const r = await api(`/api/dine-in/kds/${kotId}/escalate`, { method: 'POST', body: { reason: 'KOT not printing' } });
+      const j = await r.json();
+      if (j.error) { alert(j.error); return; }
+      setEscalated((p) => ({ ...p, [kotId]: true }));
+      flash('Manager & kitchen alerted ✓');
+    } finally { setEscalating(null); }
+  }
+
+  // ── Cashier-only bill adjustments (discount request + remove service charge) ──
+  const [discOpen, setDiscOpen] = useState(false);
+  const [discPct, setDiscPct] = useState('');
+  const [discEmail, setDiscEmail] = useState('');
+  const [discPass, setDiscPass] = useState('');
+  const [discBusy, setDiscBusy] = useState(false);
+  const [discErr, setDiscErr] = useState<string | null>(null);
+
+  async function requestDiscount() {
+    const pct = Number(discPct);
+    if (!Number.isFinite(pct) || pct <= 0) { setDiscErr('Enter a discount %'); return; }
+    if (maxDiscountPct > 0 && pct > maxDiscountPct) { setDiscErr(`Max you can request is ${maxDiscountPct}%`); return; }
+    if (!discEmail || !discPass) { setDiscErr('Approver email & password required'); return; }
+    setDiscBusy(true); setDiscErr(null);
+    try {
+      const r = await api(`/api/dine-in/orders/${id}/discount`, {
+        method: 'POST', body: { pct, approver_email: discEmail, approver_password: discPass },
+      });
+      const j = await r.json();
+      if (r.status === 403 && j.needs_approval) { setDiscErr('A Manager or Admin must approve — check the login.'); return; }
+      if (j.error) { setDiscErr(j.error); return; }
+      if (j.order) setOrder(j.order);
+      setDiscOpen(false); setDiscPct(''); setDiscEmail(''); setDiscPass('');
+      flash(`Discount ${pct}% applied ✓`);
+    } finally { setDiscBusy(false); }
+  }
+
+  const [scOpen, setScOpen] = useState(false);
+  const [scReason, setScReason] = useState('');
+  const [scBusy, setScBusy] = useState(false);
+  const [scErr, setScErr] = useState<string | null>(null);
+
+  async function removeServiceCharge() {
+    if (!scReason.trim()) { setScErr('A reason is required'); return; }
+    setScBusy(true); setScErr(null);
+    try {
+      const r = await api(`/api/dine-in/orders/${id}/service-charge`, {
+        method: 'POST', body: { remove: true, reason: scReason.trim() },
+      });
+      const j = await r.json();
+      if (j.error) { setScErr(j.error); return; }
+      if (j.order) setOrder(j.order);
+      setScOpen(false); setScReason('');
+      flash('Service charge removed ✓');
+    } finally { setScBusy(false); }
+  }
+
   if (!order) return <div className="flex items-center justify-center min-h-screen text-[#8B7355]"><Loader2 className="w-6 h-6 animate-spin" /></div>;
 
   return (
@@ -245,15 +362,19 @@ export default function CaptainOrder() {
         <button onClick={openTables} className="md:hidden p-2 -ml-1 active:scale-95" aria-label="Open tables"><Menu className="w-5 h-5" /></button>
         <button onClick={() => router.push('/captain')} className="p-2 active:scale-95"><ArrowLeft className="w-5 h-5" /></button>
         <div className="flex-1 min-w-0">
-          <p className="font-bold leading-tight">{order.table_number ? `Table ${order.table_number}` : 'Takeaway'} · #{order.order_number}</p>
-          <p className="text-[11px] text-white/60 leading-tight">{order.zone || order.order_type}{order.status !== 'open' ? ` · ${order.status}` : ''}</p>
+          <p className="font-bold leading-tight truncate">{order.table_number ? `Table ${order.table_number}` : 'Takeaway'} · #{order.order_number}</p>
+          <p className="text-[11px] text-white/60 leading-tight truncate flex items-center gap-1.5">
+            <span>{order.zone || order.order_type}{order.status !== 'open' ? ` · ${order.status}` : ''}</span>
+            {order.guest_name ? <span className="text-white/80">· {order.guest_name}</span> : null}
+            {order.covers ? <span className="inline-flex items-center gap-0.5"><Users className="w-3 h-3" />{order.covers}</span> : null}
+          </p>
         </div>
         {order.status === 'open' && order.table_number && (
           <button onClick={() => openTableAction('move')} title="Move / merge table"
             className="p-2 text-white/70 hover:text-white active:scale-95"><ArrowLeftRight className="w-5 h-5" /></button>
         )}
         <div className="text-right">
-          <p className="text-[10px] text-white/60 leading-none">Total</p>
+          <p className="text-[10px] text-white/60 leading-none">Amount</p>
           <p className="font-extrabold text-[#FF8A4C]">₹{Math.round(order.total)}</p>
         </div>
       </header>
@@ -267,11 +388,25 @@ export default function CaptainOrder() {
           </div>
           <div className="px-3 pb-2 flex flex-wrap gap-2">
             {printAlerts.map((k) => (
-              <button key={k.id} onClick={() => resendKot(k.id)} disabled={resending === k.id}
-                className="bg-white/15 hover:bg-white/25 active:scale-95 rounded-lg px-2.5 py-1.5 text-xs font-medium flex items-center gap-1.5 disabled:opacity-60">
-                {resending === k.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Printer className="w-3.5 h-3.5" />}
-                Re-send KOT #{k.kot_number}{k.station ? ` · ${String(k.station).toUpperCase()}` : ''}
-              </button>
+              <div key={k.id} className="flex flex-wrap items-center gap-1.5">
+                <button onClick={() => resendKot(k.id)} disabled={resending === k.id}
+                  className="bg-white/15 hover:bg-white/25 active:scale-95 rounded-lg px-2.5 py-1.5 text-xs font-medium flex items-center gap-1.5 disabled:opacity-60">
+                  {resending === k.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Printer className="w-3.5 h-3.5" />}
+                  Re-send KOT #{k.kot_number}{k.station ? ` · ${String(k.station).toUpperCase()}` : ''}
+                </button>
+                {/* If re-sends still fail (agent/printer down), page the manager & kitchen. */}
+                {escalated[k.id] ? (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-1.5 rounded-lg bg-white/20">
+                    <CheckCircle2 className="w-3.5 h-3.5" /> Alerted
+                  </span>
+                ) : (
+                  <button onClick={() => escalateKot(k.id)} disabled={escalating === k.id}
+                    className="bg-white text-red-700 hover:bg-white/90 active:scale-95 rounded-lg px-2.5 py-1.5 text-xs font-bold flex items-center gap-1.5 disabled:opacity-60">
+                    {escalating === k.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <BellRing className="w-3.5 h-3.5" />}
+                    Alert Manager &amp; Kitchen
+                  </button>
+                )}
+              </div>
             ))}
           </div>
         </div>
@@ -348,13 +483,31 @@ export default function CaptainOrder() {
             <div className="text-center py-16 text-[#8B7355]"><ShoppingBag className="w-8 h-8 mx-auto mb-2 opacity-50" />No items yet — add from the Menu.</div>
           ) : order.items.map((it) => {
             const editable = order.status === 'open' && it.status === 'pending';
+            // Per-item kitchen timer: count UP from fired_at until completed_at.
+            const firedMs = parseTs(it.fired_at);
+            const isFired = Number.isFinite(firedMs);
+            const isDone = !!it.completed_at;
+            const prep = Number(it.prep_minutes || 0);
+            const elapsed = isDone ? (parseTs(it.completed_at) - firedMs) : (now - firedMs);
+            const overdue = isFired && !isDone && prep > 0 && elapsed >= prep * 60_000;
             return (
-              <div key={it.id} className="bg-white border border-[#E8D5C4] rounded-xl px-3 py-2.5 mb-2">
+              <div key={it.id} className={`bg-white border rounded-xl px-3 py-2.5 mb-2 ${overdue ? 'border-red-300' : 'border-[#E8D5C4]'}`}>
                 <div className="flex items-start gap-2">
                   <div className="flex-1 min-w-0">
                     <p className="font-medium text-[#2D1B0E] flex items-center gap-2 flex-wrap">
-                      <span>{it.name}</span>
+                      <span className={isDone ? 'line-through text-[#8B7355]' : ''}>{it.name}</span>
                       {(() => { const s = itemState(it); return s ? <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${s.cls}`}><s.Icon className="w-3 h-3" />{s.label}</span> : null; })()}
+                      {/* Live count-up timer for fired, not-yet-completed items. */}
+                      {isFired && !isDone && (
+                        <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded-full tabular-nums ${overdue ? 'text-white bg-red-600 animate-pulse' : 'text-[#6B5744] bg-[#FFF1E3] border border-[#E8D5C4]'}`}>
+                          <Timer className="w-3 h-3" />{mmss(elapsed)}{prep > 0 ? ` / ${prep}m` : ''}
+                        </span>
+                      )}
+                      {isDone && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full text-green-700 bg-green-100">
+                          <Check className="w-3 h-3" /> Done{prep > 0 || isFired ? ` · ${mmss(elapsed)}` : ''}
+                        </span>
+                      )}
                     </p>
                     {it.notes && <p className="text-[11px] text-[#af4408] mt-0.5">{it.notes}</p>}
                   </div>
@@ -371,7 +524,23 @@ export default function CaptainOrder() {
                         className="w-9 h-9 rounded-full bg-[#af4408] text-white flex items-center justify-center active:scale-90"><Plus className="w-4 h-4" /></button>
                     </div>
                   ) : <span className="text-sm text-[#8B7355]">Qty {it.quantity}</span>}
-                  {pending === it.id && <Loader2 className="w-4 h-4 animate-spin text-[#af4408]" />}
+                  <div className="flex items-center gap-2">
+                    {pending === it.id && <Loader2 className="w-4 h-4 animate-spin text-[#af4408]" />}
+                    {/* Complete / un-complete — only for fired items. */}
+                    {isFired && order.status === 'open' && (
+                      isDone ? (
+                        <button onClick={() => toggleComplete(it)} disabled={pending === it.id}
+                          className="flex items-center gap-1 text-xs font-semibold text-[#8B7355] border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 active:scale-95 disabled:opacity-50">
+                          <ArrowLeftRight className="w-3.5 h-3.5" /> Undo
+                        </button>
+                      ) : (
+                        <button onClick={() => toggleComplete(it)} disabled={pending === it.id}
+                          className="flex items-center gap-1 text-xs font-bold text-white bg-green-600 rounded-lg px-2.5 py-1.5 active:scale-95 disabled:opacity-50">
+                          <Check className="w-3.5 h-3.5" /> Complete
+                        </button>
+                      )
+                    )}
+                  </div>
                 </div>
               </div>
             );
@@ -392,15 +561,25 @@ export default function CaptainOrder() {
         // Anchored to the main column: full width on phones, offset by the sidebar
         // (w-72 = 18rem) on md+ so it never sits over the sidebar.
         <div className="fixed bottom-0 left-0 right-0 md:left-72 bg-white border-t border-[#E8D5C4] px-3 py-2.5 z-10">
-          <div className="max-w-3xl mx-auto flex items-center gap-2">
-            <button onClick={() => setSettleOpen(true)} className="flex items-center gap-1.5 border border-[#af4408] text-[#af4408] px-4 py-3 rounded-xl text-sm font-semibold active:scale-95">
-              <Receipt className="w-4 h-4" /> Bill
-            </button>
-            <button onClick={sendKot} disabled={firing || pendingCount === 0}
-              className="flex-1 flex items-center justify-center gap-2 bg-[#FF6B35] disabled:opacity-40 text-white py-3 rounded-xl text-sm font-bold active:scale-95">
-              {firing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
-              Send KOT{pendingCount > 0 ? ` (${pendingCount})` : ''}
-            </button>
+          <div className="max-w-3xl mx-auto">
+            {/* Bill is blocked until every fired item is completed. */}
+            {!canBill && (
+              <p className="text-[11px] text-[#af4408] font-medium mb-1.5 flex items-center gap-1">
+                <Timer className="w-3.5 h-3.5" /> Complete all items to bill ({firedIncomplete.length} left)
+              </p>
+            )}
+            <div className="flex items-center gap-2">
+              <button onClick={() => setSettleOpen(true)} disabled={!canBill}
+                title={canBill ? undefined : `Complete all items to bill (${firedIncomplete.length} left)`}
+                className="flex items-center gap-1.5 border border-[#af4408] text-[#af4408] px-4 py-3 rounded-xl text-sm font-semibold active:scale-95 disabled:opacity-40 disabled:active:scale-100">
+                <Receipt className="w-4 h-4" /> Bill
+              </button>
+              <button onClick={sendKot} disabled={firing || pendingCount === 0}
+                className="flex-1 flex items-center justify-center gap-2 bg-[#FF6B35] disabled:opacity-40 text-white py-3 rounded-xl text-sm font-bold active:scale-95">
+                {firing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
+                Send KOT{pendingCount > 0 ? ` (${pendingCount})` : ''}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -548,7 +727,67 @@ export default function CaptainOrder() {
               <p className="font-bold text-lg text-[#2D1B0E]">Collect payment</p>
               <button onClick={() => setSettleOpen(false)} className="p-1"><X className="w-5 h-5 text-[#8B7355]" /></button>
             </div>
-            <p className="text-sm text-[#8B7355] mb-3">Total due <b className="text-[#2D1B0E]">₹{Math.round(order.total)}</b></p>
+            <p className="text-sm text-[#8B7355] mb-3">Total due <b className="text-[#2D1B0E]">₹{Math.round(order.total)}</b>{order.discount > 0 ? <span className="text-green-700"> · disc −₹{Math.round(order.discount)}</span> : null}</p>
+
+            {/* Cashier-only bill adjustments. Captains lack can_request_discount and
+                never see this block; discount is manager-approved server-side. */}
+            {canDiscount && (
+              <div className="mb-3 space-y-2">
+                {!discOpen ? (
+                  <button onClick={() => { setDiscOpen(true); setDiscErr(null); }}
+                    className="w-full flex items-center justify-center gap-2 border border-[#D4B896] text-[#6B5744] py-2.5 rounded-xl text-sm font-semibold active:scale-95">
+                    <BadgePercent className="w-4 h-4" /> Request discount{maxDiscountPct > 0 ? ` (up to ${maxDiscountPct}%)` : ''}
+                  </button>
+                ) : (
+                  <div className="bg-[#FFF9F3] border border-[#E8D5C4] rounded-xl p-3 space-y-2">
+                    <p className="text-xs font-semibold text-[#8B7355] flex items-center gap-1"><BadgePercent className="w-3.5 h-3.5" /> Discount (Manager approval)</p>
+                    <div className="relative">
+                      <input value={discPct} onChange={(e) => setDiscPct(e.target.value)} inputMode="decimal" placeholder={`Discount % ${maxDiscountPct > 0 ? `(max ${maxDiscountPct})` : ''}`}
+                        className="w-full border border-[#D4B896] rounded-lg pl-3 pr-8 py-2 text-sm" />
+                      <Percent className="w-4 h-4 text-[#8B7355] absolute right-2.5 top-1/2 -translate-y-1/2" />
+                    </div>
+                    <input value={discEmail} onChange={(e) => setDiscEmail(e.target.value)} placeholder="Approver email"
+                      className="w-full border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+                    <input type="password" value={discPass} onChange={(e) => setDiscPass(e.target.value)} placeholder="Approver password"
+                      className="w-full border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+                    {discErr && <p className="text-xs text-red-600">{discErr}</p>}
+                    <div className="flex gap-2">
+                      <button onClick={() => { setDiscOpen(false); setDiscErr(null); }} className="flex-1 border border-[#E8D5C4] text-[#6B5744] py-2 rounded-lg text-sm font-medium active:scale-95">Cancel</button>
+                      <button onClick={requestDiscount} disabled={discBusy}
+                        className="flex-1 flex items-center justify-center gap-1.5 bg-[#af4408] text-white py-2 rounded-lg text-sm font-bold active:scale-95 disabled:opacity-50">
+                        {discBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Apply
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {!scOpen ? (
+                  order.service_charge_reason ? (
+                    <p className="text-xs text-[#8B7355] flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5 text-green-600" /> Service charge removed</p>
+                  ) : (
+                    <button onClick={() => { setScOpen(true); setScErr(null); }}
+                      className="w-full flex items-center justify-center gap-2 border border-[#D4B896] text-[#6B5744] py-2.5 rounded-xl text-sm font-semibold active:scale-95">
+                      <X className="w-4 h-4" /> Remove service charge
+                    </button>
+                  )
+                ) : (
+                  <div className="bg-[#FFF9F3] border border-[#E8D5C4] rounded-xl p-3 space-y-2">
+                    <p className="text-xs font-semibold text-[#8B7355]">Remove service charge — reason</p>
+                    <input value={scReason} onChange={(e) => setScReason(e.target.value)} placeholder="e.g. guest complaint, comped"
+                      className="w-full border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+                    {scErr && <p className="text-xs text-red-600">{scErr}</p>}
+                    <div className="flex gap-2">
+                      <button onClick={() => { setScOpen(false); setScErr(null); }} className="flex-1 border border-[#E8D5C4] text-[#6B5744] py-2 rounded-lg text-sm font-medium active:scale-95">Cancel</button>
+                      <button onClick={removeServiceCharge} disabled={scBusy}
+                        className="flex-1 flex items-center justify-center gap-1.5 bg-[#af4408] text-white py-2 rounded-lg text-sm font-bold active:scale-95 disabled:opacity-50">
+                        {scBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Remove
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             <button onClick={printBillNow} disabled={printingBill}
               className="w-full flex items-center justify-center gap-2 border border-[#af4408] text-[#af4408] py-3 rounded-xl text-sm font-semibold active:scale-95 disabled:opacity-50 mb-3">
               {printingBill ? <Loader2 className="w-4 h-4 animate-spin" /> : <Receipt className="w-4 h-4" />} Print bill at counter
@@ -556,12 +795,13 @@ export default function CaptainOrder() {
             <p className="text-xs font-semibold text-[#8B7355] mb-1.5">Collect &amp; close</p>
             <div className="grid grid-cols-3 gap-2">
               {['cash', 'upi', 'card'].map((mthd) => (
-                <button key={mthd} onClick={() => settle(mthd)} disabled={settling}
+                <button key={mthd} onClick={() => settle(mthd)} disabled={settling || !canBill}
                   className="flex flex-col items-center gap-1 bg-[#FFF1E3] border border-[#D4B896] rounded-xl py-4 active:scale-95 disabled:opacity-50">
                   <span className="text-sm font-semibold text-[#2D1B0E] uppercase">{mthd}</span>
                 </button>
               ))}
             </div>
+            {!canBill && <p className="text-center text-xs text-[#af4408] mt-2">Complete all items to bill ({firedIncomplete.length} left)</p>}
             {settling && <p className="text-center text-sm text-[#8B7355] mt-3"><Loader2 className="w-4 h-4 animate-spin inline" /> Settling…</p>}
           </div>
         </div>

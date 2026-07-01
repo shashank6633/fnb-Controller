@@ -446,6 +446,10 @@ function initializeSchema(db: Database.Database) {
     if (!miNames.has('direct_reviewed')) {
       db.exec(`ALTER TABLE menu_items ADD COLUMN direct_reviewed INTEGER NOT NULL DEFAULT 0`);
     }
+    // Per-dish prep time (minutes) → drives the captain's per-item countup timer.
+    if (!miNames.has('prep_minutes')) {
+      db.exec(`ALTER TABLE menu_items ADD COLUMN prep_minutes INTEGER NOT NULL DEFAULT 0`);
+    }
     // Backfill — any menu item already with a material_id is implicitly reviewed
     db.exec(`UPDATE menu_items SET direct_reviewed = 1 WHERE material_id IS NOT NULL AND direct_reviewed = 0`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_menu_items_direct_reviewed ON menu_items(direct_reviewed)`);
@@ -1196,6 +1200,11 @@ function initializeSchema(db: Database.Database) {
     // requisitions / consumption / approvals are visible to this user.
     // Admin / head chef / store manager always see everything, ignoring this.
     if (!has('visible_department_ids')) db.exec(`ALTER TABLE users ADD COLUMN visible_department_ids TEXT`);
+    // Captain area assignment: which floors/zones + specific tables a captain may
+    // work. NULL = all (unrestricted). Enforced only when the `captain_area_lock`
+    // setting is ON and the user is a plain captain (admins/managers bypass).
+    if (!has('preferred_zones'))     db.exec(`ALTER TABLE users ADD COLUMN preferred_zones TEXT`);      // JSON array of zone strings
+    if (!has('preferred_table_ids')) db.exec(`ALTER TABLE users ADD COLUMN preferred_table_ids TEXT`);  // JSON array of table ids
   } catch (e) { console.error('users role-flags migration failed:', e); }
 
   // ── Named roles (Floor Manager, Captain, Cashier, Bar Manager …) ───────────
@@ -1225,6 +1234,13 @@ function initializeSchema(db: Database.Database) {
     `);
     const ucols = db.prepare("PRAGMA table_info(users)").all() as any[];
     if (!ucols.some((c: any) => c.name === 'role_id')) db.exec(`ALTER TABLE users ADD COLUMN role_id TEXT`);
+
+    // Discount permission per role (set by an ops manager/admin on /settings/roles):
+    // can_request_discount = this role may REQUEST a bill discount (e.g. Cashier);
+    // max_discount_pct = the cap they can request. Approval is still Manager/Admin.
+    const rCols = db.prepare("PRAGMA table_info(roles)").all() as any[];
+    if (!rCols.some((c: any) => c.name === 'can_request_discount')) db.exec(`ALTER TABLE roles ADD COLUMN can_request_discount INTEGER NOT NULL DEFAULT 0`);
+    if (!rCols.some((c: any) => c.name === 'max_discount_pct'))     db.exec(`ALTER TABLE roles ADD COLUMN max_discount_pct REAL NOT NULL DEFAULT 0`);
 
     const seedRole = db.prepare(`
       INSERT OR IGNORE INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, is_system, sort_order, description)
@@ -1474,6 +1490,40 @@ function initializeSchema(db: Database.Database) {
     const kCols = db.prepare("PRAGMA table_info(kots)").all() as any[];
     if (!kCols.some((c: any) => c.name === 'fired_by'))      db.exec(`ALTER TABLE kots ADD COLUMN fired_by TEXT DEFAULT ''`);
     if (!kCols.some((c: any) => c.name === 'reprint_count')) db.exec(`ALTER TABLE kots ADD COLUMN reprint_count INTEGER NOT NULL DEFAULT 0`);
+    // Guest capture (a table is opened with the guest's details).
+    const orCols = db.prepare("PRAGMA table_info(orders)").all() as any[];
+    const hasOrd = (n: string) => orCols.some((c: any) => c.name === n);
+    if (!hasOrd('guest_name'))            db.exec(`ALTER TABLE orders ADD COLUMN guest_name TEXT DEFAULT ''`);
+    if (!hasOrd('guest_mobile'))          db.exec(`ALTER TABLE orders ADD COLUMN guest_mobile TEXT DEFAULT ''`);
+    // Bill: service charge amount + why a cashier removed it; discount % + approver.
+    if (!hasOrd('service_charge'))        db.exec(`ALTER TABLE orders ADD COLUMN service_charge REAL NOT NULL DEFAULT 0`);
+    if (!hasOrd('service_charge_reason')) db.exec(`ALTER TABLE orders ADD COLUMN service_charge_reason TEXT DEFAULT ''`);
+    if (!hasOrd('discount_pct'))          db.exec(`ALTER TABLE orders ADD COLUMN discount_pct REAL NOT NULL DEFAULT 0`);
+    if (!hasOrd('discount_approved_by'))  db.exec(`ALTER TABLE orders ADD COLUMN discount_approved_by TEXT DEFAULT ''`);
+    // Per-item prep timer + completion: prep_minutes snapshot from the menu item,
+    // fired_at when it went to the kitchen (timer start), completed_at when the
+    // captain marks it received. Bill is gated until every fired item completes.
+    if (!oiCols.some((c: any) => c.name === 'prep_minutes')) db.exec(`ALTER TABLE order_items ADD COLUMN prep_minutes INTEGER NOT NULL DEFAULT 0`);
+    if (!oiCols.some((c: any) => c.name === 'fired_at'))     db.exec(`ALTER TABLE order_items ADD COLUMN fired_at TEXT`);
+    if (!oiCols.some((c: any) => c.name === 'completed_at')) db.exec(`ALTER TABLE order_items ADD COLUMN completed_at TEXT`);
+    // KOT escalation: a captain flags a KOT that would not print, so the Manager
+    // (in-app) and the Kitchen Display both see "not printed — action needed".
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS kot_alerts (
+        id          TEXT PRIMARY KEY,
+        kot_id      TEXT,
+        order_id    TEXT,
+        outlet_id   TEXT,
+        kot_number  INTEGER,
+        station     TEXT DEFAULT '',
+        table_number TEXT DEFAULT '',
+        reason      TEXT DEFAULT '',
+        created_by  TEXT DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        resolved_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_kot_alerts_open ON kot_alerts(resolved_at);
+    `);
   } catch (e) { console.error('POS orders schema failed:', e); }
 
   // Phase 1 §6: wastages — items thrown away (spoilage / expiry / damage / overcooked / spillage).

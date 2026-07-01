@@ -35,6 +35,14 @@ export interface SessionUser {
   page_access: string | null;
   /** JSON-stringified array of department_ids whose data is visible. null = only own dept. */
   visible_department_ids: string | null;
+  /** JSON array of restaurant_tables.zone strings a captain may work. null = all areas. */
+  preferred_zones: string | null;
+  /** JSON array of table ids a captain may work (in addition to zones). null = none. */
+  preferred_table_ids: string | null;
+  /** May REQUEST a bill discount (cashier roles; admin always true). Approval is still Manager/Admin. */
+  can_request_discount: boolean;
+  /** Max discount % this user may request (admin = 100). */
+  max_discount_pct: number;
 }
 
 export async function hashPassword(plain: string): Promise<string> {
@@ -75,9 +83,11 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
   const row = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.department_id,
            u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
+           u.preferred_zones, u.preferred_table_ids,
            u.role_id,
            r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
+           r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount,
            s.expires_at
     FROM sessions s JOIN users u ON u.id = s.user_id
     LEFT JOIN roles r ON r.id = u.role_id
@@ -109,6 +119,12 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     // null = full access (backward compat for users without a role or override).
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
     visible_department_ids: row.visible_department_ids || null,
+    preferred_zones: row.preferred_zones || null,
+    preferred_table_ids: row.preferred_table_ids || null,
+    // Bill discount permission (from the role; admin always may). Approval is
+    // still a Manager/Admin login — this only gates who may REQUEST a discount.
+    can_request_discount: (hasRole ? row.role_base : row.role) === 'admin' ? true : (hasRole && !!row.role_can_discount),
+    max_discount_pct: (hasRole ? row.role_base : row.role) === 'admin' ? 100 : (hasRole ? (Number(row.role_max_discount) || 0) : 0),
   };
 }
 
@@ -143,9 +159,11 @@ export async function verifyApprover(email: string, password: string): Promise<S
   const db = getDb();
   const row = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.department_id, u.password_hash,
-           u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids, u.role_id,
+           u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
+           u.preferred_zones, u.preferred_table_ids, u.role_id,
            r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
-           r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store
+           r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
+           r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount
     FROM users u LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
     WHERE lower(u.email) = lower(?) AND u.is_active = 1
   `).get(email) as any;
@@ -161,6 +179,10 @@ export async function verifyApprover(email: string, password: string): Promise<S
     is_store_manager: !!row.is_store_manager || (hasRole && !!row.role_store),
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
     visible_department_ids: row.visible_department_ids || null,
+    preferred_zones: row.preferred_zones || null,
+    preferred_table_ids: row.preferred_table_ids || null,
+    can_request_discount: (hasRole ? row.role_base : row.role) === 'admin' ? true : (hasRole && !!row.role_can_discount),
+    max_discount_pct: (hasRole ? row.role_base : row.role) === 'admin' ? 100 : (hasRole ? (Number(row.role_max_discount) || 0) : 0),
   };
 }
 

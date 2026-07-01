@@ -198,47 +198,100 @@ function money(n) {
   return 'Rs ' + v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// Item row: item name on the left, then Qty / Rate / Amt right-aligned in fixed
+// numeric columns. The name is truncated so it never collides with Qty. At 32
+// cols the columns shrink but the structure is identical (ASCII only).
+function billItemRow(name, qty, rate, amt, cols) {
+  const qtyW  = cols >= 48 ? 4 : 3;
+  const rateW = cols >= 48 ? 9 : 7;
+  const amtW  = cols >= 48 ? 10 : 8;
+  const pad = (s, w) => { s = String(s); return s.length >= w ? s : ' '.repeat(w - s.length) + s; };
+  const right = pad(qty, qtyW) + pad(rate, rateW) + pad(amt, amtW);
+  let nm = String(name ?? '');
+  const nameW = cols - right.length - 1;                 // 1-space gap min
+  if (nameW < 1) return right.slice(0, cols);
+  if (nm.length > nameW) nm = nm.slice(0, Math.max(0, nameW - 1)) + '.';
+  return nm + ' '.repeat(cols - nm.length - right.length) + right;
+}
+
 function buildBill(doc, cols, doCut) {
   const chunks = [];
   const push = (b) => chunks.push(Buffer.from(b));
   const line = (s = '') => chunks.push(Buffer.from(String(s) + '\n', 'ascii'));
   const rule = () => line('-'.repeat(cols));
+  const center = (s) => { push(CMD.alignCenter); line(s); push(CMD.alignLeft); };
 
   push(CMD.init);
+
+  // ── Header block (all centered) ──────────────────────────────────────────
   push(CMD.alignCenter); push(CMD.boldOn); push(CMD.dblOn);
-  line((doc.shopName || 'RESTAURANT').toUpperCase());
+  line(String(doc.brandName || 'RESTAURANT').toUpperCase());
   push(CMD.dblOff); push(CMD.boldOff);
-  if (doc.address) line(doc.address);
-  if (doc.gstin) line(`GSTIN: ${doc.gstin}`);
-  if (doc.phone) line(`Ph: ${doc.phone}`);
-  if (doc.headerNote) line(doc.headerNote);
+  if (doc.companyName) line(String(doc.companyName));
+  if (doc.address) line(String(doc.address));
+  if (doc.contact) line(`Contact no: ${doc.contact}`);
+  if (doc.email) line(`Email: ${doc.email}`);
+  if (doc.fssai) line(`FSSAI no: ${doc.fssai}`);
+  if (doc.gstin) line(`GST no: ${doc.gstin}`);
   push(CMD.alignLeft);
   rule();
-  line(twoCol(doc.billNo ? `Bill #${doc.billNo}` : 'Bill', doc.table ? `Table ${doc.table}` : '', cols));
-  line(twoCol(fmtTime(doc.date), doc.server ? `Server: ${doc.server}` : '', cols));
+
+  // ── Order type + location ────────────────────────────────────────────────
+  push(CMD.alignCenter); push(CMD.boldOn);
+  line(String(doc.orderType || 'DINE-IN').toUpperCase());
+  push(CMD.boldOff); push(CMD.alignLeft);
+  const floor = doc.floor ? String(doc.floor) : '';
+  const table = doc.table ? String(doc.table) : '';
+  if (floor || table) line(`${floor}${floor && table ? ' : ' : ''}${table}`);
   rule();
-  // header
-  line(twoCol('Item', 'Amount', cols));
+
+  // ── Guest details ──────────────────────────────────────────────────────────
+  if (doc.guestName)   line(`Guest Name: ${doc.guestName}`);
+  if (doc.guestMobile) line(`Mobile: ${doc.guestMobile}`);
+  line(`Date & Time: ${fmtTime(doc.date)}`);
+  if (doc.captainName) line(`Captain Name: ${doc.captainName}`);
+  rule();
+
+  // ── Guests + Order no (two columns) ────────────────────────────────────────
+  line(twoCol(`Number of Guests: ${Number(doc.guests) || 0}`, doc.orderNo ? `Order no: ${doc.orderNo}` : '', cols));
+  rule();
+
+  // ── Item table ───────────────────────────────────────────────────────────
+  push(CMD.boldOn);
+  line(billItemRow('Item Name', 'Qty', 'Rate', 'Amt', cols));
+  push(CMD.boldOff);
   rule();
   for (const it of (doc.items || [])) {
     const qty = Number(it.qty) || 1;
-    const price = Number(it.price) || 0;
-    const amount = it.amount != null ? Number(it.amount) : qty * price;
-    line(it.name || '');
-    line(twoCol(`   ${qty} x ${money(price)}`, money(amount), cols));
+    const rate = Number(it.rate) || 0;
+    const amount = it.amount != null ? Number(it.amount) : qty * rate;
+    line(billItemRow(it.name || '', qty, money(rate), money(amount), cols));
   }
   rule();
-  line(twoCol('Subtotal', money(doc.subtotal ?? (doc.items || []).reduce((s, it) => s + (it.amount != null ? Number(it.amount) : (Number(it.qty)||1) * (Number(it.price)||0)), 0)), cols));
-  if (doc.discount) line(twoCol('Discount', '-' + money(doc.discount), cols));
-  for (const t of (doc.tax || [])) line(twoCol(t.label || 'Tax', money(t.amount), cols));
+
+  // ── Totals block ─────────────────────────────────────────────────────────
+  line(twoCol('Sub Total', money(doc.subtotal ?? 0), cols));
+  if (Number(doc.serviceCharge)) line(twoCol('Service Charges', money(doc.serviceCharge), cols));
+  if (Number(doc.cgst)) line(twoCol(`CGST@${doc.cgstPct != null ? doc.cgstPct : 2.5}%`, money(doc.cgst), cols));
+  if (Number(doc.sgst)) line(twoCol(`SGST@${doc.sgstPct != null ? doc.sgstPct : 2.5}%`, money(doc.sgst), cols));
+  if (Number(doc.discount) > 0) line(twoCol('Discount', '-' + money(doc.discount), cols));
+
   push(CMD.boldOn); push(CMD.dblOn);
-  // double-width halves the columns, so render total on its own emphasized line
+  // double-width halves the columns, so render the total on its own emphasized line
   line(twoCol('TOTAL', money(doc.total ?? 0), Math.floor(cols / 2)));
   push(CMD.dblOff); push(CMD.boldOff);
+  // Grand Total = final payable (rounded); then the payment line once settled.
+  if (doc.grandTotal != null) { push(CMD.boldOn); line(twoCol('Grand Total', money(doc.grandTotal), cols)); push(CMD.boldOff); }
+  if (doc.paymentMethod) {
+    line(twoCol(`Paid by ${String(doc.paymentMethod).toUpperCase()}`, money(doc.amountPaid != null ? doc.amountPaid : (doc.grandTotal != null ? doc.grandTotal : doc.total)), cols));
+    line(twoCol('Balance', money(doc.balance != null ? doc.balance : 0), cols));
+  }
   rule();
-  push(CMD.alignCenter);
-  line(doc.footer || 'Thank you! Visit again.');
-  push(CMD.alignLeft);
+
+  // ── Footer ───────────────────────────────────────────────────────────────
+  if (doc.footer) center(String(doc.footer));
+  if (doc.printedBy) line(`Printed by ${doc.printedBy}`);
+  line(`Printed on: ${fmtTime(doc.date)}`);
   push(CMD.feed3);
   if (doCut) push(CMD.cut);
   return Buffer.concat(chunks);
