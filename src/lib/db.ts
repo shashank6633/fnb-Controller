@@ -1500,6 +1500,10 @@ function initializeSchema(db: Database.Database) {
     // ('cloud' for normal online orders, 'offline' for replayed ones).
     if (!hasOrd('client_ref'))            db.exec(`ALTER TABLE orders ADD COLUMN client_ref TEXT`);
     if (!hasOrd('origin'))                db.exec(`ALTER TABLE orders ADD COLUMN origin TEXT DEFAULT 'cloud'`);
+    // DB-level idempotency guard for offline replay: at most one order per
+    // client_ref. Partial index so the many NULL client_refs (all online orders)
+    // are exempt. The replay route catches the constraint as "already existed".
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_ref ON orders(client_ref) WHERE client_ref IS NOT NULL`);
     // Bill: service charge amount + why a cashier removed it; discount % + approver.
     if (!hasOrd('service_charge'))        db.exec(`ALTER TABLE orders ADD COLUMN service_charge REAL NOT NULL DEFAULT 0`);
     if (!hasOrd('service_charge_reason')) db.exec(`ALTER TABLE orders ADD COLUMN service_charge_reason TEXT DEFAULT ''`);

@@ -13,15 +13,19 @@ async function requireManager() {
 }
 
 /** GET — list tables for the active outlet, each annotated with its open order (if any). */
-export async function GET() {
+export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const outletId = await getCurrentOutletId();
     // Restrict a locked-in captain to their assigned floors/tables (server-side —
-    // never rely on client filtering). null = no restriction.
-    const area = captainAreaFilter(db, me);
+    // never rely on client filtering). null = no restriction. `?scope=all` bypasses
+    // it for the offline cache warmer: the offline mini-POS must offer EVERY table
+    // (any captain may use it during an outage), and table existence isn't sensitive
+    // — actually working a table is still gated server-side by canWorkTable().
+    const scopeAll = new URL(request.url).searchParams.get('scope') === 'all';
+    const area = scopeAll ? null : captainAreaFilter(db, me);
     const tables = db.prepare(`
       SELECT t.*,
              o.id AS open_order_id, o.order_number AS open_order_number, o.total AS open_order_total,

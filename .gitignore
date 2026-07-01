@@ -93,3 +93,11 @@ captain-android/.gradle/
 captain-android/build/
 captain-android/*.idsig
 captain-android/local.properties
+
+# Print-bridge runtime files (written next to the .mjs on the counter PC)
+public/cache.json
+public/kot-outbox.json
+scripts/cache.json
+scripts/kot-outbox.json
+cache.json
+kot-outbox.json

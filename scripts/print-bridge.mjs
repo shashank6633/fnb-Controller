@@ -54,7 +54,7 @@ const CACHE_FILE  = path.join(SCRIPT_DIR, 'cache.json');
 const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 
-const VERSION = '2.2.0';   // 2.2.0 = offline LAN KOT: /cache, /offline, /kot(+pending,+mark-synced); LAN bind default
+const VERSION = '2.2.1';   // 2.2.1 = offline LAN KOT + audit hardening (loopback gate, fast-fail, partial-print ok)
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -399,7 +399,7 @@ function printIp(target, payload, opts = {}) {
     let phase = 'connect';
     const bytes = [];
     let timer = null;
-    const sock = net.createConnection({ host, port, timeout: 6000 });
+    const sock = net.createConnection({ host, port, timeout: opts.connectTimeout || 6000 });
     const fail = (msg) => { if (timer) clearTimeout(timer); try { sock.destroy(); } catch {} reject(new Error(`printer ${host}:${port} — ${msg}`)); };
     const writePayload = () => { phase = 'print'; sock.write(payload, () => sock.end()); };
     const evaluate = () => {
@@ -478,9 +478,14 @@ async function withRetry(fn, attempts = 3) {
   throw last;
 }
 
-async function printTo(printer, payload) {
+async function printTo(printer, payload, opts = {}) {
   const t = (printer && printer.transport) || 'ip';
-  if (t === 'ip')   return withRetry(() => printIp(printer.target, payload, printer), 3);
+  // opts.fast (offline /kot): 1 attempt, 3s connect timeout, so a dead printer
+  // fails in ~3s instead of ~18s — the order is journaled regardless, and the
+  // captain is warned. The online /print path keeps the resilient 3x/6s default.
+  const attempts = opts.fast ? 1 : 3;
+  const connectTimeout = opts.fast ? 3000 : undefined;
+  if (t === 'ip')   return withRetry(() => printIp(printer.target, payload, { ...printer, connectTimeout }), attempts);
   if (t === 'usb')  return printUsb(printer.target, payload);
   if (t === 'file') return printFile(printer.target, payload);
   throw new Error(`unknown transport "${t}"`);
@@ -634,9 +639,29 @@ function buildOfflineKotDocs(fire, cache, localNumber, nowIso) {
   return { docs, missingPrinter };
 }
 
+// True when the request came from the counter PC itself (loopback). The bridge
+// binds 0.0.0.0 so captain tablets can reach the offline page + POST /kot, but
+// the endpoints that write files/redirect printers/poison the cache/mark orders
+// synced must stay counter-only.
+function isLoopback(req) {
+  const a = (req.socket && req.socket.remoteAddress) || '';
+  return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
+}
+// Reachable from the LAN (captain tablets): the offline page, firing a KOT, the
+// pending count, health — plus GET /cache (the offline page reads the menu).
+// POST /cache, /print, /print-batch, /printer-status, /kot/mark-synced are
+// counter-only (loopback) so a hostile LAN device can't write files, redirect
+// printers, poison the cached menu, or mark orders synced.
+const LAN_OPEN = new Set(['/health', '/offline', '/kot', '/kot/pending']);
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method === 'OPTIONS') return sendJson(res, 204, {});
+
+  const lanOk = LAN_OPEN.has(url.pathname) || (req.method === 'GET' && url.pathname === '/cache');
+  if (!lanOk && !isLoopback(req)) {
+    return sendJson(res, 403, { ok: false, error: 'this endpoint is available only on the counter PC (localhost)' });
+  }
 
   if (req.method === 'GET' && url.pathname === '/health') {
     return sendJson(res, 200, { ok: true, version: VERSION, platform: os.platform(), uptimeSec: Math.round((Date.now() - startedAt) / 1000) });
@@ -790,14 +815,14 @@ const server = http.createServer((req, res) => {
         if (!groups.has(key)) groups.set(key, { printer, items: [] });
         groups.get(key).items.push({ station: d.station, payload });
       }
-      let anyFailed = false;
+      const stationsFailed = [];
       await Promise.allSettled([...groups.values()].map(async (g) => {
         const buf = Buffer.concat(g.items.map((it) => it.payload));
         try {
-          await printTo(g.printer, buf);
+          await printTo(g.printer, buf, { fast: true });   // fail fast; order is journaled anyway
           for (const it of g.items) stationsPrinted.push(it.station);
         } catch (e) {
-          anyFailed = true;
+          for (const it of g.items) stationsFailed.push(it.station);
           console.error(`[bridge] offline KOT ${localNumber} print failed on ${g.printer.transport}:${g.printer.target} - ${e.message}`);
         }
       }));
@@ -810,8 +835,11 @@ const server = http.createServer((req, res) => {
       box.jobs.push(record);
       writeJsonFile(OUTBOX_FILE, box);
 
-      console.log(`[bridge] offline KOT ${localNumber}: ${stationsPrinted.length} station ticket(s) printed${anyFailed ? ' (some failed)' : ''}`);
-      return sendJson(res, 200, { ok: !anyFailed, localNumber, stationsPrinted });
+      console.log(`[bridge] offline KOT ${localNumber}: ${stationsPrinted.length} printed${stationsFailed.length ? ', ' + stationsFailed.length + ' FAILED' : ''}`);
+      // ok:true means the order was CAPTURED (journaled -> will sync). A failed
+      // station is reported separately so the captain is warned WITHOUT re-firing
+      // (a re-fire would mint a new clientRef and create a duplicate order).
+      return sendJson(res, 200, { ok: true, localNumber, stationsPrinted, stationsFailed });
     });
     return;
   }

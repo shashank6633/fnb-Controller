@@ -238,6 +238,7 @@
   .fired-banner .lbl{color:var(--ok);font-weight:800;font-size:14px;letter-spacing:.4px;text-transform:uppercase;}
   .fired-banner .num{font-size:40px;font-weight:900;color:var(--brown-d);margin:4px 0;letter-spacing:1px;}
   .fired-banner .sub{color:var(--muted);font-size:14px;}
+  .fired-banner .warn-line{color:var(--danger);font-weight:700;font-size:13px;margin-top:8px;line-height:1.3;}
   /* ---- session ticket log ---- */
   .ticketlog{margin-top:16px;}
   .ticketlog h3{font-size:14px;color:var(--brown-d);margin:0 0 8px;}
@@ -766,13 +767,21 @@ function onFired(body, fire){
   // confirmation banner
   var stations = (body.stationsPrinted && body.stationsPrinted.length)
     ? body.stationsPrinted.join(', ') : '';
+  var failed = (body.stationsFailed && body.stationsFailed.length) ? body.stationsFailed : [];
   $('firedBanner').innerHTML =
     '<div class="fired-banner">'+
       '<div class="lbl">Sent to kitchen</div>'+
       '<div class="num">Ticket '+esc(ln)+'</div>'+
       '<div class="sub">Table '+esc(tableLabel)+' &middot; '+itemCount+' item'+(itemCount===1?'':'s')+
         (stations ? ' &middot; '+esc(stations) : '')+'</div>'+
+      (failed.length
+        ? '<div class="sub warn-line">Printer didn’t respond: '+esc(failed.join(', '))+
+          '. Tell that station &mdash; the order is saved, do NOT fire again.</div>'
+        : '')+
     '</div>';
+  // The order IS captured either way (it will sync). A failed station is a
+  // warning, never an error that makes the captain re-fire (that would duplicate).
+  if (failed.length) toast('Saved as '+ln+', but the '+failed.join(', ')+' printer did not respond — do NOT re-fire.', true);
   renderSessionLog();
 
   // reset cart, keep table+guest for convenience, jump to done

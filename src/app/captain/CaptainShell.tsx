@@ -204,7 +204,9 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   // The plain <a> is deliberate: a top-level navigate escapes the TWA https
   // mixed-content block that would kill a fetch() to an http:// counter address.
   const offlineBanner = offline ? (
-    <div className="fixed top-0 inset-x-0 z-[70] bg-red-700 text-white shadow-lg">
+    // In normal flow (not fixed) so it reserves its own space and pushes the page
+    // down instead of covering each route's sticky header (back button, table bar).
+    <div className="relative z-[70] bg-red-700 text-white shadow-lg">
       <div className="max-w-3xl mx-auto px-4 py-2.5 flex items-center gap-3 flex-wrap">
         <WifiOff className="w-5 h-5 shrink-0" />
         <p className="text-sm font-semibold leading-tight min-w-0 flex-1">

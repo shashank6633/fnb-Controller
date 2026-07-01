@@ -135,7 +135,7 @@ export async function buildCache(): Promise<OfflineCache | null> {
   try {
     const [menuRes, tablesRes, settingsRes, design, stations] = await Promise.all([
       api('/api/menu-items?active_only=true').then((r) => (r.ok ? r.json() : null)).catch(() => null),
-      api('/api/dine-in/tables').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      api('/api/dine-in/tables?scope=all').then((r) => (r.ok ? r.json() : null)).catch(() => null),
       api('/api/settings').then((r) => (r.ok ? r.json() : null)).catch(() => null),
       getKotDesign().catch(() => null),
       getStations(true).catch(() => [] as PrintStation[]),

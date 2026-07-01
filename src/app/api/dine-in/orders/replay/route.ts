@@ -72,10 +72,12 @@ export async function POST(request: Request) {
 
         // Next daily order number — SAME MAX(order_number)+1-per-outlet/day logic
         // as src/app/api/dine-in/orders/route.ts.
+        // Number against the FIRE's own day (createdAt), not replay time, so an
+        // outage that straddles midnight can't collide with a genuine same-day order.
         const seq = db.prepare(`
           SELECT COALESCE(MAX(order_number), 0) + 1 AS n FROM orders
-          WHERE (outlet_id = ? OR outlet_id IS NULL) AND date(created_at) = date('now')
-        `).get(outletId) as any;
+          WHERE (outlet_id = ? OR outlet_id IS NULL) AND date(created_at) = date(COALESCE(?, 'now'))
+        `).get(outletId, createdAt || null) as any;
         const orderNumber = seq?.n || 1;
 
         const orderId = generateId();
@@ -116,29 +118,57 @@ export async function POST(request: Request) {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'fired', ?, ?, ?, ?, ?)
         `);
 
+        let subtotal = 0;
         for (const [station, its] of Object.entries(byStation)) {
           // Per-outlet, per-day KOT number — SAME logic as the 'fire' action.
           const kseq = db.prepare(`
             SELECT COALESCE(MAX(kot_number), 0) + 1 AS n FROM kots
-            WHERE (outlet_id = ? OR outlet_id IS NULL) AND date(created_at) = date('now')
-          `).get(outletId) as any;
+            WHERE (outlet_id = ? OR outlet_id IS NULL) AND date(created_at) = date(COALESCE(?, 'now'))
+          `).get(outletId, createdAt || null) as any;
           const kotId = generateId();
           insertKot.run(kotId, outletId, orderId, kseq?.n || 1, station, captainName, createdAt || null, createdAt || null);
           for (const it of its) {
             const qty = Number(it?.qty) || 0;
             const price = Number(it?.price) || 0;
+            const lineTotal = Math.round(price * qty * 100) / 100;
+            subtotal += lineTotal;
             insertItem.run(
               generateId(), orderId, it?.menuId || null, String(it?.name || ''), station,
-              qty, price, Math.round(price * qty * 100) / 100,
+              qty, price, lineTotal,
               String(it?.notes || ''), Number(it?.prep_minutes) || 0, createdAt || null, kotId, createdAt || null,
             );
           }
         }
 
+        // Roll the line items up onto the order. CRITICAL: the settle route bills
+        // from the STORED order.subtotal (then adds service charge + CGST/SGST via
+        // computeBill) — it does NOT re-sum the items. Without this the order would
+        // settle at Rs 0. tax stays 0 here (settle applies the configured taxes).
+        const subTotalR = Math.round(subtotal * 100) / 100;
+        db.prepare(`UPDATE orders SET subtotal = ?, tax_total = 0, total = ?, updated_at = ? WHERE id = ?`)
+          .run(subTotalR, subTotalR, createdAt || null, orderId);
+
         return { id: orderId, orderNumber, alreadyExisted: false };
       });
 
-      const out = create();
+      // Isolate each fire: one bad row must NOT 500 the whole batch (which would
+      // leave every good fire un-synced and retrying forever). A UNIQUE(client_ref)
+      // violation from a concurrent replayer just means "already done".
+      let out;
+      try {
+        out = create();
+      } catch (e: any) {
+        if (/UNIQUE constraint failed:\s*orders\.client_ref/i.test(String(e?.message))) {
+          const ex = db.prepare('SELECT id, order_number FROM orders WHERE client_ref = ?').get(clientRef) as any;
+          results.push({ clientRef, orderId: ex?.id || null, orderNumber: ex?.order_number ?? null, alreadyExisted: true });
+        } else {
+          // Quarantine: empty clientRef so the counter never marks it synced (it
+          // stays in the bridge outbox and can be retried / investigated).
+          console.error('[/api/dine-in/orders/replay] fire failed', clientRef, e?.message);
+          results.push({ clientRef: '', orderId: null, orderNumber: null, alreadyExisted: false });
+        }
+        continue;
+      }
       results.push({
         clientRef,
         orderId: out.id,
