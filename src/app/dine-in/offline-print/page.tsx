@@ -79,7 +79,10 @@ export default function OfflinePrintPage() {
     setBridgeUrlState(getBridgeUrl());
     loadStations(); loadJobs(); loadMenuStations(); checkBridge(); refreshQueue();
     ensureDrainLoop();
-    const t = setInterval(refreshQueue, 5000);
+    // Auto-reconnect: silently re-probe the bridge every 4s (no "Checking…"
+    // flicker), so when the bridge starts/restarts the page connects itself —
+    // the operator never has to click Refresh.
+    const t = setInterval(() => { refreshQueue(); probeBridge().then(setHealth); }, 4000);
     return () => clearInterval(t);
   }, [loadStations, loadJobs, loadMenuStations, checkBridge, refreshQueue]);
 
@@ -206,10 +209,10 @@ export default function OfflinePrintPage() {
               : health ? <Wifi className="w-5 h-5 text-green-600" /> : <WifiOff className="w-5 h-5 text-red-500" />}
             <div>
               <p className="font-semibold text-[#2D1B0E]">
-                {probing ? 'Checking bridge…' : health ? 'Print bridge connected' : 'Print bridge not found'}
+                {probing ? 'Checking bridge…' : health ? 'Print bridge connected' : 'Print bridge not connected'}
               </p>
               <p className="text-xs text-[#8B7355]">
-                {health ? `v${health.version} · ${health.platform} · up ${health.uptimeSec}s` : `Run the bridge on this PC, then click refresh. (${getBridgeUrl()})`}
+                {health ? `v${health.version} · ${health.platform} · up ${health.uptimeSec}s` : `Trying ${getBridgeUrl()} every few seconds — start the bridge on this counter PC and it will connect automatically. See the steps below.`}
               </p>
             </div>
           </div>
@@ -244,35 +247,38 @@ export default function OfflinePrintPage() {
         </button>
       </div>
 
-      {/* Setup help */}
-      <div className="bg-white border border-[#E8D5C4] rounded-xl">
+      {/* Setup / troubleshooter — auto-opens when the bridge isn't connected */}
+      <div className={`bg-white border rounded-xl ${!probing && !health ? 'border-red-300' : 'border-[#E8D5C4]'}`}>
         <button onClick={() => setShowHelp(!showHelp)} className="w-full flex items-center justify-between p-4 text-left">
-          <span className="font-semibold text-[#2D1B0E]">How to start the print bridge (on the counter PC)</span>
-          {showHelp ? <ChevronDown className="w-5 h-5 text-[#8B7355]" /> : <ChevronRight className="w-5 h-5 text-[#8B7355]" />}
+          <span className="font-semibold text-[#2D1B0E]">{!probing && !health ? 'Bridge not connected — how to fix it' : 'Start / troubleshoot the print bridge'}</span>
+          {(showHelp || (!probing && !health)) ? <ChevronDown className="w-5 h-5 text-[#8B7355]" /> : <ChevronRight className="w-5 h-5 text-[#8B7355]" />}
         </button>
-        {showHelp && (
-          <div className="px-4 pb-4 text-sm text-[#6B5744] space-y-2">
-            <p>The bridge is a tiny program that runs on the billing-counter computer (the one with the bill printer on USB and on the same network as the kitchen printers).</p>
+        {(showHelp || (!probing && !health)) && (
+          <div className="px-4 pb-4 text-sm text-[#6B5744] space-y-3">
+            {/* Troubleshooter — the two checks that fix 90% of "not connected" */}
+            <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 space-y-2">
+              <p className="text-xs text-[#8B7355]">This page reconnects on its own — the moment the bridge runs on this PC, the status above turns green. No need to click Refresh.</p>
+              <p className="font-medium text-[#2D1B0E]">1. Are you on the counter PC?</p>
+              <p>The bridge is <b>localhost</b> — it only answers on the exact PC wired to the printers. On a tablet or any other computer this will always say “not connected”, and that’s fine: only the counter PC needs it (the captain tablet prints <i>through</i> it).</p>
+              <p className="font-medium text-[#2D1B0E]">2. Is the bridge program running?</p>
+              <p>On <i>this</i> PC, open the health check. If you see version text, it’s running (this page will connect within seconds). If it won’t open, the bridge isn’t running — start it below.</p>
+              <a href={`${getBridgeUrl()}/health`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-1.5 rounded-lg text-xs font-medium no-underline"><Wifi className="w-3.5 h-3.5" /> Open bridge health check ({getBridgeUrl()}/health)</a>
+            </div>
 
-            <p className="font-medium text-[#2D1B0E]">Recommended — install once as an always-on service</p>
-            <p>Run this <b>once per counter PC</b> in PowerShell <b>(as Administrator)</b>. It auto-starts at every boot, restarts itself if it crashes, and the cashier never launches anything again:</p>
-            <pre className="bg-[#2D1B0E] text-[#F5E9DC] text-[11px] rounded-lg p-2 overflow-x-auto whitespace-pre-wrap">{`powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm ${typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`}</pre>
-            <p className="text-xs text-[#8B7355]">It installs Node (if missing), the service, and a daily auto-updater. After it says HEALTHY, click <b>Refresh</b> above → green. <b>If it says “Unable to connect to the remote server”</b>, your PowerShell is on an old TLS — the <code>SecurityProtocol=Tls12</code> at the start of this command fixes that.</p>
-
-            <p className="font-medium text-[#2D1B0E] mt-3">Or run it manually (for a quick test)</p>
-            <div className="flex flex-wrap gap-2 my-2">
+            <p className="font-medium text-[#2D1B0E]">Start it now (quick)</p>
+            <p>On the counter PC, double-click <code className="bg-[#FFF1E3] px-1 rounded">print-bridge.bat</code> → a black window says “listening on … 9920” → keep it open. This page turns green within a few seconds.</p>
+            <div className="flex flex-wrap gap-2 my-1">
               <a href="/print-bridge.bat" download className="inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-3 py-2 rounded-lg text-xs font-medium no-underline"><Download className="w-4 h-4" /> Download launcher (.bat)</a>
               <a href="/print-bridge.mjs" download className="inline-flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-2 rounded-lg text-xs font-medium no-underline"><Download className="w-4 h-4" /> Download bridge (.mjs)</a>
             </div>
-            <p className="font-medium text-[#2D1B0E]">Manual steps (Windows counter PC):</p>
-            <ol className="list-decimal ml-5 space-y-1">
-              <li>Install <b>Node.js</b> — get the <b>LTS</b> installer from <code className="bg-[#FFF1E3] px-1 rounded">nodejs.org</code> and click through the defaults.</li>
-              <li>On <i>this PC</i>, download <b>both</b> files above into one folder (e.g. <code className="bg-[#FFF1E3] px-1 rounded">C:\fnb-bridge\</code>).</li>
-              <li>Double-click <code className="bg-[#FFF1E3] px-1 rounded">print-bridge.bat</code>. A black window opens saying it&apos;s listening — <b>keep it open</b>.</li>
-              <li>Come back here and click <b>Refresh</b> — the status turns green.</li>
-              <li>Add your printers below. <b>USB</b>: share the printer in Windows and enter <code className="bg-[#FFF1E3] px-1 rounded">\\localhost\POS80</code>. <b>Network (IP)</b>: enter <code className="bg-[#FFF1E3] px-1 rounded">192.168.1.50:9100</code>.</li>
-            </ol>
-            <p className="text-xs text-[#8B7355]">Prefer a terminal? In Command Prompt: <code className="bg-[#FFF1E3] px-1 rounded">cd C:\fnb-bridge</code> then <code className="bg-[#FFF1E3] px-1 rounded">node print-bridge.mjs</code>. No PowerShell policy change is needed. Because the bridge and printers are all on-site, printing keeps working even if the internet drops.</p>
+            <p className="text-xs text-[#8B7355]">First time? Install <b>Node.js LTS</b> from <code className="bg-[#FFF1E3] px-1 rounded">nodejs.org</code>, put <b>both</b> files above in one folder (e.g. <code className="bg-[#FFF1E3] px-1 rounded">C:\fnb-bridge\</code>), then double-click the .bat.</p>
+
+            <p className="font-medium text-[#2D1B0E] mt-2">Make it permanent — auto-start on every boot (recommended)</p>
+            <p>Run this <b>once</b> in PowerShell <b>(as Administrator)</b>. It installs Node if missing, runs the bridge as an always-on Windows service, and auto-updates daily — the counter never has to launch anything again:</p>
+            <pre className="bg-[#2D1B0E] text-[#F5E9DC] text-[11px] rounded-lg p-2 overflow-x-auto whitespace-pre-wrap">{`powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm ${typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`}</pre>
+            <p className="text-xs text-[#8B7355]"><b>If it says “Unable to connect to the remote server”:</b> let the browser download it instead — open <code className="bg-[#FFF1E3] px-1 rounded break-all">{typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1</code> in this browser (choose <b>Keep</b> if warned), then in an <b>admin</b> PowerShell run <code className="bg-[#FFF1E3] px-1 rounded break-all">{'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install-bridge-service.ps1"'}</code>. Wait for <b>HEALTHY — v2.1.0</b>.</p>
+
+            <p className="text-xs text-[#8B7355] mt-1">Add printers below. <b>USB</b>: share it in Windows, enter <code className="bg-[#FFF1E3] px-1 rounded">\\localhost\POS80</code>. <b>Network</b>: enter <code className="bg-[#FFF1E3] px-1 rounded">192.168.1.50:9100</code>. Everything is on-site, so printing keeps working even if the internet drops.</p>
           </div>
         )}
       </div>
