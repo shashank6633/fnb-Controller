@@ -307,6 +307,24 @@ export default function OfflinePrintPage() {
               <a href={`${getBridgeUrl()}/health`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-1.5 rounded-lg text-xs font-medium no-underline"><Wifi className="w-3.5 h-3.5" /> Open bridge health check ({getBridgeUrl()}/health)</a>
             </div>
 
+            {/* How the offline KOT system works — plain-English overview + one-time setup */}
+            <div className="bg-[#EFF6F1] border border-[#CFE6D6] rounded-lg p-3 space-y-2">
+              <p className="font-semibold text-[#1F5136] flex items-center gap-1.5"><WifiOff className="w-4 h-4" /> How KOTs keep printing when the internet is down</p>
+              <p><b>Normally</b> a KOT travels: captain tablet → the cloud → <b>this counter PC</b> → printer. The first two steps use the internet.</p>
+              <p><b>If the internet drops</b> (but your WiFi router is still on): captains tap <b>“Open Offline Kitchen Mode”</b> on their tablet — this counter PC then serves them a small ordering page <i>over WiFi</i>, and KOTs print straight to the kitchen. Offline tickets are numbered <code className="bg-white px-1 rounded">L001</code>, <code className="bg-white px-1 rounded">L002</code>…</p>
+              <p><b>When the internet returns</b>, this counter PC <b>automatically syncs</b> those tickets into the system as normal orders (nothing prints twice). Bills are made online as usual — offline mode is for KOTs only.</p>
+              <div className="bg-white/70 rounded-md p-2.5 mt-1">
+                <p className="font-medium text-[#1F5136] mb-1">One-time setup</p>
+                <ol className="list-decimal ml-4 space-y-0.5">
+                  <li>Keep the bridge running as the always-on service (see below).</li>
+                  <li>Find this PC’s address: open <b>Command Prompt</b>, run <code className="bg-[#FFF1E3] px-1 rounded">ipconfig</code>, note the <b>IPv4 Address</b> (e.g. <code className="bg-[#FFF1E3] px-1 rounded">192.168.1.10</code>).</li>
+                  <li>Put it in <b>“Counter PC offline address”</b> at the top of this page as <code className="bg-[#FFF1E3] px-1 rounded break-all">http://192.168.1.10:9920/offline</code> and <b>Save</b>.</li>
+                  <li><b>Bookmark</b> that same link on each captain tablet’s home screen.</li>
+                </ol>
+              </div>
+              <p className="text-xs text-[#5C7A67]"><b>Good to know:</b> offline mode rides out an <i>internet/ISP</i> outage — it still needs the local <b>WiFi router</b> to be on. Keep the router, this PC and the printer on a small <b>UPS</b> so a short power/internet blip never stops the kitchen.</p>
+            </div>
+
             <p className="font-medium text-[#2D1B0E]">Start it now (quick)</p>
             <p>On the counter PC, double-click <code className="bg-[#FFF1E3] px-1 rounded">print-bridge.bat</code> → a black window says “listening on … 9920” → keep it open. This page turns green within a few seconds.</p>
             <div className="flex flex-wrap gap-2 my-1">

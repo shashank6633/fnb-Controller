@@ -39,6 +39,10 @@ export interface CachePrinter { station: string; transport: 'ip' | 'usb' | 'file
 export interface OfflineCache {
   updatedAt: string;
   outletName: string;
+  // The cloud app's origin (e.g. https://fnb.akanhyd.com) — lets the offline
+  // page's "Home" button return to the app even when opened from a bookmark
+  // (an HTTPS->HTTP navigation strips the referrer, so we carry it explicitly).
+  appUrl?: string;
   tables: CacheTable[];
   menu: CacheMenuItem[];
   kotDesign: { lines: KotLine[]; headerNote?: string; footerNote?: string };
@@ -182,6 +186,7 @@ export async function buildCache(): Promise<OfflineCache | null> {
     return {
       updatedAt: new Date().toISOString(),
       outletName,
+      appUrl: typeof window !== 'undefined' ? window.location.origin : undefined,
       tables,
       menu,
       kotDesign,

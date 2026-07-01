@@ -58,6 +58,13 @@
     box-shadow:var(--shadow);
     padding-top:calc(10px + env(safe-area-inset-top));
   }
+  .topbar .homebtn{
+    background:rgba(255,255,255,.16);color:var(--white);
+    border:1px solid rgba(255,255,255,.35);
+    padding:7px 13px;border-radius:999px;font-size:14px;font-weight:800;
+    cursor:pointer;white-space:nowrap;-webkit-tap-highlight-color:transparent;
+  }
+  .topbar .homebtn:active{background:rgba(255,255,255,.30);}
   .topbar .brand{font-weight:800;letter-spacing:.3px;font-size:19px;}
   .topbar .outlet{opacity:.9;font-size:14px;}
   .topbar .offline-tag{
@@ -249,6 +256,7 @@
 <h1 class="visually-hidden">Offline kitchen order-ticket entry — fire KOTs to the kitchen during an internet outage</h1>
 
 <div class="topbar">
+  <button type="button" class="homebtn" id="homeBtn" onclick="goHome()" aria-label="Back to home">&#8592; Home</button>
   <span class="brand">Offline KOT</span>
   <span class="outlet" id="outletName"></span>
   <span class="offline-tag">Kitchen only</span>
@@ -380,6 +388,19 @@ var state = {
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+/* Back to the main app home. This page is served by the counter-PC bridge over
+   http, so we can't assume the app origin — prefer the appUrl the cache carries
+   (pushed by the online Print Agent), then the referrer, then plain history. */
+function goHome(){
+  var url = (CACHE && CACHE.appUrl) ? CACHE.appUrl : '';
+  if (url) { window.location.href = url; return; }
+  if (document.referrer) { window.location.href = document.referrer; return; }
+  if (window.history.length > 1) { window.history.back(); return; }
+  // Nothing to go back to (opened cold from a bookmark, no cache yet): reload
+  // so the operator at least gets a fresh state rather than a dead button.
+  window.location.reload();
+}
 
 // uuid v4 (crypto if available, else Math.random fallback so it works offline everywhere)
 function uuidv4(){
