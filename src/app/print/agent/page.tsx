@@ -117,6 +117,8 @@ export default function PrintAgent() {
   function saveUrl() { setBridgeUrl(urlInput); setShowCfg(false); probeBridge().then(setHealth); }
 
   const bridgeOk = !!health?.ok;
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  const installerCmd = `powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm ${origin}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`;
 
   return (
     <div className="min-h-screen bg-[#0F0A06] text-white">
@@ -137,6 +139,28 @@ export default function PrintAgent() {
             <button onClick={() => setShowCfg((s) => !s)} className="p-2 text-white/60 hover:text-white"><Settings className="w-5 h-5" /></button>
           </div>
         </header>
+
+        {/* Bridge-down prompt — unmissable; the counter can't print without it.
+            Auto-clears the moment the bridge starts (health poll every 5s). */}
+        {!bridgeOk && (
+          <div className="rounded-2xl border-2 border-red-500 bg-red-500/15 p-4 mb-4">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-6 h-6 text-red-400 shrink-0 animate-pulse mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <p className="font-bold text-red-200">Print Bridge is not running — this counter cannot print.</p>
+                <p className="text-sm text-white/70 mt-0.5">Start it on THIS PC. This page reconnects on its own — the moment the bridge runs, this turns green (no need to reload).</p>
+                <p className="text-sm text-white/85 mt-3"><b>Quickest:</b> double-click <code className="bg-black/40 px-1 rounded">print-bridge.bat</code> and keep the black window open. <b>Best (auto-starts on every boot):</b> run this once in PowerShell (Admin):</p>
+                <pre className="bg-black/50 text-emerald-200 text-[11px] rounded-lg p-2 mt-2 overflow-x-auto whitespace-pre-wrap">{installerCmd}</pre>
+                <div className="flex flex-wrap gap-2 mt-2">
+                  <a href="/print-bridge.bat" download className="inline-flex items-center gap-1.5 bg-[#FF8A4C] text-black px-3 py-1.5 rounded-lg text-xs font-semibold no-underline"><Printer className="w-3.5 h-3.5" /> Download launcher (.bat)</a>
+                  <a href={`${getBridgeUrl()}/health`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 border border-white/30 text-white/80 px-3 py-1.5 rounded-lg text-xs font-medium no-underline"><Wifi className="w-3.5 h-3.5" /> Test bridge ({getBridgeUrl()}/health)</a>
+                  <a href="/dine-in/offline-print" className="inline-flex items-center gap-1.5 border border-white/30 text-white/80 px-3 py-1.5 rounded-lg text-xs font-medium no-underline"><Settings className="w-3.5 h-3.5" /> Full setup &amp; troubleshooting</a>
+                </div>
+                <p className="text-white/45 text-xs mt-2">Not on the counter PC? The bridge only runs on the machine wired to the printers — “not reachable” is expected on any other device.</p>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Status cards */}
         <div className="grid grid-cols-2 gap-3 mb-4">

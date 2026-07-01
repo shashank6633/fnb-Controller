@@ -24,6 +24,17 @@ jobs:
 
             npm install
 
+            # Ensure a swap file exists so a heavy `next build` can't exhaust RAM
+            # and take the whole instance down (which happened 2026-07-01 — the box
+            # became unreachable on ALL ports). Idempotent: created only once, and
+            # persisted in /etc/fstab so it survives reboots.
+            if ! sudo swapon --show 2>/dev/null | grep -q '/swapfile'; then
+              echo "Creating 2G swap file…"
+              sudo fallocate -l 2G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+              sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+              grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+            fi
+
             # The app runs as root (sudo pm2), so the running server leaves
             # root-owned files inside .next that a user-run `next build` can't
             # overwrite → EACCES build failure (favicon.ico.body, *.rsc, ...).
