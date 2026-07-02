@@ -1,5 +1,5 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
-import { getCurrentUser, canProcessAsStore, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth';
 
 /**
  * Store Manager processes a chef-approved requisition.
@@ -42,7 +42,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canProcessAsStore(me)) return Response.json({ error: 'Store manager permission required' }, { status: 403 });
+    // STRICT: issuing stock is the store person's act alone — no admin bypass
+    // (admin processing from a desk left reqs stuck in the issue queue).
+    if (!canIssueAsStore(me)) return Response.json({ error: 'Only the Store person can issue items to a department.' }, { status: 403 });
 
     const { id } = await params;
     const db = getDb();

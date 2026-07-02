@@ -34,6 +34,10 @@ interface Department { id: string; name: string; code?: string; }
 interface ReqItem {
   id: string; req_id: string; material_id: string;
   material_name: string; material_sku?: string; material_unit: string;
+  /** Unit the department REQUESTED in (recipe unit or purchase unit, e.g. 'BTL').
+   *  quantity_requested / chef_approved_qty / quantity_issued are all in THIS unit. */
+  unit?: string;
+  material_purchase_unit?: string; material_pack_size?: number;
   quantity_requested: number; quantity_issued: number; quantity_to_purchase: number;
   current_stock: number; average_price: number; last_purchase_price?: number; notes: string;
   /** Chef-edited approval qty (overrides quantity_requested if set). NULL = no edit. */
@@ -68,6 +72,20 @@ interface Requisition {
   fulfilled_at?: string;
   item_count?: number; estimated_value?: number;
   items?: ReqItem[];
+}
+
+/** Unit a line was REQUESTED in (legacy rows without ri.unit fall back to the
+ *  material's recipe unit — identical behaviour to before the UOM selector). */
+function reqUnit(it: ReqItem): string {
+  return it.unit || it.material_unit;
+}
+/** Recipe-units per 1 requested-unit: pack_size when the request was made in the
+ *  material's PURCHASE unit (e.g. 1 BTL = 750 ml), else 1. Multiply a requested
+ *  qty by this to compare it against current_stock (always in recipe units). */
+function reqPackFactor(it: ReqItem): number {
+  const pack = Number(it.material_pack_size) || 1;
+  return (it.unit && it.material_purchase_unit && it.unit === it.material_purchase_unit && it.unit !== it.material_unit && pack > 1)
+    ? pack : 1;
 }
 
 const STATUS_BADGE: Record<string, string> = {
@@ -132,8 +150,8 @@ export default function RequisitionsPage() {
     }).catch(() => {});
   }, []);
   const [importing, setImporting] = useState(false);
-  const [viewer, setViewer] = useState<{ email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean }>({
-    email: '', role: '', can_chef: false, can_mgmt: false, can_store: false,
+  const [viewer, setViewer] = useState<{ email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean }>({
+    email: '', role: '', can_chef: false, can_mgmt: false, can_store: false, can_issue: false,
   });
 
   const reload = async () => {
@@ -149,6 +167,7 @@ export default function RequisitionsPage() {
     setViewer({
       email: r.viewer_email || '', role: r.viewer_role || '',
       can_chef: !!r.viewer_can_approve_chef, can_mgmt: !!r.viewer_can_approve_mgmt, can_store: !!r.viewer_can_process_store,
+      can_issue: !!r.viewer_can_issue_store,
     });
     setLoading(false);
   };
@@ -533,7 +552,7 @@ function RecahoImportModal({ onClose, onCommitted }: { onClose: () => void; onCo
 function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt, reload }: {
   r: Requisition; expanded: boolean; onToggle: () => void;
   materials: Material[];
-  viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean };
+  viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean };
   requireMgmt: boolean;
   reload: () => void;
 }) {
@@ -593,7 +612,7 @@ function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt,
 
 function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
   r: Requisition; materials: Material[];
-  viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean };
+  viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean };
   requireMgmt: boolean;
   reload: () => void;
 }) {
@@ -625,7 +644,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
   // there's no Mgmt action to take.
   const canMgmtAct = requireMgmt && viewer.can_mgmt && detail.status === 'chef_approved';
   // Store may act on mgmt-approved (current SOP) or chef_approved (legacy in-flight)
-  const canStoreAct = viewer.can_store && (detail.status === 'mgmt_approved' || detail.status === 'chef_approved');
+  const canStoreAct = viewer.can_issue && (detail.status === 'mgmt_approved' || detail.status === 'chef_approved');  // STRICT: store person only, no admin bypass (mirrors canIssueAsStore)
   const canCancel = (isAuthor || isAdmin) && !['fulfilled', 'cancelled', 'chef_rejected'].includes(detail.status);
   // Phase 1 §2: dept staff confirms goods physically arrived. One-shot — only on fulfilled, not yet acked.
   const canAck   = detail.status === 'fulfilled' && !detail.dept_acknowledged_at && (isAuthor || isAdmin);
@@ -693,7 +712,9 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
             <tbody>
               {(detail.items || []).map(it => {
                 const rejected = !!it.is_rejected;
-                const short = (it.current_stock < it.quantity_requested);
+                // Stock is in recipe units; the request may be in the purchase
+                // unit (e.g. BTL) — convert before comparing.
+                const short = (it.current_stock < it.quantity_requested * reqPackFactor(it));
                 // Rejected lines get strikethrough + faded; rest render normal.
                 const rowCls = `border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`;
                 return (
@@ -703,7 +724,9 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
                       {it.material_name}
                       {it.chef_note && <div className="text-[9px] text-amber-700 no-underline">Chef: {it.chef_note}</div>}
                     </td>
-                    <td className="py-1 px-2 text-right font-mono">{it.quantity_requested.toLocaleString('en-IN')} {it.material_unit}</td>
+                    <td className="py-1 px-2 text-right font-mono" title={reqPackFactor(it) > 1 ? `= ${(it.quantity_requested * reqPackFactor(it)).toLocaleString('en-IN')} ${it.material_unit}` : undefined}>
+                      {it.quantity_requested.toLocaleString('en-IN')} {reqUnit(it)}
+                    </td>
                     <td className="py-1 px-2 text-right font-mono">
                       {rejected
                         ? <span className="text-red-700 no-underline">—</span>
@@ -1071,7 +1094,7 @@ function ChefApproveModal({ req, onClose, onDone }: { req: Requisition; onClose:
                 return (
                   <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${isRej ? 'opacity-50 line-through bg-red-50/30' : ''}`}>
                     <td className="py-1 px-2">{it.material_name}</td>
-                    <td className="py-1 px-2 text-right font-mono text-[#6B5744]">{it.quantity_requested} {it.material_unit}</td>
+                    <td className="py-1 px-2 text-right font-mono text-[#6B5744]">{it.quantity_requested} {reqUnit(it)}</td>
                     <td className="py-1 px-2">
                       <input type="number" step="any" value={overrides[it.id] ?? ''}
                              disabled={isRej}
@@ -1220,16 +1243,23 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   const rejectedCount = (req.items || []).length - visibleItems.length;
   const [lines, setLines] = useState(() =>
     visibleItems.map(it => {
+      // effective demand is in the REQUESTED unit (ri.unit — may be the purchase
+      // unit like BTL); chef_approved_qty is edited in that same unit.
       const effective = (it.chef_approved_qty != null && it.chef_approved_qty > 0)
         ? Number(it.chef_approved_qty)
         : it.quantity_requested;
+      // requested-unit → recipe-unit factor (1 BTL = pack_size recipe units).
+      const reqFactor = reqPackFactor(it);
       // Clamp current_stock to 0 for "issuable" math — a negative stock means
       // the books are already over-consumed (a prior recipe-deduction outran
       // purchases). We must NOT propose issuing a negative qty as if the
       // material were on the shelf; default issue stays 0 and the entire
       // requested amount becomes a shortfall the store must source via PO.
+      // Stock is in RECIPE units — convert to requested units before comparing
+      // (floor when packs: you can't hand over 0.4 of a bottle against a BTL ask).
       const safeStock = Math.max(0, Number(it.current_stock) || 0);
-      const issuable  = Math.min(effective, safeStock);
+      const stockInReqUnits = reqFactor > 1 ? Math.floor(safeStock / reqFactor) : safeStock;
+      const issuable  = Math.min(effective, stockInReqUnits);
       const shortfall = Math.max(0, effective - issuable);
       // Purchase-unit metadata so the PO math can switch between recipe-unit
       // (kg / ml / pcs) and purchase-unit (BTL / PKT / CASE) entry. pack_size
@@ -1240,10 +1270,13 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // pack_size > 1; otherwise the recipe-unit IS the purchase-unit and the
       // distinction doesn't matter.
       const buyInPurchaseUnit = packSize > 1;
-      // Convert shortfall (in recipe units) to purchase-unit qty if we're
-      // entering the PO line in purchase units. Ceil so the order covers
-      // the demand — vendors don't sell fractional bottles.
-      const buyQty = buyInPurchaseUnit ? Math.ceil(shortfall / packSize) : shortfall;
+      // Convert shortfall to purchase-unit qty for the PO line. If the request
+      // was ALREADY in the purchase unit (reqFactor>1) the shortfall is in
+      // purchase units — use it as-is; else it's recipe units → divide by pack.
+      // Ceil so the order covers the demand — vendors don't sell fractional bottles.
+      const buyQty = buyInPurchaseUnit
+        ? (reqFactor > 1 ? Math.ceil(shortfall) : Math.ceil(shortfall / packSize))
+        : shortfall;
       // Convert recipe-unit-based last price to per-purchase-unit price.
       // last_purchase_price on raw_materials is per recipe unit (the canonical),
       // so for purchase-unit entry we multiply by pack_size.
@@ -1254,6 +1287,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         material_id: it.material_id,         // needed to look up mapped vendors
         material_name: it.material_name,
         material_unit: it.material_unit,     // recipe unit (canonical)
+        req_unit: reqUnit(it),               // unit the dept requested in — requested/issued qtys are in THIS unit
         purchase_unit: purchaseUnit,         // vendor-facing unit
         pack_size: packSize,                 // recipe-units per purchase-unit
         current_stock: it.current_stock,     // keep raw value for the warning render
@@ -1481,7 +1515,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                           <div className="text-[9px] text-red-700 font-semibold">⚠ Negative stock — raise PO ASAP</div>
                         )}
                       </td>
-                      <td className="py-1.5 px-2 text-right font-mono">{ln.requested} {ln.material_unit}</td>
+                      <td className="py-1.5 px-2 text-right font-mono">{ln.requested} {ln.req_unit}</td>
                       <td className={`py-1.5 px-2 text-right font-mono ${negStock ? 'text-red-700 font-bold' : 'text-[#6B5744]'}`}>
                         {ln.current_stock}{negStock && ' ⚠'}
                       </td>

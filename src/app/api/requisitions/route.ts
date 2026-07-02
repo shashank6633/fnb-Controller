@@ -1,5 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId, canApproveAsMgmt, canProcessAsStore } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 
 // Statuses at which a requisition can be edited, by whom:
@@ -176,6 +176,9 @@ export async function GET(request: Request) {
       viewer_can_approve_chef: me ? (me.role === 'admin' || isAnyMainDeptHead(db, me)) : false,
       viewer_can_approve_mgmt: me ? canApproveAsMgmt(me) : false,
       viewer_can_process_store: me ? canProcessAsStore(me) : false,
+      // STRICT issue permission — store person only, no admin bypass. Drives the
+      // Issue / Store-Process buttons; the routes enforce it server-side too.
+      viewer_can_issue_store: me ? canIssueAsStore(me) : false,
     });
   } catch (e: any) {
     console.error('[/api/requisitions GET]', e);

@@ -845,6 +845,7 @@ export default function InventoryPage() {
                       <ArrowUpDown className="w-3 h-3" />
                     </button>
                   </th>
+                  <th className="px-4 py-3 font-medium text-right" title="Most recent purchase price (per recipe unit); hover a value for the purchase date. — = never purchased.">Latest ₹</th>
                   <th className="px-4 py-3 font-medium text-right">Avg Price</th>
                   <th className="px-4 py-3 font-medium text-right">
                     <button
@@ -950,6 +951,19 @@ export default function InventoryPage() {
                               );
                             }
                             return <>{m.current_stock.toLocaleString('en-IN')} <span className="text-[10px] text-[#8B7355]">{m.unit}</span></>;
+                          })()}
+                        </td>
+                        {/* Latest ₹ — most recent purchase price PER PURCHASE UNIT, right
+                            beside Current Stock. Derived server-side from total/qty of the
+                            last purchase (basis-safe against historical rows whose quantity
+                            was recorded in recipe units instead of purchase units). */}
+                        <td className="px-4 py-3 text-right text-[#6B5744] font-mono"
+                            title={(m as any).last_purchase_date ? `Last bought ${(m as any).last_purchase_date}` : 'Never purchased'}>
+                          {(() => {
+                            const lp = Number((m as any).latest_price_purchase_unit) || 0;
+                            if (!lp) return <span className="text-[#C0A98F]">—</span>;
+                            const pu = (m as any).purchase_unit || m.unit;
+                            return <>{formatCurrency(lp)}<span className="ml-1 text-[10px] text-[#8B7355]">/ {pu}</span></>;
                           })()}
                         </td>
                         <td className="px-4 py-3 text-right text-[#6B5744] font-mono">

@@ -136,6 +136,14 @@ export function canApproveAsChef(user: SessionUser): boolean {
 export function canProcessAsStore(user: SessionUser): boolean {
   return user.role === 'admin' || user.is_store_manager;
 }
+/** Can this user physically ISSUE items to a department? STRICTLY the store
+ *  person (is_store_manager flag) — deliberately NO admin bypass: issuing is a
+ *  physical stock handover at the store, and letting admins do it from a desk
+ *  left requisitions stuck in the issue queue. (Admin can still VIEW everything
+ *  and can grant themselves the flag if they truly man the store.) */
+export function canIssueAsStore(user: SessionUser): boolean {
+  return !!user.is_store_manager;
+}
 /** Can this user approve requisitions as Management (the 2nd gate after Chef)?
  *  Per Phase 1 SOP: Dept → Chef → Mgmt → Store. Today admin = mgmt; expand later
  *  with an explicit `is_management` flag if you want to separate it from admin. */

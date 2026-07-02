@@ -1,5 +1,5 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
-import { getCurrentUser, canProcessAsStore } from '@/lib/auth';
+import { getCurrentUser, canIssueAsStore } from '@/lib/auth';
 
 /**
  * Per-item store issue endpoint — the workhorse of /store-requisitions.
@@ -39,8 +39,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canProcessAsStore(me)) {
-      return Response.json({ error: 'Store manager permission required' }, { status: 403 });
+    // STRICT: only the store person (is_store_manager) issues stock — deliberately
+    // no admin bypass. Issuing is a physical handover at the store; admin issuing
+    // from a desk left requisitions stuck half-processed in the issue queue.
+    if (!canIssueAsStore(me)) {
+      return Response.json({ error: 'Only the Store person can issue items to a department.' }, { status: 403 });
     }
 
     const { id } = await params;

@@ -33,6 +33,19 @@ export async function GET(request: Request) {
       SELECT rm.*,
         COALESCE((SELECT unit_price FROM purchases WHERE material_id = rm.id ORDER BY date DESC, created_at DESC LIMIT 1), 0) as last_purchase_price,
         COALESCE((SELECT date FROM purchases WHERE material_id = rm.id ORDER BY date DESC, created_at DESC LIMIT 1), '') as last_purchase_date,
+        -- Latest price PER PURCHASE UNIT, derived from total/qty of the most
+        -- recent purchase. Historical rows mix quantity bases (some in purchase
+        -- units, some in recipe units) — detect: a qty that's a clean multiple
+        -- of pack_size (and >= one pack) was recorded in recipe units, so scale
+        -- total/qty back up by pack. Basis-safe where raw unit_price is not.
+        COALESCE((SELECT CASE
+             WHEN COALESCE(rm.pack_size, 1) > 1 AND p.quantity >= rm.pack_size AND (p.quantity % rm.pack_size) = 0
+               THEN (p.total_price / p.quantity) * rm.pack_size
+             ELSE (p.total_price / p.quantity)
+           END
+           FROM purchases p
+           WHERE p.material_id = rm.id AND p.quantity > 0 AND COALESCE(p.total_price, 0) > 0
+           ORDER BY p.date DESC, p.created_at DESC LIMIT 1), 0) as latest_price_purchase_unit,
         COALESCE((SELECT SUM(ABS(quantity)) FROM inventory_transactions WHERE material_id = rm.id AND quantity < 0), 0) as total_consumed,
         ROUND(rm.current_stock * rm.average_price, 2) as stock_value,
         -- Recency view: rolling 30-day (monthly) weighted avg drives recipe / req cost.
