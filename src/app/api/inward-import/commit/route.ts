@@ -154,31 +154,34 @@ export async function POST(req: Request) {
             }
           }
 
-          // Convert qty + price into the material's stock unit
-          const pack = packSize(r.purchaseUnit);
-          let qty   = r.inwardQty * pack;            // first expand case → pieces
-          let rate  = pack > 1 ? r.rate / pack : r.rate;
+          // Store the purchases ROW in PURCHASE units (qty = bottles/pieces, rate =
+          // ₹ per purchase unit) so updateMaterialPrice (which ÷pack) stays correct;
+          // bump STOCK in RECIPE units via the material's pack_size. The old code
+          // stored ml-basis rows AND divided the rate, which corrupted average_price
+          // ~pack× (Jameson ₹2.85/BTL instead of ₹2,421). Now aligned with every
+          // other purchase path (purchases/opening-stock use material.pack_size).
+          const casePack = packSize(r.purchaseUnit);              // pieces per case (e.g. 24), else 1
+          const purchaseQty  = r.inwardQty * casePack;            // in PURCHASE units (bottles/pieces)
+          const purchaseRate = casePack > 1 ? r.rate / casePack : r.rate;  // ₹ per purchase unit
 
-          if (mat.unit === 'ml' || mat.unit === 'l') {
-            const volMl = parseMaterialVolumeMl(mat.name);
-            if (volMl) {
-              const factor = mat.unit === 'l' ? volMl / 1000 : volMl;
-              qty = qty * factor;
-              rate = rate / factor;
-            }
-          }
+          if (purchaseQty <= 0) { stats.skipped++; continue; }
 
-          if (qty <= 0) { stats.skipped++; continue; }
+          const matPack = Number(mat.pack_size) || 1;             // recipe units per purchase unit
+          const ru = String(mat.unit || '').toLowerCase();
+          const pu = String(mat.purchase_unit || mat.unit || '').toLowerCase();
+          const packConv = (matPack > 1 && ru !== pu) ? matPack : 1;
+          const stockQty       = purchaseQty * packConv;          // RECIPE units for stock + tx
+          const recipeUnitRate = purchaseRate / packConv;         // ₹ per recipe unit (matches average_price basis)
 
           const purchaseId = randomUUID();
           const date = r.inwardDate || new Date().toISOString().split('T')[0];
           insertPurchase.run(
-            purchaseId, mat.id, r.supplier, qty, rate, r.totalAmount, date,
+            purchaseId, mat.id, r.supplier, purchaseQty, purchaseRate, r.totalAmount, date,
             r.notes || `Imported from inward report`, outletId,
           );
-          insertTx.run(randomUUID(), mat.id, qty, purchaseId,
+          insertTx.run(randomUUID(), mat.id, stockQty, purchaseId,
                        `Inward import — ${r.supplier || 'unknown vendor'}`, outletId);
-          bumpStock.run(qty, rate, date, mat.id);
+          bumpStock.run(stockQty, recipeUnitRate, date, mat.id);
 
           touchedMaterials.add(mat.id);
           stats.purchases++;

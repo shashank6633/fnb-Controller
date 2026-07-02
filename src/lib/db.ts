@@ -929,6 +929,61 @@ function initializeSchema(db: Database.Database) {
       for (const d of others) { const p = BAR_DEPT.test(d.name) ? barId : OPS_DEPT.test(d.name) ? opsId : kitchenId; setParent.run(p, d.id); }
       db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('dept_hierarchy_v1', '1')`).run();
     }
+
+    // ── ONE-TIME PRICE/STOCK BASIS REPAIR (2026-07) ──────────────────────────
+    // Historical inward-import rows mixed unit bases, corrupting money data:
+    //  A) ml/L materials: purchase rows written in RECIPE units (qty=9000 ml,
+    //     price ₹/ml); updateMaterialPrice then ÷pack again → average_price ~pack×
+    //     too small (Jameson ₹2.85/BTL instead of ₹2,421). Stock was fine.
+    //  B) kg/g (and keg) materials: stock bumped in PURCHASE units (10 kegs stored
+    //     as "10" in an ml field) → stock ~pack× too small. Price was fine.
+    // Guard flag so it runs exactly once; both sets are classified BEFORE any
+    // mutation (normalizing rows first would fool the detector).
+    const priceRepaired = db.prepare("SELECT value FROM settings WHERE key = 'price_basis_repair_v1'").get() as { value?: string } | undefined;
+    if (!priceRepaired) {
+      // Atomic: if any step throws, roll back everything so a re-run starts from
+      // the original (un-normalized) rows — a half-normalized DB would be
+      // mis-classified on the next attempt.
+      const runRepair = db.transaction(() => {
+        const packMats = db.prepare(`
+          SELECT id, pack_size, current_stock FROM raw_materials
+          WHERE COALESCE(pack_size,1) > 1 AND LOWER(unit) <> LOWER(COALESCE(purchase_unit, unit))
+        `).all() as { id: string; pack_size: number; current_stock: number }[];
+        const priceSet: { id: string; pack_size: number }[] = [];
+        const stockSet: { id: string; pack_size: number; current_stock: number; purchSum: number }[] = [];
+        for (const m of packMats) {
+          const pr = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(quantity),0) sq FROM purchases WHERE material_id = ? AND quantity > 0`).get(m.id) as any;
+          if (!pr.n) continue;                          // no purchases → leave for manual review
+          const recipeRows = (db.prepare(`SELECT COUNT(*) n FROM purchases WHERE material_id = ? AND quantity >= ? AND (quantity % ?) = 0`).get(m.id, m.pack_size, m.pack_size) as any).n;
+          if (recipeRows > 0) priceSet.push({ id: m.id, pack_size: m.pack_size });          // A: price wrong, stock OK
+          else stockSet.push({ id: m.id, pack_size: m.pack_size, current_stock: m.current_stock, purchSum: pr.sq }); // B: stock wrong, price OK
+        }
+        // A) normalize recipe-basis rows → purchase units (prefer invoice total_price)
+        const updRow = db.prepare(`UPDATE purchases SET quantity = ?, unit_price = ? WHERE id = ?`);
+        for (const m of priceSet) {
+          const rows = db.prepare(`SELECT id, quantity, unit_price, total_price FROM purchases WHERE material_id = ? AND quantity >= ? AND (quantity % ?) = 0`).all(m.id, m.pack_size, m.pack_size) as any[];
+          for (const r of rows) {
+            const nq = r.quantity / m.pack_size;
+            const nup = (r.total_price > 0) ? r.total_price / nq : r.unit_price * m.pack_size;
+            updRow.run(nq, Math.round(nup * 10000) / 10000, r.id);
+          }
+        }
+        // B) rebase stock into recipe units: add (pack-1) × Σ(purchase qty)
+        for (const m of stockSet) {
+          const correction = m.purchSum * (m.pack_size - 1);
+          if (correction > 0) db.prepare(`UPDATE raw_materials SET current_stock = ? WHERE id = ?`).run(m.current_stock + correction, m.id);
+        }
+        // re-price every purchased material (now safe), cascade recipe/sub-recipe costs
+        for (const x of db.prepare(`SELECT DISTINCT material_id id FROM purchases`).all() as any[]) updateMaterialPrice(db, x.id);
+        for (const s of db.prepare(`SELECT id FROM sub_recipes`).all() as any[]) recalculateSubRecipeCost(db, s.id);
+        for (const r of db.prepare(`SELECT id FROM recipes`).all() as any[]) recalculateRecipeCost(db, r.id);
+        db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('price_basis_repair_v1', '1')`).run();
+        console.log(`[db] price/stock basis repair: fixed ${priceSet.length} prices + ${stockSet.length} stocks`);
+      });
+      try { runRepair(); }
+      catch (e) { console.error('[db] price_basis_repair_v1 failed (rolled back, left unrepaired):', e); }
+    }
+
     db.exec(`
 
       CREATE TABLE IF NOT EXISTS requisitions (
@@ -2060,13 +2115,19 @@ export function updateMaterialPrice(db: Database.Database, materialId: string): 
         .run(Math.round(avgPrice * 10000) / 10000, materialId);
     }
   } else {
-    // FIFO: use latest purchase price
+    // FIFO: use latest purchase price — normalised to ₹/recipe unit (÷pack),
+    // exactly like the average branch, so a pack>1 material flipped to FIFO
+    // doesn't store a ₹/purchase-unit price into a ₹/recipe-unit field.
     const latest = db.prepare(
       'SELECT unit_price FROM purchases WHERE material_id = ? ORDER BY date DESC, created_at DESC LIMIT 1'
     ).get(materialId) as any;
     if (latest) {
+      const packSize = Number(material.pack_size) || 1;
+      const recipeUnit = String(material.unit || '').toLowerCase();
+      const purchaseUnit = String(material.purchase_unit || material.unit || '').toLowerCase();
+      const price = (packSize > 1 && recipeUnit !== purchaseUnit) ? latest.unit_price / packSize : latest.unit_price;
       db.prepare('UPDATE raw_materials SET average_price = ?, updated_at = datetime(\'now\') WHERE id = ?')
-        .run(latest.unit_price, materialId);
+        .run(Math.round(price * 10000) / 10000, materialId);
     }
   }
 
