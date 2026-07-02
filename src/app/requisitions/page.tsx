@@ -794,8 +794,17 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
 
   const today = new Date().toISOString().slice(0, 10);
   const [date, setDate] = useState(today);
-  // Initial dept: locked → user's home dept; free choice → first dept in list.
-  const [departmentId, setDepartmentId] = useState(lockedDeptId || departments[0]?.id || '');
+  // Default the department to the user's OWN department automatically for everyone
+  // who has one (a staff user is locked to it; admin/manager/head see it pre-selected
+  // but can still switch). Only fall back to the first dept when the user has no home
+  // department (e.g. a pure admin).
+  const [departmentId, setDepartmentId] = useState(me?.department_id || lockedDeptId || departments[0]?.id || '');
+  // Safety net: if `me` resolves after this modal mounts, adopt the user's home
+  // department — but never override a choice already made.
+  useEffect(() => {
+    if (me?.department_id) setDepartmentId((cur) => cur || me.department_id!);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me?.department_id]);
   const [notes, setNotes] = useState('');
   const [items, setItems] = useState<Array<{ material_id: string; quantity_requested: number; notes: string }>>([
     { material_id: '', quantity_requested: 1, notes: '' },
