@@ -616,7 +616,10 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
   const isAdmin  = viewer.role === 'admin';
   const canEdit  = (isAuthor || isAdmin) && detail.status === 'draft';
   const canSubmit = (isAuthor || isAdmin) && detail.status === 'draft' && (detail.items?.length || 0) > 0;
-  const canChefAct = viewer.can_chef && detail.status === 'submitted';
+  // Per-requisition: only the head of THIS req's main department (or admin) sees
+  // Approve/Reject. detail.can_approve_chef comes from the API (isMainDeptHead);
+  // fall back to the global hint only if the field is absent (older payload).
+  const canChefAct = ((detail as any).can_approve_chef ?? viewer.can_chef) && detail.status === 'submitted';
   // Only show Mgmt Approve when the global gate is ON. When OFF, chef approval
   // is the final gate — the requisition is already in the store inbox and
   // there's no Mgmt action to take.

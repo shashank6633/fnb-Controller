@@ -891,6 +891,44 @@ function initializeSchema(db: Database.Database) {
     // the dept's staff can see in inventory pickers. NULL = no filter (see all).
     // Admin / head-chef / store-manager always bypass this filter.
     if (!dCols.some((c:any)=>c.name==='material_categories')) db.exec(`ALTER TABLE departments ADD COLUMN material_categories TEXT`);
+    // ── Main-department hierarchy (2026-07): 3 mains (Kitchen/Bar/Operations),
+    //    each with a head_user_id (the sole approver for everything under it);
+    //    existing departments become sub-departments via parent_id. Categories
+    //    are assigned on the MAIN dept and inherited by its sub-depts. ──
+    if (!dCols.some((c:any)=>c.name==='parent_id'))    db.exec(`ALTER TABLE departments ADD COLUMN parent_id TEXT`);
+    if (!dCols.some((c:any)=>c.name==='head_user_id')) db.exec(`ALTER TABLE departments ADD COLUMN head_user_id TEXT`);
+    // One-time seed, guarded by a settings flag so admin edits are never clobbered.
+    const deptHierSeeded = db.prepare("SELECT value FROM settings WHERE key = 'dept_hierarchy_v1'").get() as { value?: string } | undefined;
+    if (!deptHierSeeded) {
+      const mkMain = (name: string): string => {
+        db.prepare(`INSERT OR IGNORE INTO departments (id, name, parent_id, is_active) VALUES (?, ?, NULL, 1)`).run(generateId(), name);
+        return (db.prepare(`SELECT id FROM departments WHERE name = ?`).get(name) as { id: string }).id;
+      };
+      const kitchenId = mkMain('Kitchen');
+      const barId = mkMain('Bar');
+      const opsId = mkMain('Operations');
+      db.prepare(`UPDATE departments SET parent_id = NULL WHERE id IN (?, ?, ?)`).run(kitchenId, barId, opsId);
+      // Bucket existing raw-material categories into the 3 mains as a STARTING
+      // default (admin refines in the Departments UI). Keyword-based so future
+      // categories still land somewhere sensible.
+      const cats = (db.prepare(`SELECT DISTINCT COALESCE(NULLIF(category,''),'other') c FROM raw_materials`).all() as { c: string }[]).map(r => r.c);
+      // Operations FIRST — otherwise short liquor tokens false-match: e.g. "gin"
+      // is a substring of "packa-gin-g". Short/ambiguous bar words are also
+      // word-boundaried (\bbar\b, \brum\b, \bgin\b) so they don't hit "barley" etc.
+      const OPS_CAT = /packag|housekeep|station|clean|disposable|cutlery|printer|office|maintenance|tissue/i;
+      const BAR_CAT = /\bbar\b|beer|wine|whisk|\brum\b|tequila|vodka|\bgin\b|brandy|scotch|bourbon|liqueur|liquor|spirit|beverage|syrup|crush|cocktail|soda|malt/i;
+      const bkt: Record<string, string[]> = { kitchen: [], bar: [], ops: [] };
+      for (const c of cats) { if (OPS_CAT.test(c)) bkt.ops.push(c); else if (BAR_CAT.test(c)) bkt.bar.push(c); else bkt.kitchen.push(c); }
+      const setCats = (id: string, arr: string[]) => { if (arr.length) db.prepare(`UPDATE departments SET material_categories = ? WHERE id = ? AND (material_categories IS NULL OR material_categories = '')`).run(JSON.stringify(arr), id); };
+      setCats(kitchenId, bkt.kitchen); setCats(barId, bkt.bar); setCats(opsId, bkt.ops);
+      // Assign each existing (non-main) department a parent by name heuristic.
+      const others = db.prepare(`SELECT id, name FROM departments WHERE id NOT IN (?, ?, ?)`).all(kitchenId, barId, opsId) as { id: string; name: string }[];
+      const BAR_DEPT = /\bbar\b|liquor|beverage|wine|cocktail/i;
+      const OPS_DEPT = /operation|store|packag|house|admin|office|general|\bgm\b|front|reception|maintenance/i;
+      const setParent = db.prepare(`UPDATE departments SET parent_id = ? WHERE id = ? AND parent_id IS NULL`);
+      for (const d of others) { const p = BAR_DEPT.test(d.name) ? barId : OPS_DEPT.test(d.name) ? opsId : kitchenId; setParent.run(p, d.id); }
+      db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('dept_hierarchy_v1', '1')`).run();
+    }
     db.exec(`
 
       CREATE TABLE IF NOT EXISTS requisitions (

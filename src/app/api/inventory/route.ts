@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 
 export async function GET(request: Request) {
   try {
@@ -17,20 +18,15 @@ export async function GET(request: Request) {
     // the vendor has no contracts at all — caller should fall back to scope=all.
     const vendorId = url.searchParams.get('vendor_id');
     // Department-scoped material visibility:
-    // - admin / head chef / store manager → see everything
+    // - admin / store manager → see everything (they buy for every department)
     // - scope=all → see everything (callers like /grn must opt in)
-    // - everyone else → filtered to their dept's `material_categories` whitelist
-    //   (NULL whitelist on the dept = no filter, see everything; keeps backward compat)
+    // - everyone else, INCLUDING dept heads (Main Chef / Bar Manager / GM) →
+    //   filtered to their MAIN department's `material_categories` whitelist, which
+    //   sub-departments inherit. NULL whitelist on the main dept = no filter.
     const me = await getCurrentUser();
     let categoryWhitelist: string[] | null = null;
-    if (scope !== 'all' && me && me.role !== 'admin' && !me.is_head_chef && !me.is_store_manager && me.department_id) {
-      const dept = db.prepare(`SELECT material_categories FROM departments WHERE id = ?`).get(me.department_id) as { material_categories?: string | null } | undefined;
-      if (dept?.material_categories) {
-        try {
-          const arr = JSON.parse(dept.material_categories);
-          if (Array.isArray(arr) && arr.length > 0) categoryWhitelist = arr;
-        } catch { /* malformed → ignore filter */ }
-      }
+    if (scope !== 'all' && me && me.role !== 'admin' && !me.is_store_manager) {
+      categoryWhitelist = effectiveCategoriesForUser(db, me);
     }
 
     let query = `

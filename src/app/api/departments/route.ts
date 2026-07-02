@@ -22,9 +22,13 @@ export async function GET(request: Request) {
     const id = new URL(request.url).searchParams.get('id');
     if (id) {
       const row = db.prepare(`
-        SELECT d.*, u.name AS head_chef_name, u.email AS head_chef_email
+        SELECT d.*, u.name AS head_chef_name, u.email AS head_chef_email,
+               hu.name AS head_user_name, hu.email AS head_user_email,
+               p.name AS parent_name
         FROM departments d
         LEFT JOIN users u ON u.id = d.head_chef_user_id
+        LEFT JOIN users hu ON hu.id = d.head_user_id
+        LEFT JOIN departments p ON p.id = d.parent_id
         WHERE d.id = ?
       `).get(id);
       if (!row) return Response.json({ error: 'Not found' }, { status: 404 });
@@ -34,13 +38,18 @@ export async function GET(request: Request) {
       SELECT d.*,
              u.name  AS head_chef_name,
              u.email AS head_chef_email,
+             hu.name  AS head_user_name,
+             hu.email AS head_user_email,
+             p.name  AS parent_name,
              (SELECT COUNT(*) FROM users WHERE department_id = d.id AND is_active = 1) AS member_count,
              (SELECT COUNT(*) FROM requisitions
                WHERE department_id = d.id
                  AND status NOT IN ('fulfilled', 'cancelled', 'chef_rejected')) AS open_requisition_count
       FROM departments d
       LEFT JOIN users u ON u.id = d.head_chef_user_id
-      ORDER BY d.is_active DESC, d.name ASC
+      LEFT JOIN users hu ON hu.id = d.head_user_id
+      LEFT JOIN departments p ON p.id = d.parent_id
+      ORDER BY (d.parent_id IS NOT NULL), d.is_active DESC, d.name ASC
     `).all();
     console.log(`[/api/departments GET] returning ${(rows as any[]).length} departments`);
     return Response.json({ departments: rows });
@@ -61,9 +70,10 @@ export async function POST(request: Request) {
     }
     const id = generateId();
     db.prepare(`
-      INSERT INTO departments (id, name, code, description, head_chef_user_id, is_active, submission_windows, submission_grace_minutes)
-      VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+      INSERT INTO departments (id, name, code, description, head_chef_user_id, head_user_id, parent_id, is_active, submission_windows, submission_grace_minutes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
     `).run(id, String(b.name).trim(), b.code || '', b.description || '', b.head_chef_user_id || null,
+            b.head_user_id || null, b.parent_id || null,
             String(b.submission_windows || '').trim(),
             b.submission_grace_minutes != null ? Number(b.submission_grace_minutes) : 30);
     const row = db.prepare('SELECT * FROM departments WHERE id = ?').get(id);
@@ -100,6 +110,8 @@ export async function PUT(request: Request) {
         submission_windows       = COALESCE(?, submission_windows),
         submission_grace_minutes = COALESCE(?, submission_grace_minutes),
         material_categories      = CASE WHEN ? = 1 THEN ? ELSE material_categories END,
+        parent_id                = CASE WHEN ? = 1 THEN ? ELSE parent_id END,
+        head_user_id             = CASE WHEN ? = 1 THEN ? ELSE head_user_id END,
         updated_at        = datetime('now')
       WHERE id = ?
     `).run(
@@ -111,6 +123,11 @@ export async function PUT(request: Request) {
       // CASE flag: 1 if caller explicitly sent material_categories, else 0 (keep old value)
       b.material_categories !== undefined ? 1 : 0,
       matCatsJson ?? null,
+      // parent_id / head_user_id: CASE flag so they can be set OR cleared to NULL
+      b.parent_id !== undefined ? 1 : 0,
+      b.parent_id ?? null,
+      b.head_user_id !== undefined ? 1 : 0,
+      b.head_user_id ?? null,
       b.id,
     );
     const row = db.prepare('SELECT * FROM departments WHERE id = ?').get(b.id);

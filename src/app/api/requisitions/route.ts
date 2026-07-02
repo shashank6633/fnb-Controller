@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt, canProcessAsStore } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, canApproveAsMgmt, canProcessAsStore } from '@/lib/auth';
+import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead } from '@/lib/dept-hierarchy';
 
 // Statuses at which a requisition can be edited, by whom:
 //   draft                                            → drafter or admin
@@ -44,28 +45,15 @@ function nextReqNumber(db: ReturnType<typeof getDb>, isoDate: string): string {
 //   - if visible_department_ids is set (JSON array): those dept IDs
 //   - else dept staff: only requisitions for their own department
 //   - else (no dept, no flag): only requisitions they personally drafted
+// Visibility (main-department model): admin + store see all; a main-dept HEAD
+// sees every requisition under their main dept (all sub-departments); everyone
+// else sees ONLY the requisitions they personally drafted. See requisitionVisibility.
 async function visibilityFilter() {
   const me = await getCurrentUser();
   if (!me) return { sql: '0=1', params: [] as any[], me: null };
-  if (me.role === 'admin' || me.is_head_chef || me.is_store_manager) {
-    return { sql: '1=1', params: [], me };
-  }
-  // Explicit visible-departments map (admin can grant multi-dept visibility)
-  if (me.visible_department_ids) {
-    try {
-      const ids = JSON.parse(me.visible_department_ids);
-      if (Array.isArray(ids) && ids.length > 0) {
-        const placeholders = ids.map(() => '?').join(',');
-        return { sql: `r.department_id IN (${placeholders})`, params: ids, me };
-      }
-    } catch { /* fall through to defaults */ }
-  }
-  // Default: dept staff see only their own dept
-  if (me.department_id) {
-    return { sql: 'r.department_id = ?', params: [me.department_id], me };
-  }
-  // No department & no privileged flag → only requisitions they personally drafted
-  return { sql: 'r.drafted_by = ?', params: [me.email], me };
+  const vis = requisitionVisibility(getDb(), me);
+  if (!vis) return { sql: '1=1', params: [], me };       // null = see all (admin/store)
+  return { sql: vis.sql, params: vis.params, me };
 }
 
 // ---------- GET ----------
@@ -74,7 +62,7 @@ export async function GET(request: Request) {
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');
-    const { sql: visSql, params: visParams } = await visibilityFilter();
+    const { sql: visSql, params: visParams, me: visMe } = await visibilityFilter();
 
     if (id) {
       const r = db.prepare(`
@@ -103,7 +91,9 @@ export async function GET(request: Request) {
         WHERE ri.req_id = ?
         ORDER BY d.name, rm.name
       `).all(id);
-      return Response.json({ requisition: { ...r, items } });
+      // Per-req approve permission for the detail view: only this req's main-dept head.
+      const can_approve_chef = visMe ? isMainDeptHead(db, visMe, r.department_id) : false;
+      return Response.json({ requisition: { ...r, items, can_approve_chef } });
     }
 
     const status       = url.searchParams.get('status');
@@ -169,11 +159,18 @@ export async function GET(request: Request) {
     `).all(...params);
 
     const me = await getCurrentUser();
+    // Per-requisition approve permission: only the head of THAT requisition's
+    // main department (or admin) may approve it. The global flag is just a hint
+    // for the UI (is this user a head anywhere?) — the per-row flag is authoritative.
+    const rowsWithPerm = (rows as any[]).map((r) => ({
+      ...r,
+      can_approve_chef: me ? isMainDeptHead(db, me, r.department_id) : false,
+    }));
     return Response.json({
-      requisitions: rows,
+      requisitions: rowsWithPerm,
       viewer_role: me?.role || 'guest',
       viewer_email: me?.email || '',
-      viewer_can_approve_chef: me ? canApproveAsChef(me) : false,
+      viewer_can_approve_chef: me ? (me.role === 'admin' || isAnyMainDeptHead(db, me)) : false,
       viewer_can_approve_mgmt: me ? canApproveAsMgmt(me) : false,
       viewer_can_process_store: me ? canProcessAsStore(me) : false,
     });
@@ -335,7 +332,9 @@ export async function PUT(request: Request) {
     //   chef_approved → admin only (escape hatch; bypasses normal flow)
     const isAdmin = me.role === 'admin';
     const isAuthor = r.drafted_by === me.email;
-    const isChef = canApproveAsChef(me);
+    // Only the head of THIS requisition's main department (or admin) may tweak a
+    // submitted req before approving it.
+    const isChef = isMainDeptHead(db, me, r.department_id);
     let allowed = false;
     if (r.status === 'draft')               allowed = isAuthor || isAdmin;
     else if (r.status === 'submitted')      allowed = isChef || isAdmin;

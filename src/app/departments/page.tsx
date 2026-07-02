@@ -6,7 +6,7 @@
  * assign a head chef per department, and see member + open-requisition counts.
  */
 
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Building, Plus, Edit, Save, X, Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
 
@@ -21,9 +21,21 @@ interface Department {
   submission_windows?: string;        // CSV of HH:MM e.g. "11:00,18:30"
   submission_grace_minutes?: number;  // default 30
   material_categories?: string | null; // JSON array of allowed raw_materials.category values
+  // Main-department hierarchy. parent_id === null → this IS a main department.
+  parent_id?: string | null;          // main dept this sub-dept belongs to
+  head_user_id?: string | null;       // sole approver for everything under a MAIN dept
+  parent_name?: string;               // resolved name of parent (main) dept
+  head_user_name?: string;            // resolved name of the department head
+  head_user_email?: string;
 }
 
-const empty = (): Partial<Department> => ({ name: '', code: '', description: '', head_chef_user_id: null, is_active: 1 });
+const empty = (): Partial<Department> => ({ name: '', code: '', description: '', head_chef_user_id: null, is_active: 1, parent_id: null, head_user_id: null });
+
+// Count categories in a department's material_categories JSON string.
+const catCount = (mc?: string | null): number => {
+  if (!mc) return 0;
+  try { const a = JSON.parse(mc); return Array.isArray(a) ? a.length : 0; } catch { return 0; }
+};
 
 export default function DepartmentsPage() {
   const [me, setMe] = useState<{ role: string } | null>(null);
@@ -76,18 +88,27 @@ export default function DepartmentsPage() {
     if (!editing?.name) { alert('Name required'); return; }
     setSaving(true);
     try {
-      // material_categories lives as a JSON string in state for easy round-trip
-      // from the server; the API expects an actual array, so convert here.
-      let matCats: string[] | null | undefined = undefined;
-      if (editing.material_categories !== undefined) {
-        if (editing.material_categories === null || editing.material_categories === '') {
-          matCats = null;
-        } else {
+      const isMain = !editing.parent_id; // no parent → this is a MAIN department
+      const body: Record<string, unknown> = { ...editing };
+      // parent_id / head_user_id always round-trip (can be set OR cleared to null).
+      body.parent_id = editing.parent_id || null;
+      // Head is meaningful only for MAIN departments; sub-depts inherit it.
+      body.head_user_id = isMain ? (editing.head_user_id || null) : null;
+
+      if (isMain) {
+        // material_categories lives as a JSON string in state for easy round-trip
+        // from the server; the API expects an actual array, so convert here.
+        let matCats: string[] | null = null;
+        if (editing.material_categories) {
           try { const arr = JSON.parse(editing.material_categories); matCats = Array.isArray(arr) ? arr : null; }
           catch { matCats = null; }
         }
+        body.material_categories = matCats;
+      } else {
+        // Sub-departments inherit categories from their main — never send this
+        // field, or the API would clear the (irrelevant) sub-dept whitelist.
+        delete body.material_categories;
       }
-      const body = { ...editing, material_categories: matCats };
       const r = await api('/api/departments', {
         method: editing.id ? 'PUT' : 'POST',
         body,
@@ -97,6 +118,17 @@ export default function DepartmentsPage() {
       reload();
     } finally { setSaving(false); }
   };
+
+  // ── Main-department grouping ──────────────────────────────────────────────
+  // Mains = rows with parent_id === null (Kitchen / Bar / Operations, plus any
+  // other top-level dept). Each group = the main followed by its sub-depts.
+  const mains = depts.filter(d => !d.parent_id);
+  const subsByParent = (pid: string) => depts.filter(d => d.parent_id === pid);
+  // The parent-selector options: only MAIN departments, excluding the dept being
+  // edited (a dept can't be its own parent — keeps the tree 2 levels deep).
+  const mainOptions = mains.filter(m => m.id !== editing?.id);
+  // Parent row for the dept currently being edited (used for inheritance display).
+  const editingParent = editing?.parent_id ? depts.find(d => d.id === editing.parent_id) : null;
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
@@ -154,47 +186,96 @@ export default function DepartmentsPage() {
               </tr>
             </thead>
             <tbody>
-              {depts.map(d => (
-                <tr key={d.id} className={`border-t border-[#E8D5C4]/50 ${d.is_active ? '' : 'opacity-60'}`}>
-                  <td className="py-2 px-3 font-medium text-[#2D1B0E]">{d.name}
-                    {d.description && <div className="text-[10px] text-[#8B7355]">{d.description}</div>}
-                  </td>
-                  <td className="py-2 px-3 font-mono text-xs text-[#6B5744]">
-                    {d.code || '—'}
-                    {d.submission_windows && (
-                      <div className="text-[10px] text-blue-700 mt-0.5" title="Submission allowed only in these slots">
-                        ⏰ {d.submission_windows}{d.submission_grace_minutes ? ` ±${d.submission_grace_minutes}m` : ''}
+              {mains.map(main => {
+                const subs = subsByParent(main.id);
+                const rows: React.ReactNode[] = [];
+                // ── Group header for the MAIN department ──
+                rows.push(
+                  <tr key={`hdr-${main.id}`} className="bg-[#FFF1E3] border-t-2 border-[#af4408]/30">
+                    <td colSpan={7} className="py-2 px-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <Building className="w-4 h-4 text-[#af4408]" />
+                          <span className="font-bold text-[#2D1B0E]">{main.name}</span>
+                          {main.code && <span className="font-mono text-[10px] text-[#6B5744]">({main.code})</span>}
+                          <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-[#af4408]/10 text-[#af4408] font-semibold">Main dept</span>
+                          {!main.is_active && <span className="text-[10px] px-2 py-0.5 rounded bg-[#E8D5C4] text-[#6B5744]">Archived</span>}
+                        </div>
+                        <div className="flex items-center gap-3 text-[10px] text-[#6B5744]">
+                          <span>
+                            Head:{' '}
+                            {main.head_user_name
+                              ? <span className="text-[#2D1B0E] font-medium">{main.head_user_name}</span>
+                              : <span className="italic text-[#8B7355]">— no head set —</span>}
+                          </span>
+                          <span title="Item categories inherited by all sub-departments">
+                            {catCount(main.material_categories)} categor{catCount(main.material_categories) === 1 ? 'y' : 'ies'}
+                          </span>
+                          {isAdmin && (
+                            <button onClick={() => setEditing({ ...main })} className="text-[#6B5744] hover:text-[#af4408]">
+                              <Edit className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
                       </div>
-                    )}
-                  </td>
-                  <td className="py-2 px-3">
-                    {d.head_chef_name ? (
-                      <>
-                        <div className="text-[#2D1B0E]">{d.head_chef_name}</div>
-                        <div className="text-[10px] text-[#8B7355]">{d.head_chef_email}</div>
-                      </>
-                    ) : <span className="text-[#8B7355] italic text-xs">unassigned</span>}
-                  </td>
-                  <td className="py-2 px-3 text-right font-mono">{d.member_count || 0}</td>
-                  <td className="py-2 px-3 text-right font-mono">
-                    {d.open_requisition_count ? (
-                      <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">{d.open_requisition_count}</span>
-                    ) : '0'}
-                  </td>
-                  <td className="py-2 px-3">
-                    {d.is_active
-                      ? <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Active</span>
-                      : <span className="text-[10px] px-2 py-0.5 rounded bg-[#E8D5C4] text-[#6B5744]">Archived</span>}
-                  </td>
-                  <td className="py-2 px-3 text-right">
-                    {isAdmin && (
-                      <button onClick={() => setEditing({ ...d })} className="text-[#6B5744] hover:text-[#af4408]">
-                        <Edit className="w-4 h-4" />
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                  </tr>
+                );
+                // ── Nested rows for each sub-department (plus the main's own detail row) ──
+                const renderDeptRow = (d: Department, isSub: boolean) => (
+                  <tr key={d.id} className={`border-t border-[#E8D5C4]/50 ${d.is_active ? '' : 'opacity-60'}`}>
+                    <td className="py-2 px-3 font-medium text-[#2D1B0E]">
+                      <div className={isSub ? 'pl-6 flex items-center gap-1.5' : ''}>
+                        {isSub && <span className="text-[#D4B896]">↳</span>}
+                        <span>{d.name}</span>
+                      </div>
+                      {d.description && <div className={`text-[10px] text-[#8B7355] ${isSub ? 'pl-6' : ''}`}>{d.description}</div>}
+                      <div className={`text-[10px] text-[#8B7355] ${isSub ? 'pl-6' : ''}`}>
+                        {isSub
+                          ? <>under <span className="text-[#6B5744]">{d.parent_name || main.name}</span></>
+                          : <span className="text-[#8B7355]">top-level</span>}
+                      </div>
+                    </td>
+                    <td className="py-2 px-3 font-mono text-xs text-[#6B5744]">
+                      {d.code || '—'}
+                      {d.submission_windows && (
+                        <div className="text-[10px] text-blue-700 mt-0.5" title="Submission allowed only in these slots">
+                          ⏰ {d.submission_windows}{d.submission_grace_minutes ? ` ±${d.submission_grace_minutes}m` : ''}
+                        </div>
+                      )}
+                    </td>
+                    <td className="py-2 px-3">
+                      {d.head_chef_name ? (
+                        <>
+                          <div className="text-[#2D1B0E]">{d.head_chef_name}</div>
+                          <div className="text-[10px] text-[#8B7355]">{d.head_chef_email}</div>
+                        </>
+                      ) : <span className="text-[#8B7355] italic text-xs">unassigned</span>}
+                    </td>
+                    <td className="py-2 px-3 text-right font-mono">{d.member_count || 0}</td>
+                    <td className="py-2 px-3 text-right font-mono">
+                      {d.open_requisition_count ? (
+                        <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">{d.open_requisition_count}</span>
+                      ) : '0'}
+                    </td>
+                    <td className="py-2 px-3">
+                      {d.is_active
+                        ? <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Active</span>
+                        : <span className="text-[10px] px-2 py-0.5 rounded bg-[#E8D5C4] text-[#6B5744]">Archived</span>}
+                    </td>
+                    <td className="py-2 px-3 text-right">
+                      {isAdmin && (
+                        <button onClick={() => setEditing({ ...d })} className="text-[#6B5744] hover:text-[#af4408]">
+                          <Edit className="w-4 h-4" />
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+                rows.push(renderDeptRow(main, false));
+                subs.forEach(s => rows.push(renderDeptRow(s, true)));
+                return rows;
+              })}
             </tbody>
           </table>
         )}
@@ -226,6 +307,47 @@ export default function DepartmentsPage() {
                           rows={2}
                           className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
               </label>
+
+              {/* Main-department selector: pick the parent, or make this a main dept. */}
+              <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+                Main department
+                <select value={editing.parent_id || ''}
+                        onChange={e => setEditing(p => p ? { ...p, parent_id: e.target.value || null } : p)}
+                        className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
+                  <option value="">— This is a main department —</option>
+                  {mainOptions.map(m => <option key={m.id} value={m.id}>{m.name}{m.code ? ` (${m.code})` : ''}</option>)}
+                </select>
+                <span className="text-[10px] text-[#8B7355]">
+                  {editing.parent_id
+                    ? `Sub-department: inherits its head + item categories from ${editingParent?.name || 'its main department'}.`
+                    : 'Main department: has its own head and item categories, shared by all its sub-departments.'}
+                </span>
+              </label>
+
+              {/* Department head — MAIN depts only. Subs show read-only inheritance. */}
+              {!editing.parent_id ? (
+                <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+                  Department head (approves all requisitions under this department)
+                  <select value={editing.head_user_id || ''}
+                          onChange={e => setEditing(p => p ? { ...p, head_user_id: e.target.value || null } : p)}
+                          className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
+                    <option value="">(no head set)</option>
+                    {users.map(u => <option key={u.id} value={u.id}>{u.name || u.email}</option>)}
+                  </select>
+                  <span className="text-[10px] text-[#8B7355]">
+                    The sole approver for requisitions in this department and all its sub-departments.
+                  </span>
+                </label>
+              ) : (
+                <div className="text-xs text-[#6B5744] flex flex-col gap-1">
+                  Department head
+                  <div className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-[11px] text-[#6B5744]">
+                    Approvals handled by <span className="font-medium text-[#2D1B0E]">{editingParent?.name || 'the main department'}</span>&rsquo;s head
+                    {' '}(<span className="font-medium">{editingParent?.head_user_name || 'not set'}</span>).
+                  </div>
+                </div>
+              )}
+
               <label className="text-xs text-[#6B5744] flex flex-col gap-1">
                 Head Chef
                 <select value={editing.head_chef_user_id || ''}
@@ -253,34 +375,59 @@ export default function DepartmentsPage() {
                        onChange={e => setEditing(p => ({ ...p, submission_grace_minutes: Number(e.target.value) || 0 }))}
                        className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm font-mono" />
               </label>
-              <div className="text-xs text-[#6B5744] flex flex-col gap-1">
-                <div className="flex items-center justify-between">
-                  <span>Material Categories <span className="text-[#8B7355] font-normal">— what staff in this dept can see in inventory pickers</span></span>
-                  <button type="button" onClick={clearCats} className="text-[10px] text-[#af4408] hover:underline">
-                    Clear (= see all)
-                  </button>
+              {/* Item categories — MAIN depts define them; subs inherit read-only. */}
+              {!editing.parent_id ? (
+                <div className="text-xs text-[#6B5744] flex flex-col gap-1">
+                  <div className="flex items-center justify-between">
+                    <span>Material Categories <span className="text-[#8B7355] font-normal">— items this department (and its sub-departments) can see</span></span>
+                    <button type="button" onClick={clearCats} className="text-[10px] text-[#af4408] hover:underline">
+                      Clear (= see all)
+                    </button>
+                  </div>
+                  {catalogCategories.length === 0 ? (
+                    <div className="text-[10px] text-[#8B7355] italic px-2 py-1 bg-[#FFF8F0] border border-[#E8D5C4] rounded">
+                      No categories found in inventory yet.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-1 px-2 py-1.5 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg max-h-48 overflow-y-auto">
+                      {catalogCategories.map(c => (
+                        <label key={c.category} className="flex items-center gap-1.5 text-xs hover:bg-white px-1 py-0.5 rounded cursor-pointer">
+                          <input type="checkbox" checked={editingCats.has(c.category)} onChange={() => toggleCat(c.category)} />
+                          <span className="text-[#2D1B0E] truncate">{c.category}</span>
+                          <span className="text-[9px] text-[#8B7355] ml-auto">{c.count}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                  <span className="text-[10px] text-[#8B7355]">
+                    {editingCats.size === 0
+                      ? 'No filter set — this department (and its sub-departments) sees all materials.'
+                      : `${editingCats.size} categor${editingCats.size === 1 ? 'y' : 'ies'} selected. Staff in this department and its sub-departments only see these in inventory pickers. Admins / head chef / store manager always see all.`}
+                  </span>
                 </div>
-                {catalogCategories.length === 0 ? (
-                  <div className="text-[10px] text-[#8B7355] italic px-2 py-1 bg-[#FFF8F0] border border-[#E8D5C4] rounded">
-                    No categories found in inventory yet.
+              ) : (
+                <div className="text-xs text-[#6B5744] flex flex-col gap-1">
+                  Material Categories
+                  <div className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-[11px] text-[#6B5744]">
+                    Inherits item categories from <span className="font-medium text-[#2D1B0E]">{editingParent?.name || 'its main department'}</span>.
+                    {(() => {
+                      const parentCats: string[] = (() => {
+                        if (!editingParent?.material_categories) return [];
+                        try { const a = JSON.parse(editingParent.material_categories); return Array.isArray(a) ? a : []; } catch { return []; }
+                      })();
+                      return parentCats.length === 0 ? (
+                        <div className="mt-1 text-[#8B7355] italic">No filter set on the main department — sees all materials.</div>
+                      ) : (
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {parentCats.map(c => (
+                            <span key={c} className="px-1.5 py-0.5 rounded bg-white border border-[#E8D5C4] text-[#2D1B0E]">{c}</span>
+                          ))}
+                        </div>
+                      );
+                    })()}
                   </div>
-                ) : (
-                  <div className="grid grid-cols-2 md:grid-cols-3 gap-1 px-2 py-1.5 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg max-h-48 overflow-y-auto">
-                    {catalogCategories.map(c => (
-                      <label key={c.category} className="flex items-center gap-1.5 text-xs hover:bg-white px-1 py-0.5 rounded cursor-pointer">
-                        <input type="checkbox" checked={editingCats.has(c.category)} onChange={() => toggleCat(c.category)} />
-                        <span className="text-[#2D1B0E] truncate">{c.category}</span>
-                        <span className="text-[9px] text-[#8B7355] ml-auto">{c.count}</span>
-                      </label>
-                    ))}
-                  </div>
-                )}
-                <span className="text-[10px] text-[#8B7355]">
-                  {editingCats.size === 0
-                    ? 'No filter set — dept sees all materials.'
-                    : `${editingCats.size} categor${editingCats.size === 1 ? 'y' : 'ies'} selected. Staff in this dept will only see these in inventory pickers. Admins / head chef / store manager always see all.`}
-                </span>
-              </div>
+                </div>
+              )}
               {editing.id && (
                 <label className="text-xs text-[#6B5744] flex items-center gap-2">
                   <input type="checkbox" checked={!!editing.is_active}
