@@ -1,6 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsMgmt, canProcessAsStore } from '@/lib/auth';
-import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead } from '@/lib/dept-hierarchy';
+import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 
 // Statuses at which a requisition can be edited, by whom:
 //   draft                                            → drafter or admin
@@ -265,6 +265,26 @@ export async function POST(request: Request) {
         const offender = validItems.find((it: any) => it.department_id !== me.department_id);
         if (offender) {
           return Response.json({ error: 'You can only raise requisitions for your own department' }, { status: 403 });
+        }
+      }
+    }
+
+    // Server-side category guard (defense in depth): a department user — including
+    // a dept head — can only requisition materials within their MAIN department's
+    // category whitelist, even if the client is bypassed with a crafted material_id.
+    // Admin + store are exempt (they buy across all departments).
+    if (me.role !== 'admin' && !me.is_store_manager) {
+      const wl = effectiveCategoriesForUser(db, me);
+      if (wl && wl.length) {
+        const allow = new Set(wl);
+        const ids = validItems.map((it: any) => it.material_id);
+        const rows = db.prepare(
+          `SELECT id, COALESCE(NULLIF(category, ''), 'other') AS category FROM raw_materials WHERE id IN (${ids.map(() => '?').join(',')})`,
+        ).all(...ids) as { id: string; category: string }[];
+        const catById = new Map(rows.map((r) => [r.id, r.category]));
+        const offender = validItems.find((it: any) => !allow.has(catById.get(it.material_id) || ' '));
+        if (offender) {
+          return Response.json({ error: "One or more items are outside your department's allowed categories." }, { status: 403 });
         }
       }
     }

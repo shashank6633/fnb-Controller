@@ -1,15 +1,17 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 
 /**
  * List distinct raw_materials.category values currently in the catalog,
- * with material counts. Used by /departments to populate the material-
- * category whitelist checkboxes.
+ * with material counts. Drives the /departments whitelist checkboxes.
  *
  * GET /api/inventory/categories
  *   → { categories: [{ category: 'vegetables', count: 47 }, ...] }
  *
- * Admin-only (this drives the dept management UI).
+ * Admin + store see EVERY category (they configure the whitelists / buy for all).
+ * A department user only ever gets the categories of their OWN main department —
+ * so even a direct call can't enumerate categories outside their scope.
  */
 export const dynamic = 'force-dynamic';
 
@@ -23,7 +25,15 @@ export async function GET() {
       FROM raw_materials
       GROUP BY COALESCE(NULLIF(category, ''), 'other')
       ORDER BY category ASC
-    `).all();
+    `).all() as { category: string; count: number }[];
+    // Department-scope non-privileged users to their own main-dept categories.
+    if (me.role !== 'admin' && !me.is_store_manager) {
+      const wl = effectiveCategoriesForUser(db, me);
+      if (wl) {
+        const allow = new Set(wl);
+        return Response.json({ categories: rows.filter((r) => allow.has(r.category)) });
+      }
+    }
     return Response.json({ categories: rows });
   } catch (e: any) {
     console.error('[/api/inventory/categories]', e);
