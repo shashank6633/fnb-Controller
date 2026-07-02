@@ -39,9 +39,12 @@ export function computeBill(
   const scPct = Number(d.serviceChargePct) || 0;
   const serviceCharge = (d.serviceChargeOn !== false && !o.serviceRemoved && scPct > 0)
     ? round2(subtotal * scPct / 100) : 0;
-  const discount = o.discount_pct
+  const rawDiscount = o.discount_pct
     ? round2(subtotal * (Number(o.discount_pct) || 0) / 100)
     : round2(o.discount || 0);
+  // Clamp: a discount can never exceed the pre-tax base, so the taxable/total
+  // can't go negative (guards against a bad/oversized discount amount).
+  const discount = Math.min(Math.max(0, rawDiscount), round2(subtotal + serviceCharge));
   const taxable = round2(subtotal + serviceCharge - discount);
   const cgst = round2(taxable * (Number(d.cgstPct) || 0) / 100);
   const sgst = round2(taxable * (Number(d.sgstPct) || 0) / 100);

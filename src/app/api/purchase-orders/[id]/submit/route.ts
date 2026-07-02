@@ -6,6 +6,7 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
   try {
     const { id } = await params;
     const db = getDb();
+    if (!(await currentRole())) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const po = db.prepare('SELECT status FROM purchase_orders WHERE id = ?').get(id) as any;
     if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
     if (po.status !== 'draft') return Response.json({ error: `Only drafts can be submitted (current: ${po.status})` }, { status: 400 });

@@ -6,7 +6,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   try {
     const { id } = await params;
     const db = getDb();
-    if (await effectiveRole() !== 'admin') {
+    const role = await effectiveRole();
+    if (!role) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (role !== 'admin') {
       return Response.json({ error: 'Only Admin can reject POs' }, { status: 403 });
     }
     const body = await req.json().catch(() => ({}));

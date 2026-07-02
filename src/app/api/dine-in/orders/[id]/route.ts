@@ -200,9 +200,16 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
           break;
         }
         case 'set_meta':
-          db.prepare(`UPDATE orders SET covers = ?, discount = ?, notes = ?, updated_at = datetime('now') WHERE id = ?`)
+          // SECURITY: `discount` is DELIBERATELY not settable here — it used to let
+          // any signed-in user (a captain) set an arbitrary flat discount, bypassing
+          // the manager-approved /discount flow (and could drive the total negative).
+          // All discount changes must go through POST /api/dine-in/orders/[id]/discount
+          // (role cap + live manager approval). set_meta only touches covers + notes.
+          if (b.discount !== undefined) {
+            return Response.json({ error: 'Discounts must be requested via the discount approval flow, not set_meta.' }, { status: 403 });
+          }
+          db.prepare(`UPDATE orders SET covers = ?, notes = ?, updated_at = datetime('now') WHERE id = ?`)
             .run(b.covers === undefined ? order.covers : Number(b.covers) || 0,
-                 b.discount === undefined ? order.discount : Math.max(0, Number(b.discount) || 0),
                  b.notes === undefined ? order.notes : String(b.notes), id);
           break;
         case 'set_guest':

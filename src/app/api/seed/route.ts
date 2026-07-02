@@ -1,7 +1,13 @@
 import { getDb, generateId, updateMaterialPrice, recalculateSubRecipeCost, recalculateRecipeCost, deductInventoryForSale } from '@/lib/db';
+import { requireRole } from '@/lib/auth';
 
 export async function POST() {
   try {
+    // SECURITY: this DELETEs all inventory/recipes/purchases/sales and reseeds demo
+    // data. It was completely unauthenticated — any caller could wipe production.
+    // Admin only now.
+    const auth = await requireRole('admin');
+    if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
     const db = getDb();
 
     const seed = db.transaction(() => {

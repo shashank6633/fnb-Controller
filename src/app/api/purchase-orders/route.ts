@@ -16,18 +16,20 @@ import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
  *   submit, approve, receive, reject, cancel
  */
 
-function currentRole(db: ReturnType<typeof getDb>): 'admin' | 'manager' {
-  // Legacy: settings-based role for unauthenticated calls (kept as fallback)
-  const r = db.prepare("SELECT value FROM settings WHERE key = 'current_role'").get() as any;
-  return r?.value === 'manager' ? 'manager' : 'admin';
-}
-
-/** Prefer logged-in user role; fall back to settings if no session.
+/** Role of the CURRENT SESSION, or null when there is no valid session.
+ *  SECURITY: never falls back to a privileged role. The old settings-based
+ *  `current_role` fallback meant a forged/expired cookie was treated as admin
+ *  on every PO money/stock action — removed. Callers MUST 401 on null.
  *  Collapses 'staff' → 'manager' for the legacy two-tier callers in this file. */
-async function effectiveRole(): Promise<'admin' | 'manager'> {
+async function effectiveRole(): Promise<'admin' | 'manager' | null> {
   const user = await getCurrentUser();
-  if (user) return user.role === 'admin' ? 'admin' : 'manager';
-  return currentRole(getDb());
+  if (!user) return null;
+  return user.role === 'admin' ? 'admin' : 'manager';
+}
+/** Back-compat shim for callers that used the old sync currentRole(db): now
+ *  session-based and nullable. */
+async function currentRole(): Promise<'admin' | 'manager' | null> {
+  return effectiveRole();
 }
 
 async function effectiveActor(): Promise<string> {
@@ -165,6 +167,7 @@ export async function GET(request: Request) {
 // ---------- POST (create draft) ----------
 export async function POST(request: Request) {
   try {
+    if (!(await effectiveRole())) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const body = await request.json();
     const { date, vendor_id, vendor, notes, items } = body;
@@ -227,6 +230,7 @@ export async function POST(request: Request) {
 // ---------- PUT (update draft items / metadata) ----------
 export async function PUT(request: Request) {
   try {
+    if (!(await effectiveRole())) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const body = await request.json();
     const { id, date, vendor_id, vendor, notes, items } = body;
@@ -289,6 +293,7 @@ export async function PUT(request: Request) {
 // ---------- DELETE (drafts only) ----------
 export async function DELETE(request: Request) {
   try {
+    if (!(await effectiveRole())) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');

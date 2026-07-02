@@ -159,6 +159,23 @@ export function proxy(req: NextRequest) {
     } catch { /* on DB error, fall through — fail open */ }
   }
 
+  // 2c. SECURITY: validate the session for state-changing API calls. Presence of
+  // the fnb_session cookie (checked in step 2) is NOT validity — a forged/expired
+  // token was previously accepted by every mutating handler (some of which have no
+  // handler-level auth). Validate the token against the sessions table here so a
+  // junk cookie can never reach a POST/PUT/PATCH/DELETE handler. (GETs stay lenient;
+  // sensitive GETs authenticate in-handler.)
+  if (isApi && isStateChanging(req.method)) {
+    try {
+      const db = getDb();
+      const valid = db.prepare(`
+        SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id
+        WHERE s.token = ? AND u.is_active = 1 AND s.expires_at > datetime('now')
+      `).get(session);
+      if (!valid) return NextResponse.json({ error: 'Sign in required' }, { status: 401 });
+    } catch { /* infra/DB error → fall through (don't hard-fail the whole app) */ }
+  }
+
   // 3. CSRF check on sensitive state-changing API calls
   if (isApi && isStateChanging(req.method)) {
     const required = CSRF_REQUIRED_PREFIXES.some(p => pathname.startsWith(p));

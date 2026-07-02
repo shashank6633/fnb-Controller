@@ -18,8 +18,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   try {
     const { id } = await params;
     const db = getDb();
-    const role = currentRole(db);
-    // Either role can mark received (warehouse op), but the PO must be approved first.
+    // Either role can mark received (warehouse op) — but a VALID session is required
+    // (no fail-open to admin). Receiving bumps stock + rewrites average_price.
+    const role = await currentRole();
+    if (!role) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id) as any;
     if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
     if (po.status !== 'approved') {
