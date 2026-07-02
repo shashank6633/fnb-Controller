@@ -806,12 +806,12 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me?.department_id]);
   const [notes, setNotes] = useState('');
-  const [items, setItems] = useState<Array<{ material_id: string; quantity_requested: number; notes: string }>>([
-    { material_id: '', quantity_requested: 1, notes: '' },
+  const [items, setItems] = useState<Array<{ material_id: string; quantity_requested: number; unit: string; notes: string }>>([
+    { material_id: '', quantity_requested: 1, unit: '', notes: '' },
   ]);
   const [saving, setSaving] = useState(false);
 
-  const addLine = () => setItems(p => [...p, { material_id: '', quantity_requested: 1, notes: '' }]);
+  const addLine = () => setItems(p => [...p, { material_id: '', quantity_requested: 1, unit: '', notes: '' }]);
   const update = (i: number, patch: any) => setItems(p => p.map((it, j) => j === i ? { ...it, ...patch } : it));
   const remove = (i: number) => setItems(p => p.filter((_, j) => j !== i));
 
@@ -881,30 +881,39 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
             <div className="space-y-2">
               {/* Phase 1 §2: per-line context — Category · On-hand · Buffer · PUoM · Last rate */}
               <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wide text-[#8B7355] px-1">
-                <div className="col-span-4">Material · Category</div>
+                <div className="col-span-3">Material · Category</div>
                 <div className="col-span-2 text-right">On hand · Buffer</div>
-                <div className="col-span-1 text-right">Qty</div>
+                <div className="col-span-2 text-right">Qty · Unit</div>
                 <div className="col-span-2 text-right">PUoM · Last ₹</div>
                 <div className="col-span-2">Notes</div>
                 <div className="col-span-1"></div>
               </div>
               {items.map((it, i) => {
                 const mat = materials.find(m => m.id === it.material_id);
-                const short    = mat ? mat.current_stock < it.quantity_requested : false;
+                // Units the requester can pick: the recipe (base) unit + the
+                // purchase unit if different. When they choose the purchase unit,
+                // 1 of it = pack_size recipe units — so convert for the on-hand /
+                // buffer warnings (which are shown in recipe units).
+                const unitOpts = mat ? Array.from(new Set([mat.unit, mat.purchase_unit].filter(Boolean))) as string[] : [];
+                const packSize = Number(mat?.pack_size || 1);
+                const inPurchaseUnit = !!mat && !!mat.purchase_unit && it.unit === mat.purchase_unit && packSize > 1;
+                const reqRecipe = it.quantity_requested * (inPurchaseUnit ? packSize : 1);
+                const short    = mat ? mat.current_stock < reqRecipe : false;
                 const buffer   = Number(mat?.reorder_level || 0);
-                const postReq  = mat ? (mat.current_stock - it.quantity_requested) : 0;
+                const postReq  = mat ? (mat.current_stock - reqRecipe) : 0;
                 const belowBuffer = mat && buffer > 0 && postReq < buffer;
                 const pu = mat?.purchase_unit || mat?.unit || '';
                 const lastRate = (mat?.last_purchase_price ?? mat?.average_price) || 0;
                 return (
                   <div key={i} className="grid grid-cols-12 gap-2 text-xs items-start">
-                    <div className="col-span-4">
+                    <div className="col-span-3">
                       <MaterialTypeahead
                         materials={materials}
                         value={it.material_id}
                         // Disable any material already picked on another row to avoid dupes
                         excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
-                        onPick={(id) => update(i, { material_id: id })}
+                        // Default the unit to the material's recipe (base) unit on pick.
+                        onPick={(id) => { const m = materials.find(x => x.id === id); update(i, { material_id: id, unit: m?.unit || '' }); }}
                       />
                       {mat?.category && <div className="text-[9px] text-[#8B7355] mt-0.5">{mat.category}</div>}
                     </div>
@@ -922,10 +931,27 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                         </>
                       ) : <span className="text-[#8B7355]">—</span>}
                     </div>
-                    <input type="number" step="any" value={it.quantity_requested || ''}
-                           onChange={e => update(i, { quantity_requested: parseFloat(e.target.value) || 0 })}
-                           placeholder="Qty"
-                           className="col-span-1 px-2 py-1 border border-[#E8D5C4] rounded text-right" />
+                    {/* Qty + Unit-of-measure selector */}
+                    <div className="col-span-2 flex gap-1 items-start">
+                      <input type="number" step="any" value={it.quantity_requested || ''}
+                             onChange={e => update(i, { quantity_requested: parseFloat(e.target.value) || 0 })}
+                             placeholder="Qty"
+                             className="w-full min-w-0 px-2 py-1 border border-[#E8D5C4] rounded text-right" />
+                      {mat && unitOpts.length > 1 ? (
+                        <select value={it.unit || mat.unit}
+                                onChange={e => update(i, { unit: e.target.value })}
+                                title="Unit of measure for this quantity"
+                                className="shrink-0 px-1 py-1 border border-[#E8D5C4] rounded bg-[#FFF8F0] text-[11px] max-w-[70px]">
+                          {unitOpts.map(u => (
+                            <option key={u} value={u}>
+                              {u}{u === mat.purchase_unit && u !== mat.unit && packSize > 1 ? ` (×${packSize})` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      ) : mat ? (
+                        <span className="shrink-0 text-[10px] text-[#8B7355] pt-1.5">{it.unit || mat.unit}</span>
+                      ) : null}
+                    </div>
                     <div className="col-span-2 text-right text-[10px] leading-snug">
                       {mat ? (
                         <>

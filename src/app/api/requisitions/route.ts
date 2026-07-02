@@ -148,7 +148,10 @@ export async function GET(request: Request) {
       SELECT r.*, d.name AS department_name, d.code AS department_code,
              po.po_number AS linked_po_number, po.status AS linked_po_status,
              (SELECT COUNT(*) FROM requisition_items WHERE req_id = r.id) AS item_count,
-             (SELECT COALESCE(SUM(ri.quantity_requested * rm.average_price), 0)
+             (SELECT COALESCE(SUM(
+                  ri.quantity_requested
+                  * (CASE WHEN ri.unit = rm.purchase_unit AND COALESCE(rm.pack_size, 1) > 1 THEN rm.pack_size ELSE 1 END)
+                  * rm.average_price), 0)
                 FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
                 WHERE ri.req_id = r.id) AS estimated_value
       FROM requisitions r
