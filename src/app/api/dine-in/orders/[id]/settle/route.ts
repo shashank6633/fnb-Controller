@@ -1,7 +1,7 @@
 import { getDb, recordSale } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { todayIST } from '@/lib/format-date';
-import { computeBill } from '@/lib/bill-calc';
+import { computeBill, sumItemTax } from '@/lib/bill-calc';
 
 const VALID_METHODS = ['cash', 'upi', 'card'];
 
@@ -60,6 +60,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const bill = computeBill(
       {
         subtotal: order.subtotal,
+        itemTax: sumItemTax(items),   // per-item GST (food 5% / liquor 0%)
         serviceRemoved: !!order.service_charge_reason,
         discount_pct: order.discount_pct,
         discount: order.discount,

@@ -113,10 +113,13 @@ export async function POST(request: Request) {
           VALUES (?, ?, ?, ?, ?, 'served', ?, ?, ?)
         `);
         const insertItem = db.prepare(`
-          INSERT INTO order_items (id, order_id, menu_item_id, name, station, quantity, unit_price, line_total,
+          INSERT INTO order_items (id, order_id, menu_item_id, name, station, quantity, unit_price, line_total, tax_value,
                                    status, notes, prep_minutes, fired_at, kot_id, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'fired', ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'fired', ?, ?, ?, ?, ?)
         `);
+        // Snapshot the menu item's GST% so an offline order settles with the
+        // correct per-item tax (Food & Beverages 5%, Liquor 0%) once synced.
+        const taxOf = db.prepare('SELECT tax_value FROM menu_items WHERE id = ?');
 
         let subtotal = 0;
         for (const [station, its] of Object.entries(byStation)) {
@@ -132,9 +135,10 @@ export async function POST(request: Request) {
             const price = Number(it?.price) || 0;
             const lineTotal = Math.round(price * qty * 100) / 100;
             subtotal += lineTotal;
+            const taxRow = it?.menuId ? (taxOf.get(it.menuId) as any) : null;
             insertItem.run(
               generateId(), orderId, it?.menuId || null, String(it?.name || ''), station,
-              qty, price, lineTotal,
+              qty, price, lineTotal, Number(taxRow?.tax_value) || 0,
               String(it?.notes || ''), Number(it?.prep_minutes) || 0, createdAt || null, kotId, createdAt || null,
             );
           }

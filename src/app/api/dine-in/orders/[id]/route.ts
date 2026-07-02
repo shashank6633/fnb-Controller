@@ -1,23 +1,36 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, canApproveTableOp, verifyApprover } from '@/lib/auth';
 import { emitKds } from '@/lib/kds-bus';
+import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
 import type Database from 'better-sqlite3';
 
-/** Recompute and persist order totals from its line items + discount. */
+/** The bill_design settings (service charge %, legacy tax %) used by computeBill. */
+function billDesign(db: Database.Database) {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'bill_design'").get() as any;
+  let d: any = {};
+  if (row?.value) { try { d = JSON.parse(row.value) || {}; } catch { d = {}; } }
+  return {
+    serviceChargeOn: d.serviceChargeOn !== false,
+    serviceChargePct: Number(d.serviceChargePct) || 0,
+    cgstPct: d.cgstPct == null ? 2.5 : Number(d.cgstPct) || 0,
+    sgstPct: d.sgstPct == null ? 2.5 : Number(d.sgstPct) || 0,
+  };
+}
+
+/** Recompute + persist order totals via the SAME computeBill the settle route and
+ *  printed bill use — so the running "total due" always equals what's charged.
+ *  Tax is PER ITEM (Food & Beverages 5%, Liquor 0%) from each line's tax_value. */
 function recomputeTotals(db: Database.Database, orderId: string) {
   const items = db.prepare('SELECT quantity, unit_price, tax_value FROM order_items WHERE order_id = ?').all(orderId) as any[];
-  let subtotal = 0, tax = 0;
-  for (const it of items) {
-    const line = it.unit_price * it.quantity;
-    subtotal += line;
-    tax += line * (it.tax_value || 0) / 100;
-  }
-  const order = db.prepare('SELECT discount FROM orders WHERE id = ?').get(orderId) as any;
-  const discount = order?.discount || 0;
-  const r = (n: number) => Math.round(n * 100) / 100;
-  const total = Math.max(0, r(subtotal + tax - discount));
-  db.prepare(`UPDATE orders SET subtotal = ?, tax_total = ?, total = ?, updated_at = datetime('now') WHERE id = ?`)
-    .run(r(subtotal), r(tax), total, orderId);
+  const order = db.prepare('SELECT discount, discount_pct, service_charge_reason FROM orders WHERE id = ?').get(orderId) as any;
+  const subtotal = items.reduce((s, it) => s + it.unit_price * it.quantity, 0);
+  const itemTax = sumItemTax(items.map((it) => ({ line_total: it.unit_price * it.quantity, tax_value: it.tax_value })));
+  const bill = computeBill(
+    { subtotal, itemTax, serviceRemoved: !!order?.service_charge_reason, discount_pct: order?.discount_pct, discount: order?.discount },
+    billDesign(db),
+  );
+  db.prepare(`UPDATE orders SET subtotal = ?, tax_total = ?, service_charge = ?, total = ?, updated_at = datetime('now') WHERE id = ?`)
+    .run(bill.subtotal, round2(bill.cgst + bill.sgst), bill.serviceCharge, bill.total, orderId);
 }
 
 function loadOrder(db: Database.Database, id: string) {

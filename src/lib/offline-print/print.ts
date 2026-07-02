@@ -470,6 +470,9 @@ export async function printBill(order: BillOrder, printedBy?: string): Promise<{
   const b = computeBill(
     {
       subtotal,
+      // order.tax_total is the per-item GST (food 5% / liquor 0%) computed at
+      // add/settle time — pass it so the printed bill matches the charged total.
+      itemTax: Number(order.tax_total) || 0,
       serviceRemoved: !!(order.service_charge_reason && String(order.service_charge_reason).trim()),
       discount_pct: order.discount_pct == null ? undefined : Number(order.discount_pct),
       discount: Number(order.discount) || 0,

@@ -367,7 +367,7 @@ export default function MenuItemsPage() {
             <button onClick={openImport} className="flex items-center gap-2 px-4 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium">
               <FileSpreadsheet className="w-4 h-4" />Import from Akan POS
             </button>
-            <button onClick={() => setEditItem({ id: '', name: '', category: '', station: '', item_type: 'foods', dietary_tag: '', selling_price: 0, listing_price: 0, item_code: '', tax_value: 0, prep_minutes: 15, is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '' })} className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
+            <button onClick={() => setEditItem({ id: '', name: '', category: '', station: '', item_type: 'foods', dietary_tag: '', selling_price: 0, listing_price: 0, item_code: '', tax_value: 5, prep_minutes: 15, is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '' })} className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
               <Plus className="w-4 h-4" />New Item
             </button>
           </div>
@@ -782,7 +782,9 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
           <div className="grid grid-cols-3 gap-3">
             <div>
               <label className="block text-xs font-medium text-[#6B5744] mb-1">Type</label>
-              <select value={form.item_type} onChange={e => setForm({ ...form, item_type: e.target.value })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
+              <select value={form.item_type}
+                      onChange={e => { const t = e.target.value; setForm({ ...form, item_type: t, tax_value: t === 'liquors' ? 0 : 5 }); }}
+                      className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
                 <option value="foods">Foods</option>
                 <option value="liquors">Liquor</option>
                 <option value="beverages">Beverages</option>
@@ -812,8 +814,9 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
               <input type="number" step="0.01" value={form.listing_price} onChange={e => setForm({ ...form, listing_price: Number(e.target.value) })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
             </div>
             <div>
-              <label className="block text-xs font-medium text-[#6B5744] mb-1">Tax %</label>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">GST %</label>
               <input type="number" step="0.01" value={form.tax_value} onChange={e => setForm({ ...form, tax_value: Number(e.target.value) })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+              <p className="text-[10px] text-[#8B7355] mt-0.5">Food &amp; Beverages 5% · Liquor 0%. Auto-set by Type; override if needed.</p>
             </div>
           </div>
           <div className="grid grid-cols-3 gap-3">
