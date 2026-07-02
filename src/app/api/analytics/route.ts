@@ -19,7 +19,7 @@ export async function GET(request: Request) {
         COALESCE(SUM(CASE WHEN bill_type = 'normal' THEN total_revenue ELSE 0 END), 0) as total_revenue,
         COALESCE(SUM(total_cost), 0) as total_cost,
         COALESCE(SUM(CASE WHEN bill_type = 'normal' THEN total_revenue ELSE 0 END) - SUM(total_cost), 0) as gross_profit,
-        COALESCE(SUM(CASE WHEN bill_type IN ('nc', 'complimentary') THEN total_cost ELSE 0 END), 0) as nc_loss,
+        COALESCE(SUM(CASE WHEN bill_type IN ('nc', 'comp') THEN total_cost ELSE 0 END), 0) as nc_loss,
         COALESCE(SUM(quantity_sold), 0) as total_items_sold
       FROM sales
       WHERE date >= ? AND date <= ?
@@ -112,8 +112,8 @@ export async function GET(request: Request) {
     const ncImpact = db.prepare(`
       SELECT
         date,
-        SUM(CASE WHEN bill_type IN ('nc', 'complimentary') THEN total_cost ELSE 0 END) as nc_cost,
-        SUM(CASE WHEN bill_type IN ('nc', 'complimentary') THEN 1 ELSE 0 END) as nc_count
+        SUM(CASE WHEN bill_type IN ('nc', 'comp') THEN total_cost ELSE 0 END) as nc_cost,
+        SUM(CASE WHEN bill_type IN ('nc', 'comp') THEN 1 ELSE 0 END) as nc_count
       FROM sales
       WHERE date >= ? AND date <= ?
       GROUP BY date

@@ -81,8 +81,8 @@ export async function GET(request: Request) {
         CASE WHEN SUM(s.total_revenue) > 0
           THEN ROUND(SUM(s.total_cost) / SUM(s.total_revenue) * 100, 2)
           ELSE 0 END as food_cost_percent,
-        SUM(CASE WHEN s.bill_type IN ('nc', 'complimentary') THEN s.quantity_sold ELSE 0 END) as nc_quantity,
-        SUM(CASE WHEN s.bill_type IN ('nc', 'complimentary') THEN s.total_cost ELSE 0 END) as nc_cost
+        SUM(CASE WHEN s.bill_type IN ('nc', 'comp') THEN s.quantity_sold ELSE 0 END) as nc_quantity,
+        SUM(CASE WHEN s.bill_type IN ('nc', 'comp') THEN s.total_cost ELSE 0 END) as nc_cost
       FROM sales s
       WHERE 1=1 ${dateFilter}
       GROUP BY s.item_name
@@ -113,8 +113,8 @@ export async function GET(request: Request) {
           ELSE 0 END as gross_margin,
         SUM(CASE WHEN s.bill_type = 'nc' THEN 1 ELSE 0 END) as nc_count,
         SUM(CASE WHEN s.bill_type = 'nc' THEN s.total_cost ELSE 0 END) as nc_cost,
-        SUM(CASE WHEN s.bill_type = 'complimentary' THEN 1 ELSE 0 END) as complimentary_count,
-        SUM(CASE WHEN s.bill_type = 'complimentary' THEN s.total_cost ELSE 0 END) as complimentary_cost
+        SUM(CASE WHEN s.bill_type = 'comp' THEN 1 ELSE 0 END) as complimentary_count,
+        SUM(CASE WHEN s.bill_type = 'comp' THEN s.total_cost ELSE 0 END) as complimentary_cost
       FROM sales s
       WHERE 1=1 ${dateFilter}
       GROUP BY ${periodGroup}
@@ -124,8 +124,8 @@ export async function GET(request: Request) {
     // NC impact
     const ncImpact = db.prepare(`
       SELECT
-        SUM(CASE WHEN s.bill_type IN ('nc', 'complimentary') THEN s.total_cost ELSE 0 END) as total_nc_cost,
-        SUM(CASE WHEN s.bill_type IN ('nc', 'complimentary') THEN s.quantity_sold ELSE 0 END) as total_nc_quantity
+        SUM(CASE WHEN s.bill_type IN ('nc', 'comp') THEN s.total_cost ELSE 0 END) as total_nc_cost,
+        SUM(CASE WHEN s.bill_type IN ('nc', 'comp') THEN s.quantity_sold ELSE 0 END) as total_nc_quantity
       FROM sales s
       WHERE 1=1 ${dateFilter}
     `).get(...params) as any;
