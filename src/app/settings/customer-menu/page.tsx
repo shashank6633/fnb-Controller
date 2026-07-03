@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, apiJson } from '@/lib/api';
 
 type Style = 'thumbnails' | 'chips';
+type Mode = 'captain' | 'direct';
 
 // QR-menu design tokens (QR Code menu/atoms.jsx `C`).
 const C = {
@@ -19,6 +20,7 @@ const FONTS_HREF = 'https://fonts.googleapis.com/css2?family=Instrument+Serif:it
 
 export default function CustomerMenuDesignPage() {
   const [style, setStyle] = useState<Style>('thumbnails');
+  const [mode, setMode] = useState<Mode>('captain');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -28,21 +30,27 @@ export default function CustomerMenuDesignPage() {
     setLoading(true);
     try {
       const d = await apiJson<{ value: string | null }>('/api/settings?key=customer_menu_design');
-      try { const j = JSON.parse(d.value || '{}'); if (j.categoryStyle === 'chips' || j.categoryStyle === 'thumbnails') setStyle(j.categoryStyle); } catch {}
+      try {
+        const j = JSON.parse(d.value || '{}');
+        if (j.categoryStyle === 'chips' || j.categoryStyle === 'thumbnails') setStyle(j.categoryStyle);
+        if (j.orderMode === 'direct' || j.orderMode === 'captain') setMode(j.orderMode);
+      } catch {}
     } catch (e: any) { setErr(e.message || 'Failed to load'); }
     finally { setLoading(false); }
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  const choose = async (s: Style) => {
-    if (s === style && !err) { /* still allow re-save */ }
-    setStyle(s); setSaving(true); setErr(''); setSaved(false);
+  // Persist the whole design object (categoryStyle + orderMode) in one setting.
+  const save = async (next: { categoryStyle: Style; orderMode: Mode }) => {
+    setSaving(true); setErr(''); setSaved(false);
     try {
-      await api('/api/settings', { method: 'PUT', body: { key: 'customer_menu_design', value: JSON.stringify({ categoryStyle: s }) } });
+      await api('/api/settings', { method: 'PUT', body: { key: 'customer_menu_design', value: JSON.stringify(next) } });
       setSaved(true); setTimeout(() => setSaved(false), 2200);
     } catch (e: any) { setErr(e.message || 'Could not save'); }
     finally { setSaving(false); }
   };
+  const chooseStyle = (s: Style) => { setStyle(s); save({ categoryStyle: s, orderMode: mode }); };
+  const chooseMode = (m: Mode) => { setMode(m); save({ categoryStyle: style, orderMode: m }); };
 
   return (
     <div style={{ maxWidth: 860, margin: '0 auto', padding: '24px 20px 80px', fontFamily: SANS, color: C.ink }}>
@@ -53,34 +61,74 @@ export default function CustomerMenuDesignPage() {
       <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 1.6, textTransform: 'uppercase', color: C.terra, fontWeight: 500 }}>Customer QR Menu</div>
       <h1 style={{ fontFamily: SERIF, fontSize: 34, fontWeight: 400, margin: '2px 0 6px', color: C.ink, lineHeight: 1.05 }}>Menu Page Design</h1>
       <p style={{ color: C.inkSoft, margin: '0 0 20px', fontSize: 14, lineHeight: 1.5, maxWidth: 620 }}>
-        Choose how categories appear on the customer menu (the page guests see after scanning their table QR).
+        Control how the customer menu looks and how QR orders reach your kitchen (the page guests see after scanning their table QR).
         Changes apply instantly to every table.
       </p>
 
       {err && <div style={{ background: C.terraTint, color: C.terraDeep, padding: '10px 14px', borderRadius: 8, marginBottom: 16, fontSize: 13 }}>{err}</div>}
-      {saved && <div style={{ background: '#DCE8DE', color: C.forest, padding: '10px 14px', borderRadius: 8, marginBottom: 16, fontSize: 13, fontWeight: 500 }}>✓ Saved — the customer menu now uses this style.</div>}
+      {saved && <div style={{ background: '#DCE8DE', color: C.forest, padding: '10px 14px', borderRadius: 8, marginBottom: 16, fontSize: 13, fontWeight: 500 }}>✓ Saved — the customer menu now uses these settings.</div>}
 
       {loading ? <p style={{ color: C.inkMute }}>Loading…</p> : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 18 }}>
-          <Option
-            active={style === 'thumbnails'} disabled={saving} onClick={() => choose('thumbnails')}
-            title="Thumbnails" tagline="Category cards with images"
-            desc="Guests first see a grid of category cards, then tap one to browse its dishes. Feels premium and visual."
-            preview={<ThumbPreview />}
+        <>
+          {/* ── QR Ordering Mode ─────────────────────────────────────────── */}
+          <SectionHead
+            title="QR Ordering Mode"
+            desc="Decide what happens when a guest taps Place Order. Switch anytime — the customer-facing menu doesn't change."
           />
-          <Option
-            active={style === 'chips'} disabled={saving} onClick={() => choose('chips')}
-            title="Chips" tagline="Quick filter pills"
-            desc="All dishes on one scroll, with a sticky row of category pills to jump around. Fast and compact."
-            preview={<ChipsPreview />}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 18, marginBottom: 34 }}>
+            <Option
+              active={mode === 'captain'} disabled={saving} onClick={() => chooseMode('captain')}
+              title="Captain Confirmation" tagline="Recommended default"
+              desc="Guest submits the cart → it lands in the Captain's queue as Pending. The captain checks with the table, tweaks/adds items, then sends the KOT. Fewer mistakes, more upsell."
+              preview={<FlowPreview steps={['Guest cart', 'Captain reviews', 'Captain sends KOT', 'Kitchen']} highlight={1} />}
+            />
+            <Option
+              active={mode === 'direct'} disabled={saving} onClick={() => chooseMode('direct')}
+              title="Direct Ordering" tagline="Auto-send KOT"
+              desc="Guest confirms on their phone (“send to kitchen?”) → the KOT prints straight to the right station instantly. Fully self-service, no captain step."
+              preview={<FlowPreview steps={['Guest cart', 'Confirm popup', 'KOT fires', 'Kitchen']} highlight={2} />}
+            />
+          </div>
+          {mode === 'direct' && (
+            <div style={{ background: C.terraTint, color: C.terraDeep, padding: '10px 14px', borderRadius: 10, margin: '-22px 0 34px', fontSize: 12.5, lineHeight: 1.5 }}>
+              <b>Heads up:</b> in Direct mode, customer orders fire to the kitchen without a captain checking them. Best for counters, food courts, or trusted regulars.
+            </div>
+          )}
+
+          {/* ── Category display ─────────────────────────────────────────── */}
+          <SectionHead
+            title="Category Display"
+            desc="How dish categories appear on the menu. Food, Beverages and Liquor each get their own tab automatically."
           />
-        </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 18 }}>
+            <Option
+              active={style === 'thumbnails'} disabled={saving} onClick={() => chooseStyle('thumbnails')}
+              title="Thumbnails" tagline="Category cards with images"
+              desc="Guests first see a grid of category cards, then tap one to browse its dishes. Feels premium and visual."
+              preview={<ThumbPreview />}
+            />
+            <Option
+              active={style === 'chips'} disabled={saving} onClick={() => chooseStyle('chips')}
+              title="Chips" tagline="Quick filter pills"
+              desc="All dishes on one scroll, with a sticky row of category pills to jump around. Fast and compact."
+              preview={<ChipsPreview />}
+            />
+          </div>
+        </>
       )}
 
       <p style={{ color: C.inkMute, fontSize: 12.5, marginTop: 20 }}>
         Tip: preview the live menu by scanning any table's standee, or open <b>Settings → QR Standees</b> to print them.
-        Food, Beverages and Liquor each get their own tab automatically.
       </p>
+    </div>
+  );
+}
+
+function SectionHead({ title, desc }: { title: string; desc: string }) {
+  return (
+    <div style={{ margin: '0 0 14px' }}>
+      <h2 style={{ fontFamily: SERIF, fontSize: 23, fontWeight: 400, margin: 0, color: C.ink }}>{title}</h2>
+      <p style={{ color: C.inkSoft, fontSize: 13, lineHeight: 1.5, margin: '3px 0 0', maxWidth: 620 }}>{desc}</p>
     </div>
   );
 }
@@ -104,6 +152,24 @@ function Option({ active, disabled, onClick, title, tagline, desc, preview }: {
       <div style={{ borderRadius: 12, overflow: 'hidden', border: `1px solid ${C.ruleSoft}`, background: C.paper }}>{preview}</div>
       <p style={{ color: C.inkSoft, fontSize: 13, lineHeight: 1.45, margin: '12px 2px 0' }}>{desc}</p>
     </button>
+  );
+}
+
+// Small left-to-right flow strip for the ordering-mode previews.
+function FlowPreview({ steps, highlight }: { steps: string[]; highlight: number }) {
+  return (
+    <div style={{ padding: '16px 12px', display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+      {steps.map((s, i) => (
+        <span key={i} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <span style={{
+            fontFamily: MONO, fontSize: 9, letterSpacing: 0.4, padding: '5px 8px', borderRadius: 8, whiteSpace: 'nowrap',
+            background: i === highlight ? C.terra : C.card, color: i === highlight ? '#fff' : C.inkSoft,
+            border: `1px solid ${i === highlight ? C.terra : C.rule}`, fontWeight: i === highlight ? 600 : 400,
+          }}>{s}</span>
+          {i < steps.length - 1 && <span style={{ color: C.inkMute, fontSize: 11 }}>→</span>}
+        </span>
+      ))}
+    </div>
   );
 }
 

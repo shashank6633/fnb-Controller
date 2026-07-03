@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { resolveTableByToken, buildCustomerMenu } from '@/lib/customer';
+import { resolveTableByToken, buildCustomerMenu, getCustomerMenuDesign } from '@/lib/customer';
 
 /**
  * GET /api/customer/menu?t=<qr_token>
@@ -23,11 +23,9 @@ export async function GET(req: Request) {
     const brandRow = db.prepare("SELECT value FROM settings WHERE key = 'business_name'").get() as any;
     const brand = { name: (brandRow?.value || 'Akan').toString() };
 
-    // How the customer menu presents categories — set on Settings → Customer Menu.
-    const designRow = db.prepare("SELECT value FROM settings WHERE key = 'customer_menu_design'").get() as any;
-    let categoryStyle: 'thumbnails' | 'chips' = 'thumbnails';
-    try { const d = JSON.parse(designRow?.value || '{}'); if (d.categoryStyle === 'chips' || d.categoryStyle === 'thumbnails') categoryStyle = d.categoryStyle; } catch {}
-    const design = { categoryStyle };
+    // How the customer menu presents categories + which ordering workflow runs —
+    // set on Settings → Customer Menu Page Design.
+    const design = getCustomerMenuDesign();
 
     const menu = buildCustomerMenu(table.outlet_id);
 

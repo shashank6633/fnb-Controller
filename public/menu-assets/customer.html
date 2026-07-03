@@ -179,6 +179,19 @@
   .sheet.on{transform:translateY(0)}
   .grab{width:40px;height:4px;border-radius:4px;background:var(--rule);margin:10px auto 0;flex:none}
   .sheet-scroll{overflow-y:auto;padding:6px 22px 0;-webkit-overflow-scrolling:touch}
+  /* centered confirm dialog (direct-ordering "send to kitchen?") */
+  .cscrim{position:fixed;inset:0;z-index:60;background:rgba(28,20,10,.5);display:flex;align-items:center;justify-content:center;padding:26px;
+    opacity:0;pointer-events:none;transition:opacity .22s ease;-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px)}
+  .cscrim.on{opacity:1;pointer-events:auto}
+  .cdlg{width:100%;max-width:360px;background:var(--paper);border-radius:24px;padding:26px 24px 22px;text-align:center;
+    box-shadow:0 20px 60px rgba(28,20,10,.34);transform:translateY(14px) scale(.97);transition:transform .26s cubic-bezier(.2,.8,.2,1)}
+  .cscrim.on .cdlg{transform:none}
+  .cdlg-ic{width:58px;height:58px;border-radius:50%;margin:0 auto 12px;display:flex;align-items:center;justify-content:center;
+    font-size:27px;background:var(--terraTint);color:var(--terraDeep)}
+  .cdlg h3{font-size:24px;margin:0 0 6px;line-height:1.12}
+  .cdlg p{font-size:14px;color:var(--inkSoft);margin:0 0 18px;line-height:1.5}
+  .cdlg .btn{width:100%}
+  .cno{margin-top:10px;width:100%;background:none;border:none;color:var(--inkMute);font-size:14px;padding:6px;cursor:pointer}
 
   .isheet-hero{height:190px;border-radius:20px;margin-top:8px;position:relative;overflow:hidden}
   .isheet-hero .init{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--serif);font-size:64px;color:rgba(255,255,255,.92)}
@@ -286,7 +299,7 @@
     {id:'cutlery',ic:'🍴',t:'Extra cutlery',s:'Spoons, forks, napkins'},
     {id:'bill',ic:'🧾',t:'Request bill',s:"We'll bring the cheque"}];
 
-  var S={screen:'loading',table:null,brand:{name:'Akan'},menu:null,design:{categoryStyle:'thumbnails'},section:'food',cat:'',q:'',vegOnly:false,cart:{},scannedAt:nowTime(),lastOrder:null,orders:[]};
+  var S={screen:'loading',table:null,brand:{name:'Akan'},menu:null,design:{categoryStyle:'thumbnails',orderMode:'captain'},section:'food',cat:'',q:'',vegOnly:false,cart:{},scannedAt:nowTime(),lastOrder:null,orders:[]};
   var SEC=[{id:'food',label:'Food',station:'Kitchen',unit:'dishes'},{id:'bev',label:'Beverages',station:'Bar',unit:'drinks'},{id:'liquor',label:'Liquor',station:'Bar',unit:'pours'}];
   function secMeta(id){return SEC.filter(function(s){return s.id===id;})[0]||SEC[0];}
   function secCount(id){var m=(S.menu&&S.menu[id])||{sub:[]};return m.sub.reduce(function(n,s){return n+s.items.length;},0);}
@@ -588,11 +601,35 @@
   }
 
   function placeOrder(){
+    // Direct ordering: confirm before firing straight to the kitchen.
+    // Captain mode: submit quietly to the captain's approval queue.
+    if(S.design&&S.design.orderMode==='direct'){confirmSend(sendOrder);return;}
+    sendOrder();
+  }
+  function sendOrder(){
     var btn=document.getElementById('place');if(btn){btn.disabled=true;btn.querySelector('span').textContent='Sending…';}
     var items=cartArr().map(function(x){return{id:x.item.id,qty:x.qty,note:x.note||''};});
     api('/api/customer/orders',{method:'POST',body:JSON.stringify({t:TOKEN,items:items,note:(S.orderNote||'').slice(0,300)})}).then(function(r){
-      S.lastOrder={id:r.orderId,total:r.subtotal};clearCart();S.orderNote='';closeSheet();S.screen='track';render();pollOrders();
+      S.lastOrder={id:r.orderId,total:r.subtotal,mode:r.mode};clearCart();S.orderNote='';closeSheet();S.screen='track';render();pollOrders();
     }).catch(function(e){toast(e.message||'Could not place order');if(btn){btn.disabled=false;btn.querySelector('span').textContent='Place order';}});
+  }
+  // Centered "send to kitchen?" confirmation (direct ordering only). Layers above
+  // the open cart sheet; cancel returns to the cart, confirm fires the order.
+  function confirmSend(onYes){
+    var ov=document.createElement('div');ov.className='cscrim';
+    ov.innerHTML='<div class="cdlg">'+
+      '<div class="cdlg-ic">🔥</div>'+
+      '<h3 class="serif">Send this order to the kitchen?</h3>'+
+      '<p>Your dishes will start being prepared right away. You can always add more later.</p>'+
+      '<button class="btn forest" id="cyes"><span>Yes, send to kitchen</span></button>'+
+      '<button class="cno" id="cno">Not yet — review order</button>'+
+    '</div>';
+    document.body.appendChild(ov);
+    requestAnimationFrame(function(){ov.classList.add('on');});
+    function done(){ov.classList.remove('on');setTimeout(function(){if(ov.parentNode)ov.parentNode.removeChild(ov);},260);}
+    ov.querySelector('#cno').onclick=done;
+    ov.onclick=function(e){if(e.target===ov)done();};
+    ov.querySelector('#cyes').onclick=function(){done();onYes();};
   }
 
   // ---------- TRACKING ----------
@@ -603,21 +640,27 @@
   }
   function renderTrack(){
     var orders=S.orders||[];
+    var direct=(S.design&&S.design.orderMode==='direct');
     var anyOpen=orders.some(function(o){return o.status==='open';});
     var allPending=orders.length&&orders.every(function(o){return o.status==='pending_approval';});
     // stage: 0 received,1 preparing,2 ready,3 served — we know up to preparing from status.
     var stage=anyOpen?1:0;
     var tab=orders.reduce(function(s,o){return s+(Number(o.subtotal)||0);},0);
     var steps=[
-      {t:'Order received',s:'Sent to the kitchen for confirmation'},
+      {t:'Order received',s:direct?'Sent straight to the kitchen':'Sent to your captain to confirm'},
       {t:'Preparing',s:'The kitchen is on it'},
       {t:'Ready',s:'Plated and on the way'},
       {t:'Served',s:'Enjoy your meal'}
     ];
+    var badge=anyOpen?'👨‍🍳':(allPending?'⏳':'✓');
+    var head=anyOpen?'Being prepared':(allPending?'Order sent':'Thank you');
+    var sub=allPending
+      ? (direct?'Sending your order to the kitchen…':'Your captain is reviewing your order at the table.')
+      : (anyOpen?'Your order is confirmed and being prepared.':'Your order is placed.');
     app.innerHTML='<div class="track fade">'+
-      '<div class="track-hero"><div class="track-badge">'+(anyOpen?'👨‍🍳':'✓')+'</div>'+
-        '<h1>'+(anyOpen?'Being prepared':'Thank you')+'</h1>'+
-        '<p>'+(allPending?'Your order is with the kitchen for confirmation.':(anyOpen?'Your order was accepted and is being prepared.':'Your order is placed.'))+'</p></div>'+
+      '<div class="track-hero"><div class="track-badge">'+badge+'</div>'+
+        '<h1>'+head+'</h1>'+
+        '<p>'+sub+'</p></div>'+
       '<div class="steps">'+steps.map(function(st,i){var cls=i<stage?'done':(i===stage?'active':'pending');return '<div class="step '+cls+'"><div class="line"></div><div class="dot">'+(i<stage?'✓':(i===stage?'●':(i+1))).toString()+'</div><div><div class="st">'+st.t+'</div><div class="ss">'+st.s+'</div></div></div>';}).join('')+'</div>'+
       '<div class="tab-card"><div style="display:flex;justify-content:space-between;align-items:baseline"><span class="kicker">Running tab</span><span class="serif" style="font-size:24px">'+money(tab)+'</span></div>'+
         '<div style="display:flex;gap:10px;margin-top:14px"><button class="btn ghost" id="more" style="height:48px">Add more</button><button class="btn ghost" id="svc" style="height:48px">Service</button></div></div>'+
@@ -648,7 +691,7 @@
   function boot(){
     if(!TOKEN){S.screen='error';render();return;}
     api('/api/customer/menu?t='+encodeURIComponent(TOKEN)).then(function(r){
-      S.table=r.table;S.brand=r.brand||{name:'Akan'};S.menu=r.menu;S.design=r.design||{categoryStyle:'thumbnails'};
+      S.table=r.table;S.brand=r.brand||{name:'Akan'};S.menu=r.menu;S.design=Object.assign({categoryStyle:'thumbnails',orderMode:'captain'},r.design||{});
       // reconcile stored cart items against fresh menu (prices/availability)
       var byId={};['food','bev','liquor'].forEach(function(sec){((S.menu[sec])||{sub:[]}).sub.forEach(function(su){su.items.forEach(function(it){byId[it.id]=it;});});});
       var valid={};Object.keys(S.cart).forEach(function(k){var line=S.cart[k];var fresh=line&&line.item&&byId[line.item.id];if(fresh)valid[k]={item:fresh,qty:line.qty,opts:line.opts||null,note:line.note||''};});

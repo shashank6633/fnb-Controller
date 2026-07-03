@@ -1,5 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
-import { resolveTableByToken, priceLookup } from '@/lib/customer';
+import { resolveTableByToken, priceLookup, getCustomerMenuDesign } from '@/lib/customer';
+import { fireStagingOrder } from '@/lib/kot-fire';
+import { emitKds } from '@/lib/kds-bus';
 
 const MAX_LINES = 60;      // sanity caps — a prank can't create a huge order
 const MAX_QTY_PER_LINE = 40;
@@ -7,13 +9,19 @@ const MAX_QTY_PER_LINE = 40;
 /**
  * POST /api/customer/orders   (PUBLIC — table-token scoped)
  *
- * A guest submits their cart from the QR menu. We create a STAGING order with
- * status 'pending_approval' (origin 'customer') — nothing is fired to the
- * kitchen and no bill exists yet. The Captain reviews it in the approval queue
- * and Approve/Reject/Modify (see /api/dine-in/customer-orders). Only on approval
- * do the items fire to the KDS.
+ * A guest submits their cart from the QR menu. We always create the order with
+ * origin 'customer'; what happens next depends on the QR Ordering Mode (Settings
+ * → Customer Menu Page Design):
+ *   - 'captain' (default): the order stays 'pending_approval' — nothing fires and
+ *     no bill exists yet. The Captain reviews it in the approval queue and
+ *     Approve/Reject/Modify (see /api/dine-in/customer-orders). Only on approval
+ *     do the items fire to the KDS.
+ *   - 'direct': the guest already confirmed on their phone, so we fire the KOT
+ *     straight to the kitchen (shared fireStagingOrder — promote to 'open',
+ *     assign a daily number / merge one-bill-per-table, emit to the KDS). No
+ *     captain step.
  *
- * Body: { t: <qr_token>, items: [{ id, qty }], note?: string }
+ * Body: { t: <qr_token>, items: [{ id, qty, note? }], note?: string }
  * Prices, tax %, station and name are ALWAYS re-read from menu_items — never
  * trusted from the client.
  */
@@ -84,10 +92,34 @@ export async function POST(req: Request) {
     });
     const subtotal = create();
 
+    // Direct ordering: the guest confirmed on their phone → fire the KOT now.
+    // Captain mode: leave it pending for the captain to review + send.
+    const { orderMode } = getCustomerMenuDesign();
+    if (orderMode === 'direct') {
+      try {
+        const fired = fireStagingOrder(db, orderId, { firedBy: 'QR Order', serverId: '' });
+        for (const k of fired.firedKots) emitKds({ type: 'kot.new', outlet_id: k.outlet_id, station: k.station, kot: k });
+        return Response.json({
+          ok: true,
+          orderId: fired.targetId,
+          status: 'open',            // fired to the kitchen — customer sees "Preparing"
+          mode: 'direct',
+          subtotal: fired.subtotal,
+          lines: lines.length,
+        });
+      } catch (e: any) {
+        // If firing fails, the order still exists as pending_approval — a captain
+        // can recover it. Surface a soft error so the guest can retry/flag staff.
+        console.error('[/api/customer/orders POST direct-fire]', e);
+        return Response.json({ ok: false, error: 'Could not send your order to the kitchen. Please ask our staff.' }, { status: 500 });
+      }
+    }
+
     return Response.json({
       ok: true,
       orderId,
       status: 'pending_approval',
+      mode: 'captain',
       subtotal,
       lines: lines.length,
     });

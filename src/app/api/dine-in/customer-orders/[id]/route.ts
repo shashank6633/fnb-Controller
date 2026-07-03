@@ -1,6 +1,7 @@
-import { getDb, generateId } from '@/lib/db';
+import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { emitKds } from '@/lib/kds-bus';
+import { fireStagingOrder } from '@/lib/kot-fire';
 
 /**
  * POST /api/dine-in/customer-orders/[id]   (STAFF)
@@ -75,93 +76,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     // ── APPROVE (optionally modify) → fire to kitchen ────────────────────────
     if (action === 'approve') {
-      const firedKots: any[] = [];
-      const result = db.transaction(() => {
-        applyEdits();
-
-        // Items to fire = this staging order's remaining lines.
-        const fireItems = db.prepare(`
-          SELECT oi.*, mi.item_type AS item_type, mi.prep_minutes AS mi_prep_minutes
-          FROM order_items oi LEFT JOIN menu_items mi ON oi.menu_item_id = mi.id
-          WHERE oi.order_id = ? AND oi.quantity > 0
-        `).all(id) as any[];
-        if (fireItems.length === 0) throw new Error('Nothing to approve — all lines were removed');
-
-        // One bill per table: if a live OPEN order exists on this table, merge into it.
-        const live = db.prepare(`
-          SELECT * FROM orders WHERE table_id = ? AND status = 'open' AND id != ?
-          ORDER BY created_at ASC LIMIT 1
-        `).get(staging.table_id, id) as any;
-
-        let targetId: string, targetOutlet: string | null, targetNumber: number, targetServer: string, merged: boolean;
-        if (live) {
-          // Reassign staging lines onto the live order, then void the empty shell.
-          db.prepare('UPDATE order_items SET order_id = ? WHERE order_id = ?').run(live.id, id);
-          db.prepare(`
-            UPDATE orders SET status = 'void', voided_at = datetime('now'), updated_at = datetime('now'),
-              notes = TRIM(COALESCE(notes,'') || ' [merged into order #' || CAST(? AS INTEGER) || ']')
-            WHERE id = ?
-          `).run(live.order_number, id);
-          targetId = live.id; targetOutlet = live.outlet_id;
-          targetNumber = live.order_number; targetServer = live.server_name; merged = true;
-        } else {
-          // Promote staging → open with a real per-outlet/day number.
-          const seq = db.prepare(`
-            SELECT COALESCE(MAX(order_number), 0) + 1 AS n FROM orders
-            WHERE (outlet_id = ? OR outlet_id IS NULL) AND date(created_at) = date('now')
-          `).get(staging.outlet_id) as any;
-          // The approving captain takes ownership of the table (server_id/name),
-          // so this table's future QR orders + service requests route to them.
-          db.prepare(`
-            UPDATE orders SET status = 'open', order_number = ?, server_id = ?, server_name = ?, updated_at = datetime('now')
-            WHERE id = ?
-          `).run(seq.n, me.id, me.name || me.email, id);
-          targetId = id; targetOutlet = staging.outlet_id;
-          targetNumber = seq.n; targetServer = me.name || me.email; merged = false;
-        }
-
-        // Fire exactly the (moved) staging lines — group by station, one KOT each.
-        const tableRow = staging.table_id
-          ? db.prepare('SELECT table_number, zone FROM restaurant_tables WHERE id = ?').get(staging.table_id) as any
-          : null;
-        const byStation: Record<string, any[]> = {};
-        for (const it of fireItems) {
-          const st = (it.station && String(it.station).trim()) || 'kitchen';
-          (byStation[st] ||= []).push(it);
-        }
-        const setKot = db.prepare(
-          "UPDATE order_items SET kot_id = ?, status = 'fired', fired_at = datetime('now'), prep_minutes = ? WHERE id = ?"
-        );
-        for (const [station, its] of Object.entries(byStation)) {
-          const kseq = db.prepare(`
-            SELECT COALESCE(MAX(kot_number), 0) + 1 AS n FROM kots
-            WHERE (outlet_id = ? OR outlet_id IS NULL) AND date(created_at) = date('now')
-          `).get(targetOutlet) as any;
-          const kotId = generateId();
-          const firedBy = me.name || me.email;
-          db.prepare(`
-            INSERT INTO kots (id, outlet_id, order_id, kot_number, station, status, fired_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'new', ?, datetime('now'), datetime('now'))
-          `).run(kotId, targetOutlet, targetId, kseq.n, station, firedBy);
-          for (const it of its) setKot.run(kotId, Number(it.mi_prep_minutes) || 15, it.id);
-          firedKots.push({
-            id: kotId, outlet_id: targetOutlet, order_id: targetId, kot_number: kseq.n, station, status: 'new',
-            order_number: targetNumber, order_type: 'dine-in',
-            table_number: tableRow?.table_number || null, zone: tableRow?.zone || null,
-            captain: targetServer || null, fired_by: firedBy, reprint_count: 0,
-            items: its.map((x) => ({ name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),
-          });
-        }
-
-        const subtotal = recompute(targetId);
-        return { targetId, merged, subtotal };
+      // The approving captain takes ownership of the table (server_id/name), so
+      // this table's future QR orders + service requests route to them. Shared
+      // fire logic with direct QR ordering — see src/lib/kot-fire.ts.
+      const out = fireStagingOrder(db, id, {
+        firedBy: me.name || me.email,
+        serverId: me.id,
+        edits: Array.isArray(body?.items) ? body.items : undefined,
       });
-      const out = result();
 
       // KDS fan-out after commit — kitchen displays light up.
-      for (const k of firedKots) emitKds({ type: 'kot.new', outlet_id: k.outlet_id, station: k.station, kot: k });
+      for (const k of out.firedKots) emitKds({ type: 'kot.new', outlet_id: k.outlet_id, station: k.station, kot: k });
 
-      return Response.json({ ok: true, action: 'approve', orderId: out.targetId, merged: out.merged, subtotal: out.subtotal, fired_kots: firedKots });
+      return Response.json({ ok: true, action: 'approve', orderId: out.targetId, merged: out.merged, subtotal: out.subtotal, fired_kots: out.firedKots });
     }
 
     return Response.json({ error: 'Unknown action' }, { status: 400 });

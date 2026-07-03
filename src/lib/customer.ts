@@ -18,6 +18,34 @@ export interface ResolvedTable {
   outlet_name: string;
 }
 
+export interface CustomerMenuDesign {
+  /** How categories present on the menu. */
+  categoryStyle: 'thumbnails' | 'chips';
+  /**
+   * QR ordering workflow (Settings → Customer Menu Page Design):
+   *  - 'captain' : guest cart → Captain approval queue → captain sends KOT (default, safer).
+   *  - 'direct'  : guest confirms → KOT fires straight to the kitchen, no captain step.
+   */
+  orderMode: 'captain' | 'direct';
+}
+
+/**
+ * Read the customer-menu design settings (categoryStyle + orderMode) from the
+ * single `customer_menu_design` JSON setting. Falls back to the safe defaults
+ * (thumbnails + captain confirmation) for any missing/invalid field.
+ */
+export function getCustomerMenuDesign(): CustomerMenuDesign {
+  const db = getDb();
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'customer_menu_design'").get() as any;
+  const out: CustomerMenuDesign = { categoryStyle: 'thumbnails', orderMode: 'captain' };
+  try {
+    const d = JSON.parse(row?.value || '{}');
+    if (d.categoryStyle === 'chips' || d.categoryStyle === 'thumbnails') out.categoryStyle = d.categoryStyle;
+    if (d.orderMode === 'direct' || d.orderMode === 'captain') out.orderMode = d.orderMode;
+  } catch {}
+  return out;
+}
+
 /** Resolve a table by its QR token. Returns null for unknown/inactive tables. */
 export function resolveTableByToken(token: string): ResolvedTable | null {
   const t = String(token || '').trim();
