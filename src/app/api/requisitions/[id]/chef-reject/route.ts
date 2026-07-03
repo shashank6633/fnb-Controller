@@ -1,6 +1,5 @@
 import { getDb, logAuditEvent } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
-import { isMainDeptHead } from '@/lib/dept-hierarchy';
+import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
 
 /**
  * Head Chef rejects a submitted requisition → moves to 'chef_rejected'.
@@ -15,9 +14,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const db = getDb();
     const r = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(id) as any;
     if (!r) return Response.json({ error: 'Not found' }, { status: 404 });
-    // Only the head of THIS requisition's main department (or admin) may reject.
-    if (!isMainDeptHead(db, me, r.department_id)) {
-      return Response.json({ error: "Only this department's head can reject this requisition." }, { status: 403 });
+    // Any Head Chef (is_head_chef role) or an admin may reject — same gate as
+    // chef-approve so a chef who can approve can also send a req back.
+    if (!canApproveAsChef(me)) {
+      return Response.json({ error: 'Only a head chef or an admin can reject this requisition.' }, { status: 403 });
     }
     if (r.status !== 'submitted') {
       return Response.json({ error: `Only submitted requisitions can be rejected (current: ${r.status})` }, { status: 400 });

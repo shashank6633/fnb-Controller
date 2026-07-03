@@ -1,6 +1,5 @@
 import { getDb, logAuditEvent } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
-import { isMainDeptHead } from '@/lib/dept-hierarchy';
+import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
 
 /**
  * Head Chef approves a submitted requisition → moves to 'chef_approved'.
@@ -18,9 +17,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const db = getDb();
     const r = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(id) as any;
     if (!r) return Response.json({ error: 'Not found' }, { status: 404 });
-    // Only the head of THIS requisition's main department (or admin) may approve.
-    if (!isMainDeptHead(db, me, r.department_id)) {
-      return Response.json({ error: "Only this department's head can approve this requisition." }, { status: 403 });
+    // Any Head Chef (is_head_chef role) or an admin may approve — matches the
+    // Party Approvals page visibility + the per-item edit gate (canApproveAsChef).
+    if (!canApproveAsChef(me)) {
+      return Response.json({ error: 'Only a head chef or an admin can approve this requisition.' }, { status: 403 });
     }
     if (r.status !== 'submitted') {
       return Response.json({ error: `Only submitted requisitions can be approved (current: ${r.status})` }, { status: 400 });
