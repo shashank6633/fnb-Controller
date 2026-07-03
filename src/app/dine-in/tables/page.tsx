@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { api } from '@/lib/api';
-import { Utensils, Plus, Trash2, Loader2, X } from 'lucide-react';
+import { Utensils, Plus, Trash2, Loader2, X, Layers } from 'lucide-react';
 
 interface TableRow {
   id: string;
@@ -14,12 +14,35 @@ interface TableRow {
   open_order_number: number | null;
 }
 
+/** Expand a bulk-entry string into individual table numbers. Accepts ranges
+ *  ("1-20", "A1-A10"), comma/newline lists ("1,2,3"), and any mix
+ *  ("1-10, 15, T1-T4"). Prefix must match on both ends of a range. De-duped. */
+function parseTableNumbers(input: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (n: string) => { n = n.trim(); if (n && !seen.has(n)) { seen.add(n); out.push(n); } };
+  for (const tok of input.split(/[\n,]+/).map(s => s.trim()).filter(Boolean)) {
+    const m = tok.match(/^([A-Za-z]*)\s*(\d+)\s*[-–]\s*([A-Za-z]*)\s*(\d+)$/);
+    if (m && (m[3] === '' || m[1].toLowerCase() === m[3].toLowerCase())) {
+      const prefix = m[1];
+      let a = parseInt(m[2], 10), b = parseInt(m[4], 10);
+      if (b < a) { const t = a; a = b; b = t; }
+      if (b - a <= 500) { for (let i = a; i <= b; i++) add(prefix + i); continue; }
+    }
+    add(tok);
+  }
+  return out;
+}
+
 export default function TablesPage() {
   const [tables, setTables] = useState<TableRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({ table_number: '', zone: '', seats: 2 });
   const [edit, setEdit] = useState<TableRow | null>(null);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulk, setBulk] = useState({ text: '', zone: '', seats: 2 });
+  const bulkNumbers = useMemo(() => parseTableNumbers(bulk.text), [bulk.text]);
 
   const load = useCallback(async () => {
     try {
@@ -39,6 +62,21 @@ export default function TablesPage() {
       const j = await r.json();
       if (j.error) alert(j.error);
       else { setForm({ table_number: '', zone: '', seats: 2 }); await load(); }
+    } finally { setSaving(false); }
+  }
+
+  async function createBulk() {
+    if (!bulkNumbers.length) return;
+    setSaving(true);
+    try {
+      const r = await api('/api/dine-in/tables', { method: 'POST', body: { table_numbers: bulkNumbers, zone: bulk.zone, seats: bulk.seats } });
+      const j = await r.json();
+      if (j.error) { alert(j.error); return; }
+      const msg = `Created ${j.created} table${j.created === 1 ? '' : 's'}.` +
+        (j.skipped ? ` Skipped ${j.skipped} that already exist${j.skipped === 1 ? 's' : ''}${j.skippedNumbers?.length ? `: ${j.skippedNumbers.slice(0, 12).join(', ')}${j.skippedNumbers.length > 12 ? '…' : ''}` : ''}.` : '');
+      setBulkOpen(false); setBulk({ text: '', zone: '', seats: 2 });
+      await load();
+      alert(msg);
     } finally { setSaving(false); }
   }
 
@@ -90,6 +128,10 @@ export default function TablesPage() {
           className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium">
           {saving ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} Add table
         </button>
+        <button onClick={() => { setBulk({ text: '', zone: form.zone, seats: form.seats }); setBulkOpen(true); }}
+          className="flex items-center gap-2 border border-[#D4B896] text-[#af4408] hover:bg-[#FFF1E3] px-4 py-2 rounded-lg text-sm font-medium">
+          <Layers size={16} /> Bulk add
+        </button>
       </div>
 
       {loading ? (
@@ -111,6 +153,45 @@ export default function TablesPage() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {bulkOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4" onClick={() => !saving && setBulkOpen(false)}>
+          <div className="bg-white border border-[#E8D5C4] rounded-xl w-full max-w-md p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-1">
+              <h2 className="font-semibold text-[#2D1B0E] flex items-center gap-2"><Layers size={18} className="text-[#af4408]" /> Bulk add tables</h2>
+              <button onClick={() => setBulkOpen(false)}><X size={18} className="text-[#8B7355]" /></button>
+            </div>
+            <p className="text-xs text-[#8B7355] mb-3">Enter a range like <code className="bg-[#FFF1E3] px-1 rounded">1-20</code>, a list <code className="bg-[#FFF1E3] px-1 rounded">1, 2, 5</code>, or a mix <code className="bg-[#FFF1E3] px-1 rounded">1-10, T1-T4</code>. Existing numbers are skipped.</p>
+            <textarea value={bulk.text} onChange={(e) => setBulk({ ...bulk, text: e.target.value })} rows={3} autoFocus
+              placeholder="e.g. 1-20, 25, T1-T6"
+              className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2 text-sm font-mono" />
+            <div className="flex gap-3 mt-3">
+              <div className="flex-1">
+                <label className="block text-xs text-[#8B7355] mb-1">Zone (all)</label>
+                <input value={bulk.zone} onChange={(e) => setBulk({ ...bulk, zone: e.target.value })}
+                  placeholder="Main / Terrace" className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+              </div>
+              <div className="w-24">
+                <label className="block text-xs text-[#8B7355] mb-1">Seats (all)</label>
+                <input type="number" min={1} value={bulk.seats} onChange={(e) => setBulk({ ...bulk, seats: Number(e.target.value) })}
+                  className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+              </div>
+            </div>
+            <div className="mt-3 text-xs text-[#8B7355] bg-[#FBF4DF] border border-[#E8D5C4] rounded-lg px-3 py-2 min-h-[38px]">
+              {bulkNumbers.length === 0 ? 'Nothing to add yet.' : (
+                <><b className="text-[#2D1B0E]">{bulkNumbers.length} table{bulkNumbers.length === 1 ? '' : 's'}</b>: {bulkNumbers.slice(0, 24).join(', ')}{bulkNumbers.length > 24 ? ` … +${bulkNumbers.length - 24} more` : ''}</>
+              )}
+            </div>
+            <div className="flex justify-end gap-2 mt-5">
+              <button onClick={() => setBulkOpen(false)} className="px-4 py-2 text-sm text-[#8B7355]">Cancel</button>
+              <button onClick={createBulk} disabled={saving || !bulkNumbers.length}
+                className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50">
+                {saving ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} Create {bulkNumbers.length || ''} table{bulkNumbers.length === 1 ? '' : 's'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

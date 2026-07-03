@@ -42,22 +42,60 @@ export async function GET(request: Request) {
   }
 }
 
-/** POST — create a table (manager). */
+/** POST — create table(s) (manager).
+ *  Single:  { table_number, zone?, seats? }
+ *  Bulk:    { table_numbers: string[], zone?, seats? }  → creates many at once,
+ *           skipping any number that already exists for this outlet. Each new
+ *           table gets its own qr_token. Returns { created, skipped, skippedNumbers }. */
 export async function POST(request: Request) {
   const auth = await requireManager();
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
   try {
     const db = getDb();
     const b = await request.json();
-    const tableNumber = String(b.table_number ?? '').trim();
-    if (!tableNumber) return Response.json({ error: 'table_number is required' }, { status: 400 });
     const outletId = await getCurrentOutletId();
-    const id = generateId();
-    db.prepare(`
+    const zone = String(b.zone ?? '').trim();
+    const seats = Number(b.seats) || 2;
+
+    // Normalise to a list (single or bulk), de-duped + trimmed, cap the batch.
+    const raw: any[] = Array.isArray(b.table_numbers) ? b.table_numbers : [b.table_number];
+    const seen = new Set<string>();
+    const wanted: string[] = [];
+    for (const v of raw) {
+      const n = String(v ?? '').trim();
+      if (!n || seen.has(n)) continue;
+      seen.add(n); wanted.push(n);
+    }
+    if (!wanted.length) return Response.json({ error: 'table_number is required' }, { status: 400 });
+    if (wanted.length > 500) return Response.json({ error: 'Too many tables at once (max 500).' }, { status: 400 });
+
+    // Skip numbers that already exist for this outlet (active or inactive) so a
+    // bulk add never creates duplicates or clashes with a deactivated table.
+    const existsStmt = db.prepare(
+      "SELECT 1 FROM restaurant_tables WHERE table_number = ? AND (outlet_id = ? OR (outlet_id IS NULL AND ? IS NULL)) LIMIT 1",
+    );
+    const ins = db.prepare(`
       INSERT INTO restaurant_tables (id, outlet_id, table_number, zone, seats, qr_token, is_active, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
-    `).run(id, outletId, tableNumber, String(b.zone ?? '').trim(), Number(b.seats) || 2, generateId());
-    return Response.json({ id, success: true }, { status: 201 });
+    `);
+    const skippedNumbers: string[] = [];
+    let created = 0;
+    let firstId = '';
+    const tx = db.transaction(() => {
+      for (const n of wanted) {
+        if (existsStmt.get(n, outletId, outletId)) { skippedNumbers.push(n); continue; }
+        const id = generateId();
+        ins.run(id, outletId, n, zone, seats, generateId());
+        if (!firstId) firstId = id;
+        created++;
+      }
+    });
+    tx();
+
+    return Response.json(
+      { success: true, id: firstId || undefined, created, skipped: skippedNumbers.length, skippedNumbers },
+      { status: 201 },
+    );
   } catch (e: any) {
     console.error('[/api/dine-in/tables POST]', e);
     return Response.json({ error: e.message }, { status: 500 });
