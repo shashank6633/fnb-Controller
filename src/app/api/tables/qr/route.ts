@@ -1,6 +1,10 @@
+import path from 'path';
+import fs from 'fs';
 import QRCode from 'qrcode';
 import { getDb, newQrToken } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, requireRole } from '@/lib/auth';
+
+const TEMPLATE_PATH = path.join(process.cwd(), 'public', 'standee-template.pdf');
 
 /**
  * Customer QR standee management (STAFF).
@@ -44,10 +48,14 @@ export async function GET(req: Request) {
       ORDER BY CAST(table_number AS INTEGER), table_number
     `).all(outletId) as any[];
 
+    // When a template is uploaded, colour the preview QR like the template's
+    // cream card so the on-page preview matches the printed standee.
+    const hasTemplate = fs.existsSync(TEMPLATE_PATH);
+    const qrColor = hasTemplate ? { dark: '#171008', light: '#FBE8CF' } : { dark: '#231C12', light: '#FFF8E2' };
     const tables = await Promise.all(rows.map(async (r) => {
       const menuUrl = `${base}/menu?t=${encodeURIComponent(r.qr_token)}`;
       const qrSvg = await QRCode.toString(menuUrl, {
-        type: 'svg', margin: 0, errorCorrectionLevel: 'M',
+        type: 'svg', margin: hasTemplate ? 1 : 0, errorCorrectionLevel: 'M', color: qrColor,
       });
       return {
         id: r.id,
@@ -64,7 +72,7 @@ export async function GET(req: Request) {
     const brandRow = db.prepare("SELECT value FROM settings WHERE key = 'business_name'").get() as any;
     const brand = (brandRow?.value || 'Akan').toString();
 
-    return Response.json({ tables, base, brand }, { headers: { 'Cache-Control': 'no-store' } });
+    return Response.json({ tables, base, brand, hasTemplate }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (e: any) {
     console.error('[/api/tables/qr GET]', e);
     return Response.json({ error: e.message }, { status: 500 });
