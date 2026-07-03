@@ -37,7 +37,7 @@ const TPL = {
   labelSizeF: 0.059, // label font size (fraction of width)
   cream: '#FBE8CF',  // the card colour (sampled) — the QR light modules blend into it
   dark: '#171008',   // QR dark modules
-  logoF: 0.20,       // centre-logo size as a fraction of the QR (safe for level-H recovery)
+  logoF: 0.40,       // centre-logo size as a fraction of the QR (transparent, no disc; verified scannable via degradation sweep)
 };
 
 const SIZES: Record<string, 'A4' | 'A5' | 'A6'> = { A4: 'A4', A5: 'A5', A6: 'A6' };
@@ -135,12 +135,12 @@ async function buildFromTemplate(tables: any[], urlFor: (t: any) => string, show
     const cx = W * TPL.qrCxF, cy = H * TPL.qrCyF;
     page.drawImage(await out.embedPng(qrPng), { x: cx - qs / 2, y: cy - qs / 2, width: qs, height: qs });
 
-    // Centre logo on a cream disc (punches the QR modules out cleanly behind it).
+    // Centre logo drawn TRANSPARENT directly on the QR (no backing disc). Size is
+    // kept within level-H recovery so it stays scannable (see TPL.logoF).
     if (logoImg) {
       const ls = qs * TPL.logoF;
       const s = ls / Math.max(logoImg.width, logoImg.height);
       const lw = logoImg.width * s, lh = logoImg.height * s;
-      page.drawCircle({ x: cx, y: cy, size: Math.max(lw, lh) * 0.82, color: hex(TPL.cream) });
       page.drawImage(logoImg, { x: cx - lw / 2, y: cy - lh / 2, width: lw, height: lh });
     }
 

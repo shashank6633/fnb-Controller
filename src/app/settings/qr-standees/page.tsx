@@ -9,6 +9,7 @@ interface QrTable { id: string; table_number: string; zone: string; seats: numbe
 // kept in sync with TPL in /api/tables/qr/pdf so preview == printed output.
 const TPL_QR = { left: 26.84, top: 23.42, width: 46.53 }; // %
 const TPL_LABEL_TOP = 59.3;                               // %
+const TPL_LOGO = 40;  // centre-logo width as % of the QR (keep in sync with TPL.logoF in the PDF route)
 type Size = 'A4' | 'A5' | 'A6';
 
 // QR-menu design tokens (QR Code menu/atoms.jsx `C`).
@@ -171,9 +172,8 @@ export default function QrStandeesPage() {
                   <img alt={`QR for table ${chosen[0].table_number}`} src={`data:image/svg+xml;utf8,${encodeURIComponent(chosen[0].qr_svg)}`} style={{ width: '100%', height: '100%', display: 'block' }} />
                   {hasLogo && (
                     <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <div style={{ width: '33%', aspectRatio: '1 / 1', background: '#FBE8CF', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <img alt="logo" src="/akan-logo.png" style={{ width: '61%', height: '61%', objectFit: 'contain' }} />
-                      </div>
+                      {/* Transparent glyph directly on the QR — no backing disc. */}
+                      <img alt="logo" src="/akan-logo.png" style={{ width: `${TPL_LOGO}%`, height: 'auto', objectFit: 'contain' }} />
                     </div>
                   )}
                 </div>
