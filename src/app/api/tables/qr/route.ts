@@ -43,7 +43,7 @@ export async function GET(req: Request) {
     }
 
     const rows = db.prepare(`
-      SELECT id, table_number, zone, seats, qr_token
+      SELECT id, table_number, zone, seats, qr_token, qr_printed_at
       FROM restaurant_tables
       WHERE is_active = 1 AND (outlet_id = ? OR outlet_id IS NULL)
       ORDER BY CAST(table_number AS INTEGER), table_number
@@ -64,6 +64,7 @@ export async function GET(req: Request) {
         zone: r.zone || '',
         seats: r.seats,
         qr_token: r.qr_token,
+        qr_printed_at: r.qr_printed_at || null,   // NULL = standee never printed
         menu_url: menuUrl,
         qr_svg: qrSvg,
       };
@@ -82,11 +83,29 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    const gate = await requireRole('admin');
-    if (!gate.ok) return Response.json({ error: gate.message }, { status: gate.status });
     const db = getDb();
     const outletId = await getCurrentOutletId();
     const body = await req.json().catch(() => ({}));
+
+    // Mark standees printed / not-printed (manager) — used by the QR Standees page
+    // to track which tables are done. Separate from the admin-only token regen.
+    if (body?.action === 'mark-printed') {
+      const me = await getCurrentUser();
+      if (!me || (me.role !== 'admin' && me.role !== 'manager')) {
+        return Response.json({ error: 'Manager role required' }, { status: 403 });
+      }
+      const ids = (Array.isArray(body?.ids) ? body.ids : []).map((x: any) => String(x)).filter(Boolean);
+      if (!ids.length) return Response.json({ error: 'ids required' }, { status: 400 });
+      const printed = body?.printed !== false;   // default true
+      const stamp = printed ? "datetime('now')" : 'NULL';
+      const upd = db.prepare(`UPDATE restaurant_tables SET qr_printed_at = ${stamp}, updated_at = datetime('now') WHERE id = ? AND (outlet_id = ? OR outlet_id IS NULL)`);
+      const tx = db.transaction(() => { for (const id of ids) upd.run(id, outletId); });
+      tx();
+      return Response.json({ ok: true, updated: ids.length, printed });
+    }
+
+    const gate = await requireRole('admin');
+    if (!gate.ok) return Response.json({ error: gate.message }, { status: gate.status });
     const mode = String(body?.mode || 'missing');
 
     const where = mode === 'all'

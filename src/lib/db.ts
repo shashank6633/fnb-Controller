@@ -1650,6 +1650,16 @@ function initializeSchema(db: Database.Database) {
       if (!kaHas('server_id')) db.exec("ALTER TABLE kot_alerts ADD COLUMN server_id TEXT DEFAULT ''");
     } catch (e) { console.error('kot_alerts column migration failed:', e); }
 
+    // restaurant_tables.qr_printed_at — when this table's QR standee was last
+    // printed/downloaded (NULL = never), so the QR Standees page can show which
+    // are done vs still pending. See /api/tables/qr + /api/tables/qr/pdf.
+    try {
+      const rtCols = db.prepare("PRAGMA table_info(restaurant_tables)").all() as any[];
+      if (!rtCols.some((x: any) => x.name === 'qr_printed_at')) {
+        db.exec("ALTER TABLE restaurant_tables ADD COLUMN qr_printed_at TEXT");
+      }
+    } catch (e) { console.error('restaurant_tables qr_printed_at migration failed:', e); }
+
     // Customer QR menu — table-side service requests (bell). A guest at a table
     // taps "Call waiter / Refill water / Extra cutlery / Request bill" and the
     // request lands here for the Captain/Waiter dashboard to accept → complete.

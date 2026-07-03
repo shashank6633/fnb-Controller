@@ -3,7 +3,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, apiJson } from '@/lib/api';
 
-interface QrTable { id: string; table_number: string; zone: string; seats: number; qr_token: string; menu_url: string; qr_svg: string; }
+interface QrTable { id: string; table_number: string; zone: string; seats: number; qr_token: string; qr_printed_at: string | null; menu_url: string; qr_svg: string; }
+
+/** Short "12 Jun" / "12 Jun '26" style date for the printed stamp. */
+function fmtWhen(ts: string | null): string {
+  if (!ts) return '';
+  const d = new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
+  if (isNaN(d.getTime())) return '';
+  return new Intl.DateTimeFormat('en-GB', { day: '2-digit', month: 'short' }).format(d);
+}
 
 // QR/label placement on the "Akan 4×6" template (fractions of the page) —
 // kept in sync with TPL in /api/tables/qr/pdf so preview == printed output.
@@ -66,6 +74,18 @@ export default function QrStandeesPage() {
   const chosen = useMemo(() => tables.filter(t => sel[t.id]), [tables, sel]);
   const allSelected = tables.length > 0 && tables.every(t => sel[t.id]);
   const cleanBase = base ? base.replace(/\/+$/, '') : '';
+  const printedCount = useMemo(() => tables.filter(t => t.qr_printed_at).length, [tables]);
+  const pendingCount = tables.length - printedCount;
+
+  // Toggle a table's printed stamp (manual correction) → refresh the list.
+  const markPrinted = async (ids: string[], printed: boolean) => {
+    if (!ids.length) return;
+    try {
+      await api('/api/tables/qr', { method: 'POST', body: { action: 'mark-printed', ids, printed } });
+      await load(base && base !== window.location.origin ? base : undefined);
+    } catch (e: any) { setErr(e.message || 'Failed to update'); }
+  };
+  const selectUnprinted = () => setSel(Object.fromEntries(tables.map(t => [t.id, !t.qr_printed_at])));
 
   // The PDF endpoint auto-uses the uploaded template when present; size/tagline
   // only matter for the generated fallback.
@@ -79,7 +99,12 @@ export default function QrStandeesPage() {
     p.set('_', String(nonce));
     return `/api/tables/qr/pdf?${p.toString()}`;
   };
-  const downloadPdf = () => { const a = document.createElement('a'); a.href = pdfUrl({ dl: true }); a.rel = 'noopener'; a.click(); };
+  const downloadPdf = () => {
+    const a = document.createElement('a'); a.href = pdfUrl({ dl: true }); a.rel = 'noopener'; a.click();
+    // The download stamps those tables as printed server-side — refresh so the
+    // list reflects it (small delay so the request lands first).
+    setTimeout(() => load(base && base !== window.location.origin ? base : undefined), 1500);
+  };
   const previewUrl = chosen.length ? pdfUrl({ one: chosen[0].id }) : '';
 
   return (
@@ -136,7 +161,21 @@ export default function QrStandeesPage() {
         <button onClick={downloadPdf} disabled={!chosen.length} style={btn(C.ink)}>Download PDF ({chosen.length} table{chosen.length === 1 ? '' : 's'})</button>
         <button onClick={() => window.open(pdfUrl({}), '_blank')} disabled={!chosen.length} style={btnGhost()}>Print</button>
         <button onClick={() => setSel(Object.fromEntries(tables.map(t => [t.id, !allSelected])))} style={btnGhost()}>{allSelected ? 'Deselect all' : 'Select all'}</button>
+        {pendingCount > 0 && <button onClick={selectUnprinted} style={btnGhost()}>Select {pendingCount} not-printed</button>}
       </div>
+
+      {/* Printed-status summary — which standees are done vs still pending. */}
+      {!!tables.length && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center', marginBottom: 18, fontSize: 13 }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: '#E3EEE6', color: C.forest, borderRadius: 999, padding: '4px 12px', fontWeight: 500 }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: C.forest }} /> {printedCount} printed
+          </span>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: pendingCount ? C.terraTint : C.cardElev, color: pendingCount ? C.terraDeep : C.inkMute, borderRadius: 999, padding: '4px 12px', fontWeight: 500 }}>
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: pendingCount ? C.terra : C.inkMute }} /> {pendingCount} not printed yet
+          </span>
+          <span style={{ color: C.inkMute, fontFamily: MONO, fontSize: 11 }}>Downloading a table's standee marks it printed · every table's QR is generated</span>
+        </div>
+      )}
 
       {loading && <p style={{ color: C.inkMute }}>Loading tables…</p>}
       {!loading && !tables.length && <p style={{ color: C.inkMute }}>No active tables yet. Add tables under Dine-In → Tables first.</p>}
@@ -152,6 +191,13 @@ export default function QrStandeesPage() {
                   <input type="checkbox" checked={!!sel[t.id]} onChange={e => setSel(s => ({ ...s, [t.id]: e.target.checked }))} />
                   <span style={{ fontFamily: SERIF, fontSize: 17 }}>Table {t.table_number}</span>
                   {t.zone && <span style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: 0.6, color: C.inkMute, textTransform: 'uppercase' }}>{t.zone}</span>}
+                  <span
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); markPrinted([t.id], !t.qr_printed_at); }}
+                    title={t.qr_printed_at ? `Printed ${fmtWhen(t.qr_printed_at)} — click to mark as not printed` : 'Not printed yet — click to mark as printed'}
+                    style={{ marginLeft: 'auto', fontFamily: MONO, fontSize: 9.5, letterSpacing: 0.4, textTransform: 'uppercase', borderRadius: 999, padding: '2px 8px', whiteSpace: 'nowrap',
+                      background: t.qr_printed_at ? '#E3EEE6' : C.terraTint, color: t.qr_printed_at ? C.forest : C.terraDeep, border: `1px solid ${t.qr_printed_at ? 'rgba(45,74,58,.2)' : C.terra}` }}>
+                    {t.qr_printed_at ? `✓ ${fmtWhen(t.qr_printed_at)}` : 'Not printed'}
+                  </span>
                 </label>
               ))}
             </div>

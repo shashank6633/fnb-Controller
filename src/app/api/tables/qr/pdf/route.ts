@@ -84,6 +84,16 @@ export async function GET(req: Request) {
     else if (wantIds) tables = tables.filter(t => wantIds.has(t.id));
     if (!tables.length) return Response.json({ error: 'No tables selected' }, { status: 400 });
 
+    // A real download (not the in-page preview via ?one=) means these standees
+    // are being printed → stamp them so the QR Standees page shows them as done.
+    if (download && !oneId) {
+      try {
+        const mark = db.prepare("UPDATE restaurant_tables SET qr_printed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?");
+        const tx = db.transaction(() => { for (const t of tables) mark.run(t.id); });
+        tx();
+      } catch (e) { console.error('[qr/pdf mark-printed]', e); }
+    }
+
     const brandRow = db.prepare("SELECT value FROM settings WHERE key = 'business_name'").get() as any;
     const brand = (brandRow?.value || 'Akan').toString();
 
