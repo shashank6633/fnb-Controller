@@ -63,12 +63,21 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/party-bookings',      // sheet refresh (POST forces live fetch)
   '/api/dine-in/tables',      // POS table management (create/edit/delete)
   '/api/dine-in/orders',      // POS orders: open, add items, fire, settle, void
+  '/api/dine-in/customer-orders', // Captain approve/reject/modify of QR-menu orders
+  '/api/dine-in/service-requests', // Captain accept/complete of table service requests
   '/api/dine-in/kds',         // KDS bump (the SSE stream is GET, exempt)
   '/api/dine-in/offline-print', // print-station config + print-job journal
+  '/api/tables',              // QR standee token generation (admin)
 ];
 
 function isPublic(pathname: string): boolean {
   if (PUBLIC_PATHS.has(pathname)) return true;
+  // Customer QR menu: the scan-to-order page + its public, table-token-scoped
+  // APIs must work with NO staff session (guests aren't logged in). Order
+  // submissions land as 'pending_approval' and are gated by Captain approval,
+  // so nothing reaches the kitchen or the bill without staff review.
+  if (pathname === '/menu') return true;
+  if (pathname.startsWith('/api/customer/')) return true;
   if (pathname.includes('/print')) return true;            // PO print pages render via cookie if present
   if (pathname.startsWith('/_next')) return true;
   if (pathname.startsWith('/favicon')) return true;
@@ -81,7 +90,7 @@ function isPublic(pathname: string): boolean {
   // counter-PC installer (Invoke-WebRequest) and manual download can fetch it.
   // It carries no secrets — the menu is loaded from the bridge's /cache at runtime.
   if (pathname === '/offline-pos.html') return true;
-  if (pathname.match(/\.(png|jpg|jpeg|svg|ico|webp|gif|css|js|mjs|map|json|webmanifest|txt|woff2?|ttf|bat|ps1)$/)) return true;
+  if (pathname.match(/\.(png|jpg|jpeg|svg|ico|webp|gif|css|js|jsx|mjs|map|json|webmanifest|txt|woff2?|ttf|bat|ps1)$/)) return true;
   return false;
 }
 

@@ -101,3 +101,9 @@ scripts/cache.json
 scripts/kot-outbox.json
 cache.json
 kot-outbox.json
+
+# Customer QR menu — design-source archive + heavy reference binaries
+/QR Code menu.zip
+/QR Code menu/screenshots/
+/QR Code menu/uploads/
+/QR Code menu/.thumbnail

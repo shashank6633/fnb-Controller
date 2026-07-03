@@ -39,6 +39,7 @@ export const PAGE_CATALOG: PageSection[] = [
     label: 'Dine-In',
     pages: [
       { path: '/dine-in/floor',       label: 'Order Floor' },
+      { path: '/dine-in/requests',    label: 'Customer Orders & Requests' },
       { path: '/dine-in/kitchen',     label: 'Kitchen Display' },
       { path: '/dine-in/offline-print', label: 'KOT & Bill Printers' },
       { path: '/dine-in/tables',      label: 'Tables' },
@@ -113,6 +114,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/settings/categories', label: 'Settings — Category Manager' },
       { path: '/settings/page-access', label: 'Settings — Page Access' },
       { path: '/settings/integrations', label: 'Settings — Integrations' },
+      { path: '/settings/qr-standees', label: 'Settings — QR Standees' },
       { path: '/admin/data-hygiene',  label: 'Admin — Data Hygiene' },
       { path: '/admin/reset',         label: 'Admin — Reset' },
     ],

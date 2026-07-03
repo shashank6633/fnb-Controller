@@ -1626,6 +1626,38 @@ function initializeSchema(db: Database.Database) {
       );
       CREATE INDEX IF NOT EXISTS idx_kot_alerts_open ON kot_alerts(resolved_at);
     `);
+
+    // Customer QR menu — table-side service requests (bell). A guest at a table
+    // taps "Call waiter / Refill water / Extra cutlery / Request bill" and the
+    // request lands here for the Captain/Waiter dashboard to accept → complete.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS service_requests (
+        id           TEXT PRIMARY KEY,
+        outlet_id    TEXT,
+        table_id     TEXT,
+        table_number TEXT DEFAULT '',
+        type         TEXT NOT NULL,                       -- waiter | water | cutlery | bill
+        status       TEXT NOT NULL DEFAULT 'pending',     -- pending | accepted | completed
+        note         TEXT DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        accepted_at  TEXT,
+        accepted_by  TEXT DEFAULT '',
+        completed_at TEXT,
+        completed_by TEXT DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS idx_service_requests_status ON service_requests(status);
+      CREATE INDEX IF NOT EXISTS idx_service_requests_table  ON service_requests(table_id);
+    `);
+
+    // Customer QR menu — every table needs a stable, hard-to-guess qr_token that
+    // the printed standee encodes (…/menu?t=<token>). Backfill any table that has
+    // none. Idempotent: only touches rows still missing a token. NULLs are exempt
+    // from idx_rtables_qr (SQLite treats NULLs as distinct), so no collisions.
+    const needToken = db.prepare("SELECT id FROM restaurant_tables WHERE qr_token IS NULL OR qr_token = ''").all() as any[];
+    if (needToken.length) {
+      const setTok = db.prepare("UPDATE restaurant_tables SET qr_token = ?, updated_at = datetime('now') WHERE id = ?");
+      for (const t of needToken) setTok.run(newQrToken(), t.id);
+    }
   } catch (e) { console.error('POS orders schema failed:', e); }
 
   // Phase 1 §6: wastages — items thrown away (spoilage / expiry / damage / overcooked / spillage).
@@ -1936,6 +1968,21 @@ export function convertToMaterialUnit(
 
 export function generateId(): string {
   return crypto.randomUUID();
+}
+
+/**
+ * A compact, URL-safe token for a table's QR standee (…/menu?t=<token>).
+ * 12 chars of base32-ish alphabet ≈ 60 bits — unguessable enough for a dine-in
+ * menu (the Captain-approval step is the real gate), short enough to keep the
+ * printed QR low-density and crisp.
+ */
+export function newQrToken(): string {
+  const ALPHABET = 'abcdefghijkmnpqrstuvwxyz23456789'; // no l/o/0/1 ambiguity
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  let s = '';
+  for (const b of bytes) s += ALPHABET[b & 31];
+  return s;
 }
 
 /**
