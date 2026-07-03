@@ -337,7 +337,10 @@
   // as separate cart lines. note = the joined choice values (shows on cart + KOT).
   function optNote(opts){if(!opts)return '';var v=[];for(var k in opts){if(opts[k])v.push(opts[k]);}return v.join(' · ');}
   function lineKey(id,note){return note?(id+'|'+note):id;}
-  function addVariant(item,qty,opts){var note=optNote(opts);var key=lineKey(item.id,note);S.cart[key]={item:item,qty:qty,opts:opts||null,note:note};saveCart();}
+  // "Add to order" ADDS to the matching line (same item + same chosen options),
+  // never overwrites — so tapping Add twice makes 2, and adding a variant that's
+  // already in the cart increments it instead of resetting to the sheet qty.
+  function addVariant(item,qty,opts){var note=optNote(opts);var key=lineKey(item.id,note);var cur=S.cart[key]?S.cart[key].qty:0;S.cart[key]={item:item,qty:cur+qty,opts:opts||null,note:note};saveCart();}
   function setQtyKey(key,q){if(q<=0)delete S.cart[key];else if(S.cart[key])S.cart[key].qty=q;saveCart();}
   function saveCart(){try{localStorage.setItem('akan_cart_'+TOKEN,JSON.stringify(S.cart));}catch(e){}}
   function loadCart(){try{var r=localStorage.getItem('akan_cart_'+TOKEN);if(r)S.cart=JSON.parse(r)||{};}catch(e){S.cart={};}}
@@ -558,7 +561,10 @@
     return out;
   }
   function openItem(it){
-    if(!it)return;var q=Math.max(1,qtyOf(it.id));
+    // The sheet's stepper is "how many to ADD" — always start at 1 (Add accumulates).
+    // Reading qtyOf(id) here was wrong for variants (their key is id|note, so it
+    // returned 0) and made re-opening a variant reset the cart line to 1.
+    if(!it)return;var q=1;
     var hasTaste=it.taste&&(it.taste.sour||it.taste.sweet||it.taste.spicy||it.taste.tangy);
     var pairs=pairsFor(it), spiceLbl=['None','Mild','Medium','Hot'][it.spice||0];
     var dietLbl=({'Veg':'Vegetarian','Non-Veg':'Non-Vegetarian','Egg':'Contains Egg'}[it.diet])||it.diet||({v:'Vegetarian',n:'Non-Vegetarian',e:'Contains Egg'}[it.veg]||'Vegetarian');
