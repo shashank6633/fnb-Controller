@@ -168,6 +168,18 @@
   .cartbar .go{background:#fff;color:var(--forest);border:none;border-radius:12px;height:42px;padding:0 16px;font-weight:600;font-size:14px;display:flex;align-items:center;gap:8px}
   .bell{position:fixed;right:16px;z-index:39;bottom:calc(16px + var(--safe-b));width:54px;height:54px;border-radius:50%;background:var(--card);border:1px solid var(--rule);box-shadow:var(--shadow);display:flex;align-items:center;justify-content:center}
   .bell.lift{bottom:calc(90px + var(--safe-b))}
+  /* bottom tab bar — Menu / Search / Order / Table (persistent nav) */
+  .tabbar{position:fixed;left:0;right:0;bottom:0;z-index:40;max-width:520px;margin:0 auto;background:var(--paper);
+    border-top:1px solid var(--rule);display:flex;padding-bottom:var(--safe-b);box-shadow:0 -8px 28px rgba(28,20,10,.07)}
+  .tab{flex:1;background:none;border:none;cursor:pointer;position:relative;display:flex;flex-direction:column;
+    align-items:center;gap:3px;padding:9px 0 8px;color:var(--inkMute);-webkit-tap-highlight-color:transparent;transition:color .15s}
+  .tab .ti{display:flex;align-items:center;justify-content:center;height:22px}
+  .tab .ti svg{width:21px;height:21px}
+  .tab .tl{font-size:10.5px;font-weight:500;letter-spacing:.01em}
+  .tab.on{color:var(--terra)}
+  .tab .tbadge{position:absolute;top:4px;left:calc(50% + 3px);min-width:16px;height:16px;padding:0 4px;border-radius:999px;
+    background:var(--terra);color:#fff;font-family:var(--mono);font-size:9.5px;font-weight:600;display:flex;align-items:center;
+    justify-content:center;line-height:1;box-shadow:0 0 0 2px var(--paper)}
 
   /* ---------- SHEETS ---------- */
   .scrim{position:fixed;inset:0;z-index:50;background:rgba(28,20,10,.42);opacity:0;pointer-events:none;transition:opacity .24s ease}
@@ -251,7 +263,7 @@
   .action.sent .s{color:rgba(255,255,255,.8)}
 
   /* ---------- TRACKING ---------- */
-  .track{min-height:100dvh;padding:0 22px calc(26px + var(--safe-b));display:flex;flex-direction:column}
+  .track{min-height:100dvh;padding:0 22px calc(88px + var(--safe-b));display:flex;flex-direction:column}
   .track-hero{padding:44px 0 0;text-align:center}
   .track-badge{width:72px;height:72px;border-radius:50%;background:var(--forest);color:#fff;display:flex;align-items:center;justify-content:center;font-size:34px;margin:0 auto}
   .track h1{font-family:var(--serif);font-size:38px;margin:16px 0 0;font-weight:400}
@@ -288,7 +300,8 @@
   var qs=new URLSearchParams(location.search);
   var TOKEN=qs.get('t')||qs.get('table')||'';
   var app=document.getElementById('app'), scrim=document.getElementById('scrim'), toastEl=document.getElementById('toast');
-  var ICON={search:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>',
+  var ICON={menu:'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>',
+    search:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="11" cy="11" r="7"/><path d="m20 20-3-3"/></svg>',
     back:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M15 5l-7 7 7 7"/></svg>',
     bell:'<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>',
     bag:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>',
@@ -483,18 +496,34 @@
     app.querySelectorAll('[data-open]').forEach(function(o){o.onclick=function(){openItem(itemById(o.getAttribute('data-open')));};});
   }
 
-  // ---------- FLOATING (cart bar + bell) ----------
+  // ---------- BOTTOM TAB BAR (Menu / Search / Order / Table) ----------
+  function tabHTML(id,icon,label,active,badge){
+    return '<button class="tab'+(active?' on':'')+'" data-tab="'+id+'">'+
+      (badge>0?'<span class="tbadge">'+badge+'</span>':'')+
+      '<span class="ti">'+icon+'</span><span class="tl">'+label+'</span></button>';
+  }
   function mountFloat(){
-    var old=document.getElementById('floatwrap');if(old)old.remove();
-    var oldb=document.getElementById('bell');if(oldb)oldb.remove();
-    if(S.screen!=='menu')return;
+    // legacy floating elements (superseded by the tab bar) — remove if present
+    var oldf=document.getElementById('floatwrap');if(oldf)oldf.remove();
+    var oldbell=document.getElementById('bell');if(oldbell)oldbell.remove();
+    var old=document.getElementById('tabbar');if(old)old.remove();
+    if(S.screen!=='menu'&&S.screen!=='track')return;   // persistent nav on menu + order tracking
     var n=cartCount();
-    var wrap=document.createElement('div');wrap.className='floatwrap';wrap.id='floatwrap';
-    if(n>0){wrap.innerHTML='<div class="cartbar"><span class="n">'+n+'</span><span class="lbl">'+money(cartSub())+'</span>'+
-      '<button class="go">View order '+ICON.bag+'</button></div>';
-      wrap.querySelector('.cartbar').onclick=openCart;}
-    document.body.appendChild(wrap);
-    var bell=document.createElement('button');bell.className='bell'+(n>0?' lift':'');bell.id='bell';bell.innerHTML=ICON.bell;bell.style.color='var(--terra)';bell.onclick=openService;document.body.appendChild(bell);
+    var bar=document.createElement('nav');bar.className='tabbar';bar.id='tabbar';
+    bar.innerHTML=
+      tabHTML('menu',ICON.menu,'Menu',S.screen==='menu')+
+      tabHTML('search',ICON.search,'Search',false)+
+      tabHTML('order',ICON.bag,'Order',S.screen==='track',n)+
+      tabHTML('table',ICON.bell,'Table',false);
+    document.body.appendChild(bar);
+    bar.querySelector('[data-tab="menu"]').onclick=function(){closeSheet();if(S.screen!=='menu'){S.screen='menu';render();}else{window.scrollTo(0,0);}};
+    bar.querySelector('[data-tab="search"]').onclick=function(){closeSheet();if(S.screen!=='menu'){S.screen='menu';render();}var qi=document.getElementById('q');if(qi){try{qi.scrollIntoView({block:'start'});}catch(e){}qi.focus();}};
+    bar.querySelector('[data-tab="order"]').onclick=function(){
+      if(cartCount()>0){openCart();}
+      else if((S.orders&&S.orders.length)||S.lastOrder){closeSheet();S.screen='track';render();pollOrders();}
+      else{toast('Add items to start your order');}
+    };
+    bar.querySelector('[data-tab="table"]').onclick=openService;
   }
 
   // ---------- SHEETS ----------
