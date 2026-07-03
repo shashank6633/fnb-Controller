@@ -23,12 +23,19 @@ export async function GET(req: Request) {
     const brandRow = db.prepare("SELECT value FROM settings WHERE key = 'business_name'").get() as any;
     const brand = { name: (brandRow?.value || 'Akan').toString() };
 
+    // How the customer menu presents categories — set on Settings → Customer Menu.
+    const designRow = db.prepare("SELECT value FROM settings WHERE key = 'customer_menu_design'").get() as any;
+    let categoryStyle: 'thumbnails' | 'chips' = 'thumbnails';
+    try { const d = JSON.parse(designRow?.value || '{}'); if (d.categoryStyle === 'chips' || d.categoryStyle === 'thumbnails') categoryStyle = d.categoryStyle; } catch {}
+    const design = { categoryStyle };
+
     const menu = buildCustomerMenu(table.outlet_id);
 
     return Response.json({
       ok: true,
       table: { id: table.id, number: table.table_number, zone: table.zone, seats: table.seats },
       brand,
+      design,
       menu,
     }, {
       // Menu can be cached briefly at the edge/browser; it changes rarely.

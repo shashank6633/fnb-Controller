@@ -38,6 +38,7 @@ import {
   Smartphone,
   Bell,
   QrCode,
+  LayoutGrid,
   type LucideIcon,
 } from "lucide-react";
 
@@ -139,6 +140,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Page Access",    href: "/settings/page-access",   icon: ShieldAlert },
       { kind: "link", label: "Integrations",   href: "/settings/integrations",  icon: ShieldAlert },
       { kind: "link", label: "QR Standees",    href: "/settings/qr-standees",   icon: QrCode },
+      { kind: "link", label: "Menu Design",    href: "/settings/customer-menu", icon: LayoutGrid },
       { kind: "link", label: "Outlets",        href: "/outlets",                icon: Store },
       { kind: "link", label: "Audit Log",      href: "/audit",                  icon: History },
       { kind: "link", label: "Data Hygiene",   href: "/admin/data-hygiene",     icon: ShieldAlert },

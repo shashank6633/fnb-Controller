@@ -115,6 +115,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/settings/page-access', label: 'Settings — Page Access' },
       { path: '/settings/integrations', label: 'Settings — Integrations' },
       { path: '/settings/qr-standees', label: 'Settings — QR Standees' },
+      { path: '/settings/customer-menu', label: 'Settings — Menu Design' },
       { path: '/admin/data-hygiene',  label: 'Admin — Data Hygiene' },
       { path: '/admin/reset',         label: 'Admin — Reset' },
     ],

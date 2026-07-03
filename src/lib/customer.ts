@@ -65,9 +65,13 @@ function prettyCategory(slug: string): string {
     .trim() || 'Others';
 }
 
-// Which top section a menu item belongs to. Foods → food; beverages/liquors → bev.
-function sectionOf(itemType: string): 'food' | 'bev' {
-  return String(itemType || '').toLowerCase().startsWith('food') ? 'food' : 'bev';
+// Which top section a menu item belongs to. Foods → food; liquors → liquor;
+// beverages (and anything else) → bev.
+function sectionOf(itemType: string): 'food' | 'bev' | 'liquor' {
+  const s = String(itemType || '').toLowerCase();
+  if (s.startsWith('food')) return 'food';
+  if (s.startsWith('liqu')) return 'liquor';
+  return 'bev';
 }
 
 // Loose ordering so the menu reads naturally (starters → mains → desserts, etc.).
@@ -107,7 +111,7 @@ interface MenuSection {
  * Every item carries ALL fields the UI reads, with safe synthesized defaults
  * for the curated fields the backend doesn't store (taste/pairs/spice/tags).
  */
-export function buildCustomerMenu(outletId: string | null): { food: MenuSection; bev: MenuSection } {
+export function buildCustomerMenu(outletId: string | null): { food: MenuSection; bev: MenuSection; liquor: MenuSection } {
   const db = getDb();
   // Show this outlet's items; items with NULL outlet are shared/global.
   const rows = db.prepare(`
@@ -119,9 +123,10 @@ export function buildCustomerMenu(outletId: string | null): { food: MenuSection;
   `).all() as any[];
 
   // section -> category slug -> item list
-  const buckets: Record<'food' | 'bev', Map<string, any[]>> = {
+  const buckets: Record<'food' | 'bev' | 'liquor', Map<string, any[]>> = {
     food: new Map(),
     bev: new Map(),
+    liquor: new Map(),
   };
 
   for (const r of rows) {
@@ -166,6 +171,7 @@ export function buildCustomerMenu(outletId: string | null): { food: MenuSection;
   return {
     food: buildSection('Food', buckets.food),
     bev: buildSection('Beverages', buckets.bev),
+    liquor: buildSection('Liquor', buckets.liquor),
   };
 }
 
