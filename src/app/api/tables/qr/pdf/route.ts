@@ -37,7 +37,7 @@ const TPL = {
   labelSizeF: 0.059, // label font size (fraction of width)
   cream: '#FBE8CF',  // the card colour (sampled) — the QR light modules blend into it
   dark: '#171008',   // QR dark modules
-  logoF: 0.24,       // centre-logo size as a fraction of the QR (safe for level-H recovery)
+  logoF: 0.20,       // centre-logo size as a fraction of the QR (safe for level-H recovery)
 };
 
 const SIZES: Record<string, 'A4' | 'A5' | 'A6'> = { A4: 'A4', A5: 'A5', A6: 'A6' };
@@ -140,7 +140,7 @@ async function buildFromTemplate(tables: any[], urlFor: (t: any) => string, show
       const ls = qs * TPL.logoF;
       const s = ls / Math.max(logoImg.width, logoImg.height);
       const lw = logoImg.width * s, lh = logoImg.height * s;
-      page.drawCircle({ x: cx, y: cy, size: Math.max(lw, lh) * 0.66, color: hex(TPL.cream) });
+      page.drawCircle({ x: cx, y: cy, size: Math.max(lw, lh) * 0.82, color: hex(TPL.cream) });
       page.drawImage(logoImg, { x: cx - lw / 2, y: cy - lh / 2, width: lw, height: lh });
     }
 

@@ -171,8 +171,8 @@ export default function QrStandeesPage() {
                   <img alt={`QR for table ${chosen[0].table_number}`} src={`data:image/svg+xml;utf8,${encodeURIComponent(chosen[0].qr_svg)}`} style={{ width: '100%', height: '100%', display: 'block' }} />
                   {hasLogo && (
                     <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <div style={{ width: '32%', aspectRatio: '1 / 1', background: '#FBE8CF', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                        <img alt="logo" src="/akan-logo.png" style={{ width: '84%', height: '84%', objectFit: 'contain' }} />
+                      <div style={{ width: '33%', aspectRatio: '1 / 1', background: '#FBE8CF', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <img alt="logo" src="/akan-logo.png" style={{ width: '61%', height: '61%', objectFit: 'contain' }} />
                       </div>
                     </div>
                   )}
