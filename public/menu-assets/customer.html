@@ -590,11 +590,16 @@
       '</div><div style="height:16px"></div></div>';
     openSheet(s);
     var qv=q;
-    function paint(){document.getElementById('iqty').textContent=qv;document.getElementById('iamt').textContent=money(it.price*qv);}
-    document.getElementById('iinc').onclick=function(){qv++;paint();};
-    document.getElementById('idec').onclick=function(){qv=Math.max(1,qv-1);paint();};
+    // Scope every control to THIS sheet (s.querySelector), never document-wide:
+    // closeSheet keeps the previous sheet in the DOM for its 320ms slide-out, so a
+    // global getElementById('iqty'/'iinc'/'iadd') would hit the OLD, closing sheet
+    // and leave the new one's + / − / Add dead — which made a freshly-opened item
+    // keep its default qty (the "picked 4, cart shows 2" bug).
+    function paint(){s.querySelector('#iqty').textContent=qv;s.querySelector('#iamt').textContent=money(it.price*qv);}
+    s.querySelector('#iinc').onclick=function(){qv++;paint();};
+    s.querySelector('#idec').onclick=function(){qv=Math.max(1,qv-1);paint();};
     s.querySelectorAll('.optrow').forEach(function(row){var g=groups[+row.getAttribute('data-optg')];row.querySelectorAll('[data-optc]').forEach(function(ch){ch.onclick=function(){sel[g.label]=ch.getAttribute('data-optc');row.querySelectorAll('.optchip').forEach(function(x){x.classList.toggle('on',x===ch);});};});});
-    document.getElementById('iadd').onclick=function(){addVariant(it,qv,groups.length?sel:null);closeSheet();toast(it.name+(groups.length?(' · '+optNote(sel)):'')+' added');mountFloat();var w=app.querySelector('[data-q="'+cssid(it.id)+'"]');if(w){w.innerHTML=qtyCtl(it,qtyOf(it.id));bindQ(w,it);}};
+    s.querySelector('#iadd').onclick=function(){addVariant(it,qv,groups.length?sel:null);closeSheet();toast(it.name+(groups.length?(' · '+optNote(sel)):'')+' added');mountFloat();var w=app.querySelector('[data-q="'+cssid(it.id)+'"]');if(w){w.innerHTML=qtyCtl(it,qtyOf(it.id));bindQ(w,it);}};
     s.querySelectorAll('[data-pair]').forEach(function(b){b.onclick=function(){openItem(itemById(b.getAttribute('data-pair')));};});
   }
 
