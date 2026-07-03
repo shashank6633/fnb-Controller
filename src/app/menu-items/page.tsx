@@ -739,6 +739,10 @@ function IssueChip({ active, onClick, color, count, label }: { active: boolean; 
 function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => void; categories: string[]; stations: string[]; isNew: boolean }) {
   const [form, setForm] = useState({ ...item });
   const [saving, setSaving] = useState(false);
+  const F = form as any;
+  const tagArr: string[] = Array.isArray(F.tags) ? F.tags : (F.tags ? (() => { try { const j = JSON.parse(F.tags); return Array.isArray(j) ? j : String(F.tags).split(','); } catch { return String(F.tags).split(','); } })() : []);
+  const toggleTag = (tg: string) => setForm({ ...form, tags: (tagArr.indexOf(tg) >= 0 ? tagArr.filter(x => x !== tg) : tagArr.concat(tg)) } as any);
+  const TAGS: [string, string][] = [['most-ordered', 'Most Ordered'], ['chef', "Chef's"], ['bestseller', 'Bestseller'], ['popular', 'Popular']];
 
   const save = async () => {
     setSaving(true);
@@ -825,6 +829,48 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
               <input type="number" step="1" min="0" value={form.prep_minutes ?? 0} onChange={e => setForm({ ...form, prep_minutes: Number(e.target.value) })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
             </div>
           </div>
+          {/* Customer QR-menu presentation */}
+          <div className="rounded-xl border border-[#E8D5C4] bg-[#FFFBF5] p-4 space-y-3">
+            <p className="text-[11px] font-semibold text-[#8B5A2B] uppercase tracking-wide">Customer Menu (QR)</p>
+            <div>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">Image URL</label>
+              <input type="url" value={F.image_url || ''} onChange={e => setForm({ ...form, image_url: e.target.value } as any)} placeholder="https://…/paneer-tikka.jpg" className="w-full px-3 py-2 bg-white border border-[#D4B896] rounded-lg text-sm" />
+              <p className="text-[10px] text-[#8B7355] mt-0.5">Best: square ~1080×1080px, JPG/WebP, under 300 KB. It’s cropped to fit the card thumbnails and the item photo.</p>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-[#6B5744] mb-1">Spice level</label>
+                <select value={F.spice_level ?? 0} onChange={e => setForm({ ...form, spice_level: Number(e.target.value) } as any)} className="w-full px-3 py-2 bg-white border border-[#D4B896] rounded-lg text-sm">
+                  <option value={0}>None</option><option value={1}>Mild</option><option value={2}>Medium</option><option value={3}>Hot</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-[#6B5744] mb-1">Serves</label>
+                <input type="text" value={F.serves || ''} onChange={e => setForm({ ...form, serves: e.target.value } as any)} placeholder="e.g. 1-2" className="w-full px-3 py-2 bg-white border border-[#D4B896] rounded-lg text-sm" />
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">Tags</label>
+              <div className="flex gap-2 flex-wrap">
+                {TAGS.map(([id, label]) => {
+                  const on = tagArr.indexOf(id) >= 0;
+                  return <button type="button" key={id} onClick={() => toggleTag(id)} className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${on ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#D4B896] hover:bg-[#FFF1E3]'}`}>{label}</button>;
+                })}
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">Taste profile <span className="text-[#8B7355] font-normal">(0–4 each — powers the radar chart)</span></label>
+              <div className="grid grid-cols-4 gap-2">
+                {(['sour', 'sweet', 'spicy', 'tangy'] as const).map(t => (
+                  <div key={t}>
+                    <span className="block text-[10px] uppercase tracking-wide text-[#8B7355] mb-1">{t}</span>
+                    <input type="number" min={0} max={4} step={1} value={F['taste_' + t] ?? 0} onChange={e => setForm({ ...form, ['taste_' + t]: Math.max(0, Math.min(4, Number(e.target.value) || 0)) } as any)} className="w-full px-2 py-2 bg-white border border-[#D4B896] rounded-lg text-sm text-center" />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
           <label className="flex items-center gap-2 cursor-pointer">
             <input type="checkbox" checked={!!form.is_active} onChange={e => setForm({ ...form, is_active: e.target.checked ? 1 : 0 })} className="accent-[#af4408] w-4 h-4" />
             <span className="text-sm text-[#6B5744]">Active (shown on menu)</span>

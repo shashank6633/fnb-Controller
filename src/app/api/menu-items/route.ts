@@ -64,18 +64,24 @@ export async function POST(request: Request) {
   try {
     const db = getDb();
     const body = await request.json();
-    const { name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, prep_minutes, is_active, recipe_id, material_id, notes } = body;
+    const { name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, prep_minutes, is_active, recipe_id, material_id, notes,
+            image_url, spice_level, tags, taste_sour, taste_sweet, taste_spicy, taste_tangy, serves } = body;
 
     if (!name) return Response.json({ error: 'name is required' }, { status: 400 });
+    const clamp = (v: any, max: number) => Math.max(0, Math.min(max, Math.floor(Number(v) || 0)));
+    const tagsStr = Array.isArray(tags) ? JSON.stringify(tags) : (typeof tags === 'string' ? tags : '');
 
     const id = generateId();
     db.prepare(`
-      INSERT INTO menu_items (id, name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, prep_minutes, is_active, recipe_id, material_id, source, notes, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, datetime('now'), datetime('now'))
+      INSERT INTO menu_items (id, name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, prep_minutes, is_active, recipe_id, material_id, source, notes,
+                              image_url, spice_level, tags, taste_sour, taste_sweet, taste_spicy, taste_tangy, serves, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     `).run(
       id, name, category || '', station || '', item_type || 'foods', dietary_tag || '',
       Number(selling_price) || 0, Number(listing_price) || 0, item_code || '', Number(tax_value) || 0,
-      Number(prep_minutes) || 0, is_active === false ? 0 : 1, recipe_id || null, material_id || null, notes || ''
+      Number(prep_minutes) || 0, is_active === false ? 0 : 1, recipe_id || null, material_id || null, notes || '',
+      (image_url || '').toString(), clamp(spice_level, 3), tagsStr,
+      clamp(taste_sour, 4), clamp(taste_sweet, 4), clamp(taste_spicy, 4), clamp(taste_tangy, 4), (serves || '').toString()
     );
 
     const item = db.prepare('SELECT * FROM menu_items WHERE id = ?').get(id);
@@ -93,13 +99,16 @@ export async function PUT(request: Request) {
 
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
 
-    const allowed = ['name', 'category', 'station', 'item_type', 'dietary_tag', 'selling_price', 'listing_price', 'item_code', 'tax_value', 'prep_minutes', 'is_active', 'recipe_id', 'material_id', 'notes'];
+    const allowed = ['name', 'category', 'station', 'item_type', 'dietary_tag', 'selling_price', 'listing_price', 'item_code', 'tax_value', 'prep_minutes', 'is_active', 'recipe_id', 'material_id', 'notes',
+      'image_url', 'spice_level', 'tags', 'taste_sour', 'taste_sweet', 'taste_spicy', 'taste_tangy', 'serves'];
     const updates: string[] = [];
     const values: any[] = [];
     for (const key of allowed) {
       if (fields[key] !== undefined) {
         updates.push(`${key} = ?`);
-        values.push(typeof fields[key] === 'boolean' ? (fields[key] ? 1 : 0) : fields[key]);
+        // tags may arrive as an array from the form → store as JSON text.
+        let v: any = key === 'tags' && Array.isArray(fields[key]) ? JSON.stringify(fields[key]) : fields[key];
+        values.push(typeof v === 'boolean' ? (v ? 1 : 0) : v);
       }
     }
     if (updates.length === 0) return Response.json({ error: 'no fields to update' }, { status: 400 });

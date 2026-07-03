@@ -450,6 +450,19 @@ function initializeSchema(db: Database.Database) {
     if (!miNames.has('prep_minutes')) {
       db.exec(`ALTER TABLE menu_items ADD COLUMN prep_minutes INTEGER NOT NULL DEFAULT 0`);
     }
+    // Customer QR-menu presentation fields (item detail: photo, spice, tags, taste
+    // radar, serves). All optional; the menu still renders with sensible defaults.
+    const miAdds: Array<[string, string]> = [
+      ['image_url', "TEXT DEFAULT ''"],
+      ['spice_level', 'INTEGER NOT NULL DEFAULT 0'],   // 0 none · 1 mild · 2 medium · 3 hot
+      ['tags', "TEXT DEFAULT ''"],                      // JSON array: most-ordered|chef|bestseller|popular
+      ['taste_sour', 'INTEGER NOT NULL DEFAULT 0'],     // each 0–4
+      ['taste_sweet', 'INTEGER NOT NULL DEFAULT 0'],
+      ['taste_spicy', 'INTEGER NOT NULL DEFAULT 0'],
+      ['taste_tangy', 'INTEGER NOT NULL DEFAULT 0'],
+      ['serves', "TEXT DEFAULT ''"],                    // e.g. "1-2"
+    ];
+    for (const [c, t] of miAdds) if (!miNames.has(c)) db.exec(`ALTER TABLE menu_items ADD COLUMN ${c} ${t}`);
     // Backfill — any menu item already with a material_id is implicitly reviewed
     db.exec(`UPDATE menu_items SET direct_reviewed = 1 WHERE material_id IS NOT NULL AND direct_reviewed = 0`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_menu_items_direct_reviewed ON menu_items(direct_reviewed)`);

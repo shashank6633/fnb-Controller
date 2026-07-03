@@ -186,6 +186,40 @@
   .field textarea,.field input{width:100%;background:var(--card);border:1px solid var(--rule);border-radius:13px;padding:12px 13px;font-size:14.5px;color:var(--ink);outline:none;resize:none}
   .sheet-cta{padding:14px 22px 0;flex:none}
 
+  /* item detail (reference layout) */
+  .ish-hero{height:200px;margin:-6px -22px 0;position:relative;overflow:hidden}
+  .ish-hero .init{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--serif);font-size:72px;color:rgba(255,255,255,.92)}
+  .ish-hero img{width:100%;height:100%;object-fit:cover}
+  .ish-hero::after{content:"";position:absolute;inset:0;opacity:.42;background:repeating-linear-gradient(-45deg,rgba(255,255,255,.12) 0 2px,transparent 2px 15px)}
+  .ish-meta{display:flex;align-items:center;gap:9px;margin-top:16px;flex-wrap:wrap}
+  .chilis{display:inline-flex;gap:2px;align-items:center}
+  .chili{width:11px;height:14px}
+  .tagchip{font-family:var(--mono);font-size:9px;letter-spacing:.09em;text-transform:uppercase;font-weight:500;padding:3px 9px;border-radius:7px;background:var(--terra);color:#fff}
+  .tagchip.chef{background:var(--terraTint);color:var(--terraDeep)}
+  .tagchip.best{background:#F6E7C9;color:#8A5A12}
+  .tagchip.pop{background:#D9E4DB;color:var(--forest)}
+  .sectlabel{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--inkMute);display:flex;align-items:center;gap:12px;margin:24px 0 10px}
+  .sectlabel .rl{flex:1;height:1px;background:var(--rule)}
+  .radarbox{background:var(--cardElev);border:1px solid var(--rule);border-radius:16px;padding:8px 4px}
+  .ral{font-family:var(--mono);font-size:9px;letter-spacing:.05em;fill:var(--inkSoft)}
+  .ish-cta{display:flex;gap:12px;align-items:center;margin:22px 0 4px}
+  .ish-cta .stepper{height:56px;border-radius:999px;background:var(--card);border:1px solid var(--rule)}
+  .ish-cta .stepper button{width:46px;height:56px;color:var(--ink);font-size:20px}
+  .ish-cta .stepper span{font-size:16px;min-width:26px}
+  .ish-add{flex:1;height:56px;border-radius:999px;border:none;background:var(--terra);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 24px;font-size:15.5px;font-weight:500}
+  .ish-add:active{transform:scale(.99)}
+  .pairrow{display:flex;gap:12px;overflow-x:auto;margin:0 -22px;padding:2px 22px 4px;scrollbar-width:none}
+  .pairrow::-webkit-scrollbar{display:none}
+  .paircard{flex:none;width:150px;background:var(--card);border:1px solid var(--rule);border-radius:16px;padding:7px;box-shadow:var(--shadowSoft);text-align:left}
+  .paircard .pimg{height:96px;border-radius:11px;position:relative;overflow:hidden}
+  .paircard .pimg::after{content:"";position:absolute;inset:0;opacity:.4;background:repeating-linear-gradient(-45deg,rgba(255,255,255,.16) 0 2px,transparent 2px 13px)}
+  .paircard .ptag{position:absolute;top:6px;left:6px;z-index:2;font-family:var(--mono);font-size:7.5px;letter-spacing:.05em;text-transform:uppercase;background:var(--paper);color:var(--inkSoft);padding:2px 6px;border-radius:6px;max-width:88%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .paircard .pnm{font-family:var(--serif);font-size:16px;margin:9px 3px 0;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .paircard .pf{display:flex;justify-content:space-between;align-items:center;margin:5px 3px 4px}
+  .detgrid{display:grid;grid-template-columns:1fr 1fr;gap:17px 14px;margin-top:18px;padding-top:18px;border-top:1px solid var(--rule)}
+  .detgrid .k{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--inkMute)}
+  .detgrid .v{font-size:15.5px;color:var(--ink);margin-top:3px}
+
   .billrow{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;font-size:14px;color:var(--inkSoft)}
   .billrow .v{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--ink)}
   .billrow.tot{color:var(--ink);font-weight:600;font-size:16px}
@@ -444,31 +478,59 @@
   function openSheet(node){closeSheet();curSheet=node;document.body.appendChild(node);scrim.classList.add('on');requestAnimationFrame(function(){node.classList.add('on');});scrim.onclick=closeSheet;}
   function closeSheet(){scrim.classList.remove('on');if(curSheet){var n=curSheet;n.classList.remove('on');setTimeout(function(){if(n.parentNode)n.parentNode.removeChild(n);},320);curSheet=null;}}
 
+  var TAGMETA={'most-ordered':['','Most Ordered'],'chef':['chef','Chef’s'],'bestseller':['best','Bestseller'],'popular':['pop','Popular']};
+  function chilis(level){var out='<span class="chilis">';for(var i=0;i<3;i++){var on=i<level;out+='<svg class="chili" viewBox="0 0 12 15" fill="'+(on?'#B4502E':'#E9C6AB')+'"><path d="M6 .5c2 2.5 3.2 4.6 3.2 7.3C9.2 11.5 7.7 14 6 14.5 4.3 14 2.8 11.5 2.8 7.8 2.8 5.1 4 3 6 .5Z"/></svg>';}return out+'</span>';}
+  function radarSVG(t){
+    var W=250,H=176,cx=125,cy=90,R=62;
+    var axes=[['SPICY',t.spicy||0,0],['SWEET',t.sweet||0,90],['SOUR',t.sour||0,180],['TANGY',t.tangy||0,270]];
+    function pt(v,ang){var a=ang*Math.PI/180,r=(Math.max(0,Math.min(4,v))/4)*R;return [cx+r*Math.sin(a),cy-r*Math.cos(a)];}
+    var rings='';[0.34,0.67,1].forEach(function(f){rings+='<circle cx="'+cx+'" cy="'+cy+'" r="'+(R*f).toFixed(1)+'" fill="none" stroke="rgba(35,28,18,.10)"/>';});
+    var lines='';axes.forEach(function(a){var p=pt(4,a[2]);lines+='<line x1="'+cx+'" y1="'+cy+'" x2="'+p[0].toFixed(1)+'" y2="'+p[1].toFixed(1)+'" stroke="rgba(35,28,18,.08)"/>';});
+    var poly=axes.map(function(a){var p=pt(a[1],a[2]);return p[0].toFixed(1)+','+p[1].toFixed(1);}).join(' ');
+    return '<svg viewBox="0 0 '+W+' '+H+'" width="100%">'+rings+lines+
+      '<polygon points="'+poly+'" fill="rgba(180,80,46,.5)" stroke="#B4502E" stroke-width="1.5"/><circle cx="'+cx+'" cy="'+cy+'" r="2" fill="#8E3A1E"/>'+
+      '<text x="'+cx+'" y="14" text-anchor="middle" class="ral">SPICY ('+(t.spicy||0)+')</text>'+
+      '<text x="'+(W-4)+'" y="'+(cy+4)+'" text-anchor="end" class="ral">SWEET ('+(t.sweet||0)+')</text>'+
+      '<text x="'+cx+'" y="'+(H-3)+'" text-anchor="middle" class="ral">SOUR ('+(t.sour||0)+')</text>'+
+      '<text x="4" y="'+(cy+4)+'" text-anchor="start" class="ral">TANGY ('+(t.tangy||0)+')</text></svg>';
+  }
+  function pairsFor(it){
+    var pool=[],srcs=it.section==='food'?['bev','liquor']:['food'];
+    srcs.forEach(function(sec){((S.menu&&S.menu[sec])||{sub:[]}).sub.forEach(function(su){su.items.forEach(function(x){if(x.id!==it.id)pool.push(x);});});});
+    if(!pool.length)return [];
+    var h=0;for(var i=0;i<it.id.length;i++)h=(h*31+it.id.charCodeAt(i))>>>0;
+    var out=[],seen={};for(var k=0;k<pool.length&&out.length<3;k++){var p=pool[(h+k*7)%pool.length];if(!seen[p.id]){seen[p.id]=1;out.push(p);}}
+    return out;
+  }
   function openItem(it){
-    if(!it)return;var q=qtyOf(it.id);
-    var s=document.createElement('div');s.className='sheet';
+    if(!it)return;var q=Math.max(1,qtyOf(it.id));
+    var hasTaste=it.taste&&(it.taste.sour||it.taste.sweet||it.taste.spicy||it.taste.tangy);
+    var tagHTML=(it.tags||[]).map(function(tg){var m=TAGMETA[tg];return m?'<span class="tagchip '+m[0]+'">'+m[1]+'</span>':'';}).join('');
+    var pairs=pairsFor(it), spiceLbl=['None','Mild','Medium','Hot'][it.spice||0];
+    var dietLbl=({'Veg':'Vegetarian','Non-Veg':'Non-Vegetarian','Egg':'Contains Egg'}[it.diet])||it.diet||({v:'Vegetarian',n:'Non-Vegetarian',e:'Contains Egg'}[it.veg]||'Vegetarian');
+    var s=document.createElement('div');s.className='sheet';s.style.maxHeight='94dvh';
     s.innerHTML='<div class="grab"></div><div class="sheet-scroll">'+
-      '<div class="isheet-hero" style="background:'+hueGrad(it.hue||30)+'"><div class="init">'+esc((it.name||'?').charAt(0))+'</div></div>'+
-      '<div class="card-tags" style="margin-top:14px"><span class="vdot '+esc(it.veg||'v')+'"></span></div>'+
-      '<h2 class="serif" style="font-size:28px;margin:6px 0 0">'+esc(it.name)+'</h2>'+
-      '<div class="price" style="font-size:17px;margin-top:6px">'+money(it.price)+'</div>'+
-      (it.desc?'<p style="color:var(--inkSoft);font-size:14px;line-height:1.55;margin:12px 0 0">'+esc(it.desc)+'</p>':'')+
-      '<div class="field"><label>Special instructions (optional)</label><textarea rows="2" id="inote" placeholder="e.g. less spicy, no onion…">'+esc((S.cart[it.id]&&S.cart[it.id].note)||'')+'</textarea></div>'+
-      '<div style="display:flex;align-items:center;justify-content:space-between;margin:20px 0 6px"><span class="kicker">Quantity</span>'+
-        '<span class="stepper" id="istep"><button id="idec">−</button><span id="iqty">'+Math.max(1,q)+'</span><button id="iinc">+</button></span></div>'+
-      '</div>'+
-      '<div class="sheet-cta"><button class="btn terra between" id="iadd"><span>'+(q>0?'Update cart':'Add to cart')+'</span><span class="mono">'+money(it.price*Math.max(1,q))+'</span></button></div>';
+      '<div class="ish-hero" style="background:'+hueGrad(it.hue||30)+'">'+(it.image?'<img src="'+esc(it.image)+'" alt="">':'<div class="init">'+esc((it.name||'?').charAt(0))+'</div>')+'</div>'+
+      '<div class="ish-meta"><span class="vdot '+esc(it.veg||'v')+'"></span>'+(it.spice>0?chilis(it.spice):'')+tagHTML+'</div>'+
+      '<h2 class="serif" style="font-size:31px;margin:9px 0 0;line-height:1.03">'+esc(it.name)+'</h2>'+
+      (it.desc?'<p style="color:var(--inkSoft);font-size:14.5px;line-height:1.5;margin:11px 0 0">'+esc(it.desc)+'</p>':'')+
+      (hasTaste?'<div class="sectlabel">Taste Profile<span class="rl"></span></div><div class="radarbox">'+radarSVG(it.taste)+'</div>':'')+
+      '<div class="ish-cta"><span class="stepper"><button id="idec">−</button><span id="iqty">'+q+'</span><button id="iinc">+</button></span>'+
+        '<button class="ish-add" id="iadd"><span>Add to order</span><span class="mono" id="iamt">'+money(it.price*q)+'</span></button></div>'+
+      (pairs.length?'<div class="sectlabel">Pairs with<span class="rl"></span></div><div class="pairrow">'+pairs.map(function(p){return '<button class="paircard" data-pair="'+esc(p.id)+'"><div class="pimg" style="background:'+hueGrad(p.hue||30)+'">'+(p.image?'<img src="'+esc(p.image)+'" style="width:100%;height:100%;object-fit:cover">':'')+'<span class="ptag">'+esc(p.subName||'')+'</span></div><div class="pnm">'+esc(p.name)+'</div><div class="pf"><span class="price" style="font-size:13px">'+money(p.price)+'</span><span style="color:var(--inkMute)">&rsaquo;</span></div></button>';}).join('')+'</div>':'')+
+      '<div class="detgrid">'+
+        '<div><div class="k">Spice</div><div class="v">'+spiceLbl+'</div></div>'+
+        '<div><div class="k">Diet</div><div class="v">'+esc(dietLbl)+'</div></div>'+
+        '<div><div class="k">Serves</div><div class="v">'+esc(it.serves?(it.serves+' people'):'—')+'</div></div>'+
+        '<div><div class="k">Prep</div><div class="v">'+(it.prep_minutes?('~ '+it.prep_minutes+' minutes'):'—')+'</div></div>'+
+      '</div><div style="height:16px"></div></div>';
     openSheet(s);
-    var qv=Math.max(1,q);
-    function paint(){document.getElementById('iqty').textContent=qv;document.querySelector('#iadd span:last-child').textContent=money(it.price*qv);}
+    var qv=q;
+    function paint(){document.getElementById('iqty').textContent=qv;document.getElementById('iamt').textContent=money(it.price*qv);}
     document.getElementById('iinc').onclick=function(){qv++;paint();};
     document.getElementById('idec').onclick=function(){qv=Math.max(1,qv-1);paint();};
-    document.getElementById('iadd').onclick=function(){
-      var note=document.getElementById('inote').value.trim();
-      S.cart[it.id]={item:it,qty:qv,note:note};saveCart();
-      closeSheet();toast(it.name+' added');mountFloat();
-      var w=app.querySelector('[data-q="'+cssid(it.id)+'"]');if(w){w.innerHTML=qtyCtl(it,qv);bindQ(w,it);}
-    };
+    document.getElementById('iadd').onclick=function(){S.cart[it.id]={item:it,qty:qv};saveCart();closeSheet();toast(it.name+' added');mountFloat();var w=app.querySelector('[data-q="'+cssid(it.id)+'"]');if(w){w.innerHTML=qtyCtl(it,qv);bindQ(w,it);}};
+    s.querySelectorAll('[data-pair]').forEach(function(b){b.onclick=function(){openItem(itemById(b.getAttribute('data-pair')));};});
   }
 
   function openCart(){

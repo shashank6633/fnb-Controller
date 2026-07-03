@@ -49,6 +49,16 @@ function vegOf(tag: string | null): 'v' | 'n' | 'e' {
   return 'v'; // Veg or unmarked → green dot (matches the design's own convention)
 }
 
+/** Parse the stored tags (JSON array or comma list) → known tag slugs. */
+function parseTags(raw: string | null): string[] {
+  const s = String(raw || '').trim();
+  if (!s) return [];
+  let arr: any[] = [];
+  try { const j = JSON.parse(s); if (Array.isArray(j)) arr = j; else arr = s.split(','); } catch { arr = s.split(','); }
+  const valid = new Set(['most-ordered', 'chef', 'bestseller', 'popular']);
+  return arr.map(x => String(x || '').toLowerCase().trim()).filter(x => valid.has(x));
+}
+
 /** Deterministic hue (0–359) from a string, so each dish gets a stable colour. */
 function hueOf(s: string): number {
   let h = 0;
@@ -116,7 +126,11 @@ export function buildCustomerMenu(outletId: string | null): { food: MenuSection;
   // Show this outlet's items; items with NULL outlet are shared/global.
   const rows = db.prepare(`
     SELECT id, name, category, station, item_type, dietary_tag,
-           selling_price, tax_value, prep_minutes, COALESCE(notes,'') AS notes
+           selling_price, tax_value, prep_minutes, COALESCE(notes,'') AS notes,
+           COALESCE(image_url,'') AS image_url, COALESCE(spice_level,0) AS spice_level,
+           COALESCE(tags,'') AS tags, COALESCE(taste_sour,0) AS taste_sour,
+           COALESCE(taste_sweet,0) AS taste_sweet, COALESCE(taste_spicy,0) AS taste_spicy,
+           COALESCE(taste_tangy,0) AS taste_tangy, COALESCE(serves,'') AS serves
     FROM menu_items
     WHERE is_active = 1 AND selling_price > 0
     ORDER BY category, name
@@ -139,13 +153,20 @@ export function buildCustomerMenu(outletId: string | null): { food: MenuSection;
       desc: r.notes || '',
       price: Math.round(Number(r.selling_price) || 0),
       veg: vegOf(r.dietary_tag),
-      spice: 0,
-      tags: [],
-      taste: { sour: 0, sweet: 0, spicy: 0, tangy: 0 },
+      diet: r.dietary_tag || '',
+      spice: Math.max(0, Math.min(3, Number(r.spice_level) || 0)),
+      tags: parseTags(r.tags),
+      taste: {
+        sour: Number(r.taste_sour) || 0, sweet: Number(r.taste_sweet) || 0,
+        spicy: Number(r.taste_spicy) || 0, tangy: Number(r.taste_tangy) || 0,
+      },
+      image: (r.image_url || '').toString(),
+      serves: (r.serves || '').toString(),
       pairs: [],
       hue: hueOf(r.name || r.id),
       subName: prettyCategory(cat),
       // extra fields the ordering flow needs (ignored by the UI's render):
+      section: sec,
       station: r.station || 'kitchen',
       item_type: r.item_type || '',
       tax_value: Number(r.tax_value) || 0,
