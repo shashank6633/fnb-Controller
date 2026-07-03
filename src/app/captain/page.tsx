@@ -5,7 +5,6 @@ import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { Loader2, Utensils, ChevronRight, Receipt, Menu } from 'lucide-react';
 import { CaptainUI } from './CaptainShell';
-import CustomerRequestsPanel from '@/components/CustomerRequestsPanel';
 
 interface TableTile {
   id: string; table_number: string; zone: string; seats: number;
@@ -42,10 +41,6 @@ export default function CaptainHome() {
 
   return (
     <div className="p-4 sm:p-6 pb-24 lg:pb-6 max-w-4xl">
-      {/* Incoming from the customer QR menu — pending orders to approve + table
-          service requests. Auto-appears when a table orders/rings; hidden when idle. */}
-      <CustomerRequestsPanel variant="embed" />
-
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <button onClick={openTables} className="md:hidden p-2 -ml-2 rounded-lg bg-[#1C0F05] text-white active:scale-95" aria-label="Open tables">

@@ -6,12 +6,12 @@
  * the routed page in the main area. The sidebar is the table selector and
  * quick-switcher; it polls live status and highlights the open table.
  */
-import { useEffect, useState, useCallback, useMemo, createContext } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef, createContext } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
 import {
   ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search, Loader2,
-  MapPin, ChevronDown, Users, WifiOff,
+  MapPin, ChevronDown, Users, WifiOff, Bell,
 } from 'lucide-react';
 
 /** Lets the routed pages open the tables sidebar/drawer (the ☰ in their headers). */
@@ -31,7 +31,13 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   const router = useRouter();
   const pathname = usePathname();
   const [tables, setTables] = useState<TableTile[]>([]);
-  const [me, setMe] = useState<{ name?: string; email?: string } | null>(null);
+  const [me, setMe] = useState<{ name?: string; email?: string; id?: string } | null>(null);
+  // Customer QR-menu orders + service requests scoped to THIS captain's tables:
+  // a live badge on the sidebar tab + a toast when new ones arrive.
+  const [reqCount, setReqCount] = useState(0);
+  const [toast, setToast] = useState<{ key: number; text: string } | null>(null);
+  const seenReq = useRef<Set<string>>(new Set());
+  const firstReq = useRef(true);
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -108,6 +114,56 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
 
   // Close the drawer whenever the route changes (a table was opened).
   useEffect(() => { setDrawer(false); }, [pathname]);
+
+  // Poll customer orders + service requests for MY tables (+ unclaimed). Keeps the
+  // sidebar badge live and raises a toast (+ soft beep) when a NEW one arrives, so
+  // the captain is alerted on any screen without a panel hijacking the page.
+  useEffect(() => {
+    let stop = false;
+    const beep = () => {
+      try {
+        const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
+        if (!AC) return;
+        const ctx = new AC(); const o = ctx.createOscillator(); const g = ctx.createGain();
+        o.connect(g); g.connect(ctx.destination); o.type = 'sine'; o.frequency.value = 880;
+        g.gain.setValueAtTime(0.0001, ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.06, ctx.currentTime + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.25);
+        o.start(); o.stop(ctx.currentTime + 0.26);
+        setTimeout(() => { try { ctx.close(); } catch {} }, 400);
+      } catch {}
+    };
+    const poll = async () => {
+      try {
+        const [o, r] = await Promise.all([
+          api('/api/dine-in/customer-orders').then((x) => x.json()).catch(() => ({})),
+          api('/api/dine-in/service-requests').then((x) => x.json()).catch(() => ({})),
+        ]);
+        if (stop) return;
+        const myId = me?.id;
+        const mine = (owner?: string | null) => !owner || owner === myId;
+        const items: { id: string; text: string }[] = [];
+        for (const ord of (o?.orders || [])) if (mine(ord.table_owner_id)) items.push({ id: 'o:' + ord.id, text: `New order · Table ${ord.table?.number ?? '—'}` });
+        for (const req of (r?.requests || [])) if (mine(req.table_owner_id)) items.push({ id: 's:' + req.id, text: `Table ${req.table_number} · ${req.type}` });
+        setReqCount(items.length);
+        const fresh = items.filter((it) => !seenReq.current.has(it.id));
+        const present = new Set(items.map((it) => it.id));
+        seenReq.current = present; // seen == currently present (so a completed+returning id can re-alert)
+        if (firstReq.current) { firstReq.current = false; return; } // seed silently on first load
+        // Alert on new items — but not while the captain is already on the board.
+        if (fresh.length && !window.location.pathname.endsWith('/captain/requests')) {
+          setToast({ key: Date.now(), text: fresh.length === 1 ? fresh[0].text : `${fresh.length} new orders / requests` });
+          beep();
+        }
+      } catch {}
+    };
+    poll();
+    const t = setInterval(poll, 8000);
+    return () => { stop = true; clearInterval(t); };
+  }, [me?.id]);
+
+  // Auto-dismiss the toast.
+  useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 6000); return () => clearTimeout(t); }, [toast]);
 
   const currentOrderId = useMemo(() => pathname.match(/\/captain\/order\/([^/]+)/)?.[1] || null, [pathname]);
   const occupiedCount = tables.filter((t) => t.open_order_id).length;
@@ -282,6 +338,25 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
         </div>
       </div>
 
+      {/* Customer QR-menu tab — orders to approve + table service requests (my tables) */}
+      <div className="px-3 pb-2">
+        <button
+          onClick={() => { router.push('/captain/requests'); setDrawer(false); }}
+          className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-semibold transition active:scale-95 ${
+            pathname === '/captain/requests'
+              ? 'bg-[#af4408] text-white'
+              : reqCount > 0
+                ? 'bg-[#af4408]/25 text-[#FFC79A] ring-1 ring-[#af4408]/60'
+                : 'bg-white/5 text-white/70 hover:text-white'}`}
+        >
+          <Bell className={`w-4 h-4 shrink-0 ${reqCount > 0 && pathname !== '/captain/requests' ? 'animate-pulse' : ''}`} />
+          <span className="flex-1 text-left truncate">Orders &amp; Requests</span>
+          {reqCount > 0 && (
+            <span className="shrink-0 min-w-[20px] h-5 px-1.5 rounded-full bg-[#FF6B35] text-white text-[11px] font-bold flex items-center justify-center">{reqCount}</span>
+          )}
+        </button>
+      </div>
+
       {/* Tables by floor */}
       <div className="flex-1 overflow-y-auto px-3 pb-3 space-y-3">
         {zones.length === 0 ? (
@@ -386,6 +461,17 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   return (
     <CaptainUI.Provider value={{ openTables: () => setDrawer(true) }}>
     {offlineBanner}
+    {/* New-order / new-request toast — tap to jump to the Orders & Requests view. */}
+    {toast && (
+      <button
+        onClick={() => { setToast(null); router.push('/captain/requests'); }}
+        className="fixed top-3 left-1/2 -translate-x-1/2 z-[80] flex items-center gap-2 max-w-[92vw] bg-[#af4408] text-white pl-3 pr-2 py-2.5 rounded-full shadow-2xl ring-1 ring-white/20 active:scale-95"
+      >
+        <Bell className="w-4 h-4 shrink-0" />
+        <span className="text-sm font-semibold truncate">{toast.text}</span>
+        <span className="shrink-0 text-[11px] font-bold bg-white/20 px-2 py-0.5 rounded-full">View</span>
+      </button>
+    )}
     <div className="md:flex min-h-screen">
       {/* Persistent sidebar (tablet/desktop, md+) */}
       <aside className="hidden md:block shrink-0 h-screen sticky top-0">{sidebar}</aside>

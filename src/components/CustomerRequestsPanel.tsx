@@ -50,8 +50,9 @@ function ago(ts: string): string {
   return m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
 }
 
-export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 'page' | 'embed' }) {
-  const embed = variant === 'embed';
+export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 'page' | 'embed' | 'captain' }) {
+  const embed = variant === 'embed';        // captain-home mini panel: compact + hide when idle
+  const scopeMine = variant !== 'page';     // embed + captain scope to THIS captain's tables (+ unclaimed)
   const [orders, setOrders] = useState<PendingOrder[]>([]);
   const [requests, setRequests] = useState<ServiceReq[]>([]);
   const [edits, setEdits] = useState<Record<string, Record<string, number>>>({});
@@ -62,11 +63,11 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
   const [, tick] = useState(0);
   const timer = useRef<any>(null);
 
-  // On the Captain page (embed) we scope to THIS captain's tables. Fetch who I am.
+  // Captain views scope to THIS captain's tables. Fetch who I am.
   useEffect(() => {
-    if (!embed) return;
+    if (!scopeMine) return;
     fetch('/api/auth/me').then(r => r.json()).then(d => setMyId(d?.user?.id || null)).catch(() => {});
-  }, [embed]);
+  }, [scopeMine]);
 
   const refresh = useCallback(async () => {
     try {
@@ -116,7 +117,7 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
 
   // Embed (Captain page): show only MY tables + not-yet-claimed tables (owner null).
   // Page (manager board): show everything.
-  const mine = (ownerId?: string | null) => !embed || !ownerId || ownerId === myId;
+  const mine = (ownerId?: string | null) => !scopeMine || !ownerId || ownerId === myId;
   const vOrders = orders.filter(o => mine(o.table_owner_id));
   const vRequests = requests.filter(r => mine(r.table_owner_id));
 
@@ -164,7 +165,7 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
             return (
               <div key={o.id} style={card(C.forest)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-                  <div style={{ fontFamily: SERIF, fontWeight: 400, fontSize: 24, color: C.ink }}>Table {o.table.number} {o.table.zone && <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 0.8, color: C.inkMute, textTransform: 'uppercase' }}>· {o.table.zone}</span>}{embed && unclaimed && <span style={{ fontFamily: MONO, fontSize: 9, letterSpacing: 0.6, color: C.terra, textTransform: 'uppercase', marginLeft: 6, border: `1px solid ${C.terraTint}`, borderRadius: 4, padding: '1px 5px' }}>unclaimed</span>}</div>
+                  <div style={{ fontFamily: SERIF, fontWeight: 400, fontSize: 24, color: C.ink }}>Table {o.table.number} {o.table.zone && <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 0.8, color: C.inkMute, textTransform: 'uppercase' }}>· {o.table.zone}</span>}{scopeMine && unclaimed && <span style={{ fontFamily: MONO, fontSize: 9, letterSpacing: 0.6, color: C.terra, textTransform: 'uppercase', marginLeft: 6, border: `1px solid ${C.terraTint}`, borderRadius: 4, padding: '1px 5px' }}>unclaimed</span>}</div>
                   <div style={{ fontFamily: MONO, fontSize: 11, color: C.inkMute }}>{ago(o.created_at)}</div>
                 </div>
                 {o.note && <div style={{ fontFamily: SANS, fontSize: 12.5, color: C.terraDeep, background: C.cardElev, borderLeft: `2px solid ${C.egg}`, borderRadius: 6, padding: '5px 9px', margin: '8px 0' }}>“{o.note}”</div>}
