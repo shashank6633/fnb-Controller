@@ -858,7 +858,7 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
               <div>
                 <label className="block text-xs font-medium text-[#6B5744] mb-1">Spice level</label>
                 <select value={F.spice_level ?? 0} onChange={e => setForm({ ...form, spice_level: Number(e.target.value) } as any)} className="w-full px-3 py-2 bg-white border border-[#D4B896] rounded-lg text-sm">
-                  <option value={0}>None</option><option value={1}>Mild</option><option value={2}>Medium</option><option value={3}>Hot</option>
+                  <option value={0}>None</option><option value={1}>🌶️ Mild</option><option value={2}>🌶️🌶️ Medium</option><option value={3}>🌶️🌶️🌶️ Hot</option>
                 </select>
               </div>
               <div>

@@ -206,8 +206,7 @@
   .ish-hero img{width:100%;height:100%;object-fit:cover}
   .ish-hero::after{content:"";position:absolute;inset:0;opacity:.42;background:repeating-linear-gradient(-45deg,rgba(255,255,255,.12) 0 2px,transparent 2px 15px)}
   .ish-meta{display:flex;align-items:center;gap:9px;margin-top:16px;flex-wrap:wrap}
-  .chilis{display:inline-flex;gap:2px;align-items:center}
-  .chili{width:11px;height:14px}
+  .chilis{display:inline-flex;gap:1px;align-items:center;font-size:12px;line-height:1;letter-spacing:-1px}
   .tagchip{font-family:var(--mono);font-size:9px;letter-spacing:.09em;text-transform:uppercase;font-weight:500;padding:3px 9px;border-radius:7px;background:var(--terra);color:#fff}
   .tagchip.mo{background:var(--terra);color:#fff}
   .tagchip.chef{background:var(--forest);color:#fff}
@@ -505,7 +504,8 @@
 
   var TAGMETA={'most-ordered':['mo','Most Ordered'],'chef':['chef','★ Chef’s Pick'],'bestseller':['best','Bestseller'],'popular':['pop','Popular']};
   function tagsHTML(tags,base){return (tags||[]).map(function(tg){var m=TAGMETA[tg];return m?'<span class="'+base+' '+m[0]+'">'+m[1]+'</span>':'';}).join('');}
-  function chilis(level){var out='<span class="chilis">';for(var i=0;i<3;i++){var on=i<level;out+='<svg class="chili" viewBox="0 0 12 15" fill="'+(on?'#B4502E':'#E9C6AB')+'"><path d="M6 .5c2 2.5 3.2 4.6 3.2 7.3C9.2 11.5 7.7 14 6 14.5 4.3 14 2.8 11.5 2.8 7.8 2.8 5.1 4 3 6 .5Z"/></svg>';}return out+'</span>';}
+  // Spice shown as red-chilli emoji: one 🌶️ per level (1=mild, 2=medium, 3=hot).
+  function chilis(level){var n=Math.max(0,Math.min(3,level|0));if(!n)return '';var out='<span class="chilis" title="Spice '+n+'/3" aria-label="Spice level '+n+' of 3">';for(var i=0;i<n;i++){out+='🌶️';}return out+'</span>';}
   function radarSVG(t){
     var W=250,H=176,cx=125,cy=90,R=62;
     var axes=[['SPICY',t.spicy||0,0],['SWEET',t.sweet||0,90],['SOUR',t.sour||0,180],['TANGY',t.tangy||0,270]];
@@ -548,7 +548,7 @@
         '<button class="ish-add" id="iadd"><span>Add to order</span><span class="mono" id="iamt">'+money(it.price*q)+'</span></button></div>'+
       (pairs.length?'<div class="sectlabel">Pairs with<span class="rl"></span></div><div class="pairrow">'+pairs.map(function(p){return '<button class="paircard" data-pair="'+esc(p.id)+'"><div class="pimg" style="background:'+hueGrad(p.hue||30)+'">'+(p.image?'<img src="'+esc(p.image)+'" style="width:100%;height:100%;object-fit:cover">':'')+'<span class="ptag">'+esc(p.subName||'')+'</span></div><div class="pnm">'+esc(p.name)+'</div><div class="pf"><span class="price" style="font-size:13px">'+money(p.price)+'</span><span style="color:var(--inkMute)">&rsaquo;</span></div></button>';}).join('')+'</div>':'')+
       '<div class="detgrid">'+
-        '<div><div class="k">Spice</div><div class="v">'+spiceLbl+'</div></div>'+
+        '<div><div class="k">Spice</div><div class="v">'+spiceLbl+(it.spice>0?' '+chilis(it.spice):'')+'</div></div>'+
         '<div><div class="k">Diet</div><div class="v">'+esc(dietLbl)+'</div></div>'+
         '<div><div class="k">Serves</div><div class="v">'+esc(it.serves?(it.serves+' people'):'—')+'</div></div>'+
         '<div><div class="k">Prep</div><div class="v">'+(it.prep_minutes?('~ '+it.prep_minutes+' minutes'):'—')+'</div></div>'+
