@@ -25,6 +25,35 @@ import MaterialTypeahead from '@/components/MaterialTypeahead';
 import { fmtIST } from '@/lib/format-date';
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 
+/** Heuristic sanity check for a requisition line — returns a human-readable
+ *  warning when the quantity smells like a UNIT mistake (the classic "12 ml of
+ *  oil" when the chef meant 12 bottles). Warn-only; the approving chef decides.
+ *  Uses the live qty so fixing the number clears the flag immediately. */
+function plausibilityFlag(it: any, guests: number | null | undefined, effQty: number): string | null {
+  if (it.is_rejected) return null;
+  const qty = Number(effQty) || 0;
+  if (qty <= 0) return null;
+  const unit = String(it.material_unit || '').toLowerCase();
+  const pack = Number(it.material_pack_size) || 1;
+  const pu = String(it.material_purchase_unit || '').trim();
+  const price = Number(it.average_price) || 0;
+  const cost = qty * price;
+
+  // A) Less than ONE purchase pack of a pack-based material (oil sold in 1L
+  //    bottles, rice in 30kg bags): "12 ml" < 1,000 ml/BTL almost certainly
+  //    means 12 BTL. pack >= 100 keeps kg/kg or pcs materials out of this rule.
+  if (pack >= 100 && qty < pack) {
+    return `Only ${qty.toLocaleString('en-IN')} ${unit} — less than one ${pu || 'pack'} (${pack.toLocaleString('en-IN')} ${unit}). Did the chef mean ${qty.toLocaleString('en-IN')} ${pu || 'packs'}?`;
+  }
+  // B) Absurdly small for the crowd AND nearly free: under 0.5 g/ml per guest
+  //    with line cost < ₹50. The cost floor keeps genuinely tiny-but-expensive
+  //    items (saffron) from being flagged.
+  if (guests && guests > 0 && (unit === 'g' || unit === 'ml') && qty / guests < 0.5 && cost < 50) {
+    return `${qty.toLocaleString('en-IN')} ${unit} ≈ ${(qty / guests).toFixed(2)} ${unit}/guest for ${guests} guests (≈${fmt(cost)}) — check the unit.`;
+  }
+  return null;
+}
+
 interface PartyReq {
   id: string;
   req_number: string;
@@ -564,7 +593,19 @@ export default function PartyApprovalsPage() {
                                     {/* Edit / reject is allowed when the req is still submitted (chef approval phase). */}
                                     {(() => {
                                       const editable = r.status === 'submitted';
+                                      const guests = detail.guest_count ?? r.guest_count ?? null;
+                                      // Count implausible lines against the SAVED qtys (drafts are per-row below).
+                                      const flaggedCount = detail.items.filter((x: any) => {
+                                        const q = x.chef_approved_qty != null ? Number(x.chef_approved_qty) : Number(x.quantity_requested);
+                                        return !!plausibilityFlag(x, guests, q || 0);
+                                      }).length;
                                       return (
+                                    <>
+                                    {flaggedCount > 0 && (
+                                      <div className="mb-1.5 px-2 py-1 rounded bg-amber-100 border border-amber-300 text-amber-900 text-[11px]">
+                                        ⚠ {flaggedCount} line{flaggedCount === 1 ? ' looks' : 's look'} implausible (likely a unit mistake — e.g. ml instead of bottles). Hover the ⚠ on each line, and fix the qty before approving.
+                                      </div>
+                                    )}
                                     <table className="w-full text-[11px]">
                                       <thead className="text-[#6B5744]">
                                         <tr>
@@ -596,13 +637,22 @@ export default function PartyApprovalsPage() {
                                           const rejected = !!it.is_rejected;
                                           const lineCost = rejected ? 0 : effQty * price;
                                           const isSaving = savingItemId === it.id;
-                                          const rowCls = `border-t border-[#E8D5C4]/40 ${rejected ? 'opacity-50 line-through' : ''}`;
+                                          // Plausibility check against the LIVE qty — editing the
+                                          // number to a sane value clears the flag immediately.
+                                          const flag = plausibilityFlag(it, guests, effQty);
+                                          const rowCls = `border-t border-[#E8D5C4]/40 ${rejected ? 'opacity-50 line-through' : flag ? 'bg-amber-50' : ''}`;
                                           return (
                                             <tr key={it.id} className={rowCls}>
                                               <td className="py-0.5 font-mono text-[10px] text-[#8B7355]">{it.material_sku || '—'}</td>
                                               <td className="py-0.5 text-[#2D1B0E]">
                                                 {it.material_name}
                                                 {rejected && <span className="ml-1 text-[9px] px-1 rounded bg-red-100 text-red-700 no-underline inline-block">rejected</span>}
+                                                {flag && (
+                                                  <span title={flag}
+                                                        className="ml-1 text-[9px] px-1 rounded bg-amber-200 text-amber-900 inline-block cursor-help align-middle">
+                                                    ⚠ check unit
+                                                  </span>
+                                                )}
                                               </td>
                                               <td className="py-0.5 text-right font-mono text-[#8B7355]">
                                                 {reqQty} <span className="text-[9px]">{it.material_unit || ''}</span>
@@ -673,6 +723,7 @@ export default function PartyApprovalsPage() {
                                         </tr>
                                       </tfoot>
                                     </table>
+                                    </>
                                       );
                                     })()}
                                     {detail.notes && (

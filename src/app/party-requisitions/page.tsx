@@ -788,7 +788,14 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
       const m = materials.find(x => x.id === it.material_id);
       if (!m) continue;
       const q = Number(it.qty) || 0;
-      t += q * (m.average_price || 0);
+      if (q === 0) continue;
+      // Same conversion as the per-line cost: a qty entered in the purchase
+      // unit (BTL/BAG) is pack_size recipe-units each. Without this the footer
+      // total disagrees with the line costs whenever a purchase unit is used.
+      const recipeU = (m.unit || '').trim();
+      const lineU = (it.unit || allowedUnitsForMaterial(m)[0] || recipeU).trim();
+      const effQty = (lineU && lineU !== recipeU) ? q * (Number(m.pack_size) || 1) : q;
+      t += effQty * (m.average_price || 0);
     }
     return t;
   }, [items, materials]);
@@ -808,7 +815,9 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
       if (!it.material_id || !(Number(it.qty) > 0)) continue;
       const m = materials.find(x => x.id === it.material_id);
       const allowed = allowedUnitsForMaterial(m);
-      const u = (it.unit || m?.unit || '').trim();
+      // Fallback matches what the dropdown DISPLAYS when unit is unset
+      // (allowedUnits[0] = ordering unit) — never silently reinterpret as recipe unit.
+      const u = (it.unit || allowed[0] || m?.unit || '').trim();
       if (allowed.length > 0 && u && !allowed.includes(u)) {
         setError(`Line ${idx + 1}: unit "${u}" is not registered for ${m?.name}. Allowed: ${allowed.join(', ')}.`);
         return;
@@ -819,7 +828,9 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
       .map(i => {
         const m = materials.find(x => x.id === i.material_id);
         const recipeU = (m?.unit || '').trim();
-        const lineU = (i.unit || recipeU).trim();
+        // Same fallback as the dropdown display (ordering unit first) — an unset
+        // unit must be interpreted as what the user SAW, not the recipe unit.
+        const lineU = (i.unit || allowedUnitsForMaterial(m)[0] || recipeU).trim();
         const q = Number(i.qty) || 0;
         // Persist quantity in RECIPE units so downstream code (recipe cost,
         // chef approval, store issue) keeps working uniformly. When the staff
@@ -1121,7 +1132,8 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
                   const q = Number(it.qty) || 0;
                   if (!m || q === 0) return 0;
                   const recipeU = (m.unit || '').trim();
-                  const lineU = (it.unit || recipeU).trim();
+                  // Match the dropdown's display fallback (ordering unit first).
+                  const lineU = (it.unit || allowedUnits[0] || recipeU).trim();
                   if (lineU === recipeU) return q;
                   // line unit == purchase_unit → convert to recipe units via pack_size
                   const pack = Number(m.pack_size) || 1;
@@ -1135,13 +1147,22 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
                         materials={materials as any}
                         value={it.material_id}
                         onPick={(id) => {
-                          // When a material is picked, default the unit to its
-                          // recipe_unit (canonical) and auto-add a new trailing
-                          // line if this is the last row.
+                          // When a material is picked FRESH, default the unit to the
+                          // ORDERING unit (purchase_unit — how humans think in bulk:
+                          // BTL / bag), NOT the recipe unit (g/ml). This is the fix for
+                          // "chef typed 12 meaning litres, got 12 ml". ONLY when
+                          // pack_size > 1 — the purchase-unit conversion multiplies by
+                          // pack_size, so a mis-configured pack_size=1 material must
+                          // keep its recipe unit or "12 BTL" would store as 12 ml.
+                          // Prefilled/edited lines keep recipe units because their
+                          // quantities are already stored canonically.
                           const mat = materials.find(x => x.id === id);
+                          const pu = (mat?.purchase_unit || '').trim();
+                          const ru = (mat?.unit || '').trim();
+                          const ordering = (pu && pu !== ru && (Number(mat?.pack_size) || 1) > 1) ? pu : ru;
                           ensureTrailingEmpty(i, {
                             material_id: id,
-                            unit: (mat?.unit || '').trim() || '',
+                            unit: ordering || '',
                           });
                         }}
                         excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
