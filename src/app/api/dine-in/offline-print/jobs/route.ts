@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { raiseKotAlert } from '@/lib/kot-alerts';
 
 /**
  * Print-job journal. The browser prints directly to the local bridge (so it
@@ -51,6 +52,30 @@ export async function POST(request: Request) {
       status, Number(b.attempts) || 1, String(b.last_error || ''),
       status === 'printed' ? new Date().toISOString() : null,
     );
+
+    // A KOT that gave up printing (after the outbox exhausted its retries) is a
+    // real kitchen problem — raise an alert so the respective captain + floor
+    // manager are told. Only for real fire/reprint KOTs (not test tickets/bills).
+    if (status === 'failed' && docType === 'kot' && source !== 'test' && b.ref_id) {
+      try {
+        const kot = db.prepare(`
+          SELECT k.id, k.order_id, k.outlet_id, k.kot_number, k.station,
+                 o.server_id, rt.table_number
+          FROM kots k
+          JOIN orders o ON o.id = k.order_id
+          LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
+          WHERE k.id = ?
+        `).get(String(b.ref_id)) as any;
+        if (kot) {
+          raiseKotAlert(db, {
+            kotId: kot.id, orderId: kot.order_id, outletId: kot.outlet_id,
+            kotNumber: kot.kot_number, station: kot.station, tableNumber: kot.table_number,
+            serverId: kot.server_id, kind: 'print_failed', createdBy: 'printer',
+            reason: `KOT #${kot.kot_number} failed to print at ${kot.station || 'the kitchen'}${b.last_error ? ' — ' + String(b.last_error).slice(0, 80) : ''}.`,
+          });
+        }
+      } catch (ae) { console.error('[/api/dine-in/offline-print/jobs print-fail alert]', ae); }
+    }
 
     return Response.json({ ok: true, id }, { status: 201 });
   } catch (e: any) {

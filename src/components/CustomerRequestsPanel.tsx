@@ -19,6 +19,15 @@ import { api, apiJson } from '@/lib/api';
 interface OrderItem { id: string; name: string; station: string; qty: number; unit_price: number; line_total: number; note?: string; }
 interface PendingOrder { id: string; subtotal: number; note: string; created_at: string; table: { number: string; zone: string }; items: OrderItem[]; table_owner_id?: string | null; }
 interface ServiceReq { id: string; type: string; status: string; note: string; created_at: string; table_number: string; zone: string; table_owner_id?: string | null; }
+interface KotAlert { id: string; kot_number: number; station: string; table_number: string; reason: string; kind: string; server_id?: string | null; created_at: string; }
+
+// Friendly label for each auto-raised KOT issue kind.
+const ALERT_KIND: Record<string, string> = {
+  fire_failed:  'Order didn’t reach kitchen',
+  print_failed: 'KOT didn’t print',
+  unprinted:    'KOT not confirmed',
+  manual:       'Flagged by staff',
+};
 
 const C = {
   paper: '#F1E8D0', card: '#FBF4DF', cardElev: '#FFF8E2',
@@ -55,6 +64,7 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
   const scopeMine = variant !== 'page';     // embed + captain scope to THIS captain's tables (+ unclaimed)
   const [orders, setOrders] = useState<PendingOrder[]>([]);
   const [requests, setRequests] = useState<ServiceReq[]>([]);
+  const [alerts, setAlerts] = useState<KotAlert[]>([]);
   const [edits, setEdits] = useState<Record<string, Record<string, number>>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [err, setErr] = useState('');
@@ -71,12 +81,14 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
 
   const refresh = useCallback(async () => {
     try {
-      const [o, r] = await Promise.all([
+      const [o, r, a] = await Promise.all([
         apiJson<{ orders: PendingOrder[] }>('/api/dine-in/customer-orders'),
         apiJson<{ requests: ServiceReq[] }>('/api/dine-in/service-requests'),
+        apiJson<{ alerts: KotAlert[] }>('/api/dine-in/kot-alerts?open=1').catch(() => ({ alerts: [] })),
       ]);
       setOrders(o.orders || []);
       setRequests(r.requests || []);
+      setAlerts(a.alerts || []);
       setErr('');
     } catch (e: any) { setErr(e.message || 'Refresh failed'); }
     finally { setLoaded(true); }
@@ -115,13 +127,22 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
     finally { setBusy(b => ({ ...b, [id]: false })); }
   };
 
+  const resolveAlert = async (id: string) => {
+    setAlerts(a => a.filter(x => x.id !== id));   // optimistic
+    setBusy(b => ({ ...b, [id]: true }));
+    try { await api('/api/dine-in/kot-alerts', { method: 'POST', body: { id, resolve: true } }); await refresh(); }
+    catch (e: any) { setErr(e.message || 'Action failed'); await refresh(); }
+    finally { setBusy(b => ({ ...b, [id]: false })); }
+  };
+
   // Embed (Captain page): show only MY tables + not-yet-claimed tables (owner null).
   // Page (manager board): show everything.
   const mine = (ownerId?: string | null) => !scopeMine || !ownerId || ownerId === myId;
   const vOrders = orders.filter(o => mine(o.table_owner_id));
   const vRequests = requests.filter(r => mine(r.table_owner_id));
+  const vAlerts = alerts.filter(a => mine(a.server_id));
 
-  const nothing = !vOrders.length && !vRequests.length;
+  const nothing = !vOrders.length && !vRequests.length && !vAlerts.length;
   // Embedded on the Captain page: stay invisible until a table needs something.
   if (embed && (!loaded || nothing)) return null;
 
@@ -153,6 +174,28 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
         </div>
       )}
       {err && <div style={{ background: C.terraTint, color: C.terraDeep, padding: '8px 12px', borderRadius: 8, margin: '10px 0', fontSize: 13, fontFamily: SANS }}>{err}</div>}
+
+      {/* ── Kitchen alerts (KOT issues) — urgent, so they sit above everything ── */}
+      {vAlerts.length > 0 && (
+        <section style={{ margin: embed ? '4px 0 14px' : '16px 0 8px' }}>
+          <h2 style={{ ...hdr(), color: C.terraDeep }}>⚠ Kitchen alerts <Count n={vAlerts.length} color={C.terra} /></h2>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 }}>
+            {vAlerts.map(a => (
+              <div key={a.id} style={{ background: '#FBEDE7', border: `1px solid ${C.terraTint}`, borderLeft: `4px solid ${C.terra}`, borderRadius: 10, padding: 13 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
+                  <div style={{ fontFamily: SERIF, fontWeight: 400, fontSize: 20, color: C.ink }}>
+                    Table {a.table_number || '—'}
+                    <span style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: 0.6, color: C.terraDeep, textTransform: 'uppercase', marginLeft: 8, border: `1px solid ${C.terra}`, borderRadius: 4, padding: '1px 6px' }}>{ALERT_KIND[a.kind] || a.kind}</span>
+                  </div>
+                  <span style={{ fontFamily: MONO, fontSize: 10.5, color: C.inkMute }}>{ago(a.created_at)}</span>
+                </div>
+                <div style={{ fontFamily: SANS, fontSize: 13, color: C.terraDeep, margin: '7px 0 11px', lineHeight: 1.45 }}>{a.reason || 'A kitchen ticket needs attention.'}</div>
+                <button onClick={() => resolveAlert(a.id)} disabled={busy[a.id]} style={{ ...actBtn(C.terra), width: '100%' }}>{busy[a.id] ? '…' : 'Mark handled'}</button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: embed ? 'repeat(auto-fit, minmax(280px, 1fr))' : 'repeat(auto-fit, minmax(320px, 1fr))', gap: embed ? 16 : 24, marginTop: embed ? 4 : 16 }}>
         {/* ── Pending customer orders ── */}

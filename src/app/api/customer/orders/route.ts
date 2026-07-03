@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { resolveTableByToken, priceLookup, getCustomerMenuDesign } from '@/lib/customer';
 import { fireStagingOrder } from '@/lib/kot-fire';
+import { raiseKotAlert } from '@/lib/kot-alerts';
 import { emitKds } from '@/lib/kds-bus';
 
 const MAX_LINES = 60;      // sanity caps — a prank can't create a huge order
@@ -109,8 +110,16 @@ export async function POST(req: Request) {
         });
       } catch (e: any) {
         // If firing fails, the order still exists as pending_approval — a captain
-        // can recover it. Surface a soft error so the guest can retry/flag staff.
+        // can recover it. Raise a KOT alert so the respective captain + floor
+        // manager are told immediately, then surface a soft error to the guest.
         console.error('[/api/customer/orders POST direct-fire]', e);
+        try {
+          raiseKotAlert(db, {
+            orderId, outletId: table.outlet_id, tableNumber: String(table.table_number || ''),
+            kind: 'fire_failed', createdBy: 'QR Order',
+            reason: `Self-order from Table ${table.table_number || '?'} could not reach the kitchen — needs manual firing.`,
+          });
+        } catch (ae) { console.error('[/api/customer/orders POST fire-alert]', ae); }
         return Response.json({ ok: false, error: 'Could not send your order to the kitchen. Please ask our staff.' }, { status: 500 });
       }
     }

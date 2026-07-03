@@ -1640,6 +1640,15 @@ function initializeSchema(db: Database.Database) {
       );
       CREATE INDEX IF NOT EXISTS idx_kot_alerts_open ON kot_alerts(resolved_at);
     `);
+    // kot_alerts: `kind` categorises the issue (manual|fire_failed|print_failed|
+    // unprinted); `server_id` snapshots the table's owning captain so an alert
+    // can route to "the respective captain" (see src/lib/kot-alerts.ts).
+    try {
+      const kaCols = db.prepare("PRAGMA table_info(kot_alerts)").all() as any[];
+      const kaHas = (c: string) => kaCols.some((x: any) => x.name === c);
+      if (!kaHas('kind'))      db.exec("ALTER TABLE kot_alerts ADD COLUMN kind TEXT DEFAULT 'manual'");
+      if (!kaHas('server_id')) db.exec("ALTER TABLE kot_alerts ADD COLUMN server_id TEXT DEFAULT ''");
+    } catch (e) { console.error('kot_alerts column migration failed:', e); }
 
     // Customer QR menu — table-side service requests (bell). A guest at a table
     // taps "Call waiter / Refill water / Extra cutlery / Request bill" and the

@@ -135,9 +135,10 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
     };
     const poll = async () => {
       try {
-        const [o, r] = await Promise.all([
+        const [o, r, a] = await Promise.all([
           api('/api/dine-in/customer-orders').then((x) => x.json()).catch(() => ({})),
           api('/api/dine-in/service-requests').then((x) => x.json()).catch(() => ({})),
+          api('/api/dine-in/kot-alerts?open=1').then((x) => x.json()).catch(() => ({})),
         ]);
         if (stop) return;
         const myId = me?.id;
@@ -145,6 +146,8 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
         const items: { id: string; text: string }[] = [];
         for (const ord of (o?.orders || [])) if (mine(ord.table_owner_id)) items.push({ id: 'o:' + ord.id, text: `New order · Table ${ord.table?.number ?? '—'}` });
         for (const req of (r?.requests || [])) if (mine(req.table_owner_id)) items.push({ id: 's:' + req.id, text: `Table ${req.table_number} · ${req.type}` });
+        // KOT trouble (self-order didn't print / reach the kitchen) — urgent.
+        for (const al of (a?.alerts || [])) if (mine(al.server_id)) items.push({ id: 'a:' + al.id, text: `⚠ Kitchen issue · Table ${al.table_number || '—'}` });
         setReqCount(items.length);
         const fresh = items.filter((it) => !seenReq.current.has(it.id));
         const present = new Set(items.map((it) => it.id));
