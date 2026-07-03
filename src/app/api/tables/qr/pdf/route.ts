@@ -32,7 +32,7 @@ const TPL = {
   qrCxF: 0.5010,   // QR centre X (fraction of width)
   qrCyF: 0.6107,   // QR centre Y (fraction of height, from BOTTOM — pdf-lib origin)
   qrSizeF: 0.4653, // QR size (fraction of width) — covers the card's QR footprint
-  labelYF: 0.3980, // "TABLE n" baseline (fraction of height, from bottom) — nudged up to clear the "Scan to" line
+  labelYF: 0.3800, // "TABLE n" baseline (fraction of height, from bottom) — centred in the gap between the QR card and the "Scan to" line
   labelSizeF: 0.059, // label font size (fraction of width)
   cream: '#FBE8CF',  // the card colour (sampled) — the QR light modules blend into it
   dark: '#171008',   // QR dark modules

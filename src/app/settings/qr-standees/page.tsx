@@ -8,7 +8,7 @@ interface QrTable { id: string; table_number: string; zone: string; seats: numbe
 // QR/label placement on the "Akan 4×6" template (fractions of the page) —
 // kept in sync with TPL in /api/tables/qr/pdf so preview == printed output.
 const TPL_QR = { left: 26.84, top: 23.42, width: 46.53 }; // %
-const TPL_LABEL_TOP = 57.5;                               // %
+const TPL_LABEL_TOP = 59.3;                               // %
 type Size = 'A4' | 'A5' | 'A6';
 
 // QR-menu design tokens (QR Code menu/atoms.jsx `C`).
