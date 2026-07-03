@@ -79,6 +79,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           item_name: it.name,
           recipe_id: it.recipe_id,
           quantity_sold: it.quantity,
+          // Already consumed at KOT-complete? Record the sale (revenue) but don't
+          // deduct stock again. Not-yet-completed items (e.g. quick-settled without
+          // a KDS bump) still deduct here as the backstop.
+          skip_inventory: !!it.recipe_deducted_at,
           bill_type: order.bill_type || 'normal',
           selling_price: it.unit_price,
           date,

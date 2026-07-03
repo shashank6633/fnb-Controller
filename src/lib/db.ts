@@ -1660,6 +1660,16 @@ function initializeSchema(db: Database.Database) {
       }
     } catch (e) { console.error('restaurant_tables qr_printed_at migration failed:', e); }
 
+    // order_items.recipe_deducted_at — set when the item's recipe was deducted
+    // from stock (on KOT "served"/complete). NULL = not yet consumed. The settle
+    // path skips inventory for already-stamped items so stock never double-drops.
+    try {
+      const oiCols = db.prepare("PRAGMA table_info(order_items)").all() as any[];
+      if (!oiCols.some((x: any) => x.name === 'recipe_deducted_at')) {
+        db.exec("ALTER TABLE order_items ADD COLUMN recipe_deducted_at TEXT");
+      }
+    } catch (e) { console.error('order_items recipe_deducted_at migration failed:', e); }
+
     // Customer QR menu — table-side service requests (bell). A guest at a table
     // taps "Call waiter / Refill water / Extra cutlery / Request bill" and the
     // request lands here for the Captain/Waiter dashboard to accept → complete.
@@ -2306,6 +2316,10 @@ export interface SaleInput {
   pos_item_name?: string | null;
   variant_name?: string | null;
   outlet_id?: string | null;
+  // Record the sale (revenue) but do NOT deduct inventory again — used at settle
+  // when the item's recipe was already deducted at KOT-complete (see the KDS bump
+  // route). Prevents double-deduction under the "consume on KOT complete" model.
+  skip_inventory?: boolean;
 }
 
 /**
@@ -2347,7 +2361,7 @@ export function recordSale(db: Database.Database, s: SaleInput): string {
     s.pos_item_id || null, s.pos_item_name || null, s.variant_name || null, s.outlet_id || null,
   );
 
-  if (s.recipe_id) {
+  if (s.recipe_id && !s.skip_inventory) {
     deductInventoryForSale(db, s.recipe_id, s.quantity_sold, id, billType);
   }
   return id;
