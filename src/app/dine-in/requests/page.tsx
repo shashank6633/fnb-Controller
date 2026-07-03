@@ -7,6 +7,20 @@ interface OrderItem { id: string; name: string; station: string; qty: number; un
 interface PendingOrder { id: string; subtotal: number; note: string; created_at: string; table: { number: string; zone: string }; items: OrderItem[]; }
 interface ServiceReq { id: string; type: string; status: string; note: string; created_at: string; table_number: string; zone: string; }
 
+// ── Exact tokens from the QR-menu design (QR Code menu/atoms.jsx `C`) ──
+const C = {
+  paper: '#F1E8D0', card: '#FBF4DF', cardElev: '#FFF8E2',
+  ink: '#231C12', inkSoft: '#5B4F3A', inkMute: '#8E8166',
+  rule: 'rgba(35,28,18,0.10)', ruleSoft: 'rgba(35,28,18,0.06)',
+  terra: '#B4502E', terraDeep: '#8E3A1E', terraTint: '#E9C6AB',
+  forest: '#2D4A3A', forestDeep: '#1F362A', forestTint: '#C9D6CB', egg: '#C9911E',
+};
+const SERIF = '"Instrument Serif", Georgia, serif';
+const SANS = '"Geist", system-ui, sans-serif';
+const MONO = '"Geist Mono", ui-monospace, monospace';
+const FONTS_HREF =
+  'https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap';
+
 const SERVICE_META: Record<string, { label: string; icon: string }> = {
   waiter:  { label: 'Call waiter',    icon: '🙋' },
   water:   { label: 'Refill water',   icon: '💧' },
@@ -79,55 +93,63 @@ export default function RequestsBoardPage() {
   };
 
   return (
-    <div style={{ maxWidth: 1200, margin: '0 auto', padding: '20px 16px 80px' }}>
+    <div style={{ maxWidth: 1200, margin: '0 auto', padding: '20px 16px 80px', fontFamily: SANS, color: C.ink }}>
+      {/* Load the exact design fonts (the app shell only ships Inter). */}
+      <link rel="preconnect" href="https://fonts.googleapis.com" />
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+      <link rel="stylesheet" href={FONTS_HREF} />
+
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-        <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0 }}>Customer Orders &amp; Requests</h1>
-        <span style={{ fontSize: 12, color: '#888' }}>Live · refreshes every {POLL_MS / 1000}s</span>
+        <div>
+          <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 1.6, textTransform: 'uppercase', color: C.terra, fontWeight: 500 }}>Customer QR Menu</div>
+          <h1 style={{ fontFamily: SERIF, fontSize: 26, fontWeight: 400, margin: '2px 0 0', color: C.ink }}>Orders &amp; Requests</h1>
+        </div>
+        <span style={{ fontFamily: MONO, fontSize: 11, letterSpacing: 0.6, color: C.inkMute, textTransform: 'uppercase' }}>● Live · refreshes every {POLL_MS / 1000}s</span>
       </div>
-      {err && <div style={{ background: '#fee', color: '#a00', padding: '8px 12px', borderRadius: 8, margin: '12px 0', fontSize: 13 }}>{err}</div>}
+      {err && <div style={{ background: C.terraTint, color: C.terraDeep, padding: '8px 12px', borderRadius: 8, margin: '12px 0', fontSize: 13, fontFamily: SANS }}>{err}</div>}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 24, marginTop: 16 }}>
         {/* ── Pending customer orders ── */}
         <section>
-          <h2 style={hdr()}>Pending orders <Count n={orders.length} color="#2d4a3a" /></h2>
+          <h2 style={hdr()}>Pending orders <Count n={orders.length} color={C.forest} /></h2>
           {!orders.length && <Empty>No orders waiting for approval.</Empty>}
           {orders.map(o => {
             const edited = orderEdited(o);
             return (
-              <div key={o.id} style={card('#2d4a3a')}>
+              <div key={o.id} style={card(C.forest)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-                  <div style={{ fontWeight: 700, fontSize: 17 }}>Table {o.table.number} {o.table.zone && <span style={{ fontSize: 12, color: '#999', fontWeight: 400 }}>· {o.table.zone}</span>}</div>
-                  <div style={{ fontSize: 12, color: '#999' }}>{ago(o.created_at)}</div>
+                  <div style={{ fontFamily: SERIF, fontWeight: 400, fontSize: 24, color: C.ink }}>Table {o.table.number} {o.table.zone && <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 0.8, color: C.inkMute, textTransform: 'uppercase' }}>· {o.table.zone}</span>}</div>
+                  <div style={{ fontFamily: MONO, fontSize: 11, color: C.inkMute }}>{ago(o.created_at)}</div>
                 </div>
-                {o.note && <div style={{ fontSize: 12.5, color: '#8a6d3b', background: '#fcf6e6', borderRadius: 6, padding: '4px 8px', margin: '8px 0' }}>“{o.note}”</div>}
+                {o.note && <div style={{ fontFamily: SANS, fontSize: 12.5, color: C.terraDeep, background: C.cardElev, borderLeft: `2px solid ${C.egg}`, borderRadius: 6, padding: '5px 9px', margin: '8px 0' }}>“{o.note}”</div>}
                 <div style={{ margin: '10px 0' }}>
                   {o.items.map(it => {
                     const q = qtyOf(o, it);
                     return (
-                      <div key={it.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 0', borderBottom: '1px solid #f0efe9', opacity: q === 0 ? 0.4 : 1 }}>
-                        <div style={{ display: 'inline-flex', alignItems: 'center', border: '1px solid #ddd', borderRadius: 999, overflow: 'hidden' }}>
+                      <div key={it.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: `1px solid ${C.ruleSoft}`, opacity: q === 0 ? 0.4 : 1 }}>
+                        <div style={{ display: 'inline-flex', alignItems: 'center', border: `1px solid ${C.rule}`, borderRadius: 999, overflow: 'hidden', background: C.cardElev }}>
                           <button onClick={() => setQty(o, it, q - 1)} style={stepBtn()}>−</button>
-                          <span style={{ minWidth: 22, textAlign: 'center', fontVariantNumeric: 'tabular-nums', fontSize: 13, fontWeight: 600 }}>{q}</span>
+                          <span style={{ minWidth: 22, textAlign: 'center', fontFamily: MONO, fontSize: 12.5, fontWeight: 600, color: C.ink }}>{q}</span>
                           <button onClick={() => setQty(o, it, q + 1)} style={stepBtn()}>+</button>
                         </div>
                         <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontSize: 14, textDecoration: q === 0 ? 'line-through' : 'none' }}>{it.name}</div>
-                          <div style={{ fontSize: 10.5, color: '#aaa', textTransform: 'uppercase', letterSpacing: 0.5 }}>{it.station}</div>
+                          <div style={{ fontFamily: SANS, fontSize: 14, color: C.ink, textDecoration: q === 0 ? 'line-through' : 'none' }}>{it.name}</div>
+                          <div style={{ fontFamily: MONO, fontSize: 9.5, color: C.inkMute, textTransform: 'uppercase', letterSpacing: 0.8 }}>{it.station}</div>
                         </div>
-                        <div style={{ fontSize: 13, color: '#666', fontVariantNumeric: 'tabular-nums' }}>₹{it.unit_price * q}</div>
+                        <div style={{ fontFamily: MONO, fontSize: 13, color: C.inkSoft, fontVariantNumeric: 'tabular-nums' }}>₹{it.unit_price * q}</div>
                       </div>
                     );
                   })}
                 </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-                  <span style={{ fontSize: 12, color: '#999' }}>{edited ? 'Modified' : 'Subtotal'}</span>
-                  <span style={{ fontWeight: 700, fontSize: 15 }}>₹{liveSubtotal(o)}</span>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 12 }}>
+                  <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 1.2, textTransform: 'uppercase', color: edited ? C.terra : C.inkMute }}>{edited ? 'Modified' : 'Subtotal'}</span>
+                  <span style={{ fontFamily: MONO, fontWeight: 600, fontSize: 15, color: C.ink }}>₹{liveSubtotal(o)}</span>
                 </div>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  <button onClick={() => approve(o)} disabled={busy[o.id]} style={{ ...actBtn('#2d4a3a'), flex: 2 }}>
+                  <button onClick={() => approve(o)} disabled={busy[o.id]} style={{ ...actBtn(C.forest), flex: 2 }}>
                     {busy[o.id] ? '…' : edited ? 'Approve modified → Kitchen' : 'Approve → Kitchen'}
                   </button>
-                  <button onClick={() => reject(o)} disabled={busy[o.id]} style={{ ...actBtn('#b4502e'), flex: 1 }}>Reject</button>
+                  <button onClick={() => reject(o)} disabled={busy[o.id]} style={{ ...actBtn(C.terra), flex: 1 }}>Reject</button>
                 </div>
               </div>
             );
@@ -136,20 +158,20 @@ export default function RequestsBoardPage() {
 
         {/* ── Service requests (bell) ── */}
         <section>
-          <h2 style={hdr()}>Service requests <Count n={requests.length} color="#b4502e" /></h2>
+          <h2 style={hdr()}>Service requests <Count n={requests.length} color={C.terra} /></h2>
           {!requests.length && <Empty>No table service requests right now.</Empty>}
           {requests.map(r => {
             const m = SERVICE_META[r.type] || { label: r.type, icon: '🔔' };
             const accepted = r.status === 'accepted';
             return (
-              <div key={r.id} style={{ ...card(accepted ? '#c99a3a' : '#b4502e'), display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div key={r.id} style={{ ...card(accepted ? C.egg : C.terra), display: 'flex', alignItems: 'center', gap: 12 }}>
                 <div style={{ fontSize: 26 }}>{m.icon}</div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 700, fontSize: 15 }}>Table {r.table_number} · {m.label}</div>
-                  <div style={{ fontSize: 12, color: '#999' }}>{ago(r.created_at)}{accepted ? ' · accepted' : ''}</div>
+                  <div style={{ fontFamily: SERIF, fontWeight: 400, fontSize: 19, color: C.ink }}>Table {r.table_number} · {m.label}</div>
+                  <div style={{ fontFamily: MONO, fontSize: 10.5, letterSpacing: 0.4, color: accepted ? C.egg : C.inkMute, textTransform: 'uppercase' }}>{ago(r.created_at)}{accepted ? ' · accepted' : ''}</div>
                 </div>
-                {!accepted && <button onClick={() => serviceAct(r.id, 'accept')} disabled={busy[r.id]} style={actBtn('#c99a3a')}>Accept</button>}
-                <button onClick={() => serviceAct(r.id, 'complete')} disabled={busy[r.id]} style={actBtn('#2d4a3a')}>Done</button>
+                {!accepted && <button onClick={() => serviceAct(r.id, 'accept')} disabled={busy[r.id]} style={actBtn(C.egg)}>Accept</button>}
+                <button onClick={() => serviceAct(r.id, 'complete')} disabled={busy[r.id]} style={actBtn(C.forest)}>Done</button>
               </div>
             );
           })}
@@ -159,9 +181,9 @@ export default function RequestsBoardPage() {
   );
 }
 
-const hdr = (): React.CSSProperties => ({ fontSize: 14, textTransform: 'uppercase', letterSpacing: 1, color: '#666', margin: '0 0 12px', display: 'flex', alignItems: 'center', gap: 8 });
-const card = (accent: string): React.CSSProperties => ({ background: '#fff', border: '1px solid #eee', borderLeft: `4px solid ${accent}`, borderRadius: 10, padding: 14, marginBottom: 12, boxShadow: '0 1px 4px rgba(0,0,0,0.04)' });
-const actBtn = (bg: string): React.CSSProperties => ({ background: bg, color: '#fff', border: 'none', borderRadius: 8, padding: '9px 12px', fontSize: 13, fontWeight: 600, cursor: 'pointer' });
-const stepBtn = (): React.CSSProperties => ({ width: 26, height: 26, border: 'none', background: '#f4f3ee', cursor: 'pointer', fontSize: 15, lineHeight: 1 });
-function Count({ n, color }: { n: number; color: string }) { return <span style={{ background: color, color: '#fff', borderRadius: 999, fontSize: 12, fontWeight: 700, padding: '1px 9px', minWidth: 20, textAlign: 'center' }}>{n}</span>; }
-function Empty({ children }: { children: React.ReactNode }) { return <div style={{ color: '#aaa', fontSize: 13, padding: '20px 4px', textAlign: 'center', border: '1px dashed #e5e5e5', borderRadius: 10 }}>{children}</div>; }
+const hdr = (): React.CSSProperties => ({ fontFamily: MONO, fontSize: 11, textTransform: 'uppercase', letterSpacing: 1.6, color: C.inkSoft, margin: '0 0 12px', display: 'flex', alignItems: 'center', gap: 8, fontWeight: 500 });
+const card = (accent: string): React.CSSProperties => ({ background: C.card, border: `1px solid ${C.rule}`, borderLeft: `4px solid ${accent}`, borderRadius: 10, padding: 14, marginBottom: 12, boxShadow: '0 1px 4px rgba(35,28,18,0.05)' });
+const actBtn = (bg: string): React.CSSProperties => ({ background: bg, color: C.paper, border: 'none', borderRadius: 999, padding: '9px 14px', fontSize: 13, fontWeight: 500, fontFamily: SANS, cursor: 'pointer', letterSpacing: 0.2 });
+const stepBtn = (): React.CSSProperties => ({ width: 26, height: 26, border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 15, lineHeight: 1, color: C.ink });
+function Count({ n, color }: { n: number; color: string }) { return <span style={{ background: color, color: C.paper, borderRadius: 999, fontFamily: MONO, fontSize: 12, fontWeight: 600, padding: '1px 9px', minWidth: 20, textAlign: 'center' }}>{n}</span>; }
+function Empty({ children }: { children: React.ReactNode }) { return <div style={{ color: C.inkMute, fontFamily: SANS, fontSize: 13, padding: '20px 4px', textAlign: 'center', border: `1px dashed ${C.rule}`, borderRadius: 10 }}>{children}</div>; }

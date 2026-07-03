@@ -36,6 +36,8 @@ import {
   Scissors,
   Printer,
   Smartphone,
+  Bell,
+  QrCode,
   type LucideIcon,
 } from "lucide-react";
 
@@ -59,6 +61,7 @@ const navTree: NavEntry[] = [
     icon: UtensilsCrossed,
     items: [
       { kind: "link", label: "Order Floor",        href: "/dine-in/floor",             icon: ShoppingCart },
+      { kind: "link", label: "Customer Orders & Requests", href: "/dine-in/requests",  icon: Bell },
       { kind: "link", label: "Kitchen Display",    href: "/dine-in/kitchen",           icon: ChefHat },
       { kind: "link", label: "KOT & Bill Printers", href: "/dine-in/offline-print",    icon: Printer },
       { kind: "link", label: "Captain (Tablet)",   href: "/captain",                   icon: Smartphone },
@@ -135,6 +138,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Categories",     href: "/settings/categories",    icon: Boxes },
       { kind: "link", label: "Page Access",    href: "/settings/page-access",   icon: ShieldAlert },
       { kind: "link", label: "Integrations",   href: "/settings/integrations",  icon: ShieldAlert },
+      { kind: "link", label: "QR Standees",    href: "/settings/qr-standees",   icon: QrCode },
       { kind: "link", label: "Outlets",        href: "/outlets",                icon: Store },
       { kind: "link", label: "Audit Log",      href: "/audit",                  icon: History },
       { kind: "link", label: "Data Hygiene",   href: "/admin/data-hygiene",     icon: ShieldAlert },

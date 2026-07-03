@@ -74,9 +74,11 @@
       'align-items:center', 'justify-content:center', 'text-align:center', 'padding:32px',
       'color:#FBF4DF', 'font-family:Geist,system-ui,sans-serif',
     ].join(';');
+    // Colours below are the exact QR-menu design tokens (atoms.jsx C): card #FBF4DF
+    // for the title, a soft warm paper tint for the body — on the dark #1F1A14 body.
     o.innerHTML =
-      '<div style="font-family:\'Instrument Serif\',serif;font-size:32px;margin-bottom:10px">' + title + '</div>' +
-      '<div style="font-size:14.5px;line-height:1.5;color:#D8CFB8;max-width:340px">' + body + '</div>';
+      '<div style="font-family:\'Instrument Serif\',serif;font-size:34px;line-height:1.05;margin-bottom:10px;color:#FBF4DF">' + title + '</div>' +
+      '<div style="font-family:\'Geist\',system-ui,sans-serif;font-size:14.5px;line-height:1.5;color:#E9C6AB;max-width:340px">' + body + '</div>';
     document.body.appendChild(o);
   }
 
