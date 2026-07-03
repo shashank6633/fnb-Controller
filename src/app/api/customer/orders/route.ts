@@ -28,19 +28,24 @@ export async function POST(req: Request) {
     if (!rawItems.length) return Response.json({ ok: false, error: 'Your cart is empty.' }, { status: 400 });
     if (rawItems.length > MAX_LINES) return Response.json({ ok: false, error: 'Too many items — please ask a server.' }, { status: 400 });
 
-    // Collapse duplicate ids, clamp quantities.
-    const wanted = new Map<string, number>();
+    // Collapse duplicate (id + per-line note) lines, clamp quantities. The note
+    // carries the chosen variant (e.g. "Chilled") so it reaches the KOT — and two
+    // notes on the same item (Normal vs Chilled water) stay as SEPARATE lines.
+    const wanted = new Map<string, { id: string; qty: number; note: string }>();
     for (const it of rawItems) {
       const id = String(it?.id || '').trim();
       const qty = Math.min(MAX_QTY_PER_LINE, Math.max(1, Math.floor(Number(it?.qty) || 0)));
+      const lnote = String(it?.note || '').slice(0, 120).trim();
       if (!id || qty <= 0) continue;
-      wanted.set(id, Math.min(MAX_QTY_PER_LINE, (wanted.get(id) || 0) + qty));
+      const key = id + '|' + lnote;
+      const cur = wanted.get(key);
+      wanted.set(key, { id, qty: Math.min(MAX_QTY_PER_LINE, (cur?.qty || 0) + qty), note: lnote });
     }
     if (!wanted.size) return Response.json({ ok: false, error: 'Your cart is empty.' }, { status: 400 });
 
-    const prices = priceLookup([...wanted.keys()]);
-    const lines = [...wanted.entries()]
-      .map(([id, qty]) => ({ id, qty, mi: prices.get(id) }))
+    const prices = priceLookup([...new Set([...wanted.values()].map(w => w.id))]);
+    const lines = [...wanted.values()]
+      .map(w => ({ id: w.id, qty: w.qty, note: w.note, mi: prices.get(w.id) }))
       .filter(l => l.mi); // drop items that no longer exist / are inactive
     if (!lines.length) return Response.json({ ok: false, error: 'These items are no longer available.' }, { status: 409 });
 
@@ -61,8 +66,8 @@ export async function POST(req: Request) {
 
       const insItem = db.prepare(`
         INSERT INTO order_items (id, order_id, menu_item_id, recipe_id, name, station,
-                                 quantity, unit_price, tax_value, line_total, status, prep_minutes, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, datetime('now'))
+                                 quantity, unit_price, tax_value, line_total, status, prep_minutes, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, datetime('now'))
       `);
       let subtotal = 0;
       for (const l of lines) {
@@ -70,7 +75,7 @@ export async function POST(req: Request) {
         subtotal += lineTotal;
         insItem.run(
           generateId(), orderId, l.id, l.mi!.recipe_id, l.mi!.name, l.mi!.station,
-          l.qty, l.mi!.unit_price, l.mi!.tax_value, lineTotal, l.mi!.prep_minutes,
+          l.qty, l.mi!.unit_price, l.mi!.tax_value, lineTotal, l.mi!.prep_minutes, l.note || '',
         );
       }
       const sub = Math.round(subtotal * 100) / 100;

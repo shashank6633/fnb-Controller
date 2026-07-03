@@ -736,9 +736,26 @@ function IssueChip({ active, onClick, color, count, label }: { active: boolean; 
   );
 }
 
+// Options/variants <-> the admin textarea ("Label: a, b" per line).
+function optionsToText(raw: any): string {
+  let arr: any[] = [];
+  if (Array.isArray(raw)) arr = raw;
+  else { try { const j = JSON.parse(raw || '[]'); if (Array.isArray(j)) arr = j; } catch { /* ignore */ } }
+  return arr.map((g: any) => `${g?.label || ''}: ${(g?.choices || []).join(', ')}`).join('\n');
+}
+function textToOptions(t: string): Array<{ label: string; choices: string[] }> {
+  return t.split('\n').map(line => {
+    const i = line.indexOf(':'); if (i < 0) return null;
+    const label = line.slice(0, i).trim();
+    const choices = line.slice(i + 1).split(',').map(c => c.trim()).filter(Boolean);
+    return label && choices.length >= 2 ? { label, choices } : null;
+  }).filter((x): x is { label: string; choices: string[] } => !!x);
+}
+
 function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => void; categories: string[]; stations: string[]; isNew: boolean }) {
   const [form, setForm] = useState({ ...item });
   const [saving, setSaving] = useState(false);
+  const [optsText, setOptsText] = useState(() => optionsToText((item as any).options));
   const F = form as any;
   const tagArr: string[] = Array.isArray(F.tags) ? F.tags : (F.tags ? (() => { try { const j = JSON.parse(F.tags); return Array.isArray(j) ? j : String(F.tags).split(','); } catch { return String(F.tags).split(','); } })() : []);
   const toggleTag = (tg: string) => setForm({ ...form, tags: (tagArr.indexOf(tg) >= 0 ? tagArr.filter(x => x !== tg) : tagArr.concat(tg)) } as any);
@@ -868,6 +885,11 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
                   </div>
                 ))}
               </div>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">Options / Variants <span className="text-[#8B7355] font-normal">(optional)</span></label>
+              <textarea value={optsText} onChange={e => { setOptsText(e.target.value); setForm({ ...form, options: textToOptions(e.target.value) } as any); }} rows={2} placeholder="Temperature: Normal, Chilled" className="w-full px-3 py-2 bg-white border border-[#D4B896] rounded-lg text-sm font-mono" />
+              <p className="text-[10px] text-[#8B7355] mt-0.5">One per line as <b>Label: choice1, choice2</b>. The guest picks one when ordering (e.g. a water bottle → <b>Temperature: Normal, Chilled</b>), and the choice prints on the KOT.</p>
             </div>
           </div>
 

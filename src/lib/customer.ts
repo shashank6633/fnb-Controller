@@ -59,6 +59,21 @@ function parseTags(raw: string | null): string[] {
   return arr.map(x => String(x || '').toLowerCase().trim()).filter(x => valid.has(x));
 }
 
+/** Parse item options/variants (JSON [{label, choices[]}]) — e.g. Temperature: Normal/Chilled. */
+function parseOptions(raw: string | null): Array<{ label: string; choices: string[] }> {
+  const s = String(raw || '').trim();
+  if (!s) return [];
+  let arr: any[] = [];
+  try { const j = JSON.parse(s); if (Array.isArray(j)) arr = j; else return []; } catch { return []; }
+  return arr
+    .map(g => ({
+      label: String((g && g.label) || '').trim(),
+      choices: (Array.isArray(g && g.choices) ? g.choices : []).map((c: any) => String(c || '').trim()).filter(Boolean),
+    }))
+    .filter(g => g.label && g.choices.length >= 2)
+    .slice(0, 4);
+}
+
 /** Deterministic hue (0–359) from a string, so each dish gets a stable colour. */
 function hueOf(s: string): number {
   let h = 0;
@@ -130,7 +145,8 @@ export function buildCustomerMenu(outletId: string | null): { food: MenuSection;
            COALESCE(image_url,'') AS image_url, COALESCE(spice_level,0) AS spice_level,
            COALESCE(tags,'') AS tags, COALESCE(taste_sour,0) AS taste_sour,
            COALESCE(taste_sweet,0) AS taste_sweet, COALESCE(taste_spicy,0) AS taste_spicy,
-           COALESCE(taste_tangy,0) AS taste_tangy, COALESCE(serves,'') AS serves
+           COALESCE(taste_tangy,0) AS taste_tangy, COALESCE(serves,'') AS serves,
+           COALESCE(options,'') AS options
     FROM menu_items
     WHERE is_active = 1 AND selling_price > 0
     ORDER BY category, name
@@ -162,6 +178,7 @@ export function buildCustomerMenu(outletId: string | null): { food: MenuSection;
       },
       image: (r.image_url || '').toString(),
       serves: (r.serves || '').toString(),
+      options: parseOptions(r.options),
       pairs: [],
       hue: hueOf(r.name || r.id),
       subName: prettyCategory(cat),

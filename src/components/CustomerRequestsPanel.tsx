@@ -16,7 +16,7 @@ import { api, apiJson } from '@/lib/api';
  * Instrument Serif / Geist / Geist Mono so it reads as one product with the menu.
  */
 
-interface OrderItem { id: string; name: string; station: string; qty: number; unit_price: number; line_total: number; }
+interface OrderItem { id: string; name: string; station: string; qty: number; unit_price: number; line_total: number; note?: string; }
 interface PendingOrder { id: string; subtotal: number; note: string; created_at: string; table: { number: string; zone: string }; items: OrderItem[]; table_owner_id?: string | null; }
 interface ServiceReq { id: string; type: string; status: string; note: string; created_at: string; table_number: string; zone: string; table_owner_id?: string | null; }
 
@@ -180,7 +180,7 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
                           <button onClick={() => setQty(o, it, q + 1)} style={stepBtn()}>+</button>
                         </div>
                         <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontFamily: SANS, fontSize: 14, color: C.ink, textDecoration: q === 0 ? 'line-through' : 'none' }}>{it.name}</div>
+                          <div style={{ fontFamily: SANS, fontSize: 14, color: C.ink, textDecoration: q === 0 ? 'line-through' : 'none' }}>{it.name}{it.note ? <span style={{ color: C.terra, fontWeight: 500 }}> · {it.note}</span> : null}</div>
                           <div style={{ fontFamily: MONO, fontSize: 9.5, color: C.inkMute, textTransform: 'uppercase', letterSpacing: 0.8 }}>{it.station}</div>
                         </div>
                         <div style={{ fontFamily: MONO, fontSize: 13, color: C.inkSoft, fontVariantNumeric: 'tabular-nums' }}>₹{it.unit_price * q}</div>

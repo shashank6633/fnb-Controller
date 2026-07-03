@@ -461,6 +461,7 @@ function initializeSchema(db: Database.Database) {
       ['taste_spicy', 'INTEGER NOT NULL DEFAULT 0'],
       ['taste_tangy', 'INTEGER NOT NULL DEFAULT 0'],
       ['serves', "TEXT DEFAULT ''"],                    // e.g. "1-2"
+      ['options', "TEXT DEFAULT ''"],                   // JSON: [{label, choices:[…]}] — e.g. Temperature: Normal/Chilled
     ];
     for (const [c, t] of miAdds) if (!miNames.has(c)) db.exec(`ALTER TABLE menu_items ADD COLUMN ${c} ${t}`);
     // Backfill — any menu item already with a material_id is implicitly reviewed

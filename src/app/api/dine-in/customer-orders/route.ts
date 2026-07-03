@@ -31,7 +31,7 @@ export async function GET() {
     `).all(outletId) as any[];
 
     const itemStmt = db.prepare(`
-      SELECT id, menu_item_id, name, station, quantity, unit_price, tax_value, line_total
+      SELECT id, menu_item_id, name, station, quantity, unit_price, tax_value, line_total, COALESCE(notes,'') AS notes
       FROM order_items WHERE order_id = ? ORDER BY created_at ASC
     `);
 
@@ -47,7 +47,7 @@ export async function GET() {
       table: { id: o.table_id, number: o.table_number || '—', zone: o.zone || '' },
       items: (itemStmt.all(o.id) as any[]).map(i => ({
         id: i.id, menu_item_id: i.menu_item_id, name: i.name, station: i.station,
-        qty: i.quantity, unit_price: i.unit_price, tax_value: i.tax_value, line_total: i.line_total,
+        qty: i.quantity, unit_price: i.unit_price, tax_value: i.tax_value, line_total: i.line_total, note: i.notes || '',
       })),
     }));
 
