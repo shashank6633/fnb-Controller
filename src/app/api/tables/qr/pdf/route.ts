@@ -2,6 +2,7 @@ import path from 'path';
 import fs from 'fs';
 import PDFDocument from 'pdfkit';
 import { PDFDocument as PDFLib, rgb, StandardFonts } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
 import QRCode from 'qrcode';
 import { getDb, newQrToken } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
@@ -42,6 +43,9 @@ const TPL = {
 const SIZES: Record<string, 'A4' | 'A5' | 'A6'> = { A4: 'A4', A5: 'A5', A6: 'A6' };
 const TEMPLATE_PATH = path.join(process.cwd(), 'public', 'standee-template.pdf');
 const LOGO_PATH = path.join(process.cwd(), 'public', 'akan-logo.png');
+// The template's body font (matches "Scan to Order, Savour, Pay"); pulled from
+// the user's Adobe Fonts (Typekit) web kit. Falls back to Helvetica-Bold.
+const LOOS_PATH = path.join(process.cwd(), 'public', 'fonts', 'LoosNormal-Bold.ttf');
 
 function originFrom(req: Request, override?: string | null): string {
   if (override && /^https?:\/\//i.test(override)) return override.replace(/\/+$/, '');
@@ -108,7 +112,11 @@ export async function GET(req: Request) {
 async function buildFromTemplate(tables: any[], urlFor: (t: any) => string, showNum: boolean): Promise<Buffer> {
   const tplBytes = fs.readFileSync(TEMPLATE_PATH);
   const out = await PDFLib.create();
-  const font = await out.embedFont(StandardFonts.HelveticaBold);
+  out.registerFontkit(fontkit);
+  // "TABLE n" in LoosNormal-Bold (same as the template's "Scan to Order" text).
+  const font = fs.existsSync(LOOS_PATH)
+    ? await out.embedFont(fs.readFileSync(LOOS_PATH), { subset: true })
+    : await out.embedFont(StandardFonts.HelveticaBold);
   // Embed the template artwork ONCE and reuse it on every page (keeps the file
   // small — otherwise the ~840KB template would be duplicated per table).
   const [tpl] = await out.embedPdf(tplBytes, [0]);

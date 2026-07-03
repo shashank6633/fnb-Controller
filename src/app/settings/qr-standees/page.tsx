@@ -86,6 +86,8 @@ export default function QrStandeesPage() {
       <link rel="preconnect" href="https://fonts.googleapis.com" />
       <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
       <link rel="stylesheet" href={FONTS_HREF} />
+      {/* Adobe Fonts (Typekit) kit with Loos — so the preview's TABLE label matches the PDF. */}
+      <link rel="stylesheet" href="https://use.typekit.net/whb1ejl.css" />
 
       <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 1.6, textTransform: 'uppercase', color: C.terra, fontWeight: 500 }}>Customer QR Menu</div>
       <h1 style={{ fontFamily: SERIF, fontSize: 34, fontWeight: 400, margin: '2px 0 6px', color: C.ink, lineHeight: 1.05 }}>Table QR Standees</h1>
@@ -175,7 +177,7 @@ export default function QrStandeesPage() {
                     </div>
                   )}
                 </div>
-                <div style={{ position: 'absolute', left: 0, right: 0, top: `${TPL_LABEL_TOP}%`, textAlign: 'center', color: '#FBE8CF', fontFamily: SANS, fontWeight: 700, fontSize: 19, letterSpacing: '0.04em' }}>TABLE {chosen[0].table_number}</div>
+                <div style={{ position: 'absolute', left: 0, right: 0, top: `${TPL_LABEL_TOP}%`, textAlign: 'center', color: '#FBE8CF', fontFamily: `"loos-normal", ${SANS}`, fontWeight: 700, fontSize: 19, letterSpacing: '0.04em' }}>TABLE {chosen[0].table_number}</div>
               </div>
             ) : (
               <iframe key={previewUrl} src={previewUrl} title="Standee preview" style={{ width: '100%', height: 620, border: `1px solid ${C.rule}`, borderRadius: 10, background: C.card }} />
