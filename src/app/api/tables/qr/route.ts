@@ -5,6 +5,7 @@ import { getDb, newQrToken } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, requireRole } from '@/lib/auth';
 
 const TEMPLATE_PATH = path.join(process.cwd(), 'public', 'standee-template.pdf');
+const LOGO_PATH = path.join(process.cwd(), 'public', 'akan-logo.png');
 
 /**
  * Customer QR standee management (STAFF).
@@ -72,7 +73,7 @@ export async function GET(req: Request) {
     const brandRow = db.prepare("SELECT value FROM settings WHERE key = 'business_name'").get() as any;
     const brand = (brandRow?.value || 'Akan').toString();
 
-    return Response.json({ tables, base, brand, hasTemplate }, { headers: { 'Cache-Control': 'no-store' } });
+    return Response.json({ tables, base, brand, hasTemplate, hasLogo: fs.existsSync(LOGO_PATH) }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (e: any) {
     console.error('[/api/tables/qr GET]', e);
     return Response.json({ error: e.message }, { status: 500 });

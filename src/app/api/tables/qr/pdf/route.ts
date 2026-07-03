@@ -36,10 +36,12 @@ const TPL = {
   labelSizeF: 0.059, // label font size (fraction of width)
   cream: '#FBE8CF',  // the card colour (sampled) — the QR light modules blend into it
   dark: '#171008',   // QR dark modules
+  logoF: 0.24,       // centre-logo size as a fraction of the QR (safe for level-H recovery)
 };
 
 const SIZES: Record<string, 'A4' | 'A5' | 'A6'> = { A4: 'A4', A5: 'A5', A6: 'A6' };
 const TEMPLATE_PATH = path.join(process.cwd(), 'public', 'standee-template.pdf');
+const LOGO_PATH = path.join(process.cwd(), 'public', 'akan-logo.png');
 
 function originFrom(req: Request, override?: string | null): string {
   if (override && /^https?:\/\//i.test(override)) return override.replace(/\/+$/, '');
@@ -112,14 +114,27 @@ async function buildFromTemplate(tables: any[], urlFor: (t: any) => string, show
   const [tpl] = await out.embedPdf(tplBytes, [0]);
   const W = tpl.width, H = tpl.height;
 
+  // Optional centre logo (public/akan-logo.png) — embedded once, reused per page.
+  const logoImg = fs.existsSync(LOGO_PATH) ? await out.embedPng(fs.readFileSync(LOGO_PATH)) : null;
+
   for (const t of tables) {
     const page = out.addPage([W, H]);
     page.drawPage(tpl, { x: 0, y: 0, width: W, height: H });
 
-    // New QR on the cream card (its light modules match the card → seamless).
-    const qrPng = await QRCode.toBuffer(urlFor(t), { type: 'png', margin: 1, width: 640, errorCorrectionLevel: 'M', color: { dark: TPL.dark, light: TPL.cream } });
+    // High error-correction ('H', ~30% recovery) so the centre logo stays scannable.
+    const qrPng = await QRCode.toBuffer(urlFor(t), { type: 'png', margin: 1, width: 720, errorCorrectionLevel: logoImg ? 'H' : 'M', color: { dark: TPL.dark, light: TPL.cream } });
     const qs = W * TPL.qrSizeF;
-    page.drawImage(await out.embedPng(qrPng), { x: W * TPL.qrCxF - qs / 2, y: H * TPL.qrCyF - qs / 2, width: qs, height: qs });
+    const cx = W * TPL.qrCxF, cy = H * TPL.qrCyF;
+    page.drawImage(await out.embedPng(qrPng), { x: cx - qs / 2, y: cy - qs / 2, width: qs, height: qs });
+
+    // Centre logo on a cream disc (punches the QR modules out cleanly behind it).
+    if (logoImg) {
+      const ls = qs * TPL.logoF;
+      const s = ls / Math.max(logoImg.width, logoImg.height);
+      const lw = logoImg.width * s, lh = logoImg.height * s;
+      page.drawCircle({ x: cx, y: cy, size: Math.max(lw, lh) * 0.66, color: hex(TPL.cream) });
+      page.drawImage(logoImg, { x: cx - lw / 2, y: cy - lh / 2, width: lw, height: lh });
+    }
 
     // Table number
     if (showNum) {

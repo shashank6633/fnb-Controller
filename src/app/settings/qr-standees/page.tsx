@@ -26,6 +26,7 @@ const FONTS_HREF = 'https://fonts.googleapis.com/css2?family=Instrument+Serif:it
 export default function QrStandeesPage() {
   const [tables, setTables] = useState<QrTable[]>([]);
   const [hasTemplate, setHasTemplate] = useState(false);
+  const [hasLogo, setHasLogo] = useState(false);
   const [tagline, setTagline] = useState('Scan · Browse · Order from your table');
   const [base, setBase] = useState('');
   const [size, setSize] = useState<Size>('A5');
@@ -39,9 +40,10 @@ export default function QrStandeesPage() {
     setLoading(true); setErr('');
     try {
       const q = origin ? `?base=${encodeURIComponent(origin)}` : '';
-      const data = await apiJson<{ tables: QrTable[]; base: string; hasTemplate: boolean }>(`/api/tables/qr${q}`);
+      const data = await apiJson<{ tables: QrTable[]; base: string; hasTemplate: boolean; hasLogo: boolean }>(`/api/tables/qr${q}`);
       setTables(data.tables);
       setHasTemplate(!!data.hasTemplate);
+      setHasLogo(!!data.hasLogo);
       if (!origin) setBase(data.base);
       setSel(prev => { const next: Record<string, boolean> = {}; for (const t of data.tables) next[t.id] = prev[t.id] ?? true; return next; });
       setNonce(n => n + 1);
@@ -163,8 +165,16 @@ export default function QrStandeesPage() {
               // WYSIWYG overlay: your template image + this table's QR + number,
               // at the same positions the PDF stamps them.
               <div style={{ position: 'relative', width: 320, height: 480, backgroundImage: 'url(/standee-template-preview.png)', backgroundSize: 'cover', backgroundPosition: 'center', borderRadius: 10, border: `1px solid ${C.rule}`, overflow: 'hidden' }}>
-                <img alt={`QR for table ${chosen[0].table_number}`} src={`data:image/svg+xml;utf8,${encodeURIComponent(chosen[0].qr_svg)}`}
-                  style={{ position: 'absolute', left: `${TPL_QR.left}%`, top: `${TPL_QR.top}%`, width: `${TPL_QR.width}%`, aspectRatio: '1 / 1', display: 'block' }} />
+                <div style={{ position: 'absolute', left: `${TPL_QR.left}%`, top: `${TPL_QR.top}%`, width: `${TPL_QR.width}%`, aspectRatio: '1 / 1' }}>
+                  <img alt={`QR for table ${chosen[0].table_number}`} src={`data:image/svg+xml;utf8,${encodeURIComponent(chosen[0].qr_svg)}`} style={{ width: '100%', height: '100%', display: 'block' }} />
+                  {hasLogo && (
+                    <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <div style={{ width: '32%', aspectRatio: '1 / 1', background: '#FBE8CF', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <img alt="logo" src="/akan-logo.png" style={{ width: '84%', height: '84%', objectFit: 'contain' }} />
+                      </div>
+                    </div>
+                  )}
+                </div>
                 <div style={{ position: 'absolute', left: 0, right: 0, top: `${TPL_LABEL_TOP}%`, textAlign: 'center', color: '#FBE8CF', fontFamily: SANS, fontWeight: 700, fontSize: 19, letterSpacing: '0.04em' }}>TABLE {chosen[0].table_number}</div>
               </div>
             ) : (
