@@ -53,8 +53,9 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CACHE_FILE  = path.join(SCRIPT_DIR, 'cache.json');
 const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
+const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.2.1';   // 2.2.1 = offline LAN KOT + audit hardening (loopback gate, fast-fail, partial-print ok)
+const VERSION = '2.3.0';   // 2.3.0 = idempotent by jobId (a retried print after a lost ack is a no-op → never double-prints). 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -538,6 +539,42 @@ function writeJsonFile(file, obj) {
   catch (e) { console.error(`[bridge] failed writing ${path.basename(file)}: ${e.message}`); return false; }
 }
 
+// ── Idempotency: never print the same jobId twice ────────────────────────────
+// The browser outbox RETRIES any print it doesn't get a success-ack for. That's
+// exactly what happens when the printer/LAN blips AFTER a ticket already printed
+// — the ack is lost on the drop, so the outbox re-sends and (without this guard)
+// the bridge reprints it: the "double print on disconnect/reconnect" the counter
+// sees. Every real KOT/bill carries a STABLE jobId (kot_<id>, bill_<id>, and
+// distinct ids for copies/reprints/master), so we remember printed jobIds for a
+// few hours and treat a repeat as an instant success WITHOUT touching the printer.
+// Legitimate reprints use a DIFFERENT id (…_r1) so they are never suppressed.
+const PRINTED_TTL_MS = 6 * 3600_000;   // a jobId is unique per service day; 6h window
+const PRINTED = new Map();             // jobId → printedAt (ms)
+
+function loadPrinted() {
+  const raw = readJsonFile(PRINTED_FILE);
+  if (raw && typeof raw === 'object') {
+    const now = Date.now();
+    for (const [id, ts] of Object.entries(raw)) if (now - Number(ts) < PRINTED_TTL_MS) PRINTED.set(id, Number(ts));
+  }
+}
+function alreadyPrinted(jobId) {
+  if (!jobId) return false;
+  const ts = PRINTED.get(jobId);
+  if (ts == null) return false;
+  if (Date.now() - ts >= PRINTED_TTL_MS) { PRINTED.delete(jobId); return false; }
+  return true;
+}
+function markPrinted(jobId) {
+  if (!jobId) return;
+  PRINTED.set(jobId, Date.now());
+  // prune expired ids, then persist so a bridge restart mid-service still dedups
+  const now = Date.now();
+  for (const [id, ts] of PRINTED) if (now - ts >= PRINTED_TTL_MS) PRINTED.delete(id);
+  writeJsonFile(PRINTED_FILE, Object.fromEntries(PRINTED));
+}
+loadPrinted();
+
 // Load CACHE from memory, falling back to cache.json on cold start.
 function loadCache() {
   if (CACHE) return CACHE;
@@ -694,6 +731,8 @@ const server = http.createServer((req, res) => {
       const groups = new Map();
       for (const j of jobs) {
         const jobId = j.jobId || `job_${Date.now()}_${Math.round(Math.random() * 1e6)}`;
+        // Already printed (a retry after a lost ack) → instant success, no reprint.
+        if (alreadyPrinted(jobId)) { results.push({ jobId, ok: true, deduped: true }); continue; }
         const printer = j.printer || {};
         try {
           const payload = render(j.doc || {}, printer.width);
@@ -708,7 +747,8 @@ const server = http.createServer((req, res) => {
         const buf = Buffer.concat(g.items.map((it) => it.payload));   // all tickets, one stream
         try {
           await printTo(g.printer, buf);
-          for (const it of g.items) results.push({ jobId: it.jobId, ok: true, bytes: it.payload.length });
+          // Record BEFORE acking so a lost ack can't cause a reprint on retry.
+          for (const it of g.items) { markPrinted(it.jobId); results.push({ jobId: it.jobId, ok: true, bytes: it.payload.length }); }
         } catch (e) {
           for (const it of g.items) results.push({ jobId: it.jobId, ok: false, error: String(e.message || e) });
         }
@@ -730,7 +770,10 @@ const server = http.createServer((req, res) => {
       try {
         const payload = render(body.doc || {}, body.printer && body.printer.width);
         if (url.searchParams.get('dryRun')) return sendJson(res, 200, { ok: true, jobId, bytes: payload.length, dryRun: true });
+        // Already printed (a retry after a lost ack) → instant success, no reprint.
+        if (alreadyPrinted(jobId)) { console.log(`[bridge] deduped ${jobId} (already printed)`); return sendJson(res, 200, { ok: true, jobId, deduped: true }); }
         await printTo(body.printer || {}, payload);
+        markPrinted(jobId);
         console.log(`[bridge] printed ${jobId} (${payload.length} bytes) → ${body.printer?.transport}:${body.printer?.target}`);
         return sendJson(res, 200, { ok: true, jobId, bytes: payload.length });
       } catch (e) {

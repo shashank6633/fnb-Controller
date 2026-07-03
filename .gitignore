@@ -97,10 +97,13 @@ captain-android/local.properties
 # Print-bridge runtime files (written next to the .mjs on the counter PC)
 public/cache.json
 public/kot-outbox.json
+public/printed-jobs.json
 scripts/cache.json
 scripts/kot-outbox.json
+scripts/printed-jobs.json
 cache.json
 kot-outbox.json
+printed-jobs.json
 
 # Customer QR menu — design-source archive + heavy reference binaries
 /QR Code menu.zip
