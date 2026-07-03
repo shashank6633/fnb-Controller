@@ -35,6 +35,8 @@ export default function DepartmentConsumptionPage() {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [materials, setMaterials]     = useState<Material[]>([]);
   const [data, setData] = useState<any>(null);
+  const [register, setRegister] = useState<any>(null);
+  const [view, setView] = useState<'summary' | 'register'>('summary');
   const [loading, setLoading] = useState(false);
 
   const [expandedDept, setExpandedDept] = useState<string | null>(null);
@@ -45,8 +47,9 @@ export default function DepartmentConsumptionPage() {
     if (departmentId) qs.set('department_id', departmentId);
     if (category)     qs.set('category', category);
     if (materialId)   qs.set('material_id', materialId);
+    if (view === 'register') qs.set('view', 'register');
     const j = await fetch(`/api/department-consumption?${qs}`).then(r => r.json());
-    setData(j);
+    if (view === 'register') setRegister(j); else setData(j);
     setLoading(false);
   };
   useEffect(() => {
@@ -58,30 +61,39 @@ export default function DepartmentConsumptionPage() {
       setMaterials(m.materials || []);
     });
   }, []);
-  useEffect(() => { reload(); }, [from, to, departmentId, category, materialId]);
+  useEffect(() => { reload(); }, [from, to, departmentId, category, materialId, view]);
 
   const categories = useMemo(() => Array.from(new Set(materials.map(m => m.category))).sort(), [materials]);
 
   const matrixForDept = (deptId: string) =>
     (data?.by_department_material || []).filter((row: any) => row.department_id === deptId);
 
-  const exportCsv = () => {
-    if (!data?.by_department_material?.length) return;
-    const headers = ['department','material','sku','category','unit','qty','avg_price','value'];
-    const lines = [headers.join(',')];
-    for (const r of data.by_department_material) {
-      const avg = r.qty > 0 ? r.value / r.qty : 0;
-      const row = [r.department_name, r.material_name, r.material_sku || '', r.category || '', r.material_unit,
-                   r.qty.toString(), avg.toFixed(2), r.value.toString()];
-      lines.push(row.map(x => /[",]/.test(x) ? `"${x.replace(/"/g, '""')}"` : x).join(','));
-    }
+  const csvCell = (x: any) => { const s = String(x ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const downloadCsv = (name: string, lines: string[]) => {
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `dept-consumption-${from}_to_${to}.csv`;
+    const a = document.createElement('a'); a.href = url; a.download = name;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+  const exportCsv = () => {
+    if (view === 'register') {
+      if (!register?.rows?.length) return;
+      const lines = [['date','department','material','category','unit','qty','value','requisitions'].join(',')];
+      for (const r of register.rows) {
+        lines.push([r.date, r.department_name, r.material_name, r.category || '', r.unit, r.qty, r.value, r.req_count].map(csvCell).join(','));
+      }
+      downloadCsv(`materials-register-${from}_to_${to}.csv`, lines);
+      return;
+    }
+    if (!data?.by_department_material?.length) return;
+    const lines = [['department','material','sku','category','unit','qty','avg_price','value'].join(',')];
+    for (const r of data.by_department_material) {
+      const avg = r.qty > 0 ? r.value / r.qty : 0;
+      lines.push([r.department_name, r.material_name, r.material_sku || '', r.category || '', r.material_unit,
+                  r.qty, avg.toFixed(2), r.value].map(csvCell).join(','));
+    }
+    downloadCsv(`dept-consumption-${from}_to_${to}.csv`, lines);
   };
 
   return (
@@ -96,10 +108,18 @@ export default function DepartmentConsumptionPage() {
             <span className="block italic">Audit / analytics only — not part of recipe-cost calculations.</span>
           </p>
         </div>
-        <button onClick={exportCsv} disabled={!data?.by_department_material?.length}
-                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2 disabled:opacity-50">
-          <Download className="w-4 h-4" /> Export CSV
-        </button>
+        <div className="flex items-center gap-2">
+          <div className="inline-flex rounded-lg border border-[#E8D5C4] overflow-hidden text-sm">
+            <button onClick={() => setView('summary')}
+                    className={`px-3 py-2 ${view === 'summary' ? 'bg-[#af4408] text-white' : 'bg-white text-[#6B5744] hover:bg-[#FFF1E3]'}`}>Summary</button>
+            <button onClick={() => setView('register')}
+                    className={`px-3 py-2 border-l border-[#E8D5C4] ${view === 'register' ? 'bg-[#af4408] text-white' : 'bg-white text-[#6B5744] hover:bg-[#FFF1E3]'}`}>Date register</button>
+          </div>
+          <button onClick={exportCsv} disabled={view === 'register' ? !register?.rows?.length : !data?.by_department_material?.length}
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2 disabled:opacity-50">
+            <Download className="w-4 h-4" /> Export CSV
+          </button>
+        </div>
       </div>
 
       {/* Filter bar */}
@@ -153,7 +173,7 @@ export default function DepartmentConsumptionPage() {
         </div>
       )}
 
-      {data?.summary && (
+      {view === 'summary' && data?.summary && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <Stat label="Total Value Issued" value={fmt(data.summary.total_value)} hint="Σ qty × avg price" />
           <Stat label="Total Qty Lines" value={data.summary.materials.toLocaleString('en-IN') + ' materials'}
@@ -164,7 +184,7 @@ export default function DepartmentConsumptionPage() {
       )}
 
       {/* Department leaderboard */}
-      {data?.by_department?.length > 0 && (
+      {view === 'summary' && data?.by_department?.length > 0 && (
         <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
           <div className="px-4 py-2 border-b border-[#E8D5C4] bg-[#FFF1E3]/50 flex items-center justify-between">
             <h3 className="text-sm font-semibold text-[#2D1B0E]">By Department</h3>
@@ -222,7 +242,7 @@ export default function DepartmentConsumptionPage() {
       )}
 
       {/* Top materials */}
-      {data?.top_materials?.length > 0 && (
+      {view === 'summary' && data?.top_materials?.length > 0 && (
         <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
           <div className="px-4 py-2 border-b border-[#E8D5C4] bg-[#FFF1E3]/50 flex items-center gap-2">
             <Package className="w-4 h-4 text-[#af4408]" />
@@ -257,11 +277,67 @@ export default function DepartmentConsumptionPage() {
         </div>
       )}
 
-      {!loading && data && (data.by_department?.length || 0) === 0 && (
+      {view === 'summary' && !loading && data && (data.by_department?.length || 0) === 0 && (
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-8 text-center text-sm text-[#8B7355]">
           No requisition data in this range.
           <div className="text-xs mt-2">Import Recaho Transfer reports from <a href="/requisitions" className="text-[#af4408] underline">Requisitions</a> to populate this view.</div>
         </div>
+      )}
+
+      {/* ── DATE REGISTER: on which date which department took what items ── */}
+      {view === 'register' && (
+        <>
+          {register?.totals && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <Stat label="Total Value Issued" value={fmt(register.totals.total_value)} hint={`${register.totals.rows} date·dept·item rows`} />
+              <Stat label="Days" value={String(register.totals.days)} hint={`${register.totals.departments} dept(s)`} />
+              <Stat label="Distinct Materials" value={String(register.totals.materials)} />
+              <Stat label="Date Range" value={`${register.range?.from} → ${register.range?.to}`} />
+            </div>
+          )}
+          <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+            <div className="px-4 py-2 border-b border-[#E8D5C4] bg-[#FFF1E3]/50">
+              <h3 className="text-sm font-semibold text-[#2D1B0E]">Issued Materials Register</h3>
+              <p className="text-[10px] text-[#8B7355]">On which date each department drew which materials — by the actual store-issue date. Newest first.</p>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="text-[#8B7355] bg-[#FFF8F0]">
+                  <tr>
+                    <th className="text-left  py-1.5 px-3 font-medium">Date</th>
+                    <th className="text-left  py-1.5 px-3 font-medium">Department</th>
+                    <th className="text-left  py-1.5 px-3 font-medium">Material</th>
+                    <th className="text-left  py-1.5 px-3 font-medium">Category</th>
+                    <th className="text-right py-1.5 px-3 font-medium">Qty</th>
+                    <th className="text-right py-1.5 px-3 font-medium">Value ₹</th>
+                    <th className="text-right py-1.5 px-3 font-medium">Reqs</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(register?.rows || []).map((r: any, i: number) => {
+                    const newDate = i === 0 || register.rows[i - 1].date !== r.date;
+                    return (
+                      <tr key={i} className={`border-t border-[#E8D5C4]/50 ${newDate ? 'border-t-[#D4B896]' : ''}`}>
+                        <td className="py-1.5 px-3 font-mono text-[#6B5744] whitespace-nowrap">{newDate ? r.date : ''}</td>
+                        <td className="py-1.5 px-3 font-medium text-[#2D1B0E]">{r.department_name}</td>
+                        <td className="py-1.5 px-3">{r.material_name}</td>
+                        <td className="py-1.5 px-3 text-[#6B5744]">{r.category}</td>
+                        <td className="py-1.5 px-3 text-right font-mono">{fmt2(r.qty)} <span className="text-[#8B7355]">{r.unit}</span></td>
+                        <td className="py-1.5 px-3 text-right font-mono font-semibold text-[#af4408]">{fmt(r.value)}</td>
+                        <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{r.req_count}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          {!loading && register && (register.rows?.length || 0) === 0 && (
+            <div className="bg-white border border-[#E8D5C4] rounded-xl p-8 text-center text-sm text-[#8B7355]">
+              No materials were issued in this range. Once the store issues requisitions, each hand-over shows up here by date.
+            </div>
+          )}
+        </>
       )}
     </div>
   );

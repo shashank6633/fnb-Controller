@@ -51,6 +51,69 @@ export async function GET(request: Request) {
     if (materialId)   { where.push('ri.material_id = ?');  params.push(materialId); }
     const WHERE = where.join(' AND ');
 
+    // ── REGISTER view: "on which DATE which DEPARTMENT took what ITEMS" ───────
+    // Groups actual store-issue events (unrolled from requisition_items.issue_history)
+    // by handover date × department × material. The date filter applies to the
+    // ISSUE timestamp (when it left the store), which is the truest movement date.
+    if ((url.searchParams.get('view') || '') === 'register') {
+      const rw: string[] = ["ri.issue_history IS NOT NULL", "ri.issue_history != ''", "ri.issue_history != '[]'",
+        "r.status NOT IN ('cancelled','chef_rejected')"];
+      const rp: any[] = [];
+      if (outletId)     { rw.push('(r.outlet_id = ? OR r.outlet_id IS NULL)'); rp.push(outletId); }
+      if (departmentId) { rw.push('(ri.department_id = ? OR r.department_id = ?)'); rp.push(departmentId, departmentId); }
+      if (categoryF)    { rw.push('rm.category = ?'); rp.push(categoryF); }
+      if (materialId)   { rw.push('ri.material_id = ?'); rp.push(materialId); }
+      const rows = db.prepare(`
+        SELECT ri.req_id, ri.material_id, ri.issue_history,
+               rm.name AS material_name, rm.unit, rm.category, rm.average_price, rm.last_purchase_price,
+               r.req_number,
+               COALESCE(dl.name, dr.name) AS department_name,
+               COALESCE(ri.department_id, r.department_id) AS department_id
+        FROM requisition_items ri
+        JOIN raw_materials rm ON rm.id = ri.material_id
+        JOIN requisitions r   ON r.id  = ri.req_id
+        LEFT JOIN departments dr ON dr.id = r.department_id
+        LEFT JOIN departments dl ON dl.id = ri.department_id
+        WHERE ${rw.join(' AND ')}
+      `).all(...rp) as any[];
+
+      const map = new Map<string, any>();
+      const days = new Set<string>(), depts = new Set<string>(), mats = new Set<string>();
+      let totQty = 0, totVal = 0;
+      for (const row of rows) {
+        let hist: any[] = [];
+        try { hist = JSON.parse(row.issue_history || '[]'); } catch { continue; }
+        if (!Array.isArray(hist)) continue;
+        const unitCost = Number(row.last_purchase_price) || Number(row.average_price) || 0;
+        for (const h of hist) {
+          const day = String(h && h.at || '').slice(0, 10);
+          if (!day || day < from || day > to) continue;
+          const qty = Number(h.qty) || 0; if (qty <= 0) continue;
+          const key = day + '|' + (row.department_id || '') + '|' + row.material_id;
+          let g = map.get(key);
+          if (!g) {
+            g = { date: day, department_id: row.department_id || '', department_name: row.department_name || '—',
+                  material_id: row.material_id, material_name: row.material_name, unit: row.unit, category: row.category || '',
+                  qty: 0, value: 0, reqs: new Set<string>() };
+            map.set(key, g);
+          }
+          g.qty += qty; g.value += qty * unitCost; g.reqs.add(row.req_number);
+          days.add(day); depts.add(row.department_id || ''); mats.add(row.material_id);
+          totQty += qty; totVal += qty * unitCost;
+        }
+      }
+      const regRows = [...map.values()]
+        .map(g => ({ date: g.date, department_id: g.department_id, department_name: g.department_name,
+          material_id: g.material_id, material_name: g.material_name, unit: g.unit, category: g.category,
+          qty: Math.round(g.qty * 1000) / 1000, value: Math.round(g.value * 100) / 100, req_count: g.reqs.size }))
+        .sort((a, b) => b.date.localeCompare(a.date) || a.department_name.localeCompare(b.department_name) || b.value - a.value);
+      return Response.json({
+        view: 'register', range: { from, to }, rows: regRows,
+        totals: { rows: regRows.length, total_qty: Math.round(totQty * 1000) / 1000, total_value: Math.round(totVal * 100) / 100,
+          days: days.size, departments: depts.size, materials: mats.size },
+      });
+    }
+
     const summary = db.prepare(`
       SELECT
         COUNT(DISTINCT r.id)             AS requisition_count,
