@@ -17,8 +17,8 @@ import { api, apiJson } from '@/lib/api';
  */
 
 interface OrderItem { id: string; name: string; station: string; qty: number; unit_price: number; line_total: number; }
-interface PendingOrder { id: string; subtotal: number; note: string; created_at: string; table: { number: string; zone: string }; items: OrderItem[]; }
-interface ServiceReq { id: string; type: string; status: string; note: string; created_at: string; table_number: string; zone: string; }
+interface PendingOrder { id: string; subtotal: number; note: string; created_at: string; table: { number: string; zone: string }; items: OrderItem[]; table_owner_id?: string | null; }
+interface ServiceReq { id: string; type: string; status: string; note: string; created_at: string; table_number: string; zone: string; table_owner_id?: string | null; }
 
 const C = {
   paper: '#F1E8D0', card: '#FBF4DF', cardElev: '#FFF8E2',
@@ -58,8 +58,15 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [err, setErr] = useState('');
   const [loaded, setLoaded] = useState(false);
+  const [myId, setMyId] = useState<string | null>(null);
   const [, tick] = useState(0);
   const timer = useRef<any>(null);
+
+  // On the Captain page (embed) we scope to THIS captain's tables. Fetch who I am.
+  useEffect(() => {
+    if (!embed) return;
+    fetch('/api/auth/me').then(r => r.json()).then(d => setMyId(d?.user?.id || null)).catch(() => {});
+  }, [embed]);
 
   const refresh = useCallback(async () => {
     try {
@@ -107,7 +114,13 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
     finally { setBusy(b => ({ ...b, [id]: false })); }
   };
 
-  const nothing = !orders.length && !requests.length;
+  // Embed (Captain page): show only MY tables + not-yet-claimed tables (owner null).
+  // Page (manager board): show everything.
+  const mine = (ownerId?: string | null) => !embed || !ownerId || ownerId === myId;
+  const vOrders = orders.filter(o => mine(o.table_owner_id));
+  const vRequests = requests.filter(r => mine(r.table_owner_id));
+
+  const nothing = !vOrders.length && !vRequests.length;
   // Embedded on the Captain page: stay invisible until a table needs something.
   if (embed && (!loaded || nothing)) return null;
 
@@ -143,14 +156,15 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
       <div style={{ display: 'grid', gridTemplateColumns: embed ? 'repeat(auto-fit, minmax(280px, 1fr))' : 'repeat(auto-fit, minmax(320px, 1fr))', gap: embed ? 16 : 24, marginTop: embed ? 4 : 16 }}>
         {/* ── Pending customer orders ── */}
         <section>
-          <h2 style={hdr()}>Pending orders <Count n={orders.length} color={C.forest} /></h2>
-          {!orders.length && !embed && <Empty>No orders waiting for approval.</Empty>}
-          {orders.map(o => {
+          <h2 style={hdr()}>Pending orders <Count n={vOrders.length} color={C.forest} /></h2>
+          {!vOrders.length && !embed && <Empty>No orders waiting for approval.</Empty>}
+          {vOrders.map(o => {
             const edited = orderEdited(o);
+            const unclaimed = !o.table_owner_id;
             return (
               <div key={o.id} style={card(C.forest)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-                  <div style={{ fontFamily: SERIF, fontWeight: 400, fontSize: 24, color: C.ink }}>Table {o.table.number} {o.table.zone && <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 0.8, color: C.inkMute, textTransform: 'uppercase' }}>· {o.table.zone}</span>}</div>
+                  <div style={{ fontFamily: SERIF, fontWeight: 400, fontSize: 24, color: C.ink }}>Table {o.table.number} {o.table.zone && <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 0.8, color: C.inkMute, textTransform: 'uppercase' }}>· {o.table.zone}</span>}{embed && unclaimed && <span style={{ fontFamily: MONO, fontSize: 9, letterSpacing: 0.6, color: C.terra, textTransform: 'uppercase', marginLeft: 6, border: `1px solid ${C.terraTint}`, borderRadius: 4, padding: '1px 5px' }}>unclaimed</span>}</div>
                   <div style={{ fontFamily: MONO, fontSize: 11, color: C.inkMute }}>{ago(o.created_at)}</div>
                 </div>
                 {o.note && <div style={{ fontFamily: SANS, fontSize: 12.5, color: C.terraDeep, background: C.cardElev, borderLeft: `2px solid ${C.egg}`, borderRadius: 6, padding: '5px 9px', margin: '8px 0' }}>“{o.note}”</div>}
@@ -190,9 +204,9 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
 
         {/* ── Service requests (bell) ── */}
         <section>
-          <h2 style={hdr()}>Service requests <Count n={requests.length} color={C.terra} /></h2>
-          {!requests.length && !embed && <Empty>No table service requests right now.</Empty>}
-          {requests.map(r => {
+          <h2 style={hdr()}>Service requests <Count n={vRequests.length} color={C.terra} /></h2>
+          {!vRequests.length && !embed && <Empty>No table service requests right now.</Empty>}
+          {vRequests.map(r => {
             const m = SERVICE_META[r.type] || { label: r.type, icon: '🔔' };
             const accepted = r.status === 'accepted';
             return (

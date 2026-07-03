@@ -110,12 +110,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             SELECT COALESCE(MAX(order_number), 0) + 1 AS n FROM orders
             WHERE (outlet_id = ? OR outlet_id IS NULL) AND date(created_at) = date('now')
           `).get(staging.outlet_id) as any;
+          // The approving captain takes ownership of the table (server_id/name),
+          // so this table's future QR orders + service requests route to them.
           db.prepare(`
-            UPDATE orders SET status = 'open', order_number = ?, updated_at = datetime('now')
+            UPDATE orders SET status = 'open', order_number = ?, server_id = ?, server_name = ?, updated_at = datetime('now')
             WHERE id = ?
-          `).run(seq.n, id);
+          `).run(seq.n, me.id, me.name || me.email, id);
           targetId = id; targetOutlet = staging.outlet_id;
-          targetNumber = seq.n; targetServer = staging.server_name || 'Customer'; merged = false;
+          targetNumber = seq.n; targetServer = me.name || me.email; merged = false;
         }
 
         // Fire exactly the (moved) staging lines — group by station, one KOT each.

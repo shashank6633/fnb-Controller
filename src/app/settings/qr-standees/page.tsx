@@ -79,6 +79,20 @@ export default function QrStandeesPage() {
   const chosen = tables.filter(t => sel[t.id]);
   const allSelected = tables.length > 0 && tables.every(t => sel[t.id]);
 
+  // Server-generated PDF at the EXACT page size (browsers ignore @page size on
+  // Safari → A4). One standee per page, embedded Instrument Serif + QR.
+  const pdfUrl = (dl: boolean) => {
+    const p = new URLSearchParams();
+    p.set('size', size);
+    const ids = chosen.map(t => t.id).join(',');
+    if (ids) p.set('tables', ids);
+    if (base) p.set('base', base.replace(/\/+$/, ''));
+    if (tagline) p.set('tagline', tagline);
+    if (dl) p.set('download', '1');
+    return `/api/tables/qr/pdf?${p.toString()}`;
+  };
+  const downloadPdf = () => { const a = document.createElement('a'); a.href = pdfUrl(true); a.rel = 'noopener'; a.click(); };
+
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 20px 80px', fontFamily: SANS, color: C.ink }}>
       {/* Load the exact design fonts (the app shell only ships Inter). */}
@@ -145,8 +159,11 @@ export default function QrStandeesPage() {
           <button onClick={() => regenerate('all')} disabled={!!busy} style={btn(C.terra)}>
             {busy === 'all' ? 'Working…' : 'Regenerate all'}
           </button>
-          <button onClick={() => window.print()} disabled={!chosen.length} style={btn(C.ink)}>
-            Print / Download PDF ({chosen.length} standee{chosen.length === 1 ? '' : 's'})
+          <button onClick={downloadPdf} disabled={!chosen.length} style={btn(C.ink)}>
+            Download PDF · {size} ({chosen.length} standee{chosen.length === 1 ? '' : 's'})
+          </button>
+          <button onClick={() => window.open(pdfUrl(false), '_blank')} disabled={!chosen.length} style={btnGhost()}>
+            Print
           </button>
           <button onClick={() => setSel(Object.fromEntries(tables.map(t => [t.id, !allSelected])))} style={btnGhost()}>
             {allSelected ? 'Deselect all' : 'Select all'}

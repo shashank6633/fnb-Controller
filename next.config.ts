@@ -20,9 +20,10 @@ const nextConfig: NextConfig = {
   // are non-blocking at runtime. Will be cleaned up before production.
   typescript: { ignoreBuildErrors: true },
 
-  // pdf-parse v2 has ESM internals that break Next.js RSC bundling. Force
-  // it to load via Node's runtime require instead of being bundled.
-  serverExternalPackages: ['pdf-parse'],
+  // pdf-parse v2 has ESM internals that break Next.js RSC bundling. pdfkit reads
+  // its font data (.afm) + embedded TTF at runtime and must not be webpack-bundled.
+  // Force both to load via Node's runtime require instead of being bundled.
+  serverExternalPackages: ['pdf-parse', 'pdfkit'],
 
   /**
    * Force browsers to fetch fresh HTML on every navigation. Without this,
