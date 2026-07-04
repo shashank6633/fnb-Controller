@@ -47,6 +47,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/captain',             label: 'Captain (Tablet POS)' },
       { path: '/print/agent',         label: 'Print Agent (Counter)' },
       { path: '/dine-in/kot-analytics', label: 'KOT Data Points' },
+      { path: '/dine-in/captain-performance', label: 'Captain Response Times' },
       { path: '/menu-items',          label: 'Menu Items' },
       { path: '/recipes',             label: 'Recipes' },
       { path: '/direct-items',        label: 'Direct Items' },

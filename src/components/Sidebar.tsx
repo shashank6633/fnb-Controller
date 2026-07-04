@@ -39,6 +39,7 @@ import {
   Bell,
   QrCode,
   LayoutGrid,
+  Timer,
   type LucideIcon,
 } from "lucide-react";
 
@@ -68,6 +69,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Captain (Tablet)",   href: "/captain",                   icon: Smartphone },
       { kind: "link", label: "Print Agent",        href: "/print/agent",               icon: Printer },
       { kind: "link", label: "KOT Data Points",    href: "/dine-in/kot-analytics",     icon: BarChart3 },
+      { kind: "link", label: "Captain Response Times", href: "/dine-in/captain-performance", icon: Timer },
       { kind: "link", label: "Tables",             href: "/dine-in/tables",            icon: Utensils },
       { kind: "link", label: "Menu Items",         href: "/menu-items",                icon: BookOpen },
       { kind: "link", label: "Recipes",            href: "/recipes",                   icon: ChefHat },
