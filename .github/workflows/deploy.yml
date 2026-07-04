@@ -15,6 +15,11 @@ jobs:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
+          # npm install + next build on the box takes ~10 min — the action's
+          # default command_timeout (10m) killed the session right at the finish
+          # line on 2026-07-04 (build succeeded, run reported "failure"). Give it
+          # comfortable headroom so a slow install can't kill a deploy mid-build.
+          command_timeout: 25m
 
           script: |
             set -e                                   # abort on any error — never restart on a failed build
