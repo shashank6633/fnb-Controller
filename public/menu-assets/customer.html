@@ -261,6 +261,16 @@
   .action .t{font-family:var(--serif);font-size:19px;line-height:1.1}
   .action .s{font-size:12.5px;color:var(--inkSoft);margin-top:1px}
   .action.sent .s{color:rgba(255,255,255,.8)}
+  /* service-request live states: requested (waiting) + accepted (on the way) */
+  .action.req{background:var(--cardElev);border-color:var(--egg,#C9911E)}
+  .action.req .ic{background:rgba(201,145,30,.16)}
+  .action.otw{background:var(--forest);border-color:var(--forest);color:#fff}
+  .action.otw .ic{background:rgba(255,255,255,.16)}
+  .action.otw .s{color:rgba(255,255,255,.85)}
+  .action .svcdot{width:8px;height:8px;border-radius:50%;flex:none;margin-left:auto}
+  .action.req .svcdot{background:var(--egg,#C9911E);animation:svcpulse 1.2s infinite}
+  .action.otw .svcdot{background:#fff}
+  @keyframes svcpulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.7)}}
 
   /* ---------- TRACKING ---------- */
   .track{min-height:100dvh;padding:0 22px calc(88px + var(--safe-b));display:flex;flex-direction:column}
@@ -306,12 +316,12 @@
     bell:'<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>',
     bag:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>',
     filter:'<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 6h16M7 12h10M10 18h4"/></svg>'};
-  var SVC=[{id:'waiter',ic:'🙋',t:'Call waiter',s:'A server will be right over'},
-    {id:'water',ic:'💧',t:'Refill water',s:'Still or sparkling — your call'},
-    {id:'cutlery',ic:'🍴',t:'Extra cutlery',s:'Spoons, forks, napkins'},
-    {id:'bill',ic:'🧾',t:'Request bill',s:"We'll bring the cheque"}];
+  var SVC=[{id:'waiter',ic:'🙋',t:'Call waiter',s:'A server will be right over',otw:'Your server is on the way'},
+    {id:'water',ic:'💧',t:'Refill water',s:'Still or sparkling — your call',otw:'Bringing your water refill'},
+    {id:'cutlery',ic:'🍴',t:'Extra cutlery',s:'Spoons, forks, napkins',otw:'Bringing your cutlery'},
+    {id:'bill',ic:'🧾',t:'Request bill',s:"We'll bring the cheque",otw:'Bringing your bill'}];
 
-  var S={screen:'loading',table:null,brand:{name:'Akan'},menu:null,design:{categoryStyle:'thumbnails',orderMode:'captain'},section:'food',cat:'',q:'',vegOnly:false,cart:{},scannedAt:nowTime(),lastOrder:null,orders:[]};
+  var S={screen:'loading',table:null,brand:{name:'Akan'},menu:null,design:{categoryStyle:'thumbnails',orderMode:'captain'},section:'food',cat:'',q:'',vegOnly:false,cart:{},scannedAt:nowTime(),lastOrder:null,orders:[],svcReqs:{}};
   var SEC=[{id:'food',label:'Food',station:'Kitchen',unit:'dishes'},{id:'bev',label:'Beverages',station:'Bar',unit:'drinks'},{id:'liquor',label:'Liquor',station:'Bar',unit:'pours'}];
   function secMeta(id){return SEC.filter(function(s){return s.id===id;})[0]||SEC[0];}
   function secCount(id){var m=(S.menu&&S.menu[id])||{sub:[]};return m.sub.reduce(function(n,s){return n+s.items.length;},0);}
@@ -517,7 +527,7 @@
       tabHTML('menu',ICON.menu,'Menu',S.screen==='menu')+
       tabHTML('search',ICON.search,'Search',false)+
       tabHTML('order',ICON.bag,'Order',S.screen==='track',n)+
-      tabHTML('table',ICON.bell,'Table',false);
+      tabHTML('table',ICON.bell,'Table',false,svcActiveCount());
     document.body.appendChild(bar);
     bar.querySelector('[data-tab="menu"]').onclick=function(){closeSheet();if(S.screen!=='menu'){S.screen='menu';render();}else{window.scrollTo(0,0);}};
     bar.querySelector('[data-tab="search"]').onclick=function(){closeSheet();if(S.screen!=='menu'){S.screen='menu';render();}var qi=document.getElementById('q');if(qi){try{qi.scrollIntoView({block:'start'});}catch(e){}qi.focus();}};
@@ -710,22 +720,59 @@
     mountFloat();
   }
 
-  // ---------- SERVICE ----------
+  // ---------- SERVICE (live: call → captain accepts → done → call again) ----------
+  function svcActiveCount(){var n=0;for(var k in S.svcReqs){if(S.svcReqs[k])n++;}return n;}
   function openService(){
-    var s=document.createElement('div');s.className='sheet';
+    var s=document.createElement('div');s.className='sheet';s.id='svcsheet';
+    openSheet(s);paintService();pollService();
+  }
+  // Re-render the service actions from the live S.svcReqs status map. Each action
+  // shows one of three states: idle (tap to call) → requested (waiting) → on the
+  // way (captain accepted). When the captain marks it done it returns to idle, so
+  // the guest can call again — any number of times.
+  function paintService(){
+    var s=document.getElementById('svcsheet');if(!s)return;
     s.innerHTML='<div class="grab"></div><div class="sheet-scroll">'+
       '<div class="kicker terra" style="margin-top:12px">Table '+esc(S.table?S.table.number:'')+' · service</div>'+
       '<h2 class="serif" style="font-size:27px;margin:3px 0 4px">How can we help?</h2>'+
-      SVC.map(function(a){return '<button class="action" data-svc="'+a.id+'"><span class="ic">'+a.ic+'</span><span><span class="t">'+a.t+'</span><br><span class="s">'+a.s+'</span></span></button>';}).join('')+
+      SVC.map(function(a){
+        var st=S.svcReqs[a.id];
+        if(st==='accepted')return '<div class="action otw"><span class="ic">🙋</span><span style="flex:1"><span class="t">On the way!</span><br><span class="s">'+esc(a.otw||'Your server is on the way')+'</span></span><span class="svcdot"></span></div>';
+        if(st==='pending')return '<div class="action req"><span class="ic">'+a.ic+'</span><span style="flex:1"><span class="t">Requested</span><br><span class="s">Notifying your server…</span></span><span class="svcdot"></span></div>';
+        return '<button class="action" data-svc="'+a.id+'"><span class="ic">'+a.ic+'</span><span><span class="t">'+a.t+'</span><br><span class="s">'+a.s+'</span></span></button>';
+      }).join('')+
+      '<div class="kicker" style="text-align:center;margin-top:12px;opacity:.7">You can call as many times as you need</div>'+
       '<div style="height:6px"></div></div>';
-    openSheet(s);
-    s.querySelectorAll('[data-svc]').forEach(function(b){b.onclick=function(){sendSvc(b,b.getAttribute('data-svc'));};});
+    s.querySelectorAll('[data-svc]').forEach(function(b){b.onclick=function(){sendSvc(b.getAttribute('data-svc'));};});
   }
-  function sendSvc(btn,type){
-    btn.classList.add('sent');var meta=SVC.filter(function(x){return x.id===type;})[0];
-    btn.querySelector('.ic').textContent='✓';btn.querySelector('.t').textContent='On its way';btn.querySelector('.s').textContent="We've notified your server.";
-    api('/api/customer/service-requests',{method:'POST',body:JSON.stringify({t:TOKEN,type:type})}).catch(function(){});
+  function sendSvc(type){
+    S.svcReqs[type]='pending';paintService();mountFloat();            // optimistic
+    api('/api/customer/service-requests',{method:'POST',body:JSON.stringify({t:TOKEN,type:type})})
+      .then(function(r){if(r&&r.status){S.svcReqs[type]=r.status;paintService();mountFloat();}})
+      .catch(function(){toast('Could not send — please try again');S.svcReqs[type]=null;delete S.svcReqs[type];paintService();mountFloat();});
   }
+  // Poll the table's requests → reflect the captain's Accept / Done back to the
+  // guest (progress + toasts). Runs on a light interval while the app is open.
+  var svcTimer=null;
+  function pollService(){
+    if(!S.table){return;}
+    api('/api/customer/service-requests?t='+encodeURIComponent(TOKEN)).then(function(r){
+      var reqs=(r&&r.requests)||[];
+      // most-recent request per type; only pending/accepted count as "active".
+      var latest={};for(var i=0;i<reqs.length;i++){var q=reqs[i];if(latest[q.type]===undefined)latest[q.type]=q.status;}
+      var next={};
+      SVC.forEach(function(a){
+        var st=latest[a.id];
+        var now=(st==='pending'||st==='accepted')?st:null;
+        var was=S.svcReqs[a.id]||null;
+        if(was==='pending'&&now==='accepted')toast('🙋 '+a.t+' — your server is on the way!');
+        else if((was==='pending'||was==='accepted')&&!now)toast('✓ Done — call again anytime');
+        if(now)next[a.id]=now;
+      });
+      S.svcReqs=next;paintService();mountFloat();
+    }).catch(function(){});
+  }
+  function startSvcPoll(){if(svcTimer)return;svcTimer=setInterval(function(){if(S.table&&S.screen!=='loading'&&S.screen!=='error')pollService();},7000);}
 
   // ---------- BOOT ----------
   function boot(){
@@ -737,6 +784,7 @@
       var valid={};Object.keys(S.cart).forEach(function(k){var line=S.cart[k];var fresh=line&&line.item&&byId[line.item.id];if(fresh)valid[k]={item:fresh,qty:line.qty,opts:line.opts||null,note:line.note||''};});
       S.cart=valid;saveCart();
       S.screen='landing';render();
+      pollService();startSvcPoll();   // reflect any in-flight captain accept/done + keep it live
     }).catch(function(e){S.screen='error';S.errmsg=e.message;render();});
   }
   render();boot();
