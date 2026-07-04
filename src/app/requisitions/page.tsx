@@ -705,7 +705,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
                     <th className="text-right py-1 px-2 font-medium">To Purchase</th>
                   </>
                 )}
-                <th className="text-right py-1 px-2 font-medium">Avg ₹</th>
+                <th className="text-right py-1 px-2 font-medium" title="Average price per purchase/ordering unit">Avg ₹ / unit</th>
                 <th className="text-left  py-1 px-2 font-medium">Status</th>
               </tr>
             </thead>
@@ -715,6 +715,13 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
                 // Stock is in recipe units; the request may be in the purchase
                 // unit (e.g. BTL) — convert before comparing.
                 const short = (it.current_stock < it.quantity_requested * reqPackFactor(it));
+                // Purchase-unit context for display: stock is stored in recipe
+                // units (g/ml) and average_price is ₹/recipe-unit — both are
+                // unreadable raw (18,000 / ₹0). Convert to the ordering unit.
+                const packN = Number(it.material_pack_size) || 1;
+                const hasPU = !!(it.material_purchase_unit && it.material_purchase_unit !== it.material_unit && packN > 1);
+                const puLbl = it.material_purchase_unit || it.material_unit || '';
+                const avgPerPU = (it.average_price || 0) * (hasPU ? packN : 1);
                 // Rejected lines get strikethrough + faded; rest render normal.
                 const rowCls = `border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`;
                 return (
@@ -735,7 +742,12 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
                           : <span className="text-[#C0A98F]">—</span>}
                     </td>
                     <td className={`py-1 px-2 text-right font-mono ${short ? 'text-red-700 font-semibold' : 'text-[#6B5744]'}`}>
-                      {it.current_stock.toLocaleString('en-IN')} {short && '⚠'}
+                      {it.current_stock.toLocaleString('en-IN')} {it.material_unit}{short && ' ⚠'}
+                      {hasPU && (
+                        <div className="text-[9px] text-[#8B7355] font-normal no-underline">
+                          = {(it.current_stock / packN).toLocaleString('en-IN', { maximumFractionDigits: 1 })} {puLbl}
+                        </div>
+                      )}
                     </td>
                     {(detail.status === 'store_processed' || detail.status === 'fulfilled') && (
                       <>
@@ -743,7 +755,11 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
                         <td className="py-1 px-2 text-right font-mono text-blue-700">{rejected ? '—' : (it.quantity_to_purchase || 0)}</td>
                       </>
                     )}
-                    <td className="py-1 px-2 text-right font-mono text-[#6B5744]">{fmt(it.average_price || 0)}</td>
+                    <td className="py-1 px-2 text-right font-mono text-[#6B5744]"
+                        title={`avg ₹${(it.average_price || 0).toFixed(4)}/${it.material_unit}`}>
+                      {avgPerPU >= 1 ? fmt(avgPerPU) : `₹${avgPerPU.toFixed(2)}`}
+                      <span className="text-[#8B7355]">/{puLbl}</span>
+                    </td>
                     <td className="py-1 px-2 no-underline">
                       {rejected
                         ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-700 border border-red-200 font-medium">Rejected by Chef</span>
@@ -925,7 +941,6 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                 const postReq  = mat ? (mat.current_stock - reqRecipe) : 0;
                 const belowBuffer = mat && buffer > 0 && postReq < buffer;
                 const pu = mat?.purchase_unit || mat?.unit || '';
-                const lastRate = (mat?.last_purchase_price ?? mat?.average_price) || 0;
                 return (
                   <div key={i} className="grid grid-cols-12 gap-2 text-xs items-start">
                     <div className="col-span-3">
@@ -954,32 +969,37 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                         </>
                       ) : <span className="text-[#8B7355]">—</span>}
                     </div>
-                    {/* Qty + Unit-of-measure selector */}
-                    <div className="col-span-2 flex gap-1 items-start">
+                    {/* Qty (full-width) with the FIXED ordering unit shown BELOW it —
+                        no picker. The dept always requisitions in the bulk unit it's
+                        bought in (BTL/PKT/bag), so "12" can't be misread as 12 ml.
+                        "BTL = 750 ml" spells out the pack conversion. Stacking the
+                        label under the input keeps the qty box big and comfortable. */}
+                    <div className="col-span-2">
                       <input type="number" step="any" value={it.quantity_requested || ''}
                              onChange={e => update(i, { quantity_requested: parseFloat(e.target.value) || 0 })}
                              placeholder="Qty"
                              className="w-full min-w-0 px-3 py-2 border border-[#E8D5C4] rounded text-right text-sm tabular-nums" />
-                      {/* Unit FIXED to the material's purchase / ordering unit — no
-                          picker. The dept always requisitions in the bulk unit it's
-                          bought in (BTL/PKT/bag), so "12" can't be misread as 12 ml.
-                          1 purchase unit = pack_size recipe units (shown as ×N). */}
                       {mat ? (
-                        <span className="shrink-0 text-[10px] text-[#8B7355] pt-1.5 whitespace-nowrap" title="Ordering unit (purchase unit)">
-                          {mat.purchase_unit || mat.unit}{mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? <span className="text-[#B99]"> ×{packSize}</span> : ''}
-                        </span>
+                        <div className="text-[10px] text-[#8B7355] mt-0.5 text-right whitespace-nowrap" title="Ordering unit (purchase unit)">
+                          {mat.purchase_unit || mat.unit}{mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? <span className="text-[#B99]"> = {packSize.toLocaleString('en-IN')} {mat.unit}</span> : ''}
+                        </div>
                       ) : null}
                     </div>
                     <div className="col-span-2 text-right text-[10px] leading-snug">
                       {mat ? (
                         <>
                           <div className="text-[#6B5744]">{pu}</div>
-                          {/* Rate shown PER PURCHASE UNIT (the unit the dept orders
-                              in), so it matches the qty's unit — no more "BTL" priced
-                              "/ml". lastRate is ₹/recipe-unit → ×pack_size for ₹/PU. */}
+                          {/* Rate PER PURCHASE UNIT so it matches the qty's unit.
+                              /api/inventory's last_purchase_price is the raw last
+                              purchases.unit_price — ALREADY ₹/purchase-unit (e.g.
+                              ₹1905.31/BTL) — so show it as-is. Fallback when no
+                              purchase yet: average_price (₹/recipe-unit) × pack. */}
                           <div className="font-mono text-[#6B5744]"
-                               title={`₹${lastRate.toFixed(4)}/${mat.unit}${mat.last_purchase_date ? ' · last bought '+mat.last_purchase_date : ''}`}>
-                            ₹{(lastRate * (mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? packSize : 1)).toFixed(2)}
+                               title={`avg ₹${(mat.average_price || 0).toFixed(4)}/${mat.unit}${mat.last_purchase_date ? ' · last bought ' + mat.last_purchase_date : ''}`}>
+                            ₹{(Number(mat.last_purchase_price) > 0
+                                ? Number(mat.last_purchase_price)
+                                : (mat.average_price || 0) * (mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? packSize : 1)
+                              ).toFixed(2)}
                             <span className="text-[#8B7355]">/{pu}</span>
                           </div>
                         </>
