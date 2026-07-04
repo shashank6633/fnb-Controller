@@ -1147,22 +1147,15 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
                         materials={materials as any}
                         value={it.material_id}
                         onPick={(id) => {
-                          // When a material is picked FRESH, default the unit to the
-                          // ORDERING unit (purchase_unit — how humans think in bulk:
-                          // BTL / bag), NOT the recipe unit (g/ml). This is the fix for
-                          // "chef typed 12 meaning litres, got 12 ml". ONLY when
-                          // pack_size > 1 — the purchase-unit conversion multiplies by
-                          // pack_size, so a mis-configured pack_size=1 material must
-                          // keep its recipe unit or "12 BTL" would store as 12 ml.
-                          // Prefilled/edited lines keep recipe units because their
-                          // quantities are already stored canonically.
+                          // The line's unit is FIXED to the material's purchase /
+                          // ordering unit (allowedUnits[0] = purchase_unit, falling
+                          // back to the base unit when none is set). No picker — staff
+                          // always requisition in the bulk unit the material is bought
+                          // in, so "12" can't be misread as 12 ml.
                           const mat = materials.find(x => x.id === id);
-                          const pu = (mat?.purchase_unit || '').trim();
-                          const ru = (mat?.unit || '').trim();
-                          const ordering = (pu && pu !== ru && (Number(mat?.pack_size) || 1) > 1) ? pu : ru;
                           ensureTrailingEmpty(i, {
                             material_id: id,
-                            unit: ordering || '',
+                            unit: allowedUnitsForMaterial(mat)[0] || '',
                           });
                         }}
                         excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
@@ -1172,19 +1165,11 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
                            onChange={e => ensureTrailingEmpty(i, { qty: e.target.value })}
                            placeholder="Qty"
                            className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
-                    {/* Unit dropdown — only the material's registered units
-                        (recipe_unit + purchase_unit). For materials with a single
-                        unit registered, this becomes a label, not a dropdown. */}
-                    {allowedUnits.length > 1 ? (
-                      <select value={it.unit || allowedUnits[0]}
-                              onChange={e => update(i, { unit: e.target.value })}
-                              title="Pick one of this material's registered units"
-                              className="col-span-1 px-1 py-1.5 border border-[#D4B896] rounded text-xs bg-white">
-                        {allowedUnits.map(u => <option key={u} value={u}>{u}</option>)}
-                      </select>
-                    ) : (
-                      <span className="col-span-1 text-xs text-[#8B7355] py-2">{allowedUnits[0] || m?.unit || ''}</span>
-                    )}
+                    {/* Unit is FIXED to the material's purchase / ordering unit —
+                        no picker. Staff always requisition in bulk units (BTL /
+                        PKT / bag), never raw g/ml, so a "12" can't be misread as
+                        12 ml. allowedUnits[0] is the purchase_unit. */}
+                    <span className="col-span-1 text-xs text-[#8B7355] py-2 truncate" title="Ordering unit (purchase unit)">{allowedUnits[0] || m?.unit || ''}</span>
                     {mixedMode ? (
                       <select value={it.department_id}
                               onChange={e => update(i, { department_id: e.target.value })}

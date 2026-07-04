@@ -917,7 +917,6 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                 // purchase unit if different. When they choose the purchase unit,
                 // 1 of it = pack_size recipe units — so convert for the on-hand /
                 // buffer warnings (which are shown in recipe units).
-                const unitOpts = mat ? Array.from(new Set([mat.unit, mat.purchase_unit].filter(Boolean))) as string[] : [];
                 const packSize = Number(mat?.pack_size || 1);
                 const inPurchaseUnit = !!mat && !!mat.purchase_unit && it.unit === mat.purchase_unit && packSize > 1;
                 const reqRecipe = it.quantity_requested * (inPurchaseUnit ? packSize : 1);
@@ -935,8 +934,9 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                         value={it.material_id}
                         // Disable any material already picked on another row to avoid dupes
                         excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
-                        // Default the unit to the material's recipe (base) unit on pick.
-                        onPick={(id) => { const m = materials.find(x => x.id === id); update(i, { material_id: id, unit: m?.unit || '' }); }}
+                        // Default the unit to the material's PURCHASE / ordering unit
+                        // (fall back to the base unit when none is configured).
+                        onPick={(id) => { const m = materials.find(x => x.id === id); update(i, { material_id: id, unit: (m?.purchase_unit || m?.unit || '') }); }}
                       />
                       {mat?.category && <div className="text-[9px] text-[#8B7355] mt-0.5">{mat.category}</div>}
                     </div>
@@ -960,19 +960,14 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                              onChange={e => update(i, { quantity_requested: parseFloat(e.target.value) || 0 })}
                              placeholder="Qty"
                              className="w-full min-w-0 px-2 py-1 border border-[#E8D5C4] rounded text-right" />
-                      {mat && unitOpts.length > 1 ? (
-                        <select value={it.unit || mat.unit}
-                                onChange={e => update(i, { unit: e.target.value })}
-                                title="Unit of measure for this quantity"
-                                className="shrink-0 px-1 py-1 border border-[#E8D5C4] rounded bg-[#FFF8F0] text-[11px] max-w-[70px]">
-                          {unitOpts.map(u => (
-                            <option key={u} value={u}>
-                              {u}{u === mat.purchase_unit && u !== mat.unit && packSize > 1 ? ` (×${packSize})` : ''}
-                            </option>
-                          ))}
-                        </select>
-                      ) : mat ? (
-                        <span className="shrink-0 text-[10px] text-[#8B7355] pt-1.5">{it.unit || mat.unit}</span>
+                      {/* Unit FIXED to the material's purchase / ordering unit — no
+                          picker. The dept always requisitions in the bulk unit it's
+                          bought in (BTL/PKT/bag), so "12" can't be misread as 12 ml.
+                          1 purchase unit = pack_size recipe units (shown as ×N). */}
+                      {mat ? (
+                        <span className="shrink-0 text-[10px] text-[#8B7355] pt-1.5 whitespace-nowrap" title="Ordering unit (purchase unit)">
+                          {mat.purchase_unit || mat.unit}{mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? <span className="text-[#B99]"> ×{packSize}</span> : ''}
+                        </span>
                       ) : null}
                     </div>
                     <div className="col-span-2 text-right text-[10px] leading-snug">
