@@ -55,7 +55,7 @@ const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.3.1';   // 2.3.1 = bill item table columns realigned (Rs Rate/Amt no longer collide with Qty). 2.3.0 = idempotent by jobId (retried print after a lost ack is a no-op). 2.2.1 = offline LAN KOT + audit hardening.
+const VERSION = '2.3.2';   // 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -216,15 +216,15 @@ function money(n) {
   const v = Math.round((Number(n) || 0) * 100) / 100;
   return 'Rs ' + v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
-// Compact "Rs" price for the item table's Rate/Amt columns: no space after Rs and
-// no ".00" for whole rupees, so the columns stay narrow and keep a clean gap from
-// Qty (money()'s "Rs 8,000.00" was too wide and butted against the qty number).
+// Plain number for the item table's Rate/Amt columns — NO "Rs" prefix (that only
+// belongs on the totals: Sub Total / CGST / SGST / Discount / Service Charges /
+// Total / Grand Total / Payment, which use money()). Keeps the columns narrow and
+// well-spaced; ".00" only shown when there are actual paise.
 function itemMoney(n) {
   const v = Math.round((Number(n) || 0) * 100) / 100;
-  const s = Number.isInteger(v)
+  return Number.isInteger(v)
     ? v.toLocaleString('en-IN')
     : v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return 'Rs' + s;
 }
 
 // Item row: name on the left, then Qty / Rate / Amt right-aligned in the GIVEN
