@@ -959,7 +959,7 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                       <input type="number" step="any" value={it.quantity_requested || ''}
                              onChange={e => update(i, { quantity_requested: parseFloat(e.target.value) || 0 })}
                              placeholder="Qty"
-                             className="w-full min-w-0 px-2 py-1 border border-[#E8D5C4] rounded text-right" />
+                             className="w-full min-w-0 px-3 py-2 border border-[#E8D5C4] rounded text-right text-sm tabular-nums" />
                       {/* Unit FIXED to the material's purchase / ordering unit — no
                           picker. The dept always requisitions in the bulk unit it's
                           bought in (BTL/PKT/bag), so "12" can't be misread as 12 ml.
@@ -974,8 +974,13 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                       {mat ? (
                         <>
                           <div className="text-[#6B5744]">{pu}</div>
-                          <div className="font-mono text-[#6B5744]" title={mat.last_purchase_date ? `Last bought ${mat.last_purchase_date}` : ''}>
-                            ₹{lastRate.toFixed(2)}{mat.pack_size && mat.pack_size > 1 ? <> <span className="text-[#8B7355]">/{mat.unit}</span></> : null}
+                          {/* Rate shown PER PURCHASE UNIT (the unit the dept orders
+                              in), so it matches the qty's unit — no more "BTL" priced
+                              "/ml". lastRate is ₹/recipe-unit → ×pack_size for ₹/PU. */}
+                          <div className="font-mono text-[#6B5744]"
+                               title={`₹${lastRate.toFixed(4)}/${mat.unit}${mat.last_purchase_date ? ' · last bought '+mat.last_purchase_date : ''}`}>
+                            ₹{(lastRate * (mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? packSize : 1)).toFixed(2)}
+                            <span className="text-[#8B7355]">/{pu}</span>
                           </div>
                         </>
                       ) : <span className="text-[#8B7355]">—</span>}

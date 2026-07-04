@@ -1114,12 +1114,12 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
             </div>
             {/* Column headers */}
             <div className="grid grid-cols-12 gap-2 mb-1 text-[10px] font-medium text-[#8B7355] uppercase tracking-wide px-1">
-              <div className="col-span-4">Material</div>
-              <div className="col-span-2 text-right">Qty</div>
+              <div className="col-span-3">Material</div>
+              <div className="col-span-3 text-right">Qty</div>
               <div className="col-span-1">Unit</div>
               {mixedMode
                 ? <div className="col-span-3">Department</div>
-                : <div className="col-span-3">Notes (optional)</div>}
+                : <div className="col-span-3">Notes</div>}
               <div className="col-span-2 text-right">Cost</div>
             </div>
             <div className="space-y-2">
@@ -1140,9 +1140,14 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
                   return q * pack;
                 })();
                 const lineCost = m && effectiveQty > 0 ? effectiveQty * (m.average_price || 0) : 0;
+                // Rate shown PER PURCHASE UNIT so the cost is human-verifiable and
+                // unit-mismatched prices are obvious. average_price is ₹/recipe-unit,
+                // so ×pack_size gives ₹/purchase-unit (e.g. 0.1785/ml ×1000 = ₹178.50/BTL).
+                const puUnit = (allowedUnits[0] || (m?.unit || '')).trim();
+                const pricePerPU = (m?.average_price || 0) * ((m && puUnit && puUnit !== (m.unit || '').trim()) ? (Number(m.pack_size) || 1) : 1);
                 return (
                   <div key={i} className="grid grid-cols-12 gap-2 items-start">
-                    <div className="col-span-4">
+                    <div className="col-span-3">
                       <MaterialTypeahead
                         materials={materials as any}
                         value={it.material_id}
@@ -1164,7 +1169,7 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
                     <input type="number" step="any" value={it.qty}
                            onChange={e => ensureTrailingEmpty(i, { qty: e.target.value })}
                            placeholder="Qty"
-                           className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
+                           className="col-span-3 px-3 py-2 border border-[#D4B896] rounded text-sm text-right font-mono tabular-nums" />
                     {/* Unit is FIXED to the material's purchase / ordering unit —
                         no picker. Staff always requisition in bulk units (BTL /
                         PKT / bag), never raw g/ml, so a "12" can't be misread as
@@ -1195,8 +1200,9 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
                           {it.confidence[0]}
                         </span>
                       )}
-                      <span className="text-xs font-mono text-[#6B5744]" title={`${m?.average_price ? '₹'+m.average_price+'/'+m.unit : ''}`}>
-                        {fmt(lineCost)}
+                      <span className="text-right leading-tight" title={m ? `₹${pricePerPU.toFixed(2)} per ${puUnit}` : ''}>
+                        <span className="block text-xs font-mono text-[#6B5744]">{fmt(lineCost)}</span>
+                        {m && pricePerPU > 0 && <span className="block text-[9px] font-mono text-[#8B7355]">₹{pricePerPU.toFixed(2)}/{puUnit}</span>}
                       </span>
                       <button type="button" onClick={() => removeLine(i)}
                               className="text-red-600 hover:text-red-700"><Trash2 size={12} /></button>
