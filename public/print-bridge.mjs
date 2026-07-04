@@ -55,7 +55,7 @@ const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.3.0';   // 2.3.0 = idempotent by jobId (a retried print after a lost ack is a no-op → never double-prints). 2.2.1 = offline LAN KOT + audit hardening.
+const VERSION = '2.3.1';   // 2.3.1 = bill item table columns realigned (Rs Rate/Amt no longer collide with Qty). 2.3.0 = idempotent by jobId (retried print after a lost ack is a no-op). 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -216,21 +216,30 @@ function money(n) {
   const v = Math.round((Number(n) || 0) * 100) / 100;
   return 'Rs ' + v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
+// Compact "Rs" price for the item table's Rate/Amt columns: no space after Rs and
+// no ".00" for whole rupees, so the columns stay narrow and keep a clean gap from
+// Qty (money()'s "Rs 8,000.00" was too wide and butted against the qty number).
+function itemMoney(n) {
+  const v = Math.round((Number(n) || 0) * 100) / 100;
+  const s = Number.isInteger(v)
+    ? v.toLocaleString('en-IN')
+    : v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return 'Rs' + s;
+}
 
-// Item row: item name on the left, then Qty / Rate / Amt right-aligned in fixed
-// numeric columns. The name is truncated so it never collides with Qty. At 32
-// cols the columns shrink but the structure is identical (ASCII only).
-function billItemRow(name, qty, rate, amt, cols) {
-  const qtyW  = cols >= 48 ? 4 : 3;
-  const rateW = cols >= 48 ? 9 : 7;
-  const amtW  = cols >= 48 ? 10 : 8;
-  const pad = (s, w) => { s = String(s); return s.length >= w ? s : ' '.repeat(w - s.length) + s; };
-  const right = pad(qty, qtyW) + pad(rate, rateW) + pad(amt, amtW);
+// Item row: name on the left, then Qty / Rate / Amt right-aligned in the GIVEN
+// column widths `w` (computed once per table from the widest value incl. the
+// header, so the Rate/Amt labels sit exactly above their numbers) with a
+// guaranteed 1-space gap between every column — so an "Rs" value can never touch
+// the qty. Name is truncated to fit. ASCII only.
+function billItemRow(name, qty, rate, amt, cols, w) {
+  const rj = (s, width) => { s = String(s); return s.length >= width ? s : ' '.repeat(width - s.length) + s; };
+  const right = rj(qty, w.qty) + ' ' + rj(rate, w.rate) + ' ' + rj(amt, w.amt);
   let nm = String(name ?? '');
-  const nameW = cols - right.length - 1;                 // 1-space gap min
-  if (nameW < 1) return right.slice(0, cols);
+  const nameW = cols - right.length - 1;                 // ≥1 space between name and qty
+  if (nameW < 1) return right.slice(-cols);
   if (nm.length > nameW) nm = nm.slice(0, Math.max(0, nameW - 1)) + '.';
-  return nm + ' '.repeat(cols - nm.length - right.length) + right;
+  return nm + ' '.repeat(Math.max(1, cols - nm.length - right.length)) + right;
 }
 
 // Default BILL line order (mirrors DEFAULT_BILL_LINES in print.ts) — used when a
@@ -298,14 +307,22 @@ function buildBill(doc, cols, doCut) {
     captain:     (m) => { if (doc.captainName) leftS(`Captain Name: ${doc.captainName}`, m); },
     guestsOrder: (m) => leftS(twoCol(`Number of Guests: ${Number(doc.guests) || 0}`, doc.orderNo ? `Order no: ${doc.orderNo}` : '', cols), m),
     items:       (m) => {
-      push(CMD.boldOn); line(billItemRow('Item Name', 'Qty', 'Rate', 'Amt', cols)); push(CMD.boldOff);
-      rule();
-      for (const it of (doc.items || [])) {
+      const its = (doc.items || []).map((it) => {
         const qty = Number(it.qty) || 1;
         const rate = Number(it.rate) || 0;
         const amount = it.amount != null ? Number(it.amount) : qty * rate;
-        line(billItemRow(it.name || '', qty, money(rate), money(amount), cols));
-      }
+        return { name: it.name || '', qty: String(qty), rate: itemMoney(rate), amt: itemMoney(amount) };
+      });
+      // One shared set of column widths for the whole table (widest value incl.
+      // the header text) → header aligns over its numbers, columns keep a gap.
+      const w = {
+        qty:  Math.max(3, ...its.map((r) => r.qty.length)),
+        rate: Math.max('Rate'.length, ...its.map((r) => r.rate.length)),
+        amt:  Math.max('Amt'.length, ...its.map((r) => r.amt.length)),
+      };
+      push(CMD.boldOn); line(billItemRow('Item Name', 'Qty', 'Rate', 'Amt', cols, w)); push(CMD.boldOff);
+      rule();
+      for (const r of its) line(billItemRow(r.name, r.qty, r.rate, r.amt, cols, w));
     },
     subTotal:      (m) => twoColS('Sub Total', money(doc.subtotal ?? 0), m),
     serviceCharge: (m) => { if (Number(doc.serviceCharge)) twoColS('Service Charges', money(doc.serviceCharge), m); },
