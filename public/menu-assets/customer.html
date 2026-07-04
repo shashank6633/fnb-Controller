@@ -290,7 +290,18 @@
   .step .st{font-family:var(--serif);font-size:19px;line-height:1.15}
   .step.pending .st{color:var(--inkMute)}
   .step .ss{font-size:12.5px;color:var(--inkSoft);margin-top:1px}
-  .tab-card{margin-top:auto;background:var(--card);border:1px solid var(--rule);border-radius:16px;padding:15px}
+  .tab-card{margin-top:22px;background:var(--card);border:1px solid var(--rule);border-radius:16px;padding:15px}
+  /* order history — what the guest actually ordered (itemised) */
+  .ordwrap{margin-top:26px}
+  .ordcard{background:var(--card);border:1px solid var(--rule);border-radius:14px;padding:13px 15px;margin-top:10px}
+  .ordhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+  .ordhead .on{font-family:var(--serif);font-size:18px}
+  .ordstatus{font-family:var(--mono);font-size:9px;letter-spacing:.06em;text-transform:uppercase;padding:3px 9px;border-radius:999px;white-space:nowrap}
+  .ordstatus.open{background:#E3EEE6;color:var(--forest)}
+  .ordstatus.pending_approval{background:var(--terraTint);color:var(--terraDeep)}
+  .ordrow{display:flex;justify-content:space-between;gap:10px;font-size:13.5px;padding:3px 0;color:var(--ink)}
+  .ordrow .q{color:var(--terra);font-family:var(--mono);font-size:12px;margin-right:5px}
+  .ordsub{display:flex;justify-content:space-between;border-top:1px solid var(--ruleSoft);margin-top:7px;padding-top:7px;font-weight:600;font-size:13.5px}
 
   .toast{position:fixed;left:50%;transform:translateX(-50%) translateY(-16px);top:14px;z-index:80;background:var(--ink);color:var(--paper);padding:11px 18px;border-radius:999px;font-size:13.5px;font-weight:500;box-shadow:var(--shadow);opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;max-width:90%}
   .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
@@ -522,11 +533,15 @@
     var old=document.getElementById('tabbar');if(old)old.remove();
     if(S.screen!=='menu'&&S.screen!=='track')return;   // persistent nav on menu + order tracking
     var n=cartCount();
+    // Order-tab badge: items in the cart, OR (cart empty) active orders on this
+    // table — so after ordering the guest still sees a badge to tap into history.
+    var activeOrders=(S.orders||[]).filter(function(o){return o.status==='open'||o.status==='pending_approval';}).length;
+    var orderBadge=n||activeOrders;
     var bar=document.createElement('nav');bar.className='tabbar';bar.id='tabbar';
     bar.innerHTML=
       tabHTML('menu',ICON.menu,'Menu',S.screen==='menu')+
       tabHTML('search',ICON.search,'Search',false)+
-      tabHTML('order',ICON.bag,'Order',S.screen==='track',n)+
+      tabHTML('order',ICON.bag,'Order',S.screen==='track',orderBadge)+
       tabHTML('table',ICON.bell,'Table',false,svcActiveCount());
     document.body.appendChild(bar);
     bar.querySelector('[data-tab="menu"]').onclick=function(){closeSheet();if(S.screen!=='menu'){S.screen='menu';render();}else{window.scrollTo(0,0);}};
@@ -712,6 +727,14 @@
         '<h1>'+head+'</h1>'+
         '<p>'+sub+'</p></div>'+
       '<div class="steps">'+steps.map(function(st,i){var cls=i<stage?'done':(i===stage?'active':'pending');return '<div class="step '+cls+'"><div class="line"></div><div class="dot">'+(i<stage?'✓':(i===stage?'●':(i+1))).toString()+'</div><div><div class="st">'+st.t+'</div><div class="ss">'+st.s+'</div></div></div>';}).join('')+'</div>'+
+      // ORDER HISTORY — the itemised record of what the guest ordered on this table.
+      (orders.length?('<div class="ordwrap"><div class="kicker" style="margin-bottom:2px">Your order'+(orders.length>1?'s':'')+'</div>'+
+        orders.map(function(o){
+          var stLbl=o.status==='open'?(direct?'Preparing':'Confirmed'):(o.status==='pending_approval'?(direct?'Sending to kitchen':'Awaiting captain'):o.status);
+          return '<div class="ordcard"><div class="ordhead"><span class="on">'+(o.order_number?('Order #'+esc(String(o.order_number))):'Your order')+'</span><span class="ordstatus '+esc(o.status)+'">'+esc(stLbl)+'</span></div>'+
+            (o.items||[]).map(function(it){return '<div class="ordrow"><span><span class="q">'+esc(String(it.qty))+'×</span>'+esc(it.name)+'</span><span>'+money(it.line_total)+'</span></div>';}).join('')+
+            '<div class="ordsub"><span>Subtotal</span><span>'+money(o.subtotal)+'</span></div></div>';
+        }).join('')+'</div>'):'')+
       '<div class="tab-card"><div style="display:flex;justify-content:space-between;align-items:baseline"><span class="kicker">Running tab</span><span class="serif" style="font-size:24px">'+money(tab)+'</span></div>'+
         '<div style="display:flex;gap:10px;margin-top:14px"><button class="btn ghost" id="more" style="height:48px">Add more</button><button class="btn ghost" id="svc" style="height:48px">Service</button></div></div>'+
     '</div>';
@@ -785,6 +808,7 @@
       S.cart=valid;saveCart();
       S.screen='landing';render();
       pollService();startSvcPoll();   // reflect any in-flight captain accept/done + keep it live
+      pollOrders();                   // load this table's existing orders so history survives a reload
     }).catch(function(e){S.screen='error';S.errmsg=e.message;render();});
   }
   render();boot();
