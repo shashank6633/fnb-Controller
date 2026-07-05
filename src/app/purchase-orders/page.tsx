@@ -855,7 +855,13 @@ function CreatePOModal({ materials, onClose, onCreated }: {
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
-      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-8 shadow-xl">
+      {/* maxHeight:none overrides the global mobile modal cap (globals.css §5,
+          `max-height: calc(100vh-1rem)`). That cap has no overflow, so with many
+          item lines the content spilled OUT of the white card. The overlay above
+          (items-start + overflow-y-auto) scrolls the tall card instead — and,
+          unlike an internal scroll, never clips the material-picker dropdown. */}
+      <div style={{ maxHeight: 'none' }}
+           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-8 shadow-xl">
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
           <h2 className="font-bold text-[#2D1B0E]">New Purchase Order</h2>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
@@ -901,12 +907,15 @@ function CreatePOModal({ materials, onClose, onCreated }: {
           <div>
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-sm font-semibold text-[#2D1B0E]">Items</h3>
-              <button onClick={addLine} className="text-xs text-[#af4408] hover:underline flex items-center gap-1">
+              {/* Desktop keeps a quick top button; the primary one lives at the
+                  bottom of the list so on mobile you always see it right after the
+                  material you just added (rather than scrolled off the top). */}
+              <button onClick={addLine} className="hidden md:flex text-xs text-[#af4408] hover:underline items-center gap-1">
                 <Plus className="w-3 h-3" /> Add line
               </button>
             </div>
-            <table className="w-full text-xs">
-              <thead className="text-[#8B7355]">
+            <table className="w-full text-xs block md:table">
+              <thead className="text-[#8B7355] hidden md:table-header-group">
                 <tr>
                   <th className="text-left py-1 px-2 font-medium" style={{ width: '34%' }}>Material</th>
                   <th className="text-left py-1 px-2 font-medium" style={{ width: '26%' }}>Vendor</th>
@@ -916,13 +925,14 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                   <th className="w-8"></th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className="block md:table-row-group">
                 {items.map((it, i) => {
                   const mat = materials.find(m => m.id === it.material_id);
                   const lineTotal = Number(it.quantity) * Number(it.unit_price);
                   return (
-                    <tr key={i} className="border-t border-[#E8D5C4]/50 align-top">
-                      <td className="py-1 px-2">
+                    <tr key={i} className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
+                      <td className="py-1 px-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
                         <SimpleMaterialPicker value={it.material_id} materials={eligibleMaterials}
                                               onChange={(id, m) => {
                                                 const patch: Partial<POLine> = { material_id: id };
@@ -945,7 +955,8 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                           </div>
                         )}
                       </td>
-                      <td className="py-1 px-2">
+                      <td className="py-1 px-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Vendor</span>
                         {/* Vendor picker — autocomplete-style: type or pick from master */}
                         <input
                           list={`po-vendor-list-${i}`}
@@ -987,12 +998,14 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                           ) : null;
                         })()}
                       </td>
-                      <td className="py-1 px-2">
+                      <td className="py-1 px-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Qty</span>
                         <input type="number" step="any" value={it.quantity || ''}
                                onChange={e => updateLine(i, { quantity: parseFloat(e.target.value) || 0 })}
                                className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
                       </td>
-                      <td className="py-1 px-2">
+                      <td className="py-1 px-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Unit ₹</span>
                         <input type="number" step="any" value={it.unit_price || ''}
                                onChange={e => updateLine(i, { unit_price: parseFloat(e.target.value) || 0 })}
                                className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
@@ -1002,8 +1015,11 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                         onMatch={p => updateLine(i, { unit_price: p })} />
                         )}
                       </td>
-                      <td className="py-1 px-2 text-right font-mono pt-2">{fmt(lineTotal)}</td>
-                      <td className="py-1 px-2 pt-2">
+                      <td className="py-1 px-2 text-right font-mono pt-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Line ₹</span>
+                        {fmt(lineTotal)}
+                      </td>
+                      <td className="py-1 px-2 pt-2 block md:table-cell">
                         <button onClick={() => removeLine(i)} className="text-red-500 hover:text-red-700">
                           <Trash2 className="w-3 h-3" />
                         </button>
@@ -1012,14 +1028,20 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                   );
                 })}
               </tbody>
-              <tfoot>
-                <tr className="border-t border-[#E8D5C4] font-semibold">
-                  <td className="py-2 px-2 text-right" colSpan={4}>Total</td>
-                  <td className="py-2 px-2 text-right font-mono">{fmt(total)}</td>
-                  <td></td>
+              <tfoot className="block md:table-footer-group">
+                <tr className="border-t border-[#E8D5C4] font-semibold block md:table-row">
+                  <td className="py-2 px-2 text-right block md:table-cell" colSpan={4}>Total</td>
+                  <td className="py-2 px-2 text-right font-mono block md:table-cell">{fmt(total)}</td>
+                  <td className="block md:table-cell"></td>
                 </tr>
               </tfoot>
             </table>
+            {/* Primary Add-line — full width at the BOTTOM so after entering a
+                material the button sits right below it (mobile-friendly). */}
+            <button type="button" onClick={addLine}
+                    className="mt-2 w-full flex items-center justify-center gap-1.5 py-2.5 border-2 border-dashed border-[#E8D5C4] rounded-lg text-sm font-medium text-[#af4408] hover:border-[#af4408] hover:bg-[#FFF1E3] active:bg-[#FFE8D5]">
+              <Plus className="w-4 h-4" /> Add line
+            </button>
           </div>
 
           <label className="text-xs text-[#6B5744] flex flex-col gap-1">

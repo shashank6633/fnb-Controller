@@ -369,7 +369,12 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
-      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-4xl my-8 shadow-xl">
+      {/* maxHeight:none overrides the global mobile modal cap (globals.css §5,
+          `max-height: calc(100vh-1rem)`) which has no overflow — so a tall
+          line-items list spilled OUT of the white card. Letting the card grow
+          keeps content inside; the overlay above (overflow-y-auto) scrolls it,
+          and unlike an internal scroll it never clips the material dropdown. */}
+      <div style={{ maxHeight: 'none' }} className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-4xl my-8 shadow-xl">
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
           <h2 className="font-bold text-[#2D1B0E]">New Ad-hoc Goods Receipt Note</h2>
           <button onClick={onClose}><X className="w-5 h-5 text-[#8B7355]" /></button>
@@ -491,11 +496,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
           <div className="border border-[#E8D5C4] rounded-lg">
             <div className="bg-[#FFF1E3] px-3 py-1.5 text-[#6B5744] flex items-center justify-between rounded-t-lg">
               <span className="font-semibold">Line Items</span>
-              <button onClick={addLine} className="text-xs text-[#af4408] hover:underline flex items-center gap-1"><Plus className="w-3 h-3" /> Add line</button>
+              <button onClick={addLine} className="hidden md:flex text-xs text-[#af4408] hover:underline items-center gap-1"><Plus className="w-3 h-3" /> Add line</button>
             </div>
             <div>
-              <table className="w-full text-xs">
-                <thead className="text-[#8B7355]">
+              <table className="w-full text-xs block md:table">
+                <thead className="text-[#8B7355] hidden md:table-header-group">
                   <tr>
                     <th className="text-left  py-1 px-2 font-medium">Material</th>
                     <th className="text-right py-1 px-2 font-medium">Received</th>
@@ -505,10 +510,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                     <th className="w-8"></th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody className="block md:table-row-group">
                   {items.map((it, i) => (
-                    <tr key={i} className="border-t border-[#E8D5C4]/50 align-top">
-                      <td className="py-1 px-2">
+                    <tr key={i} className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
+                      <td className="py-1 px-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
                         <MaterialTypeahead
                           materials={filteredMaterials as any}
                           value={it.material_id}
@@ -516,31 +522,34 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                           excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                         />
                       </td>
-                      <td className="py-1 px-2">
+                      <td className="py-1 px-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Received</span>
                         <input type="number" step="any"
                                // Browser-level guard: min=0 unless this is a back-correction GRN.
                                {...(isAdjustment ? {} : { min: 0 })}
                                value={it.quantity_received}
                                onChange={e => updateLine(i, { quantity_received: e.target.value })}
-                               className={`w-20 px-1.5 py-1 border rounded text-right text-xs ${
+                               className={`w-full md:w-20 px-1.5 py-1 border rounded text-right text-xs ${
                                  parseFloat(it.quantity_received) < 0
                                    ? 'border-amber-400 bg-amber-50 text-amber-900 font-semibold'
                                    : 'border-[#E8D5C4]'
                                }`} />
                       </td>
-                      <td className="py-1 px-2">
+                      <td className="py-1 px-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Accepted</span>
                         <input type="number" step="any"
                                {...(isAdjustment ? {} : { min: 0 })}
                                value={it.quantity_accepted}
                                onChange={e => updateLine(i, { quantity_accepted: e.target.value })}
                                placeholder="(=received)"
-                               className={`w-20 px-1.5 py-1 border rounded text-right text-xs ${
+                               className={`w-full md:w-20 px-1.5 py-1 border rounded text-right text-xs ${
                                  parseFloat(it.quantity_accepted) < 0
                                    ? 'border-amber-400 bg-amber-50 text-amber-900 font-semibold'
                                    : 'border-[#E8D5C4]'
                                }`} />
                       </td>
-                      <td className="py-1 px-2">
+                      <td className="py-1 px-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Reject reason</span>
                         <select value={it.rejection_reason} onChange={e => updateLine(i, { rejection_reason: e.target.value })}
                                 className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-xs bg-[#FFF8F0]">
                           <option value="">—</option>
@@ -552,10 +561,12 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                           <option value="other">other</option>
                         </select>
                       </td>
-                      <td className="py-1 px-2"><input type="number" step="any" value={it.unit_price}
+                      <td className="py-1 px-2 block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Unit ₹</span>
+                        <input type="number" step="any" value={it.unit_price}
                                                        onChange={e => updateLine(i, { unit_price: e.target.value })}
-                                                       className="w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" /></td>
-                      <td className="py-1 px-2 text-right"><button onClick={() => removeLine(i)} className="text-red-500"><Trash2 className="w-3 h-3" /></button></td>
+                                                       className="w-full md:w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" /></td>
+                      <td className="py-1 px-2 text-right block md:table-cell"><button onClick={() => removeLine(i)} className="text-red-500"><Trash2 className="w-3 h-3" /></button></td>
                     </tr>
                   ))}
                 </tbody>
@@ -573,14 +584,14 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                   const lineCount = items.filter(ln => ln.material_id && (parseFloat(ln.quantity_received) || 0) !== 0).length;
                   if (lineCount === 0) return null;
                   return (
-                    <tfoot className="bg-[#FFF1E3]/60 font-semibold text-[#2D1B0E]">
-                      <tr>
-                        <td className="py-1.5 px-2 text-right text-[10px] text-[#6B5744]">{lineCount} line{lineCount === 1 ? '' : 's'}</td>
-                        <td className="py-1.5 px-2 text-right font-mono">{totRec.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
-                        <td className="py-1.5 px-2 text-right font-mono">{totAcc.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
-                        <td className="py-1.5 px-2"></td>
-                        <td className="py-1.5 px-2 text-right text-[10px] text-[#6B5744]">Total ₹</td>
-                        <td className="py-1.5 px-2 text-right font-mono text-emerald-800">
+                    <tfoot className="bg-[#FFF1E3]/60 font-semibold text-[#2D1B0E] block md:table-footer-group">
+                      <tr className="block md:table-row">
+                        <td className="py-1.5 px-2 text-right text-[10px] text-[#6B5744] block md:table-cell">{lineCount} line{lineCount === 1 ? '' : 's'}</td>
+                        <td className="py-1.5 px-2 text-right font-mono block md:table-cell">{totRec.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
+                        <td className="py-1.5 px-2 text-right font-mono block md:table-cell">{totAcc.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
+                        <td className="py-1.5 px-2 block md:table-cell"></td>
+                        <td className="py-1.5 px-2 text-right text-[10px] text-[#6B5744] block md:table-cell">Total ₹</td>
+                        <td className="py-1.5 px-2 text-right font-mono text-emerald-800 block md:table-cell">
                           ₹{totVal.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
                         </td>
                       </tr>
@@ -590,6 +601,10 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               </table>
             </div>
           </div>
+          {/* Primary Add-line — full width at the BOTTOM so on mobile the button
+              sits right below the material you just added (rather than off-screen
+              at the top of the box). Desktop keeps the compact top button. */}
+          <button type="button" onClick={addLine} className="mt-2 w-full flex items-center justify-center gap-1.5 py-2.5 border-2 border-dashed border-[#E8D5C4] rounded-lg text-sm font-medium text-[#af4408] hover:border-[#af4408] hover:bg-[#FFF1E3] active:bg-[#FFE8D5]"><Plus className="w-4 h-4" /> Add line</button>
 
           <label className="flex flex-col gap-1 text-[#6B5744]">Notes
             <textarea rows={2} value={notes} onChange={e => setNotes(e.target.value)}

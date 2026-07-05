@@ -1458,7 +1458,12 @@ export default function PurchasesPage() {
       {billModalOpen && (
         <div className="fixed inset-0 z-50 flex items-start justify-center pt-8 pb-8 overflow-y-auto">
           <div className="fixed inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setBillModalOpen(false)} />
-          <div className="relative w-full max-w-4xl bg-white rounded-2xl shadow-xl border border-[#E8D5C4] mx-4">
+          {/* maxHeight:none overrides the global mobile modal cap (globals.css §5,
+              `max-height: calc(100vh-1rem)`), which has no overflow and so spilled
+              tall bill content OUT of the card. The overlay above (items-start +
+              overflow-y-auto) scrolls the grown card, and — unlike an internal
+              scroll — never clips the material typeahead dropdown. */}
+          <div style={{ maxHeight: 'none' }} className="relative w-full max-w-4xl bg-white rounded-2xl shadow-xl border border-[#E8D5C4] mx-4">
             {/* Bill Header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4]">
               <div className="flex items-center gap-3">
@@ -1592,7 +1597,7 @@ export default function PurchasesPage() {
                   <button
                     type="button"
                     onClick={addBillLine}
-                    className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-[#af4408] border border-[#af4408] rounded-lg hover:bg-[#af4408]/10 transition-colors"
+                    className="hidden md:flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-[#af4408] border border-[#af4408] rounded-lg hover:bg-[#af4408]/10 transition-colors"
                   >
                     <Plus className="w-3 h-3" /> Add Item
                   </button>
@@ -1606,8 +1611,8 @@ export default function PurchasesPage() {
                   set in inventory, a <strong>BTL / CASE</strong> toggle appears next to the qty input — pick CASE and type the case count + per-case price.
                 </div>
                 <div className="overflow-x-auto rounded-xl border border-[#E8D5C4]">
-                  <table className="w-full text-sm">
-                    <thead className="bg-[#FFF1E3]">
+                  <table className="w-full text-sm block md:table">
+                    <thead className="bg-[#FFF1E3] hidden md:table-header-group">
                       <tr className="text-[#6B5744]">
                         <th className="text-left py-2.5 px-3 font-medium w-[30%]">Material *</th>
                         <th className="text-left py-2.5 px-3 font-medium w-[12%]">Brand</th>
@@ -1619,17 +1624,19 @@ export default function PurchasesPage() {
                         <th className="py-2.5 px-2 w-8"></th>
                       </tr>
                     </thead>
-                    <tbody>
+                    <tbody className="block md:table-row-group">
                       {billCalc.items.map((item, idx) => (
-                        <tr key={item.id} className="border-t border-[#E8D5C4]/50">
-                          <td className="py-2 px-2">
+                        <tr key={item.id} className="border-t border-[#E8D5C4]/50 block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:border-t md:space-y-0">
+                          <td className="py-2 px-2 block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
                             <MaterialTypeahead
                               materials={materials as any}
                               value={item.material_id}
                               onPick={(id) => updateBillLine(item.id, 'material_id', id)}
                             />
                           </td>
-                          <td className="py-2 px-2">
+                          <td className="py-2 px-2 block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Brand</span>
                             <input
                               type="text"
                               value={item.brand}
@@ -1638,7 +1645,8 @@ export default function PurchasesPage() {
                               className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
                             />
                           </td>
-                          <td className="py-2 px-2">
+                          <td className="py-2 px-2 block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Qty</span>
                             {(() => {
                               const mat = materials.find(m => m.id === item.material_id) as any;
                               const caseSize = Number(mat?.case_size) || 1;
@@ -1676,7 +1684,8 @@ export default function PurchasesPage() {
                               );
                             })()}
                           </td>
-                          <td className="py-2 px-2">
+                          <td className="py-2 px-2 block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Unit Price</span>
                             <input
                               type="number" step="0.01" min="0"
                               value={item.unit_price}
@@ -1689,16 +1698,19 @@ export default function PurchasesPage() {
                               <div className="text-[9px] text-[#8B7355] text-right">per case</div>
                             )}
                           </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744]">
+                          <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744] block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Line Total</span>
                             {formatCurrency(item.line_total)}
                           </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono text-amber-600">
+                          <td className="py-2 px-3 text-right text-xs font-mono text-amber-600 block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">GST Share</span>
                             {formatCurrency(item.gst_share)}
                           </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono font-semibold text-[#af4408]">
+                          <td className="py-2 px-3 text-right text-xs font-mono font-semibold text-[#af4408] block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Final Unit ₹</span>
                             {formatCurrency(item.final_unit_price)}
                           </td>
-                          <td className="py-2 px-1">
+                          <td className="py-2 px-1 block md:table-cell">
                             {billCalc.items.length > 1 && (
                               <button
                                 type="button"
@@ -1714,6 +1726,12 @@ export default function PurchasesPage() {
                     </tbody>
                   </table>
                 </div>
+                {/* Primary Add-item — full width at the BOTTOM so on mobile it sits
+                    right below the item you just entered (the top button is desktop-only). */}
+                <button type="button" onClick={addBillLine}
+                        className="mt-2 w-full flex items-center justify-center gap-1.5 py-2.5 border-2 border-dashed border-[#E8D5C4] rounded-lg text-sm font-medium text-[#af4408] hover:border-[#af4408] hover:bg-[#FFF1E3] active:bg-[#FFE8D5]">
+                  <Plus className="w-4 h-4" /> Add line
+                </button>
               </div>
 
               {/* Bill Summary */}
