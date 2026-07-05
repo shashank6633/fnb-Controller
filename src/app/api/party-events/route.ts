@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentOutletId } from '@/lib/auth';
+import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 
 /**
  * Party Events P&L.
@@ -28,6 +28,13 @@ export async function GET(request: Request) {
     const eventName = url.searchParams.get('event');
     const eventDate = url.searchParams.get('date');
     const outletId = await getCurrentOutletId();
+    // Revenue & profit are ADMIN/HOD-only. Department users (kitchen/bar/service)
+    // get consumption/cost only — financial fields are zeroed server-side so the
+    // numbers never reach the browser, not just hidden in the UI.
+    const me = await getCurrentUser();
+    const canSeeFinancials = me?.role === 'admin' || !!me?.is_head_chef;
+    const redact = <T extends Record<string, any>>(o: T): T =>
+      canSeeFinancials ? o : ({ ...o, revenue: 0, profit: 0, food_cost_percent: 0, per_head_revenue: 0, per_head_profit: 0 });
 
     // Single event detail
     if (eventName && eventDate) {
@@ -89,13 +96,13 @@ export async function GET(request: Request) {
           unit_price: Math.round((i.average_price || 0) * 100) / 100,
           line_cost:  Math.round(i.quantity_requested * (i.average_price || 0) * 100) / 100,
         })),
-        sales: sales.map(s => ({
+        sales: canSeeFinancials ? sales.map(s => ({
           item_name: s.item_name, qty: s.qty,
           revenue: Math.round(s.revenue || 0),
           category: s.category,
           link_type: s.link_type as 'manual' | 'auto',
-        })),
-        summary: {
+        })) : [],
+        summary: redact({
           cost: Math.round(cost * 100) / 100,
           revenue: Math.round(revenue),
           profit: Math.round((revenue - cost) * 100) / 100,
@@ -103,7 +110,7 @@ export async function GET(request: Request) {
           per_head_cost:     guests > 0 ? Math.round((cost / guests) * 100) / 100 : 0,
           per_head_revenue:  guests > 0 ? Math.round(revenue / guests) : 0,
           per_head_profit:   guests > 0 ? Math.round(((revenue - cost) / guests) * 100) / 100 : 0,
-        },
+        }),
       });
     }
 
@@ -139,7 +146,7 @@ export async function GET(request: Request) {
       events: events.map(e => {
         const cost = Number(e.cost) || 0;
         const rev  = Number(e.revenue) || 0;
-        return {
+        return redact({
           event_name: e.event_name,
           event_date: e.event_date,
           guest_count: e.guest_count,
@@ -151,7 +158,7 @@ export async function GET(request: Request) {
           food_cost_percent: rev > 0 ? Math.round((cost / rev) * 10000) / 100 : 0,
           per_head_cost: e.guest_count > 0 ? Math.round((cost / e.guest_count) * 100) / 100 : 0,
           per_head_revenue: e.guest_count > 0 ? Math.round(rev / e.guest_count) : 0,
-        };
+        });
       }),
     });
   } catch (e: any) {

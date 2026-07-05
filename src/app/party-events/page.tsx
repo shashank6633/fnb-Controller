@@ -49,11 +49,18 @@ export default function PartyEventsPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [linkSubmitting, setLinkSubmitting] = useState(false);
   const [rowBusyId, setRowBusyId] = useState<string | null>(null);
+  // Revenue & profit are ADMIN/HOD-only on this page. Department users (kitchen /
+  // bar / service staff) see only cost / consumption. Gate = role admin || is_head_chef.
+  const [canSeeFinancials, setCanSeeFinancials] = useState(false);
 
   useEffect(() => {
     fetch('/api/party-events').then(r => r.json()).then(d => {
       setEvents(d.events || []); setLoading(false);
     });
+    fetch('/api/auth/me').then(r => r.json()).then(d => {
+      const u = d?.user;
+      setCanSeeFinancials(u?.role === 'admin' || !!u?.is_head_chef);
+    }).catch(() => {});
   }, []);
 
   const openEvent = async (e: Event) => {
@@ -178,15 +185,17 @@ export default function PartyEventsPage() {
               </div>
             </div>
 
-            {/* P&L summary */}
+            {/* P&L summary — Cost/consumption for everyone; Revenue/Profit/FC% admin+HOD only */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <Card label="Cost"        value={fmt(detail.summary.cost)}    sub={detail.guest_count > 0 ? `${fmt(detail.summary.per_head_cost)}/head` : undefined} tone="red" />
-              <Card label="Revenue"     value={fmt(detail.summary.revenue)} sub={detail.guest_count > 0 ? `${fmt(detail.summary.per_head_revenue)}/head` : undefined} tone="green" />
-              <Card label="Profit"      value={fmt(detail.summary.profit)}  sub={detail.guest_count > 0 ? `${fmt(detail.summary.per_head_profit)}/head` : undefined}
-                    tone={detail.summary.profit >= 0 ? 'green' : 'red'} />
-              <Card label="Food Cost %" value={`${detail.summary.food_cost_percent}%`}
-                    sub={detail.summary.food_cost_percent > 35 ? '⚠ above 35% target' : 'within target'}
-                    tone={detail.summary.food_cost_percent > 35 ? 'amber' : 'green'} />
+              {canSeeFinancials && (<>
+                <Card label="Revenue"     value={fmt(detail.summary.revenue)} sub={detail.guest_count > 0 ? `${fmt(detail.summary.per_head_revenue)}/head` : undefined} tone="green" />
+                <Card label="Profit"      value={fmt(detail.summary.profit)}  sub={detail.guest_count > 0 ? `${fmt(detail.summary.per_head_profit)}/head` : undefined}
+                      tone={detail.summary.profit >= 0 ? 'green' : 'red'} />
+                <Card label="Food Cost %" value={`${detail.summary.food_cost_percent}%`}
+                      sub={detail.summary.food_cost_percent > 35 ? '⚠ above 35% target' : 'within target'}
+                      tone={detail.summary.food_cost_percent > 35 ? 'amber' : 'green'} />
+              </>)}
             </div>
 
             {/* Cost breakdown */}
@@ -228,8 +237,8 @@ export default function PartyEventsPage() {
               </table>
             </div>
 
-            {/* Revenue breakdown */}
-            {(() => {
+            {/* Revenue breakdown — admin/HOD only */}
+            {canSeeFinancials && (() => {
               const autoCount = detail.sales.filter(s => s.link_type !== 'manual').length;
               const manCount = detail.sales.filter(s => s.link_type === 'manual').length;
               return (
@@ -428,10 +437,12 @@ export default function PartyEventsPage() {
                 <th className="text-right py-2 px-3 font-medium">Guests</th>
                 <th className="text-right py-2 px-3 font-medium">Reqs</th>
                 <th className="text-right py-2 px-3 font-medium">Cost</th>
-                <th className="text-right py-2 px-3 font-medium">Revenue</th>
-                <th className="text-right py-2 px-3 font-medium">Profit</th>
-                <th className="text-right py-2 px-3 font-medium">FC%</th>
-                <th className="text-right py-2 px-3 font-medium">/head</th>
+                {canSeeFinancials && (<>
+                  <th className="text-right py-2 px-3 font-medium">Revenue</th>
+                  <th className="text-right py-2 px-3 font-medium">Profit</th>
+                  <th className="text-right py-2 px-3 font-medium">FC%</th>
+                  <th className="text-right py-2 px-3 font-medium">/head</th>
+                </>)}
               </tr>
             </thead>
             <tbody>
@@ -447,14 +458,16 @@ export default function PartyEventsPage() {
                     <td className="py-1.5 px-3 text-right font-mono">{e.guest_count || '—'}</td>
                     <td className="py-1.5 px-3 text-right font-mono text-[#8B7355]">{e.req_count}</td>
                     <td className="py-1.5 px-3 text-right font-mono">{fmt(e.cost)}</td>
-                    <td className="py-1.5 px-3 text-right font-mono text-green-700">{fmt(e.revenue)}</td>
-                    <td className={`py-1.5 px-3 text-right font-mono font-semibold ${profitTone}`}>{fmt(e.profit)}</td>
-                    <td className={`py-1.5 px-3 text-right font-mono font-semibold ${fcTone}`}>
-                      {e.revenue > 0 ? `${e.food_cost_percent.toFixed(1)}%` : '—'}
-                    </td>
-                    <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">
-                      {(e.guest_count ?? 0) > 0 ? fmt(e.per_head_revenue - e.per_head_cost) : '—'}
-                    </td>
+                    {canSeeFinancials && (<>
+                      <td className="py-1.5 px-3 text-right font-mono text-green-700">{fmt(e.revenue)}</td>
+                      <td className={`py-1.5 px-3 text-right font-mono font-semibold ${profitTone}`}>{fmt(e.profit)}</td>
+                      <td className={`py-1.5 px-3 text-right font-mono font-semibold ${fcTone}`}>
+                        {e.revenue > 0 ? `${e.food_cost_percent.toFixed(1)}%` : '—'}
+                      </td>
+                      <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">
+                        {(e.guest_count ?? 0) > 0 ? fmt(e.per_head_revenue - e.per_head_cost) : '—'}
+                      </td>
+                    </>)}
                   </tr>
                 );
               })}
