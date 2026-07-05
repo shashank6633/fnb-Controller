@@ -429,11 +429,11 @@ export default function PartyApprovalsPage() {
                     {g.reqs.length} req{g.reqs.length === 1 ? '' : 's'}
                     {g.submitted_count > 0 && (
                       <span className="ml-2 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800"
-                            title="Awaiting Head Chef approval">{g.submitted_count} with chef</span>
+                            title="Awaiting HOD approval">{g.submitted_count} with HOD</span>
                     )}
                     {g.pending_mgmt_count > 0 && (
                       <span className="ml-2 px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800"
-                            title="Chef-approved — waiting for Management approval">{g.pending_mgmt_count} with mgmt</span>
+                            title="HOD-approved — waiting for Management approval">{g.pending_mgmt_count} with mgmt</span>
                     )}
                     {g.approved_count > 0 && (
                       <span className="ml-2 px-1.5 py-0.5 rounded bg-blue-100 text-blue-800"
@@ -509,16 +509,16 @@ export default function PartyApprovalsPage() {
                                 //   require_mgmt=OFF → "With Store" (blue, direct to issue desk)
                                 const chefApprovedLabel = requireMgmt
                                   ? { label: 'With Mgmt',  cls: 'bg-indigo-100 text-indigo-800',
-                                      tip: 'Chef has approved — waiting for Management approval' }
+                                      tip: 'HOD has approved — waiting for Management approval' }
                                   : { label: 'With Store', cls: 'bg-blue-100 text-blue-800',
-                                      tip: 'Chef has approved — sent directly to Store (Mgmt gate is OFF)' };
+                                      tip: 'HOD has approved — sent directly to Store (Mgmt gate is OFF)' };
                                 const labelMap: Record<string, { label: string; cls: string; tip?: string }> = {
-                                  submitted:       { label: 'With Chef',        cls: 'bg-amber-100 text-amber-800',
-                                                     tip: 'Awaiting Head Chef approval' },
+                                  submitted:       { label: 'With HOD',         cls: 'bg-amber-100 text-amber-800',
+                                                     tip: 'Awaiting HOD approval' },
                                   chef_approved:   chefApprovedLabel,
                                   mgmt_approved:   { label: 'With Store',       cls: 'bg-blue-100 text-blue-800',
                                                      tip: 'Mgmt-approved — waiting for Store to issue' },
-                                  chef_rejected:   { label: 'Rejected by Chef', cls: 'bg-red-100 text-red-700' },
+                                  chef_rejected:   { label: 'Rejected by HOD', cls: 'bg-red-100 text-red-700' },
                                   store_processed: { label: 'Issued (partial)', cls: 'bg-purple-100 text-purple-700' },
                                   fulfilled:       { label: 'Fulfilled',        cls: 'bg-emerald-200 text-emerald-900' },
                                   cancelled:       { label: 'Cancelled',        cls: 'bg-gray-200 text-gray-700' },
@@ -543,8 +543,8 @@ export default function PartyApprovalsPage() {
                                           className="text-emerald-700 hover:bg-emerald-100 px-2 py-0.5 rounded disabled:opacity-40 disabled:cursor-not-allowed"
                                           title={allLinesRejected
                                             ? 'Every line is rejected — use Reject (with a reason) to send the whole requisition back.'
-                                            : 'Approve as Head Chef (1st gate). Use "view items" on the row to edit qty / reject lines first.'}>
-                                    {isBusy ? <Loader2 size={11} className="animate-spin" /> : '✓ Chef Approve'}
+                                            : 'Approve as HOD (1st gate). Use "view items" on the row to edit qty / reject lines first.'}>
+                                    {isBusy ? <Loader2 size={11} className="animate-spin" /> : '✓ HOD Approve'}
                                   </button>
                                   <button onClick={() => reject(r.id)} disabled={isBusy}
                                           className="text-red-700 hover:bg-red-100 px-2 py-0.5 rounded">

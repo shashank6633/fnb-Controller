@@ -474,7 +474,7 @@ export default function PartyRequisitionsPage() {
                                 <th className="text-left  py-1 px-2 font-medium">SKU</th>
                                 <th className="text-left  py-1 px-2 font-medium">Material</th>
                                 <th className="text-right py-1 px-2 font-medium">Requested</th>
-                                <th className="text-right py-1 px-2 font-medium">Chef OK</th>
+                                <th className="text-right py-1 px-2 font-medium">HOD OK</th>
                                 <th className="text-right py-1 px-2 font-medium">Issued</th>
                                 <th className="text-left  py-1 px-2 font-medium">Status</th>
                               </tr>
@@ -1098,7 +1098,7 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
             </div>
             {!mixedMode && (
               <div className="text-[10px] text-[#8B7355]">
-                Each dept raises its own party req. Head Chef sees them all together on the <strong>Party Approvals</strong> screen.
+                Each dept raises its own party req. HOD sees them all together on the <strong>Party Approvals</strong> screen.
               </div>
             )}
           </div>
@@ -1281,9 +1281,9 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
           {/* Save & Submit → primary action, lands on Head Chef's approval inbox */}
           <button onClick={() => submit(true)} disabled={saving}
                   className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#af4408] hover:bg-[#933807] text-white rounded text-sm disabled:opacity-50"
-                  title="Save and immediately send to Head Chef for approval.">
+                  title="Save and immediately send to HOD for approval.">
             {saving ? <Loader2 className="animate-spin" size={14} /> : <ChefHat size={14} />}
-            {saving ? 'Saving…' : 'Save & Submit to Chef'}
+            {saving ? 'Saving…' : 'Save & Submit to HOD'}
           </button>
         </div>
       </div>

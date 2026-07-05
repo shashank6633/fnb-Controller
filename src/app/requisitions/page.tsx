@@ -14,7 +14,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ClipboardList, Plus, Trash2, Send, CheckCircle2, XCircle, Package,
-  AlertTriangle, ChevronDown, ChevronRight, Loader2, Upload, Search, X, Eye,
+  AlertTriangle, ChevronDown, ChevronRight, Loader2, Upload, Search, X, Eye, Pencil,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { fmtIST } from '@/lib/format-date';
@@ -99,7 +99,7 @@ const STATUS_BADGE: Record<string, string> = {
   cancelled:       'bg-[#E8D5C4] text-[#6B5744]',
 };
 const STATUS_LABEL: Record<string, string> = {
-  draft: 'Draft', submitted: 'With Head Chef',
+  draft: 'Draft', submitted: 'With HOD',
   chef_approved: 'With Mgmt', mgmt_approved: 'With Store',
   chef_rejected: 'Rejected', store_processed: 'Issued (partial)', fulfilled: 'Fulfilled', cancelled: 'Cancelled',
 };
@@ -129,6 +129,8 @@ export default function RequisitionsPage() {
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [creating, setCreating] = useState(false);
+  // Draft being edited — when set, the create modal opens in edit mode (PUT).
+  const [editDraft, setEditDraft] = useState<Requisition | null>(null);
   // Full user record — viewer (from list endpoint) only carries permission
   // flags; we need department_id + is_head_chef + is_store_manager to decide
   // whether the dept selector in the create modal should be locked.
@@ -210,7 +212,7 @@ export default function RequisitionsPage() {
           <ClipboardList className="w-7 h-7 text-[#af4408]" />
           <div>
             <h1 className="text-2xl font-bold text-[#2D1B0E]">Department Requisitions</h1>
-            <p className="text-xs text-[#6B5744]">Internal stock requests → Head Chef → Store Manager → Vendor PO (admin approves) → Fulfilled.</p>
+            <p className="text-xs text-[#6B5744]">Internal stock requests → HOD (Head of Department) → Store Manager → Vendor PO (admin approves) → Fulfilled.</p>
           </div>
         </div>
         <div className="flex gap-2">
@@ -238,14 +240,14 @@ export default function RequisitionsPage() {
           final gate and there's no Mgmt action to take here. */}
       {(requireMgmt && viewer.can_mgmt && counts.inbox_mgmt > 0) && (
         <div className="mb-3 px-4 py-2 bg-indigo-50 border border-indigo-200 rounded-lg text-xs text-indigo-800 flex items-center gap-2">
-          <CheckCircle2 className="w-4 h-4" /> {counts.inbox_mgmt} chef-approved requisition(s) waiting for Management approval.
+          <CheckCircle2 className="w-4 h-4" /> {counts.inbox_mgmt} HOD-approved requisition(s) waiting for Management approval.
           <button onClick={() => setStatusFilter('inbox-mgmt')} className="ml-auto underline">Approve</button>
         </div>
       )}
       {(viewer.can_store && counts.inbox_store > 0) && (
         <div className="mb-3 px-4 py-2 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-800 flex items-center gap-2">
           <Package className="w-4 h-4" />
-          {counts.inbox_store} {requireMgmt ? 'mgmt-approved' : 'chef-approved'} requisition(s) for store to process.
+          {counts.inbox_store} {requireMgmt ? 'mgmt-approved' : 'HOD-approved'} requisition(s) for store to process.
           <button onClick={() => setStatusFilter('inbox-store')} className="ml-auto underline">Process</button>
         </div>
       )}
@@ -259,7 +261,7 @@ export default function RequisitionsPage() {
         <div className="mb-3 px-3 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-[11px] text-[#6B5744] flex items-center gap-2">
           <Eye className="w-3.5 h-3.5" />
           <span>
-            <b>View only.</b> This is the {statusFilter === 'inbox-chef' ? 'Head Chef\'s' : 'Management\'s'} approval queue —
+            <b>View only.</b> This is the {statusFilter === 'inbox-chef' ? 'HOD\'s' : 'Management\'s'} approval queue —
             you can see what's pending but the action buttons (Approve / Reject) are gated to that role.
           </span>
         </div>
@@ -270,7 +272,7 @@ export default function RequisitionsPage() {
       <div className="flex flex-wrap gap-1 mb-3 text-xs">
         {[
           { k: 'all', l: 'All' }, { k: 'open', l: `Open (${counts.open})` },
-          { k: 'inbox-chef', l: `Chef Inbox (${counts.inbox_chef})` },
+          { k: 'inbox-chef', l: `HOD Inbox (${counts.inbox_chef})` },
           ...(requireMgmt ? [{ k: 'inbox-mgmt', l: `Mgmt Inbox (${counts.inbox_mgmt})` }] : []),
           { k: 'inbox-store', l: `Store Inbox (${counts.inbox_store})` },
           // "Partially issued" only appears when there's at least one — saves
@@ -320,7 +322,8 @@ export default function RequisitionsPage() {
                                 materials={materials}
                                 viewer={viewer}
                                 requireMgmt={requireMgmt}
-                                reload={reload} />
+                                reload={reload}
+                                onEdit={(draft) => { setEditDraft(draft); setCreating(true); }} />
               ))}
             </tbody>
           </table>
@@ -330,7 +333,8 @@ export default function RequisitionsPage() {
       {creating && (
         <CreateRequisitionModal departments={departments} materials={materials}
                                 me={me}
-                                onClose={() => setCreating(false)}
+                                editDraft={editDraft}
+                                onClose={() => { setCreating(false); setEditDraft(null); }}
                                 onCreated={reload} />
       )}
       {importing && (
@@ -412,7 +416,7 @@ function RecahoImportModal({ onClose, onCommitted }: { onClose: () => void; onCo
                   Just create departments? ({preview.missing_departments.length} new)
                 </div>
                 <div className="text-amber-800 mt-0.5">
-                  Skip the transfer import for now and only seed the Departments page so you can assign Head Chefs and Store Managers right away.
+                  Skip the transfer import for now and only seed the Departments page so you can assign HODs (Heads of Department) and Store Managers right away.
                 </div>
               </div>
               <button onClick={() => send('departments')} disabled={busy}
@@ -549,12 +553,13 @@ function RecahoImportModal({ onClose, onCommitted }: { onClose: () => void; onCo
 }
 
 /* ============================================================ */
-function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt, reload }: {
+function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt, reload, onEdit }: {
   r: Requisition; expanded: boolean; onToggle: () => void;
   materials: Material[];
   viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean };
   requireMgmt: boolean;
   reload: () => void;
+  onEdit: (draft: Requisition) => void;
 }) {
   return (
     <>
@@ -605,16 +610,17 @@ function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt,
           {r.drafted_by}
         </td>
       </tr>
-      {expanded && <RequisitionDetail r={r} materials={materials} viewer={viewer} requireMgmt={requireMgmt} reload={reload} />}
+      {expanded && <RequisitionDetail r={r} materials={materials} viewer={viewer} requireMgmt={requireMgmt} reload={reload} onEdit={onEdit} />}
     </>
   );
 }
 
-function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
+function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }: {
   r: Requisition; materials: Material[];
   viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean };
   requireMgmt: boolean;
   reload: () => void;
+  onEdit: (draft: Requisition) => void;
 }) {
   const [detail, setDetail] = useState<Requisition | null>(null);
   const [busy, setBusy] = useState(false);
@@ -697,7 +703,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
                 <th className="text-left py-1 px-2 font-medium">SKU</th>
                 <th className="text-left py-1 px-2 font-medium">Material</th>
                 <th className="text-right py-1 px-2 font-medium">Requested</th>
-                <th className="text-right py-1 px-2 font-medium" title="Chef-approved quantity (overrides Requested when set)">Chef OK</th>
+                <th className="text-right py-1 px-2 font-medium" title="HOD-approved quantity (overrides Requested when set)">HOD OK</th>
                 <th className="text-right py-1 px-2 font-medium">On Hand</th>
                 {(detail.status === 'store_processed' || detail.status === 'fulfilled') && (
                   <>
@@ -762,7 +768,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
                     </td>
                     <td className="py-1 px-2 no-underline">
                       {rejected
-                        ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-700 border border-red-200 font-medium">Rejected by Chef</span>
+                        ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-700 border border-red-200 font-medium">Rejected by HOD</span>
                         : it.chef_approved_qty != null
                           ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200">Qty edited</span>
                           : <span className="text-[10px] text-[#C0A98F]">—</span>}
@@ -777,7 +783,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
           <div><b>Drafted by:</b> {detail.drafted_by}</div>
           {detail.notes && <div><b>Notes:</b> {detail.notes}</div>}
           {detail.submitted_at  && <div><b>Submitted:</b> {fmtIST(detail.submitted_at)} by {detail.submitted_by}</div>}
-          {detail.chef_approved_at && <div className="text-blue-700"><b>Chef approved:</b> {fmtIST(detail.chef_approved_at)} by {detail.chef_approved_by}{detail.chef_note && ` — "${detail.chef_note}"`}</div>}
+          {detail.chef_approved_at && <div className="text-blue-700"><b>HOD approved:</b> {fmtIST(detail.chef_approved_at)} by {detail.chef_approved_by}{detail.chef_note && ` — "${detail.chef_note}"`}</div>}
           {detail.mgmt_approved_at && <div className="text-indigo-700"><b>Mgmt approved:</b> {fmtIST(detail.mgmt_approved_at)} by {detail.mgmt_approved_by}{detail.mgmt_note && ` — "${detail.mgmt_note}"`}</div>}
           {detail.rejected_at && <div className="text-red-700"><b>Rejected:</b> {detail.rejected_reason} ({detail.rejected_by} · {fmtIST(detail.rejected_at)})</div>}
           {detail.store_processed_at && <div className="text-purple-700"><b>Store processed:</b> {fmtIST(detail.store_processed_at)} by {detail.store_processed_by}{detail.store_note && ` — "${detail.store_note}"`}</div>}
@@ -790,8 +796,9 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
 
       {/* Action buttons */}
       <div className="flex flex-wrap gap-2 mt-2">
-        {canSubmit  && <button disabled={busy} onClick={submit}     className="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded inline-flex items-center gap-1"><Send className="w-3 h-3" /> Submit to Chef</button>}
-        {canChefAct && <button onClick={() => setShowApprove(true)} className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Chef Approve</button>}
+        {canEdit    && <button disabled={busy} onClick={() => onEdit(detail)} className="px-3 py-1.5 text-xs bg-[#af4408] hover:bg-[#8a3506] text-white rounded inline-flex items-center gap-1"><Pencil className="w-3 h-3" /> Edit</button>}
+        {canSubmit  && <button disabled={busy} onClick={submit}     className="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded inline-flex items-center gap-1"><Send className="w-3 h-3" /> Submit to HOD</button>}
+        {canChefAct && <button onClick={() => setShowApprove(true)} className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> HOD Approve</button>}
         {canChefAct && <button onClick={() => setShowReject(true)}  className="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded inline-flex items-center gap-1"><XCircle className="w-3 h-3" /> Reject</button>}
         {canMgmtAct && <button onClick={() => setShowMgmtApprove(true)} className="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Mgmt Approve</button>}
         {canStoreAct && <button onClick={() => setShowProcess(true)} className="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded inline-flex items-center gap-1"><Package className="w-3 h-3" /> Issue to Department</button>}
@@ -813,11 +820,14 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload }: {
 /* ============================================================ */
 /* Create new requisition                                        */
 /* ============================================================ */
-function CreateRequisitionModal({ departments, materials, me, onClose, onCreated }: {
+function CreateRequisitionModal({ departments, materials, me, editDraft, onClose, onCreated }: {
   departments: Department[]; materials: Material[];
   me: { role?: string; department_id?: string | null; is_head_chef?: boolean; is_store_manager?: boolean } | null;
+  editDraft?: Requisition | null;
   onClose: () => void; onCreated: () => void;
 }) {
+  // When editing a draft, we PUT instead of POST and pre-fill the form from it.
+  const isEditing = !!editDraft;
   // Department locking — internal requisitions belong to the user's home dept.
   // Only privileged roles can pick a different dept (e.g. an admin raising on
   // behalf of a team that doesn't have its own dispatcher yet):
@@ -832,22 +842,31 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
   const lockedDeptId = !canChangeDept ? (me?.department_id || '') : '';
 
   const today = new Date().toISOString().slice(0, 10);
-  const [date, setDate] = useState(today);
+  const [date, setDate] = useState(editDraft?.date || today);
   // Default the department to the user's OWN department automatically for everyone
   // who has one (a staff user is locked to it; admin/manager/head see it pre-selected
   // but can still switch). Only fall back to the first dept when the user has no home
-  // department (e.g. a pure admin).
-  const [departmentId, setDepartmentId] = useState(me?.department_id || lockedDeptId || departments[0]?.id || '');
+  // department (e.g. a pure admin). When editing, honour the draft's own department.
+  const [departmentId, setDepartmentId] = useState(editDraft?.department_id || me?.department_id || lockedDeptId || departments[0]?.id || '');
   // Safety net: if `me` resolves after this modal mounts, adopt the user's home
-  // department — but never override a choice already made.
+  // department — but never override a choice already made. Skip entirely when
+  // editing so we don't clobber the draft's department.
   useEffect(() => {
+    if (isEditing) return;
     if (me?.department_id) setDepartmentId((cur) => cur || me.department_id!);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me?.department_id]);
-  const [notes, setNotes] = useState('');
-  const [items, setItems] = useState<Array<{ material_id: string; quantity_requested: number; unit: string; notes: string }>>([
-    { material_id: '', quantity_requested: 1, unit: '', notes: '' },
-  ]);
+  const [notes, setNotes] = useState(editDraft?.notes || '');
+  const [items, setItems] = useState<Array<{ material_id: string; quantity_requested: number; unit: string; notes: string }>>(
+    editDraft && (editDraft.items?.length || 0) > 0
+      ? editDraft.items!.map(it => ({
+          material_id: it.material_id,
+          quantity_requested: it.quantity_requested,
+          unit: it.unit || '',
+          notes: it.notes || '',
+        }))
+      : [{ material_id: '', quantity_requested: 1, unit: '', notes: '' }],
+  );
   const [saving, setSaving] = useState(false);
 
   const addLine = () => setItems(p => [...p, { material_id: '', quantity_requested: 1, unit: '', notes: '' }]);
@@ -867,23 +886,31 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
     if (cleaned.length === 0) { alert('Add at least one item'); return; }
     setSaving(true);
     try {
-      const r = await api('/api/requisitions', {
-        method: 'POST',
-        body: { date, department_id: departmentId, notes, items: cleaned },
-      });
+      // Editing a draft → PUT (replaces items on the existing requisition).
+      // Creating → POST (unchanged behaviour). The submitted-to-chef id is the
+      // draft's own id when editing, or the newly-created id when creating.
+      const r = isEditing
+        ? await api('/api/requisitions', {
+            method: 'PUT',
+            body: { id: editDraft!.id, date, department_id: departmentId, notes, items: cleaned },
+          })
+        : await api('/api/requisitions', {
+            method: 'POST',
+            body: { date, department_id: departmentId, notes, items: cleaned },
+          });
       if (!r.ok) { alert((await r.json()).error || 'Failed'); return; }
       if (submitAfter) {
         const j = await r.json().catch(() => ({}));
-        const newId = j?.requisition?.id;
-        if (newId) {
-          const s = await api(`/api/requisitions/${newId}/submit`, { method: 'POST', body: {} });
+        const targetId = isEditing ? editDraft!.id : j?.requisition?.id;
+        if (targetId) {
+          const s = await api(`/api/requisitions/${targetId}/submit`, { method: 'POST', body: {} });
           if (!s.ok) {
             const sj = await s.json().catch(() => ({}));
-            alert('Saved as draft, but submit to chef failed: ' + (sj.error || 'unknown') +
+            alert('Saved as draft, but submit to HOD failed: ' + (sj.error || 'unknown') +
                   '\nYou can submit it from the requisition’s detail view.');
           }
         } else {
-          alert('Saved as draft. Open it to submit to chef.');
+          alert('Saved as draft. Open it to submit to HOD.');
         }
       }
       onCreated(); onClose();
@@ -901,7 +928,7 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
       <div style={{ maxHeight: 'none' }}
            className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-8 shadow-xl">
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
-          <h2 className="font-bold text-[#2D1B0E]">New Department Requisition</h2>
+          <h2 className="font-bold text-[#2D1B0E]">{isEditing ? 'Edit Draft Requisition' : 'New Department Requisition'}</h2>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>
         <div className="p-5 space-y-4">
@@ -927,7 +954,7 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                   return d ? `${d.code ? `[${d.code}] ` : ''}${d.name}` : '(no department assigned to your user)';
                 })()}
                        readOnly
-                       title="Internal requisitions are scoped to your home department. Admins / Head Chefs / Store Managers can pick any."
+                       title="Internal requisitions are scoped to your home department. Admins / HODs / Store Managers can pick any."
                        className="px-2 py-1.5 border border-blue-200 rounded-lg bg-blue-50/40 text-sm text-[#6B5744] cursor-not-allowed" />
               )}
             </label>
@@ -1073,11 +1100,11 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
           <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
           <button onClick={() => save(false)} disabled={saving}
                   className="px-3 py-1.5 border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] text-sm rounded-lg disabled:opacity-50">
-            {saving ? 'Saving…' : 'Save as Draft'}
+            {saving ? 'Saving…' : (isEditing ? 'Save Changes' : 'Save as Draft')}
           </button>
           <button onClick={() => save(true)} disabled={saving}
                   className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg disabled:opacity-50 inline-flex items-center gap-1">
-            <Send className="w-3.5 h-3.5" /> {saving ? 'Working…' : 'Submit to Chef'}
+            <Send className="w-3.5 h-3.5" /> {saving ? 'Working…' : 'Submit to HOD'}
           </button>
         </div>
       </div>
@@ -1143,7 +1170,7 @@ function ChefApproveModal({ req, onClose, onDone }: { req: Requisition; onClose:
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
       <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-2xl my-8 shadow-xl">
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
-          <h2 className="font-bold text-[#2D1B0E]">Chef Approve — {req.req_number}</h2>
+          <h2 className="font-bold text-[#2D1B0E]">HOD Approve — {req.req_number}</h2>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>
         <div className="p-5 space-y-3 text-xs">

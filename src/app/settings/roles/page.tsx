@@ -198,12 +198,18 @@ export default function RolesAdmin() {
 
               <div className="flex flex-wrap gap-4">
                 <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
-                  <input type="checkbox" checked={draft.is_head_chef} onChange={(e) => setDraft({ ...draft, is_head_chef: e.target.checked })} /> Can approve as Head Chef
+                  <input type="checkbox" checked={draft.is_head_chef} onChange={(e) => setDraft({ ...draft, is_head_chef: e.target.checked })} /> Is HOD (Head of Department)
                 </label>
                 <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
                   <input type="checkbox" checked={draft.is_store_manager} onChange={(e) => setDraft({ ...draft, is_store_manager: e.target.checked })} /> Can issue stock as Store Manager
                 </label>
               </div>
+              {!draft.is_head_chef && (
+                <p className="-mt-1 text-[11px] text-amber-700 flex items-start gap-1">
+                  <span aria-hidden>⚠</span>
+                  <span>This role <b>can’t approve requisitions</b> — tick the approval box above to allow it (admins can always approve).</span>
+                </p>
+              )}
 
               {/* Bill-discount authority — lets a cashier/captain request a discount on a
                   running bill (still needs a manager/admin approver at settle time). */}

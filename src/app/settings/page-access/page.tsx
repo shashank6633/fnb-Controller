@@ -243,7 +243,7 @@ export default function PageAccessSettingsPage() {
                               {curDepts.size === 0
                                 ? `Default: only this user's own department (${u.department_name || 'none'}).`
                                 : `Sees requisitions / data for ${curDepts.size} department${curDepts.size === 1 ? '' : 's'}.`}
-                              {' '}Admins / head chef / store manager always see all.
+                              {' '}Admins / HOD / store manager always see all.
                             </div>
                           </div>
                           <button onClick={() => setDeptDraft(p => ({ ...p, [u.id]: new Set() }))}

@@ -47,10 +47,10 @@ const POSITION_TEMPLATES: Array<{
     defaults: { role: 'staff', is_head_chef: 0, is_store_manager: 0 }, hint: 'Manually configure role + permissions below.' },
   { value: 'Department User',     label: 'Department User (own requisitions only)',
     defaults: { role: 'staff', is_head_chef: 0, is_store_manager: 0 }, hint: 'Raises & views ONLY their own department’s requisitions. Remember to set the Department below.' },
-  { value: 'Head Chef',           label: 'Head Chef',
+  { value: 'Head Chef',           label: 'HOD (Head of Department)',
     defaults: { role: 'manager', is_head_chef: 1, is_store_manager: 0 }, hint: 'Approves requisitions — ⚠ sees ALL departments’ requisitions.' },
   { value: 'Sous Chef',           label: 'Sous Chef',
-    defaults: { role: 'manager', is_head_chef: 1, is_store_manager: 0 }, hint: 'Approves when Head Chef is away — ⚠ sees ALL requisitions.' },
+    defaults: { role: 'manager', is_head_chef: 1, is_store_manager: 0 }, hint: 'Approves when HOD is away — ⚠ sees ALL requisitions.' },
   { value: 'Bar Manager',         label: 'Bar Manager',
     defaults: { role: 'manager', is_head_chef: 1, is_store_manager: 0 }, hint: 'Approves requisitions — ⚠ sees ALL departments’ requisitions.' },
   { value: 'Operations Manager',  label: 'Operations Manager',
@@ -78,7 +78,7 @@ function roleSummary(u: AppUser): string {
   const tags: string[] = [];
   if (u.position) tags.push(u.position);
   else {
-    if (u.is_head_chef)     tags.push('Head Chef');
+    if (u.is_head_chef)     tags.push('HOD');
     if (u.is_store_manager) tags.push('Store Manager');
   }
   if (u.department_name)  tags.push(u.department_name);
@@ -222,7 +222,7 @@ export default function UsersPage() {
                       <div className="flex gap-1 flex-wrap">
                         {u.is_head_chef ? (
                           <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 font-medium inline-flex items-center gap-0.5">
-                            <ChefHat className="w-3 h-3" /> Head Chef
+                            <ChefHat className="w-3 h-3" /> HOD
                           </span>
                         ) : null}
                         {u.is_store_manager ? (
@@ -362,7 +362,7 @@ export default function UsersPage() {
                   </select>
                   <span className="block text-[10px] text-[#8B7355] mt-0.5">
                     Department staff (e.g. Bartender, Pizza Cook) raise requisitions for their own department.
-                    Leave blank for Head Chef / Store Manager who span all kitchens.
+                    Leave blank for HOD / Store Manager who span all kitchens.
                   </span>
                 </label>
 
@@ -374,7 +374,7 @@ export default function UsersPage() {
                            onChange={e => setEditing({ ...editing, is_head_chef: e.target.checked ? 1 : 0 })} />
                     <span>
                       <span className="inline-flex items-center gap-1 font-medium text-blue-700">
-                        <ChefHat className="w-3 h-3" /> Head Chef
+                        <ChefHat className="w-3 h-3" /> Is HOD (Head of Department)
                       </span>
                       <span className="block text-[10px] text-[#8B7355]">
                         Approves / rejects requisitions submitted by department staff.
@@ -390,7 +390,7 @@ export default function UsersPage() {
                         <Warehouse className="w-3 h-3" /> Store Manager
                       </span>
                       <span className="block text-[10px] text-[#8B7355]">
-                        Processes chef-approved requisitions — issues from stock, raises vendor POs for shortfall.
+                        Processes HOD-approved requisitions — issues from stock, raises vendor POs for shortfall.
                       </span>
                     </span>
                   </label>

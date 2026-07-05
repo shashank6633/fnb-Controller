@@ -74,7 +74,7 @@ export default function FoodConsumptionPage() {
         <div className="flex-1">
           <h1 className="text-xl font-semibold text-[#2D1B0E]">Food Consumption</h1>
           <p className="text-xs text-[#8B7355]">
-            Food cost per party from chef-approved party requisitions (Party Approvals).
+            Food cost per party from HOD-approved party requisitions (Party Approvals).
             Cost auto-pulls from each material&apos;s average purchase price.
           </p>
         </div>
@@ -85,7 +85,7 @@ export default function FoodConsumptionPage() {
           <Utensils size={16} className="text-amber-700" />
           <div className="flex-1 min-w-0 text-[10px] text-[#8B7355]">
             Showing {filter === 'past' ? 'past' : 'all'} events from the AKAN Party Manager sheet.
-            Food items come from chef-approved party requisitions.
+            Food items come from HOD-approved party requisitions.
           </div>
           <select value={filter} onChange={e => setFilter(e.target.value as any)}
                   className="text-xs px-2 py-1 border border-[#D4B896] rounded bg-white">

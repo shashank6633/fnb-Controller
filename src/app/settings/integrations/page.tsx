@@ -495,8 +495,8 @@ function PartyRulesCard({ onError, onOk }: { onError: (m: string) => void; onOk:
       if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
       setRequireMgmt(next);
       onOk(next
-        ? '✓ Mgmt approval REQUIRED — party requisitions now need Chef + Mgmt before reaching the store.'
-        : '✓ Mgmt approval OPTIONAL — once Chef approves, the requisition goes directly to the store.');
+        ? '✓ Mgmt approval REQUIRED — party requisitions now need HOD + Mgmt before reaching the store.'
+        : '✓ Mgmt approval OPTIONAL — once HOD approves, the requisition goes directly to the store.');
     } finally { setBusy(false); }
   };
 
@@ -582,18 +582,18 @@ function PartyRulesCard({ onError, onOk }: { onError: (m: string) => void; onOk:
           </div>
           <div className="text-[11px] text-[#8B7355] mt-0.5">
             {requireMgmt
-              ? '✓ ON. Flow: Department → Chef → Mgmt → Store. Mgmt Approve button appears on /party-approvals for admins; party reqs are held at "With Mgmt" status until Mgmt acts.'
-              : '✓ OFF (default). Flow: Department → Chef → Store. Once Chef approves, the requisition goes directly to the store inbox — no second gate.'}
-            {' '}Internal kitchen requisitions are never gated by Mgmt regardless of this setting (Chef approval alone is always enough for kitchen restocks).
+              ? '✓ ON. Flow: Department → HOD → Mgmt → Store. Mgmt Approve button appears on /party-approvals for admins; party reqs are held at "With Mgmt" status until Mgmt acts.'
+              : '✓ OFF (default). Flow: Department → HOD → Store. Once HOD approves, the requisition goes directly to the store inbox — no second gate.'}
+            {' '}Internal kitchen requisitions are never gated by Mgmt regardless of this setting (HOD approval alone is always enough for kitchen restocks).
           </div>
         </div>
       </label>
 
       {requireMgmt && (
         <div className="bg-indigo-50 border border-indigo-200 rounded p-2 text-[11px] text-indigo-900">
-          🛡 Mgmt gate is active. Already chef-approved party requisitions sitting in the queue
+          🛡 Mgmt gate is active. Already HOD-approved party requisitions sitting in the queue
           will remain at "With Mgmt" until an admin approves them on <code>/party-approvals</code>.
-          Internal kitchen reqs continue to flow Chef → Store without any change.
+          Internal kitchen reqs continue to flow HOD → Store without any change.
         </div>
       )}
     </div>

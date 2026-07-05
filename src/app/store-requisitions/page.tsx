@@ -449,7 +449,7 @@ function ReqCard(props: {
               <tr>
                 <th className="text-left  py-1.5 px-2 font-medium">Material</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="Quantity requested in the recipe unit (kg / L / pcs / etc.)">Requested (qty + unit)</th>
-                <th className="text-right py-1.5 px-2 font-medium" title="Chef-approved quantity (overrides requested if set)">Chef OK</th>
+                <th className="text-right py-1.5 px-2 font-medium" title="HOD-approved quantity (overrides requested if set)">HOD OK</th>
                 <th className="text-right py-1.5 px-2 font-medium">Issued so far</th>
                 <th className="text-right py-1.5 px-2 font-medium">Outstanding</th>
                 <th className="text-left  py-1.5 px-2 font-medium">Last issue</th>
