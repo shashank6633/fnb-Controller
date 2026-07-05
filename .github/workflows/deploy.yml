@@ -15,11 +15,12 @@ jobs:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          # npm install + next build on the box takes ~10 min — the action's
-          # default command_timeout (10m) killed the session right at the finish
-          # line on 2026-07-04 (build succeeded, run reported "failure"). Give it
-          # comfortable headroom so a slow install can't kill a deploy mid-build.
-          command_timeout: 25m
+          # `next build` on the small Lightsail box (Turbopack + heavy swap) has
+          # grown to ~25 min and blew past the 25m cap on 2026-07-05 (timed out
+          # mid-build → pm2 never restarted → prod stuck on the old build). GCP
+          # builds locally and is unaffected; only this on-box build needs the
+          # headroom. 45m leaves comfortable margin over the observed ~25 min.
+          command_timeout: 45m
 
           script: |
             set -e                                   # abort on any error — never restart on a failed build
