@@ -13,6 +13,7 @@
  */
 
 import { refreshUpcomingParties } from './party-refresh';
+import { checkDeferDueSoon } from './defer-due-check';
 
 /**
  * Adaptive cadence:
@@ -68,6 +69,20 @@ export function startSchedulerOnce(): void {
       globalThis.__fnbScheduler__!.lastRun = Date.now();
       globalThis.__fnbScheduler__!.lastResult = res;
       console.log(`[scheduler] refresh @ IST ${istHour()}h: ${res.fetched_parties} parties · ${res.status_changes} status changes · ${res.notifications_created} notifications · ${res.slack_sent} slack sent`);
+
+      // Feature 4 — warn store managers about deferred requisition items coming
+      // due within ~4h. Runs on the same cadence as the party refresh. Fully
+      // best-effort: any failure here is logged and swallowed so it can NEVER
+      // break the refresh loop.
+      try {
+        const dd = await checkDeferDueSoon('cron');
+        if (dd.candidates > 0 || dd.notifications_created > 0) {
+          console.log(`[scheduler] defer-due @ IST ${istHour()}h: ${dd.candidates} due-soon · ${dd.notifications_created} notifications · ${dd.slack_sent} slack sent`);
+        }
+        if (dd.errors.length) console.warn('[scheduler] defer-due errors:', dd.errors);
+      } catch (e: any) {
+        console.error('[scheduler] defer-due check failed:', e?.message);
+      }
     } catch (e: any) {
       console.error('[scheduler] refresh failed:', e?.message);
       globalThis.__fnbScheduler__!.lastResult = { error: e?.message };

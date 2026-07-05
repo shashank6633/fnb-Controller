@@ -14,26 +14,33 @@ import { getCurrentUser, canIssueAsStore } from '@/lib/auth';
  *   lines: [
  *     {
  *       id: string,                    // requisition_item id
- *       action: 'issue' | 'defer' | 'undo',
+ *       action: 'issue' | 'defer' | 'undo' | 'reject' | 'unreject',
  *       quantity?: number,             // for 'issue': how much was handed over now
  *       defer_until?: string,          // for 'defer': ISO datetime the store will issue later
- *       reason?: string,               // for 'defer': free-text "out of cold storage"
+ *       reason?: string,               // for 'defer'/'reject': free-text "out of cold storage" / "discontinued"
  *     }
  *   ],
  *   note?: string,                     // optional req-level note (e.g. "Bar pickup at 7pm")
  * }
  *
  * Effects per action:
- *   issue   → quantity_issued += qty (append to issue_history JSON);
- *             issued_at=now, issued_by=me; clear deferred fields.
- *             current_stock is NEVER touched (recipe-deduction owns that).
- *   defer   → deferred_until + defer_reason set. quantity_issued unchanged.
- *   undo    → clears issued/deferred fields. Use to fix mistakes.
+ *   issue    → quantity_issued += qty (append to issue_history JSON);
+ *              issued_at=now, issued_by=me; clear deferred fields.
+ *              current_stock is NEVER touched (recipe-deduction owns that).
+ *   defer    → deferred_until + defer_reason set. quantity_issued unchanged.
+ *   undo     → clears issued/deferred fields. Use to fix mistakes.
+ *              (Does NOT clear a store rejection — use 'unreject' for that.)
+ *   reject   → store-rejects the line: store_rejected=1, store_reject_reason=reason,
+ *              quantity_issued=0, deferred fields cleared. DISTINCT from the chef's
+ *              is_rejected — this is the store saying it cannot fulfil the line.
+ *   unreject → clears store_rejected + store_reject_reason (line becomes issuable again).
  *
  * Parent requisition status auto-advances to 'fulfilled' when every
  * non-rejected item has quantity_issued >= effective_qty (chef_approved_qty
- * if set, else quantity_requested). Otherwise stays 'mgmt_approved' /
- * 'chef_approved' / 'store_processed' so it remains in the store queue.
+ * if set, else quantity_requested). A line rejected by the chef (is_rejected)
+ * OR by the store (store_rejected) counts as "done" and is not required to be
+ * issued. Otherwise stays 'mgmt_approved' / 'chef_approved' / 'store_processed'
+ * so it remains in the store queue.
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -89,6 +96,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           issue_history = '[]'
       WHERE id = ?
     `);
+    // Store-side rejection. Distinct from the chef's is_rejected. Reset any issue
+    // progress + deferred fields so the line reads cleanly as "store-rejected".
+    const updReject = db.prepare(`
+      UPDATE requisition_items
+      SET store_rejected = 1, store_reject_reason = ?,
+          quantity_issued = 0, issued_at = NULL, issued_by = NULL,
+          deferred_until = NULL, defer_reason = '',
+          issue_history = '[]'
+      WHERE id = ?
+    `);
+    const updUnreject = db.prepare(`
+      UPDATE requisition_items
+      SET store_rejected = 0, store_reject_reason = ''
+      WHERE id = ?
+    `);
 
     const auditPerLine: any[] = [];
     const nowIso = new Date().toISOString();
@@ -103,7 +125,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           quantity_issued: it.quantity_issued || 0,
           deferred_until:  it.deferred_until,
           defer_reason:    it.defer_reason,
+          store_rejected:  it.store_rejected || 0,
+          store_reject_reason: it.store_reject_reason || '',
         };
+        // A store-rejected line accepts only 'unreject' — clear the rejection
+        // first before issuing/deferring/undoing it again.
+        if (it.store_rejected && action !== 'unreject') continue;
         if (action === 'issue') {
           const addQty = Number(ln.quantity);
           if (!Number.isFinite(addQty) || addQty <= 0) continue;
@@ -129,18 +156,31 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           auditPerLine.push({ id: it.id, material: it.material_name, action, before, after: {
             quantity_issued: 0, issued_at: null, issued_by: null,
           }});
+        } else if (action === 'reject') {
+          const reason = String(ln.reason || '').trim();
+          updReject.run(reason, it.id);
+          auditPerLine.push({ id: it.id, material: it.material_name, action, before, after: {
+            store_rejected: 1, store_reject_reason: reason, quantity_issued: 0,
+          }});
+        } else if (action === 'unreject') {
+          updUnreject.run(it.id);
+          auditPerLine.push({ id: it.id, material: it.material_name, action, before, after: {
+            store_rejected: 0, store_reject_reason: '',
+          }});
         }
       }
 
       // --- Auto-advance parent status if fully fulfilled.
       // Treat is_rejected items as "complete" (chef said no).
+      // Treat store_rejected items as "complete" too (store said it can't fulfil).
       // Treat items with deferred_until in the future as still-open (don't fulfill).
       const fresh = db.prepare(`
-        SELECT id, is_rejected, quantity_requested, chef_approved_qty, quantity_issued, deferred_until
+        SELECT id, is_rejected, store_rejected, quantity_requested, chef_approved_qty, quantity_issued, deferred_until
         FROM requisition_items WHERE req_id = ?
       `).all(id) as any[];
       const allDone = fresh.every(it => {
         if (it.is_rejected) return true;
+        if (it.store_rejected) return true;
         const eff = (it.chef_approved_qty != null ? Number(it.chef_approved_qty) : Number(it.quantity_requested)) || 0;
         const got = Number(it.quantity_issued) || 0;
         return got >= eff && !it.deferred_until;     // deferred = still pending even if qty matches

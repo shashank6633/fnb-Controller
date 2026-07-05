@@ -1,4 +1,5 @@
 import { refreshUpcomingParties } from '@/lib/party-refresh';
+import { checkDeferDueSoon } from '@/lib/defer-due-check';
 import { getCurrentUser } from '@/lib/auth';
 import { getSchedulerStatus } from '@/lib/scheduler';
 
@@ -33,7 +34,15 @@ export async function POST(request: Request) {
 
   try {
     const result = await refreshUpcomingParties(tokenOk ? 'external_cron' : 'admin_manual');
-    return Response.json({ ok: true, result });
+    // Feature 4 — same pipeline also checks deferred items coming due. Fully
+    // best-effort: never let it fail the refresh response.
+    let defer_due: any = null;
+    try {
+      defer_due = await checkDeferDueSoon(tokenOk ? 'external_cron' : 'admin_manual');
+    } catch (e: any) {
+      console.error('[/api/cron/refresh-parties] defer-due check failed:', e?.message);
+    }
+    return Response.json({ ok: true, result, defer_due });
   } catch (e: any) {
     console.error('[/api/cron/refresh-parties]', e);
     return Response.json({ error: e.message }, { status: 500 });

@@ -1276,6 +1276,21 @@ function initializeSchema(db: Database.Database) {
     if (!has('issue_history'))  db.exec(`ALTER TABLE requisition_items ADD COLUMN issue_history TEXT DEFAULT '[]'`);
   } catch (e) { console.error('requisition_items store-issue migration failed:', e); }
 
+  // Migration: store-side per-item rejection. DISTINCT from is_rejected (which is
+  // the chef's field). The store person can reject a line they cannot fulfil at
+  // all (e.g. material discontinued, wrong item requested) without it being a
+  // chef decision. A store-rejected line is treated like a chef-rejected line for
+  // fulfillment purposes — it is NOT required to be issued for the parent req to
+  // become 'fulfilled'.
+  //   store_rejected       — 1 = the store rejected this line (won't be issued)
+  //   store_reject_reason  — free-text ("discontinued", "wrong item", etc.)
+  try {
+    const cols = db.prepare("PRAGMA table_info(requisition_items)").all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    if (!has('store_rejected'))      db.exec(`ALTER TABLE requisition_items ADD COLUMN store_rejected INTEGER NOT NULL DEFAULT 0`);
+    if (!has('store_reject_reason')) db.exec(`ALTER TABLE requisition_items ADD COLUMN store_reject_reason TEXT DEFAULT ''`);
+  } catch (e) { console.error('requisition_items store-reject migration failed:', e); }
+
   // Migration: Unit-audit locks — a curated snapshot of admin-fixed unit fields
   // (recipe_unit, purchase_unit, pack_size, case_size, category) per material.
   // Keyed by SKU (preferred) and name (fallback) so it survives a full data wipe
