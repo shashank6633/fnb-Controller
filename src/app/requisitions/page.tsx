@@ -651,7 +651,12 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
   const canMgmtAct = requireMgmt && viewer.can_mgmt && detail.status === 'chef_approved';
   // Store may act on mgmt-approved (current SOP) or chef_approved (legacy in-flight)
   const canStoreAct = viewer.can_issue && (detail.status === 'mgmt_approved' || detail.status === 'chef_approved');  // STRICT: store person only, no admin bypass (mirrors canIssueAsStore)
-  const canCancel = (isAuthor || isAdmin) && !['fulfilled', 'cancelled', 'chef_rejected'].includes(detail.status);
+  // Cancel: HOD/admin may cancel any live requisition. The department drafter may
+  // cancel ONLY while it is still a DRAFT — once it is submitted (Chef Inbox) or
+  // being issued (Partially Issued), only HOD/admin can cancel it.
+  const isHodOrAdmin = isAdmin || viewer.can_chef;
+  const canCancel = !['fulfilled', 'cancelled', 'chef_rejected'].includes(detail.status)
+    && (isHodOrAdmin || (isAuthor && detail.status === 'draft'));
   // Phase 1 §2: dept staff confirms goods physically arrived. One-shot — only on fulfilled, not yet acked.
   const canAck   = detail.status === 'fulfilled' && !detail.dept_acknowledged_at && (isAuthor || isAdmin);
 

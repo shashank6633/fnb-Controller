@@ -18,8 +18,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     if (TERMINAL.includes(r.status)) {
       return Response.json({ error: `Cannot cancel — requisition is ${r.status}` }, { status: 400 });
     }
-    if (r.drafted_by !== me.email && me.role !== 'admin') {
-      return Response.json({ error: 'Only the drafter or admin can cancel' }, { status: 403 });
+    // HOD/admin may cancel any live requisition. The department drafter may cancel
+    // ONLY while it is still a draft — once submitted (Chef Inbox) or being issued
+    // (Partially Issued / store_processed), only HOD or admin can cancel it.
+    const isHodOrAdmin = me.role === 'admin' || !!me.is_head_chef;
+    const mayCancel = isHodOrAdmin || (r.drafted_by === me.email && r.status === 'draft');
+    if (!mayCancel) {
+      return Response.json({
+        error: 'Only HOD or admin can cancel a requisition once it has been submitted. The drafter can cancel it only while it is still a draft.',
+      }, { status: 403 });
     }
     db.prepare(`
       UPDATE requisitions SET status = 'cancelled', cancelled_at = datetime('now'),
