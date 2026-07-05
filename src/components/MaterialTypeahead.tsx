@@ -105,10 +105,13 @@ export default function MaterialTypeahead({
     } else {
       list = [...list].sort((a, b) => a.name.localeCompare(b.name));
     }
-    // Larger cap when a query is active — substring matches across 900+
-    // materials can blow past 80 easily and the user's target shouldn't get
-    // truncated. Empty-query view keeps the cap small for snappy first paint.
-    return list.slice(0, raw ? 200 : 80);
+    // Render the WHOLE list — the dropdown is scrollable (max-h + overflow-y-auto),
+    // so the user can scroll through every material even with no search query.
+    // (A tiny empty-query cap of 80 used to stop the list at ~"B" alphabetically,
+    // which read as "the dropdown won't load past B".) A high safety ceiling keeps
+    // pathological catalogues from mounting tens of thousands of nodes at once;
+    // beyond it, typing to filter is the intended path.
+    return list.slice(0, 1000);
   }, [materials, query, excludeIds]);
 
   useEffect(() => { setActive(0); }, [query]);
@@ -169,10 +172,15 @@ export default function MaterialTypeahead({
       )}
 
       {open && results.length > 0 && (
-        // Dropdown can overflow the parent column up to 480px wide so long
-        // material names fit on a single line wherever possible.
-        <ul className="absolute z-30 left-0 mt-1 max-h-72 overflow-y-auto bg-white border border-[#D4B896] rounded shadow-lg
-                       w-full min-w-full sm:min-w-[360px] max-w-[480px]">
+        // Dropdown widens up to 480px so long names fit, but never past the
+        // viewport (max-w-[calc(100vw-1.5rem)]) so it can't spill outside the
+        // modal on mobile. Tall + scrollable so every material is reachable.
+        <ul className="absolute z-30 left-0 mt-1 max-h-[55vh] overflow-y-auto overscroll-contain bg-white border border-[#D4B896] rounded shadow-lg
+                       w-full min-w-full sm:min-w-[360px] max-w-[min(480px,calc(100vw-1.5rem))]">
+          <li className="sticky top-0 z-10 bg-[#FFF8F0] border-b border-[#E8D5C4] px-2 py-1 text-[10px] text-[#8B7355] flex items-center justify-between gap-2">
+            <span>{results.length}{results.length >= 1000 ? '+' : ''} material{results.length === 1 ? '' : 's'}{query.trim() ? ' matched' : ''}</span>
+            <span className="text-[#B99] hidden sm:inline">type to filter · scroll for more</span>
+          </li>
           {results.map((m, i) => {
             const isActive = i === active;
             const lowStock = !!(m.reorder_level && m.current_stock != null && m.current_stock < m.reorder_level);

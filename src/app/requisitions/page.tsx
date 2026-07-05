@@ -913,7 +913,10 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
           <div>
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-sm font-semibold text-[#2D1B0E]">Items needed</h3>
-              <button onClick={addLine} className="text-xs text-[#af4408] hover:underline flex items-center gap-1">
+              {/* Desktop keeps a quick top button; the primary one lives at the
+                  bottom of the list so on mobile you always see it right after the
+                  material you just added (rather than scrolled off the top). */}
+              <button onClick={addLine} className="hidden md:flex text-xs text-[#af4408] hover:underline items-center gap-1">
                 <Plus className="w-3 h-3" /> Add line
               </button>
             </div>
@@ -1028,6 +1031,12 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                 );
               })}
             </div>
+            {/* Primary Add-line — full width at the BOTTOM so after entering a
+                material the button sits right below it (mobile-friendly). */}
+            <button onClick={addLine} type="button"
+                    className="mt-2 w-full flex items-center justify-center gap-1.5 py-2.5 border-2 border-dashed border-[#E8D5C4] rounded-lg text-sm font-medium text-[#af4408] hover:border-[#af4408] hover:bg-[#FFF1E3] active:bg-[#FFE8D5]">
+              <Plus className="w-4 h-4" /> Add line
+            </button>
           </div>
 
           <label className="text-xs text-[#6B5744] flex flex-col gap-1">
