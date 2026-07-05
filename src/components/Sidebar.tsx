@@ -40,6 +40,7 @@ import {
   QrCode,
   LayoutGrid,
   Timer,
+  Download,
   type LucideIcon,
 } from "lucide-react";
 
@@ -174,6 +175,24 @@ export default function Sidebar() {
   // screens (visited links closed correctly via onClick, but back/forward
   // navigation didn't).
   useEffect(() => { setMobileOpen(false); }, [pathname]);
+
+  // PWA install: capture the browser's install prompt so we can offer a visible
+  // "Install app" button (the app already ships a full manifest + icons, but the
+  // native install affordance is easy to miss). `installed` hides it once running
+  // standalone. iOS Safari doesn't fire beforeinstallprompt — those users install
+  // via Share → Add to Home Screen, so we simply don't show the button there.
+  const [installEvt, setInstallEvt] = useState<any>(null);
+  const [installed, setInstalled] = useState(false);
+  useEffect(() => {
+    const onPrompt = (e: Event) => { e.preventDefault(); setInstallEvt(e); };
+    const onInstalled = () => { setInstallEvt(null); setInstalled(true); };
+    window.addEventListener('beforeinstallprompt', onPrompt);
+    window.addEventListener('appinstalled', onInstalled);
+    try { if (window.matchMedia('(display-mode: standalone)').matches || (navigator as any).standalone) setInstalled(true); } catch {}
+    return () => { window.removeEventListener('beforeinstallprompt', onPrompt); window.removeEventListener('appinstalled', onInstalled); };
+  }, []);
+  const installApp = async () => { if (!installEvt) return; installEvt.prompt(); try { await installEvt.userChoice; } catch {} setInstallEvt(null); };
+
   // Current user — used to filter nav links by the per-user page_access map.
   const [me, setMe] = useState<{ role?: string; page_access?: string | null } | null>(null);
   useEffect(() => {
@@ -325,6 +344,20 @@ export default function Sidebar() {
           entry.kind === "section" ? renderSection(entry) : renderLink(entry)
         )}
       </nav>
+
+      {/* Install app (PWA) — shown only when the browser offers to install and
+          we're not already running standalone. Works in the mobile drawer too. */}
+      {installEvt && !installed && (
+        <div className="px-3 pt-3">
+          <button
+            onClick={installApp}
+            title="Install F&B Controller as an app"
+            className="flex items-center justify-center gap-2 w-full px-3 py-2 rounded-lg bg-[#af4408] text-white text-sm font-medium hover:bg-[#8a3506] transition-colors"
+          >
+            <Download size={16} />{!collapsed && <span>Install app</span>}
+          </button>
+        </div>
+      )}
 
       {/* Collapse toggle (desktop only) */}
       <div className="hidden lg:block px-3 py-4 border-t border-[#3D2614]">
