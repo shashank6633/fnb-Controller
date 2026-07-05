@@ -155,6 +155,17 @@ export default function FoodConsumptionPage() {
                   );
                 })}
               </tbody>
+              <tfoot>
+                <tr className="border-t-2 border-[#E8D5C4] bg-[#FFF1E3] font-semibold text-[#2D1B0E]">
+                  <td className="py-2 px-3" colSpan={4}>
+                    Overall food cost — {visible.filter(r => (r.food_items || 0) > 0).length} of {visible.length} parties recorded
+                  </td>
+                  <td className="py-2 px-3 text-right font-mono whitespace-nowrap">
+                    {fmt(visible.reduce((a, r) => a + (r.food_cost || 0), 0))}
+                  </td>
+                  <td className="py-2 px-3"></td>
+                </tr>
+              </tfoot>
             </table>
           </div>
         )}

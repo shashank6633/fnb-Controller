@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
+import { loadBookingsCache, loadUpcomingParties, resolveBookingRevenue } from '@/lib/party-revenue';
 
 /**
  * Party Events P&L.
@@ -34,7 +35,14 @@ export async function GET(request: Request) {
     const me = await getCurrentUser();
     const canSeeFinancials = me?.role === 'admin' || !!me?.is_head_chef;
     const redact = <T extends Record<string, any>>(o: T): T =>
-      canSeeFinancials ? o : ({ ...o, revenue: 0, profit: 0, food_cost_percent: 0, per_head_revenue: 0, per_head_profit: 0 });
+      canSeeFinancials ? o : ({ ...o, revenue: 0, profit: 0, food_cost_percent: 0, per_head_revenue: 0, per_head_profit: 0, booking_total: 0 });
+
+    // Revenue is the Party Bookings sheet Final Total (matched to the party by
+    // candidate names + date, gated to confirmed + past) — NOT POS sales, which
+    // rarely match. Same source as the /parties P&L, so the two agree.
+    const today = new Date().toISOString().slice(0, 10);
+    const bookings = loadBookingsCache(db);
+    const cachedParties = loadUpcomingParties(db);
 
     // Single event detail
     if (eventName && eventDate) {
@@ -74,7 +82,8 @@ export async function GET(request: Request) {
       `).all(eventName, eventDate, eventName, eventDate, eventDate) as any[];
 
       const cost    = items.reduce((s, i) => s + i.quantity_requested * (i.average_price || 0), 0);
-      const revenue = sales.reduce((s, x) => s + (x.revenue || 0), 0);
+      const br      = resolveBookingRevenue(bookings, cachedParties, eventName, eventDate, today);
+      const revenue = br.revenue;
       const guests  = reqs[0]?.guest_count || 0;
 
       return Response.json({
@@ -105,6 +114,8 @@ export async function GET(request: Request) {
         summary: redact({
           cost: Math.round(cost * 100) / 100,
           revenue: Math.round(revenue),
+          booking_total: Math.round(br.booking_total),
+          revenue_withheld_reason: br.withheld_reason,
           profit: Math.round((revenue - cost) * 100) / 100,
           food_cost_percent: revenue > 0 ? Math.round((cost / revenue) * 10000) / 100 : 0,
           per_head_cost:     guests > 0 ? Math.round((cost / guests) * 100) / 100 : 0,
@@ -145,7 +156,8 @@ export async function GET(request: Request) {
     return Response.json({
       events: events.map(e => {
         const cost = Number(e.cost) || 0;
-        const rev  = Number(e.revenue) || 0;
+        const br   = resolveBookingRevenue(bookings, cachedParties, e.event_name, e.event_date, today);
+        const rev  = br.revenue;   // Party Bookings Final Total (gated), not POS sales
         return redact({
           event_name: e.event_name,
           event_date: e.event_date,
@@ -154,6 +166,8 @@ export async function GET(request: Request) {
           req_count: e.req_count,
           cost: Math.round(cost * 100) / 100,
           revenue: Math.round(rev),
+          booking_total: Math.round(br.booking_total),
+          revenue_withheld_reason: br.withheld_reason,
           profit: Math.round((rev - cost) * 100) / 100,
           food_cost_percent: rev > 0 ? Math.round((cost / rev) * 10000) / 100 : 0,
           per_head_cost: e.guest_count > 0 ? Math.round((cost / e.guest_count) * 100) / 100 : 0,

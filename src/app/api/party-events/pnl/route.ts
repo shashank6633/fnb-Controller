@@ -76,8 +76,15 @@ function revenueGate(status: string | undefined, eventDate: string | undefined, 
   return { allow: true, reason: null };
 }
 
+/** All names a party's requisition might have been raised under (Raise Req uses
+ *  contact_person first; guest_name is often blank; some are keyed by company/FP). */
+function candidateNames(p: { contact_person?: string; guest_name?: string; company?: string; event_name?: string; fp_id?: string }): string[] {
+  return [...new Set([p.contact_person, p.guest_name, p.company, p.event_name, p.fp_id]
+    .map(x => String(x || '').trim()).filter(Boolean))];
+}
+
 function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
-                key: { party_unique_id?: string; event_name?: string; event_date?: string },
+                key: { party_unique_id?: string; event_name?: string; event_date?: string; eventNames?: string[] },
                 gate: { allow: boolean; reason: string | null }) {
   // Revenue = Party Bookings Final Total (matched by party_unique_id) — but ONLY
   // counted once the party is confirmed/done AND its date has passed (gate). The
@@ -85,10 +92,18 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
   const bookingTotal = key.party_unique_id ? (bookings.get(key.party_unique_id) || 0) : 0;
   const revenue = gate.allow ? bookingTotal : 0;
 
-  // Food cost from party requisitions
+  // Food cost from party requisitions. A requisition links to a party ONLY by
+  // event_name+date (no party_unique_id), and the name it was raised with may be
+  // the contact person, the company, or the FP id — so match on the date + ANY of
+  // the party's candidate names, not a single guessed one (else food cost = ₹0).
   let foodCost = 0;
   let foodItems = 0;
-  if (key.event_name && key.event_date) {
+  const names = [...new Set(
+    (key.eventNames && key.eventNames.length ? key.eventNames : (key.event_name ? [key.event_name] : []))
+      .map(n => String(n || '').trim()).filter(Boolean)
+  )];
+  if (names.length && key.event_date) {
+    const ph = names.map(() => '?').join(',');
     const food = db.prepare(`
       SELECT COALESCE(SUM(ri.quantity_requested * rm.average_price), 0) AS cost,
              COUNT(ri.id) AS item_count
@@ -96,10 +111,10 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
       JOIN requisition_items ri ON ri.req_id = r.id
       JOIN raw_materials rm ON rm.id = ri.material_id
       WHERE r.purpose = 'party'
-        AND r.event_name = ?
+        AND r.event_name IN (${ph})
         AND r.event_date = ?
         AND r.status NOT IN ('cancelled', 'chef_rejected')
-    `).get(key.event_name, key.event_date) as { cost: number; item_count: number };
+    `).get(...names, key.event_date) as { cost: number; item_count: number };
     foodCost = food.cost || 0;
     foodItems = food.item_count || 0;
   }
@@ -164,7 +179,8 @@ export async function GET(request: Request) {
         (party_unique_id && x.party_unique_id === party_unique_id) ||
         (!party_unique_id && x.event_name === event_name && x.event_date === event_date));
       const gate = revenueGate(p?.status, p?.event_date ?? event_date, today);
-      const pnl = pnlFor(db, bookings, { party_unique_id, event_name, event_date }, gate);
+      const eventNames = p ? candidateNames(p).concat(event_name ? [event_name] : []) : (event_name ? [event_name] : []);
+      const pnl = pnlFor(db, bookings, { party_unique_id, event_name, event_date: p?.event_date ?? event_date, eventNames }, gate);
       return Response.json({ pnl });
     }
 
@@ -183,6 +199,7 @@ export async function GET(request: Request) {
         party_unique_id: p.party_unique_id,
         event_name: p.event_name,
         event_date: p.event_date,
+        eventNames: candidateNames(p),
       }, revenueGate(p.status, p.event_date, today)),
     }));
     return Response.json({ pnl: out });
