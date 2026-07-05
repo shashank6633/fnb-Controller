@@ -854,7 +854,9 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
   const update = (i: number, patch: any) => setItems(p => p.map((it, j) => j === i ? { ...it, ...patch } : it));
   const remove = (i: number) => setItems(p => p.filter((_, j) => j !== i));
 
-  const submit = async () => {
+  // submitAfter=false → just save as draft. submitAfter=true → create then
+  // immediately POST /submit so it lands in the Head Chef's inbox in one click.
+  const save = async (submitAfter: boolean) => {
     if (!departmentId) {
       alert(canChangeDept
         ? 'Pick a department.'
@@ -870,6 +872,20 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
         body: { date, department_id: departmentId, notes, items: cleaned },
       });
       if (!r.ok) { alert((await r.json()).error || 'Failed'); return; }
+      if (submitAfter) {
+        const j = await r.json().catch(() => ({}));
+        const newId = j?.requisition?.id;
+        if (newId) {
+          const s = await api(`/api/requisitions/${newId}/submit`, { method: 'POST', body: {} });
+          if (!s.ok) {
+            const sj = await s.json().catch(() => ({}));
+            alert('Saved as draft, but submit to chef failed: ' + (sj.error || 'unknown') +
+                  '\nYou can submit it from the requisition’s detail view.');
+          }
+        } else {
+          alert('Saved as draft. Open it to submit to chef.');
+        }
+      }
       onCreated(); onClose();
     } finally { setSaving(false); }
   };
@@ -998,8 +1014,8 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                       </div>
                       <div className="md:col-span-2">
                         <Lbl>Qty · Unit</Lbl>
-                        <input type="number" step="any" value={it.quantity_requested || ''}
-                               onChange={e => update(i, { quantity_requested: parseFloat(e.target.value) || 0 })}
+                        <input type="number" step="any" min={0} value={it.quantity_requested || ''}
+                               onChange={e => update(i, { quantity_requested: Math.max(0, parseFloat(e.target.value) || 0) })}
                                placeholder="Qty"
                                className="w-full min-w-0 px-2 md:px-3 py-2 border border-[#E8D5C4] rounded text-right text-sm tabular-nums" />
                         {mat ? (
@@ -1053,11 +1069,15 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                       className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
           </label>
         </div>
-        <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2">
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex flex-wrap justify-end gap-2">
           <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
-          <button onClick={submit} disabled={saving}
-                  className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg disabled:opacity-50">
+          <button onClick={() => save(false)} disabled={saving}
+                  className="px-3 py-1.5 border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] text-sm rounded-lg disabled:opacity-50">
             {saving ? 'Saving…' : 'Save as Draft'}
+          </button>
+          <button onClick={() => save(true)} disabled={saving}
+                  className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg disabled:opacity-50 inline-flex items-center gap-1">
+            <Send className="w-3.5 h-3.5" /> {saving ? 'Working…' : 'Submit to Chef'}
           </button>
         </div>
       </div>
