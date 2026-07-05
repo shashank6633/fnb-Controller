@@ -1107,13 +1107,15 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
           <div>
             <div className="flex items-center justify-between mb-2">
               <label className="text-xs font-semibold text-[#2D1B0E]">Items needed</label>
+              {/* Desktop keeps a quick top button; the primary Add-line is full-width
+                  at the BOTTOM so on mobile it sits right below the last material. */}
               <button type="button" onClick={addLine}
-                      className="text-xs text-[#af4408] hover:underline inline-flex items-center gap-1">
+                      className="hidden md:inline-flex text-xs text-[#af4408] hover:underline items-center gap-1">
                 <Plus size={12} /> Add line
               </button>
             </div>
-            {/* Column headers */}
-            <div className="grid grid-cols-12 gap-2 mb-1 text-[10px] font-medium text-[#8B7355] uppercase tracking-wide px-1">
+            {/* Column headers — desktop only; mobile rows carry inline labels */}
+            <div className="hidden md:grid grid-cols-12 gap-2 mb-1 text-[10px] font-medium text-[#8B7355] uppercase tracking-wide px-1">
               <div className="col-span-3">Material</div>
               <div className="col-span-3 text-right">Qty</div>
               <div className="col-span-1">Unit</div>
@@ -1145,80 +1147,107 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
                 // so ×pack_size gives ₹/purchase-unit (e.g. 0.1785/ml ×1000 = ₹178.50/BTL).
                 const puUnit = (allowedUnits[0] || (m?.unit || '')).trim();
                 const pricePerPU = (m?.average_price || 0) * ((m && puUnit && puUnit !== (m.unit || '').trim()) ? (Number(m.pack_size) || 1) : 1);
+                const Lbl = ({ children }: { children: React.ReactNode }) => (
+                  <div className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] mb-0.5">{children}</div>
+                );
                 return (
-                  <div key={i} className="grid grid-cols-12 gap-2 items-start">
-                    <div className="col-span-3">
-                      <MaterialTypeahead
-                        materials={materials as any}
-                        value={it.material_id}
-                        onPick={(id) => {
-                          // The line's unit is FIXED to the material's purchase /
-                          // ordering unit (allowedUnits[0] = purchase_unit, falling
-                          // back to the base unit when none is set). No picker — staff
-                          // always requisition in the bulk unit the material is bought
-                          // in, so "12" can't be misread as 12 ml.
-                          const mat = materials.find(x => x.id === id);
-                          ensureTrailingEmpty(i, {
-                            material_id: id,
-                            unit: allowedUnitsForMaterial(mat)[0] || '',
-                          });
-                        }}
-                        excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
-                      />
+                  // Mobile: a stacked card (material on its own line, then Qty·Unit,
+                  // then Dept/Notes, then Cost). Desktop (md+): the original 12-col grid.
+                  <div key={i} className="rounded-lg border border-[#E8D5C4] bg-white p-3 space-y-2.5 text-xs
+                                          md:rounded-none md:border-0 md:bg-transparent md:p-0 md:space-y-0
+                                          md:grid md:grid-cols-12 md:gap-2 md:items-start">
+                    {/* Material — full width mobile, col-3 desktop */}
+                    <div className="md:col-span-3">
+                      <div className="flex items-start gap-2">
+                        <div className="flex-1 min-w-0">
+                          <Lbl>Material</Lbl>
+                          <MaterialTypeahead
+                            materials={materials as any}
+                            value={it.material_id}
+                            onPick={(id) => {
+                              // Line unit is FIXED to the material's purchase / ordering
+                              // unit (allowedUnits[0]) — staff always requisition in the
+                              // bulk unit so "12" can't be misread as 12 ml.
+                              const mat = materials.find(x => x.id === id);
+                              ensureTrailingEmpty(i, { material_id: id, unit: allowedUnitsForMaterial(mat)[0] || '' });
+                            }}
+                            excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
+                          />
+                        </div>
+                        {/* delete — inline top-right on mobile */}
+                        <button type="button" onClick={() => removeLine(i)} className="md:hidden text-red-600 shrink-0 pt-5" aria-label="Remove line"><Trash2 size={16} /></button>
+                      </div>
                     </div>
-                    <input type="number" step="any" value={it.qty}
-                           onChange={e => ensureTrailingEmpty(i, { qty: e.target.value })}
-                           placeholder="Qty"
-                           className="col-span-3 px-3 py-2 border border-[#D4B896] rounded text-sm text-right font-mono tabular-nums" />
-                    {/* Unit is FIXED to the material's purchase / ordering unit —
-                        no picker. Staff always requisition in bulk units (BTL /
-                        PKT / bag), never raw g/ml, so a "12" can't be misread as
-                        12 ml. allowedUnits[0] is the purchase_unit. */}
-                    <span className="col-span-1 text-xs text-[#8B7355] py-2 truncate" title="Ordering unit (purchase unit)">{allowedUnits[0] || m?.unit || ''}</span>
-                    {mixedMode ? (
-                      <select value={it.department_id}
-                              onChange={e => update(i, { department_id: e.target.value })}
-                              className={`col-span-3 px-2 py-1.5 border rounded text-xs ${it.department_id ? 'border-[#D4B896] bg-white' : 'border-amber-400 bg-amber-50 text-amber-800'}`}>
-                        <option value="">— pick dept —</option>
-                        {departments.map(d => (
-                          <option key={d.id} value={d.id}>{d.code ? `[${d.code}] ` : ''}{d.name}</option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
-                             placeholder="Notes (optional)"
-                             className="col-span-3 px-2 py-1.5 border border-[#D4B896] rounded text-xs" />
-                    )}
-                    <div className="col-span-2 flex items-center justify-end gap-1">
-                      {it.confidence && (
-                        <span title={`Confidence: ${it.confidence}`}
-                              className={`text-[9px] px-1 py-0.5 rounded uppercase font-semibold ${
-                                it.confidence === 'high'   ? 'bg-emerald-100 text-emerald-800' :
-                                it.confidence === 'medium' ? 'bg-amber-100 text-amber-800' :
-                                                             'bg-gray-100 text-gray-600'
-                              }`}>
-                          {it.confidence[0]}
-                        </span>
+                    {/* Qty + Unit: 2-up on mobile; flow straight into the grid on desktop */}
+                    <div className="grid grid-cols-2 gap-2 md:contents">
+                      <div className="md:col-span-3">
+                        <Lbl>Qty</Lbl>
+                        <input type="number" step="any" value={it.qty}
+                               onChange={e => ensureTrailingEmpty(i, { qty: e.target.value })}
+                               placeholder="Qty"
+                               className="w-full min-w-0 px-3 py-2 border border-[#D4B896] rounded text-sm text-right font-mono tabular-nums" />
+                      </div>
+                      <div className="md:col-span-1">
+                        <Lbl>Unit</Lbl>
+                        <div className="text-xs text-[#8B7355] py-2 truncate" title="Ordering unit (purchase unit)">{allowedUnits[0] || m?.unit || ''}</div>
+                      </div>
+                    </div>
+                    {/* Dept (mixed mode) or Notes — full width mobile, col-3 desktop */}
+                    <div className="md:col-span-3">
+                      <Lbl>{mixedMode ? 'Department' : 'Notes'}</Lbl>
+                      {mixedMode ? (
+                        <select value={it.department_id}
+                                onChange={e => update(i, { department_id: e.target.value })}
+                                className={`w-full px-2 py-1.5 border rounded text-xs ${it.department_id ? 'border-[#D4B896] bg-white' : 'border-amber-400 bg-amber-50 text-amber-800'}`}>
+                          <option value="">— pick dept —</option>
+                          {departments.map(d => (
+                            <option key={d.id} value={d.id}>{d.code ? `[${d.code}] ` : ''}{d.name}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
+                               placeholder="Notes (optional)"
+                               className="w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs" />
                       )}
-                      <span className="text-right leading-tight" title={m ? `₹${pricePerPU.toFixed(2)} per ${puUnit}` : ''}>
-                        <span className="block text-xs font-mono text-[#6B5744]">{fmt(lineCost)}</span>
-                        {m && pricePerPU > 0 && <span className="block text-[9px] font-mono text-[#8B7355]">₹{pricePerPU.toFixed(2)}/{puUnit}</span>}
-                      </span>
-                      <button type="button" onClick={() => removeLine(i)}
-                              className="text-red-600 hover:text-red-700"><Trash2 size={12} /></button>
                     </div>
-                    {/* In mixed mode, dept takes the col-span-3 slot so notes
-                        get an extra row. In single mode the col-span-3 already
-                        holds notes — no extra row needed. */}
+                    {/* Cost — with mobile label; delete lives here on desktop */}
+                    <div className="md:col-span-2 flex items-center justify-between md:justify-end gap-1">
+                      <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355]">Cost</span>
+                      <div className="flex items-center gap-1">
+                        {it.confidence && (
+                          <span title={`Confidence: ${it.confidence}`}
+                                className={`text-[9px] px-1 py-0.5 rounded uppercase font-semibold ${
+                                  it.confidence === 'high'   ? 'bg-emerald-100 text-emerald-800' :
+                                  it.confidence === 'medium' ? 'bg-amber-100 text-amber-800' :
+                                                               'bg-gray-100 text-gray-600'
+                                }`}>
+                            {it.confidence[0]}
+                          </span>
+                        )}
+                        <span className="text-right leading-tight" title={m ? `₹${pricePerPU.toFixed(2)} per ${puUnit}` : ''}>
+                          <span className="block text-xs font-mono text-[#6B5744]">{fmt(lineCost)}</span>
+                          {m && pricePerPU > 0 && <span className="block text-[9px] font-mono text-[#8B7355]">₹{pricePerPU.toFixed(2)}/{puUnit}</span>}
+                        </span>
+                        <button type="button" onClick={() => removeLine(i)}
+                                className="hidden md:inline-flex text-red-600 hover:text-red-700"><Trash2 size={12} /></button>
+                      </div>
+                    </div>
+                    {/* Mixed mode: notes get their own full-width row below */}
                     {mixedMode && (
                       <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
                              placeholder="Line notes (optional)"
-                             className="col-span-12 px-2 py-1 border border-[#E8D5C4] rounded text-[11px] text-[#6B5744] -mt-1" />
+                             className="md:col-span-12 w-full px-2 py-1 border border-[#E8D5C4] rounded text-[11px] text-[#6B5744] md:-mt-1" />
                     )}
                   </div>
                 );
               })}
             </div>
+            {/* Primary Add-line — full width at the BOTTOM so on mobile it sits
+                right below the material you just added. */}
+            <button type="button" onClick={addLine}
+                    className="mt-2 w-full flex items-center justify-center gap-1.5 py-2.5 border-2 border-dashed border-[#E8D5C4] rounded-lg text-sm font-medium text-[#af4408] hover:border-[#af4408] hover:bg-[#FFF1E3] active:bg-[#FFE8D5]">
+              <Plus size={16} /> Add line
+            </button>
           </div>
 
           {/* Live cost estimate */}

@@ -1051,7 +1051,9 @@ function SimpleMaterialPicker({ value, materials, onChange }: {
   const sel = materials.find(m => m.id === value);
   const list = useMemo(() => {
     const norm = q.toLowerCase().trim();
-    return (norm ? materials.filter(m => m.name.toLowerCase().includes(norm) || (m.sku || '').toLowerCase().includes(norm)) : materials).slice(0, 50);
+    // Render the whole list (dropdown scrolls) — a small empty-query cap used to
+    // stop the list a few letters in and read as "won't load further".
+    return (norm ? materials.filter(m => m.name.toLowerCase().includes(norm) || (m.sku || '').toLowerCase().includes(norm)) : materials).slice(0, 1000);
   }, [q, materials]);
   useEffect(() => {
     const onClick = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
@@ -1064,9 +1066,9 @@ function SimpleMaterialPicker({ value, materials, onChange }: {
         {sel ? (<><span className="text-[10px] font-mono text-[#8B7355] mr-1">{sel.sku}</span>{sel.name}</>) : <span className="text-[#8B7355]">Select…</span>}
       </button>
       {open && (
-        <div className="absolute z-30 mt-1 w-[360px] bg-white border border-[#D4B896] rounded shadow-lg p-2 max-h-72 overflow-y-auto">
+        <div className="absolute z-30 mt-1 w-[min(360px,calc(100vw-2rem))] bg-white border border-[#D4B896] rounded shadow-lg p-2 max-h-[55vh] overflow-y-auto overscroll-contain">
           <input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="Search SKU or name…"
-                 className="w-full px-2 py-1 text-xs border border-[#E8D5C4] rounded mb-1" />
+                 className="w-full px-2 py-1 text-xs border border-[#E8D5C4] rounded mb-1 sticky top-0" />
           <div className="space-y-0.5">
             {list.map(m => (
               <button key={m.id} onClick={() => { onChange(m.id, m); setOpen(false); setQ(''); }}
