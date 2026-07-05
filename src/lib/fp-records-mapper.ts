@@ -86,18 +86,37 @@ export interface UpcomingParty {
 }
 
 /** Coerce sheet cell → ISO date YYYY-MM-DD if recognisable. */
+const MONTHS: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
 function toIsoDate(v: any): string | undefined {
   if (v == null || v === '') return undefined;
+  // Excel / Google Sheets serial date number (days since 1899-12-30). Sheets
+  // returns a raw number when a date cell is formatted as plain number/general —
+  // that row previously failed String()-based parsing and got silently dropped.
+  if (typeof v === 'number' && v > 59 && v < 100000) {
+    const d = new Date(Math.round((v - 25569) * 86400000));
+    return isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
+  }
   const s = String(v).trim();
+  if (!s) return undefined;
   // DD-MM-YYYY or DD/MM/YYYY
   let m = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
   if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
-  // YYYY-MM-DD already
+  // YYYY-MM-DD already (optionally followed by a time)
   m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
   // M/D/YYYY (US format)
   m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (m) return `${m[3]}-${m[1].padStart(2,'0')}-${m[2].padStart(2,'0')}`;
+  // Month-name formats: "10 Jul 2026", "10-July-2026", "10 July 2026"
+  const norm = s.toLowerCase().replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
+  let mm = norm.match(/^(\d{1,2})[ -]([a-z]{3,})[ -](\d{4})$/);
+  if (mm && MONTHS[mm[2].slice(0, 3)]) return `${mm[3]}-${String(MONTHS[mm[2].slice(0, 3)]).padStart(2,'0')}-${mm[1].padStart(2,'0')}`;
+  // "Jul 10 2026" / "July 10, 2026"
+  mm = norm.match(/^([a-z]{3,})[ -](\d{1,2})[ -](\d{4})$/);
+  if (mm && MONTHS[mm[1].slice(0, 3)]) return `${mm[3]}-${String(MONTHS[mm[1].slice(0, 3)]).padStart(2,'0')}-${mm[2].padStart(2,'0')}`;
   return undefined;
 }
 
