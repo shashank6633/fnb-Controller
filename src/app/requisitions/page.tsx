@@ -918,8 +918,9 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
               </button>
             </div>
             <div className="space-y-2">
-              {/* Phase 1 §2: per-line context — Category · On-hand · Buffer · PUoM · Last rate */}
-              <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wide text-[#8B7355] px-1">
+              {/* Column header — desktop only; on mobile each field carries its own
+                  inline label so a cramped 12-col grid never hides the material name. */}
+              <div className="hidden md:grid md:grid-cols-12 gap-2 text-[10px] uppercase tracking-wide text-[#8B7355] px-1">
                 <div className="col-span-3">Material · Category</div>
                 <div className="col-span-2 text-right">On hand · Buffer</div>
                 <div className="col-span-2 text-right">Qty · Unit</div>
@@ -941,74 +942,88 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
                 const postReq  = mat ? (mat.current_stock - reqRecipe) : 0;
                 const belowBuffer = mat && buffer > 0 && postReq < buffer;
                 const pu = mat?.purchase_unit || mat?.unit || '';
+                // Tiny inline field label — mobile only (desktop uses the header row).
+                const Lbl = ({ children }: { children: React.ReactNode }) => (
+                  <div className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] mb-0.5">{children}</div>
+                );
                 return (
-                  <div key={i} className="grid grid-cols-12 gap-2 text-xs items-start">
-                    <div className="col-span-3">
-                      <MaterialTypeahead
-                        materials={materials}
-                        value={it.material_id}
-                        // Disable any material already picked on another row to avoid dupes
-                        excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
-                        // Default the unit to the material's PURCHASE / ordering unit
-                        // (fall back to the base unit when none is configured).
-                        onPick={(id) => { const m = materials.find(x => x.id === id); update(i, { material_id: id, unit: (m?.purchase_unit || m?.unit || '') }); }}
-                      />
-                      {mat?.category && <div className="text-[9px] text-[#8B7355] mt-0.5">{mat.category}</div>}
-                    </div>
-                    <div className="col-span-2 text-right text-[10px] leading-snug">
-                      {mat ? (
-                        <>
-                          <div className={`font-mono ${short ? 'text-red-700 font-semibold' : 'text-[#2D1B0E]'}`}>
-                            {mat.current_stock.toLocaleString('en-IN')} {mat.unit}
-                          </div>
-                          <div className={`font-mono ${belowBuffer ? 'text-red-700 font-semibold' : 'text-[#8B7355]'}`}
-                               title={belowBuffer ? `Will drop to ${postReq.toFixed(2)} ${mat.unit}, below buffer ${buffer}` : `Buffer / reorder level`}>
-                            buf: {buffer || '—'}
-                            {belowBuffer && <span className="ml-1">⚠</span>}
-                          </div>
-                        </>
-                      ) : <span className="text-[#8B7355]">—</span>}
-                    </div>
-                    {/* Qty (full-width) with the FIXED ordering unit shown BELOW it —
-                        no picker. The dept always requisitions in the bulk unit it's
-                        bought in (BTL/PKT/bag), so "12" can't be misread as 12 ml.
-                        "BTL = 750 ml" spells out the pack conversion. Stacking the
-                        label under the input keeps the qty box big and comfortable. */}
-                    <div className="col-span-2">
-                      <input type="number" step="any" value={it.quantity_requested || ''}
-                             onChange={e => update(i, { quantity_requested: parseFloat(e.target.value) || 0 })}
-                             placeholder="Qty"
-                             className="w-full min-w-0 px-3 py-2 border border-[#E8D5C4] rounded text-right text-sm tabular-nums" />
-                      {mat ? (
-                        <div className="text-[10px] text-[#8B7355] mt-0.5 text-right whitespace-nowrap" title="Ordering unit (purchase unit)">
-                          {mat.purchase_unit || mat.unit}{mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? <span className="text-[#B99]"> = {packSize.toLocaleString('en-IN')} {mat.unit}</span> : ''}
+                  // Mobile: a stacked card (material name on its own full-width line,
+                  // then On-hand / Qty / Last-₹ side by side, then Notes). Desktop
+                  // (md+): the original single-line 12-col grid, unchanged.
+                  <div key={i} className="rounded-lg border border-[#E8D5C4] bg-white p-3 space-y-2.5 text-xs
+                                          md:rounded-none md:border-0 md:bg-transparent md:p-0 md:space-y-0
+                                          md:grid md:grid-cols-12 md:gap-2 md:items-start">
+                    {/* Material — full width on mobile (name never truncated), col-3 desktop */}
+                    <div className="md:col-span-3">
+                      <div className="flex items-start gap-2">
+                        <div className="flex-1 min-w-0">
+                          <MaterialTypeahead
+                            materials={materials}
+                            value={it.material_id}
+                            excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
+                            onPick={(id) => { const m = materials.find(x => x.id === id); update(i, { material_id: id, unit: (m?.purchase_unit || m?.unit || '') }); }}
+                          />
+                          {mat?.category && <div className="text-[9px] text-[#8B7355] mt-0.5">{mat.category}</div>}
                         </div>
-                      ) : null}
+                        {/* delete — inline on mobile (top-right of the card) */}
+                        <button onClick={() => remove(i)} className="md:hidden text-red-500 shrink-0 pt-2" aria-label="Remove line"><Trash2 className="w-4 h-4" /></button>
+                      </div>
                     </div>
-                    <div className="col-span-2 text-right text-[10px] leading-snug">
-                      {mat ? (
-                        <>
-                          <div className="text-[#6B5744]">{pu}</div>
-                          {/* Rate PER PURCHASE UNIT so it matches the qty's unit.
-                              /api/inventory's last_purchase_price is the raw last
-                              purchases.unit_price — ALREADY ₹/purchase-unit (e.g.
-                              ₹1905.31/BTL) — so show it as-is. Fallback when no
-                              purchase yet: average_price (₹/recipe-unit) × pack. */}
-                          <div className="font-mono text-[#6B5744]"
-                               title={`avg ₹${(mat.average_price || 0).toFixed(4)}/${mat.unit}${mat.last_purchase_date ? ' · last bought ' + mat.last_purchase_date : ''}`}>
-                            ₹{(Number(mat.last_purchase_price) > 0
-                                ? Number(mat.last_purchase_price)
-                                : (mat.average_price || 0) * (mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? packSize : 1)
-                              ).toFixed(2)}
-                            <span className="text-[#8B7355]">/{pu}</span>
+                    {/* Numeric group: 3-up on mobile; on desktop `contents` lets each
+                        block flow straight into the parent 12-col grid. */}
+                    <div className="grid grid-cols-3 gap-2 md:contents">
+                      <div className="md:col-span-2 md:text-right text-[10px] leading-snug">
+                        <Lbl>On hand · Buf</Lbl>
+                        {mat ? (
+                          <>
+                            <div className={`font-mono ${short ? 'text-red-700 font-semibold' : 'text-[#2D1B0E]'}`}>
+                              {mat.current_stock.toLocaleString('en-IN')} {mat.unit}
+                            </div>
+                            <div className={`font-mono ${belowBuffer ? 'text-red-700 font-semibold' : 'text-[#8B7355]'}`}
+                                 title={belowBuffer ? `Will drop to ${postReq.toFixed(2)} ${mat.unit}, below buffer ${buffer}` : `Buffer / reorder level`}>
+                              buf: {buffer || '—'}{belowBuffer && <span className="ml-1">⚠</span>}
+                            </div>
+                          </>
+                        ) : <span className="text-[#8B7355]">—</span>}
+                      </div>
+                      <div className="md:col-span-2">
+                        <Lbl>Qty · Unit</Lbl>
+                        <input type="number" step="any" value={it.quantity_requested || ''}
+                               onChange={e => update(i, { quantity_requested: parseFloat(e.target.value) || 0 })}
+                               placeholder="Qty"
+                               className="w-full min-w-0 px-2 md:px-3 py-2 border border-[#E8D5C4] rounded text-right text-sm tabular-nums" />
+                        {mat ? (
+                          <div className="text-[10px] text-[#8B7355] mt-0.5 text-right whitespace-nowrap" title="Ordering unit (purchase unit)">
+                            {mat.purchase_unit || mat.unit}{mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? <span className="text-[#B99]"> = {packSize.toLocaleString('en-IN')} {mat.unit}</span> : ''}
                           </div>
-                        </>
-                      ) : <span className="text-[#8B7355]">—</span>}
+                        ) : null}
+                      </div>
+                      <div className="md:col-span-2 md:text-right text-[10px] leading-snug">
+                        <Lbl>PUoM · Last ₹</Lbl>
+                        {mat ? (
+                          <>
+                            <div className="text-[#6B5744]">{pu}</div>
+                            <div className="font-mono text-[#6B5744]"
+                                 title={`avg ₹${(mat.average_price || 0).toFixed(4)}/${mat.unit}${mat.last_purchase_date ? ' · last bought ' + mat.last_purchase_date : ''}`}>
+                              ₹{(Number(mat.last_purchase_price) > 0
+                                  ? Number(mat.last_purchase_price)
+                                  : (mat.average_price || 0) * (mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? packSize : 1)
+                                ).toFixed(2)}
+                              <span className="text-[#8B7355]">/{pu}</span>
+                            </div>
+                          </>
+                        ) : <span className="text-[#8B7355]">—</span>}
+                      </div>
                     </div>
-                    <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
-                           placeholder="Notes"
-                           className="col-span-2 px-2 py-1 border border-[#E8D5C4] rounded" />
-                    <button onClick={() => remove(i)} className="col-span-1 text-red-500 pt-1"><Trash2 className="w-3 h-3" /></button>
+                    {/* Notes — full width on mobile, col-2 desktop */}
+                    <div className="md:col-span-2">
+                      <Lbl>Notes</Lbl>
+                      <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
+                             placeholder="Notes (optional)"
+                             className="w-full px-2 py-2 md:py-1 border border-[#E8D5C4] rounded" />
+                    </div>
+                    {/* delete — desktop only (mobile has the inline one above) */}
+                    <button onClick={() => remove(i)} className="hidden md:block md:col-span-1 text-red-500 pt-1" aria-label="Remove line"><Trash2 className="w-3 h-3" /></button>
                   </div>
                 );
               })}
