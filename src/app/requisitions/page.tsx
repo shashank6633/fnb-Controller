@@ -876,7 +876,14 @@ function CreateRequisitionModal({ departments, materials, me, onClose, onCreated
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
-      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-8 shadow-xl">
+      {/* maxHeight:none overrides the global mobile modal cap (globals.css §5,
+          `max-height: calc(100vh-1rem)`). That cap has no overflow, so with many
+          item lines the content spilled OUT of the white card. Letting the card
+          grow keeps every line inside it — the overlay above (overflow-y-auto)
+          scrolls the tall card — and, unlike an internal scroll, never clips the
+          absolutely-positioned material dropdown. */}
+      <div style={{ maxHeight: 'none' }}
+           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-8 shadow-xl">
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
           <h2 className="font-bold text-[#2D1B0E]">New Department Requisition</h2>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
