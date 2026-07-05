@@ -82,7 +82,7 @@ export async function GET(request: Request) {
       `).all(eventName, eventDate, eventName, eventDate, eventDate) as any[];
 
       const cost    = items.reduce((s, i) => s + i.quantity_requested * (i.average_price || 0), 0);
-      const br      = resolveBookingRevenue(bookings, cachedParties, eventName, eventDate, today);
+      const br      = resolveBookingRevenue(bookings, cachedParties, eventName, eventDate, today, true);
       const revenue = br.revenue;
       const guests  = reqs[0]?.guest_count || 0;
 
@@ -156,7 +156,7 @@ export async function GET(request: Request) {
     return Response.json({
       events: events.map(e => {
         const cost = Number(e.cost) || 0;
-        const br   = resolveBookingRevenue(bookings, cachedParties, e.event_name, e.event_date, today);
+        const br   = resolveBookingRevenue(bookings, cachedParties, e.event_name, e.event_date, today, true);
         const rev  = br.revenue;   // Party Bookings Final Total (gated), not POS sales
         return redact({
           event_name: e.event_name,

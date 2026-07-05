@@ -81,10 +81,17 @@ export function candidateNames(p: CachedParty): string[] {
 export function resolveBookingRevenue(
   bookings: Map<string, number>, parties: CachedParty[],
   eventName: string, eventDate: string, today: string,
+  canonicalOnly = false,
 ): { party_unique_id: string | null; booking_total: number; revenue: number; withheld_reason: string | null } {
   const en = String(eventName || '').trim();
   const p = parties.find(x => x.event_date === eventDate && candidateNames(x).includes(en));
   if (!p || !p.party_unique_id) return { party_unique_id: null, booking_total: 0, revenue: 0, withheld_reason: 'no booking row' };
+  // A party can have requisitions raised under several names (contact person AND
+  // company). To avoid attributing its one booking Final Total to every such event
+  // row, only the party's canonical name (contact_person-first) carries the revenue.
+  if (canonicalOnly && en !== String(p.event_name || '').trim()) {
+    return { party_unique_id: p.party_unique_id, booking_total: 0, revenue: 0, withheld_reason: 'counted on the primary event row' };
+  }
   const total = bookings.get(p.party_unique_id) || 0;
   const gate = revenueGate(p.status, p.event_date, today);
   return {
