@@ -62,13 +62,15 @@ function loadUpcomingPartiesCache(): { party_unique_id?: string; fp_id?: string;
 
 /**
  * Booking Final-Total counts as party REVENUE only when BOTH hold:
- *   1. the F&P Records status is Confirmed or Done (locked-in), and
+ *   1. the party is locked-in — F&P Records status 'Approved' (the value the AKAN
+ *      Party Manager sheet actually uses; 'Confirmed'/'Done' accepted as synonyms).
+ *      Verified against live GCP data 2026-07-05: statuses are Approved | Draft.
  *   2. the event date is over (event_date <= today) — no revenue for future parties.
  * Returns the reason it's withheld (or null when eligible) so the UI can explain.
  */
 function revenueGate(status: string | undefined, eventDate: string | undefined, today: string): { allow: boolean; reason: string | null } {
   const s = String(status || '').trim().toLowerCase();
-  const confirmed = s === 'confirmed' || s === 'done';
+  const confirmed = s === 'approved' || s === 'confirmed' || s === 'done';
   if (!confirmed) return { allow: false, reason: 'awaiting confirmation' };
   if (!eventDate || eventDate > today) return { allow: false, reason: 'party not over yet' };
   return { allow: true, reason: null };
