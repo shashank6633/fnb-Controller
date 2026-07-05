@@ -630,13 +630,28 @@ export default function PurchasesPage() {
           Papa.parse(file, { header: true, skipEmptyLines: true, complete: (r) => resolve(r.data as any[]) });
         });
       }
-      const mapped = rows.map((r: any) => ({
-        sku:  r.sku  ?? r.SKU  ?? '',
-        name: r.name ?? r.Name ?? r.item_name ?? r['Item Name'] ?? '',
-        qty:  r.qty  ?? r.quantity ?? r.Qty ?? r.Quantity ?? r['INWARD QTY'] ?? '',
-        rate: r.rate ?? r.Rate ?? r.unit_price ?? r.price ?? r.Price ?? '',
-        date: r.date ?? r.Date ?? '',
-      }));
+      // Read every column CASE-INSENSITIVELY. Operators fill the template with
+      // varying header case (SKU/NAME/QTY/RATE vs sku/name/qty/rate); a mismatch
+      // used to leave name/qty/rate blank so EVERY row was skipped ("0 created").
+      const toIso = (v: any): string => {
+        if (v == null || v === '') return '';
+        if (v instanceof Date) return isNaN(v.getTime()) ? '' : v.toISOString().slice(0, 10);
+        // Excel serial date (e.g. 46204) → ISO. Guard tiny numbers.
+        if (typeof v === 'number' && v > 59) { const d = new Date(Math.round((v - 25569) * 86400000)); return isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10); }
+        const s = String(v).trim(); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : '';
+      };
+      const mapped = rows.map((r: any) => {
+        const lc: Record<string, any> = {};
+        for (const k in r) lc[String(k).toLowerCase().trim()] = r[k];
+        const pick = (...keys: string[]) => { for (const k of keys) { const v = lc[k]; if (v !== undefined && v !== null && v !== '') return v; } return ''; };
+        return {
+          sku:  pick('sku'),
+          name: pick('name', 'item_name', 'item name', 'material', 'material name'),
+          qty:  pick('qty', 'quantity', 'opening_qty', 'opening qty', 'inward qty'),
+          rate: pick('rate', 'unit_price', 'price', 'unit price'),
+          date: toIso(pick('date')),
+        };
+      });
       const res = await api('/api/purchases/opening-stock', { method: 'POST', body: { rows: mapped } });
       const j = await res.json().catch(() => ({}));
       if (!res.ok) { alert(j.error || 'Upload failed'); return; }
