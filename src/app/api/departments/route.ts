@@ -70,10 +70,11 @@ export async function POST(request: Request) {
     }
     const id = generateId();
     db.prepare(`
-      INSERT INTO departments (id, name, code, description, head_chef_user_id, head_user_id, parent_id, is_active, submission_windows, submission_grace_minutes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      INSERT INTO departments (id, name, code, description, head_chef_user_id, head_user_id, parent_id, area, is_active, submission_windows, submission_grace_minutes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
     `).run(id, String(b.name).trim(), b.code || '', b.description || '', b.head_chef_user_id || null,
             b.head_user_id || null, b.parent_id || null,
+            String(b.area || '').trim(),
             String(b.submission_windows || '').trim(),
             b.submission_grace_minutes != null ? Number(b.submission_grace_minutes) : 30);
     const row = db.prepare('SELECT * FROM departments WHERE id = ?').get(id);
@@ -105,6 +106,7 @@ export async function PUT(request: Request) {
         name              = COALESCE(?, name),
         code              = COALESCE(?, code),
         description       = COALESCE(?, description),
+        area              = COALESCE(?, area),
         head_chef_user_id = ?,
         is_active         = COALESCE(?, is_active),
         submission_windows       = COALESCE(?, submission_windows),
@@ -116,6 +118,7 @@ export async function PUT(request: Request) {
       WHERE id = ?
     `).run(
       b.name ?? null, b.code ?? null, b.description ?? null,
+      b.area ?? null,
       b.head_chef_user_id !== undefined ? b.head_chef_user_id : null,
       b.is_active != null ? (b.is_active ? 1 : 0) : null,
       b.submission_windows ?? null,

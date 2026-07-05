@@ -867,6 +867,19 @@ function initializeSchema(db: Database.Database) {
   } catch (e) { console.error('sales.category backfill failed:', e); }
 
   // ============================================================
+  // Migration: department-wise closing stock (2026-07).
+  // closing_stock is now recorded PER-DEPARTMENT — the same material can be held
+  // by several departments, each recording its own physical count. department_id
+  // is nullable: NULL / '' = the store / overall count (backward-compatible with
+  // existing callers that don't send a department_id).
+  try {
+    const csCols = db.prepare("PRAGMA table_info(closing_stock)").all() as any[];
+    if (csCols.length > 0 && !csCols.some((c: any) => c.name === 'department_id')) {
+      db.exec(`ALTER TABLE closing_stock ADD COLUMN department_id TEXT`);
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_closing_stock_dept ON closing_stock(department_id)`);
+  } catch (e) { console.error('closing_stock.department_id migration failed:', e); }
+
   // Department-wise Internal Requisitions
   // ============================================================
   // Workflow:
@@ -911,6 +924,11 @@ function initializeSchema(db: Database.Database) {
     //    are assigned on the MAIN dept and inherited by its sub-depts. ──
     if (!dCols.some((c:any)=>c.name==='parent_id'))    db.exec(`ALTER TABLE departments ADD COLUMN parent_id TEXT`);
     if (!dCols.some((c:any)=>c.name==='head_user_id')) db.exec(`ALTER TABLE departments ADD COLUMN head_user_id TEXT`);
+    // ── Department AREA (2026-07): coarse grouping used for closing-stock rollups.
+    //    Values: kitchen | bar | store | service | other. '' = unset. A department
+    //    belongs to exactly one area; several sub-departments can share an area
+    //    (e.g. Hot Kitchen + Cold Kitchen + Pastry all roll up to 'kitchen').
+    if (!dCols.some((c:any)=>c.name==='area')) db.exec(`ALTER TABLE departments ADD COLUMN area TEXT DEFAULT ''`);
     // One-time seed, guarded by a settings flag so admin edits are never clobbered.
     const deptHierSeeded = db.prepare("SELECT value FROM settings WHERE key = 'dept_hierarchy_v1'").get() as { value?: string } | undefined;
     if (!deptHierSeeded) {

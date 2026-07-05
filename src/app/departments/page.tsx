@@ -20,6 +20,7 @@ interface Department {
   member_count?: number; open_requisition_count?: number;
   submission_windows?: string;        // CSV of HH:MM e.g. "11:00,18:30"
   submission_grace_minutes?: number;  // default 30
+  area?: string;                       // kitchen | bar | store | service | other | '' (unset)
   material_categories?: string | null; // JSON array of allowed raw_materials.category values
   // Main-department hierarchy. parent_id === null → this IS a main department.
   parent_id?: string | null;          // main dept this sub-dept belongs to
@@ -29,7 +30,17 @@ interface Department {
   head_user_email?: string;
 }
 
-const empty = (): Partial<Department> => ({ name: '', code: '', description: '', head_chef_user_id: null, is_active: 1, parent_id: null, head_user_id: null });
+const empty = (): Partial<Department> => ({ name: '', code: '', description: '', head_chef_user_id: null, is_active: 1, parent_id: null, head_user_id: null, area: '' });
+
+// Coarse areas used for closing-stock rollups. A department belongs to exactly one.
+const AREA_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: '— Unassigned —' },
+  { value: 'kitchen', label: 'Kitchen' },
+  { value: 'bar', label: 'Bar' },
+  { value: 'store', label: 'Store' },
+  { value: 'service', label: 'Service / Operations' },
+  { value: 'other', label: 'Other' },
+];
 
 // Count categories in a department's material_categories JSON string.
 const catCount = (mc?: string | null): number => {
@@ -137,7 +148,7 @@ export default function DepartmentsPage() {
           <Building className="w-7 h-7 text-[#af4408]" />
           <div>
             <h1 className="text-2xl font-bold text-[#2D1B0E]">Departments</h1>
-            <p className="text-xs text-[#6B5744]">Define operating departments and assign their head chef approvers.</p>
+            <p className="text-xs text-[#6B5744]">Define operating departments and assign their HOD (Head of Department) approvers.</p>
           </div>
         </div>
         {isAdmin && (
@@ -178,7 +189,7 @@ export default function DepartmentsPage() {
               <tr>
                 <th className="text-left  py-2 px-3 font-medium">Name</th>
                 <th className="text-left  py-2 px-3 font-medium">Code</th>
-                <th className="text-left  py-2 px-3 font-medium">Head Chef</th>
+                <th className="text-left  py-2 px-3 font-medium">HOD</th>
                 <th className="text-right py-2 px-3 font-medium">Members</th>
                 <th className="text-right py-2 px-3 font-medium">Open Reqs</th>
                 <th className="text-left  py-2 px-3 font-medium">Status</th>
@@ -308,6 +319,20 @@ export default function DepartmentsPage() {
                           className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
               </label>
 
+              {/* Area — coarse grouping that drives closing-stock rollups. Several
+                  departments can share an area (all kitchen sub-depts → Kitchen). */}
+              <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+                Area
+                <select value={editing.area || ''}
+                        onChange={e => setEditing(p => p ? { ...p, area: e.target.value } : p)}
+                        className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
+                  {AREA_OPTIONS.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+                </select>
+                <span className="text-[10px] text-[#8B7355]">
+                  Groups departments for closing-stock rollups (Kitchen / Bar / Store / Service).
+                </span>
+              </label>
+
               {/* Main-department selector: pick the parent, or make this a main dept. */}
               <label className="text-xs text-[#6B5744] flex flex-col gap-1">
                 Main department
@@ -349,7 +374,7 @@ export default function DepartmentsPage() {
               )}
 
               <label className="text-xs text-[#6B5744] flex flex-col gap-1">
-                Head Chef
+                HOD (Head of Department)
                 <select value={editing.head_chef_user_id || ''}
                         onChange={e => setEditing(p => ({ ...p, head_chef_user_id: e.target.value || null }))}
                         className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
@@ -402,7 +427,7 @@ export default function DepartmentsPage() {
                   <span className="text-[10px] text-[#8B7355]">
                     {editingCats.size === 0
                       ? 'No filter set — this department (and its sub-departments) sees all materials.'
-                      : `${editingCats.size} categor${editingCats.size === 1 ? 'y' : 'ies'} selected. Staff in this department and its sub-departments only see these in inventory pickers. Admins / head chef / store manager always see all.`}
+                      : `${editingCats.size} categor${editingCats.size === 1 ? 'y' : 'ies'} selected. Staff in this department and its sub-departments only see these in inventory pickers. Admins / HOD / store manager always see all.`}
                   </span>
                 </div>
               ) : (

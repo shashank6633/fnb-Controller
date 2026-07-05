@@ -10,11 +10,70 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { MapPin, Loader2, Save, ChevronLeft, Package, CheckCircle2 } from 'lucide-react';
+import {
+  MapPin,
+  Loader2,
+  Save,
+  ChevronLeft,
+  Package,
+  CheckCircle2,
+  ClipboardCheck,
+  X,
+  Search,
+  AlertTriangle,
+  TrendingDown,
+  TrendingUp,
+  Minus,
+  CheckCircle,
+  AlertCircle,
+} from 'lucide-react';
 import { api } from '@/lib/api';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const today = () => new Date().toISOString().slice(0, 10);
+
+/* ------------------------------------------------------------------ */
+/* Closing-stock UPDATE modal helpers (moved from Raw Materials page)  */
+/* ------------------------------------------------------------------ */
+
+// Kept in sync with the Raw Materials page — drives category chips/labels in
+// the Record Closing Stock modal below.
+const CATEGORIES = [
+  'veg',
+  'non-veg',
+  'bar',
+  'grocery',
+  'dairy',
+  'bakery',
+  'spices',
+  'beverages',
+  'packaging',
+  'other',
+] as const;
+
+const CATEGORY_COLORS: Record<string, { bg: string; text: string }> = {
+  veg: { bg: 'bg-green-500/15', text: 'text-green-400' },
+  'non-veg': { bg: 'bg-red-500/15', text: 'text-red-400' },
+  bar: { bg: 'bg-purple-500/15', text: 'text-purple-400' },
+  grocery: { bg: 'bg-amber-500/15', text: 'text-amber-400' },
+  dairy: { bg: 'bg-blue-500/15', text: 'text-[#af4408]' },
+  bakery: { bg: 'bg-orange-500/15', text: 'text-orange-400' },
+  spices: { bg: 'bg-yellow-500/15', text: 'text-yellow-400' },
+  beverages: { bg: 'bg-cyan-500/15', text: 'text-cyan-400' },
+  packaging: { bg: 'bg-slate-500/15', text: 'text-[#8B7355]' },
+  other: { bg: 'bg-gray-500/15', text: 'text-gray-400' },
+};
+
+function formatCurrency(value: number): string {
+  return '₹' + value.toLocaleString('en-IN', { maximumFractionDigits: 2 });
+}
+
+function categoryLabel(cat: string): string {
+  return cat
+    .split('-')
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join('-');
+}
 
 interface LocSummary { location: string; items: number; counted_today: number; low_stock: number; }
 interface Item {
@@ -29,10 +88,35 @@ export default function ClosingStockByLocationPage() {
   // Store managers would otherwise just click it without a physical recount,
   // which defeats the purpose of the closing-stock workflow.
   const [meRole, setMeRole] = useState<string | null>(null);
+  // Full viewer so we can scope closing stock per-department. A plain department
+  // user (staff, not head-chef / store-manager) only counts their OWN department;
+  // Admin / Manager / HOD (head-chef) / Store Manager may pick any department and
+  // see the per-area rollup.
+  const [me, setMe] = useState<any>(null);
   useEffect(() => {
-    fetch('/api/auth/me').then(r => r.json()).then(d => setMeRole(d?.user?.role || null)).catch(() => {});
+    fetch('/api/auth/me').then(r => r.json()).then(d => { setMe(d?.user || null); setMeRole(d?.user?.role || null); }).catch(() => {});
   }, []);
   const isAdmin = meRole === 'admin';
+  // Can this viewer see/update ALL departments (and the rollup)?
+  const canSeeAllDepts = !!me && (me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef || !!me.is_store_manager);
+  // The department a plain user is locked to (their own). null = store/overall.
+  const ownDeptId: string | null = me?.department_id || null;
+
+  // Departments list (for the admin/HOD selector) + the currently-selected dept.
+  // '' means store / overall (no owning department).
+  const [departments, setDepartments] = useState<any[]>([]);
+  const [selectedDept, setSelectedDept] = useState<string>('');
+  useEffect(() => {
+    if (!me) return;
+    // Plain department users are pinned to their own department.
+    if (!canSeeAllDepts) { setSelectedDept(ownDeptId || ''); return; }
+    fetch('/api/departments').then(r => r.json()).then(d => {
+      setDepartments((d?.departments || []).filter((x: any) => x.is_active));
+    }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me]);
+  // The department_id sent on POST to scope saved counts. Plain users → own dept.
+  const activeDeptId: string = canSeeAllDepts ? selectedDept : (ownDeptId || '');
   const [date, setDate] = useState(today());
   const [locations, setLocations] = useState<LocSummary[]>([]);
   const [totals, setTotals] = useState({ locations: 0, items: 0, counted: 0 });
@@ -58,6 +142,167 @@ export default function ClosingStockByLocationPage() {
   const [categoryFilter, setCategoryFilter] = useState<string>('');
   const [itemSearch, setItemSearch] = useState<string>('');
 
+  /* ---- Closing-stock UPDATE modal (moved from Raw Materials page) ---- */
+  // Full raw-material list — only fetched when the modal opens so the
+  // location-count workflow above stays lightweight.
+  const [materials, setMaterials] = useState<any[]>([]);
+  const [closingStockOpen, setClosingStockOpen] = useState(false);
+  const [closingDate, setClosingDate] = useState(new Date().toISOString().split('T')[0]);
+  const [closingItems, setClosingItems] = useState<Record<string, { physical_stock: string; notes: string }>>({});
+  const [closingSearch, setClosingSearch] = useState('');
+  const [closingCategory, setClosingCategory] = useState('');
+  const [adjustStockModal, setAdjustStockModal] = useState(false);
+  const [closingSubmitting, setClosingSubmitting] = useState(false);
+  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[] } | null>(null);
+  const [closingHistory, setClosingHistory] = useState<any[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyDate, setHistoryDate] = useState<string | null>(null);
+  const [historyItems, setHistoryItems] = useState<any[]>([]);
+  const [historySummary, setHistorySummary] = useState<any>(null);
+  // Per-area rollup (admin/HOD only) — each area's overall physical closing value
+  // for the selected date. Sourced from summary.by_area on /api/closing-stock.
+  const [byArea, setByArea] = useState<any[]>([]);
+  const AREA_LABELS: Record<string, string> = {
+    kitchen: 'Kitchen', bar: 'Bar', store: 'Store', service: 'Service / Ops', other: 'Other', __store__: 'Store / Overall',
+  };
+
+  /** Category options grouped by super_category so the modal dropdown renders
+   *  with <optgroup> headers. Mirrors the derivation on the Raw Materials page. */
+  const availableCategories = useMemo(() => {
+    const live = new Set(materials.map(m => (m.category || '').trim()).filter(Boolean));
+    const all = new Set<string>([...CATEGORIES, ...live]);
+    return Array.from(all).sort((a, b) => a.localeCompare(b));
+  }, [materials]);
+
+  const categoryGroups = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const m of materials) {
+      const cat = (m.category || '').trim();
+      if (!cat) continue;
+      const sup = ((m as any).super_category || '').trim() || '(Other)';
+      if (!map.has(sup)) map.set(sup, new Set());
+      map.get(sup)!.add(cat);
+    }
+    for (const c of availableCategories) {
+      const found = Array.from(map.values()).some(set => set.has(c));
+      if (!found) {
+        if (!map.has('(Other)')) map.set('(Other)', new Set());
+        map.get('(Other)')!.add(c);
+      }
+    }
+    return Array.from(map.entries())
+      .sort(([a], [b]) => (a === '(Other)' ? 1 : b === '(Other)' ? -1 : a.localeCompare(b)))
+      .map(([sup, set]) => ({ sup, cats: Array.from(set).sort((a, b) => a.localeCompare(b)) }));
+  }, [materials, availableCategories]);
+
+  const fetchMaterials = async () => {
+    try {
+      const res = await fetch('/api/inventory');
+      if (res.ok) {
+        const json = await res.json();
+        setMaterials(json.materials ?? []);
+        return json.materials ?? [];
+      }
+    } catch (_) {}
+    return [];
+  };
+
+  const openClosingStock = async () => {
+    setClosingStockOpen(true);
+    setClosingDate(new Date().toISOString().split('T')[0]);
+    setClosingResult(null);
+    setClosingSearch('');
+    setClosingCategory('');
+    setShowHistory(false);
+    // Pull the full material list, then pre-seed an empty entry per material.
+    const list = await fetchMaterials();
+    const seed: Record<string, { physical_stock: string; notes: string }> = {};
+    for (const m of list) {
+      seed[m.id] = { physical_stock: '', notes: '' };
+    }
+    setClosingItems(seed);
+    fetchClosingHistory();
+  };
+
+  const fetchClosingHistory = async () => {
+    try {
+      const res = await fetch('/api/closing-stock');
+      if (res.ok) {
+        const json = await res.json();
+        setClosingHistory(json.dates || []);
+      }
+    } catch (_) {}
+  };
+
+  const viewHistoryDate = async (d: string) => {
+    setHistoryDate(d);
+    setHistoryLoading(true);
+    try {
+      const res = await fetch(`/api/closing-stock?date=${d}`);
+      if (res.ok) {
+        const json = await res.json();
+        setHistoryItems(json.items || []);
+        setHistorySummary(json.summary || null);
+        setByArea(json.summary?.by_area || []);
+      }
+    } catch (_) {}
+    setHistoryLoading(false);
+  };
+
+  const updateClosingItem = (materialId: string, field: 'physical_stock' | 'notes', value: string) => {
+    setClosingItems(prev => ({
+      ...prev,
+      [materialId]: { ...prev[materialId], [field]: value },
+    }));
+  };
+
+  const submitClosingStock = async () => {
+    setClosingSubmitting(true);
+    setClosingResult(null);
+    try {
+      const itemsToSubmit = Object.entries(closingItems)
+        .filter(([_, v]) => v.physical_stock !== '')
+        .map(([materialId, v]) => ({
+          material_id: materialId,
+          physical_stock: parseFloat(v.physical_stock),
+          notes: v.notes,
+        }));
+
+      if (itemsToSubmit.length === 0) {
+        setClosingResult({ success: 0, errors: ['Enter physical stock for at least one material'] });
+        setClosingSubmitting(false);
+        return;
+      }
+
+      const res = await api('/api/closing-stock', {
+        method: 'POST',
+        // department_id scopes this batch of counts to the active department
+        // ('' = store/overall). Plain users are pinned to their own department.
+        body: { date: closingDate, items: itemsToSubmit, adjust_stock: adjustStockModal, department_id: activeDeptId },
+      });
+      const json = await res.json();
+      setClosingResult(json);
+      if (json.success > 0) {
+        await fetchMaterials();
+        await fetchClosingHistory();
+        await reloadLocations();
+      }
+    } catch (err: any) {
+      setClosingResult({ success: 0, errors: [err.message] });
+    } finally {
+      setClosingSubmitting(false);
+    }
+  };
+
+  const closingFiltered = materials.filter(m => {
+    if (closingSearch) {
+      if (!m.name.toLowerCase().includes(closingSearch.toLowerCase())) return false;
+    }
+    if (closingCategory && m.category !== closingCategory) return false;
+    return true;
+  });
+
   const reloadLocations = async () => {
     setLoading(true);
     const d = await fetch(`/api/closing-stock/locations?date=${date}`).then(r => r.json());
@@ -66,6 +311,18 @@ export default function ClosingStockByLocationPage() {
     setLoading(false);
   };
   useEffect(() => { reloadLocations(); /* eslint-disable-next-line */ }, [date]);
+
+  // Per-area rollup for the top-level date — admin / HOD / store-manager only.
+  // Uses the summary.by_area block, which is date-scoped and independent of any
+  // department filter, so it always reflects every area's overall closing value.
+  const reloadRollup = async () => {
+    if (!canSeeAllDepts) { setByArea([]); return; }
+    try {
+      const json = await fetch(`/api/closing-stock?date=${date}`).then(r => r.json());
+      setByArea(json?.summary?.by_area || []);
+    } catch { setByArea([]); }
+  };
+  useEffect(() => { reloadRollup(); /* eslint-disable-next-line */ }, [date, canSeeAllDepts]);
 
   const openLocation = async (loc: string) => {
     setActive(loc);
@@ -137,7 +394,8 @@ export default function ClosingStockByLocationPage() {
       const payload = pendingEntries.map(({ material_id, physical }) => ({ material_id, physical_stock: physical }));
       const r = await api('/api/closing-stock', {
         method: 'POST',
-        body: { date, items: payload, adjust_stock: adjustStock },
+        // Scope these location counts to the active department ('' = store/overall).
+        body: { date, items: payload, adjust_stock: adjustStock, department_id: activeDeptId },
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
@@ -387,6 +645,13 @@ export default function ClosingStockByLocationPage() {
             <a href="/inventory" className="text-[#af4408] underline">Raw Materials</a>.
           </p>
         </div>
+        <button
+          onClick={openClosingStock}
+          className="flex items-center gap-2 px-4 py-2.5 border border-green-600 text-green-700 hover:bg-green-50 rounded-lg text-sm font-medium transition-colors"
+        >
+          <ClipboardCheck className="w-4 h-4" />
+          Update / Record Closing Stock
+        </button>
         <label className="text-xs text-[#6B5744] flex flex-col gap-1">
           Date
           <input type="date" value={date} onChange={e => setDate(e.target.value)}
@@ -411,6 +676,47 @@ export default function ClosingStockByLocationPage() {
           </div>
         </div>
       </div>
+
+      {/* Department scope — who's count is being viewed/recorded. Admin / Manager /
+          HOD / Store Manager may pick any department (or the store/overall bucket);
+          a plain department user is pinned to their own department. */}
+      {canSeeAllDepts ? (
+        <div className="bg-white border border-[#E8D5C4] rounded-xl px-4 py-3 flex items-center gap-3 flex-wrap">
+          <span className="text-xs font-medium text-[#6B5744]">Counting for department</span>
+          <select value={selectedDept} onChange={e => setSelectedDept(e.target.value)}
+                  className="px-2 py-1.5 border border-[#D4B896] rounded text-sm bg-white">
+            <option value="">— Store / Overall —</option>
+            {departments.map(d => (
+              <option key={d.id} value={d.id}>
+                {d.name}{d.area ? ` · ${AREA_LABELS[d.area] || d.area}` : ''}
+              </option>
+            ))}
+          </select>
+          <span className="text-[10px] text-[#8B7355]">
+            Counts you save below are recorded against this department.
+          </span>
+        </div>
+      ) : ownDeptId ? (
+        <div className="bg-[#FFF1E3] border border-[#D4B896] rounded-xl px-4 py-2.5 text-xs text-[#6B5744]">
+          You are recording closing stock for your own department only.
+        </div>
+      ) : null}
+
+      {/* Per-area rollup — admin/HOD view of each area's overall closing value. */}
+      {canSeeAllDepts && byArea.length > 0 && (
+        <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
+          <div className="text-xs font-semibold text-[#2D1B0E] mb-2">Area rollup — physical closing value ({date})</div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+            {byArea.map((a: any) => (
+              <div key={a.area} className="border border-[#E8D5C4] rounded-lg p-3 bg-[#FFF8F0]">
+                <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">{AREA_LABELS[a.area] || a.area}</div>
+                <div className="text-lg font-semibold text-[#2D1B0E] mt-1">{fmt(a.physical_value)}</div>
+                <div className="text-[10px] text-[#8B7355] mt-0.5">{a.item_count} item{a.item_count === 1 ? '' : 's'}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {loading ? (
         <div className="p-10 text-center text-sm text-[#8B7355]"><Loader2 className="animate-spin inline mr-1" size={14} /> Loading locations…</div>
@@ -450,6 +756,315 @@ export default function ClosingStockByLocationPage() {
               </button>
             );
           })}
+        </div>
+      )}
+      {/* ================================================================ */}
+      {/* CLOSING STOCK MODAL (moved from Raw Materials page)              */}
+      {/* ================================================================ */}
+      {closingStockOpen && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-4 pb-4 overflow-y-auto">
+          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setClosingStockOpen(false)} />
+          <div className="relative w-full max-w-6xl bg-white rounded-2xl shadow-xl border border-[#E8D5C4] mx-4 my-4">
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4] sticky top-0 bg-white rounded-t-2xl z-20">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-green-100">
+                  <ClipboardCheck className="w-5 h-5 text-green-600" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-semibold text-[#2D1B0E]">Record Closing Stock</h2>
+                  <p className="text-xs text-[#8B7355]">Enter physical count for each material</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setShowHistory(!showHistory)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${showHistory ? 'bg-purple-100 text-purple-700' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4]'}`}
+                >
+                  {showHistory ? 'Back to Entry' : 'View History'}
+                </button>
+                <button onClick={() => setClosingStockOpen(false)} className="p-1 text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+              </div>
+            </div>
+
+            {showHistory ? (
+              /* History View */
+              <div className="px-6 py-5 space-y-4">
+                {closingHistory.length === 0 ? (
+                  <div className="text-center py-12 text-[#8B7355]">
+                    <ClipboardCheck className="w-10 h-10 mx-auto mb-3 opacity-30" />
+                    <p>No closing stock records found</p>
+                  </div>
+                ) : !historyDate ? (
+                  <div className="space-y-2">
+                    <h3 className="text-sm font-semibold text-[#2D1B0E]">Closing Stock Records</h3>
+                    {closingHistory.map((h: any) => (
+                      <div
+                        key={h.date}
+                        onClick={() => viewHistoryDate(h.date)}
+                        className="bg-white border border-[#E8D5C4] rounded-lg p-4 cursor-pointer hover:shadow-md transition-shadow"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="font-semibold text-[#2D1B0E]">{new Date(h.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' })}</p>
+                            <p className="text-xs text-[#8B7355]">{h.item_count} items recorded</p>
+                          </div>
+                          <div className="flex items-center gap-4 text-xs">
+                            {h.shortage_count > 0 && (
+                              <span className="flex items-center gap-1 text-red-500"><TrendingDown className="w-3 h-3" />{h.shortage_count} shortage</span>
+                            )}
+                            {h.excess_count > 0 && (
+                              <span className="flex items-center gap-1 text-blue-500"><TrendingUp className="w-3 h-3" />{h.excess_count} excess</span>
+                            )}
+                            <span className="text-[#af4408] font-semibold">Variance: {formatCurrency(h.total_variance_value)}</span>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : historyLoading ? (
+                  <div className="text-center py-12"><Loader2 className="w-8 h-8 text-[#af4408] animate-spin mx-auto" /></div>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <button onClick={() => setHistoryDate(null)} className="text-xs text-[#af4408] hover:underline mb-1">&larr; Back to dates</button>
+                        <h3 className="text-sm font-semibold text-[#2D1B0E]">
+                          Closing Stock — {new Date(historyDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' })}
+                        </h3>
+                      </div>
+                      {historySummary && (
+                        <div className="flex gap-4 text-xs">
+                          <span className="text-[#6B5744]">Items: <span className="font-bold">{historySummary.total_items}</span></span>
+                          <span className="text-red-500">Shortage: <span className="font-bold">{historySummary.shortage_count}</span></span>
+                          <span className="text-blue-500">Excess: <span className="font-bold">{historySummary.excess_count}</span></span>
+                          <span className="text-[#af4408]">Variance Value: <span className="font-bold">{formatCurrency(Math.abs(historySummary.total_variance_value))}</span></span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="overflow-x-auto max-h-[60vh] overflow-y-auto rounded-lg border border-[#E8D5C4]">
+                      <table className="w-full text-sm">
+                        <thead className="sticky top-0 bg-[#FFF1E3] z-10">
+                          <tr className="text-[#8B7355]">
+                            <th className="text-left py-2.5 px-3 font-medium">Material</th>
+                            <th className="text-left py-2.5 px-3 font-medium">Category</th>
+                            <th className="text-right py-2.5 px-3 font-medium">System Stock</th>
+                            <th className="text-right py-2.5 px-3 font-medium">Physical Stock</th>
+                            <th className="text-right py-2.5 px-3 font-medium">Variance</th>
+                            <th className="text-right py-2.5 px-3 font-medium">Variance (₹)</th>
+                            <th className="text-left py-2.5 px-3 font-medium">Notes</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {historyItems.map((item: any) => {
+                            const isShortage = item.variance < 0;
+                            const isExcess = item.variance > 0;
+                            return (
+                              <tr key={item.id} className={`border-t border-[#E8D5C4]/50 ${isShortage ? 'bg-red-50/50' : isExcess ? 'bg-blue-50/50' : ''}`}>
+                                <td className="py-2 px-3 text-[#2D1B0E] font-medium text-xs">{item.material_name}</td>
+                                <td className="py-2 px-3 text-xs text-[#6B5744]">{categoryLabel(item.category)}</td>
+                                <td className="py-2 px-3 text-right text-xs font-mono">{item.system_stock} {item.unit}</td>
+                                <td className="py-2 px-3 text-right text-xs font-mono font-semibold">{item.physical_stock} {item.unit}</td>
+                                <td className={`py-2 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
+                                  {item.variance > 0 ? '+' : ''}{item.variance} {item.unit}
+                                </td>
+                                <td className={`py-2 px-3 text-right text-xs font-mono ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
+                                  {item.variance_value > 0 ? '+' : ''}{formatCurrency(item.variance_value)}
+                                </td>
+                                <td className="py-2 px-3 text-xs text-[#8B7355]">{item.notes || '-'}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* Entry View */
+              <div className="px-6 py-5 space-y-4">
+                {/* Date & Options */}
+                <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-end">
+                  <div>
+                    <label className="block text-xs font-medium text-[#6B5744] mb-1">Closing Date *</label>
+                    <input
+                      type="date"
+                      value={closingDate}
+                      onChange={e => setClosingDate(e.target.value)}
+                      className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] [color-scheme:light]"
+                    />
+                  </div>
+                  {/* Department scope — same selection as the grid header. Admin /
+                      HOD pick any department; plain users are shown read-only. */}
+                  <div>
+                    <label className="block text-xs font-medium text-[#6B5744] mb-1">Department</label>
+                    {canSeeAllDepts ? (
+                      <select
+                        value={selectedDept}
+                        onChange={e => setSelectedDept(e.target.value)}
+                        className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+                      >
+                        <option value="">Store / Overall</option>
+                        {departments.map(d => (
+                          <option key={d.id} value={d.id}>
+                            {d.name}{d.area ? ` · ${AREA_LABELS[d.area] || d.area}` : ''}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <div className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#6B5744]">
+                        {departments.find(d => d.id === ownDeptId)?.name || 'Your department'}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <label className="block text-xs font-medium text-[#6B5744] mb-1">Search Material</label>
+                    <div className="relative">
+                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />
+                      <input
+                        type="text"
+                        value={closingSearch}
+                        onChange={e => setClosingSearch(e.target.value)}
+                        placeholder="Filter by name..."
+                        className="w-full pl-10 pr-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-[#6B5744] mb-1">Category</label>
+                    <select
+                      value={closingCategory}
+                      onChange={e => setClosingCategory(e.target.value)}
+                      className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+                    >
+                      <option value="">All Categories</option>
+                      {categoryGroups.map(g => (
+                        <optgroup key={g.sup} label={g.sup}>
+                          {g.cats.map(c => <option key={c} value={c}>{categoryLabel(c)}</option>)}
+                        </optgroup>
+                      ))}
+                    </select>
+                  </div>
+                  <label className="flex items-center gap-2 cursor-pointer bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    <input type="checkbox" checked={adjustStockModal} onChange={e => setAdjustStockModal(e.target.checked)} className="accent-[#af4408] w-4 h-4" />
+                    <span className="text-xs text-amber-800 font-medium whitespace-nowrap">Adjust system stock</span>
+                  </label>
+                </div>
+
+                {adjustStockModal && (
+                  <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs">
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                    System stock will be updated to match physical counts. Variances will be logged as inventory adjustments.
+                  </div>
+                )}
+
+                {/* Materials Table */}
+                <div className="overflow-x-auto max-h-[55vh] overflow-y-auto rounded-lg border border-[#E8D5C4]">
+                  <table className="w-full text-sm">
+                    <thead className="sticky top-0 bg-[#FFF1E3] z-10">
+                      <tr className="text-[#8B7355]">
+                        <th className="text-left py-2.5 px-3 font-medium">Material</th>
+                        <th className="text-left py-2.5 px-3 font-medium">Category</th>
+                        <th className="text-right py-2.5 px-3 font-medium">System Stock</th>
+                        <th className="text-right py-2.5 px-3 font-medium">Unit</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-32">Physical Count *</th>
+                        <th className="text-right py-2.5 px-3 font-medium">Variance</th>
+                        <th className="text-left py-2.5 px-3 font-medium w-40">Notes</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {closingFiltered.map((m) => {
+                        const ci = closingItems[m.id];
+                        const physicalVal = ci ? parseFloat(ci.physical_stock) : NaN;
+                        const variance = !isNaN(physicalVal) ? Math.round((physicalVal - m.current_stock) * 1000) / 1000 : null;
+                        const isShortage = variance !== null && variance < 0;
+                        const isExcess = variance !== null && variance > 0;
+                        return (
+                          <tr key={m.id} className={`border-t border-[#E8D5C4]/50 ${isShortage ? 'bg-red-50/30' : isExcess ? 'bg-blue-50/30' : ''}`}>
+                            <td className="py-1.5 px-3 text-[#2D1B0E] font-medium text-xs">{m.name}</td>
+                            <td className="py-1.5 px-3">
+                              <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${CATEGORY_COLORS[m.category]?.bg || ''} ${CATEGORY_COLORS[m.category]?.text || ''}`}>
+                                {categoryLabel(m.category)}
+                              </span>
+                            </td>
+                            <td className="py-1.5 px-3 text-right text-xs font-mono text-[#2D1B0E]">{m.current_stock}</td>
+                            <td className="py-1.5 px-3 text-right text-xs text-[#8B7355]">{m.unit}</td>
+                            <td className="py-1.5 px-2">
+                              <input
+                                type="number"
+                                step="0.01"
+                                min="0"
+                                value={ci?.physical_stock || ''}
+                                onChange={e => updateClosingItem(m.id, 'physical_stock', e.target.value)}
+                                placeholder={m.current_stock.toString()}
+                                className="w-full px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-right font-mono text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408] placeholder-[#C4B09A]"
+                              />
+                            </td>
+                            <td className={`py-1.5 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : variance === 0 ? 'text-green-600' : 'text-[#8B7355]'}`}>
+                              {variance !== null ? (
+                                <span className="flex items-center justify-end gap-1">
+                                  {isShortage && <TrendingDown className="w-3 h-3" />}
+                                  {isExcess && <TrendingUp className="w-3 h-3" />}
+                                  {variance === 0 && <Minus className="w-3 h-3" />}
+                                  {variance > 0 ? '+' : ''}{variance} {m.unit}
+                                </span>
+                              ) : '-'}
+                            </td>
+                            <td className="py-1.5 px-2">
+                              <input
+                                type="text"
+                                value={ci?.notes || ''}
+                                onChange={e => updateClosingItem(m.id, 'notes', e.target.value)}
+                                placeholder="Optional"
+                                className="w-full px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-[#2D1B0E] placeholder-[#C4B09A] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
+                              />
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Submit */}
+                <div className="flex items-center justify-between">
+                  <p className="text-xs text-[#8B7355]">
+                    {Object.values(closingItems).filter(v => v.physical_stock !== '').length} of {materials.length} items filled
+                  </p>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => setClosingStockOpen(false)}
+                      className="px-4 py-2 text-sm text-[#6B5744] bg-[#FFF1E3] rounded-lg hover:bg-[#E8D5C4] transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={submitClosingStock}
+                      disabled={closingSubmitting}
+                      className="flex items-center gap-2 px-5 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+                    >
+                      {closingSubmitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <ClipboardCheck className="w-4 h-4" />}
+                      {closingSubmitting ? 'Saving...' : 'Save Closing Stock'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Result */}
+                {closingResult && (
+                  <div className={`p-3 rounded-lg border ${closingResult.errors.length > 0 && closingResult.success === 0 ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
+                    <div className="flex items-start gap-2 text-sm">
+                      {closingResult.success > 0 ? <CheckCircle className="w-4 h-4 text-green-600 mt-0.5" /> : <AlertCircle className="w-4 h-4 text-red-500 mt-0.5" />}
+                      <div>
+                        {closingResult.success > 0 && <p className="text-green-700">Closing stock recorded for {closingResult.success} items!</p>}
+                        {closingResult.errors.map((e, i) => <p key={i} className="text-red-600 text-xs">{e}</p>)}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
