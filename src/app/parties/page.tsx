@@ -40,6 +40,9 @@ interface PnLRow {
   margin_pct: number;
   has_revenue: boolean;
   has_liquor_recorded: boolean;
+  booking_total?: number;                   // raw Final Total from the sheet (before the gate)
+  revenue_withheld_reason?: string | null;  // why revenue isn't counted yet (or null)
+  status?: string;
 }
 
 export default function PartyPnLAdminPage() {
@@ -183,7 +186,11 @@ export default function PartyPnLAdminPage() {
                       </td>
                       <td className="py-1.5 px-3 text-right font-mono">{r.pax || '—'}</td>
                       <td className="py-1.5 px-3 text-right font-mono">
-                        {r.has_revenue ? fmt(r.revenue) : <span className="text-amber-700 text-[10px]">no booking row</span>}
+                        {r.has_revenue
+                          ? fmt(r.revenue)
+                          : (r.booking_total ?? 0) > 0
+                            ? <span className="text-amber-700 text-[10px]" title={`Final Total ${fmt(r.booking_total || 0)} is on the sheet but not counted yet`}>⏳ {r.revenue_withheld_reason || 'pending'}</span>
+                            : <span className="text-[#8B7355] text-[10px]">no booking row</span>}
                       </td>
                       <td className="py-1.5 px-3 text-right font-mono">
                         {r.food_cost > 0 ? fmt(r.food_cost) : <span className="text-[#8B7355]">—</span>}
