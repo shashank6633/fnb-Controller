@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, canApproveAsChef } from '@/lib/auth';
 import { enrichBatch, shelfLifeRemaining, ProductionBatch } from '@/lib/production-batch';
 
 /**
@@ -19,6 +19,7 @@ export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const url = new URL(request.url);
     const barcode = (url.searchParams.get('barcode') || '').trim();

@@ -1,5 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, canApproveAsChef } from '@/lib/auth';
 import { enrichBatch, ProductionBatch } from '@/lib/production-batch';
 
 /**
@@ -56,6 +56,7 @@ export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const db = getDb();
     const url = new URL(request.url);
@@ -110,6 +111,7 @@ export async function POST(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const body = await request.json().catch(() => ({}));
     const item_name = String(body?.item_name || '').trim();

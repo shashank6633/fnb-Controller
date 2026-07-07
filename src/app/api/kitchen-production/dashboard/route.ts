@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, canApproveAsChef } from '@/lib/auth';
 import { parseDateTime, expiryStatus, ProductionBatch } from '@/lib/production-batch';
 import { todayIST, fmtISTIsoDate } from '@/lib/format-date';
 
@@ -38,6 +38,7 @@ export async function GET() {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const db = getDb();
     const outletId = await getCurrentOutletId();

@@ -19,6 +19,11 @@ export interface PageEntry {
   path: string;
   /** Display label */
   label: string;
+  /**
+   * When true, only HODs (is_head_chef) and admins may see/open this page,
+   * regardless of the user's page_access map. First catalog-level tier gate.
+   */
+  hodOnly?: boolean;
 }
 
 export interface PageSection {
@@ -78,9 +83,9 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
       { path: '/store-requisitions',  label: 'Store Requisitions (Issue)' },
-      { path: '/kitchen-production',   label: 'Kitchen Production' },
-      { path: '/kitchen-production/dashboard', label: 'Kitchen Production — Dashboard' },
-      { path: '/kitchen-production/reports', label: 'Kitchen Production — Reports' },
+      { path: '/kitchen-production',   label: 'Kitchen Production', hodOnly: true },
+      { path: '/kitchen-production/dashboard', label: 'Kitchen Production — Dashboard', hodOnly: true },
+      { path: '/kitchen-production/reports', label: 'Kitchen Production — Reports', hodOnly: true },
       { path: '/kitchen-production/scan', label: 'Kitchen Production — Scan' },
       { path: '/purchases',           label: 'Purchases' },
       { path: '/purchase-orders',     label: 'Purchase Orders' },
@@ -132,6 +137,23 @@ export const PAGE_CATALOG: PageSection[] = [
 export const ALL_PAGE_PATHS: string[] = PAGE_CATALOG.flatMap(s => s.pages.map(p => p.path));
 
 /**
+ * Is `pathname` under an HOD-only catalog entry? Uses LONGEST-prefix match so a
+ * non-restricted child (e.g. /kitchen-production/scan) can sit under a
+ * restricted parent (/kitchen-production) without inheriting the lock.
+ */
+export function isHodOnlyPath(pathname: string): boolean {
+  let best: PageEntry | null = null;
+  for (const section of PAGE_CATALOG) {
+    for (const p of section.pages) {
+      if (pathname === p.path || pathname.startsWith(p.path + '/')) {
+        if (!best || p.path.length > best.path.length) best = p;
+      }
+    }
+  }
+  return !!best?.hodOnly;
+}
+
+/**
  * Pages that EVERY signed-in user can access regardless of their access map.
  *
  * Only /login here. The Dashboard `/` is intentionally NOT included anymore
@@ -149,7 +171,7 @@ export const ALWAYS_ALLOWED: string[] = ['/login'];
  * include `/`. Returns the first allowed path in their map (in catalog order
  * so the UX is predictable), or '/login' as a final fallback.
  */
-export function firstAllowedPath(user: { role?: string; page_access?: string | null } | null): string {
+export function firstAllowedPath(user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null): string {
   if (!user) return '/login';
   if (user.role === 'admin') return '/';
   if (!user.page_access) return '/';                     // null map = full access → /
@@ -159,10 +181,11 @@ export function firstAllowedPath(user: { role?: string; page_access?: string | n
   if (!Array.isArray(allowed) || allowed.length === 0) return '/';
   // Iterate the catalog in display order so the redirect lands somewhere the
   // user "naturally" starts (Dashboard if allowed, else first dine-in/parties
-  // page they have, etc.).
+  // page they have, etc.). Skip HOD-only pages the user can't actually open, so
+  // a non-HOD isn't redirected to a page that immediately re-blocks them.
   for (const section of PAGE_CATALOG) {
     for (const p of section.pages) {
-      if (allowed.includes(p.path)) return p.path;
+      if (allowed.includes(p.path) && !(p.hodOnly && !user.is_head_chef)) return p.path;
     }
   }
   return '/login';
@@ -180,11 +203,16 @@ export function firstAllowedPath(user: { role?: string; page_access?: string | n
  */
 export function canAccessPage(
   pathname: string,
-  user: { role?: string; page_access?: string | null } | null,
+  user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null,
 ): boolean {
   if (!user) return false;
   if (user.role === 'admin') return true;
   if (ALWAYS_ALLOWED.some(p => pathname === p)) return true;
+
+  // HOD-only pages: a non-admin must be an HOD (is_head_chef), whatever their
+  // page_access map says. MUST run before the null-map backward-compat grant
+  // below, so legacy full-access staff are still locked out of these pages.
+  if (isHodOnlyPath(pathname) && !user.is_head_chef) return false;
 
   // No explicit map → grant everything (backward compat)
   if (!user.page_access) return true;

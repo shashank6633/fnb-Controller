@@ -201,7 +201,7 @@ export default function Sidebar() {
   const installApp = async () => { if (!installEvt) return; installEvt.prompt(); try { await installEvt.userChoice; } catch {} setInstallEvt(null); };
 
   // Current user — used to filter nav links by the per-user page_access map.
-  const [me, setMe] = useState<{ role?: string; page_access?: string | null } | null>(null);
+  const [me, setMe] = useState<{ role?: string; page_access?: string | null; is_head_chef?: boolean } | null>(null);
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user || null)).catch(() => {});
   }, []);

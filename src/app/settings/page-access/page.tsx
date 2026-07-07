@@ -284,10 +284,12 @@ export default function PageAccessSettingsPage() {
                         {isExpanded && (
                           <div className="px-4 py-2 grid grid-cols-2 md:grid-cols-3 gap-1.5 text-xs">
                             {section.pages.map(p => (
-                              <label key={p.path} className="flex items-center gap-1.5 cursor-pointer hover:bg-[#FFF8F0] px-1 py-0.5 rounded">
+                              <label key={p.path} title={p.hodOnly ? 'Only HODs (Is HOD) and admins can open this page — this grant is ignored for non-HODs' : undefined}
+                                     className="flex items-center gap-1.5 cursor-pointer hover:bg-[#FFF8F0] px-1 py-0.5 rounded">
                                 <input type="checkbox" checked={cur.has(p.path)}
                                        onChange={() => togglePath(u.id, p.path)} />
                                 <span className="text-[#2D1B0E]">{p.label}</span>
+                                {p.hodOnly && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">HOD only</span>}
                                 <span className="text-[9px] font-mono text-[#8B7355] ml-auto">{p.path}</span>
                               </label>
                             ))}

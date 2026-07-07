@@ -1,5 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
+import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
 import { ProductionBatch } from '@/lib/production-batch';
 import { buildTSPL, labelPreview, readLabelPrinter } from '@/lib/tspl-label';
 
@@ -16,6 +16,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const { id } = await params;
     const db = getDb();

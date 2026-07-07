@@ -252,12 +252,21 @@ export default function RolesAdmin() {
                             {section.label}
                           </button>
                           <div className="grid sm:grid-cols-2 gap-x-4 gap-y-1 pl-6">
-                            {section.pages.map((p) => (
-                              <label key={p.path} className="flex items-center gap-2 text-sm text-[#6B5744]">
-                                <input type="checkbox" checked={draft.pages.has(p.path)} onChange={() => togglePage(p.path)} />
+                            {section.pages.map((p) => {
+                              // HOD-only pages can't be granted to a non-HOD role —
+                              // the proxy would block them anyway. Lock the checkbox
+                              // and show why until "Is HOD" is ticked for this role.
+                              const lockedHod = !!p.hodOnly && !draft.is_head_chef;
+                              return (
+                              <label key={p.path}
+                                     title={p.hodOnly ? 'Only HODs (tick “Is HOD” above) and admins can open this page' : undefined}
+                                     className={`flex items-center gap-2 text-sm ${lockedHod ? 'text-[#B79A82]' : 'text-[#6B5744]'}`}>
+                                <input type="checkbox" checked={draft.pages.has(p.path)} disabled={lockedHod} onChange={() => togglePage(p.path)} />
                                 {p.label}
+                                {p.hodOnly && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">HOD only</span>}
                               </label>
-                            ))}
+                              );
+                            })}
                           </div>
                         </div>
                       );
