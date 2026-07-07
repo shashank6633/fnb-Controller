@@ -15,6 +15,34 @@ import type { ProductionBatch } from './production-batch';
 
 export const LABEL_PRINTER_KEY = 'label_printer';
 
+/** Which detail rows appear on the label (in this fixed print order). */
+export interface LabelFieldToggles {
+  batch: boolean;
+  prepared: boolean;
+  expiry: boolean;
+  qty: boolean;
+  by: boolean;
+  loc: boolean;
+}
+
+/**
+ * User-tunable label layout. Both the on-screen preview and the printed TSPL
+ * read from THIS object so the two always match. Scales are multipliers on a
+ * sensible base size (1.0 ≈ the old sizing); defaults are deliberately bigger.
+ */
+export interface LabelDesignConfig {
+  /** Item-name size multiplier (base 15px preview / bitmap-font ×2 print). */
+  title_scale: number;
+  /** Detail-row size multiplier (base 9px preview / bitmap-font print). */
+  field_scale: number;
+  /** Per-row visibility toggles. */
+  fields: LabelFieldToggles;
+  /** CODE128 bar height in printer dots (203dpi → 8 dots/mm). */
+  barcode_height: number;
+  /** Print the human-readable barcode text under the bars. */
+  show_barcode_text: boolean;
+}
+
 export interface LabelPrinterConfig {
   mode: 'tspl' | 'bartender';
   transport: 'usb' | 'ip';
@@ -28,6 +56,44 @@ export interface LabelPrinterConfig {
   qr: boolean;
   /** BarTender .btw template path (only used when mode === 'bartender'). */
   bartender_template: string;
+  /** Sizing/layout of what actually gets drawn on the label. */
+  design: LabelDesignConfig;
+}
+
+export function defaultLabelDesign(): LabelDesignConfig {
+  return {
+    title_scale: 1.3,
+    field_scale: 1.4,
+    fields: { batch: true, prepared: true, expiry: true, qty: true, by: true, loc: true },
+    barcode_height: 50,
+    show_barcode_text: true,
+  };
+}
+
+/** Coerce an arbitrary parsed value into a valid, fully-populated design config. */
+export function normalizeLabelDesign(raw: any): LabelDesignConfig {
+  const d = defaultLabelDesign();
+  if (!raw || typeof raw !== 'object') return d;
+  const numIn = (v: any, def: number, lo: number, hi: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def;
+  };
+  const bool = (v: any, def: boolean) => (v === undefined ? def : !!v);
+  const f = raw.fields && typeof raw.fields === 'object' ? raw.fields : {};
+  return {
+    title_scale: numIn(raw.title_scale, d.title_scale, 0.8, 3),
+    field_scale: numIn(raw.field_scale, d.field_scale, 0.8, 3),
+    fields: {
+      batch: bool(f.batch, d.fields.batch),
+      prepared: bool(f.prepared, d.fields.prepared),
+      expiry: bool(f.expiry, d.fields.expiry),
+      qty: bool(f.qty, d.fields.qty),
+      by: bool(f.by, d.fields.by),
+      loc: bool(f.loc, d.fields.loc),
+    },
+    barcode_height: Math.round(numIn(raw.barcode_height, d.barcode_height, 20, 90)),
+    show_barcode_text: bool(raw.show_barcode_text, d.show_barcode_text),
+  };
 }
 
 export function defaultLabelPrinter(): LabelPrinterConfig {
@@ -41,6 +107,7 @@ export function defaultLabelPrinter(): LabelPrinterConfig {
     print_preview: true,
     qr: false,
     bartender_template: '',
+    design: defaultLabelDesign(),
   };
 }
 
@@ -64,6 +131,7 @@ export function normalizeLabelPrinter(raw: any): LabelPrinterConfig {
     print_preview: raw.print_preview === undefined ? d.print_preview : !!raw.print_preview,
     qr: raw.qr === undefined ? d.qr : !!raw.qr,
     bartender_template: typeof raw.bartender_template === 'string' ? raw.bartender_template : d.bartender_template,
+    design: normalizeLabelDesign(raw.design),
   };
 }
 
@@ -106,6 +174,26 @@ export interface BuildTSPLOptions {
   labelHeightMm?: number;
   /** Inter-label gap in mm (default 2). */
   gapMm?: number;
+  /** Sizing/layout design (defaults applied when omitted). */
+  design?: LabelDesignConfig;
+}
+
+/** Detail-row keys in fixed print order. */
+export const LABEL_FIELD_KEYS = ['batch', 'prepared', 'expiry', 'qty', 'by', 'loc'] as const;
+export type LabelFieldKey = (typeof LABEL_FIELD_KEYS)[number];
+
+/**
+ * Character budgets for wrapping. They SHRINK as the scales grow so the same
+ * budget drives both the printed bitmap-font wrap and the on-screen preview,
+ * keeping the two visually aligned.
+ */
+function charBudgets(titleScale: number, fieldScale: number, withQr: boolean) {
+  const baseName = withQr ? 13 : 20;
+  const baseRow = withQr ? 30 : 46;
+  return {
+    nameChars: Math.max(6, Math.round(baseName / Math.max(0.6, titleScale))),
+    rowChars: Math.max(10, Math.round(baseRow / Math.max(0.6, fieldScale))),
+  };
 }
 
 /** Escape a string for a TSPL quoted literal ( \ and " are the reserved chars ). */
@@ -151,6 +239,7 @@ function wrap(text: string, maxChars: number, maxLines: number): string[] {
  * Returns the raw TSPL2 text (CRLF-terminated commands) ready to send to the bridge.
  */
 export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): string {
+  const design = normalizeLabelDesign(opts.design);
   const copies = Math.max(1, Math.round(Number(opts.copies) || 1));
   const withQr = !!opts.qr;
   const widthMm = opts.labelWidthMm && opts.labelWidthMm > 0 ? opts.labelWidthMm : 50;
@@ -158,11 +247,56 @@ export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): strin
   const gapMm = opts.gapMm != null && opts.gapMm >= 0 ? opts.gapMm : 2;
   const qrValue = (opts.scanUrl && opts.scanUrl.trim()) || batch.barcode || '';
 
-  // Text column narrows when a QR sits on the right.
-  const nameChars = withQr ? 13 : 20;
-  const rowChars = withQr ? 30 : 46;
-
+  const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+  const { nameChars, rowChars } = charBudgets(design.title_scale, design.field_scale, withQr);
   const nameLines = wrap(batch.item_name, nameChars, 2);
+
+  // Integer bitmap-font multipliers derived from the scales (bigger than the old
+  // fixed 2/1). title_scale 1.3 → ×3 item name, field_scale 1.4 → ×2 rows.
+  let titleMult = clamp(Math.round(design.title_scale * 2), 2, 5);
+  let fieldMult = clamp(Math.round(design.field_scale * 2) - 1, 1, 4);
+  let barcodeH = clamp(Math.round(design.barcode_height), 20, 90);
+  const textH = design.show_barcode_text ? 22 : 0; // human-readable line height (dots)
+
+  // Detail rows honoring the field toggles, in fixed order.
+  const dt = (d: string, t: string) => [d, t].filter(Boolean).join(' ');
+  const rowText: Record<LabelFieldKey, string> = {
+    batch: `Batch: ${batch.batch_number || ''}`,
+    prepared: `Prepared: ${dt(batch.production_date, batch.production_time)}`,
+    expiry: `Expiry: ${dt(batch.expiry_date, batch.expiry_time)}`,
+    qty: `Qty: ${batch.quantity_produced ?? ''} ${batch.unit || ''}`.trim(),
+    by: `By: ${batch.prepared_by || ''}`,
+    loc: `Loc: ${batch.storage_location || ''}`,
+  };
+  const rows = LABEL_FIELD_KEYS.filter((k) => design.fields[k]).map((k) => rowText[k]);
+
+  const barcodeVal = batch.barcode || '';
+
+  // Base bitmap-font heights (dots) so line spacing tracks the font size.
+  const TITLE_FH = 24;
+  const FIELD_FH = 12;
+  // 2 mm safe margin on every side: the label is a die-cut rectangle with rounded
+  // corners and the print head drifts slightly, so nothing is drawn in the outer
+  // 2 mm (16 dots @ 203 dpi). Content lives inside [M, size-M] on both axes.
+  const M = 16;
+  const printableH = heightMm * 8;
+  const usableH = printableH - 2 * M;         // height available between top & bottom margins
+  const needed = () =>
+    nameLines.length * (TITLE_FH * titleMult + 6) +
+    6 +
+    rows.length * (FIELD_FH * fieldMult + 10) +
+    8 +
+    (barcodeVal ? barcodeH + textH : 0);
+
+  // Shrink to stay inside the safe area: rows first, then barcode, then title.
+  let guard = 30;
+  while (needed() > usableH && guard-- > 0) {
+    if (fieldMult > 1) fieldMult--;
+    else if (barcodeH > 40) barcodeH -= 6;
+    else if (titleMult > 2) titleMult--;
+    else if (barcodeH > 24) barcodeH -= 4;
+    else break;
+  }
 
   const T = (x: number, y: number, font: string, xm: number, ym: number, text: string) =>
     `TEXT ${x},${y},"${font}",0,${xm},${ym},"${tsplEscape(text)}"`;
@@ -174,41 +308,33 @@ export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): strin
   lines.push('REFERENCE 0,0');
   lines.push('CLS');
 
-  // Item name (font "3" ≈ 12x20 base; x2/y2 → large & bold-ish).
-  let y = 12;
+  // Item name (font "3"; multiplier scales with title_scale). Origin at the 2 mm margin.
+  let y = M;
   for (const ln of nameLines) {
-    lines.push(T(12, y, '3', 2, 2, ln));
-    y += 44;
+    lines.push(T(M, y, '3', titleMult, titleMult, ln));
+    y += TITLE_FH * titleMult + 6;
   }
-  y += 4; // gap after the name block
+  y += 6; // gap after the name block
 
-  // Detail rows (font "2" ≈ 8x12 base).
-  const dt = (d: string, t: string) => [d, t].filter(Boolean).join(' ');
-  const rows: string[] = [
-    `Batch: ${batch.batch_number || ''}`,
-    `Prepared: ${dt(batch.production_date, batch.production_time)}`,
-    `Expiry: ${dt(batch.expiry_date, batch.expiry_time)}`,
-    `Qty: ${batch.quantity_produced ?? ''} ${batch.unit || ''}`.trim(),
-    `By: ${batch.prepared_by || ''}`,
-    `Loc: ${batch.storage_location || ''}`,
-  ];
+  // Detail rows (font "2"; multiplier scales with field_scale).
   for (const r of rows) {
-    lines.push(T(12, y, '2', 1, 1, wrap(r, rowChars, 1)[0]));
-    y += 26;
+    lines.push(T(M, y, '2', fieldMult, fieldMult, wrap(r, rowChars, 1)[0]));
+    y += FIELD_FH * fieldMult + 10;
   }
 
-  // CODE128 barcode with its human-readable value, anchored near the bottom.
-  const barcodeVal = batch.barcode || '';
+  // CODE128 barcode anchored near the bottom, clamped inside the bottom 2 mm margin.
   if (barcodeVal) {
-    const by = Math.min(y + 6, heightMm * 8 - 70);
-    // BARCODE x,y,"128",height,human-readable(1),rotation,narrow,wide,"content"
-    lines.push(`BARCODE 12,${by},"128",48,1,0,2,2,"${tsplEscape(barcodeVal)}"`);
+    const maxBy = Math.max(M, printableH - M - barcodeH - textH);
+    const by = Math.min(y + 4, maxBy);
+    const humanReadable = design.show_barcode_text ? 1 : 0;
+    // BARCODE x,y,"128",height,human-readable,rotation,narrow,wide,"content"
+    lines.push(`BARCODE ${M},${by},"128",${barcodeH},${humanReadable},0,2,2,"${tsplEscape(barcodeVal)}"`);
   }
 
-  // Optional QR on the right side.
+  // Optional QR on the right side, inset by the 2 mm margin (top & right).
   if (withQr && qrValue) {
     // QRCODE x,y,ECClevel,cellWidth,mode,rotation,"content"
-    lines.push(`QRCODE ${widthMm * 8 - 108},12,M,4,A,0,"${tsplEscape(qrValue)}"`);
+    lines.push(`QRCODE ${widthMm * 8 - 108 - M},${M},M,4,A,0,"${tsplEscape(qrValue)}"`);
   }
 
   lines.push(`PRINT ${copies},1`);
@@ -227,12 +353,18 @@ export interface LabelPreview {
   qty: string;
   by: string;
   loc: string;
-  /** Ready-to-render label rows in order (label + value already joined). */
+  /** Ready-to-render label rows in order (already filtered by field toggles). */
   rows: Array<{ label: string; value: string }>;
   qr: boolean;
   qr_value: string;
   width_mm: number;
   height_mm: number;
+  /** Design-derived on-screen sizes so the preview matches the print. */
+  title_px: number;
+  field_px: number;
+  /** CODE128 bar height in printer dots (convert to px via dots/8×pxPerMm). */
+  barcode_height: number;
+  show_barcode_text: boolean;
 }
 
 /**
@@ -240,16 +372,29 @@ export interface LabelPreview {
  * HTML/SVG label preview. Mirrors the TSPL layout so the preview matches the print.
  */
 export function labelPreview(batch: LabelBatch, opts: BuildTSPLOptions = {}): LabelPreview {
+  const design = normalizeLabelDesign(opts.design);
   const withQr = !!opts.qr;
   const widthMm = opts.labelWidthMm && opts.labelWidthMm > 0 ? opts.labelWidthMm : 50;
   const heightMm = opts.labelHeightMm && opts.labelHeightMm > 0 ? opts.labelHeightMm : 40;
+  const { nameChars } = charBudgets(design.title_scale, design.field_scale, withQr);
   const dt = (d: string, t: string) => [d, t].filter(Boolean).join(' ');
   const qty = `${batch.quantity_produced ?? ''} ${batch.unit || ''}`.trim();
   const prepared = dt(batch.production_date, batch.production_time);
   const expiry = dt(batch.expiry_date, batch.expiry_time);
+  const allRows: Array<{ key: LabelFieldKey; label: string; value: string }> = [
+    { key: 'batch', label: 'Batch', value: batch.batch_number || '' },
+    { key: 'prepared', label: 'Prepared', value: prepared },
+    { key: 'expiry', label: 'Expiry', value: expiry },
+    { key: 'qty', label: 'Qty', value: qty },
+    { key: 'by', label: 'By', value: batch.prepared_by || '' },
+    { key: 'loc', label: 'Loc', value: batch.storage_location || '' },
+  ];
+  const rows = allRows
+    .filter((r) => design.fields[r.key])
+    .map(({ label, value }) => ({ label, value }));
   return {
     item_name: batch.item_name || '',
-    item_name_lines: wrap(batch.item_name, withQr ? 13 : 20, 2),
+    item_name_lines: wrap(batch.item_name, nameChars, 2),
     batch_number: batch.batch_number || '',
     barcode: batch.barcode || '',
     prepared,
@@ -257,17 +402,16 @@ export function labelPreview(batch: LabelBatch, opts: BuildTSPLOptions = {}): La
     qty,
     by: batch.prepared_by || '',
     loc: batch.storage_location || '',
-    rows: [
-      { label: 'Batch', value: batch.batch_number || '' },
-      { label: 'Prepared', value: prepared },
-      { label: 'Expiry', value: expiry },
-      { label: 'Qty', value: qty },
-      { label: 'By', value: batch.prepared_by || '' },
-      { label: 'Loc', value: batch.storage_location || '' },
-    ],
+    rows,
     qr: withQr,
     qr_value: (opts.scanUrl && opts.scanUrl.trim()) || batch.barcode || '',
     width_mm: widthMm,
     height_mm: heightMm,
+    // Base title 15px × title_scale, base field 9px × field_scale
+    // (field_scale 1.4 ⇒ ~13px, title_scale 1.3 ⇒ ~20px).
+    title_px: Math.round(15 * design.title_scale),
+    field_px: Math.round(9 * design.field_scale),
+    barcode_height: Math.round(Math.min(90, Math.max(20, design.barcode_height))),
+    show_barcode_text: design.show_barcode_text,
   };
 }

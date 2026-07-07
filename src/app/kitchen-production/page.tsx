@@ -29,10 +29,27 @@ import { api } from '@/lib/api';
 import { fmtIST, fmtISTDate, todayIST, fmtISTIsoDate } from '@/lib/format-date';
 import { parseDateTime } from '@/lib/production-batch';
 import { bridgePrint } from '@/lib/offline-print/bridge-client';
-import { labelPreview } from '@/lib/tspl-label';
-import type { LabelPrinterConfig } from '@/lib/tspl-label';
-import JsBarcode from 'jsbarcode';
-import QRCode from 'qrcode';
+import { labelPreview, LABEL_FIELD_KEYS } from '@/lib/tspl-label';
+import type { LabelPrinterConfig, LabelBatch, LabelFieldKey } from '@/lib/tspl-label';
+import LabelCanvas from '@/components/LabelCanvas';
+
+// Representative batch used to render the live label-design preview.
+const SAMPLE_LABEL_BATCH: LabelBatch = {
+  item_name: 'Chicken Gravy',
+  batch_number: 'CG260707001',
+  barcode: 'PROD000123',
+  production_date: '07 Jul 26',
+  production_time: '14:30',
+  expiry_date: '09 Jul 26',
+  expiry_time: '14:30',
+  quantity_produced: 5,
+  unit: 'kg',
+  prepared_by: 'Suresh',
+  storage_location: 'Cold Room 2',
+};
+const LABEL_FIELD_LABELS: Record<LabelFieldKey, string> = {
+  batch: 'Batch #', prepared: 'Prepared', expiry: 'Expiry', qty: 'Qty', by: 'Prepared by', loc: 'Location',
+};
 
 // ─── Types ──────────────────────────────────────────────────────────────
 interface Batch {
@@ -1237,29 +1254,13 @@ function LabelPreviewModal({ batch, cfg, onClose }: {
   const [qr, setQr] = useState<boolean>(!!cfg?.qr);
   const widthMm = cfg?.label_width_mm || 50;
   const heightMm = cfg?.label_height_mm || 40;
-  const pv = labelPreview(batch, { qr, labelWidthMm: widthMm, labelHeightMm: heightMm });
-  const SCALE = 7;
-  const w = widthMm * SCALE, h = heightMm * SCALE;
-
-  const barcodeRef = useRef<SVGSVGElement | null>(null);
-  const qrRef = useRef<HTMLCanvasElement | null>(null);
-
-  useEffect(() => {
-    if (barcodeRef.current && pv.barcode) {
-      try {
-        JsBarcode(barcodeRef.current, pv.barcode, {
-          format: 'CODE128', displayValue: true, height: 34, width: 1.4,
-          margin: 0, fontSize: 12, textMargin: 1,
-        });
-      } catch { /* invalid content → leave blank */ }
-    }
-  }, [pv.barcode]);
-
-  useEffect(() => {
-    if (qr && qrRef.current && pv.qr_value) {
-      QRCode.toCanvas(qrRef.current, pv.qr_value, { width: 76, margin: 0 }).catch(() => {});
-    }
-  }, [qr, pv.qr_value]);
+  // Same `design` the printer uses → the preview matches the printed label.
+  const pv = labelPreview(batch, {
+    qr,
+    labelWidthMm: widthMm,
+    labelHeightMm: heightMm,
+    design: cfg?.design,
+  });
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
@@ -1273,32 +1274,7 @@ function LabelPreviewModal({ batch, cfg, onClose }: {
         <div className="p-5 space-y-4">
           <div className="text-[11px] text-[#8B7355] text-center">{widthMm} × {heightMm} mm · preview only (not printed)</div>
           <div className="flex justify-center">
-            <div className="relative bg-white border border-[#2D1B0E] overflow-hidden" style={{ width: w, height: h }}>
-              <div className="absolute inset-0 p-2 flex flex-col">
-                {/* item name */}
-                <div className={qr ? 'pr-[84px]' : ''}>
-                  {pv.item_name_lines.map((ln, i) => (
-                    <div key={i} className="font-bold text-[#111] leading-tight" style={{ fontSize: 15 }}>{ln}</div>
-                  ))}
-                </div>
-                {/* QR */}
-                {qr && pv.qr_value && (
-                  <canvas ref={qrRef} className="absolute top-2 right-2" width={76} height={76} />
-                )}
-                {/* detail rows */}
-                <div className="mt-1 space-y-0.5">
-                  {pv.rows.map((r, i) => (
-                    <div key={i} className="text-[#111] leading-tight truncate" style={{ fontSize: 9 }}>
-                      <span className="font-semibold">{r.label}:</span> {r.value || '—'}
-                    </div>
-                  ))}
-                </div>
-                {/* barcode */}
-                <div className="mt-auto flex justify-center">
-                  {pv.barcode ? <svg ref={barcodeRef} /> : <span className="text-[9px] text-gray-400">no barcode</span>}
-                </div>
-              </div>
-            </div>
+            <LabelCanvas preview={pv} scale={7} />
           </div>
           <label className="flex items-center justify-center gap-2 text-sm text-[#6B5744]">
             <input type="checkbox" checked={qr} onChange={e => setQr(e.target.checked)} className="accent-[#af4408]" />
@@ -1327,8 +1303,15 @@ function PrinterSettingsModal({ onClose, onSaved }: {
       .finally(() => setLoading(false));
   }, []);
 
+  const [tab, setTab] = useState<'printer' | 'design'>('printer');
+
   const set = <K extends keyof LabelPrinterConfig>(k: K, v: LabelPrinterConfig[K]) =>
     setCfg(c => (c ? { ...c, [k]: v } : c));
+  // Patch a sub-field of the label design (font sizes, barcode, toggles).
+  const setDesign = <K extends keyof LabelPrinterConfig['design']>(k: K, v: LabelPrinterConfig['design'][K]) =>
+    setCfg(c => (c ? { ...c, design: { ...c.design, [k]: v } } : c));
+  const setField = (k: LabelFieldKey, v: boolean) =>
+    setCfg(c => (c ? { ...c, design: { ...c.design, fields: { ...c.design.fields, [k]: v } } } : c));
 
   const save = async () => {
     if (!cfg) return;
@@ -1343,12 +1326,22 @@ function PrinterSettingsModal({ onClose, onSaved }: {
     finally { setSaving(false); }
   };
 
+  // Live preview of the current design (same renderer + config the printer uses).
+  const designPreview = cfg
+    ? labelPreview(SAMPLE_LABEL_BATCH, {
+        qr: cfg.qr,
+        labelWidthMm: cfg.label_width_mm,
+        labelHeightMm: cfg.label_height_mm,
+        design: cfg.design,
+      })
+    : null;
+
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
-      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md shadow-xl my-4" onClick={e => e.stopPropagation()}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-2xl shadow-xl my-4" onClick={e => e.stopPropagation()}>
         <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between">
           <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
-            <Settings className="w-5 h-5 text-[#af4408]" /> Label Printer Settings
+            <Settings className="w-5 h-5 text-[#af4408]" /> Label Printer &amp; Design
           </div>
           <button onClick={onClose} disabled={saving} className="text-[#8B7355] hover:text-[#2D1B0E] disabled:opacity-50"><X className="w-5 h-5" /></button>
         </div>
@@ -1357,54 +1350,119 @@ function PrinterSettingsModal({ onClose, onSaved }: {
           <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
         ) : cfg ? (
           <>
-            <div className="p-5 space-y-4">
-              <div className="grid grid-cols-2 gap-3">
-                <Field label="Mode">
-                  <select value={cfg.mode} onChange={e => set('mode', e.target.value as LabelPrinterConfig['mode'])} className={inputCls}>
-                    <option value="tspl">TSPL (TE210 native)</option>
-                    <option value="bartender">BarTender</option>
-                  </select>
-                </Field>
-                <Field label="Transport">
-                  <select value={cfg.transport} onChange={e => set('transport', e.target.value as LabelPrinterConfig['transport'])} className={inputCls}>
-                    <option value="usb">USB</option>
-                    <option value="ip">Network (IP)</option>
-                  </select>
-                </Field>
+            <div className="px-5 pt-4">
+              <div className="flex gap-1 bg-[#FFF1E3] rounded-xl p-1 w-fit">
+                {([['printer', 'Printer', Printer], ['design', 'Label design', Eye]] as const).map(([k, label, Icon]) => (
+                  <button key={k} type="button" onClick={() => setTab(k)}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold ${tab === k ? 'bg-[#af4408] text-white' : 'text-[#6B5744]'}`}>
+                    <Icon className="w-4 h-4" /> {label}
+                  </button>
+                ))}
               </div>
-              <Field label={cfg.transport === 'ip' ? 'Target (host:port)' : 'Target (USB queue / share name)'}>
-                <input value={cfg.target} onChange={e => set('target', e.target.value)}
-                       placeholder={cfg.transport === 'ip' ? '192.168.1.60:9100' : 'TE210'} className={inputCls} />
-              </Field>
-              <div className="grid grid-cols-3 gap-3">
-                <Field label="Width (mm)">
-                  <input type="number" min={1} value={cfg.label_width_mm} onChange={e => set('label_width_mm', Number(e.target.value))} className={inputCls} />
-                </Field>
-                <Field label="Height (mm)">
-                  <input type="number" min={1} value={cfg.label_height_mm} onChange={e => set('label_height_mm', Number(e.target.value))} className={inputCls} />
-                </Field>
-                <Field label="Copies">
-                  <input type="number" min={1} value={cfg.copies} onChange={e => set('copies', Number(e.target.value))} className={inputCls} />
-                </Field>
-              </div>
-              <div className="flex flex-col gap-2">
-                <label className="flex items-center gap-2 text-sm text-[#6B5744]">
-                  <input type="checkbox" checked={cfg.qr} onChange={e => set('qr', e.target.checked)} className="accent-[#af4408]" />
-                  Add a QR code to every label by default
-                </label>
-                <label className="flex items-center gap-2 text-sm text-[#6B5744]">
-                  <input type="checkbox" checked={cfg.print_preview} onChange={e => set('print_preview', e.target.checked)} className="accent-[#af4408]" />
-                  Show preview before printing
-                </label>
-              </div>
-              {cfg.mode === 'bartender' && (
-                <Field label="BarTender template (.btw)">
-                  <input value={cfg.bartender_template} onChange={e => set('bartender_template', e.target.value)}
-                         placeholder="C:\labels\batch.btw" className={inputCls} />
-                </Field>
-              )}
-              {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
             </div>
+
+            {tab === 'printer' ? (
+              <div className="p-5 space-y-4">
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Mode">
+                    <select value={cfg.mode} onChange={e => set('mode', e.target.value as LabelPrinterConfig['mode'])} className={inputCls}>
+                      <option value="tspl">TSPL (TE210 native)</option>
+                      <option value="bartender">BarTender</option>
+                    </select>
+                  </Field>
+                  <Field label="Transport">
+                    <select value={cfg.transport} onChange={e => set('transport', e.target.value as LabelPrinterConfig['transport'])} className={inputCls}>
+                      <option value="usb">USB</option>
+                      <option value="ip">Network (IP)</option>
+                    </select>
+                  </Field>
+                </div>
+                <Field label={cfg.transport === 'ip' ? 'Target (host:port)' : 'Target (USB queue / share name)'}>
+                  <input value={cfg.target} onChange={e => set('target', e.target.value)}
+                         placeholder={cfg.transport === 'ip' ? '192.168.1.60:9100' : 'TE210'} className={inputCls} />
+                </Field>
+                <div className="grid grid-cols-3 gap-3">
+                  <Field label="Width (mm)">
+                    <input type="number" min={1} value={cfg.label_width_mm} onChange={e => set('label_width_mm', Number(e.target.value))} className={inputCls} />
+                  </Field>
+                  <Field label="Height (mm)">
+                    <input type="number" min={1} value={cfg.label_height_mm} onChange={e => set('label_height_mm', Number(e.target.value))} className={inputCls} />
+                  </Field>
+                  <Field label="Copies">
+                    <input type="number" min={1} value={cfg.copies} onChange={e => set('copies', Number(e.target.value))} className={inputCls} />
+                  </Field>
+                </div>
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-center gap-2 text-sm text-[#6B5744]">
+                    <input type="checkbox" checked={cfg.qr} onChange={e => set('qr', e.target.checked)} className="accent-[#af4408]" />
+                    Add a QR code to every label by default
+                  </label>
+                  <label className="flex items-center gap-2 text-sm text-[#6B5744]">
+                    <input type="checkbox" checked={cfg.print_preview} onChange={e => set('print_preview', e.target.checked)} className="accent-[#af4408]" />
+                    Show preview before printing
+                  </label>
+                </div>
+                {cfg.mode === 'bartender' && (
+                  <Field label="BarTender template (.btw)">
+                    <input value={cfg.bartender_template} onChange={e => set('bartender_template', e.target.value)}
+                           placeholder="C:\labels\batch.btw" className={inputCls} />
+                  </Field>
+                )}
+              </div>
+            ) : (
+              <div className="p-5 grid md:grid-cols-2 gap-5 items-start">
+                {/* Design controls */}
+                <div className="space-y-4">
+                  <p className="text-xs text-[#8B7355]">Sizes apply to both the on-screen preview and the printed label. The label prints with a 2 mm safe margin and rounded corners.</p>
+                  <div>
+                    <div className="flex items-center justify-between text-sm font-semibold text-[#8B7355]">
+                      <span>Item name size</span><span className="text-[#af4408]">{cfg.design.title_scale.toFixed(1)}×</span>
+                    </div>
+                    <input type="range" min={0.8} max={3} step={0.1} value={cfg.design.title_scale}
+                           onChange={e => setDesign('title_scale', Number(e.target.value))} className="w-full accent-[#af4408]" />
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between text-sm font-semibold text-[#8B7355]">
+                      <span>Detail text size (Batch / Prepared / Expiry / Qty / By / Loc)</span><span className="text-[#af4408]">{cfg.design.field_scale.toFixed(1)}×</span>
+                    </div>
+                    <input type="range" min={0.8} max={3} step={0.1} value={cfg.design.field_scale}
+                           onChange={e => setDesign('field_scale', Number(e.target.value))} className="w-full accent-[#af4408]" />
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between text-sm font-semibold text-[#8B7355]">
+                      <span>Barcode height</span><span className="text-[#af4408]">{cfg.design.barcode_height} dots</span>
+                    </div>
+                    <input type="range" min={20} max={90} step={2} value={cfg.design.barcode_height}
+                           onChange={e => setDesign('barcode_height', Number(e.target.value))} className="w-full accent-[#af4408]" />
+                  </div>
+                  <label className="flex items-center gap-2 text-sm text-[#6B5744]">
+                    <input type="checkbox" checked={cfg.design.show_barcode_text} onChange={e => setDesign('show_barcode_text', e.target.checked)} className="accent-[#af4408]" />
+                    Print the barcode number under the bars
+                  </label>
+                  <div>
+                    <div className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-1">Show fields</div>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {LABEL_FIELD_KEYS.map(k => (
+                        <label key={k} className="flex items-center gap-2 text-sm text-[#6B5744]">
+                          <input type="checkbox" checked={cfg.design.fields[k]} onChange={e => setField(k, e.target.checked)} className="accent-[#af4408]" />
+                          {LABEL_FIELD_LABELS[k]}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                {/* Live preview */}
+                <div>
+                  <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-2 text-center">Live preview · {cfg.label_width_mm} × {cfg.label_height_mm} mm</p>
+                  <div className="flex justify-center">
+                    {designPreview && <LabelCanvas preview={designPreview} scale={7} />}
+                  </div>
+                  <p className="text-[11px] text-[#8B7355] text-center mt-2">Sample data — real batches fill their own values.</p>
+                </div>
+              </div>
+            )}
+
+            {error && <div className="mx-5 mb-2 bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
             <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
               <button onClick={onClose} disabled={saving} className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Cancel</button>
               <button onClick={save} disabled={saving} className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-50">
