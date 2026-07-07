@@ -1015,12 +1015,24 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                     <div className="md:col-span-3">
                       <div className="flex items-start gap-2">
                         <div className="flex-1 min-w-0">
-                          <MaterialTypeahead
-                            materials={materials}
-                            value={it.material_id}
-                            excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
-                            onPick={(id) => { const m = materials.find(x => x.id === id); update(i, { material_id: id, unit: (m?.purchase_unit || m?.unit || '') }); }}
-                          />
+                          {isEditing && it.material_id ? (
+                            // Editing a draft: a chosen material is LOCKED (read-only text,
+                            // no dropdown, no clear ×). To swap it, delete the line (trash)
+                            // and add a new one — so only the current selection ever shows.
+                            <div title="To change the material, delete this line and add a new one"
+                                 className="w-full text-left px-2 py-1 text-xs border border-[#E8D5C4] rounded bg-[#F5EDE3] text-[#2D1B0E] break-words leading-snug cursor-not-allowed">
+                              {mat?.sku && <span className="text-[#8B7355] font-mono">{mat.sku} — </span>}
+                              <span>{mat?.name || '(material removed)'}</span>
+                              {mat?.unit && <span className="text-[#8B7355]"> ({mat.unit})</span>}
+                            </div>
+                          ) : (
+                            <MaterialTypeahead
+                              materials={materials}
+                              value={it.material_id}
+                              excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
+                              onPick={(id) => { const m = materials.find(x => x.id === id); update(i, { material_id: id, unit: (m?.purchase_unit || m?.unit || '') }); }}
+                            />
+                          )}
                           {mat?.category && <div className="text-[9px] text-[#8B7355] mt-0.5">{mat.category}</div>}
                         </div>
                         {/* delete — inline on mobile (top-right of the card) */}
