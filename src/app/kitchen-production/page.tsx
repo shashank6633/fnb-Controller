@@ -17,13 +17,19 @@
  *   GET  /api/kitchen-production/[id]
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ChefHat, Plus, Loader2, RefreshCw, Search, X, Package, Clock, MapPin,
   User as UserIcon, AlertTriangle, CheckCircle2, History, Barcode as BarcodeIcon,
+  Printer, Settings, Eye, Copy, CheckSquare, Square, Save, CheckCircle,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { fmtIST, fmtISTDate, todayIST } from '@/lib/format-date';
+import { bridgePrint } from '@/lib/offline-print/bridge-client';
+import { labelPreview } from '@/lib/tspl-label';
+import type { LabelPrinterConfig } from '@/lib/tspl-label';
+import JsBarcode from 'jsbarcode';
+import QRCode from 'qrcode';
 
 // ─── Types ──────────────────────────────────────────────────────────────
 interface Batch {
@@ -131,6 +137,35 @@ const blankForm = (preparedBy = ''): FormState => ({
   recipe_id: '', remarks: '',
 });
 
+// ─── Label printing ──────────────────────────────────────────────────────
+// Ask the server for the batch's TSPL2 label, then forward it to the on-box
+// print bridge (localhost:9920) EXACTLY like the KOT/bill flow: same bridgePrint
+// helper, a raw `tspl` doc the bridge (v2.4.0+) sends to the TE210 verbatim.
+type PrintOpts = { reprint?: boolean; copies?: number; qr?: boolean };
+
+async function printLabelViaBridge(id: string, opts: PrintOpts = {}): Promise<void> {
+  const body: Record<string, any> = { reprint: !!opts.reprint };
+  if (opts.copies != null) body.copies = opts.copies;
+  if (opts.qr !== undefined) body.qr = opts.qr;
+
+  const r = await api(`/api/kitchen-production/${id}/print`, { method: 'POST', body });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+
+  const printer = j.printer as LabelPrinterConfig;
+  let res;
+  try {
+    res = await bridgePrint({
+      jobId: `label_${id}_${Date.now()}`,
+      printer: { transport: printer.transport, target: printer.target },
+      doc: { type: 'tspl', payload: j.tspl },
+    });
+  } catch (e: any) {
+    throw new Error(`Print bridge not reachable at localhost:9920 — is the counter print agent running? (${e?.message || e})`);
+  }
+  if (!res.ok) throw new Error(res.error || 'Printer rejected the label');
+}
+
 // ─── Page ───────────────────────────────────────────────────────────────
 export default function KitchenProductionPage() {
   const [batches, setBatches] = useState<Batch[]>([]);
@@ -153,20 +188,96 @@ export default function KitchenProductionPage() {
 
   // Reference data
   const [meName, setMeName] = useState('');
+  const [isAdmin, setIsAdmin] = useState(false);
   const [recipes, setRecipes] = useState<RecipeOpt[]>([]);
+  const [printerCfg, setPrinterCfg] = useState<LabelPrinterConfig | null>(null);
 
-  // One-shot: current user (for prepared_by default) + recipes for the dropdown.
+  // Label printing UI state
+  const [printingId, setPrintingId] = useState<string | null>(null);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkPrinting, setBulkPrinting] = useState(false);
+  const [previewBatch, setPreviewBatch] = useState<Batch | null>(null);
+  const [showPrinterSettings, setShowPrinterSettings] = useState(false);
+  const [justCreated, setJustCreated] = useState<{ id: string; batch_number: string } | null>(null);
+
+  // Toast
+  const [toast, setToast] = useState<{ msg: string; kind: 'ok' | 'err' } | null>(null);
+  const toastTimer = useRef<number | null>(null);
+  const showToast = (msg: string, kind: 'ok' | 'err' = 'ok') => {
+    setToast({ msg, kind });
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 3800);
+  };
+
+  const loadPrinterCfg = () => {
+    fetch('/api/settings/label-printer', { credentials: 'same-origin' })
+      .then(r => r.json()).then(d => { if (d?.printer) setPrinterCfg(d.printer); }).catch(() => {});
+  };
+
+  // One-shot: current user (for prepared_by default) + recipes for the dropdown
+  // + the saved label-printer config (dimensions / qr default for previews).
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => {
       const n = d?.user?.name || d?.user?.email || '';
       setMeName(n);
+      setIsAdmin(d?.user?.role === 'admin');
       setForm(f => (f.prepared_by ? f : { ...f, prepared_by: n }));
     }).catch(() => {});
     fetch('/api/recipes').then(r => r.json()).then(d => {
       const list: any[] = Array.isArray(d) ? d : (d.recipes || d.list || d.items || []);
       setRecipes(list.map((r: any) => ({ id: r.id, name: r.name })).filter(r => r.id && r.name));
     }).catch(() => {});
+    loadPrinterCfg();
   }, []);
+
+  // Print one batch's label (reprint flag flows through to the transaction type).
+  const handlePrint = async (id: string, reprint: boolean) => {
+    setPrintingId(id);
+    try {
+      await printLabelViaBridge(id, { reprint });
+      showToast(reprint ? 'Label reprinted' : 'Label sent to printer', 'ok');
+    } catch (e: any) {
+      showToast(e?.message || 'Print failed', 'err');
+    } finally {
+      setPrintingId(null);
+    }
+  };
+
+  const toggleSelect = (id: string) =>
+    setSelected(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const exitSelect = () => { setSelectMode(false); setSelected(new Set()); };
+
+  // Bulk print: one API call → then forward each job's tspl to the bridge in order.
+  const bulkPrint = async () => {
+    const ids = Array.from(selected);
+    if (!ids.length) return;
+    setBulkPrinting(true);
+    try {
+      const r = await api('/api/kitchen-production/print-bulk', { method: 'POST', body: { ids } });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      const printer = j.printer as LabelPrinterConfig;
+      const jobs: Array<{ id: string; batch_number: string; tspl: string }> = Array.isArray(j.jobs) ? j.jobs : [];
+      let ok = 0, fail = 0;
+      for (const job of jobs) {
+        try {
+          const res = await bridgePrint({
+            jobId: `label_${job.id}_${Date.now()}`,
+            printer: { transport: printer.transport, target: printer.target },
+            doc: { type: 'tspl', payload: job.tspl },
+          });
+          res.ok ? ok++ : fail++;
+        } catch { fail++; }
+      }
+      showToast(`Printed ${ok}/${jobs.length} label${jobs.length === 1 ? '' : 's'}${fail ? ` — ${fail} failed (bridge?)` : ''}`, fail ? 'err' : 'ok');
+      exitSelect();
+    } catch (e: any) {
+      showToast(e?.message || 'Bulk print failed', 'err');
+    } finally {
+      setBulkPrinting(false);
+    }
+  };
 
   const reload = async () => {
     setLoading(true); setError(null);
@@ -235,6 +346,7 @@ export default function KitchenProductionPage() {
       if (!r.ok) { setFormError(j.error || 'Failed to save batch'); return; }
       setShowForm(false);
       setRefreshKey(k => k + 1);
+      if (j?.batch?.id) setJustCreated({ id: j.batch.id, batch_number: j.batch.batch_number || '' });
     } catch (e: any) { setFormError(e.message || 'Failed to save batch'); }
     finally { setSaving(false); }
   };
@@ -254,9 +366,16 @@ export default function KitchenProductionPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {isAdmin && (
+            <button onClick={() => setShowPrinterSettings(true)}
+                    title="Label printer settings"
+                    className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+              <Settings className="w-4 h-4" /> <span className="hidden sm:inline">Printer</span>
+            </button>
+          )}
           <button onClick={() => setRefreshKey(k => k + 1)}
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
-            <RefreshCw className="w-4 h-4" /> Refresh
+            <RefreshCw className="w-4 h-4" /> <span className="hidden sm:inline">Refresh</span>
           </button>
           <button onClick={openNewForm}
                   className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center gap-2">
@@ -290,6 +409,40 @@ export default function KitchenProductionPage() {
         </select>
       </div>
 
+      {/* Bulk-select action bar */}
+      {!loading && batches.length > 0 && (
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="text-xs text-[#8B7355]">
+            {batches.length} batch{batches.length === 1 ? '' : 'es'}
+            {selectMode && <> · <span className="font-semibold text-[#af4408]">{selected.size} selected</span></>}
+          </div>
+          <div className="flex items-center gap-2">
+            {!selectMode ? (
+              <button onClick={() => setSelectMode(true)}
+                      className="px-3 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+                <CheckSquare className="w-4 h-4" /> Select
+              </button>
+            ) : (
+              <>
+                <button onClick={() => setSelected(new Set(batches.map(b => b.id)))}
+                        className="px-3 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm">
+                  Select all
+                </button>
+                <button onClick={bulkPrint} disabled={!selected.size || bulkPrinting}
+                        className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-50">
+                  {bulkPrinting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Printer className="w-4 h-4" />}
+                  Print selected ({selected.size})
+                </button>
+                <button onClick={exitSelect} disabled={bulkPrinting}
+                        className="px-3 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
+                  Cancel
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {error && <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">{error}</div>}
 
       {/* Cards */}
@@ -309,7 +462,18 @@ export default function KitchenProductionPage() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           {batches.map(b => (
-            <BatchCard key={b.id} batch={b} onOpen={() => setDetailId(b.id)} />
+            <BatchCard
+              key={b.id}
+              batch={b}
+              onOpen={() => setDetailId(b.id)}
+              selectMode={selectMode}
+              selected={selected.has(b.id)}
+              onToggleSelect={() => toggleSelect(b.id)}
+              onPrint={() => handlePrint(b.id, false)}
+              onReprint={() => handlePrint(b.id, true)}
+              onPreview={() => setPreviewBatch(b)}
+              printing={printingId === b.id}
+            />
           ))}
         </div>
       )}
@@ -329,17 +493,80 @@ export default function KitchenProductionPage() {
       {detailId && (
         <BatchDetailDrawer id={detailId} onClose={() => setDetailId(null)} />
       )}
+
+      {/* Just-created → one-click print */}
+      {justCreated && (
+        <JustCreatedModal
+          batchNumber={justCreated.batch_number}
+          onClose={() => setJustCreated(null)}
+          onPrint={async () => {
+            const id = justCreated.id;
+            setPrintingId(id);
+            try {
+              await printLabelViaBridge(id, {});
+              showToast('Label sent to printer', 'ok');
+              setJustCreated(null);
+            } catch (e: any) {
+              showToast(e?.message || 'Print failed', 'err');
+            } finally { setPrintingId(null); }
+          }}
+          printing={printingId === justCreated.id}
+        />
+      )}
+
+      {/* Preview (WYSIWYG, no printing) */}
+      {previewBatch && (
+        <LabelPreviewModal
+          batch={previewBatch}
+          cfg={printerCfg}
+          onClose={() => setPreviewBatch(null)}
+        />
+      )}
+
+      {/* Printer settings (admin) */}
+      {showPrinterSettings && (
+        <PrinterSettingsModal
+          onClose={() => setShowPrinterSettings(false)}
+          onSaved={(cfg) => { setPrinterCfg(cfg); showToast('Printer settings saved', 'ok'); }}
+        />
+      )}
+
+      {/* Toast */}
+      {toast && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[60] max-w-[92vw]">
+          <div className={`px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium flex items-center gap-2 border ${
+            toast.kind === 'ok'
+              ? 'bg-emerald-600 text-white border-emerald-700'
+              : 'bg-red-600 text-white border-red-700'}`}>
+            {toast.kind === 'ok' ? <CheckCircle className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+            <span>{toast.msg}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 // ─── Batch card ─────────────────────────────────────────────────────────
-function BatchCard({ batch, onOpen }: { batch: Batch; onOpen: () => void }) {
+function BatchCard({
+  batch, onOpen, selectMode, selected, onToggleSelect, onPrint, onReprint, onPreview, printing,
+}: {
+  batch: Batch; onOpen: () => void;
+  selectMode: boolean; selected: boolean; onToggleSelect: () => void;
+  onPrint: () => void; onReprint: () => void; onPreview: () => void; printing: boolean;
+}) {
   const tone = EXPIRY_TONE[batch.expiry_status] || EXPIRY_TONE.green;
   const remaining = batch.remaining_quantity ?? Math.max(0, batch.quantity_produced - batch.quantity_consumed);
+  const stop = (e: React.MouseEvent) => e.stopPropagation();
   return (
-    <button onClick={onOpen}
-            className={`text-left bg-white border-2 ${tone.border} rounded-xl p-4 hover:shadow-md transition-shadow flex flex-col gap-3`}>
+    <div onClick={() => (selectMode ? onToggleSelect() : onOpen())}
+         className={`relative text-left bg-white border-2 rounded-xl p-4 ${selectMode ? 'pl-9' : ''} hover:shadow-md transition-shadow flex flex-col gap-3 cursor-pointer ${
+           selected ? 'border-[#af4408] ring-2 ring-[#af4408]/30' : tone.border}`}>
+      {selectMode && (
+        <div className="absolute top-3 left-2.5">
+          {selected ? <CheckSquare className="w-5 h-5 text-[#af4408]" /> : <Square className="w-5 h-5 text-[#8B7355]" />}
+        </div>
+      )}
       {/* Top row: item + status/FIFO badges */}
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
@@ -410,7 +637,24 @@ function BatchCard({ batch, onOpen }: { batch: Batch; onOpen: () => void }) {
           )}
         </div>
       </div>
-    </button>
+
+      {/* Label actions */}
+      <div className="flex items-center gap-1.5 border-t border-[#E8D5C4] pt-2" onClick={stop}>
+        <button onClick={onPrint} disabled={printing}
+                className="flex-1 px-2 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 disabled:opacity-50">
+          {printing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Printer className="w-3.5 h-3.5" />}
+          Print label
+        </button>
+        <button onClick={onReprint} disabled={printing} title="Reprint label"
+                className="px-2 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-xs flex items-center gap-1 disabled:opacity-50">
+          <Copy className="w-3.5 h-3.5" /> Reprint
+        </button>
+        <button onClick={onPreview} title="Preview label"
+                className="px-2 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-xs flex items-center gap-1">
+          <Eye className="w-3.5 h-3.5" /> Preview
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -711,6 +955,227 @@ function Detail({ label, value, strong, capitalize }: { label: string; value: st
     <div>
       <div className="text-[11px] text-[#8B7355]">{label}</div>
       <div className={`${strong ? 'font-bold text-emerald-700' : 'text-[#2D1B0E]'} ${capitalize ? 'capitalize' : ''}`}>{value}</div>
+    </div>
+  );
+}
+
+// ─── Just-created → one-click print ───────────────────────────────────────
+function JustCreatedModal({ batchNumber, onClose, onPrint, printing }: {
+  batchNumber: string; onClose: () => void; onPrint: () => void; printing: boolean;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-sm shadow-xl p-5 text-center" onClick={e => e.stopPropagation()}>
+        <div className="w-12 h-12 rounded-full bg-emerald-100 flex items-center justify-center mx-auto mb-3">
+          <CheckCircle2 className="w-6 h-6 text-emerald-600" />
+        </div>
+        <div className="font-semibold text-[#2D1B0E]">Batch created</div>
+        {batchNumber && <div className="font-mono text-sm text-[#af4408] mt-1">{batchNumber}</div>}
+        <p className="text-xs text-[#8B7355] mt-2">Print the label now, or later from the card.</p>
+        <div className="flex items-center gap-2 mt-4">
+          <button onClick={onClose} disabled={printing}
+                  className="flex-1 px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
+            Later
+          </button>
+          <button onClick={onPrint} disabled={printing}
+                  className="flex-1 px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50">
+            {printing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Printer className="w-4 h-4" />}
+            Print label
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Label preview (WYSIWYG; does NOT print) ──────────────────────────────
+// Renders the 50×40 mm label using labelPreview() data — the CODE128 via
+// jsbarcode, the QR via the qrcode lib — at true label proportions.
+function LabelPreviewModal({ batch, cfg, onClose }: {
+  batch: Batch; cfg: LabelPrinterConfig | null; onClose: () => void;
+}) {
+  const [qr, setQr] = useState<boolean>(!!cfg?.qr);
+  const widthMm = cfg?.label_width_mm || 50;
+  const heightMm = cfg?.label_height_mm || 40;
+  const pv = labelPreview(batch, { qr, labelWidthMm: widthMm, labelHeightMm: heightMm });
+  const SCALE = 7;
+  const w = widthMm * SCALE, h = heightMm * SCALE;
+
+  const barcodeRef = useRef<SVGSVGElement | null>(null);
+  const qrRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    if (barcodeRef.current && pv.barcode) {
+      try {
+        JsBarcode(barcodeRef.current, pv.barcode, {
+          format: 'CODE128', displayValue: true, height: 34, width: 1.4,
+          margin: 0, fontSize: 12, textMargin: 1,
+        });
+      } catch { /* invalid content → leave blank */ }
+    }
+  }, [pv.barcode]);
+
+  useEffect(() => {
+    if (qr && qrRef.current && pv.qr_value) {
+      QRCode.toCanvas(qrRef.current, pv.qr_value, { width: 76, margin: 0 }).catch(() => {});
+    }
+  }, [qr, pv.qr_value]);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+            <Eye className="w-5 h-5 text-[#af4408]" /> Label Preview
+          </div>
+          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="p-5 space-y-4">
+          <div className="text-[11px] text-[#8B7355] text-center">{widthMm} × {heightMm} mm · preview only (not printed)</div>
+          <div className="flex justify-center">
+            <div className="relative bg-white border border-[#2D1B0E] overflow-hidden" style={{ width: w, height: h }}>
+              <div className="absolute inset-0 p-2 flex flex-col">
+                {/* item name */}
+                <div className={qr ? 'pr-[84px]' : ''}>
+                  {pv.item_name_lines.map((ln, i) => (
+                    <div key={i} className="font-bold text-[#111] leading-tight" style={{ fontSize: 15 }}>{ln}</div>
+                  ))}
+                </div>
+                {/* QR */}
+                {qr && pv.qr_value && (
+                  <canvas ref={qrRef} className="absolute top-2 right-2" width={76} height={76} />
+                )}
+                {/* detail rows */}
+                <div className="mt-1 space-y-0.5">
+                  {pv.rows.map((r, i) => (
+                    <div key={i} className="text-[#111] leading-tight truncate" style={{ fontSize: 9 }}>
+                      <span className="font-semibold">{r.label}:</span> {r.value || '—'}
+                    </div>
+                  ))}
+                </div>
+                {/* barcode */}
+                <div className="mt-auto flex justify-center">
+                  {pv.barcode ? <svg ref={barcodeRef} /> : <span className="text-[9px] text-gray-400">no barcode</span>}
+                </div>
+              </div>
+            </div>
+          </div>
+          <label className="flex items-center justify-center gap-2 text-sm text-[#6B5744]">
+            <input type="checkbox" checked={qr} onChange={e => setQr(e.target.checked)} className="accent-[#af4408]" />
+            Show QR code
+          </label>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Printer settings (admin) ─────────────────────────────────────────────
+function PrinterSettingsModal({ onClose, onSaved }: {
+  onClose: () => void; onSaved: (cfg: LabelPrinterConfig) => void;
+}) {
+  const [cfg, setCfg] = useState<LabelPrinterConfig | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch('/api/settings/label-printer', { credentials: 'same-origin' })
+      .then(r => r.json())
+      .then(d => { if (d?.printer) setCfg(d.printer); else setError(d?.error || 'Failed to load'); })
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const set = <K extends keyof LabelPrinterConfig>(k: K, v: LabelPrinterConfig[K]) =>
+    setCfg(c => (c ? { ...c, [k]: v } : c));
+
+  const save = async () => {
+    if (!cfg) return;
+    setSaving(true); setError(null);
+    try {
+      const r = await api('/api/settings/label-printer', { method: 'POST', body: { printer: cfg } });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      onSaved(j.printer);
+      onClose();
+    } catch (e: any) { setError(e?.message || 'Failed to save'); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md shadow-xl my-4" onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+            <Settings className="w-5 h-5 text-[#af4408]" /> Label Printer Settings
+          </div>
+          <button onClick={onClose} disabled={saving} className="text-[#8B7355] hover:text-[#2D1B0E] disabled:opacity-50"><X className="w-5 h-5" /></button>
+        </div>
+
+        {loading ? (
+          <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
+        ) : cfg ? (
+          <>
+            <div className="p-5 space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Mode">
+                  <select value={cfg.mode} onChange={e => set('mode', e.target.value as LabelPrinterConfig['mode'])} className={inputCls}>
+                    <option value="tspl">TSPL (TE210 native)</option>
+                    <option value="bartender">BarTender</option>
+                  </select>
+                </Field>
+                <Field label="Transport">
+                  <select value={cfg.transport} onChange={e => set('transport', e.target.value as LabelPrinterConfig['transport'])} className={inputCls}>
+                    <option value="usb">USB</option>
+                    <option value="ip">Network (IP)</option>
+                  </select>
+                </Field>
+              </div>
+              <Field label={cfg.transport === 'ip' ? 'Target (host:port)' : 'Target (USB queue / share name)'}>
+                <input value={cfg.target} onChange={e => set('target', e.target.value)}
+                       placeholder={cfg.transport === 'ip' ? '192.168.1.60:9100' : 'TE210'} className={inputCls} />
+              </Field>
+              <div className="grid grid-cols-3 gap-3">
+                <Field label="Width (mm)">
+                  <input type="number" min={1} value={cfg.label_width_mm} onChange={e => set('label_width_mm', Number(e.target.value))} className={inputCls} />
+                </Field>
+                <Field label="Height (mm)">
+                  <input type="number" min={1} value={cfg.label_height_mm} onChange={e => set('label_height_mm', Number(e.target.value))} className={inputCls} />
+                </Field>
+                <Field label="Copies">
+                  <input type="number" min={1} value={cfg.copies} onChange={e => set('copies', Number(e.target.value))} className={inputCls} />
+                </Field>
+              </div>
+              <div className="flex flex-col gap-2">
+                <label className="flex items-center gap-2 text-sm text-[#6B5744]">
+                  <input type="checkbox" checked={cfg.qr} onChange={e => set('qr', e.target.checked)} className="accent-[#af4408]" />
+                  Add a QR code to every label by default
+                </label>
+                <label className="flex items-center gap-2 text-sm text-[#6B5744]">
+                  <input type="checkbox" checked={cfg.print_preview} onChange={e => set('print_preview', e.target.checked)} className="accent-[#af4408]" />
+                  Show preview before printing
+                </label>
+              </div>
+              {cfg.mode === 'bartender' && (
+                <Field label="BarTender template (.btw)">
+                  <input value={cfg.bartender_template} onChange={e => set('bartender_template', e.target.value)}
+                         placeholder="C:\labels\batch.btw" className={inputCls} />
+                </Field>
+              )}
+              {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
+            </div>
+            <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
+              <button onClick={onClose} disabled={saving} className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Cancel</button>
+              <button onClick={save} disabled={saving} className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-50">
+                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="p-6 text-sm text-red-700">{error || 'Failed to load settings.'}</div>
+        )}
+      </div>
     </div>
   );
 }

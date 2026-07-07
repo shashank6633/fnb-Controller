@@ -58,7 +58,9 @@ export async function bridgeStatus(target: string, timeoutMs = 3000): Promise<Pr
 }
 
 export type PrinterTarget = { transport: 'ip' | 'usb' | 'file'; target: string; width?: 32 | 48 };
-export type PrintDoc = Record<string, any> & { type: 'kot' | 'bill' };
+// 'tspl'/'raw' carry a ready-made command string in `payload` that the bridge
+// (v2.4.0+) sends to the printer verbatim — used for TSPL2 label jobs (TSC TE210).
+export type PrintDoc = Record<string, any> & { type: 'kot' | 'bill' | 'tspl' | 'raw' };
 export type PrintResult = { ok: boolean; jobId: string; bytes?: number; error?: string };
 
 export type BatchJob = { jobId: string; printer: PrinterTarget; doc: PrintDoc };

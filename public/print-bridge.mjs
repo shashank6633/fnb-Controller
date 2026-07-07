@@ -35,6 +35,7 @@
  *                  "target": "192.168.1.50:9100" | "POS-80" | "/tmp/out.bin",
  *                  "width": 48 },                      // 48=80mm, 32=58mm
  *     "doc": { "type": "kot" | "bill", ... }           // see renderers below
+ *            | { "type": "tspl" | "raw", "payload": "<bytes>" }  // sent verbatim
  *   }
  *
  * This file has ZERO dependencies and never touches the app or its database.
@@ -55,7 +56,7 @@ const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.3.2';   // 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
+const VERSION = '2.4.0';   // 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -359,6 +360,16 @@ function buildBill(doc, cols, doCut) {
 }
 
 function render(doc, width) {
+  // Raw passthrough for a NON-ESC/POS printer. The TSC TE210 is a direct-thermal
+  // LABEL printer that speaks TSPL2 (its own command language), so the app sends a
+  // ready-made TSPL2 command string as doc.payload with doc.type 'tspl' (or the
+  // generic 'raw'). We emit those bytes VERBATIM — no init/cut/ESC-POS wrapping —
+  // straight to the same USB/IP transports the KOT/bill path uses. `width` is
+  // irrelevant for raw jobs (the label geometry is baked into the TSPL itself).
+  if (doc.type === 'tspl' || doc.type === 'raw') {
+    const p = doc.payload != null ? doc.payload : '';
+    return Buffer.isBuffer(p) ? p : Buffer.from(String(p), 'utf8');
+  }
   const cols = Number(width) === 32 ? 32 : 48;
   const doCut = doc.cut !== false;
   if (doc.type === 'bill') return buildBill(doc, cols, doCut);
