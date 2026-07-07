@@ -1,6 +1,18 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 
+// Bar items, liquor, spirits, wine, beer, beverages and mixers are costed as
+// LIQUOR COST — never food — regardless of which department requisitioned them.
+// Lower-cased, trimmed raw_materials.category values. Keep in sync with the
+// material category vocabulary.
+const LIQUOR_CATEGORIES = [
+  'bar', 'beer', 'beverages', 'beverage', 'liquor', 'liqueur', 'spirits', 'spirit',
+  'blended-scotch', 'bourbon', 'single-malt-whiskey', 'whiskey', 'whisky', 'scotch',
+  'rum', 'vodka', 'gin', 'brandy', 'tequila', 'wine', 'red-wine', 'white-wine',
+  'champagne', 'sparkling-wine', 'syrups', 'syrup', 'crush', 'puree', 'mixers',
+  'mixer', 'mocktail', 'cocktail', 'aerated', 'soft-drink', 'soft-drinks', 'juices', 'juice',
+];
+
 /**
  * Per-party P&L.
  *
@@ -98,18 +110,20 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
   // the party's candidate names, not a single guessed one (else food cost = ₹0).
   let foodCost = 0;
   let foodItems = 0;
+  let liquorFromReqs = 0;      // Bar / liquor / beverage requisition items → liquor cost, not food
+  let liquorFromReqItems = 0;
   const names = [...new Set(
     (key.eventNames && key.eventNames.length ? key.eventNames : (key.event_name ? [key.event_name] : []))
       .map(n => String(n || '').trim()).filter(Boolean)
   )];
   if (names.length && key.event_date) {
     const ph = names.map(() => '?').join(',');
+    const lph = LIQUOR_CATEGORIES.map(() => '?').join(',');
     // ACTUALS, not estimates: cost the ISSUED quantity (what the store actually
-    // handed over) × avg price, and only for FULFILLED requisitions — so the P&L
-    // shows ₹0 until the party's materials are fulfilled, then the real issued
-    // cost. (Was quantity_requested across every non-rejected req, which counted
-    // chef-approved-but-unfulfilled requisitions at their requested — overstated.)
-    const food = db.prepare(`
+    // handed over) × avg price, only for FULFILLED requisitions. AND split by
+    // category: liquor / beer / wine / spirits / beverages / mixers are costed as
+    // LIQUOR, everything else as FOOD.
+    const runSplit = (inOrNotIn: 'IN' | 'NOT IN') => db.prepare(`
       SELECT COALESCE(SUM(ri.quantity_issued * rm.average_price), 0) AS cost,
              COUNT(CASE WHEN ri.quantity_issued > 0 THEN 1 END) AS item_count
       FROM requisitions r
@@ -119,29 +133,43 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
         AND r.event_name IN (${ph})
         AND r.event_date = ?
         AND r.status = 'fulfilled'
-    `).get(...names, key.event_date) as { cost: number; item_count: number };
+        AND LOWER(TRIM(COALESCE(rm.category, ''))) ${inOrNotIn} (${lph})
+    `).get(...names, key.event_date, ...LIQUOR_CATEGORIES) as { cost: number; item_count: number };
+    const food = runSplit('NOT IN');
     foodCost = food.cost || 0;
     foodItems = food.item_count || 0;
+    const liq = runSplit('IN');
+    liquorFromReqs = liq.cost || 0;
+    liquorFromReqItems = liq.item_count || 0;
   }
 
-  // Liquor cost from party_consumption
-  let liquorCost = 0;
-  let liquorItems = 0;
+  // Liquor cost has TWO sources that don't overlap:
+  //   1. party_consumption  — liquor drawn straight from the bar and logged on the
+  //      Liquor Consumption screen (cost snapshotted as cost_at_time).
+  //   2. requisition items in a liquor/beverage category (computed above as
+  //      liquorFromReqs) — bar/beverage materials the Bar dept requisitioned from
+  //      the store for the party. These are the "Bar items, Liquor, Beverages"
+  //      the user wants pulled out of food cost and into liquor cost.
+  let liquorFromConsumption = 0;
+  let liquorConsumptionItems = 0;
   if (key.party_unique_id) {
     const r = db.prepare(`
       SELECT COALESCE(SUM(cost_at_time), 0) AS cost, COUNT(*) AS n
       FROM party_consumption WHERE party_unique_id = ?
     `).get(key.party_unique_id) as { cost: number; n: number };
-    liquorCost = r.cost || 0;
-    liquorItems = r.n || 0;
+    liquorFromConsumption = r.cost || 0;
+    liquorConsumptionItems = r.n || 0;
   } else if (key.event_name && key.event_date) {
     const r = db.prepare(`
       SELECT COALESCE(SUM(cost_at_time), 0) AS cost, COUNT(*) AS n
       FROM party_consumption WHERE event_name = ? AND event_date = ?
     `).get(key.event_name, key.event_date) as { cost: number; n: number };
-    liquorCost = r.cost || 0;
-    liquorItems = r.n || 0;
+    liquorFromConsumption = r.cost || 0;
+    liquorConsumptionItems = r.n || 0;
   }
+
+  const liquorCost = liquorFromConsumption + liquorFromReqs;
+  const liquorItems = liquorConsumptionItems + liquorFromReqItems;
 
   const totalCost = foodCost + liquorCost;
   const profit = revenue - totalCost;
@@ -156,6 +184,8 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
     food_items: foodItems,
     liquor_cost: liquorCost,
     liquor_items: liquorItems,
+    liquor_from_consumption: liquorFromConsumption,   // logged on the Liquor Consumption screen
+    liquor_from_requisitions: liquorFromReqs,         // bar/beverage requisition items pulled out of food
     total_cost: totalCost,
     profit,
     margin,                       // 0..1 (negative possible)
