@@ -37,12 +37,14 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       qr,
       labelWidthMm: printer.label_width_mm,
       labelHeightMm: printer.label_height_mm,
+      design: printer.design,        // honor the saved Label-design config on the printed label
     });
     const preview = labelPreview(batch, {
       copies,
       qr,
       labelWidthMm: printer.label_width_mm,
       labelHeightMm: printer.label_height_mm,
+      design: printer.design,
     });
 
     const remaining = Math.max(0, (batch.quantity_produced || 0) - (batch.quantity_consumed || 0));

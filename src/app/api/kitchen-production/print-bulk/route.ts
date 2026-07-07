@@ -42,6 +42,7 @@ export async function POST(request: Request) {
           qr,
           labelWidthMm: printer.label_width_mm,
           labelHeightMm: printer.label_height_mm,
+          design: printer.design,        // honor the saved Label-design config on bulk prints
         });
 
         const remaining = Math.max(0, (batch.quantity_produced || 0) - (batch.quantity_consumed || 0));
