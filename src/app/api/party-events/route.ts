@@ -164,10 +164,11 @@ export async function GET(request: Request) {
                   )) AS revenue
         FROM requisitions r
         WHERE r.purpose = 'party' AND r.event_name != ''
+          ${deptScopeId ? 'AND EXISTS (SELECT 1 FROM requisition_items ri4 WHERE ri4.req_id = r.id AND ri4.department_id = ?)' : ''}
         GROUP BY r.event_name, r.event_date
       )
       SELECT * FROM ev ORDER BY event_date DESC, event_name
-    `).all(...(deptScopeId ? [deptScopeId, deptScopeId] : [])) as any[];
+    `).all(...(deptScopeId ? [deptScopeId, deptScopeId, deptScopeId] : [])) as any[];
 
     return Response.json({
       events: events.map(e => {

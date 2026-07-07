@@ -63,18 +63,29 @@ export default function PartyEventsPage() {
     }).catch(() => {});
   }, []);
 
+  // A dept user opening an event they didn't cater gets a 404 {error}. Fall back
+  // to a valid empty detail so the render never dereferences undefined fields.
+  const emptyDetail = (e: Event) => ({
+    event_name: e.event_name, event_date: e.event_date,
+    guest_count: 0, customer: '', notes: '',
+    requisitions: [], items: [], sales: [],
+    summary: { cost: 0, revenue: 0, booking_total: 0, revenue_withheld_reason: null,
+      profit: 0, food_cost_percent: 0, per_head_cost: 0, per_head_revenue: 0, per_head_profit: 0 },
+  });
+  const safeDetail = (d: any, e: Event) => (d && !d.error && Array.isArray(d.requisitions) ? d : emptyDetail(e));
+
   const openEvent = async (e: Event) => {
     setActive(e); setDetail(null); setDetailLoading(true);
     const qs = new URLSearchParams({ event: e.event_name, date: e.event_date });
-    const d = await fetch(`/api/party-events?${qs}`).then(r => r.json());
-    setDetail(d); setDetailLoading(false);
+    const d = await fetch(`/api/party-events?${qs}`).then(r => r.json()).catch(() => null);
+    setDetail(safeDetail(d, e)); setDetailLoading(false);
   };
 
   const reloadDetail = async () => {
     if (!active) return;
     const qs = new URLSearchParams({ event: active.event_name, date: active.event_date });
-    const d = await fetch(`/api/party-events?${qs}`).then(r => r.json());
-    setDetail(d);
+    const d = await fetch(`/api/party-events?${qs}`).then(r => r.json()).catch(() => null);
+    setDetail(safeDetail(d, active));
   };
 
   const openLinkModal = async () => {

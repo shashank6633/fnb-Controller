@@ -150,9 +150,10 @@ export function proxy(req: NextRequest) {
       const user = row ? {
         role: (row.role_id && row.role_base) ? row.role_base : row.role,
         page_access: row.page_access != null ? row.page_access : (row.role_id ? (row.role_page_access ?? null) : null),
-        // Effective HOD flag = own column OR assigned role's flag (mirrors getCurrentUser).
-        // Needed so canAccessPage can gate hodOnly pages server-side.
-        is_head_chef: !!row.is_head_chef || (!!row.role_id && !!row.role_head_chef),
+        // Effective HOD flag = own column OR assigned role's flag. Mirror
+        // getCurrentUser EXACTLY (auth.ts): the role contributes only when it is a
+        // real assigned role (role_id AND base_role present), so the two never drift.
+        is_head_chef: !!row.is_head_chef || (!!row.role_id && !!row.role_base && !!row.role_head_chef),
       } : undefined;
       if (user && !canAccessPage(pathname, user)) {
         // Dashboard `/` is no longer ALWAYS_ALLOWED — so a user without
