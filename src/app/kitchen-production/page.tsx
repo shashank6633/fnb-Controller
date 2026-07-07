@@ -28,7 +28,7 @@ import {
 import { api } from '@/lib/api';
 import { fmtIST, fmtISTDate, todayIST, fmtISTIsoDate } from '@/lib/format-date';
 import { parseDateTime } from '@/lib/production-batch';
-import { bridgePrint, probeBridge } from '@/lib/offline-print/bridge-client';
+import { bridgePrint, probeBridge, bridgeStatus } from '@/lib/offline-print/bridge-client';
 import { labelPreview, LABEL_FIELD_KEYS } from '@/lib/tspl-label';
 import type { LabelPrinterConfig, LabelBatch, LabelFieldKey } from '@/lib/tspl-label';
 import LabelCanvas from '@/components/LabelCanvas';
@@ -1340,6 +1340,39 @@ function PrinterSettingsModal({ onClose, onSaved }: {
   }, []);
 
   const [tab, setTab] = useState<'printer' | 'design'>('printer');
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ bridge: string; printer: string; print: string } | null>(null);
+
+  // One-click on-site diagnostic: bridge version → printer status → real test label.
+  const runTestPrint = async () => {
+    if (!cfg) return;
+    setTesting(true); setTestResult(null);
+    const out = { bridge: '…', printer: '…', print: '…' };
+    try {
+      const health = await probeBridge();
+      if (!health || !health.ok) {
+        setTestResult({ bridge: '✗ not running — start the AKAN Print Bridge on this PC', printer: '—', print: '—' });
+        return;
+      }
+      const okVer = cmpVer(health.version, MIN_LABEL_BRIDGE) >= 0;
+      out.bridge = `${okVer ? '✓' : '⚠'} v${health.version}${okVer ? '' : ` — update to v${MIN_LABEL_BRIDGE}+`}`;
+      setTestResult({ ...out });
+      const st = await bridgeStatus(cfg.target).catch(() => null);
+      out.printer = st
+        ? (st.reachable ? `✓ reachable${st.paperOut ? ' · PAPER OUT' : ''}${st.coverOpen ? ' · COVER OPEN' : ''}` : `✗ unreachable at "${cfg.target}"`)
+        : '? status unavailable';
+      setTestResult({ ...out });
+      const r = await api('/api/kitchen-production/print-test', { method: 'POST', body: {} });
+      const j = await r.json();
+      if (!r.ok) { out.print = '✗ ' + (j.error || 'could not build test label'); setTestResult({ ...out }); return; }
+      const res = await bridgePrint({ jobId: `test_${Date.now()}`, printer: { transport: cfg.transport, target: cfg.target }, doc: { type: 'tspl', payload: j.tspl } });
+      out.print = res.ok ? '✓ sent — a TEST label should print now' : '✗ ' + (res.error || 'printer rejected the label');
+      setTestResult({ ...out });
+    } catch (e: any) {
+      out.print = '✗ ' + (e?.message || 'failed');
+      setTestResult({ ...out });
+    } finally { setTesting(false); }
+  };
 
   const set = <K extends keyof LabelPrinterConfig>(k: K, v: LabelPrinterConfig[K]) =>
     setCfg(c => (c ? { ...c, [k]: v } : c));
@@ -1445,6 +1478,24 @@ function PrinterSettingsModal({ onClose, onSaved }: {
                            placeholder="C:\labels\batch.btw" className={inputCls} />
                   </Field>
                 )}
+
+                {/* Test Print — diagnose the bridge + printer link on-site */}
+                <div className="pt-3 border-t border-[#F0E4D6]">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm text-[#6B5744]">Run a test print to check the bridge + TE210 on <b>this</b> computer.</div>
+                    <button type="button" onClick={runTestPrint} disabled={testing}
+                      className="shrink-0 px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-50">
+                      {testing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Printer className="w-4 h-4" />} Test Print
+                    </button>
+                  </div>
+                  {testResult && (
+                    <div className="mt-2 text-xs bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5 space-y-1 font-mono">
+                      <div><span className="text-[#8B7355]">Bridge:&nbsp;</span>{testResult.bridge}</div>
+                      <div><span className="text-[#8B7355]">Printer:</span> {testResult.printer}</div>
+                      <div><span className="text-[#8B7355]">Label:&nbsp;&nbsp;</span>{testResult.print}</div>
+                    </div>
+                  )}
+                </div>
               </div>
             ) : (
               <div className="p-5 grid lg:grid-cols-2 gap-5 items-start">
