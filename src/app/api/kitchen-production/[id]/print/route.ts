@@ -1,4 +1,4 @@
-import { getDb, generateId } from '@/lib/db';
+import { getDb } from '@/lib/db';
 import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
 import { ProductionBatch } from '@/lib/production-batch';
 import { buildTSPL, labelPreview, readLabelPrinter } from '@/lib/tspl-label';
@@ -47,24 +47,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       design: printer.design,
     });
 
-    const remaining = Math.max(0, (batch.quantity_produced || 0) - (batch.quantity_consumed || 0));
-    db.prepare(
-      `INSERT INTO batch_transactions (
-         id, batch_id, outlet_id, type, quantity, balance_quantity, user, department, remarks
-       ) VALUES (?,?,?,?,?,?,?,?,?)`
-    ).run(
-      generateId(),
-      batch.id,
-      batch.outlet_id,
-      reprint ? 'reprinted' : 'printed',
-      0,
-      remaining,
-      me.name || me.email || '',
-      me.department_id || '',
-      `${copies} label${copies === 1 ? '' : 's'}${qr ? ' +QR' : ''}`,
-    );
-
-    return Response.json({ tspl, preview, printer });
+    // NOTE: we do NOT log a 'printed'/'reprinted' transaction here. This route only
+    // BUILDS the label; the physical print happens on the counter PC's bridge. The
+    // client logs the transaction via /print-confirm ONLY after the bridge accepts
+    // the job, so "Printed" in the history reflects an actual hand-off, not just
+    // that a label was generated.
+    return Response.json({ tspl, preview, printer, reprint, copies, qr });
   } catch (e: any) {
     console.error('POST /api/kitchen-production/[id]/print failed:', e);
     return Response.json({ error: e?.message || 'Failed to build label' }, { status: 500 });

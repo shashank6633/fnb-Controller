@@ -1,4 +1,4 @@
-import { getDb, generateId } from '@/lib/db';
+import { getDb } from '@/lib/db';
 import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
 import { ProductionBatch } from '@/lib/production-batch';
 import { buildTSPL, readLabelPrinter } from '@/lib/tspl-label';
@@ -27,9 +27,6 @@ export async function POST(request: Request) {
     const qr = body?.qr !== undefined ? !!body.qr : !!printer.qr;
     const copies = Math.max(1, Math.round(Number(printer.copies) || 1));
 
-    const user = me.name || me.email || '';
-    const department = me.department_id || '';
-
     const jobs: Array<{ id: string; batch_number: string; tspl: string }> = [];
 
     const run = db.transaction(() => {
@@ -45,23 +42,9 @@ export async function POST(request: Request) {
           design: printer.design,        // honor the saved Label-design config on bulk prints
         });
 
-        const remaining = Math.max(0, (batch.quantity_produced || 0) - (batch.quantity_consumed || 0));
-        db.prepare(
-          `INSERT INTO batch_transactions (
-             id, batch_id, outlet_id, type, quantity, balance_quantity, user, department, remarks
-           ) VALUES (?,?,?,?,?,?,?,?,?)`
-        ).run(
-          generateId(),
-          batch.id,
-          batch.outlet_id,
-          'printed',
-          0,
-          remaining,
-          user,
-          department,
-          `bulk ${copies} label${copies === 1 ? '' : 's'}${qr ? ' +QR' : ''}`,
-        );
-
+        // No transaction logged here — the client calls /[id]/print-confirm for
+        // each job the bridge actually accepts, so bulk 'printed' rows reflect
+        // real hand-offs, not just generated labels.
         jobs.push({ id: batch.id, batch_number: batch.batch_number, tspl });
       }
     });

@@ -28,7 +28,7 @@ import {
 import { api } from '@/lib/api';
 import { fmtIST, fmtISTDate, todayIST, fmtISTIsoDate } from '@/lib/format-date';
 import { parseDateTime } from '@/lib/production-batch';
-import { bridgePrint } from '@/lib/offline-print/bridge-client';
+import { bridgePrint, probeBridge } from '@/lib/offline-print/bridge-client';
 import { labelPreview, LABEL_FIELD_KEYS } from '@/lib/tspl-label';
 import type { LabelPrinterConfig, LabelBatch, LabelFieldKey } from '@/lib/tspl-label';
 import LabelCanvas from '@/components/LabelCanvas';
@@ -187,7 +187,29 @@ const blankForm = (preparedBy = ''): FormState => ({
 // helper, a raw `tspl` doc the bridge (v2.4.0+) sends to the TE210 verbatim.
 type PrintOpts = { reprint?: boolean; copies?: number; qr?: boolean };
 
+// Labels need the print bridge running on THIS PC at v2.4.0+ (raw TSPL passthrough
+// to the TE210). Preflight so a missing/old bridge gives a clear, actionable error
+// instead of silently marking the batch "Printed" with nothing coming out.
+const MIN_LABEL_BRIDGE = '2.4.0';
+function cmpVer(a: string, b: string): number {
+  const pa = String(a || '0').split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b || '0').split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d; }
+  return 0;
+}
+async function ensureLabelBridge(): Promise<void> {
+  const health = await probeBridge();
+  if (!health || !health.ok) {
+    throw new Error('Print bridge is not running on this computer. Start the AKAN Print Bridge (download it from the KOT & Bill Printers page), then try again.');
+  }
+  if (cmpVer(health.version, MIN_LABEL_BRIDGE) < 0) {
+    throw new Error(`Print bridge is v${health.version}, but label printing needs v${MIN_LABEL_BRIDGE}+. Re-download the bridge from the KOT & Bill Printers page and restart it.`);
+  }
+}
+
 async function printLabelViaBridge(id: string, opts: PrintOpts = {}): Promise<void> {
+  await ensureLabelBridge();   // clear error BEFORE we generate/log — no false "Printed"
+
   const body: Record<string, any> = { reprint: !!opts.reprint };
   if (opts.copies != null) body.copies = opts.copies;
   if (opts.qr !== undefined) body.qr = opts.qr;
@@ -207,7 +229,14 @@ async function printLabelViaBridge(id: string, opts: PrintOpts = {}): Promise<vo
   } catch (e: any) {
     throw new Error(`Print bridge not reachable at localhost:9920 — is the counter print agent running? (${e?.message || e})`);
   }
-  if (!res.ok) throw new Error(res.error || 'Printer rejected the label');
+  if (!res.ok) throw new Error(res.error || `Printer rejected the label — check the TE210 is on, has labels, and the target "${printer.target}" is set for raw printing.`);
+
+  // Bridge ACCEPTED the job — only now log the 'printed'/'reprinted' transaction,
+  // so the batch history reflects an actual hand-off, not just a generated label.
+  await api(`/api/kitchen-production/${id}/print-confirm`, {
+    method: 'POST',
+    body: { reprint: !!opts.reprint, copies: j.copies, qr: j.qr },
+  }).catch(() => {});
 }
 
 // ─── Page ───────────────────────────────────────────────────────────────
@@ -305,6 +334,7 @@ export default function KitchenProductionPage() {
     if (!ids.length) return;
     setBulkPrinting(true);
     try {
+      await ensureLabelBridge();   // clear error if bridge missing/old — before generating
       const r = await api('/api/kitchen-production/print-bulk', { method: 'POST', body: { ids } });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
@@ -318,7 +348,13 @@ export default function KitchenProductionPage() {
             printer: { transport: printer.transport, target: printer.target },
             doc: { type: 'tspl', payload: job.tspl },
           });
-          res.ok ? ok++ : fail++;
+          if (res.ok) {
+            ok++;
+            // Log 'printed' only for jobs the bridge accepted.
+            await api(`/api/kitchen-production/${job.id}/print-confirm`, {
+              method: 'POST', body: { copies: printer.copies, qr: printer.qr },
+            }).catch(() => {});
+          } else { fail++; }
         } catch { fail++; }
       }
       showToast(`Printed ${ok}/${jobs.length} label${jobs.length === 1 ? '' : 's'}${fail ? ` — ${fail} failed (bridge?)` : ''}`, fail ? 'err' : 'ok');
