@@ -1,5 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 
 // Statuses at which a requisition can be edited, by whom:
@@ -91,8 +91,11 @@ export async function GET(request: Request) {
         WHERE ri.req_id = ?
         ORDER BY d.name, rm.name
       `).all(id);
-      // Per-req approve permission for the detail view: only this req's main-dept head.
-      const can_approve_chef = visMe ? isMainDeptHead(db, visMe, r.department_id) : false;
+      // Approve permission for the detail view: any HOD (is_head_chef) or admin —
+      // matching the chef-approve/reject API (canApproveAsChef) — OR this req's
+      // main-dept head. (UI was gating only on dept-head, so is_head_chef HODs saw
+      // view-only even though the API would let them act.)
+      const can_approve_chef = visMe ? (canApproveAsChef(visMe) || isMainDeptHead(db, visMe, r.department_id)) : false;
       return Response.json({ requisition: { ...r, items, can_approve_chef } });
     }
 
@@ -167,13 +170,13 @@ export async function GET(request: Request) {
     // for the UI (is this user a head anywhere?) — the per-row flag is authoritative.
     const rowsWithPerm = (rows as any[]).map((r) => ({
       ...r,
-      can_approve_chef: me ? isMainDeptHead(db, me, r.department_id) : false,
+      can_approve_chef: me ? (canApproveAsChef(me) || isMainDeptHead(db, me, r.department_id)) : false,
     }));
     return Response.json({
       requisitions: rowsWithPerm,
       viewer_role: me?.role || 'guest',
       viewer_email: me?.email || '',
-      viewer_can_approve_chef: me ? (me.role === 'admin' || isAnyMainDeptHead(db, me)) : false,
+      viewer_can_approve_chef: me ? (canApproveAsChef(me) || isAnyMainDeptHead(db, me)) : false,
       viewer_can_approve_mgmt: me ? canApproveAsMgmt(me) : false,
       viewer_can_process_store: me ? canProcessAsStore(me) : false,
       // STRICT issue permission — store person only, no admin bypass. Drives the
@@ -358,9 +361,10 @@ export async function PUT(request: Request) {
     //   chef_approved → admin only (escape hatch; bypasses normal flow)
     const isAdmin = me.role === 'admin';
     const isAuthor = r.drafted_by === me.email;
-    // Only the head of THIS requisition's main department (or admin) may tweak a
-    // submitted req before approving it.
-    const isChef = isMainDeptHead(db, me, r.department_id);
+    // Any HOD (is_head_chef) or admin — matching canApproveAsChef / the chef-approve
+    // API — OR the head of THIS req's main department may tweak a submitted req
+    // before approving it.
+    const isChef = canApproveAsChef(me) || isMainDeptHead(db, me, r.department_id);
     let allowed = false;
     if (r.status === 'draft')               allowed = isAuthor || isAdmin;
     else if (r.status === 'submitted')      allowed = isChef || isAdmin;
