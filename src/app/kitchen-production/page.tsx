@@ -1338,18 +1338,19 @@ function PrinterSettingsModal({ onClose, onSaved }: {
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
-      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-2xl shadow-xl my-4" onClick={e => e.stopPropagation()}>
-        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between">
-          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
-            <Settings className="w-5 h-5 text-[#af4408]" /> Label Printer &amp; Design
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl shadow-xl flex flex-col overflow-hidden" style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2 min-w-0">
+            <Settings className="w-5 h-5 text-[#af4408] shrink-0" /> <span className="truncate">Label Printer &amp; Design</span>
           </div>
-          <button onClick={onClose} disabled={saving} className="text-[#8B7355] hover:text-[#2D1B0E] disabled:opacity-50"><X className="w-5 h-5" /></button>
+          <button onClick={onClose} disabled={saving} className="text-[#8B7355] hover:text-[#2D1B0E] disabled:opacity-50 shrink-0"><X className="w-5 h-5" /></button>
         </div>
 
         {loading ? (
           <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
         ) : cfg ? (
           <>
+            <div className="flex-1 min-h-0 overflow-y-auto">
             <div className="px-5 pt-4">
               <div className="flex gap-1 bg-[#FFF1E3] rounded-xl p-1 w-fit">
                 {([['printer', 'Printer', Printer], ['design', 'Label design', Eye]] as const).map(([k, label, Icon]) => (
@@ -1410,26 +1411,26 @@ function PrinterSettingsModal({ onClose, onSaved }: {
                 )}
               </div>
             ) : (
-              <div className="p-5 grid md:grid-cols-2 gap-5 items-start">
+              <div className="p-5 grid lg:grid-cols-2 gap-5 items-start">
                 {/* Design controls */}
-                <div className="space-y-4">
+                <div className="space-y-4 min-w-0">
                   <p className="text-xs text-[#8B7355]">Sizes apply to both the on-screen preview and the printed label. The label prints with a 2 mm safe margin and rounded corners.</p>
                   <div>
-                    <div className="flex items-center justify-between text-sm font-semibold text-[#8B7355]">
+                    <div className="flex items-center justify-between gap-2 text-sm font-semibold text-[#8B7355]">
                       <span>Item name size</span><span className="text-[#af4408]">{cfg.design.title_scale.toFixed(1)}×</span>
                     </div>
                     <input type="range" min={0.8} max={3} step={0.1} value={cfg.design.title_scale}
                            onChange={e => setDesign('title_scale', Number(e.target.value))} className="w-full accent-[#af4408]" />
                   </div>
                   <div>
-                    <div className="flex items-center justify-between text-sm font-semibold text-[#8B7355]">
+                    <div className="flex items-center justify-between gap-2 text-sm font-semibold text-[#8B7355]">
                       <span>Detail text size (Batch / Prepared / Expiry / Qty / By / Loc)</span><span className="text-[#af4408]">{cfg.design.field_scale.toFixed(1)}×</span>
                     </div>
                     <input type="range" min={0.8} max={3} step={0.1} value={cfg.design.field_scale}
                            onChange={e => setDesign('field_scale', Number(e.target.value))} className="w-full accent-[#af4408]" />
                   </div>
                   <div>
-                    <div className="flex items-center justify-between text-sm font-semibold text-[#8B7355]">
+                    <div className="flex items-center justify-between gap-2 text-sm font-semibold text-[#8B7355]">
                       <span>Barcode height</span><span className="text-[#af4408]">{cfg.design.barcode_height} dots</span>
                     </div>
                     <input type="range" min={20} max={90} step={2} value={cfg.design.barcode_height}
@@ -1452,10 +1453,10 @@ function PrinterSettingsModal({ onClose, onSaved }: {
                   </div>
                 </div>
                 {/* Live preview */}
-                <div>
+                <div className="min-w-0">
                   <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-2 text-center">Live preview · {cfg.label_width_mm} × {cfg.label_height_mm} mm</p>
-                  <div className="flex justify-center">
-                    {designPreview && <LabelCanvas preview={designPreview} scale={7} />}
+                  <div className="flex justify-center max-w-full overflow-x-auto">
+                    {designPreview && <LabelCanvas preview={designPreview} scale={6} />}
                   </div>
                   <p className="text-[11px] text-[#8B7355] text-center mt-2">Sample data — real batches fill their own values.</p>
                 </div>
@@ -1463,7 +1464,8 @@ function PrinterSettingsModal({ onClose, onSaved }: {
             )}
 
             {error && <div className="mx-5 mb-2 bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
-            <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
+            </div>
+            <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
               <button onClick={onClose} disabled={saving} className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Cancel</button>
               <button onClick={save} disabled={saving} className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-50">
                 {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
