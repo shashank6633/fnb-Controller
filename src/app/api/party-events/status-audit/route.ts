@@ -7,7 +7,8 @@ import { getCurrentUser } from '@/lib/auth';
  * GET /api/party-events/status-audit?limit=50&days=7
  *   → { changes: [...] }
  *
- * Any signed-in user (read-only).
+ * HOD/admin only — mirrors the Party Events page gate so Cooks/Staff can't read
+ * the FP status-change audit even by calling the endpoint directly.
  */
 export const dynamic = 'force-dynamic';
 
@@ -15,6 +16,7 @@ export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (!(me.role === 'admin' || me.is_head_chef)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
     const db = getDb();
     const url = new URL(request.url);
     const limit = Math.min(Number(url.searchParams.get('limit') || 50), 200);

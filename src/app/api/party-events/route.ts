@@ -34,6 +34,11 @@ export async function GET(request: Request) {
     // numbers never reach the browser, not just hidden in the UI.
     const me = await getCurrentUser();
     const canSeeFinancials = me?.role === 'admin' || !!me?.is_head_chef;
+    // A department user (not admin, not HOD) may see ONLY their own department's
+    // slice of a party's cost/items — never the whole party across all depts.
+    // Scope by the per-line requisition_items.department_id. A dept-less
+    // non-privileged user gets a sentinel that matches nothing → sees zero cost.
+    const deptScopeId = canSeeFinancials ? null : (me?.department_id ?? '__no_dept__');
     const redact = <T extends Record<string, any>>(o: T): T =>
       canSeeFinancials ? o : ({ ...o, revenue: 0, profit: 0, food_cost_percent: 0, per_head_revenue: 0, per_head_profit: 0, booking_total: 0 });
 
@@ -46,13 +51,17 @@ export async function GET(request: Request) {
 
     // Single event detail
     if (eventName && eventDate) {
+      // For a department user, show ONLY requisitions that carry an item for their
+      // department (EXISTS on the dept-scoped items) — so the requisitions list,
+      // the count, and the header never leak other departments' req metadata.
       const reqs = db.prepare(`
         SELECT r.*, d.name AS department_name
         FROM requisitions r
         JOIN departments d ON d.id = r.department_id
         WHERE r.purpose = 'party' AND r.event_name = ? AND r.event_date = ?
+          ${deptScopeId ? 'AND EXISTS (SELECT 1 FROM requisition_items ri WHERE ri.req_id = r.id AND ri.department_id = ?)' : ''}
         ORDER BY r.created_at
-      `).all(eventName, eventDate) as any[];
+      `).all(...(deptScopeId ? [eventName, eventDate, deptScopeId] : [eventName, eventDate])) as any[];
       if (reqs.length === 0) return Response.json({ error: 'Event not found' }, { status: 404 });
 
       const items = db.prepare(`
@@ -62,8 +71,9 @@ export async function GET(request: Request) {
         JOIN requisition_items ri ON ri.req_id = r.id
         JOIN raw_materials rm ON rm.id = ri.material_id
         WHERE r.purpose = 'party' AND r.event_name = ? AND r.event_date = ?
+          ${deptScopeId ? 'AND ri.department_id = ?' : ''}
         ORDER BY rm.name
-      `).all(eventName, eventDate) as any[];
+      `).all(...(deptScopeId ? [eventName, eventDate, deptScopeId] : [eventName, eventDate])) as any[];
 
       const sales = db.prepare(`
         SELECT s.item_name,
@@ -131,14 +141,20 @@ export async function GET(request: Request) {
         SELECT r.event_name, r.event_date,
                MAX(r.guest_count) AS guest_count,
                MAX(r.customer)    AS customer,
-               COUNT(*)           AS req_count,
+               ${deptScopeId
+                 ? `(SELECT COUNT(DISTINCT r3.id) FROM requisitions r3
+                       JOIN requisition_items ri3 ON ri3.req_id = r3.id
+                      WHERE r3.purpose = 'party' AND r3.event_name = r.event_name
+                        AND r3.event_date = r.event_date AND ri3.department_id = ?)`
+                 : 'COUNT(*)'} AS req_count,
                (SELECT COALESCE(SUM(ri.quantity_requested * rm.average_price), 0)
                   FROM requisitions r2
                   JOIN requisition_items ri ON ri.req_id = r2.id
                   JOIN raw_materials rm ON rm.id = ri.material_id
                   WHERE r2.purpose = 'party'
                     AND r2.event_name = r.event_name
-                    AND r2.event_date = r.event_date) AS cost,
+                    AND r2.event_date = r.event_date
+                    ${deptScopeId ? 'AND ri.department_id = ?' : ''}) AS cost,
                (SELECT COALESCE(SUM(s.total_revenue), 0)
                   FROM sales s
                   WHERE (
@@ -151,7 +167,7 @@ export async function GET(request: Request) {
         GROUP BY r.event_name, r.event_date
       )
       SELECT * FROM ev ORDER BY event_date DESC, event_name
-    `).all() as any[];
+    `).all(...(deptScopeId ? [deptScopeId, deptScopeId] : [])) as any[];
 
     return Response.json({
       events: events.map(e => {

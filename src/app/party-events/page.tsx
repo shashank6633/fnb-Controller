@@ -417,8 +417,9 @@ export default function PartyEventsPage() {
       {/* Upcoming Parties — pulled live from AKAN Party Manager Google Sheet */}
       <UpcomingPartiesPanel />
 
-      {/* Status change audit — last 7 days of FP status flips */}
-      <StatusChangesPanel />
+      {/* Status change audit — last 7 days of FP status flips. HOD/admin only;
+          Cooks & Staff never see it (and never fire its fetch). */}
+      {canSeeFinancials && <StatusChangesPanel />}
 
       <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
         {loading ? (
