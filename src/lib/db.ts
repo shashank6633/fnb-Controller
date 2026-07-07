@@ -1983,6 +1983,57 @@ function initializeSchema(db: Database.Database) {
       db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('migration_pack_size_reset_for_non_ml_v1', '1')").run();
     }
   } catch (e) { console.error('raw_materials.purchase_unit migration failed:', e); }
+
+  // Kitchen Production / Batch tracking: prepared items get a batch + barcode at
+  // production time, are drawn down FIFO on consumption, and every state change is
+  // recorded in an append-only audit trail.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS production_batches (
+        id                 TEXT PRIMARY KEY,
+        outlet_id          TEXT,
+        batch_number       TEXT,
+        barcode            TEXT UNIQUE,
+        item_name          TEXT NOT NULL,
+        category           TEXT DEFAULT '',
+        material_id        TEXT,
+        recipe_id          TEXT,
+        production_date    TEXT,
+        production_time    TEXT,
+        expiry_date        TEXT,
+        expiry_time        TEXT,
+        shelf_life         TEXT DEFAULT '',
+        quantity_produced  REAL NOT NULL DEFAULT 0,
+        quantity_consumed  REAL NOT NULL DEFAULT 0,
+        unit               TEXT DEFAULT '',
+        prepared_by        TEXT DEFAULT '',
+        kitchen_section    TEXT DEFAULT '',
+        storage_location   TEXT DEFAULT '',
+        remarks            TEXT DEFAULT '',
+        status             TEXT NOT NULL DEFAULT 'active',   -- active | consumed | expired | disposed
+        created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_production_batches_item   ON production_batches(item_name);
+      CREATE INDEX IF NOT EXISTS idx_production_batches_barcode ON production_batches(barcode);
+      CREATE INDEX IF NOT EXISTS idx_production_batches_status ON production_batches(status);
+      CREATE INDEX IF NOT EXISTS idx_production_batches_expiry ON production_batches(expiry_date);
+
+      CREATE TABLE IF NOT EXISTS batch_transactions (
+        id                TEXT PRIMARY KEY,
+        batch_id          TEXT NOT NULL,
+        outlet_id         TEXT,
+        type              TEXT NOT NULL,   -- created | printed | reprinted | scanned | consumed | transferred | returned | wasted | expired | disposed
+        quantity          REAL DEFAULT 0,
+        balance_quantity  REAL DEFAULT 0,
+        user              TEXT DEFAULT '',
+        department        TEXT DEFAULT '',
+        remarks           TEXT DEFAULT '',
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_batch_transactions_batch ON batch_transactions(batch_id);
+    `);
+  } catch (e) { console.error('production_batches/batch_transactions schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

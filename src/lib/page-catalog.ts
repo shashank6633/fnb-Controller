@@ -78,6 +78,7 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
       { path: '/store-requisitions',  label: 'Store Requisitions (Issue)' },
+      { path: '/kitchen-production',   label: 'Kitchen Production' },
       { path: '/purchases',           label: 'Purchases' },
       { path: '/purchase-orders',     label: 'Purchase Orders' },
       { path: '/grn',                 label: 'Goods Receipt (GRN)' },

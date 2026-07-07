@@ -62,6 +62,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/party-consumption',   // post-party liquor consumption recording
   '/api/party-bookings',      // sheet refresh (POST forces live fetch)
   '/api/dine-in/tables',      // POS table management (create/edit/delete)
+  '/api/kitchen-production',   // prepared-item batches + FIFO consumption
   '/api/dine-in/orders',      // POS orders: open, add items, fire, settle, void
   '/api/dine-in/customer-orders', // Captain approve/reject/modify of QR-menu orders
   '/api/dine-in/service-requests', // Captain accept/complete of table service requests
