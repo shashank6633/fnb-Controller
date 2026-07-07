@@ -88,6 +88,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/butchering',          label: 'Butchering' },
       { path: '/receiving-variance',  label: 'Receiving Variance' },
       { path: '/departments',         label: 'Departments' },
+      { path: '/department-materials', label: 'Dept Materials (Party)' },
       { path: '/vendors',             label: 'Vendors' },
       { path: '/vendors/materials',   label: 'Vendor → Items' },
       { path: '/contracts',           label: 'Contracts' },

@@ -14,7 +14,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Building2, Package, ArrowUpRight, Loader2, Download, Filter, ChevronDown, ChevronRight,
+  Building2, Package, ArrowUpRight, Loader2, Download, Filter, ChevronDown, ChevronRight, Warehouse,
 } from 'lucide-react';
 
 const fmt  = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
@@ -109,6 +109,10 @@ export default function DepartmentConsumptionPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <a href="/department-materials"
+             className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+            <Warehouse className="w-4 h-4" /> Dept Materials (Party)
+          </a>
           <div className="inline-flex rounded-lg border border-[#E8D5C4] overflow-hidden text-sm">
             <button onClick={() => setView('summary')}
                     className={`px-3 py-2 ${view === 'summary' ? 'bg-[#af4408] text-white' : 'bg-white text-[#6B5744] hover:bg-[#FFF1E3]'}`}>Summary</button>

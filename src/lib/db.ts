@@ -1084,6 +1084,43 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('requisitions schema failed:', e); }
 
+  // Department on-hand ledger — party fulfilment TRANSFERS materials store→dept:
+  // raw_materials.current_stock decreases (store ledger) and the respective
+  // department's on_hand increases. Post-party each department records leftover
+  // balance so consumption is tracked. department_materials is the running
+  // balance; department_material_transactions is the append-only ledger.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS department_materials (
+        id            TEXT PRIMARY KEY,
+        outlet_id     TEXT,
+        department_id TEXT NOT NULL,
+        material_id   TEXT NOT NULL,
+        on_hand       REAL NOT NULL DEFAULT 0,
+        updated_at    TEXT DEFAULT (datetime('now')),
+        UNIQUE(department_id, material_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_dept_materials_dept ON department_materials(department_id);
+
+      CREATE TABLE IF NOT EXISTS department_material_transactions (
+        id            TEXT PRIMARY KEY,
+        outlet_id     TEXT,
+        department_id TEXT NOT NULL,
+        material_id   TEXT NOT NULL,
+        type          TEXT NOT NULL,               -- received | consumed | returned | adjusted
+        quantity      REAL DEFAULT 0,              -- positive = in, negative = out
+        balance_after REAL DEFAULT 0,
+        reference_id  TEXT,
+        event_name    TEXT DEFAULT '',
+        event_date    TEXT DEFAULT '',
+        notes         TEXT DEFAULT '',
+        user          TEXT DEFAULT '',
+        created_at    TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_dept_mat_tx_dept_mat ON department_material_transactions(department_id, material_id);
+    `);
+  } catch (e) { console.error('department_materials schema failed:', e); }
+
   // Butchering — track whole-carcass breakdown into named cuts.
   // Buys carcass at vendor rate (per kg of dressed weight); cuts inherit
   // pro-rata cost (default by weight). Waste is tracked separately so the

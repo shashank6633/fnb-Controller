@@ -60,6 +60,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/recipe-workbook-import', // bulk recipe-costing workbook upload (preview + commit)
   '/api/butchering',          // carcass breakdown batches + seed
   '/api/party-consumption',   // post-party liquor consumption recording
+  '/api/department-materials', // dept on-hand transfer view + post-party reconcile
   '/api/party-bookings',      // sheet refresh (POST forces live fetch)
   '/api/dine-in/tables',      // POS table management (create/edit/delete)
   '/api/kitchen-production',   // prepared-item batches + FIFO consumption + label print

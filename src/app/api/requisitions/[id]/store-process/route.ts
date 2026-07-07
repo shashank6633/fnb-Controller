@@ -1,5 +1,6 @@
-import { getDb, generateId, logAuditEvent } from '@/lib/db';
+import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth';
+import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 
 /**
  * Store Manager processes a chef-approved requisition.
@@ -222,65 +223,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       const finalStatus = linkedPoId ? 'store_processed' : 'fulfilled';
       const fulfilledAt = linkedPoId ? null : new Date().toISOString();
 
-      // --- 3a. PARTY requisition stock deduction ---
-      // Business rule: only purchases ADD to current_stock and only recipe-deduction
-      // subtracts — EXCEPT for party requisitions, which consume directly (no recipe).
-      // Internal requisitions remain audit-only and never reach this branch.
-      // Only fire on the final fulfilled transition (i.e. when no PO is being raised).
+      // --- 3a. PARTY requisition TRANSFER (store → department) ---
+      // Business rule: party requisitions consume directly (no recipe). On the
+      // final 'fulfilled' transition, TRANSFER the issued materials out of the
+      // store (raw_materials.current_stock − / inventory_transactions) and INTO
+      // the owning department's on-hand balance. The helper owns the dedup guard
+      // (via the existing party_consumption ledger row), the store deduction, and
+      // the department credit — so it is safe to call from both fulfilment paths
+      // without any double-transfer. Only fire when no PO is being raised.
       if (finalStatus === 'fulfilled' && r.purpose === 'party') {
-        // Idempotency guard — never deduct twice for the same requisition.
-        const already = db.prepare(`
-          SELECT 1 FROM inventory_transactions
-          WHERE reference_id = ? AND type = 'party_consumption'
-          LIMIT 1
-        `).get(id);
-        if (already) {
-          logAuditEvent(db, {
-            event_type: 'requisition.party_consumption.skipped',
-            entity_type: 'requisition',
-            entity_id: id,
-            actor_email: me.email,
-            after: { reason: 'already_deducted' },
-            note: 'Party consumption skipped — inventory_transactions row already exists',
-          });
-        } else {
-          const decStock = db.prepare(`
-            UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now')
-            WHERE id = ?
-          `);
-          const insTx = db.prepare(`
-            INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-            VALUES (?, ?, 'party_consumption', ?, ?, ?, datetime('now'))
-          `);
-          const partyNote = `Party: ${r.event_name || '(unnamed)'} @ ${r.event_date || ''}`.trim();
-          const auditItems: any[] = [];
-          let totalCost = 0;
-          for (const it of items) {
-            const ln = lineMap.get(it.id) || {};
-            const issued = Number(ln.quantity_issued) || Number(it.quantity_issued) || Number(it.quantity_requested) || 0;
-            if (issued <= 0) continue;
-            decStock.run(issued, it.material_id);
-            insTx.run(generateId(), it.material_id, -issued, id, partyNote);
-            const unitCost = Number(it.last_purchase_price) || Number(it.average_price) || 0;
-            const lineCost = Math.round(issued * unitCost * 100) / 100;
-            totalCost += lineCost;
-            auditItems.push({
-              material_id: it.material_id,
-              material_name: it.material_name,
-              quantity: issued,
-              unit_cost: unitCost,
-              line_cost: lineCost,
-            });
-          }
-          logAuditEvent(db, {
-            event_type: 'requisition.party_consumption',
-            entity_type: 'requisition',
-            entity_id: id,
-            actor_email: me.email,
-            after: { items: auditItems, total_cost: Math.round(totalCost * 100) / 100 },
-            note: partyNote,
-          });
-        }
+        applyPartyFulfillment(db, id, me.email);
       }
       db.prepare(`
         UPDATE requisitions

@@ -1,5 +1,6 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore } from '@/lib/auth';
+import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 
 /**
  * Per-item store issue endpoint — the workhorse of /store-requisitions.
@@ -198,6 +199,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               updated_at = datetime('now')
           WHERE id = ?
         `).run(me.email, me.email, note, note, id);
+        // Party path also TRANSFERS store → department (store deduction + dept
+        // credit). The helper is idempotent via the party_consumption ledger row,
+        // so re-fulfilment or the store-process path can never double-transfer.
+        if (r.purpose === 'party') {
+          applyPartyFulfillment(db, id, me.email);
+        }
       } else {
         // Mark in-progress so the queue knows it's been touched
         if (r.status === 'mgmt_approved' || r.status === 'chef_approved') {
