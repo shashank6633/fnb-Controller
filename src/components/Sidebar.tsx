@@ -41,6 +41,7 @@ import {
   LayoutGrid,
   Timer,
   Download,
+  ScanLine,
   type LucideIcon,
 } from "lucide-react";
 
@@ -112,6 +113,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
       { kind: "link", label: "Issue Requisitions", href: "/store-requisitions", icon: Package },
       { kind: "link", label: "Kitchen Production", href: "/kitchen-production", icon: ChefHat },
+      { kind: "link", label: "Scan Batch",         href: "/kitchen-production/scan", icon: ScanLine },
       { kind: "link", label: "Purchases",          href: "/purchases",          icon: ShoppingCart },
       { kind: "link", label: "Purchase Orders",    href: "/purchase-orders",    icon: ClipboardList },
       { kind: "link", label: "Goods Receipt (GRN)", href: "/grn",               icon: ClipboardList },

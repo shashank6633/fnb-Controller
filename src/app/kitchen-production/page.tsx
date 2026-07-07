@@ -18,10 +18,11 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import Link from 'next/link';
 import {
   ChefHat, Plus, Loader2, RefreshCw, Search, X, Package, Clock, MapPin,
   User as UserIcon, AlertTriangle, CheckCircle2, History, Barcode as BarcodeIcon,
-  Printer, Settings, Eye, Copy, CheckSquare, Square, Save, CheckCircle,
+  Printer, Settings, Eye, Copy, CheckSquare, Square, Save, CheckCircle, ScanLine,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { fmtIST, fmtISTDate, todayIST } from '@/lib/format-date';
@@ -366,6 +367,10 @@ export default function KitchenProductionPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <Link href="/kitchen-production/scan"
+                className="px-3 py-2 bg-white border border-[#af4408] hover:bg-[#FFF1E3] text-[#af4408] rounded-lg text-sm font-medium flex items-center gap-2">
+            <ScanLine className="w-4 h-4" /> Scan
+          </Link>
           {isAdmin && (
             <button onClick={() => setShowPrinterSettings(true)}
                     title="Label printer settings"

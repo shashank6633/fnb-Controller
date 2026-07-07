@@ -64,6 +64,26 @@ export function batchAgeHours(
   return Math.round(Math.max(0, hrs) * 10) / 10;
 }
 
+/** Human "time until expiry" string from an expiry date/time vs now (e.g. "2d 4h left", "expired"). */
+export function shelfLifeRemaining(
+  expiry_date: string | null | undefined,
+  expiry_time: string | null | undefined,
+  now: Date,
+): string {
+  const exp = parseDateTime(expiry_date, expiry_time);
+  if (!exp) return 'no expiry';
+  let ms = exp.getTime() - now.getTime();
+  if (ms <= 0) return 'expired';
+  const days = Math.floor(ms / (24 * 3600 * 1000));
+  ms -= days * 24 * 3600 * 1000;
+  const hours = Math.floor(ms / (3600 * 1000));
+  ms -= hours * 3600 * 1000;
+  const mins = Math.floor(ms / (60 * 1000));
+  if (days > 0) return `${days}d ${hours}h left`;
+  if (hours > 0) return `${hours}h ${mins}m left`;
+  return `${mins}m left`;
+}
+
 /** Attach derived fields (no fifo_priority — that is a list-level ranking). */
 export function enrichBatch(b: ProductionBatch, now: Date) {
   const remaining_quantity = Math.max(0, (b.quantity_produced || 0) - (b.quantity_consumed || 0));
