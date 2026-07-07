@@ -104,16 +104,21 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
   )];
   if (names.length && key.event_date) {
     const ph = names.map(() => '?').join(',');
+    // ACTUALS, not estimates: cost the ISSUED quantity (what the store actually
+    // handed over) × avg price, and only for FULFILLED requisitions — so the P&L
+    // shows ₹0 until the party's materials are fulfilled, then the real issued
+    // cost. (Was quantity_requested across every non-rejected req, which counted
+    // chef-approved-but-unfulfilled requisitions at their requested — overstated.)
     const food = db.prepare(`
-      SELECT COALESCE(SUM(ri.quantity_requested * rm.average_price), 0) AS cost,
-             COUNT(ri.id) AS item_count
+      SELECT COALESCE(SUM(ri.quantity_issued * rm.average_price), 0) AS cost,
+             COUNT(CASE WHEN ri.quantity_issued > 0 THEN 1 END) AS item_count
       FROM requisitions r
       JOIN requisition_items ri ON ri.req_id = r.id
       JOIN raw_materials rm ON rm.id = ri.material_id
       WHERE r.purpose = 'party'
         AND r.event_name IN (${ph})
         AND r.event_date = ?
-        AND r.status NOT IN ('cancelled', 'chef_rejected')
+        AND r.status = 'fulfilled'
     `).get(...names, key.event_date) as { cost: number; item_count: number };
     foodCost = food.cost || 0;
     foodItems = food.item_count || 0;
