@@ -79,6 +79,8 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
       { path: '/store-requisitions',  label: 'Store Requisitions (Issue)' },
       { path: '/kitchen-production',   label: 'Kitchen Production' },
+      { path: '/kitchen-production/dashboard', label: 'Kitchen Production — Dashboard' },
+      { path: '/kitchen-production/reports', label: 'Kitchen Production — Reports' },
       { path: '/kitchen-production/scan', label: 'Kitchen Production — Scan' },
       { path: '/purchases',           label: 'Purchases' },
       { path: '/purchase-orders',     label: 'Purchase Orders' },

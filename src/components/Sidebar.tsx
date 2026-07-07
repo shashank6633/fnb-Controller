@@ -113,6 +113,8 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
       { kind: "link", label: "Issue Requisitions", href: "/store-requisitions", icon: Package },
       { kind: "link", label: "Kitchen Production", href: "/kitchen-production", icon: ChefHat },
+      { kind: "link", label: "Production Dashboard", href: "/kitchen-production/dashboard", icon: LayoutGrid },
+      { kind: "link", label: "Production Reports", href: "/kitchen-production/reports", icon: BarChart3 },
       { kind: "link", label: "Scan Batch",         href: "/kitchen-production/scan", icon: ScanLine },
       { kind: "link", label: "Purchases",          href: "/purchases",          icon: ShoppingCart },
       { kind: "link", label: "Purchase Orders",    href: "/purchase-orders",    icon: ClipboardList },

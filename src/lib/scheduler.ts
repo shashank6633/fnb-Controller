@@ -14,6 +14,7 @@
 
 import { refreshUpcomingParties } from './party-refresh';
 import { checkDeferDueSoon } from './defer-due-check';
+import { checkKitchenExpiry } from './kitchen-expiry-check';
 
 /**
  * Adaptive cadence:
@@ -82,6 +83,20 @@ export function startSchedulerOnce(): void {
         if (dd.errors.length) console.warn('[scheduler] defer-due errors:', dd.errors);
       } catch (e: any) {
         console.error('[scheduler] defer-due check failed:', e?.message);
+      }
+
+      // Kitchen Production — auto-expire past-expiry batches and warn the
+      // kitchen about batches nearing expiry. Same cadence as the party refresh.
+      // Fully best-effort: any failure is logged and swallowed so it can NEVER
+      // break the refresh loop or the defer-due check above.
+      try {
+        const ke = await checkKitchenExpiry('cron');
+        if (ke.expired > 0 || ke.notifications_created > 0) {
+          console.log(`[scheduler] kitchen-expiry @ IST ${istHour()}h: ${ke.expired} expired · ${ke.alert_candidates} near-expiry · ${ke.notifications_created} notifications · ${ke.slack_sent} slack sent`);
+        }
+        if (ke.errors.length) console.warn('[scheduler] kitchen-expiry errors:', ke.errors);
+      } catch (e: any) {
+        console.error('[scheduler] kitchen-expiry check failed:', e?.message);
       }
     } catch (e: any) {
       console.error('[scheduler] refresh failed:', e?.message);

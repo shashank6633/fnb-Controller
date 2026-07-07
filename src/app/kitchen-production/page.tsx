@@ -23,9 +23,11 @@ import {
   ChefHat, Plus, Loader2, RefreshCw, Search, X, Package, Clock, MapPin,
   User as UserIcon, AlertTriangle, CheckCircle2, History, Barcode as BarcodeIcon,
   Printer, Settings, Eye, Copy, CheckSquare, Square, Save, CheckCircle, ScanLine,
+  LayoutGrid, BarChart3, Trash2, Send, Undo2,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { fmtIST, fmtISTDate, todayIST } from '@/lib/format-date';
+import { fmtIST, fmtISTDate, todayIST, fmtISTIsoDate } from '@/lib/format-date';
+import { parseDateTime } from '@/lib/production-batch';
 import { bridgePrint } from '@/lib/offline-print/bridge-client';
 import { labelPreview } from '@/lib/tspl-label';
 import type { LabelPrinterConfig } from '@/lib/tspl-label';
@@ -106,6 +108,30 @@ function nowHHMM(): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
+// Expiry-bucket deep-link support (from the dashboard tiles). Mirrors the
+// bucket semantics in /api/kitchen-production/dashboard: buckets are over
+// ACTIVE batches only; today/tomorrow are IST calendar days for still-future
+// batches; 3d/7d are rolling 72h/168h windows; expired = active & past expiry.
+const EXPIRY_BUCKET_LABEL: Record<string, string> = {
+  expired: 'Expired', today: 'Expiring today', tomorrow: 'Expiring tomorrow',
+  '3d': 'Expiring within 3 days', '7d': 'Expiring within 7 days',
+};
+function inExpiryBucket(b: Batch, bucket: string, now: Date, today: string, tomorrow: string): boolean {
+  if (b.status !== 'active') return false;
+  const exp = parseDateTime(b.expiry_date, b.expiry_time);
+  if (!exp) return false;
+  const delta = exp.getTime() - now.getTime();
+  const expDay = fmtISTIsoDate(exp);
+  switch (bucket) {
+    case 'expired':  return delta <= 0;
+    case 'today':    return delta > 0 && expDay === today;
+    case 'tomorrow': return delta > 0 && expDay === tomorrow;
+    case '3d':       return delta > 0 && delta <= 72 * 3600 * 1000;
+    case '7d':       return delta > 0 && delta <= 168 * 3600 * 1000;
+    default:         return true;
+  }
+}
+
 // Colour tokens per expiry traffic-light.
 const EXPIRY_TONE: Record<Batch['expiry_status'], {
   border: string; badge: string; label: string; dot: string;
@@ -176,6 +202,7 @@ export default function KitchenProductionPage() {
   const [statusFilter, setStatusFilter] = useState<'active' | 'all'>('active');
   const [category, setCategory] = useState('');
   const [search, setSearch] = useState('');
+  const [expiryFilter, setExpiryFilter] = useState('');   // deep-link from dashboard tiles
   const [refreshKey, setRefreshKey] = useState(0);
 
   // New-batch modal
@@ -230,6 +257,12 @@ export default function KitchenProductionPage() {
       setRecipes(list.map((r: any) => ({ id: r.id, name: r.name })).filter(r => r.id && r.name));
     }).catch(() => {});
     loadPrinterCfg();
+    // Honour ?expiry=<bucket> deep-links from the dashboard expiry tiles. Buckets
+    // are over active batches, so also force the Active tab on.
+    try {
+      const b = new URLSearchParams(window.location.search).get('expiry') || '';
+      if (b && EXPIRY_BUCKET_LABEL[b]) { setExpiryFilter(b); setStatusFilter('active'); }
+    } catch { /* ignore */ }
   }, []);
 
   // Print one batch's label (reprint flag flows through to the transaction type).
@@ -310,6 +343,16 @@ export default function KitchenProductionPage() {
     return Array.from(set).sort();
   }, [batches]);
 
+  // Apply the (client-side) expiry-bucket deep-link filter on top of whatever
+  // the server returned. Kept out of the fetch query since buckets are derived.
+  const visibleBatches = useMemo(() => {
+    if (!expiryFilter) return batches;
+    const now = new Date();
+    const today = todayIST();
+    const tomorrow = fmtISTIsoDate(new Date(now.getTime() + 24 * 3600 * 1000));
+    return batches.filter(b => inExpiryBucket(b, expiryFilter, now, today, tomorrow));
+  }, [batches, expiryFilter]);
+
   const openNewForm = () => {
     setForm(blankForm(meName));
     setFormError(null);
@@ -367,6 +410,14 @@ export default function KitchenProductionPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <Link href="/kitchen-production/dashboard"
+                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+            <LayoutGrid className="w-4 h-4" /> <span className="hidden sm:inline">Dashboard</span>
+          </Link>
+          <Link href="/kitchen-production/reports"
+                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+            <BarChart3 className="w-4 h-4" /> <span className="hidden sm:inline">Reports</span>
+          </Link>
           <Link href="/kitchen-production/scan"
                 className="px-3 py-2 bg-white border border-[#af4408] hover:bg-[#FFF1E3] text-[#af4408] rounded-lg text-sm font-medium flex items-center gap-2">
             <ScanLine className="w-4 h-4" /> Scan
@@ -414,11 +465,25 @@ export default function KitchenProductionPage() {
         </select>
       </div>
 
+      {/* Active expiry deep-link chip */}
+      {expiryFilter && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full bg-[#FFF1E3] border border-[#D4B896] text-[#8a3506]">
+            <AlertTriangle className="w-3.5 h-3.5" />
+            {EXPIRY_BUCKET_LABEL[expiryFilter]}
+            <button onClick={() => setExpiryFilter('')} className="ml-0.5 hover:text-[#af4408]" title="Clear filter">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </span>
+          <span className="text-xs text-[#8B7355]">{visibleBatches.length} match{visibleBatches.length === 1 ? '' : 'es'}</span>
+        </div>
+      )}
+
       {/* Bulk-select action bar */}
-      {!loading && batches.length > 0 && (
+      {!loading && visibleBatches.length > 0 && (
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <div className="text-xs text-[#8B7355]">
-            {batches.length} batch{batches.length === 1 ? '' : 'es'}
+            {visibleBatches.length} batch{visibleBatches.length === 1 ? '' : 'es'}
             {selectMode && <> · <span className="font-semibold text-[#af4408]">{selected.size} selected</span></>}
           </div>
           <div className="flex items-center gap-2">
@@ -429,7 +494,7 @@ export default function KitchenProductionPage() {
               </button>
             ) : (
               <>
-                <button onClick={() => setSelected(new Set(batches.map(b => b.id)))}
+                <button onClick={() => setSelected(new Set(visibleBatches.map(b => b.id)))}
                         className="px-3 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm">
                   Select all
                 </button>
@@ -455,18 +520,20 @@ export default function KitchenProductionPage() {
         <div className="p-8 text-center text-sm text-[#8B7355]">
           <Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading batches…
         </div>
-      ) : batches.length === 0 ? (
+      ) : visibleBatches.length === 0 ? (
         <div className="p-10 bg-white border border-[#E8D5C4] rounded-xl text-center text-sm text-[#8B7355]">
           <Package className="w-8 h-8 mx-auto mb-2 text-[#D4B896]" />
-          {search || category
-            ? 'No batches match your filters.'
-            : statusFilter === 'active'
-              ? 'No active production batches yet. Click “New Production Batch” to log one.'
-              : 'No production batches recorded yet.'}
+          {expiryFilter
+            ? `No active batches are ${EXPIRY_BUCKET_LABEL[expiryFilter].toLowerCase()}.`
+            : search || category
+              ? 'No batches match your filters.'
+              : statusFilter === 'active'
+                ? 'No active production batches yet. Click “New Production Batch” to log one.'
+                : 'No production batches recorded yet.'}
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-          {batches.map(b => (
+          {visibleBatches.map(b => (
             <BatchCard
               key={b.id}
               batch={b}
@@ -496,7 +563,12 @@ export default function KitchenProductionPage() {
 
       {/* Detail drawer */}
       {detailId && (
-        <BatchDetailDrawer id={detailId} onClose={() => setDetailId(null)} />
+        <BatchDetailDrawer
+          id={detailId}
+          onClose={() => setDetailId(null)}
+          onChanged={() => setRefreshKey(k => k + 1)}
+          showToast={showToast}
+        />
       )}
 
       {/* Just-created → one-click print */}
@@ -817,13 +889,20 @@ function ReadOnlyField({ label }: { label: string }) {
 }
 
 // ─── Detail drawer ──────────────────────────────────────────────────────
-function BatchDetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
+function BatchDetailDrawer({ id, onClose, onChanged, showToast }: {
+  id: string; onClose: () => void;
+  onChanged?: () => void;
+  showToast?: (msg: string, kind?: 'ok' | 'err') => void;
+}) {
   const [batch, setBatch] = useState<Batch | null>(null);
   const [txns, setTxns] = useState<Txn[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  // Waste / dispose / transfer / return action modal.
+  const [action, setAction] = useState<DisposeAction | null>(null);
+
+  const load = () => {
     let cancelled = false;
     setLoading(true); setError(null);
     fetch(`/api/kitchen-production/${id}`, { credentials: 'same-origin' })
@@ -836,11 +915,23 @@ function BatchDetailDrawer({ id, onClose }: { id: string; onClose: () => void })
       .catch(e => { if (!cancelled) setError(e.message); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [id]);
+  };
+
+  useEffect(() => load(), [id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const onActionDone = (label: string) => {
+    setAction(null);
+    load();                        // refresh drawer (batch + txns)
+    onChanged?.();                 // refresh the card list behind it
+    showToast?.(label, 'ok');
+  };
 
   const tone = batch ? (EXPIRY_TONE[batch.expiry_status] || EXPIRY_TONE.green) : EXPIRY_TONE.green;
+  const remaining = batch ? (batch.remaining_quantity ?? Math.max(0, batch.quantity_produced - batch.quantity_consumed)) : 0;
+  const canAct = !!batch && batch.status === 'active';
 
   return (
+    <>
     <div className="fixed inset-0 z-50 bg-black/40 flex items-stretch justify-end" onClick={onClose}>
       <div className="bg-[#FFF8F0] w-full max-w-md h-full shadow-xl overflow-y-auto border-l border-[#E8D5C4]"
            onClick={e => e.stopPropagation()}>
@@ -901,6 +992,38 @@ function BatchDetailDrawer({ id, onClose }: { id: string; onClose: () => void })
               </div>
             )}
 
+            {/* Actions */}
+            {canAct ? (
+              <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+                <div className="text-[11px] font-medium text-[#8B7355] mb-2">Batch actions</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button onClick={() => setAction('wasted')} disabled={remaining <= 0}
+                          className="px-2.5 py-2 bg-red-50 border border-red-200 hover:bg-red-100 text-red-700 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 disabled:opacity-40">
+                    <Trash2 className="w-4 h-4" /> Waste
+                  </button>
+                  <button onClick={() => setAction('disposed')} disabled={remaining <= 0}
+                          className="px-2.5 py-2 bg-red-50 border border-red-200 hover:bg-red-100 text-red-700 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 disabled:opacity-40">
+                    <AlertTriangle className="w-4 h-4" /> Dispose
+                  </button>
+                  <button onClick={() => setAction('transferred')}
+                          className="px-2.5 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-xs font-medium flex items-center justify-center gap-1.5">
+                    <Send className="w-4 h-4" /> Transfer
+                  </button>
+                  <button onClick={() => setAction('returned')}
+                          className="px-2.5 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-xs font-medium flex items-center justify-center gap-1.5">
+                    <Undo2 className="w-4 h-4" /> Return
+                  </button>
+                </div>
+                {remaining <= 0 && (
+                  <div className="text-[11px] text-[#8B7355] mt-2">Nothing left on hand to waste or dispose.</div>
+                )}
+              </div>
+            ) : batch.status !== 'active' ? (
+              <div className="bg-[#FFF1E3]/60 border border-[#E8D5C4] rounded-xl p-3 text-[11px] text-[#8B7355]">
+                This batch is <span className="capitalize font-medium">{batch.status}</span> — no further actions.
+              </div>
+            ) : null}
+
             {/* Transactions */}
             <div>
               <div className="text-sm font-semibold text-[#2D1B0E] flex items-center gap-1.5 mb-2">
@@ -939,6 +1062,118 @@ function BatchDetailDrawer({ id, onClose }: { id: string; onClose: () => void })
             </div>
           </div>
         ) : null}
+      </div>
+    </div>
+
+    {/* Action modal (waste / dispose / transfer / return) */}
+    {action && batch && (
+      <DisposeActionModal
+        batch={batch}
+        action={action}
+        remaining={remaining}
+        onCancel={() => setAction(null)}
+        onDone={onActionDone}
+      />
+    )}
+    </>
+  );
+}
+
+// ─── Waste / dispose / transfer / return modal ───────────────────────────
+type DisposeAction = 'wasted' | 'disposed' | 'transferred' | 'returned';
+
+const ACTION_META: Record<DisposeAction, {
+  title: string; verb: string; removes: boolean; danger: boolean; blurb: string;
+}> = {
+  wasted:      { title: 'Record Waste',   verb: 'Record waste', removes: true,  danger: true,
+                 blurb: 'Remove spoiled / unusable stock from this batch.' },
+  disposed:    { title: 'Dispose Stock',  verb: 'Dispose',      removes: true,  danger: true,
+                 blurb: 'Write off and dispose stock from this batch.' },
+  transferred: { title: 'Transfer Batch', verb: 'Transfer',     removes: false, danger: false,
+                 blurb: 'Log a movement of this batch to another location — stock on hand is unchanged.' },
+  returned:    { title: 'Return Batch',   verb: 'Return',       removes: false, danger: false,
+                 blurb: 'Log a return of this batch — stock on hand is unchanged.' },
+};
+
+function DisposeActionModal({ batch, action, remaining, onCancel, onDone }: {
+  batch: Batch; action: DisposeAction; remaining: number;
+  onCancel: () => void; onDone: (label: string) => void;
+}) {
+  const meta = ACTION_META[action];
+  const [qty, setQty] = useState<string>(String(remaining || ''));
+  const [remarks, setRemarks] = useState('');
+  const [confirmed, setConfirmed] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    const q = Number(qty);
+    if (!Number.isFinite(q) || q <= 0) { setError('Enter a quantity greater than 0.'); return; }
+    if (meta.removes && q > remaining + 1e-9) { setError(`Only ${fmtNum(remaining)} on hand.`); return; }
+    setSubmitting(true); setError(null);
+    try {
+      const r = await api(`/api/kitchen-production/${batch.id}/dispose`, {
+        method: 'POST',
+        body: { action, quantity: q, remarks: remarks.trim() },
+      });
+      const j = await r.json();
+      if (!r.ok) { setError(j.error || 'Failed to record'); return; }
+      onDone(`${batch.item_name} — ${meta.verb.toLowerCase()} (${fmtNum(q)}${batch.unit ? ' ' + batch.unit : ''})`);
+    } catch (e: any) { setError(e?.message || 'Failed to record'); }
+    finally { setSubmitting(false); }
+  };
+
+  const disabled = submitting || (meta.removes && !confirmed);
+
+  return (
+    <div className="fixed inset-0 z-[55] bg-black/50 flex items-center justify-center p-4" onClick={onCancel}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-sm shadow-xl" onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between">
+          <div className={`font-semibold flex items-center gap-2 ${meta.danger ? 'text-red-700' : 'text-[#2D1B0E]'}`}>
+            {meta.danger ? <Trash2 className="w-5 h-5" /> : <Send className="w-5 h-5 text-[#af4408]" />}
+            {meta.title}
+          </div>
+          <button onClick={onCancel} disabled={submitting} className="text-[#8B7355] hover:text-[#2D1B0E] disabled:opacity-50">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="p-5 space-y-3">
+          <div className="text-xs text-[#6B5744]">{meta.blurb}</div>
+          <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-3 py-2 text-xs text-[#6B5744]">
+            <span className="font-semibold text-[#2D1B0E]">{batch.item_name}</span>
+            <span className="font-mono ml-2">{batch.batch_number}</span>
+            <div className="mt-0.5">On hand: <b className="text-emerald-700">{fmtNum(remaining)}{batch.unit ? ' ' + batch.unit : ''}</b></div>
+          </div>
+          <Field label={`Quantity${batch.unit ? ` (${batch.unit})` : ''}`} required>
+            <input type="number" step="any" min={0} value={qty} onChange={e => setQty(e.target.value)}
+                   className={inputCls} autoFocus />
+          </Field>
+          <Field label="Remarks">
+            <textarea value={remarks} onChange={e => setRemarks(e.target.value)} rows={2}
+                      placeholder={meta.removes ? 'Reason (e.g. spoilage, over-prep)…' : 'Where to / why…'}
+                      className={inputCls} />
+          </Field>
+          {meta.removes && (
+            <label className="flex items-start gap-2 text-xs text-[#6B5744] cursor-pointer">
+              <input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)}
+                     className="accent-[#af4408] mt-0.5" />
+              I confirm removing this stock — this cannot be undone.
+            </label>
+          )}
+          {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
+        </div>
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
+          <button onClick={onCancel} disabled={submitting}
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
+            Cancel
+          </button>
+          <button onClick={submit} disabled={disabled}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-50 text-white ${
+                    meta.danger ? 'bg-red-600 hover:bg-red-700' : 'bg-[#af4408] hover:bg-[#8a3506]'}`}>
+            {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+            {meta.verb}
+          </button>
+        </div>
       </div>
     </div>
   );
