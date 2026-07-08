@@ -334,7 +334,14 @@ export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): strin
   // Optional QR on the right side, inset by the 2 mm margin (top & right).
   if (withQr && qrValue) {
     // QRCODE x,y,ECClevel,cellWidth,mode,rotation,"content"
-    lines.push(`QRCODE ${widthMm * 8 - 108 - M},${M},M,4,A,0,"${tsplEscape(qrValue)}"`);
+    // Camera phones lock onto a BIGGER QR much faster than the Code128, so use the
+    // largest cell width that keeps the symbol inside the 108-dot reservation the
+    // x-position (and the item-name wrap budget) already assume. Symbol modules
+    // grow with content (auto version, byte-mode capacities at ECC M), so a longer
+    // future scanUrl shrinks the cell instead of spilling past the right margin.
+    const qrModules = qrValue.length <= 14 ? 21 : qrValue.length <= 26 ? 25 : qrValue.length <= 42 ? 29 : qrValue.length <= 62 ? 33 : qrValue.length <= 84 ? 37 : 41;
+    const qrCell = Math.max(2, Math.min(6, Math.floor(108 / qrModules)));
+    lines.push(`QRCODE ${widthMm * 8 - 108 - M},${M},M,${qrCell},A,0,"${tsplEscape(qrValue)}"`);
   }
 
   lines.push(`PRINT ${copies},1`);

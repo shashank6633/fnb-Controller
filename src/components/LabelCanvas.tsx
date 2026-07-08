@@ -26,8 +26,10 @@ export interface LabelCanvasProps {
 export default function LabelCanvas({ preview: pv, scale = 7, className = '' }: LabelCanvasProps) {
   const w = pv.width_mm * scale;
   const h = pv.height_mm * scale;
-  // QR occupies ~11 mm; barcode bar height comes from design dots (8 dots/mm).
-  const qrPx = Math.round(11 * scale);
+  // QR occupies ~13 mm (21 modules × cell 5 = 105 dots on the print — buildTSPL
+  // sizes it to fill its 108-dot reservation so cameras lock on fast); barcode
+  // bar height comes from design dots (8 dots/mm).
+  const qrPx = Math.round(13 * scale);
   const barcodePx = Math.max(18, Math.round((pv.barcode_height / 8) * scale));
 
   const barcodeRef = useRef<SVGSVGElement | null>(null);

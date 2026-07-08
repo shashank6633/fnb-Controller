@@ -201,8 +201,14 @@ export default function KitchenScanPage() {
 
   // ── process one scanned/typed code ────────────────────────────────────
   const processScan = useCallback(async (raw: string, opts: { fromCamera?: boolean } = {}) => {
-    const code = (raw || '').trim();
+    let code = (raw || '').trim();
     if (!code) return;
+    // The label's QR may carry the bare barcode (today) or a deep-link URL that
+    // CONTAINS it (future scanUrl). Pull the PROD###### out of whatever was
+    // decoded so both resolve; anything else (manual entry, other codes) passes
+    // through unchanged.
+    const prod = code.match(/PROD\d{3,}/i);
+    if (prod) code = prod[0].toUpperCase();
 
     // Debounce duplicate camera reads of the same label.
     if (opts.fromCamera) {
