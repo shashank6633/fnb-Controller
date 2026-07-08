@@ -507,7 +507,7 @@ public static class FnbRawPrint {
       try {
         if (!StartPagePrinter(h)) throw new Exception("StartPagePrinter failed err=" + Marshal.GetLastWin32Error());
         IntPtr p = Marshal.AllocCoTaskMem(bytes.Length);
-        try { Marshal.Copy(bytes, 0, p, bytes.Length); int w; if (!WritePrinter(h, p, bytes.Length, out w)) throw new Exception("WritePrinter failed err=" + Marshal.GetLastWin32Error()); }
+        try { Marshal.Copy(bytes, 0, p, bytes.Length); int w; if (!WritePrinter(h, p, bytes.Length, out w)) throw new Exception("WritePrinter failed err=" + Marshal.GetLastWin32Error()); if (w != bytes.Length) throw new Exception("WritePrinter partial write " + w + "/" + bytes.Length); }
         finally { Marshal.FreeCoTaskMem(p); }
         EndPagePrinter(h);
       } finally { EndDocPrinter(h); }
@@ -532,7 +532,7 @@ async function printUsb(target, payload) {
       } else {
         // A printer NAME → raw-spool through the Win32 spooler (no sharing required,
         // no GDI driver mangling). This is what the app's printer picker sends.
-        const ps1 = path.join(os.tmpdir(), `fnb-rawprint-${Date.now()}.ps1`);
+        const ps1 = path.join(os.tmpdir(), `fnb-rawprint-${Date.now()}-${process.hrtime()[1]}.ps1`);
         await fs.promises.writeFile(ps1, RAW_PRINT_PS1);
         try {
           await runCmd('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-Printer', t, '-FilePath', tmp]);
