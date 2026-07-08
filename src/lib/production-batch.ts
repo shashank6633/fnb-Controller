@@ -94,3 +94,43 @@ export function enrichBatch(b: ProductionBatch, now: Date) {
     batch_age_hours: batchAgeHours(b.production_date, b.production_time, now),
   };
 }
+
+/**
+ * FIFO verdict for one batch, shared by the /scan and /take endpoints so the
+ * two can never drift. fifo_priority = the batch's rank among the item's
+ * ACTIVE batches (oldest = 1; null when the batch itself isn't active).
+ * fifo_use_first = older active batches to use BEFORE this one (oldest first,
+ * capped at 5); for a non-active batch it lists ALL actives (the first entry
+ * is the item's current FIFO #1).
+ */
+export function computeFifo(
+  db: { prepare: (sql: string) => { all: (...a: any[]) => any[] } },
+  row: ProductionBatch,
+  outletId: string | null,
+  now: Date,
+): { fifo_priority: number | null; fifo_use_first: any[] } {
+  const active = db.prepare(
+    `SELECT * FROM production_batches
+      WHERE status = 'active' AND item_name = ?
+        ${outletId ? 'AND (outlet_id = ? OR outlet_id IS NULL)' : ''}
+      ORDER BY production_date ASC, production_time ASC, created_at ASC`
+  ).all(...(outletId ? [row.item_name, outletId] : [row.item_name])) as ProductionBatch[];
+  const idx = active.findIndex((a) => a.id === row.id);
+  const fifo_priority = row.status === 'active' && idx >= 0 ? idx + 1 : null;
+  const before = row.status === 'active' ? (idx >= 0 ? active.slice(0, idx) : []) : active;
+  const fifo_use_first = before.slice(0, 5).map((b) => {
+    const e = enrichBatch(b, now);
+    return {
+      barcode: b.barcode,
+      batch_number: b.batch_number,
+      production_date: b.production_date,
+      production_time: b.production_time,
+      expiry_date: b.expiry_date,
+      storage_location: b.storage_location,
+      remaining_quantity: e.remaining_quantity,
+      unit: b.unit,
+      shelf_life_remaining: shelfLifeRemaining(b.expiry_date, b.expiry_time, now),
+    };
+  });
+  return { fifo_priority, fifo_use_first };
+}

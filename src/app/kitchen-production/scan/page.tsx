@@ -36,6 +36,7 @@ import {
 import { BrowserMultiFormatReader } from '@zxing/browser';
 import { BarcodeFormat, DecodeHintType } from '@zxing/library';
 import { fmtISTDate, fmtIST } from '@/lib/format-date';
+import { api } from '@/lib/api';
 import {
   scanAndFlush, listHistory, queuedCount, ensureScanFlushLoop, flushQueue,
   type ScanHistoryEntry,
@@ -441,7 +442,8 @@ export default function KitchenScanPage() {
 
       {/* Result */}
       {result && (
-        <ResultPanel result={result} online={online} onClose={() => setResult(null)} />
+        <ResultPanel result={result} online={online} onClose={() => setResult(null)}
+          onBatchUpdate={(batch) => setResult(r => (r && r.status === 'found' ? { ...r, batch } : r))} />
       )}
 
       {/* History */}
@@ -483,8 +485,8 @@ export default function KitchenScanPage() {
 }
 
 // ─── Result panel ─────────────────────────────────────────────────────────
-function ResultPanel({ result, online, onClose }: {
-  result: ScanResult; online: boolean; onClose: () => void;
+function ResultPanel({ result, online, onClose, onBatchUpdate }: {
+  result: ScanResult; online: boolean; onClose: () => void; onBatchUpdate: (batch: Batch) => void;
 }) {
   // Queued (offline) — the scan is saved and will resolve once back online.
   if (result.status === 'queued') {
@@ -639,6 +641,9 @@ function ResultPanel({ result, online, onClose }: {
           <QtyChip label="Remaining" value={`${fmtNum(b.remaining_quantity)}${b.unit ? ' ' + b.unit : ''}`} tone="text-emerald-700" />
         </div>
 
+        {/* Take stock — partial draw-down from THIS batch; auto-completes at 0 */}
+        <TakeStock b={b} online={online} onUpdated={onBatchUpdate} />
+
         {/* Details grid */}
         <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4 grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
           <Detail label="Production" value={fmtDateTimeParts(b.production_date, b.production_time)} />
@@ -678,6 +683,82 @@ function DetailIcon({ icon, label, value }: { icon: React.ReactNode; label: stri
     <div>
       <div className="text-[11px] text-[#8B7355] flex items-center gap-1">{icon}{label}</div>
       <div className="text-[#2D1B0E] truncate">{value}</div>
+    </div>
+  );
+}
+
+// "Take stock" — deduct a quantity from the scanned batch (POST /take). Kept as
+// its own component so its hooks sit outside ResultPanel's early returns and the
+// success note survives the batch flipping to 'consumed'. Online-only: the
+// server must validate remaining, so offline takes are refused up front.
+function TakeStock({ b, online, onUpdated }: {
+  b: Batch; online: boolean; onUpdated: (batch: Batch) => void;
+}) {
+  const [qty, setQty] = useState('');
+  const [taking, setTaking] = useState(false);
+  const [note, setNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+
+  if (b.status !== 'active' || b.remaining_quantity <= 0) {
+    // Batch just completed (or was already inactive) — keep showing the outcome.
+    return note ? (
+      <div className={`rounded-lg px-3 py-2 text-sm font-medium ${note.kind === 'ok' ? 'bg-emerald-50 border border-emerald-200 text-emerald-800' : 'bg-red-50 border border-red-200 text-red-700'}`}>
+        {note.text}
+      </div>
+    ) : null;
+  }
+
+  const unitSfx = b.unit ? ` ${b.unit}` : '';
+  const take = async () => {
+    const q = Number(qty);
+    if (!Number.isFinite(q) || q <= 0) { setNote({ kind: 'err', text: 'Enter a quantity greater than 0.' }); return; }
+    if (q > b.remaining_quantity + 1e-9) { setNote({ kind: 'err', text: `Only ${fmtNum(b.remaining_quantity)}${unitSfx} left in this batch.` }); return; }
+    if (!online) { setNote({ kind: 'err', text: 'You are offline — taking stock needs a connection.' }); return; }
+    if (b.expiry_status === 'red' && !window.confirm('This batch is EXPIRED — it should be disposed, not used. Take from it anyway?')) return;
+    if ((b.fifo_priority ?? 1) > 1) {
+      const first = b.fifo_use_first?.[0];
+      const okAnyway = window.confirm(
+        `This batch is FIFO #${b.fifo_priority}${first ? ` — ${first.barcode} should be used first` : ''}. Take from this one anyway?`
+      );
+      if (!okAnyway) return;
+    }
+    setTaking(true); setNote(null);
+    try {
+      const r = await api('/api/kitchen-production/take', { method: 'POST', body: { barcode: b.barcode, quantity: q } });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setQty('');
+      setNote({
+        kind: 'ok',
+        text: j.completed
+          ? `Took ${fmtNum(j.taken)}${unitSfx} — batch fully used, marked completed ✓`
+          : `Took ${fmtNum(j.taken)}${unitSfx} — ${fmtNum(j.remaining)}${unitSfx} left`,
+      });
+      onUpdated(j.batch as Batch);
+    } catch (e: any) {
+      setNote({ kind: 'err', text: e?.message || 'Failed to take stock' });
+    } finally { setTaking(false); }
+  };
+
+  return (
+    <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3 space-y-2">
+      <div className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide">Take stock from this batch</div>
+      <div className="flex items-center gap-2">
+        <input
+          type="number" inputMode="decimal" min={0} step="any" value={qty}
+          onChange={(e) => setQty(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') take(); }}
+          placeholder={`e.g. 3 (max ${fmtNum(b.remaining_quantity)})`}
+          className="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm bg-white"
+        />
+        {b.unit && <span className="text-sm text-[#6B5744] shrink-0">{b.unit}</span>}
+        <button onClick={take} disabled={taking}
+          className="shrink-0 px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+          {taking ? <Loader2 className="w-4 h-4 animate-spin" /> : <Package className="w-4 h-4" />} Take
+        </button>
+      </div>
+      {note && (
+        <div className={`text-sm font-medium ${note.kind === 'ok' ? 'text-emerald-700' : 'text-red-700'}`}>{note.text}</div>
+      )}
     </div>
   );
 }

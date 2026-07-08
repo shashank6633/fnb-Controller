@@ -1,6 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { enrichBatch, shelfLifeRemaining, ProductionBatch } from '@/lib/production-batch';
+import { enrichBatch, shelfLifeRemaining, computeFifo, ProductionBatch } from '@/lib/production-batch';
 
 /**
  * POST /api/kitchen-production/scan
@@ -57,40 +57,8 @@ export async function POST(request: Request) {
        ) VALUES (?,?,?,?,?,?,?,?,?)`
     ).run(generateId(), row.id, outletId, 'scanned', 0, remaining, userLabel, department, remarks);
 
-    // FIFO verdict for the scanner. fifo_priority = this batch's rank among the
-    // item's ACTIVE batches (oldest = 1). fifo_use_first = the OLDER active
-    // batches that must be used before this one (oldest first, capped at 5) so
-    // the scan screen can say "use PROD-xxxx first". Scanning a consumed/expired
-    // label still points at the item's current FIFO #1.
-    let fifo_priority: number | null = null;
-    let fifo_use_first: any[] = [];
-    {
-      const active = db.prepare(
-        `SELECT * FROM production_batches
-          WHERE status = 'active' AND item_name = ?
-            ${outletId ? 'AND (outlet_id = ? OR outlet_id IS NULL)' : ''}
-          ORDER BY production_date ASC, production_time ASC, created_at ASC`
-      ).all(...(outletId ? [row.item_name, outletId] : [row.item_name])) as ProductionBatch[];
-      const idx = active.findIndex((a) => a.id === row.id);
-      if (row.status === 'active' && idx >= 0) fifo_priority = idx + 1;
-      // Older-than-scanned actives; for a non-active scanned label, ALL actives
-      // are "use instead" candidates (the first entry is the current FIFO #1).
-      const before = row.status === 'active' ? (idx >= 0 ? active.slice(0, idx) : []) : active;
-      fifo_use_first = before.slice(0, 5).map((b) => {
-        const e = enrichBatch(b, now);
-        return {
-          barcode: b.barcode,
-          batch_number: b.batch_number,
-          production_date: b.production_date,
-          production_time: b.production_time,
-          expiry_date: b.expiry_date,
-          storage_location: b.storage_location,
-          remaining_quantity: e.remaining_quantity,
-          unit: b.unit,
-          shelf_life_remaining: shelfLifeRemaining(b.expiry_date, b.expiry_time, now),
-        };
-      });
-    }
+    // FIFO verdict — shared computeFifo() so /scan and /take never drift.
+    const { fifo_priority, fifo_use_first } = computeFifo(db, row, outletId, now);
 
     const batch = {
       ...enriched,
