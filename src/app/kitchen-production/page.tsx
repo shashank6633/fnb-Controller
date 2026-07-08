@@ -28,7 +28,7 @@ import {
 import { api } from '@/lib/api';
 import { fmtIST, fmtISTDate, todayIST, fmtISTIsoDate } from '@/lib/format-date';
 import { parseDateTime } from '@/lib/production-batch';
-import { bridgePrint, probeBridge, bridgeStatus } from '@/lib/offline-print/bridge-client';
+import { bridgePrint, probeBridge, bridgeStatus, listBridgePrinters, type BridgePrinter } from '@/lib/offline-print/bridge-client';
 import { labelPreview, LABEL_FIELD_KEYS } from '@/lib/tspl-label';
 import type { LabelPrinterConfig, LabelBatch, LabelFieldKey } from '@/lib/tspl-label';
 import LabelCanvas from '@/components/LabelCanvas';
@@ -1339,6 +1339,11 @@ function PrinterSettingsModal({ onClose, onSaved }: {
       .finally(() => setLoading(false));
   }, []);
 
+  // Installed printers from the bridge (v2.5.0+) → a picker so nobody types share
+  // paths. null = bridge unreachable/old → fall back to the free-text target.
+  const [printers, setPrinters] = useState<BridgePrinter[] | null>(null);
+  useEffect(() => { listBridgePrinters().then(setPrinters).catch(() => setPrinters(null)); }, []);
+
   const [tab, setTab] = useState<'printer' | 'design'>('printer');
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ bridge: string; printer: string; print: string } | null>(null);
@@ -1447,9 +1452,27 @@ function PrinterSettingsModal({ onClose, onSaved }: {
                     </select>
                   </Field>
                 </div>
-                <Field label={cfg.transport === 'ip' ? 'Target (host:port)' : 'Target (USB queue / share name)'}>
-                  <input value={cfg.target} onChange={e => set('target', e.target.value)}
-                         placeholder={cfg.transport === 'ip' ? '192.168.1.60:9100' : 'TE210'} className={inputCls} />
+                <Field label={cfg.transport === 'ip' ? 'Target (host:port)' : 'Printer'}>
+                  {cfg.transport === 'usb' && printers && printers.length > 0 ? (
+                    <>
+                      <select value={printers.some(p => p.name === cfg.target) ? cfg.target : '__manual__'}
+                              onChange={e => { if (e.target.value !== '__manual__') set('target', e.target.value); }}
+                              className={inputCls}>
+                        <option value="__manual__">— pick an installed printer —</option>
+                        {printers.map(p => (
+                          <option key={p.name} value={p.name}>{p.name}{p.isDefault ? ' (default)' : ''}{p.shareName ? ` · shared: ${p.shareName}` : ''}</option>
+                        ))}
+                      </select>
+                      <input value={cfg.target} onChange={e => set('target', e.target.value)}
+                             placeholder="or type the printer name / \\pc\share" className={`${inputCls} mt-1.5`} />
+                    </>
+                  ) : (
+                    <input value={cfg.target} onChange={e => set('target', e.target.value)}
+                           placeholder={cfg.transport === 'ip' ? '192.168.1.60:9100' : 'TE210'} className={inputCls} />
+                  )}
+                  {cfg.transport === 'usb' && printers === null && (
+                    <p className="text-[11px] text-[#8B7355] mt-1">Bridge v2.5.0+ can list printers here — update the bridge to pick from a dropdown. For now, type the printer's exact name.</p>
+                  )}
                 </Field>
                 <div className="grid grid-cols-3 gap-3">
                   <Field label="Width (mm)">

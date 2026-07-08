@@ -57,6 +57,21 @@ export async function bridgeStatus(target: string, timeoutMs = 3000): Promise<Pr
   } catch { return null; }
 }
 
+export type BridgePrinter = { name: string; shareName: string; port: string; isDefault: boolean };
+
+/** Installed printers on the counter PC (bridge v2.5.0+). null if unreachable/old. */
+export async function listBridgePrinters(timeoutMs = 6000): Promise<BridgePrinter[] | null> {
+  try {
+    return await withTimeout(async (signal) => {
+      const r = await fetch(`${getBridgeUrl()}/printers`, { signal, cache: 'no-store' });
+      if (!r.ok) return null;
+      const j = await r.json();
+      if (!j?.ok || !Array.isArray(j.printers)) return null;
+      return j.printers.map((p: any) => ({ name: String(p.name || ''), shareName: String(p.shareName || ''), port: String(p.port || ''), isDefault: !!p.isDefault })) as BridgePrinter[];
+    }, timeoutMs);
+  } catch { return null; }
+}
+
 export type PrinterTarget = { transport: 'ip' | 'usb' | 'file'; target: string; width?: 32 | 48 };
 // 'tspl'/'raw' carry a ready-made command string in `payload` that the bridge
 // (v2.4.0+) sends to the printer verbatim — used for TSPL2 label jobs (TSC TE210).

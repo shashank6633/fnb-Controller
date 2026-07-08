@@ -56,7 +56,7 @@ const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.4.0';   // 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
+const VERSION = '2.5.0';   // 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -457,34 +457,117 @@ function printIp(target, payload, opts = {}) {
   });
 }
 
-function printUsb(target, payload) {
+// Spawn a command, resolve on exit 0, reject with stderr otherwise.
+function runCmd(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { windowsHide: true, ...opts });
+    let err = '';
+    if (p.stderr) p.stderr.on('data', (d) => (err += d));
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code} ${err.trim()}`))));
+    p.on('error', (e) => reject(e));
+  });
+}
+
+// Spawn a command and capture stdout.
+function runCmdCapture(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { windowsHide: true });
+    let out = '', err = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (err += d));
+    p.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`${cmd} exited ${code} ${err.trim()}`))));
+    p.on('error', (e) => reject(e));
+  });
+}
+
+// PowerShell that raw-spools a file to a Windows printer BY NAME through the Win32
+// print spooler (RAW datatype) — no sharing, no GDI driver mangling. Single-quoted
+// here-string so PowerShell does not interpolate the C#. Written to a temp .ps1.
+const RAW_PRINT_PS1 = `param([Parameter(Mandatory=$true)][string]$Printer,[Parameter(Mandatory=$true)][string]$FilePath)
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class FnbRawPrint {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct DOCINFO { [MarshalAs(UnmanagedType.LPWStr)] public string pDocName; [MarshalAs(UnmanagedType.LPWStr)] public string pOutputFile; [MarshalAs(UnmanagedType.LPWStr)] public string pDataType; }
+  [DllImport("winspool.Drv", EntryPoint="OpenPrinterW", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool OpenPrinter(string src, out IntPtr h, IntPtr pd);
+  [DllImport("winspool.Drv", EntryPoint="ClosePrinter", SetLastError=true)] static extern bool ClosePrinter(IntPtr h);
+  [DllImport("winspool.Drv", EntryPoint="StartDocPrinterW", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool StartDocPrinter(IntPtr h, int level, ref DOCINFO di);
+  [DllImport("winspool.Drv", EntryPoint="EndDocPrinter", SetLastError=true)] static extern bool EndDocPrinter(IntPtr h);
+  [DllImport("winspool.Drv", EntryPoint="StartPagePrinter", SetLastError=true)] static extern bool StartPagePrinter(IntPtr h);
+  [DllImport("winspool.Drv", EntryPoint="EndPagePrinter", SetLastError=true)] static extern bool EndPagePrinter(IntPtr h);
+  [DllImport("winspool.Drv", EntryPoint="WritePrinter", SetLastError=true)] static extern bool WritePrinter(IntPtr h, IntPtr buf, int count, out int written);
+  public static void Send(string printer, byte[] bytes) {
+    IntPtr h;
+    if (!OpenPrinter(printer, out h, IntPtr.Zero)) throw new Exception("OpenPrinter failed for printer, err=" + Marshal.GetLastWin32Error());
+    try {
+      DOCINFO di = new DOCINFO(); di.pDocName = "FNB Label"; di.pDataType = "RAW";
+      if (!StartDocPrinter(h, 1, ref di)) throw new Exception("StartDocPrinter failed err=" + Marshal.GetLastWin32Error());
+      try {
+        if (!StartPagePrinter(h)) throw new Exception("StartPagePrinter failed err=" + Marshal.GetLastWin32Error());
+        IntPtr p = Marshal.AllocCoTaskMem(bytes.Length);
+        try { Marshal.Copy(bytes, 0, p, bytes.Length); int w; if (!WritePrinter(h, p, bytes.Length, out w)) throw new Exception("WritePrinter failed err=" + Marshal.GetLastWin32Error()); }
+        finally { Marshal.FreeCoTaskMem(p); }
+        EndPagePrinter(h);
+      } finally { EndDocPrinter(h); }
+    } finally { ClosePrinter(h); }
+  }
+}
+'@
+[FnbRawPrint]::Send($Printer, [System.IO.File]::ReadAllBytes($FilePath))`;
+
+async function printUsb(target, payload) {
   // Cross-platform raw spool to an OS-installed USB printer. No native deps.
   const plat = os.platform();
+  const t = String(target || '').trim();
   if (plat === 'win32') {
-    // target = a shared printer path, e.g. \\localhost\POS80  (share the printer
-    // with that name, "Generic / Text Only" driver passes ESC/POS through raw).
-    return new Promise((resolve, reject) => {
-      const tmp = path.join(os.tmpdir(), `fnb-kot-${Date.now()}.bin`);
-      fs.writeFile(tmp, payload, (werr) => {
-        if (werr) return reject(werr);
-        const p = spawn('cmd', ['/c', 'copy', '/b', tmp, String(target)], { windowsHide: true });
-        let err = '';
-        p.stderr.on('data', (d) => (err += d));
-        p.on('close', (code) => { fs.unlink(tmp, () => {}); code === 0 ? resolve() : reject(new Error(`copy /b → ${target} failed (${code}) ${err}`)); });
-        p.on('error', (e) => { fs.unlink(tmp, () => {}); reject(e); });
-      });
-    });
+    const tmp = path.join(os.tmpdir(), `fnb-label-${Date.now()}-${process.hrtime()[1]}.bin`);
+    await fs.promises.writeFile(tmp, payload);
+    try {
+      if (t.startsWith('\\\\')) {
+        // \\host\share UNC path → copy /b (legacy; needs the printer shared with a
+        // "Generic / Text Only" driver so raw bytes pass through).
+        await runCmd('cmd', ['/c', 'copy', '/b', tmp, t]);
+      } else {
+        // A printer NAME → raw-spool through the Win32 spooler (no sharing required,
+        // no GDI driver mangling). This is what the app's printer picker sends.
+        const ps1 = path.join(os.tmpdir(), `fnb-rawprint-${Date.now()}.ps1`);
+        await fs.promises.writeFile(ps1, RAW_PRINT_PS1);
+        try {
+          await runCmd('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-Printer', t, '-FilePath', tmp]);
+        } finally { fs.promises.unlink(ps1).catch(() => {}); }
+      }
+    } finally { fs.promises.unlink(tmp).catch(() => {}); }
+    return;
   }
   // macOS / Linux: target = CUPS printer name (lpstat -p). -o raw = pass bytes through.
   return new Promise((resolve, reject) => {
-    const p = spawn('lp', ['-d', String(target), '-o', 'raw'], { stdio: ['pipe', 'ignore', 'pipe'] });
+    const p = spawn('lp', ['-d', t, '-o', 'raw'], { stdio: ['pipe', 'ignore', 'pipe'] });
     let err = '';
     p.stderr.on('data', (d) => (err += d));
-    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`lp -d ${target} failed (${code}) ${err.trim()}`))));
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`lp -d ${t} failed (${code}) ${err.trim()}`))));
     p.on('error', (e) => reject(new Error(`lp not available — ${e.message}`)));
     p.stdin.write(payload);
     p.stdin.end();
   });
+}
+
+// List installed printers so the app can offer a picker (name + share + port).
+async function listPrinters() {
+  const plat = os.platform();
+  if (plat === 'win32') {
+    const out = await runCmdCapture('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+      'Get-CimInstance Win32_Printer | Select-Object Name,ShareName,PortName,Default | ConvertTo-Json -Compress']);
+    let arr = [];
+    try { const j = JSON.parse(out.trim() || '[]'); arr = Array.isArray(j) ? j : [j]; } catch {}
+    return arr.filter(Boolean).map((p) => ({ name: p.Name || '', shareName: p.ShareName || '', port: p.PortName || '', isDefault: !!p.Default }));
+  }
+  // macOS / Linux: CUPS destinations
+  try {
+    const out = await runCmdCapture('lpstat', ['-e']).catch(() => runCmdCapture('lpstat', ['-a']));
+    return out.split('\n').map((l) => l.trim().split(/\s+/)[0]).filter(Boolean).map((name) => ({ name, shareName: '', port: '', isDefault: false }));
+  } catch { return []; }
 }
 
 function printFile(target, payload) {            // for testing without a printer
@@ -732,12 +815,34 @@ const server = http.createServer((req, res) => {
     return sendJson(res, 200, { ok: true, version: VERSION, platform: os.platform(), uptimeSec: Math.round((Date.now() - startedAt) / 1000) });
   }
 
-  // Live printer status for the dashboard: GET /printer-status?target=ip:9100
+  // Installed printers (for the app's printer picker): GET /printers
+  if (req.method === 'GET' && url.pathname === '/printers') {
+    listPrinters().then((printers) => sendJson(res, 200, { ok: true, printers }))
+      .catch((e) => sendJson(res, 200, { ok: false, printers: [], error: String(e.message) }));
+    return;
+  }
+
+  // Live printer status: GET /printer-status?target=ip:9100 (IP) or a printer
+  // NAME / \\host\share (USB). IP targets get a live ESC/POS status probe; USB
+  // targets just confirm the printer is installed (a TCP probe is meaningless).
   if (req.method === 'GET' && url.pathname === '/printer-status') {
     const target = url.searchParams.get('target');
     if (!target) return sendJson(res, 400, { ok: false, error: 'target required' });
-    queryIpStatus(target).then((s) => sendJson(res, 200, { ok: true, target, ...s }))
-      .catch((e) => sendJson(res, 200, { ok: false, target, reachable: false, error: String(e.message) }));
+    const isIp = /^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(target) || (target.includes(':') && !target.startsWith('\\'));
+    if (isIp) {
+      queryIpStatus(target).then((s) => sendJson(res, 200, { ok: true, target, transport: 'ip', ...s }))
+        .catch((e) => sendJson(res, 200, { ok: false, target, reachable: false, error: String(e.message) }));
+    } else {
+      listPrinters().then((printers) => {
+        const norm = (s) => String(s || '').toLowerCase().replace(/^\\\\[^\\]+\\/, '');
+        const key = norm(target);
+        const found = printers.find((p) => norm(p.name) === key || (p.shareName && norm(p.shareName) === key));
+        sendJson(res, 200, {
+          ok: true, target, transport: 'usb', installed: !!found, reachable: !!found,
+          supported: false, paperOut: false, paperLow: false, coverOpen: false, error: false,
+        });
+      }).catch((e) => sendJson(res, 200, { ok: false, target, reachable: false, error: String(e.message) }));
+    }
     return;
   }
 
