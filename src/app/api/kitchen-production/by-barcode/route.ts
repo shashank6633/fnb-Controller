@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef } from '@/lib/auth';
-import { enrichBatch, shelfLifeRemaining, ProductionBatch } from '@/lib/production-batch';
+import { enrichBatch, shelfLifeRemaining, computeFifo, ProductionBatch } from '@/lib/production-batch';
 
 /**
  * GET /api/kitchen-production/by-barcode?barcode=PROD000145
@@ -42,18 +42,8 @@ export async function GET(request: Request) {
     const now = new Date();
     const enriched = enrichBatch(row, now);
 
-    // fifo_priority: rank among ACTIVE batches of the same item, oldest-first.
-    let fifo_priority: number | null = null;
-    if (row.status === 'active') {
-      const active = db.prepare(
-        `SELECT id FROM production_batches
-          WHERE status = 'active' AND item_name = ?
-            ${outletId ? 'AND (outlet_id = ? OR outlet_id IS NULL)' : ''}
-          ORDER BY production_date ASC, production_time ASC, created_at ASC`
-      ).all(...(outletId ? [row.item_name, outletId] : [row.item_name])) as { id: string }[];
-      const idx = active.findIndex((a) => a.id === row.id);
-      if (idx >= 0) fifo_priority = idx + 1;
-    }
+    // Same FIFO grouping as scan/take/list (by production_item_id).
+    const { fifo_priority } = computeFifo(db, row, outletId, now);
 
     const batch = {
       ...enriched,

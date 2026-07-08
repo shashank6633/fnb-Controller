@@ -8,6 +8,8 @@ export interface ProductionBatch {
   batch_number: string;
   barcode: string;
   item_name: string;
+  /** FK to the production_items master; null on legacy free-typed batches. */
+  production_item_id?: string | null;
   category: string;
   material_id: string | null;
   recipe_id: string | null;
@@ -96,6 +98,25 @@ export function enrichBatch(b: ProductionBatch, now: Date) {
 }
 
 /**
+ * SQL condition + params matching ALL batches that belong to the SAME production
+ * item as `row`. THE single source of truth for FIFO grouping — every surface
+ * (scan/take verdict, list ranks, consume draw-down, by-barcode, dashboard
+ * compliance) uses this so they can never disagree. Groups by
+ * production_item_id when the row carries one (a rename or a case-typo can never
+ * split a chain), also folding in any legacy unlinked same-name rows; falls back
+ * to NOCASE name only for rows with no master item at all.
+ */
+export function itemGroupClause(row: { production_item_id?: string | null; item_name: string }): { cond: string; params: any[] } {
+  if (row.production_item_id) {
+    return {
+      cond: '(production_item_id = ? OR (production_item_id IS NULL AND item_name = ? COLLATE NOCASE))',
+      params: [row.production_item_id, row.item_name],
+    };
+  }
+  return { cond: 'item_name = ? COLLATE NOCASE', params: [row.item_name] };
+}
+
+/**
  * FIFO verdict for one batch, shared by the /scan and /take endpoints so the
  * two can never drift. fifo_priority = the batch's rank among the item's
  * ACTIVE batches (oldest = 1; null when the batch itself isn't active).
@@ -109,12 +130,13 @@ export function computeFifo(
   outletId: string | null,
   now: Date,
 ): { fifo_priority: number | null; fifo_use_first: any[] } {
+  const { cond: itemCond, params: itemParams } = itemGroupClause(row);
   const active = db.prepare(
     `SELECT * FROM production_batches
-      WHERE status = 'active' AND item_name = ?
+      WHERE status = 'active' AND ${itemCond}
         ${outletId ? 'AND (outlet_id = ? OR outlet_id IS NULL)' : ''}
       ORDER BY production_date ASC, production_time ASC, created_at ASC`
-  ).all(...(outletId ? [row.item_name, outletId] : [row.item_name])) as ProductionBatch[];
+  ).all(...(outletId ? [...itemParams, outletId] : itemParams)) as ProductionBatch[];
   const idx = active.findIndex((a) => a.id === row.id);
   const fifo_priority = row.status === 'active' && idx >= 0 ? idx + 1 : null;
   const before = row.status === 'active' ? (idx >= 0 ? active.slice(0, idx) : []) : active;

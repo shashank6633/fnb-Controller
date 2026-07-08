@@ -92,7 +92,8 @@ export async function GET(request: Request) {
       const enriched = enrichBatch(b, now);
       let fifo_priority: number | null = null;
       if (b.status === 'active') {
-        const key = b.item_name;
+        // Rank by master-item id when present (matches computeFifo), else name.
+        const key = b.production_item_id || b.item_name.trim().toLowerCase();
         fifoCounter[key] = (fifoCounter[key] || 0) + 1;
         fifo_priority = fifoCounter[key];
       }
@@ -114,8 +115,7 @@ export async function POST(request: Request) {
     if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const body = await request.json().catch(() => ({}));
-    const item_name = String(body?.item_name || '').trim();
-    if (!item_name) return Response.json({ error: 'item_name is required' }, { status: 400 });
+    let item_name = String(body?.item_name || '').trim();
 
     const quantity_produced = Number(body?.quantity_produced) || 0;
     if (quantity_produced <= 0) {
@@ -124,6 +124,29 @@ export async function POST(request: Request) {
 
     const outletId = await getCurrentOutletId();
     const db = getDb();
+
+    // Every batch MUST link to a Production Item (production_item_id), so FIFO can
+    // never be split by a free-typed variant. The item is authoritative for the
+    // name; category/unit/storage fall back to its defaults when left blank.
+    //   - production_item_id given (the shipped UI path) → validate it.
+    //   - only item_name given (a stale tablet mid-rolling-deploy) → RESOLVE it to
+    //     an existing master by name (NOCASE); reject unknown names rather than
+    //     insert a NULL-id row that would resurrect a name / split a chain later.
+    let production_item_id = String(body?.production_item_id || '').trim() || null;
+    let pItem: any = null;
+    if (production_item_id) {
+      pItem = db.prepare(`SELECT * FROM production_items WHERE id = ?`).get(production_item_id);
+      if (!pItem) return Response.json({ error: 'Unknown production item — refresh the item list' }, { status: 400 });
+      if (!pItem.is_active) return Response.json({ error: `"${pItem.name}" is deactivated — reactivate it in the item list first` }, { status: 400 });
+      item_name = pItem.name;
+    } else if (item_name) {
+      pItem = db.prepare(`SELECT * FROM production_items WHERE name = ? COLLATE NOCASE`).get(item_name);
+      if (!pItem) return Response.json({ error: `"${item_name}" is not in the Production Items list — refresh and select an item (or add it via Manage Items).` }, { status: 400 });
+      production_item_id = pItem.id;
+      item_name = pItem.name;   // canonicalise to the master's exact name/case
+    } else {
+      return Response.json({ error: 'A production item is required — refresh and select one from the list.' }, { status: 400 });
+    }
 
     const production_date = String(body?.production_date || '').trim();
     const department = me.department_id || '';
@@ -136,18 +159,19 @@ export async function POST(request: Request) {
 
       db.prepare(
         `INSERT INTO production_batches (
-           id, outlet_id, batch_number, barcode, item_name, category,
+           id, outlet_id, batch_number, barcode, item_name, production_item_id, category,
            material_id, recipe_id, production_date, production_time,
            expiry_date, expiry_time, shelf_life, quantity_produced, quantity_consumed,
            unit, prepared_by, kitchen_section, storage_location, remarks, status
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       ).run(
         id,
         outletId,
         batch_number,
         barcode,
         item_name,
-        String(body?.category || ''),
+        production_item_id,
+        String(body?.category || '') || String(pItem?.category || ''),
         body?.material_id || null,
         body?.recipe_id || null,
         production_date,
@@ -157,10 +181,10 @@ export async function POST(request: Request) {
         String(body?.shelf_life || ''),
         quantity_produced,
         0,
-        String(body?.unit || ''),
+        String(body?.unit || '') || String(pItem?.unit || ''),
         String(body?.prepared_by || ''),
         String(body?.kitchen_section || ''),
-        String(body?.storage_location || ''),
+        String(body?.storage_location || '') || String(pItem?.default_storage_location || ''),
         String(body?.remarks || ''),
         'active',
       );

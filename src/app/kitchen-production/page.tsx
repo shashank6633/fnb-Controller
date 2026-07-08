@@ -17,7 +17,7 @@
  *   GET  /api/kitchen-production/[id]
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   ChefHat, Plus, Loader2, RefreshCw, Search, X, Package, Clock, MapPin,
@@ -164,22 +164,38 @@ const CATEGORY_SUGGESTIONS = [
 ];
 
 type FormState = {
-  item_name: string; category: string;
+  production_item_id: string; item_name: string; category: string;
   production_date: string; production_time: string;
-  expiry_date: string; expiry_time: string;
+  expiry_date: string; expiry_time: string; expiry_manual: boolean;
   shelf_life: string; quantity_produced: string; unit: string;
   prepared_by: string; kitchen_section: string; storage_location: string;
   recipe_id: string; remarks: string;
 };
 
 const blankForm = (preparedBy = ''): FormState => ({
-  item_name: '', category: '',
+  production_item_id: '', item_name: '', category: '',
   production_date: todayIST(), production_time: nowHHMM(),
-  expiry_date: '', expiry_time: '',
+  expiry_date: '', expiry_time: '', expiry_manual: false,
   shelf_life: '', quantity_produced: '', unit: '',
   prepared_by: preparedBy, kitchen_section: '', storage_location: '',
   recipe_id: '', remarks: '',
 });
+
+// The Production Items master (fixed list the batch form selects from).
+interface ProductionItem {
+  id: string; name: string; category: string; unit: string;
+  shelf_life_hours: number; default_storage_location: string; is_active: number;
+}
+
+// Local-time expiry = production date/time + shelf-life hours (no TZ conversion).
+function expiryFromShelfLife(date: string, time: string, hours: number): { d: string; t: string } | null {
+  if (!date || !hours || hours <= 0) return null;
+  const d = new Date(`${date}T${(time || '00:00')}:00`);
+  if (isNaN(d.getTime())) return null;
+  d.setTime(d.getTime() + hours * 3_600_000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return { d: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`, t: `${pad(d.getHours())}:${pad(d.getMinutes())}` };
+}
 
 // ─── Label printing ──────────────────────────────────────────────────────
 // Ask the server for the batch's TSPL2 label, then forward it to the on-box
@@ -274,6 +290,17 @@ export default function KitchenProductionPage() {
   const [previewBatch, setPreviewBatch] = useState<Batch | null>(null);
   const [showPrinterSettings, setShowPrinterSettings] = useState(false);
   const [justCreated, setJustCreated] = useState<{ id: string; batch_number: string } | null>(null);
+
+  // Production Items master (fixed list the create form selects from).
+  const [pItems, setPItems] = useState<ProductionItem[]>([]);
+  const [showItems, setShowItems] = useState(false);
+  const loadPItems = useCallback(() => {
+    fetch('/api/kitchen-production/items', { credentials: 'same-origin' })
+      .then(r => r.json())
+      .then(d => setPItems(Array.isArray(d?.items) ? d.items : []))
+      .catch(() => {});
+  }, []);
+  useEffect(() => { loadPItems(); }, [loadPItems]);
 
   // Toast
   const [toast, setToast] = useState<{ msg: string; kind: 'ok' | 'err' } | null>(null);
@@ -412,10 +439,48 @@ export default function KitchenProductionPage() {
     setShowForm(true);
   };
 
-  const setField = (k: keyof FormState, v: string) => setForm(f => ({ ...f, [k]: v }));
+  const setField = (k: keyof FormState, v: string) => setForm(f => {
+    const next: FormState = { ...f, [k]: v };
+    // Editing expiry directly makes it "manual" (stops auto-recompute).
+    if (k === 'expiry_date' || k === 'expiry_time') next.expiry_manual = true;
+    // Changing production date/time re-derives the expiry from the selected
+    // item's shelf life — unless the chef has set a custom expiry.
+    if ((k === 'production_date' || k === 'production_time') && f.production_item_id && !f.expiry_manual) {
+      const it = pItems.find(x => x.id === f.production_item_id);
+      const hrs = Number(it?.shelf_life_hours) || 0;
+      const exp = hrs > 0 ? expiryFromShelfLife(next.production_date, next.production_time, hrs) : null;
+      if (exp) { next.expiry_date = exp.d; next.expiry_time = exp.t; }
+    }
+    return next;
+  });
+
+  // Selecting a master item fills the batch form from its defaults: name (the
+  // authoritative one — FIFO groups by this item's id), category, unit, storage,
+  // and — when the item has a shelf life — the expiry date/time computed from
+  // the production date/time. Everything stays editable after (a manual expiry
+  // edit then sticks).
+  const pickItem = (id: string) => {
+    const it = pItems.find(x => x.id === id);
+    if (!it) { setForm(f => ({ ...f, production_item_id: '', item_name: '' })); return; }
+    setForm(f => {
+      const exp = expiryFromShelfLife(f.production_date, f.production_time, Number(it.shelf_life_hours) || 0);
+      return {
+        ...f,
+        production_item_id: it.id,
+        item_name: it.name,
+        category: it.category || f.category,
+        unit: it.unit || f.unit,
+        storage_location: it.default_storage_location || f.storage_location,
+        shelf_life: it.shelf_life_hours > 0 ? `${it.shelf_life_hours} hrs` : f.shelf_life,
+        expiry_date: exp ? exp.d : f.expiry_date,
+        expiry_time: exp ? exp.t : f.expiry_time,
+        expiry_manual: false,   // freshly derived on pick
+      };
+    });
+  };
 
   const save = async () => {
-    if (!form.item_name.trim()) { setFormError('Production Item Name is required.'); return; }
+    if (!form.production_item_id) { setFormError('Select a Production Item from the list (manage the list via the Items button).'); return; }
     const qty = Number(form.quantity_produced);
     if (!qty || qty <= 0) { setFormError('Quantity Produced must be greater than 0.'); return; }
     setSaving(true); setFormError(null);
@@ -423,6 +488,7 @@ export default function KitchenProductionPage() {
       const r = await api('/api/kitchen-production', {
         method: 'POST',
         body: {
+          production_item_id: form.production_item_id,
           item_name: form.item_name.trim(),
           category: form.category.trim(),
           production_date: form.production_date,
@@ -475,6 +541,11 @@ export default function KitchenProductionPage() {
                 className="px-3 py-2 bg-white border border-[#af4408] hover:bg-[#FFF1E3] text-[#af4408] rounded-lg text-sm font-medium flex items-center gap-2">
             <ScanLine className="w-4 h-4" /> Scan
           </Link>
+          <button onClick={() => setShowItems(true)}
+                  title="Production Items master list"
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+            <Package className="w-4 h-4" /> <span className="hidden sm:inline">Items</span>
+          </button>
           {isAdmin && (
             <button onClick={() => setShowPrinterSettings(true)}
                     title="Label printer settings"
@@ -609,6 +680,9 @@ export default function KitchenProductionPage() {
           form={form} setField={setField}
           saving={saving} error={formError}
           recipes={recipes}
+          pItems={pItems}
+          onPickItem={pickItem}
+          onManageItems={() => setShowItems(true)}
           onCancel={() => { if (!saving) setShowForm(false); }}
           onSave={save}
         />
@@ -659,6 +733,11 @@ export default function KitchenProductionPage() {
           onClose={() => setShowPrinterSettings(false)}
           onSaved={(cfg) => { setPrinterCfg(cfg); showToast('Printer settings saved', 'ok'); }}
         />
+      )}
+
+      {/* Production Items master list */}
+      {showItems && (
+        <ProductionItemsModal onClose={() => { setShowItems(false); loadPItems(); }} />
       )}
 
       {/* Toast */}
@@ -798,11 +877,14 @@ function QtyChip({ label, value, tone }: { label: string; value: string; tone: s
 }
 
 // ─── New-batch modal ────────────────────────────────────────────────────
-function BatchFormModal({ form, setField, saving, error, recipes, onCancel, onSave }: {
+function BatchFormModal({ form, setField, saving, error, recipes, pItems, onPickItem, onManageItems, onCancel, onSave }: {
   form: FormState;
   setField: (k: keyof FormState, v: string) => void;
   saving: boolean; error: string | null;
   recipes: RecipeOpt[];
+  pItems: ProductionItem[];
+  onPickItem: (id: string) => void;
+  onManageItems: () => void;
   onCancel: () => void; onSave: () => void;
 }) {
   return (
@@ -829,9 +911,17 @@ function BatchFormModal({ form, setField, saving, error, recipes, onCancel, onSa
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <Field label="Production Item Name" required>
-              <input value={form.item_name} onChange={e => setField('item_name', e.target.value)}
-                     placeholder="e.g. Chicken Gravy" className={inputCls} autoFocus />
+            <Field label="Production Item" required>
+              <select value={form.production_item_id} onChange={e => onPickItem(e.target.value)} className={inputCls} autoFocus>
+                <option value="">— select an item —</option>
+                {pItems.map(it => (
+                  <option key={it.id} value={it.id}>{it.name}{it.unit ? ` (${it.unit})` : ''}</option>
+                ))}
+              </select>
+              <button type="button" onClick={onManageItems}
+                      className="mt-1 text-[11px] text-[#af4408] hover:underline">
+                Item not in the list? Manage items…
+              </button>
             </Field>
             <Field label="Category">
               <input list="kp-category-list" value={form.category} onChange={e => setField('category', e.target.value)}
@@ -1585,6 +1675,144 @@ function PrinterSettingsModal({ onClose, onSaved }: {
         ) : (
           <div className="p-6 text-sm text-red-700">{error || 'Failed to load settings.'}</div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Production Items master list (add / edit / activate) ────────────────
+// The fixed list the New Production Batch form selects from. Items are never
+// deleted — deactivating hides them from the picker while old batches keep a
+// valid production_item_id (FIFO groups by that id).
+function ProductionItemsModal({ onClose }: { onClose: () => void }) {
+  const [items, setItems] = useState<ProductionItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const blank = { id: '', name: '', category: '', unit: '', shelf_life_hours: '', default_storage_location: '' };
+  const [draft, setDraft] = useState<typeof blank>(blank);
+
+  const load = () => {
+    fetch('/api/kitchen-production/items?all=1', { credentials: 'same-origin' })
+      .then(r => r.json())
+      .then(d => { setItems(Array.isArray(d?.items) ? d.items : []); setError(d?.error || null); })
+      .catch(e => setError(e?.message || 'Failed to load'))
+      .finally(() => setLoading(false));
+  };
+  useEffect(load, []);
+
+  const saveDraft = async () => {
+    if (!draft.name.trim()) { setError('Item name is required'); return; }
+    setSaving(true); setError(null);
+    try {
+      const body: any = {
+        name: draft.name.trim(), category: draft.category.trim(), unit: draft.unit.trim(),
+        shelf_life_hours: Number(draft.shelf_life_hours) || 0,
+        default_storage_location: draft.default_storage_location.trim(),
+      };
+      if (draft.id) body.id = draft.id;
+      const r = await api('/api/kitchen-production/items', { method: draft.id ? 'PUT' : 'POST', body });
+      const j = await r.json();
+      if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
+      setDraft(blank);
+      load();
+    } catch (e: any) { setError(e?.message || 'Failed to save'); }
+    finally { setSaving(false); }
+  };
+
+  const toggleActive = async (it: ProductionItem) => {
+    try {
+      const r = await api('/api/kitchen-production/items', { method: 'PUT', body: { id: it.id, is_active: !it.is_active } });
+      if (!r.ok) { const j = await r.json(); setError(j.error || `HTTP ${r.status}`); return; }
+      load();
+    } catch (e: any) { setError(e?.message || 'Failed to update'); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl shadow-xl flex flex-col overflow-hidden" style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+            <Package className="w-5 h-5 text-[#af4408]" /> Production Items
+          </div>
+          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
+          <p className="text-xs text-[#8B7355]">
+            The fixed list New Production Batch selects from — each item has an ID that FIFO
+            groups by, so renaming an item never splits its batch chain. Deactivate instead of
+            deleting: old batches keep their item link.
+          </p>
+
+          {/* Add / edit form */}
+          <div className="rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] p-3 space-y-2">
+            <div className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide">{draft.id ? 'Edit item' : 'Add item'}</div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+              <input value={draft.name} onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
+                     placeholder="Item name (e.g. Chicken Gravy) *" className={inputCls} />
+              <input list="kp-category-list" value={draft.category} onChange={e => setDraft(d => ({ ...d, category: e.target.value }))}
+                     placeholder="Category (e.g. Gravy)" className={inputCls} />
+              <input value={draft.unit} onChange={e => setDraft(d => ({ ...d, unit: e.target.value }))}
+                     placeholder="Unit (kg / L / pcs)" className={inputCls} />
+              <input type="number" min={0} step="any" value={draft.shelf_life_hours}
+                     onChange={e => setDraft(d => ({ ...d, shelf_life_hours: e.target.value }))}
+                     placeholder="Shelf life (hours)" className={inputCls} />
+              <input value={draft.default_storage_location} onChange={e => setDraft(d => ({ ...d, default_storage_location: e.target.value }))}
+                     placeholder="Default storage (e.g. Cold Room 2)" className={inputCls} />
+              <div className="flex items-center gap-2">
+                <button onClick={saveDraft} disabled={saving}
+                        className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+                  {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} {draft.id ? 'Save changes' : 'Add item'}
+                </button>
+                {draft.id && (
+                  <button onClick={() => setDraft(blank)} className="px-3 py-2 bg-white border border-[#E8D5C4] text-[#6B5744] rounded-lg text-sm">Cancel</button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
+
+          {/* List */}
+          {loading ? (
+            <div className="py-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
+          ) : items.length === 0 ? (
+            <div className="py-8 text-center text-sm text-[#8B7355]">No items yet — add the first one above.</div>
+          ) : (
+            <div className="overflow-x-auto rounded-xl border border-[#E8D5C4]">
+              <table className="w-full text-sm">
+                <thead className="bg-[#FFF1E3] text-[11px] uppercase tracking-wide text-[#8B7355]">
+                  <tr>
+                    <th className="text-left px-3 py-2">Item</th>
+                    <th className="text-left px-3 py-2">Category</th>
+                    <th className="text-left px-3 py-2">Unit</th>
+                    <th className="text-right px-3 py-2">Shelf life</th>
+                    <th className="text-left px-3 py-2">Storage</th>
+                    <th className="text-right px-3 py-2">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#F0E4D6]">
+                  {items.map(it => (
+                    <tr key={it.id} className={it.is_active ? '' : 'opacity-50'}>
+                      <td className="px-3 py-2 font-medium text-[#2D1B0E]">{it.name}{!it.is_active && <span className="ml-1.5 text-[9px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full">inactive</span>}</td>
+                      <td className="px-3 py-2 text-[#6B5744]">{it.category || '—'}</td>
+                      <td className="px-3 py-2 text-[#6B5744]">{it.unit || '—'}</td>
+                      <td className="px-3 py-2 text-right text-[#6B5744]">{it.shelf_life_hours > 0 ? `${it.shelf_life_hours} h` : '—'}</td>
+                      <td className="px-3 py-2 text-[#6B5744]">{it.default_storage_location || '—'}</td>
+                      <td className="px-3 py-2 text-right whitespace-nowrap">
+                        <button onClick={() => setDraft({ id: it.id, name: it.name, category: it.category || '', unit: it.unit || '', shelf_life_hours: it.shelf_life_hours ? String(it.shelf_life_hours) : '', default_storage_location: it.default_storage_location || '' })}
+                                className="text-[#af4408] hover:underline text-xs font-medium mr-3">Edit</button>
+                        <button onClick={() => toggleActive(it)}
+                                className="text-[#8B7355] hover:underline text-xs font-medium">{it.is_active ? 'Deactivate' : 'Activate'}</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

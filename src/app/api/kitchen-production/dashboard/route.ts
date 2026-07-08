@@ -52,11 +52,15 @@ export async function GET() {
 
     // ---- expiry buckets over ACTIVE batches (computed in JS with `now`) ----
     const activeBatches = db.prepare(
-      `SELECT id, item_name, batch_number, material_id, unit, quantity_produced,
+      `SELECT id, item_name, production_item_id, batch_number, material_id, unit, quantity_produced,
               quantity_consumed, expiry_date, expiry_time
          FROM production_batches
         WHERE status = 'active' ${outletSql}`
     ).all(...outletParams) as ProductionBatch[];
+
+    // FIFO chains group by production_item_id (rename/typo safe), else NOCASE name.
+    const fifoKey = (b: { production_item_id?: string | null; item_name: string }) =>
+      b.production_item_id || String(b.item_name || '').trim().toLowerCase();
 
     let expiring_today = 0, expiring_tomorrow = 0, expiring_3d = 0, expiring_7d = 0, expired = 0;
     const nowMs = now.getTime();
@@ -138,28 +142,29 @@ export async function GET() {
     // remaining — i.e. newer stock was consumed while older stock sat unused.
     // compliance = compliant ÷ drawn-from batches (100% when none drawn).
     const drawn = db.prepare(
-      `SELECT id, item_name, production_date, production_time
+      `SELECT id, item_name, production_item_id, production_date, production_time
          FROM production_batches
         WHERE quantity_consumed > 0 ${outletSql}`
     ).all(...outletParams) as ProductionBatch[];
     let fifo_compliance_pct = 100;
     if (drawn.length) {
-      // Oldest still-active-with-stock production datetime per item.
+      // Oldest still-active-with-stock production datetime per FIFO chain.
       const oldestActive: Record<string, number> = {};
       for (const b of activeBatches) {
         const rem = Math.max(0, (b.quantity_produced || 0) - (b.quantity_consumed || 0));
         if (rem <= 0) continue;
+        const k = fifoKey(b);
         const p = parseDateTime(b.production_date, b.production_time);
         const t = p ? p.getTime() : Number.POSITIVE_INFINITY;
-        if (oldestActive[b.item_name] === undefined || t < oldestActive[b.item_name]) {
-          oldestActive[b.item_name] = t;
+        if (oldestActive[k] === undefined || t < oldestActive[k]) {
+          oldestActive[k] = t;
         }
       }
       let violations = 0;
       for (const b of drawn) {
         const p = parseDateTime(b.production_date, b.production_time);
         const t = p ? p.getTime() : Number.POSITIVE_INFINITY;
-        const oldest = oldestActive[b.item_name];
+        const oldest = oldestActive[fifoKey(b)];
         // Consumed from this batch while a strictly-older batch still has stock.
         if (oldest !== undefined && oldest < t) violations += 1;
       }

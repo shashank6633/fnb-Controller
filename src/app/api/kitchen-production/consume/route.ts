@@ -1,6 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef } from '@/lib/auth';
-import { ProductionBatch } from '@/lib/production-batch';
+import { ProductionBatch, itemGroupClause } from '@/lib/production-batch';
 
 /**
  * POST /api/kitchen-production/consume
@@ -37,11 +37,19 @@ export async function POST(request: Request) {
     const department = me.department_id || '';
     const userLabel = me.name || me.email || '';
 
-    // ACTIVE batches of this item, oldest production first.
+    // ACTIVE batches of this item, oldest production first. Group by the SAME rule
+    // every FIFO surface uses (itemGroupClause) so consume draws in the exact order
+    // the scan/list screens advertise — resolve the name to a master id (NOCASE)
+    // first, else fall back to legacy exact-name matching.
     const where: string[] = ["status = 'active'"];
     const params: any[] = [];
-    if (material_id) { where.push('material_id = ?'); params.push(material_id); }
-    else { where.push('item_name = ?'); params.push(item_name); }
+    if (material_id) {
+      where.push('material_id = ?'); params.push(material_id);
+    } else {
+      const pItem = db.prepare(`SELECT id FROM production_items WHERE name = ? COLLATE NOCASE`).get(item_name) as { id: string } | undefined;
+      const g = itemGroupClause({ production_item_id: pItem?.id ?? null, item_name });
+      where.push(g.cond); params.push(...g.params);
+    }
     if (outletId) { where.push('(outlet_id = ? OR outlet_id IS NULL)'); params.push(outletId); }
 
     const result = db.transaction(() => {

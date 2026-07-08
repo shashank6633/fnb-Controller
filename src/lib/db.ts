@@ -2071,6 +2071,51 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_batch_transactions_batch ON batch_transactions(batch_id);
     `);
   } catch (e) { console.error('production_batches/batch_transactions schema failed:', e); }
+
+  // Production Items master — the FIXED list of prepared items a batch can be
+  // recorded against. Batch creation selects from this list (no free-typed
+  // names), and FIFO groups by production_item_id so a rename (or a legacy
+  // typo) can never split an item's FIFO chain.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS production_items (
+        id                       TEXT PRIMARY KEY,
+        outlet_id                TEXT,
+        name                     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        category                 TEXT DEFAULT '',
+        unit                     TEXT DEFAULT '',
+        shelf_life_hours         REAL DEFAULT 0,
+        default_storage_location TEXT DEFAULT '',
+        is_active                INTEGER NOT NULL DEFAULT 1,
+        created_at               TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at               TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    const bCols = db.prepare('PRAGMA table_info(production_batches)').all() as { name: string }[];
+    if (!bCols.some((c) => c.name === 'production_item_id')) {
+      db.exec(`ALTER TABLE production_batches ADD COLUMN production_item_id TEXT`);
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_production_batches_pitem ON production_batches(production_item_id)`);
+    // Backfill (idempotent, re-runs every boot): every distinct batch item name
+    // becomes a master item (INSERT OR IGNORE on the NOCASE-unique name), and any
+    // batch without a production_item_id links to its item by name. New batches
+    // always carry the id, so this only ever touches legacy rows.
+    db.exec(`
+      INSERT OR IGNORE INTO production_items (id, name, category, unit)
+        SELECT lower(hex(randomblob(16))), TRIM(item_name), MAX(COALESCE(category,'')), MAX(COALESCE(unit,''))
+        FROM production_batches
+        WHERE production_item_id IS NULL
+          AND TRIM(COALESCE(item_name,'')) != ''
+        GROUP BY TRIM(item_name) COLLATE NOCASE;
+      UPDATE production_batches
+         SET production_item_id = (
+           SELECT pi.id FROM production_items pi
+            WHERE pi.name = TRIM(production_batches.item_name) COLLATE NOCASE
+         )
+       WHERE production_item_id IS NULL
+         AND TRIM(COALESCE(item_name,'')) != '';
+    `);
+  } catch (e) { console.error('production_items schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----
