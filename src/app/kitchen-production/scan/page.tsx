@@ -64,6 +64,13 @@ interface Batch {
   expiry_status: 'green' | 'yellow' | 'red';
   batch_age_hours: number;
   fifo_priority: number | null;
+  /** Older ACTIVE batches of the same item to use BEFORE this one (oldest first). */
+  fifo_use_first?: Array<{
+    barcode: string; batch_number: string;
+    production_date: string; production_time: string;
+    expiry_date: string; storage_location: string;
+    remaining_quantity: number; unit: string; shelf_life_remaining: string;
+  }>;
   shelf_life_remaining: string;
 }
 
@@ -567,6 +574,53 @@ function ResultPanel({ result, online, onClose }: {
             </span>
           </div>
         </div>
+
+        {/* FIFO verdict — the answer to "can I use this one?" */}
+        {b.status === 'active' && b.fifo_priority === 1 && (
+          <div className="rounded-lg border-2 border-emerald-300 bg-emerald-50 px-3 py-2.5 flex items-center gap-2">
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+            <div className="text-sm font-bold text-emerald-800">FIFO OK — use this batch first</div>
+          </div>
+        )}
+        {b.status === 'active' && (b.fifo_priority ?? 1) > 1 && (b.fifo_use_first?.length ?? 0) > 0 && (
+          <div className="rounded-lg border-2 border-amber-400 bg-amber-50 px-3 py-2.5 space-y-1.5">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+              <div className="text-sm font-bold text-amber-800">
+                Not first — use this batch before it:
+              </div>
+            </div>
+            {(() => { const f = b.fifo_use_first![0]; return (
+              <div className="ml-7 text-xs text-amber-900 space-y-0.5">
+                <div className="font-mono font-bold text-base flex items-center gap-1.5">
+                  <BarcodeIcon className="w-4 h-4" /> {f.barcode}
+                </div>
+                <div>{f.batch_number} · prepared {f.production_date} {f.production_time}</div>
+                <div>
+                  {f.storage_location ? <>📍 {f.storage_location} · </> : null}
+                  {fmtNum(f.remaining_quantity)}{f.unit ? ' ' + f.unit : ''} left · {f.shelf_life_remaining}
+                </div>
+                {b.fifo_use_first!.length > 1 && (
+                  <div className="text-amber-700">+{b.fifo_use_first!.length - 1} more older batch{b.fifo_use_first!.length > 2 ? 'es' : ''} before this one</div>
+                )}
+              </div>
+            ); })()}
+          </div>
+        )}
+        {b.status !== 'active' && (b.fifo_use_first?.length ?? 0) > 0 && (
+          <div className="rounded-lg border-2 border-sky-300 bg-sky-50 px-3 py-2.5 space-y-1">
+            <div className="flex items-center gap-2">
+              <Clock className="w-5 h-5 text-sky-600 shrink-0" />
+              <div className="text-sm font-bold text-sky-800 capitalize">This batch is {b.status} — current FIFO #1:</div>
+            </div>
+            {(() => { const f = b.fifo_use_first![0]; return (
+              <div className="ml-7 text-xs text-sky-900">
+                <span className="font-mono font-bold">{f.barcode}</span> · {f.batch_number}
+                {f.storage_location ? <> · 📍 {f.storage_location}</> : null} · {f.shelf_life_remaining}
+              </div>
+            ); })()}
+          </div>
+        )}
 
         {/* Batch # / barcode */}
         <div className="flex items-center gap-2 flex-wrap text-[11px]">
