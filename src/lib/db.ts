@@ -1382,6 +1382,9 @@ function initializeSchema(db: Database.Database) {
     // setting is ON and the user is a plain captain (admins/managers bypass).
     if (!has('preferred_zones'))     db.exec(`ALTER TABLE users ADD COLUMN preferred_zones TEXT`);      // JSON array of zone strings
     if (!has('preferred_table_ids')) db.exec(`ALTER TABLE users ADD COLUMN preferred_table_ids TEXT`);  // JSON array of table ids
+    // Parent Role / functional section: Kitchen | Bar | Service | Maintenance | Store
+    // ('' = unset). Per-user; drives the KDS ticket filter + KOT printer routing.
+    if (!has('section'))             db.exec(`ALTER TABLE users ADD COLUMN section TEXT DEFAULT ''`);
   } catch (e) { console.error('users role-flags migration failed:', e); }
 
   // ── Named roles (Floor Manager, Captain, Cashier, Bar Manager …) ───────────

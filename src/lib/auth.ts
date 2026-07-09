@@ -39,6 +39,8 @@ export interface SessionUser {
   preferred_zones: string | null;
   /** JSON array of table ids a captain may work (in addition to zones). null = none. */
   preferred_table_ids: string | null;
+  /** Parent Role / functional section: Kitchen|Bar|Service|Maintenance|Store ('' = unset). Drives KDS filter + KOT printer routing. */
+  section: string;
   /** May REQUEST a bill discount (cashier roles; admin always true). Approval is still Manager/Admin. */
   can_request_discount: boolean;
   /** Max discount % this user may request (admin = 100). */
@@ -83,7 +85,7 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
   const row = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.department_id,
            u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
-           u.preferred_zones, u.preferred_table_ids,
+           u.preferred_zones, u.preferred_table_ids, u.section,
            u.role_id,
            r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
@@ -121,6 +123,7 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     visible_department_ids: row.visible_department_ids || null,
     preferred_zones: row.preferred_zones || null,
     preferred_table_ids: row.preferred_table_ids || null,
+    section: row.section || '',
     // Bill discount permission (from the role; admin always may). Approval is
     // still a Manager/Admin login — this only gates who may REQUEST a discount.
     can_request_discount: (hasRole ? row.role_base : row.role) === 'admin' ? true : (hasRole && !!row.role_can_discount),
@@ -168,7 +171,7 @@ export async function verifyApprover(email: string, password: string): Promise<S
   const row = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.department_id, u.password_hash,
            u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
-           u.preferred_zones, u.preferred_table_ids, u.role_id,
+           u.preferred_zones, u.preferred_table_ids, u.section, u.role_id,
            r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
            r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount
@@ -189,6 +192,7 @@ export async function verifyApprover(email: string, password: string): Promise<S
     visible_department_ids: row.visible_department_ids || null,
     preferred_zones: row.preferred_zones || null,
     preferred_table_ids: row.preferred_table_ids || null,
+    section: row.section || '',
     can_request_discount: (hasRole ? row.role_base : row.role) === 'admin' ? true : (hasRole && !!row.role_can_discount),
     max_discount_pct: (hasRole ? row.role_base : row.role) === 'admin' ? 100 : (hasRole ? (Number(row.role_max_discount) || 0) : 0),
   };

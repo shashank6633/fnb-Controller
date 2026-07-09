@@ -256,7 +256,8 @@ export default function UsersPage() {
                                 visible_department_ids: u.visible_department_ids ?? null,
                                 preferred_zones: u.preferred_zones ?? null,
                                 preferred_table_ids: u.preferred_table_ids ?? null,
-                              })}
+                                section: (u as any).section ?? '',
+                              } as any)}
                               className="p-1 text-[#6B5744] hover:text-[#af4408]"><Edit className="w-3.5 h-3.5" /></button>
                     </td>
                   </tr>
@@ -363,6 +364,23 @@ export default function UsersPage() {
                   <span className="block text-[10px] text-[#8B7355] mt-0.5">
                     Department staff (e.g. Bartender, Pizza Cook) raise requisitions for their own department.
                     Leave blank for HOD / Store Manager who span all kitchens.
+                  </span>
+                </label>
+
+                <label className="block text-xs text-[#6B5744]">Parent Role / Section
+                  <select value={(editing as any).section || ''}
+                          onChange={e => setEditing({ ...editing, section: e.target.value } as any)}
+                          className="w-full mt-1 px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
+                    <option value="">— None —</option>
+                    <option value="Kitchen">Kitchen</option>
+                    <option value="Bar">Bar</option>
+                    <option value="Service">Service</option>
+                    <option value="Maintenance">Maintenance</option>
+                    <option value="Store">Store</option>
+                  </select>
+                  <span className="block text-[10px] text-[#8B7355] mt-0.5">
+                    Kitchen &amp; Bar auto-filter the Kitchen Display to that section&apos;s KOTs and route KOT
+                    printing (food vs bar). Service / Maintenance / Store are organisational only.
                   </span>
                 </label>
 

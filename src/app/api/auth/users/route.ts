@@ -13,7 +13,7 @@ export async function GET() {
   const users = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.is_active, u.created_at, u.last_login_at,
            u.department_id, u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
-           u.preferred_zones, u.preferred_table_ids,
+           u.preferred_zones, u.preferred_table_ids, u.section,
            u.role_id, r.name AS role_name,
            d.name AS department_name
     FROM users u
@@ -25,6 +25,15 @@ export async function GET() {
 }
 
 const VALID_ROLES = ['admin', 'manager', 'staff'] as const;
+// Parent Role / functional section (per-user). '' = unset.
+const VALID_SECTIONS = ['Kitchen', 'Bar', 'Service', 'Maintenance', 'Store'] as const;
+function normSection(v: any): string | null {
+  if (v == null) return '';
+  const s = String(v).trim();
+  if (s === '') return '';
+  const hit = VALID_SECTIONS.find(x => x.toLowerCase() === s.toLowerCase());
+  return hit || null; // null = invalid → caller rejects
+}
 
 /**
  * Resolve the effective privilege tier + flags for a user save. When a named
@@ -43,8 +52,10 @@ function resolveRole(db: any, role_id: any, explicitRole: any, explicitChef: any
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
-  const { email, name, role, role_id, password, position, department_id, is_head_chef, is_store_manager } = await req.json();
+  const { email, name, role, role_id, password, position, department_id, is_head_chef, is_store_manager, section } = await req.json();
   if (!email || !password) return Response.json({ error: 'email + password required' }, { status: 400 });
+  const sec = normSection(section);
+  if (sec === null) return Response.json({ error: `section must be one of ${VALID_SECTIONS.join(', ')}` }, { status: 400 });
   const db = getDb();
   const eff = resolveRole(db, role_id, role, is_head_chef, is_store_manager);
   if (!VALID_ROLES.includes(eff.role)) {
@@ -54,14 +65,15 @@ export async function POST(req: Request) {
   if (exists) return Response.json({ error: 'Email already in use' }, { status: 409 });
   const hash = await hashPassword(password);
   db.prepare(`
-    INSERT INTO users (id, email, password_hash, name, role, role_id, position, department_id, is_head_chef, is_store_manager)
-    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO users (id, email, password_hash, name, role, role_id, position, department_id, is_head_chef, is_store_manager, section)
+    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     String(email).toLowerCase(), hash, name || '', eff.role, eff.role_id,
     position || '',
     department_id || null,
     eff.is_head_chef ? 1 : 0,
     eff.is_store_manager ? 1 : 0,
+    sec,
   );
   return Response.json({ success: true }, { status: 201 });
 }
@@ -79,6 +91,11 @@ export async function PUT(req: Request) {
   if (is_active != null)        { sets.push('is_active = ?'); params.push(is_active ? 1 : 0); }
   if (position !== undefined)   { sets.push('position = ?'); params.push(position || ''); }
   if (department_id !== undefined) { sets.push('department_id = ?'); params.push(department_id || null); }
+  if (b.section !== undefined) {
+    const sec = normSection(b.section);
+    if (sec === null) return Response.json({ error: `section must be one of ${VALID_SECTIONS.join(', ')}` }, { status: 400 });
+    sets.push('section = ?'); params.push(sec);
+  }
   // Role: if role_id is present, resolve the named role (its tier + flags win);
   // if absent, honor any explicit role/flags (legacy edit).
   if ('role_id' in b) {
