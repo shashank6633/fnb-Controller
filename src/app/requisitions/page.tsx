@@ -732,7 +732,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                       <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`}>
                         <td className="py-1 px-2">{it.material_name}</td>
                         <td className="py-1 px-2 text-right font-mono">{it.quantity_requested.toLocaleString('en-IN')}</td>
-                        <td className="py-1 px-2">{reqUnit(it)}</td>
+                        <td className="py-1 px-2 font-bold text-[#2D1B0E]">{reqUnit(it)}</td>
                       </tr>
                     );
                   })}
@@ -1127,15 +1127,37 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                       )}
                       <div className={simple ? 'md:col-span-4' : 'md:col-span-2'}>
                         <Lbl>Qty · Unit</Lbl>
-                        <input type="number" step="any" min={0} value={it.quantity_requested || ''}
-                               onChange={e => update(i, { quantity_requested: Math.max(0, parseFloat(e.target.value) || 0) })}
-                               placeholder="Qty"
-                               className="w-full min-w-0 px-2 md:px-3 py-2 border border-[#E8D5C4] rounded text-right text-sm tabular-nums" />
-                        {mat ? (
-                          <div className="text-[10px] text-[#8B7355] mt-0.5 text-right whitespace-nowrap" title="Ordering unit (purchase unit)">
-                            {mat.purchase_unit || mat.unit}{mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? <span className="text-[#B99]"> = {packSize.toLocaleString('en-IN')} {mat.unit}</span> : ''}
-                          </div>
-                        ) : null}
+                        {simple ? (
+                          // Staff: unit shown BOLD right beside the qty input.
+                          <>
+                            <div className="flex items-center gap-2">
+                              <input type="number" step="any" min={0} value={it.quantity_requested || ''}
+                                     onChange={e => update(i, { quantity_requested: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                     placeholder="Qty"
+                                     className="flex-1 min-w-0 px-2 md:px-3 py-2 border border-[#E8D5C4] rounded text-right text-sm tabular-nums" />
+                              {mat && (
+                                <span className="text-sm font-bold text-[#2D1B0E] whitespace-nowrap" title="Ordering unit">
+                                  {mat.purchase_unit || mat.unit}
+                                </span>
+                              )}
+                            </div>
+                            {mat && mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? (
+                              <div className="text-[10px] text-[#8B7355] mt-0.5 text-right whitespace-nowrap">= {packSize.toLocaleString('en-IN')} {mat.unit}</div>
+                            ) : null}
+                          </>
+                        ) : (
+                          <>
+                            <input type="number" step="any" min={0} value={it.quantity_requested || ''}
+                                   onChange={e => update(i, { quantity_requested: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                   placeholder="Qty"
+                                   className="w-full min-w-0 px-2 md:px-3 py-2 border border-[#E8D5C4] rounded text-right text-sm tabular-nums" />
+                            {mat ? (
+                              <div className="text-[10px] text-[#8B7355] mt-0.5 text-right whitespace-nowrap" title="Ordering unit (purchase unit)">
+                                {mat.purchase_unit || mat.unit}{mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? <span className="text-[#B99]"> = {packSize.toLocaleString('en-IN')} {mat.unit}</span> : ''}
+                              </div>
+                            ) : null}
+                          </>
+                        )}
                       </div>
                       {!simple && (
                       <div className="md:col-span-2 md:text-right text-[10px] leading-snug">
