@@ -191,6 +191,8 @@ export default function InventoryPage() {
   const [importResult, setImportResult] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   // Round-trip CSV (export edits + re-upload)
   const [roundtripImporting, setRoundtripImporting] = useState(false);
+  // Bulk rate-correction tool
+  const [showRates, setShowRates] = useState(false);
 
   /* ---- Fetch ---- */
 
@@ -580,6 +582,14 @@ export default function InventoryPage() {
               {roundtripImporting ? 'Uploading...' : 'Re-upload Edits'}
               <input type="file" accept=".csv" onChange={handleRoundTripUpload} className="hidden" disabled={roundtripImporting} />
             </label>
+            <button
+              onClick={() => setShowRates(true)}
+              className="flex items-center gap-2 px-4 py-2.5 border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium transition-colors"
+              title="Bulk-correct average rates by SKU or name. Updates existing materials in place, so all past requisition costs recompute at the corrected rate."
+            >
+              <ClipboardCheck className="w-4 h-4" />
+              Update Rates
+            </button>
             <button
               onClick={openAddModal}
               className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium transition-colors"
@@ -1408,6 +1418,10 @@ export default function InventoryPage() {
           </div>
         </div>
       )}
+
+      {showRates && (
+        <UpdateRatesModal onClose={() => setShowRates(false)} onApplied={fetchMaterials} />
+      )}
     </div>
   );
 }
@@ -1444,6 +1458,145 @@ function SummaryCard({
         <span className="text-sm text-[#8B7355]">{label}</span>
       </div>
       <p className={`text-2xl font-bold ${a.text}`}>{value}</p>
+    </div>
+  );
+}
+
+// ─── Bulk rate correction ────────────────────────────────────────────────
+// Paste "SKU or name, rate" lines (or upload a 2-column CSV). Rates default to
+// per-purchase-unit (₹/kg etc.) and are converted to the per-recipe-unit
+// average_price with each material's pack_size, then written in place. Because
+// requisition/party costs read average_price LIVE, every past requisition
+// recomputes at the corrected rate. Preview first, then apply.
+interface RateMatch { sku: string; name: string; unit: string; pack_size: number; old: number; new: number; }
+function UpdateRatesModal({ onClose, onApplied }: { onClose: () => void; onApplied: () => void }) {
+  const [text, setText] = useState('');
+  const [basis, setBasis] = useState<'purchase' | 'recipe'>('purchase');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<null | {
+    matched: RateMatch[]; matchedCount: number; unmatched: string[];
+    ambiguous: { key: string; count: number }[]; invalid: { key: string; reason: string }[];
+  }>(null);
+  const [done, setDone] = useState<string | null>(null);
+
+  // Parse "identifier <comma|tab> rate" per line. Ignores a header row.
+  const parseRows = () => {
+    const out: { key: string; rate: number }[] = [];
+    for (const raw of text.split('\n')) {
+      const line = raw.trim();
+      if (!line) continue;
+      const parts = line.split(/\t|,(?=[^,]*$)/); // split on tab, or the LAST comma (names may contain commas)
+      if (parts.length < 2) continue;
+      const rate = Number(parts[parts.length - 1].replace(/[₹,\s]/g, ''));
+      const key = parts.slice(0, parts.length - 1).join(',').trim().replace(/^"|"$/g, '');
+      if (!key || /^(sku|name|item|material)$/i.test(key)) continue; // skip header
+      out.push({ key, rate });
+    }
+    return out;
+  };
+
+  const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setText(await f.text());
+    e.target.value = '';
+  };
+
+  const run = async (dryRun: boolean) => {
+    const rows = parseRows();
+    if (!rows.length) { setError('Paste at least one line: SKU-or-name, rate'); return; }
+    setBusy(true); setError(null); if (!dryRun) setDone(null);
+    try {
+      const r = await api('/api/inventory/update-rates', { method: 'POST', body: { rows, basis, dryRun } });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      if (dryRun) { setPreview(j); }
+      else {
+        setDone(`Updated ${j.applied} material${j.applied === 1 ? '' : 's'} — all past requisition costs now use the corrected rate.`);
+        setPreview(null);
+        onApplied();
+      }
+    } catch (e: any) { setError(e?.message || 'Failed'); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-2xl shadow-xl flex flex-col overflow-hidden" style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2"><ClipboardCheck className="w-5 h-5 text-[#af4408]" /> Update Rates</div>
+          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
+          <p className="text-xs text-[#8B7355]">
+            Correct wrong rates in bulk. One line per item: <b>SKU or exact name</b>, then the rate.
+            Existing materials are updated in place (nothing deleted), so <b>every past requisition &amp;
+            party cost recomputes at the corrected rate</b>. Preview before applying.
+          </p>
+
+          <div className="flex flex-wrap items-center gap-3 text-sm">
+            <span className="text-[#8B7355]">Rate is:</span>
+            <label className="flex items-center gap-1.5"><input type="radio" checked={basis === 'purchase'} onChange={() => setBasis('purchase')} className="accent-[#af4408]" /> per purchase unit (₹/kg, ₹/L…)</label>
+            <label className="flex items-center gap-1.5"><input type="radio" checked={basis === 'recipe'} onChange={() => setBasis('recipe')} className="accent-[#af4408]" /> per recipe unit (₹/g, ₹/ml…)</label>
+          </div>
+
+          <textarea value={text} onChange={e => { setText(e.target.value); setPreview(null); }}
+            rows={6} placeholder={"MAT-00123, 180\nChicken Boneless, 320\nRefined Oil, 140"}
+            className="w-full border border-[#D4B896] rounded-lg px-3 py-2 text-sm font-mono" />
+          <label className="text-xs text-[#af4408] hover:underline cursor-pointer inline-flex items-center gap-1">
+            <Upload className="w-3.5 h-3.5" /> …or upload a 2-column CSV (identifier, rate)
+            <input type="file" accept=".csv,.txt" onChange={onFile} className="hidden" />
+          </label>
+
+          {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
+          {done && <div className="bg-green-50 border border-green-200 rounded-lg p-2.5 text-sm text-green-800 flex items-center gap-2"><CheckCircle className="w-4 h-4" /> {done}</div>}
+
+          {preview && (
+            <div className="space-y-2">
+              <div className="text-sm font-semibold text-[#2D1B0E]">{preview.matchedCount} matched</div>
+              {preview.matched.length > 0 && (
+                <div className="overflow-x-auto rounded-lg border border-[#E8D5C4] max-h-64 overflow-y-auto">
+                  <table className="w-full text-xs">
+                    <thead className="bg-[#FFF1E3] text-[#8B7355] sticky top-0"><tr>
+                      <th className="text-left px-2 py-1.5">SKU</th><th className="text-left px-2 py-1.5">Name</th>
+                      <th className="text-right px-2 py-1.5">Old avg</th><th className="text-right px-2 py-1.5">New avg</th>
+                      <th className="text-left px-2 py-1.5">/unit</th>
+                    </tr></thead>
+                    <tbody className="divide-y divide-[#F0E4D6]">
+                      {preview.matched.map((m, i) => (
+                        <tr key={i}>
+                          <td className="px-2 py-1.5 font-mono text-[#8B7355]">{m.sku}</td>
+                          <td className="px-2 py-1.5 text-[#2D1B0E]">{m.name}</td>
+                          <td className="px-2 py-1.5 text-right text-[#8B7355]">{(Number(m.old)||0).toFixed(4)}</td>
+                          <td className="px-2 py-1.5 text-right font-semibold text-emerald-700">{(Number(m.new)||0).toFixed(4)}</td>
+                          <td className="px-2 py-1.5 text-[#8B7355]">{m.unit}{m.pack_size > 1 ? ` (÷${m.pack_size})` : ''}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {preview.ambiguous.length > 0 && <div className="text-xs text-amber-700">⚠ {preview.ambiguous.length} name(s) match multiple materials — use the SKU instead: {preview.ambiguous.map(a => a.key).join(', ')}</div>}
+              {preview.unmatched.length > 0 && <div className="text-xs text-red-700">✗ {preview.unmatched.length} not found: {preview.unmatched.slice(0, 20).join(', ')}{preview.unmatched.length > 20 ? '…' : ''}</div>}
+              {preview.invalid.length > 0 && <div className="text-xs text-red-700">✗ {preview.invalid.length} invalid rate(s): {preview.invalid.map(i => i.key).slice(0, 10).join(', ')}</div>}
+            </div>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
+          <button onClick={onClose} disabled={busy} className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Close</button>
+          <button onClick={() => run(true)} disabled={busy} className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5 disabled:opacity-50">
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Preview
+          </button>
+          <button onClick={() => run(false)} disabled={busy || !preview || preview.matchedCount === 0}
+            title={!preview ? 'Preview first' : ''}
+            className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} Apply {preview ? `(${preview.matchedCount})` : ''}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
