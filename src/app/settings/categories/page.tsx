@@ -20,7 +20,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Layers, Loader2, Plus, Save, Search, AlertCircle, CheckCircle2, Edit2,
+  Layers, Loader2, Plus, Save, Search, AlertCircle, AlertTriangle, CheckCircle2, Edit2,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 
@@ -87,6 +87,12 @@ export default function CategoryManagerPage() {
     setPendingRename(prev => ({ ...prev, [leaf]: newName }));
 
   const pendingCount = Object.keys(pendingAssign).length + Object.keys(pendingRename).length;
+  // Staged renames that actually change the leaf name (matches saveAll's filter).
+  // Renames are the risky op — they don't migrate the dept category whitelists.
+  const renameCount = useMemo(
+    () => Object.entries(pendingRename).filter(([from, to]) => from !== to && to.trim()).length,
+    [pendingRename]
+  );
 
   const saveAll = async () => {
     setSaving(true); setError(null); setFlash(null);
@@ -192,6 +198,25 @@ export default function CategoryManagerPage() {
         </button>
       </div>
 
+      {/* Rename is the one risky op: it rewrites the leaf name on every material
+          but does NOT update the per-department category access lists (stored on
+          /departments as the OLD leaf names). Warn the moment a rename is staged. */}
+      {renameCount > 0 && (
+        <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-900">
+          <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+          <div>
+            <span className="font-semibold">
+              {renameCount} rename{renameCount > 1 ? 's' : ''} staged — this affects department access.
+            </span>{' '}
+            Renaming (or merging) a category updates it on every material, but it does <strong>not</strong> update
+            the category access lists on the <strong>Departments</strong> page — those still hold the old name.
+            After saving, a renamed category can disappear from a department's Inventory list and Requisition item
+            picker until you re-add the new name to that department. Re-check each affected department's category
+            access after saving. (Closing-stock counts are unaffected — they see every category.)
+          </div>
+        </div>
+      )}
+
       {flash && (
         <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-lg p-3 text-sm flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4" /> {flash}
@@ -277,6 +302,14 @@ export default function CategoryManagerPage() {
         Tip: leaves with <code className="px-1 bg-[#FFF1E3] rounded">— placeholder</code> count are
         sub-categories you created here but no material uses yet — they still appear in dropdowns
         so the kitchen team can pick them when adding a new material.
+      </p>
+      <p className="text-[10px] text-amber-700 flex items-start gap-1">
+        <AlertTriangle className="w-3 h-3 mt-0.5 flex-shrink-0" />
+        <span>
+          Renaming a category does not update department category-access lists (they store the old
+          name). After a rename or merge, re-check <strong>Departments → category access</strong> or the
+          renamed category may vanish from that department's Inventory &amp; Requisition pickers.
+        </span>
       </p>
     </div>
   );
