@@ -858,20 +858,9 @@ export default function InventoryPage() {
                           })()}
                         </td>
                         <td className="px-4 py-3 text-right text-[#6B5744] font-mono">
-                          {(() => {
-                            // Show price in purchase-unit terms too: ₹/BTL = ₹/ml × pack_size
-                            const ps = (m as any).pack_size || 1;
-                            const pu = (m as any).purchase_unit || m.unit;
-                            if (ps > 1) {
-                              return (
-                                <>
-                                  {formatCurrency(m.average_price * ps)}
-                                  <span className="ml-1 text-[10px] text-[#8B7355]">/ {pu}</span>
-                                </>
-                              );
-                            }
-                            return formatCurrency(m.average_price);
-                          })()}
+                          {/* Inline-editable rate: shown & entered in ₹ per purchase unit
+                              (₹/kg), auto-converted to per-recipe-unit average_price on save. */}
+                          <EditableRate m={m} onSaved={fetchMaterials} />
                         </td>
                         <td className="px-4 py-3 text-right text-[#3D2614] font-mono">
                           {formatCurrency(m.stock_value ?? 0)}
@@ -1598,5 +1587,64 @@ function UpdateRatesModal({ onClose, onApplied }: { onClose: () => void; onAppli
         </div>
       </div>
     </div>
+  );
+}
+
+// ─── Inline per-row rate edit ─────────────────────────────────────────────
+// The Avg Price cell: click to edit the rate in ₹ per PURCHASE unit (how you
+// read it off an invoice). On save it POSTs to /api/inventory/update-rates
+// (basis 'purchase'), which divides by pack_size → per-recipe-unit average_price.
+// Because requisition/party costs read average_price LIVE, the fix flows to all
+// past requisitions immediately.
+function EditableRate({ m, onSaved }: { m: RawMaterial; onSaved: () => void }) {
+  const ps = Number((m as any).pack_size) || 1;
+  const pu = (m as any).purchase_unit || m.unit;
+  const current = (Number(m.average_price) || 0) * ps;   // ₹ per purchase unit
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const start = () => { setVal(current ? String(Math.round(current * 10000) / 10000) : ''); setErr(null); setEditing(true); };
+  const save = async () => {
+    const rate = Number(val);
+    if (!Number.isFinite(rate) || rate < 0) { setErr('bad'); return; }
+    setSaving(true); setErr(null);
+    try {
+      const r = await api('/api/inventory/update-rates', { method: 'POST', body: { rows: [{ key: (m as any).sku || m.name, rate }], basis: 'purchase' } });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      if ((j.applied || 0) < 1) throw new Error('no match');
+      setEditing(false);
+      onSaved();
+    } catch (e: any) { setErr(e?.message || 'failed'); }
+    finally { setSaving(false); }
+  };
+
+  if (editing) {
+    return (
+      <span className="inline-flex items-center gap-1 justify-end">
+        <span className="text-[10px] text-[#8B7355]">₹</span>
+        <input
+          autoFocus type="number" min={0} step="any" value={val}
+          onChange={e => setVal(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') save(); if (e.key === 'Escape') setEditing(false); }}
+          className={`w-20 border rounded px-1.5 py-0.5 text-right text-xs bg-white ${err ? 'border-red-400' : 'border-[#D4B896]'}`}
+        />
+        <span className="text-[10px] text-[#8B7355]">/{pu}</span>
+        <button onClick={save} disabled={saving} title="Save" className="text-emerald-600 hover:text-emerald-700 disabled:opacity-50">
+          {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />}
+        </button>
+        <button onClick={() => setEditing(false)} disabled={saving} title="Cancel" className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-3.5 h-3.5" /></button>
+      </span>
+    );
+  }
+  return (
+    <button onClick={start} title="Click to edit the rate (₹ per purchase unit)"
+      className="group inline-flex items-center gap-1 justify-end hover:text-[#af4408]">
+      {current ? formatCurrency(current) : <span className="text-[#C0A98F]">—</span>}
+      {ps > 1 && <span className="ml-0.5 text-[10px] text-[#8B7355]">/ {pu}</span>}
+      <Edit className="w-3 h-3 opacity-0 group-hover:opacity-100 text-[#af4408]" />
+    </button>
   );
 }
