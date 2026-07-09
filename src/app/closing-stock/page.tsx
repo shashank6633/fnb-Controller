@@ -26,7 +26,10 @@ import {
   Minus,
   CheckCircle,
   AlertCircle,
+  Download,
+  Upload,
 } from 'lucide-react';
+import Papa from 'papaparse';
 import { api } from '@/lib/api';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
@@ -288,6 +291,93 @@ export default function ClosingStockByLocationPage() {
       });
       const json = await res.json();
       setClosingResult(json);
+      if (json.success > 0) {
+        await fetchMaterials();
+        await fetchClosingHistory();
+        await reloadLocations();
+      }
+    } catch (err: any) {
+      setClosingResult({ success: 0, errors: [err.message] });
+    } finally {
+      setClosingSubmitting(false);
+    }
+  };
+
+  // --- CSV template download + bulk upload -----------------------------
+  // Mirror the modal's manual save exactly: physical_stock is a plain number
+  // in the material's RECIPE unit (m.unit), matched to a material by id, and
+  // POSTed to the same /api/closing-stock endpoint. adjust_stock is FORCED
+  // off for the CSV path — a bulk file must never overwrite system stock.
+  const csvEscape = (v: any) => {
+    if (v == null) return '';
+    const s = String(v);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const CSV_COLS = ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Physical count'];
+  const downloadClosingTemplate = async () => {
+    let mats = materials;
+    if (!mats.length) mats = await fetchMaterials();
+    const lines = [CSV_COLS.join(',')];
+    for (const m of mats) {
+      lines.push([
+        m.id, m.sku || '', m.name || '',
+        (m.super_category || m.category || ''), m.unit || '',
+        m.current_stock ?? 0, '',   // Physical count — left blank for the counter
+      ].map(csvEscape).join(','));
+    }
+    const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `closing-stock-template-${closingDate}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+  const uploadClosingCsv = async (file: File) => {
+    setClosingSubmitting(true);
+    setClosingResult(null);
+    try {
+      let mats = materials;
+      if (!mats.length) mats = await fetchMaterials();
+      const byId = new Map(mats.map(m => [String(m.id), m]));
+      const bySku = new Map(mats.filter(m => m.sku).map(m => [String(m.sku).trim().toLowerCase(), m]));
+      const byName = new Map(mats.map(m => [String(m.name).trim().toLowerCase(), m]));
+      const text = await file.text();
+      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+      if (parsed.errors?.length) {
+        setClosingResult({ success: 0, errors: ['CSV parse error: ' + parsed.errors[0].message] });
+        return;
+      }
+      const rows = parsed.data as any[];
+      const items: { material_id: string; physical_stock: number }[] = [];
+      const errors: string[] = [];
+      const get = (row: any, ...keys: string[]) => {
+        for (const k of keys) if (row[k] != null && String(row[k]).trim() !== '') return String(row[k]).trim();
+        return '';
+      };
+      for (const row of rows) {
+        const pc = get(row, 'Physical count', 'Physical Count', 'physical_count', 'physical count');
+        if (pc === '') continue;                               // blank = not counted → skip
+        const label = get(row, 'Name', 'name') || get(row, 'material_id') || get(row, 'SKU', 'sku') || 'row';
+        const qty = parseFloat(pc);
+        if (isNaN(qty) || qty < 0) { errors.push(`${label}: invalid physical count "${pc}"`); continue; }
+        const idKey = get(row, 'material_id');
+        const skuKey = get(row, 'SKU', 'sku').toLowerCase();
+        const nameKey = get(row, 'Name', 'name').toLowerCase();
+        const m = (idKey && byId.get(idKey)) || (skuKey && bySku.get(skuKey)) || (nameKey && byName.get(nameKey));
+        if (!m) { errors.push(`${label}: material not found (check material_id / SKU / Name)`); continue; }
+        items.push({ material_id: m.id, physical_stock: qty });
+      }
+      if (items.length === 0) {
+        setClosingResult({ success: 0, errors: errors.length ? errors : ['No physical counts found in the file'] });
+        return;
+      }
+      const res = await api('/api/closing-stock', {
+        method: 'POST',
+        body: { date: closingDate, items, adjust_stock: false, department_id: activeDeptId },
+      });
+      const json = await res.json();
+      setClosingResult({ success: json.success || 0, errors: [...errors, ...(json.errors || [])] });
       if (json.success > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
@@ -781,7 +871,30 @@ export default function ClosingStockByLocationPage() {
                   <p className="text-xs text-[#8B7355]">Enter physical count for each material</p>
                 </div>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                {!showHistory && (
+                  <>
+                    {/* Download a template pre-filled with current stock, count
+                        offline in Excel, then upload the filled file back. */}
+                    <button
+                      onClick={downloadClosingTemplate}
+                      className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4] inline-flex items-center gap-1"
+                      title="Download a CSV of current stock with a blank Physical count column"
+                    >
+                      <Download className="w-3.5 h-3.5" /> Template
+                    </button>
+                    <label
+                      className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4] inline-flex items-center gap-1 cursor-pointer"
+                      title="Upload the filled CSV to record physical counts in bulk"
+                    >
+                      <Upload className="w-3.5 h-3.5" /> Upload CSV
+                      <input
+                        type="file" accept=".csv,text/csv" className="hidden"
+                        onChange={e => { const f = e.target.files?.[0]; if (f) uploadClosingCsv(f); e.target.value = ''; }}
+                      />
+                    </label>
+                  </>
+                )}
                 <button
                   onClick={() => setShowHistory(!showHistory)}
                   className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${showHistory ? 'bg-purple-100 text-purple-700' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4]'}`}
