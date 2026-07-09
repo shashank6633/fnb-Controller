@@ -66,6 +66,7 @@ export async function GET(request: Request) {
 
       const items = db.prepare(`
         SELECT ri.*, rm.name AS material_name, rm.sku, rm.unit, rm.average_price,
+               ri.unit AS req_unit, rm.purchase_unit AS purchase_unit, rm.pack_size AS pack_size,
                r.req_number, r.id AS req_id
         FROM requisitions r
         JOIN requisition_items ri ON ri.req_id = r.id
@@ -91,7 +92,15 @@ export async function GET(request: Request) {
         GROUP BY s.item_name, link_type ORDER BY revenue DESC
       `).all(eventName, eventDate, eventName, eventDate, eventDate) as any[];
 
-      const cost    = items.reduce((s, i) => s + i.quantity_requested * (i.average_price || 0), 0);
+      // Recipe-units per requested-unit: ×pack_size only when the line was
+      // requested in the material's purchase unit (1 BTL = 750 ml), else ×1.
+      // Mirrors reqPackFactor() on the requisitions screen so costs agree.
+      const packFactor = (i: any) => {
+        const pack = Number(i.pack_size) || 1;
+        return (i.req_unit && i.purchase_unit && i.req_unit === i.purchase_unit
+                && i.req_unit !== i.unit && pack > 1) ? pack : 1;
+      };
+      const cost    = items.reduce((s, i) => s + i.quantity_requested * packFactor(i) * (i.average_price || 0), 0);
       const br      = resolveBookingRevenue(bookings, cachedParties, eventName, eventDate, today, true);
       const revenue = br.revenue;
       const guests  = reqs[0]?.guest_count || 0;
@@ -113,7 +122,7 @@ export async function GET(request: Request) {
           unit:       i.unit,
           quantity:   i.quantity_requested,
           unit_price: Math.round((i.average_price || 0) * 100) / 100,
-          line_cost:  Math.round(i.quantity_requested * (i.average_price || 0) * 100) / 100,
+          line_cost:  Math.round(i.quantity_requested * packFactor(i) * (i.average_price || 0) * 100) / 100,
         })),
         sales: canSeeFinancials ? sales.map(s => ({
           item_name: s.item_name, qty: s.qty,
@@ -147,7 +156,11 @@ export async function GET(request: Request) {
                       WHERE r3.purpose = 'party' AND r3.event_name = r.event_name
                         AND r3.event_date = r.event_date AND ri3.department_id = ?)`
                  : 'COUNT(*)'} AS req_count,
-               (SELECT COALESCE(SUM(ri.quantity_requested * rm.average_price), 0)
+               (SELECT COALESCE(SUM(ri.quantity_requested
+                          * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                                       AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+                                  THEN rm.pack_size ELSE 1 END)
+                          * rm.average_price), 0)
                   FROM requisitions r2
                   JOIN requisition_items ri ON ri.req_id = r2.id
                   JOIN raw_materials rm ON rm.id = ri.material_id

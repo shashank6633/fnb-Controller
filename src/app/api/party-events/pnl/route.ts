@@ -123,8 +123,17 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
     // handed over) × avg price, only for FULFILLED requisitions. AND split by
     // category: liquor / beer / wine / spirits / beverages / mixers are costed as
     // LIQUOR, everything else as FOOD.
+    // Cost the ISSUED qty in recipe units × ₹/recipe-unit. quantity_issued is in
+    // ri.unit; convert to recipe units with the SAME pack factor the requisition
+    // screens use (reqPackFactor): × pack_size only when the line was requested in
+    // the material's purchase unit (e.g. 1 BTL = 750 ml). Legacy rows with a blank
+    // ri.unit stay ×1, matching how they display everywhere else.
     const runSplit = (inOrNotIn: 'IN' | 'NOT IN') => db.prepare(`
-      SELECT COALESCE(SUM(ri.quantity_issued * rm.average_price), 0) AS cost,
+      SELECT COALESCE(SUM(ri.quantity_issued
+               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+                       THEN rm.pack_size ELSE 1 END)
+               * rm.average_price), 0) AS cost,
              COUNT(CASE WHEN ri.quantity_issued > 0 THEN 1 END) AS item_count
       FROM requisitions r
       JOIN requisition_items ri ON ri.req_id = r.id
@@ -199,6 +208,13 @@ export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    // Party P&L is financial data (revenue / cost / margin). Restrict to the same
+    // audience that sees party financials elsewhere (party-events page + route):
+    // admin or a department head. Plain staff (cooks / bar / service) must not be
+    // able to pull profitability by hitting this endpoint directly.
+    if (!(me.role === 'admin' || me.is_head_chef)) {
+      return Response.json({ error: 'Not authorised' }, { status: 403 });
+    }
     const db = getDb();
     const url = new URL(request.url);
     const party_unique_id = url.searchParams.get('party_unique_id') || undefined;

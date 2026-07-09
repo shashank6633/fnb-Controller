@@ -30,7 +30,13 @@ export async function GET(request: Request) {
              ri.quantity_requested AS qty,
              ri.quantity_issued    AS qty_issued,
              rm.average_price      AS avg_price,
-             (ri.quantity_requested * rm.average_price) AS cost,
+             -- ×pack_size to convert a purchase-unit request (1 BTL) to recipe
+             -- units before costing at ₹/recipe-unit; ×1 for blank-unit rows.
+             (ri.quantity_requested
+               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+                       THEN rm.pack_size ELSE 1 END)
+               * rm.average_price) AS cost,
              r.status              AS req_status,
              r.id                  AS req_id
       FROM requisitions r
