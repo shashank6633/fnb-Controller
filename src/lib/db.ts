@@ -2324,33 +2324,23 @@ export function updateMaterialPrice(db: Database.Database, materialId: string): 
   if (!material) return;
 
   if (material.costing_method === 'average') {
-    // Rolling 30-day (monthly) weighted average — recent purchases dominate.
-    // If there were no purchases in the last 30 days, fall back to the most
-    // recent 90 days (handles low-velocity items like spices). Only if THAT
-    // is also empty do we fall back to all-time.
-    const monthly = db.prepare(`
-      SELECT SUM(quantity * unit_price) as total_value, SUM(quantity) as total_qty
-      FROM purchases WHERE material_id = ? AND date >= date('now', '-30 day')
-    `).get(materialId) as any;
+    // SAME-MONTH weighted average: use ONLY the purchases made in the calendar
+    // month of the material's MOST RECENT purchase. The average therefore always
+    // reflects that month's prices and NEVER blends across a full year (older
+    // months are ignored). A material with no purchases at all is left untouched
+    // (so a manually-corrected rate stays put until a real purchase lands).
+    const sameMonth = db.prepare(`
+      SELECT SUM(quantity * unit_price) AS total_value, SUM(quantity) AS total_qty
+      FROM purchases
+      WHERE material_id = ?
+        AND strftime('%Y-%m', date) = (
+          SELECT strftime('%Y-%m', MAX(date)) FROM purchases WHERE material_id = ?
+        )
+    `).get(materialId, materialId) as any;
 
     let avgPrice: number | null = null;   // ₹ per purchase_unit (e.g. ₹/kg)
-    if (monthly && monthly.total_qty > 0) {
-      avgPrice = monthly.total_value / monthly.total_qty;
-    } else {
-      // Quarterly fallback for slow-moving items
-      const quarterly = db.prepare(`
-        SELECT SUM(quantity * unit_price) as total_value, SUM(quantity) as total_qty
-        FROM purchases WHERE material_id = ? AND date >= date('now', '-90 day')
-      `).get(materialId) as any;
-      if (quarterly && quarterly.total_qty > 0) {
-        avgPrice = quarterly.total_value / quarterly.total_qty;
-      } else {
-        const allTime = db.prepare(`
-          SELECT SUM(quantity * unit_price) as total_value, SUM(quantity) as total_qty
-          FROM purchases WHERE material_id = ?
-        `).get(materialId) as any;
-        if (allTime && allTime.total_qty > 0) avgPrice = allTime.total_value / allTime.total_qty;
-      }
+    if (sameMonth && sameMonth.total_qty > 0) {
+      avgPrice = sameMonth.total_value / sameMonth.total_qty;
     }
 
     // 🔧 Normalise to ₹ per RECIPE unit. Purchases are entered in purchase_unit
