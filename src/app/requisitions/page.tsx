@@ -660,6 +660,18 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
   // Phase 1 §2: dept staff confirms goods physically arrived. One-shot — only on fulfilled, not yet acked.
   const canAck   = detail.status === 'fulfilled' && !detail.dept_acknowledged_at && (isAuthor || isAdmin);
 
+  // Plain department staff (NOT admin / manager / HOD / store) get a stripped-down,
+  // mobile-friendly item view: Item / Qty / Unit per line + one overall total.
+  // HOD, admin, store and manager keep the full table (the else branch below).
+  const isPlainDept = viewer.role !== 'admin' && viewer.role !== 'manager'
+    && !viewer.can_chef && !viewer.can_mgmt && !viewer.can_store && !viewer.can_issue;
+  // Overall requisition cost = Σ requested-qty × pack-factor × ₹/recipe-unit.
+  // reqPackFactor converts a purchase-unit request (e.g. 1 BTL) to recipe units
+  // before costing at average_price (₹/recipe-unit) — same convention as party
+  // costing. Rejected lines excluded (they won't be issued).
+  const reqTotal = (detail.items || []).reduce(
+    (s, it) => s + (it.is_rejected ? 0 : (it.quantity_requested || 0) * reqPackFactor(it) * (it.average_price || 0)), 0);
+
   const submit = async () => {
     if (!confirm('Submit this requisition for head-chef approval?')) return;
     setBusy(true);
@@ -702,6 +714,36 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
     <tr><td colSpan={10} className="bg-[#FFF8F0] py-3 px-4">
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 mb-3">
         <div className="lg:col-span-3">
+          {isPlainDept ? (
+            /* Department (plain staff) view — only Item / Qty / Unit + one total. */
+            <>
+              <table className="w-full text-xs">
+                <thead className="text-[#8B7355]">
+                  <tr>
+                    <th className="text-left  py-1 px-2 font-medium">Item</th>
+                    <th className="text-right py-1 px-2 font-medium">Qty</th>
+                    <th className="text-left  py-1 px-2 font-medium">Unit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(detail.items || []).map(it => {
+                    const rejected = !!it.is_rejected;
+                    return (
+                      <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`}>
+                        <td className="py-1 px-2">{it.material_name}</td>
+                        <td className="py-1 px-2 text-right font-mono">{it.quantity_requested.toLocaleString('en-IN')}</td>
+                        <td className="py-1 px-2">{reqUnit(it)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <div className="mt-2 flex items-center justify-between border-t-2 border-[#D4B896] pt-2">
+                <span className="text-xs font-semibold text-[#2D1B0E]">Requisition total</span>
+                <span className="text-sm font-mono font-semibold text-[#2D1B0E]">{fmt(reqTotal)}</span>
+              </div>
+            </>
+          ) : (
           <table className="w-full text-xs">
             <thead className="text-[#8B7355]">
               <tr>
@@ -783,6 +825,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
               })}
             </tbody>
           </table>
+          )}
         </div>
         <div className="text-[11px] text-[#6B5744] space-y-1.5">
           <div><b>Drafted by:</b> {detail.drafted_by}</div>
