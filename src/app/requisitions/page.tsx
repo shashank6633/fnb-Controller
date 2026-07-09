@@ -921,6 +921,19 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
   const update = (i: number, patch: any) => setItems(p => p.map((it, j) => j === i ? { ...it, ...patch } : it));
   const remove = (i: number) => setItems(p => p.filter((_, j) => j !== i));
 
+  // Staff (non-privileged) get a stripped create form — Material / Qty / Unit only
+  // + one overall requisition total. Privileged roles keep the full stock/price
+  // columns (On hand · Buffer, PUoM · Last ₹, per-line Notes).
+  const simple = !canChangeDept;
+  const createTotal = items.reduce((s, it) => {
+    const m = materials.find(x => x.id === it.material_id);
+    if (!m) return s;
+    const pack = Number(m.pack_size) || 1;
+    // reqPackFactor: ×pack only when requested in the purchase unit (1 BTL = pack recipe units).
+    const factor = (it.unit && m.purchase_unit && it.unit === m.purchase_unit && it.unit !== m.unit && pack > 1) ? pack : 1;
+    return s + (Number(it.quantity_requested) || 0) * factor * (m.average_price || 0);
+  }, 0);
+
   // submitAfter=false → just save as draft. submitAfter=true → create then
   // immediately POST /submit so it lands in the Head Chef's inbox in one click.
   const save = async (submitAfter: boolean) => {
@@ -1022,12 +1035,22 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
               {/* Column header — desktop only; on mobile each field carries its own
                   inline label so a cramped 12-col grid never hides the material name. */}
               <div className="hidden md:grid md:grid-cols-12 gap-2 text-[10px] uppercase tracking-wide text-[#8B7355] px-1">
-                <div className="col-span-3">Material · Category</div>
-                <div className="col-span-2 text-right">On hand · Buffer</div>
-                <div className="col-span-2 text-right">Qty · Unit</div>
-                <div className="col-span-2 text-right">PUoM · Last ₹</div>
-                <div className="col-span-2">Notes</div>
-                <div className="col-span-1"></div>
+                {simple ? (
+                  <>
+                    <div className="col-span-7">Material · Category</div>
+                    <div className="col-span-4 text-right">Qty · Unit</div>
+                    <div className="col-span-1"></div>
+                  </>
+                ) : (
+                  <>
+                    <div className="col-span-3">Material · Category</div>
+                    <div className="col-span-2 text-right">On hand · Buffer</div>
+                    <div className="col-span-2 text-right">Qty · Unit</div>
+                    <div className="col-span-2 text-right">PUoM · Last ₹</div>
+                    <div className="col-span-2">Notes</div>
+                    <div className="col-span-1"></div>
+                  </>
+                )}
               </div>
               {items.map((it, i) => {
                 const mat = materials.find(m => m.id === it.material_id);
@@ -1054,8 +1077,9 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                   <div key={i} className="rounded-lg border border-[#E8D5C4] bg-white p-3 space-y-2.5 text-xs
                                           md:rounded-none md:border-0 md:bg-transparent md:p-0 md:space-y-0
                                           md:grid md:grid-cols-12 md:gap-2 md:items-start">
-                    {/* Material — full width on mobile (name never truncated), col-3 desktop */}
-                    <div className="md:col-span-3">
+                    {/* Material — full width on mobile (name never truncated); wider on
+                        desktop for staff (fewer columns), col-3 for the full form. */}
+                    <div className={simple ? 'md:col-span-7' : 'md:col-span-3'}>
                       <div className="flex items-start gap-2">
                         <div className="flex-1 min-w-0">
                           {isEditing && it.material_id ? (
@@ -1084,7 +1108,8 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                     </div>
                     {/* Numeric group: 3-up on mobile; on desktop `contents` lets each
                         block flow straight into the parent 12-col grid. */}
-                    <div className="grid grid-cols-3 gap-2 md:contents">
+                    <div className={simple ? 'md:contents' : 'grid grid-cols-3 gap-2 md:contents'}>
+                      {!simple && (
                       <div className="md:col-span-2 md:text-right text-[10px] leading-snug">
                         <Lbl>On hand · Buf</Lbl>
                         {mat ? (
@@ -1099,7 +1124,8 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                           </>
                         ) : <span className="text-[#8B7355]">—</span>}
                       </div>
-                      <div className="md:col-span-2">
+                      )}
+                      <div className={simple ? 'md:col-span-4' : 'md:col-span-2'}>
                         <Lbl>Qty · Unit</Lbl>
                         <input type="number" step="any" min={0} value={it.quantity_requested || ''}
                                onChange={e => update(i, { quantity_requested: Math.max(0, parseFloat(e.target.value) || 0) })}
@@ -1111,6 +1137,7 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                           </div>
                         ) : null}
                       </div>
+                      {!simple && (
                       <div className="md:col-span-2 md:text-right text-[10px] leading-snug">
                         <Lbl>PUoM · Last ₹</Lbl>
                         {mat ? (
@@ -1127,14 +1154,18 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                           </>
                         ) : <span className="text-[#8B7355]">—</span>}
                       </div>
+                      )}
                     </div>
-                    {/* Notes — full width on mobile, col-2 desktop */}
+                    {/* Notes — full width on mobile, col-2 desktop. Hidden for staff
+                        (their form is Material / Qty / Unit only). */}
+                    {!simple && (
                     <div className="md:col-span-2">
                       <Lbl>Notes</Lbl>
                       <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
                              placeholder="Notes (optional)"
                              className="w-full px-2 py-2 md:py-1 border border-[#E8D5C4] rounded" />
                     </div>
+                    )}
                     {/* delete — desktop only (mobile has the inline one above) */}
                     <button onClick={() => remove(i)} className="hidden md:block md:col-span-1 text-red-500 pt-1" aria-label="Remove line"><Trash2 className="w-3 h-3" /></button>
                   </div>
@@ -1155,6 +1186,15 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                       placeholder="Why is this needed?"
                       className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
           </label>
+
+          {/* Overall requisition value — staff form only (privileged users see
+              per-line prices instead). Σ qty × pack-factor × avg ₹/recipe-unit. */}
+          {simple && (
+            <div className="flex items-center justify-between border-t-2 border-[#D4B896] pt-3">
+              <span className="text-sm font-semibold text-[#2D1B0E]">Requisition total</span>
+              <span className="text-base font-mono font-semibold text-[#2D1B0E]">{fmt(createTotal)}</span>
+            </div>
+          )}
         </div>
         <div className="px-5 py-3 border-t border-[#E8D5C4] flex flex-wrap justify-end gap-2">
           <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
