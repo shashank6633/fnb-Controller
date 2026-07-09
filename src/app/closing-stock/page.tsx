@@ -198,7 +198,12 @@ export default function ClosingStockByLocationPage() {
 
   const fetchMaterials = async () => {
     try {
-      const res = await fetch('/api/inventory');
+      // Closing stock is a PHYSICAL count organised by storage location — a
+      // single location (walk-in chiller, dry store, bar counter) holds items
+      // from many departments. So the counter must see every category/material
+      // regardless of their own department's whitelist. scope=all bypasses the
+      // dept-category filter, matching the (already unfiltered) by-location view.
+      const res = await fetch('/api/inventory?scope=all');
       if (res.ok) {
         const json = await res.json();
         setMaterials(json.materials ?? []);
@@ -884,8 +889,9 @@ export default function ClosingStockByLocationPage() {
             ) : (
               /* Entry View */
               <div className="px-6 py-5 space-y-4">
-                {/* Date & Options */}
-                <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-end">
+                {/* Date & Options — wrap so the 5 controls never overflow or
+                    overlap on narrow/tablet widths (they stack/wrap instead). */}
+                <div className="flex flex-wrap gap-4 items-end">
                   <div>
                     <label className="block text-xs font-medium text-[#6B5744] mb-1">Closing Date *</label>
                     <input
@@ -918,7 +924,7 @@ export default function ClosingStockByLocationPage() {
                       </div>
                     )}
                   </div>
-                  <div className="flex-1 min-w-0">
+                  <div className="flex-1 min-w-[180px]">
                     <label className="block text-xs font-medium text-[#6B5744] mb-1">Search Material</label>
                     <div className="relative">
                       <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />

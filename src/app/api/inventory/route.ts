@@ -67,7 +67,10 @@ export async function GET(request: Request) {
     }
     if (categoryWhitelist) {
       const placeholders = categoryWhitelist.map(() => '?').join(',');
-      query += ` AND rm.category IN (${placeholders})`;
+      // COLLATE NOCASE so a dept whitelist saved with different casing (e.g.
+      // "Bar") still matches the lowercase stored category ("bar"). Without it a
+      // case-mismatched whitelist silently drops those categories from view.
+      query += ` AND rm.category COLLATE NOCASE IN (${placeholders})`;
       params.push(...categoryWhitelist);
     }
     if (vendorId) {
