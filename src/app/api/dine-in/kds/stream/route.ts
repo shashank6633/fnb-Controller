@@ -1,5 +1,6 @@
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { subscribeKds, type KdsEvent } from '@/lib/kds-bus';
+import { sectionMatchesStation } from '@/lib/kot-section';
 
 export const dynamic = 'force-dynamic';
 
@@ -13,7 +14,11 @@ export async function GET(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
   const outletId = await getCurrentOutletId();
-  const station = new URL(request.url).searchParams.get('station');
+  const url = new URL(request.url);
+  const station = url.searchParams.get('station');
+  // Same section gate as the KDS GET: plain staff locked to their section.
+  const privileged = me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef;
+  const section = (!privileged && me.section) ? me.section : (url.searchParams.get('section') || '');
 
   const encoder = new TextEncoder();
   let closed = false;
@@ -39,6 +44,7 @@ export async function GET(request: Request) {
 
       unsubscribe = subscribeKds((evt: KdsEvent) => {
         if (outletId && evt.outlet_id && evt.outlet_id !== outletId) return;
+        if (!sectionMatchesStation(section, evt.station || '')) return;
         if (station && station !== 'all' && evt.station !== station) return;
         send(`data: ${JSON.stringify(evt)}\n\n`);
       });

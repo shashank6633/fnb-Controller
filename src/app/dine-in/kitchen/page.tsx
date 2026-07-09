@@ -37,6 +37,7 @@ export default function KitchenPage() {
   const [kots, setKots] = useState<Kot[]>([]);
   const [stations, setStations] = useState<string[]>([]);
   const [station, setStation] = useState('all');
+  const [mySection, setMySection] = useState('');   // Parent Role / Section of the logged-in user
   const [live, setLive] = useState(false);
   const [, setTick] = useState(0);
   const [alerts, setAlerts] = useState<KotAlert[]>([]);
@@ -44,12 +45,12 @@ export default function KitchenPage() {
 
   const load = useCallback(async (st: string) => {
     try {
-      const r = await api(`/api/dine-in/kds?station=${st}`);
+      const r = await api(`/api/dine-in/kds?station=${st}&section=${encodeURIComponent(mySection)}`);
       const j = await r.json();
       setKots(j.items || []);
       setStations(j.stations || []);
     } catch (_) {}
-  }, []);
+  }, [mySection]);
 
   const loadAlerts = useCallback(async () => {
     try {
@@ -70,14 +71,20 @@ export default function KitchenPage() {
   useEffect(() => {
     load(station);
     esRef.current?.close();
-    const es = new EventSource(`/api/dine-in/kds/stream?station=${station}`);
+    const es = new EventSource(`/api/dine-in/kds/stream?station=${station}&section=${encodeURIComponent(mySection)}`);
     es.onopen = () => setLive(true);
     es.onmessage = () => load(station);          // any kot.new / kot.bumped → refetch
     es.onerror = () => setLive(false);            // browser auto-reconnects; poll covers the gap
     esRef.current = es;
     const poll = setInterval(() => load(station), 10000);
     return () => { es.close(); clearInterval(poll); };
-  }, [station, load]);
+  }, [station, mySection, load]);
+
+  // Seed the section filter from the logged-in user (Kitchen/Bar auto-scopes the
+  // board; Service/Maintenance/Store/admin without a section see everything).
+  useEffect(() => {
+    api('/api/auth/me').then(r => r.json()).then(d => setMySection(d?.user?.section || '')).catch(() => {});
+  }, []);
 
   // Poll unresolved KOT escalations (~10s) — shown as a red banner above the grid.
   useEffect(() => {
