@@ -952,10 +952,15 @@ export default function ClosingStockByLocationPage() {
                       ))}
                     </select>
                   </div>
-                  <label className="flex items-center gap-2 cursor-pointer bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                    <input type="checkbox" checked={adjustStockModal} onChange={e => setAdjustStockModal(e.target.checked)} className="accent-[#af4408] w-4 h-4" />
-                    <span className="text-xs text-amber-800 font-medium whitespace-nowrap">Adjust system stock</span>
-                  </label>
+                  {/* Only admins may overwrite system stock from a count. The
+                      server also forces adjust_stock=false for non-admins (see
+                      /api/closing-stock POST), so hiding it here just matches. */}
+                  {isAdmin && (
+                    <label className="flex items-center gap-2 cursor-pointer bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                      <input type="checkbox" checked={adjustStockModal} onChange={e => setAdjustStockModal(e.target.checked)} className="accent-[#af4408] w-4 h-4" />
+                      <span className="text-xs text-amber-800 font-medium whitespace-nowrap">Adjust system stock</span>
+                    </label>
+                  )}
                 </div>
 
                 {adjustStockModal && (
