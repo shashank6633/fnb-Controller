@@ -43,6 +43,9 @@ import {
   Timer,
   Download,
   ScanLine,
+  Bot,
+  GraduationCap,
+  HelpCircle,
   type LucideIcon,
 } from "lucide-react";
 
@@ -138,6 +141,22 @@ const navTree: NavEntry[] = [
 
   { kind: "link", label: "Dept Consumption", href: "/department-consumption", icon: BarChart3 },
   { kind: "link", label: "Staff Meals",      href: "/staff-meals",            icon: Utensils },
+
+  // AKAN CRM — AI assistant / training / quizzes for Front Office & GRE staff.
+  // Links only show for users granted the paths in page-catalog (AKAN CRM section).
+  {
+    kind: "section",
+    label: "AKAN CRM",
+    icon: Bot,
+    items: [
+      { kind: "link", label: "AI Assistant",     href: "/crm/assistant",  icon: Bot },
+      { kind: "link", label: "Training",         href: "/crm/training",   icon: GraduationCap },
+      { kind: "link", label: "Quiz",             href: "/crm/quiz",       icon: HelpCircle },
+      { kind: "link", label: "Guest Quiz Links", href: "/crm/quiz-links", icon: Link2 },
+      { kind: "link", label: "CRM Settings",     href: "/crm/settings",   icon: ShieldAlert },
+    ],
+  },
+
   {
     kind: "section",
     label: "Settings",

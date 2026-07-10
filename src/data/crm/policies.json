@@ -1,0 +1,29 @@
+{
+  "entry_policy": {
+    "normal_days": "No entry fees or cover charges on regular days (Sunday to Thursday).",
+    "weekends": "Cover charges may apply ONLY on Friday and Saturday IF a big live band or famous singer is performing that weekend. Otherwise, no cover charges even on weekends.",
+    "summary": "We generally do not charge entry fees. Cover charges are only for special Friday/Saturday events with big performers."
+  },
+  "dress_code": {
+    "policy": "No strict dress code. Decent dressing is required.",
+    "examples": "Smart casual to casual wear is fine. Please dress decently."
+  },
+  "age_policy": {
+    "first_floor": "Strictly 21+ only. This is the pub and live band area. No exceptions for underage guests, even with parents.",
+    "second_floor": "Below 21 years allowed ONLY with parents/guardians. No liquor will be served to them. They will be given a RED WRISTBAND for identification.",
+    "third_floor": "Below 21 years allowed ONLY with parents/guardians. No liquor will be served to them. They will be given a RED WRISTBAND for identification.",
+    "id_requirement": "Valid government-issued photo ID required for age verification at entry.",
+    "underage_liquor_policy": "Absolutely NO liquor served to guests under 21 on any floor. Red wristband system enforced on 2nd and 3rd floors."
+  },
+  "bar_policy": {
+    "type": "Full bar with all spirits, cocktails, mocktails, wines, beers, and non-alcoholic beverages.",
+    "brewery": "No in-house brewery.",
+    "underage": "No liquor served to guests under 21 years of age."
+  },
+  "payment": {
+    "methods": ["Cash", "All major credit/debit cards", "UPI (GPay, PhonePe, Paytm)"],
+    "gst": "GST applicable as per government norms"
+  },
+  "outside_food": "Outside food and beverages are not allowed.",
+  "smoking": "Smoking is allowed only in designated outdoor areas."
+}

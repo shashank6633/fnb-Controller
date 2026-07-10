@@ -1,0 +1,499 @@
+{
+  "scripts": [
+    {
+      "id": "birthday_inquiry",
+      "title": "Birthday Party Inquiry",
+      "scenario": "Customer calls asking about hosting a birthday party at Akan.",
+      "opening": "Thank you for calling Akan Hyderabad! I'd love to help you plan a birthday celebration with us. May I know your name please?",
+      "key_questions": [
+        "What date are you looking at for the celebration?",
+        "Approximately how many guests are you expecting?",
+        "Do you have a floor preference? Our 1st floor is the pub/band area (21+ only), while 2nd and 3rd floors are great for family celebrations.",
+        "Would you like any special arrangements like cake, decorations, or a dedicated setup?"
+      ],
+      "key_info_to_share": [
+        "All floors available for private bookings based on calendar.",
+        "1st floor: 400 seating / 550 standing - best for large parties (21+ only).",
+        "2nd floor: 190 seating (semi-indoor + outdoor) - family friendly.",
+        "3rd floor: 180 outdoor seating with stunning Durgam Cheruvu Cable Bridge view.",
+        "Custom food and beverage packages available.",
+        "Valet parking available for all guests."
+      ],
+      "closing": "I'll share the details with our events team and they will get back to you with a customized proposal. Can I get your WhatsApp number to share the details?",
+      "upsell_tips": [
+        "If the party falls on Friday/Saturday, mention the live band experience!",
+        "For Sunday birthdays, suggest combining with the Sunday Brunch Buffet.",
+        "Recommend the 3rd floor for the best views and photo opportunities."
+      ]
+    },
+    {
+      "id": "corporate_booking",
+      "title": "Corporate Event Booking",
+      "scenario": "Company HR or admin calls about hosting a corporate event.",
+      "opening": "Thank you for calling Akan Hyderabad! We'd be delighted to host your corporate event. We're located right next to iLabs, very convenient for IT companies.",
+      "key_questions": [
+        "What type of corporate event is this? (Team outing, client dinner, annual party, conference after-party?)",
+        "What date and time are you considering?",
+        "How many attendees are you expecting?",
+        "Do you need any audio-visual setup, projector, or mic facilities?",
+        "Is this a sit-down dinner or cocktail-style event?"
+      ],
+      "key_info_to_share": [
+        "Located right next to iLabs Gate 7 - very convenient for IT companies.",
+        "Full 1st floor available for big corporate parties (400 seated / 550 standing).",
+        "All 3 floors available based on calendar.",
+        "Custom food and beverage packages tailored to your budget.",
+        "Valet parking available for all guests.",
+        "2nd and 3rd floor are family-friendly if team members bring families."
+      ],
+      "closing": "Let me take your details and our events coordinator will get back to you within 24 hours with a customized proposal. May I have your email and WhatsApp number?",
+      "upsell_tips": [
+        "Suggest combining with a weekend live band night for team outings.",
+        "Mention Sunday workshops for team-building activities (pottery, pizza making, etc.).",
+        "Highlight the 3rd floor cable bridge view for client-facing events."
+      ]
+    },
+    {
+      "id": "table_reservation",
+      "title": "Table Reservation",
+      "scenario": "Customer wants to reserve a table for dining.",
+      "opening": "Thank you for calling Akan Hyderabad! I'd be happy to help you with a table reservation.",
+      "key_questions": [
+        "For what date and time would you like the reservation?",
+        "How many guests will be dining?",
+        "Do you have a floor preference? 1st floor is our pub area (21+ only), 2nd and 3rd floors have outdoor seating with cable bridge views.",
+        "Is this for a special occasion?"
+      ],
+      "key_info_to_share": [
+        "We are open Sun-Thu: 12PM-11:30PM, Fri-Sat: 12PM-12:30AM.",
+        "No entry fees or cover charges on regular days.",
+        "Valet parking available.",
+        "You can also book via ReserveGo or WhatsApp."
+      ],
+      "closing": "Your table is reserved! We'll send a confirmation on WhatsApp. We look forward to welcoming you!",
+      "upsell_tips": [
+        "If coming on Fri/Sat, mention the live band from 9 PM.",
+        "If coming on Sunday, mention the Sunday Brunch Buffet (12-4 PM).",
+        "Recommend the 3rd floor for the best cable bridge view experience."
+      ]
+    },
+    {
+      "id": "event_night_info",
+      "title": "Event Night Information",
+      "scenario": "Customer calls asking about tonight's or upcoming events.",
+      "opening": "Thank you for calling Akan Hyderabad! Let me tell you about our exciting events.",
+      "key_questions": [
+        "Are you asking about tonight specifically, or upcoming events?",
+        "How many people will be in your group?",
+        "Have you visited us before?"
+      ],
+      "key_info_to_share": [
+        "Friday & Saturday: Regional Telugu Live Bands from 9PM-12:30AM on the 1st floor.",
+        "Sunday: Bollywood Sufi & Qawali Bands from 9PM-11:30PM.",
+        "Sunday Brunch Buffet: 12PM-4PM with fun workshops.",
+        "Cover charges may apply only if a big performer is featured that weekend.",
+        "1st floor band area is strictly 21+ only.",
+        "Events are updated on Instagram @akan.hyd.",
+        "Event tickets available on BookMyShow."
+      ],
+      "closing": "Would you like me to reserve a table for the event? We recommend booking in advance as event nights fill up quickly!",
+      "upsell_tips": [
+        "Mention BookMyShow for easy ticket booking.",
+        "Suggest the 2nd or 3rd floor if they have family/underage members."
+      ]
+    },
+    {
+      "id": "complaint_handling",
+      "title": "Complaint Handling",
+      "scenario": "Customer calls with a complaint about food, service, or experience.",
+      "opening": "Thank you for reaching out to Akan Hyderabad. I sincerely apologize for the inconvenience you faced. Your feedback is very important to us.",
+      "key_questions": [
+        "Could you share more details about your experience?",
+        "When did you visit us and which floor were you on?",
+        "May I have your name and contact number so our manager can follow up personally?"
+      ],
+      "key_info_to_share": [
+        "Express genuine empathy and concern - listen actively.",
+        "Do NOT argue, justify, or blame the customer.",
+        "Assure the guest that their feedback is valuable and will be acted upon.",
+        "Escalate to the duty manager immediately if the complaint is serious.",
+        "Never make promises about compensation without manager approval."
+      ],
+      "closing": "I truly appreciate you bringing this to our attention. Our manager will personally reach out to you today to ensure we make this right.",
+      "upsell_tips": [
+        "Do NOT upsell during complaint handling. Focus entirely on resolution."
+      ]
+    },
+    {
+      "id": "sunday_brunch_inquiry",
+      "title": "Sunday Brunch & Workshop Inquiry",
+      "scenario": "Customer calls asking about Sunday brunch or workshops.",
+      "opening": "Thank you for calling Akan Hyderabad! Our Sunday Brunch is one of our most popular offerings. Let me share the details!",
+      "key_questions": [
+        "Are you interested in just the brunch, or also one of our fun workshops?",
+        "How many adults and children will be joining?",
+        "Would you like to make a reservation for this Sunday?"
+      ],
+      "key_info_to_share": [
+        "Sunday Brunch Buffet: 12:00 PM - 4:00 PM every Sunday.",
+        "Adult pricing: Rs. 1,499/- + Tax (without alcohol).",
+        "Children (5-12 years): Rs. 799/- + Tax. Below 5: Complimentary.",
+        "Workshop options: Pizza Making, Mixology, Sushi Making, Glass Painting, Candle Making, Pottery - Rs. 999/- (solo) or Rs. 1,599/- (with brunch).",
+        "Leather Making workshop: Rs. 1,299/- (solo) or Rs. 1,799/- (with brunch)."
+      ],
+      "closing": "Shall I book a table for this Sunday's brunch? We recommend reserving early as it gets quite popular!",
+      "upsell_tips": [
+        "Always recommend the workshop + brunch combo for better value.",
+        "Highlight the family-friendly nature - kids love the workshops!",
+        "Mention the 3rd floor outdoor seating with cable bridge views for brunch."
+      ]
+    },
+    {
+      "id": "vegetarian_guest",
+      "title": "Vegetarian / Dietary Requirements",
+      "scenario": "Customer calls asking about vegetarian, vegan, Jain, or gluten-free options.",
+      "opening": "Thank you for calling Akan Hyderabad! We have a wonderful range of options for all dietary preferences.",
+      "key_questions": [
+        "Are you looking for vegetarian, vegan, Jain, or gluten-free options?",
+        "How many guests and when are you planning to visit?",
+        "Would you like me to share our menu link so you can browse the options?"
+      ],
+      "key_info_to_share": [
+        "Extensive vegetarian menu including: Paneer Majestic, Truffle Malai Broccoli, Stuffed Paneer Tikka, Edamame Truffle Dimsum, various sushi rolls, pizzas, pastas, and Indian curries.",
+        "Veg bestsellers: Paneer Majestic, Smoked Dal Makhani, Paneer Butter Masala, Sweet Potato Apricot Tikki.",
+        "Vegan options available - several salads and dishes marked vegan. Kitchen can prepare vegan-friendly dishes on request.",
+        "Jain food available on request.",
+        "Gluten-free options marked on menu.",
+        "Menu link: akanhyd.com/menu"
+      ],
+      "closing": "I'm sure you'll find plenty to enjoy! Shall I reserve a table for you?",
+      "upsell_tips": [
+        "Recommend Edamame Truffle Dimsum (vegan, Chef's Kiss) as a must-try.",
+        "Highlight the Smoked Dal Makhani as a crowd favorite.",
+        "Suggest the Sunday Brunch which has a wide buffet spread for all diets."
+      ]
+    },
+    {
+      "id": "underage_guest_inquiry",
+      "title": "Underage Guest / Family with Teenagers",
+      "scenario": "Customer calls asking if they can bring their teenager or young family member.",
+      "opening": "Thank you for calling Akan Hyderabad! Great question - let me explain our age policy so you can plan your visit perfectly.",
+      "key_questions": [
+        "How old is the youngest member in your group?",
+        "How many guests total?",
+        "Which day are you planning to visit?"
+      ],
+      "key_info_to_share": [
+        "1st Floor (Pub/Band area): STRICTLY 21+ ONLY. No exceptions, even with parents.",
+        "2nd Floor & 3rd Floor: Under-21 guests allowed ONLY with parents/guardians.",
+        "Under-21 guests receive a RED WRISTBAND - they will NOT be served any alcoholic drinks.",
+        "3rd floor is fully outdoor with amazing Durgam Cheruvu Cable Bridge view - great for families!",
+        "2nd floor has semi-indoor and outdoor seating.",
+        "Valid government photo ID required at entry."
+      ],
+      "closing": "I'd recommend the 3rd floor for your family - the view is absolutely stunning! Shall I reserve a table?",
+      "upsell_tips": [
+        "Recommend 3rd floor for the view and outdoor vibe.",
+        "If visiting Sunday, suggest the brunch + workshop combo (kids love pottery/pizza making).",
+        "Mention that kids below 5 eat free at the Sunday Brunch."
+      ]
+    },
+    {
+      "id": "menu_recommendation",
+      "title": "Menu & Food Recommendation",
+      "scenario": "Customer calls asking what's good on the menu, or needs food recommendations.",
+      "opening": "Thank you for calling Akan Hyderabad! We have an amazing multi-cuisine menu. Let me help you pick the best dishes!",
+      "key_questions": [
+        "Do you prefer vegetarian or non-vegetarian?",
+        "Any specific cuisine preference? We have Indian, Pan-Asian, Italian, Mexican, and more.",
+        "How spicy do you like your food?",
+        "Any allergies or dietary restrictions?"
+      ],
+      "key_info_to_share": [
+        "Crowd Favorites: Paneer Majestic, Southern Style Chicken 65, Butter Chicken, Murgh Dum Biryani, Smoked Dal Makhani.",
+        "Chef's Kiss items: Chocolate of the Gods (dessert), Angara Chicken Kebab, Tandoori Karvepaku Prawns, Edamame Truffle Dimsum.",
+        "Unique must-try: Wasabi White Chocolate Kulfi, Thandai Risotto, Bhimavaram Chicken Kaju Pakodi.",
+        "For seafood lovers: Grilled Lobster, Butter Garlic Prawns, Malvani Fish Curry, Andhra Prawn Pulao.",
+        "We have a full sushi menu, gourmet pizzas, live charcoal grill counter, and amazing desserts.",
+        "Share menu link: akanhyd.com/menu for full menu with prices."
+      ],
+      "closing": "I'd love for you to try our specialties! Shall I reserve a table for you?",
+      "upsell_tips": [
+        "Always recommend at least one Chef's Kiss item.",
+        "Mention the live charcoal grill counter for an interactive experience.",
+        "Suggest ending the meal with Chocolate of the Gods - it's our signature dessert."
+      ]
+    },
+    {
+      "id": "whiskey_bar_inquiry",
+      "title": "Bar & Whiskey Collection Inquiry",
+      "scenario": "Customer calls asking about the bar, cocktails, or whiskey collection.",
+      "opening": "Thank you for calling Akan Hyderabad! We have an excellent full bar with a premium collection. Let me tell you about it!",
+      "key_questions": [
+        "Are you interested in whiskey, cocktails, beer, or wine?",
+        "Is this for a personal visit or planning an event?",
+        "When are you planning to visit?"
+      ],
+      "key_info_to_share": [
+        "Full bar - all spirits, cocktails, mocktails, wines, beers (domestic and imported).",
+        "Premium Single Malts: Glenfiddich 12yr, Glenmorangie 10yr, Talisker 10yr, Singleton, Indri, Royal Brackla (12/18/21yr).",
+        "Blended Scotch: Johnnie Walker (Red/Black), Chivas Regal (12/15/18yr), Dewar's range (up to 21yr), Royal Salute.",
+        "Standard pour is 50ml, subject to availability.",
+        "Note: We are NOT a brewery. We serve curated premium brands.",
+        "Bar on 1st floor is 21+ ONLY. 2nd and 3rd floor bars serve adults only (red wristband for under-21)."
+      ],
+      "closing": "Come experience our collection! Would you like to reserve a spot? Friday/Saturday nights have live bands to complement your drinks!",
+      "upsell_tips": [
+        "For whiskey enthusiasts, mention the Royal Brackla 21yr as a premium experience.",
+        "Suggest pairing drinks with our bar nibbles - Cajun Spiced Foxnut, Devil Cashewnuts.",
+        "If on Fri/Sat, mention the live band atmosphere."
+      ]
+    },
+    {
+      "id": "sushi_pan_asian",
+      "title": "Sushi & Pan-Asian Menu Inquiry",
+      "scenario": "Customer calls asking about sushi or Asian food options.",
+      "opening": "Thank you for calling Akan Hyderabad! We have a fantastic Pan-Asian menu including fresh sushi, dimsums, baos, and more!",
+      "key_questions": [
+        "Are you looking specifically for sushi, or our full Pan-Asian menu?",
+        "Vegetarian or non-vegetarian preference?",
+        "How many guests?"
+      ],
+      "key_info_to_share": [
+        "Full sushi menu with both veg and non-veg options - Maki, Uramaki, Nigiri styles.",
+        "Veg sushi highlights: Avocado Cream Cheese Maki, Edamame Truffle Uramaki, Veg Tempura Uramaki.",
+        "Non-veg sushi: Salmon Nigiri, Aburi Salmon Nigiri, Sawagani Maki (soft shell crab), Ebi Uramaki (prawn tempura).",
+        "Dimsums: Edamame Truffle Dimsum (vegan, Chef's Kiss), Prawn Dimsum, Tibetan Chicken Dimsum.",
+        "Baos: Grilled Vegetable Bao, Spicy Thai Chicken Bao.",
+        "Also: Japanese Udon Noodles, Nasi Goreng, Thai curries, Khow Suey soups.",
+        "Sunday workshop includes Sushi Making class!"
+      ],
+      "closing": "Would you like to reserve a table? Our sushi is freshly prepared and very popular!",
+      "upsell_tips": [
+        "Mention the Sunday Sushi Making workshop for sushi enthusiasts.",
+        "Recommend pairing sushi with our mocktails or Japanese sake.",
+        "Suggest the 3rd floor outdoor seating for a unique sushi experience with the cable bridge view."
+      ]
+    },
+    {
+      "id": "large_group_walk_in",
+      "title": "Large Group / Walk-in Availability",
+      "scenario": "Customer calls to check if they can walk in with a large group (8+ people).",
+      "opening": "Thank you for calling Akan Hyderabad! We'd love to host your group. Let me check availability for you.",
+      "key_questions": [
+        "How many people are in your group?",
+        "What time are you planning to come?",
+        "Is everyone above 21? (Important for 1st floor seating)",
+        "Any preference for indoor or outdoor seating?"
+      ],
+      "key_info_to_share": [
+        "For groups of 8+, we strongly recommend advance booking to guarantee seating together.",
+        "Walk-ins are welcome but subject to availability, especially on Fri/Sat evenings.",
+        "2nd floor: 190 capacity. 3rd floor: 180 capacity (fully outdoor).",
+        "1st floor: 400 seating but 21+ only.",
+        "Valet parking available for all guests.",
+        "You can book via phone, WhatsApp (+919649652222), or ReserveGo."
+      ],
+      "closing": "Let me reserve a table for your group right now so you're guaranteed a great spot. What time works?",
+      "upsell_tips": [
+        "For Fri/Sat groups, highlight the live band experience.",
+        "Suggest the 3rd floor for the best group photos with cable bridge view.",
+        "For corporate groups, mention custom food packages."
+      ]
+    },
+    {
+      "id": "parking_directions",
+      "title": "Parking & Directions",
+      "scenario": "Customer calls asking about parking or how to reach Akan.",
+      "opening": "Thank you for calling Akan Hyderabad! Let me guide you to our location.",
+      "key_questions": [
+        "Where are you coming from?",
+        "Are you driving or taking a cab?"
+      ],
+      "key_info_to_share": [
+        "Location: Akan Hyderabad, Opp Durgam Cheruvu, Beside iLabs Gate No 7, Madhapur.",
+        "Landmark: Right next to iLabs Gate 7, opposite Durgam Cheruvu lake.",
+        "Valet parking is available - just pull up at the entrance.",
+        "For cab/auto: Tell them 'Akan restaurant near iLabs Gate 7, Madhapur' or use Google Maps.",
+        "Very accessible from Hi-Tech City, Gachibowli, and Kondapur areas."
+      ],
+      "closing": "Just follow Google Maps to 'Akan Hyderabad' and our valet will take care of parking. See you soon!",
+      "upsell_tips": [
+        "If they mention they're nearby IT companies, mention corporate event hosting capabilities.",
+        "Mention the stunning Durgam Cheruvu Cable Bridge view from the 3rd floor."
+      ]
+    },
+    {
+      "id": "date_night_romantic",
+      "title": "Date Night / Romantic Dinner",
+      "scenario": "Customer calls planning a date night or special romantic dinner.",
+      "opening": "Thank you for calling Akan Hyderabad! We have the perfect ambiance for a special evening together.",
+      "key_questions": [
+        "Is this for a special occasion - anniversary, proposal, or just a date night?",
+        "What day and time are you planning?",
+        "Would you prefer indoor cozy seating or outdoor with the cable bridge view?"
+      ],
+      "key_info_to_share": [
+        "3rd floor: Fully outdoor with a stunning lit-up Durgam Cheruvu Cable Bridge view - most romantic!",
+        "2nd floor: Semi-indoor + outdoor, more intimate and cozy.",
+        "Friday/Saturday: Live Telugu bands from 9PM create amazing atmosphere.",
+        "Sunday: Bollywood Sufi & Qawali from 9PM for a soulful evening.",
+        "Special arrangements can be made for proposals/anniversaries - talk to our events team.",
+        "Signature dessert: Chocolate of the Gods - perfect for sharing!"
+      ],
+      "closing": "Let me reserve the best table for you with a view. Shall I also coordinate any special arrangements?",
+      "upsell_tips": [
+        "Recommend the 3rd floor corner table for the best cable bridge view.",
+        "Suggest starting with cocktails, then dinner, ending with Chocolate of the Gods.",
+        "For proposals, mention that the events team can help with special decorations."
+      ]
+    },
+    {
+      "id": "first_time_visitor",
+      "title": "First-Time Visitor General Inquiry",
+      "scenario": "Customer calls for the first time and wants to know everything about Akan.",
+      "opening": "Welcome! Thank you for your interest in Akan Hyderabad! We're one of Hyderabad's most exciting dining destinations. Let me tell you all about us!",
+      "key_questions": [
+        "What brings you to Akan - dining, drinks, events, or a celebration?",
+        "How many guests?",
+        "When are you planning to visit?"
+      ],
+      "key_info_to_share": [
+        "Akan is a multi-cuisine Pub + Restaurant + Event Space opposite Durgam Cheruvu.",
+        "3 floors: 1st floor (pub, 21+ only), 2nd floor (semi-indoor/outdoor), 3rd floor (fully outdoor with cable bridge view).",
+        "Multi-cuisine menu: Indian, Pan-Asian, Italian, Mexican, sushi, live grill counter, gourmet pizzas.",
+        "Full bar with premium whiskey collection, cocktails, beers, wines.",
+        "Open Sun-Thu: 12PM-11:30PM, Fri-Sat: 12PM-12:30AM.",
+        "Live bands every Fri/Sat/Sun evenings.",
+        "Sunday Brunch Buffet (12-4PM) with fun workshops.",
+        "Valet parking. Contact: +919649652222. Instagram: @akan.hyd."
+      ],
+      "closing": "I'm sure you'll love the experience! Shall I reserve a table for your first visit?",
+      "upsell_tips": [
+        "Recommend the 3rd floor for first-timers - the view is unforgettable.",
+        "If visiting on a weekend, highlight the live band atmosphere.",
+        "Suggest trying the crowd favorites: Murgh Dum Biryani, Butter Chicken, Paneer Majestic."
+      ]
+    },
+    {
+      "id": "takeaway_delivery",
+      "title": "Takeaway / Delivery Inquiry",
+      "scenario": "Customer calls asking about takeaway or home delivery options.",
+      "opening": "Thank you for calling Akan Hyderabad! Yes, we do offer takeaway and delivery.",
+      "key_questions": [
+        "Would you like to pick up (takeaway) or get it delivered?",
+        "What would you like to order?",
+        "For delivery: What is your delivery address?"
+      ],
+      "key_info_to_share": [
+        "Takeaway: You can order via our website akanbrewingco.inmyarea.in or call us.",
+        "Delivery: Available through Swiggy and Zomato.",
+        "Full food menu available for delivery. Some items may vary.",
+        "Alcohol delivery is NOT available (as per regulations).",
+        "You can also WhatsApp your order to +919649652222.",
+        "Packaging is eco-friendly and food-safe."
+      ],
+      "closing": "Shall I take your order now, or would you prefer to order online? I can share the ordering link on WhatsApp.",
+      "upsell_tips": [
+        "Suggest adding desserts - Chocolate of the Gods travels well!",
+        "Recommend their bestsellers for delivery: Butter Chicken, Murgh Dum Biryani.",
+        "Mention that dining in gives the full experience - live bands, cable bridge view."
+      ]
+    },
+    {
+      "id": "drunk_aggressive_caller",
+      "title": "Difficult / Aggressive Caller",
+      "scenario": "An intoxicated, angry, or aggressive caller demands entry, refund, or makes unreasonable requests.",
+      "opening": "Thank you for calling Akan Hyderabad. I understand you're upset. Let me try my best to help you.",
+      "key_questions": [
+        "Could you please share what happened?",
+        "May I have your name and the date of your visit?",
+        "Would you like me to connect you with our manager?"
+      ],
+      "key_info_to_share": [
+        "STAY CALM. Never raise your voice or argue back.",
+        "Use the customer's name if available - it de-escalates.",
+        "Acknowledge their frustration: 'I completely understand your frustration, sir/ma'am.'",
+        "If they're demanding entry while intoxicated: 'For everyone's safety, we have a responsibility to ensure a comfortable experience for all guests.'",
+        "If abusive: 'I want to help you, but I would appreciate if we can have a respectful conversation.'",
+        "Always offer to escalate: 'Let me connect you with our manager who can assist you better.'",
+        "NEVER make false promises or agree to refunds without manager approval."
+      ],
+      "closing": "I appreciate your patience. Let me have our manager call you back to resolve this. Can I confirm your contact number?",
+      "upsell_tips": [
+        "Do NOT upsell. Focus on de-escalation and resolution only."
+      ]
+    },
+    {
+      "id": "whatsapp_reservation_confirm",
+      "title": "WhatsApp Reservation Confirmation Call",
+      "scenario": "Customer received a WhatsApp booking confirmation and calls to verify or modify it.",
+      "opening": "Thank you for calling Akan Hyderabad! I can help you with your reservation. May I have the name or booking reference?",
+      "key_questions": [
+        "What name was the booking made under?",
+        "Do you want to modify the date, time, or number of guests?",
+        "Any special requests or occasion we should note?"
+      ],
+      "key_info_to_share": [
+        "Reservations can be made/modified via phone, WhatsApp, or ReserveGo.",
+        "Contact WhatsApp: +919649652222.",
+        "Changes are subject to availability, especially on Fri/Sat.",
+        "For cancellations, please inform at least 2 hours before.",
+        "We hold tables for 15 minutes past the reserved time."
+      ],
+      "closing": "Your reservation is updated! We'll send the updated confirmation on WhatsApp. See you then!",
+      "upsell_tips": [
+        "If they're upgrading guest count, suggest a larger table or floor change.",
+        "Mention any upcoming events on their booking date."
+      ]
+    },
+    {
+      "id": "cover_charge_confusion",
+      "title": "Cover Charge / Entry Fee Confusion",
+      "scenario": "Customer calls confused about whether there's a cover charge or entry fee.",
+      "opening": "Thank you for calling Akan Hyderabad! Great question - let me clarify our entry policy for you.",
+      "key_questions": [
+        "Which day are you planning to visit?",
+        "Are you asking about a specific event or general dining?"
+      ],
+      "key_info_to_share": [
+        "Normally, there is NO cover charge or entry fee at Akan.",
+        "Cover charges apply ONLY on special occasions - when a big-name performer is featured on Fri/Sat.",
+        "When cover charges apply, they are usually redeemable against food and beverages.",
+        "Regular Fri/Sat with house bands: NO cover charge.",
+        "Check our Instagram @akan.hyd or BookMyShow for any special event announcements.",
+        "Sunday brunch has a fixed pricing (Rs. 1,499/- + tax) but that includes the full buffet."
+      ],
+      "closing": "So for your visit, there should be no cover charge unless there's a special ticketed event. Would you like me to check for your specific date?",
+      "upsell_tips": [
+        "Highlight that even without a cover, they get to enjoy live bands on Fri/Sat/Sun.",
+        "Mention BookMyShow for any upcoming special events."
+      ]
+    },
+    {
+      "id": "food_allergy_concern",
+      "title": "Food Allergy / Special Dietary Concern",
+      "scenario": "Customer calls worried about food allergies or specific dietary needs for their group.",
+      "opening": "Thank you for calling Akan Hyderabad! We take food allergies very seriously and want to ensure a safe dining experience for you.",
+      "key_questions": [
+        "What specific allergies does your guest have? (Nuts, gluten, dairy, shellfish, etc.)",
+        "How many guests with dietary concerns?",
+        "When are you planning to visit?"
+      ],
+      "key_info_to_share": [
+        "Our menu has symbols for: Gluten Free, Vegan, Spicy, Chef's Kiss, and Crowd Fav items.",
+        "Our kitchen can accommodate most allergies with advance notice.",
+        "Nut allergies: Several dishes use cashews, peanuts, almonds - always inform your server.",
+        "Gluten-free options are available and marked on the menu.",
+        "Jain food can be prepared on request.",
+        "We recommend informing the server again when you arrive so the kitchen is prepared.",
+        "For severe allergies, speaking with our chef directly can be arranged."
+      ],
+      "closing": "I'll make a note on your reservation about the allergies so our kitchen is prepared. What name and time shall I book under?",
+      "upsell_tips": [
+        "Recommend specific safe dishes based on the allergy.",
+        "Suggest the Sunday brunch where the buffet display allows them to see ingredients."
+      ]
+    }
+  ]
+}

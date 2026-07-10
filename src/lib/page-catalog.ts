@@ -117,6 +117,19 @@ export const PAGE_CATALOG: PageSection[] = [
     ],
   },
   {
+    // AKAN CRM — AI assistant / training / quizzes for the Front Office & GRE
+    // team (ported from the standalone Flask app). Grant per user/role like any
+    // other page. Quiz Links + CRM Settings are HOD/admin surfaces.
+    label: 'AKAN CRM',
+    pages: [
+      { path: '/crm/assistant',  label: 'AI Assistant' },
+      { path: '/crm/training',   label: 'Training' },
+      { path: '/crm/quiz',       label: 'Quiz' },
+      { path: '/crm/quiz-links', label: 'Guest Quiz Links', hodOnly: true },
+      { path: '/crm/settings',   label: 'CRM Settings',     hodOnly: true },
+    ],
+  },
+  {
     label: 'Admin',
     pages: [
       { path: '/users',               label: 'Users' },

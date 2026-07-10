@@ -1,0 +1,704 @@
+{
+  "menu_link": "https://akanbrewingco.inmyarea.in/order-menu/parcel",
+  "official_menu": "https://akanhyd.com/menu/",
+  "cost_for_two": "Approximately Rs. 2000-2500 for two (without alcohol)",
+  "cuisine_types": [
+    "North Indian",
+    "South Indian",
+    "Chinese",
+    "Italian",
+    "Mexican",
+    "Afghani",
+    "Chettinad",
+    "Pan-Asian",
+    "Thai",
+    "Japanese",
+    "Malaysian",
+    "Middle Eastern"
+  ],
+  "dietary_options": {
+    "vegetarian": "Extensive vegetarian options available across all categories.",
+    "non_vegetarian": "Wide range including chicken, mutton, lamb, prawns, fish, lobster.",
+    "jain": "Jain food options available on request.",
+    "vegan": "Vegan-friendly options available on request.",
+    "gluten_free": "Multiple gluten-free options available."
+  },
+  "menu_categories": {
+    "soups": {
+      "category": "Soups",
+      "items": [
+        "Chicken Manchow Soup - ₹349",
+        "Cream of Chicken Soup - ₹349",
+        "Khow Suey Chicken - Light fragrant soup with Thai herbs and spices thickened with coconut milk and served with chicken - ₹349",
+        "Khow Suey Veg - Light fragrant soup with Thai herbs and spices thickened with coconut milk - ₹299",
+        "Laksa Chicken Soup - A spicy, fragrant Southeast Asian noodle soup with a rich, creamy coconut base - ₹349",
+        "Mutton Marag Soup - Rich hearty mutton soup with mutton chunks and dry fruits - ₹349",
+        "Paya Shorba - A Special  Nizami soup with succulent lamb trotters - ₹349",
+        "Roasted Cauliflower Veloute Soup - Slow roasted cauliflower cooked with miso and blended into veloute smooth soup - ₹299",
+        "Roasted Miso Chicken Cauliflower Veloute Soup - Slow roasted cauliflower miso veloute with chicken broth and chicken cubes - ₹349",
+        "Roasted Pumpkin Soup - Pumpkin and paprika veloute with spicy garlic croutons - ₹299",
+        "Truffle Mushroom Soup - A creamy mushroom soup garnished with truffle oil - ₹299",
+        "Veg Manchow Soup - ₹299"
+      ]
+    },
+    "bar_nibbles": {
+      "category": "Bar Nibbles",
+      "items": [
+        "Boiled Masala Peanuts - Boiled Peanuts tossed in a spicy mixture of chopped tomatoes, onions, chillis, coriander and chat masala - ₹249",
+        "Cajun Spiced Foxnuts - Makana Toasted in Cajun spice mix of paprika, onion and garlic powder - ₹299",
+        "Devilled Cashew - Roasted Cashew nuts tossed in a spicy and tangy spice mix with crispy onion flakes - ₹349"
+      ]
+    },
+    "salads": {
+      "category": "Salads",
+      "items": [
+        "Asian Green Salad - Romaine Lettuce, Edamame Beans, Pecan Nuts, Parmesan, Japanese Mayo - ₹399",
+        "Chicken Tikka & Apple Salad - chicken tikka, apple, mixed greens, cherry tomatoes, cucumber, pomegranate, roasted almonds tossed in mayo & jalapeno dr - ₹399",
+        "Falafel & Hummus Salad - falafel, hammus, mixed greens, olives, fresh veggies, pomegranate in citrus mustard dressing - ₹399",
+        "Green Salad - ₹349",
+        "Watermelon with feta - A refreshing summer salad with juicy watermelon, tangy feta, zesty orange and briny olives, balanced with fresh herbs - ₹399"
+      ]
+    },
+    "small_plates_veg": {
+      "category": "Small Plates - Veg",
+      "items": [
+        "Baby Potatoes in Raw Mango Sweet Chilli Sauce - Sliced baby potatoes tossed in sweet chilli sauce along with raw mangoes. - ₹399",
+        "Broccoli  cheese spanakopita - A crispy, golden phyllo pastry filled with a savoury mix of broccoli and cheese - ₹389",
+        "Built up Veg Nachos - Crispy nachos, Home made sour cream, Salsa, refried Beans and home made Cheese sauce - ₹429",
+        "Cajun spiced Paneer and pineapple skewers - cottage cheese and pineapple  skewers marinated in Cajun spices  and grilled - ₹449",
+        "Crispy Lotus Stem & Water Chestnut Honey Chilly Sauce - Crispy lotus steam and water chestnuts tossed in sweet chilli sauce - ₹429",
+        "Crispy Podi Dusted Lotus Stem - Lotus stem dredged with podi and served with tangy mint sauce and aioli - ₹429",
+        "Crispy Shitaki Mushrooms - Crispy shitake mushroom tossed in tangy siracha sauce topped with toasted sesame seeds - ₹449",
+        "French fries - ₹389",
+        "Hara Subz Seekh Kabab - A spiced kebab made with fresh green vegetables, herbs and aromatic spices, cooked in tandoor to perfection - ₹399",
+        "Korean Paneer Chilly - crispy paneer tossed in a sweet-spicy gochujang glaze with bold Asian flavors. - ₹449",
+        "Mushroom Kaju Fry - Batter fried Mushrooms, crunchy cashew tossed with Indian herbs and spices - ₹449",
+        "Mushroom pesto bruschetta - Mushrooms sautéed in cheesy pesto sauce, served on toasted garlic bread and drizzled with balsamic reduction - ₹449",
+        "Punjabi Paneer Tikka - Paneer marinated in yogurt and spices, grilled to perfection and served with mint\nchutney - ₹449",
+        "Stuffed Paneer Tikka - Paneer stuffed with cheese , green chili and Indian spices cooked  cooked in tandoor - ₹449",
+        "Sweet Potato & Apricot Tikki - Minin sweet potatoes stuffed with apricot relish on a bed of refried beans served with mint chutney, tamarind chutney an - ₹399",
+        "Thecha tandoori Brocolli - Smoky tandoori broccoli infused with spicy Maharashtrian thecha, delivering a bold and fiery flavor. - ₹449",
+        "Truffle malai broccoli - Broccoli marinated in aromatic truffle cream and yoghurt marinade & cooked in tandoor - ₹449",
+        "Veg Shikampuri kebab - A fragrant Indian patty kebab lightly spice and pan seared - ₹429"
+      ]
+    },
+    "small_plates_non_veg": {
+      "category": "Small Plates - Non Veg",
+      "items": [
+        "Ajwaini Fish Tikka - Fish fillets marinated in yoghurt Ajwain seeds and  herbs cooked in tandoor - ₹549",
+        "Angara Chicken Kebab - Chicken marinated with fiery Indian spices and cooked in tandoor - ₹499",
+        "Bhimavaram  chicken kaju pakodi - A crispy, spicy bheemavaram-style chicken  and cashew pakodi tossed with bold south Indian flavors. - ₹499",
+        "Built Up Chicken Nachos - Crispy nachos, Home made sour cream, Salsa, refried Beans with chicken and home made Cheese sauce - ₹499",
+        "Butter Garlic Prawns - Buttery Prawns tossed in creamy garlic sauce drizzled with balsamic glaze - ₹599",
+        "Cambodian Grilled Fish - Fish marinated in Thai herbs, garlic, ginger and shallots grilled to perfection and served with cucumber salad - ₹599",
+        "Chicken Kheema Spring Roll - Crispy spring rolls filled with spicy chicken kheema, wrapped in a crunchy golden shells. - ₹499",
+        "Chicken pesto Bruschetta - Crispy garlic bread topped with juicy chicken, fresh basil pesto and a hint of parmesan. - ₹499",
+        "Chilli Basil Chicken - Oriental crispy stir fry chicken in fragrant chili and Thai basil sauce - ₹449",
+        "Chilli Basil Prawns - Oriental crispy stir fry prawns in fragrant chili and Thai basil sauce - ₹599",
+        "Chilly Garlic Chicken Popcorn - Herbs marinated chicken nuggets fried till golden brown and tossed in our special spice mix - ₹449",
+        "Chongquing Chicken - Oriental style chicken marinated with hot garlic sauce and stir-fried - ₹499",
+        "Classic Chicken Tikka - Chicken marinated in Indian spices, yoghurt and herb and cooked in tandoor - ₹499",
+        "Cumin Chilli Lamb - crispy fried lamb  tossed in cumin flavored Asian glaze - ₹599",
+        "ELLIPAYA KARAM FISH & CHIPS - Crispy Fish and Chips tossed in a spicy garlicky podi - ₹499",
+        "Fish Fingers - Crispy Fish fillets cut in finger shape marinated with Indian spices - ₹499",
+        "Gongura Prawns - Prawns marinated with gongura sauce tossed with butter and spices - ₹599",
+        "Kodi Chips - Crispy, spicy & addictive telangana appetizer featuring thinly sliced, marinated chicken deep-fried to a golden crunch. - ₹449",
+        "Kothimira Chicken - “Succulent chicken tossed in a vibrant coriander-chilli marinade bursting with fresh herb flavour.” - ₹499",
+        "Lamb Seekh Kofta - Mutton mince marinated with Indian herbs served with Indian spiced demi glaze - ₹599",
+        "Lamb Shammi Kebab - Minced mutton patty cooked with Indian spices and pan seared to golden brown, served on a garlic melba - ₹599",
+        "Miso Malai Chicken Tikka - Chicken marinated in aromatic miso, cream cheese, & yoghurt marinade & cooked in tandoor - ₹499",
+        "Morrocan chicken skewers - Chicken satay marinated in Moroccan spice mix  and grilled - ₹499",
+        "Mutton Kheema Bunny Chow - Mumbai street style kheema tossed in home made special spices mix stuffed inside mini buns with mint sauce, pickled onio - ₹599",
+        "Mutton Kheema Tikki - Mutton mince tossed in spicy Indian sauce, served in tikki style - ₹599",
+        "Mutton Manchurian - Akan's tiwst for our favorite dish, minced Mutton in hot and spicy sauce. - ₹599",
+        "Parsi Style Egg Bhurji Bunny Chow - Mini buns  stuffed with spicy egg burji and served with mint sauce, pickled onions, pomegranate & cheese sauce - ₹399",
+        "Red Lantern Chicken - Crispy chicken tossed in home made oriental spice mix and stir-fried - ₹449",
+        "Red Lantern Prawn - Crispy Prawns tossed in home made oriental spice mix and stir-fried - ₹599",
+        "Sheek kebab Mutton - Succulent lamb meat flavored with Indian spices & herbs, cooked on charcoal - ₹599",
+        "Southern Style Chicken 65 - A classic Andhra style crispy chicken tossed in a yoghurt green chili and curry leaf sauce - ₹499",
+        "Spicy Schezwan Wings - Crispy Chicken wings tossed in Indo Chinese Schezwan sauce - ₹449",
+        "Tandoori karivepaku prawns - Charred tandoori prawns infused with aromatic curry leaves and bold spices. - ₹599",
+        "Tawa Fish - Fish fillets marinated in Indian spices and pan seared - ₹599",
+        "Thecha Tandoori Murgh - Smoky tandoori chicken infused with fiery Maharashtrian thecha, delivering a bold and spicy kick. - ₹499",
+        "Zatar Spiced Lamb Seekh Kebab - Succulent lamb mince mixed with zaatar spices cooked on skewers in tandoor - ₹599"
+      ]
+    },
+    "sushi": {
+      "category": "Pan Asian - Sushi",
+      "items": [
+        "Aburi Salmon Nigiri - torched salmon japanese mayo & teriyaki glaze - ₹479 (half) / ₹899 (full)",
+        "Asparagus pickled cucumber & carrot ura maki - Blue pea rice ura maki with togarashi & japanese mayo - ₹339 (half) / ₹649 (full)",
+        "Avacado & Cream Cheese Sushi Maki - Maki roll with Japanese Mayo - ₹349 (half) / ₹679 (full)",
+        "Chicken Katsu Sushi - crispy panko fried chicken Maki - ₹399 (half) / ₹749 (full)",
+        "Crab Stick & Avacado Sushi - Crispy shitake & torched cheese - ₹509 (half) / ₹969 (full)",
+        "Crunchy Tuna Sushi Roll - spicy tuna & togarashi mayo - ₹479 (half) / ₹899 (full)",
+        "Ebi Uramaki - Prawn tempura sushi - ₹409 (half) / ₹769 (full)",
+        "Edamame & Truffle Uramaki - Blue pea sushi rice roll edamame mix with truffle - ₹349 (half) / ₹679 (full)",
+        "Prawns Tempura Sushi - ₹409 (half) / ₹769 (full)",
+        "Salmon Cream Cheese, Avacado sushi - Philadelphia style sushi roll - ₹479 (half) / ₹899 (full)",
+        "Salmon Nigiri - thinly sliced salmon with japanese mayo - ₹479 (half) / ₹899 (full)",
+        "Sawagani Maki - crispy fried soft shell crab maki sushi togarashi mayo - ₹479 (half) / ₹899 (full)",
+        "Shitake & Smoked Cheese Uramaki - crispy shitake & torched cheese - ₹389 (half) / ₹699 (full)",
+        "Smoked Unagi Ura Maki - crab stick smoked eel japanese mayo teriyaki glaze - ₹479 (half) / ₹899 (full)",
+        "Veg Tempura Ura Maki - Blue pea rice, crispy veg tempura uramaki - ₹339 (half) / ₹649 (full)"
+      ]
+    },
+    "dimsums": {
+      "category": "Pan Asian - Dimsums",
+      "items": [
+        "Chicken Wonton - Soft chicken dumplings with schezwan chili oil and chives - ₹549",
+        "Edamame truffle Dimsum - Crystal dumplings stuffed with Edamame mince flavored with truffle oil - ₹499",
+        "Prawn Dimsum - Crystal dumplings stuffed with juicy Shrimp Thai chili and coriander mixture - ₹599",
+        "Tibetan Chicken Dim Sum - Minced chicken ginger scallion dumpling wrapped in red lotus dough - ₹549"
+      ]
+    },
+    "baos": {
+      "category": "Pan Asian - Baos",
+      "items": [
+        "Assorted Grilled Vegetables Bao - steamed bao stuffed with Exotic vegetables tossed in oriental BBQ sauce - ₹499",
+        "Spicy Thai Chicken Bao - Steamed bao stuffed with chicken mince flavored with Thai herbs and spices - ₹549"
+      ]
+    },
+    "gourmet_pizza": {
+      "category": "Gourmet Pizza",
+      "items": [
+        "BBQ Chicken (NSP/Thin Crust) - Marinara, onions, Jalapenos ,BBQ chicken, and mozzarella - ₹649",
+        "Chicken Tikka (NSP/Thin Crust) - Smoky spiced chicken tikka, tangy tomato sauce, gooey cheese and crispy crust - ₹649",
+        "Cilantro Pesto Chicken (NSP/Thin Crust) - A crispy golden crust pizza topped with juicy chicken,  fragrant cilantro pesto and creamy mozzarell - ₹649",
+        "Cilantro pesto chicken (NSP/Thin Crust) - A crispy golden crust pizza topped with juicy chicken,  fragrant cilantro pesto and creamy mozzarell - ₹649",
+        "Lamb Pepperoni (NSP/Thin Crust) - A crispy crust pizza topped with spicy lamb pepperoni, zesty tomato sauce, and melted mozzarella - ₹699",
+        "Margherita (NSP/Thin Crust) - A classic Italian pizza with tangy tomato sauce, mozzarella cheese and fragrant basil. - ₹549",
+        "Paneer Tikka (NSP/Thin Crust) - A smoky and spicy paneer, tangy sauce, gooey cheese and crispy crust - ₹549",
+        "Peri Peri Chicken (NSP/Thin Crust) - A spicy, cheese delight with juicy peri peri marinated chicken, vibrant veggies and crispy crust. - ₹649",
+        "Peri Peri Paneer (NSP/Thin Crust) - A spicy, cheese delight with peri peri marinated paneer, vibrant veggies and crispy crust. - ₹549",
+        "Spinach funghi (NSP/Thin Crust) - A flavorful combination of earthy mushrooms, sautéed spinach, creamy cheese and and crispy crust. - ₹549",
+        "Verdura Fresca (NSP/Thin Crust) - A crispy, garden fresh pizza with vibrant seasonal vegetables and creamy mozzarella - ₹599"
+      ]
+    },
+    "pasta": {
+      "category": "Pasta (Penne & Spaghetti)",
+      "items": [
+        "Arrabbiata Pasta - Penne pasta tossed in rich aromatic Italian tomato based sauce with exotic veget - ₹549 (Chicken) / ₹499 (Veg) / ₹499 (base)",
+        "Madras Curry Pasta - Penne pasta tossed in special madras curry sauce, that is  light, flavorful and  - ₹549 (Chicken) / ₹499 (Veg) / ₹499 (base)",
+        "Penne Alfredo Pasta - Penne pasta tossed is a creamy white sauce served with exotic vegetables - ₹549 (Chicken) / ₹499 (Veg) / ₹499 (base)",
+        "Spaghetti Aglio olio - Classic speghetti tossed with garlic, chilli flakes & olive oil with chicken for - ₹599 (base) / ₹549 (chicken) / ₹499 (veg)"
+      ]
+    },
+    "curries_veg": {
+      "category": "Main Course - Curries Veg",
+      "items": [
+        "Hariyali Kofta Curry - Soft paneer balls deep fried & cooked in a rich spiced spinach gravy - ₹549",
+        "Lasooni Dal Palak - Yellow dal cooked with Spinach and tempered with lots of crispy golden garlic flakes - ₹449",
+        "Methi Chaman - A light fragnent spinach and fenugreek curry with a hint of kasuri methi - ₹499",
+        "Mutter Mushroom Masala - A flavorful curry with mushrooms & green peas in a spiced tomato gravy - ₹499",
+        "Paneer butter masala - A rich, buttery tomato based gravy with aromatic spices. herbs and soft malai paneer. - ₹499",
+        "Smoked Dal Makhani - Lentils simmered in a classic buttery, creamy tomato curry with a hint of kasuri methi & smoked with cloves - ₹549",
+        "Thai Green Curry Veg - Exotic vegetables cooked in a fragrant coconut based curry  flavored with Thai green chilies coriander and other herbs - ₹549",
+        "Thai Red Curry Veg - Exotic vegetables cooked in a fragrant coconut based curry  flavored with Thai red chilies and other herbs - ₹549"
+      ]
+    },
+    "curries_non_veg": {
+      "category": "Main Course - Curries Non Veg",
+      "items": [
+        "Butter Chicken - Chicken tossed in a rich luscious buttery gravy with tomatoes and spices - ₹549",
+        "Chicken Saagwala - Tender chicken simmered in a flavorful spiced spinach gravy - ₹549",
+        "Kadai Chicken - Chicken stir-fried with bell peppers, onions in spicy aromatic kadai masala - ₹549",
+        "Kharda Mutton - Mutton pieces cooked in a chili & coriander bedded gravy with confit garlic - ₹649",
+        "Malvani fish curry - A Coastal delight with fresh fish simmered in a spicy coconut-based Malvani masa - ₹599",
+        "Mutton Maratha - Spicy, rich mutton curry with bold Maharashtrian flavors and fiery coconut based - ₹649",
+        "Mutton Rogan Josh - A famous Kashmiri mutton gravy with fresh  spices - ₹649",
+        "Thai Green Curry Non-veg - Prawns cooked in a fragrant coconut based curry  flavored with Thai green chilie - ₹549 (Chicken) / ₹649 (Prawns) / ₹549 (base)",
+        "Thai Red Curry Non-veg - Lamb cooked in a fragrant coconut based curry  flavored with Thai red chilies an - ₹549 (Chicken) / ₹699 (Lamb) / ₹649 (Prawns) / ₹549 (base)"
+      ]
+    },
+    "rice_and_noodles": {
+      "category": "Rice, Biryani & Noodles",
+      "items": [
+        "Andhra Prawns Pulao - Fragrant basmati rice cooked with succulent prawns and aromatic spiced - ₹649",
+        "Arabian Veg Pulao - A vegetables pulao flavored with middle eastern mix of spices and served with cu - ₹499",
+        "Avakaya Pappu Annam - A Classic Andhra style Khichdi with raw mango and lentils - ₹549 (Chicken) / ₹449 (Veg) / ₹449 (base)",
+        "Chicken tikka pulao - A Smokey, spiced chicken tikka with fragrant masala- infused basmati rice. - ₹549",
+        "Chilli Garlic Noodle - Noddle's tossed in a spicy chili garlic sauce with oriental vegetables and eggs. - ₹549 (Chicken) / ₹499 (Egg) / ₹449 (Veg) / ₹449 (base)",
+        "Curd Rice - A light creamy yoghurt rice tempered with Indian spice and topped with cashews a - ₹399",
+        "Gongura Mutton Pulao - Fragrant basmati rice cooked with succulent Mutton marinated with Indian spices, - ₹649",
+        "Hawker Style Fried Rice - Malaysian style  fried rice with curry powder, oyster mushroom sauce and chili s - ₹499 (Chicken) / ₹449 (Egg) / ₹449 (Veg) / ₹449 (base)",
+        "Japanese Udon Noodles - Japanese style thick noodles stir fried with oriental vegetables, soya, mirin an - ₹499 (Chicken) / ₹449 (Veg) / ₹449 (base)",
+        "Jeera Rice - Basmati Rice tempered with ,cumin ,clarified butter, herbs , spices - ₹249",
+        "Karam podi Chicken pulao - A dish of fragrant basmati rice cooked with succulent chicken and aromatic spice - ₹549",
+        "Murgh Dum Biryani - Our special Chicken dum biryani cooked in dum with whole spices. - ₹599",
+        "Mutton kheema pulao - Basmati rice tossed with moist mutton keema and spicy tomato sauce - ₹649",
+        "Nasi Goreng Chicken - Famous Indonesian fried rice flavored with shallots, garlic any soya sauce and c - ₹599",
+        "Nasi goreng prawns - Famous Indonesian fried rice flavored with shallots, garlic any soya sauce and p - ₹649",
+        "Plain Rice - Cooked Long Grain Rice - ₹189",
+        "Street Style Fried Rice - A Chinese style Fried rice made with long grain rice, oriental vegetables and eg - ₹499 (Chicken) / ₹449 (Egg) / ₹449 (Veg) / ₹449 (base)",
+        "Thai Chilli Basil Fried Rice - Jasmine rice flavored with Thai chilis Thai basil and garlic served with chicken - ₹499 (Chicken) / ₹449 (Egg) / ₹549 (base) / ₹449 (veg)"
+      ]
+    },
+    "breads": {
+      "category": "Breads",
+      "items": [
+        "Kulcha (Masala ,Chilly Cheese) - ₹129",
+        "Laccha Paratha - ₹99",
+        "Naan - Butter ₹89 / Garlic ₹99 / Plain ₹79 / base ₹79",
+        "Roti - Butter ₹89 / Kothmir ₹79 / Plain ₹79 / base ₹79"
+      ]
+    },
+    "desserts": {
+      "category": "Desserts",
+      "items": [
+        "Chocolate Brownie - ₹349",
+        "Chocolate Of The Gods - A velvety Dense chocolate dessert with coconut base, strawberry lemon gel, coffee tuile and diced fruits - ₹349",
+        "Gulab Jamun - ₹349",
+        "Shahi Tukra - Classic Indian dessert with a twist of cardamom sugar bread doughnut, rabdi mousse and rabdi soup - ₹349",
+        "Shahtoot Trifle - Mulberry compote, creamy mousse, chocolate branch and mulberry sorbet - ₹349",
+        "Strawberry Cheesecake - Rich, sweet, and creamy cheesecake with a crisp cracker crust, topped with a bright,\nbeautiful strawberry sauce - ₹399",
+        "White Chocolate Kulfi - Kulfi flavored with white chocolate wasabi, caramelized  white chocolate, lemon cake and chocolate foxnut - ₹349",
+        "sheer kurma milk cake - A classic Ramzan desserts of vermicelli and milk flavored with cardamom, dry fruits and dates topped on a milk cake - ₹349"
+      ]
+    },
+    "grills": {
+      "category": "Grills",
+      "items": [
+        "Grilled BBQ Paneer Steak - Smokey bbq paneer steak served with sauteed veggies & mash potatoes - ₹549",
+        "Grilled Fish - Herb marinated Basa fillet, served with buttery mash potatoes, sautéed veggies and caper butter sauce - ₹649",
+        "Grilled Lobster - Grilled lobster with succulent lobster meat in spicy tomato sauce, served with sautéed vegetables. - ₹1299",
+        "Grilled chicken leg - Grilled chicken leg served with sauteed veggies & mash potatoes & chicken jua - ₹649",
+        "Grilled jumbo prawns - Herb marinated jumbo prawns sauteed veggies & caper butter sauce - ₹849"
+      ]
+    },
+    "live_grills": {
+      "category": "Live Counters (Charcoal Grill)",
+      "items": [
+        "ACHARI PANEER GRILL - Malai Paneer marinated in tangy spicy anchari masala and cooked on charcoal - ₹449",
+        "Afghani Chicken Tikka - Succulent, smoky chicken pieces marinated in a blend of yogurt, cream, and aromatic spices,\ngrilled to perfection - ₹499",
+        "CURRY LEAF & GREEN CHILLI PRAWNS GRILL - Prawns marinated in curryleaf, coriander, green chilli and cooked on charcoal - ₹599",
+        "PUDINA FISH TIKKA GRILL - Fish marinated in mint and yoghurt and grilled over charcoal. - ₹549",
+        "SARSON BROCOLLI GRILL - Brocolli marinated in kasundi Mustard paste, green chilli  and yoghurt, cooked over charcoal. - ₹449",
+        "SHISH TAOUK GRILL - Chicken marinated in paprika, yoghurt garlic and tomato paste - ₹499",
+        "THEECHA MUSHROOM GRILL - ₹449"
+      ]
+    },
+    "ramadan_special": {
+      "category": "Ramadan Special Menu",
+      "items": [
+        "Mutton Marag Soup RM - A flavorful, brothy soup with tender mutton, nutty flavors, and aromatic spices! - ₹349",
+        "Paya Shorba RM - (Mutton trotters soup simmered with spices which is rich & decadent) - ₹349",
+        "Ajwaini Tawa Fish - Pan seared Fish fillets marinated in yoghurt, Ajwain seeds and herbs - ₹499",
+        "Beetroot Cutlet - Crispy and flavorful beetroot cutlets with a perfect blend of spices and earthy sweetness - ₹389",
+        "Chicken Kheema Spring Roll RM - ₹449",
+        "Hara Subz Seekh Kebabs RM - ₹399",
+        "Koliwada Spiced Prawns - A crispy prawn pakoda infused with bold koliwada spices for a perfect blend of crunch and heat - ₹599",
+        "Mutton Seekh Kebab - Juicy, spiced mutton seekh kebabs perfectly cooked in tandoor for a smoky, flavorful bite! - ₹599",
+        "Haleem with Condiments & Naan - ₹599",
+        "Mutton Nalli Nihari - Rich, slow-cooked stew of mutton shanks and bone marrow, simmered for hours in a spiced, velvety gravy - ₹549",
+        "Khubani Ka Meetha - A luscious Hyderabadi dessert of slow-stewed dried apricots, delicately sweet and topped with cream for a royal finish. - ₹349",
+        "Sheer Kurma Trifle - ₹349"
+      ]
+    },
+    "mocktails": {
+      "category": "Mocktails",
+      "items": [
+        "Blueberry Chia Fizz - (A puree made out of fresh blueberries mixed with mint leaves ,lime juice and chia seeds topped up with soda.) - ₹349",
+        "Cucumber & Kaffir Lime Lemonade - (Fresh cucumber chunks muddle with kaffir lime ,elderflower syrups top of with soda .) - ₹349",
+        "Garden City - Rosemary , Cucumber , Lime , Sugar , Pineapple Juice - ₹299",
+        "Passion Fruit & Ginger Tonic - (Fresh basil leaves with ginger chunks muddle with passion fruit puree ,top with ginger ale .) - ₹349",
+        "Pineapple & Elderflower Sprite - (Fresh mint leaves muddle with pineapple juice and elderflower syrups ,lime juice .) - ₹349",
+        "Pomegranate & Cardamom Bubbles - (Green cardamom muddle with lime juice and elderflower syrups ,mixed with pomegranate juice top of ginger ale.) - ₹349",
+        "Rossel - Strawberry , Kafir Lime , Lemonade - ₹299",
+        "Tropical Bloom - Peach - Coconut - Pineapple - Tonic water - ₹449",
+        "Very Berry - Fresh Blueberry , Thyme , Lime , Apple Soda - ₹299",
+        "Virgin Colada - ₹299",
+        "Virgin Mojito - ₹299",
+        "Watermelon & Ginger Tonic - (Fresh watermelon blended with ginger ,lime juice with chat masala.) - ₹349",
+        "berry lucious - ₹299",
+        "granada - ₹299",
+        "strreets of asia - ₹299"
+      ]
+    },
+    "soft_beverages": {
+      "category": "Soft Beverages",
+      "items": [
+        "Canned Juice - ₹199",
+        "Coke - ₹199",
+        "Diet Coke - ₹199",
+        "Fresh Lime - ₹199",
+        "Ginger Ale - ₹199",
+        "Mixers 120 ml - ₹129",
+        "PERRIER 330ML - ₹299",
+        "Red Bull - ₹299",
+        "Soda - ₹199",
+        "Sprite - ₹199",
+        "THUMSUP CAN - ₹199",
+        "Tonic Water - ₹199",
+        "WATALOG WATER BOTTLE - ₹149"
+      ]
+    },
+    "single_malt_whiskey": {
+      "category": "Single Malt Whisk(e)y",
+      "items": [
+        "Godawan 01 Rich & Rounded 30ml - ₹549",
+        "Godawan 01 Rich & Rounded Bottle - ₹12,999",
+        "Godawan 02 Fruit & Spice 30ml - ₹549",
+        "Godawan 02 Fruit & Spice Bottle - ₹12,999",
+        "Indri Indian Single Malt 30ml - ₹549",
+        "Indri Indian Single Malt Bottle - ₹11,999",
+        "Glenfiddich 12 Y.O 30ml - ₹629",
+        "Glenlivet 12 Y.O 30ml - ₹649",
+        "Glenlivet 12 Y.O Bottle - ₹13,999",
+        "Glenmorangie 10 Y.O 30ml - ₹849",
+        "Glenmorangie 10 Y.O Bottle - ₹17,999",
+        "Talisker 10 Y.O 30ml - ₹629",
+        "Talisker 10 Y.O Bottle - ₹12,999",
+        "Singleton 12 Y.O 30ml - ₹769",
+        "Singleton 12 Y.O Bottle - ₹16,499",
+        "Singleton 15 Y.O 30ml - ₹899",
+        "Singleton 15 Y.O Bottle - ₹18,999",
+        "Aberfeldy 12 Yrs 30ml - ₹1,119",
+        "Aberfeldy 12 Yrs Bottle - ₹23,999",
+        "Royal Brackla 12 Yrs 30ml - ₹1,099",
+        "Royal Brackla 12 Yrs Bottle - ₹24,999",
+        "Royal Brackla 18 Yrs Bottle - ₹50,999",
+        "Royal Brackla 21 Yrs Bottle - ₹82,499"
+      ]
+    },
+    "blended_scotch": {
+      "category": "Blended Scotch",
+      "items": [
+        "Johnnie Walker Red Label 30ml - ₹399",
+        "Johnnie Walker Red Label Bottle - ₹7,999",
+        "Johnnie Walker Black Label 30ml - ₹649",
+        "Johnnie Walker Black Label Bottle - ₹12,099",
+        "Johnnie Walker Blonde 30ml - ₹499",
+        "Johnnie Walker Blonde Bottle - ₹10,999",
+        "Chivas Regal 12 Yrs 30ml - ₹549",
+        "Chivas Regal 12 Yrs Bottle - ₹12,099",
+        "Chivas Regal 18 Yrs 30ml - ₹849",
+        "Dewar's White Label 30ml - ₹599",
+        "Dewar's White Label Bottle - ₹9,099",
+        "Dewar's 12 Yrs 30ml - ₹549",
+        "Dewar's 12 Yrs Bottle - ₹10,999",
+        "Dewar's 15 Yrs 30ml - ₹929",
+        "Dewar's 15 Yrs Bottle - ₹11,999",
+        "Dewar's 18 Yrs 30ml - ₹849",
+        "Dewar's 18 Yrs Bottle - ₹17,999",
+        "Ballantine's Finest 30ml - ₹399",
+        "Ballantine's Finest Bottle - ₹7,999",
+        "Dyavol Inception 30ml - ₹849",
+        "Dyavol Inception Bottle - ₹19,999"
+      ]
+    },
+    "world_whiskies": {
+      "category": "Whiskies Of The World",
+      "items": [
+        "Jack Daniel's No.7 30ml - ₹549",
+        "Jack Daniel's No.7 Bottle - ₹10,999",
+        "Jack Daniel's Honey 30ml - ₹549",
+        "Jack Daniel's Honey Bottle - ₹13,199",
+        "Jack Daniel's Apple 30ml - ₹399",
+        "Jack Daniel's Apple Bottle - ₹9,999",
+        "Jack Daniel's Fire 30ml - ₹479",
+        "Jack Daniel's Fire Bottle - ₹12,099",
+        "Gentleman's Jack 30ml - ₹649",
+        "Gentleman's Jack Bottle - ₹15,399",
+        "Jack Daniel's Barrel Select 30ml - ₹1,099",
+        "Jack Daniel's Barrel Select Bottle - ₹24,999",
+        "Jim Beam White 30ml - ₹399",
+        "Jim Beam White Bottle - ₹8,799",
+        "Jim Beam Honey 30ml - ₹449",
+        "Jim Beam Honey Bottle - ₹11,000",
+        "Jim Beam Orange 30ml - ₹449",
+        "Jim Beam Orange Bottle - ₹11,000",
+        "Jameson Irish 30ml - ₹399",
+        "Jameson Irish Bottle - ₹9,999",
+        "Suntory Toki 30ml - ₹599",
+        "Suntory Toki Bottle - ₹12,999",
+        "Tokki Bottle - ₹13,999"
+      ]
+    },
+    "vodka": {
+      "category": "Vodka",
+      "items": [
+        "Absolut 30ml - ₹419",
+        "Absolut Bottle - ₹8,799",
+        "Ketel One 30ml - ₹419",
+        "Ketel One Bottle - ₹7,999",
+        "Grey Goose 30ml - ₹529",
+        "Grey Goose Bottle - ₹13,199",
+        "Belvedere 30ml - ₹599",
+        "Belvedere Bottle - ₹12,999",
+        "D'yavol Vodka 30ml - ₹529",
+        "D'yavol Vodka Bottle - ₹10,999"
+      ]
+    },
+    "gin": {
+      "category": "Gin",
+      "items": [
+        "Beefeater 30ml - ₹349",
+        "Beefeater Bottle - ₹6,999",
+        "Bombay Sapphire 30ml - ₹429",
+        "Bombay Sapphire Bottle - ₹8,299",
+        "Bombay Sapphire Sunset 30ml - ₹449",
+        "Bombay Sapphire Cru 30ml - ₹789",
+        "Bombay Sapphire Cru Bottle - ₹16,999",
+        "Tanqueray London Dry 30ml - ₹429",
+        "Tanqueray London Dry Bottle - ₹8,299",
+        "Tanqueray No.10 30ml - ₹599",
+        "Tanqueray No.10 Bottle - ₹15,999",
+        "Roku Japanese Gin 30ml - ₹829",
+        "Roku Japanese Gin Bottle - ₹16,999",
+        "Hendrick's 30ml - ₹799"
+      ]
+    },
+    "tequila": {
+      "category": "Tequila",
+      "items": [
+        "Jose Cuervo Silver 30ml - ₹529",
+        "Jose Cuervo Silver Bottle - ₹11,799",
+        "Jose Cuervo Reposado 30ml - ₹589",
+        "Jose Cuervo Reposado Bottle - ₹11,999",
+        "Patron Reposado 30ml - ₹1,119",
+        "Patron Reposado Bottle - ₹25,199",
+        "Patron Silver 30ml - ₹1,449",
+        "Patron Silver Bottle - ₹31,899",
+        "Don Julio Reposado 30ml - ₹1,199",
+        "Don Julio Reposado Bottle - ₹32,999",
+        "Don Julio Anejo 30ml - ₹1,899",
+        "Don Julio Anejo Bottle - ₹36,999"
+      ]
+    },
+    "rum": {
+      "category": "Rum",
+      "items": [
+        "Bacardi White Rum 30ml - ₹299",
+        "Bacardi White Rum Bottle - ₹11,999",
+        "Bacardi Mango Chilli Rum 30ml - ₹399",
+        "Camikara Rum 30ml - ₹349",
+        "Camikara Rum Bottle - ₹7,999"
+      ]
+    },
+    "brandy": {
+      "category": "Brandy",
+      "items": [
+        "Kyron 30ml - ₹349",
+        "Kyron Bottle - ₹5,999"
+      ]
+    },
+    "beer": {
+      "category": "Beer",
+      "items": [
+        "Kingfisher Premium Draught 330ml - ₹299",
+        "Kingfisher Ultra 330ml - ₹349",
+        "Kingfisher Ultra Max 330ml - ₹349",
+        "Kingfisher Ultra Wit 330ml - ₹599",
+        "Budweiser 330ml - ₹349",
+        "Budweiser Draught 330ml - ₹329",
+        "Heineken 330ml - ₹399",
+        "Corona 330ml - ₹599",
+        "Corona 500ml - ₹749",
+        "Hoegaarden - ₹649"
+      ]
+    },
+    "liqueurs_aperitifs": {
+      "category": "Liqueurs & Aperitifs",
+      "items": [
+        "Jagermeister 30ml - ₹1,079",
+        "Jagermeister Bottle - ₹12,999",
+        "Kahlua 30ml - ₹589",
+        "Kahlua Bottle - ₹11,699",
+        "Baileys Irish Cream 30ml - ₹589",
+        "Baileys Irish Cream Bottle - ₹13,199",
+        "Sambuca 30ml - ₹449"
+      ]
+    },
+    "white_wine": {
+      "category": "White Wine",
+      "items": [
+        "AG Fortyseven Chardonnay Glass - ₹999",
+        "AG Fortyseven Chardonnay Bottle - ₹5,499",
+        "Jacob's Creek Chardonnay Glass - ₹999",
+        "Jacob's Creek Chardonnay Bottle - ₹5,499",
+        "Sula Chenin Blanc 150ml Glass - ₹1,299",
+        "Black Tower Riesling Glass - ₹1,249",
+        "Black Tower Riesling Bottle - ₹5,999"
+      ]
+    },
+    "red_wine": {
+      "category": "Red Wine",
+      "items": [
+        "AG Fortyseven Shiraz Glass - ₹999",
+        "AG Fortyseven Shiraz Bottle - ₹4,999",
+        "AG Fortyseven Malbec Shiraz 150ml Glass - ₹999",
+        "Jacob's Creek Cabernet Shiraz Glass - ₹999",
+        "Jacob's Creek Cabernet Shiraz Bottle - ₹5,499",
+        "Sula Shiraz 150ml Glass - ₹1,299",
+        "Sula Shiraz Bottle 750ml - ₹6,499",
+        "Black Tower Pinot Noir Glass - ₹1,249",
+        "Black Tower Pinot Noir Bottle - ₹5,999",
+        "Barefoot Shiraz Bottle - ₹9,999"
+      ]
+    },
+    "rose_wine": {
+      "category": "Rosé Wine",
+      "items": [
+        "Source Grenache Rosé Glass - ₹699",
+        "Source Grenache Rosé Bottle - ₹3,999"
+      ]
+    },
+    "sparkling_champagne": {
+      "category": "Sparkling & Champagne",
+      "items": [
+        "Sula Brut Tropical Bottle - ₹5,499",
+        "Sula Tropical Brut Cremant de Nashik Bottle - ₹6,999",
+        "Sula Sparkling Shiraz Bottle - ₹5,749",
+        "Chandon Brut Bottle - ₹7,699",
+        "Prosecco Zonin Bottle - ₹4,999",
+        "Martini Prosecco Bottle - ₹4,999",
+        "Sula Tropical Brut Cremant de Nashik (Premium) Bottle - ₹9,999"
+      ]
+    },
+    "classic_cocktails": {
+      "category": "Classic Cocktails",
+      "items": [
+        "Pina Colada - ₹799",
+        "Mimosa - ₹849",
+        "Mulled Wine - ₹829",
+        "Hoppy Mule - ₹799",
+        "Hot Toddy - ₹799",
+        "Cosmopolitan - ₹1,039",
+        "Martini (Classic/Dry/Dirty/Gibson/Vesper) - ₹799",
+        "Bloody Mary - ₹799",
+        "Penicillin - ₹799",
+        "Clover Club - ₹799",
+        "Aperol Spritz - ₹799",
+        "Negroni - ₹799",
+        "Bramble - ₹799",
+        "Paloma - ₹1,039",
+        "Margarita - ₹1,039",
+        "Espresso Martini - ₹799",
+        "French 75 - ₹799",
+        "Daiquiri - ₹1,039",
+        "Gimlet - ₹1,039",
+        "Long Island Iced Tea - ₹799",
+        "LIIT Pitcher - ₹999",
+        "Whisky Sour - ₹799",
+        "Old Fashioned - ₹799",
+        "Manhattan - ₹799",
+        "Mojito - ₹799",
+        "Mojito Pitcher - ₹999",
+        "Tom Collins - ₹799",
+        "Mai Tai - ₹799",
+        "Gin & Tonic - ₹799"
+      ]
+    },
+    "signature_cocktails": {
+      "category": "Signature Cocktails",
+      "items": [
+        "Coorg Coffee Whisky (Sous Vide) - ₹849",
+        "Strawberry Gin Milk Wash - ₹849",
+        "Raw Mango Tequila - ₹849",
+        "Breaking Dawn Old Fashioned - ₹849",
+        "Spiced Pear & Cinnamon Whisky - ₹849",
+        "Kokum & Curry Leaf Gin - ₹849",
+        "Butter Scotch Rum - ₹849",
+        "Tropical Storm (Vodka) - ₹849",
+        "Lavender Gin Fizz - ₹849",
+        "Smoked Pineapple Mezcal - ₹849",
+        "Guava Chilli Margarita - ₹849",
+        "Rose Cardamom Whisky Sour - ₹849",
+        "Basil Cucumber Gimlet - ₹849",
+        "Lychee Sake Spritz - ₹849",
+        "Tamarind Old Fashioned - ₹849"
+      ]
+    },
+    "shooters": {
+      "category": "Shooters",
+      "items": [
+        "B-52 - ₹599",
+        "Jager Bomb - ₹1,499",
+        "Kamikaze - ₹599"
+      ]
+    }
+  },
+  "bar": {
+    "type": "Full Bar (No In-House Brewery)",
+    "note": "No in-house brewery. We serve a curated selection of the best brands.",
+    "alcohol_not_served_to_under_21": true,
+    "whiskey_single_malts": [
+      "The Singleton of Dufftown 12 YRS",
+      "Talisker 10 YRS",
+      "Glenlivet 12 YRS",
+      "Glenfiddich 12 YRS",
+      "Glenmorangie 10 YRS",
+      "Sexton Irish",
+      "Brenne",
+      "Aberfeldy 12 YRS",
+      "Aultmore",
+      "Indri",
+      "Jura",
+      "Royal Brackla 12 YRS",
+      "Royal Brackla 18 YRS",
+      "Royal Brackla 21 YRS"
+    ],
+    "whiskey_blended_scotch": [
+      "Johnnie Walker Red Label",
+      "Ballantine's Finest",
+      "Ballantine's 12 YRS",
+      "Johnnie Walker Black Label",
+      "Chivas Regal 12 YRS",
+      "Chivas Regal 15 YRS",
+      "Chivas Regal 18 YRS",
+      "D'Yavol Inception",
+      "Dewar's White",
+      "Dewar's 8 YRS Japanese Smooth",
+      "Dewar's 12 YRS",
+      "Dewar's 15 YRS",
+      "Dewar's 18 YRS",
+      "Dewar's 21 YRS",
+      "Royal Salute"
+    ],
+    "offerings": "All spirits, cocktails, mocktails, wines, beers (domestic and imported), and non-alcoholic beverages.",
+    "standard_pour": "50ml (Standard pour, subject to availability)"
+  },
+  "signature_must_know": {
+    "crowd_favorites": [
+      "Chilly Garlic Chicken Popcorn - ₹449",
+      "Southern Style Chicken 65 - ₹499",
+      "Paneer butter masala - ₹499",
+      "Smoked Dal Makhani - ₹549",
+      "Butter Chicken - ₹549",
+      "Murgh Dum Biryani - ₹599"
+    ],
+    "chefs_kiss": [
+      "Sweet Potato & Apricot Tikki - ₹399",
+      "Angara Chicken Kebab - ₹499",
+      "Tandoori karivepaku prawns - ₹599",
+      "Edamame truffle Dimsum - ₹499",
+      "Smoked Dal Makhani - ₹549",
+      "Malvani fish curry - ₹599",
+      "Chocolate Of The Gods - ₹349"
+    ],
+    "vegetarian_bestsellers": [
+      "Truffle malai broccoli - ₹449",
+      "Stuffed Paneer Tikka - ₹449",
+      "Smoked Dal Makhani - ₹549",
+      "Paneer butter masala - ₹499",
+      "Edamame truffle Dimsum - ₹499"
+    ],
+    "seafood_highlights": [
+      "Grilled Lobster - ₹1299",
+      "Grilled jumbo prawns - ₹849",
+      "Butter Garlic Prawns - ₹599",
+      "Tandoori karivepaku prawns - ₹599",
+      "Malvani fish curry - ₹599",
+      "Ajwaini Fish Tikka - ₹549",
+      "Andhra Prawns Pulao - ₹649"
+    ]
+  },
+  "menu_note": "Prices are base prices before taxes (GST applies). Food menu items and prices from official Akan Brewing Co backup dated 5th March. Alcohol/drinks prices from official online menu. When a customer asks for the menu, ALWAYS list items with prices. Do NOT just send the link. For alcohol, prices shown are for 30ml peg or bottle as indicated. Bottle service available for all spirits.",
+  "bar_info": {
+    "description": "Akan Brewing Co features a fully stocked bar with premium spirits, wines, cocktails, and beers.",
+    "serving_sizes": "Spirits available in 30ml peg or full bottle. Wines by glass (150ml) or bottle (750ml). Beer in 330ml or 500ml.",
+    "happy_hours": "Check with staff for current happy hour offers.",
+    "note": "All alcohol prices are subject to applicable taxes. Legal drinking age (21+) applies. Please drink responsibly."
+  }
+}

@@ -2119,6 +2119,222 @@ function initializeSchema(db: Database.Database) {
          AND TRIM(COALESCE(item_name,'')) != '';
     `);
   } catch (e) { console.error('production_items schema failed:', e); }
+
+  // ── AKAN CRM (ported from the standalone Flask app) ───────────────────────
+  // AI assistant / training / quiz / guest-quiz for the Front Office & GRE team.
+  // Users are THIS app's users (users.id TEXT) — the Flask app's own users table
+  // (and its plaintext-password column) is deliberately NOT ported.
+  // Seeds below fire ONLY when a table/section is EMPTY — a deploy can never
+  // overwrite live CRM knowledge or the question bank (deploy-safety rule).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS crm_chat_sessions (
+        id          TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL,
+        title       TEXT DEFAULT '',
+        mode        TEXT NOT NULL DEFAULT 'assistant',   -- assistant | training
+        status      TEXT NOT NULL DEFAULT 'active',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_chat_sessions_user ON crm_chat_sessions(user_id, mode);
+
+      CREATE TABLE IF NOT EXISTS crm_messages (
+        id               TEXT PRIMARY KEY,
+        session_id       TEXT NOT NULL,
+        role             TEXT NOT NULL,                  -- user | assistant
+        content          TEXT NOT NULL,
+        response_time_ms INTEGER,
+        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (session_id) REFERENCES crm_chat_sessions(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_messages_session ON crm_messages(session_id);
+
+      CREATE TABLE IF NOT EXISTS crm_training_sessions (
+        id              TEXT PRIMARY KEY,
+        user_id         TEXT NOT NULL,
+        chat_session_id TEXT,
+        difficulty      TEXT NOT NULL DEFAULT 'medium',
+        category        TEXT NOT NULL DEFAULT 'general',
+        language        TEXT NOT NULL DEFAULT 'english',
+        status          TEXT NOT NULL DEFAULT 'active',  -- active | completed | abandoned
+        questions_asked INTEGER NOT NULL DEFAULT 0,
+        total_score     REAL NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at    TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_training_user ON crm_training_sessions(user_id);
+
+      CREATE TABLE IF NOT EXISTS crm_training_responses (
+        id                  TEXT PRIMARY KEY,
+        training_session_id TEXT NOT NULL,
+        question_number     INTEGER NOT NULL,
+        question            TEXT NOT NULL,
+        user_response       TEXT NOT NULL,
+        score               REAL NOT NULL DEFAULT 0,
+        feedback            TEXT DEFAULT '',              -- JSON evaluation blob
+        ideal_answer        TEXT DEFAULT '',
+        created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (training_session_id) REFERENCES crm_training_sessions(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_training_resp ON crm_training_responses(training_session_id);
+
+      CREATE TABLE IF NOT EXISTS crm_quiz_sessions (
+        id              TEXT PRIMARY KEY,
+        user_id         TEXT NOT NULL,
+        category        TEXT NOT NULL DEFAULT 'all',
+        difficulty      TEXT NOT NULL DEFAULT 'medium',
+        language        TEXT NOT NULL DEFAULT 'english',
+        source          TEXT NOT NULL DEFAULT 'bank',     -- bank | ai
+        questions_json  TEXT NOT NULL DEFAULT '[]',
+        total_questions INTEGER NOT NULL DEFAULT 0,
+        score           INTEGER NOT NULL DEFAULT 0,
+        status          TEXT NOT NULL DEFAULT 'active',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at    TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_quiz_user ON crm_quiz_sessions(user_id);
+
+      CREATE TABLE IF NOT EXISTS crm_quiz_responses (
+        id              TEXT PRIMARY KEY,
+        quiz_session_id TEXT NOT NULL,
+        question_number INTEGER NOT NULL,
+        question        TEXT NOT NULL,
+        options_json    TEXT NOT NULL DEFAULT '[]',
+        correct_index   INTEGER NOT NULL DEFAULT 0,
+        selected_index  INTEGER,
+        is_correct      INTEGER NOT NULL DEFAULT 0,
+        explanation     TEXT DEFAULT '',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (quiz_session_id) REFERENCES crm_quiz_sessions(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_quiz_resp ON crm_quiz_responses(quiz_session_id);
+
+      CREATE TABLE IF NOT EXISTS crm_cheat_logs (
+        id              TEXT PRIMARY KEY,
+        user_id         TEXT,
+        quiz_session_id TEXT,
+        cheat_type      TEXT NOT NULL DEFAULT '',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS crm_question_bank (
+        id            TEXT PRIMARY KEY,
+        category      TEXT NOT NULL DEFAULT '',
+        subcategory   TEXT DEFAULT '',
+        difficulty    TEXT NOT NULL DEFAULT 'medium',
+        question      TEXT NOT NULL,
+        options_json  TEXT NOT NULL DEFAULT '[]',
+        correct_index INTEGER NOT NULL DEFAULT 0,
+        explanation   TEXT DEFAULT '',
+        is_active     INTEGER NOT NULL DEFAULT 1,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_qbank_cat ON crm_question_bank(category, difficulty);
+
+      CREATE TABLE IF NOT EXISTS crm_user_seen_questions (
+        id          TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL,
+        question_id TEXT NOT NULL,
+        was_correct INTEGER,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_seen_user ON crm_user_seen_questions(user_id);
+
+      CREATE TABLE IF NOT EXISTS crm_quiz_links (
+        id             TEXT PRIMARY KEY,
+        link_code      TEXT NOT NULL UNIQUE,
+        title          TEXT NOT NULL DEFAULT 'AKAN Staff Quiz',
+        difficulty     TEXT NOT NULL DEFAULT 'medium',
+        question_count INTEGER NOT NULL DEFAULT 10,
+        pass_threshold INTEGER NOT NULL DEFAULT 60,
+        max_attempts   INTEGER NOT NULL DEFAULT 100,
+        attempt_count  INTEGER NOT NULL DEFAULT 0,
+        expires_at     TEXT,
+        is_active      INTEGER NOT NULL DEFAULT 1,
+        created_by     TEXT,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS crm_guest_quiz_sessions (
+        id                 TEXT PRIMARY KEY,
+        link_id            TEXT NOT NULL,
+        guest_name         TEXT NOT NULL DEFAULT '',
+        guest_mobile       TEXT NOT NULL DEFAULT '',
+        guest_position     TEXT NOT NULL DEFAULT '',
+        questions_json     TEXT NOT NULL DEFAULT '[]',
+        total_questions    INTEGER NOT NULL DEFAULT 0,
+        score              INTEGER NOT NULL DEFAULT 0,
+        status             TEXT NOT NULL DEFAULT 'active', -- active | completed | cheated
+        time_taken_seconds INTEGER,
+        started_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at       TEXT,
+        FOREIGN KEY (link_id) REFERENCES crm_quiz_links(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_guest_link ON crm_guest_quiz_sessions(link_id);
+
+      CREATE TABLE IF NOT EXISTS crm_guest_quiz_responses (
+        id               TEXT PRIMARY KEY,
+        guest_session_id TEXT NOT NULL,
+        question_number  INTEGER NOT NULL,
+        question         TEXT NOT NULL,
+        options_json     TEXT NOT NULL DEFAULT '[]',
+        correct_index    INTEGER NOT NULL DEFAULT 0,
+        selected_index   INTEGER,
+        is_correct       INTEGER NOT NULL DEFAULT 0,
+        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (guest_session_id) REFERENCES crm_guest_quiz_sessions(id)
+      );
+
+      -- Knowledge base: one row per section (venue_info, policies, events,
+      -- menu_info, call_scripts, custom_faqs). content = the section's JSON.
+      CREATE TABLE IF NOT EXISTS crm_knowledge (
+        section    TEXT PRIMARY KEY,
+        content    TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_by TEXT DEFAULT ''
+      );
+    `);
+
+    // Seed question bank + knowledge from the bundled Flask-app export, ONLY
+    // when empty/missing (a redeploy can never clobber live edits). Files live
+    // in src/data/crm/ (committed); loaded lazily so the middleware bundle
+    // doesn't swell.
+    const qn = (db.prepare(`SELECT COUNT(*) AS n FROM crm_question_bank`).get() as any).n;
+    if (qn === 0) {
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const file = path.join(process.cwd(), 'src', 'data', 'crm', 'question-bank.json');
+        if (fs.existsSync(file)) {
+          const rows = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const ins = db.prepare(`
+            INSERT INTO crm_question_bank (id, category, subcategory, difficulty, question, options_json, correct_index, explanation)
+            VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?)
+          `);
+          const tx = db.transaction((all: any[]) => {
+            for (const r of all) ins.run(r.category || '', r.subcategory || '', r.difficulty || 'medium', r.question, r.options_json || '[]', r.correct_index ?? 0, r.explanation || '');
+          });
+          tx(rows);
+          console.log(`[crm] seeded question bank: ${rows.length} questions`);
+        }
+      } catch (e) { console.error('crm question bank seed failed:', e); }
+    }
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const dir = path.join(process.cwd(), 'src', 'data', 'crm');
+      const SECTIONS = ['venue_info', 'policies', 'events', 'menu_info', 'call_scripts', 'custom_faqs'];
+      const insKb = db.prepare(`INSERT OR IGNORE INTO crm_knowledge (section, content) VALUES (?, ?)`);
+      for (const s of SECTIONS) {
+        const f = path.join(dir, `${s}.json`);
+        if (fs.existsSync(f)) insKb.run(s, fs.readFileSync(f, 'utf8'));
+      }
+    } catch (e) { console.error('crm knowledge seed failed:', e); }
+  } catch (e) { console.error('crm schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

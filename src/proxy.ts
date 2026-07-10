@@ -71,6 +71,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/dine-in/kds',         // KDS bump (the SSE stream is GET, exempt)
   '/api/dine-in/offline-print', // print-station config + print-job journal
   '/api/tables',              // QR standee token generation (admin)
+  '/api/crm',                 // AKAN CRM (chat/training/quiz/settings) — guest-quiz is carved out in isPublic
 ];
 
 function isPublic(pathname: string): boolean {
@@ -81,6 +82,11 @@ function isPublic(pathname: string): boolean {
   // so nothing reaches the kitchen or the bill without staff review.
   if (pathname === '/menu') return true;
   if (pathname.startsWith('/api/customer/')) return true;
+  // CRM guest quiz: shareable-link quiz for job candidates / trial staff — no
+  // account. Security rests on the unguessable link_code + server-side answer
+  // stripping + attempt/expiry gates in the guest-quiz routes themselves.
+  if (pathname.startsWith('/quiz/link/')) return true;
+  if (pathname.startsWith('/api/crm/guest-quiz/')) return true;
   if (pathname.includes('/print')) return true;            // PO print pages render via cookie if present
   if (pathname.startsWith('/_next')) return true;
   if (pathname.startsWith('/favicon')) return true;

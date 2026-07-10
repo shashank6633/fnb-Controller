@@ -1,0 +1,67 @@
+{
+  "name": "Akan Hyderabad",
+  "tagline": "Pub | Restaurant | Corporate Event Space | Weekend Live Band Venue",
+  "description": "Akan is a vibrant pub, family restaurant, corporate event space, and weekend live band venue in Hyderabad's tech corridor with stunning views of Durgam Cheruvu Cable Bridge.",
+  "location": {
+    "address": "Opp Durgam Cheruvu, Beside iLabs Gate No 7, Hyderabad",
+    "landmark": "Opposite Durgam Cheruvu, Next to iLabs Gate 7",
+    "city": "Hyderabad",
+    "google_maps_link": ""
+  },
+  "contact": {
+    "phone": "+919649652222",
+    "whatsapp": "+919649652222",
+    "instagram": "@akan.hyd",
+    "instagram_url": "https://www.instagram.com/akan.hyd",
+    "reservation_url": "https://widget.reservego.co/widget/outlet/659bd2c91a33ffb38833af30?source=10",
+    "bookmyshow_url": "https://in.bookmyshow.com/explore/c/venues/akan-hyderabad/akan"
+  },
+  "timings": {
+    "sunday_to_thursday": "12:00 PM - 11:30 PM",
+    "friday_saturday": "12:00 PM - 12:30 AM",
+    "kitchen_last_order": "45 minutes before closing"
+  },
+  "spaces": {
+    "first_floor": {
+      "name": "1st Floor - Pub / Band Area",
+      "layout": "Pub layout with high seating and tables",
+      "high_seating_capacity": 400,
+      "standing_capacity": 550,
+      "features": "Live bands perform here on weekends. Full floor available for big corporate parties.",
+      "age_restriction": "Strictly 21+ only. No exceptions.",
+      "view": "Indoor pub ambiance"
+    },
+    "second_floor": {
+      "name": "2nd Floor - Semi Indoor & Outdoor",
+      "semi_indoor_seating": 130,
+      "outdoor_seating": 60,
+      "total_capacity": 190,
+      "seating_type": "Low seating",
+      "features": "Semi-indoor and outdoor seating. Family friendly.",
+      "age_restriction": "Below 21 allowed with parents. No liquor served to them (red wristband).",
+      "view": "Outdoor area with Durgam Cheruvu Cable Bridge view"
+    },
+    "third_floor": {
+      "name": "3rd Floor - Fully Outdoor",
+      "seating": 180,
+      "seating_type": "Comfort low seating",
+      "features": "Fully outdoor with vibrant and cool Durgam Cheruvu Cable Bridge view. Perfect for families and groups.",
+      "age_restriction": "Below 21 allowed with parents. No liquor served to them (red wristband).",
+      "view": "Stunning panoramic Durgam Cheruvu Cable Bridge view"
+    }
+  },
+  "total_capacity": {
+    "seated": "710+ across all floors",
+    "with_standing": "900+ including 1st floor standing"
+  },
+  "parking": "Valet parking available",
+  "reservations": {
+    "methods": [
+      "Phone: +919649652222",
+      "WhatsApp: +919649652222",
+      "ReserveGo website",
+      "BookMyShow (for events)"
+    ],
+    "reservation_url": "https://widget.reservego.co/widget/outlet/659bd2c91a33ffb38833af30?source=10"
+  }
+}

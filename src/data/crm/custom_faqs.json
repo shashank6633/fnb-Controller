@@ -1,0 +1,24 @@
+{
+  "faqs": [
+    {
+      "id": 1,
+      "question": "Do you allow outside food or cake?",
+      "answer": "Outside food and beverages are not allowed. However, we can arrange cakes and special setups for celebrations. Please let us know in advance."
+    },
+    {
+      "id": 2,
+      "question": "Is there a hookah/shisha facility?",
+      "answer": "Please call us at +919649652222 for the latest information on available facilities."
+    },
+    {
+      "id": 3,
+      "question": "Do you have Wi-Fi?",
+      "answer": "Yes, complimentary Wi-Fi is available for all guests."
+    },
+    {
+      "id": 4,
+      "question": "Can I bring my pet?",
+      "answer": "Please contact us at +919649652222 to check our current pet policy."
+    }
+  ]
+}

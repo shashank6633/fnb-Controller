@@ -1,0 +1,310 @@
+{
+  "regular_events": {
+    "friday_saturday": {
+      "type": "Regional Telugu Live Bands",
+      "timing": "9:00 PM - 12:30 AM",
+      "floor": "1st Floor (Pub Area)",
+      "details": "Every Friday and Saturday night, enjoy live regional Telugu band performances. The 1st floor comes alive with amazing music and energy.",
+      "exception": "If a big corporate party has booked the full 1st floor, the live band may not happen that particular week."
+    },
+    "sunday": {
+      "type": "Bollywood Sufi & Qawali Live Bands",
+      "timing": "9:00 PM - 11:30 PM",
+      "floor": "1st Floor (Pub Area)",
+      "details": "Every Sunday evening, enjoy soulful Bollywood Sufi and Qawali live performances."
+    }
+  },
+  "sunday_brunch": {
+    "timing": "12:00 PM - 4:00 PM",
+    "type": "Sunday Brunch Buffet",
+    "pricing": {
+      "adult": "Rs. 1,499/- + Tax (without alcohol)",
+      "children": "Rs. 799/- + Tax (ages 5-12 years)",
+      "below_5": "Complimentary for children below 5 years"
+    },
+    "details": "Every Sunday we have a lavish brunch buffet from 12 PM to 4 PM. Perfect for families!"
+  },
+  "sunday_workshops": {
+    "timing": "During Sunday Brunch hours (12:00 PM - 4:00 PM)",
+    "workshops": [
+      {
+        "name": "Pizza Making",
+        "workshop_only": "Rs. 999/-",
+        "with_brunch": "Rs. 1,599/-"
+      },
+      {
+        "name": "Mixology",
+        "workshop_only": "Rs. 999/-",
+        "with_brunch": "Rs. 1,599/-"
+      },
+      {
+        "name": "Sushi Making",
+        "workshop_only": "Rs. 999/-",
+        "with_brunch": "Rs. 1,599/-"
+      },
+      {
+        "name": "Glass Painting",
+        "workshop_only": "Rs. 999/-",
+        "with_brunch": "Rs. 1,599/-"
+      },
+      {
+        "name": "Candle Making",
+        "workshop_only": "Rs. 999/-",
+        "with_brunch": "Rs. 1,599/-"
+      },
+      {
+        "name": "Pottery",
+        "workshop_only": "Rs. 999/-",
+        "with_brunch": "Rs. 1,599/-"
+      },
+      {
+        "name": "Leather Making",
+        "workshop_only": "Rs. 1,299/-",
+        "with_brunch": "Rs. 1,799/-"
+      }
+    ],
+    "details": "Fun hands-on workshops every Sunday during brunch hours. Great for families, couples, and friends!"
+  },
+  "corporate_events": {
+    "availability": "All three floors available for corporate parties based on calendar and availability.",
+    "first_floor_note": "Full 1st floor available for big corporate parties (400 seated / 550 standing). When booked for corporate events, the regular weekend live band may be rescheduled.",
+    "facilities": "Audio-visual setup can be arranged on request.",
+    "booking_contact": "Call +919649652222 or WhatsApp for corporate event inquiries.",
+    "minimum_pax": "Minimum 30 pax required for party bookings.",
+    "live_counters_pax": "Live Counters for Addons are available for groups ranging from 50-300 pax.",
+    "important_policies": [
+      "Not included in packages: Breezer, Shots, Red Bull, Ginger Ale & Tonic Water",
+      "Outside Food and Drinks are NOT allowed",
+      "Alcohol is not served to individuals under the age of 21",
+      "Addon prices are per person",
+      "Terms & Conditions Apply"
+    ],
+    "packages": {
+      "platinum": {
+        "price": "Rs. 5,999/- ++ Tax per person",
+        "drinks_duration": "3 hours",
+        "food": {
+          "veg_starters": "Any 3",
+          "non_veg_starters": "Any 3",
+          "veg_main_course": "Any 3",
+          "non_veg_main_course": "Any 3",
+          "fried_flavoured_rice": "Any 1",
+          "dal": "Any 1",
+          "salad": "Any 1",
+          "accompaniments": "Included",
+          "desserts": "Any 2"
+        },
+        "drinks": {
+          "spirits": ["Godawan Single Malt", "Chivas Regal 12yrs", "The Glenlivet 12yrs", "Grey Goose Vodka", "Belvedere Vodka", "Bombay Sapphire", "Bacardi White Rum"],
+          "beers": ["Budweiser", "Corona", "Heineken", "Kingfisher Ultra"],
+          "wines": ["J.C Red Wine", "J.C White Wine", "A.G White Wine", "A.G Red Wine"],
+          "others": ["Dark Rum", "3 Cocktails", "3 Mocktails", "Aerated Drinks"]
+        },
+        "note": "Premium package with top-shelf spirits including single malts. Best for high-end corporate events."
+      },
+      "gold": {
+        "price": "Rs. 3,999/- ++ Tax per person",
+        "drinks_duration": "2.5 hours",
+        "food": {
+          "veg_starters": "Any 3",
+          "non_veg_starters": "Any 3",
+          "veg_main_course": "Any 3",
+          "non_veg_main_course": "Any 3",
+          "fried_flavoured_rice": "Any 1",
+          "dal": "Any 1",
+          "salad": "Any 1",
+          "accompaniments": "Included",
+          "desserts": "Any 2"
+        },
+        "drinks": {
+          "spirits": ["J.W Black Label", "Chivas Regal 12yrs", "Bacardi White Rum", "Absolut Vodka", "Ketel One Vodka", "Bombay Sapphire"],
+          "beers": ["Budweiser", "Budweiser Draught", "Kingfisher Draught", "Kingfisher Ultra", "Heineken"],
+          "wines": ["J.C Red Wine", "J.C White Wine", "A.G White Wine", "A.G Red Wine"],
+          "others": ["Dark Rum", "3 Cocktails", "3 Mocktails", "Aerated Drinks"]
+        },
+        "note": "Great mid-premium package with JW Black Label and premium vodkas."
+      },
+      "silver": {
+        "price": "Rs. 2,999/- ++ Tax per person",
+        "drinks_duration": "2.5 hours",
+        "food": {
+          "veg_starters": "Any 3",
+          "non_veg_starters": "Any 3",
+          "veg_main_course": "Any 2",
+          "non_veg_main_course": "Any 2",
+          "fried_flavoured_rice": "Any 1",
+          "dal": "Any 1",
+          "salad": "Any 1",
+          "accompaniments": "Included",
+          "desserts": "Any 2"
+        },
+        "drinks": {
+          "spirits": ["Ballantines Finest", "Red Label", "Jameson", "Ketel One Vodka", "Absolut Vodka", "Beefeater Gin"],
+          "beers": ["Kingfisher Draught", "Budweiser Draught", "Kingfisher Ultra", "Heineken"],
+          "wines": ["A.G White Wine", "A.G Red Wine", "J.C Red Wine", "J.C White Wine"],
+          "others": ["Dark Rum", "Bacardi White Rum", "3 Cocktails", "3 Mocktails", "Aerated Drinks"]
+        },
+        "note": "Popular value package with good spirits selection."
+      },
+      "imfl_regular": {
+        "price": "Rs. 2,499/- ++ Tax per person",
+        "drinks_duration": "2.5 hours",
+        "food": {
+          "veg_starters": "Any 3",
+          "non_veg_starters": "Any 3",
+          "veg_main_course": "Any 2",
+          "non_veg_main_course": "Any 2",
+          "fried_flavoured_rice": "Any 1",
+          "dal": "Any 1",
+          "salad": "Any 1",
+          "accompaniments": "Included",
+          "desserts": "Any 2"
+        },
+        "drinks": {
+          "spirits": ["Black Dog", "100 Pipers", "Smirnoff Vodka", "Greater Than Gin", "Bacardi White Rum"],
+          "beers": ["Kingfisher Premium", "Budweiser Draught", "Kingfisher Draught"],
+          "wines": ["SULA White Wine", "SULA Red Wine"],
+          "others": ["Dark Rum", "3 Barman Special Cocktails", "3 Barman Special Mocktails", "Aerated Drinks"]
+        },
+        "note": "Budget-friendly with IMFL spirits and SULA wines."
+      },
+      "beer_and_wine": {
+        "price": "Rs. 2,199/- ++ Tax per person",
+        "drinks_duration": "2 hours",
+        "food": {
+          "veg_starters": "Any 3",
+          "non_veg_starters": "Any 3",
+          "veg_main_course": "Any 2",
+          "non_veg_main_course": "Any 2",
+          "fried_flavoured_rice": "Any 1",
+          "dal": "Any 1",
+          "salad": "Any 1",
+          "accompaniments": "Included",
+          "desserts": "Any 2"
+        },
+        "drinks": {
+          "beers": ["Kingfisher Premium", "Budweiser Draught", "Kingfisher Draught"],
+          "wines": ["SULA Red Wine", "SULA White Wine"],
+          "others": ["Bacardi White Rum", "Dark Rum", "3 Barman Special Mocktails", "Aerated Drinks"]
+        },
+        "note": "Beer and wine focused package — no hard spirits."
+      },
+      "food_and_beer": {
+        "price": "Rs. 1,999/- ++ Tax per person",
+        "drinks_duration": "2 hours",
+        "food": {
+          "veg_starters": "Any 3",
+          "non_veg_starters": "Any 3",
+          "veg_main_course": "Any 2",
+          "non_veg_main_course": "Any 2",
+          "fried_flavoured_rice": "Any 1",
+          "dal": "Any 1",
+          "salad": "Any 1",
+          "accompaniments": "Included",
+          "desserts": "Any 2"
+        },
+        "drinks": {
+          "beers": ["Kingfisher Premium", "Budweiser Draught", "Kingfisher Draught"],
+          "others": ["3 Mocktails", "Aerated Drinks"]
+        },
+        "note": "Beer-only drinks package with full food."
+      },
+      "food_only_nonveg": {
+        "price": "Rs. 1,599/- ++ Tax per person",
+        "drinks_duration": "Soft beverages only",
+        "food": {
+          "veg_starters": "Any 3",
+          "non_veg_starters": "Any 3",
+          "veg_main_course": "Any 2",
+          "non_veg_main_course": "Any 2",
+          "fried_flavoured_rice": "Any 1",
+          "dal": "Any 1",
+          "salad": "Any 1",
+          "accompaniments": "Included",
+          "desserts": "Any 2"
+        },
+        "drinks": {
+          "others": ["2 Barman Special Mocktails", "Aerated Drinks"]
+        },
+        "note": "Full veg + non-veg food without alcohol."
+      },
+      "food_only_veg": {
+        "price": "Rs. 1,199/- ++ Tax per person",
+        "drinks_duration": "Soft beverages only",
+        "food": {
+          "veg_starters": "Any 3",
+          "veg_main_course": "Any 2",
+          "fried_flavoured_rice": "Any 1",
+          "dal": "Any 1",
+          "salad": "Any 1",
+          "accompaniments": "Included",
+          "desserts": "Any 2"
+        },
+        "drinks": {
+          "others": ["2 Barman Special Mocktails", "Aerated Drinks"]
+        },
+        "note": "Pure vegetarian food-only package."
+      }
+    },
+    "package_food_menu": {
+      "serving_time": "90 minutes for food",
+      "veg_starters": {
+        "continental": ["Chilly Garlic Potato Wedges", "Veg Cheese Croquette", "Corn Jalapeno Poppers", "Beetroot Cilantro Falafel", "Paneer PopCorn"],
+        "indian": ["Tandoori Paneer Tikka", "Green Peas Hara Bara Kebab", "Corn Bell Pepper Tikki", "Banjara Paneer Tikka", "Achari Gobi Tikka"],
+        "asian": ["Stir Fry Crispy Veg", "Baby Corn Salt & Pepper", "Chilli Garlic Potato Wedges", "Gobi 65", "Paneer Chilly Dry"]
+      },
+      "non_veg_starters": {
+        "continental": ["Chicken Moroccan Spiced Popcorn", "Panko Kasundi Fish Fingers", "Smoked BBQ Chicken Wings", "Cajun Spiced Chicken", "Mexican Fish"],
+        "indian": ["Tandoori Murgh Tikka", "Koliwada Fish", "Guntur Karam Kodi Roast", "Ajwaini Fish Tikka", "Achari Murgh Tikka"],
+        "asian": ["Hunnan Chicken", "Pepper Chicken", "Schezwan Chicken Wings", "Chicken 65", "Chilly Chicken Dry"]
+      },
+      "veg_main_course": {
+        "continental": ["Vegetable Alfredo Pasta", "Veg Arrabbiata Pasta", "Madras Curry Pasta", "Veg Pink Sauce Pasta", "Coriander & Garlic Pesto Pasta"],
+        "indian": ["Kadai Subzi", "Paneer Butter Masala", "Veg Subzi Kholapuri", "Nizami Handi", "Paneer Lababdar", "Veg Biryani", "Veg Tehri Pulao"],
+        "asian": ["Hot Garlic Paneer", "Veg Manchurian", "Schezwan Vegetables Gravy", "Veg Fried Rice", "Burnt Garlic Fried Rice", "Veg Schezwan Rice", "Chilly Garlic Rice"]
+      },
+      "non_veg_main_course": {
+        "continental": ["Chicken Alfredo Pasta", "Chicken Arrabbiata Pasta", "Chicken Madras Curry Pasta", "Chicken Pink Sauce Pasta", "Coriander & Garlic Pesto Pasta"],
+        "indian": ["Kadai Murgh (With Bone)", "Murgh Butter Masala (With Bone)", "Chicken Korma (With Bone)", "Chicken Tikka Masala (With Bone)", "Chicken Do Pyaza (With Bone)", "Chicken Biryani"],
+        "asian": ["Fish In Oyster Sauce", "Chilly Chicken Gravy", "Chicken Schezwan Gravy", "Chicken Fried Rice", "Chicken Burnt Garlic Fried Rice", "Chicken Schezwan Rice", "Chicken Chilly Garlic Rice"]
+      },
+      "dal_options": ["Dal Tadka", "Tomato Dal", "Palak Dal", "Rajma Masala"],
+      "salad_options": ["Papdi Chat Salad", "Veg Green Salad", "Russian Salad", "Mexican Beans Salad"],
+      "rice_options": ["Bagara Rice", "Jeera Rice", "Veg Fried Rice", "Egg Fried Rice"],
+      "dessert_options": ["Brownie With Ice Cream", "Mango White Chocolate & Sago Pudding", "Gulab Jamun", "Double Ka Meetha", "Honey Noodle With Ice Cream", "Baked Bread Butter Pudding"],
+      "accompaniments": ["Assorted Indian Breads", "Mirchi Ka Salan", "Raita", "Steam Rice", "Plain Curd"]
+    },
+    "addons": {
+      "mutton_starters": {
+        "price": "Rs. 250/- per person",
+        "items": ["Lamb Seekh Kebab", "Lamb Shami Kebab", "Mutton Chettinad", "Mutton Gongura"]
+      },
+      "mutton_main_course": {
+        "price": "Rs. 200/- per person",
+        "items": ["Kadai Gosht", "Rara Gosht", "Palak Gosht", "Mutton Rogan Josh", "Mutton Kheema"]
+      },
+      "prawns_starters": {
+        "price": "Rs. 300/- per person",
+        "items": ["Butter Garlic Prawns", "Basil Prawns", "Prawns Bhaticharu", "Thai Chilli Basil Prawns"]
+      },
+      "prawns_main_course": {
+        "price": "Rs. 300/- per person",
+        "items": ["Royyala Iguru", "Prawns Malvani", "Goan Prawns Curry", "Thai Prawns Curry"]
+      },
+      "live_counters": {
+        "note": "Available for groups of 50-300 pax",
+        "options": [
+          {"name": "Veg Starter Counter", "price": "Rs. 125/- per person"},
+          {"name": "Chicken Starter Counter", "price": "Rs. 150/- per person"},
+          {"name": "Live Chat Counter", "price": "Rs. 125/- per person"},
+          {"name": "Live Pasta Counter", "price": "Rs. 150/- per person"},
+          {"name": "Live Tawa Fried Fish", "price": "Rs. 200/- per person"},
+          {"name": "Live Mexican Wraps (Burritos, Enchiladas, Chimichangas)", "price": "Rs. 200/- per person"},
+          {"name": "Dessert Counter", "price": "Rs. 200/- per person"}
+        ]
+      }
+    }
+  },
+  "event_updates": "All events are updated on our Instagram page @akan.hyd and frontdesk WhatsApp groups. Follow us for the latest event announcements!",
+  "upcoming_events": []
+}
