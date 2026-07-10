@@ -6,15 +6,16 @@
  * Left rail (drawer on mobile): Quick Topics, Call Scripts, Recent Chats.
  * Main: message stream + typing indicator + input, language select, New Chat.
  *
- * NOTE: audio upload / mic (call-recording analysis) is deliberately deferred
- * to a later pass — text chat only for now.
+ * Call-recording analysis: the paperclip beside Send uploads an audio file to
+ * /api/crm/chat/analyze-recording → AI transcript + quality score + coaching
+ * rendered as an assistant message (with a Score chip) in a fresh session.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle, Bot, Briefcase, Building2, Cake, Car, Clock, FileText, Loader2,
-  MapPin, MessageSquare, Music, PanelLeft, Phone, Plus, Send, Shirt, Sparkles,
-  Ticket, UserRound, UtensilsCrossed, Wine, X,
+  MapPin, MessageSquare, Music, PanelLeft, Paperclip, Phone, Plus, Send, Shirt,
+  Sparkles, Ticket, UserRound, UtensilsCrossed, Wine, X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { api } from '@/lib/api';
@@ -32,6 +33,7 @@ interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   response_time_ms?: number | null;
+  score?: number | null; // call-analysis quality score (client-side only)
 }
 
 interface CallScript {
@@ -273,6 +275,7 @@ export default function CrmAssistantPage() {
   const [input, setInput] = useState('');
   const [language, setLanguage] = useState<'english' | 'telugu' | 'hindi'>('english');
   const [sending, setSending] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [cooldown, setCooldown] = useState<number | null>(null);
 
@@ -281,6 +284,7 @@ export default function CrmAssistantPage() {
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   /* load sessions + scripts */
   const loadSessions = useCallback(() => {
@@ -319,7 +323,7 @@ export default function CrmAssistantPage() {
   /* auto-scroll to the newest message */
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [messages, sending]);
+  }, [messages, sending, analyzing]);
 
   const newChat = () => {
     setActiveSessionId(null);
@@ -351,7 +355,7 @@ export default function CrmAssistantPage() {
 
   const send = async (text: string) => {
     const message = text.trim();
-    if (!message || sending) return;
+    if (!message || sending || analyzing) return;
     setError(null);
     setCooldown(null);
     setDrawerOpen(false);
@@ -385,6 +389,53 @@ export default function CrmAssistantPage() {
     } finally {
       setSending(false);
     }
+  };
+
+  /* upload a call recording → AI transcript + score + coaching */
+  const analyzeRecording = async (file: File) => {
+    if (sending || analyzing) return;
+    setError(null);
+    setCooldown(null);
+    setDrawerOpen(false);
+    if (file.size > 14 * 1024 * 1024) {
+      setError('Recording too large (max 14MB) — trim or compress it');
+      return;
+    }
+    setMessages(prev => [...prev, { role: 'user', content: `Uploaded recording: ${file.name}` }]);
+    setAnalyzing(true);
+    try {
+      const fd = new FormData();
+      fd.append('audio', file);
+      fd.append('language', language);
+      const r = await api('/api/crm/chat/analyze-recording', { method: 'POST', body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (r.status === 429) {
+        const wait = Number(j.wait_seconds) || 30;
+        setCooldown(wait);
+        return;
+      }
+      if (!r.ok) {
+        setError(j.error || `HTTP ${r.status}`);
+        return;
+      }
+      // The analysis lives in a fresh session — switch to it.
+      if (j.session_id) setActiveSessionId(j.session_id);
+      setMessages(prev => [...prev, {
+        role: 'assistant', content: j.content || '',
+        response_time_ms: j.response_time_ms, score: j.score ?? null,
+      }]);
+      loadSessions();
+    } catch (e: any) {
+      setError(e?.message || 'Failed to analyze recording');
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-selecting the same file
+    if (file) analyzeRecording(file);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -493,21 +544,33 @@ export default function CrmAssistantPage() {
                       <div className="bg-white border border-[#E8D5C4] text-sm text-[#2D1B0E] rounded-2xl rounded-bl-sm px-4 py-2.5 break-words">
                         <FormattedText text={m.content} />
                       </div>
-                      {m.response_time_ms != null && (
-                        <div className="text-[10px] text-[#8B7355] mt-1 ml-1">
-                          {(Number(m.response_time_ms) / 1000).toFixed(1)}s
+                      {(m.score != null || m.response_time_ms != null) && (
+                        <div className="flex items-center gap-2 mt-1 ml-1">
+                          {m.score != null && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#af4408] bg-[#FFF8F0] border border-[#E8D5C4] rounded-full px-2 py-0.5">
+                              <Sparkles size={11} /> Score: {m.score}/10
+                            </span>
+                          )}
+                          {m.response_time_ms != null && (
+                            <span className="text-[10px] text-[#8B7355]">
+                              {(Number(m.response_time_ms) / 1000).toFixed(1)}s
+                            </span>
+                          )}
                         </div>
                       )}
                     </div>
                   </div>
                 )
               ))}
-              {sending && (
+              {(sending || analyzing) && (
                 <div className="flex justify-start">
                   <div className="bg-white border border-[#E8D5C4] rounded-2xl rounded-bl-sm px-4 py-3 flex items-center gap-1.5">
                     <span className="w-2 h-2 rounded-full bg-[#af4408]/60 animate-bounce" />
                     <span className="w-2 h-2 rounded-full bg-[#af4408]/60 animate-bounce [animation-delay:150ms]" />
                     <span className="w-2 h-2 rounded-full bg-[#af4408]/60 animate-bounce [animation-delay:300ms]" />
+                    {analyzing && (
+                      <span className="ml-1.5 text-sm text-[#8B7355]">Analyzing call recording…</span>
+                    )}
                   </div>
                 </div>
               )}
@@ -544,11 +607,29 @@ export default function CrmAssistantPage() {
               rows={1}
               placeholder="Type a customer question… (Enter to send)"
               className="flex-1 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] placeholder:text-[#8B7355] resize-none focus:outline-none focus:border-[#af4408] max-h-32"
-              disabled={sending}
+              disabled={sending || analyzing}
+            />
+            <input
+              ref={fileRef}
+              type="file"
+              accept="audio/*,.m4a,.aac,.flac,.webm,.mp4"
+              onChange={onFileChange}
+              className="hidden"
+              aria-hidden="true"
+              tabIndex={-1}
             />
             <button
+              onClick={() => fileRef.current?.click()}
+              disabled={sending || analyzing}
+              className="shrink-0 bg-[#FFF8F0] border border-[#E8D5C4] hover:border-[#af4408] hover:text-[#af4408] disabled:opacity-50 disabled:cursor-not-allowed text-[#6B5744] rounded-lg p-2.5"
+              aria-label="Upload call recording for analysis"
+              title="Upload call recording for AI analysis (max 14MB)"
+            >
+              {analyzing ? <Loader2 size={18} className="animate-spin" /> : <Paperclip size={18} />}
+            </button>
+            <button
               onClick={() => send(input)}
-              disabled={sending || !input.trim()}
+              disabled={sending || analyzing || !input.trim()}
               className="shrink-0 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg p-2.5"
               aria-label="Send message"
             >
