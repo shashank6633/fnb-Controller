@@ -61,9 +61,18 @@ export async function GET() {
     const rows = db.prepare(`SELECT ${COLUMNS.join(', ')} FROM raw_materials ORDER BY sku, name`).all() as any[];
 
     const lines: string[] = [];
-    lines.push(COLUMNS.join(','));
+    // avg_price_per_purchase_unit is a READ-ONLY display column (₹/BTL etc, =
+    // average_price × pack_size when the purchase unit differs) so the CSV
+    // matches what the UI shows. The round-trip import ignores unknown columns,
+    // so it can never be written back — average_price stays the canonical
+    // ₹/recipe-unit value.
+    lines.push([...COLUMNS, 'avg_price_per_purchase_unit'].join(','));
     for (const r of rows) {
-      lines.push(COLUMNS.map(c => csvEscape(r[c])).join(','));
+      const pack = Number(r.pack_size) || 1;
+      const perPU = (r.purchase_unit && r.purchase_unit !== r.unit && pack > 1)
+        ? Math.round((r.average_price || 0) * pack * 100) / 100
+        : (r.average_price ?? 0);
+      lines.push([...COLUMNS.map(c => csvEscape(r[c])), csvEscape(perPU)].join(','));
     }
     const csv = lines.join('\n') + '\n';
 
