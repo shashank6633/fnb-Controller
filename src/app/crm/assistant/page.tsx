@@ -7,8 +7,9 @@
  * Main: message stream + typing indicator + input, language select, New Chat.
  *
  * Call-recording analysis: the paperclip beside Send uploads an audio file to
- * /api/crm/chat/analyze-recording → AI transcript + quality score + coaching
- * rendered as an assistant message (with a Score chip) in a fresh session.
+ * /api/crm/chat/analyze-recording. Structured results ({kind:'call_analysis'}
+ * JSON) render as a full-width CallAnalysisCard scorecard; legacy markdown
+ * analyses keep the old text bubble + Score chip.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -19,6 +20,7 @@ import {
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { api } from '@/lib/api';
+import CallAnalysisCard, { type CallAnalysisData } from './CallAnalysisCard';
 
 /* ── types ────────────────────────────────────────────────────────────── */
 
@@ -106,6 +108,26 @@ const EMPTY_STATE_CHIPS: { label: string; q: string }[] = [
   { label: 'Weekend Events', q: 'What events happen on weekends?' },
   { label: 'Reservations', q: 'How to book a table?' },
 ];
+
+/* ── structured call-analysis detection ───────────────────────────────── */
+
+/**
+ * Assistant messages that store the structured scorecard are JSON strings
+ * tagged {kind:'call_analysis'} (both live responses and saved sessions).
+ * Anything else — normal chat replies, legacy markdown analyses — returns
+ * null and takes the plain-text bubble path.
+ */
+function tryParseCallAnalysis(content: string): CallAnalysisData | null {
+  const text = (content || '').trim();
+  if (!text.startsWith('{')) return null;
+  try {
+    const obj = JSON.parse(text);
+    if (obj && typeof obj === 'object' && obj.kind === 'call_analysis' && obj.dimensions) {
+      return obj as CallAnalysisData;
+    }
+  } catch { /* not JSON — plain text message */ }
+  return null;
+}
 
 /* ── text rendering: line breaks + **bold** (no innerHTML) ────────────── */
 
@@ -531,14 +553,32 @@ export default function CrmAssistantPage() {
             </div>
           ) : (
             <>
-              {messages.map((m, i) => (
-                m.role === 'user' ? (
-                  <div key={m.id || `m${i}`} className="flex justify-end">
-                    <div className="max-w-[85%] bg-[#af4408] text-white text-sm rounded-2xl rounded-br-sm px-4 py-2.5 break-words">
-                      <FormattedText text={m.content} />
+              {messages.map((m, i) => {
+                if (m.role === 'user') {
+                  return (
+                    <div key={m.id || `m${i}`} className="flex justify-end">
+                      <div className="max-w-[85%] bg-[#af4408] text-white text-sm rounded-2xl rounded-br-sm px-4 py-2.5 break-words">
+                        <FormattedText text={m.content} />
+                      </div>
                     </div>
-                  </div>
-                ) : (
+                  );
+                }
+                // Structured call-analysis → full-width scorecard card.
+                const analysis = tryParseCallAnalysis(m.content);
+                if (analysis) {
+                  return (
+                    <div key={m.id || `m${i}`} className="w-full">
+                      <CallAnalysisCard data={analysis} />
+                      {m.response_time_ms != null && (
+                        <div className="text-[10px] text-[#8B7355] mt-1 ml-1">
+                          {(Number(m.response_time_ms) / 1000).toFixed(1)}s
+                        </div>
+                      )}
+                    </div>
+                  );
+                }
+                // Plain chat replies + legacy markdown analyses (old Score chip).
+                return (
                   <div key={m.id || `m${i}`} className="flex justify-start">
                     <div className="max-w-[90%]">
                       <div className="bg-white border border-[#E8D5C4] text-sm text-[#2D1B0E] rounded-2xl rounded-bl-sm px-4 py-2.5 break-words">
@@ -560,8 +600,8 @@ export default function CrmAssistantPage() {
                       )}
                     </div>
                   </div>
-                )
-              ))}
+                );
+              })}
               {(sending || analyzing) && (
                 <div className="flex justify-start">
                   <div className="bg-white border border-[#E8D5C4] rounded-2xl rounded-bl-sm px-4 py-3 flex items-center gap-1.5">

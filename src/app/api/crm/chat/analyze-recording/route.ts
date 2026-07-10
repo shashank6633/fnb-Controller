@@ -6,12 +6,17 @@ import { analyzeCallRecording } from '@/lib/crm-audio';
 /**
  * POST /api/crm/chat/analyze-recording  (multipart/form-data)
  *   audio: File, language?: string →
- *   { session_id, content, score, language_detected, response_time_ms }
+ *   { session_id, analysis?, content, score, language_detected, response_time_ms }
  *
  * Port of the Flask /api/chat/analyze_recording endpoint: validates the
  * upload, runs the AI call analysis (Gemini audio; Claude coaches on a Gemini
  * transcript when provider=claude), then stores the result as a fresh
  * assistant chat session with a single assistant message.
+ *
+ * When the model returns the structured scorecard, crm_messages.content is
+ * the JSON string {kind:'call_analysis', ...analysis, response_time_ms} so
+ * saved sessions re-render the scorecard; otherwise the raw markdown text is
+ * stored/returned exactly as before (backward compatible).
  */
 
 const MAX_AUDIO_BYTES = 14 * 1024 * 1024; // Gemini inline_data request limit
@@ -83,6 +88,11 @@ export async function POST(request: Request) {
     const result = await analyzeCallRecording({ base64, mimeType, language });
     const responseTimeMs = Date.now() - t0;
 
+    // Structured scorecard → store the tagged JSON payload; legacy text → as-is.
+    const storedContent = result.analysis
+      ? JSON.stringify({ kind: 'call_analysis', ...result.analysis, response_time_ms: responseTimeMs })
+      : result.content;
+
     // Persist only after a successful analysis (no orphan sessions on failure).
     const db = getDb();
     const sessionId = generateId();
@@ -93,11 +103,12 @@ export async function POST(request: Request) {
     db.prepare(`
       INSERT INTO crm_messages (id, session_id, role, content, response_time_ms)
       VALUES (?, ?, 'assistant', ?, ?)
-    `).run(generateId(), sessionId, result.content, responseTimeMs);
+    `).run(generateId(), sessionId, storedContent, responseTimeMs);
 
     return Response.json({
       session_id: sessionId,
-      content: result.content,
+      ...(result.analysis ? { analysis: result.analysis } : {}),
+      content: storedContent,
       score: result.score,
       language_detected: result.language,
       response_time_ms: responseTimeMs,
