@@ -26,7 +26,7 @@ export async function GET() {
 
 const VALID_ROLES = ['admin', 'manager', 'staff'] as const;
 // Parent Role / functional section (per-user). '' = unset.
-const VALID_SECTIONS = ['Kitchen', 'Bar', 'Service', 'Maintenance', 'Store'] as const;
+const VALID_SECTIONS = ['Kitchen', 'Bar', 'Service', 'Maintenance', 'Store', 'GRE'] as const;
 function normSection(v: any): string | null {
   if (v == null) return '';
   const s = String(v).trim();

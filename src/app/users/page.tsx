@@ -377,6 +377,7 @@ export default function UsersPage() {
                     <option value="Service">Service</option>
                     <option value="Maintenance">Maintenance</option>
                     <option value="Store">Store</option>
+                    <option value="GRE">GRE (Front Office)</option>
                   </select>
                   <span className="block text-[10px] text-[#8B7355] mt-0.5">
                     Kitchen &amp; Bar auto-filter the Kitchen Display to that section&apos;s KOTs and route KOT
