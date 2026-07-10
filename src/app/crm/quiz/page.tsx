@@ -13,8 +13,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { useCallback, useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
-  Brain, Loader2, AlertCircle, CheckCircle2, XCircle, ChevronRight,
+  ArrowLeft, Brain, Loader2, AlertCircle, CheckCircle2, XCircle, ChevronRight,
   Trophy, RotateCcw, History, Play,
 } from 'lucide-react';
 import { api } from '@/lib/api';
@@ -56,6 +57,7 @@ function fmtDate(s: string): string {
 }
 
 export default function CrmQuizPage() {
+  const router = useRouter();
   const [phase, setPhase] = useState<'setup' | 'quiz' | 'report'>('setup');
   const [category, setCategory] = useState('random');
   const [difficulty, setDifficulty] = useState('medium');
@@ -194,6 +196,12 @@ export default function CrmQuizPage() {
 
   return (
     <div className="p-4 sm:p-6 space-y-4 max-w-3xl mx-auto">
+      <button
+        onClick={() => router.back()}
+        className="inline-flex items-center gap-1 text-sm text-[#6B5744] hover:text-[#2D1B0E] transition-colors"
+      >
+        <ArrowLeft className="w-4 h-4" /> Back
+      </button>
       <div className="flex items-center gap-2">
         <Brain className="w-6 h-6 text-[#af4408]" />
         <h1 className="text-xl font-bold text-[#2D1B0E]">Daily Quiz</h1>

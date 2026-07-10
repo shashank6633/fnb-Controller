@@ -10,8 +10,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
-  GraduationCap, Loader2, AlertCircle, Send, History, Play, Trophy,
+  ArrowLeft, GraduationCap, Loader2, AlertCircle, Send, History, Play, Trophy,
   RotateCcw, Lightbulb, CheckCircle2, XCircle, MessageSquareQuote, LogOut,
 } from 'lucide-react';
 import { api } from '@/lib/api';
@@ -83,6 +84,7 @@ function catLabel(value: string): string {
 }
 
 export default function CrmTrainingPage() {
+  const router = useRouter();
   const [phase, setPhase] = useState<'setup' | 'session'>('setup');
   const [difficulty, setDifficulty] = useState('medium');
   const [category, setCategory] = useState('random');
@@ -207,6 +209,12 @@ export default function CrmTrainingPage() {
 
   return (
     <div className="p-4 sm:p-6 space-y-4 max-w-3xl mx-auto">
+      <button
+        onClick={() => router.back()}
+        className="inline-flex items-center gap-1 text-sm text-[#6B5744] hover:text-[#2D1B0E] transition-colors"
+      >
+        <ArrowLeft className="w-4 h-4" /> Back
+      </button>
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <div className="flex items-center gap-2">
           <GraduationCap className="w-6 h-6 text-[#af4408]" />

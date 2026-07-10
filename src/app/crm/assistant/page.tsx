@@ -13,8 +13,9 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
-  AlertCircle, Bot, Briefcase, Building2, Cake, Car, Clock, FileText, Loader2,
+  AlertCircle, ArrowLeft, Bot, Briefcase, Building2, Cake, Car, Clock, FileText, Loader2,
   MapPin, MessageSquare, Music, PanelLeft, Paperclip, Phone, Plus, Send, Shirt,
   Sparkles, Ticket, UserRound, UtensilsCrossed, Wine, X,
 } from 'lucide-react';
@@ -283,6 +284,7 @@ function Rail({
 /* ── page ─────────────────────────────────────────────────────────────── */
 
 export default function CrmAssistantPage() {
+  const router = useRouter();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
@@ -490,6 +492,14 @@ export default function CrmAssistantPage() {
       <section className="flex-1 min-w-0 flex flex-col bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
         {/* Header */}
         <div className="flex items-center gap-2 px-3 sm:px-4 py-2.5 border-b border-[#E8D5C4]">
+          <button
+            onClick={() => router.back()}
+            className="inline-flex items-center gap-1 shrink-0 text-sm text-[#6B5744] hover:text-[#2D1B0E] transition-colors"
+            aria-label="Go back"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            <span className="hidden sm:inline">Back</span>
+          </button>
           <button
             onClick={() => setDrawerOpen(true)}
             className="lg:hidden p-1.5 rounded-lg text-[#6B5744] hover:bg-[#FFF8F0]"

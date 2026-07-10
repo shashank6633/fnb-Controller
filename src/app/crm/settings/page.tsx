@@ -12,8 +12,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { useCallback, useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
-  Settings, BookOpen, Bot, BarChart3, Database, Loader2, Save, Sparkles,
+  ArrowLeft, Settings, BookOpen, Bot, BarChart3, Database, Loader2, Save, Sparkles,
   CheckCircle2, AlertCircle, Trash2, Plus, RefreshCw, KeyRound, Zap, Users,
   MessageSquare, ListChecks, GraduationCap, Percent, Target,
 } from 'lucide-react';
@@ -38,6 +39,7 @@ const TABS: { key: TabKey; label: string; icon: any }[] = [
 ];
 
 export default function CrmSettingsPage() {
+  const router = useRouter();
   const [me, setMe] = useState<any>(undefined); // undefined = loading, null = signed out
   const [tab, setTab] = useState<TabKey>('kb');
 
@@ -68,6 +70,12 @@ export default function CrmSettingsPage() {
   return (
     <div className="p-4 sm:p-6 space-y-4 max-w-6xl mx-auto">
       <div>
+        <button
+          onClick={() => router.back()}
+          className="inline-flex items-center gap-1 text-sm text-[#6B5744] hover:text-[#2D1B0E] transition-colors mb-2"
+        >
+          <ArrowLeft className="w-4 h-4" /> Back
+        </button>
         <h1 className="text-2xl font-bold text-[#2D1B0E] flex items-center gap-2">
           <Settings className="w-6 h-6 text-[#af4408]" /> CRM Settings
         </h1>
