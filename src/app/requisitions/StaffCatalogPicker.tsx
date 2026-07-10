@@ -21,7 +21,7 @@
  *     /api/requisitions/<id>/submit.
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Loader2, Minus, Plus, Search, Send, ShoppingCart, X } from 'lucide-react';
 import { api } from '@/lib/api';
 
@@ -76,7 +76,10 @@ const inr = (v: number, dp = 0) =>
 
 export default function StaffCatalogPicker({ materials, me, departments, editDraft, onClose, onCreated }: {
   materials: Material[];
-  me: { role?: string; email?: string; department_id?: string | null } | null;
+  me: {
+    role?: string; email?: string; department_id?: string | null;
+    is_head_chef?: boolean; is_store_manager?: boolean;
+  } | null;
   departments: Department[];
   /** When set, the picker edits this draft (PUT) instead of creating (POST). */
   editDraft?: EditDraft | null;
@@ -86,9 +89,24 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
   const isEditing = !!editDraft;
   const today = new Date().toISOString().slice(0, 10);
   const date = editDraft?.date || today;
-  // Edit mode keeps the draft's own department; otherwise staff are locked to
-  // their home department (server enforces this on POST too).
-  const deptId = editDraft?.department_id || me?.department_id || '';
+  // Same privilege condition as CreateRequisitionModal.canChangeDept —
+  // admin / head chef / store manager / manager may raise for any department;
+  // everyone else is locked to their home department (server enforces too).
+  const canChangeDept = me?.role === 'admin'
+    || !!me?.is_head_chef
+    || !!me?.is_store_manager
+    || me?.role === 'manager';
+  // Edit mode keeps the draft's own department; privileged users default to
+  // their home department (or the first active one) but can switch below.
+  const [deptId, setDeptId] = useState(
+    editDraft?.department_id || me?.department_id || (canChangeDept ? departments[0]?.id || '' : ''));
+  // Safety net: if `me` resolves after mount, adopt the home department —
+  // never overriding a choice already made (mirrors the old modal).
+  useEffect(() => {
+    if (isEditing) return;
+    if (me?.department_id) setDeptId(cur => cur || me.department_id!);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me?.department_id]);
   const dept = departments.find(d => d.id === deptId);
 
   const [search, setSearch] = useState('');
@@ -174,7 +192,9 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
   // Same POST/PUT + submit flow as CreateRequisitionModal.save().
   const save = async (submitAfter: boolean) => {
     if (!deptId) {
-      setError('Your user has no home department set. Ask an admin to assign one on /users.');
+      setError(canChangeDept
+        ? 'Pick a department.'
+        : 'Your user has no home department set. Ask an admin to assign one on /users.');
       return;
     }
     if (cartLines.length === 0) { setError('Add at least one item.'); return; }
@@ -219,13 +239,28 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
       {/* ── Header ─────────────────────────────────────────── */}
       <div className="shrink-0 px-3 pt-3 pb-2 border-b border-[#E8D5C4] bg-[#FFF8F0]">
         <div className="flex items-center justify-between gap-2 mb-2">
-          <div className="min-w-0">
-            <div className="text-sm font-bold text-[#2D1B0E] truncate">
-              {isEditing
-                ? `Edit Draft ${editDraft!.req_number}`
-                : dept ? `${dept.code ? `[${dept.code}] ` : ''}${dept.name}` : 'New Requisition'}
-            </div>
-            <div className="text-[11px] text-[#8B7355]">
+          <div className="min-w-0 flex-1">
+            {isEditing ? (
+              <div className="text-sm font-bold text-[#2D1B0E] truncate">
+                {`Edit Draft ${editDraft!.req_number}`}
+              </div>
+            ) : canChangeDept ? (
+              // Privileged users (admin / HOD / store manager / manager) may
+              // raise for any department — same options as the old modal.
+              <select value={deptId} onChange={e => setDeptId(e.target.value)}
+                      className="w-full max-w-xs px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-white text-sm font-semibold text-[#2D1B0E]">
+                <option value="">Select department…</option>
+                {departments.map(d => (
+                  <option key={d.id} value={d.id}>{d.code ? `[${d.code}] ` : ''}{d.name}</option>
+                ))}
+              </select>
+            ) : (
+              // Staff: locked read-only home-department display.
+              <div className="text-sm font-bold text-[#2D1B0E] truncate">
+                {dept ? `${dept.code ? `[${dept.code}] ` : ''}${dept.name}` : 'New Requisition'}
+              </div>
+            )}
+            <div className="text-[11px] text-[#8B7355] mt-0.5">
               {isEditing && dept ? `${dept.name} · ` : ''}{date}
             </div>
           </div>

@@ -332,13 +332,15 @@ export default function RequisitionsPage() {
       </div>
 
       {creating && (() => {
-        // Plain department staff (NOT admin / HOD / store manager / manager) get
-        // the mobile catalog-and-cart picker for BOTH new requisitions and draft
-        // editing (same condition as `simple` / `canChangeDept` inside
-        // CreateRequisitionModal). Privileged roles keep the classic modal.
+        // NEW requisitions: EVERY role uses the catalog-and-cart picker (the
+        // picker gives privileged users a department selector in its header).
+        // DRAFT EDITING: plain department staff (NOT admin / HOD / store
+        // manager / manager — same condition as `simple` / `canChangeDept`
+        // inside CreateRequisitionModal) keep the picker; privileged roles
+        // keep the classic modal for edits.
         const isStaff = !!me && me.role !== 'admin' && me.role !== 'manager'
           && !me.is_head_chef && !me.is_store_manager;
-        return isStaff ? (
+        return (!editDraft || isStaff) ? (
           <StaffCatalogPicker materials={materials} me={me} departments={departments}
                               editDraft={editDraft}
                               onClose={() => { setCreating(false); setEditDraft(null); }}
