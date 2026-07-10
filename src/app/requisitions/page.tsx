@@ -19,6 +19,7 @@ import {
 import { api } from '@/lib/api';
 import { fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
+import StaffCatalogPicker from './StaffCatalogPicker';
 
 const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 
@@ -330,13 +331,26 @@ export default function RequisitionsPage() {
         )}
       </div>
 
-      {creating && (
-        <CreateRequisitionModal departments={departments} materials={materials}
-                                me={me}
-                                editDraft={editDraft}
-                                onClose={() => { setCreating(false); setEditDraft(null); }}
-                                onCreated={reload} />
-      )}
+      {creating && (() => {
+        // Plain department staff (NOT admin / HOD / store manager / manager) get
+        // the mobile catalog-and-cart picker for BOTH new requisitions and draft
+        // editing (same condition as `simple` / `canChangeDept` inside
+        // CreateRequisitionModal). Privileged roles keep the classic modal.
+        const isStaff = !!me && me.role !== 'admin' && me.role !== 'manager'
+          && !me.is_head_chef && !me.is_store_manager;
+        return isStaff ? (
+          <StaffCatalogPicker materials={materials} me={me} departments={departments}
+                              editDraft={editDraft}
+                              onClose={() => { setCreating(false); setEditDraft(null); }}
+                              onCreated={reload} />
+        ) : (
+          <CreateRequisitionModal departments={departments} materials={materials}
+                                  me={me}
+                                  editDraft={editDraft}
+                                  onClose={() => { setCreating(false); setEditDraft(null); }}
+                                  onCreated={reload} />
+        );
+      })()}
       {importing && (
         <RecahoImportModal onClose={() => setImporting(false)} onCommitted={reload} />
       )}
