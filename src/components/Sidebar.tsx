@@ -79,6 +79,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Tables",             href: "/dine-in/tables",            icon: Utensils },
       { kind: "link", label: "Menu Items",         href: "/menu-items",                icon: BookOpen },
       { kind: "link", label: "Recipes",            href: "/recipes",                   icon: ChefHat },
+      { kind: "link", label: "Menu Engineering",   href: "/menu-engineering",          icon: BarChart3 },
       { kind: "link", label: "Direct Items",       href: "/direct-items",              icon: Link2 },
       { kind: "link", label: "Sales Upload",       href: "/sales",                     icon: Upload },
       { kind: "link", label: "Reconciliation",     href: "/dine-in/reconciliation",    icon: AlertTriangle },

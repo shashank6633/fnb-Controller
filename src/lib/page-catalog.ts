@@ -111,6 +111,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/department-consumption', label: 'Dept Consumption' },
       { path: '/staff-meals',         label: 'Staff Meals' },
       { path: '/reports',             label: 'Reports' },
+      { path: '/menu-engineering',    label: 'Menu Engineering', hodOnly: true },
       { path: '/audit',               label: 'Audit' },
       { path: '/eod',                 label: 'End-of-Day' },
       { path: '/outlets',             label: 'Outlets' },
