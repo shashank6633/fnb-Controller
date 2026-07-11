@@ -19,6 +19,7 @@ import {
 import { api } from '@/lib/api';
 import { fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
+import TabScroller from '@/components/TabScroller';
 import StaffCatalogPicker from './StaffCatalogPicker';
 
 const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
@@ -270,7 +271,7 @@ export default function RequisitionsPage() {
 
       {/* Filters. The Mgmt Inbox tab only appears when the Mgmt-approval gate
           is enabled on Settings → Integrations — otherwise it's noise. */}
-      <div className="flex flex-wrap gap-1 mb-3 text-xs">
+      <TabScroller className="gap-1 mb-3 text-xs">
         {[
           { k: 'all', l: 'All' }, { k: 'open', l: `Open (${counts.open})` },
           { k: 'inbox-chef', l: `HOD Inbox (${counts.inbox_chef})` },
@@ -289,9 +290,11 @@ export default function RequisitionsPage() {
             {o.l}
           </button>
         ))}
-      </div>
+      </TabScroller>
 
-      <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+      {/* overflow-x-auto (NOT hidden): the 10-column table is wider than a phone
+          viewport — clipping made the right columns + row actions unreachable. */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-x-auto">
         {loading ? (
           <div className="p-8 text-center text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
         ) : filtered.length === 0 ? (
@@ -581,8 +584,11 @@ function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt,
     <>
       <tr className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF8F0]/50">
         <td className="py-2 px-2 align-top">
-          <button onClick={onToggle} className="text-[#6B5744]">
-            {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          {/* p-1 -m-1 widens the tap target without shifting layout; shrink-0
+              keeps the icon from collapsing to 0 width in the squeezed cell. */}
+          <button onClick={onToggle} aria-label={expanded ? 'Collapse' : 'Expand'}
+                  className="text-[#6B5744] inline-flex items-center justify-center p-1 -m-1">
+            {expanded ? <ChevronDown className="w-4 h-4 shrink-0" /> : <ChevronRight className="w-4 h-4 shrink-0" />}
           </button>
         </td>
         <td className="py-2 px-3 font-mono font-semibold text-[#2D1B0E]">{r.req_number}</td>
@@ -728,6 +734,11 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
 
   return (
     <tr><td colSpan={10} className="bg-[#FFF8F0] py-3 px-4">
+      {/* The td spans the FULL table width (wider than a phone screen inside the
+          horizontally-scrolling list). sticky left-0 + a viewport-width cap keep
+          the detail card (items, audit trail, action buttons) pinned and fully
+          visible without sideways scrolling on phones; lg: restores full width. */}
+      <div className="sticky left-0 max-w-[calc(100vw-4rem)] lg:static lg:max-w-none">
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 mb-3">
         <div className="lg:col-span-3">
           {isPlainDept ? (
@@ -760,6 +771,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
               </div>
             </>
           ) : (
+          <div className="overflow-x-auto">
           <table className="w-full text-xs">
             <thead className="text-[#8B7355]">
               <tr>
@@ -841,6 +853,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
               })}
             </tbody>
           </table>
+          </div>
           )}
         </div>
         <div className="text-[11px] text-[#6B5744] space-y-1.5">
@@ -868,6 +881,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
         {canStoreAct && <button onClick={() => setShowProcess(true)} className="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded inline-flex items-center gap-1"><Package className="w-3 h-3" /> Issue to Department</button>}
         {canAck     && <button disabled={busy} onClick={ack} className="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Confirm Received at Dept</button>}
         {canCancel  && <button disabled={busy} onClick={cancel}     className="px-3 py-1.5 text-xs text-red-600 hover:underline">Cancel</button>}
+      </div>
       </div>
 
       {/* All modals portaled to body — see ModalPortal docstring. Rendering

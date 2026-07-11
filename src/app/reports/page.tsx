@@ -28,6 +28,7 @@ import {
   ReferenceLine,
 } from 'recharts';
 import type { ItemPnL, PeriodReport } from '@/types';
+import TabScroller from '@/components/TabScroller';
 
 const COLORS = {
   revenue: '#10B981',
@@ -483,11 +484,11 @@ export default function ReportsPage() {
                 </button>
               );
               return (
-                <div className="flex gap-1.5">
+                <TabScroller className="gap-1.5">
                   <Btn value="" label="All" items={total} rev={(dine?.revenue || 0) + (party?.revenue || 0)} />
                   <Btn value="DINE_IN" label="Dine-In" items={dine?.items} rev={dine?.revenue} />
                   <Btn value="PARTY"   label="Party"   items={party?.items} rev={party?.revenue} />
-                </div>
+                </TabScroller>
               );
             })()}
           </div>

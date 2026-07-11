@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { api } from '@/lib/api';
+import TabScroller from '@/components/TabScroller';
 import {
   Utensils,
   Plus,
@@ -393,7 +394,7 @@ export default function MenuItemsPage() {
               </h3>
               {issueFilter && <button onClick={() => setIssueFilter(null)} className="text-xs text-[#af4408] hover:underline">Clear filter</button>}
             </div>
-            <div className="flex flex-wrap gap-2">
+            <TabScroller className="gap-2">
               {summary.noPrice > 0 && <IssueChip active={issueFilter === 'noPrice'} onClick={() => setIssueFilter(issueFilter === 'noPrice' ? null : 'noPrice')} color="red" count={summary.noPrice} label="No Selling Price" />}
               {summary.noCategory > 0 && <IssueChip active={issueFilter === 'noCategory'} onClick={() => setIssueFilter(issueFilter === 'noCategory' ? null : 'noCategory')} color="amber" count={summary.noCategory} label="No Category" />}
               {summary.noStation > 0 && <IssueChip active={issueFilter === 'noStation'} onClick={() => setIssueFilter(issueFilter === 'noStation' ? null : 'noStation')} color="amber" count={summary.noStation} label="No Station" />}
@@ -401,7 +402,7 @@ export default function MenuItemsPage() {
               {(summary.total - summary.withRecipe - summary.withMaterial) > 0 && (
                 <IssueChip active={issueFilter === 'noRecipe'} onClick={() => setIssueFilter(issueFilter === 'noRecipe' ? null : 'noRecipe')} color="blue" count={summary.total - summary.withRecipe - summary.withMaterial} label="No Recipe / Material Link" />
               )}
-            </div>
+            </TabScroller>
           </div>
         )}
 
@@ -429,7 +430,7 @@ export default function MenuItemsPage() {
             }
             const sortedCats = [...categories].sort((a, b) => (countByCat[b] || 0) - (countByCat[a] || 0));
             return (
-              <div className="flex flex-wrap gap-1.5">
+              <TabScroller className="gap-1.5">
                 <button onClick={() => setCategoryFilter('')}
                         className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
                           !categoryFilter ? 'bg-[#af4408] text-white'
@@ -449,7 +450,7 @@ export default function MenuItemsPage() {
                     </button>
                   );
                 })}
-              </div>
+              </TabScroller>
             );
           })()}
 

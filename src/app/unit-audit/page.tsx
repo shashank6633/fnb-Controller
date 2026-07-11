@@ -18,6 +18,7 @@ import {
   Download, Upload,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import TabScroller from '@/components/TabScroller';
 
 const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 
@@ -303,7 +304,7 @@ export default function UnitAuditPage() {
       )}
 
       {/* Severity tabs */}
-      <div className="flex gap-2 flex-wrap text-xs">
+      <TabScroller className="gap-2 text-xs">
         {(['high', 'medium', 'low', 'ok', 'all'] as const).map(s => {
           const counts = (data?.severity_counts || {}) as Record<string, number>;
           const n = s === 'all' ? data?.total ?? 0 : (counts[s] ?? 0);
@@ -322,11 +323,11 @@ export default function UnitAuditPage() {
             </button>
           );
         })}
-      </div>
+      </TabScroller>
 
       {/* Flag chips */}
       {data && (
-        <div className="flex flex-wrap gap-1 text-[10px] items-center">
+        <TabScroller className="gap-1 text-[10px] items-center">
           <Filter className="w-3 h-3 text-[#8B7355]" />
           <span className="text-[#8B7355] mr-1">Flag:</span>
           <button onClick={() => setFlagFilter('')}
@@ -344,7 +345,7 @@ export default function UnitAuditPage() {
               </button>
             );
           })}
-        </div>
+        </TabScroller>
       )}
 
       {/* Search + bulk actions */}

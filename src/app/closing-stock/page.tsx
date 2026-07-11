@@ -31,6 +31,7 @@ import {
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
+import TabScroller from '@/components/TabScroller';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const today = () => new Date().toISOString().slice(0, 10);
@@ -570,7 +571,7 @@ export default function ClosingStockByLocationPage() {
               </span>
             </div>
             {categoryCounts.length > 1 && (
-              <div className="flex flex-wrap gap-1.5">
+              <TabScroller className="gap-1.5">
                 <button onClick={() => setCategoryFilter('')}
                         className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
                           !categoryFilter ? 'bg-[#af4408] text-white'
@@ -589,7 +590,7 @@ export default function ClosingStockByLocationPage() {
                     </button>
                   );
                 })}
-              </div>
+              </TabScroller>
             )}
           </div>
         )}

@@ -112,7 +112,9 @@ export default function PurchaseOrdersPage() {
 
         {/* Filter tabs */}
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 shadow flex flex-wrap items-center gap-3">
-          <div className="flex gap-1 bg-[#FFF1E3] rounded-lg p-1 text-xs">
+          {/* Segmented control scrolls sideways on phones instead of overflowing;
+              scrollbar hidden. max-w-full keeps it inside the wrapping toolbar. */}
+          <div className="flex gap-1 bg-[#FFF1E3] rounded-lg p-1 text-xs flex-nowrap overflow-x-auto max-w-full no-scrollbar">
             {([
               ['all',      `All (${pos.length})`,                       'bg-[#af4408]'],
               ['draft',    `Draft (${counts.draft})`,                   'bg-gray-600'],
@@ -122,7 +124,7 @@ export default function PurchaseOrdersPage() {
               ['rejected', `Rejected/Cancelled (${counts.rejected})`,   'bg-red-600'],
             ] as const).map(([v, label, bg]) => (
               <button key={v} onClick={() => setTab(v as any)}
-                      className={`px-2.5 py-1 rounded-md font-medium transition-colors ${tab === v ? `${bg} text-white` : 'text-[#6B5744] hover:bg-white'}`}>
+                      className={`px-2.5 py-1 rounded-md font-medium transition-colors shrink-0 whitespace-nowrap ${tab === v ? `${bg} text-white` : 'text-[#6B5744] hover:bg-white'}`}>
                 {label}
               </button>
             ))}

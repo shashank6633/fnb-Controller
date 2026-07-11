@@ -23,6 +23,12 @@
   --color-sidebar-active: #af4408;
 }
 
+/* Hide the scrollbar on horizontal tab/pill scrollers (TabScroller). Lives
+   here (un-layered) so it beats the global `* { scrollbar-width: thin }`
+   below — Tailwind's layered [scrollbar-width:none] utility loses to it. */
+.no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; width: 0; height: 0; }
+
 /* Smooth scrollbar styling */
 * {
   scrollbar-width: thin;
@@ -219,8 +225,12 @@ main > div > div.grid > *:nth-child(6) { animation-delay: 0.20s; }
 
   /* 5. Modals — make sure even modals authored with a max-w-Xxl scale down
    *    to the viewport. The fixed.inset-0 wrapper's p-4 padding was eating
-   *    width on phones; we keep the padding but cap the inner card. */
-  .fixed.inset-0 > div:not([class*="absolute"]) {
+   *    width on phones; we keep the padding but cap the inner card.
+   *    Scoped to CENTERED card overlays (justify-center) only — full-screen
+   *    takeovers (e.g. the staff requisition picker: `fixed inset-0 bg-white
+   *    flex flex-col`) and bottom sheets must keep their children at the full
+   *    viewport width, not capped 1rem short of it. */
+  .fixed.inset-0[class*="justify-center"] > div:not([class*="absolute"]) {
     max-height: calc(100vh - 1rem);
     max-width: calc(100vw - 1rem);
   }
@@ -241,8 +251,14 @@ main > div > div.grid > *:nth-child(6) { animation-delay: 0.20s; }
     max-width: 100%;
   }
 
-  /* 8. Embedded charts / SVGs / iframes never break out. */
-  main iframe, main canvas, main svg { max-width: 100%; height: auto; }
+  /* 8. Embedded charts / SVGs / iframes never break out.
+   *    EXCEPT icon svgs inside buttons/links: `max-width: 100%` on an svg
+   *    whose parent shrink-wraps (an icon-only <button>) resolves circularly
+   *    to width 0 — the icon vanishes and the button becomes untappable
+   *    (this killed the requisitions expand chevron on phones). Icons always
+   *    carry explicit w-*/h-* classes, so they never break out anyway. */
+  main iframe, main canvas { max-width: 100%; height: auto; }
+  main svg:not(button svg):not(a svg) { max-width: 100%; height: auto; }
 
   /* 9. The .flex utility on toolbar containers wraps onto multiple rows so
    *    chips don't squish. Excludes flex-nowrap (explicit opt-out) AND

@@ -19,6 +19,7 @@ import {
   MessageSquare, ListChecks, GraduationCap, Percent, Target,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import TabScroller from '@/components/TabScroller';
 
 const KB_SECTIONS: { key: string; label: string }[] = [
   { key: 'venue_info', label: 'Venue' },
@@ -85,7 +86,7 @@ export default function CrmSettingsPage() {
       </div>
 
       {/* Tab pills */}
-      <div className="flex flex-wrap gap-2">
+      <TabScroller className="gap-2">
         {TABS.map(t => {
           const Icon = t.icon;
           const active = tab === t.key;
@@ -103,7 +104,7 @@ export default function CrmSettingsPage() {
             </button>
           );
         })}
-      </div>
+      </TabScroller>
 
       {tab === 'kb' && <KnowledgeTab />}
       {tab === 'llm' && <ProviderTab />}

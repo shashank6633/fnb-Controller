@@ -5,6 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search, Send } from 'lucide-react';
 import { printFiredKots, printBill } from '@/lib/offline-print/print';
+import TabScroller from '@/components/TabScroller';
 
 interface MenuItem { id: string; name: string; category: string; station: string; selling_price: number; recipe_id: string | null; is_active: number; }
 interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; }
@@ -106,12 +107,12 @@ export default function OrderTerminalPage() {
             <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search menu…"
               className="w-full bg-white border border-[#E8D5C4] rounded-lg pl-9 pr-3 py-2 text-sm" />
           </div>
-          <div className="flex flex-wrap gap-1.5 mb-3">
+          <TabScroller className="gap-1.5 mb-3">
             {categories.map((c) => (
               <button key={c} onClick={() => setCat(c)}
                 className={`text-xs px-2.5 py-1 rounded-full ${cat === c ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'}`}>{c}</button>
             ))}
-          </div>
+          </TabScroller>
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-[60vh] overflow-y-auto pr-1">
             {visible.map((m) => {
               const noPrice = !(m.selling_price > 0);

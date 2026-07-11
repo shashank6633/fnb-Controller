@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '@/lib/api';
 import { ChefHat, Clock, Wifi, WifiOff, AlertTriangle } from 'lucide-react';
+import TabScroller from '@/components/TabScroller';
 
 interface KotItem { name: string; quantity: number; notes: string; status: string; }
 interface Kot {
@@ -118,14 +119,14 @@ export default function KitchenPage() {
         </span>
       </div>
 
-      <div className="flex flex-wrap gap-1.5 mb-4">
+      <TabScroller className="gap-1.5 mb-4">
         {stationOptions.map((s) => (
           <button key={s} onClick={() => setStation(s)}
             className={`text-xs px-3 py-1.5 rounded-full capitalize ${station === s ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'}`}>
             {s === 'all' ? 'All stations' : s}
           </button>
         ))}
-      </div>
+      </TabScroller>
 
       {alerts.length > 0 && (
         <div className="mb-4 rounded-xl border-2 border-red-500 bg-red-600 text-white shadow-lg overflow-hidden">

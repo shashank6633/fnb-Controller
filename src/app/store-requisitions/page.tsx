@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { fmtIST } from '@/lib/format-date';
+import TabScroller from '@/components/TabScroller';
 
 interface Department { id: string; name: string; }
 interface ReqLine {
@@ -378,7 +379,7 @@ export default function StoreRequisitionsPage() {
       </div>
 
       {/* Status tabs */}
-      <div className="flex gap-2 flex-wrap text-xs">
+      <TabScroller className="gap-2 text-xs">
         {([
           { k: 'open',             label: 'Pending Issue',   icon: AlertCircle, tone: 'amber' },
           { k: 'deferred',         label: 'Deferred',        icon: Clock,       tone: 'blue' },
@@ -404,7 +405,7 @@ export default function StoreRequisitionsPage() {
             </button>
           );
         })}
-      </div>
+      </TabScroller>
 
       {/* Filters */}
       <div className="flex flex-wrap items-center gap-2 bg-white border border-[#E8D5C4] rounded-xl p-3">
