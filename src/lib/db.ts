@@ -2335,6 +2335,21 @@ function initializeSchema(db: Database.Database) {
       }
     } catch (e) { console.error('crm knowledge seed failed:', e); }
   } catch (e) { console.error('crm schema failed:', e); }
+
+  // ── AKAN CRM — Daily Digest (additive) ─────────────────────────────────────
+  // One AI-written owner briefing per calendar day (/crm/digest). Regenerating
+  // upserts the same row; data_json keeps the exact data pack the LLM saw.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS crm_digests (
+        digest_date  TEXT PRIMARY KEY,                       -- YYYY-MM-DD
+        content      TEXT NOT NULL,                          -- markdown briefing
+        data_json    TEXT DEFAULT '{}',
+        generated_at TEXT DEFAULT (datetime('now')),
+        generated_by TEXT DEFAULT ''
+      );
+    `);
+  } catch (e) { console.error('crm_digests schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

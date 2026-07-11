@@ -420,6 +420,208 @@ export function slowMovers(db: DB) {
   };
 }
 
+/* ── additive views (Daily Digest + Smart Reorder) ─────────────────────── */
+/* ADDED for /crm/digest and /crm/reorder. Purely additive — nothing above
+ * this block changed, and neither function is registered in ANALYST_VIEWS
+ * (the digest/reorder routes import them directly). */
+
+/** Everything waiting on someone's yes — for the morning digest. Lists cap at 8. */
+export function pendingApprovals(db: DB) {
+  const cnt = (sql: string): number =>
+    Number((db.prepare(sql).get() as any)?.n) || 0;
+
+  // 1. Requisitions submitted by departments, waiting on the HOD (chef) inbox.
+  const reqSubmitted = db.prepare(`
+    SELECT r.req_number, COALESCE(d.name,'(unknown dept)') AS department, r.date,
+           (SELECT COUNT(*) FROM requisition_items ri WHERE ri.req_id = r.id) AS items
+    FROM requisitions r LEFT JOIN departments d ON d.id = r.department_id
+    WHERE r.status = 'submitted'
+    ORDER BY r.date DESC, r.created_at DESC LIMIT 8
+  `).all() as any[];
+
+  // 2. Approved requisitions sitting in the Store Manager's issue queue.
+  const reqStoreQueue = db.prepare(`
+    SELECT r.req_number, COALESCE(d.name,'(unknown dept)') AS department, r.date, r.status,
+           (SELECT COUNT(*) FROM requisition_items ri WHERE ri.req_id = r.id) AS items
+    FROM requisitions r LEFT JOIN departments d ON d.id = r.department_id
+    WHERE r.status IN ('chef_approved','mgmt_approved')
+    ORDER BY r.date DESC, r.created_at DESC LIMIT 8
+  `).all() as any[];
+
+  // 3. Purchase orders awaiting approval. PO status vocabulary (db.ts +
+  //    /api/purchase-orders actions): draft | pending | pending_reapproval |
+  //    approved | received | rejected | cancelled. "Awaiting approval" =
+  //    submitted-but-undecided = pending / pending_reapproval.
+  const poAwaiting = db.prepare(`
+    SELECT po_number, COALESCE(NULLIF(TRIM(vendor),''),'(no vendor)') AS vendor,
+           date, status, ROUND(COALESCE(total_cost,0),2) AS total_cost
+    FROM purchase_orders
+    WHERE status IN ('pending','pending_reapproval')
+    ORDER BY date DESC, created_at DESC LIMIT 8
+  `).all() as any[];
+
+  // 4. Guest-quiz links expiring within the next 3 days.
+  const expiringLinks = db.prepare(`
+    SELECT title, link_code, expires_at, attempt_count, max_attempts
+    FROM crm_quiz_links
+    WHERE is_active = 1 AND expires_at IS NOT NULL
+      AND datetime(expires_at) >= datetime('now')
+      AND datetime(expires_at) <= datetime('now','+3 days')
+    ORDER BY datetime(expires_at) LIMIT 8
+  `).all() as any[];
+
+  return {
+    as_of: today(),
+    note: 'Items waiting on an approval or about to expire. Counts are totals; lists show the newest 8.',
+    requisitions_awaiting_chef: {
+      count: cnt(`SELECT COUNT(*) AS n FROM requisitions WHERE status = 'submitted'`),
+      rows: reqSubmitted,
+    },
+    requisitions_in_store_queue: {
+      count: cnt(`SELECT COUNT(*) AS n FROM requisitions WHERE status IN ('chef_approved','mgmt_approved')`),
+      rows: reqStoreQueue,
+    },
+    purchase_orders_awaiting_approval: {
+      count: cnt(`SELECT COUNT(*) AS n FROM purchase_orders WHERE status IN ('pending','pending_reapproval')`),
+      rows: poAwaiting,
+    },
+    draft_po_count: cnt(`SELECT COUNT(*) AS n FROM purchase_orders WHERE status = 'draft'`),
+    quiz_links_expiring_3d: {
+      count: cnt(`SELECT COUNT(*) AS n FROM crm_quiz_links
+                  WHERE is_active = 1 AND expires_at IS NOT NULL
+                    AND datetime(expires_at) >= datetime('now')
+                    AND datetime(expires_at) <= datetime('now','+3 days')`),
+      rows: expiringLinks,
+    },
+  };
+}
+
+/**
+ * Smart Reorder rows — same trigger + qty math as reorderSuggestions (verbatim),
+ * but WITH material_id / pack data and vendor + price enrichment so the
+ * /crm/reorder page can turn a row straight into a draft-PO line.
+ *
+ * Per material:
+ *   vendors      — pickable options: ACTIVE vendor_contracts (₹/purchase-unit
+ *                  from the contract) merged with plain vendor_materials mappings.
+ *   preferred    — cheapest active contract's vendor; else the first mapped
+ *                  vendor; else null.
+ *   unit_price   — ₹/PURCHASE-unit: contract price → last_purchase_price (already
+ *                  ₹/PU — same derivation the Requisitions page shows as "Last ₹")
+ *                  → average_price × pack_size.
+ */
+export function reorderSuggestionsEnriched(db: DB) {
+  const use = dailyUseMap(db, 14);
+
+  // Active contracts, cheapest first (ORDER BY makes "first per material" = preferred).
+  const contracts = db.prepare(`
+    SELECT vc.material_id, vc.vendor_id, v.name AS vendor_name, vc.unit_price
+    FROM vendor_contracts vc JOIN vendors v ON v.id = vc.vendor_id
+    WHERE vc.is_active = 1 AND vc.valid_from <= date('now')
+      AND (vc.valid_to IS NULL OR vc.valid_to >= date('now'))
+    ORDER BY vc.unit_price ASC, v.name
+  `).all() as { material_id: string; vendor_id: string; vendor_name: string; unit_price: number }[];
+  const contractsByMat = new Map<string, typeof contracts>();
+  for (const c of contracts) {
+    const arr = contractsByMat.get(c.material_id) || [];
+    arr.push(c); contractsByMat.set(c.material_id, arr);
+  }
+
+  // Plain vendor↔material mappings (no price).
+  const mappings = db.prepare(`
+    SELECT vm.material_id, vm.vendor_id, v.name AS vendor_name
+    FROM vendor_materials vm JOIN vendors v ON v.id = vm.vendor_id
+    ORDER BY v.name
+  `).all() as { material_id: string; vendor_id: string; vendor_name: string }[];
+  const mappingsByMat = new Map<string, typeof mappings>();
+  for (const m of mappings) {
+    const arr = mappingsByMat.get(m.material_id) || [];
+    arr.push(m); mappingsByMat.set(m.material_id, arr);
+  }
+
+  // last_purchase_price is ₹/purchase-unit (see /requisitions "PUoM · Last ₹").
+  const lastPrice = new Map<string, number>();
+  for (const r of db.prepare(`
+    SELECT id, last_purchase_price FROM raw_materials WHERE COALESCE(last_purchase_price,0) > 0
+  `).all() as { id: string; last_purchase_price: number }[]) {
+    lastPrice.set(r.id, r.last_purchase_price);
+  }
+
+  const out: any[] = [];
+  for (const m of activeMaterials(db)) {
+    // ── trigger + suggested qty: IDENTICAL math to reorderSuggestions ──
+    const avg = use.get(m.id) || 0;
+    const belowReorder = m.reorder_level > 0 && m.current_stock <= m.reorder_level;
+    const daysLeft = avg > 0 ? m.current_stock / avg : null;
+    if (!belowReorder && !(daysLeft != null && daysLeft < 7)) continue;
+    const pack = m.pack_size > 0 ? m.pack_size : 1;
+    const need7 = avg * 7;
+    let packs = Math.ceil(Math.max(0, need7 - m.current_stock) / pack);
+    if (packs <= 0 && belowReorder) {
+      packs = Math.max(1, Math.ceil((m.reorder_level - m.current_stock) / pack));
+    }
+    if (packs <= 0) continue;
+
+    // ── vendor options + preferred ──
+    const matContracts = contractsByMat.get(m.id) || [];
+    const matMappings = mappingsByMat.get(m.id) || [];
+    const contractPriceByVendor = new Map(matContracts.map(c => [c.vendor_id, r2(c.unit_price)]));
+    const seen = new Set<string>();
+    const vendorOptions: { vendor_id: string; vendor_name: string; contract_price: number | null }[] = [];
+    for (const c of matContracts) {
+      if (seen.has(c.vendor_id)) continue;
+      seen.add(c.vendor_id);
+      vendorOptions.push({ vendor_id: c.vendor_id, vendor_name: c.vendor_name, contract_price: r2(c.unit_price) });
+    }
+    for (const v of matMappings) {
+      if (seen.has(v.vendor_id)) continue;
+      seen.add(v.vendor_id);
+      vendorOptions.push({ vendor_id: v.vendor_id, vendor_name: v.vendor_name, contract_price: contractPriceByVendor.get(v.vendor_id) ?? null });
+    }
+    const preferred = matContracts[0]              // cheapest active contract
+      ?? matMappings[0]                            // else first plain mapping
+      ?? null;                                     // else unassigned
+
+    // ── ₹/purchase-unit ──
+    let unitPrice: number;
+    let priceSource: 'contract' | 'last_purchase' | 'average';
+    if (matContracts[0]) { unitPrice = r2(matContracts[0].unit_price); priceSource = 'contract'; }
+    else if (lastPrice.has(m.id)) { unitPrice = r2(lastPrice.get(m.id)); priceSource = 'last_purchase'; }
+    else { unitPrice = r2(m.average_price * pack); priceSource = 'average'; }
+
+    const hasPU = !!(m.purchase_unit && m.purchase_unit.toLowerCase() !== (m.unit || '').toLowerCase() && pack > 1);
+    out.push({
+      material_id: m.id,
+      name: m.name, sku: m.sku || '', category: m.category,
+      current_stock: r3(m.current_stock), unit: m.unit,
+      purchase_unit: m.purchase_unit || m.unit,
+      pack_size: pack,
+      current_stock_pu: r2(hasPU ? m.current_stock / pack : m.current_stock),
+      avg_daily_use_14d: r3(avg),
+      days_of_stock_left: daysLeft == null ? null : r2(daysLeft),
+      suggested_order_qty: packs,
+      order_unit: m.purchase_unit || m.unit,
+      unit_price: unitPrice,
+      price_source: priceSource,
+      preferred_vendor_id: preferred?.vendor_id ?? null,
+      preferred_vendor_name: preferred?.vendor_name ?? null,
+      vendors: vendorOptions,
+      line_estimate: r2(packs * unitPrice),
+    });
+  }
+  out.sort((a, b) => {
+    const ax = a.days_of_stock_left == null ? 9e9 : a.days_of_stock_left;
+    const bx = b.days_of_stock_left == null ? 9e9 : b.days_of_stock_left;
+    return ax - bx || b.line_estimate - a.line_estimate;
+  });
+  return {
+    as_of: today(),
+    latest_issue_date: latestIssueDate(db),
+    note: 'Suggested qty = ceil((7-day need − on-hand) ÷ pack size), in PURCHASE units. unit_price is ₹/purchase-unit (contract → last purchase → average×pack).',
+    rows: out.slice(0, 60),
+  };
+}
+
 /* ── registry the analyst route uses ───────────────────────────────────── */
 
 export const ANALYST_VIEWS = {

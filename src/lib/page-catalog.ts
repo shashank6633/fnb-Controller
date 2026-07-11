@@ -124,6 +124,10 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/crm/assistant',  label: 'AI Assistant' },
       { path: '/crm/analyst',    label: 'AI Analyst — Data', hodOnly: true },
+      { path: '/crm/digest',     label: 'Daily Digest',      hodOnly: true },
+      // NOT hodOnly: store managers raise POs too — the page + API gate on
+      // admin/HOD/store-manager themselves.
+      { path: '/crm/reorder',    label: 'Smart Reorder' },
       { path: '/crm/training',   label: 'Training' },
       { path: '/crm/quiz',       label: 'Quiz' },
       { path: '/crm/quiz-links', label: 'Guest Quiz Links', hodOnly: true },
