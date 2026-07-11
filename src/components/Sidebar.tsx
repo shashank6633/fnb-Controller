@@ -150,6 +150,7 @@ const navTree: NavEntry[] = [
     icon: Bot,
     items: [
       { kind: "link", label: "AI Assistant",     href: "/crm/assistant",  icon: Bot },
+      { kind: "link", label: "AI Analyst",       href: "/crm/analyst",    icon: BarChart3 },
       { kind: "link", label: "Training",         href: "/crm/training",   icon: GraduationCap },
       { kind: "link", label: "Quiz",             href: "/crm/quiz",       icon: HelpCircle },
       { kind: "link", label: "Guest Quiz Links", href: "/crm/quiz-links", icon: Link2 },
