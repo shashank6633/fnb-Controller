@@ -129,6 +129,9 @@ export const PAGE_CATALOG: PageSection[] = [
       // NOT hodOnly: store managers raise POs too — the page + API gate on
       // admin/HOD/store-manager themselves.
       { path: '/crm/reorder',    label: 'Smart Reorder' },
+      // NOT hodOnly: managers run the guest book / loyalty desk — the page +
+      // API gate on admin/manager-tier/HOD themselves.
+      { path: '/crm/guests',     label: 'Guests & Loyalty' },
       { path: '/crm/training',   label: 'Training' },
       { path: '/crm/quiz',       label: 'Quiz' },
       { path: '/crm/quiz-links', label: 'Guest Quiz Links', hodOnly: true },

@@ -2350,6 +2350,48 @@ function initializeSchema(db: Database.Database) {
       );
     `);
   } catch (e) { console.error('crm_digests schema failed:', e); }
+
+  // ── AKAN CRM — Guest Database + Loyalty (additive) ─────────────────────────
+  // Guest directory keyed by normalized 10-digit mobile (/crm/guests). Visits
+  // append to crm_guest_visits and roll up onto the guest row (visit_count /
+  // total_spend / points). Points accrue at `crm_loyalty_points_per_100` pts
+  // per ₹100 billed. Tier (Bronze/Silver/Gold) is COMPUTED from points at read
+  // time — never stored. POS capture hooks call upsertGuestVisit() in
+  // src/lib/crm-guests.ts (wired in a later pass).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS crm_guests (
+        id             TEXT PRIMARY KEY,
+        name           TEXT DEFAULT '',
+        mobile         TEXT NOT NULL UNIQUE,                -- normalized 10-digit
+        birthday       TEXT DEFAULT '',                     -- 'YYYY-MM-DD' or 'MM-DD'
+        notes          TEXT DEFAULT '',
+        first_visit_at TEXT DEFAULT (datetime('now')),
+        last_visit_at  TEXT,
+        visit_count    INTEGER NOT NULL DEFAULT 0,
+        total_spend    REAL NOT NULL DEFAULT 0,
+        points         REAL NOT NULL DEFAULT 0,
+        is_active      INTEGER NOT NULL DEFAULT 1,
+        created_at     TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_guests_mobile ON crm_guests(mobile);
+
+      CREATE TABLE IF NOT EXISTS crm_guest_visits (
+        id            TEXT PRIMARY KEY,
+        guest_id      TEXT NOT NULL,
+        order_id      TEXT DEFAULT '',
+        bill_amount   REAL NOT NULL DEFAULT 0,
+        points_earned REAL NOT NULL DEFAULT 0,
+        visited_at    TEXT DEFAULT (datetime('now')),
+        source        TEXT DEFAULT 'pos',                   -- 'pos' | 'manual' | …
+        FOREIGN KEY (guest_id) REFERENCES crm_guests(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_guest_visits_guest ON crm_guest_visits(guest_id);
+
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('crm_loyalty_points_per_100', '1');
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('crm_review_link', '');
+    `);
+  } catch (e) { console.error('crm_guests schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

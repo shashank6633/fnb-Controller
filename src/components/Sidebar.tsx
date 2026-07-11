@@ -154,6 +154,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "AI Analyst",       href: "/crm/analyst",    icon: BarChart3 },
       { kind: "link", label: "Daily Digest",     href: "/crm/digest",     icon: FileText },
       { kind: "link", label: "Smart Reorder",    href: "/crm/reorder",    icon: ShoppingCart },
+      { kind: "link", label: "Guests & Loyalty", href: "/crm/guests",     icon: Users },
       { kind: "link", label: "Training",         href: "/crm/training",   icon: GraduationCap },
       { kind: "link", label: "Quiz",             href: "/crm/quiz",       icon: HelpCircle },
       { kind: "link", label: "Guest Quiz Links", href: "/crm/quiz-links", icon: Link2 },
