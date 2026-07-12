@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
-import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search, Send } from 'lucide-react';
+import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search, Send, CheckCircle2, MessageCircle } from 'lucide-react';
 import { printFiredKots, printBill } from '@/lib/offline-print/print';
 import TabScroller from '@/components/TabScroller';
 
@@ -12,11 +12,20 @@ interface OrderItem { id: string; name: string; quantity: number; unit_price: nu
 interface Order {
   id: string; order_number: number; status: string; order_type: string;
   table_number: string | null; zone: string | null;
+  guest_name?: string | null; guest_mobile?: string | null;
   subtotal: number; tax_total: number; discount: number; total: number;
   items: OrderItem[];
 }
 
 function rupee(n: number) { return '₹' + (Math.round(n * 100) / 100).toLocaleString('en-IN'); }
+
+// Client-side mirror of normalizeMobile() — bare 10 digits for the wa.me link.
+function waMobile(raw: string): string {
+  let d = String(raw || '').replace(/\D/g, '');
+  if (d.length === 12 && d.startsWith('91')) d = d.slice(2);
+  if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
+  return d.length === 10 ? d : '';
+}
 
 export default function OrderTerminalPage() {
   const router = useRouter();
@@ -29,6 +38,14 @@ export default function OrderTerminalPage() {
   const [settleOpen, setSettleOpen] = useState(false);
   const [settling, setSettling] = useState(false);
 
+  // ── Guest capture at settle (feeds CRM loyalty) + WhatsApp review request ──
+  const [gMobile, setGMobile] = useState('');
+  const [gName, setGName] = useState('');
+  const [reviewLink, setReviewLink] = useState('');
+  const [settledInfo, setSettledInfo] = useState<{ mobile: string; total: number } | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const flash = (m: string) => { setToast(m); setTimeout(() => setToast(null), 2500); };
+
   const loadOrder = useCallback(async () => {
     const r = await api(`/api/dine-in/orders/${id}`);
     const j = await r.json();
@@ -38,7 +55,17 @@ export default function OrderTerminalPage() {
   useEffect(() => {
     loadOrder();
     fetch('/api/menu-items').then((r) => r.json()).then((j) => setMenu((j.items || []).filter((m: MenuItem) => m.is_active)));
+    // Google review URL (crm_review_link) — powers the WhatsApp review button.
+    fetch('/api/settings?key=crm_review_link').then((r) => r.json()).then((j) => setReviewLink(String(j?.value || '').trim())).catch(() => {});
   }, [loadOrder]);
+
+  // Prefill the settle modal's guest fields from the order's opening capture
+  // (never overwrites something the cashier already typed).
+  useEffect(() => {
+    if (!settleOpen) return;
+    setGMobile((prev) => prev || order?.guest_mobile || '');
+    setGName((prev) => prev || order?.guest_name || '');
+  }, [settleOpen, order?.guest_mobile, order?.guest_name]);
 
   const categories = useMemo(() => ['All', ...Array.from(new Set(menu.map((m) => m.category || 'Other')))], [menu]);
   const visible = useMemo(() => menu.filter((m) =>
@@ -70,6 +97,23 @@ export default function OrderTerminalPage() {
       if (j.error) { alert(j.error); return; }
       // Print the bill via the local bridge (best-effort; never blocks settle).
       if (order) printBill({ ...order, payment_method: method }).catch(() => {});
+      const mob = gMobile.trim();
+      if (mob) {
+        // Fire-and-forget AFTER the settle succeeded — a guest-capture failure
+        // (bad mobile, offline, …) must never block or undo the settle.
+        api('/api/crm/guests/settle-capture', {
+          method: 'POST',
+          body: { mobile: mob, name: gName.trim() || undefined, order_id: id, bill_amount: j.total ?? order?.total ?? 0 },
+        }).then(async (res) => {
+          const g = await res.json().catch(() => ({} as any));
+          if (res.ok && !g.deduped) flash(`Guest saved · ${Math.round(Number(g.points_earned) || 0)} pts`);
+        }).catch(() => {});
+        // Stay on the page: show the settle-success dialog (review request).
+        setSettleOpen(false);
+        setSettledInfo({ mobile: mob, total: Number(j.total ?? order?.total ?? 0) });
+        loadOrder();
+        return;
+      }
       router.push('/dine-in/floor');
     } finally { setSettling(false); }
   }
@@ -192,6 +236,15 @@ export default function OrderTerminalPage() {
           <div className="bg-white border border-[#E8D5C4] rounded-xl w-full max-w-sm p-5" onClick={(e) => e.stopPropagation()}>
             <h2 className="font-semibold text-[#2D1B0E] mb-1">Settle order</h2>
             <p className="text-sm text-[#8B7355] mb-4">Total due <strong className="text-[#af4408]">{rupee(order.total)}</strong> — choose payment method.</p>
+            {/* Optional guest capture — feeds CRM loyalty; settling works
+                exactly as before when left blank. */}
+            <p className="text-[11px] font-semibold text-[#8B7355] mb-1">Guest (optional — earns loyalty points)</p>
+            <div className="flex gap-2 mb-4">
+              <input value={gMobile} onChange={(e) => setGMobile(e.target.value)} type="tel" inputMode="tel" placeholder="Guest mobile"
+                className="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+              <input value={gName} onChange={(e) => setGName(e.target.value)} placeholder="Name"
+                className="w-28 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+            </div>
             <div className="grid grid-cols-3 gap-2">
               {['cash', 'upi', 'card'].map((m) => (
                 <button key={m} onClick={() => settle(m)} disabled={settling}
@@ -204,6 +257,31 @@ export default function OrderTerminalPage() {
           </div>
         </div>
       )}
+
+      {/* Settle-success dialog — shown only when a guest mobile was captured,
+          so the cashier can send the WhatsApp review request before leaving. */}
+      {settledInfo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="bg-white border border-[#E8D5C4] rounded-xl w-full max-w-sm p-5 text-center">
+            <CheckCircle2 className="w-10 h-10 text-green-600 mx-auto mb-2" />
+            <h2 className="font-semibold text-[#2D1B0E]">Order settled</h2>
+            <p className="text-sm text-[#8B7355] mb-4">{rupee(settledInfo.total)} collected · guest {settledInfo.mobile}</p>
+            {reviewLink && waMobile(settledInfo.mobile) && (
+              <a href={`https://wa.me/91${waMobile(settledInfo.mobile)}?text=${encodeURIComponent(`Thank you for dining at AKAN! We'd love your feedback: ${reviewLink}`)}`}
+                target="_blank" rel="noopener noreferrer"
+                className="w-full flex items-center justify-center gap-2 bg-green-600 hover:bg-green-700 text-white py-2.5 rounded-lg text-sm font-medium mb-2">
+                <MessageCircle size={16} /> Send review request on WhatsApp
+              </a>
+            )}
+            <button onClick={() => router.push('/dine-in/floor')}
+              className="w-full border border-[#E8D5C4] text-[#6B5744] py-2.5 rounded-lg text-sm font-medium hover:bg-[#FFF1E3]">
+              Done
+            </button>
+          </div>
+        </div>
+      )}
+
+      {toast && <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] bg-[#2D1B0E] text-white text-sm px-4 py-2.5 rounded-full shadow-lg">{toast}</div>}
     </div>
   );
 }

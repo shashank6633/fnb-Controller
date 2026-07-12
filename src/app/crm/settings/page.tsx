@@ -30,13 +30,14 @@ const KB_SECTIONS: { key: string; label: string }[] = [
   { key: 'custom_faqs', label: 'FAQs' },
 ];
 
-type TabKey = 'kb' | 'llm' | 'analytics' | 'qbank';
+type TabKey = 'kb' | 'llm' | 'analytics' | 'qbank' | 'guests';
 
 const TABS: { key: TabKey; label: string; icon: any }[] = [
   { key: 'kb', label: 'Knowledge Base', icon: BookOpen },
   { key: 'llm', label: 'AI Provider', icon: Bot },
   { key: 'analytics', label: 'Analytics', icon: BarChart3 },
   { key: 'qbank', label: 'Question Bank', icon: Database },
+  { key: 'guests', label: 'Guest & Reviews', icon: MessageSquare },
 ];
 
 export default function CrmSettingsPage() {
@@ -110,6 +111,7 @@ export default function CrmSettingsPage() {
       {tab === 'llm' && <ProviderTab />}
       {tab === 'analytics' && <AnalyticsTab />}
       {tab === 'qbank' && <QuestionBankTab />}
+      {tab === 'guests' && <GuestReviewsTab />}
     </div>
   );
 }
@@ -699,6 +701,71 @@ function AnalyticsTab() {
               </li>
             ))}
           </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── 5. Guest & Reviews tab ──────────────────────────────────────────── */
+
+function GuestReviewsTab() {
+  const [link, setLink] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [flash, setFlash] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch('/api/settings?key=crm_review_link')
+      .then(r => r.json())
+      .then(j => setLink(String(j?.value || '')))
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const save = async () => {
+    setSaving(true); setError(null); setFlash(null);
+    try {
+      const r = await api('/api/settings', { method: 'PUT', body: { key: 'crm_review_link', value: link.trim() } });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
+      setFlash('Review link saved');
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div className="space-y-3">
+      {flash && <Flash text={flash} />}
+      {error && <ErrorBox text={error} />}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 sm:p-4 space-y-2">
+        <div className="text-sm font-semibold text-[#2D1B0E] flex items-center gap-1.5">
+          <MessageSquare className="w-4 h-4 text-[#af4408]" /> Google review link
+        </div>
+        <p className="text-[10px] text-[#8B7355]">
+          After settling a bill with a guest mobile captured, the POS offers a &quot;Send review
+          request on WhatsApp&quot; button that shares this link with the guest. Leave empty to disable.
+        </p>
+        {loading ? (
+          <div className="py-4 text-center text-sm text-[#8B7355]">
+            <Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Loading…
+          </div>
+        ) : (
+          <div className="flex flex-col sm:flex-row gap-2">
+            <input
+              value={link}
+              onChange={e => setLink(e.target.value)}
+              placeholder="https://g.page/r/…/review"
+              className="flex-1 px-3 py-2 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg text-sm"
+            />
+            <button
+              onClick={save}
+              disabled={saving}
+              className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
+            </button>
+          </div>
         )}
       </div>
     </div>

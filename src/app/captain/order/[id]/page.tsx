@@ -7,11 +7,12 @@ import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
   ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu, Filter, ChevronDown,
   AlertTriangle, Printer, Timer, Check, Users, BellRing, BadgePercent, Percent,
+  MessageCircle,
 } from 'lucide-react';
 import { CaptainUI } from '../../CaptainShell';
 
 interface MenuItem { id: string; name: string; category: string; station: string; item_type: string; dietary_tag: string; selling_price: number; is_active: number; recipe_id: string | null; }
-interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; notes: string; kot_status?: string | null; prep_minutes?: number | null; fired_at?: string | null; completed_at?: string | null; }
+interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; notes: string; menu_item_id?: string | null; kot_status?: string | null; prep_minutes?: number | null; fired_at?: string | null; completed_at?: string | null; }
 interface TableLite { id: string; table_number: string; zone: string; open_order_id: string | null; open_order_number: number | null; open_order_total: number | null; }
 
 // Per-item kitchen state badge from order_items.status + the KOT status.
@@ -67,6 +68,17 @@ const PORTIONS = ['Full', 'Half', 'Parcel'];
 
 const vegColor = (tag: string) => /non/i.test(tag) ? 'border-red-500' : /egg/i.test(tag) ? 'border-amber-500' : 'border-green-600';
 
+// "Often ordered with" suggestion returned by /api/dine-in/upsell.
+interface UpsellItem { menu_item_id: string; name: string; price: number; times_together: number; }
+
+// Client-side mirror of normalizeMobile() — bare 10 digits for the wa.me link.
+function waMobile(raw: string): string {
+  let d = String(raw || '').replace(/\D/g, '');
+  if (d.length === 12 && d.startsWith('91')) d = d.slice(2);
+  if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
+  return d.length === 10 ? d : '';
+}
+
 export default function CaptainOrder() {
   const router = useRouter();
   const { openTables } = useContext(CaptainUI);
@@ -94,6 +106,17 @@ export default function CaptainOrder() {
   // 1-second wall clock — re-renders the per-item count-up timers.
   const [now, setNow] = useState(() => Date.now());
 
+  // ── Guest capture at settle (feeds CRM loyalty) + WhatsApp review request ──
+  const [gMobile, setGMobile] = useState('');
+  const [gName, setGName] = useState('');
+  const [reviewLink, setReviewLink] = useState('');
+  // Set after a settle where a guest mobile was captured → shows the success
+  // sheet (review request) instead of navigating straight back to the floor.
+  const [settledInfo, setSettledInfo] = useState<{ mobile: string; total: number } | null>(null);
+
+  // ── Upsell suggestions ("often ordered with") for the current cart ──
+  const [upsell, setUpsell] = useState<UpsellItem[]>([]);
+
   // Modifier sheet
   const [sheet, setSheet] = useState<MenuItem | null>(null);
   const [mQty, setMQty] = useState(1);
@@ -117,7 +140,38 @@ export default function CaptainOrder() {
     }).catch(() => {});
     // Who am I? Only cashiers/managers (can_request_discount) get the bill controls.
     fetch('/api/auth/me').then((r) => r.json()).then((j) => { if (j.user) setMe(j.user); }).catch(() => {});
+    // Google review URL (crm_review_link) — powers the WhatsApp review button.
+    fetch('/api/settings?key=crm_review_link').then((r) => r.json()).then((j) => setReviewLink(String(j?.value || '').trim())).catch(() => {});
   }, [loadOrder]);
+
+  // Prefill the settle sheet's guest fields from the order's opening capture
+  // (never overwrites something the captain already typed).
+  useEffect(() => {
+    if (!settleOpen) return;
+    setGMobile((prev) => prev || order?.guest_mobile || '');
+    setGName((prev) => prev || order?.guest_name || '');
+  }, [settleOpen, order?.guest_mobile, order?.guest_name]);
+
+  // Debounced (800ms) refetch of upsell suggestions whenever the cart changes.
+  const cartIdsKey = useMemo(() => Array.from(new Set(
+    (order?.items || []).map((i) => i.menu_item_id).filter(Boolean) as string[],
+  )).sort().join(','), [order]);
+  useEffect(() => {
+    if (!cartIdsKey || order?.status !== 'open') { setUpsell([]); return; }
+    const t = setTimeout(() => {
+      api(`/api/dine-in/upsell?item_ids=${encodeURIComponent(cartIdsKey)}`)
+        .then((r) => r.json())
+        .then((j) => setUpsell(Array.isArray(j?.items) ? j.items : []))
+        .catch(() => {});
+    }, 800);
+    return () => clearTimeout(t);
+  }, [cartIdsKey, order?.status]);
+
+  // Only suggest items we can actually open in the modifier sheet (present in
+  // the loaded menu) — a tapped chip then adds EXACTLY like the menu grid.
+  const upsellChips = useMemo(() => upsell
+    .map((u) => ({ u, m: menu.find((mi) => mi.id === u.menu_item_id) }))
+    .filter((x): x is { u: UpsellItem; m: MenuItem } => !!x.m), [upsell, menu]);
 
   // 1s ticker so every fired-item count-up timer stays live. Only runs while the
   // order is open (no point ticking on a settled/closed order).
@@ -280,6 +334,23 @@ export default function CaptainOrder() {
       const r = await api(`/api/dine-in/orders/${id}/settle`, { method: 'POST', body: { payment_method: method } });
       const j = await r.json();
       if (j.error) { alert(j.error); return; }
+      const mob = gMobile.trim();
+      if (mob) {
+        // Fire-and-forget AFTER the settle succeeded — a guest-capture failure
+        // (bad mobile, offline, …) must never block or undo the settle.
+        api('/api/crm/guests/settle-capture', {
+          method: 'POST',
+          body: { mobile: mob, name: gName.trim() || undefined, order_id: id, bill_amount: j.total ?? order?.total ?? 0 },
+        }).then(async (res) => {
+          const g = await res.json().catch(() => ({} as any));
+          if (res.ok && !g.deduped) flash(`Guest saved · ${Math.round(Number(g.points_earned) || 0)} pts`);
+        }).catch(() => {});
+        // Stay on the page: show the settle-success sheet (review request).
+        setSettleOpen(false);
+        setSettledInfo({ mobile: mob, total: Number(j.total ?? order?.total ?? 0) });
+        loadOrder();
+        return;
+      }
       router.push('/captain');
     } finally { setSettling(false); }
   }
@@ -455,7 +526,7 @@ export default function CaptainOrder() {
             )}
           </div>
           {/* Menu list */}
-          <main className="flex-1 px-3 py-2 pb-24">
+          <main className={`flex-1 px-3 py-2 ${upsellChips.length > 0 ? 'pb-32' : 'pb-24'}`}>
             {visibleMenu.length === 0 ? <p className="text-center text-[#8B7355] py-10 text-sm">No items.</p> : (
               <div className="space-y-2">
                 {visibleMenu.map((m) => (
@@ -478,7 +549,7 @@ export default function CaptainOrder() {
         </>
       ) : (
         /* Cart / running order */
-        <main className="flex-1 px-3 py-2 pb-44">
+        <main className={`flex-1 px-3 py-2 ${upsellChips.length > 0 ? 'pb-52' : 'pb-44'}`}>
           {order.items.length === 0 ? (
             <div className="text-center py-16 text-[#8B7355]"><ShoppingBag className="w-8 h-8 mx-auto mb-2 opacity-50" />No items yet — add from the Menu.</div>
           ) : order.items.map((it) => {
@@ -562,6 +633,19 @@ export default function CaptainOrder() {
         // (w-72 = 18rem) on md+ so it never sits over the sidebar.
         <div className="fixed bottom-0 left-0 right-0 md:left-72 bg-white border-t border-[#E8D5C4] px-3 py-2.5 z-10">
           <div className="max-w-3xl mx-auto">
+            {/* Upsell chips — "often ordered with" the current cart. One-row
+                horizontal scroll (TabScroller-style); hidden when no suggestions. */}
+            {upsellChips.length > 0 && (
+              <div className="flex flex-nowrap overflow-x-auto no-scrollbar items-center gap-1.5 mb-1.5 -mx-1 px-1 [&>*]:shrink-0 [&>*]:whitespace-nowrap">
+                <span className="text-[10px] font-semibold text-[#8B7355]">Often ordered with:</span>
+                {upsellChips.map(({ u, m }) => (
+                  <button key={u.menu_item_id} onClick={() => openSheet(m)}
+                    className="flex items-center gap-1 bg-[#FFF1E3] border border-[#E8D5C4] text-[#6B5744] rounded-full px-2.5 py-1 text-[11px] font-medium active:scale-95">
+                    <Plus className="w-3 h-3 text-[#af4408]" /> {u.name} · ₹{Math.round(u.price)}
+                  </button>
+                ))}
+              </div>
+            )}
             {/* Bill is blocked until every fired item is completed. */}
             {!canBill && (
               <p className="text-[11px] text-[#af4408] font-medium mb-1.5 flex items-center gap-1">
@@ -792,6 +876,15 @@ export default function CaptainOrder() {
               className="w-full flex items-center justify-center gap-2 border border-[#af4408] text-[#af4408] py-3 rounded-xl text-sm font-semibold active:scale-95 disabled:opacity-50 mb-3">
               {printingBill ? <Loader2 className="w-4 h-4 animate-spin" /> : <Receipt className="w-4 h-4" />} Print bill at counter
             </button>
+            {/* Optional guest capture — feeds CRM loyalty; settling works
+                exactly as before when left blank. */}
+            <p className="text-xs font-semibold text-[#8B7355] mb-1.5">Guest (optional — earns loyalty points)</p>
+            <div className="flex gap-2 mb-3">
+              <input value={gMobile} onChange={(e) => setGMobile(e.target.value)} type="tel" inputMode="tel" placeholder="Guest mobile"
+                className="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+              <input value={gName} onChange={(e) => setGName(e.target.value)} placeholder="Name"
+                className="w-28 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+            </div>
             <p className="text-xs font-semibold text-[#8B7355] mb-1.5">Collect &amp; close</p>
             <div className="grid grid-cols-3 gap-2">
               {['cash', 'upi', 'card'].map((mthd) => (
@@ -803,6 +896,30 @@ export default function CaptainOrder() {
             </div>
             {!canBill && <p className="text-center text-xs text-[#af4408] mt-2">Complete all items to bill ({firedIncomplete.length} left)</p>}
             {settling && <p className="text-center text-sm text-[#8B7355] mt-3"><Loader2 className="w-4 h-4 animate-spin inline" /> Settling…</p>}
+          </div>
+        </div>
+      )}
+
+      {/* Settle-success sheet — shown only when a guest mobile was captured,
+          so the captain can send the WhatsApp review request before leaving. */}
+      {settledInfo && (
+        <div className="fixed inset-0 z-40 flex items-end">
+          <div className="absolute inset-0 bg-black/40" />
+          <div className="relative w-full max-w-3xl mx-auto bg-white rounded-t-3xl p-4 pb-6 text-center">
+            <CheckCircle2 className="w-10 h-10 text-green-600 mx-auto mb-2" />
+            <p className="font-bold text-lg text-[#2D1B0E]">Payment collected</p>
+            <p className="text-sm text-[#8B7355] mb-4">₹{Math.round(settledInfo.total)} settled · guest {settledInfo.mobile}</p>
+            {reviewLink && waMobile(settledInfo.mobile) && (
+              <a href={`https://wa.me/91${waMobile(settledInfo.mobile)}?text=${encodeURIComponent(`Thank you for dining at AKAN! We'd love your feedback: ${reviewLink}`)}`}
+                target="_blank" rel="noopener noreferrer"
+                className="w-full flex items-center justify-center gap-2 bg-green-600 text-white py-3 rounded-xl text-sm font-bold active:scale-95 mb-2">
+                <MessageCircle className="w-4 h-4" /> Send review request on WhatsApp
+              </a>
+            )}
+            <button onClick={() => router.push('/captain')}
+              className="w-full border border-[#E8D5C4] text-[#6B5744] py-3 rounded-xl text-sm font-semibold active:scale-95">
+              Done
+            </button>
           </div>
         </div>
       )}
