@@ -105,22 +105,41 @@ export default function ClosingStockByLocationPage() {
   const canSeeAllDepts = !!me && (me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef || !!me.is_store_manager);
   // The department a plain user is locked to (their own). null = store/overall.
   const ownDeptId: string | null = me?.department_id || null;
+  // Explicitly-granted extra departments (Users → Page Access & Department
+  // Visibility). A staff-tier user with a non-empty list may pick among THOSE
+  // departments (plus their own) — no tier change needed to count e.g. Bar.
+  const visibleDeptIds = useMemo<string[]>(() => {
+    if (!me?.visible_department_ids) return [];
+    try {
+      const a = JSON.parse(me.visible_department_ids);
+      return Array.isArray(a) ? a.map(String).filter(Boolean) : [];
+    } catch { return []; }
+  }, [me]);
+  // Does this viewer get a department picker at all (full list or granted subset)?
+  const hasDeptChoice = canSeeAllDepts || visibleDeptIds.length > 0;
 
-  // Departments list (for the admin/HOD selector) + the currently-selected dept.
-  // '' means store / overall (no owning department).
+  // Departments list (picker options + own-dept name for the pinned banner) +
+  // the currently-selected dept. '' means store / overall (no owning department).
   const [departments, setDepartments] = useState<any[]>([]);
   const [selectedDept, setSelectedDept] = useState<string>('');
   useEffect(() => {
     if (!me) return;
-    // Plain department users are pinned to their own department.
-    if (!canSeeAllDepts) { setSelectedDept(ownDeptId || ''); return; }
+    // Non-all-dept users start on (or stay pinned to) their own department.
+    if (!canSeeAllDepts) setSelectedDept(ownDeptId || '');
     fetch('/api/departments').then(r => r.json()).then(d => {
       setDepartments((d?.departments || []).filter((x: any) => x.is_active));
     }).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me]);
-  // The department_id sent on POST to scope saved counts. Plain users → own dept.
-  const activeDeptId: string = canSeeAllDepts ? selectedDept : (ownDeptId || '');
+  // Departments this viewer may record for: the full list for Admin / Manager /
+  // HOD / Store Manager; only the granted subset (plus own dept) otherwise.
+  const pickableDepts = useMemo(() => {
+    if (canSeeAllDepts) return departments;
+    const allow = new Set<string>([...visibleDeptIds, ...(ownDeptId ? [ownDeptId] : [])]);
+    return departments.filter((d: any) => allow.has(d.id));
+  }, [departments, canSeeAllDepts, visibleDeptIds, ownDeptId]);
+  // The department_id sent on POST to scope saved counts. Pinned users → own dept.
+  const activeDeptId: string = hasDeptChoice ? selectedDept : (ownDeptId || '');
   const [date, setDate] = useState(today());
   const [locations, setLocations] = useState<LocSummary[]>([]);
   const [totals, setTotals] = useState({ locations: 0, items: 0, counted: 0 });
@@ -170,6 +189,24 @@ export default function ClosingStockByLocationPage() {
   const AREA_LABELS: Record<string, string> = {
     kitchen: 'Kitchen', bar: 'Bar', store: 'Store', service: 'Service / Ops', other: 'Other', __store__: 'Store / Overall',
   };
+
+  // Name of the department a pinned user records for ('Store/Overall' when none).
+  const ownDeptName = departments.find((d: any) => d.id === ownDeptId)?.name
+    || (ownDeptId ? 'your department' : 'Store/Overall');
+  // Amber info banner shown wherever the department picker is HIDDEN — surfaces
+  // the user's EFFECTIVE tier (named roles can silently downgrade a "manager" to
+  // staff) and how an admin can unlock other departments. Rendered in both the
+  // top-level department area and the Record Closing Stock modal.
+  const tierBanner = (me && !hasDeptChoice) ? (
+    <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-4 py-2.5 text-xs text-amber-800">
+      <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+      <span>
+        Recording for <strong>{ownDeptName}</strong>. Your access tier is {`'${me.role}'`}
+        {me.role_name ? <> from role {`'${me.role_name}'`}</> : null} — Manager tier (or HOD/Store
+        Manager) unlocks recording for other departments like Bar. An admin can change this in Users.
+      </span>
+    </div>
+  ) : null;
 
   /** Category options grouped by super_category so the modal dropdown renders
    *  with <optgroup> headers. Mirrors the derivation on the Raw Materials page. */
@@ -775,28 +812,27 @@ export default function ClosingStockByLocationPage() {
 
       {/* Department scope — who's count is being viewed/recorded. Admin / Manager /
           HOD / Store Manager may pick any department (or the store/overall bucket);
-          a plain department user is pinned to their own department. */}
-      {canSeeAllDepts ? (
+          a user with granted visible departments picks among that subset; a plain
+          department user is pinned to their own department (amber banner). */}
+      {hasDeptChoice ? (
         <div className="bg-white border border-[#E8D5C4] rounded-xl px-4 py-3 flex items-center gap-3 flex-wrap">
           <span className="text-xs font-medium text-[#6B5744]">Counting for department</span>
           <select value={selectedDept} onChange={e => setSelectedDept(e.target.value)}
                   className="px-2 py-1.5 border border-[#D4B896] rounded text-sm bg-white">
-            <option value="">— Store / Overall —</option>
-            {departments.map(d => (
+            {(canSeeAllDepts || !ownDeptId) && <option value="">— Store / Overall —</option>}
+            {pickableDepts.map(d => (
               <option key={d.id} value={d.id}>
                 {d.name}{d.area ? ` · ${AREA_LABELS[d.area] || d.area}` : ''}
               </option>
             ))}
           </select>
           <span className="text-[10px] text-[#8B7355]">
-            Counts you save below are recorded against this department.
+            {canSeeAllDepts
+              ? 'Counts you save below are recorded against this department.'
+              : 'You may record for your granted departments. Counts you save below are recorded against the selected one.'}
           </span>
         </div>
-      ) : ownDeptId ? (
-        <div className="bg-[#FFF1E3] border border-[#D4B896] rounded-xl px-4 py-2.5 text-xs text-[#6B5744]">
-          You are recording closing stock for your own department only.
-        </div>
-      ) : null}
+      ) : tierBanner}
 
       {/* Per-area rollup — admin/HOD view of each area's overall closing value. */}
       {canSeeAllDepts && byArea.length > 0 && (
@@ -1016,17 +1052,18 @@ export default function ClosingStockByLocationPage() {
                     />
                   </div>
                   {/* Department scope — same selection as the grid header. Admin /
-                      HOD pick any department; plain users are shown read-only. */}
+                      HOD pick any department; visible-dept users pick among their
+                      granted subset; pinned users are shown read-only. */}
                   <div>
                     <label className="block text-xs font-medium text-[#6B5744] mb-1">Department</label>
-                    {canSeeAllDepts ? (
+                    {hasDeptChoice ? (
                       <select
                         value={selectedDept}
                         onChange={e => setSelectedDept(e.target.value)}
                         className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
                       >
-                        <option value="">Store / Overall</option>
-                        {departments.map(d => (
+                        {(canSeeAllDepts || !ownDeptId) && <option value="">Store / Overall</option>}
+                        {pickableDepts.map(d => (
                           <option key={d.id} value={d.id}>
                             {d.name}{d.area ? ` · ${AREA_LABELS[d.area] || d.area}` : ''}
                           </option>
@@ -1034,7 +1071,7 @@ export default function ClosingStockByLocationPage() {
                       </select>
                     ) : (
                       <div className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#6B5744]">
-                        {departments.find(d => d.id === ownDeptId)?.name || 'Your department'}
+                        {ownDeptName}
                       </div>
                     )}
                   </div>
@@ -1076,6 +1113,9 @@ export default function ClosingStockByLocationPage() {
                     </label>
                   )}
                 </div>
+
+                {/* Effective-tier banner — only when the dept picker is hidden. */}
+                {tierBanner}
 
                 {adjustStockModal && (
                   <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs">

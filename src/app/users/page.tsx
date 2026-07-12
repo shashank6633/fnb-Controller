@@ -184,6 +184,7 @@ export default function UsersPage() {
                   <th className="text-left  py-2 px-3 font-medium">Name / Email</th>
                   <th className="text-left  py-2 px-3 font-medium">Position</th>
                   <th className="text-left  py-2 px-3 font-medium">Role</th>
+                  <th className="text-left  py-2 px-3 font-medium">Effective tier</th>
                   <th className="text-left  py-2 px-3 font-medium">Department</th>
                   <th className="text-left  py-2 px-3 font-medium">Permissions</th>
                   <th className="text-left  py-2 px-3 font-medium">Status</th>
@@ -212,6 +213,26 @@ export default function UsersPage() {
                       }`}>
                         {u.role === 'admin' ? <ShieldCheck className="w-3 h-3" /> : <Shield className="w-3 h-3" />} {(u.role || 'staff').toUpperCase()}
                       </span>
+                    </td>
+                    {/* EFFECTIVE tier — what getCurrentUser actually resolves: the
+                        assigned named role's base_role wins over the legacy user
+                        tier. Surfaces silent downgrades (e.g. a "manager" user
+                        whose named role is staff-based). Purely display. */}
+                    <td className="py-2 px-3">
+                      {(() => {
+                        const assignedRole = u.role_id ? roles.find(x => x.id === u.role_id) : undefined;
+                        const tier: UserRole = (assignedRole?.base_role || u.role || 'staff') as UserRole;
+                        const cls = tier === 'admin'   ? 'bg-red-100 text-red-700'
+                                  : tier === 'manager' ? 'bg-amber-100 text-amber-800'
+                                                       : 'bg-gray-100 text-gray-600';
+                        const fromRole = u.role_id ? (assignedRole?.name || u.role_name || '') : '';
+                        return (
+                          <span className={`inline-flex items-center text-[10px] font-semibold px-1.5 py-0.5 rounded ${cls}`}
+                                title={fromRole ? `from role ${fromRole}` : undefined}>
+                            {tier.toUpperCase()}
+                          </span>
+                        );
+                      })()}
                     </td>
                     <td className="py-2 px-3 text-xs text-[#6B5744]">
                       {u.department_name
