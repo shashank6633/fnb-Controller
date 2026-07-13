@@ -74,17 +74,12 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "KOT & Bill Printers", href: "/dine-in/offline-print",    icon: Printer },
       { kind: "link", label: "Captain (Tablet)",   href: "/captain",                   icon: Smartphone },
       { kind: "link", label: "Print Agent",        href: "/print/agent",               icon: Printer },
-      { kind: "link", label: "KOT Data Points",    href: "/dine-in/kot-analytics",     icon: BarChart3 },
-      { kind: "link", label: "Captain Response Times", href: "/dine-in/captain-performance", icon: Timer },
       { kind: "link", label: "Tables",             href: "/dine-in/tables",            icon: Utensils },
       { kind: "link", label: "Menu Items",         href: "/menu-items",                icon: BookOpen },
       { kind: "link", label: "Recipes",            href: "/recipes",                   icon: ChefHat },
-      { kind: "link", label: "Menu Engineering",   href: "/menu-engineering",          icon: BarChart3 },
       { kind: "link", label: "Direct Items",       href: "/direct-items",              icon: Link2 },
       { kind: "link", label: "Sales Upload",       href: "/sales",                     icon: Upload },
       { kind: "link", label: "Reconciliation",     href: "/dine-in/reconciliation",    icon: AlertTriangle },
-      { kind: "link", label: "Reports",            href: "/reports?segment=DINE_IN",   icon: BarChart3 },
-      { kind: "link", label: "Variance Report",    href: "/variance-report",           icon: ClipboardCheck },
     ],
   },
 
@@ -101,7 +96,6 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Food Consumption",            href: "/food-consumption",   icon: Utensils },
       { kind: "link", label: "Party Liquor Consumption",    href: "/party-pnl",          icon: PartyPopper },
       { kind: "link", label: "Party P&L",                   href: "/parties",            icon: BarChart3 },
-      { kind: "link", label: "Reports",                     href: "/reports?segment=PARTY", icon: BarChart3 },
     ],
   },
 
@@ -148,14 +142,28 @@ const navTree: NavEntry[] = [
     items: [
       { kind: "link", label: "Kitchen Production", href: "/kitchen-production", icon: ChefHat },
       { kind: "link", label: "Production Dashboard", href: "/kitchen-production/dashboard", icon: LayoutGrid },
-      { kind: "link", label: "Production Reports", href: "/kitchen-production/reports", icon: BarChart3 },
       { kind: "link", label: "Scan Batch",         href: "/kitchen-production/scan", icon: ScanLine },
       { kind: "link", label: "Butchering",         href: "/butchering",         icon: Scissors },
     ],
   },
 
-  { kind: "link", label: "Dept Consumption", href: "/department-consumption", icon: BarChart3 },
-  { kind: "link", label: "Staff Meals",      href: "/staff-meals",            icon: Utensils },
+  // Reports — every analytics/report surface across segments in one place,
+  // mirroring the page-catalog "Reports" section.
+  {
+    kind: "section",
+    label: "Reports",
+    icon: BarChart3,
+    items: [
+      { kind: "link", label: "Reports",            href: "/reports",                icon: BarChart3 },
+      { kind: "link", label: "Menu Engineering",   href: "/menu-engineering",       icon: BarChart3 },
+      { kind: "link", label: "Variance Report",    href: "/variance-report",        icon: ClipboardCheck },
+      { kind: "link", label: "Dept Consumption",   href: "/department-consumption", icon: BarChart3 },
+      { kind: "link", label: "Staff Meals",        href: "/staff-meals",            icon: Utensils },
+      { kind: "link", label: "KOT Data Points",    href: "/dine-in/kot-analytics",  icon: BarChart3 },
+      { kind: "link", label: "Captain Response Times", href: "/dine-in/captain-performance", icon: Timer },
+      { kind: "link", label: "Production Reports", href: "/kitchen-production/reports", icon: BarChart3 },
+    ],
+  },
 
   // AKAN CRM — AI assistant / training / quizzes for Front Office & GRE staff.
   // Links only show for users granted the paths in page-catalog (AKAN CRM section).

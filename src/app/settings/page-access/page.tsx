@@ -42,7 +42,7 @@ export default function PageAccessSettingsPage() {
   const [draft, setDraft] = useState<Record<string, Set<string>>>({});
   // userId → Set<departmentId> of currently checked departments
   const [deptDraft, setDeptDraft] = useState<Record<string, Set<string>>>({});
-  const [expanded, setExpanded] = useState<Set<string>>(new Set(['Parties', 'Purchasing', 'Inventory', 'Production'])); // default-expand likely-used sections
+  const [expanded, setExpanded] = useState<Set<string>>(new Set(['Parties', 'Purchasing', 'Inventory', 'Production', 'Reports'])); // default-expand likely-used sections
   const [busy, setBusy] = useState<string | null>(null);
 
   const load = async () => {
