@@ -51,8 +51,8 @@ import {
 
 // ─── Nav structure ──────────────────────────────────────────────────────
 // Either a flat link OR a collapsible section that wraps children. The
-// "Store" section bundles all back-office store + inventory pages so the
-// sidebar stays compact instead of one long flat list.
+// Purchasing / Inventory / Production sections bundle all back-office store
+// pages so the sidebar stays compact instead of one long flat list.
 type NavLink    = { kind: "link"; label: string; href: string; icon: LucideIcon };
 type NavSection = { kind: "section"; label: string; icon: LucideIcon; items: NavLink[] };
 type NavEntry   = NavLink | NavSection;
@@ -109,34 +109,48 @@ const navTree: NavEntry[] = [
   // party requisitions; this is for routine kitchen restocking.
   { kind: "link", label: "Internal Requisitions", href: "/requisitions", icon: ListChecks },
 
-  // Store — shared infrastructure for both Dine-In + Parties.
+  // Back-office store pages — shared infrastructure for both Dine-In + Parties,
+  // split into Purchasing / Inventory / Production.
   {
     kind: "section",
-    label: "Store",
+    label: "Purchasing",
+    icon: ShoppingCart,
+    items: [
+      { kind: "link", label: "Purchases",          href: "/purchases",          icon: ShoppingCart },
+      { kind: "link", label: "Purchase Orders",    href: "/purchase-orders",    icon: ClipboardList },
+      { kind: "link", label: "Goods Receipt (GRN)", href: "/grn",               icon: ClipboardList },
+      { kind: "link", label: "Receiving Variance", href: "/receiving-variance", icon: AlertTriangle },
+      { kind: "link", label: "Vendors",            href: "/vendors",            icon: Building2 },
+      { kind: "link", label: "Vendor → Items",     href: "/vendors/materials",  icon: Building2 },
+      { kind: "link", label: "Contracts",          href: "/contracts",          icon: FileText },
+    ],
+  },
+  {
+    kind: "section",
+    label: "Inventory",
     icon: Boxes,
     items: [
+      { kind: "link", label: "Raw Materials",      href: "/inventory",          icon: Package },
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
       { kind: "link", label: "Issue Requisitions", href: "/store-requisitions", icon: Package },
+      { kind: "link", label: "Closing Stock",      href: "/closing-stock",      icon: ClipboardCheck },
+      { kind: "link", label: "Daily Roll-up",      href: "/daily-rollup",       icon: ClipboardCheck },
+      { kind: "link", label: "Wastage",            href: "/wastage",            icon: ClipboardCheck },
+      { kind: "link", label: "Unit Audit",         href: "/unit-audit",         icon: ShieldAlert },
+      { kind: "link", label: "Unit Registry",      href: "/units",              icon: ShieldAlert },
+      { kind: "link", label: "Dept Materials (Party)", href: "/department-materials", icon: Warehouse },
+    ],
+  },
+  {
+    kind: "section",
+    label: "Production",
+    icon: ChefHat,
+    items: [
       { kind: "link", label: "Kitchen Production", href: "/kitchen-production", icon: ChefHat },
       { kind: "link", label: "Production Dashboard", href: "/kitchen-production/dashboard", icon: LayoutGrid },
       { kind: "link", label: "Production Reports", href: "/kitchen-production/reports", icon: BarChart3 },
       { kind: "link", label: "Scan Batch",         href: "/kitchen-production/scan", icon: ScanLine },
-      { kind: "link", label: "Purchases",          href: "/purchases",          icon: ShoppingCart },
-      { kind: "link", label: "Purchase Orders",    href: "/purchase-orders",    icon: ClipboardList },
-      { kind: "link", label: "Goods Receipt (GRN)", href: "/grn",               icon: ClipboardList },
       { kind: "link", label: "Butchering",         href: "/butchering",         icon: Scissors },
-      { kind: "link", label: "Receiving Variance", href: "/receiving-variance", icon: AlertTriangle },
-      { kind: "link", label: "Departments",        href: "/departments",        icon: Building },
-      { kind: "link", label: "Dept Materials (Party)", href: "/department-materials", icon: Warehouse },
-      { kind: "link", label: "Vendors",            href: "/vendors",            icon: Building2 },
-      { kind: "link", label: "Vendor → Items",     href: "/vendors/materials",  icon: Building2 },
-      { kind: "link", label: "Contracts",          href: "/contracts",          icon: FileText },
-      { kind: "link", label: "Raw Materials",      href: "/inventory",          icon: Package },
-      { kind: "link", label: "Unit Audit",         href: "/unit-audit",         icon: ShieldAlert },
-      { kind: "link", label: "Unit Registry",      href: "/units",              icon: ShieldAlert },
-      { kind: "link", label: "Closing Stock",      href: "/closing-stock",      icon: ClipboardCheck },
-      { kind: "link", label: "Daily Roll-up",      href: "/daily-rollup",       icon: ClipboardCheck },
-      { kind: "link", label: "Wastage",            href: "/wastage",            icon: ClipboardCheck },
     ],
   },
 
@@ -167,6 +181,7 @@ const navTree: NavEntry[] = [
     label: "Settings",
     icon: ShieldAlert,
     items: [
+      { kind: "link", label: "Departments",    href: "/departments",            icon: Building },
       { kind: "link", label: "Users",          href: "/users",                  icon: Users },
       { kind: "link", label: "Roles",          href: "/settings/roles",         icon: Users },
       { kind: "link", label: "Print Design",   href: "/settings/print-design",  icon: Printer },
