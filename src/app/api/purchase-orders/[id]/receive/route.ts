@@ -1,6 +1,7 @@
 import { getDb, generateId, updateMaterialPrice, logAuditEvent } from '@/lib/db';
 import { currentRole } from '@/app/api/purchase-orders/route';
 import { getCurrentUser } from '@/lib/auth';
+import { centralFlowBlock } from '@/lib/store-engine';
 
 /**
  * Mark an approved PO as Received.
@@ -66,11 +67,28 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     if (items.length === 0) return Response.json({ error: 'PO has no items' }, { status: 400 });
 
+    // Phase B store guard (batch → skip + report per line): store-mapped
+    // materials (liquor) on HISTORICAL POs are skipped at receive time so they
+    // never bump Central stock / purchases / average_price. New POs can't even
+    // contain them (create/edit reject). The PO data itself is untouched.
+    const storeBlocked: { material_id: string; material_name: string; error: string }[] = [];
+    const receivable = items.filter((it: any) => {
+      const msg = centralFlowBlock(db, String(it.material_id || ''));
+      if (msg) { storeBlocked.push({ material_id: it.material_id, material_name: it.material_name, error: msg }); return false; }
+      return true;
+    });
+    if (receivable.length === 0) {
+      return Response.json({
+        error: `Nothing to receive — every line is a store-mapped material. ${storeBlocked[0]?.error || ''}`,
+        store_blocked: storeBlocked,
+      }, { status: 400 });
+    }
+
     // Reject negative qty / price in the receive payload BEFORE the txn starts.
     // Receiving is an additive workflow — stock corrections (negative qtys) live
     // on the dedicated GRN back-correction flow. A negative here would silently
     // reduce stock without the audit-trail tagging that back-corrections get.
-    for (const it of items) {
+    for (const it of receivable) {
       const ov = overrides.get(it.id);
       if (!ov) continue;
       const checks: Array<[string, unknown]> = [
@@ -139,7 +157,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // Excess detection happens inline below — the `excessLines` array is
       // hoisted at the outer function scope (filled here, read post-txn for
       // the admin audit + Slack ping).
-      for (const it of items) {
+      for (const it of receivable) {
         const ov = overrides.get(it.id);
         const received = ov?.quantity   != null ? Number(ov.quantity)   : it.quantity;
         const accepted = ov?.accepted   != null ? Number(ov.accepted)   : received;
@@ -362,7 +380,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       received_at: receivedAt,
       grn_id:     (result as any).grn_id,
       grn_number: (result as any).grn_number,
-      lines_processed: items.length,
+      lines_processed: receivable.length,
+      store_blocked: storeBlocked,
       materials_touched: touchedMaterials.size,
       total_cost: total,
       excess_lines: excessLines.length,           // expose to caller so the UI

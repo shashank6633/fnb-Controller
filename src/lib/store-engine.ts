@@ -161,6 +161,31 @@ export function isStoreMappedMaterial(db: Database, materialIdOrCategory: string
 }
 
 /**
+ * Phase B HARD guard: returns the blocking error message when a material must
+ * NOT enter Central Store flows (purchases / GRN / PO / inward import), else
+ * null (= Central material, proceed). Accepts a raw_materials.id OR a raw
+ * category string, like isStoreMappedMaterial.
+ *
+ * Wired into: /api/purchases POST, /api/grn POST (per-line skip+report),
+ * /api/purchase-orders POST+PUT (draft compose), /api/purchase-orders/[id]/
+ * receive (per-line skip+report, so HISTORICAL liquor POs never pollute
+ * central stock), /api/inward-import/commit (per-row skip+report).
+ * Store procurement lives ONLY in store_stock_ledger via /api/stores/[id]/
+ * procure — central purchases / average_price / current_stock stay untouched.
+ */
+export function centralFlowBlock(db: Database, materialIdOrCategory: string): string | null {
+  const key = String(materialIdOrCategory || '').trim();
+  if (!key) return null;
+  const mat = db.prepare('SELECT name, category FROM raw_materials WHERE id = ?').get(key) as { name: string; category: string } | undefined;
+  const category = mat ? mat.category : key;
+  const storeId = materialStoreId(db, { category });
+  if (!storeId) return null;
+  const store = getStoreById(db, storeId);
+  const label = mat ? `"${mat.name}"` : `Category "${category}"`;
+  return `${label} is a ${store?.name || 'store location'} material — use Inventory → Liquor Store → New Purchase. Store-mapped materials never enter Central Store purchases.`;
+}
+
+/**
  * Soft-warning hook for Phase B UI banners: returns a human-readable warning
  * string when the material belongs to a store location, else null. Existing
  * purchase flows may render this as a non-blocking banner BEFORE Phase B turns

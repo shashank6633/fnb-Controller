@@ -1,4 +1,5 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
+import { centralFlowBlock } from '@/lib/store-engine';
 
 export async function GET(request: Request) {
   try {
@@ -67,6 +68,12 @@ export async function POST(request: Request) {
     if (!material) {
       return Response.json({ error: 'Material not found' }, { status: 404 });
     }
+
+    // Phase B store guard: store-mapped materials (liquor) must NEVER enter
+    // Central Store purchases — they live in the store ledger only
+    // (/api/stores/[id]/procure). Historical rows are untouched.
+    const storeBlock = centralFlowBlock(db, material_id);
+    if (storeBlock) return Response.json({ error: storeBlock }, { status: 400 });
 
     const total_price = Math.round(quantity * unit_price * 100) / 100;
     const id = generateId();

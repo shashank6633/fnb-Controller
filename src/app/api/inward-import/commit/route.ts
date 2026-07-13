@@ -6,6 +6,7 @@ import {
 } from '@/lib/recaho-inward';
 import { requireRole, getCurrentOutletId } from '@/lib/auth';
 import { findUnitLock } from '@/lib/unit-audit-lock';
+import { centralFlowBlock } from '@/lib/store-engine';
 
 /**
  * Step 2 — actually persist the inward report into the DB.
@@ -82,6 +83,8 @@ export async function POST(req: Request) {
 
     const stats = { purchases: 0, newMaterials: 0, reusedMaterials: 0,
                     newVendors: 0, skipped: 0, errors: [] as string[],
+                    // Phase B store guard — liquor rows skipped (batch: per-line, never fail the file)
+                    store_blocked: [] as Array<{ material: string; error: string }>,
                     unit_audit_warnings: [] as Array<{
                       material: string; sku?: string;
                       locked_purchase_unit?: string; incoming_purchase_unit?: string;
@@ -152,6 +155,17 @@ export async function POST(req: Request) {
                 });
               }
             }
+          }
+
+          // Phase B store guard (batch → skip + report per row): store-mapped
+          // materials (liquor) never enter Central purchases/stock via imports.
+          // The master row above may still be created/reused — harmless; only
+          // the purchase + stock movement is blocked. Use the Liquor Store page.
+          const storeMsg = centralFlowBlock(db, mat.id);
+          if (storeMsg) {
+            stats.store_blocked.push({ material: r.itemName, error: storeMsg });
+            stats.skipped++;
+            continue;
           }
 
           // Store the purchases ROW in PURCHASE units (qty = bottles/pieces, rate =

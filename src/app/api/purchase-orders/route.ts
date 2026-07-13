@@ -1,5 +1,18 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { centralFlowBlock } from '@/lib/store-engine';
+
+/** Phase B store guard for PO composition (create/edit are interactive, so we
+ *  reject the request with a clear message instead of silently dropping lines).
+ *  Store-mapped materials (liquor) are procured on the store ledger, never on
+ *  Central Store POs. Historical POs are untouched (receive skips their lines). */
+function storeBlockedError(db: ReturnType<typeof getDb>, items: any[]): string | null {
+  for (const it of items || []) {
+    const msg = centralFlowBlock(db, String(it?.material_id || ''));
+    if (msg) return msg;
+  }
+  return null;
+}
 
 /**
  * Purchase Orders REST API.
@@ -176,6 +189,8 @@ export async function POST(request: Request) {
     if (!Array.isArray(items) || items.length === 0) {
       return Response.json({ error: 'items array required' }, { status: 400 });
     }
+    const blocked = storeBlockedError(db, items);
+    if (blocked) return Response.json({ error: blocked }, { status: 400 });
 
     // Resolve vendor — prefer vendor_id, cache name for display
     let resolvedVendorId: string | null = vendor_id || null;
@@ -238,6 +253,10 @@ export async function PUT(request: Request) {
     const po = db.prepare('SELECT status FROM purchase_orders WHERE id = ?').get(id) as any;
     if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
     if (po.status !== 'draft') return Response.json({ error: 'Only drafts can be edited' }, { status: 400 });
+    if (Array.isArray(items)) {
+      const blocked = storeBlockedError(db, items);
+      if (blocked) return Response.json({ error: blocked }, { status: 400 });
+    }
 
     let resolvedVendorName = vendor;
     if (vendor_id) {

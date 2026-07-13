@@ -1,5 +1,6 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { centralFlowBlock } from '@/lib/store-engine';
 
 /**
  * GRN read API. Listing + detail.
@@ -86,6 +87,22 @@ export async function POST(request: Request) {
     }
     const outletId = await getCurrentOutletId();
 
+    // Phase B store guard (batch endpoint → skip + report per line, never fail
+    // the whole GRN): store-mapped materials (liquor) can't be received into
+    // Central stock — they're procured on the store ledger instead.
+    const storeBlocked: { material_id: string; error: string }[] = [];
+    const receivable = items.filter((it: any) => {
+      const msg = centralFlowBlock(db, String(it.material_id || ''));
+      if (msg) { storeBlocked.push({ material_id: it.material_id, error: msg }); return false; }
+      return true;
+    });
+    if (receivable.length === 0) {
+      return Response.json({
+        error: `No receivable lines — ${storeBlocked.length} store-mapped line(s) blocked. ${storeBlocked[0]?.error || ''}`,
+        store_blocked: storeBlocked,
+      }, { status: 400 });
+    }
+
     // Generate GRN number
     const yr = String(date).slice(0, 4);
     const lastGrn = db.prepare(`SELECT grn_number FROM goods_receipt_notes WHERE grn_number LIKE 'GRN-' || ? || '-%' ORDER BY grn_number DESC LIMIT 1`).get(yr) as any;
@@ -129,7 +146,7 @@ export async function POST(request: Request) {
       `);
 
       let hasReject = false;
-      for (const it of items) {
+      for (const it of receivable) {
         const received = Number(it.quantity_received) || 0;
         const accepted = it.quantity_accepted != null ? Number(it.quantity_accepted) : received;
         // Rejected qty only makes sense in the positive-receipt case
@@ -175,7 +192,8 @@ export async function POST(request: Request) {
 
     const grn = db.prepare('SELECT * FROM goods_receipt_notes WHERE id = ?').get(grnId);
     return Response.json({ success: true, grn_id: grnId, grn_number: grnNumber, grn,
-                           materials_touched: touched.size }, { status: 201 });
+                           materials_touched: touched.size,
+                           store_blocked: storeBlocked }, { status: 201 });
   } catch (e: any) {
     console.error('[grn POST]', e);
     return Response.json({ error: e.message }, { status: 500 });
