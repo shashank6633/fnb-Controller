@@ -20,6 +20,7 @@ import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { Menu, LogOut, UtensilsCrossed } from 'lucide-react';
 import { api } from '@/lib/api';
+import NotificationBell from '@/components/NotificationBell';
 
 interface SessionUser { email: string; name: string; role: string; }
 
@@ -67,8 +68,10 @@ export default function MobileTopBar() {
         </div>
       </div>
 
-      {/* Right: user chip (tap → logout menu) */}
+      {/* Right: action-inbox bell + user chip (tap → logout menu) */}
       {user && (
+        <div className="flex items-center gap-1">
+          <NotificationBell dark />
         <div className="relative">
           <button
             onClick={() => setMenuOpen(o => !o)}
@@ -92,6 +95,7 @@ export default function MobileTopBar() {
               </div>
             </>
           )}
+        </div>
         </div>
       )}
     </header>

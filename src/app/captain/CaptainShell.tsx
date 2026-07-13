@@ -9,6 +9,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef, createContext } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
+import NotificationBell from '@/components/NotificationBell';
 import {
   ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search, Loader2,
   MapPin, ChevronDown, Users, WifiOff, Bell,
@@ -311,6 +312,8 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
           </div>
         </div>
         <div className="flex items-center gap-1">
+          {/* Action-inbox bell (icon-only; panel opens rightward over the main area) */}
+          <NotificationBell dark align="left" />
           <button onClick={load} className="p-2 text-white/60 hover:text-white active:scale-95"><RefreshCw className="w-4 h-4" /></button>
           <div className="relative">
             <button onClick={() => setMenuOpen((o) => !o)} className="p-2 text-white/60 hover:text-white"><MoreVertical className="w-4 h-4" /></button>
@@ -476,8 +479,11 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
       </button>
     )}
     <div className="md:flex min-h-screen">
-      {/* Persistent sidebar (tablet/desktop, md+) */}
-      <aside className="hidden md:block shrink-0 h-screen sticky top-0">{sidebar}</aside>
+      {/* Persistent sidebar (tablet/desktop, md+). z-40: sticky creates a stacking
+          context, so without a z-index the bell's dropdown (inside the sidebar)
+          would paint UNDER the main column's content where it overhangs it. Kept
+          below the drawer (z-50) and the modals/toasts (z-[60]+). */}
+      <aside className="hidden md:block shrink-0 h-screen sticky top-0 z-40">{sidebar}</aside>
 
       {/* Drawer (phones / portrait, < md) — opened by the ☰ in each page header */}
       {drawer && <div className="fixed inset-0 bg-black/50 z-40 md:hidden" onClick={() => setDrawer(false)} />}

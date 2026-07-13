@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { LogOut, ShieldCheck, User as UserIcon, Store } from 'lucide-react';
 import { usePathname, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
+import NotificationBell from '@/components/NotificationBell';
 
 interface SessionUser { id: string; email: string; name: string; role: 'admin' | 'manager'; }
 interface Outlet { id: string; name: string; is_default: number; }
@@ -68,6 +69,9 @@ export default function UserBar() {
       ) : null}
 
       <span className="text-[#E8D5C4]">·</span>
+
+      {/* Action-inbox bell — left of the user identity chip */}
+      <NotificationBell />
 
       {user.role === 'admin' ? <ShieldCheck className="w-3.5 h-3.5 text-[#af4408]" /> : <UserIcon className="w-3.5 h-3.5 text-[#6B5744]" />}
       <span className="text-xs font-medium text-[#2D1B0E]">{user.name || user.email}</span>
