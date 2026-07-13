@@ -178,7 +178,8 @@ export default function UsersPage() {
 
         <div className="bg-white border border-[#E8D5C4] rounded-xl shadow overflow-hidden">
           {loading ? <div className="p-6 text-center text-sm text-[#8B7355]">Loading…</div> : (
-            <table className="w-full text-sm">
+            <div className="overflow-x-auto">
+            <table className="w-full min-w-[800px] text-sm">
               <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
                 <tr>
                   <th className="text-left  py-2 px-3 font-medium">Name / Email</th>
@@ -285,6 +286,7 @@ export default function UsersPage() {
                 ))}
               </tbody>
             </table>
+            </div>
           )}
         </div>
 

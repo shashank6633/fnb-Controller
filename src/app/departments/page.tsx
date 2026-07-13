@@ -184,7 +184,8 @@ export default function DepartmentsPage() {
         ) : depts.length === 0 ? (
           <div className="p-8 text-center text-[#8B7355]">No departments yet. Click "New Department" to add Bar, Hot Kitchen, Cold Kitchen, Pastry, etc.</div>
         ) : (
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-xl">
+          <table className="w-full min-w-[560px] text-sm">
             <thead className="text-xs text-[#8B7355] bg-[#FFF8F0]">
               <tr>
                 <th className="text-left  py-2 px-3 font-medium">Name</th>
@@ -289,6 +290,7 @@ export default function DepartmentsPage() {
               })}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 

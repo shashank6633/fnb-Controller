@@ -248,7 +248,8 @@ export default function CategoryManagerPage() {
               {g.leaves.length === 0 ? (
                 <div className="px-4 py-3 text-xs text-[#8B7355] italic">No sub-categories yet. Use the form above to add one under "{g.super_category}".</div>
               ) : (
-                <table className="w-full text-xs">
+                <div className="overflow-x-auto">
+                <table className="w-full min-w-[560px] text-xs">
                   <thead className="text-[#6B5744]">
                     <tr>
                       <th className="text-left  py-1.5 px-3 font-medium">Sub-category</th>
@@ -292,6 +293,7 @@ export default function CategoryManagerPage() {
                     })}
                   </tbody>
                 </table>
+                </div>
               )}
             </div>
           ))}

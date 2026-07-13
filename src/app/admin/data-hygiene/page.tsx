@@ -175,7 +175,8 @@ export default function DataHygienePage() {
                 ✓ No issues match your filters.
               </div>
             ) : (
-              <table className="w-full text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full min-w-[600px] text-xs">
                 <thead className="bg-[#FFF1E3] text-[#6B5744]">
                   <tr>
                     <th className="text-left py-2 px-3 font-medium w-16">Severity</th>
@@ -215,6 +216,7 @@ export default function DataHygienePage() {
                   })}
                 </tbody>
               </table>
+              </div>
             )}
             {filtered.length > 500 && (
               <div className="px-3 py-2 bg-[#FFF8F0] text-[10px] text-[#8B7355] text-center">
