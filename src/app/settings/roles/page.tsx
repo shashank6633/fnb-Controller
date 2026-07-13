@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
 import { PAGE_CATALOG } from '@/lib/page-catalog';
-import { Shield, Plus, Pencil, Trash2, X, Check, Loader2, Users } from 'lucide-react';
+import { Shield, Plus, Pencil, Trash2, X, Check, Loader2, Users, ChevronDown, ChevronRight } from 'lucide-react';
 
 interface Role {
   id: string;
@@ -46,6 +46,9 @@ export default function RolesAdmin() {
   const [forbidden, setForbidden] = useState(false);
   const [draft, setDraft] = useState<ReturnType<typeof blankDraft> | null>(null);
   const [saving, setSaving] = useState(false);
+  // Mobile-only accordion UI state (which page-access sections are expanded).
+  // Render-layer only — never touches the draft/save payload.
+  const [openSections, setOpenSections] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     try {
@@ -57,8 +60,9 @@ export default function RolesAdmin() {
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  function openCreate() { setDraft(blankDraft()); }
+  function openCreate() { setOpenSections(new Set()); setDraft(blankDraft()); }
   function openEdit(role: Role) {
+    setOpenSections(new Set());
     setDraft({
       id: role.id, name: role.name, base_role: role.base_role, description: role.description || '',
       is_head_chef: !!role.is_head_chef, is_store_manager: !!role.is_store_manager,
@@ -76,6 +80,19 @@ export default function RolesAdmin() {
       const all = paths.every((p) => d.pages.has(p));
       const n = new Set(d.pages);
       paths.forEach((p) => all ? n.delete(p) : n.add(p));
+      return { ...d, pages: n };
+    });
+  }
+  /** Mobile accordion: expand/collapse a section card (UI-only). */
+  function toggleAccordion(label: string) {
+    setOpenSections((s) => { const n = new Set(s); n.has(label) ? n.delete(label) : n.add(label); return n; });
+  }
+  /** Mobile [All]/[None]: callers pass only SELECTABLE paths (HOD-locked excluded). */
+  function setSectionPages(paths: string[], on: boolean) {
+    setDraft((d) => {
+      if (!d) return d;
+      const n = new Set(d.pages);
+      paths.forEach((p) => on ? n.add(p) : n.delete(p));
       return { ...d, pages: n };
     });
   }
@@ -238,7 +255,57 @@ export default function RolesAdmin() {
               ) : (
                 <div>
                   <label className="text-xs font-semibold text-[#8B7355]">Pages this role can open</label>
-                  <div className="mt-1 border border-[#E8D5C4] rounded-xl divide-y divide-[#F0E4D6]">
+
+                  {/* Mobile (<lg): accordion — one collapsible card per section. Same
+                      draft.pages state as the desktop grid below; render-layer only. */}
+                  <div className="mt-1 space-y-2 lg:hidden">
+                    {PAGE_CATALOG.map((section) => {
+                      const selectable = section.pages
+                        .filter((p) => !(p.hodOnly && !draft.is_head_chef))
+                        .map((p) => p.path);
+                      const selCount = section.pages.filter((p) => draft.pages.has(p.path)).length;
+                      const open = openSections.has(section.label);
+                      return (
+                        <div key={section.label} className="border border-[#E8D5C4] rounded-xl bg-white overflow-hidden">
+                          <button type="button" onClick={() => toggleAccordion(section.label)} aria-expanded={open}
+                            className="w-full min-h-[44px] px-3 py-2.5 flex items-center justify-between gap-2 text-sm font-semibold text-[#2D1B0E]">
+                            <span>{section.label}</span>
+                            <span className="flex items-center gap-1.5 text-xs font-medium text-[#8B7355]">
+                              {selCount}/{section.pages.length}
+                              {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                            </span>
+                          </button>
+                          {open && (
+                            <div className="border-t border-[#F0E4D6]">
+                              <div className="flex gap-2 px-3 py-2 border-b border-[#F0E4D6] bg-[#FFF8F0]">
+                                <button type="button" onClick={() => setSectionPages(selectable, true)}
+                                  className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-[#D4B896] text-[#6B5744] active:scale-95">All</button>
+                                <button type="button" onClick={() => setSectionPages(selectable, false)}
+                                  className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-[#D4B896] text-[#6B5744] active:scale-95">None</button>
+                              </div>
+                              <div className="divide-y divide-[#F0E4D6]">
+                                {section.pages.map((p) => {
+                                  const lockedHod = !!p.hodOnly && !draft.is_head_chef;
+                                  return (
+                                    <label key={p.path}
+                                           title={p.hodOnly ? 'Only HODs (tick “Is HOD” above) and admins can open this page' : undefined}
+                                           className={`flex items-center gap-3 w-full min-h-[44px] px-3 py-2 text-sm ${lockedHod ? 'text-[#B79A82]' : 'text-[#6B5744] active:bg-[#FFF8F0]'}`}>
+                                      <input type="checkbox" checked={draft.pages.has(p.path)} disabled={lockedHod} onChange={() => togglePage(p.path)} />
+                                      <span className="flex-1">{p.label}</span>
+                                      {p.hodOnly && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium shrink-0">HOD only</span>}
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Desktop (≥lg): original section grid — unchanged. */}
+                  <div className="mt-1 border border-[#E8D5C4] rounded-xl divide-y divide-[#F0E4D6] hidden lg:block">
                     {PAGE_CATALOG.map((section) => {
                       const paths = section.pages.map((p) => p.path);
                       const allOn = paths.every((p) => draft.pages.has(p));
@@ -275,9 +342,17 @@ export default function RolesAdmin() {
                 </div>
               )}
             </div>
-            <div className="sticky bottom-0 bg-white border-t border-[#F0E4D6] px-5 py-3 flex justify-end gap-2">
+            {/* Desktop (≥lg) footer — original, unchanged. */}
+            <div className="sticky bottom-0 bg-white border-t border-[#F0E4D6] px-5 py-3 hidden lg:flex justify-end gap-2">
               <button onClick={() => setDraft(null)} className="px-4 py-2 text-sm text-[#6B5744]">Cancel</button>
               <button onClick={save} disabled={saving} className="flex items-center gap-2 bg-[#af4408] text-white px-5 py-2 rounded-lg text-sm font-semibold disabled:opacity-50">
+                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Save role
+              </button>
+            </div>
+            {/* Mobile (<lg) sticky action bar — same handlers as the desktop buttons. */}
+            <div className="sticky bottom-0 bg-white border-t border-[#F0E4D6] px-4 py-3 grid grid-cols-2 gap-2 lg:hidden">
+              <button onClick={() => setDraft(null)} className="min-h-[44px] px-4 py-2 text-sm font-semibold text-[#6B5744] border border-[#D4B896] rounded-lg active:scale-95">Cancel</button>
+              <button onClick={save} disabled={saving} className="min-h-[44px] flex items-center justify-center gap-2 bg-[#af4408] text-white px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50 active:scale-95">
                 {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Save role
               </button>
             </div>
