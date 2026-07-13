@@ -3,62 +3,126 @@ name: Deploy FNB Controller
 on:
   workflow_dispatch:
 
+# Never let two deploys race each other on the box (the old on-box-build flow
+# had exactly this failure mode when a retry was fired mid-run).
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy to Lightsail
-        uses: appleboy/ssh-action@v1.0.3
+      # ── 1. BUILD ON THE RUNNER ────────────────────────────────────────
+      # `next build` on the small Lightsail box OOM-ground for 25-45 min and
+      # raced the running root pm2 process for .next ownership (recurring
+      # EACCES). The runner has 16GB RAM and builds in a few minutes; the box
+      # now only receives the finished artifact and restarts.
+      - name: Checkout (tip of main at dispatch time = GITHUB_SHA)
+        uses: actions/checkout@v4
 
+      # Node 20 matches the box: deploy/aws/vm-setup.sh installs Node 20 via
+      # NodeSource ("▶ 2/7 — Node.js 20") and deploy/aws/RUNBOOK.md confirms.
+      # (Those scripts are otherwise stale, but they are the Node evidence we
+      # have — and 20 is the LTS fallback regardless.) The .next artifact is
+      # plain JS, but keeping majors aligned avoids surprises; node_modules
+      # (incl. native better-sqlite3) stays box-built and is never shipped.
+      - name: Setup Node 20 (matches box Node major)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Next.js
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run build
+
+      # .next/cache is the compiler cache — big and unused by `next start`.
+      # Everything else (BUILD_ID, *-manifest.json, required-server-files.json,
+      # server/, static/) ships. Verified locally: this tarball alone, dropped
+      # into the repo, boots `next start` and serves /api/build-info.
+      - name: Pack build artifact
+        run: |
+          test -f .next/BUILD_ID
+          test -f .next/required-server-files.json
+          tar -czf next-build.tgz --exclude='.next/cache' .next
+          ls -lh next-build.tgz
+
+      # ── 2. TRANSFER ───────────────────────────────────────────────────
+      - name: Upload artifact to Lightsail
+        uses: appleboy/scp-action@v1.0.0
         with:
           host: ${{ secrets.HOST }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          # `next build` on the small Lightsail box (Turbopack + heavy swap) has
-          # grown to ~25 min and blew past the 25m cap on 2026-07-05 (timed out
-          # mid-build → pm2 never restarted → prod stuck on the old build). GCP
-          # builds locally and is unaffected; only this on-box build needs the
-          # headroom. 45m leaves comfortable margin over the observed ~25 min.
-          command_timeout: 45m
+          source: next-build.tgz
+          target: /tmp/
+          overwrite: true
 
+      # ── 3. ACTIVATE ON THE BOX ────────────────────────────────────────
+      # set -e everywhere: any failure aborts BEFORE pm2 restart, so a broken
+      # transfer/checkout can never take down the running build. The old .next
+      # is kept as .next.bak for one-command manual rollback.
+      - name: Activate on Lightsail
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          envs: GITHUB_SHA
+          # No on-box build any more — npm install + untar + restart only.
+          command_timeout: 15m
           script: |
-            set -e                                   # abort on any error — never restart on a failed build
+            set -e                                   # abort on any error — never restart on a broken deploy
             cd /var/www/fnb-controller
 
-            git pull origin main
+            # Code on the box MUST match the commit the runner built, or the
+            # runtime source (public/, next.config, API routes' expectations)
+            # drifts from the artifact. Verify BEFORE touching anything.
+            git fetch origin main
+            if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+              echo "ABORT: origin/main is $(git rev-parse --short origin/main) but the runner built $GITHUB_SHA."
+              echo "main moved between dispatch and deploy — re-run the workflow."
+              exit 1
+            fi
+            git merge --ff-only "$GITHUB_SHA"
 
+            # Verify the artifact actually landed before touching node_modules
+            # or the live .next.
+            test -s /tmp/next-build.tgz
+
+            # Same npm install as before (NOT --omit=dev): node_modules stays
+            # box-built so the native better-sqlite3 binding always matches
+            # the box's OS/Node — we never ship node_modules from the runner.
             npm install
 
-            # Ensure plenty of swap so a heavy `next build` can't OOM-kill the box
-            # (2026-07-01 it took the instance down on all ports; 2026-07-04 a lone
-            # 2G swapfile proved too small and the build was `Killed`). Idempotent:
-            # each swapfile is created once and persisted in /etc/fstab. We add a
-            # SECOND file rather than resize because the first may already exist.
-            ensure_swap() {
-              local f="$1" sz="$2"
-              if ! sudo swapon --show 2>/dev/null | grep -q "$f"; then
-                echo "Adding swap $f ($sz)…"
-                sudo fallocate -l "$sz" "$f" 2>/dev/null || sudo dd if=/dev/zero of="$f" bs=1M count=$(( ${sz%G} * 1024 ))
-                sudo chmod 600 "$f" && sudo mkswap "$f" && sudo swapon "$f"
-                grep -q "$f" /etc/fstab || echo "$f none swap sw 0 0" | sudo tee -a /etc/fstab
-              fi
-            }
-            ensure_swap /swapfile  2G
-            ensure_swap /swapfile2 4G     # headroom so next build never OOMs
-            free -h 2>/dev/null | grep -i swap || true
+            # Stage-extract on the same filesystem so the final swap is a pure
+            # rename. A corrupt/partial tarball fails HERE, with the live
+            # .next untouched and pm2 still serving the old build.
+            rm -rf .next.stage
+            mkdir .next.stage
+            tar -xzf /tmp/next-build.tgz -C .next.stage
+            test -f .next.stage/.next/BUILD_ID
+            test -f .next.stage/.next/required-server-files.json
 
-            # The app runs as root (sudo pm2), so the running server leaves
-            # root-owned files inside .next that a user-run `next build` can't
-            # overwrite → EACCES build failure (favicon.ico.body, *.rsc, ...).
-            # Take ownership FIRST, then remove, so the build user can always
-            # clean and recreate .next. This breaks the recurring-EACCES cycle.
-            sudo chown -R "$(whoami)" .next 2>/dev/null || true
-            rm -rf .next
+            # mv-swap: keep the previous build as .next.bak. The running pm2
+            # process (root) holds the old dir open — rename doesn't disturb
+            # it; it serves the old build until the restart below. Rollback:
+            #   sudo mv .next .next.broken && sudo mv .next.bak .next \
+            #     && sudo pm2 restart fnb-controller
+            sudo rm -rf .next.bak
+            if [ -d .next ]; then sudo mv .next .next.bak; fi
+            sudo mv .next.stage/.next .next
+            rmdir .next.stage
+            rm -f /tmp/next-build.tgz
 
-            # Cap the V8 heap (same as GCP's known-good local build) so Node uses
-            # swap gracefully instead of ballooning; set -e stops here on failure.
-            NODE_OPTIONS="--max-old-space-size=4096" npm run build
-
+            # Only reached when checkout + install + untar ALL succeeded.
             sudo pm2 restart fnb-controller --update-env
             sudo pm2 save
