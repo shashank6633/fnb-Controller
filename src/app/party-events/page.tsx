@@ -215,7 +215,8 @@ export default function PartyEventsPage() {
                 <TrendingDown size={14} className="text-red-600" />
                 <h2 className="text-sm font-semibold text-[#2D1B0E]">Cost — items issued ({detail.items.length})</h2>
               </div>
-              <table className="w-full text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-xs min-w-[560px]">
                 <thead className="bg-[#FFF8F0] text-[#8B7355]">
                   <tr>
                     <th className="text-left  py-2 px-3 font-medium">Req #</th>
@@ -246,6 +247,7 @@ export default function PartyEventsPage() {
                   </tr>
                 </tfoot>
               </table>
+              </div>
             </div>
 
             {/* Revenue breakdown — admin/HOD only */}
@@ -274,7 +276,8 @@ export default function PartyEventsPage() {
                   No party-tagged sales recorded for {detail.event_date}.
                 </div>
               ) : (
-                <table className="w-full text-xs">
+                <div className="overflow-x-auto">
+                <table className="w-full text-xs min-w-[560px]">
                   <thead className="bg-[#FFF8F0] text-[#8B7355]">
                     <tr>
                       <th className="text-left  py-2 px-3 font-medium">Item</th>
@@ -324,6 +327,7 @@ export default function PartyEventsPage() {
                     </tr>
                   </tfoot>
                 </table>
+                </div>
               )}
             </div>
               );
@@ -358,7 +362,8 @@ export default function PartyEventsPage() {
                     No unattributed party sales on this date — everything is already linked.
                   </div>
                 ) : (
-                  <table className="w-full text-xs">
+                  <div className="overflow-x-auto">
+                  <table className="w-full text-xs min-w-[520px]">
                     <thead className="bg-[#FFF8F0] text-[#8B7355]">
                       <tr>
                         <th className="py-2 px-2 w-8"></th>
@@ -386,6 +391,7 @@ export default function PartyEventsPage() {
                       ))}
                     </tbody>
                   </table>
+                  </div>
                 )}
               </div>
               <div className="px-5 py-3 border-t border-[#E8D5C4] bg-[#FFF8F0] flex items-center justify-end gap-2">
@@ -440,7 +446,8 @@ export default function PartyEventsPage() {
             No party events yet. <a href="/party-requisitions" className="text-[#af4408] underline">Raise the first party requisition</a> to start tracking events.
           </div>
         ) : (
-          <table className="w-full text-xs">
+          <div className="overflow-x-auto">
+          <table className="w-full text-xs min-w-[640px]">
             <thead className="bg-[#FFF1E3] text-[#6B5744]">
               <tr>
                 <th className="text-left  py-2 px-3 font-medium">Date</th>
@@ -485,6 +492,7 @@ export default function PartyEventsPage() {
               })}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>
@@ -1108,7 +1116,8 @@ function StatusChangesPanel() {
           ) : changes.length === 0 ? (
             <div className="text-xs text-[#8B7355] italic">No FP status changes in the last 7 days.</div>
           ) : (
-            <table className="w-full text-xs">
+            <div className="overflow-x-auto">
+            <table className="w-full text-xs min-w-[560px]">
               <thead className="text-[#6B5744]">
                 <tr>
                   <th className="text-left  py-1.5 px-2 font-medium">When</th>
@@ -1138,6 +1147,7 @@ function StatusChangesPanel() {
                 })}
               </tbody>
             </table>
+            </div>
           )}
         </div>
       )}

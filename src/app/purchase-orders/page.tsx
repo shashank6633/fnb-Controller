@@ -536,7 +536,8 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
           {po.received_at  && <div><span className="font-semibold">Received:</span>  {dateLabel(po.received_at)}</div>}
           {po.rejected_reason && <div className="text-red-600"><span className="font-semibold">Rejected:</span> {po.rejected_reason}</div>}
         </div>
-        <table className="text-xs flex-1">
+        <div className="flex-1 min-w-0 overflow-x-auto">
+        <table className="text-xs w-full min-w-[640px]">
           <thead className="text-[#8B7355]">
             <tr>
               <th className="text-left  py-1 px-2 font-medium">SKU</th>
@@ -632,6 +633,7 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
             </tfoot>
           )}
         </table>
+        </div>
       </div>
     </td></tr>
   );
@@ -857,18 +859,19 @@ function CreatePOModal({ materials, onClose, onCreated }: {
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
-      {/* maxHeight:none overrides the global mobile modal cap (globals.css §5,
-          `max-height: calc(100vh-1rem)`). That cap has no overflow, so with many
-          item lines the content spilled OUT of the white card. The overlay above
-          (items-start + overflow-y-auto) scrolls the tall card instead — and,
-          unlike an internal scroll, never clips the material-picker dropdown. */}
-      <div style={{ maxHeight: 'none' }}
-           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-8 shadow-xl">
-        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+      {/* House safe-modal shell: card capped to the viewport, BODY scrolls
+          internally, header + footer pinned — so Save/Cancel are always on
+          screen (previously the card grew ~1000px tall and Save sat below the
+          fold on phones). The material-picker dropdown lives inside the
+          scrollable body; its absolute panel extends the body's scroll area,
+          so it stays reachable. */}
+      <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl shadow-xl flex flex-col overflow-hidden">
+        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
           <h2 className="font-bold text-[#2D1B0E]">New Purchase Order</h2>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>
-        <div className="p-5 space-y-4">
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
           {/* Header — Phase 1 §3: pick VENDOR first, then materials are filtered to that vendor. */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <label className="text-xs text-[#6B5744] flex flex-col gap-1">
@@ -916,7 +919,8 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                 <Plus className="w-3 h-3" /> Add line
               </button>
             </div>
-            <table className="w-full text-xs block md:table">
+            <div className="overflow-x-auto">
+            <table className="w-full text-xs block md:table md:min-w-[600px]">
               <thead className="text-[#8B7355] hidden md:table-header-group">
                 <tr>
                   <th className="text-left py-1 px-2 font-medium" style={{ width: '34%' }}>Material</th>
@@ -1038,6 +1042,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                 </tr>
               </tfoot>
             </table>
+            </div>
             {/* Primary Add-line — full width at the BOTTOM so after entering a
                 material the button sits right below it (mobile-friendly). */}
             <button type="button" onClick={addLine}
@@ -1052,7 +1057,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                       className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
           </label>
         </div>
-        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
           <button onClick={onClose} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
           <button onClick={submit} disabled={saving}
                   className="px-3 py-2 text-sm bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg disabled:opacity-50 inline-flex items-center gap-1">

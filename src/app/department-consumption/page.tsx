@@ -16,6 +16,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Building2, Package, ArrowUpRight, Loader2, Download, Filter, ChevronDown, ChevronRight, Warehouse,
 } from 'lucide-react';
+import TabScroller from '@/components/TabScroller';
 
 const fmt  = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const fmt2 = (v: number) => (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -126,8 +127,10 @@ export default function DepartmentConsumptionPage() {
         </div>
       </div>
 
-      {/* Filter bar */}
-      <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 flex flex-wrap gap-2 items-end text-xs">
+      {/* Filter bar — one-row sideways scroller on phones (the Material select's
+          intrinsic width can exceed the viewport); wraps as before on md+. */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 text-xs">
+      <TabScroller className="gap-2 items-end">
         <div className="inline-flex items-center gap-1 text-[#6B5744]">
           <Filter className="w-3.5 h-3.5" /> Filter
         </div>
@@ -169,6 +172,7 @@ export default function DepartmentConsumptionPage() {
           <button onClick={() => { setDepartmentId(''); setCategory(''); setMaterialId(''); }}
                   className="px-2 py-1 text-[#af4408] hover:underline">Clear</button>
         )}
+      </TabScroller>
       </div>
 
       {loading && (
@@ -194,7 +198,8 @@ export default function DepartmentConsumptionPage() {
             <h3 className="text-sm font-semibold text-[#2D1B0E]">By Department</h3>
             <span className="text-[10px] text-[#8B7355]">Click row to drill into materials</span>
           </div>
-          <table className="w-full text-xs">
+          <div className="overflow-x-auto">
+          <table className="w-full text-xs min-w-[640px]">
             <thead className="text-[#8B7355] bg-[#FFF8F0]">
               <tr>
                 <th className="w-6"></th>
@@ -242,6 +247,7 @@ export default function DepartmentConsumptionPage() {
               })}
             </tbody>
           </table>
+          </div>
         </div>
       )}
 
@@ -252,7 +258,8 @@ export default function DepartmentConsumptionPage() {
             <Package className="w-4 h-4 text-[#af4408]" />
             <h3 className="text-sm font-semibold text-[#2D1B0E]">Top Materials Across All Departments</h3>
           </div>
-          <table className="w-full text-xs">
+          <div className="overflow-x-auto">
+          <table className="w-full text-xs min-w-[600px]">
             <thead className="text-[#8B7355] bg-[#FFF8F0]">
               <tr>
                 <th className="text-left  py-1.5 px-3 font-medium">SKU</th>
@@ -278,6 +285,7 @@ export default function DepartmentConsumptionPage() {
               ))}
             </tbody>
           </table>
+          </div>
         </div>
       )}
 

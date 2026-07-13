@@ -107,7 +107,8 @@ export default function GrnPage() {
         ) : list.length === 0 ? (
           <div className="p-8 text-center text-sm text-[#8B7355]">No GRNs in this range. They're created automatically when you receive a PO.</div>
         ) : (
-          <table className="w-full text-xs">
+          <div className="overflow-x-auto">
+          <table className="w-full text-xs min-w-[880px]">
             <thead className="bg-[#FFF1E3] text-[#6B5744]">
               <tr>
                 <th className="w-6"></th>
@@ -129,6 +130,7 @@ export default function GrnPage() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>
@@ -195,7 +197,8 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
                   </div>
                 );
               })()}
-              <table className="w-full text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-xs min-w-[640px]">
                 <thead className="text-[#8B7355]">
                   <tr>
                     <th className="text-left  py-1 px-2 font-medium">Material</th>
@@ -223,6 +226,7 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
                   ))}
                 </tbody>
               </table>
+              </div>
             </>
           )}
         </td></tr>
@@ -369,17 +373,19 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
-      {/* maxHeight:none overrides the global mobile modal cap (globals.css §5,
-          `max-height: calc(100vh-1rem)`) which has no overflow — so a tall
-          line-items list spilled OUT of the white card. Letting the card grow
-          keeps content inside; the overlay above (overflow-y-auto) scrolls it,
-          and unlike an internal scroll it never clips the material dropdown. */}
-      <div style={{ maxHeight: 'none' }} className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-4xl my-8 shadow-xl">
-        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+      {/* House safe-modal shell: the card is capped to the viewport and the BODY
+          scrolls internally, so the header + Save/Cancel footer are always on
+          screen (previously the card grew to ~1400px and Save sat far below the
+          fold on phones). The MaterialTypeahead dropdown lives inside the
+          scrollable body — its absolute panel extends the body's scroll area,
+          so it stays reachable. */}
+      <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-4xl shadow-xl flex flex-col overflow-hidden">
+        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
           <h2 className="font-bold text-[#2D1B0E]">New Ad-hoc Goods Receipt Note</h2>
           <button onClick={onClose}><X className="w-5 h-5 text-[#8B7355]" /></button>
         </div>
-        <div className="p-5 space-y-4 text-xs">
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4 text-xs">
           <p className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
             Use this when goods arrive WITHOUT a PO — cash purchase, sample, donation, vendor return.
             On save: creates a GRN, writes <code>purchases</code> rows, bumps stock + recipe-cost cascade.
@@ -498,8 +504,8 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               <span className="font-semibold">Line Items</span>
               <button onClick={addLine} className="hidden md:flex text-xs text-[#af4408] hover:underline items-center gap-1"><Plus className="w-3 h-3" /> Add line</button>
             </div>
-            <div>
-              <table className="w-full text-xs block md:table">
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs block md:table md:min-w-[600px]">
                 <thead className="text-[#8B7355] hidden md:table-header-group">
                   <tr>
                     <th className="text-left  py-1 px-2 font-medium">Material</th>
@@ -612,7 +618,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                       className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
           </label>
         </div>
-        <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2">
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2 shrink-0">
           <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
           <button onClick={submit} disabled={busy}
                   className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg flex items-center gap-1.5 disabled:opacity-50">

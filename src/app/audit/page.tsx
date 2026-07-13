@@ -120,7 +120,8 @@ export default function AuditPage() {
             {loading ? 'Loading…' : 'No events match these filters.'}
           </div>
         ) : (
-          <table className="w-full text-xs">
+          <div className="overflow-x-auto">
+          <table className="w-full text-xs min-w-[900px]">
             <thead className="bg-[#FFF1E3] text-[#6B5744]">
               <tr>
                 <th className="text-left py-2 px-3 font-medium w-32">When</th>
@@ -178,6 +179,7 @@ export default function AuditPage() {
               })}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>
