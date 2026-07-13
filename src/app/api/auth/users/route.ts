@@ -12,7 +12,8 @@ export async function GET() {
   const db = getDb();
   const users = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.is_active, u.created_at, u.last_login_at,
-           u.department_id, u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
+           u.department_id, u.is_head_chef, u.is_store_manager, u.can_approve_requisitions,
+           u.page_access, u.visible_department_ids,
            u.preferred_zones, u.preferred_table_ids, u.section,
            u.role_id, r.name AS role_name,
            d.name AS department_name
@@ -41,23 +42,23 @@ function normSection(v: any): string | null {
  * truth); otherwise fall back to the explicitly-passed role + flags (legacy).
  * Returns null role_id if the role doesn't exist.
  */
-function resolveRole(db: any, role_id: any, explicitRole: any, explicitChef: any, explicitStore: any) {
+function resolveRole(db: any, role_id: any, explicitRole: any, explicitChef: any, explicitStore: any, explicitApproveReq: any) {
   if (role_id) {
-    const r = db.prepare('SELECT id, base_role, is_head_chef, is_store_manager FROM roles WHERE id = ? AND is_active = 1').get(role_id) as any;
-    if (r) return { role_id: r.id, role: r.base_role, is_head_chef: !!r.is_head_chef, is_store_manager: !!r.is_store_manager };
+    const r = db.prepare('SELECT id, base_role, is_head_chef, is_store_manager, can_approve_requisitions FROM roles WHERE id = ? AND is_active = 1').get(role_id) as any;
+    if (r) return { role_id: r.id, role: r.base_role, is_head_chef: !!r.is_head_chef, is_store_manager: !!r.is_store_manager, can_approve_requisitions: !!r.can_approve_requisitions };
   }
-  return { role_id: null, role: explicitRole, is_head_chef: !!explicitChef, is_store_manager: !!explicitStore };
+  return { role_id: null, role: explicitRole, is_head_chef: !!explicitChef, is_store_manager: !!explicitStore, can_approve_requisitions: !!explicitApproveReq };
 }
 
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
-  const { email, name, role, role_id, password, position, department_id, is_head_chef, is_store_manager, section } = await req.json();
+  const { email, name, role, role_id, password, position, department_id, is_head_chef, is_store_manager, can_approve_requisitions, section } = await req.json();
   if (!email || !password) return Response.json({ error: 'email + password required' }, { status: 400 });
   const sec = normSection(section);
   if (sec === null) return Response.json({ error: `section must be one of ${VALID_SECTIONS.join(', ')}` }, { status: 400 });
   const db = getDb();
-  const eff = resolveRole(db, role_id, role, is_head_chef, is_store_manager);
+  const eff = resolveRole(db, role_id, role, is_head_chef, is_store_manager, can_approve_requisitions);
   if (!VALID_ROLES.includes(eff.role)) {
     return Response.json({ error: `role must be one of ${VALID_ROLES.join(', ')}` }, { status: 400 });
   }
@@ -65,14 +66,15 @@ export async function POST(req: Request) {
   if (exists) return Response.json({ error: 'Email already in use' }, { status: 409 });
   const hash = await hashPassword(password);
   db.prepare(`
-    INSERT INTO users (id, email, password_hash, name, role, role_id, position, department_id, is_head_chef, is_store_manager, section)
-    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO users (id, email, password_hash, name, role, role_id, position, department_id, is_head_chef, is_store_manager, can_approve_requisitions, section)
+    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     String(email).toLowerCase(), hash, name || '', eff.role, eff.role_id,
     position || '',
     department_id || null,
     eff.is_head_chef ? 1 : 0,
     eff.is_store_manager ? 1 : 0,
+    eff.can_approve_requisitions ? 1 : 0,
     sec,
   );
   return Response.json({ success: true }, { status: 201 });
@@ -99,7 +101,7 @@ export async function PUT(req: Request) {
   // Role: if role_id is present, resolve the named role (its tier + flags win);
   // if absent, honor any explicit role/flags (legacy edit).
   if ('role_id' in b) {
-    const eff = resolveRole(db, b.role_id, b.role, b.is_head_chef, b.is_store_manager);
+    const eff = resolveRole(db, b.role_id, b.role, b.is_head_chef, b.is_store_manager, b.can_approve_requisitions);
     if (eff.role != null && !VALID_ROLES.includes(eff.role)) {
       return Response.json({ error: `role must be one of ${VALID_ROLES.join(', ')}` }, { status: 400 });
     }
@@ -107,6 +109,7 @@ export async function PUT(req: Request) {
     if (eff.role != null) { sets.push('role = ?'); params.push(eff.role); }
     sets.push('is_head_chef = ?'); params.push(eff.is_head_chef ? 1 : 0);
     sets.push('is_store_manager = ?'); params.push(eff.is_store_manager ? 1 : 0);
+    sets.push('can_approve_requisitions = ?'); params.push(eff.can_approve_requisitions ? 1 : 0);
   } else {
     if (b.role != null) {
       if (!VALID_ROLES.includes(b.role)) return Response.json({ error: `role must be one of ${VALID_ROLES.join(', ')}` }, { status: 400 });
@@ -114,6 +117,7 @@ export async function PUT(req: Request) {
     }
     if (b.is_head_chef !== undefined)     { sets.push('is_head_chef = ?');     params.push(b.is_head_chef ? 1 : 0); }
     if (b.is_store_manager !== undefined) { sets.push('is_store_manager = ?'); params.push(b.is_store_manager ? 1 : 0); }
+    if (b.can_approve_requisitions !== undefined) { sets.push('can_approve_requisitions = ?'); params.push(b.can_approve_requisitions ? 1 : 0); }
   }
   // page_access: array of paths → JSON string. null/[] clears the map (= full access).
   if (page_access !== undefined) {

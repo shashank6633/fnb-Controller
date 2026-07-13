@@ -1385,6 +1385,11 @@ function initializeSchema(db: Database.Database) {
     // Parent Role / functional section: Kitchen | Bar | Service | Maintenance | Store
     // ('' = unset). Per-user; drives the KDS ticket filter + KOT printer routing.
     if (!has('section'))             db.exec(`ALTER TABLE users ADD COLUMN section TEXT DEFAULT ''`);
+    // Granular approval flag: may approve requisitions (dine-in + party) WITHOUT
+    // the full HOD flag — no HOD-only pages, no party financials. Lets e.g. a
+    // Bar Manager clear the approval inbox. Mirrors the is_head_chef pattern
+    // (user flag OR assigned role's flag; see getCurrentUser / canApproveAsChef).
+    if (!has('can_approve_requisitions')) db.exec(`ALTER TABLE users ADD COLUMN can_approve_requisitions INTEGER NOT NULL DEFAULT 0`);
   } catch (e) { console.error('users role-flags migration failed:', e); }
 
   // ── Named roles (Floor Manager, Captain, Cashier, Bar Manager …) ───────────
@@ -1421,6 +1426,9 @@ function initializeSchema(db: Database.Database) {
     const rCols = db.prepare("PRAGMA table_info(roles)").all() as any[];
     if (!rCols.some((c: any) => c.name === 'can_request_discount')) db.exec(`ALTER TABLE roles ADD COLUMN can_request_discount INTEGER NOT NULL DEFAULT 0`);
     if (!rCols.some((c: any) => c.name === 'max_discount_pct'))     db.exec(`ALTER TABLE roles ADD COLUMN max_discount_pct REAL NOT NULL DEFAULT 0`);
+    // Granular approval flag on the role (mirrors users.can_approve_requisitions):
+    // holders may approve dine-in + party requisitions without being an HOD.
+    if (!rCols.some((c: any) => c.name === 'can_approve_requisitions')) db.exec(`ALTER TABLE roles ADD COLUMN can_approve_requisitions INTEGER NOT NULL DEFAULT 0`);
 
     const seedRole = db.prepare(`
       INSERT OR IGNORE INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, is_system, sort_order, description)

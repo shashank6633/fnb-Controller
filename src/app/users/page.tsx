@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Users, Plus, Edit, X, Save, Loader2, ShieldCheck, Shield, ChefHat, Warehouse, Building, ChevronDown, ChevronRight, ShieldAlert, MapPin } from 'lucide-react';
+import { Users, Plus, Edit, X, Save, Loader2, ShieldCheck, Shield, ChefHat, Warehouse, Building, ChevronDown, ChevronRight, ShieldAlert, MapPin, CheckSquare } from 'lucide-react';
 import { api } from '@/lib/api';
 import { PAGE_CATALOG, ALL_PAGE_PATHS } from '@/lib/page-catalog';
 
@@ -18,6 +18,8 @@ interface AppUser {
   department_name?: string | null;
   is_head_chef?: number;
   is_store_manager?: number;
+  /** Granular: approve requisitions (dine-in + party) without the full HOD flag. */
+  can_approve_requisitions?: number;
   /** JSON-stringified array of allowed page paths. NULL = full access. */
   page_access?: string | null;
   /** JSON-stringified array of department_ids whose data is visible. NULL = own dept only. */
@@ -31,7 +33,7 @@ interface AppUser {
 interface Department { id: string; name: string; code?: string; is_active: number; }
 /** Dine-in table (subset of restaurant_tables) — used for the captain-area picker. */
 interface RestTable { id: string; table_number: string; zone?: string | null; seats?: number; }
-interface Role { id: string; name: string; base_role: UserRole; is_head_chef: number; is_store_manager: number; description?: string; }
+interface Role { id: string; name: string; base_role: UserRole; is_head_chef: number; is_store_manager: number; can_approve_requisitions?: number; description?: string; }
 
 /**
  * Position templates — picking one auto-suggests the approval flags.
@@ -169,7 +171,7 @@ export default function UsersPage() {
           <button onClick={() => setEditing({
             role: 'staff', role_id: null, is_active: 1, name: '', email: '', password: '',
             position: '',
-            department_id: null, is_head_chef: 0, is_store_manager: 0,
+            department_id: null, is_head_chef: 0, is_store_manager: 0, can_approve_requisitions: 0,
           })}
                   className="inline-flex items-center gap-2 px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
             <Plus className="w-4 h-4" /> New User
@@ -252,12 +254,17 @@ export default function UsersPage() {
                             <Warehouse className="w-3 h-3" /> Store
                           </span>
                         ) : null}
+                        {!u.is_head_chef && !!u.can_approve_requisitions ? (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-teal-100 text-teal-700 font-medium inline-flex items-center gap-0.5">
+                            <CheckSquare className="w-3 h-3" /> Approver
+                          </span>
+                        ) : null}
                         {u.role === 'admin' && (
                           <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">
                             ★ All
                           </span>
                         )}
-                        {!u.is_head_chef && !u.is_store_manager && u.role !== 'admin' && (
+                        {!u.is_head_chef && !u.is_store_manager && !u.can_approve_requisitions && u.role !== 'admin' && (
                           <span className="text-[10px] text-[#8B7355] italic">staff</span>
                         )}
                       </div>
@@ -274,6 +281,7 @@ export default function UsersPage() {
                                 department_id: u.department_id ?? null,
                                 is_head_chef: u.is_head_chef ?? 0,
                                 is_store_manager: u.is_store_manager ?? 0,
+                                can_approve_requisitions: u.can_approve_requisitions ?? 0,
                                 page_access: u.page_access ?? null,
                                 visible_department_ids: u.visible_department_ids ?? null,
                                 preferred_zones: u.preferred_zones ?? null,
@@ -351,6 +359,7 @@ export default function UsersPage() {
                             // A named role drives the tier + flags + (default) pages.
                             setEditing({ ...editing!, role_id: rid, role: r.base_role,
                               is_head_chef: r.is_head_chef ? 1 : 0, is_store_manager: r.is_store_manager ? 1 : 0,
+                              can_approve_requisitions: r.can_approve_requisitions ? 1 : 0,
                               page_access: null });
                           }}
                           className="w-full mt-1 px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm font-medium">
@@ -439,6 +448,24 @@ export default function UsersPage() {
                       </span>
                     </span>
                   </label>
+                  <label className="flex items-start gap-2 text-xs text-[#6B5744] py-1 border-t border-[#E8D5C4]/50">
+                    <input type="checkbox" className="mt-0.5" disabled={!!editing.role_id}
+                           checked={!!editing.can_approve_requisitions}
+                           onChange={e => setEditing({ ...editing, can_approve_requisitions: e.target.checked ? 1 : 0 })} />
+                    <span>
+                      <span className="inline-flex items-center gap-1 font-medium text-teal-700">
+                        <CheckSquare className="w-3 h-3" /> Can approve requisitions (dine-in + party)
+                      </span>
+                      <span className="block text-[10px] text-[#8B7355]">
+                        Approval inbox only — no HOD-only pages, no party financials. Not needed if “Is HOD” is ticked.
+                      </span>
+                    </span>
+                  </label>
+                  {editing.role_id ? (
+                    <p className="text-[10px] text-[#8B7355] mt-1 italic">
+                      Set by the assigned role — edit them in Settings → Roles.
+                    </p>
+                  ) : null}
                   {editing.role === 'admin' && (
                     <p className="text-[10px] text-amber-800 mt-1 italic">
                       Admin role already includes both permissions implicitly.

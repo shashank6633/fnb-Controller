@@ -1,5 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
+import { getCurrentUser, canManageKitchenProduction } from '@/lib/auth';
 
 /**
  * Production Items master — the fixed list batch creation selects from.
@@ -16,7 +16,7 @@ export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
     const db = getDb();
     const all = new URL(request.url).searchParams.get('all') === '1';
     const items = db.prepare(
@@ -32,7 +32,7 @@ export async function POST(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const body = await request.json().catch(() => ({}));
     const name = String(body?.name || '').trim();
@@ -64,7 +64,7 @@ export async function PUT(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const body = await request.json().catch(() => ({}));
     const id = String(body?.id || '').trim();

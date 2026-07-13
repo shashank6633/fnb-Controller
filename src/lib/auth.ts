@@ -31,6 +31,10 @@ export interface SessionUser {
   /** Additive flags. Admin always implicitly has both. */
   is_head_chef: boolean;
   is_store_manager: boolean;
+  /** Granular: may approve requisitions (dine-in + party) WITHOUT the full HOD
+   *  flag — no HOD-only pages, no party financials. Union of the user's own
+   *  flag and the assigned role's flag (see canApproveAsChef). */
+  can_approve_requisitions: boolean;
   /** JSON-stringified array of allowed page paths. null = full access (backward compat). */
   page_access: string | null;
   /** JSON-stringified array of department_ids whose data is visible. null = only own dept. */
@@ -84,11 +88,13 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
   // site reads these resolved values, so none of them needs to know about roles.
   const row = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.department_id,
-           u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
+           u.is_head_chef, u.is_store_manager, u.can_approve_requisitions,
+           u.page_access, u.visible_department_ids,
            u.preferred_zones, u.preferred_table_ids, u.section,
            u.role_id,
            r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
+           r.can_approve_requisitions AS role_can_approve_req,
            r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount,
            s.expires_at
     FROM sessions s JOIN users u ON u.id = s.user_id
@@ -117,6 +123,7 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     // Flags: union of the user's own flags and the role's flags.
     is_head_chef: !!row.is_head_chef || (hasRole && !!row.role_head_chef),
     is_store_manager: !!row.is_store_manager || (hasRole && !!row.role_store),
+    can_approve_requisitions: !!row.can_approve_requisitions || (hasRole && !!row.role_can_approve_req),
     // Pages: a per-user page_access overrides; else inherit the role's set; else
     // null = full access (backward compat for users without a role or override).
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
@@ -131,8 +138,19 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
   };
 }
 
-/** Can this user approve requisitions as head chef? Admin always true. */
+/** Can this user approve requisitions (dine-in + party)? Admin always true.
+ *  Full HODs (is_head_chef) approve; so do holders of the granular
+ *  can_approve_requisitions flag (e.g. a Bar Manager) — WITHOUT gaining
+ *  HOD-only pages (proxy gates those on is_head_chef via isHodOnlyPath) or
+ *  party financials (gated inline on role==='admin' || is_head_chef). */
 export function canApproveAsChef(user: SessionUser): boolean {
+  return user.role === 'admin' || user.is_head_chef || user.can_approve_requisitions;
+}
+/** Kitchen Production (batches / labels / FIFO consume / dispose) is an
+ *  HOD-only surface — strictly head chef or admin. Deliberately NOT
+ *  canApproveAsChef: the granular can_approve_requisitions flag must not
+ *  unlock production APIs (its pages are hodOnly in the catalog too). */
+export function canManageKitchenProduction(user: SessionUser): boolean {
   return user.role === 'admin' || user.is_head_chef;
 }
 /** Can this user process requisitions / raise vendor POs as store manager? Admin always true. */
@@ -170,10 +188,12 @@ export async function verifyApprover(email: string, password: string): Promise<S
   const db = getDb();
   const row = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, u.position, u.department_id, u.password_hash,
-           u.is_head_chef, u.is_store_manager, u.page_access, u.visible_department_ids,
+           u.is_head_chef, u.is_store_manager, u.can_approve_requisitions,
+           u.page_access, u.visible_department_ids,
            u.preferred_zones, u.preferred_table_ids, u.section, u.role_id,
            r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
+           r.can_approve_requisitions AS role_can_approve_req,
            r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount
     FROM users u LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
     WHERE lower(u.email) = lower(?) AND u.is_active = 1
@@ -188,6 +208,7 @@ export async function verifyApprover(email: string, password: string): Promise<S
     position: row.position || '', department_id: row.department_id || null,
     is_head_chef: !!row.is_head_chef || (hasRole && !!row.role_head_chef),
     is_store_manager: !!row.is_store_manager || (hasRole && !!row.role_store),
+    can_approve_requisitions: !!row.can_approve_requisitions || (hasRole && !!row.role_can_approve_req),
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
     visible_department_ids: row.visible_department_ids || null,
     preferred_zones: row.preferred_zones || null,

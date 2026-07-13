@@ -12,6 +12,8 @@ interface Role {
   page_access: string | null; // JSON array or null (= all)
   is_head_chef: number;
   is_store_manager: number;
+  /** Granular: approve requisitions (dine-in + party) without the full HOD flag. */
+  can_approve_requisitions: number;
   is_system: number;
   sort_order: number;
   description: string;
@@ -36,7 +38,8 @@ function parsePages(pa: string | null): string[] {
 
 const blankDraft = () => ({
   id: '' as string, name: '', base_role: 'staff' as Role['base_role'], description: '',
-  is_head_chef: false, is_store_manager: false, pages: new Set<string>(), is_system: 0,
+  is_head_chef: false, is_store_manager: false, can_approve_requisitions: false,
+  pages: new Set<string>(), is_system: 0,
   can_request_discount: false, max_discount_pct: 0,
 });
 
@@ -66,6 +69,7 @@ export default function RolesAdmin() {
     setDraft({
       id: role.id, name: role.name, base_role: role.base_role, description: role.description || '',
       is_head_chef: !!role.is_head_chef, is_store_manager: !!role.is_store_manager,
+      can_approve_requisitions: !!role.can_approve_requisitions,
       pages: new Set(parsePages(role.page_access)), is_system: role.is_system,
       can_request_discount: !!role.can_request_discount, max_discount_pct: Number(role.max_discount_pct) || 0,
     });
@@ -105,6 +109,7 @@ export default function RolesAdmin() {
       const body: any = {
         name: draft.name.trim(), base_role: draft.base_role, description: draft.description,
         is_head_chef: draft.is_head_chef, is_store_manager: draft.is_store_manager,
+        can_approve_requisitions: draft.can_approve_requisitions,
         page_access: draft.base_role === 'admin' ? null : Array.from(draft.pages),
         can_request_discount: draft.can_request_discount,
         max_discount_pct: draft.can_request_discount ? Number(draft.max_discount_pct) || 0 : 0,
@@ -220,11 +225,17 @@ export default function RolesAdmin() {
                 <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
                   <input type="checkbox" checked={draft.is_store_manager} onChange={(e) => setDraft({ ...draft, is_store_manager: e.target.checked })} /> Can issue stock as Store Manager
                 </label>
+                <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
+                  <input type="checkbox" checked={draft.can_approve_requisitions} onChange={(e) => setDraft({ ...draft, can_approve_requisitions: e.target.checked })} /> Can approve requisitions (dine-in + party)
+                </label>
               </div>
-              {!draft.is_head_chef && (
+              <p className="-mt-1 text-[11px] text-[#8B7355]">
+                “Can approve requisitions” grants ONLY the approval inbox (dine-in + party) — no HOD-only pages, no party financials. “Is HOD” includes it.
+              </p>
+              {!draft.is_head_chef && !draft.can_approve_requisitions && (
                 <p className="-mt-1 text-[11px] text-amber-700 flex items-start gap-1">
                   <span aria-hidden>⚠</span>
-                  <span>This role <b>can’t approve requisitions</b> — tick the approval box above to allow it (admins can always approve).</span>
+                  <span>This role <b>can’t approve requisitions</b> — tick an approval box above to allow it (admins can always approve).</span>
                 </p>
               )}
 

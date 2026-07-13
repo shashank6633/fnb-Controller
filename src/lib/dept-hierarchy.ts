@@ -92,6 +92,13 @@ export function requisitionVisibility(
   if (!user) return { sql: '1=0', params: [] };
   // Admin and store team need the full pipeline.
   if (user.role === 'admin' || user.is_store_manager) return null;
+  // Granular approvers (can_approve_requisitions, e.g. a Bar Manager) are
+  // GLOBAL approvers — like the admin fallback in canApproveAsChef they may
+  // approve ANY department's submitted requisition, so they must see the full
+  // pipeline too (approval inbox, party approvals, bell counts). Full-HOD
+  // (is_head_chef) visibility is deliberately untouched: heads keep their
+  // main-dept subtree scoping below.
+  if (user.can_approve_requisitions) return null;
   // A main-dept head sees every requisition under their main dept (all sub-depts).
   const head = db.prepare(
     `SELECT id FROM departments WHERE head_user_id = ? AND parent_id IS NULL LIMIT 1`,

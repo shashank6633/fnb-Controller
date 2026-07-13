@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
+import { getCurrentUser, canManageKitchenProduction } from '@/lib/auth';
 import { buildTSPL, readLabelPrinter, type LabelBatch } from '@/lib/tspl-label';
 
 /**
@@ -27,7 +27,7 @@ export async function POST() {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canApproveAsChef(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const db = getDb();
     const printer = readLabelPrinter(db);
