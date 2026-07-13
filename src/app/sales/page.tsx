@@ -1634,6 +1634,7 @@ function TopItemsCard({ title, icon, items, metric }: { title: string; icon: Rea
         {icon}
         <h3 className="text-sm font-semibold text-[#2D1B0E]">{title}</h3>
       </div>
+      <div className="overflow-x-auto">
       <table className="w-full text-sm">
         <thead className="bg-[#FFF8F0]">
           <tr className="text-[#8B7355]">
@@ -1656,6 +1657,7 @@ function TopItemsCard({ title, icon, items, metric }: { title: string; icon: Rea
           ))}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }

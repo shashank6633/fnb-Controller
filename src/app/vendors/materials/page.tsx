@@ -369,6 +369,7 @@ export default function VendorMaterialsPage() {
             These purchases used vendor names that don't match any active vendor record.
             Add them on <a href="/vendors" className="underline">/vendors</a> and re-run the backfill.
           </div>
+          <div className="overflow-x-auto">
           <table className="w-full text-xs">
             <thead><tr className="text-left">
               <th className="py-1">Vendor name</th>
@@ -385,6 +386,7 @@ export default function VendorMaterialsPage() {
               ))}
             </tbody>
           </table>
+          </div>
         </div>
       )}
     </div>

@@ -96,9 +96,9 @@ export default function ReceivingVariancePage() {
           To
           <input type="date" value={to} onChange={e => setTo(e.target.value)} className="px-2 py-1.5 border border-[#D4B896] rounded text-sm" />
         </label>
-        <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+        <label className="text-xs text-[#6B5744] flex flex-col gap-1 min-w-0 max-w-full">
           Vendor
-          <select value={vendor} onChange={e => setVendor(e.target.value)} className="px-2 py-1.5 border border-[#D4B896] rounded text-sm min-w-[200px]">
+          <select value={vendor} onChange={e => setVendor(e.target.value)} className="px-2 py-1.5 border border-[#D4B896] rounded text-sm w-full max-w-full min-w-0 sm:w-auto sm:min-w-[200px]">
             <option value="">All vendors</option>
             {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
           </select>

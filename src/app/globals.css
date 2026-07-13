@@ -271,6 +271,18 @@ main > div > div.grid > *:nth-child(6) { animation-delay: 0.20s; }
   }
 }
 
+/* 12. Lock document scroll while a modal is open (mobile-audit P2, global).
+ *     Every modal overlay in the app is conditionally rendered as
+ *     `fixed inset-0 … bg-black/40|50|60`, so :has() only matches while a
+ *     dialog (or the sidebar drawer backdrop) is actually mounted — the
+ *     background page can no longer scroll behind it. Scoped to mobile so
+ *     desktop keeps its scrollbar (no layout shift) and the sticky-sidebar
+ *     caveat in rule 1 stays untouched. Dropdown click-catchers (bare
+ *     `fixed inset-0 z-20/30`, no backdrop tint) deliberately don't match. */
+@media (max-width: 1023.98px) {
+  body:has(.fixed.inset-0[class*="bg-black/"]) { overflow: hidden; }
+}
+
 /* 10. iOS Safari momentum scrolling for any overflow container. */
 .overflow-x-auto, .overflow-y-auto, .overflow-auto {
   -webkit-overflow-scrolling: touch;

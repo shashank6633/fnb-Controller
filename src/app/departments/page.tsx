@@ -224,7 +224,7 @@ export default function DepartmentsPage() {
                             {catCount(main.material_categories)} categor{catCount(main.material_categories) === 1 ? 'y' : 'ies'}
                           </span>
                           {isAdmin && (
-                            <button onClick={() => setEditing({ ...main })} className="text-[#6B5744] hover:text-[#af4408]">
+                            <button onClick={() => setEditing({ ...main })} className="p-2 -m-2 text-[#6B5744] hover:text-[#af4408]">
                               <Edit className="w-4 h-4" />
                             </button>
                           )}
@@ -277,7 +277,7 @@ export default function DepartmentsPage() {
                     </td>
                     <td className="py-2 px-3 text-right">
                       {isAdmin && (
-                        <button onClick={() => setEditing({ ...d })} className="text-[#6B5744] hover:text-[#af4408]">
+                        <button onClick={() => setEditing({ ...d })} className="p-2 -m-2 text-[#6B5744] hover:text-[#af4408]">
                           <Edit className="w-4 h-4" />
                         </button>
                       )}

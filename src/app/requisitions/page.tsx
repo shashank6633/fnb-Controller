@@ -520,7 +520,8 @@ function RecahoImportModal({ onClose, onCommitted }: { onClose: () => void; onCo
               {preview.sample_groups?.length > 0 && (
                 <details>
                   <summary className="cursor-pointer text-[#6B5744] font-medium">Sample of new transfers</summary>
-                  <table className="w-full mt-1 text-[10px] font-mono">
+                  <div className="overflow-x-auto">
+                  <table className="w-full mt-1 text-[10px] max-lg:text-xs font-mono">
                     <thead className="text-[#8B7355]"><tr>
                       <th className="text-left">Transfer ID</th><th className="text-left">Department</th>
                       <th className="text-left">Date</th><th className="text-right">Lines</th><th className="text-right">Total ₹</th>
@@ -534,6 +535,7 @@ function RecahoImportModal({ onClose, onCommitted }: { onClose: () => void; onCo
                       ))}
                     </tbody>
                   </table>
+                  </div>
                 </details>
               )}
 
@@ -1331,6 +1333,7 @@ function ChefApproveModal({ req, onClose, onDone }: { req: Requisition; onClose:
             (with a "Rejected by Chef" badge) so the audit trail is preserved — they're skipped
             during store issue.
           </p>
+          <div className="overflow-x-auto">
           <table className="w-full text-xs">
             <thead className="text-[#8B7355]"><tr>
               <th className="text-left py-1 px-2 font-medium">Material</th>
@@ -1360,6 +1363,7 @@ function ChefApproveModal({ req, onClose, onDone }: { req: Requisition; onClose:
               })}
             </tbody>
           </table>
+          </div>
           <label className="text-xs text-[#6B5744] flex flex-col gap-1">
             Approval note (optional)
             <textarea value={note} onChange={e => setNote(e.target.value)} rows={2}

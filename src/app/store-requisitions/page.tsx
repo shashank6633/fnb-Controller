@@ -994,6 +994,7 @@ function HistoryDrawer({ line, onClose }: { line: ReqLine; onClose: () => void }
           {history.length === 0 ? (
             <div className="text-sm text-[#8B7355] text-center py-6">No issue events yet for this item.</div>
           ) : (
+            <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead className="bg-[#FFF1E3] text-[#6B5744]">
                 <tr>
@@ -1019,6 +1020,7 @@ function HistoryDrawer({ line, onClose }: { line: ReqLine; onClose: () => void }
                 ))}
               </tbody>
             </table>
+            </div>
           )}
         </div>
       </div>

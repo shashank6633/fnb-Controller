@@ -117,6 +117,7 @@ export default function UnitsPage() {
               <div className={`${tone.bg} ${tone.text} px-4 py-2 font-semibold text-sm`}>
                 {tone.label} <span className="text-[10px] font-normal opacity-70">({grouped[dim].length})</span>
               </div>
+              <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead className="text-[#8B7355]">
                   <tr>
@@ -148,6 +149,7 @@ export default function UnitsPage() {
                   ))}
                 </tbody>
               </table>
+              </div>
             </div>
           );
         })}

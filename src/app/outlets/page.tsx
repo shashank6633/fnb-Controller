@@ -50,6 +50,7 @@ export default function OutletsPage() {
 
         <div className="bg-white border border-[#E8D5C4] rounded-xl shadow overflow-hidden">
           {loading ? <div className="p-6 text-center text-sm text-[#8B7355]">Loading…</div> : (
+            <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
                 <tr>
@@ -77,6 +78,7 @@ export default function OutletsPage() {
                 ))}
               </tbody>
             </table>
+            </div>
           )}
         </div>
 

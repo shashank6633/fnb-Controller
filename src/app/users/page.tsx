@@ -280,7 +280,7 @@ export default function UsersPage() {
                                 preferred_table_ids: u.preferred_table_ids ?? null,
                                 section: (u as any).section ?? '',
                               } as any)}
-                              className="p-1 text-[#6B5744] hover:text-[#af4408]"><Edit className="w-3.5 h-3.5" /></button>
+                              className="p-2 -m-1 text-[#6B5744] hover:text-[#af4408]"><Edit className="w-4 h-4" /></button>
                     </td>
                   </tr>
                 ))}

@@ -607,7 +607,7 @@ export default function InventoryPage() {
               {importResult.type === 'success' ? <CheckCircle className="w-5 h-5" /> : <AlertTriangle className="w-5 h-5" />}
               <span className="text-sm font-medium">{importResult.message}</span>
             </div>
-            <button onClick={() => setImportResult(null)} className="p-1 hover:opacity-70"><X className="w-4 h-4" /></button>
+            <button onClick={() => setImportResult(null)} className="p-2 -m-1 hover:opacity-70"><X className="w-4 h-4" /></button>
           </div>
         )}
 
@@ -894,7 +894,7 @@ export default function InventoryPage() {
                         <td className="px-4 py-3 text-center">
                           <button
                             onClick={() => openEditModal(m)}
-                            className="p-1.5 rounded-lg text-[#8B7355] hover:text-[#2D1B0E] hover:bg-[#FFF1E3] transition-colors"
+                            className="p-2 -m-0.5 rounded-lg text-[#8B7355] hover:text-[#2D1B0E] hover:bg-[#FFF1E3] transition-colors"
                             title="Edit"
                           >
                             <Edit className="w-4 h-4" />

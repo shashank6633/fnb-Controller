@@ -339,6 +339,7 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
               <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">Nothing recorded for this event yet.</div>
             ) : (
               <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
+                <div className="overflow-x-auto">
                 <table className="w-full text-xs">
                   <thead className="bg-[#FFF1E3] text-[#6B5744]">
                     <tr>
@@ -370,6 +371,7 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                     ))}
                   </tbody>
                 </table>
+                </div>
               </div>
             )}
           </div>

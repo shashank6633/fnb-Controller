@@ -330,12 +330,15 @@ export default function VendorsPage() {
 
         {editing && (
           <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
-            <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-2xl my-8 shadow-xl">
-              <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+            {/* House safe-modal shell: card capped to viewport, body scrolls
+                internally, so header + Save/Cancel stay on screen on phones. */}
+            <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+                 className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-2xl shadow-xl flex flex-col overflow-hidden">
+              <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
                 <h2 className="font-bold text-[#2D1B0E]">{editing.id ? 'Edit Vendor' : 'New Vendor'}</h2>
                 <button onClick={() => setEditing(null)} className="text-[#8B7355]"><X className="w-5 h-5" /></button>
               </div>
-              <div className="p-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="flex-1 min-h-0 overflow-y-auto p-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <Field label="Name *" v={editing.name || ''} onChange={x => setEditing({ ...editing, name: x })} />
                 <Field label="Contact person" v={editing.contact_person || ''} onChange={x => setEditing({ ...editing, contact_person: x })} />
                 <Field label="Phone" v={editing.phone || ''} onChange={x => setEditing({ ...editing, phone: x })} />
@@ -358,7 +361,7 @@ export default function VendorsPage() {
                             className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
                 </div>
               </div>
-              <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
+              <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
                 <button onClick={() => setEditing(null)} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
                 <button onClick={save} disabled={saving}
                         className="px-3 py-2 text-sm bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
