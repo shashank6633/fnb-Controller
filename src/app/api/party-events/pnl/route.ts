@@ -204,17 +204,40 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
   };
 }
 
+/**
+ * Strip the FINANCIAL fields (revenue / food cost / profit / margin) from a
+ * P&L row, keeping only what the liquor-consumption recorder needs: event
+ * identity + the liquor fields. Liquor cost is NOT withheld — the same numbers
+ * are already visible to every signed-in user via GET /api/party-consumption
+ * (cost_at_time), and the bar recorder needs them to see what's punched.
+ */
+function stripFinancials(row: any) {
+  return {
+    party_unique_id: row.party_unique_id,
+    fp_id: row.fp_id,
+    event_name: row.event_name,
+    event_date: row.event_date,
+    guest_name: row.guest_name,
+    status: row.status,
+    pax: row.pax,
+    liquor_cost: row.liquor_cost,
+    liquor_items: row.liquor_items,
+    has_liquor_recorded: row.has_liquor_recorded,
+    financials_hidden: true,
+  };
+}
+
 export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    // Party P&L is financial data (revenue / cost / margin). Restrict to the same
-    // audience that sees party financials elsewhere (party-events page + route):
-    // admin or a department head. Plain staff (cooks / bar / service) must not be
-    // able to pull profitability by hitting this endpoint directly.
-    if (!(me.role === 'admin' || me.is_head_chef)) {
-      return Response.json({ error: 'Not authorised' }, { status: 403 });
-    }
+    // Party P&L is financial data (revenue / cost / margin). Restrict FINANCIALS
+    // to the same audience that sees party financials elsewhere (party-events
+    // page + route): admin or a department head. Plain staff (bar / service) DO
+    // need the event LIST to record liquor consumption on /party-pnl — a hard
+    // 403 here bricked that page for Bar users granted /party-pnl. So: full
+    // payload for admin/HOD, stripped non-financial payload for everyone else.
+    const financialsAllowed = me.role === 'admin' || me.is_head_chef;
     const db = getDb();
     const url = new URL(request.url);
     const party_unique_id = url.searchParams.get('party_unique_id') || undefined;
@@ -232,7 +255,7 @@ export async function GET(request: Request) {
       const gate = revenueGate(p?.status, p?.event_date ?? event_date, today);
       const eventNames = p ? candidateNames(p).concat(event_name ? [event_name] : []) : (event_name ? [event_name] : []);
       const pnl = pnlFor(db, bookings, { party_unique_id, event_name, event_date: p?.event_date ?? event_date, eventNames }, gate);
-      return Response.json({ pnl });
+      return Response.json({ pnl: financialsAllowed ? pnl : stripFinancials(pnl) });
     }
 
     // Bulk: every cached party. Booking revenue is counted ONLY for Confirmed/Done
@@ -253,7 +276,7 @@ export async function GET(request: Request) {
         eventNames: candidateNames(p),
       }, revenueGate(p.status, p.event_date, today)),
     }));
-    return Response.json({ pnl: out });
+    return Response.json({ pnl: financialsAllowed ? out : out.map(stripFinancials) });
   } catch (e: any) {
     console.error('[/api/party-events/pnl GET]', e);
     return Response.json({ error: e.message }, { status: 500 });
