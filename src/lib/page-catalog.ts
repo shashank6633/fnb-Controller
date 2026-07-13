@@ -45,6 +45,7 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/dine-in/floor',       label: 'Order Floor' },
       { path: '/dine-in/requests',    label: 'Customer Orders & Requests' },
+      { path: '/dine-in/discount-approvals', label: 'Discount Approvals' },
       { path: '/dine-in/kitchen',     label: 'Kitchen Display' },
       { path: '/dine-in/offline-print', label: 'KOT & Bill Printers' },
       { path: '/dine-in/tables',      label: 'Tables' },

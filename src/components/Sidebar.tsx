@@ -43,6 +43,7 @@ import {
   Timer,
   Download,
   ScanLine,
+  BadgePercent,
   Bot,
   GraduationCap,
   HelpCircle,
@@ -70,6 +71,7 @@ const navTree: NavEntry[] = [
     items: [
       { kind: "link", label: "Order Floor",        href: "/dine-in/floor",             icon: ShoppingCart },
       { kind: "link", label: "Customer Orders & Requests", href: "/dine-in/requests",  icon: Bell },
+      { kind: "link", label: "Discount Approvals", href: "/dine-in/discount-approvals", icon: BadgePercent },
       { kind: "link", label: "Kitchen Display",    href: "/dine-in/kitchen",           icon: ChefHat },
       { kind: "link", label: "KOT & Bill Printers", href: "/dine-in/offline-print",    icon: Printer },
       { kind: "link", label: "Captain (Tablet)",   href: "/captain",                   icon: Smartphone },

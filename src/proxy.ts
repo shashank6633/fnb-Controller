@@ -66,6 +66,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/kitchen-production',   // prepared-item batches + FIFO consumption + label print
   '/api/settings/label-printer', // TSC label-printer config (admin) — matched by /api/settings too, kept explicit
   '/api/dine-in/orders',      // POS orders: open, add items, fire, settle, void
+  '/api/dine-in/discount-requests', // remote bill-discount requests + approve/reject
   '/api/dine-in/customer-orders', // Captain approve/reject/modify of QR-menu orders
   '/api/dine-in/service-requests', // Captain accept/complete of table service requests
   '/api/dine-in/kds',         // KDS bump (the SSE stream is GET, exempt)

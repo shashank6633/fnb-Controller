@@ -48,6 +48,13 @@ interface Me {
   max_discount_pct?: number | null;
 }
 
+// Latest remote discount request for this order (GET /api/dine-in/discount-requests?order_id=…).
+interface DiscReq {
+  id: string; status: 'pending' | 'approved' | 'rejected';
+  requested_pct: number; reason: string;
+  decided_by?: string | null; decided_note?: string | null;
+}
+
 // Parse a SQLite/ISO timestamp (space or 'T' separated) as UTC → ms epoch.
 function parseTs(s?: string | null): number {
   if (!s) return NaN;
@@ -385,6 +392,59 @@ export default function CaptainOrder() {
   const [discBusy, setDiscBusy] = useState(false);
   const [discErr, setDiscErr] = useState<string | null>(null);
 
+  // ── Remote discount approval (parallel to the at-the-till approver login) ──
+  // The cashier files a request; a Manager/Admin approves it from the
+  // /dine-in/discount-approvals page (bell notification). We poll the latest
+  // request for this order every ~20s to drive the pending/rejected chip and
+  // refresh the bill the moment it's approved.
+  const [discReason, setDiscReason] = useState('');
+  const [discReqBusy, setDiscReqBusy] = useState(false);
+  const [discReq, setDiscReq] = useState<DiscReq | null>(null);
+  const [dismissedReqIds, setDismissedReqIds] = useState<Set<string>>(new Set());
+  const lastReqRef = useRef<{ id: string; status: string } | null>(null);
+
+  const pollDiscReq = useCallback(async () => {
+    try {
+      const r = await api(`/api/dine-in/discount-requests?order_id=${id}`);
+      if (!r.ok) return;
+      const j = await r.json();
+      const req: DiscReq | null = j.request || null;
+      const prev = lastReqRef.current;
+      // Transition detection: pending → approved refreshes the bill (totals
+      // recompute through the existing loadOrder path); pending → rejected flashes.
+      if (req && prev && prev.id === req.id && prev.status === 'pending' && req.status !== 'pending') {
+        if (req.status === 'approved') { flash(`Discount ${req.requested_pct}% approved ✓`); loadOrder(); }
+        else if (req.status === 'rejected') flash('Discount request rejected');
+      }
+      lastReqRef.current = req ? { id: req.id, status: req.status } : null;
+      setDiscReq(req);
+    } catch { /* offline — keep last state */ }
+  }, [id, loadOrder]);
+
+  useEffect(() => {
+    if (!canDiscount || !order || order.status !== 'open') return;
+    pollDiscReq();
+    const t = setInterval(pollDiscReq, 20000);
+    return () => clearInterval(t);
+  }, [canDiscount, order?.status, pollDiscReq]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function requestRemoteApproval() {
+    const pct = Number(discPct);
+    if (!Number.isFinite(pct) || pct <= 0) { setDiscErr('Enter a discount %'); return; }
+    if (maxDiscountPct > 0 && pct > maxDiscountPct) { setDiscErr(`Max you can request is ${maxDiscountPct}%`); return; }
+    setDiscReqBusy(true); setDiscErr(null);
+    try {
+      const r = await api('/api/dine-in/discount-requests', {
+        method: 'POST', body: { order_id: id, pct, reason: discReason.trim() },
+      });
+      const j = await r.json();
+      if (j.error) { setDiscErr(j.error); return; }
+      if (j.request) { lastReqRef.current = { id: j.request.id, status: j.request.status }; setDiscReq(j.request); }
+      setDiscOpen(false); setDiscPct(''); setDiscReason(''); setDiscEmail(''); setDiscPass('');
+      flash(`Discount ${pct}% requested — awaiting approval`);
+    } finally { setDiscReqBusy(false); }
+  }
+
   async function requestDiscount() {
     const pct = Number(discPct);
     if (!Number.isFinite(pct) || pct <= 0) { setDiscErr('Enter a discount %'); return; }
@@ -485,6 +545,22 @@ export default function CaptainOrder() {
       {allPrinted && printAlerts.length === 0 && order.status === 'open' && (
         <div className="bg-green-50 text-green-800 px-3 py-1.5 text-xs font-medium flex items-center gap-1.5 border-b border-green-100">
           <CheckCircle2 className="w-3.5 h-3.5" /> All KOTs printed at the counter
+        </div>
+      )}
+
+      {/* Remote discount request status chip (cashier view, polled ~20s) */}
+      {discReq?.status === 'pending' && (
+        <div className="bg-amber-50 text-amber-800 px-3 py-1.5 text-xs font-semibold flex items-center gap-1.5 border-b border-amber-200">
+          <Timer className="w-3.5 h-3.5" /> Discount {discReq.requested_pct}% — awaiting approval
+        </div>
+      )}
+      {discReq?.status === 'rejected' && !dismissedReqIds.has(discReq.id) && (
+        <div className="bg-red-50 text-red-700 px-3 py-1.5 text-xs font-semibold flex items-center gap-1.5 border-b border-red-200">
+          <X className="w-3.5 h-3.5" /> Discount {discReq.requested_pct}% rejected{discReq.decided_by ? ` by ${discReq.decided_by}` : ''}
+          <button onClick={() => setDismissedReqIds((p) => new Set(p).add(discReq.id))}
+            className="ml-auto px-2 py-0.5 rounded-md bg-red-100 text-red-700 font-bold active:scale-95" aria-label="Dismiss">
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -817,7 +893,11 @@ export default function CaptainOrder() {
                 never see this block; discount is manager-approved server-side. */}
             {canDiscount && (
               <div className="mb-3 space-y-2">
-                {!discOpen ? (
+                {discReq?.status === 'pending' ? (
+                  <div className="w-full flex items-center gap-2 bg-amber-50 border border-amber-200 text-amber-800 py-2.5 px-3 rounded-xl text-sm font-semibold">
+                    <Timer className="w-4 h-4 shrink-0" /> Discount {discReq.requested_pct}% — awaiting approval
+                  </div>
+                ) : !discOpen ? (
                   <button onClick={() => { setDiscOpen(true); setDiscErr(null); }}
                     className="w-full flex items-center justify-center gap-2 border border-[#D4B896] text-[#6B5744] py-2.5 rounded-xl text-sm font-semibold active:scale-95">
                     <BadgePercent className="w-4 h-4" /> Request discount{maxDiscountPct > 0 ? ` (up to ${maxDiscountPct}%)` : ''}
@@ -837,9 +917,20 @@ export default function CaptainOrder() {
                     {discErr && <p className="text-xs text-red-600">{discErr}</p>}
                     <div className="flex gap-2">
                       <button onClick={() => { setDiscOpen(false); setDiscErr(null); }} className="flex-1 border border-[#E8D5C4] text-[#6B5744] py-2 rounded-lg text-sm font-medium active:scale-95">Cancel</button>
-                      <button onClick={requestDiscount} disabled={discBusy}
+                      <button onClick={requestDiscount} disabled={discBusy || discReqBusy}
                         className="flex-1 flex items-center justify-center gap-1.5 bg-[#af4408] text-white py-2 rounded-lg text-sm font-bold active:scale-95 disabled:opacity-50">
                         {discBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Apply
+                      </button>
+                    </div>
+                    {/* No manager at the till? File a remote request instead — a
+                        Manager/Admin approves it from Discount Approvals (bell). */}
+                    <div className="pt-1 border-t border-[#E8D5C4] space-y-2">
+                      <p className="text-[11px] text-[#8B7355]">No manager here? Send it for remote approval:</p>
+                      <input value={discReason} onChange={(e) => setDiscReason(e.target.value)} placeholder="Reason (e.g. regular guest, complaint)"
+                        className="w-full border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+                      <button onClick={requestRemoteApproval} disabled={discReqBusy || discBusy}
+                        className="w-full flex items-center justify-center gap-1.5 border border-[#af4408] text-[#af4408] py-2 rounded-lg text-sm font-bold active:scale-95 disabled:opacity-50">
+                        {discReqBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <BellRing className="w-4 h-4" />} Request remote approval
                       </button>
                     </div>
                   </div>

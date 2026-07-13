@@ -19,10 +19,12 @@ import { requisitionVisibility } from '@/lib/dept-hierarchy';
  *   - plain staff      : their OWN requisitions by stage (with HOD / being
  *                        issued / fulfilled today)
  *
- * NOTE — bill discounts deliberately have NO bucket: the discount flow
- * (POST /api/dine-in/orders/[id]/discount) verifies the approving Manager's
- * login synchronously on the spot, so a "pending discount request" state
- * never persists anywhere.
+ * Bill discounts: the synchronous flow (POST /api/dine-in/orders/[id]/discount)
+ * still verifies the approving Manager's login on the spot and never persists
+ * a pending state. The REMOTE flow (discount_requests) does persist one, so:
+ *   - approvers (admin/manager-tier/HOD) : pending bill-discount requests
+ *                                          → /dine-in/discount-approvals
+ *   - everyone else                      : their OWN pending requests → /captain
  *
  * Items with count = 0 are omitted. This sits beside the existing
  * GET /api/notifications (party defer feed), which is untouched.
@@ -114,6 +116,30 @@ export async function GET() {
         [],
       );
       push('reorder', 'Items below reorder level', n, '/crm/reorder');
+    }
+
+    // ── Bill discounts awaiting REMOTE approval ──────────────────────────
+    // Approver gate mirrors /api/dine-in/discount-requests: admin, manager
+    // tier, or HOD. Only requests on still-open orders count (a settled order
+    // can't take a discount anymore). Non-approvers see their OWN pending
+    // requests and are pointed back to the Captain app.
+    if (isAdmin || me.role === 'manager' || me.is_head_chef) {
+      const n = one(
+        `SELECT COUNT(*) AS n FROM discount_requests dr
+         JOIN orders o ON o.id = dr.order_id
+         WHERE dr.status = 'pending' AND o.status = 'open'
+           AND (dr.outlet_id = ? OR dr.outlet_id IS NULL)`,
+        [outletId],
+      );
+      push('discount_approvals', 'Bill discounts awaiting approval', n, '/dine-in/discount-approvals');
+    } else {
+      const n = one(
+        `SELECT COUNT(*) AS n FROM discount_requests dr
+         JOIN orders o ON o.id = dr.order_id
+         WHERE dr.status = 'pending' AND o.status = 'open' AND lower(dr.requested_by) = lower(?)`,
+        [me.email],
+      );
+      push('my_discount_pending', 'My discount requests awaiting approval', n, '/captain');
     }
 
     // ── Plain staff: MY requisitions by stage ─────────────────────────────

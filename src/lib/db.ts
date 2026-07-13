@@ -2392,6 +2392,71 @@ function initializeSchema(db: Database.Database) {
       INSERT OR IGNORE INTO settings (key, value) VALUES ('crm_review_link', '');
     `);
   } catch (e) { console.error('crm_guests schema failed:', e); }
+
+  // ── Remote bill-discount approvals ─────────────────────────────────────────
+  // Parallel REQUEST → REMOTE APPROVE path beside the synchronous at-the-till
+  // flow (POST /api/dine-in/orders/[id]/discount, which stays unchanged). A
+  // cashier files a request; a Manager/Admin/HOD approves it from anywhere via
+  // /dine-in/discount-approvals. Approving applies the discount to the order
+  // with EXACTLY the same columns/semantics as the sync route.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS discount_requests (
+        id            TEXT PRIMARY KEY,
+        order_id      TEXT NOT NULL,
+        outlet_id     TEXT,
+        requested_by  TEXT NOT NULL,                      -- requester's email (like requisitions.drafted_by)
+        requested_pct REAL NOT NULL,
+        reason        TEXT DEFAULT '',
+        status        TEXT NOT NULL DEFAULT 'pending',    -- pending | approved | rejected
+        decided_by    TEXT DEFAULT '',                    -- approver's display name (mirrors orders.discount_approved_by)
+        decided_note  TEXT DEFAULT '',
+        decided_at    TEXT,
+        created_at    TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_discount_requests_status ON discount_requests(status);
+      CREATE INDEX IF NOT EXISTS idx_discount_requests_order  ON discount_requests(order_id);
+    `);
+  } catch (e) { console.error('discount_requests schema failed:', e); }
+
+  // ── Config-audit fingerprint (evidence instrumentation, 2026-07-13) ────────
+  // Prod complaint: "user roles & permission settings change on every deploy."
+  // A byte-diff boot test proved the boot path does NOT mutate users/roles, but
+  // to catch ANY future mutation WITH a timestamp we fingerprint the permission
+  // config (users' tier/role/page map + full roles page maps) on every boot and
+  // log every transition. A deploy-boot that logs a change here = real DB
+  // mutation; a complaint WITHOUT a log row here = stale cached bundle on the
+  // client (hard-refresh fixes it). Purely additive; never blocks boot.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS config_fingerprint_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        old_hash    TEXT,
+        new_hash    TEXT NOT NULL,
+        changed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { createHash } = require('crypto') as typeof import('crypto');
+    const userLines = (db.prepare(`
+      SELECT id || '|' || COALESCE(role,'') || '|' || COALESCE(role_id,'') || '|' || COALESCE(page_access,'<NULL>') AS line
+      FROM users ORDER BY id
+    `).all() as any[]).map(r => r.line);
+    const roleLines = (db.prepare(`
+      SELECT id || '|' || COALESCE(base_role,'') || '|' || COALESCE(page_access,'<NULL>') AS line
+      FROM roles ORDER BY id
+    `).all() as any[]).map(r => r.line);
+    const fingerprint = createHash('sha256')
+      .update(userLines.join('\n') + '\n==ROLES==\n' + roleLines.join('\n'))
+      .digest('hex');
+    const prev = db.prepare("SELECT value FROM settings WHERE key = 'config_fingerprint'").get() as any;
+    if (prev && prev.value !== fingerprint) {
+      db.prepare('INSERT INTO config_fingerprint_log (old_hash, new_hash) VALUES (?, ?)')
+        .run(prev.value, fingerprint);
+      console.log(`[config-audit] users/roles permission config CHANGED since last boot: ${prev.value.slice(0, 12)}… → ${fingerprint.slice(0, 12)}… (see config_fingerprint_log)`);
+    }
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('config_fingerprint', ?)").run(fingerprint);
+  } catch (e) { console.error('config fingerprint audit failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----
