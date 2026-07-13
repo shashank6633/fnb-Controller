@@ -2566,6 +2566,37 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('store engine (store_locations/…) schema failed:', e); }
 
+  // ── Store closing counts — Phase C (spec F6, additive) ────────────────────
+  // Independent per-store daily physical counts (Liquor Store first). A count
+  // NEVER moves stock — rows here are a pure register (system vs physical vs
+  // variance snapshot at count time), so closing can't distort the ledger.
+  // The optional admin-only "adjust to physical" action posts a regular
+  // 'adjustment' ledger row via /api/stores/[id]/closing — this table stays
+  // movement-free. UNIQUE(store_id, material_id, date) → same-day recount is
+  // an upsert, never a duplicate row. Completely separate from the central
+  // closing_stock table — zero interaction with /closing-stock.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS store_closing_counts (
+        id             TEXT PRIMARY KEY,
+        store_id       TEXT NOT NULL,
+        material_id    TEXT NOT NULL,
+        date           TEXT NOT NULL,               -- YYYY-MM-DD count date
+        system_qty     REAL NOT NULL DEFAULT 0,     -- ledger SUM as-of date (recipe units)
+        physical_qty   REAL NOT NULL DEFAULT 0,     -- counted qty (recipe units)
+        variance       REAL NOT NULL DEFAULT 0,     -- physical − system
+        variance_value REAL NOT NULL DEFAULT 0,     -- variance × weighted-avg ₹/recipe-unit
+        counted_by     TEXT DEFAULT '',             -- actor email
+        note           TEXT DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(store_id, material_id, date),
+        FOREIGN KEY (store_id)    REFERENCES store_locations(id),
+        FOREIGN KEY (material_id) REFERENCES raw_materials(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_store_closing_store_date ON store_closing_counts(store_id, date);
+    `);
+  } catch (e) { console.error('store_closing_counts schema failed:', e); }
+
   // ── Config-audit fingerprint (evidence instrumentation, 2026-07-13) ────────
   // Prod complaint: "user roles & permission settings change on every deploy."
   // A byte-diff boot test proved the boot path does NOT mutate users/roles, but

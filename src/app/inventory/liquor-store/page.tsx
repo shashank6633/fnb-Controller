@@ -9,7 +9,10 @@
  *
  * Sections: STOCK (search + category chips + totals), NEW PURCHASE
  * (can_procure), ADJUSTMENT incl. one-time OPENING (can_adjust), LEDGER tab
- * (type chips / material search / date range).
+ * (type chips / material search / date range), CLOSING STOCK tab
+ * (can_close_stock — independent daily physical counts, Phase C) and REPORTS
+ * tab (11 store-scoped reports + CSV download, Phase D). Store closing is
+ * COMPLETELY separate from the central /closing-stock module.
  *
  * In-page gate: /api/stores/[id]/my-access → can_view (the APIs also 403
  * server-side, this is just the 🔒 UX). Stock quantities are RECIPE units on
@@ -19,7 +22,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Wine, Plus, Search, X, Loader2, AlertCircle, AlertTriangle, CheckCircle2,
-  SlidersHorizontal, ScrollText, Boxes, Warehouse,
+  SlidersHorizontal, ScrollText, Boxes, Warehouse, ClipboardCheck, BarChart3,
+  Download, History, Save,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import TabScroller from '@/components/TabScroller';
@@ -90,9 +94,10 @@ export default function LiquorStorePage() {
   const [ledger, setLedger] = useState<LedgerRow[]>([]);
   const [ledgerLoading, setLedgerLoading] = useState(false);
 
-  const [tab, setTab] = useState<'stock' | 'ledger'>('stock');
+  const [tab, setTab] = useState<'stock' | 'ledger' | 'closing' | 'reports'>('stock');
   const [flash, setFlash] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [meRole, setMeRole] = useState<string>('');   // admin-only closing 'adjust' toggle
 
   // Stock filters
   const [q, setQ] = useState('');
@@ -112,11 +117,20 @@ export default function LiquorStorePage() {
     { can_view: false, can_procure: false, can_adjust: false, can_close_stock: false };
   const store = stores.find(s => s.id === storeId) || null;
 
+  // Closing tab is gated on can_close_stock — bounce off it after a store switch.
+  useEffect(() => {
+    if (tab === 'closing' && !access.can_close_stock) setTab('stock');
+  }, [tab, access.can_close_stock]);
+
   /* Boot: active stores + my access per store */
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
+        // Role (for the admin-only "adjust to physical" toggle on Closing)
+        fetch('/api/auth/me').then(r => r.json()).then(j => {
+          if (!cancelled) setMeRole(j?.user?.role || '');
+        }).catch(() => {});
         const r = await fetch('/api/stores');
         const j = await r.json();
         if (j.error) throw new Error(j.error);
@@ -306,6 +320,18 @@ export default function LiquorStorePage() {
                   tab === 'ledger' ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
           <ScrollText className="w-3.5 h-3.5" /> Ledger
         </button>
+        {access.can_close_stock && (
+          <button onClick={() => setTab('closing')}
+                  className={`px-3 py-1.5 rounded-full text-xs font-medium border flex items-center gap-1.5 ${
+                    tab === 'closing' ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
+            <ClipboardCheck className="w-3.5 h-3.5" /> Closing Stock
+          </button>
+        )}
+        <button onClick={() => setTab('reports')}
+                className={`px-3 py-1.5 rounded-full text-xs font-medium border flex items-center gap-1.5 ${
+                  tab === 'reports' ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
+          <BarChart3 className="w-3.5 h-3.5" /> Reports
+        </button>
       </TabScroller>
 
       {tab === 'stock' ? (
@@ -447,6 +473,14 @@ export default function LiquorStorePage() {
             </>
           )}
         </>
+      ) : tab === 'closing' && store ? (
+        <ClosingSection
+          storeId={store.id} storeName={store.name}
+          stock={stock} isAdmin={meRole === 'admin'}
+          onSaved={afterWrite}
+        />
+      ) : tab === 'reports' && store ? (
+        <ReportsSection storeId={store.id} storeCode={store.code || 'store'} />
       ) : (
         <>
           {/* Ledger filters */}
@@ -883,5 +917,642 @@ function AdjustModal({ storeId, storeName, materials, hasHistory, onClose, onSav
                   className={inputCls} />
       </div>
     </ModalShell>
+  );
+}
+
+/* ── Closing Stock section (Phase C — independent store closing counts) ──
+   Counts are a pure REGISTER (store_closing_counts) — saving never moves
+   stock. Admin-only "adjust to physical" additionally posts 'adjustment'
+   ledger rows. Completely separate from the central /closing-stock page. */
+
+interface ClosingCount {
+  material_id: string; date: string; system_qty: number; physical_qty: number;
+  variance: number; variance_value: number; counted_by: string; note: string;
+  material_name: string; unit: string; purchase_unit: string; pack_size: number;
+}
+interface ClosingDay {
+  date: string; item_count: number; shortage_count: number; excess_count: number;
+  total_variance_value: number; abs_variance_value: number;
+}
+
+function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
+  storeId: string; storeName: string; stock: StockRow[];
+  isAdmin: boolean; onSaved: (msg: string) => void;
+}) {
+  const [view, setView] = useState<'count' | 'history'>('count');
+  const [date, setDate] = useState(today());
+  const [counts, setCounts] = useState<ClosingCount[]>([]);
+  const [systemAsof, setSystemAsof] = useState<Record<string, number>>({});
+  const [dayLoading, setDayLoading] = useState(false);
+  const [whole, setWhole] = useState<Record<string, string>>({});   // purchase units (BTL)
+  const [loose, setLoose] = useState<Record<string, string>>({});   // recipe units (ml)
+  const [note, setNote] = useState('');
+  const [adjust, setAdjust] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  // History
+  const [days, setDays] = useState<ClosingDay[]>([]);
+  const [histLoading, setHistLoading] = useState(false);
+  const [histDate, setHistDate] = useState('');
+
+  const loadDay = useCallback(async (d: string) => {
+    setDayLoading(true); setErr(null);
+    try {
+      const r = await fetch(`/api/stores/${storeId}/closing?date=${d}`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setCounts(j.counts || []);
+      const m: Record<string, number> = {};
+      for (const s of j.system_asof || []) m[s.material_id] = Number(s.qty) || 0;
+      setSystemAsof(m);
+    } catch (e: any) { setErr(e.message); }
+    finally { setDayLoading(false); }
+  }, [storeId]);
+
+  const loadHistory = useCallback(async () => {
+    setHistLoading(true); setErr(null);
+    try {
+      const r = await fetch(`/api/stores/${storeId}/closing`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setDays(j.dates || []);
+    } catch (e: any) { setErr(e.message); }
+    finally { setHistLoading(false); }
+  }, [storeId]);
+
+  useEffect(() => { loadDay(date); setWhole({}); setLoose({}); }, [date, loadDay]);
+  useEffect(() => { if (view === 'history') { loadHistory(); setHistDate(''); } }, [view, loadHistory]);
+
+  const countedBy = useMemo(() => {
+    const m = new Map<string, ClosingCount>();
+    for (const c of counts) m.set(c.material_id, c);
+    return m;
+  }, [counts]);
+
+  // Physical qty in RECIPE units from the dual entry (null = untouched row).
+  const physicalFor = (r: StockRow): number | null => {
+    const pc = packConv(r);
+    const num = (s?: string) => (s != null && s !== '' && !isNaN(Number(s))) ? Number(s) : null;
+    const w = num(whole[r.material_id]), l = num(loose[r.material_id]);
+    if (w == null && l == null) return null;
+    return (w ?? 0) * pc + (l ?? 0);
+  };
+  const systemFor = (r: StockRow): number =>
+    systemAsof[r.material_id] !== undefined ? systemAsof[r.material_id] : (Number(r.qty) || 0);
+
+  const rows = useMemo(
+    () => [...stock].sort((a, b) => a.material_name.localeCompare(b.material_name)),
+    [stock],
+  );
+  const pending = rows
+    .map(r => ({ r, phys: physicalFor(r) }))
+    .filter((x): x is { r: StockRow; phys: number } => x.phys != null);
+  const pendingVarianceValue = pending.reduce(
+    (s, { r, phys }) => s + (phys - systemFor(r)) * (Number(r.avg_cost) || 0), 0);
+
+  const save = async () => {
+    if (pending.length === 0) return;
+    if (pending.some(p => p.phys < 0)) { setErr('Physical counts cannot be negative'); return; }
+    setErr(null); setBusy(true);
+    try {
+      const r = await api(`/api/stores/${storeId}/closing`, {
+        method: 'POST',
+        body: {
+          date,
+          items: pending.map(({ r, phys }) => ({ material_id: r.material_id, physical_qty: phys })),
+          note: note.trim(),
+          adjust_to_physical: isAdmin ? adjust : undefined,
+        },
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setWhole({}); setLoose({}); setNote(''); setAdjust(false);
+      await loadDay(date);
+      onSaved(`Saved ${j.summary.items} closing count${j.summary.items === 1 ? '' : 's'} for ${date}` +
+        (j.summary.adjusted_count ? ` — ${j.summary.adjusted_count} adjusted to physical` : ''));
+    } catch (e: any) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  /* history detail = read-only counts of a past date */
+  const openHistDate = (d: string) => { setHistDate(d); loadDay(d); };
+
+  return (
+    <div className="space-y-3">
+      {/* Sub-toggle: Count / History */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex rounded-lg border border-[#E8D5C4] overflow-hidden">
+          <button onClick={() => setView('count')}
+                  className={`px-3 py-1.5 text-xs font-medium flex items-center gap-1.5 ${view === 'count' ? 'bg-[#af4408] text-white' : 'bg-white text-[#6B5744]'}`}>
+            <ClipboardCheck className="w-3.5 h-3.5" /> Count
+          </button>
+          <button onClick={() => setView('history')}
+                  className={`px-3 py-1.5 text-xs font-medium flex items-center gap-1.5 ${view === 'history' ? 'bg-[#af4408] text-white' : 'bg-white text-[#6B5744]'}`}>
+            <History className="w-3.5 h-3.5" /> History
+          </button>
+        </div>
+        {view === 'count' && (
+          <input type="date" value={date} max={today()} onChange={e => setDate(e.target.value)}
+                 aria-label="Count date"
+                 className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg text-sm bg-white" />
+        )}
+      </div>
+
+      {err && (
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0" /> {err}
+        </div>
+      )}
+
+      {view === 'count' ? (
+        <>
+          <p className="text-[11px] text-[#8B7355]">
+            Physical count for <b>{date}</b> — system qty is the {storeName} ledger sum as of that date.
+            Saving a count records it only; stock is never changed by a count.
+          </p>
+
+          {dayLoading ? (
+            <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
+          ) : rows.length === 0 ? (
+            <div className="p-8 text-center text-sm text-[#8B7355] bg-white border border-[#E8D5C4] rounded-xl">
+              Nothing to count yet — record a purchase or opening stock first.
+            </div>
+          ) : (
+            <>
+              {/* Desktop table */}
+              <div className="hidden md:block bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[760px] text-xs">
+                    <thead className="bg-[#FFF1E3] text-[#8B7355]">
+                      <tr>
+                        <th className="text-left px-3 py-2 font-medium">Material</th>
+                        <th className="text-right px-3 py-2 font-medium">System</th>
+                        <th className="text-left px-3 py-2 font-medium w-[260px]">Physical count</th>
+                        <th className="text-right px-3 py-2 font-medium">Variance</th>
+                        <th className="text-left px-3 py-2 font-medium">Today</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#F0E4D6]">
+                      {rows.map(r => {
+                        const pc = packConv(r);
+                        const sys = systemFor(r);
+                        const phys = physicalFor(r);
+                        const existing = countedBy.get(r.material_id);
+                        const v = phys != null ? Math.round((phys - sys) * 1000) / 1000 : null;
+                        const vv = v != null ? v * (Number(r.avg_cost) || 0) : null;
+                        const box = 'w-16 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]';
+                        return (
+                          <tr key={r.material_id} className="hover:bg-[#FFF8F0] align-top">
+                            <td className="px-3 py-2">
+                              <div className="text-[#2D1B0E] font-medium">{r.material_name}</div>
+                              <div className="text-[10px] text-[#8B7355]">{r.category}</div>
+                            </td>
+                            <td className="px-3 py-2 text-right whitespace-nowrap font-mono text-[#6B5744]">
+                              {pc > 1
+                                ? <>{fq(sys / pc)} {r.purchase_unit}<div className="text-[10px]">{fq(sys)} {r.unit}</div></>
+                                : <>{fq(sys)} {r.unit}</>}
+                            </td>
+                            <td className="px-3 py-2">
+                              <div className="flex items-center gap-1 flex-wrap">
+                                {pc > 1 && (<>
+                                  <input type="number" step="any" min={0} value={whole[r.material_id] ?? ''}
+                                         onChange={e => setWhole(p => ({ ...p, [r.material_id]: e.target.value }))}
+                                         placeholder="0" title={`Full ${r.purchase_unit} — 1 = ${fq(r.pack_size)} ${r.unit}`}
+                                         className={box} />
+                                  <span className="text-[10px] text-[#8B7355]">{r.purchase_unit}</span>
+                                  <span className="text-[10px] text-[#8B7355]">+</span>
+                                </>)}
+                                <input type="number" step="any" min={0} value={loose[r.material_id] ?? ''}
+                                       onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
+                                       placeholder="0" title={pc > 1 ? `Loose / open ${r.unit}` : `Count in ${r.unit}`}
+                                       className={box} />
+                                <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
+                                {phys != null && pc > 1 && (
+                                  <span className="text-[10px] font-mono text-[#af4408] whitespace-nowrap">= {fq(phys)} {r.unit}</span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="px-3 py-2 text-right whitespace-nowrap font-mono">
+                              {v == null ? <span className="text-[#8B7355]">—</span> : (
+                                <span className={v < 0 ? 'text-red-700' : v > 0 ? 'text-blue-700' : 'text-emerald-700'}>
+                                  {v > 0 ? '+' : ''}{fq(v)} {r.unit}
+                                  <div className="text-[10px]">{vv != null && vv !== 0 ? (vv > 0 ? '+' : '−') + inr(Math.abs(vv)) : inr(0)}</div>
+                                </span>
+                              )}
+                            </td>
+                            <td className="px-3 py-2">
+                              {existing ? (
+                                <span className="inline-block text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
+                                      title={`By ${existing.counted_by} — variance ${existing.variance > 0 ? '+' : ''}${existing.variance} ${r.unit}`}>
+                                  ✓ {fq(existing.physical_qty)} {r.unit}
+                                </span>
+                              ) : <span className="text-[10px] text-[#8B7355]">—</span>}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Mobile cards */}
+              <div className="md:hidden space-y-2">
+                {rows.map(r => {
+                  const pc = packConv(r);
+                  const sys = systemFor(r);
+                  const phys = physicalFor(r);
+                  const existing = countedBy.get(r.material_id);
+                  const v = phys != null ? Math.round((phys - sys) * 1000) / 1000 : null;
+                  const vv = v != null ? v * (Number(r.avg_cost) || 0) : null;
+                  const box = 'w-16 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white';
+                  return (
+                    <div key={r.material_id} className="bg-white border border-[#E8D5C4] rounded-xl p-3 text-xs">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium text-[#2D1B0E] break-words">{r.material_name}</div>
+                          <div className="text-[10px] text-[#8B7355]">
+                            System: {pc > 1 ? `${fq(sys / pc)} ${r.purchase_unit} (${fq(sys)} ${r.unit})` : `${fq(sys)} ${r.unit}`}
+                          </div>
+                        </div>
+                        {existing && (
+                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">
+                            ✓ {fq(existing.physical_qty)} {r.unit}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-2 flex items-center gap-1 flex-wrap">
+                        {pc > 1 && (<>
+                          <input type="number" step="any" min={0} inputMode="decimal" value={whole[r.material_id] ?? ''}
+                                 onChange={e => setWhole(p => ({ ...p, [r.material_id]: e.target.value }))}
+                                 placeholder="0" className={box} />
+                          <span className="text-[10px] text-[#8B7355]">{r.purchase_unit}</span>
+                          <span className="text-[10px] text-[#8B7355]">+</span>
+                        </>)}
+                        <input type="number" step="any" min={0} inputMode="decimal" value={loose[r.material_id] ?? ''}
+                               onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
+                               placeholder="0" className={box} />
+                        <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
+                        {v != null && (
+                          <span className={`ml-auto font-mono ${v < 0 ? 'text-red-700' : v > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
+                            {v > 0 ? '+' : ''}{fq(v)} {r.unit}{vv != null ? ` · ${vv > 0 ? '+' : vv < 0 ? '−' : ''}${inr(Math.abs(vv))}` : ''}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Save bar */}
+              <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3 space-y-2">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-[#6B5744]">
+                  <span><b className="text-[#2D1B0E]">{pending.length}</b> item{pending.length === 1 ? '' : 's'} entered</span>
+                  {pending.length > 0 && (
+                    <span>Variance <b className={pendingVarianceValue < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}>
+                      {pendingVarianceValue < 0 ? '−' : ''}{inr(Math.abs(pendingVarianceValue))}</b></span>
+                  )}
+                  <input value={note} onChange={e => setNote(e.target.value)} placeholder="Note (optional)…"
+                         className="flex-1 min-w-[140px] px-2 py-1.5 border border-[#E8D5C4] rounded text-xs bg-white" />
+                  <button onClick={save} disabled={busy || pending.length === 0}
+                          className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+                    {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                    Save counts{pending.length > 0 ? ` (${pending.length})` : ''}
+                  </button>
+                </div>
+                {isAdmin && (
+                  <label className="flex items-start gap-2 text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg p-2 cursor-pointer">
+                    <input type="checkbox" checked={adjust} onChange={e => setAdjust(e.target.checked)} className="accent-[#af4408] mt-0.5" />
+                    <span>
+                      <b>Adjust stock to physical</b> (admin) — additionally posts an <i>adjustment</i> ledger row for
+                      each variance so {storeName} stock matches the count. ⚠️ This reconciles away shortages — use only
+                      after verifying the physical count.
+                    </span>
+                  </label>
+                )}
+              </div>
+            </>
+          )}
+        </>
+      ) : (
+        /* ── History ── */
+        histLoading ? (
+          <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading history…</div>
+        ) : days.length === 0 ? (
+          <div className="p-8 text-center text-sm text-[#8B7355] bg-white border border-[#E8D5C4] rounded-xl">
+            No closing counts recorded yet for {storeName}.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[520px] text-xs">
+                  <thead className="bg-[#FFF1E3] text-[#8B7355]">
+                    <tr>
+                      <th className="text-left px-3 py-2 font-medium">Date</th>
+                      <th className="text-right px-3 py-2 font-medium">Items</th>
+                      <th className="text-right px-3 py-2 font-medium">Short</th>
+                      <th className="text-right px-3 py-2 font-medium">Excess</th>
+                      <th className="text-right px-3 py-2 font-medium">Variance ₹</th>
+                      <th className="px-3 py-2"></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#F0E4D6]">
+                    {days.map(d => (
+                      <tr key={d.date} className={`hover:bg-[#FFF8F0] cursor-pointer ${histDate === d.date ? 'bg-[#FFF1E3]' : ''}`}
+                          onClick={() => openHistDate(d.date)}>
+                        <td className="px-3 py-2 font-medium text-[#2D1B0E] whitespace-nowrap">{d.date}</td>
+                        <td className="px-3 py-2 text-right">{d.item_count}</td>
+                        <td className="px-3 py-2 text-right text-red-700">{d.shortage_count || '—'}</td>
+                        <td className="px-3 py-2 text-right text-blue-700">{d.excess_count || '—'}</td>
+                        <td className={`px-3 py-2 text-right font-mono ${d.total_variance_value < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}`}>
+                          {d.total_variance_value < 0 ? '−' : ''}{inr(Math.abs(d.total_variance_value))}
+                        </td>
+                        <td className="px-3 py-2 text-right text-[10px] text-[#af4408]">view</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {histDate && (
+              dayLoading ? (
+                <div className="p-6 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading {histDate}…</div>
+              ) : (
+                <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+                  <div className="px-3 py-2 bg-[#FFF1E3] text-xs font-medium text-[#2D1B0E]">Counts on {histDate}</div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[560px] text-xs">
+                      <thead className="text-[#8B7355] border-b border-[#F0E4D6]">
+                        <tr>
+                          <th className="text-left px-3 py-2 font-medium">Material</th>
+                          <th className="text-right px-3 py-2 font-medium">System</th>
+                          <th className="text-right px-3 py-2 font-medium">Physical</th>
+                          <th className="text-right px-3 py-2 font-medium">Variance</th>
+                          <th className="text-right px-3 py-2 font-medium">₹</th>
+                          <th className="text-left px-3 py-2 font-medium">By</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[#F0E4D6]">
+                        {counts.map(c => (
+                          <tr key={c.material_id}>
+                            <td className="px-3 py-2 text-[#2D1B0E]">{c.material_name}
+                              {c.note && <div className="text-[10px] text-[#8B7355]">{c.note}</div>}
+                            </td>
+                            <td className="px-3 py-2 text-right font-mono text-[#6B5744]">{fq(c.system_qty)} {c.unit}</td>
+                            <td className="px-3 py-2 text-right font-mono text-[#2D1B0E]">{fq(c.physical_qty)} {c.unit}</td>
+                            <td className={`px-3 py-2 text-right font-mono ${c.variance < 0 ? 'text-red-700' : c.variance > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
+                              {c.variance > 0 ? '+' : ''}{fq(c.variance)} {c.unit}
+                            </td>
+                            <td className={`px-3 py-2 text-right font-mono ${c.variance_value < 0 ? 'text-red-700' : 'text-[#6B5744]'}`}>
+                              {c.variance_value < 0 ? '−' : ''}{inr(Math.abs(c.variance_value))}
+                            </td>
+                            <td className="px-3 py-2 text-[#8B7355]">{(c.counted_by || '').split('@')[0] || '—'}</td>
+                          </tr>
+                        ))}
+                        {counts.length === 0 && (
+                          <tr><td colSpan={6} className="px-3 py-4 text-center text-[#8B7355]">No counts on this date.</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )
+            )}
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+/* ── Reports section (Phase D — store-scoped reports + CSV) ────────────── */
+
+type ColFmt = 'qty' | 'inr' | 'inr4' | undefined;
+interface ReportCol { k: string; l: string; fmt?: ColFmt; }
+interface ReportDef { key: string; label: string; dated?: boolean; days?: boolean; cols: ReportCol[]; }
+
+const REPORT_DEFS: ReportDef[] = [
+  { key: 'current_stock', label: 'Current Stock', cols: [
+    { k: 'material', l: 'Material' }, { k: 'sku', l: 'SKU' }, { k: 'category', l: 'Category' },
+    { k: 'qty_purchase', l: 'On hand', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
+    { k: 'qty', l: 'Recipe qty', fmt: 'qty' }, { k: 'unit', l: 'R.unit' },
+    { k: 'avg_cost', l: 'Avg cost', fmt: 'inr4' }, { k: 'value', l: 'Value', fmt: 'inr' },
+  ] },
+  { key: 'ledger', label: 'Stock Ledger', dated: true, cols: [
+    { k: 'date', l: 'Date' }, { k: 'txn_type', l: 'Type' }, { k: 'material', l: 'Material' },
+    { k: 'qty', l: 'Qty', fmt: 'qty' }, { k: 'unit', l: 'Unit' },
+    { k: 'unit_cost', l: 'Unit cost', fmt: 'inr4' }, { k: 'running_balance', l: 'Balance', fmt: 'qty' },
+    { k: 'supplier', l: 'Supplier' }, { k: 'ref', l: 'Ref' }, { k: 'by', l: 'By' },
+  ] },
+  { key: 'purchases', label: 'Purchase Register', dated: true, cols: [
+    { k: 'date', l: 'Date' }, { k: 'material', l: 'Material' },
+    { k: 'qty_purchase', l: 'Qty', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
+    { k: 'rate_purchase', l: 'Rate', fmt: 'inr' }, { k: 'cost', l: 'Cost', fmt: 'inr' },
+    { k: 'supplier', l: 'Supplier' }, { k: 'vendor', l: 'Vendor' },
+    { k: 'invoice', l: 'Invoice' }, { k: 'by', l: 'By' },
+  ] },
+  { key: 'movement', label: 'Movement', dated: true, cols: [
+    { k: 'material', l: 'Material' }, { k: 'unit', l: 'Unit' },
+    { k: 'opening', l: 'Opening', fmt: 'qty' }, { k: 'in_qty', l: 'In', fmt: 'qty' },
+    { k: 'out_qty', l: 'Out', fmt: 'qty' }, { k: 'adjust_qty', l: 'Adjust', fmt: 'qty' },
+    { k: 'closing', l: 'Closing', fmt: 'qty' },
+  ] },
+  { key: 'daily_closing', label: 'Daily Closing', dated: true, cols: [
+    { k: 'date', l: 'Date' }, { k: 'items', l: 'Items' },
+    { k: 'shortages', l: 'Short' }, { k: 'excesses', l: 'Excess' },
+    { k: 'variance_value', l: 'Variance ₹', fmt: 'inr' },
+    { k: 'abs_variance_value', l: 'Abs ₹', fmt: 'inr' },
+  ] },
+  { key: 'valuation', label: 'Valuation', cols: [
+    { k: 'category', l: 'Category' }, { k: 'items', l: 'Items' },
+    { k: 'qty', l: 'Qty (recipe)', fmt: 'qty' }, { k: 'value', l: 'Value', fmt: 'inr' },
+  ] },
+  { key: 'low_stock', label: 'Low Stock', cols: [
+    { k: 'material', l: 'Material' }, { k: 'category', l: 'Category' },
+    { k: 'qty', l: 'On hand', fmt: 'qty' }, { k: 'unit', l: 'Unit' },
+    { k: 'reorder_level', l: 'Reorder at', fmt: 'qty' }, { k: 'deficit', l: 'Deficit', fmt: 'qty' },
+    { k: 'value', l: 'Value', fmt: 'inr' },
+  ] },
+  { key: 'dead_stock', label: 'Dead Stock', days: true, cols: [
+    { k: 'material', l: 'Material' }, { k: 'category', l: 'Category' },
+    { k: 'qty', l: 'On hand', fmt: 'qty' }, { k: 'unit', l: 'Unit' },
+    { k: 'value', l: 'Value', fmt: 'inr' }, { k: 'last_outward', l: 'Last outward' },
+  ] },
+  { key: 'supplier', label: 'Supplier-wise', dated: true, cols: [
+    { k: 'supplier', l: 'Supplier' }, { k: 'purchases', l: 'Purchases' },
+    { k: 'qty', l: 'Qty (recipe)', fmt: 'qty' }, { k: 'total_value', l: 'Value', fmt: 'inr' },
+  ] },
+  { key: 'category', label: 'Category-wise', cols: [
+    { k: 'category', l: 'Category' }, { k: 'material', l: 'Material' }, { k: 'sku', l: 'SKU' },
+    { k: 'qty_purchase', l: 'On hand', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
+    { k: 'avg_cost', l: 'Avg cost', fmt: 'inr4' }, { k: 'value', l: 'Value', fmt: 'inr' },
+  ] },
+  { key: 'audit', label: 'Audit Trail', dated: true, cols: [
+    { k: 'date', l: 'Date' }, { k: 'event', l: 'Event' },
+    { k: 'actor', l: 'Actor' }, { k: 'note', l: 'Note' },
+  ] },
+];
+
+function csvEscape(v: any): string {
+  if (v == null) return '';
+  const s = String(v);
+  if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function ReportsSection({ storeId, storeCode }: { storeId: string; storeCode: string }) {
+  const [type, setType] = useState('current_stock');
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [deadDays, setDeadDays] = useState('30');
+  const [rows, setRows] = useState<any[]>([]);
+  const [totals, setTotals] = useState<Record<string, any>>({});
+  const [truncated, setTruncated] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const def = REPORT_DEFS.find(d => d.key === type) || REPORT_DEFS[0];
+
+  const load = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      const p = new URLSearchParams({ type });
+      const d = REPORT_DEFS.find(x => x.key === type);
+      if (d?.dated) { if (from) p.set('from', from); if (to) p.set('to', to); }
+      if (d?.days && deadDays) p.set('days', deadDays);
+      const r = await fetch(`/api/stores/${storeId}/reports?${p.toString()}`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setRows(j.rows || []);
+      setTotals(j.totals || {});
+      setTruncated(!!j.truncated);
+    } catch (e: any) { setErr(e.message); setRows([]); setTotals({}); }
+    finally { setLoading(false); }
+  }, [storeId, type, from, to, deadDays]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const fmtCell = (v: any, fmt: ColFmt) => {
+    if (v == null || v === '') return '—';
+    if (fmt === 'qty') return fq(Number(v));
+    if (fmt === 'inr') {
+      const num = Number(v) || 0;
+      return num < 0 ? '−' + inr(Math.abs(num)) : inr(num);
+    }
+    if (fmt === 'inr4') return inr(Number(v), 4);
+    return String(v);
+  };
+  const totalLabel = (k: string) => k.replace(/_/g, ' ');
+  const totalFmt = (k: string, v: any) => {
+    if (typeof v !== 'number') return String(v);
+    if (/value|cost/.test(k)) return v < 0 ? '−' + inr(Math.abs(v)) : inr(v);
+    return fq(v);
+  };
+
+  const downloadCsv = () => {
+    const lines = [def.cols.map(c => csvEscape(c.l)).join(',')];
+    for (const r of rows) lines.push(def.cols.map(c => csvEscape(r[c.k])).join(','));
+    const blob = new Blob(['﻿' + lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${storeCode.toLowerCase()}-${type}-${today()}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+  };
+
+  return (
+    <div className="space-y-3">
+      {/* Report type pills */}
+      <TabScroller className="gap-1.5">
+        {REPORT_DEFS.map(d => (
+          <button key={d.key} onClick={() => setType(d.key)}
+                  className={`px-2.5 py-1 rounded-full text-[11px] border whitespace-nowrap ${
+                    type === d.key ? 'bg-[#2D1B0E] border-[#2D1B0E] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
+            {d.label}
+          </button>
+        ))}
+      </TabScroller>
+
+      {/* Filters + CSV */}
+      <div className="flex flex-wrap items-center gap-2">
+        {def.dated && (<>
+          <input type="date" value={from} onChange={e => setFrom(e.target.value)} aria-label="From date"
+                 className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg text-sm bg-white" />
+          <span className="text-xs text-[#8B7355]">→</span>
+          <input type="date" value={to} onChange={e => setTo(e.target.value)} aria-label="To date"
+                 className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg text-sm bg-white" />
+          {(from || to) && (
+            <button onClick={() => { setFrom(''); setTo(''); }} className="text-xs text-[#af4408] hover:underline">clear</button>
+          )}
+        </>)}
+        {def.days && (
+          <label className="flex items-center gap-1.5 text-xs text-[#6B5744]">
+            No outward in
+            <input type="number" min={1} max={365} value={deadDays} onChange={e => setDeadDays(e.target.value)}
+                   className="w-16 px-2 py-1.5 border border-[#E8D5C4] rounded-lg text-sm bg-white text-right" />
+            days
+          </label>
+        )}
+        <button onClick={downloadCsv} disabled={rows.length === 0}
+                className="ml-auto px-3 py-1.5 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-xs font-medium flex items-center gap-1.5 disabled:opacity-40">
+          <Download className="w-3.5 h-3.5" /> CSV
+        </button>
+      </div>
+
+      {err && (
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0" /> {err}
+        </div>
+      )}
+
+      {/* Totals strip */}
+      {!loading && !err && (
+        <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl px-3 sm:px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-[#6B5744]">
+          {Object.entries(totals).map(([k, v]) => (
+            <span key={k} className="capitalize">{totalLabel(k)} <b className="text-[#2D1B0E]">{totalFmt(k, v)}</b></span>
+          ))}
+          {truncated && <span className="text-amber-700">showing first 1000 rows</span>}
+        </div>
+      )}
+
+      {loading ? (
+        <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Building report…</div>
+      ) : rows.length === 0 ? (
+        <div className="p-8 text-center text-sm text-[#8B7355] bg-white border border-[#E8D5C4] rounded-xl">
+          No data for this report{def.dated && (from || to) ? ' in the selected date range' : ''}.
+        </div>
+      ) : (
+        <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs" style={{ minWidth: `${Math.max(def.cols.length * 90, 360)}px` }}>
+              <thead className="bg-[#FFF1E3] text-[#8B7355]">
+                <tr>
+                  {def.cols.map(c => (
+                    <th key={c.k} className={`px-3 py-2 font-medium whitespace-nowrap ${c.fmt ? 'text-right' : 'text-left'}`}>{c.l}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#F0E4D6]">
+                {rows.map((r, i) => (
+                  <tr key={i} className="hover:bg-[#FFF8F0]">
+                    {def.cols.map(c => (
+                      <td key={c.k}
+                          className={`px-3 py-2 ${c.fmt ? 'text-right font-mono whitespace-nowrap' : 'text-[#2D1B0E]'} ${
+                            c.fmt && Number(r[c.k]) < 0 ? 'text-red-700' : ''} ${!c.fmt ? 'max-w-[260px] break-words' : ''}`}>
+                        {fmtCell(r[c.k], c.fmt)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
