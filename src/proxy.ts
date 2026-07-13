@@ -73,6 +73,8 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/dine-in/offline-print', // print-station config + print-job journal
   '/api/tables',              // QR standee token generation (admin)
   '/api/crm',                 // AKAN CRM (chat/training/quiz/settings) — guest-quiz is carved out in isPublic
+  '/api/whatsapp',            // WhatsApp Integration (config/templates) — webhook is carved out in isPublic
+  '/api/stores',              // Store Locations (multi-store engine config: stores/categories/access)
 ];
 
 function isPublic(pathname: string): boolean {
@@ -88,6 +90,11 @@ function isPublic(pathname: string): boolean {
   // stripping + attempt/expiry gates in the guest-quiz routes themselves.
   if (pathname.startsWith('/quiz/link/')) return true;
   if (pathname.startsWith('/api/crm/guest-quiz/')) return true;
+  // WhatsApp webhook: Meta's servers call this with no session/CSRF. GET is the
+  // verify-token handshake (403s on mismatch inside the route); POST only logs
+  // the payload into whatsapp_events_log. Exact match — nothing else under
+  // /api/whatsapp is public.
+  if (pathname === '/api/whatsapp/webhook') return true;
   if (pathname.includes('/print')) return true;            // PO print pages render via cookie if present
   if (pathname.startsWith('/_next')) return true;
   if (pathname.startsWith('/favicon')) return true;

@@ -2359,6 +2359,38 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('crm_digests schema failed:', e); }
 
+  // ── WhatsApp Integration ───────────────────────────────────────────────────
+  // Configuration + template + event-log foundation for the WhatsApp module
+  // (/settings/integrations/whatsapp). Purely additive. No live Business-API
+  // traffic happens until an admin configures a provider; the existing wa.me
+  // review-request links elsewhere are untouched.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS whatsapp_templates (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL UNIQUE,
+        category   TEXT NOT NULL DEFAULT 'general',   -- notification | marketing | approval | general
+        language   TEXT NOT NULL DEFAULT 'en',
+        body       TEXT NOT NULL,                     -- supports {{placeholder}} vars
+        is_active  INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS whatsapp_events_log (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind       TEXT NOT NULL DEFAULT '',          -- 'webhook' | 'send' | future event kinds
+        payload    TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_api_provider', 'meta_cloud');
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_phone_number_id', '');
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_business_account_id', '');
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_access_token', '');
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_webhook_verify_token', '');
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_notifications_enabled', '0');
+    `);
+  } catch (e) { console.error('whatsapp schema failed:', e); }
+
   // ── AKAN CRM — Guest Database + Loyalty (additive) ─────────────────────────
   // Guest directory keyed by normalized 10-digit mobile (/crm/guests). Visits
   // append to crm_guest_visits and roll up onto the guest row (visit_count /
@@ -2426,6 +2458,113 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_discount_requests_order  ON discount_requests(order_id);
     `);
   } catch (e) { console.error('discount_requests schema failed:', e); }
+
+  // ── Multi-Store Inventory Engine — FOUNDATION (Phase A, additive) ─────────
+  // Named store locations (first: LIQUOR STORE) that own their own stock,
+  // separate from the Central Store. Everything is CONFIG, zero hardcoding:
+  // a future Wine Cellar / Beer Store / Mini Bar is just a new store_locations
+  // row + category mappings + user grants — no code change.
+  //
+  //   store_locations    — the store master (name/code/active/authorization)
+  //   store_category_map — which raw_materials.category values BELONG to a
+  //                        store (COLLATE NOCASE; matched with TRIM everywhere)
+  //   store_user_access  — per-user permission grants ("Authorized Liquor
+  //                        Users"): view / procure / adjust / close-stock
+  //   store_stock_ledger — the SINGLE SOURCE OF TRUTH for per-store stock.
+  //                        Signed quantities in RECIPE units; current stock per
+  //                        material = SUM(quantity). raw_materials.current_stock
+  //                        is NOT touched by this module.
+  //
+  // ⚠️ GUARD NOTE (Phase B wires enforcement): store-mapped materials (e.g.
+  // liquor) must eventually be BLOCKED from Central Store flows (purchases /
+  // GRN / requisition issue). Phase A only ships the detection helpers
+  // (isStoreMappedMaterial / storeGuardWarning in src/lib/store-engine.ts) —
+  // NO existing flow changes behaviour yet.
+  //
+  // Seeds are INSERT OR IGNORE — a redeploy can never clobber admin edits.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS store_locations (
+        id                     TEXT PRIMARY KEY,
+        name                   TEXT UNIQUE NOT NULL,
+        code                   TEXT DEFAULT '',
+        description            TEXT DEFAULT '',
+        is_active              INTEGER NOT NULL DEFAULT 1,
+        requires_authorization INTEGER NOT NULL DEFAULT 1,
+        created_at             TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS store_category_map (
+        id         TEXT PRIMARY KEY,
+        store_id   TEXT NOT NULL,
+        category   TEXT NOT NULL COLLATE NOCASE,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(store_id, category),
+        FOREIGN KEY (store_id) REFERENCES store_locations(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS store_user_access (
+        id              TEXT PRIMARY KEY,
+        store_id        TEXT NOT NULL,
+        user_id         TEXT NOT NULL,
+        can_view        INTEGER NOT NULL DEFAULT 1,
+        can_procure     INTEGER NOT NULL DEFAULT 0,
+        can_adjust      INTEGER NOT NULL DEFAULT 0,
+        can_close_stock INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(store_id, user_id),
+        FOREIGN KEY (store_id) REFERENCES store_locations(id),
+        FOREIGN KEY (user_id)  REFERENCES users(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS store_stock_ledger (
+        id          TEXT PRIMARY KEY,
+        store_id    TEXT NOT NULL,
+        material_id TEXT NOT NULL,
+        txn_type    TEXT NOT NULL,             -- opening|purchase|inward|outward|adjustment|closing|transfer
+        quantity    REAL NOT NULL,             -- RECIPE units, signed (+in / -out)
+        unit_cost   REAL DEFAULT 0,            -- ₹ per recipe unit at txn time
+        batch_no    TEXT DEFAULT '',
+        supplier    TEXT DEFAULT '',
+        vendor_id   TEXT DEFAULT '',
+        expiry_date TEXT DEFAULT '',
+        ref         TEXT DEFAULT '',           -- PO no / invoice no / party id …
+        notes       TEXT DEFAULT '',
+        created_by  TEXT DEFAULT '',           -- actor email
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (store_id)    REFERENCES store_locations(id),
+        FOREIGN KEY (material_id) REFERENCES raw_materials(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_store_ledger_store_material ON store_stock_ledger(store_id, material_id);
+      CREATE INDEX IF NOT EXISTS idx_store_ledger_store_created  ON store_stock_ledger(store_id, created_at);
+
+      -- Seed store #1: LIQUOR STORE (name is UNIQUE → OR IGNORE keeps admin edits)
+      INSERT OR IGNORE INTO store_locations (id, name, code, description)
+      VALUES (lower(hex(randomblob(16))), 'LIQUOR STORE', 'LIQ',
+              'Dedicated liquor store — bottles live here, not in the Central Store');
+    `);
+    // Seed the LIQUOR STORE category mappings (spec list, lowercased). Names
+    // that already exist in the raw_materials category vocabulary keep that
+    // exact kebab-case spelling (beer, blended-scotch, bourbon, red-wine, rum,
+    // single-malt-whiskey, tequila); the rest are seeded as spec'd — matching
+    // is COLLATE NOCASE + TRIM everywhere, so spacing/case never matters.
+    // (The pre-existing 'bar' category is deliberately NOT auto-seeded: the
+    // admin decides on /settings/stores whether 'bar' consumables belong here.)
+    const LIQUOR_SEED_CATEGORIES = [
+      'aperitif', 'beer', 'blended malt', 'blended-scotch', 'bourbon', 'brandy',
+      'gin', 'irish', 'japanese whisky', 'liqueur', 'red-wine', 'rose wine',
+      'rum', 'single-malt-whiskey', 'sparkling-wine', 'tennessee whiskey',
+      'tequila', 'vermouth', 'vodka', 'whiskey', 'white-wine',
+    ];
+    const liq = db.prepare(`SELECT id FROM store_locations WHERE TRIM(name) = 'LIQUOR STORE' COLLATE NOCASE`).get() as any;
+    if (liq) {
+      const insMap = db.prepare(`
+        INSERT OR IGNORE INTO store_category_map (id, store_id, category)
+        VALUES (lower(hex(randomblob(16))), ?, ?)
+      `);
+      for (const c of LIQUOR_SEED_CATEGORIES) insMap.run(liq.id, c);
+    }
+  } catch (e) { console.error('store engine (store_locations/…) schema failed:', e); }
 
   // ── Config-audit fingerprint (evidence instrumentation, 2026-07-13) ────────
   // Prod complaint: "user roles & permission settings change on every deploy."

@@ -196,6 +196,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Roles",          href: "/settings/roles",         icon: Users },
       { kind: "link", label: "Print Design",   href: "/settings/print-design",  icon: Printer },
       { kind: "link", label: "Categories",     href: "/settings/categories",    icon: Boxes },
+      { kind: "link", label: "Store Locations", href: "/settings/stores",       icon: Warehouse },
       { kind: "link", label: "Page Access",    href: "/settings/page-access",   icon: ShieldAlert },
       { kind: "link", label: "Integrations",   href: "/settings/integrations",  icon: ShieldAlert },
       { kind: "link", label: "QR Standees",    href: "/settings/qr-standees",   icon: QrCode },

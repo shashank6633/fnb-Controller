@@ -176,6 +176,9 @@ export default function IntegrationsPage() {
         </details>
       </div>
 
+      {/* WhatsApp Integration — config/templates/notifications live in their own module */}
+      <WhatsAppCard />
+
       {/* Captain area lock — restrict captains to their assigned floors/tables */}
       <CaptainAreaLockCard onError={setError} onOk={setOkMsg} />
 
@@ -366,6 +369,40 @@ function GoogleSheetsCard({ onError, onOk }: { onError: (m: string) => void; onO
           <li>Share the AKAN Party Manager sheet (Viewer) with the <code className="bg-[#FFF1E3] px-1 rounded">client_email</code> shown above</li>
         </ol>
       </details>
+    </div>
+  );
+}
+
+/**
+ * WhatsApp Integration — entry card. The actual module (provider config,
+ * templates, notification toggles, coming-soon roadmap) lives at
+ * /settings/integrations/whatsapp; this card just shows a live status pill.
+ */
+function WhatsAppCard() {
+  const [cfg, setCfg] = useState<{ configured: boolean; wa_api_provider: string } | null>(null);
+
+  useEffect(() => {
+    fetch('/api/whatsapp/config').then(r => r.json()).then(d => { if (!d.error) setCfg(d); }).catch(() => {});
+  }, []);
+
+  return (
+    <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <Send size={16} className="text-emerald-600" />
+        <h2 className="text-sm font-semibold text-[#2D1B0E]">WhatsApp</h2>
+        {cfg?.configured
+          ? <span className="ml-auto text-[11px] inline-flex items-center gap-1 text-emerald-700"><CheckCircle2 size={12} /> Configured</span>
+          : <span className="ml-auto text-[11px] inline-flex items-center gap-1 text-amber-700"><AlertTriangle size={12} /> Not configured</span>}
+      </div>
+      <p className="text-xs text-[#8B7355]">
+        Central home for all WhatsApp features — Business API credentials, message templates,
+        notification rules, webhook, and upcoming automations & AI. Configure once; every
+        future WhatsApp feature plugs into it.
+      </p>
+      <a href="/settings/integrations/whatsapp"
+         className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#af4408] hover:bg-[#933807] text-white text-sm rounded">
+        Open WhatsApp module →
+      </a>
     </div>
   );
 }
