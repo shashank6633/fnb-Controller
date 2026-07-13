@@ -145,7 +145,8 @@ export default function ContractsPage() {
             No contracts {filter === 'active' ? 'currently active' : ''}.
           </div>
         ) : (
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto">
+          <table className="w-full text-sm min-w-[760px]">
             <thead className="text-[#8B7355] bg-[#FFF8F0] text-xs">
               <tr>
                 <th className="text-left  py-2 px-3 font-medium">Vendor</th>
@@ -204,6 +205,7 @@ export default function ContractsPage() {
               })}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 

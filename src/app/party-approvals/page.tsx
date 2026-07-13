@@ -451,7 +451,8 @@ export default function PartyApprovalsPage() {
                 </div>
 
                 {isOpen && (
-                  <table className="w-full text-xs">
+                  <div className="overflow-x-auto">
+                  <table className="w-full text-xs min-w-[640px]">
                     <thead className="bg-white border-b border-[#E8D5C4] text-[#6B5744]">
                       <tr>
                         <th className="text-left  py-2 px-3 font-medium">Req #</th>
@@ -606,7 +607,8 @@ export default function PartyApprovalsPage() {
                                         ⚠ {flaggedCount} line{flaggedCount === 1 ? ' looks' : 's look'} implausible (likely a unit mistake — e.g. ml instead of bottles). Hover the ⚠ on each line, and fix the qty before approving.
                                       </div>
                                     )}
-                                    <table className="w-full text-[11px]">
+                                    <div className="overflow-x-auto">
+                                    <table className="w-full text-[11px] min-w-[640px]">
                                       <thead className="text-[#6B5744]">
                                         <tr>
                                           <th className="text-left  py-0.5 font-medium">SKU</th>
@@ -723,6 +725,7 @@ export default function PartyApprovalsPage() {
                                         </tr>
                                       </tfoot>
                                     </table>
+                                    </div>
                                     </>
                                       );
                                     })()}
@@ -739,6 +742,7 @@ export default function PartyApprovalsPage() {
                       })}
                     </tbody>
                   </table>
+                  </div>
                 )}
               </div>
             );

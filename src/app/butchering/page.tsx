@@ -105,7 +105,8 @@ export default function ButcheringPage() {
               No batches yet. Click <strong>New Batch</strong> after receiving a carcass.
             </div>
           ) : (
-            <table className="w-full text-xs">
+            <div className="overflow-x-auto">
+            <table className="w-full text-xs min-w-[760px]">
               <thead className="bg-[#FFF1E3] text-[#6B5744]">
                 <tr>
                   <th className="text-left  py-2 px-3 font-medium">Batch ID</th>
@@ -146,6 +147,7 @@ export default function ButcheringPage() {
                 })}
               </tbody>
             </table>
+            </div>
           )}
         </div>
       ) : (
@@ -574,7 +576,8 @@ function YieldReportPanel() {
                   Waste: {src.waste.total_pct.toFixed(1)}% (target ≤ {src.waste.target_max_pct}%)
                 </span>
               </div>
-              <table className="w-full text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-xs min-w-[480px]">
                 <thead className="text-[#8B7355]">
                   <tr>
                     <th className="text-left  py-1 font-medium">Cut</th>
@@ -605,6 +608,7 @@ function YieldReportPanel() {
                   ))}
                 </tbody>
               </table>
+              </div>
             </div>
           ))}
         </div>

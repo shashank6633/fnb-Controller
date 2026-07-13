@@ -349,7 +349,8 @@ export default function PartyRequisitionsPage() {
               : `No requisitions match "${search}".`}
           </div>
         ) : (
-          <table className="w-full text-xs">
+          <div className="overflow-x-auto">
+          <table className="w-full text-xs min-w-[880px]">
             <thead className="bg-[#FFF1E3] text-[#6B5744]">
               <tr>
                 <th className="text-left  py-2 px-3 font-medium w-6"></th>
@@ -468,7 +469,8 @@ export default function PartyRequisitionsPage() {
                           {detail.event_notes && (
                             <div className="text-[10px] text-[#6B5744] italic">Notes: {detail.event_notes}</div>
                           )}
-                          <table className="w-full text-[11px]">
+                          <div className="overflow-x-auto">
+                          <table className="w-full text-[11px] min-w-[520px]">
                             <thead className="text-[#8B7355]">
                               <tr>
                                 <th className="text-left  py-1 px-2 font-medium">SKU</th>
@@ -513,6 +515,7 @@ export default function PartyRequisitionsPage() {
                               })}
                             </tbody>
                           </table>
+                          </div>
                         </div>
                       )}
                     </td>
@@ -523,6 +526,7 @@ export default function PartyRequisitionsPage() {
               })}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 

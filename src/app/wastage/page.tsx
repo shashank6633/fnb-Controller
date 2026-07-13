@@ -191,7 +191,8 @@ export default function WastagePage() {
         ) : filtered.length === 0 ? (
           <div className="p-8 text-center text-sm text-[#8B7355]">No wastage entries in this range. Use the form above to record one.</div>
         ) : (
-          <table className="w-full text-xs">
+          <div className="overflow-x-auto">
+          <table className="w-full text-xs min-w-[720px]">
             <thead className="bg-[#FFF1E3] text-[#6B5744]">
               <tr>
                 <th className="text-left  py-1.5 px-3 font-medium">Date</th>
@@ -228,6 +229,7 @@ export default function WastagePage() {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
     </div>

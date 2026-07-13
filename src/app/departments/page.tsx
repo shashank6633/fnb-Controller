@@ -296,12 +296,15 @@ export default function DepartmentsPage() {
 
       {editing && (
         <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
-          <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md my-12 shadow-xl">
-            <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+          {/* House safe-modal shell: card capped to viewport, body scrolls
+              internally, so header + Save/Cancel stay on screen on phones. */}
+          <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+               className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md shadow-xl flex flex-col overflow-hidden">
+            <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
               <h2 className="font-bold text-[#2D1B0E]">{editing.id ? 'Edit Department' : 'New Department'}</h2>
               <button onClick={() => setEditing(null)} className="text-[#8B7355]"><X className="w-5 h-5" /></button>
             </div>
-            <div className="p-5 space-y-3">
+            <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-3">
               <label className="text-xs text-[#6B5744] flex flex-col gap-1">
                 Name (required)
                 <input value={editing.name || ''} onChange={e => setEditing(p => ({ ...p, name: e.target.value }))}
@@ -463,7 +466,7 @@ export default function DepartmentsPage() {
                 </label>
               )}
             </div>
-            <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2">
+            <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2 shrink-0">
               <button onClick={() => setEditing(null)} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
               <button onClick={save} disabled={saving}
                       className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg flex items-center gap-1.5 disabled:opacity-50">

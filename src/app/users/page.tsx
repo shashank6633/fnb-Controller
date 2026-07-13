@@ -292,12 +292,15 @@ export default function UsersPage() {
 
         {editing && (
           <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
-            <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md my-8 shadow-xl">
-              <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+            {/* House safe-modal shell: card capped to viewport, body scrolls
+                internally, so header + Save/Cancel stay on screen on phones. */}
+            <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+                 className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md shadow-xl flex flex-col overflow-hidden">
+              <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
                 <h2 className="font-bold text-[#2D1B0E]">{editing.id ? 'Edit User' : 'New User'}</h2>
                 <button onClick={() => setEditing(null)}><X className="w-5 h-5 text-[#8B7355]" /></button>
               </div>
-              <div className="p-5 space-y-3">
+              <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-3">
                 {!editing.id && (
                   <label className="block text-xs text-[#6B5744]">Email
                     <input value={editing.email || ''} onChange={e => setEditing({ ...editing, email: e.target.value })}
@@ -469,7 +472,7 @@ export default function UsersPage() {
                   tables={tables}
                 />
               </div>
-              <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2">
+              <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2 shrink-0">
                 <button onClick={() => setEditing(null)} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
                 <button onClick={save} className="px-3 py-2 text-sm bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg inline-flex items-center gap-1">
                   <Save className="w-4 h-4" /> Save

@@ -226,8 +226,8 @@ function FoodItemsModal({ target, onClose }: { target: PnLRow; onClose: () => vo
           ) : items.length === 0 ? (
             <div className="text-sm text-[#8B7355] py-4 text-center">No food items found for this event.</div>
           ) : (
-            <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
-              <table className="w-full text-xs">
+            <div className="border border-[#E8D5C4] rounded-lg overflow-x-auto">
+              <table className="w-full text-xs min-w-[480px]">
                 <thead className="bg-[#FFF1E3] text-[#6B5744]">
                   <tr>
                     <th className="text-left py-1.5 px-2 font-medium">Item</th>
