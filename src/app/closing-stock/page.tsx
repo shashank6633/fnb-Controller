@@ -140,6 +140,23 @@ export default function ClosingStockByLocationPage() {
   }, [departments, canSeeAllDepts, visibleDeptIds, ownDeptId]);
   // The department_id sent on POST to scope saved counts. Pinned users → own dept.
   const activeDeptId: string = hasDeptChoice ? selectedDept : (ownDeptId || '');
+  // Category whitelist (lowercased) of the ACTIVE department, resolved to its
+  // MAIN department — sub-depts inherit the main's material_categories, so walk
+  // parent_id via the departments payload. null = no filter: Store/Overall ('')
+  // or a department with no categories configured.
+  const deptCategorySet = useMemo<Set<string> | null>(() => {
+    if (!activeDeptId || departments.length === 0) return null;
+    const byId = new Map(departments.map((d: any) => [String(d.id), d]));
+    let d: any = byId.get(activeDeptId);
+    if (!d) return null;
+    if (d.parent_id && byId.get(String(d.parent_id))) d = byId.get(String(d.parent_id));
+    if (!d.material_categories) return null;
+    try {
+      const arr = JSON.parse(d.material_categories);
+      if (!Array.isArray(arr) || arr.length === 0) return null;
+      return new Set<string>(arr.map((c: any) => String(c).trim().toLowerCase()).filter(Boolean));
+    } catch { return null; }
+  }, [activeDeptId, departments]);
   const [date, setDate] = useState(today());
   const [locations, setLocations] = useState<LocSummary[]>([]);
   const [totals, setTotals] = useState({ locations: 0, items: 0, counted: 0 });
@@ -208,17 +225,35 @@ export default function ClosingStockByLocationPage() {
     </div>
   ) : null;
 
+  /* Modal item list scoped to the ACTIVE department's category whitelist.
+     Staff (no dept choice) fetch WITHOUT scope=all, so the server whitelist
+     already returns exactly their main dept's items. Privileged viewers keep
+     the scope=all fetch and are client-filtered here by the SELECTED dept's
+     category set — re-filters live when the dropdown changes. Store/Overall
+     ('') or a dept with no configured categories → no filter (full list). */
+  const deptScopedMaterials = useMemo(() => {
+    if (!hasDeptChoice || !deptCategorySet) return materials;
+    return materials.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()));
+  }, [materials, hasDeptChoice, deptCategorySet]);
+  // Is a real category whitelist in effect for the active dept? Gates the base
+  // CATEGORIES union below (no point offering categories outside the whitelist)
+  // and the "no filter configured" fallback hint in the modal.
+  const isDeptFiltered = !!activeDeptId && !!deptCategorySet;
+  // Stale category from a previously-selected dept could blank the list.
+  useEffect(() => { setClosingCategory(''); }, [activeDeptId]);
+
   /** Category options grouped by super_category so the modal dropdown renders
-   *  with <optgroup> headers. Mirrors the derivation on the Raw Materials page. */
+   *  with <optgroup> headers. Mirrors the derivation on the Raw Materials page,
+   *  but scoped to the active department's items. */
   const availableCategories = useMemo(() => {
-    const live = new Set(materials.map(m => (m.category || '').trim()).filter(Boolean));
-    const all = new Set<string>([...CATEGORIES, ...live]);
+    const live = new Set(deptScopedMaterials.map(m => (m.category || '').trim()).filter(Boolean));
+    const all = isDeptFiltered ? live : new Set<string>([...CATEGORIES, ...live]);
     return Array.from(all).sort((a, b) => a.localeCompare(b));
-  }, [materials]);
+  }, [deptScopedMaterials, isDeptFiltered]);
 
   const categoryGroups = useMemo(() => {
     const map = new Map<string, Set<string>>();
-    for (const m of materials) {
+    for (const m of deptScopedMaterials) {
       const cat = (m.category || '').trim();
       if (!cat) continue;
       const sup = ((m as any).super_category || '').trim() || '(Other)';
@@ -235,16 +270,19 @@ export default function ClosingStockByLocationPage() {
     return Array.from(map.entries())
       .sort(([a], [b]) => (a === '(Other)' ? 1 : b === '(Other)' ? -1 : a.localeCompare(b)))
       .map(([sup, set]) => ({ sup, cats: Array.from(set).sort((a, b) => a.localeCompare(b)) }));
-  }, [materials, availableCategories]);
+  }, [deptScopedMaterials, availableCategories]);
 
   const fetchMaterials = async () => {
     try {
-      // Closing stock is a PHYSICAL count organised by storage location — a
-      // single location (walk-in chiller, dry store, bar counter) holds items
-      // from many departments. So the counter must see every category/material
-      // regardless of their own department's whitelist. scope=all bypasses the
-      // dept-category filter, matching the (already unfiltered) by-location view.
-      const res = await fetch('/api/inventory?scope=all');
+      // Dept-scoped modal list:
+      // - Staff (no dept choice): omit scope=all so the server's dept-category
+      //   whitelist returns exactly their MAIN dept's items. A dept with no
+      //   whitelist configured → server applies no filter (full list), so they
+      //   are never stuck with an empty list (a hint notes the fallback).
+      // - Privileged (dept picker): keep scope=all and client-filter by the
+      //   SELECTED department via deptScopedMaterials, so switching depts
+      //   re-filters live without refetching.
+      const res = await fetch(hasDeptChoice ? '/api/inventory?scope=all' : '/api/inventory');
       if (res.ok) {
         const json = await res.json();
         setMaterials(json.materials ?? []);
@@ -307,8 +345,12 @@ export default function ClosingStockByLocationPage() {
     setClosingSubmitting(true);
     setClosingResult(null);
     try {
+      // Only submit rows in the CURRENT dept-scoped list — a privileged user
+      // who filled counts then switched department must not save the hidden
+      // rows under the newly-selected department.
+      const allowedIds = new Set(deptScopedMaterials.map((m: any) => String(m.id)));
       const itemsToSubmit = Object.entries(closingItems)
-        .filter(([_, v]) => v.physical_stock !== '')
+        .filter(([id, v]) => v.physical_stock !== '' && allowedIds.has(String(id)))
         .map(([materialId, v]) => ({
           material_id: materialId,
           physical_stock: parseFloat(v.physical_stock),
@@ -353,8 +395,16 @@ export default function ClosingStockByLocationPage() {
   };
   const CSV_COLS = ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Physical count'];
   const downloadClosingTemplate = async () => {
-    let mats = materials;
-    if (!mats.length) mats = await fetchMaterials();
+    // Export the FILTERED set — the rows this user/department is being asked
+    // to count — not the full catalogue. (Upload stays global: it matches by
+    // id/SKU/name against whatever list the viewer fetched.)
+    let mats = deptScopedMaterials;
+    if (!materials.length) {
+      const all = await fetchMaterials();
+      mats = (hasDeptChoice && deptCategorySet)
+        ? all.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()))
+        : all;
+    }
     const lines = [CSV_COLS.join(',')];
     for (const m of mats) {
       lines.push([
@@ -428,7 +478,7 @@ export default function ClosingStockByLocationPage() {
     }
   };
 
-  const closingFiltered = materials.filter(m => {
+  const closingFiltered = deptScopedMaterials.filter(m => {
     if (closingSearch) {
       if (!m.name.toLowerCase().includes(closingSearch.toLowerCase())) return false;
     }
@@ -1117,6 +1167,16 @@ export default function ClosingStockByLocationPage() {
                 {/* Effective-tier banner — only when the dept picker is hidden. */}
                 {tierBanner}
 
+                {/* Subtle fallback note — the active department has no category
+                    whitelist configured, so the full material list is shown. */}
+                {activeDeptId && departments.length > 0 && !deptCategorySet && (
+                  <p className="text-[11px] italic text-[#8B7355]">
+                    No category filter is set for{' '}
+                    {departments.find((d: any) => d.id === activeDeptId)?.name || 'this department'}
+                    {' '}— showing all materials.
+                  </p>
+                )}
+
                 {adjustStockModal && (
                   <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs">
                     <AlertTriangle className="w-4 h-4 flex-shrink-0" />
@@ -1195,7 +1255,7 @@ export default function ClosingStockByLocationPage() {
                 {/* Submit */}
                 <div className="flex items-center justify-between">
                   <p className="text-xs text-[#8B7355]">
-                    {Object.values(closingItems).filter(v => v.physical_stock !== '').length} of {materials.length} items filled
+                    {deptScopedMaterials.filter((m: any) => (closingItems[m.id]?.physical_stock ?? '') !== '').length} of {deptScopedMaterials.length} items filled
                   </p>
                   <div className="flex gap-3">
                     <button
