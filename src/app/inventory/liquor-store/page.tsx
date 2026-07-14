@@ -19,17 +19,18 @@
  * the ledger; the page shows purchase-unit equivalents (÷ pack_size) alongside.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Wine, Plus, Search, X, Loader2, AlertCircle, AlertTriangle, CheckCircle2,
   SlidersHorizontal, ScrollText, Boxes, Warehouse, ClipboardCheck, BarChart3,
-  Download, History, Save, ReceiptText, ArrowRightLeft, Trash2,
+  Download, Upload, History, Save, ReceiptText, ArrowRightLeft, Trash2,
 } from 'lucide-react';
+import Papa from 'papaparse';
 import { api } from '@/lib/api';
 import TabScroller from '@/components/TabScroller';
 import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead';
 import {
-  packFactor, caseFactor, entryMode, tripleToRecipe, fmtBreakdown, PackMeta,
+  packFactor, caseFactor, entryMode, tripleToRecipe, breakdownQty, fmtBreakdown, PackMeta,
 } from '@/lib/pack-units';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
@@ -1427,18 +1428,29 @@ interface ClosingCount {
   material_id: string; date: string; system_qty: number; physical_qty: number;
   variance: number; variance_value: number; counted_by: string; note: string;
   material_name: string; unit: string; purchase_unit: string; pack_size: number;
-  case_size: number;
+  case_size: number; category?: string;
 }
 interface ClosingDay {
   date: string; item_count: number; shortage_count: number; excess_count: number;
   total_variance_value: number; abs_variance_value: number;
 }
 
+/* Closing-stock CSV template columns — keeps the liquor Cases+Bottles+loose
+   entry convention (blank for the counter to fill). */
+const CSV_COLS_CLOSE = ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Cases', 'Bottles', 'Loose'];
+
+/* ── Closing Stock section — category-wise "Record Closing Stock" ──────────
+   Mirrors the central /closing-stock modal (header + Template / Upload CSV /
+   View History, filter row, Material|Category|System Stock|Unit|Physical
+   Count|Variance|Notes table) but keeps the liquor Cases + Bottles + loose
+   entry convention. Rows come from the page-loaded `stock` (every mapped
+   material, zero-stock included); GET …/closing?date= prefills existing
+   counts + notes for the chosen date. */
 function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   storeId: string; storeName: string; stock: StockRow[];
   isAdmin: boolean; onSaved: (msg: string) => void;
 }) {
-  const [view, setView] = useState<'count' | 'history'>('count');
+  const [showHistory, setShowHistory] = useState(false);
   const [date, setDate] = useState(today());
   const [counts, setCounts] = useState<ClosingCount[]>([]);
   const [systemAsof, setSystemAsof] = useState<Record<string, number>>({});
@@ -1446,28 +1458,60 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   const [cases, setCases] = useState<Record<string, string>>({});   // full cases (case_size × BTL)
   const [whole, setWhole] = useState<Record<string, string>>({});   // purchase units (BTL)
   const [loose, setLoose] = useState<Record<string, string>>({});   // recipe units (ml)
-  const [note, setNote] = useState('');
+  const [notes, setNotes] = useState<Record<string, string>>({});   // per-row note
   const [adjust, setAdjust] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [csvResult, setCsvResult] = useState<{ success: number; errors: string[] } | null>(null);
+  // Filters
+  const [catFilter, setCatFilter] = useState('');
+  const [q, setQ] = useState('');
   // History
   const [days, setDays] = useState<ClosingDay[]>([]);
   const [histLoading, setHistLoading] = useState(false);
   const [histDate, setHistDate] = useState('');
+  const [histCat, setHistCat] = useState('');
 
-  const loadDay = useCallback(async (d: string) => {
+  const seedFromCounts = useCallback((rows: ClosingCount[]) => {
+    // Prefill the Cases/Bottles/loose inputs + notes from that date's saved
+    // counts so re-opening a counted day is editable, not blank.
+    const c: Record<string, string> = {};
+    const w: Record<string, string> = {};
+    const l: Record<string, string> = {};
+    const n: Record<string, string> = {};
+    for (const row of rows) {
+      const meta: PackMeta = { unit: row.unit, purchase_unit: row.purchase_unit, pack_size: row.pack_size, case_size: row.case_size };
+      const bd = breakdownQty(row.physical_qty, meta);
+      if (bd) {
+        if (bd.cases) c[row.material_id] = String(bd.cases);
+        if (bd.bottles) w[row.material_id] = String(bd.bottles);
+        if (bd.loose) l[row.material_id] = String(bd.loose);
+        // A saved count of exactly 0 must still round-trip (all parts blank →
+        // treated as "not entered"), so pin a 0 in the loose box.
+        if (!bd.cases && !bd.bottles && !bd.loose) l[row.material_id] = '0';
+      } else {
+        l[row.material_id] = String(row.physical_qty);
+      }
+      if (row.note) n[row.material_id] = row.note;
+    }
+    setCases(c); setWhole(w); setLoose(l); setNotes(n);
+  }, []);
+
+  const loadDay = useCallback(async (d: string, seed: boolean) => {
     setDayLoading(true); setErr(null);
     try {
       const r = await fetch(`/api/stores/${storeId}/closing?date=${d}`);
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      setCounts(j.counts || []);
+      const rows: ClosingCount[] = j.counts || [];
+      setCounts(rows);
       const m: Record<string, number> = {};
       for (const s of j.system_asof || []) m[s.material_id] = Number(s.qty) || 0;
       setSystemAsof(m);
+      if (seed) seedFromCounts(rows);
     } catch (e: any) { setErr(e.message); }
     finally { setDayLoading(false); }
-  }, [storeId]);
+  }, [storeId, seedFromCounts]);
 
   const loadHistory = useCallback(async () => {
     setHistLoading(true); setErr(null);
@@ -1480,8 +1524,20 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
     finally { setHistLoading(false); }
   }, [storeId]);
 
-  useEffect(() => { loadDay(date); setCases({}); setWhole({}); setLoose({}); }, [date, loadDay]);
-  useEffect(() => { if (view === 'history') { loadHistory(); setHistDate(''); } }, [view, loadHistory]);
+  // Changing the count date reloads + re-seeds inputs from that day's counts.
+  // Returning from History (showHistory true→false) must NOT re-seed: it would
+  // wipe in-progress physical counts / notes. We still reload (seed=false) so
+  // the ✓saved markers and System Stock refresh to `date` after browsing other
+  // dates in history — but only actually re-seed when the date itself changed.
+  const seededDate = useRef<string | null>(null);
+  useEffect(() => {
+    if (showHistory) return;
+    setCsvResult(null);
+    const seed = seededDate.current !== date;
+    seededDate.current = date;
+    loadDay(date, seed);
+  }, [date, showHistory, loadDay]);
+  useEffect(() => { if (showHistory) { loadHistory(); setHistDate(''); setHistCat(''); } }, [showHistory, loadHistory]);
 
   const countedBy = useMemo(() => {
     const m = new Map<string, ClosingCount>();
@@ -1489,24 +1545,40 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
     return m;
   }, [counts]);
 
+  const cats = useMemo(
+    () => Array.from(new Set(stock.map(r => r.category).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
+    [stock],
+  );
+
+  const rows = useMemo(() => {
+    const raw = q.trim().toLowerCase();
+    return [...stock]
+      .filter(r => {
+        if (catFilter && r.category !== catFilter) return false;
+        if (!raw) return true;
+        return `${r.material_name} ${r.sku} ${r.category}`.toLowerCase().includes(raw);
+      })
+      .sort((a, b) => a.material_name.localeCompare(b.material_name));
+  }, [stock, catFilter, q]);
+
   // Physical qty in RECIPE units from the Cases/Bottles/loose entry (null =
   // untouched row): cases × case_size × pack + bottles × pack + loose.
   const physicalFor = (r: StockRow): number | null => {
-    const pc = packConv(r);
-    const cf = caseFactor(r);
     const num = (s?: string) => (s != null && s !== '' && !isNaN(Number(s))) ? Number(s) : null;
     const c = num(cases[r.material_id]), w = num(whole[r.material_id]), l = num(loose[r.material_id]);
     if (c == null && w == null && l == null) return null;
-    return (c ?? 0) * cf * pc + (w ?? 0) * pc + (l ?? 0);
+    return tripleToRecipe(c ?? 0, w ?? 0, l ?? 0, r);
   };
-  const systemFor = (r: StockRow): number =>
-    systemAsof[r.material_id] !== undefined ? systemAsof[r.material_id] : (Number(r.qty) || 0);
+  // As-of-date ledger sum for the chosen closing date (0 when the material has
+  // no ledger rows on/before that date). Must NOT fall back to the live
+  // all-time qty — that would make a backdated System Stock/variance disagree
+  // with what the POST route persists (which computes SUM as-of `date` = 0).
+  const systemFor = (r: StockRow): number => systemAsof[r.material_id] ?? 0;
 
-  const rows = useMemo(
-    () => [...stock].sort((a, b) => a.material_name.localeCompare(b.material_name)),
-    [stock],
-  );
-  const pending = rows
+  // Every material the user entered a physical count for is saved — derived from
+  // the FULL mapped stock list, not the filtered `rows`, so a count typed before
+  // changing the Category/Search filter is never silently dropped on Save.
+  const pending = stock
     .map(r => ({ r, phys: physicalFor(r) }))
     .filter((x): x is { r: StockRow; phys: number } => x.phys != null);
   const pendingVarianceValue = pending.reduce(
@@ -1517,47 +1589,158 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
     if (pending.some(p => p.phys < 0)) { setErr('Physical counts cannot be negative'); return; }
     setErr(null); setBusy(true);
     try {
+      // Each row carries its OWN note. The batch-level `note` is left empty so
+      // the route's fallback (blank item note → batch note) cannot copy one
+      // row's note onto rows the counter left un-noted.
       const r = await api(`/api/stores/${storeId}/closing`, {
         method: 'POST',
         body: {
           date,
-          items: pending.map(({ r, phys }) => ({ material_id: r.material_id, physical_qty: phys })),
-          note: note.trim(),
+          items: pending.map(({ r, phys }) => ({
+            material_id: r.material_id,
+            physical_qty: phys,
+            note: (notes[r.material_id] || '').trim(),
+          })),
+          note: '',
           adjust_to_physical: isAdmin ? adjust : undefined,
         },
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      setCases({}); setWhole({}); setLoose({}); setNote(''); setAdjust(false);
-      await loadDay(date);
+      setAdjust(false);
+      await loadDay(date, true);
       onSaved(`Saved ${j.summary.items} closing count${j.summary.items === 1 ? '' : 's'} for ${date}` +
         (j.summary.adjusted_count ? ` — ${j.summary.adjusted_count} adjusted to physical` : ''));
     } catch (e: any) { setErr(e.message); }
     finally { setBusy(false); }
   };
 
+  /* ── CSV template + bulk upload ──────────────────────────────────────
+     Template exports the currently-filtered material set with blank
+     Cases/Bottles/Loose columns; upload matches by material_id → SKU → Name,
+     converts the triple to recipe units and posts to the SAME endpoint with
+     adjust_to_physical forced OFF (a bulk file must never reconcile stock). */
+  const downloadTemplate = () => {
+    const lines = [CSV_COLS_CLOSE.join(',')];
+    for (const r of rows) {
+      lines.push([
+        r.material_id, r.sku || '', r.material_name || '', r.category || '', r.unit || '',
+        systemFor(r), '', '', '',   // Cases / Bottles / Loose — blank for the counter
+      ].map(csvEscape).join(','));
+    }
+    const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `liquor-closing-template-${date}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const uploadCsv = async (file: File) => {
+    setBusy(true); setErr(null); setCsvResult(null);
+    try {
+      const byId = new Map(stock.map(r => [String(r.material_id), r]));
+      const bySku = new Map(stock.filter(r => r.sku).map(r => [String(r.sku).trim().toLowerCase(), r]));
+      const byName = new Map(stock.map(r => [String(r.material_name).trim().toLowerCase(), r]));
+      const text = await file.text();
+      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+      if (parsed.errors?.length) {
+        setCsvResult({ success: 0, errors: ['CSV parse error: ' + parsed.errors[0].message] });
+        return;
+      }
+      const get = (row: any, ...keys: string[]) => {
+        for (const k of keys) if (row[k] != null && String(row[k]).trim() !== '') return String(row[k]).trim();
+        return '';
+      };
+      const items: { material_id: string; physical_qty: number; note: string }[] = [];
+      const errors: string[] = [];
+      for (const row of parsed.data as any[]) {
+        const casesRaw = get(row, 'Cases', 'cases', 'Case', 'cs');
+        const btlRaw = get(row, 'Bottles', 'bottles', 'Bottle', 'btl', 'Btl');
+        const looseRaw = get(row, 'Loose', 'loose', 'Loose (ml)', 'ml');
+        const label = get(row, 'Name', 'name') || get(row, 'material_id') || get(row, 'SKU', 'sku') || 'row';
+        if (casesRaw === '' && btlRaw === '' && looseRaw === '') continue;   // nothing entered → skip
+        const idKey = get(row, 'material_id');
+        const skuKey = get(row, 'SKU', 'sku').toLowerCase();
+        const nameKey = get(row, 'Name', 'name').toLowerCase();
+        const m = (idKey && byId.get(idKey)) || (skuKey && bySku.get(skuKey)) || (nameKey && byName.get(nameKey));
+        if (!m) { errors.push(`${label}: material not found (check material_id / SKU / Name)`); continue; }
+        const c = casesRaw === '' ? 0 : Number(casesRaw);
+        const w = btlRaw === '' ? 0 : Number(btlRaw);
+        const l = looseRaw === '' ? 0 : Number(looseRaw);
+        if ([c, w, l].some(v => !Number.isFinite(v))) { errors.push(`${label}: Cases/Bottles/Loose must be numbers`); continue; }
+        if (c < 0 || w < 0 || l < 0) { errors.push(`${label}: counts cannot be negative`); continue; }
+        items.push({ material_id: m.material_id, physical_qty: tripleToRecipe(c, w, l, m), note: '' });
+      }
+      if (items.length === 0) {
+        setCsvResult({ success: 0, errors: errors.length ? errors : ['No counts found in the file (fill Cases / Bottles / Loose)'] });
+        return;
+      }
+      const r = await api(`/api/stores/${storeId}/closing`, {
+        method: 'POST',
+        body: { date, items, adjust_to_physical: false },   // bulk never adjusts
+      });
+      const j = await r.json();
+      if (!r.ok) { setCsvResult({ success: 0, errors: [...errors, j.error || `HTTP ${r.status}`] }); return; }
+      setCsvResult({ success: j.summary?.items || 0, errors });
+      await loadDay(date, true);
+      onSaved(`Imported ${j.summary?.items || 0} closing count${(j.summary?.items || 0) === 1 ? '' : 's'} for ${date}`);
+    } catch (e: any) { setCsvResult({ success: 0, errors: [e.message] }); }
+    finally { setBusy(false); }
+  };
+
   /* history detail = read-only counts of a past date */
-  const openHistDate = (d: string) => { setHistDate(d); loadDay(d); };
+  const openHistDate = (d: string) => { setHistDate(d); setHistCat(''); loadDay(d, false); };
+  const histCats = useMemo(
+    () => Array.from(new Set(counts.map(c => c.category || '').filter(Boolean))).sort((a, b) => a.localeCompare(b)),
+    [counts],
+  );
+  const histRows = useMemo(
+    () => counts.filter(c => !histCat || (c.category || '') === histCat),
+    [counts, histCat],
+  );
+
+  const inCls = 'w-full px-2 py-2 border border-[#D4B896] rounded-lg text-sm bg-[#FFF1E3] text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]';
+  const box = 'w-16 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]';
+  const boxM = 'w-14 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]';
 
   return (
-    <div className="space-y-3">
-      {/* Sub-toggle: Count / History */}
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="flex rounded-lg border border-[#E8D5C4] overflow-hidden">
-          <button onClick={() => setView('count')}
-                  className={`px-3 py-1.5 text-xs font-medium flex items-center gap-1.5 ${view === 'count' ? 'bg-[#af4408] text-white' : 'bg-white text-[#6B5744]'}`}>
-            <ClipboardCheck className="w-3.5 h-3.5" /> Count
-          </button>
-          <button onClick={() => setView('history')}
-                  className={`px-3 py-1.5 text-xs font-medium flex items-center gap-1.5 ${view === 'history' ? 'bg-[#af4408] text-white' : 'bg-white text-[#6B5744]'}`}>
-            <History className="w-3.5 h-3.5" /> History
+    <div className="space-y-4">
+      {/* Header — mirrors the central Record Closing Stock modal */}
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-3">
+          <div className="p-2 rounded-lg bg-green-100">
+            <ClipboardCheck className="w-5 h-5 text-green-600" />
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold text-[#2D1B0E]">Record Closing Stock</h2>
+            <p className="text-xs text-[#8B7355]">Enter physical count for each material</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          {!showHistory && (
+            <>
+              <button onClick={downloadTemplate}
+                      className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4] inline-flex items-center gap-1"
+                      title="Download a CSV of the filtered materials with blank Cases / Bottles / Loose columns">
+                <Download className="w-3.5 h-3.5" /> Template
+              </button>
+              <label className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4] inline-flex items-center gap-1 cursor-pointer focus-within:outline-none focus-within:ring-2 focus-within:ring-[#af4408]"
+                     title="Upload the filled CSV to record physical counts in bulk">
+                <Upload className="w-3.5 h-3.5" /> Upload CSV
+                {/* sr-only (not `hidden`) keeps the input in the tab order so
+                    keyboard / screen-reader users can reach the bulk upload. */}
+                <input type="file" accept=".csv,text/csv" className="sr-only" aria-label="Upload closing-stock CSV"
+                       onChange={e => { const f = e.target.files?.[0]; if (f) uploadCsv(f); e.target.value = ''; }} />
+              </label>
+            </>
+          )}
+          <button onClick={() => setShowHistory(v => !v)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg inline-flex items-center gap-1 ${showHistory ? 'bg-purple-100 text-purple-700' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4]'}`}>
+            <History className="w-3.5 h-3.5" /> {showHistory ? 'Back to Entry' : 'View History'}
           </button>
         </div>
-        {view === 'count' && (
-          <input type="date" value={date} max={today()} onChange={e => setDate(e.target.value)}
-                 aria-label="Count date"
-                 className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg text-sm bg-white" />
-        )}
       </div>
 
       {err && (
@@ -1566,32 +1749,89 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
         </div>
       )}
 
-      {view === 'count' ? (
+      {!showHistory ? (
         <>
+          {/* Filter row: Closing Date* · Category · Search Material · Adjust */}
+          <div className="flex flex-wrap gap-3 items-end">
+            <div>
+              <label htmlFor="lc-date" className="block text-xs font-medium text-[#6B5744] mb-1">Closing Date *</label>
+              <input id="lc-date" type="date" value={date} max={today()}
+                     onChange={e => setDate(e.target.value)}
+                     className={`${inCls} [color-scheme:light]`} />
+            </div>
+            <div>
+              <label htmlFor="lc-cat" className="block text-xs font-medium text-[#6B5744] mb-1">Category</label>
+              <select id="lc-cat" value={catFilter} onChange={e => setCatFilter(e.target.value)} className={inCls}>
+                <option value="">All Categories</option>
+                {cats.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div className="flex-1 min-w-[180px]">
+              <label htmlFor="lc-search" className="block text-xs font-medium text-[#6B5744] mb-1">Search Material</label>
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />
+                <input id="lc-search" type="text" value={q} onChange={e => setQ(e.target.value)}
+                       placeholder="Filter by name, SKU, category…" className={`${inCls} pl-10`} />
+              </div>
+            </div>
+            {isAdmin && (
+              <label className="flex items-center gap-2 cursor-pointer bg-amber-50 border border-amber-200 rounded-lg px-3 py-2"
+                     title="Admin-only: also post an adjustment ledger row per variance so store stock matches the count">
+                <input type="checkbox" checked={adjust} onChange={e => setAdjust(e.target.checked)} className="accent-[#af4408] w-4 h-4" />
+                <span className="text-xs text-amber-800 font-medium whitespace-nowrap">Adjust system stock</span>
+              </label>
+            )}
+          </div>
+
           <p className="text-[11px] text-[#8B7355]">
-            Physical count for <b>{date}</b> — system qty is the {storeName} ledger sum as of that date.
-            Saving a count records it only; stock is never changed by a count.
+            Physical count for <b>{date}</b> — System Stock is the {storeName} ledger sum as of that date.
+            Saving records the count only; stock is never changed unless an admin ticks “Adjust system stock”.
           </p>
+
+          {adjust && isAdmin && (
+            <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs">
+              <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+              System stock will be updated to match each physical count. Variances are posted as adjustment ledger rows.
+            </div>
+          )}
+
+          {csvResult && (
+            <div className={`p-3 rounded-lg border ${csvResult.errors.length > 0 && csvResult.success === 0 ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
+              <div className="flex items-start gap-2 text-sm">
+                {csvResult.success > 0 ? <CheckCircle2 className="w-4 h-4 text-green-600 mt-0.5" /> : <AlertCircle className="w-4 h-4 text-red-500 mt-0.5" />}
+                <div>
+                  {csvResult.success > 0 && <p className="text-green-700">Imported {csvResult.success} count{csvResult.success === 1 ? '' : 's'} from CSV.</p>}
+                  {csvResult.errors.map((e, i) => <p key={i} className="text-red-600 text-xs">{e}</p>)}
+                </div>
+              </div>
+            </div>
+          )}
 
           {dayLoading ? (
             <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
-          ) : rows.length === 0 ? (
+          ) : stock.length === 0 ? (
             <div className="p-8 text-center text-sm text-[#8B7355] bg-white border border-[#E8D5C4] rounded-xl">
               Nothing to count yet — record a purchase or opening stock first.
+            </div>
+          ) : rows.length === 0 ? (
+            <div className="p-8 text-center text-sm text-[#8B7355] bg-white border border-[#E8D5C4] rounded-xl">
+              No materials match the current filters.
             </div>
           ) : (
             <>
               {/* Desktop table */}
               <div className="hidden md:block bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
                 <div className="overflow-x-auto">
-                  <table className="w-full min-w-[760px] text-xs">
-                    <thead className="bg-[#FFF1E3] text-[#8B7355]">
+                  <table className="w-full min-w-[820px] text-sm">
+                    <thead className="bg-[#FFF1E3] text-[#8B7355] text-xs">
                       <tr>
-                        <th className="text-left px-3 py-2 font-medium">Material</th>
-                        <th className="text-right px-3 py-2 font-medium">System</th>
-                        <th className="text-left px-3 py-2 font-medium w-[260px]">Physical count</th>
-                        <th className="text-right px-3 py-2 font-medium">Variance</th>
-                        <th className="text-left px-3 py-2 font-medium">Today</th>
+                        <th className="text-left px-3 py-2.5 font-medium">Material</th>
+                        <th className="text-left px-3 py-2.5 font-medium">Category</th>
+                        <th className="text-right px-3 py-2.5 font-medium">System Stock</th>
+                        <th className="text-right px-3 py-2.5 font-medium">Unit</th>
+                        <th className="text-left px-3 py-2.5 font-medium w-[260px]">Physical Count *</th>
+                        <th className="text-right px-3 py-2.5 font-medium">Variance</th>
+                        <th className="text-left px-3 py-2.5 font-medium w-40">Notes</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#F0E4D6]">
@@ -1603,24 +1843,30 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                         const existing = countedBy.get(r.material_id);
                         const v = phys != null ? Math.round((phys - sys) * 1000) / 1000 : null;
                         const vv = v != null ? v * (Number(r.avg_cost) || 0) : null;
-                        const box = 'w-16 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]';
+                        const vTone = v == null ? '' : v < 0 ? 'text-red-700' : v > 0 ? 'text-blue-700' : 'text-emerald-700';
                         return (
-                          <tr key={r.material_id} className="hover:bg-[#FFF8F0] align-top">
+                          <tr key={r.material_id} className={`hover:bg-[#FFF8F0] align-top ${v != null && v < 0 ? 'bg-red-50/30' : v != null && v > 0 ? 'bg-blue-50/30' : ''}`}>
                             <td className="px-3 py-2">
                               <div className="text-[#2D1B0E] font-medium">{r.material_name}</div>
-                              <div className="text-[10px] text-[#8B7355]">{r.category}</div>
+                              {r.sku && <div className="text-[10px] font-mono text-[#8B7355]">{r.sku}</div>}
                             </td>
+                            <td className="px-3 py-2 text-[#6B5744] text-xs">{r.category}</td>
                             <td className="px-3 py-2 text-right whitespace-nowrap font-mono text-[#6B5744]">
-                              {pc > 1
-                                ? <>{fmtBreakdown(sys, r)}<div className="text-[10px]">{fq(sys)} {r.unit}</div></>
-                                : <>{fq(sys)} {r.unit}</>}
+                              {fmtBreakdown(sys, r) || <>{fq(sys)} {r.unit}</>}
+                              {pc > 1 && <div className="text-[10px]">{fq(sys)} {r.unit}</div>}
+                              {existing && (
+                                <div className="text-[10px] text-emerald-700 mt-0.5"
+                                     title={`Counted by ${existing.counted_by}`}>✓ saved</div>
+                              )}
                             </td>
+                            <td className="px-3 py-2 text-right text-xs text-[#8B7355] whitespace-nowrap">{r.unit}</td>
                             <td className="px-3 py-2">
                               <div className="flex items-center gap-1 flex-wrap">
                                 {pc > 1 && cf > 1 && (<>
                                   <input type="number" step="any" min={0} value={cases[r.material_id] ?? ''}
                                          onChange={e => setCases(p => ({ ...p, [r.material_id]: e.target.value }))}
-                                         placeholder="0" title={`Full cases — 1 = ${fq(cf)} ${r.purchase_unit} = ${fq(cf * pc)} ${r.unit}`}
+                                         placeholder="0" aria-label={`${r.material_name} — cases`}
+                                         title={`Full cases — 1 = ${fq(cf)} ${r.purchase_unit} = ${fq(cf * pc)} ${r.unit}`}
                                          className={box} />
                                   <span className="text-[10px] text-[#8B7355]">cs</span>
                                   <span className="text-[10px] text-[#8B7355]">+</span>
@@ -1628,14 +1874,16 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                                 {pc > 1 && (<>
                                   <input type="number" step="any" min={0} value={whole[r.material_id] ?? ''}
                                          onChange={e => setWhole(p => ({ ...p, [r.material_id]: e.target.value }))}
-                                         placeholder="0" title={`Full ${r.purchase_unit} — 1 = ${fq(r.pack_size)} ${r.unit}`}
+                                         placeholder="0" aria-label={`${r.material_name} — ${r.purchase_unit}`}
+                                         title={`Full ${r.purchase_unit} — 1 = ${fq(r.pack_size)} ${r.unit}`}
                                          className={box} />
                                   <span className="text-[10px] text-[#8B7355]">{r.purchase_unit}</span>
                                   <span className="text-[10px] text-[#8B7355]">+</span>
                                 </>)}
                                 <input type="number" step="any" min={0} value={loose[r.material_id] ?? ''}
                                        onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
-                                       placeholder="0" title={pc > 1 ? `Loose / open ${r.unit}` : `Count in ${r.unit}`}
+                                       placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : r.unit}`}
+                                       title={pc > 1 ? `Loose / open ${r.unit}` : `Count in ${r.unit}`}
                                        className={box} />
                                 <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
                                 {phys != null && pc > 1 && (
@@ -1643,21 +1891,19 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                                 )}
                               </div>
                             </td>
-                            <td className="px-3 py-2 text-right whitespace-nowrap font-mono">
+                            <td className={`px-3 py-2 text-right whitespace-nowrap font-mono ${vTone}`}>
                               {v == null ? <span className="text-[#8B7355]">—</span> : (
-                                <span className={v < 0 ? 'text-red-700' : v > 0 ? 'text-blue-700' : 'text-emerald-700'}>
-                                  {v > 0 ? '+' : ''}{fq(v)} {r.unit}
+                                <>
+                                  {fmtBreakdown(v, r) || <>{v > 0 ? '+' : ''}{fq(v)} {r.unit}</>}
                                   <div className="text-[10px]">{vv != null && vv !== 0 ? (vv > 0 ? '+' : '−') + inr(Math.abs(vv)) : inr(0)}</div>
-                                </span>
+                                </>
                               )}
                             </td>
                             <td className="px-3 py-2">
-                              {existing ? (
-                                <span className="inline-block text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
-                                      title={`By ${existing.counted_by} — variance ${existing.variance > 0 ? '+' : ''}${existing.variance} ${r.unit}`}>
-                                  ✓ {fq(existing.physical_qty)} {r.unit}
-                                </span>
-                              ) : <span className="text-[10px] text-[#8B7355]">—</span>}
+                              <input type="text" value={notes[r.material_id] ?? ''}
+                                     onChange={e => setNotes(p => ({ ...p, [r.material_id]: e.target.value }))}
+                                     placeholder="Optional" aria-label={`${r.material_name} — note`}
+                                     className="w-full px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-[#2D1B0E] placeholder-[#C4B09A] focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
                             </td>
                           </tr>
                         );
@@ -1677,78 +1923,68 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                   const existing = countedBy.get(r.material_id);
                   const v = phys != null ? Math.round((phys - sys) * 1000) / 1000 : null;
                   const vv = v != null ? v * (Number(r.avg_cost) || 0) : null;
-                  const box = 'w-14 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white';
                   return (
                     <div key={r.material_id} className="bg-white border border-[#E8D5C4] rounded-xl p-3 text-xs">
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
                           <div className="text-sm font-medium text-[#2D1B0E] break-words">{r.material_name}</div>
                           <div className="text-[10px] text-[#8B7355]">
-                            System: {pc > 1 ? `${fmtBreakdown(sys, r)} (${fq(sys)} ${r.unit})` : `${fq(sys)} ${r.unit}`}
+                            {r.sku && <span className="font-mono">{r.sku} · </span>}{r.category}
+                          </div>
+                          <div className="text-[10px] text-[#8B7355] mt-0.5">
+                            System: {fmtBreakdown(sys, r) || `${fq(sys)} ${r.unit}`}{pc > 1 ? ` (${fq(sys)} ${r.unit})` : ''}
                           </div>
                         </div>
                         {existing && (
-                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">
-                            ✓ {fq(existing.physical_qty)} {r.unit}
-                          </span>
+                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">✓ saved</span>
                         )}
                       </div>
                       <div className="mt-2 flex items-center gap-1 flex-wrap">
                         {pc > 1 && cf > 1 && (<>
                           <input type="number" step="any" min={0} inputMode="decimal" value={cases[r.material_id] ?? ''}
                                  onChange={e => setCases(p => ({ ...p, [r.material_id]: e.target.value }))}
-                                 placeholder="0" className={box} />
+                                 placeholder="0" aria-label={`${r.material_name} — cases`} className={boxM} />
                           <span className="text-[10px] text-[#8B7355]">cs</span>
                           <span className="text-[10px] text-[#8B7355]">+</span>
                         </>)}
                         {pc > 1 && (<>
                           <input type="number" step="any" min={0} inputMode="decimal" value={whole[r.material_id] ?? ''}
                                  onChange={e => setWhole(p => ({ ...p, [r.material_id]: e.target.value }))}
-                                 placeholder="0" className={box} />
+                                 placeholder="0" aria-label={`${r.material_name} — ${r.purchase_unit}`} className={boxM} />
                           <span className="text-[10px] text-[#8B7355]">{r.purchase_unit}</span>
                           <span className="text-[10px] text-[#8B7355]">+</span>
                         </>)}
                         <input type="number" step="any" min={0} inputMode="decimal" value={loose[r.material_id] ?? ''}
                                onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
-                               placeholder="0" className={box} />
+                               placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : r.unit}`} className={boxM} />
                         <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
                         {v != null && (
                           <span className={`ml-auto font-mono ${v < 0 ? 'text-red-700' : v > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
-                            {v > 0 ? '+' : ''}{fq(v)} {r.unit}{vv != null ? ` · ${vv > 0 ? '+' : vv < 0 ? '−' : ''}${inr(Math.abs(vv))}` : ''}
+                            {fmtBreakdown(v, r) || `${v > 0 ? '+' : ''}${fq(v)} ${r.unit}`}{vv != null && vv !== 0 ? ` · ${vv > 0 ? '+' : '−'}${inr(Math.abs(vv))}` : ''}
                           </span>
                         )}
                       </div>
+                      <input type="text" value={notes[r.material_id] ?? ''}
+                             onChange={e => setNotes(p => ({ ...p, [r.material_id]: e.target.value }))}
+                             placeholder="Note (optional)" aria-label={`${r.material_name} — note`}
+                             className="mt-2 w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-[#2D1B0E] placeholder-[#C4B09A] focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
                     </div>
                   );
                 })}
               </div>
 
               {/* Save bar */}
-              <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3 space-y-2">
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-[#6B5744]">
-                  <span><b className="text-[#2D1B0E]">{pending.length}</b> item{pending.length === 1 ? '' : 's'} entered</span>
-                  {pending.length > 0 && (
-                    <span>Variance <b className={pendingVarianceValue < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}>
-                      {pendingVarianceValue < 0 ? '−' : ''}{inr(Math.abs(pendingVarianceValue))}</b></span>
-                  )}
-                  <input value={note} onChange={e => setNote(e.target.value)} placeholder="Note (optional)…"
-                         className="flex-1 min-w-[140px] px-2 py-1.5 border border-[#E8D5C4] rounded text-xs bg-white" />
-                  <button onClick={save} disabled={busy || pending.length === 0}
-                          className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
-                    {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                    Save counts{pending.length > 0 ? ` (${pending.length})` : ''}
-                  </button>
-                </div>
-                {isAdmin && (
-                  <label className="flex items-start gap-2 text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg p-2 cursor-pointer">
-                    <input type="checkbox" checked={adjust} onChange={e => setAdjust(e.target.checked)} className="accent-[#af4408] mt-0.5" />
-                    <span>
-                      <b>Adjust stock to physical</b> (admin) — additionally posts an <i>adjustment</i> ledger row for
-                      each variance so {storeName} stock matches the count. ⚠️ This reconciles away shortages — use only
-                      after verifying the physical count.
-                    </span>
-                  </label>
+              <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-[#6B5744]">
+                <span><b className="text-[#2D1B0E]">{pending.length}</b> of {stock.length} material{stock.length === 1 ? '' : 's'} counted</span>
+                {pending.length > 0 && (
+                  <span>Variance <b className={pendingVarianceValue < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}>
+                    {pendingVarianceValue < 0 ? '−' : ''}{inr(Math.abs(pendingVarianceValue))}</b></span>
                 )}
+                <button onClick={save} disabled={busy || pending.length === 0}
+                        className="ml-auto px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+                  {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                  Save counts{pending.length > 0 ? ` (${pending.length})` : ''}
+                </button>
               </div>
             </>
           )}
@@ -1800,44 +2036,55 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                 <div className="p-6 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading {histDate}…</div>
               ) : (
                 <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
-                  <div className="px-3 py-2 bg-[#FFF1E3] text-xs font-medium text-[#2D1B0E]">Counts on {histDate}</div>
+                  <div className="px-3 py-2 bg-[#FFF1E3] flex flex-wrap items-center gap-2 justify-between">
+                    <span className="text-xs font-medium text-[#2D1B0E]">Counts on {histDate}</span>
+                    {histCats.length > 1 && (
+                      <label className="flex items-center gap-1.5 text-[11px] text-[#6B5744]">
+                        <span className="sr-only">Filter history by category</span>
+                        <select value={histCat} onChange={e => setHistCat(e.target.value)}
+                                aria-label="Filter history by category"
+                                className="px-2 py-1 border border-[#D4B896] rounded text-xs bg-white">
+                          <option value="">All Categories</option>
+                          {histCats.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                      </label>
+                    )}
+                  </div>
                   <div className="overflow-x-auto">
-                    <table className="w-full min-w-[560px] text-xs">
+                    <table className="w-full min-w-[680px] text-xs">
                       <thead className="text-[#8B7355] border-b border-[#F0E4D6]">
                         <tr>
                           <th className="text-left px-3 py-2 font-medium">Material</th>
+                          <th className="text-left px-3 py-2 font-medium">Category</th>
                           <th className="text-right px-3 py-2 font-medium">System</th>
                           <th className="text-right px-3 py-2 font-medium">Physical</th>
                           <th className="text-right px-3 py-2 font-medium">Variance</th>
-                          <th className="text-right px-3 py-2 font-medium">₹</th>
-                          <th className="text-left px-3 py-2 font-medium">By</th>
+                          <th className="text-right px-3 py-2 font-medium">Variance ₹</th>
+                          <th className="text-left px-3 py-2 font-medium">Notes</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-[#F0E4D6]">
-                        {counts.map(c => (
-                          <tr key={c.material_id}>
-                            <td className="px-3 py-2 text-[#2D1B0E]">{c.material_name}
-                              {c.note && <div className="text-[10px] text-[#8B7355]">{c.note}</div>}
-                            </td>
+                        {histRows.map(c => (
+                          <tr key={c.material_id} className={c.variance < 0 ? 'bg-red-50/40' : c.variance > 0 ? 'bg-blue-50/40' : ''}>
+                            <td className="px-3 py-2 text-[#2D1B0E]">{c.material_name}</td>
+                            <td className="px-3 py-2 text-[#6B5744]">{c.category || '—'}</td>
                             <td className="px-3 py-2 text-right font-mono text-[#6B5744]">
-                              {fq(c.system_qty)} {c.unit}
-                              {fmtBreakdown(c.system_qty, c) && <div className="text-[10px]">{fmtBreakdown(c.system_qty, c)}</div>}
+                              {fmtBreakdown(c.system_qty, c) || <>{fq(c.system_qty)} {c.unit}</>}
                             </td>
                             <td className="px-3 py-2 text-right font-mono text-[#2D1B0E]">
-                              {fq(c.physical_qty)} {c.unit}
-                              {fmtBreakdown(c.physical_qty, c) && <div className="text-[10px]">{fmtBreakdown(c.physical_qty, c)}</div>}
+                              {fmtBreakdown(c.physical_qty, c) || <>{fq(c.physical_qty)} {c.unit}</>}
                             </td>
                             <td className={`px-3 py-2 text-right font-mono ${c.variance < 0 ? 'text-red-700' : c.variance > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
-                              {c.variance > 0 ? '+' : ''}{fq(c.variance)} {c.unit}
+                              {fmtBreakdown(c.variance, c) || <>{c.variance > 0 ? '+' : ''}{fq(c.variance)} {c.unit}</>}
                             </td>
                             <td className={`px-3 py-2 text-right font-mono ${c.variance_value < 0 ? 'text-red-700' : 'text-[#6B5744]'}`}>
                               {c.variance_value < 0 ? '−' : ''}{inr(Math.abs(c.variance_value))}
                             </td>
-                            <td className="px-3 py-2 text-[#8B7355]">{(c.counted_by || '').split('@')[0] || '—'}</td>
+                            <td className="px-3 py-2 text-[#8B7355]">{c.note || '—'}</td>
                           </tr>
                         ))}
-                        {counts.length === 0 && (
-                          <tr><td colSpan={6} className="px-3 py-4 text-center text-[#8B7355]">No counts on this date.</td></tr>
+                        {histRows.length === 0 && (
+                          <tr><td colSpan={7} className="px-3 py-4 text-center text-[#8B7355]">No counts on this date.</td></tr>
                         )}
                       </tbody>
                     </table>

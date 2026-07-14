@@ -16,8 +16,10 @@ import { getStoreById, materialStoreId, postLedger, userStoreAccess } from '@/li
  *      (no date)          (can_view)  → history: list of count dates w/ totals.
  *
  * POST                    (can_close_stock)
- *      { date, items: [{ material_id, physical_qty (RECIPE units) }],
+ *      { date, items: [{ material_id, physical_qty (RECIPE units), note? }],
  *        note?, adjust_to_physical? }
+ *      Each item's optional `note` (per-row) persists to the count row; when
+ *      absent/blank it falls back to the batch-level `note` (default '').
  *      For each item: system qty = ledger SUM as-of end of `date`;
  *      variance = physical − system; variance ₹ at the store's weighted-avg
  *      cost (fallback rm.average_price). Upserts on (store, material, date).
@@ -173,7 +175,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const prepared: {
       material_id: string; name: string; unit: string;
       system_qty: number; physical_qty: number; variance: number;
-      variance_value: number; avg_cost: number;
+      variance_value: number; avg_cost: number; note: string;
     }[] = [];
     const seen = new Set<string>();
     for (const item of b.items) {
@@ -192,12 +194,16 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       if (materialStoreId(db, mat) !== storeId) {
         return Response.json({ error: `"${mat.name}" is not a ${store.name} material — its category "${mat.category}" is not mapped to this store` }, { status: 400 });
       }
+      // Optional per-item note (per-row Notes column). Absent/blank → fall back
+      // to the batch-level note (which itself defaults to '').
+      const itemNote = String(item?.note ?? '').trim() || note;
       const { system_qty, avg_cost } = asOfStats(db, storeId, materialId, date);
       const variance = Math.round((physical - system_qty) * 1000) / 1000;
       const variance_value = Math.round(variance * avg_cost * 100) / 100;
       prepared.push({
         material_id: materialId, name: mat.name, unit: mat.unit,
         system_qty, physical_qty: physical, variance, variance_value, avg_cost,
+        note: itemNote,
       });
     }
 
@@ -225,7 +231,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         upsert.run(
           generateId(), storeId, p.material_id, date,
           p.system_qty, p.physical_qty, p.variance, p.variance_value,
-          user.email, note,
+          user.email, p.note,
         );
         if (adjust && p.variance !== 0) {
           const ledgerId = postLedger(db, {
