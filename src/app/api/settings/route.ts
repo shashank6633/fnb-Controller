@@ -25,6 +25,13 @@ export async function PUT(req: Request) {
   const db = getDb();
   const { key, value } = await req.json();
   if (!key) return Response.json({ error: 'key required' }, { status: 400 });
+  // The backdate limit governs a hard block that managers (non-admins) are
+  // themselves subject to on Purchase/Bulk/GRN dates. Managers keep write
+  // access to every OTHER setting, but must NOT be able to raise this key to
+  // self-lift the block — restrict this one key to admins.
+  if (key === 'purchase_backdate_limit_days' && me.role !== 'admin') {
+    return Response.json({ error: 'Admin role required to change the backdate limit' }, { status: 403 });
+  }
   db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, String(value ?? ''));
   return Response.json({ key, value });
 }

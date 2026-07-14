@@ -2,6 +2,8 @@ import { getDb, generateId, updateMaterialPrice, logAuditEvent } from '@/lib/db'
 import { currentRole } from '@/app/api/purchase-orders/route';
 import { getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
+import { checkPurchaseDate } from '@/lib/purchase-guard';
+import { todayIST } from '@/lib/format-date';
 
 /**
  * Mark an approved PO as Received.
@@ -30,9 +32,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
 
     const body = await req.json().catch(() => ({}));
-    const receivedAt = (body?.received_at as string) || new Date().toISOString().slice(0, 10);
+    // Use IST "today" for the day boundary (matches todayIST() used by the
+    // backdate guard) instead of UTC new Date() — otherwise a receive near
+    // midnight IST could resolve to the wrong calendar day.
+    const receivedAt = (body?.received_at as string) || todayIST();
     const me = await getCurrentUser();
     const receivedByEmail = me?.email || '';
+    // Backdate guard — a PO-receive writes received_at into both the GRN date
+    // and every purchases row it creates, so a user-supplied received_at must
+    // pass the same configurable window as /api/grn and /api/purchases. Admins
+    // (role === 'admin') are fully exempt.
+    const dateCheck = checkPurchaseDate(db, receivedAt, me?.role === 'admin');
+    if (!dateCheck.ok) return Response.json({ error: dateCheck.error }, { status: 400 });
     // Per-line overrides now support accept/reject for QC at the receiving bay.
     const overrides: Map<string, { quantity?: number; unit_price?: number; accepted?: number; rejection_reason?: string }> = new Map();
     if (Array.isArray(body?.item_overrides)) {

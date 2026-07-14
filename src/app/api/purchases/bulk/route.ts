@@ -1,5 +1,7 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
+import { getCurrentUser } from '@/lib/auth';
+import { checkPurchaseDate } from '@/lib/purchase-guard';
 
 interface BulkPurchaseItem {
   item_name: string;
@@ -22,6 +24,11 @@ export async function POST(request: Request) {
     if (!purchases || !Array.isArray(purchases) || purchases.length === 0) {
       return Response.json({ error: 'purchases array is required' }, { status: 400 });
     }
+
+    // Configurable backdate window (per line). Non-admins can't save a date older
+    // than N days or in the future; admins are exempt.
+    const me = await getCurrentUser();
+    const isAdmin = me?.role === 'admin';
 
     // Load all materials for name matching (with units so we can convert
     // purchase-unit quantities → recipe units for the stock increment).
@@ -77,6 +84,15 @@ export async function POST(request: Request) {
         // Validate required fields
         if (!item.item_name || (!item.quantity && !item.total_amount) || (!item.unit_price && !item.total_amount)) {
           results.errors.push(`Row ${rowNum}: Missing required fields (item_name: "${item.item_name || ''}")`);
+          results.skipped++;
+          continue;
+        }
+
+        // Configurable backdate window (per line): reject a date older than N days
+        // or in the future for non-admins; admins are exempt.
+        const dateCheck = checkPurchaseDate(db, item.date, isAdmin);
+        if (!dateCheck.ok) {
+          results.errors.push(`Row ${rowNum}: ${dateCheck.error}`);
           results.skipped++;
           continue;
         }

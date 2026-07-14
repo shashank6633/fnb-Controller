@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from 'react';
 import Link from 'next/link';
-import { fmtISTDate } from '@/lib/format-date';
+import { fmtISTDate, todayIST } from '@/lib/format-date';
 import {
   ShoppingCart,
   Plus,
@@ -35,6 +35,15 @@ function formatCurrency(value: number): string {
 function todayString(): string {
   const d = new Date();
   return d.toISOString().split('T')[0];
+}
+
+/** Subtract n days from a YYYY-MM-DD string (UTC math avoids DST/local drift). */
+function isoMinusDays(iso: string, n: number): string {
+  const [y, m, d] = iso.split('-').map(Number);
+  if (!y || !m || !d) return iso;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() - n);
+  return dt.toISOString().slice(0, 10);
 }
 
 interface PurchaseFormData {
@@ -142,6 +151,19 @@ export default function PurchasesPage() {
   // Toast
   const [toast, setToast] = useState<string | null>(null);
 
+  // Backdate limit (configurable) + admin exemption. Server is the real guard;
+  // these drive the date-input min/max (UX only) and the admin editor below.
+  const [backdateLimit, setBackdateLimit] = useState(3);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [limitInput, setLimitInput] = useState('3');
+  const [limitSaving, setLimitSaving] = useState(false);
+  const [limitSaved, setLimitSaved] = useState(false);
+
+  // Non-admins are penned to [today - N, today]. Admins get no min/max.
+  const dateMin = isAdmin ? undefined : isoMinusDays(todayIST(), backdateLimit);
+  const dateMax = isAdmin ? undefined : todayIST();
+  const backdateHint = `Backdating limited to ${backdateLimit} day(s) (admins exempt)`;
+
   // Bill Entry Modal
   const [billModalOpen, setBillModalOpen] = useState(false);
   const [billData, setBillData] = useState<BillFormData>({ ...emptyBill });
@@ -195,14 +217,59 @@ export default function PurchasesPage() {
     }
   };
 
+  const fetchBackdateConfig = async () => {
+    try {
+      const [sRes, mRes] = await Promise.all([
+        fetch('/api/settings?key=purchase_backdate_limit_days'),
+        fetch('/api/auth/me'),
+      ]);
+      const sJson = await sRes.json().catch(() => null);
+      const raw = sJson?.value;
+      const n = Math.max(0, Math.floor(Number(raw)));
+      const limit = Number.isFinite(n) && raw != null && raw !== '' ? n : 3;
+      setBackdateLimit(limit);
+      setLimitInput(String(limit));
+      const mJson = await mRes.json().catch(() => null);
+      setIsAdmin(mJson?.user?.role === 'admin');
+    } catch {
+      // Leave defaults (3 days, non-admin). Server still enforces the real guard.
+    }
+  };
+
   useEffect(() => {
     const init = async () => {
       setLoading(true);
-      await Promise.all([fetchPurchases(), fetchMaterials()]);
+      await Promise.all([fetchPurchases(), fetchMaterials(), fetchBackdateConfig()]);
       setLoading(false);
     };
     init();
   }, []);
+
+  const saveBackdateLimit = async () => {
+    const n = Math.max(0, Math.floor(Number(limitInput)));
+    if (!Number.isFinite(n)) return;
+    setLimitSaving(true);
+    setLimitSaved(false);
+    try {
+      const res = await api('/api/settings', {
+        method: 'PUT',
+        body: { key: 'purchase_backdate_limit_days', value: String(n) },
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => null);
+        throw new Error(j?.error || 'Failed to save');
+      }
+      setBackdateLimit(n);
+      setLimitInput(String(n));
+      setLimitSaved(true);
+      setTimeout(() => setLimitSaved(false), 2500);
+    } catch (err: any) {
+      setToast(err.message || 'Failed to save backdate limit');
+      setTimeout(() => setToast(null), 3000);
+    } finally {
+      setLimitSaving(false);
+    }
+  };
 
   const applyFilters = () => {
     const filters = { search: searchTerm, from: dateFrom, to: dateTo };
@@ -802,6 +869,43 @@ export default function PurchasesPage() {
           </div>
         </div>
 
+        {/* Admin-only: configurable bill backdate limit */}
+        {isAdmin && (
+          <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 shadow flex flex-col sm:flex-row sm:items-end gap-3">
+            <div>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">
+                Bill backdate limit (days)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={limitInput}
+                  onChange={(e) => { setLimitInput(e.target.value); setLimitSaved(false); }}
+                  className="w-24 px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+                />
+                <button
+                  onClick={saveBackdateLimit}
+                  disabled={limitSaving}
+                  className="flex items-center gap-2 px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-60 text-white rounded-lg text-sm font-medium transition-colors"
+                >
+                  {limitSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                  Save
+                </button>
+                {limitSaved && (
+                  <span className="flex items-center gap-1 text-xs text-green-600">
+                    <CheckCircle className="w-4 h-4" /> Saved
+                  </span>
+                )}
+              </div>
+            </div>
+            <p className="text-[11px] text-[#8B7355] sm:pb-2">
+              Non-admins can only enter purchase/bill/GRN dates within the last {backdateLimit} day(s) (no future dates). Admins are exempt.
+            </p>
+          </div>
+        )}
+
         {/* Filters Row */}
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 shadow">
           <div className="flex flex-col sm:flex-row gap-3 items-end">
@@ -1185,9 +1289,14 @@ export default function PurchasesPage() {
                   type="date"
                   value={formData.date}
                   onChange={(e) => handleFormChange('date', e.target.value)}
+                  min={dateMin}
+                  max={dateMax}
                   className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent [color-scheme:light]"
                   required
                 />
+                {!isAdmin && (
+                  <p className="mt-1 text-[11px] text-[#8B7355]">{backdateHint}</p>
+                )}
               </div>
 
               {/* Notes */}
@@ -1517,9 +1626,14 @@ export default function PurchasesPage() {
                     type="date"
                     value={billData.date}
                     onChange={(e) => updateBillField('date', e.target.value)}
+                    min={dateMin}
+                    max={dateMax}
                     className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] [color-scheme:light]"
                     required
                   />
+                  {!isAdmin && (
+                    <p className="mt-1 text-[10px] text-[#8B7355]">{backdateHint}</p>
+                  )}
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-[#6B5744] mb-1">Notes</label>

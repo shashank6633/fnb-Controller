@@ -17,7 +17,8 @@
  *   ↑/↓ navigate · Enter pick · Esc close · click outside closes.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Search, X } from 'lucide-react';
 
 export interface MaterialLite {
@@ -51,11 +52,44 @@ export default function MaterialTypeahead({
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const dropRef = useRef<HTMLDivElement>(null);
+  // Portal-positioned dropdown: rendered to document.body with `position:fixed`
+  // so it can NEVER be clipped by an ancestor's overflow (modals, scroll panes,
+  // and overflow-x-auto tables all clip an in-flow absolute dropdown — which
+  // made the list render but stay invisible inside the GRN/PO modals).
+  const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null);
 
-  // Close on click outside
+  const computePos = () => {
+    const el = wrapRef.current;
+    if (!el || typeof window === 'undefined') return;
+    const r = el.getBoundingClientRect();
+    const width = Math.max(r.width, 300);
+    // Keep it within the viewport horizontally.
+    const left = Math.min(r.left, window.innerWidth - width - 8);
+    setPos({ top: r.bottom + 4, left: Math.max(8, left), width });
+  };
+
+  // Recompute position whenever the dropdown opens, and keep it pinned to the
+  // anchor while the user scrolls/resizes (capture=true catches scroll on any
+  // ancestor scroll container, e.g. the modal body).
+  useLayoutEffect(() => {
+    if (!open) { setPos(null); return; }
+    computePos();
+    const onMove = () => computePos();
+    window.addEventListener('scroll', onMove, true);
+    window.addEventListener('resize', onMove);
+    return () => {
+      window.removeEventListener('scroll', onMove, true);
+      window.removeEventListener('resize', onMove);
+    };
+  }, [open]);
+
+  // Close on click outside — must treat the portaled dropdown as "inside" too,
+  // since it lives in document.body, not within wrapRef.
   useEffect(() => {
     const onDoc = (e: MouseEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (!wrapRef.current?.contains(t) && !dropRef.current?.contains(t)) setOpen(false);
     };
     document.addEventListener('mousedown', onDoc);
     return () => document.removeEventListener('mousedown', onDoc);
@@ -171,50 +205,58 @@ export default function MaterialTypeahead({
         </div>
       )}
 
-      {open && results.length > 0 && (
-        // Dropdown widens up to 480px so long names fit, but never past the
-        // viewport (max-w-[calc(100vw-1.5rem)]) so it can't spill outside the
-        // modal on mobile. Tall + scrollable so every material is reachable.
-        <ul className="absolute z-30 left-0 mt-1 max-h-[55vh] overflow-y-auto overscroll-contain bg-white border border-[#D4B896] rounded shadow-lg
-                       w-full min-w-full sm:min-w-[360px] max-w-[min(480px,calc(100vw-1.5rem))]">
-          <li className="sticky top-0 z-10 bg-[#FFF8F0] border-b border-[#E8D5C4] px-2 py-1 text-[10px] text-[#8B7355] flex items-center justify-between gap-2">
-            <span>{results.length}{results.length >= 1000 ? '+' : ''} material{results.length === 1 ? '' : 's'}{query.trim() ? ' matched' : ''}</span>
-            <span className="text-[#B99] hidden sm:inline">type to filter · scroll for more</span>
-          </li>
-          {results.map((m, i) => {
-            const isActive = i === active;
-            const lowStock = !!(m.reorder_level && m.current_stock != null && m.current_stock < m.reorder_level);
-            return (
-              <li key={m.id}
-                  onMouseDown={(e) => { e.preventDefault(); choose(m); }}
-                  onMouseEnter={() => setActive(i)}
-                  title={`${m.sku ? m.sku + ' — ' : ''}${m.name}`}
-                  className={`px-2 ${itemSize} cursor-pointer flex items-start justify-between gap-2 ${
-                    isActive ? 'bg-[#FFF1E3]' : 'hover:bg-[#FFF8F0]'}`}>
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
-                    {m.sku && <span className="text-[10px] font-mono text-[#8B7355]">{m.sku}</span>}
-                    {/* break-words = the full name is always visible, wrapping if needed */}
-                    <span className="text-[#2D1B0E] break-words leading-snug">{m.name}</span>
-                  </div>
-                  <div className="text-[9px] text-[#8B7355] flex gap-2 flex-wrap mt-0.5">
-                    {m.category && <span>{m.category}</span>}
-                    {showStock && m.current_stock != null && (
-                      <span className={lowStock ? 'text-red-700 font-semibold' : ''}>
-                        on hand: {m.current_stock} {m.unit}{lowStock ? ' ⚠' : ''}
-                      </span>
-                    )}
-                  </div>
-                </div>
+      {/* Dropdown is PORTALED to <body> with fixed positioning so no ancestor
+          overflow (modal, scroll pane, overflow-x-auto table) can clip it. */}
+      {open && pos && typeof document !== 'undefined' && createPortal(
+        <div ref={dropRef}
+             style={{ position: 'fixed', top: pos.top, left: pos.left, width: pos.width }}
+             className="z-[100] max-w-[calc(100vw-1rem)]">
+          {results.length > 0 ? (
+            <ul className="max-h-[55vh] overflow-y-auto overscroll-contain bg-white border border-[#D4B896] rounded shadow-lg">
+              <li className="sticky top-0 z-10 bg-[#FFF8F0] border-b border-[#E8D5C4] px-2 py-1 text-[10px] text-[#8B7355] flex items-center justify-between gap-2">
+                <span>{results.length}{results.length >= 1000 ? '+' : ''} material{results.length === 1 ? '' : 's'}{query.trim() ? ' matched' : ''}</span>
+                <span className="text-[#B99] hidden sm:inline">type to filter · scroll for more</span>
               </li>
-            );
-          })}
-        </ul>
-      )}
-      {open && query.trim() && results.length === 0 && (
-        <div className="absolute z-30 left-0 mt-1 w-full max-w-[480px] bg-white border border-[#D4B896] rounded shadow-lg p-2 text-[11px] text-[#8B7355]">
-          No materials match &quot;{query}&quot;.
-        </div>
+              {results.map((m, i) => {
+                const isActive = i === active;
+                const lowStock = !!(m.reorder_level && m.current_stock != null && m.current_stock < m.reorder_level);
+                return (
+                  <li key={m.id}
+                      onMouseDown={(e) => { e.preventDefault(); choose(m); }}
+                      onMouseEnter={() => setActive(i)}
+                      title={`${m.sku ? m.sku + ' — ' : ''}${m.name}`}
+                      className={`px-2 ${itemSize} cursor-pointer flex items-start justify-between gap-2 ${
+                        isActive ? 'bg-[#FFF1E3]' : 'hover:bg-[#FFF8F0]'}`}>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
+                        {m.sku && <span className="text-[10px] font-mono text-[#8B7355]">{m.sku}</span>}
+                        {/* break-words = the full name is always visible, wrapping if needed */}
+                        <span className="text-[#2D1B0E] break-words leading-snug">{m.name}</span>
+                      </div>
+                      <div className="text-[9px] text-[#8B7355] flex gap-2 flex-wrap mt-0.5">
+                        {m.category && <span>{m.category}</span>}
+                        {showStock && m.current_stock != null && (
+                          <span className={lowStock ? 'text-red-700 font-semibold' : ''}>
+                            on hand: {m.current_stock} {m.unit}{lowStock ? ' ⚠' : ''}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            // Never render an invisible/empty dropdown (reads as "broken").
+            // Distinguish "search matched nothing" from "no materials loaded".
+            <div className="bg-white border border-[#D4B896] rounded shadow-lg p-2 text-[11px] text-[#8B7355]">
+              {query.trim()
+                ? <>No materials match &quot;{query}&quot;.</>
+                : <>No materials loaded yet — if this list stays empty, refresh the page.</>}
+            </div>
+          )}
+        </div>,
+        document.body,
       )}
     </div>
   );

@@ -8,11 +8,21 @@
 import { useEffect, useMemo, useState } from 'react';
 import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save } from 'lucide-react';
 import { api } from '@/lib/api';
+import { todayIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
+import Combobox from '@/components/Combobox';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const today = () => new Date().toISOString().slice(0,10);
 const minusDays = (n: number) => { const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().slice(0,10); };
+/** Subtract n days from a YYYY-MM-DD string (UTC math avoids DST/local drift). */
+const isoMinusDays = (iso: string, n: number): string => {
+  const [y, m, d] = iso.split('-').map(Number);
+  if (!y || !m || !d) return iso;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() - n);
+  return dt.toISOString().slice(0, 10);
+};
 
 interface GRN {
   id: string; grn_number: string; date: string; time?: string;
@@ -260,6 +270,29 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const [materials, setMaterials] = useState<any[]>([]);
   const [busy, setBusy] = useState(false);
 
+  // Configurable backdate limit + admin exemption. Server is the real guard;
+  // these only set the receipt-date input's min/max (UX). Default: 3 days, non-admin.
+  const [backdateLimit, setBackdateLimit] = useState(3);
+  const [isAdmin, setIsAdmin] = useState(false);
+  useEffect(() => {
+    (async () => {
+      try {
+        const [sRes, mRes] = await Promise.all([
+          fetch('/api/settings?key=purchase_backdate_limit_days'),
+          fetch('/api/auth/me'),
+        ]);
+        const sJson = await sRes.json().catch(() => null);
+        const raw = sJson?.value;
+        const n = Math.max(0, Math.floor(Number(raw)));
+        setBackdateLimit(Number.isFinite(n) && raw != null && raw !== '' ? n : 3);
+        const mJson = await mRes.json().catch(() => null);
+        setIsAdmin(mJson?.user?.role === 'admin');
+      } catch { /* keep defaults; server still enforces */ }
+    })();
+  }, []);
+  const dateMin = isAdmin ? undefined : isoMinusDays(todayIST(), backdateLimit);
+  const dateMax = isAdmin ? undefined : todayIST();
+
   // Back-correction mode — when ON, negative qtys are allowed for fixing a
   // prior GRN where the store forgot to subtract something. Default OFF so
   // the day-to-day flow can't accidentally book "-5 kg received" as if that
@@ -392,20 +425,25 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
             <label className="flex flex-col gap-1 text-[#6B5744]">Receipt Date
-              <input type="date" value={date} onChange={e => setDate(e.target.value)} className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+              <input type="date" value={date} onChange={e => setDate(e.target.value)} min={dateMin} max={dateMax} className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+              {!isAdmin && (
+                <span className="text-[10px] text-[#8B7355]">Backdating limited to {backdateLimit} day(s) (admins exempt)</span>
+              )}
             </label>
             <label className="flex flex-col gap-1 text-[#6B5744]">Vendor
-              <input list="adhoc-vendors" value={vendor}
-                     onChange={e => {
-                       const typed = e.target.value;
-                       setVendor(typed);
-                       const v = vendors.find(x => x.name.toLowerCase().trim() === typed.toLowerCase().trim());
-                       setVendorId(v ? v.id : '');
-                       // Re-enable vendor-filtered picker when vendor changes
-                       setShowAllMaterials(false);
-                     }}
-                     placeholder="Type or pick"
-                     className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+              <Combobox
+                options={vendors.map(v => ({ value: v.name, label: v.name }))}
+                value={vendor}
+                allowCustom
+                placeholder="Type or pick"
+                onChange={(typed) => {
+                  setVendor(typed);
+                  const v = vendors.find(x => x.name.toLowerCase().trim() === typed.toLowerCase().trim());
+                  setVendorId(v ? v.id : '');
+                  setShowAllMaterials(false); // re-enable vendor-filtered picker when vendor changes
+                }}
+                className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0] text-sm"
+              />
               <datalist id="adhoc-vendors">{vendors.map(v => <option key={v.id} value={v.name} />)}</datalist>
               {vendorId && (
                 <div className="flex items-center gap-1.5 text-[10px] text-[#8B7355] mt-0.5">

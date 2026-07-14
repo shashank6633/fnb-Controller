@@ -1,5 +1,7 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
+import { getCurrentUser } from '@/lib/auth';
+import { checkPurchaseDate } from '@/lib/purchase-guard';
 
 export async function GET(request: Request) {
   try {
@@ -63,6 +65,12 @@ export async function POST(request: Request) {
     if (!material_id || !quantity || !unit_price || !date) {
       return Response.json({ error: 'material_id, quantity, unit_price, and date are required' }, { status: 400 });
     }
+
+    // Configurable backdate window: non-admins can't save a date older than N days
+    // or in the future; admins are exempt.
+    const me = await getCurrentUser();
+    const dateCheck = checkPurchaseDate(db, date, me?.role === 'admin');
+    if (!dateCheck.ok) return Response.json({ error: dateCheck.error }, { status: 400 });
 
     const material = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(material_id) as any;
     if (!material) {

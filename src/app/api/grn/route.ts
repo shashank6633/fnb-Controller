@@ -1,6 +1,7 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
+import { checkPurchaseDate } from '@/lib/purchase-guard';
 
 /**
  * GRN read API. Listing + detail.
@@ -85,6 +86,11 @@ export async function POST(request: Request) {
     if (!Array.isArray(items) || items.length === 0) {
       return Response.json({ error: 'items array required' }, { status: 400 });
     }
+
+    // Configurable backdate window: non-admins can't set a GRN receipt date older
+    // than N days or in the future; admins are exempt.
+    const dateCheck = checkPurchaseDate(db, date, me.role === 'admin');
+    if (!dateCheck.ok) return Response.json({ error: dateCheck.error }, { status: 400 });
     const outletId = await getCurrentOutletId();
 
     // Phase B store guard (batch endpoint → skip + report per line, never fail

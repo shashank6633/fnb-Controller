@@ -168,6 +168,11 @@ function initializeSchema(db: Database.Database) {
     -- "Menu Price @ Target" suggestion and the high-FC flag. Overwritten on
     -- recipe-workbook import from the workbook's own target cell.
     INSERT OR IGNORE INTO settings (key, value) VALUES ('target_food_cost_pct', '0.30');
+    -- Backdate window (in DAYS) for purchase-type date entry (Purchase / Bulk Bill /
+    -- GRN). Non-admins can only save a date within the last N days and never in the
+    -- future; admins are fully exempt. Admin-editable via /settings; enforced in
+    -- src/lib/purchase-guard.ts. INSERT OR IGNORE = deploy-safe (never clobbers a set value).
+    INSERT OR IGNORE INTO settings (key, value) VALUES ('purchase_backdate_limit_days', '3');
 
     -- Parties (Events / Functions)
     CREATE TABLE IF NOT EXISTS parties (
