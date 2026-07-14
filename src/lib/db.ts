@@ -2414,6 +2414,24 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('whatsapp schema failed:', e); }
 
+  // Migration: extend whatsapp_templates for Meta-approved template sends +
+  // multi-provider (Meta Cloud / Interakt). Free-form text only delivers inside
+  // the 24h window; these columns let a template map to its provider-approved
+  // template + positional param order so notifyEvent() can send anytime.
+  try {
+    const cols = db.prepare("PRAGMA table_info(whatsapp_templates)").all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    if (!has('provider_template_name')) db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN provider_template_name TEXT DEFAULT ''`); // exact approved name at the provider
+    if (!has('provider_language'))      db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN provider_language TEXT DEFAULT ''`);      // e.g. 'en_US' (Meta) / 'en' (Interakt); empty → fall back to language
+    if (!has('param_order'))            db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN param_order TEXT DEFAULT ''`);            // JSON array of var names in {{1}},{{2}}… order; empty → WA_EVENT_PARAM_ORDER
+    if (!has('send_as_template'))       db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN send_as_template INTEGER NOT NULL DEFAULT 0`); // 1 → send via provider template API, not free-form text
+  } catch (e) { console.error('whatsapp_templates template-send migration failed:', e); }
+
+  // Interakt provider API key (Basic-auth secret, used AS-IS). Additive seed.
+  try {
+    db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_interakt_api_key', '')`);
+  } catch (e) { console.error('wa_interakt_api_key seed failed:', e); }
+
   // ── AKAN CRM — Guest Database + Loyalty (additive) ─────────────────────────
   // Guest directory keyed by normalized 10-digit mobile (/crm/guests). Visits
   // append to crm_guest_visits and roll up onto the guest row (visit_count /

@@ -17,18 +17,22 @@ import { reorderSuggestions } from './crm-analyst-data';
  * below is real but only reachable once config is complete.
  */
 
+/** Meta Graph API version — v19.0 EXPIRED 2026-05-21 (HTTP 400 for all calls). */
+const META_GRAPH_VERSION = 'v23.0';
+
 /** Settings keys owned by this module (whitelist for setWaConfig). */
 export const WA_CONFIG_KEYS = [
-  'wa_api_provider',          // 'meta_cloud' | 'twilio' (coming soon) | 'wame'
+  'wa_api_provider',          // 'meta_cloud' | 'interakt' | 'twilio' (coming soon) | 'wame'
   'wa_phone_number_id',
   'wa_business_account_id',
   'wa_access_token',          // secret — masked on read
   'wa_webhook_verify_token',  // secret — masked on read
+  'wa_interakt_api_key',      // secret — masked on read (Interakt Basic auth key)
   'wa_notifications_enabled', // '1' | '0' master switch
 ] as const;
 export type WaConfigKey = typeof WA_CONFIG_KEYS[number];
 
-const SECRET_KEYS: WaConfigKey[] = ['wa_access_token', 'wa_webhook_verify_token'];
+const SECRET_KEYS: WaConfigKey[] = ['wa_access_token', 'wa_webhook_verify_token', 'wa_interakt_api_key'];
 
 export interface WaConfig {
   wa_api_provider: string;
@@ -40,6 +44,9 @@ export interface WaConfig {
   /** Masked like the access token. */
   wa_webhook_verify_token: string;
   wa_webhook_verify_token_set: boolean;
+  /** Masked like the access token — Interakt Basic-auth API key. */
+  wa_interakt_api_key: string;
+  wa_interakt_api_key_set: boolean;
   wa_notifications_enabled: boolean;
   /** True when the selected provider has everything it needs to actually send. */
   configured: boolean;
@@ -68,8 +75,9 @@ export function getWaConfigRaw(): Record<WaConfigKey, string> {
 /** Is the send path actually usable with the current provider + credentials? */
 export function isWaConfigured(raw?: Record<WaConfigKey, string>): boolean {
   const c = raw ?? getWaConfigRaw();
-  if (c.wa_api_provider !== 'meta_cloud') return false; // twilio: coming soon; wame: link-only
-  return !!(c.wa_phone_number_id.trim() && c.wa_access_token.trim());
+  if (c.wa_api_provider === 'meta_cloud') return !!(c.wa_phone_number_id.trim() && c.wa_access_token.trim());
+  if (c.wa_api_provider === 'interakt') return !!c.wa_interakt_api_key.trim();
+  return false; // twilio: coming soon; wame: link-only
 }
 
 /** Masked, UI-safe config. Secrets come back as ••••last4. */
@@ -83,6 +91,8 @@ export function getWaConfig(): WaConfig {
     wa_access_token_set: !!raw.wa_access_token,
     wa_webhook_verify_token: maskSecret(raw.wa_webhook_verify_token),
     wa_webhook_verify_token_set: !!raw.wa_webhook_verify_token,
+    wa_interakt_api_key: maskSecret(raw.wa_interakt_api_key),
+    wa_interakt_api_key_set: !!raw.wa_interakt_api_key,
     wa_notifications_enabled: raw.wa_notifications_enabled === '1',
     configured: isWaConfigured(raw),
   };
@@ -123,6 +133,22 @@ export function normalizeWaNumber(mobile: string): string {
 }
 
 /**
+ * Split a mobile into { countryCode: '+91', phoneNumber: '<local>' } for
+ * providers (Interakt) that want the country code separate from the local
+ * number. India-first: a bare 10-digit number is assumed Indian.
+ */
+export function splitWaNumber(mobile: string): { countryCode: string; phoneNumber: string } {
+  let digits = String(mobile || '').replace(/\D/g, '');
+  // India-first: a bare local number written with a trunk '0' (e.g. '09876543210')
+  // drops the single leading '0' before the length check → 10-digit local.
+  if (digits.startsWith('0')) digits = digits.slice(1);
+  if (digits.length === 12 && digits.startsWith('91')) return { countryCode: '+91', phoneNumber: digits.slice(2) };
+  if (digits.length === 10) return { countryCode: '+91', phoneNumber: digits };
+  if (digits.length > 10) return { countryCode: '+' + digits.slice(0, -10), phoneNumber: digits.slice(-10) };
+  return { countryCode: '+91', phoneNumber: digits };
+}
+
+/**
  * wa.me fallback — opens a chat with the text pre-filled; user taps send.
  * Needs no credentials. (Same scheme as the existing review-request links.)
  */
@@ -138,19 +164,31 @@ export type WaSendResult =
 
 /**
  * Send a plain-text WhatsApp message via the configured provider.
- * Provider-pluggable: today only Meta Cloud API has a live path. Incomplete
- * config NEVER throws — it returns { ok:false, reason:'not_configured' } so
- * feature code can call this unconditionally.
+ * Provider-pluggable. Incomplete config NEVER throws — it returns
+ * { ok:false, reason:'not_configured' } so feature code can call this
+ * unconditionally.
+ *
+ * Free-form text only delivers inside the 24h customer-service window (Meta) —
+ * for proactive/anytime delivery use sendWhatsAppTemplate with an approved
+ * template. Interakt has NO free-form text API at all: it refuses cleanly.
  */
 export async function sendWhatsAppMessage(to: string, body: string): Promise<WaSendResult> {
   const raw = getWaConfigRaw();
   if (!isWaConfigured(raw)) return { ok: false, reason: 'not_configured' };
 
-  // Meta Cloud API (graph.facebook.com) — the only live provider today.
+  if (raw.wa_api_provider === 'interakt') {
+    return {
+      ok: false,
+      reason: 'send_failed',
+      detail: 'Interakt sends approved templates only — free-form text is not supported by the API. Configure a template mapping for this event.',
+    };
+  }
+
+  // Meta Cloud API (graph.facebook.com).
   try {
     const toNum = normalizeWaNumber(to);
     if (!toNum || !body) return { ok: false, reason: 'send_failed', detail: 'Missing recipient or message body' };
-    const r = await fetch(`https://graph.facebook.com/v19.0/${encodeURIComponent(raw.wa_phone_number_id.trim())}/messages`, {
+    const r = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${encodeURIComponent(raw.wa_phone_number_id.trim())}/messages`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${raw.wa_access_token.trim()}`,
@@ -169,6 +207,98 @@ export async function sendWhatsAppMessage(to: string, body: string): Promise<WaS
       return { ok: false, reason: 'send_failed', detail: j?.error?.message || `Meta API HTTP ${r.status}` };
     }
     return { ok: true, provider: 'meta_cloud', message_id: j?.messages?.[0]?.id };
+  } catch (e: any) {
+    return { ok: false, reason: 'send_failed', detail: e?.message || 'Network error' };
+  }
+}
+
+/**
+ * Send a Meta-approved TEMPLATE message — delivers ANY time (no 24h window).
+ * Body params are POSITIONAL: bodyParams[0] → {{1}}, [1] → {{2}}, … and the
+ * array length MUST equal the template's placeholder count. opts.headerParams
+ * fill a header component's placeholders (optional). NEVER throws.
+ */
+export async function sendWhatsAppTemplate(
+  to: string,
+  templateName: string,
+  languageCode: string,
+  bodyParams: (string | number)[],
+  opts?: { headerParams?: (string | number)[] },
+): Promise<WaSendResult> {
+  const raw = getWaConfigRaw();
+  if (!isWaConfigured(raw)) return { ok: false, reason: 'not_configured' };
+
+  const lang = String(languageCode || '').trim() || 'en';
+  const headerParams = opts?.headerParams;
+
+  try {
+    if (raw.wa_api_provider === 'meta_cloud') {
+      const toNum = normalizeWaNumber(to);
+      if (!toNum || !templateName) return { ok: false, reason: 'send_failed', detail: 'Missing recipient or template name' };
+
+      const components: any[] = [];
+      if (headerParams && headerParams.length) {
+        components.push({ type: 'header', parameters: headerParams.map(v => ({ type: 'text', text: String(v) })) });
+      }
+      if (bodyParams && bodyParams.length) {
+        components.push({ type: 'body', parameters: bodyParams.map(v => ({ type: 'text', text: String(v) })) });
+      }
+
+      const template: any = { name: templateName, language: { code: lang } };
+      if (components.length) template.components = components;
+
+      const r = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${encodeURIComponent(raw.wa_phone_number_id.trim())}/messages`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${raw.wa_access_token.trim()}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: toNum,
+          type: 'template',
+          template,
+        }),
+      });
+      const j: any = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        return { ok: false, reason: 'send_failed', detail: j?.error?.message || `Meta API HTTP ${r.status}` };
+      }
+      return { ok: true, provider: 'meta_cloud', message_id: j?.messages?.[0]?.id };
+    }
+
+    if (raw.wa_api_provider === 'interakt') {
+      if (!templateName) return { ok: false, reason: 'send_failed', detail: 'Missing template name' };
+      const { countryCode, phoneNumber } = splitWaNumber(to);
+      if (!phoneNumber) return { ok: false, reason: 'send_failed', detail: 'Missing recipient' };
+
+      const template: any = { name: templateName, languageCode: lang, bodyValues: bodyParams.map(String) };
+      if (headerParams && headerParams.length) template.headerValues = headerParams.map(String);
+
+      const r = await fetch('https://api.interakt.ai/v1/public/message/', {
+        method: 'POST',
+        headers: {
+          // Interakt Basic key is used AS-IS — do NOT base64-encode it again.
+          'Authorization': `Basic ${raw.wa_interakt_api_key.trim()}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          countryCode,
+          phoneNumber,
+          type: 'Template',
+          template,
+        }),
+      });
+      const j: any = await r.json().catch(() => ({}));
+      if (!r.ok || j?.result === false) {
+        return { ok: false, reason: 'send_failed', detail: j?.message || `Interakt API HTTP ${r.status}` };
+      }
+      // result:true is ACCEPTED (queued), not yet delivered.
+      return { ok: true, provider: 'interakt', message_id: j?.id };
+    }
+
+    return { ok: false, reason: 'not_configured' };
   } catch (e: any) {
     return { ok: false, reason: 'send_failed', detail: e?.message || 'Network error' };
   }
@@ -198,6 +328,19 @@ export const WA_DEFAULT_EVENT_BODIES: Record<WaNotifyEvent, string> = {
   discount_decided: 'Discount request for order #{{order}} — {{pct}}% {{decision}} by {{decided_by}}.',
   low_stock_daily: '📦 Low-stock summary ({{date}}) — {{count}} material(s) to reorder:\n{{summary}}',
   digest_daily: '📋 AKAN Daily Digest — {{date}}\n\n{{content}}',
+};
+
+/**
+ * Positional variable order per event — the map from a template's {{1}},{{2}},…
+ * to the names in the `vars` object notifyEvent receives. Meta/Interakt approved
+ * templates take POSITIONAL body params (not named), so this ordering is the
+ * contract. A whatsapp_templates row may override it via its param_order column.
+ */
+export const WA_EVENT_PARAM_ORDER: Record<WaNotifyEvent, string[]> = {
+  requisition_approved: ['req_number', 'department', 'approved_by'],
+  discount_decided: ['order', 'pct', 'decision', 'decided_by'],
+  low_stock_daily: ['date', 'count', 'summary'],
+  digest_daily: ['date', 'content'],
 };
 
 /** Master switch AND the per-event toggle must both be on. */
@@ -273,13 +416,32 @@ export async function notifyEvent(
 
     let body = WA_DEFAULT_EVENT_BODIES[event] || '';
     let template_source = 'built_in';
+    // Newer DBs add provider-template columns; guard for older DBs without them.
+    let row: {
+      body?: string;
+      send_as_template?: number;
+      provider_template_name?: string;
+      provider_language?: string;
+      language?: string;
+      param_order?: string;
+    } | undefined;
     try {
-      const t = getDb().prepare(
-        'SELECT body FROM whatsapp_templates WHERE name = ? AND is_active = 1',
-      ).get(event) as { body?: string } | undefined;
-      if (t?.body) { body = t.body; template_source = 'template'; }
-    } catch { /* fall back to built-in body */ }
-    const text = renderTemplate(body, vars);
+      row = getDb().prepare(
+        `SELECT body,
+                COALESCE(send_as_template, 0) AS send_as_template,
+                provider_template_name, provider_language, language, param_order
+           FROM whatsapp_templates WHERE name = ? AND is_active = 1`,
+      ).get(event) as typeof row;
+    } catch {
+      // Older DB without the new columns — retry with just body.
+      try {
+        row = getDb().prepare(
+          'SELECT body FROM whatsapp_templates WHERE name = ? AND is_active = 1',
+        ).get(event) as typeof row;
+      } catch { /* fall back to built-in body */ }
+    }
+    if (row?.body) { body = row.body; template_source = 'template'; }
+
     const recipients = toMobile ? [String(toMobile).trim()].filter(Boolean) : getWaNotifyRecipients()[event] || [];
 
     if (!isWaConfigured()) {
@@ -290,6 +452,39 @@ export async function notifyEvent(
       logWaSendAttempt({ event, ok: false, reason: 'no_recipient', template_source });
       return;
     }
+
+    // Provider-template path: send a Meta/Interakt approved template with
+    // POSITIONAL params (delivers anytime, not just inside the 24h window).
+    const providerTemplate = String(row?.provider_template_name || '').trim();
+    if (row?.send_as_template === 1 && providerTemplate) {
+      let order = WA_EVENT_PARAM_ORDER[event];
+      if (row.param_order) {
+        try {
+          const parsed = JSON.parse(row.param_order);
+          if (Array.isArray(parsed) && parsed.length > 0 && parsed.every(v => typeof v === 'string')) order = parsed;
+        } catch { /* invalid → fall back to WA_EVENT_PARAM_ORDER */ }
+      }
+      // Meta rejects positional body params containing newlines/tabs/runs of >4
+      // spaces, so collapse every whitespace run to a single space and trim.
+      // (Only the provider-template path — the free-form text path is untouched.)
+      const params = order.map(name => {
+        const v = Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : '';
+        return v.replace(/\s+/g, ' ').trim();
+      });
+      const language = String(row.provider_language || row.language || 'en').trim() || 'en';
+      for (const to of recipients) {
+        try {
+          const res = await sendWhatsAppTemplate(to, providerTemplate, language, params);
+          logWaSendAttempt({ event, to, template_source: 'provider_template', template: providerTemplate, ...res });
+        } catch (e: any) {
+          logWaSendAttempt({ event, to, template_source: 'provider_template', template: providerTemplate, ok: false, reason: 'send_failed', detail: e?.message || 'unexpected error' });
+        }
+      }
+      return;
+    }
+
+    // Free-form text path (unchanged) — only delivers inside the 24h window.
+    const text = renderTemplate(body, vars);
     for (const to of recipients) {
       try {
         const res = await sendWhatsAppMessage(to, text);
@@ -304,12 +499,20 @@ export async function notifyEvent(
   }
 }
 
-/** Has this event already logged a send_attempt today (UTC, matches created_at)? */
-function waAttemptedToday(event: WaNotifyEvent): boolean {
+/**
+ * Has this event been SUCCESSFULLY delivered today (UTC, matches created_at)?
+ * Deliberately counts only ok:true rows — a doomed attempt (not_configured /
+ * no_recipient / send_failed) must NOT burn the day's slot, so a later run (after
+ * the admin fixes credentials/recipients, or a transient outage clears) still
+ * fires. A successful send logs a payload containing both "event":"<ev>" and
+ * "ok":true, so both fragments are required.
+ */
+function waSentToday(event: WaNotifyEvent): boolean {
   try {
     const row = getDb().prepare(`
       SELECT COUNT(*) AS n FROM whatsapp_events_log
-      WHERE kind = 'send_attempt' AND date(created_at) = date('now') AND payload LIKE ?
+      WHERE kind = 'send_attempt' AND date(created_at) = date('now')
+        AND payload LIKE ? AND payload LIKE '%"ok":true%'
     `).get(`%"event":"${event}"%`) as { n: number } | undefined;
     return (row?.n || 0) > 0;
   } catch { return false; }
@@ -319,7 +522,8 @@ function waAttemptedToday(event: WaNotifyEvent): boolean {
  * Daily WhatsApp jobs — dispatched from the /api/cron/refresh-parties pipeline
  * (external cron / admin manual run). Each job is:
  *   - guarded by its Notifications-tab toggle (+ master switch)
- *   - once per day (first attempt of the day wins; later runs skip)
+ *   - once per day (first SUCCESSFUL send wins; failed/no-op runs don't burn the
+ *     slot, so a later run still fires once config/recipients are fixed)
  *   - fully best-effort: never throws
  * Returns a per-job status string for the cron response.
  */
@@ -332,7 +536,7 @@ export async function runWaDailyNotifications(): Promise<Record<string, string>>
   //    stays actionable across 1000+ materials.
   try {
     if (!isWaNotifyEnabled('low_stock_daily')) out.low_stock_daily = 'disabled';
-    else if (waAttemptedToday('low_stock_daily')) out.low_stock_daily = 'already_sent_today';
+    else if (waSentToday('low_stock_daily')) out.low_stock_daily = 'already_sent_today';
     else {
       const rows = (reorderSuggestions(getDb())?.rows || [])
         .filter((r: any) => Number(r.priority) === 3)
@@ -353,7 +557,7 @@ export async function runWaDailyNotifications(): Promise<Record<string, string>>
   // 2. Daily digest — today's stored crm_digests briefing, if one was generated
   try {
     if (!isWaNotifyEnabled('digest_daily')) out.digest_daily = 'disabled';
-    else if (waAttemptedToday('digest_daily')) out.digest_daily = 'already_sent_today';
+    else if (waSentToday('digest_daily')) out.digest_daily = 'already_sent_today';
     else {
       const row = getDb().prepare('SELECT content FROM crm_digests WHERE digest_date = ?')
         .get(date) as { content?: string } | undefined;

@@ -34,6 +34,8 @@ interface WaConfigDto {
   wa_access_token_set: boolean;
   wa_webhook_verify_token: string;    // masked
   wa_webhook_verify_token_set: boolean;
+  wa_interakt_api_key: string;        // masked ••••last4
+  wa_interakt_api_key_set: boolean;
   wa_notifications_enabled: boolean;
   configured: boolean;
   notify: Record<string, boolean>;
@@ -43,7 +45,24 @@ interface WaConfigDto {
 interface WaTemplate {
   id: string; name: string; category: string; language: string;
   body: string; is_active: number; created_at: string; updated_at: string;
+  // Provider approved-template routing (added for template-send path)
+  send_as_template?: number;
+  provider_template_name?: string;
+  provider_language?: string;
+  param_order?: string; // JSON array of var names, in {{1}},{{2}}… order
 }
+
+/**
+ * Positional {{1}},{{2}}… var order per built-in notify event — mirrors
+ * WA_EVENT_PARAM_ORDER in lib/whatsapp.ts. Used only to hint the default
+ * "Parameter order" when a template's provider name matches a known event.
+ */
+const WA_EVENT_PARAM_ORDER: Record<string, string[]> = {
+  requisition_approved: ['req_number', 'department', 'approved_by'],
+  discount_decided:     ['order', 'pct', 'decision', 'decided_by'],
+  low_stock_daily:      ['date', 'count', 'summary'],
+  digest_daily:         ['date', 'content'],
+};
 
 /** Client-side mirror of lib/whatsapp renderTemplate() for the live preview. */
 function renderPreview(body: string, vars: Record<string, string>): string {
@@ -151,10 +170,27 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
   const [wabaId, setWabaId] = useState('');
   const [token, setToken] = useState('');
   const [verifyToken, setVerifyToken] = useState('');
+  const [interaktKey, setInteraktKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [testTo, setTestTo] = useState('');
   const [testResult, setTestResult] = useState<any>(null);
   const [seeded, setSeeded] = useState(false);
+
+  // Send-test-template card state
+  const [tplTo, setTplTo] = useState('');
+  const [tplName, setTplName] = useState('');
+  const [tplLang, setTplLang] = useState('');
+  const [tplParams, setTplParams] = useState('');
+  const [tplBusy, setTplBusy] = useState(false);
+  const [tplResult, setTplResult] = useState<any>(null);
+
+  // Meta approved-template fetch (best-effort reference list)
+  const [metaTpls, setMetaTpls] = useState<any[] | null>(null);
+  const [metaBusy, setMetaBusy] = useState(false);
+  const [metaErr, setMetaErr] = useState<string | null>(null);
+
+  const isMeta = provider === 'meta_cloud';
+  const isInterakt = provider === 'interakt';
 
   useEffect(() => {
     if (cfg && !seeded) {
@@ -183,12 +219,13 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
             // Blank secrets are ignored server-side (keep the stored value)
             wa_access_token: token.trim(),
             wa_webhook_verify_token: verifyToken.trim(),
+            wa_interakt_api_key: interaktKey.trim(),
           },
         },
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
-      setToken(''); setVerifyToken('');
+      setToken(''); setVerifyToken(''); setInteraktKey('');
       onOk('✓ WhatsApp configuration saved.');
       reload();
     } finally { setBusy(false); }
@@ -205,6 +242,42 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
     } finally { setBusy(false); }
   };
 
+  const testTemplate = async () => {
+    setTplBusy(true); onError(null); onOk(null); setTplResult(null);
+    try {
+      const params = tplParams.split(',').map(s => s.trim()).filter(Boolean);
+      const r = await api('/api/whatsapp/config', {
+        method: 'POST',
+        body: {
+          action: 'test_template',
+          to: tplTo.trim(),
+          template_name: tplName.trim(),
+          language: tplLang.trim(),
+          params,
+        },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      setTplResult(j.result);
+      if (j.result?.ok) onOk('✓ Test template accepted — check the phone.');
+    } finally { setTplBusy(false); }
+  };
+
+  const fetchMetaTemplates = async () => {
+    setMetaBusy(true); setMetaErr(null); setMetaTpls(null);
+    try {
+      const r = await fetch('/api/whatsapp/meta-templates');
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j?.ok === false) {
+        setMetaErr(j?.detail || j?.error || 'Could not fetch templates from Meta. Check the token has whatsapp_business_management scope.');
+        return;
+      }
+      setMetaTpls(Array.isArray(j.templates) ? j.templates : []);
+    } catch {
+      setMetaErr('Could not reach Meta. Try again.');
+    } finally { setMetaBusy(false); }
+  };
+
   const copyWebhook = async () => {
     try { await navigator.clipboard.writeText(webhookUrl); onOk('✓ Webhook URL copied.'); } catch { /* no-op */ }
   };
@@ -219,10 +292,27 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
           <select value={provider} onChange={e => setProvider(e.target.value)}
                   className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm">
             <option value="meta_cloud">Meta Cloud API (WhatsApp Business Platform)</option>
+            <option value="interakt">Interakt (WhatsApp BSP)</option>
             <option value="twilio" disabled>Twilio — coming soon</option>
             <option value="wame">wa.me links only (no API — manual tap-to-send)</option>
           </select>
         </label>
+
+        {isMeta && (
+          <div className="text-[11px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
+            <b>24-hour rule:</b> free-form text replies deliver only within 24 h of the guest's last
+            message. <b>Approved templates deliver anytime</b> — set a provider template name on each
+            notification (Templates tab) so proactive pings always land.
+          </div>
+        )}
+
+        {isInterakt && (
+          <div className="text-[11px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
+            <b>Templates only:</b> Interakt sends <b>approved templates</b> and has no free-form text send —
+            configure each notification as an approved template (Templates tab). Interakt manages the
+            business number & webhook on their side, so no Phone Number ID / webhook is needed here.
+          </div>
+        )}
 
         {provider === 'wame' && (
           <div className="text-[11px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
@@ -231,48 +321,64 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
           </div>
         )}
 
-        <div className="grid sm:grid-cols-2 gap-3">
+        {isInterakt && (
           <label className="block text-xs text-[#6B5744]">
-            Phone Number ID
-            <input value={phoneId} onChange={e => setPhoneId(e.target.value)} placeholder="e.g. 123456789012345"
+            Interakt API key{' '}
+            {cfg?.wa_interakt_api_key_set
+              ? <span className="text-emerald-700 font-mono">(saved: {cfg.wa_interakt_api_key})</span>
+              : <span className="text-amber-700">(not set)</span>}
+            <input type="password" value={interaktKey} onChange={e => setInteraktKey(e.target.value)}
+                   placeholder={cfg?.wa_interakt_api_key_set ? 'Leave blank to keep the saved key' : 'Paste the Interakt Secret Key (Settings → Developer)'}
                    className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
           </label>
-          <label className="block text-xs text-[#6B5744]">
-            Business Account ID (WABA)
-            <input value={wabaId} onChange={e => setWabaId(e.target.value)} placeholder="e.g. 987654321098765"
-                   className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
-          </label>
-        </div>
+        )}
 
-        <label className="block text-xs text-[#6B5744]">
-          Access token{' '}
-          {cfg?.wa_access_token_set
-            ? <span className="text-emerald-700 font-mono">(saved: {cfg.wa_access_token})</span>
-            : <span className="text-amber-700">(not set)</span>}
-          <input type="password" value={token} onChange={e => setToken(e.target.value)}
-                 placeholder={cfg?.wa_access_token_set ? 'Leave blank to keep the saved token' : 'Paste the permanent access token'}
-                 className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
-        </label>
+        {isMeta && (
+          <>
+            <div className="grid sm:grid-cols-2 gap-3">
+              <label className="block text-xs text-[#6B5744]">
+                Phone Number ID
+                <input value={phoneId} onChange={e => setPhoneId(e.target.value)} placeholder="e.g. 123456789012345"
+                       className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+              </label>
+              <label className="block text-xs text-[#6B5744]">
+                Business Account ID (WABA)
+                <input value={wabaId} onChange={e => setWabaId(e.target.value)} placeholder="e.g. 987654321098765"
+                       className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+              </label>
+            </div>
 
-        <label className="block text-xs text-[#6B5744]">
-          Webhook verify token{' '}
-          {cfg?.wa_webhook_verify_token_set
-            ? <span className="text-emerald-700 font-mono">(saved: {cfg.wa_webhook_verify_token})</span>
-            : <span className="text-amber-700">(not set)</span>}
-          <input type="password" value={verifyToken} onChange={e => setVerifyToken(e.target.value)}
-                 placeholder={cfg?.wa_webhook_verify_token_set ? 'Leave blank to keep the saved token' : 'Any secret string — you type the same one into Meta'}
-                 className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
-        </label>
+            <label className="block text-xs text-[#6B5744]">
+              Access token{' '}
+              {cfg?.wa_access_token_set
+                ? <span className="text-emerald-700 font-mono">(saved: {cfg.wa_access_token})</span>
+                : <span className="text-amber-700">(not set)</span>}
+              <input type="password" value={token} onChange={e => setToken(e.target.value)}
+                     placeholder={cfg?.wa_access_token_set ? 'Leave blank to keep the saved token' : 'Paste the permanent access token'}
+                     className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+            </label>
 
-        <div className="text-xs text-[#6B5744]">
-          <div className="mb-1">Webhook URL (paste into Meta App Dashboard → WhatsApp → Configuration):</div>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 min-w-0 truncate bg-[#FFF8F0] border border-[#E8D5C4] rounded px-2 py-1.5 text-[11px]">{webhookUrl}</code>
-            <button onClick={copyWebhook} className="shrink-0 inline-flex items-center gap-1 px-2 py-1.5 border border-[#D4B896] rounded text-[11px] text-[#6B5744] hover:bg-[#FFF1E3]">
-              <Copy size={11} /> Copy
-            </button>
-          </div>
-        </div>
+            <label className="block text-xs text-[#6B5744]">
+              Webhook verify token{' '}
+              {cfg?.wa_webhook_verify_token_set
+                ? <span className="text-emerald-700 font-mono">(saved: {cfg.wa_webhook_verify_token})</span>
+                : <span className="text-amber-700">(not set)</span>}
+              <input type="password" value={verifyToken} onChange={e => setVerifyToken(e.target.value)}
+                     placeholder={cfg?.wa_webhook_verify_token_set ? 'Leave blank to keep the saved token' : 'Any secret string — you type the same one into Meta'}
+                     className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+            </label>
+
+            <div className="text-xs text-[#6B5744]">
+              <div className="mb-1">Webhook URL (paste into Meta App Dashboard → WhatsApp → Configuration):</div>
+              <div className="flex items-center gap-2">
+                <code className="flex-1 min-w-0 truncate bg-[#FFF8F0] border border-[#E8D5C4] rounded px-2 py-1.5 text-[11px]">{webhookUrl}</code>
+                <button onClick={copyWebhook} className="shrink-0 inline-flex items-center gap-1 px-2 py-1.5 border border-[#D4B896] rounded text-[11px] text-[#6B5744] hover:bg-[#FFF1E3]">
+                  <Copy size={11} /> Copy
+                </button>
+              </div>
+            </div>
+          </>
+        )}
 
         <button onClick={save} disabled={busy}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#af4408] hover:bg-[#933807] text-white text-sm rounded disabled:opacity-50">
@@ -282,32 +388,120 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
 
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
         <h2 className="text-sm font-semibold text-[#2D1B0E]">Test the connection</h2>
+        {isInterakt ? (
+          <p className="text-xs text-[#8B7355]">
+            Interakt sends <b>approved templates only</b> — there's no free-form text send to test here.
+            Save the Interakt API key above, then use <b>Send a test template</b> below to verify the connection.
+          </p>
+        ) : (
+          <>
+            <p className="text-xs text-[#8B7355]">
+              Sends a real message via the configured provider. Until credentials are saved this
+              reports “not configured” — nothing is ever attempted blind.
+            </p>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input value={testTo} onChange={e => setTestTo(e.target.value)} placeholder="Mobile (10-digit or with 91…)"
+                     aria-label="Test recipient mobile number"
+                     className="flex-1 px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+              <button onClick={test} disabled={busy || !testTo.trim()}
+                      className="inline-flex items-center justify-center gap-1.5 px-3 py-2 border border-emerald-600 text-emerald-700 hover:bg-emerald-50 text-sm rounded disabled:opacity-50">
+                <Send size={12} /> Send test message
+              </button>
+            </div>
+            {testResult && (
+              testResult.ok
+                ? <div className="text-[11px] rounded p-2 bg-emerald-50 border border-emerald-200 text-emerald-800">
+                    <CheckCircle2 size={11} className="inline mr-1" /> Sent via {testResult.provider}{testResult.message_id ? <> · id <code className="bg-white px-1 rounded">{testResult.message_id}</code></> : null}
+                  </div>
+                : testResult.reason === 'not_configured'
+                  ? <div className="text-[11px] rounded p-2 bg-amber-50 border border-amber-200 text-amber-900">
+                      {isMeta
+                        ? <>○ Not configured yet — choose <b>Meta Cloud API</b>, fill <b>Phone Number ID</b> + <b>Access token</b>, save, then test again.</>
+                        : <>○ Not configured yet — save the provider credentials above, then test again.</>}
+                    </div>
+                  : <div className="text-[11px] rounded p-2 bg-red-50 border border-red-200 text-red-700">
+                      ✗ Send failed{testResult.detail ? <>: {testResult.detail}</> : null}
+                    </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Send an approved template — the only path that delivers outside the 24h window (and the only path Interakt supports). */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
+        <h2 className="text-sm font-semibold text-[#2D1B0E]">Send a test template</h2>
         <p className="text-xs text-[#8B7355]">
-          Sends a real message via the configured provider. Until credentials are saved this
-          reports “not configured” — nothing is ever attempted blind.
+          Fires a provider-approved template — works anytime (no 24 h window). The name & language
+          must match a template already approved on {isMeta ? 'Meta' : isInterakt ? 'Interakt' : 'the configured provider'}.
+          Parameters map to <code className="bg-[#FFF1E3] px-1 rounded">{'{{1}},{{2}}…'}</code> in body order.
         </p>
-        <div className="flex flex-col sm:flex-row gap-2">
-          <input value={testTo} onChange={e => setTestTo(e.target.value)} placeholder="Mobile (10-digit or with 91…)"
-                 className="flex-1 px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
-          <button onClick={test} disabled={busy || !testTo.trim()}
-                  className="inline-flex items-center justify-center gap-1.5 px-3 py-2 border border-emerald-600 text-emerald-700 hover:bg-emerald-50 text-sm rounded disabled:opacity-50">
-            <Send size={12} /> Send test message
-          </button>
+        <div className="grid sm:grid-cols-2 gap-2">
+          <input value={tplTo} onChange={e => setTplTo(e.target.value)} placeholder="Mobile (10-digit or 91…)"
+                 aria-label="Test template recipient mobile number"
+                 className="px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+          <input value={tplName} onChange={e => setTplName(e.target.value)} placeholder="Approved template name"
+                 aria-label="Approved template name"
+                 className="px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm" />
+          <input value={tplLang} onChange={e => setTplLang(e.target.value)} placeholder="Language e.g. en_US (Meta) / en (Interakt)"
+                 aria-label="Template language code"
+                 className="px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm" />
+          <input value={tplParams} onChange={e => setTplParams(e.target.value)} placeholder="Params, comma-separated (v1, v2, …)"
+                 aria-label="Template parameters, comma-separated"
+                 className="px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm" />
         </div>
-        {testResult && (
-          testResult.ok
+        <button onClick={testTemplate} disabled={tplBusy || !tplTo.trim() || !tplName.trim()}
+                className="inline-flex items-center justify-center gap-1.5 px-3 py-2 border border-emerald-600 text-emerald-700 hover:bg-emerald-50 text-sm rounded disabled:opacity-50">
+          {tplBusy ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />} Send test template
+        </button>
+        {tplResult && (
+          tplResult.ok
             ? <div className="text-[11px] rounded p-2 bg-emerald-50 border border-emerald-200 text-emerald-800">
-                <CheckCircle2 size={11} className="inline mr-1" /> Sent via {testResult.provider}{testResult.message_id ? <> · id <code className="bg-white px-1 rounded">{testResult.message_id}</code></> : null}
+                <CheckCircle2 size={11} className="inline mr-1" /> Accepted via {tplResult.provider}{tplResult.message_id ? <> · id <code className="bg-white px-1 rounded">{tplResult.message_id}</code></> : null}
               </div>
-            : testResult.reason === 'not_configured'
+            : tplResult.reason === 'not_configured'
               ? <div className="text-[11px] rounded p-2 bg-amber-50 border border-amber-200 text-amber-900">
-                  ○ Not configured yet — choose <b>Meta Cloud API</b>, fill <b>Phone Number ID</b> + <b>Access token</b>, save, then test again.
+                  ○ Not configured yet — save the provider credentials above, then try again.
                 </div>
               : <div className="text-[11px] rounded p-2 bg-red-50 border border-red-200 text-red-700">
-                  ✗ Send failed{testResult.detail ? <>: {testResult.detail}</> : null}
+                  ✗ Send failed{tplResult.detail ? <>: {tplResult.detail}</> : null}
                 </div>
         )}
       </div>
+
+      {/* Reference list of approved templates straight from Meta (best-effort). */}
+      {isMeta && (
+        <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h2 className="text-sm font-semibold text-[#2D1B0E]">Approved templates on Meta</h2>
+            <button onClick={fetchMetaTemplates} disabled={metaBusy}
+                    className="ml-auto inline-flex items-center gap-1.5 px-2.5 py-1 border border-[#D4B896] rounded text-xs text-[#6B5744] hover:bg-[#FFF1E3] disabled:opacity-50">
+              {metaBusy ? <Loader2 size={11} className="animate-spin" /> : <Send size={11} />} Fetch from Meta
+            </button>
+          </div>
+          <p className="text-xs text-[#8B7355]">
+            Reference only — lists templates approved on your WABA so you can copy the exact name & language
+            into the Templates tab. Needs the token to carry the <code className="bg-[#FFF1E3] px-1 rounded">whatsapp_business_management</code> scope.
+          </p>
+          {metaErr && (
+            <div className="text-[11px] rounded p-2 bg-amber-50 border border-amber-200 text-amber-900">{metaErr}</div>
+          )}
+          {metaTpls && metaTpls.length === 0 && !metaErr && (
+            <div className="text-[11px] text-[#8B7355]">No approved templates found on this WABA.</div>
+          )}
+          {metaTpls && metaTpls.length > 0 && (
+            <div className="space-y-1.5">
+              {metaTpls.map((t, i) => (
+                <div key={t.id || t.name || i} className="flex items-center gap-2 flex-wrap border border-[#E8D5C4] rounded p-2">
+                  <span className="text-xs font-mono text-[#2D1B0E]">{t.name}</span>
+                  {t.language && <span className="text-[10px] text-[#8B7355] uppercase">{t.language}</span>}
+                  {t.category && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-stone-100 text-stone-700 border border-stone-300">{String(t.category).toLowerCase()}</span>}
+                  {t.status && <span className="ml-auto text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300">{t.status}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -342,6 +536,10 @@ function TemplatesTab({ onError, onOk }: { onError: (m: string | null) => void; 
           id: editing.id, name: editing.name, category: editing.category || 'general',
           language: editing.language || 'en', body: editing.body,
           is_active: editing.is_active !== 0,
+          send_as_template: editing.send_as_template ? 1 : 0,
+          provider_template_name: (editing.provider_template_name || '').trim(),
+          provider_language: (editing.provider_language || '').trim(),
+          param_order: (editing.param_order || '').trim(),
         },
       });
       const j = await r.json().catch(() => ({}));
@@ -377,6 +575,14 @@ function TemplatesTab({ onError, onOk }: { onError: (m: string | null) => void; 
     return renderPreview(editing.body, SAMPLE_VARS);
   }, [editing?.body]);
 
+  // If the template's provider name (or its own name) matches a built-in notify
+  // event, surface that event's positional var order as a hint.
+  const paramHintEvent = useMemo(() => {
+    const cand = (editing?.provider_template_name || editing?.name || '').trim();
+    return cand && WA_EVENT_PARAM_ORDER[cand] ? cand : '';
+  }, [editing?.provider_template_name, editing?.name]);
+  const paramHint = paramHintEvent ? WA_EVENT_PARAM_ORDER[paramHintEvent].join(', ') : '';
+
   return (
     <div className="space-y-4">
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
@@ -406,6 +612,11 @@ function TemplatesTab({ onError, onOk }: { onError: (m: string | null) => void; 
                 <span className="text-sm font-medium text-[#2D1B0E]">{t.name}</span>
                 <span className={`text-[10px] px-1.5 py-0.5 rounded-full border ${CATEGORY_BADGE[t.category] || CATEGORY_BADGE.general}`}>{t.category}</span>
                 <span className="text-[10px] text-[#8B7355] uppercase">{t.language}</span>
+                {!!t.send_as_template && !!(t.provider_template_name || '').trim() && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 inline-flex items-center gap-1" title={`Provider template: ${t.provider_template_name}`}>
+                    <Send size={9} /> template
+                  </span>
+                )}
                 <div className="ml-auto flex items-center gap-1.5">
                   <label className="inline-flex items-center gap-1 text-[10px] text-[#6B5744] cursor-pointer">
                     <input type="checkbox" checked={!!t.is_active} onChange={() => toggleActive(t)} disabled={busy} />
@@ -470,6 +681,61 @@ function TemplatesTab({ onError, onOk }: { onError: (m: string | null) => void; 
               {previewText}
             </div>
           )}
+
+          {/* Provider approved-template routing — needed to deliver outside the 24h window / for Interakt. */}
+          <div className="border-t border-[#E8D5C4] pt-3 space-y-3">
+            <label className="flex items-start gap-2 cursor-pointer text-xs text-[#6B5744]">
+              <input type="checkbox" checked={!!editing.send_as_template}
+                     onChange={e => setEditing({ ...editing, send_as_template: e.target.checked ? 1 : 0 })} className="mt-0.5" />
+              <span>
+                <span className="font-medium text-[#2D1B0E]">Send as approved template</span>
+                <span className="block text-[10px] text-[#8B7355] mt-0.5">
+                  Routes through the provider's approved-template API (delivers anytime; required for Interakt).
+                  When off, the plain body above is sent as free-form text (Meta 24 h window only).
+                </span>
+              </span>
+            </label>
+
+            {!!editing.send_as_template && (
+              <div className="space-y-3 pl-6">
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <label className="block text-xs text-[#6B5744]">
+                    Provider template name
+                    <input value={editing.provider_template_name || ''}
+                           onChange={e => setEditing({ ...editing, provider_template_name: e.target.value })}
+                           placeholder="exact name approved on Meta / Interakt"
+                           className={`mt-1 w-full px-3 py-2 border rounded bg-[#FFF1E3] text-sm font-mono ${(editing.provider_template_name || '').trim() ? 'border-[#D4B896]' : 'border-red-400'}`} />
+                    {!(editing.provider_template_name || '').trim() && (
+                      <span className="block text-[10px] text-red-600 mt-1">
+                        Required when “Send as approved template” is on — without it the row falls back to free-form text and never delivers as a template.
+                      </span>
+                    )}
+                  </label>
+                  <label className="block text-xs text-[#6B5744]">
+                    Provider language
+                    <input value={editing.provider_language || ''}
+                           onChange={e => setEditing({ ...editing, provider_language: e.target.value })}
+                           placeholder="en_US (Meta) / en (Interakt)"
+                           className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+                  </label>
+                </div>
+                <label className="block text-xs text-[#6B5744]">
+                  Parameter order — variable names in <code className="bg-[#FFF1E3] px-1 rounded">{'{{1}},{{2}}…'}</code> order (comma-separated or JSON array)
+                  <input value={editing.param_order || ''}
+                         onChange={e => setEditing({ ...editing, param_order: e.target.value })}
+                         placeholder="e.g. req_number, department, approved_by"
+                         className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+                  {paramHint && (
+                    <span className="block text-[10px] text-[#8B7355] mt-1">
+                      Default order for “{paramHintEvent}”: <code className="bg-[#FFF1E3] px-1 rounded">{paramHint}</code>
+                      {' '}— leave blank to use it.
+                    </span>
+                  )}
+                </label>
+              </div>
+            )}
+          </div>
+
           <div className="flex items-center gap-2">
             <label className="inline-flex items-center gap-1.5 text-xs text-[#6B5744] cursor-pointer">
               <input type="checkbox" checked={editing.is_active !== 0}
@@ -478,7 +744,7 @@ function TemplatesTab({ onError, onOk }: { onError: (m: string | null) => void; 
             </label>
             <div className="ml-auto flex items-center gap-2">
               <button onClick={() => setEditing(null)} className="text-xs text-[#6B5744]">Cancel</button>
-              <button onClick={save} disabled={busy || !(editing.name || '').trim() || !(editing.body || '').trim()}
+              <button onClick={save} disabled={busy || !(editing.name || '').trim() || !(editing.body || '').trim() || (!!editing.send_as_template && !(editing.provider_template_name || '').trim())}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#af4408] hover:bg-[#933807] text-white text-sm rounded disabled:opacity-50">
                 {busy ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />} Save template
               </button>

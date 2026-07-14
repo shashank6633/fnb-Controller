@@ -1,7 +1,7 @@
 import { requireRole } from '@/lib/auth';
 import {
-  getWaConfig, setWaConfig, isWaSecretKey, sendWhatsAppMessage, WA_CONFIG_KEYS,
-  WA_NOTIFY_EVENTS, getWaNotifyRecipients, setWaNotifyRecipients,
+  getWaConfig, setWaConfig, isWaSecretKey, sendWhatsAppMessage, sendWhatsAppTemplate,
+  WA_CONFIG_KEYS, WA_NOTIFY_EVENTS, getWaNotifyRecipients, setWaNotifyRecipients,
 } from '@/lib/whatsapp';
 import { getDb } from '@/lib/db';
 
@@ -17,6 +17,10 @@ import { getDb } from '@/lib/db';
  *   POST /api/whatsapp/config   body { action:'test', to:'98xxxxxxxx' }
  *        Fires sendWhatsAppMessage() — returns its result verbatim, so an
  *        unconfigured provider yields a clean { ok:false, reason:'not_configured' }.
+ *   POST /api/whatsapp/config   body { action:'test_template', to, template_name,
+ *        language?, params?:(string|number)[], header_params?:(string|number)[] }
+ *        Fires sendWhatsAppTemplate() — proves an approved template delivers
+ *        anytime (outside the 24h window). Interakt sends templates only.
  *
  * Notification prefs (wa_notify_<event>) are saved through here too so the
  * whole module round-trips over one endpoint.
@@ -56,6 +60,18 @@ export async function POST(request: Request) {
       return Response.json({ ok: true, result });
     }
 
+    if (b?.action === 'test_template') {
+      const to = String(b?.to || '').trim();
+      const templateName = String(b?.template_name || '').trim();
+      if (!to) return Response.json({ error: 'Enter a mobile number to test with.' }, { status: 400 });
+      if (!templateName) return Response.json({ error: 'Enter an approved template name to test with.' }, { status: 400 });
+      const language = String(b?.language || 'en').trim() || 'en';
+      const params = Array.isArray(b?.params) ? b.params : [];
+      const headerParams = Array.isArray(b?.header_params) ? b.header_params : undefined;
+      const result = await sendWhatsAppTemplate(to, templateName, language, params, { headerParams });
+      return Response.json({ ok: true, result });
+    }
+
     if (b?.action === 'save') {
       const cfg = (b?.config && typeof b.config === 'object') ? b.config : {};
       const saved: string[] = [];
@@ -89,7 +105,7 @@ export async function POST(request: Request) {
       return Response.json({ ok: true, saved, ...getWaConfig(), notify: readNotifyPrefs(), recipients: getWaNotifyRecipients() });
     }
 
-    return Response.json({ error: 'Unknown action. Use action:"save" or action:"test".' }, { status: 400 });
+    return Response.json({ error: 'Unknown action. Use action:"save", "test" or "test_template".' }, { status: 400 });
   } catch (e: any) {
     console.error('[/api/whatsapp/config]', e);
     return Response.json({ error: e.message }, { status: 500 });
