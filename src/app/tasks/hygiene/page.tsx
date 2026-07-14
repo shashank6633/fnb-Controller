@@ -18,11 +18,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
-  AlertCircle, ArrowLeft, CheckCircle2, Download, ImageIcon, Loader2,
+  AlertCircle, ArrowLeft, CheckCircle2, Download, Loader2,
   RefreshCw, Save, SprayCan, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { HYGIENE_AREAS, type HygieneAudit } from '@/lib/tasks';
+import ImageUpload from '@/app/tasks/_components/ImageUpload';
+import UserPicker from '@/app/tasks/_components/UserPicker';
 
 /* ── area → item checklists ───────────────────────────────────────────── */
 
@@ -46,8 +48,24 @@ const AREA_ITEMS: Record<string, string[]> = {
 };
 
 type Result = 'pass' | 'fail' | 'na' | '';
-interface ItemState { result: Result; image_url: string; corrective_action: string }
+interface ItemState { result: Result; image_url: string; corrective_action: string; assignee_email: string; assignee_name: string }
 type FormState = Record<string, ItemState>; // key = `${area}|||${item}`
+
+const blankItem = (): ItemState => ({ result: '', image_url: '', corrective_action: '', assignee_email: '', assignee_name: '' });
+
+/**
+ * The hygiene POST has no assignee field — a corrective task is created for every
+ * fail and only @mentions in corrective_action fan out notifications. To honour a
+ * UserPicker assignee we splice the chosen user's `@email` into corrective_action
+ * so the existing server-side parseMentions notifies them. Idempotent.
+ */
+const withAssigneeMention = (corrective: string, email: string): string => {
+  const c = (corrective || '').trim();
+  const e = (email || '').trim();
+  if (!e) return c;
+  if (c.toLowerCase().includes('@' + e.toLowerCase())) return c;
+  return (c ? c + ' ' : '') + '@' + e;
+};
 
 const keyOf = (area: string, item: string) => `${area}|||${item}`;
 
@@ -154,6 +172,7 @@ export default function HygieneAuditsPage() {
         const next: FormState = {};
         for (const r of rows) {
           next[keyOf(r.area, r.item)] = {
+            ...blankItem(),
             result: (r.result as Result) || '',
             image_url: r.image_url || '',
             corrective_action: r.corrective_action || '',
@@ -173,7 +192,7 @@ export default function HygieneAuditsPage() {
   const setItem = (area: string, item: string, patch: Partial<ItemState>) => {
     setForm(f => {
       const k = keyOf(area, item);
-      const prev = f[k] || { result: '', image_url: '', corrective_action: '' };
+      const prev = f[k] || blankItem();
       return { ...f, [k]: { ...prev, ...patch } };
     });
   };
@@ -189,7 +208,11 @@ export default function HygieneAuditsPage() {
         item: x.item,
         result: x.st!.result,
         image_url: x.st!.image_url,
-        corrective_action: x.st!.corrective_action,
+        // On a fail, weave the picked assignee into the corrective note as an
+        // @mention so the existing POST notifies them (POST has no assignee field).
+        corrective_action: x.st!.result === 'fail'
+          ? withAssigneeMention(x.st!.corrective_action, x.st!.assignee_email)
+          : x.st!.corrective_action,
       }));
     if (audits.length === 0) { setError(`Mark at least one ${area} item before saving.`); return; }
     setSavingArea(area);
@@ -377,7 +400,7 @@ export default function HygieneAuditsPage() {
             </div>
             <div className="divide-y divide-[#F0E4D6]">
               {AREA_ITEMS[area].map(item => {
-                const st = form[keyOf(area, item)] || { result: '' as Result, image_url: '', corrective_action: '' };
+                const st = form[keyOf(area, item)] || blankItem();
                 return (
                   <div key={item} className="px-3 sm:px-4 py-2.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
@@ -396,24 +419,41 @@ export default function HygieneAuditsPage() {
                     </div>
                     {/* Photo + corrective action — corrective required-ish on fail */}
                     {(st.result === 'fail' || st.image_url || st.corrective_action) && (
-                      <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        <div className="relative">
-                          <ImageIcon size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[#8B7355]" />
+                      <div className="mt-2 space-y-2">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 items-start">
+                          <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-2">
+                            <span className="block text-[10px] font-semibold uppercase tracking-wide text-[#8B7355] mb-1.5">Photo (optional)</span>
+                            <ImageUpload
+                              value={st.image_url ? [st.image_url] : []}
+                              onChange={list => setItem(area, item, { image_url: list[0] || '' })}
+                              label="Add photo"
+                              thumbSize={48}
+                            />
+                          </div>
                           <input
-                            type="url"
-                            placeholder="Photo URL (optional)"
-                            value={st.image_url}
-                            onChange={e => setItem(area, item, { image_url: e.target.value })}
-                            className="w-full border border-[#E8D5C4] rounded-lg pl-8 pr-2.5 py-1.5 text-xs bg-white focus:outline-none focus:border-[#af4408]"
+                            type="text"
+                            placeholder={st.result === 'fail' ? 'Corrective action (auto-creates a task) — @mention to notify' : 'Note (optional)'}
+                            value={st.corrective_action}
+                            onChange={e => setItem(area, item, { corrective_action: e.target.value })}
+                            className={`w-full border rounded-lg px-2.5 py-1.5 text-xs bg-white focus:outline-none focus:border-[#af4408] ${st.result === 'fail' ? 'border-red-200' : 'border-[#E8D5C4]'}`}
                           />
                         </div>
-                        <input
-                          type="text"
-                          placeholder={st.result === 'fail' ? 'Corrective action (auto-creates a task) — @mention to notify' : 'Note (optional)'}
-                          value={st.corrective_action}
-                          onChange={e => setItem(area, item, { corrective_action: e.target.value })}
-                          className={`w-full border rounded-lg px-2.5 py-1.5 text-xs bg-white focus:outline-none focus:border-[#af4408] ${st.result === 'fail' ? 'border-red-200' : 'border-[#E8D5C4]'}`}
-                        />
+                        {st.result === 'fail' && (
+                          <div>
+                            <label className="block text-[10px] font-semibold uppercase tracking-wide text-[#8B7355] mb-1">
+                              Assign corrective task to (notified via @mention)
+                            </label>
+                            <div className="max-w-xs">
+                              <UserPicker
+                                value={st.assignee_email}
+                                onPick={u => setItem(area, item, { assignee_email: u.email, assignee_name: u.name })}
+                                allowClear
+                                onClear={() => setItem(area, item, { assignee_email: '', assignee_name: '' })}
+                                placeholder="Assign to… (optional)"
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

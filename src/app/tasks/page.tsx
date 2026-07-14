@@ -55,6 +55,7 @@ interface DashboardData {
   employee_productivity: EmpRow[];
   upcoming: UpcomingRow[];
   recent: RecentRow[];
+  range?: { from: string; to: string };
   generated_at: string;
 }
 
@@ -67,6 +68,13 @@ const STATUS_HEX: Record<string, string> = {
   reopened: '#F97316', on_hold: '#EAB308', cancelled: '#F43F5E',
 };
 const CATEGORY_HEX = ['#af4408', '#8B5CF6', '#10B981', '#F59E0B', '#3B82F6', '#EF4444', '#EC4899', '#14B8A6', '#6366F1', '#F97316', '#84CC16', '#06B6D4', '#A855F7'];
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const daysAgoISO = (n: number) => {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toISOString().slice(0, 10);
+};
 
 const fmtDate = (s: string | null | undefined) => {
   if (!s) return '—';
@@ -89,6 +97,8 @@ export default function TaskDashboardPage() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [from, setFrom] = useState(daysAgoISO(29));
+  const [to, setTo] = useState(todayISO());
 
   const allowed = !!me; // any signed-in user
 
@@ -103,7 +113,8 @@ export default function TaskDashboardPage() {
     try {
       setLoading(true);
       setError(null);
-      const res = await fetch('/api/tasks/dashboard');
+      const qs = new URLSearchParams({ from, to });
+      const res = await fetch(`/api/tasks/dashboard?${qs}`);
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
         throw new Error(j.error || `HTTP ${res.status}`);
@@ -114,7 +125,7 @@ export default function TaskDashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [from, to]);
 
   useEffect(() => {
     if (allowed) load();
@@ -189,6 +200,31 @@ export default function TaskDashboardPage() {
           <QuickAction href="/tasks/hygiene" icon={<SprayCan className="w-4 h-4" />} label="Hygiene" />
           <QuickAction href="/tasks/approvals" icon={<CheckCheck className="w-4 h-4" />} label="Approvals" />
           <QuickAction href="/tasks/calendar" icon={<CalendarClock className="w-4 h-4" />} label="Calendar" />
+        </div>
+
+        {/* Date-range filter — bounds the throughput KPIs (Completed, Hygiene, Training, Knowledge) */}
+        <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 flex flex-wrap items-end gap-4">
+          <div>
+            <label className="block text-xs text-[#8B7355] mb-1">From</label>
+            <input type="date" value={from} max={to} onChange={(e) => setFrom(e.target.value)}
+              className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#af4408]" />
+          </div>
+          <div>
+            <label className="block text-xs text-[#8B7355] mb-1">To</label>
+            <input type="date" value={to} min={from} onChange={(e) => setTo(e.target.value)}
+              className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#af4408]" />
+          </div>
+          <div className="flex gap-1.5">
+            {([['7d', 6], ['30d', 29], ['90d', 89]] as const).map(([label, days]) => (
+              <button key={label} onClick={() => { setFrom(daysAgoISO(days)); setTo(todayISO()); }}
+                className="px-2.5 py-2 rounded-lg border border-[#E8D5C4] text-xs text-[#6B5744] hover:bg-[#FFF1E3] transition-colors">
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="text-[11px] text-[#8B7355] ml-auto max-w-xs">
+            Range bounds <span className="font-medium">Completed, Hygiene, Training &amp; Knowledge</span>. Pending, overdue &amp; due-today are always live.
+          </p>
         </div>
 
         {error && (

@@ -14,7 +14,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   AlertCircle, ArrowLeft, Award, BookOpen, CheckCircle2, ChevronLeft, ChevronRight,
-  Clock, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, Trophy, X, XCircle,
+  ClipboardCheck, Clock, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, Trophy, X, XCircle,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { canManageTasks } from '@/lib/tasks';
@@ -35,6 +35,8 @@ interface TestRow {
   question_count?: number;
   my_last_result?: { score: number; passed: number; taken_at: string; reviewed: number } | null;
   attempt_count?: number;
+  max_attempts?: number;          // 0 = unlimited
+  attempts_left?: number | null;  // null = unlimited
 }
 
 const parseQ = (json: string): Question[] => {
@@ -64,6 +66,9 @@ export default function KnowledgeTestsPage() {
   const [editTest, setEditTest] = useState<TestRow | null>(null);
   // leaderboard
   const [lbTest, setLbTest] = useState<TestRow | null>(null);
+  // manager grading queue
+  const [showGrading, setShowGrading] = useState(false);
+  const [pendingReviews, setPendingReviews] = useState(0);
 
   const canManage = canManageTasks(me);
 
@@ -76,7 +81,7 @@ export default function KnowledgeTestsPage() {
     setError(null);
     fetch(`/api/tasks/knowledge-tests?q=${encodeURIComponent(q)}`)
       .then((r) => r.json())
-      .then((j) => { if (j.error) { setError(j.error); setRows([]); } else setRows(j.rows || []); })
+      .then((j) => { if (j.error) { setError(j.error); setRows([]); } else { setRows(j.rows || []); setPendingReviews(j.pending_reviews || 0); } })
       .catch((e) => { setError(e?.message || 'Failed to load'); setRows([]); })
       .finally(() => setLoading(false));
   }, [q]);
@@ -120,6 +125,12 @@ export default function KnowledgeTestsPage() {
             <p className="text-xs text-[#8B7355]">Take timed tests, auto-scored — with leaderboards {canManage && '& a test builder'}</p>
           </div>
           <button onClick={load} disabled={loading} className="inline-flex items-center gap-1.5 bg-white border border-[#E8D5C4] hover:border-[#af4408] text-[#2D1B0E] text-sm rounded-lg px-3 py-2 disabled:opacity-50"><RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> Refresh</button>
+          {canManage && (
+            <button onClick={() => setShowGrading(true)} className="relative inline-flex items-center gap-1.5 bg-white border border-[#E8D5C4] hover:border-[#af4408] text-[#2D1B0E] text-sm rounded-lg px-3 py-2">
+              <ClipboardCheck size={14} /> Grading
+              {pendingReviews > 0 && <span className="absolute -top-1.5 -right-1.5 bg-[#af4408] text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] px-1 flex items-center justify-center">{pendingReviews}</span>}
+            </button>
+          )}
           {canManage && <button onClick={() => { setEditTest(null); setShowBuilder(true); }} className="inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3606] text-white text-sm rounded-lg px-3 py-2"><Plus size={14} /> New Test</button>}
         </div>
       </div>
@@ -150,6 +161,8 @@ export default function KnowledgeTestsPage() {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {rows.map((t) => {
             const last = t.my_last_result;
+            const qCount = t.question_count ?? parseQ(t.questions_json).length;
+            const exhausted = !canManage && (t.max_attempts ?? 0) > 0 && t.attempts_left != null && t.attempts_left <= 0;
             return (
               <div key={t.id} className={`bg-white border rounded-xl p-4 flex flex-col ${t.is_active ? 'border-[#E8D5C4]' : 'border-gray-200 opacity-70'}`}>
                 <div className="flex items-start justify-between gap-2">
@@ -173,6 +186,15 @@ export default function KnowledgeTestsPage() {
                   <span>Pass ≥ {t.pass_score}%</span>
                   <span className="inline-flex items-center gap-1"><Clock size={11} /> {t.time_limit_minutes > 0 ? `${t.time_limit_minutes} min` : 'No limit'}</span>
                   {typeof t.attempt_count === 'number' && t.attempt_count > 0 && <span>{t.attempt_count} attempt{t.attempt_count === 1 ? '' : 's'}</span>}
+                  {(t.max_attempts ?? 0) > 0 && (
+                    <span className={exhausted ? 'text-rose-600 font-medium' : ''}>
+                      {canManage
+                        ? `Max ${t.max_attempts}`
+                        : t.attempts_left != null
+                          ? (t.attempts_left > 0 ? `${t.attempts_left} left` : 'No attempts left')
+                          : `Max ${t.max_attempts}`}
+                    </span>
+                  )}
                 </div>
 
                 {last && (
@@ -183,8 +205,8 @@ export default function KnowledgeTestsPage() {
                 )}
 
                 <div className="mt-3 pt-3 border-t border-[#F0E4D6] flex items-center gap-2">
-                  <button onClick={() => setRunTest(t)} disabled={!t.is_active || (t.question_count ?? parseQ(t.questions_json).length) === 0} className="flex-1 inline-flex items-center justify-center gap-1.5 bg-[#af4408] hover:bg-[#8a3606] text-white text-sm rounded-lg px-3 py-2 disabled:opacity-50">
-                    <Award size={14} /> {last ? 'Retake' : 'Take Test'}
+                  <button onClick={() => setRunTest(t)} disabled={!t.is_active || qCount === 0 || exhausted} className="flex-1 inline-flex items-center justify-center gap-1.5 bg-[#af4408] hover:bg-[#8a3606] text-white text-sm rounded-lg px-3 py-2 disabled:opacity-50">
+                    <Award size={14} /> {exhausted ? 'No attempts left' : last ? 'Retake' : 'Take Test'}
                   </button>
                   {canManage && <button onClick={() => setLbTest(t)} className="inline-flex items-center gap-1.5 bg-white border border-[#E8D5C4] hover:border-[#af4408] text-[#2D1B0E] text-sm rounded-lg px-3 py-2"><Trophy size={14} /> Leaderboard</button>}
                 </div>
@@ -197,6 +219,7 @@ export default function KnowledgeTestsPage() {
       {runTest && <TestRunner test={runTest} onClose={() => setRunTest(null)} onDone={(msg) => { setNotice(msg); load(); }} />}
       {showBuilder && <TestBuilder test={editTest} onClose={() => setShowBuilder(false)} onSaved={(msg) => { setShowBuilder(false); setNotice(msg); load(); }} onError={setError} />}
       {lbTest && <Leaderboard test={lbTest} onClose={() => setLbTest(null)} />}
+      {showGrading && <GradingModal onClose={() => setShowGrading(false)} onGraded={(msg) => { setNotice(msg); load(); }} />}
     </div>
   );
 }
@@ -338,6 +361,7 @@ function TestBuilder({ test, onClose, onSaved, onError }: { test: TestRow | null
   const [description, setDescription] = useState(test?.description || '');
   const [timeLimit, setTimeLimit] = useState(test?.time_limit_minutes ? String(test.time_limit_minutes) : '');
   const [passScore, setPassScore] = useState(test ? String(test.pass_score) : '60');
+  const [maxAttempts, setMaxAttempts] = useState(test?.max_attempts ? String(test.max_attempts) : '');
   const [isActive, setIsActive] = useState(test ? !!test.is_active : true);
   const [questions, setQuestions] = useState<Question[]>(() => {
     const qs = test ? parseQ(test.questions_json) : [];
@@ -372,6 +396,7 @@ function TestBuilder({ test, onClose, onSaved, onError }: { test: TestRow | null
       title: title.trim(), description: description.trim(), questions: clean,
       time_limit_minutes: timeLimit ? parseInt(timeLimit, 10) : 0,
       pass_score: passScore ? parseInt(passScore, 10) : 60,
+      max_attempts: maxAttempts ? parseInt(maxAttempts, 10) : 0,
       is_active: isActive ? 1 : 0,
     };
     try {
@@ -404,7 +429,11 @@ function TestBuilder({ test, onClose, onSaved, onError }: { test: TestRow | null
             <label className="text-[11px] text-[#8B7355] uppercase tracking-wide">Pass score %</label>
             <input type="number" min="0" max="100" value={passScore} onChange={(e) => setPassScore(e.target.value)} className="w-full mt-0.5 border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#af4408]" />
           </div>
-          <label className="flex items-center gap-2 text-sm text-[#2D1B0E] mt-5">
+          <div>
+            <label className="text-[11px] text-[#8B7355] uppercase tracking-wide">Max attempts</label>
+            <input type="number" min="0" placeholder="0 = unlimited" value={maxAttempts} onChange={(e) => setMaxAttempts(e.target.value)} className="w-full mt-0.5 border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#af4408]" />
+          </div>
+          <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
             <input type="checkbox" checked={isActive} onChange={(e) => setIsActive(e.target.checked)} className="accent-[#af4408]" /> Active
           </label>
         </div>
@@ -490,6 +519,129 @@ function Leaderboard({ test, onClose }: { test: TestRow; onClose: () => void }) 
                 <span className={`text-sm font-semibold ${r.ever_passed ? 'text-green-700' : 'text-[#2D1B0E]'}`}>{Math.round(r.best_score * 10) / 10}%</span>
               </div>
             ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Manager grading queue (practical / image reviews) ──────────────────── */
+
+interface GradeRow {
+  id: string;
+  test_id: string;
+  user_email: string;
+  user_name: string;
+  score: number;
+  answers_json: string;
+  passed: number;
+  reviewed: number;
+  taken_at: string;
+  test_title: string;
+  pass_score: number;
+  questions_json: string;
+}
+
+function GradingModal({ onClose, onGraded }: { onClose: () => void; onGraded: (msg: string) => void }) {
+  const [rows, setRows] = useState<GradeRow[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [scores, setScores] = useState<Record<string, string>>({});
+  const [savingId, setSavingId] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    setErr(null);
+    fetch('/api/tasks/knowledge-tests?view=grading')
+      .then((r) => r.json())
+      .then((j) => {
+        if (j.error) { setErr(j.error); setRows([]); return; }
+        const rs: GradeRow[] = j.rows || [];
+        setRows(rs);
+        setScores(Object.fromEntries(rs.map((r) => [r.id, r.score != null ? String(Math.round(r.score * 10) / 10) : ''])));
+      })
+      .catch((e) => setErr(e?.message || 'Failed to load'));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const grade = async (r: GradeRow) => {
+    const raw = scores[r.id];
+    const val = parseFloat(String(raw ?? ''));
+    if (!Number.isFinite(val)) { setErr('Enter a numeric score before saving.'); return; }
+    setSavingId(r.id);
+    setErr(null);
+    try {
+      const res = await api('/api/tasks/knowledge-tests', { method: 'POST', body: { action: 'grade', result_id: r.id, score: val } });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { setErr(j.error || `HTTP ${res.status}`); setSavingId(null); return; }
+      setRows((prev) => (prev || []).filter((x) => x.id !== r.id));
+      onGraded(`Graded ${r.user_name || r.user_email} — ${j.score}% (${j.passed ? 'passed' : 'failed'})`);
+    } catch (e: any) { setErr(e?.message || 'Failed to grade'); }
+    finally { setSavingId(null); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-0 sm:p-4" onClick={onClose}>
+      <div className="bg-white w-full sm:max-w-2xl rounded-t-2xl sm:rounded-2xl p-4 sm:p-5 space-y-3 max-h-[92vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-bold text-[#2D1B0E] flex items-center gap-2"><ClipboardCheck size={18} className="text-[#af4408]" /> Grading Queue</h2>
+          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]"><X size={18} /></button>
+        </div>
+        <p className="text-xs text-[#8B7355]">Submissions with practical answers awaiting a manual score. Setting a score recomputes pass/fail and marks the attempt reviewed.</p>
+        {err && <div className="flex items-center gap-2 bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg px-2.5 py-1.5"><AlertCircle size={13} className="shrink-0" /> {err}</div>}
+        {!rows && !err && <div className="p-6 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>}
+        {rows && rows.length === 0 && <div className="p-8 text-center text-sm text-[#8B7355]"><CheckCircle2 className="w-6 h-6 inline mb-1 text-green-500" /><br />Nothing to review — all caught up.</div>}
+        {rows && rows.length > 0 && (
+          <div className="space-y-3">
+            {rows.map((r) => {
+              const questions = parseQ(r.questions_json);
+              let answers: any[] = [];
+              try { const a = JSON.parse(r.answers_json || '[]'); if (Array.isArray(a)) answers = a; } catch { /* ignore */ }
+              const willPass = (() => { const v = parseFloat(String(scores[r.id] ?? '')); return Number.isFinite(v) ? v >= (r.pass_score || 0) : null; })();
+              return (
+                <div key={r.id} className="border border-[#E8D5C4] rounded-xl p-3 space-y-2 bg-[#FFFDF9]">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="font-semibold text-[#2D1B0E]">{r.test_title || 'Knowledge test'}</div>
+                      <div className="text-[11px] text-[#8B7355]">{r.user_name || r.user_email} · {fmtWhen(r.taken_at)} · auto {Math.round((r.score ?? 0) * 10) / 10}% · pass ≥ {r.pass_score}%</div>
+                    </div>
+                  </div>
+                  {/* Answers — practical highlighted */}
+                  <div className="space-y-1.5">
+                    {questions.map((cq, qi) => {
+                      const ans = answers[qi];
+                      const ansText = ans == null || String(ans).trim() === '' ? '—' : String(ans);
+                      const correct = cq.type !== 'practical' && cq.answer != null && String(cq.answer).trim() !== ''
+                        ? String(ans).trim().toLowerCase() === String(cq.answer).trim().toLowerCase()
+                        : null;
+                      return (
+                        <div key={qi} className={`text-xs rounded-lg px-2.5 py-1.5 border ${cq.type === 'practical' ? 'bg-purple-50 border-purple-200' : 'bg-white border-[#E8D5C4]'}`}>
+                          <div className="text-[#2D1B0E]">
+                            <span className="font-semibold">Q{qi + 1}.</span> {cq.q}
+                            {cq.type === 'practical' && <span className="ml-1 text-[10px] font-semibold text-purple-700 uppercase">practical</span>}
+                          </div>
+                          {cq.image_url && <img src={cq.image_url} alt="" className="mt-1 max-h-32 rounded border border-[#E8D5C4] max-w-full object-contain" />}
+                          <div className="mt-0.5 text-[#6B5744]">
+                            <span className="font-medium">Answer:</span> {ansText}
+                            {correct === true && <CheckCircle2 size={12} className="inline ml-1 text-green-600" />}
+                            {correct === false && <XCircle size={12} className="inline ml-1 text-rose-600" />}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* Score entry */}
+                  <div className="flex items-center gap-2 pt-1">
+                    <label className="text-xs text-[#8B7355]">Final score %</label>
+                    <input type="number" min="0" max="100" value={scores[r.id] ?? ''} onChange={(e) => setScores((s) => ({ ...s, [r.id]: e.target.value }))} className="w-24 border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:border-[#af4408]" />
+                    {willPass != null && <span className={`text-xs font-semibold ${willPass ? 'text-green-700' : 'text-rose-700'}`}>{willPass ? 'will pass' : 'will fail'}</span>}
+                    <button onClick={() => grade(r)} disabled={savingId === r.id} className="ml-auto inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3606] text-white text-sm rounded-lg px-3 py-1.5 disabled:opacity-50">
+                      {savingId === r.id ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />} Save & mark reviewed
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

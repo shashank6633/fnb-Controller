@@ -2,6 +2,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { canManageTasks, canApproveTasks, parseMentions, TASK_STATUSES, TASK_PRIORITIES } from '@/lib/tasks';
+import { notifyTaskAssignment } from '@/lib/task-automation';
 
 /**
  * Single task (/api/tasks/:id) — CORE TASKS slice.
@@ -61,6 +62,48 @@ function normalizeAssignees(body: any): { email: string; name: string }[] {
       if (a && typeof a === 'object') push(a.email, a.name);
       else push(a, '');
     }
+  }
+  return out;
+}
+
+/**
+ * Resolve @-mention tokens (no leading '@') to real users from the users table,
+ * mirroring UserPicker.resolveMention precedence: exact email > exact name >
+ * email local-part > unambiguous prefix. Unmatched tokens fall back to the raw
+ * token for both the stored mention and the notification recipient. De-duped by
+ * resolved recipient so one person is never double-notified from one note.
+ */
+function resolveMentionTargets(
+  db: any,
+  tokens: string[],
+): { mentionedEmail: string; mentionedName: string; recipient: string }[] {
+  if (!tokens.length) return [];
+  const users = db.prepare(`SELECT name, email FROM users WHERE is_active = 1`).all() as { name: string; email: string }[];
+  const out: { mentionedEmail: string; mentionedName: string; recipient: string }[] = [];
+  const seen = new Set<string>();
+  for (const raw of tokens) {
+    const t = String(raw || '').trim();
+    if (!t) continue;
+    const lower = t.toLowerCase();
+    let hit =
+      users.find((u) => (u.email || '').toLowerCase() === lower) ||
+      users.find((u) => (u.name || '').toLowerCase() === lower) ||
+      users.find((u) => (u.email || '').toLowerCase().split('@')[0] === lower);
+    if (!hit) {
+      const pfx = users.filter(
+        (u) =>
+          (u.name || '').toLowerCase().startsWith(lower) ||
+          (u.email || '').toLowerCase().split('@')[0].startsWith(lower),
+      );
+      if (pfx.length === 1) hit = pfx[0];
+    }
+    const mentionedEmail = hit ? hit.email || '' : t;
+    const mentionedName = hit ? hit.name || hit.email || '' : t;
+    const recipient = hit ? hit.email || '' : t;
+    const key = recipient.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ mentionedEmail, mentionedName, recipient });
   }
   return out;
 }
@@ -166,11 +209,11 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
           db.prepare(`INSERT INTO task_assignees (id, task_id, user_email, user_name) VALUES (?, ?, ?, ?)`)
             .run(generateId(), id, a.email, a.name);
         }
-        // Notify newly-listed assignees.
+        // Notify the assignees via the shared helper (same alert shape as create
+        // and the recurring/maintenance generators).
         for (const a of assignees) {
           if (a.email.toLowerCase() === actorEmail.toLowerCase()) continue;
-          db.prepare(`INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href) VALUES (?, ?, 'assigned', ?, ?, ?, '/tasks/my')`)
-            .run(generateId(), a.email, `Task assigned: ${task.title}`, `${me.name || actorEmail} assigned you a task.`, id);
+          notifyTaskAssignment(db, id, a.email, me.name || actorEmail);
         }
       }
       if (statusChange) {
@@ -255,12 +298,13 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
         notify(task.assignee_email, 'status', `Task ${to.replace(/_/g, ' ')}: ${task.title}`, `${actorName} moved your task to ${to.replace(/_/g, ' ')}.`, '/tasks/my');
       }
 
-      // @mentions in the transition note.
-      for (const token of parseMentions(note)) {
+      // @mentions in the transition note — resolved to real users where possible.
+      for (const m of resolveMentionTargets(db, parseMentions(note))) {
         db.prepare(`INSERT INTO task_mentions (id, task_id, comment_id, mentioned_email, mentioned_name, mentioned_by) VALUES (?, ?, '', ?, ?, ?)`)
-          .run(generateId(), id, token.includes('@') ? token : '', token, actorEmail);
+          .run(generateId(), id, m.mentionedEmail, m.mentionedName, actorEmail);
+        if (!m.recipient) continue;
         db.prepare(`INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href) VALUES (?, ?, 'mention', ?, ?, ?, '/tasks/notifications')`)
-          .run(generateId(), token, `You were mentioned on: ${task.title}`, `${actorName} mentioned you: ${note}`, id);
+          .run(generateId(), m.recipient, `You were mentioned on: ${task.title}`, `${actorName} mentioned you: ${note}`, id);
       }
     });
     tx();

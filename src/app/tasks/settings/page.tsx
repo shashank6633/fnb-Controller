@@ -18,11 +18,12 @@ import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   AlertCircle, ArrowLeft, Bell, Building2, CalendarClock, CheckCircle2, Clock,
-  GitBranch, Layers, Loader2, Plus, RefreshCw, RotateCcw, Save, Settings2, Tag,
-  Trash2, X,
+  GitBranch, Layers, Loader2, Pencil, Plus, RefreshCw, RotateCcw, Save, Settings2,
+  Tag, Trash2, X, Zap,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { TASK_PRIORITIES } from '@/lib/tasks';
+import { nextRecurrence, TASK_CATEGORIES, TASK_DEPARTMENTS, TASK_PRIORITIES } from '@/lib/tasks';
+import UserPicker from '@/app/tasks/_components/UserPicker';
 
 /* ── types ─────────────────────────────────────────────────────────────── */
 
@@ -43,14 +44,39 @@ interface Config {
   working_hours: WorkingHours;
   holidays: Holiday[];
   reminder_interval_hours: number;
+  /** Automation-consumed escalation controls (task-automation engine). */
+  escalation_enabled: boolean;
+  escalation_threshold_days: number;
+  escalation_targets: string[];
 }
+interface AutomationStatus { last_run: string; today: string; ran_today: boolean }
 interface SettingsPayload {
   categories: Category[];
   priorities: PriorityCfg[];
   config: Config;
   recurring: { rules: any[]; rule_count: number; maintenance_count: number };
+  automation?: AutomationStatus;
+  escalation_role_options?: string[];
 }
 interface Dept { id: string; name: string; code: string; is_active: number }
+
+/** A recurring_task_rules row as returned by /api/tasks/recurring. */
+interface RecurringRule {
+  id: string;
+  title: string;
+  description: string;
+  category: string;
+  department: string;
+  assignee_email: string;
+  priority: string;
+  frequency: 'daily' | 'weekly' | 'monthly' | string;
+  day_of_week: number;
+  day_of_month: number;
+  next_run_date: string;
+  last_run_date: string;
+  next_run_preview?: string;
+  is_active: number;
+}
 
 /**
  * Literal badge classes per color name. Kept as full literal strings (not
@@ -94,6 +120,46 @@ function colorSwatch(color: string) {
   return SWATCH[color] || SWATCH.gray;
 }
 
+const FREQ_CLS: Record<string, string> = {
+  daily: 'bg-blue-100 text-blue-700 border-blue-200',
+  weekly: 'bg-indigo-100 text-indigo-700 border-indigo-200',
+  monthly: 'bg-purple-100 text-purple-700 border-purple-200',
+};
+
+const EMPTY_RULE: RecurringRule = {
+  id: '',
+  title: '',
+  description: '',
+  category: 'Operations',
+  department: '',
+  assignee_email: '',
+  priority: 'medium',
+  frequency: 'daily',
+  day_of_week: 1,
+  day_of_month: 1,
+  next_run_date: '',
+  last_run_date: '',
+  is_active: 1,
+};
+
+const fmtDate = (s: string | null | undefined) => {
+  if (!s) return '—';
+  const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(s) ? s + 'T00:00:00Z' : s);
+  if (isNaN(d.getTime())) return s;
+  return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/** Live "following run" preview from the form's cadence inputs. */
+function previewNextRun(r: RecurringRule): string {
+  const anchor = /^\d{4}-\d{2}-\d{2}$/.test(r.next_run_date) ? r.next_run_date : new Date().toISOString().slice(0, 10);
+  return nextRecurrence(
+    (['daily', 'weekly', 'monthly'].includes(r.frequency) ? r.frequency : 'daily') as any,
+    anchor,
+    r.frequency === 'weekly' ? r.day_of_week : undefined,
+    r.frequency === 'monthly' ? r.day_of_month : undefined,
+  );
+}
+
 /* ── page ──────────────────────────────────────────────────────────────── */
 
 export default function TaskSettingsPage() {
@@ -112,10 +178,33 @@ export default function TaskSettingsPage() {
   const [config, setConfig] = useState<Config | null>(null);
   const [priorities, setPriorities] = useState<PriorityCfg[]>([]);
 
+  // recurring-rule manager state
+  const [rules, setRules] = useState<RecurringRule[]>([]);
+  const [rulesLoading, setRulesLoading] = useState(false);
+  const [automation, setAutomation] = useState<AutomationStatus | null>(null);
+  const [escRoleOptions, setEscRoleOptions] = useState<string[]>(['manager', 'admin', 'staff']);
+  const [showRecForm, setShowRecForm] = useState(false);
+  const [recForm, setRecForm] = useState<RecurringRule>({ ...EMPTY_RULE });
+  const [recSaving, setRecSaving] = useState(false);
+  const [recModalError, setRecModalError] = useState<string | null>(null);
+
   const allowed = !!me && me.role === 'admin';
 
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user ?? null)).catch(() => setMe(null));
+  }, []);
+
+  const loadRecurring = useCallback(() => {
+    setRulesLoading(true);
+    fetch('/api/tasks/recurring?include_inactive=1')
+      .then(r => r.json())
+      .then(j => {
+        if (j.error) return;
+        setRules(j.rules || []);
+        if (j.automation) setAutomation(j.automation);
+      })
+      .catch(() => { /* non-fatal */ })
+      .finally(() => setRulesLoading(false));
   }, []);
 
   const load = useCallback(() => {
@@ -131,10 +220,13 @@ export default function TaskSettingsPage() {
         setConfig(s.config);
         setPriorities(s.priorities || []);
         setDepts(d.departments || []);
+        if (s.automation) setAutomation(s.automation);
+        if (Array.isArray(s.escalation_role_options)) setEscRoleOptions(s.escalation_role_options);
       })
       .catch(e => setError(e?.message || 'Failed to load settings'))
       .finally(() => setLoading(false));
-  }, []);
+    loadRecurring();
+  }, [loadRecurring]);
 
   useEffect(() => { if (allowed) load(); }, [allowed, load]);
 
@@ -209,8 +301,63 @@ export default function TaskSettingsPage() {
       const r = await api('/api/tasks/settings', { method: 'PUT', body });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
-      if (j.config) { setData(j); setConfig(j.config); setPriorities(j.priorities || []); }
+      if (j.config) { setData(j); setConfig(j.config); setPriorities(j.priorities || []); if (j.automation) setAutomation(j.automation); }
       flash('Saved');
+    } catch (e: any) { setError(e?.message || 'Failed'); } finally { setSaving(false); }
+  };
+
+  /* ── recurring-rule ops ── */
+  const openRecCreate = () => {
+    setRecForm({ ...EMPTY_RULE, next_run_date: automation?.today || new Date().toISOString().slice(0, 10) });
+    setRecModalError(null);
+    setShowRecForm(true);
+  };
+  const openRecEdit = (r: RecurringRule) => {
+    setRecForm({ ...EMPTY_RULE, ...r });
+    setRecModalError(null);
+    setShowRecForm(true);
+  };
+  const saveRule = async () => {
+    if (recSaving) return;
+    if (!recForm.title.trim()) { setRecModalError('Title is required'); return; }
+    setRecSaving(true); setRecModalError(null);
+    try {
+      const editing = !!recForm.id;
+      const r = await api('/api/tasks/recurring', {
+        method: editing ? 'PUT' : 'POST',
+        body: {
+          ...(editing ? { id: recForm.id } : {}),
+          title: recForm.title,
+          description: recForm.description,
+          category: recForm.category,
+          department: recForm.department,
+          assignee_email: recForm.assignee_email,
+          priority: recForm.priority,
+          frequency: recForm.frequency,
+          day_of_week: recForm.day_of_week,
+          day_of_month: recForm.day_of_month,
+          next_run_date: recForm.next_run_date,
+          is_active: recForm.is_active,
+        },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setRecModalError(j.error || `HTTP ${r.status}`); return; }
+      setShowRecForm(false);
+      setRecForm({ ...EMPTY_RULE });
+      flash(editing ? 'Rule updated' : 'Rule created');
+      loadRecurring();
+    } catch (e: any) { setRecModalError(e?.message || 'Failed to save'); } finally { setRecSaving(false); }
+  };
+  const toggleRule = async (r: RecurringRule) => {
+    setSaving(true); setError(null);
+    try {
+      const resp = r.is_active
+        ? await api(`/api/tasks/recurring?id=${encodeURIComponent(r.id)}`, { method: 'DELETE' })
+        : await api('/api/tasks/recurring', { method: 'PUT', body: { id: r.id, is_active: 1 } });
+      const j = await resp.json().catch(() => ({}));
+      if (!resp.ok) { setError(j.error || `HTTP ${resp.status}`); return; }
+      flash(r.is_active ? 'Rule deactivated' : 'Rule reactivated');
+      loadRecurring();
     } catch (e: any) { setError(e?.message || 'Failed'); } finally { setSaving(false); }
   };
 
@@ -481,7 +628,43 @@ export default function TaskSettingsPage() {
                   <Plus size={14} /> Add rule
                 </button>
               </div>
-              <button onClick={() => saveConfig({ notification_rules: config.notification_rules, escalation_matrix: config.escalation_matrix })} disabled={saving} className="inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3606] text-white text-sm rounded-lg px-3 py-2 disabled:opacity-50">
+
+              {/* Auto-escalation engine controls (consumed by the daily automation run) */}
+              <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 space-y-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-[#2D1B0E]">
+                  <Zap size={15} className="text-[#af4408]" /> Auto-escalation engine
+                </div>
+                <p className="text-[11px] text-[#8B7355] -mt-1">These drive the once-a-day overdue sweep that notifies assignees and escalates stale tasks to the roles below. The matrix above is retained for reference.</p>
+                <label className="inline-flex items-center gap-2 text-sm text-[#2D1B0E]">
+                  <input type="checkbox" checked={!!config.escalation_enabled} onChange={e => setConfig(c => c && ({ ...c, escalation_enabled: e.target.checked }))} className="accent-[#af4408]" />
+                  Enable automatic escalation
+                </label>
+                <div className="flex flex-wrap items-end gap-4">
+                  <div>
+                    <label className="block text-[11px] text-[#8B7355] mb-1">Escalate after (days overdue)</label>
+                    <input type="number" min={0} max={365} value={config.escalation_threshold_days}
+                      onChange={e => setConfig(c => c && ({ ...c, escalation_threshold_days: Math.max(0, Number(e.target.value) || 0) }))}
+                      className="w-28 border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 text-sm bg-white focus:outline-none focus:border-[#af4408]" />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-[#8B7355] mb-1">Escalate to roles</label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {escRoleOptions.map(role => {
+                        const on = config.escalation_targets.includes(role);
+                        return (
+                          <button key={role} type="button"
+                            onClick={() => setConfig(c => c && ({ ...c, escalation_targets: on ? c.escalation_targets.filter(x => x !== role) : [...c.escalation_targets, role] }))}
+                            className={`text-xs rounded-lg px-2.5 py-1 border capitalize ${on ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
+                            {role}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <button onClick={() => saveConfig({ notification_rules: config.notification_rules, escalation_matrix: config.escalation_matrix, escalation_enabled: config.escalation_enabled, escalation_threshold_days: config.escalation_threshold_days, escalation_targets: config.escalation_targets })} disabled={saving} className="inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3606] text-white text-sm rounded-lg px-3 py-2 disabled:opacity-50">
                 {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />} Save Notifications &amp; Escalation
               </button>
             </div>
@@ -490,25 +673,62 @@ export default function TaskSettingsPage() {
           {/* ── Recurring ── */}
           {tab === 'recurring' && (
             <div className="space-y-3">
-              <p className="text-xs text-[#8B7355]">Recurring task rules &amp; maintenance schedules that auto-generate tasks. Create and edit rules on their dedicated pages.</p>
-              <div className="grid grid-cols-2 gap-2">
+              <p className="text-xs text-[#8B7355]">Recurring task rules the daily automation run turns into tasks. Maintenance schedules live on their own page.</p>
+
+              {/* Automation status + counts */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                 <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3">
-                  <div className="text-2xl font-bold text-[#af4408]">{data.recurring.rule_count}</div>
+                  <div className="text-2xl font-bold text-[#af4408]">{rules.filter(r => r.is_active).length}</div>
                   <div className="text-xs text-[#8B7355]">Active recurring rules</div>
                 </div>
                 <button onClick={() => router.push('/tasks/maintenance')} className="bg-[#FFF8F0] border border-[#E8D5C4] hover:border-[#af4408] rounded-lg p-3 text-left">
                   <div className="text-2xl font-bold text-[#af4408]">{data.recurring.maintenance_count}</div>
                   <div className="text-xs text-[#8B7355]">Maintenance schedules →</div>
                 </button>
+                <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3">
+                  <div className="text-sm font-bold text-[#2D1B0E] flex items-center gap-1.5">
+                    <CalendarClock size={15} className="text-[#af4408]" />
+                    {automation?.last_run ? fmtDate(automation.last_run) : 'Never'}
+                  </div>
+                  <div className="text-xs text-[#8B7355]">Last automation run{automation?.ran_today ? ' · today ✓' : ''}</div>
+                </div>
               </div>
-              {data.recurring.rules.length > 0 && (
+
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-sm font-semibold text-[#2D1B0E]">Rules</div>
+                <button onClick={openRecCreate} className="inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3606] text-white text-sm rounded-lg px-3 py-1.5">
+                  <Plus size={14} /> New rule
+                </button>
+              </div>
+
+              {rulesLoading && rules.length === 0 && (
+                <div className="p-6 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading rules…</div>
+              )}
+              {!rulesLoading && rules.length === 0 && (
+                <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-6 text-center text-sm text-[#8B7355]">No recurring rules yet. Create one to auto-generate tasks on a cadence.</div>
+              )}
+              {rules.length > 0 && (
                 <div className="divide-y divide-[#F0E4D6] border border-[#E8D5C4] rounded-lg overflow-hidden">
-                  {data.recurring.rules.map((r: any) => (
-                    <div key={r.id} className="flex flex-wrap items-center gap-2 px-3 py-2 text-sm">
+                  {rules.map((r) => (
+                    <div key={r.id} className={`flex flex-wrap items-center gap-2 px-3 py-2 text-sm ${!r.is_active ? 'opacity-50' : ''}`}>
                       <span className="font-medium text-[#2D1B0E] flex-1 min-w-[120px] truncate">{r.title}</span>
-                      <span className="text-xs text-[#8B7355]">{r.frequency}</span>
+                      <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full border capitalize ${FREQ_CLS[r.frequency] || 'bg-gray-100 text-gray-600 border-gray-200'}`}>
+                        {r.frequency}
+                        {r.frequency === 'weekly' && ` · ${DOW[r.day_of_week] || '?'}`}
+                        {r.frequency === 'monthly' && ` · day ${r.day_of_month}`}
+                      </span>
                       {r.department && <span className="text-[11px] px-1.5 py-0.5 rounded bg-[#FFF1E3] border border-[#E8D5C4] text-[#8a3606]">{r.department}</span>}
-                      {r.next_run_date && <span className="text-xs text-[#6B5744]">next {r.next_run_date}</span>}
+                      {r.assignee_email && <span className="text-[11px] text-[#8B7355] truncate max-w-[160px]">{r.assignee_email}</span>}
+                      <span className="text-xs text-[#6B5744]">next {r.next_run_date ? fmtDate(r.next_run_date) : '—'}</span>
+                      {!r.is_active && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-red-50 text-red-700 border border-red-200">inactive</span>}
+                      <div className="ml-auto flex items-center gap-1">
+                        <button onClick={() => openRecEdit(r)} title="Edit" className="inline-flex items-center text-[#8B7355] hover:text-[#af4408] p-1"><Pencil size={14} /></button>
+                        {r.is_active ? (
+                          <button onClick={() => toggleRule(r)} disabled={saving} title="Deactivate" className="p-1 rounded-lg text-[#8B7355] hover:text-red-600 hover:bg-red-50"><Trash2 size={14} /></button>
+                        ) : (
+                          <button onClick={() => toggleRule(r)} disabled={saving} title="Reactivate" className="p-1 rounded-lg text-[#8B7355] hover:text-green-600 hover:bg-green-50"><RotateCcw size={14} /></button>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -576,6 +796,112 @@ export default function TaskSettingsPage() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Recurring-rule create/edit modal */}
+      {showRecForm && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center p-0 sm:p-4" onClick={() => setShowRecForm(false)}>
+          <div className="bg-white w-full sm:max-w-lg rounded-t-2xl sm:rounded-2xl p-4 sm:p-5 space-y-3 max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-bold text-[#2D1B0E] flex items-center gap-2">
+                <GitBranch size={18} className="text-[#af4408]" /> {recForm.id ? 'Edit Recurring Rule' : 'New Recurring Rule'}
+              </h2>
+              <button onClick={() => setShowRecForm(false)} className="text-[#8B7355] hover:text-[#2D1B0E]"><X size={18} /></button>
+            </div>
+            {recModalError && (
+              <div className="flex items-center gap-2 bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg px-2.5 py-1.5">
+                <AlertCircle size={13} className="shrink-0" /> {recModalError}
+              </div>
+            )}
+            <div className="space-y-2">
+              <input type="text" placeholder="Rule title *" value={recForm.title}
+                onChange={(e) => setRecForm(f => ({ ...f, title: e.target.value }))}
+                className="w-full border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#af4408]" />
+              <textarea placeholder="Description (optional)" value={recForm.description} rows={2}
+                onChange={(e) => setRecForm(f => ({ ...f, description: e.target.value }))}
+                className="w-full border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#af4408]" />
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-xs text-[#8B7355]">Category</label>
+                  <select value={recForm.category} onChange={(e) => setRecForm(f => ({ ...f, category: e.target.value }))} className="w-full border border-[#E8D5C4] rounded-lg px-2.5 py-2 text-sm bg-white focus:outline-none focus:border-[#af4408]">
+                    {TASK_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-[#8B7355]">Department</label>
+                  <select value={recForm.department} onChange={(e) => setRecForm(f => ({ ...f, department: e.target.value }))} className="w-full border border-[#E8D5C4] rounded-lg px-2.5 py-2 text-sm bg-white focus:outline-none focus:border-[#af4408]">
+                    <option value="">— None —</option>
+                    {TASK_DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-xs text-[#8B7355]">Priority</label>
+                  <select value={recForm.priority} onChange={(e) => setRecForm(f => ({ ...f, priority: e.target.value }))} className="w-full border border-[#E8D5C4] rounded-lg px-2.5 py-2 text-sm bg-white focus:outline-none focus:border-[#af4408]">
+                    {PRIORITY_KEYS.map(k => <option key={k} value={k}>{k}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-[#8B7355]">Frequency</label>
+                  <select value={recForm.frequency} onChange={(e) => setRecForm(f => ({ ...f, frequency: e.target.value as any }))} className="w-full border border-[#E8D5C4] rounded-lg px-2.5 py-2 text-sm bg-white focus:outline-none focus:border-[#af4408]">
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
+                    <option value="monthly">Monthly</option>
+                  </select>
+                </div>
+              </div>
+              {recForm.frequency === 'weekly' && (
+                <div>
+                  <label className="text-xs text-[#8B7355]">Day of week</label>
+                  <div className="flex flex-wrap gap-1.5 mt-1">
+                    {DOW.map((d, idx) => (
+                      <button key={idx} type="button" onClick={() => setRecForm(f => ({ ...f, day_of_week: idx }))}
+                        className={`text-xs rounded-lg px-2.5 py-1 border ${recForm.day_of_week === idx ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
+                        {d}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {recForm.frequency === 'monthly' && (
+                <div>
+                  <label className="text-xs text-[#8B7355]">Day of month (1–31)</label>
+                  <input type="number" min={1} max={31} value={recForm.day_of_month}
+                    onChange={(e) => setRecForm(f => ({ ...f, day_of_month: Math.min(31, Math.max(1, Number(e.target.value) || 1)) }))}
+                    className="w-24 border border-[#E8D5C4] rounded-lg px-2.5 py-2 text-sm bg-white focus:outline-none focus:border-[#af4408]" />
+                </div>
+              )}
+              <div>
+                <label className="text-xs text-[#8B7355]">Assignee (optional)</label>
+                <UserPicker
+                  value={recForm.assignee_email || undefined}
+                  onPick={(u) => setRecForm(f => ({ ...f, assignee_email: u.email }))}
+                  allowClear
+                  onClear={() => setRecForm(f => ({ ...f, assignee_email: '' }))}
+                  placeholder="Unassigned — leave as draft"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-[#8B7355]">Next run date</label>
+                <input type="date" value={recForm.next_run_date}
+                  onChange={(e) => setRecForm(f => ({ ...f, next_run_date: e.target.value }))}
+                  className="w-full border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#af4408]" />
+              </div>
+              <div className="text-[11px] text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-2.5 py-1.5">
+                Fires next on <span className="font-semibold text-[#2D1B0E]">{recForm.next_run_date ? fmtDate(recForm.next_run_date) : '—'}</span>,
+                then <span className="font-semibold text-[#2D1B0E]">{fmtDate(previewNextRun(recForm))}</span>.
+              </div>
+              <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
+                <input type="checkbox" checked={!!recForm.is_active} onChange={(e) => setRecForm(f => ({ ...f, is_active: e.target.checked ? 1 : 0 }))} className="accent-[#af4408]" />
+                Active
+              </label>
+            </div>
+            <button onClick={saveRule} disabled={recSaving || !recForm.title.trim()} className="w-full inline-flex items-center justify-center gap-1.5 bg-[#af4408] hover:bg-[#8a3606] text-white text-sm font-semibold rounded-lg px-3 py-2.5 disabled:opacity-50">
+              {recSaving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />} {recForm.id ? 'Save changes' : 'Create rule'}
+            </button>
+          </div>
         </div>
       )}
     </div>

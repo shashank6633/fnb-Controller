@@ -141,6 +141,57 @@ export async function GET(request: Request) {
       )
       .all(from, to) as any[];
 
+    /* ── completion throughput (bucketed by completed_at / approved_at) ──
+     * period_series above buckets by CREATED date — useful for intake, but it
+     * misreports when work actually got done. This series buckets by the day a
+     * task was completed / approved, giving true throughput per period. */
+    const completedPeriodExpr =
+      period === 'monthly'
+        ? "strftime('%Y-%m', completed_at)"
+        : period === 'weekly'
+        ? "strftime('%Y-W%W', completed_at)"
+        : 'date(completed_at)';
+    const approvedPeriodExpr =
+      period === 'monthly'
+        ? "strftime('%Y-%m', approved_at)"
+        : period === 'weekly'
+        ? "strftime('%Y-W%W', approved_at)"
+        : 'date(approved_at)';
+
+    const completedByPeriod = db
+      .prepare(
+        `SELECT ${completedPeriodExpr} AS period, COUNT(*) AS completed
+           FROM tasks
+          WHERE is_archived = 0 AND completed_at IS NOT NULL AND completed_at != ''
+            AND date(completed_at) BETWEEN ? AND ?
+          GROUP BY period`,
+      )
+      .all(from, to) as any[];
+    const approvedByPeriod = db
+      .prepare(
+        `SELECT ${approvedPeriodExpr} AS period, COUNT(*) AS approved
+           FROM tasks
+          WHERE is_archived = 0 AND approved_at IS NOT NULL AND approved_at != ''
+            AND date(approved_at) BETWEEN ? AND ?
+          GROUP BY period`,
+      )
+      .all(from, to) as any[];
+
+    const completionMap = new Map<string, { period: string; completed: number; approved: number }>();
+    for (const r of completedByPeriod) {
+      if (!r.period) continue;
+      completionMap.set(r.period, { period: r.period, completed: Number(r.completed || 0), approved: 0 });
+    }
+    for (const r of approvedByPeriod) {
+      if (!r.period) continue;
+      const e = completionMap.get(r.period) || { period: r.period, completed: 0, approved: 0 };
+      e.approved = Number(r.approved || 0);
+      completionMap.set(r.period, e);
+    }
+    const completion_series = Array.from(completionMap.values()).sort((a, b) =>
+      a.period < b.period ? -1 : a.period > b.period ? 1 : 0,
+    );
+
     /* ── department performance ──────────────────────────────────────── */
     const department_performance = (
       db
@@ -170,24 +221,39 @@ export async function GET(request: Request) {
     }));
 
     /* ── employee productivity ───────────────────────────────────────── */
+    // Credits EVERY assignee, not just the primary (mirrors dashboard/route.ts).
+    // A multi-assignee task (task_assignees rows) counts once per assignee;
+    // legacy tasks with no task_assignees fall back to the primary assignee_email
+    // mirror so nothing is lost. Keeps the two productivity surfaces consistent.
     const employee_productivity = (
       db
         .prepare(
-          `SELECT
-             assignee_email AS email,
-             MAX(assignee_name) AS name,
+          `WITH assignee_map AS (
+             SELECT ta.task_id AS task_id, lower(ta.user_email) AS email, ta.user_name AS name
+               FROM task_assignees ta
+              WHERE ta.user_email != ''
+             UNION
+             SELECT t.id AS task_id, lower(t.assignee_email) AS email, t.assignee_name AS name
+               FROM tasks t
+              WHERE t.assignee_email != ''
+                AND NOT EXISTS (SELECT 1 FROM task_assignees x WHERE x.task_id = t.id AND x.user_email != '')
+           )
+           SELECT
+             am.email AS email,
+             MAX(am.name) AS name,
              COUNT(*) AS total,
-             SUM(CASE WHEN ${DONE} THEN 1 ELSE 0 END) AS completed,
-             SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved,
-             SUM(CASE WHEN due_date != '' AND due_date < ?
-                       AND status NOT IN ('completed','approved','cancelled')
+             SUM(CASE WHEN t.${DONE} THEN 1 ELSE 0 END) AS completed,
+             SUM(CASE WHEN t.status = 'approved' THEN 1 ELSE 0 END) AS approved,
+             SUM(CASE WHEN t.due_date != '' AND t.due_date < ?
+                       AND t.status NOT IN ('completed','approved','cancelled')
                       THEN 1 ELSE 0 END) AS overdue,
-             SUM(CASE WHEN ${DONE}
-                       AND (due_date = '' OR (completed_at IS NOT NULL AND date(completed_at) <= due_date))
+             SUM(CASE WHEN t.${DONE}
+                       AND (t.due_date = '' OR (t.completed_at IS NOT NULL AND date(t.completed_at) <= t.due_date))
                       THEN 1 ELSE 0 END) AS on_time
-           FROM tasks
-          WHERE ${rangeTasks} AND assignee_email != ''
-          GROUP BY assignee_email ORDER BY total DESC`,
+           FROM assignee_map am
+           JOIN tasks t ON t.id = am.task_id
+          WHERE t.is_archived = 0 AND date(t.created_at) BETWEEN ? AND ?
+          GROUP BY am.email ORDER BY total DESC`,
         )
         .all(today, from, to) as any[]
     ).map((r) => ({
@@ -362,6 +428,7 @@ export async function GET(request: Request) {
       priority_breakdown,
       category_breakdown,
       period_series,
+      completion_series,
       department_performance,
       employee_productivity,
       hygiene_series,

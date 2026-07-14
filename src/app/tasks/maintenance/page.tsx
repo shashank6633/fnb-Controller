@@ -17,7 +17,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   AlertCircle, ArrowLeft, CalendarClock, CheckCircle2, ClipboardList, Download,
-  Loader2, Pencil, Play, Plus, RefreshCw, Search, Wrench, X, Zap,
+  Loader2, Pencil, Play, Plus, RefreshCw, Search, Sparkles, Wrench, X, Zap,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { TASK_DEPARTMENTS, canManageTasks } from '@/lib/tasks';
@@ -105,6 +105,7 @@ export default function MaintenancePage() {
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [logs, setLogs] = useState<MaintLog[]>([]);
   const [today, setToday] = useState('');
+  const [automation, setAutomation] = useState<{ last_run: string; today: string; ran_today: boolean; due_count?: number } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -152,6 +153,11 @@ export default function MaintenancePage() {
       })
       .catch((e) => { setError(e?.message || 'Failed to load'); setSchedules([]); })
       .finally(() => setLoading(false));
+    // Automation status (last run) — non-fatal; shares the recurring route.
+    fetch('/api/tasks/recurring')
+      .then((r) => r.json())
+      .then((j) => { if (j.automation) setAutomation(j.automation); })
+      .catch(() => { /* non-fatal */ });
   }, [q, freqFilter, activeFilter]);
 
   useEffect(() => {
@@ -386,6 +392,38 @@ export default function MaintenancePage() {
           <AlertCircle size={15} className="shrink-0" /> {error}
         </div>
       )}
+
+      {/* Automation status */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 sm:p-4">
+        <div className="flex items-center gap-2 mb-2">
+          <Sparkles size={15} className="text-[#af4408]" />
+          <span className="text-sm font-semibold text-[#2D1B0E]">Auto-generation</span>
+          <span className="text-[11px] text-[#8B7355]">the daily automation run generates due maintenance tasks unattended</span>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5">
+            <div className="text-sm font-bold text-[#2D1B0E]">{automation?.last_run ? fmtDate(automation.last_run) : 'Never'}</div>
+            <div className="text-[11px] text-[#8B7355]">Last run{automation?.ran_today ? ' · today ✓' : ''}</div>
+          </div>
+          <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5">
+            <div className={`text-sm font-bold ${dueCount > 0 ? 'text-[#af4408]' : 'text-[#2D1B0E]'}`}>{dueCount}</div>
+            <div className="text-[11px] text-[#8B7355]">Schedules due now</div>
+          </div>
+          <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5">
+            <div className="text-sm font-bold text-[#2D1B0E]">{schedules.filter((s) => s.is_active).length}</div>
+            <div className="text-[11px] text-[#8B7355]">Active schedules</div>
+          </div>
+          <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5">
+            <div className="text-sm font-bold text-[#2D1B0E]">{automation?.ran_today ? 'Done today' : 'Pending'}</div>
+            <div className="text-[11px] text-[#8B7355]">Today&apos;s auto-run</div>
+          </div>
+        </div>
+        {canManage && (
+          <p className="text-[11px] text-[#8B7355] mt-2">
+            Auto-generation runs once per day. Use <span className="font-semibold text-[#8a3606]">Generate due tasks now</span> above to run it immediately.
+          </p>
+        )}
+      </div>
 
       {/* Filters */}
       <div className="flex flex-wrap gap-2 items-center">

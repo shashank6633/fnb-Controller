@@ -9,26 +9,71 @@ import { canManageTasks, parseMentions } from '@/lib/tasks';
  * GET  /api/tasks/knowledge-tests
  *        ?view=list (default) → { rows: KnowledgeTest[] }. Managers see all;
  *              staff see only active tests. Each row carries my_last_result +
- *              attempt_count for the current user (question answers stripped for
- *              non-managers so the test stays takeable).
+ *              attempt_count + max_attempts + attempts_left for the current user
+ *              (question answers stripped for non-managers so the test stays
+ *              takeable).
  *        ?view=leaderboard&test_id= → { rows } best-score-per-user, desc.
  *        ?view=history[&test_id=][&user_email=] → my (or, for managers, any)
  *              attempt history.
  *        ?view=test&test_id= → { test } full test incl. questions_json (answers
- *              stripped for non-managers).
+ *              stripped for non-managers) + max_attempts + attempts_left.
+ *        ?view=grading → { rows } results awaiting review (reviewed=0, i.e. they
+ *              contain practical answers), joined with the test title + questions
+ *              + pass_score so a manager can score them. Manager only.
  * POST /api/tasks/knowledge-tests
  *        { action:'create', title, description?, questions[]|questions_json,
- *          time_limit_minutes?, pass_score?, is_active? }  → create. Manager.
+ *          time_limit_minutes?, pass_score?, is_active?, max_attempts? }  → create. Manager.
  *        { action:'submit', test_id, answers[], duration_minutes? } → auto-score
  *          MCQ/image questions, store knowledge_test_results, passed if
- *          score >= pass_score. Any signed-in user.
- * PUT  { id, ...fields }  → edit a test. Manager.
+ *          score >= pass_score. Any signed-in user. Blocked (403) when the
+ *          per-test/global attempt cap is reached (non-managers).
+ *        { action:'grade', result_id, score, reviewed? } → manager sets the
+ *          final score for a practical/image submission, recomputes passed, and
+ *          marks reviewed=1. Manager.
+ * PUT  { id, ...fields, max_attempts? }  → edit a test. Manager.
  * DELETE ?id=[&hard=1]    → soft-deactivate (is_active=0), or hard delete. Manager.
  *
- * Signed-out → 401. Non-manager create/edit/delete → 403.
+ * Attempt policy: max attempts per test is stored in the settings KV table —
+ * a per-test override at `tm_test_max_attempts:<id>` falling back to the global
+ * `tm_max_attempts_default`. 0 (or unset) means unlimited. No schema change.
+ *
+ * Signed-out → 401. Non-manager create/edit/delete/grade → 403.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
+
+/* ── attempt-policy settings (KV, no schema change) ─────────────────────── */
+
+const MAX_ATTEMPTS_DEFAULT_KEY = 'tm_max_attempts_default';
+const testAttemptsKey = (id: string) => `tm_test_max_attempts:${id}`;
+
+function readSetting(db: any, key: string): string | null {
+  try {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as any;
+    return row ? String(row.value ?? '') : null;
+  } catch { return null; }
+}
+
+/** Effective max attempts for a test: per-test override, else global default, else 0 (unlimited). */
+function effectiveMaxAttempts(db: any, testId: string): number {
+  const per = readSetting(db, testAttemptsKey(testId));
+  const raw = per != null && per !== '' ? per : (readSetting(db, MAX_ATTEMPTS_DEFAULT_KEY) ?? '');
+  const n = parseInt(String(raw), 10);
+  return Number.isFinite(n) && n > 0 ? n : 0; // 0 = unlimited
+}
+
+/** Persist a per-test max-attempts override (0/empty → clears the override). */
+function writeTestMaxAttempts(db: any, testId: string, raw: any): void {
+  const n = parseInt(String(raw ?? ''), 10);
+  const key = testAttemptsKey(testId);
+  try {
+    if (Number.isFinite(n) && n > 0) {
+      db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, String(n));
+    } else {
+      db.prepare('DELETE FROM settings WHERE key = ?').run(key);
+    }
+  } catch { /* settings write is best-effort */ }
+}
 
 /* ── question / scoring helpers ─────────────────────────────────────────── */
 
@@ -135,6 +180,18 @@ export async function GET(request: Request) {
       return Response.json({ rows });
     }
 
+    if (view === 'grading') {
+      if (!manage) return Response.json({ error: 'Not authorised' }, { status: 403 });
+      const rows = db.prepare(
+        `SELECT r.*, t.title AS test_title, t.pass_score, t.questions_json
+         FROM knowledge_test_results r
+         LEFT JOIN knowledge_tests t ON t.id = r.test_id
+         WHERE r.reviewed = 0
+         ORDER BY r.taken_at DESC, r.created_at DESC LIMIT 300`,
+      ).all();
+      return Response.json({ rows });
+    }
+
     if (view === 'history') {
       // Non-managers may only see their own history.
       const target = manage ? (url.searchParams.get('user_email') || '') : me.email;
@@ -158,6 +215,12 @@ export async function GET(request: Request) {
       if (!test) return Response.json({ error: 'Test not found' }, { status: 404 });
       if (!manage && !test.is_active) return Response.json({ error: 'Test not available' }, { status: 403 });
       if (!manage) test.questions_json = stripAnswers(test.questions_json);
+      const maxAttempts = effectiveMaxAttempts(db, test.id);
+      const used = (db.prepare(
+        `SELECT COUNT(*) AS n FROM knowledge_test_results WHERE test_id = ? AND user_email = ?`,
+      ).get(test.id, me.email) as any)?.n ?? 0;
+      test.max_attempts = maxAttempts;
+      test.attempts_left = maxAttempts > 0 ? Math.max(0, maxAttempts - used) : null; // null = unlimited
       return Response.json({ test });
     }
 
@@ -185,6 +248,7 @@ export async function GET(request: Request) {
       const last = lastRes.get(t.id, me.email) as any;
       const attempts = (cnt.get(t.id, me.email) as any)?.n ?? 0;
       const questions = parseQuestions(t.questions_json);
+      const maxAttempts = effectiveMaxAttempts(db, t.id);
       return {
         ...t,
         // Managers keep the key; takers get answers stripped.
@@ -192,9 +256,15 @@ export async function GET(request: Request) {
         question_count: questions.length,
         my_last_result: last ? { score: last.score, passed: last.passed, taken_at: last.taken_at, reviewed: last.reviewed } : null,
         attempt_count: attempts,
+        max_attempts: maxAttempts, // 0 = unlimited
+        attempts_left: maxAttempts > 0 ? Math.max(0, maxAttempts - attempts) : null, // null = unlimited
       };
     });
-    return Response.json({ rows });
+    // Pending manual reviews (managers only) — surfaced so the UI can badge it.
+    const pending_reviews = manage
+      ? ((db.prepare(`SELECT COUNT(*) AS n FROM knowledge_test_results WHERE reviewed = 0`).get() as any)?.n ?? 0)
+      : 0;
+    return Response.json({ rows, pending_reviews });
   } catch (e: any) {
     console.error('GET /api/tasks/knowledge-tests failed:', e);
     return Response.json({ error: e?.message || 'Failed to load tests' }, { status: 500 });
@@ -220,7 +290,22 @@ export async function POST(request: Request) {
     try {
       const test = db.prepare(`SELECT * FROM knowledge_tests WHERE id = ?`).get(testId) as any;
       if (!test) return Response.json({ error: 'Test not found' }, { status: 404 });
-      if (!test.is_active && !canManageTasks(me)) return Response.json({ error: 'Test is not active' }, { status: 403 });
+      const isManager = canManageTasks(me);
+      if (!test.is_active && !isManager) return Response.json({ error: 'Test is not active' }, { status: 403 });
+
+      // Attempt policy — cap non-managers at the effective max (0 = unlimited).
+      const maxAttempts = effectiveMaxAttempts(db, testId);
+      if (!isManager && maxAttempts > 0) {
+        const used = (db.prepare(
+          `SELECT COUNT(*) AS n FROM knowledge_test_results WHERE test_id = ? AND user_email = ?`,
+        ).get(testId, me.email) as any)?.n ?? 0;
+        if (used >= maxAttempts) {
+          return Response.json(
+            { error: `Attempt limit reached — this test allows ${maxAttempts} attempt${maxAttempts === 1 ? '' : 's'}.`, attempts_left: 0, max_attempts: maxAttempts },
+            { status: 403 },
+          );
+        }
+      }
 
       const questions = parseQuestions(test.questions_json);
       const answers = Array.isArray(body?.answers) ? body.answers : [];
@@ -243,10 +328,43 @@ export async function POST(request: Request) {
       }
 
       const result = db.prepare(`SELECT * FROM knowledge_test_results WHERE id = ?`).get(id);
-      return Response.json({ result, score, passed: !!passed, reviewed: !!reviewed, needs_review: hasPractical, pass_score: test.pass_score });
+      const attemptsLeft = maxAttempts > 0
+        ? Math.max(0, maxAttempts - (((db.prepare(`SELECT COUNT(*) AS n FROM knowledge_test_results WHERE test_id = ? AND user_email = ?`).get(testId, me.email) as any)?.n) ?? 0))
+        : null;
+      return Response.json({ result, score, passed: !!passed, reviewed: !!reviewed, needs_review: hasPractical, pass_score: test.pass_score, max_attempts: maxAttempts, attempts_left: attemptsLeft });
     } catch (e: any) {
       console.error('POST submit knowledge-test failed:', e);
       return Response.json({ error: e?.message || 'Failed to submit test' }, { status: 500 });
+    }
+  }
+
+  /* --- grade a practical/image submission (managers only) --- */
+  if (action === 'grade') {
+    if (!canManageTasks(me)) return Response.json({ error: 'Not authorised' }, { status: 403 });
+    const resultId = String(body?.result_id ?? '').trim();
+    if (!resultId) return Response.json({ error: 'result_id required' }, { status: 400 });
+    try {
+      const res = db.prepare(`SELECT * FROM knowledge_test_results WHERE id = ?`).get(resultId) as any;
+      if (!res) return Response.json({ error: 'Result not found' }, { status: 404 });
+      let score = parseFloat(String(body?.score ?? ''));
+      if (!Number.isFinite(score)) return Response.json({ error: 'A numeric score is required' }, { status: 400 });
+      score = Math.round(Math.min(Math.max(score, 0), 100) * 10) / 10;
+      const test = db.prepare(`SELECT pass_score, title FROM knowledge_tests WHERE id = ?`).get(res.test_id) as any;
+      const passMark = test?.pass_score ?? 0;
+      const passed = score >= passMark ? 1 : 0;
+      db.prepare(
+        `UPDATE knowledge_test_results SET score = ?, passed = ?, reviewed = 1 WHERE id = ?`,
+      ).run(score, passed, resultId);
+      // Tell the taker their practical submission was reviewed.
+      if (res.user_email && res.user_email !== me.email) {
+        notify(db, res.user_email, 'test_graded', `Test reviewed: ${test?.title || 'Knowledge test'}`,
+          `Your submission was graded ${score}% — ${passed ? 'passed' : 'failed'} (pass mark ${passMark}%).`);
+      }
+      const result = db.prepare(`SELECT * FROM knowledge_test_results WHERE id = ?`).get(resultId);
+      return Response.json({ result, graded: true, score, passed: !!passed });
+    } catch (e: any) {
+      console.error('POST grade knowledge-test failed:', e);
+      return Response.json({ error: e?.message || 'Failed to grade submission' }, { status: 500 });
     }
   }
 
@@ -269,8 +387,10 @@ export async function POST(request: Request) {
         (id, title, description, questions_json, time_limit_minutes, pass_score, is_active, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(id, title, description, questions_json, time_limit_minutes, pass_score, is_active, me.email);
+    if (body?.max_attempts != null) writeTestMaxAttempts(db, id, body.max_attempts);
     if (description) recordMentions(db, description, me.email);
-    const test = db.prepare(`SELECT * FROM knowledge_tests WHERE id = ?`).get(id);
+    const test = db.prepare(`SELECT * FROM knowledge_tests WHERE id = ?`).get(id) as any;
+    if (test) test.max_attempts = effectiveMaxAttempts(db, id);
     return Response.json({ test, created: true });
   } catch (e: any) {
     console.error('POST create knowledge-test failed:', e);
@@ -306,10 +426,16 @@ export async function PUT(request: Request) {
     if (body.pass_score != null) { let p = parseInt(String(body.pass_score), 10); if (!Number.isFinite(p)) p = 60; setField('pass_score', Math.min(Math.max(p, 0), 100)); }
     if (body.is_active != null) setField('is_active', body.is_active === 0 || body.is_active === false ? 0 : 1);
 
-    if (!sets.length) return Response.json({ error: 'Nothing to update' }, { status: 400 });
-    sets.push(`updated_at = datetime('now')`);
-    db.prepare(`UPDATE knowledge_tests SET ${sets.join(', ')} WHERE id = ?`).run(...args, id);
-    const test = db.prepare(`SELECT * FROM knowledge_tests WHERE id = ?`).get(id);
+    // max_attempts lives in settings (KV), not a column — allow it to stand alone.
+    const touchesMaxAttempts = body.max_attempts != null;
+    if (!sets.length && !touchesMaxAttempts) return Response.json({ error: 'Nothing to update' }, { status: 400 });
+    if (sets.length) {
+      sets.push(`updated_at = datetime('now')`);
+      db.prepare(`UPDATE knowledge_tests SET ${sets.join(', ')} WHERE id = ?`).run(...args, id);
+    }
+    if (touchesMaxAttempts) writeTestMaxAttempts(db, id, body.max_attempts);
+    const test = db.prepare(`SELECT * FROM knowledge_tests WHERE id = ?`).get(id) as any;
+    if (test) test.max_attempts = effectiveMaxAttempts(db, id);
     return Response.json({ test, updated: true });
   } catch (e: any) {
     console.error('PUT /api/tasks/knowledge-tests failed:', e);
@@ -334,6 +460,7 @@ export async function DELETE(request: Request) {
     if (hard) {
       const info = db.prepare(`DELETE FROM knowledge_tests WHERE id = ?`).run(id);
       if (info.changes === 0) return Response.json({ error: 'Test not found' }, { status: 404 });
+      writeTestMaxAttempts(db, id, 0); // clear the KV attempt-cap override
       return Response.json({ deleted: true });
     }
     const info = db.prepare(`UPDATE knowledge_tests SET is_active = 0, updated_at = datetime('now') WHERE id = ?`).run(id);

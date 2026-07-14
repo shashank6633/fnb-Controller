@@ -22,6 +22,8 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { CHECKLIST_ROLES, TASK_DEPARTMENTS, TASK_PRIORITIES } from '@/lib/tasks';
+import ImageUpload from '@/app/tasks/_components/ImageUpload';
+import UserPicker from '@/app/tasks/_components/UserPicker';
 
 interface Item { id: string; label: string; sort_order: number; requires_image: number; }
 interface Template {
@@ -35,7 +37,7 @@ interface RecordRow {
 type Result = 'pass' | 'fail' | 'na' | '';
 interface ItemState {
   result: Result; comment: string; image_url: string; corrective_action: string;
-  create_task: boolean; assignee_email: string; priority: string; created_task_id: string;
+  create_task: boolean; assignee_email: string; assignee_name: string; priority: string; created_task_id: string;
 }
 
 const todayStr = () => {
@@ -45,8 +47,12 @@ const todayStr = () => {
 
 const blankState = (): ItemState => ({
   result: '', comment: '', image_url: '', corrective_action: '',
-  create_task: true, assignee_email: '', priority: 'high', created_task_id: '',
+  create_task: true, assignee_email: '', assignee_name: '', priority: 'high', created_task_id: '',
 });
+
+/** requires_image gate: an item flagged requires_image, answered pass/fail, with no photo. */
+const photoMissing = (it: Item, st: ItemState | undefined): boolean =>
+  !!it.requires_image && !!st && (st.result === 'pass' || st.result === 'fail') && !st.image_url.trim();
 
 export default function ChecklistsPage() {
   const router = useRouter();
@@ -101,7 +107,7 @@ export default function ChecklistsPage() {
               ? {
                   result: (r.result as Result) || '', comment: r.comment || '',
                   image_url: r.image_url || '', corrective_action: r.corrective_action || '',
-                  create_task: !r.created_task_id, assignee_email: '', priority: 'high',
+                  create_task: !r.created_task_id, assignee_email: '', assignee_name: '', priority: 'high',
                   created_task_id: r.created_task_id || '',
                 }
               : blankState();
@@ -132,6 +138,12 @@ export default function ChecklistsPage() {
 
   const save = async () => {
     if (!activeTemplate || saving) return;
+    // Enforce requires_image: a photo-required item answered pass/fail must have a photo.
+    const missingPhoto = items.filter(it => photoMissing(it, state[it.id]));
+    if (missingPhoto.length) {
+      setError(`Photo required before saving: ${missingPhoto.map(it => it.label).join(', ')}`);
+      return;
+    }
     const records = items
       .map(it => ({ it, st: state[it.id] }))
       .filter(x => x.st && x.st.result)
@@ -143,6 +155,7 @@ export default function ChecklistsPage() {
         corrective_action: st.corrective_action,
         create_task: st.result === 'fail' ? st.create_task : false,
         assignee_email: st.assignee_email,
+        assignee_name: st.assignee_name,
         priority: st.priority,
       }));
     if (records.length === 0) { setError('Mark at least one item before saving.'); return; }
@@ -329,13 +342,27 @@ export default function ChecklistsPage() {
                 {/* Detail row shown once answered */}
                 {st.result && (
                   <div className="mt-3 space-y-2">
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      <input type="text" placeholder="Comment (optional)" value={st.comment}
-                        onChange={e => setItem(it.id, { comment: e.target.value })}
-                        className="border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 text-sm bg-white focus:outline-none focus:border-[#af4408]" />
-                      <input type="text" placeholder="Photo URL (optional)" value={st.image_url}
-                        onChange={e => setItem(it.id, { image_url: e.target.value })}
-                        className="border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 text-sm bg-white focus:outline-none focus:border-[#af4408]" />
+                    <input type="text" placeholder="Comment (optional)" value={st.comment}
+                      onChange={e => setItem(it.id, { comment: e.target.value })}
+                      className="w-full border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 text-sm bg-white focus:outline-none focus:border-[#af4408]" />
+
+                    {/* Photo — required for requires_image items answered pass/fail */}
+                    <div className={`rounded-lg p-2.5 border ${photoMissing(it, st) ? 'border-red-300 bg-red-50' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`}>
+                      <div className="flex items-center justify-between gap-2 mb-1.5">
+                        <span className="text-[11px] font-semibold uppercase tracking-wide text-[#8B7355]">
+                          Photo {it.requires_image ? <span className="text-[#af4408]">(required)</span> : <span className="text-[#8B7355]">(optional)</span>}
+                        </span>
+                        {photoMissing(it, st) && (
+                          <span className="inline-flex items-center gap-1 text-[11px] text-red-600 font-medium">
+                            <AlertCircle size={12} /> Add a photo to save
+                          </span>
+                        )}
+                      </div>
+                      <ImageUpload
+                        value={st.image_url ? [st.image_url] : []}
+                        onChange={list => setItem(it.id, { image_url: list[0] || '' })}
+                        label="Add photo"
+                      />
                     </div>
 
                     {isFail && (
@@ -344,22 +371,32 @@ export default function ChecklistsPage() {
                           onChange={e => setItem(it.id, { corrective_action: e.target.value })}
                           className="w-full border border-red-200 rounded-lg px-2.5 py-1.5 text-sm bg-white focus:outline-none focus:border-[#af4408]" />
                         {!st.created_task_id && (
-                          <div className="flex flex-wrap items-center gap-2">
+                          <div className="space-y-2">
                             <label className="inline-flex items-center gap-1.5 text-xs text-[#6B5744]">
                               <input type="checkbox" checked={st.create_task}
                                 onChange={e => setItem(it.id, { create_task: e.target.checked })} />
                               Create corrective task
                             </label>
                             {st.create_task && (
-                              <>
-                                <input type="email" placeholder="Assign to (email, optional)" value={st.assignee_email}
-                                  onChange={e => setItem(it.id, { assignee_email: e.target.value })}
-                                  className="flex-1 min-w-[160px] border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 text-sm bg-white focus:outline-none focus:border-[#af4408]" />
-                                <select value={st.priority} onChange={e => setItem(it.id, { priority: e.target.value })}
-                                  className="border border-[#E8D5C4] rounded-lg px-2 py-1.5 text-sm bg-white focus:outline-none focus:border-[#af4408]">
-                                  {TASK_PRIORITIES.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
-                                </select>
-                              </>
+                              <div className="flex flex-wrap items-end gap-2">
+                                <div className="flex-1 min-w-[180px]">
+                                  <label className="block text-[10px] font-semibold uppercase tracking-wide text-[#8B7355] mb-1">Assign to</label>
+                                  <UserPicker
+                                    value={st.assignee_email}
+                                    onPick={u => setItem(it.id, { assignee_email: u.email, assignee_name: u.name })}
+                                    allowClear
+                                    onClear={() => setItem(it.id, { assignee_email: '', assignee_name: '' })}
+                                    placeholder="Assign to… (optional)"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-[10px] font-semibold uppercase tracking-wide text-[#8B7355] mb-1">Priority</label>
+                                  <select value={st.priority} onChange={e => setItem(it.id, { priority: e.target.value })}
+                                    className="border border-[#E8D5C4] rounded-lg px-2 py-2 text-sm bg-white focus:outline-none focus:border-[#af4408]">
+                                    {TASK_PRIORITIES.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+                                  </select>
+                                </div>
+                              </div>
                             )}
                           </div>
                         )}

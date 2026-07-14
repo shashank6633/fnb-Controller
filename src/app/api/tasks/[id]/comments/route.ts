@@ -21,6 +21,49 @@ export const dynamic = 'force-dynamic';
 
 const VALID_KINDS = new Set(['image', 'video', 'voice', 'file', 'sop_link']);
 
+/**
+ * Resolve @-mention tokens (no leading '@') to real users from the users table,
+ * mirroring UserPicker.resolveMention precedence: exact email > exact name >
+ * email local-part > unambiguous prefix. Unmatched tokens fall back to the raw
+ * token for both the stored mention and the notification recipient. De-duped by
+ * resolved recipient so one person is never double-notified from one comment.
+ * (Duplicated in ../route.ts — route files may not export non-handler helpers.)
+ */
+function resolveMentionTargets(
+  db: any,
+  tokens: string[],
+): { mentionedEmail: string; mentionedName: string; recipient: string }[] {
+  if (!tokens.length) return [];
+  const users = db.prepare(`SELECT name, email FROM users WHERE is_active = 1`).all() as { name: string; email: string }[];
+  const out: { mentionedEmail: string; mentionedName: string; recipient: string }[] = [];
+  const seen = new Set<string>();
+  for (const raw of tokens) {
+    const t = String(raw || '').trim();
+    if (!t) continue;
+    const lower = t.toLowerCase();
+    let hit =
+      users.find((u) => (u.email || '').toLowerCase() === lower) ||
+      users.find((u) => (u.name || '').toLowerCase() === lower) ||
+      users.find((u) => (u.email || '').toLowerCase().split('@')[0] === lower);
+    if (!hit) {
+      const pfx = users.filter(
+        (u) =>
+          (u.name || '').toLowerCase().startsWith(lower) ||
+          (u.email || '').toLowerCase().split('@')[0].startsWith(lower),
+      );
+      if (pfx.length === 1) hit = pfx[0];
+    }
+    const mentionedEmail = hit ? hit.email || '' : t;
+    const mentionedName = hit ? hit.name || hit.email || '' : t;
+    const recipient = hit ? hit.email || '' : t;
+    const key = recipient.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ mentionedEmail, mentionedName, recipient });
+  }
+  return out;
+}
+
 export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
@@ -71,11 +114,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           .run(generateId(), id, commentId, VALID_KINDS.has(kind) ? kind : 'file', url, String(a?.filename ?? '').trim(), actorEmail);
       }
 
-      for (const token of parseMentions(text)) {
+      // @mentions — resolved to real users (name/email) so the stored mention and
+      // the notification recipient point at the right person; unmatched tokens
+      // fall back to the raw token. De-duped by recipient in the resolver.
+      for (const m of resolveMentionTargets(db, parseMentions(text))) {
         db.prepare(`INSERT INTO task_mentions (id, task_id, comment_id, mentioned_email, mentioned_name, mentioned_by) VALUES (?, ?, ?, ?, ?, ?)`)
-          .run(generateId(), id, commentId, token.includes('@') ? token : '', token, actorEmail);
+          .run(generateId(), id, commentId, m.mentionedEmail, m.mentionedName, actorEmail);
+        if (!m.recipient) continue;
         db.prepare(`INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href) VALUES (?, ?, 'mention', ?, ?, ?, '/tasks/notifications')`)
-          .run(generateId(), token, `You were mentioned on: ${task.title}`, `${actorName}: ${text}`, id);
+          .run(generateId(), m.recipient, `You were mentioned on: ${task.title}`, `${actorName}: ${text}`, id);
       }
     });
     tx();

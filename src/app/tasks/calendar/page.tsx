@@ -18,8 +18,10 @@ import { useRouter } from 'next/navigation';
 import {
   ArrowLeft, CalendarClock, ChevronLeft, ChevronRight, Loader2, RefreshCw,
   Wrench, GraduationCap, SprayCan, Brain, ClipboardList,
+  X, ExternalLink, Play, Pause, CheckCircle2, RotateCcw, Ban, User, AlertTriangle,
 } from 'lucide-react';
-import { statusMeta } from '@/lib/tasks';
+import { statusMeta, priorityMeta, canManageTasks } from '@/lib/tasks';
+import { api } from '@/lib/api';
 
 /* ── date helpers (local calendar days) ───────────────────────────────── */
 
@@ -81,6 +83,35 @@ export default function TaskCalendarPage() {
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Task-detail drawer (Phase 2). Clicking any calendar item opens it; task
+  // items additionally expose quick status actions that PATCH /api/tasks/:id.
+  const [selected, setSelected] = useState<any>(null);
+  const [savingTo, setSavingTo] = useState<string | null>(null);
+  const [drawerErr, setDrawerErr] = useState<string | null>(null);
+
+  const openItem = useCallback((it: any) => {
+    setDrawerErr(null);
+    setSelected(it);
+  }, []);
+
+  const changeStatus = useCallback(async (to: string) => {
+    if (!selected || selected.type !== 'task') return;
+    setSavingTo(to);
+    setDrawerErr(null);
+    try {
+      const res = await api(`/api/tasks/${encodeURIComponent(selected.id)}`, { method: 'PATCH', body: { status: to } });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
+      // Reflect the new status locally (drawer + grid) without a full refetch.
+      setSelected((s: any) => (s ? { ...s, status: to } : s));
+      setItems((prev) => prev.map((x) => (x.type === 'task' && x.id === selected.id ? { ...x, status: to } : x)));
+    } catch (e: any) {
+      setDrawerErr(e?.message || 'Failed to update status');
+    } finally {
+      setSavingTo(null);
+    }
+  }, [selected]);
 
   useEffect(() => {
     fetch('/api/auth/me')
@@ -254,13 +285,150 @@ export default function TaskCalendarPage() {
             <button onClick={load} className="mt-3 px-4 py-2 bg-white border border-[#E8D5C4] rounded-lg text-sm hover:bg-[#FFF1E3]">Retry</button>
           </div>
         ) : view === 'month' ? (
-          <MonthGrid days={range.days} anchorMonth={anchor.getMonth()} byDate={byDate} today={todayStr} onItem={(it) => router.push(it.href)} onDay={(d) => { setAnchor(d); setView('day'); }} />
+          <MonthGrid days={range.days} anchorMonth={anchor.getMonth()} byDate={byDate} today={todayStr} onItem={openItem} onDay={(d) => { setAnchor(d); setView('day'); }} />
         ) : view === 'week' ? (
-          <WeekGrid days={range.days} byDate={byDate} today={todayStr} onItem={(it) => router.push(it.href)} onDay={(d) => { setAnchor(d); setView('day'); }} />
+          <WeekGrid days={range.days} byDate={byDate} today={todayStr} onItem={openItem} onDay={(d) => { setAnchor(d); setView('day'); }} />
         ) : (
-          <DayList day={anchor} items={byDate[iso(anchor)] || []} onItem={(it) => router.push(it.href)} />
+          <DayList day={anchor} items={byDate[iso(anchor)] || []} onItem={openItem} />
         )}
       </div>
+
+      {selected && (
+        <ItemDrawer
+          it={selected}
+          me={me}
+          savingTo={savingTo}
+          error={drawerErr}
+          onClose={() => setSelected(null)}
+          onStatus={changeStatus}
+          onOpen={(href: string) => router.push(href)}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ── task-detail drawer ───────────────────────────────────────────────── */
+
+// Quick status actions offered inside the drawer, keyed by target status.
+const QUICK_ACTIONS: { to: string; label: string; icon: any; manager?: boolean }[] = [
+  { to: 'in_progress', label: 'Start', icon: Play },
+  { to: 'on_hold', label: 'Hold', icon: Pause },
+  { to: 'waiting_verification', label: 'For Review', icon: CheckCircle2 },
+  { to: 'completed', label: 'Complete', icon: CheckCircle2 },
+  { to: 'approved', label: 'Approve', icon: CheckCircle2, manager: true },
+  { to: 'reopened', label: 'Reopen', icon: RotateCcw, manager: true },
+  { to: 'cancelled', label: 'Cancel', icon: Ban, manager: true },
+];
+
+function ItemDrawer({ it, me, savingTo, error, onClose, onStatus, onOpen }: {
+  it: any; me: any; savingTo: string | null; error: string | null;
+  onClose: () => void; onStatus: (to: string) => void; onOpen: (href: string) => void;
+}) {
+  const meta = typeMeta(it.type);
+  const Icon = meta.icon;
+  const isTask = it.type === 'task';
+  const sm = statusMeta(it.status);
+  const pm = priorityMeta(it.priority);
+  const manager = canManageTasks(me);
+  const dateLabel = (() => {
+    try { return parseISO(it.date).toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'long', year: 'numeric' }); }
+    catch { return it.date; }
+  })();
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end">
+      {/* backdrop */}
+      <div className="absolute inset-0 bg-black/30" onClick={onClose} />
+      {/* panel */}
+      <div className="relative w-full max-w-md bg-white h-full shadow-xl border-l border-[#E8D5C4] flex flex-col animate-[slideIn_.15s_ease-out]">
+        <div className="flex items-start justify-between gap-3 p-4 border-b border-[#E8D5C4]">
+          <div className="flex items-start gap-3 min-w-0">
+            <span className={`p-2 rounded-lg text-white shrink-0 ${meta.chip}`}><Icon className="w-4 h-4" /></span>
+            <div className="min-w-0">
+              <div className="text-[11px] uppercase tracking-wide text-[#8B7355]">{meta.label}</div>
+              <h3 className="text-base font-semibold text-[#2D1B0E] break-words">{it.title}</h3>
+            </div>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[#FFF1E3] text-[#8B7355] shrink-0" aria-label="Close">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-4 space-y-4 overflow-y-auto flex-1">
+          {/* meta rows */}
+          <div className="space-y-2.5 text-sm">
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-[#8B7355] w-20 shrink-0">Status</span>
+              {isTask
+                ? <span className={`inline-block text-[11px] font-medium px-2 py-0.5 rounded-full border ${sm.color}`}>{sm.label}</span>
+                : <span className="text-[#2D1B0E] capitalize">{String(it.status || '—').replace(/_/g, ' ')}</span>}
+            </div>
+            {isTask && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-[#8B7355] w-20 shrink-0">Priority</span>
+                <span className={`inline-block text-[11px] font-medium px-2 py-0.5 rounded-full border ${pm.color}`}>{pm.label}</span>
+              </div>
+            )}
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-[#8B7355] w-20 shrink-0">{isTask ? 'Due' : 'Date'}</span>
+              <span className="text-[#2D1B0E] flex items-center gap-1.5">
+                <CalendarClock className="w-3.5 h-3.5 text-[#8B7355]" />{dateLabel}{it.time ? <span className="font-mono text-xs text-[#8B7355]">· {it.time}</span> : null}
+              </span>
+            </div>
+            {it.assignee_name && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-[#8B7355] w-20 shrink-0">Assignee</span>
+                <span className="text-[#2D1B0E] flex items-center gap-1.5"><User className="w-3.5 h-3.5 text-[#8B7355]" />{it.assignee_name}</span>
+              </div>
+            )}
+            {it.department && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-[#8B7355] w-20 shrink-0">Department</span>
+                <span className="text-[#2D1B0E]">{it.department}</span>
+              </div>
+            )}
+            {it.meta && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-[#8B7355] w-20 shrink-0">Detail</span>
+                <span className="text-[#2D1B0E]">{it.meta}</span>
+              </div>
+            )}
+          </div>
+
+          {/* quick status actions (tasks only) */}
+          {isTask && (
+            <div className="border-t border-[#E8D5C4] pt-4">
+              <div className="text-xs font-medium text-[#8B7355] mb-2">Quick actions</div>
+              {error && (
+                <div className="mb-2 flex items-start gap-1.5 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg p-2">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />{error}
+                </div>
+              )}
+              <div className="flex flex-wrap gap-2">
+                {QUICK_ACTIONS.filter((a) => (a.manager ? manager : true) && a.to !== it.status).map((a) => {
+                  const AI = a.icon;
+                  const busy = savingTo === a.to;
+                  return (
+                    <button key={a.to} onClick={() => onStatus(a.to)} disabled={!!savingTo}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-[#E8D5C4] bg-white text-[#2D1B0E] hover:bg-[#FFF1E3] disabled:opacity-50 transition-colors">
+                      {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <AI className="w-3.5 h-3.5" />} {a.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="p-4 border-t border-[#E8D5C4]">
+          <button onClick={() => onOpen(it.href)}
+            className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3606] text-white rounded-lg text-sm font-medium transition-colors">
+            <ExternalLink className="w-4 h-4" /> {isTask ? 'Open in board' : `Open ${meta.label}`}
+          </button>
+        </div>
+      </div>
+      <style>{`@keyframes slideIn{from{transform:translateX(16px);opacity:.6}to{transform:translateX(0);opacity:1}}`}</style>
     </div>
   );
 }

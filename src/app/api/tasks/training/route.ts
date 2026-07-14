@@ -16,7 +16,10 @@ import { canManageTasks, parseMentions } from '@/lib/tasks';
  * PUT  /api/tasks/training  { id, ...fields }
  *        → partial update (attendance / completion / feedback / status). When
  *          the session is newly marked completed, its attendees get a
- *          completion notification. Gate: canManageTasks.
+ *          completion notification. Also accepts a single-attendee completion
+ *          toggle: { id, attendee_email, attendee_completed } flips that one
+ *          attendee's completed flag (+completed_at) inside attendees_json,
+ *          leaving the rest of the roster untouched. Gate: canManageTasks.
  * DELETE /api/tasks/training?id=  → remove a session. Gate: canManageTasks.
  *
  * Signed-out → 401. Non-manager mutations → 403.
@@ -42,7 +45,11 @@ function normAttendees(attendees: any, attendeesJson: any): string {
       const email = String(a.email ?? '').trim();
       const name = String(a.name ?? '').trim();
       if (!email && !name) return null;
-      return { email, name: name || email };
+      const rec: { email: string; name: string; completed?: boolean; completed_at?: string } = { email, name: name || email };
+      // Preserve per-attendee completion state across edits (Phase-2).
+      if (a.completed != null) rec.completed = !!a.completed;
+      if (a.completed_at != null) rec.completed_at = String(a.completed_at);
+      return rec;
     })
     .filter(Boolean);
   return JSON.stringify(out);
@@ -184,6 +191,24 @@ export async function PUT(request: Request) {
     if (body.session_date != null) setField('session_date', String(body.session_date).trim());
     if (body.duration_minutes != null) setField('duration_minutes', Math.max(0, parseInt(String(body.duration_minutes), 10) || 0));
     if (body.attendees != null || body.attendees_json != null) setField('attendees_json', normAttendees(body.attendees, body.attendees_json));
+    // Single-attendee completion toggle — flips one roster entry, keeps the rest.
+    if (body.attendee_email != null) {
+      const target = String(body.attendee_email).trim().toLowerCase();
+      if (!target) return Response.json({ error: 'attendee_email cannot be empty' }, { status: 400 });
+      const completed = body.attendee_completed === true || body.attendee_completed === 1;
+      let arr: any[] = [];
+      try { const p = JSON.parse(existing.attendees_json || '[]'); if (Array.isArray(p)) arr = p; } catch { arr = []; }
+      let found = false;
+      const next = arr.map((a: any) => {
+        if (String(a?.email ?? '').trim().toLowerCase() === target) {
+          found = true;
+          return { ...a, completed, completed_at: completed ? new Date().toISOString() : '' };
+        }
+        return a;
+      });
+      if (!found) return Response.json({ error: 'Attendee not found on this session' }, { status: 404 });
+      setField('attendees_json', JSON.stringify(next));
+    }
     let newStatus: string | null = null;
     if (body.status != null) {
       const s = String(body.status).trim();

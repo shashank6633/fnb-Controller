@@ -12,6 +12,11 @@ import { getCurrentUser } from '@/lib/auth';
  * Gate: any signed-in user (401 otherwise). Numbers are operational, not
  * financial, so the whole team may view them. Mutations live in other slices.
  *
+ * Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD (Phase 2, default trailing 30 days).
+ * Bounds the throughput KPIs — completed, hygiene_*, training_completion_pct,
+ * knowledge_completion_pct. State KPIs (due_today, pending, overdue,
+ * high_priority, maintenance_*, total_open) stay point-in-time "now".
+ *
  * Response shape (see contract_notes):
  *   {
  *     kpis: { due_today, pending, completed, overdue, high_priority,
@@ -42,7 +47,7 @@ function placeholders(arr: readonly string[]): string {
   return arr.map(() => '?').join(',');
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
 
@@ -51,6 +56,20 @@ export async function GET() {
     const today = todayISO();
     const openIn = placeholders(OPEN_STATUSES);
     const doneIn = placeholders(DONE_STATUSES);
+
+    // ── Date range (Phase 2) ─────────────────────────────────────────────
+    // Bounds the "throughput" KPIs (completed, hygiene, training, knowledge).
+    // The state KPIs (due_today, pending, overdue, high_priority, maintenance,
+    // total_open) remain point-in-time "now" numbers regardless of range.
+    // Defaults to a trailing 30-day window (matching /api/tasks/reports).
+    const url = new URL(request.url);
+    const to = (url.searchParams.get('to') || today).slice(0, 10);
+    const defFrom = (() => {
+      const d = new Date(to + 'T00:00:00Z');
+      d.setUTCDate(d.getUTCDate() - 29);
+      return d.toISOString().slice(0, 10);
+    })();
+    const from = (url.searchParams.get('from') || defFrom).slice(0, 10);
 
     // ── KPI scalars ──────────────────────────────────────────────────────
     const scalar = (sql: string, ...params: any[]): number => {
@@ -70,10 +89,13 @@ export async function GET() {
       ...OPEN_STATUSES,
     );
 
+    // Throughput: tasks whose completion landed inside the selected range.
     const completed = scalar(
       `SELECT COUNT(*) c FROM tasks
-        WHERE is_archived = 0 AND status IN (${doneIn})`,
-      ...DONE_STATUSES,
+        WHERE is_archived = 0 AND status IN (${doneIn})
+          AND completed_at IS NOT NULL AND completed_at != ''
+          AND date(completed_at) BETWEEN ? AND ?`,
+      ...DONE_STATUSES, from, to,
     );
 
     const overdue = scalar(
@@ -99,38 +121,40 @@ export async function GET() {
       today,
     );
 
-    // ── Hygiene score / pass rate (last 30 days) ─────────────────────────
+    // ── Hygiene score / pass rate (selected range) ───────────────────────
     const hygRow = db.prepare(
       `SELECT
          AVG(score) AS avg_score,
          SUM(CASE WHEN result = 'pass' THEN 1 ELSE 0 END) AS pass_n,
          COUNT(*) AS total_n
        FROM hygiene_audits
-       WHERE date >= date(?, '-30 days')`,
-    ).get(today) as { avg_score: number | null; pass_n: number | null; total_n: number | null };
+       WHERE date BETWEEN ? AND ?`,
+    ).get(from, to) as { avg_score: number | null; pass_n: number | null; total_n: number | null };
     const hygieneScoreAvg = Math.round(((hygRow?.avg_score ?? 0) as number) * 10) / 10;
     const hygienePassPct = hygRow?.total_n
       ? Math.round(((hygRow.pass_n ?? 0) / hygRow.total_n) * 100)
       : 0;
 
-    // ── Training completion % (completed / total sessions) ───────────────
+    // ── Training completion % (completed / total sessions in range) ──────
     const trainRow = db.prepare(
       `SELECT
          COUNT(*) AS total_n,
          SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS done_n
-       FROM training_sessions`,
-    ).get() as { total_n: number; done_n: number | null };
+       FROM training_sessions
+       WHERE session_date != '' AND date(session_date) BETWEEN ? AND ?`,
+    ).get(from, to) as { total_n: number; done_n: number | null };
     const trainingCompletionPct = trainRow?.total_n
       ? Math.round(((trainRow.done_n ?? 0) / trainRow.total_n) * 100)
       : 0;
 
-    // ── Knowledge-test completion % (passed / attempted results) ─────────
+    // ── Knowledge-test completion % (passed / attempted results in range) ─
     const ktRow = db.prepare(
       `SELECT
          COUNT(*) AS total_n,
          SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) AS passed_n
-       FROM knowledge_test_results`,
-    ).get() as { total_n: number; passed_n: number | null };
+       FROM knowledge_test_results
+       WHERE date(COALESCE(NULLIF(taken_at,''), created_at)) BETWEEN ? AND ?`,
+    ).get(from, to) as { total_n: number; passed_n: number | null };
     const knowledgeCompletionPct = ktRow?.total_n
       ? Math.round(((ktRow.passed_n ?? 0) / ktRow.total_n) * 100)
       : 0;
@@ -165,18 +189,32 @@ export async function GET() {
       r.completion_pct = r.total ? Math.round((r.completed / r.total) * 100) : 0;
     });
 
-    // ── Employee productivity (assigned tasks only) ──────────────────────
+    // ── Employee productivity (counts every assignee, not just primary) ──
+    // Phase 2: a task with several assignees (task_assignees) now credits each
+    // of them. Tasks that predate multi-assignee (no task_assignees rows) fall
+    // back to the primary assignee_email mirror so nothing is lost.
     const employeeProductivity = db.prepare(
-      `SELECT
-         assignee_email,
-         MAX(assignee_name) AS assignee_name,
+      `WITH assignee_map AS (
+         SELECT ta.task_id AS task_id, lower(ta.user_email) AS email, ta.user_name AS name
+           FROM task_assignees ta
+          WHERE ta.user_email != ''
+         UNION
+         SELECT t.id AS task_id, lower(t.assignee_email) AS email, t.assignee_name AS name
+           FROM tasks t
+          WHERE t.assignee_email != ''
+            AND NOT EXISTS (SELECT 1 FROM task_assignees x WHERE x.task_id = t.id AND x.user_email != '')
+       )
+       SELECT
+         am.email AS assignee_email,
+         MAX(am.name) AS assignee_name,
          COUNT(*) AS total,
-         SUM(CASE WHEN status IN (${doneIn}) THEN 1 ELSE 0 END) AS completed,
-         SUM(CASE WHEN status IN (${openIn}) THEN 1 ELSE 0 END) AS pending,
-         SUM(CASE WHEN status IN (${openIn}) AND due_date != '' AND due_date < ? THEN 1 ELSE 0 END) AS overdue
-       FROM tasks
-       WHERE is_archived = 0 AND assignee_email != ''
-       GROUP BY assignee_email
+         SUM(CASE WHEN t.status IN (${doneIn}) THEN 1 ELSE 0 END) AS completed,
+         SUM(CASE WHEN t.status IN (${openIn}) THEN 1 ELSE 0 END) AS pending,
+         SUM(CASE WHEN t.status IN (${openIn}) AND t.due_date != '' AND t.due_date < ? THEN 1 ELSE 0 END) AS overdue
+       FROM assignee_map am
+       JOIN tasks t ON t.id = am.task_id
+       WHERE t.is_archived = 0
+       GROUP BY am.email
        ORDER BY total DESC
        LIMIT 15`,
     ).all(...DONE_STATUSES, ...OPEN_STATUSES, ...OPEN_STATUSES, today) as any[];
@@ -226,6 +264,7 @@ export async function GET() {
       employee_productivity: employeeProductivity,
       upcoming,
       recent,
+      range: { from, to },
       generated_at: new Date().toISOString(),
     });
   } catch (e: any) {

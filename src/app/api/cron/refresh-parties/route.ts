@@ -3,6 +3,8 @@ import { checkDeferDueSoon } from '@/lib/defer-due-check';
 import { getCurrentUser } from '@/lib/auth';
 import { getSchedulerStatus } from '@/lib/scheduler';
 import { runWaDailyNotifications } from '@/lib/whatsapp';
+import { getDb } from '@/lib/db';
+import { runTaskAutomation } from '@/lib/task-automation';
 
 /**
  * Manual / external trigger for the party-sheet refresh + audit + notify
@@ -44,6 +46,15 @@ export async function POST(request: Request) {
     console.error('[/api/cron/refresh-parties] whatsapp daily jobs failed:', e?.message);
   }
 
+  // Task Management daily automation (recurring + maintenance generation, overdue
+  // sweep + escalation). Idempotent per IST day, fully best-effort, never throws.
+  let task_automation: any = null;
+  try {
+    task_automation = runTaskAutomation(getDb());
+  } catch (e: any) {
+    console.error('[/api/cron/refresh-parties] task automation failed:', e?.message);
+  }
+
   try {
     const result = await refreshUpcomingParties(tokenOk ? 'external_cron' : 'admin_manual');
     // Feature 4 — same pipeline also checks deferred items coming due. Fully
@@ -54,11 +65,11 @@ export async function POST(request: Request) {
     } catch (e: any) {
       console.error('[/api/cron/refresh-parties] defer-due check failed:', e?.message);
     }
-    return Response.json({ ok: true, result, defer_due, wa_daily });
+    return Response.json({ ok: true, result, defer_due, wa_daily, task_automation });
   } catch (e: any) {
     console.error('[/api/cron/refresh-parties]', e);
-    // wa_daily ran before the refresh — report it even on failure so external
-    // cron logs show whether the daily pings dispatched.
-    return Response.json({ error: e.message, wa_daily }, { status: 500 });
+    // wa_daily + task_automation ran before the refresh — report them even on
+    // failure so external cron logs show whether the daily jobs dispatched.
+    return Response.json({ error: e.message, wa_daily, task_automation }, { status: 500 });
   }
 }

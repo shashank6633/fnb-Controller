@@ -7,19 +7,25 @@
  * duration, attendees, completion status and post-session feedback. Managers
  * (canManageTasks) can create / edit / complete / delete; everyone signed in
  * can view the schedule. Mobile-first cards, warm theme, CSV export.
+ *
+ * Phase 2 depth: attendees are chosen from the active-user directory via the
+ * multi-select UserPicker (emails + names persisted in attendees_json), and each
+ * attendee carries a per-person completion checkbox managers can tick from the
+ * session card. Any legacy free-text attendees (no email) are preserved.
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
-  AlertCircle, ArrowLeft, CheckCircle2, Download, GraduationCap, Loader2,
+  AlertCircle, ArrowLeft, CheckCircle2, Circle, Download, GraduationCap, Loader2,
   Pencil, Plus, RefreshCw, Search, Trash2, Users, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { TASK_DEPARTMENTS, canManageTasks } from '@/lib/tasks';
+import UserPicker, { type TaskUser } from '../_components/UserPicker';
 
-interface Attendee { email: string; name: string }
+interface Attendee { email: string; name: string; completed?: boolean; completed_at?: string }
 interface Session {
   id: string;
   title: string;
@@ -52,22 +58,13 @@ const fmtDate = (s: string | null | undefined) => {
 const parseAttendees = (json: string): Attendee[] => {
   try { const a = JSON.parse(json || '[]'); return Array.isArray(a) ? a : []; } catch { return []; }
 };
-/** attendees textarea (one per line, "Name <email>" or plain) → array */
-const linesToAttendees = (text: string): Attendee[] =>
-  text.split(/[\n,]+/).map((l) => l.trim()).filter(Boolean).map((l) => {
-    const m = l.match(/^(.*?)\s*<([^>]+)>$/);
-    if (m) return { name: m[1].trim() || m[2].trim(), email: m[2].trim() };
-    return l.includes('@') ? { email: l, name: l } : { email: '', name: l };
-  });
-const attendeesToLines = (arr: Attendee[]): string =>
-  arr.map((a) => (a.email && a.name && a.name !== a.email ? `${a.name} <${a.email}>` : a.email || a.name)).join('\n');
 
 const csvCell = (x: any) => {
   const s = String(x ?? '');
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 };
 
-const EMPTY_FORM = { title: '', trainer: '', department: '', session_date: '', duration_minutes: '', attendees: '', status: 'scheduled', feedback: '' };
+const EMPTY_FORM = { title: '', trainer: '', department: '', session_date: '', duration_minutes: '', status: 'scheduled', feedback: '' };
 
 export default function TrainingTasksPage() {
   const router = useRouter();
@@ -84,6 +81,13 @@ export default function TrainingTasksPage() {
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState({ ...EMPTY_FORM });
+  // Attendee selection (email-based, from the directory).
+  const [attEmails, setAttEmails] = useState<string[]>([]);
+  const [attUsers, setAttUsers] = useState<TaskUser[]>([]);
+  // Completion state carried over from the existing roster (keyed by lower email).
+  const [attMeta, setAttMeta] = useState<Record<string, { completed?: boolean; completed_at?: string }>>({});
+  // Legacy attendees without an email (preserved verbatim on save).
+  const [attLegacy, setAttLegacy] = useState<Attendee[]>([]);
   const [saving, setSaving] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
 
@@ -113,17 +117,45 @@ export default function TrainingTasksPage() {
     return () => clearTimeout(t);
   }, [me, load]);
 
-  const openCreate = () => { setEditId(null); setForm({ ...EMPTY_FORM }); setModalError(null); setShowForm(true); };
+  const resetAttendees = () => { setAttEmails([]); setAttUsers([]); setAttMeta({}); setAttLegacy([]); };
+
+  const openCreate = () => {
+    setEditId(null);
+    setForm({ ...EMPTY_FORM });
+    resetAttendees();
+    setModalError(null);
+    setShowForm(true);
+  };
   const openEdit = (s: Session) => {
     setEditId(s.id);
     setForm({
       title: s.title, trainer: s.trainer, department: s.department, session_date: s.session_date,
       duration_minutes: s.duration_minutes ? String(s.duration_minutes) : '',
-      attendees: attendeesToLines(parseAttendees(s.attendees_json)),
       status: s.status, feedback: s.feedback,
     });
+    const roster = parseAttendees(s.attendees_json);
+    const emailed = roster.filter((a) => (a.email || '').includes('@'));
+    const legacy = roster.filter((a) => !(a.email || '').includes('@'));
+    const meta: Record<string, { completed?: boolean; completed_at?: string }> = {};
+    emailed.forEach((a) => { meta[a.email.toLowerCase()] = { completed: a.completed, completed_at: a.completed_at }; });
+    setAttEmails(emailed.map((a) => a.email));
+    setAttUsers(emailed.map((a) => ({ id: a.email, name: a.name || a.email, email: a.email, position: '', department_id: null })));
+    setAttMeta(meta);
+    setAttLegacy(legacy);
     setModalError(null);
     setShowForm(true);
+  };
+
+  /** Build the attendees payload from the picker selection, preserving completion + legacy rows. */
+  const buildAttendees = (): Attendee[] => {
+    const byEmail = new Map(attUsers.map((u) => [u.email.toLowerCase(), u]));
+    const picked: Attendee[] = attEmails.map((e) => {
+      const key = e.toLowerCase();
+      const u = byEmail.get(key);
+      const m = attMeta[key] || {};
+      return { email: e, name: u?.name || e, completed: !!m.completed, completed_at: m.completed_at || '' };
+    });
+    return [...picked, ...attLegacy];
   };
 
   const save = async () => {
@@ -137,7 +169,7 @@ export default function TrainingTasksPage() {
       department: form.department,
       session_date: form.session_date,
       duration_minutes: form.duration_minutes ? parseInt(form.duration_minutes, 10) : 0,
-      attendees: linesToAttendees(form.attendees),
+      attendees: buildAttendees(),
       status: form.status,
       feedback: form.feedback.trim(),
     };
@@ -165,6 +197,26 @@ export default function TrainingTasksPage() {
     } catch (e: any) { setError(e?.message || 'Failed to update'); }
   };
 
+  /** Toggle one attendee's completion flag on a session, optimistically. */
+  const toggleAttendee = async (s: Session, att: Attendee) => {
+    if (!att.email) return; // legacy free-text attendees have no stable key
+    const next = !att.completed;
+    // optimistic
+    setRows((prev) => prev.map((row) => {
+      if (row.id !== s.id) return row;
+      const roster = parseAttendees(row.attendees_json).map((a) =>
+        (a.email || '').toLowerCase() === att.email.toLowerCase()
+          ? { ...a, completed: next, completed_at: next ? new Date().toISOString() : '' }
+          : a);
+      return { ...row, attendees_json: JSON.stringify(roster) };
+    }));
+    try {
+      const r = await api('/api/tasks/training', { method: 'PUT', body: { id: s.id, attendee_email: att.email, attendee_completed: next } });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(j.error || `HTTP ${r.status}`); load(); return; }
+    } catch (e: any) { setError(e?.message || 'Failed to update attendance'); load(); }
+  };
+
   const remove = async (s: Session) => {
     if (!confirm(`Delete training session "${s.title}"?`)) return;
     try {
@@ -177,11 +229,13 @@ export default function TrainingTasksPage() {
   };
 
   const exportCsv = () => {
-    const head = ['Title', 'Trainer', 'Department', 'Date', 'Duration (min)', 'Attendees', 'Status', 'Feedback'];
+    const head = ['Title', 'Trainer', 'Department', 'Date', 'Duration (min)', 'Attendees', 'Completed', 'Status', 'Feedback'];
     const lines = [head.map(csvCell).join(',')];
     for (const s of rows) {
-      const att = parseAttendees(s.attendees_json).map((a) => a.name || a.email).join('; ');
-      lines.push([s.title, s.trainer, s.department, s.session_date, s.duration_minutes, att, s.status, s.feedback].map(csvCell).join(','));
+      const roster = parseAttendees(s.attendees_json);
+      const att = roster.map((a) => a.name || a.email).join('; ');
+      const done = `${roster.filter((a) => a.completed).length}/${roster.length}`;
+      lines.push([s.title, s.trainer, s.department, s.session_date, s.duration_minutes, att, done, s.status, s.feedback].map(csvCell).join(','));
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
     const a = document.createElement('a');
@@ -277,6 +331,7 @@ export default function TrainingTasksPage() {
         <div className="space-y-2">
           {rows.map((s) => {
             const att = parseAttendees(s.attendees_json);
+            const done = att.filter((a) => a.completed).length;
             return (
               <div key={s.id} className="bg-white border border-[#E8D5C4] rounded-xl p-3 sm:p-4">
                 <div className="flex flex-wrap items-start justify-between gap-2">
@@ -290,7 +345,7 @@ export default function TrainingTasksPage() {
                       {s.department && <span>{s.department}</span>}
                       <span>{fmtDate(s.session_date)}</span>
                       {s.duration_minutes > 0 && <span>{s.duration_minutes} min</span>}
-                      <span className="inline-flex items-center gap-1"><Users size={11} /> {att.length}</span>
+                      <span className="inline-flex items-center gap-1"><Users size={11} /> {att.length}{att.length > 0 && <span className="text-[#8B7355]">· {done} done</span>}</span>
                     </div>
                   </div>
                   {canManage && (
@@ -302,8 +357,20 @@ export default function TrainingTasksPage() {
                   )}
                 </div>
                 {att.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1">
-                    {att.map((a, i) => <span key={i} className="text-[11px] bg-[#FFF1E3] border border-[#E8D5C4] rounded-full px-2 py-0.5 text-[#6B5744]">{a.name || a.email}</span>)}
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {att.map((a, i) => {
+                      const chip = (
+                        <span className={`inline-flex items-center gap-1 text-[11px] rounded-full pl-1.5 pr-2 py-0.5 border ${a.completed ? 'bg-green-50 border-green-200 text-green-700' : 'bg-[#FFF1E3] border-[#E8D5C4] text-[#6B5744]'}`}>
+                          {a.completed ? <CheckCircle2 size={12} className="shrink-0" /> : <Circle size={12} className="shrink-0 text-[#8B7355]" />}
+                          {a.name || a.email}
+                        </span>
+                      );
+                      return canManage && a.email ? (
+                        <button key={i} type="button" onClick={() => toggleAttendee(s, a)} title={a.completed ? 'Mark not completed' : 'Mark completed'} className="hover:opacity-80 focus:outline-none">
+                          {chip}
+                        </button>
+                      ) : <span key={i}>{chip}</span>;
+                    })}
                   </div>
                 )}
                 {s.feedback && <div className="mt-2 text-xs text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-2.5 py-1.5"><span className="font-semibold text-[#2D1B0E]">Feedback: </span>{s.feedback}</div>}
@@ -335,7 +402,27 @@ export default function TrainingTasksPage() {
               </div>
               <div>
                 <label className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide">Attendees</label>
-                <textarea placeholder={'One per line — "Name <email>" or name/email'} rows={3} value={form.attendees} onChange={(e) => setForm((f) => ({ ...f, attendees: e.target.value }))} className="w-full mt-1 border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#af4408]" />
+                <div className="mt-1">
+                  <UserPicker
+                    multiple
+                    values={attEmails}
+                    onChange={(emails, users) => { setAttEmails(emails); setAttUsers(users); }}
+                    placeholder="Add people from the directory…"
+                  />
+                </div>
+                {attLegacy.length > 0 && (
+                  <div className="mt-1.5">
+                    <div className="text-[10px] text-[#8B7355] uppercase tracking-wide mb-1">Other attendees (kept)</div>
+                    <div className="flex flex-wrap gap-1">
+                      {attLegacy.map((a, i) => (
+                        <span key={i} className="inline-flex items-center gap-1 text-[11px] bg-[#FFF1E3] border border-[#E8D5C4] rounded-full pl-2 pr-1 py-0.5 text-[#6B5744]">
+                          {a.name || a.email}
+                          <button type="button" onClick={() => setAttLegacy((l) => l.filter((_, j) => j !== i))} className="rounded-full hover:bg-[#E8D5C4] p-0.5 text-[#8B7355]" aria-label="Remove"><X size={11} /></button>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
               <select value={form.status} onChange={(e) => setForm((f) => ({ ...f, status: e.target.value }))} className="w-full border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:border-[#af4408]">
                 {Object.keys(STATUS_LABEL).map((s) => <option key={s} value={s}>{STATUS_LABEL[s]}</option>)}

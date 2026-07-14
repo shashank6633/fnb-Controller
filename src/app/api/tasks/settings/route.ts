@@ -2,6 +2,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, requireRole } from '@/lib/auth';
 import { TASK_PRIORITIES } from '@/lib/tasks';
+import { todayIST } from '@/lib/format-date';
 
 /**
  * Task-Module Settings (/api/tasks/settings).
@@ -48,7 +49,17 @@ const KEYS = {
   holidays: 'tm_holidays',
   reminder_interval_hours: 'tm_reminder_interval_hours',
   priorities: 'tm_priorities',
+  // Escalation config actually consumed by src/lib/task-automation.ts
+  // (detectOverdueAndEscalate). Stored as PLAIN strings / JSON so the engine's
+  // getSetting()/JSON.parse reads match — see readRaw/writeRaw below.
+  escalation_enabled: 'tm_escalation_enabled',
+  escalation_threshold_days: 'tm_escalation_threshold_days',
+  escalation_targets: 'tm_escalation_targets',
+  automation_last_run: 'tm_automation_last_run',
 } as const;
+
+/** Roles the escalation sweep may copy in (must match users.role values). */
+const ESCALATION_ROLE_OPTIONS = ['manager', 'admin', 'staff'] as const;
 
 const DEFAULTS = {
   approval_levels: [
@@ -69,6 +80,10 @@ const DEFAULTS = {
   working_hours: { start: '09:00', end: '23:00', days: [1, 2, 3, 4, 5, 6, 0] },
   holidays: [] as { date: string; name: string }[],
   reminder_interval_hours: 24,
+  // Automation-consumed escalation defaults (mirror task-automation fallbacks).
+  escalation_enabled: true,
+  escalation_threshold_days: 1,
+  escalation_targets: ['manager', 'admin'] as string[],
 };
 
 function readJson<T>(db: any, key: string, fallback: T): T {
@@ -84,6 +99,25 @@ function readJson<T>(db: any, key: string, fallback: T): T {
 
 function writeKv(db: any, key: string, value: any) {
   db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`).run(key, JSON.stringify(value));
+}
+
+/**
+ * Raw (non-JSON) read/write. The automation engine reads a few keys with a bare
+ * getSetting()/parseInt and compares strings ('1'/'0'), so those keys must be
+ * stored as plain strings — NOT JSON-encoded — or the engine would misread them
+ * (e.g. JSON.stringify(false) === 'false', which is truthy).
+ */
+function readRaw(db: any, key: string, fallback: string): string {
+  try {
+    const row = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key) as { value?: string } | undefined;
+    return row?.value ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeRaw(db: any, key: string, value: string) {
+  db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`).run(key, String(value ?? ''));
 }
 
 /** Default priority list (labels/colors) — editable copy of TASK_PRIORITIES. */
@@ -109,6 +143,7 @@ export async function GET() {
 
     const priorities = readJson(db, KEYS.priorities, defaultPriorities());
 
+    const thresholdRaw = parseInt(readRaw(db, KEYS.escalation_threshold_days, String(DEFAULTS.escalation_threshold_days)), 10);
     const config = {
       approval_levels: readJson(db, KEYS.approval_levels, DEFAULTS.approval_levels),
       notification_rules: { ...DEFAULTS.notification_rules, ...readJson(db, KEYS.notification_rules, {}) },
@@ -116,6 +151,10 @@ export async function GET() {
       working_hours: { ...DEFAULTS.working_hours, ...readJson(db, KEYS.working_hours, {}) },
       holidays: readJson(db, KEYS.holidays, DEFAULTS.holidays),
       reminder_interval_hours: Number(readJson(db, KEYS.reminder_interval_hours, DEFAULTS.reminder_interval_hours)) || DEFAULTS.reminder_interval_hours,
+      // Automation-consumed escalation controls (read raw to match the engine).
+      escalation_enabled: readRaw(db, KEYS.escalation_enabled, '1') !== '0',
+      escalation_threshold_days: Number.isFinite(thresholdRaw) && thresholdRaw >= 0 ? thresholdRaw : DEFAULTS.escalation_threshold_days,
+      escalation_targets: readJson(db, KEYS.escalation_targets, DEFAULTS.escalation_targets),
     };
 
     const rules = db
@@ -123,11 +162,16 @@ export async function GET() {
       .all() as any[];
     const maint = db.prepare(`SELECT COUNT(*) c FROM maintenance_schedules WHERE is_active = 1`).get() as any;
 
+    const today = todayIST();
+    const lastRun = readRaw(db, KEYS.automation_last_run, '');
+
     return Response.json({
       categories,
       priorities,
       config,
       recurring: { rules, rule_count: rules.length, maintenance_count: maint?.c ?? 0 },
+      automation: { last_run: lastRun, today, ran_today: lastRun === today },
+      escalation_role_options: ESCALATION_ROLE_OPTIONS,
     });
   } catch (e: any) {
     console.error('GET /api/tasks/settings failed:', e);
@@ -154,6 +198,24 @@ export async function PUT(request: Request) {
       if (config.reminder_interval_hours !== undefined) {
         const n = Math.max(1, Math.min(720, Number(config.reminder_interval_hours) || DEFAULTS.reminder_interval_hours));
         writeKv(db, KEYS.reminder_interval_hours, n);
+      }
+      // Automation-consumed escalation controls — stored raw / JSON to match the
+      // task-automation engine's read path (see readRaw/writeRaw notes).
+      if (config.escalation_enabled !== undefined) {
+        writeRaw(db, KEYS.escalation_enabled, config.escalation_enabled ? '1' : '0');
+      }
+      if (config.escalation_threshold_days !== undefined) {
+        const raw = Math.trunc(Number(config.escalation_threshold_days));
+        const d = Number.isFinite(raw) ? Math.max(0, Math.min(365, raw)) : DEFAULTS.escalation_threshold_days;
+        writeRaw(db, KEYS.escalation_threshold_days, String(d));
+      }
+      if (config.escalation_targets !== undefined) {
+        const roles = Array.isArray(config.escalation_targets)
+          ? config.escalation_targets
+              .map((r: any) => String(r).trim().toLowerCase())
+              .filter((r: string) => (ESCALATION_ROLE_OPTIONS as readonly string[]).includes(r))
+          : [];
+        writeKv(db, KEYS.escalation_targets, roles.length ? Array.from(new Set(roles)) : DEFAULTS.escalation_targets);
       }
     }
     if (body?.priorities !== undefined) writeKv(db, KEYS.priorities, body.priorities);

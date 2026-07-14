@@ -2,6 +2,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { canManageTasks, TASK_STATUSES, TASK_PRIORITIES } from '@/lib/tasks';
+import { notifyTaskAssignment } from '@/lib/task-automation';
 
 /**
  * Tasks collection (/api/tasks) — CORE TASKS slice.
@@ -215,11 +216,11 @@ export async function POST(request: Request) {
       db.prepare(`INSERT INTO task_status_history (id, task_id, from_status, to_status, changed_by, note) VALUES (?, ?, '', ?, ?, ?)`)
         .run(generateId(), id, status, actorEmail, 'Task created');
 
-      // Notify assignees (unless assigning to self only).
+      // Notify each assignee (unless assigning to self), via the shared automation
+      // helper so create-time and generator-time assignment alerts stay identical.
       for (const a of assignees) {
         if (a.email.toLowerCase() === actorEmail.toLowerCase()) continue;
-        db.prepare(`INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href) VALUES (?, ?, 'assigned', ?, ?, ?, '/tasks/my')`)
-          .run(generateId(), a.email, `New task: ${title}`, `${actorName} assigned you a task.`, id);
+        notifyTaskAssignment(db, id, a.email, actorName);
       }
     });
     tx();

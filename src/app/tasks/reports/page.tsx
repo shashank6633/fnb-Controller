@@ -208,8 +208,13 @@ export default function TaskReportsPage() {
         return {
           name: 'overview',
           rows: [
+            ['Task Trend (by created date)'],
             ['Period', 'Created', 'Completed', 'Approved'],
             ...data.period_series.map((p: any) => [p.period, p.created, p.completed, p.approved]),
+            [],
+            ['Completion Throughput (by completion date)'],
+            ['Period', 'Completed', 'Approved'],
+            ...(data.completion_series || []).map((p: any) => [p.period, p.completed, p.approved]),
           ],
         };
     }
@@ -238,8 +243,13 @@ export default function TaskReportsPage() {
       ['Overdue (now)', data.summary.overdue],
       ['Completion %', data.summary.completion_rate],
       [],
+      ['Task Trend (by created date)'],
       ['Period', 'Created', 'Completed', 'Approved'],
       ...data.period_series.map((p: any) => [p.period, p.created, p.completed, p.approved]),
+      [],
+      ['Completion Throughput (by completion date)'],
+      ['Period', 'Completed', 'Approved'],
+      ...(data.completion_series || []).map((p: any) => [p.period, p.completed, p.approved]),
     ]);
     add('Departments', [
       ['Department', 'Total', 'Completed', 'Approved', 'Overdue', 'Completion %', 'Avg Minutes'],
@@ -460,7 +470,7 @@ function OverviewReport({ data, period }: { data: any; period: string }) {
         <Kpi label="Completion %" value={`${s.completion_rate}%`} tone={s.completion_rate >= 70 ? 'good' : 'warn'} />
       </div>
 
-      <Card title="Task Trend" subtitle={`Created vs completed vs approved · ${period}`}>
+      <Card title="Task Trend" subtitle={`Created vs completed vs approved · by created date · ${period}`}>
         {data.period_series.length ? (
           <ResponsiveContainer width="100%" height={300}>
             <LineChart data={data.period_series}>
@@ -475,6 +485,22 @@ function OverviewReport({ data, period }: { data: any; period: string }) {
             </LineChart>
           </ResponsiveContainer>
         ) : <EmptyChart />}
+      </Card>
+
+      <Card title="Completion Throughput" subtitle={`Tasks actually completed / approved · by completion date · ${period}`}>
+        {(data.completion_series?.length ?? 0) > 0 ? (
+          <ResponsiveContainer width="100%" height={300}>
+            <BarChart data={data.completion_series}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#E8D5C4" />
+              <XAxis dataKey="period" tick={axisTick} stroke="#8B7355" />
+              <YAxis tick={axisTick} stroke="#8B7355" allowDecimals={false} />
+              <Tooltip contentStyle={chartTooltip} />
+              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <Bar dataKey="completed" name="Completed" fill={CHART.green} radius={[4, 4, 0, 0]} />
+              <Bar dataKey="approved" name="Approved" fill={CHART.blue} radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        ) : <EmptyChart label="No completions in this range" />}
       </Card>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
