@@ -1,5 +1,6 @@
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
+import { notifyEvent } from '@/lib/whatsapp';
 
 /**
  * Head Chef approves a submitted requisition → moves to 'chef_approved'.
@@ -83,6 +84,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         note,
       });
     } catch { /* audit must never break the action */ }
+    // WhatsApp ping (fire-and-forget, AFTER the transaction committed) — gated
+    // by the Notifications-tab toggles inside notifyEvent(); a no-op when the
+    // provider is unconfigured. Must NEVER block or fail the approval.
+    try {
+      const dept = db.prepare('SELECT name FROM departments WHERE id = ?').get(r.department_id) as any;
+      void notifyEvent('requisition_approved', {
+        req_number: r.req_number,
+        department: dept?.name || r.department_id,
+        approved_by: me.name || me.email,
+      });
+    } catch { /* notification must never break the action */ }
     // Per Phase 1 SOP, the next gate is Management approval — the requisition
     // sits in 'chef_approved' until Mgmt acts (status 'mgmt_approved'), after
     // which Store can process it.

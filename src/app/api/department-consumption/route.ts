@@ -64,8 +64,9 @@ export async function GET(request: Request) {
       if (categoryF)    { rw.push('rm.category = ?'); rp.push(categoryF); }
       if (materialId)   { rw.push('ri.material_id = ?'); rp.push(materialId); }
       const rows = db.prepare(`
-        SELECT ri.req_id, ri.material_id, ri.issue_history,
-               rm.name AS material_name, rm.unit, rm.category, rm.average_price, rm.last_purchase_price,
+        SELECT ri.req_id, ri.material_id, ri.issue_history, ri.unit AS req_unit,
+               rm.name AS material_name, rm.unit, rm.category, rm.average_price,
+               rm.purchase_unit, rm.pack_size,
                r.req_number,
                COALESCE(dl.name, dr.name) AS department_name,
                COALESCE(ri.department_id, r.department_id) AS department_id
@@ -84,7 +85,26 @@ export async function GET(request: Request) {
         let hist: any[] = [];
         try { hist = JSON.parse(row.issue_history || '[]'); } catch { continue; }
         if (!Array.isArray(hist)) continue;
-        const unitCost = Number(row.last_purchase_price) || Number(row.average_price) || 0;
+        // VALUE BASIS (deliberate — do not "simplify" back):
+        // issue_history entries' qty are written by the store-issue route in the
+        // line's REQUESTED unit (ri.unit): store-issue pushes {qty: addQty} where
+        // addQty accumulates into quantity_issued, which is compared against
+        // chef_approved_qty / quantity_requested — all in ri.unit. average_price
+        // is ₹/RECIPE-unit, so convert with the same reqPackFactor semantics the
+        // requisition screens and party-events/pnl use: × pack_size only when the
+        // line was requested in the material's PURCHASE unit (e.g. 1 BTL = 750 ml).
+        // Legacy rows with a blank ri.unit stay ×1.
+        // NEVER use last_purchase_price here: it is ₹/PURCHASE-unit, so
+        // qty-in-requested/recipe-units × last_purchase_price mixes bases
+        // (the old `last_purchase_price || average_price` fallback overvalued
+        // e.g. 5 g of a material bought in 1 kg bags by ×1000).
+        const packFactor =
+          (String(row.req_unit || '').trim() !== '' &&
+           row.req_unit === row.purchase_unit &&
+           row.req_unit !== row.unit &&
+           (Number(row.pack_size) || 1) > 1)
+            ? Number(row.pack_size) : 1;
+        const unitCost = (Number(row.average_price) || 0) * packFactor;
         for (const h of hist) {
           const day = String(h && h.at || '').slice(0, 10);
           if (!day || day < from || day > to) continue;
@@ -114,13 +134,23 @@ export async function GET(request: Request) {
       });
     }
 
+    // Value math (all 5 aggregates below): quantity_issued is in ri.unit — the unit
+    // the line was REQUESTED in, which may be the material's PURCHASE unit (1 BTL =
+    // 750 ml) — while average_price is ₹/RECIPE-unit. Convert with the same pack
+    // factor the requisition screens use (reqPackFactor, same CASE as
+    // party-events/pnl): × pack_size only when the line was requested in the
+    // purchase unit. Legacy rows with a blank ri.unit stay ×1.
     const summary = db.prepare(`
       SELECT
         COUNT(DISTINCT r.id)             AS requisition_count,
         COUNT(DISTINCT r.department_id)  AS departments,
         COUNT(DISTINCT ri.material_id)   AS materials,
         COALESCE(SUM(ri.quantity_issued), 0)                                   AS total_qty,
-        COALESCE(SUM(ri.quantity_issued * rm.average_price), 0)                AS total_value
+        COALESCE(SUM(ri.quantity_issued
+          * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                       AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+                  THEN rm.pack_size ELSE 1 END)
+          * rm.average_price), 0)                                              AS total_value
       FROM requisitions r
       JOIN requisition_items ri ON ri.req_id = r.id
       JOIN raw_materials rm    ON rm.id = ri.material_id
@@ -133,7 +163,11 @@ export async function GET(request: Request) {
              COUNT(DISTINCT ri.material_id)    AS material_count,
              COUNT(*)                          AS line_count,
              COALESCE(SUM(ri.quantity_issued), 0)                              AS total_qty,
-             COALESCE(SUM(ri.quantity_issued * rm.average_price), 0)           AS total_value
+             COALESCE(SUM(ri.quantity_issued
+               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+                       THEN rm.pack_size ELSE 1 END)
+               * rm.average_price), 0)                                         AS total_value
       FROM requisitions r
       JOIN departments d ON d.id = r.department_id
       JOIN requisition_items ri ON ri.req_id = r.id
@@ -147,7 +181,11 @@ export async function GET(request: Request) {
       SELECT d.id AS department_id, d.name AS department_name,
              rm.id AS material_id, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit, rm.category,
              SUM(ri.quantity_issued)                                  AS qty,
-             SUM(ri.quantity_issued * rm.average_price)               AS value,
+             SUM(ri.quantity_issued
+               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+                       THEN rm.pack_size ELSE 1 END)
+               * rm.average_price)                                    AS value,
              COUNT(*)                                                 AS line_count
       FROM requisitions r
       JOIN departments d ON d.id = r.department_id
@@ -162,7 +200,11 @@ export async function GET(request: Request) {
       SELECT rm.id AS material_id, rm.name AS material_name, rm.sku AS material_sku,
              rm.unit AS material_unit, rm.category, rm.average_price,
              SUM(ri.quantity_issued)                            AS total_qty,
-             SUM(ri.quantity_issued * rm.average_price)         AS total_value,
+             SUM(ri.quantity_issued
+               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+                       THEN rm.pack_size ELSE 1 END)
+               * rm.average_price)                              AS total_value,
              COUNT(DISTINCT r.department_id)                    AS distinct_depts
       FROM requisitions r
       JOIN requisition_items ri ON ri.req_id = r.id
@@ -175,7 +217,11 @@ export async function GET(request: Request) {
 
     const trendByDay = db.prepare(`
       SELECT r.date,
-             SUM(ri.quantity_issued * rm.average_price) AS total_value,
+             SUM(ri.quantity_issued
+               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+                       THEN rm.pack_size ELSE 1 END)
+               * rm.average_price)                      AS total_value,
              COUNT(DISTINCT r.id)                       AS requisitions
       FROM requisitions r
       JOIN requisition_items ri ON ri.req_id = r.id

@@ -25,6 +25,20 @@ import MaterialTypeahead from '@/components/MaterialTypeahead';
 import { fmtIST } from '@/lib/format-date';
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 
+/** Recipe-units per 1 requested-unit — same semantics as reqPackFactor on the
+ *  requisitions screen and the SQL CASE in party-events/pnl: × pack_size only
+ *  when the line was requested (ri.unit) in the material's PURCHASE unit
+ *  (e.g. 1 BTL = 750 ml). Legacy rows with a blank ri.unit stay ×1.
+ *  average_price is ₹/RECIPE-unit, so every line cost here must be
+ *  qty × reqPackFactor × average_price — qty × average_price alone undervalues
+ *  purchase-unit lines by the pack size. */
+function reqPackFactor(it: any): number {
+  const pack = Number(it.material_pack_size) || 1;
+  const u = String(it.unit || '').trim();
+  return (u !== '' && it.material_purchase_unit && u === it.material_purchase_unit &&
+          u !== it.material_unit && pack > 1) ? pack : 1;
+}
+
 /** Heuristic sanity check for a requisition line — returns a human-readable
  *  warning when the quantity smells like a UNIT mistake (the classic "12 ml of
  *  oil" when the chef meant 12 bottles). Warn-only; the approving chef decides.
@@ -37,19 +51,27 @@ function plausibilityFlag(it: any, guests: number | null | undefined, effQty: nu
   const pack = Number(it.material_pack_size) || 1;
   const pu = String(it.material_purchase_unit || '').trim();
   const price = Number(it.average_price) || 0;
-  const cost = qty * price;
+  // qty is in the REQUESTED unit (ri.unit). packF > 1 means the line was
+  // deliberately requested in the purchase unit (2 BTL, not 2 ml) — so it is
+  // already whole packs, and cost must convert to recipe units first
+  // (average_price is ₹/recipe-unit).
+  const packF = reqPackFactor(it);
+  const cost = qty * packF * price;
 
   // A) Less than ONE purchase pack of a pack-based material (oil sold in 1L
   //    bottles, rice in 30kg bags): "12 ml" < 1,000 ml/BTL almost certainly
   //    means 12 BTL. pack >= 100 keeps kg/kg or pcs materials out of this rule.
-  if (pack >= 100 && qty < pack) {
+  //    Skipped for purchase-unit lines (packF > 1): "2 BTL" is exactly what the
+  //    chef meant — flagging it as "2 ml" would be a false alarm.
+  if (packF === 1 && pack >= 100 && qty < pack) {
     return `Only ${qty.toLocaleString('en-IN')} ${unit} — less than one ${pu || 'pack'} (${pack.toLocaleString('en-IN')} ${unit}). Did the chef mean ${qty.toLocaleString('en-IN')} ${pu || 'packs'}?`;
   }
   // B) Absurdly small for the crowd AND nearly free: under 0.5 g/ml per guest
   //    with line cost < ₹50. The cost floor keeps genuinely tiny-but-expensive
-  //    items (saffron) from being flagged.
-  if (guests && guests > 0 && (unit === 'g' || unit === 'ml') && qty / guests < 0.5 && cost < 50) {
-    return `${qty.toLocaleString('en-IN')} ${unit} ≈ ${(qty / guests).toFixed(2)} ${unit}/guest for ${guests} guests (≈${fmt(cost)}) — check the unit.`;
+  //    items (saffron) from being flagged. Compare in RECIPE units (qty × packF).
+  const recipeQty = qty * packF;
+  if (guests && guests > 0 && (unit === 'g' || unit === 'ml') && recipeQty / guests < 0.5 && cost < 50) {
+    return `${recipeQty.toLocaleString('en-IN')} ${unit} ≈ ${(recipeQty / guests).toFixed(2)} ${unit}/guest for ${guests} guests (≈${fmt(cost)}) — check the unit.`;
   }
   return null;
 }
@@ -624,6 +646,10 @@ export default function PartyApprovalsPage() {
                                       <tbody>
                                         {detail.items.map((it: any) => {
                                           const price = it.average_price || 0;
+                                          // Pack factor for cost math: qty is in the REQUESTED unit
+                                          // (ri.unit, possibly the purchase unit) while average_price
+                                          // is ₹/recipe-unit. See reqPackFactor above.
+                                          const packF = reqPackFactor(it);
                                           // Effective qty: chef's approved value if set, else what was requested
                                           const reqQty = Number(it.quantity_requested) || 0;
                                           const serverQty = it.chef_approved_qty != null ? Number(it.chef_approved_qty) : reqQty;
@@ -637,7 +663,7 @@ export default function PartyApprovalsPage() {
                                             : serverQty;
                                           const effQty = liveQty;
                                           const rejected = !!it.is_rejected;
-                                          const lineCost = rejected ? 0 : effQty * price;
+                                          const lineCost = rejected ? 0 : effQty * packF * price;
                                           const isSaving = savingItemId === it.id;
                                           // Plausibility check against the LIVE qty — editing the
                                           // number to a sane value clears the flag immediately.
@@ -657,7 +683,8 @@ export default function PartyApprovalsPage() {
                                                 )}
                                               </td>
                                               <td className="py-0.5 text-right font-mono text-[#8B7355]">
-                                                {reqQty} <span className="text-[9px]">{it.material_unit || ''}</span>
+                                                {/* Label with the unit the line was REQUESTED in (ri.unit), falling back to the recipe unit — matches reqUnit() on /requisitions */}
+                                                {reqQty} <span className="text-[9px]">{String(it.unit || '').trim() || it.material_unit || ''}</span>
                                               </td>
                                               <td className="py-0.5 text-right">
                                                 {editable && !rejected ? (
@@ -680,7 +707,7 @@ export default function PartyApprovalsPage() {
                                                          title={effQty !== reqQty ? `Chef adjusted from ${reqQty} → ${effQty}` : 'Click / spin / type to edit; tab/enter/blur to save'} />
                                                 ) : (
                                                   <span className={`font-mono ${effQty !== reqQty ? 'text-amber-700 font-semibold' : 'text-[#2D1B0E]'}`}>
-                                                    {effQty} <span className="text-[9px] text-[#8B7355]">{it.material_unit || ''}</span>
+                                                    {effQty} <span className="text-[9px] text-[#8B7355]">{String(it.unit || '').trim() || it.material_unit || ''}</span>
                                                   </span>
                                                 )}
                                               </td>
@@ -698,7 +725,8 @@ export default function PartyApprovalsPage() {
                                                   <span className="text-[#6B5744] italic">{it.chef_note || it.notes || ''}</span>
                                                 )}
                                               </td>
-                                              <td className="py-0.5 text-right font-mono text-[#6B5744]">{fmt(price)}</td>
+                                              {/* ₹ per REQUESTED unit (price × pack factor) so qty × ₹/unit = line cost */}
+                                              <td className="py-0.5 text-right font-mono text-[#6B5744]">{fmt(price * packF)}</td>
                                               <td className="py-0.5 text-right font-mono font-medium">{rejected ? '—' : fmt(lineCost)}</td>
                                               {editable && (
                                                 <td className="py-0.5 text-center">
@@ -718,7 +746,8 @@ export default function PartyApprovalsPage() {
                                             {fmt(detail.items.reduce((s: number, it: any) => {
                                               if (it.is_rejected) return s;
                                               const q = it.chef_approved_qty != null ? Number(it.chef_approved_qty) : Number(it.quantity_requested);
-                                              return s + (q || 0) * (it.average_price || 0);
+                                              // Same pack-factor conversion as the per-line cost above.
+                                              return s + (q || 0) * reqPackFactor(it) * (it.average_price || 0);
                                             }, 0))}
                                           </td>
                                           {editable && <td></td>}
@@ -780,7 +809,11 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
   onSaved: (approved: boolean) => void;
 }) {
   const [req, setReq] = useState<any>(null);
-  const [items, setItems] = useState<{ id?: string; material_id: string; qty: string; notes: string }[]>([]);
+  // Each line carries its saved `unit` (e.g. 'BTL') and per-line `department_id`
+  // through the edit UNCHANGED — the PUT replaces ALL items, so omitting either
+  // field silently blanked ri.unit (flipping purchase-unit lines like "2 BTL"
+  // into ×1 recipe-unit costing) and flattened per-line departments.
+  const [items, setItems] = useState<{ id?: string; material_id: string; qty: string; unit: string; notes: string; department_id?: string }[]>([]);
   const [materials, setMaterials] = useState<any[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -793,20 +826,32 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
         id: it.id,
         material_id: it.material_id,
         qty: String(it.quantity_requested),
+        unit: it.unit || '',
         notes: it.notes || '',
+        department_id: it.department_id || undefined,
       })));
     });
     fetch('/api/inventory').then(r => r.json()).then(d => setMaterials(d.materials || d || []));
   }, [reqId]);
 
-  const addLine = () => setItems(p => [...p, { material_id: '', qty: '', notes: '' }]);
+  const addLine = () => setItems(p => [...p, { material_id: '', qty: '', unit: '', notes: '' }]);
   const removeLine = (i: number) => setItems(p => p.filter((_, idx) => idx !== i));
   const update = (i: number, patch: any) => setItems(p => p.map((it, idx) => idx === i ? { ...it, ...patch } : it));
+
+  /** Recipe-units per 1 of the unit the LINE was requested in — ×pack only when
+   *  that unit is the material's PURCHASE unit (same rule as reqPackFactor above
+   *  and the estimated_value SQL). average_price is ₹/recipe-unit, so line cost
+   *  must be qty × factor × average_price. */
+  const lineFactor = (m: any, lineUnit: string): number => {
+    const pack = Number(m?.pack_size) || 1;
+    const u = String(lineUnit || '').trim();
+    return (u !== '' && m?.purchase_unit && u === m.purchase_unit && u !== m.unit && pack > 1) ? pack : 1;
+  };
 
   const totalCost = items.reduce((acc, it) => {
     const m = materials.find(x => x.id === it.material_id);
     const q = Number(it.qty) || 0;
-    return acc + q * (m?.average_price || 0);
+    return acc + q * lineFactor(m, it.unit) * (m?.average_price || 0);
   }, 0);
 
   const persist = async (alsoApprove: boolean) => {
@@ -814,7 +859,16 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
     try {
       const cleaned = items
         .filter(it => it.material_id && Number(it.qty) > 0)
-        .map(it => ({ material_id: it.material_id, quantity_requested: Number(it.qty), notes: it.notes }));
+        .map(it => ({
+          material_id: it.material_id,
+          quantity_requested: Number(it.qty),
+          // Carry the line's unit through unchanged (BTL stays BTL) — the PUT
+          // replaces every item row, so a missing unit would be persisted as ''.
+          unit: it.unit || '',
+          notes: it.notes,
+          // Preserve per-line department (party reqs are multi-dept).
+          department_id: it.department_id,
+        }));
       if (cleaned.length === 0) { setError('At least one item with qty > 0 required'); return; }
 
       const putRes = await api('/api/requisitions', { method: 'PUT', body: { id: reqId, items: cleaned } });
@@ -867,21 +921,27 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
           </div>
           {items.map((it, i) => {
             const m = materials.find(x => x.id === it.material_id);
-            const lineCost = m && Number(it.qty) > 0 ? Number(it.qty) * (m.average_price || 0) : 0;
+            const lineCost = m && Number(it.qty) > 0 ? Number(it.qty) * lineFactor(m, it.unit) * (m.average_price || 0) : 0;
             return (
               <div key={i} className="grid grid-cols-12 gap-2 items-start">
                 <div className="col-span-5">
                   <MaterialTypeahead
                     materials={materials as any}
                     value={it.material_id}
-                    onPick={(id: string) => update(i, { material_id: id })}
+                    onPick={(id: string) => {
+                      // New / swapped material → house convention: request in the
+                      // PURCHASE unit (1 BTL = pack recipe units). Existing lines
+                      // keep their saved unit until the material itself changes.
+                      const nm = materials.find(x => x.id === id);
+                      update(i, { material_id: id, unit: nm?.purchase_unit || nm?.unit || '' });
+                    }}
                     excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                   />
                 </div>
                 <input type="number" step="any" value={it.qty}
                        onChange={e => update(i, { qty: e.target.value })}
                        className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
-                <span className="col-span-1 text-xs text-[#8B7355] py-2">{m?.unit || ''}</span>
+                <span className="col-span-1 text-xs text-[#8B7355] py-2" title="Unit this line was requested in">{it.unit || m?.unit || ''}</span>
                 <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
                        placeholder="Notes"
                        className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs" />

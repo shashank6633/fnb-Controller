@@ -411,6 +411,17 @@ export async function PUT(request: Request) {
       );
 
       if (Array.isArray(items)) {
+        // Items are replaced wholesale (delete + reinsert), so snapshot each
+        // existing line's unit / department first, keyed by material. A client
+        // that resends only {material_id, qty, notes} must NOT silently blank
+        // ri.unit — that flipped purchase-unit lines ("2 BTL") into ×1
+        // recipe-unit costing on every edit. Preserve the prior unit (and
+        // per-line dept) whenever the incoming line omits them.
+        const prevRows = db.prepare(
+          'SELECT material_id, unit, department_id FROM requisition_items WHERE req_id = ?'
+        ).all(id) as { material_id: string; unit: string | null; department_id: string | null }[];
+        const prevByMat = new Map(prevRows.map(p => [p.material_id, p]));
+
         db.prepare('DELETE FROM requisition_items WHERE req_id = ?').run(id);
         const ins = db.prepare(`
           INSERT INTO requisition_items (id, req_id, material_id, quantity_requested, unit, notes, department_id)
@@ -419,10 +430,13 @@ export async function PUT(request: Request) {
         for (const it of items) {
           const qty = Number(it.quantity_requested) || 0;
           if (!it.material_id || qty <= 0) continue;
-          // Fall back to req-level dept if line omits it
-          const deptId = it.department_id || r.department_id;
-          ins.run(generateId(), id, it.material_id, qty,
-                  (it.unit || '').toString(), it.notes || '', deptId);
+          const prev = prevByMat.get(it.material_id);
+          const unit = (it.unit != null && String(it.unit).trim() !== '')
+            ? String(it.unit)
+            : (prev?.unit || '');
+          // Line dept: explicit from client → prior line dept → req-level dept.
+          const deptId = it.department_id || prev?.department_id || r.department_id;
+          ins.run(generateId(), id, it.material_id, qty, unit, it.notes || '', deptId);
         }
       }
     });
