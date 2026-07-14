@@ -23,11 +23,14 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Wine, Plus, Search, X, Loader2, AlertCircle, AlertTriangle, CheckCircle2,
   SlidersHorizontal, ScrollText, Boxes, Warehouse, ClipboardCheck, BarChart3,
-  Download, History, Save,
+  Download, History, Save, ReceiptText, ArrowRightLeft, Trash2,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import TabScroller from '@/components/TabScroller';
 import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead';
+import {
+  packFactor, caseFactor, entryMode, tripleToRecipe, fmtBreakdown, PackMeta,
+} from '@/lib/pack-units';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -36,33 +39,126 @@ interface Access { can_view: boolean; can_procure: boolean; can_adjust: boolean;
 interface StockRow {
   material_id: string; material_name: string; category: string; unit: string;
   qty: number; avg_cost: number; value: number;
-  sku: string; purchase_unit: string; pack_size: number; reorder_level: number;
+  sku: string; purchase_unit: string; pack_size: number; case_size: number;
+  reorder_level: number;
+  central_stock: number; average_price: number; has_ledger: boolean;
 }
 interface MatRow {
   id: string; name: string; sku: string; category: string; unit: string;
-  purchase_unit: string; pack_size: number; reorder_level: number; average_price: number;
+  purchase_unit: string; pack_size: number; case_size: number;
+  reorder_level: number; average_price: number;
 }
 interface LedgerRow {
   id: string; txn_type: string; quantity: number; unit_cost: number;
   batch_no: string; supplier: string; vendor_id: string; expiry_date: string;
   ref: string; notes: string; created_by: string; created_at: string;
   material_name: string; unit: string; purchase_unit: string; pack_size: number;
+  case_size: number;
 }
 interface VendorLite { id: string; name: string; }
+/** Ledger render item: a plain row, or a bill-subtotal marker after a group
+ *  of consecutive 'purchase' rows sharing one non-empty invoice ref. */
+type LedgerItem =
+  | { kind: 'row'; row: LedgerRow }
+  | { kind: 'bill'; ref: string; count: number; total: number; supplier: string };
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
-const packConv = (m: { unit?: string; purchase_unit?: string; pack_size?: number }) => {
-  const ps = Number(m.pack_size) || 1;
-  const ru = String(m.unit || '').toLowerCase().trim();
-  const pu = String(m.purchase_unit || m.unit || '').toLowerCase().trim();
-  return ps > 1 && ru !== pu ? ps : 1;
-};
+const packConv = packFactor;   // recipe units per bottle (1 = no conversion)
 const fq = (v: number, dp = 2) =>
   Number((Number(v) || 0).toFixed(dp)).toLocaleString('en-IN');
 const inr = (v: number, dp = 2) =>
   '₹' + (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: dp });
 const today = () => new Date().toISOString().slice(0, 10);
+const numOr0 = (s?: string) => {
+  const n = Number(s);
+  return s != null && s !== '' && Number.isFinite(n) ? n : 0;
+};
+
+/* One quantity: '2 cs + 9 btl + 450 ml' (bold) with '· 25,200 ml' alongside.
+   Plain-unit materials (pack_size ≤ 1) render exactly as before. */
+function DualQty({ qty, m, boldCls, sign }: {
+  qty: number; m: PackMeta; boldCls: string; sign?: boolean;
+}) {
+  const dual = fmtBreakdown(qty, m);
+  const ru = String(m.unit || '');
+  if (!dual) {
+    return <span className={boldCls}>{sign && qty > 0 ? '+' : ''}{fq(qty)} {ru}</span>;
+  }
+  return (
+    <>
+      <span className={boldCls}>{sign && qty >= 0 ? '+' : ''}{dual}</span>
+      <span className="text-[11px] text-[#8B7355] font-normal"> · {fq(qty)} {ru}</span>
+    </>
+  );
+}
+
+/* ── Cases + Bottles + loose triple entry (bar counting convention) ──────
+   Degrades with the material: case_size ≤ 1 → Bottles + loose only;
+   pack_size ≤ 1 → a single plain recipe-unit input (unchanged behaviour).
+   Values live as raw strings (blank = 0); shows the live conversion line
+   '2 cs + 9 btl + 450 ml = 25,200 ml'. */
+
+interface CBLValue { cases: string; bottles: string; loose: string; }
+const CBL_EMPTY: CBLValue = { cases: '', bottles: '', loose: '' };
+const cblRecipe = (m: PackMeta | null, v: CBLValue) =>
+  m ? tripleToRecipe(numOr0(v.cases), numOr0(v.bottles), numOr0(v.loose), m) : numOr0(v.bottles);
+
+function CBLEntry({ mat, value, onChange }: {
+  mat: PackMeta | null; value: CBLValue; onChange: (v: CBLValue) => void;
+}) {
+  const mode = mat ? entryMode(mat) : 'plain';
+  const bu = String(mat?.purchase_unit || mat?.unit || 'units');
+  const ru = String(mat?.unit || 'units');
+  const recipe = cblRecipe(mat, value);
+  const touched = value.cases !== '' || value.bottles !== '' || value.loose !== '';
+  const box = 'w-full px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]';
+  if (mode === 'plain') {
+    return (
+      <div>
+        <L>Qty ({ru})</L>
+        <input type="number" min={0} step="any" inputMode="decimal" value={value.bottles}
+               onChange={e => onChange({ ...value, bottles: e.target.value })}
+               placeholder="e.g. 2" className={box} />
+      </div>
+    );
+  }
+  return (
+    <div>
+      <div className={`grid gap-2 ${mode === 'cbl' ? 'grid-cols-3' : 'grid-cols-2'}`}>
+        {mode === 'cbl' && (
+          <div>
+            <L>Cases</L>
+            <input type="number" min={0} step="any" inputMode="decimal" value={value.cases}
+                   onChange={e => onChange({ ...value, cases: e.target.value })}
+                   placeholder="0" className={box}
+                   title={mat ? `1 case = ${fq(caseFactor(mat))} ${bu}` : undefined} />
+          </div>
+        )}
+        <div>
+          <L>{bu}</L>
+          <input type="number" min={0} step="any" inputMode="decimal" value={value.bottles}
+                 onChange={e => onChange({ ...value, bottles: e.target.value })}
+                 placeholder="0" className={box}
+                 title={mat ? `1 ${bu} = ${fq(packFactor(mat))} ${ru}` : undefined} />
+        </div>
+        <div>
+          <L>Loose ({ru})</L>
+          <input type="number" min={0} step="any" inputMode="decimal" value={value.loose}
+                 onChange={e => onChange({ ...value, loose: e.target.value })}
+                 placeholder="0" className={box} />
+        </div>
+      </div>
+      {mat && touched && (
+        <div className="mt-1 text-[11px] text-[#6B5744] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-2 py-1">
+          {mode === 'cbl' ? `${numOr0(value.cases)} cs + ` : ''}
+          {`${numOr0(value.bottles)} ${bu.toLowerCase()} + ${numOr0(value.loose)} ${ru}`}
+          {' = '}<b>{fq(recipe)} {ru}</b>
+        </div>
+      )}
+    </div>
+  );
+}
 
 const TXN_TYPES = ['purchase', 'opening', 'adjustment', 'inward', 'outward', 'closing', 'transfer'];
 const TXN_BADGE: Record<string, string> = {
@@ -112,6 +208,9 @@ export default function LiquorStorePage() {
   // Modals
   const [showPurchase, setShowPurchase] = useState(false);
   const [showAdjust, setShowAdjust] = useState(false);
+  const [showBill, setShowBill] = useState(false);
+  // Migration modal target: material_ids to preview, or 'all'
+  const [migrateTarget, setMigrateTarget] = useState<string[] | 'all' | null>(null);
 
   const access: Access = accessByStore[storeId] ||
     { can_view: false, can_procure: false, can_adjust: false, can_close_stock: false };
@@ -216,7 +315,49 @@ export default function LiquorStorePage() {
     value: filtered.reduce((s, r) => s + (Number(r.value) || 0), 0),
     low: filtered.filter(r => r.reorder_level > 0 && r.qty < r.reorder_level).length,
   }), [filtered]);
-  const hasHistory = useMemo(() => new Set(stock.map(r => r.material_id)), [stock]);
+  // Stock now lists EVERY mapped material (zero-ledger rows included at qty 0)
+  // — "has history" must come from the has_ledger flag, not mere presence.
+  const hasHistory = useMemo(
+    () => new Set(stock.filter(r => r.has_ledger).map(r => r.material_id)),
+    [stock],
+  );
+  const isAdmin = meRole === 'admin';
+  // Central-migration candidates: mapped, central stock > 0, no store history.
+  const migratable = useMemo(
+    () => stock.filter(r => (Number(r.central_stock) || 0) > 0 && !r.has_ledger),
+    [stock],
+  );
+  const migrateBlocked = useMemo(
+    () => stock.filter(r => (Number(r.central_stock) || 0) > 0 && r.has_ledger),
+    [stock],
+  );
+
+  /* Ledger + bill subtotals: bulk-bill lines share ref + created_at, so they
+     sit consecutively (newest first). A group of >1 purchase rows with the
+     same non-empty ref gets a subtotal marker appended. */
+  const ledgerItems = useMemo<LedgerItem[]>(() => {
+    const out: LedgerItem[] = [];
+    let i = 0;
+    while (i < ledger.length) {
+      const l = ledger[i];
+      const ref = l.txn_type === 'purchase' ? String(l.ref || '').trim() : '';
+      let j = i;
+      while (j < ledger.length && ref !== '' &&
+             ledger[j].txn_type === 'purchase' && String(ledger[j].ref || '').trim() === ref) j++;
+      if (j === i) j = i + 1;
+      const group = ledger.slice(i, j);
+      for (const g of group) out.push({ kind: 'row', row: g });
+      if (ref !== '' && group.length > 1) {
+        out.push({
+          kind: 'bill', ref, count: group.length,
+          total: Math.round(group.reduce((s, g) => s + (Number(g.quantity) || 0) * (Number(g.unit_cost) || 0), 0) * 100) / 100,
+          supplier: group[0].supplier || '',
+        });
+      }
+      i = j;
+    }
+    return out;
+  }, [ledger]);
 
   /* ── Render ── */
 
@@ -291,8 +432,14 @@ export default function LiquorStorePage() {
         )}
         {access.can_procure && (
           <button onClick={() => setShowPurchase(true)}
-                  className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5">
+                  className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5">
             <Plus className="w-4 h-4" /> New Purchase
+          </button>
+        )}
+        {access.can_procure && (
+          <button onClick={() => setShowBill(true)}
+                  className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5">
+            <ReceiptText className="w-4 h-4" /> New Bill
           </button>
         )}
       </div>
@@ -373,6 +520,12 @@ export default function LiquorStorePage() {
                 <AlertTriangle className="w-3.5 h-3.5" /> {totals.low} low stock
               </span>
             )}
+            {isAdmin && migratable.length > 0 && (
+              <button onClick={() => setMigrateTarget('all')}
+                      className="ml-auto px-2.5 py-1 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-xs font-medium flex items-center gap-1.5">
+                <ArrowRightLeft className="w-3.5 h-3.5" /> Migrate all central stock ({migratable.length})
+              </button>
+            )}
           </div>
 
           {/* Stock list */}
@@ -403,6 +556,7 @@ export default function LiquorStorePage() {
                       {filtered.map(r => {
                         const pc = packConv(r);
                         const low = r.reorder_level > 0 && r.qty < r.reorder_level;
+                        const central = Number(r.central_stock) || 0;
                         return (
                           <tr key={r.material_id} className="hover:bg-[#FFF8F0]">
                             <td className="px-3 py-2">
@@ -411,18 +565,22 @@ export default function LiquorStorePage() {
                             </td>
                             <td className="px-3 py-2 text-[#6B5744] text-xs">{r.category}</td>
                             <td className="px-3 py-2 text-right whitespace-nowrap">
-                              {pc > 1 ? (
-                                <>
-                                  <span className={`font-semibold ${low ? 'text-red-700' : 'text-[#2D1B0E]'}`}>{fq(r.qty / pc)} {r.purchase_unit}</span>
-                                  <span className="text-[11px] text-[#8B7355]"> · {fq(r.qty)} {r.unit}</span>
-                                </>
-                              ) : (
-                                <span className={`font-semibold ${low ? 'text-red-700' : 'text-[#2D1B0E]'}`}>{fq(r.qty)} {r.unit}</span>
-                              )}
+                              <DualQty qty={r.qty} m={r} boldCls={`font-semibold ${low ? 'text-red-700' : 'text-[#2D1B0E]'}`} />
                               {low && (
                                 <span className="ml-1.5 inline-flex items-center gap-0.5 text-[10px] text-red-700 bg-red-50 border border-red-200 rounded-full px-1.5 py-px align-middle">
                                   <AlertTriangle className="w-3 h-3" /> low
                                 </span>
+                              )}
+                              {central > 0 && (
+                                <div className="text-[10px] text-[#8B7355] mt-0.5">
+                                  In central: {fmtBreakdown(central, r) || `${fq(central)} ${r.unit}`}
+                                  {isAdmin && !r.has_ledger && (
+                                    <button onClick={() => setMigrateTarget([r.material_id])}
+                                            className="ml-1.5 px-1.5 py-px border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded text-[10px] font-medium align-middle">
+                                      Migrate
+                                    </button>
+                                  )}
+                                </div>
                               )}
                             </td>
                             <td className="px-3 py-2 text-right whitespace-nowrap text-[#6B5744]">
@@ -441,8 +599,8 @@ export default function LiquorStorePage() {
               {/* Mobile cards */}
               <div className="md:hidden space-y-2">
                 {filtered.map(r => {
-                  const pc = packConv(r);
                   const low = r.reorder_level > 0 && r.qty < r.reorder_level;
+                  const central = Number(r.central_stock) || 0;
                   return (
                     <div key={r.material_id} className="bg-white border border-[#E8D5C4] rounded-xl p-3">
                       <div className="flex items-start justify-between gap-2">
@@ -458,14 +616,22 @@ export default function LiquorStorePage() {
                       </div>
                       <div className="mt-2 flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs text-[#6B5744]">
                         <span>
-                          <b className={low ? 'text-red-700' : 'text-[#2D1B0E]'}>
-                            {pc > 1 ? `${fq(r.qty / pc)} ${r.purchase_unit}` : `${fq(r.qty)} ${r.unit}`}
-                          </b>
-                          {pc > 1 && <span className="text-[10px]"> ({fq(r.qty)} {r.unit})</span>}
+                          <DualQty qty={r.qty} m={r} boldCls={`font-bold ${low ? 'text-red-700' : 'text-[#2D1B0E]'}`} />
                         </span>
                         <span>{inr(r.avg_cost, 4)}/{r.unit}</span>
                         <span className="ml-auto font-semibold text-[#2D1B0E]">{inr(r.value)}</span>
                       </div>
+                      {central > 0 && (
+                        <div className="mt-1.5 flex items-center gap-2 text-[10px] text-[#8B7355]">
+                          <span>In central: {fmtBreakdown(central, r) || `${fq(central)} ${r.unit}`}</span>
+                          {isAdmin && !r.has_ledger && (
+                            <button onClick={() => setMigrateTarget([r.material_id])}
+                                    className="px-1.5 py-px border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded text-[10px] font-medium">
+                              Migrate
+                            </button>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -539,8 +705,20 @@ export default function LiquorStorePage() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#F0E4D6]">
-                      {ledger.map(l => {
-                        const pc = packConv(l);
+                      {ledgerItems.map((item, idx) => {
+                        if (item.kind === 'bill') {
+                          return (
+                            <tr key={`bill-${item.ref}-${idx}`} className="bg-[#FFF1E3]/70">
+                              <td colSpan={9} className="px-3 py-1.5 text-[11px] text-[#6B5744]">
+                                <ReceiptText className="w-3.5 h-3.5 inline mr-1 text-[#af4408]" />
+                                Bill <span className="font-mono">{item.ref}</span>
+                                {item.supplier ? ` · ${item.supplier}` : ''} — {item.count} lines,
+                                subtotal <b className="text-[#2D1B0E]">{inr(item.total)}</b>
+                              </td>
+                            </tr>
+                          );
+                        }
+                        const l = item.row;
                         return (
                           <tr key={l.id} className="hover:bg-[#FFF8F0] align-top">
                             <td className="px-3 py-2 whitespace-nowrap text-[#6B5744]">{String(l.created_at).slice(0, 16)}</td>
@@ -551,8 +729,8 @@ export default function LiquorStorePage() {
                             </td>
                             <td className="px-3 py-2 text-[#2D1B0E]">{l.material_name}</td>
                             <td className={`px-3 py-2 text-right whitespace-nowrap font-medium ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`}>
-                              {l.quantity > 0 ? '+' : ''}{fq(l.quantity)} {l.unit}
-                              {pc > 1 && <div className="text-[10px] font-normal text-[#8B7355]">= {fq(l.quantity / pc)} {l.purchase_unit}</div>}
+                              <DualQty qty={l.quantity} m={l} sign
+                                       boldCls={`font-medium ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`} />
                             </td>
                             <td className="px-3 py-2 text-right whitespace-nowrap text-[#6B5744]">
                               {l.unit_cost > 0 ? <>{inr(l.unit_cost, 4)}/{l.unit}</> : '—'}
@@ -578,8 +756,19 @@ export default function LiquorStorePage() {
 
               {/* Mobile cards */}
               <div className="md:hidden space-y-2">
-                {ledger.map(l => {
-                  const pc = packConv(l);
+                {ledgerItems.map((item, idx) => {
+                  if (item.kind === 'bill') {
+                    return (
+                      <div key={`bill-${item.ref}-${idx}`}
+                           className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl px-3 py-2 text-[11px] text-[#6B5744]">
+                        <ReceiptText className="w-3.5 h-3.5 inline mr-1 text-[#af4408]" />
+                        Bill <span className="font-mono">{item.ref}</span>
+                        {item.supplier ? ` · ${item.supplier}` : ''} — {item.count} lines,
+                        subtotal <b className="text-[#2D1B0E]">{inr(item.total)}</b>
+                      </div>
+                    );
+                  }
+                  const l = item.row;
                   return (
                     <div key={l.id} className="bg-white border border-[#E8D5C4] rounded-xl p-3 text-xs">
                       <div className="flex items-center justify-between gap-2">
@@ -590,8 +779,9 @@ export default function LiquorStorePage() {
                       </div>
                       <div className="mt-1.5 text-sm font-medium text-[#2D1B0E] break-words">{l.material_name}</div>
                       <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[#6B5744]">
-                        <span className={`font-semibold ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`}>
-                          {l.quantity > 0 ? '+' : ''}{fq(l.quantity)} {l.unit}{pc > 1 ? ` (= ${fq(l.quantity / pc)} ${l.purchase_unit})` : ''}
+                        <span>
+                          <DualQty qty={l.quantity} m={l} sign
+                                   boldCls={`font-semibold ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`} />
                         </span>
                         {l.unit_cost > 0 && <span>{inr(l.unit_cost, 4)}/{l.unit}</span>}
                       </div>
@@ -628,19 +818,38 @@ export default function LiquorStorePage() {
           onSaved={msg => { setShowAdjust(false); afterWrite(msg); }}
         />
       )}
+      {showBill && store && (
+        <BillModal
+          storeId={store.id} storeName={store.name}
+          materials={materials} suppliers={suppliers} vendors={vendors}
+          onClose={() => setShowBill(false)}
+          onSaved={msg => { setShowBill(false); afterWrite(msg); }}
+        />
+      )}
+      {migrateTarget && store && (
+        <MigrateModal
+          storeId={store.id} storeName={store.name}
+          candidates={migrateTarget === 'all'
+            ? migratable
+            : stock.filter(r => (migrateTarget as string[]).includes(r.material_id))}
+          blockedCount={migrateTarget === 'all' ? migrateBlocked.length : 0}
+          onClose={() => setMigrateTarget(null)}
+          onDone={msg => { setMigrateTarget(null); afterWrite(msg); }}
+        />
+      )}
     </div>
   );
 }
 
 /* ── Shared modal shell (mobile-safe: max-h + internal scroll + sticky footer) */
 
-function ModalShell({ title, icon, onClose, children, footer }: {
+function ModalShell({ title, icon, onClose, children, footer, wide }: {
   title: string; icon: React.ReactNode; onClose: () => void;
-  children: React.ReactNode; footer: React.ReactNode;
+  children: React.ReactNode; footer: React.ReactNode; wide?: boolean;
 }) {
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
-      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-lg shadow-xl flex flex-col overflow-hidden"
+      <div className={`bg-white rounded-xl border border-[#E8D5C4] w-full ${wide ? 'max-w-3xl' : 'max-w-lg'} shadow-xl flex flex-col overflow-hidden`}
            style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
         <div className="px-4 sm:px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
           <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">{icon} {title}</div>
@@ -666,7 +875,7 @@ function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, onCl
   onClose: () => void; onSaved: (msg: string) => void;
 }) {
   const [materialId, setMaterialId] = useState('');
-  const [qty, setQty] = useState('');
+  const [cbl, setCbl] = useState<CBLValue>(CBL_EMPTY);
   const [price, setPrice] = useState('');
   const [date, setDate] = useState(today());
   const [supplier, setSupplier] = useState('');
@@ -681,20 +890,24 @@ function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, onCl
   const mat = materials.find(m => m.id === materialId) || null;
   const pc = mat ? packConv(mat) : 1;
   const pu = mat ? (mat.purchase_unit || mat.unit) : '';
-  const nQty = Number(qty) || 0;
   const nPrice = Number(price) || 0;
+  const recipeQty = cblRecipe(mat, cbl);                       // recipe units
+  const bottleQty = pc > 1 ? recipeQty / pc : recipeQty;       // purchase units (₹ total)
+  const totalCost = bottleQty * nPrice;
 
   const save = async () => {
     setErr(null);
     if (!materialId) { setErr('Pick a material'); return; }
-    if (!(nQty > 0)) { setErr('Enter a quantity (purchase units)'); return; }
-    if (!(nPrice >= 0) || price === '') { setErr('Enter the price per purchase unit'); return; }
+    if (!(recipeQty > 0)) { setErr('Enter a quantity — cases, bottles and/or loose'); return; }
+    if (!(nPrice >= 0) || price === '') { setErr(`Enter the price per ${pu || 'purchase unit'}`); return; }
     setBusy(true);
     try {
       const r = await api(`/api/stores/${storeId}/procure`, {
         method: 'POST',
         body: {
-          material_id: materialId, quantity: nQty, unit_price: nPrice,
+          material_id: materialId,
+          cases: numOr0(cbl.cases), bottles: numOr0(cbl.bottles), loose: numOr0(cbl.loose),
+          unit_price: nPrice,
           supplier: supplier.trim(), vendor_id: vendorId || undefined,
           batch_no: batch.trim(), expiry_date: expiry, invoice_ref: invoiceRef.trim(),
           notes: notes.trim(), date,
@@ -702,7 +915,7 @@ function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, onCl
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      onSaved(`Recorded ${nQty} ${pu} of ${mat?.name} into ${storeName} (${inr(nQty * nPrice)})`);
+      onSaved(`Recorded ${mat ? fmtBreakdown(recipeQty, mat) || `${fq(recipeQty)} ${mat.unit}` : ''} of ${mat?.name} into ${storeName} (${inr(j.total ?? totalCost)})`);
     } catch (e: any) { setErr(e.message); }
     finally { setBusy(false); }
   };
@@ -715,7 +928,7 @@ function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, onCl
         <button onClick={save} disabled={busy || !materialId}
                 className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
           {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-          Save purchase{nQty > 0 && nPrice > 0 ? ` — ${inr(nQty * nPrice)}` : ''}
+          Save purchase{recipeQty > 0 && nPrice > 0 ? ` — ${inr(totalCost)}` : ''}
         </button>
       </>}>
       <p className="text-[11px] text-[#8B7355] -mt-1">
@@ -726,27 +939,21 @@ function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, onCl
       <div>
         <L>Material ({materials.length} mapped to this store)</L>
         <MaterialTypeahead materials={materials as MaterialLite[]} value={materialId}
-                           onPick={setMaterialId} showStock={false} compact={false}
+                           onPick={id => { setMaterialId(id); setCbl(CBL_EMPTY); }} showStock={false} compact={false}
                            placeholder="Type a liquor name, SKU or category…" />
         {mat && pc > 1 && (
           <div className="mt-1 text-[11px] text-[#6B5744] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-2 py-1">
+            {caseFactor(mat) > 1 && `1 case = ${fq(caseFactor(mat))} ${pu} · `}
             {`1 ${pu} = ${fq(mat.pack_size)} ${mat.unit}`}
-            {nQty > 0 && <>{' → adds '}<b>{`${fq(nQty * pc)} ${mat.unit}`}</b>{' to stock'}</>}
           </div>
         )}
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <L>Qty {mat ? `(${pu})` : '(purchase units)'}</L>
-          <input type="number" min={0} step="any" value={qty} onChange={e => setQty(e.target.value)}
-                 placeholder="e.g. 2" className={inputCls} />
-        </div>
-        <div>
-          <L>Price / {mat ? pu : 'purchase unit'} (₹)</L>
-          <input type="number" min={0} step="any" value={price} onChange={e => setPrice(e.target.value)}
-                 placeholder="e.g. 500" className={inputCls} />
-        </div>
+      <CBLEntry mat={mat} value={cbl} onChange={setCbl} />
+      <div>
+        <L>Price / {mat ? pu : 'purchase unit'} (₹)</L>
+        <input type="number" min={0} step="any" value={price} onChange={e => setPrice(e.target.value)}
+               placeholder="e.g. 500" className={inputCls} />
       </div>
 
       <div className="grid grid-cols-2 gap-3">
@@ -806,7 +1013,7 @@ function AdjustModal({ storeId, storeName, materials, hasHistory, onClose, onSav
 }) {
   const [materialId, setMaterialId] = useState('');
   const [sign, setSign] = useState<1 | -1>(1);
-  const [qty, setQty] = useState('');
+  const [cbl, setCbl] = useState<CBLValue>(CBL_EMPTY);
   const [reason, setReason] = useState('');
   const [opening, setOpening] = useState(false);
   const [openPrice, setOpenPrice] = useState('');
@@ -815,9 +1022,8 @@ function AdjustModal({ storeId, storeName, materials, hasHistory, onClose, onSav
 
   const mat = materials.find(m => m.id === materialId) || null;
   const isNew = !!mat && !hasHistory.has(mat.id);
-  const pc = mat ? packConv(mat) : 1;
   const pu = mat ? (mat.purchase_unit || mat.unit) : '';
-  const nQty = Number(qty) || 0;
+  const nQty = cblRecipe(mat, cbl);   // recipe units, unsigned
 
   // Opening is only offered for materials with zero ledger rows.
   useEffect(() => { if (!isNew) setOpening(false); }, [isNew]);
@@ -825,7 +1031,7 @@ function AdjustModal({ storeId, storeName, materials, hasHistory, onClose, onSav
   const save = async () => {
     setErr(null);
     if (!materialId) { setErr('Pick a material'); return; }
-    if (!(nQty > 0)) { setErr('Enter a quantity (recipe units)'); return; }
+    if (!(nQty > 0)) { setErr('Enter a quantity — cases, bottles and/or loose'); return; }
     if (!reason.trim()) { setErr('A reason is required'); return; }
     setBusy(true);
     try {
@@ -862,7 +1068,7 @@ function AdjustModal({ storeId, storeName, materials, hasHistory, onClose, onSav
       <div>
         <L>Material</L>
         <MaterialTypeahead materials={materials as MaterialLite[]} value={materialId}
-                           onPick={setMaterialId} showStock={false} compact={false}
+                           onPick={id => { setMaterialId(id); setCbl(CBL_EMPTY); }} showStock={false} compact={false}
                            placeholder="Type a liquor name, SKU or category…" />
       </div>
 
@@ -893,14 +1099,7 @@ function AdjustModal({ storeId, storeName, materials, hasHistory, onClose, onSav
         </div>
       )}
 
-      <div>
-        <L>Qty {mat ? `(${mat.unit} — recipe units)` : '(recipe units)'}</L>
-        <input type="number" min={0} step="any" value={qty} onChange={e => setQty(e.target.value)}
-               placeholder={mat && pc > 1 ? `e.g. ${fq(mat.pack_size)} = 1 ${pu}` : 'e.g. 750'} className={inputCls} />
-        {mat && pc > 1 && nQty > 0 && (
-          <div className="mt-1 text-[11px] text-[#6B5744]">{`= ${fq(nQty / pc)} ${pu} (${fq(mat.pack_size)} ${mat.unit} per ${pu})`}</div>
-        )}
-      </div>
+      <CBLEntry mat={mat} value={cbl} onChange={setCbl} />
 
       {opening && (
         <div>
@@ -920,6 +1119,291 @@ function AdjustModal({ storeId, storeName, materials, hasHistory, onClose, onSav
   );
 }
 
+/* ── Bulk Bill modal (one invoice, many lines → /procure-bill) ─────────── */
+
+interface BillLine {
+  key: number; material_id: string; cbl: CBLValue;
+  price: string; perCase: boolean; batch: string; expiry: string;
+}
+const newBillLine = (key: number): BillLine =>
+  ({ key, material_id: '', cbl: CBL_EMPTY, price: '', perCase: false, batch: '', expiry: '' });
+
+function BillModal({ storeId, storeName, materials, suppliers, vendors, onClose, onSaved }: {
+  storeId: string; storeName: string;
+  materials: MatRow[]; suppliers: string[]; vendors: VendorLite[];
+  onClose: () => void; onSaved: (msg: string) => void;
+}) {
+  const [supplier, setSupplier] = useState('');
+  const [invoiceRef, setInvoiceRef] = useState('');
+  const [date, setDate] = useState(today());
+  const [vendorId, setVendorId] = useState('');
+  const [lines, setLines] = useState<BillLine[]>([newBillLine(1)]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const matById = useMemo(() => new Map(materials.map(m => [m.id, m])), [materials]);
+  const setLine = (key: number, patch: Partial<BillLine>) =>
+    setLines(ls => ls.map(l => l.key === key ? { ...l, ...patch } : l));
+  const addLine = () => setLines(ls => [...ls, newBillLine(Math.max(0, ...ls.map(l => l.key)) + 1)]);
+  const removeLine = (key: number) => setLines(ls => ls.length > 1 ? ls.filter(l => l.key !== key) : ls);
+
+  /** Line economics: recipe qty + ₹ line total (price ÷ case when perCase). */
+  const lineCalc = (l: BillLine) => {
+    const mat = matById.get(l.material_id) || null;
+    if (!mat) return { mat: null, recipe: 0, total: 0 };
+    const recipe = cblRecipe(mat, l.cbl);
+    const cf = caseFactor(mat), pf = packFactor(mat);
+    const perBottle = l.perCase ? (Number(l.price) || 0) / cf : (Number(l.price) || 0);
+    const perRecipe = pf > 1 ? perBottle / pf : perBottle;
+    return { mat, recipe, total: recipe * perRecipe };
+  };
+  const billTotal = lines.reduce((s, l) => s + lineCalc(l).total, 0);
+  const filledLines = lines.filter(l => l.material_id || l.cbl.cases || l.cbl.bottles || l.cbl.loose || l.price);
+
+  const save = async () => {
+    setErr(null);
+    if (!invoiceRef.trim()) { setErr('Enter the invoice number'); return; }
+    if (!supplier.trim() && !vendorId) { setErr('Enter the supplier'); return; }
+    if (filledLines.length === 0) { setErr('Add at least one bill line'); return; }
+    for (let i = 0; i < filledLines.length; i++) {
+      const l = filledLines[i];
+      const { mat, recipe } = lineCalc(l);
+      if (!mat) { setErr(`Line ${i + 1}: pick a material`); return; }
+      if (!(recipe > 0)) { setErr(`Line ${i + 1} (${mat.name}): enter a quantity`); return; }
+      if (l.price === '' || !(Number(l.price) >= 0)) { setErr(`Line ${i + 1} (${mat.name}): enter the price`); return; }
+    }
+    setBusy(true);
+    try {
+      const r = await api(`/api/stores/${storeId}/procure-bill`, {
+        method: 'POST',
+        body: {
+          supplier: supplier.trim(), invoice_ref: invoiceRef.trim(),
+          vendor_id: vendorId || undefined, date,
+          lines: filledLines.map(l => ({
+            material_id: l.material_id,
+            cases: numOr0(l.cbl.cases), bottles: numOr0(l.cbl.bottles), loose: numOr0(l.cbl.loose),
+            unit_price: Number(l.price) || 0, per_case: l.perCase || undefined,
+            batch_no: l.batch.trim() || undefined, expiry_date: l.expiry || undefined,
+          })),
+        },
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      onSaved(`Bill ${invoiceRef.trim()} saved — ${j.posted} line${j.posted === 1 ? '' : 's'}, ${inr(j.total_value)}`);
+    } catch (e: any) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <ModalShell wide title="New Bill (bulk entry)" icon={<ReceiptText className="w-5 h-5 text-[#af4408]" />} onClose={onClose}
+      footer={<>
+        <span className="mr-auto text-sm text-[#6B5744]">Bill total <b className="text-[#2D1B0E]">{inr(billTotal)}</b></span>
+        <button onClick={onClose} disabled={busy}
+                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Cancel</button>
+        <button onClick={save} disabled={busy}
+                className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+          Save Bill
+        </button>
+      </>}>
+      <p className="text-[11px] text-[#8B7355] -mt-1">
+        One supplier invoice, many items — every line posts to the {storeName} ledger under the
+        same invoice ref, in one save. Central Store stays untouched.
+      </p>
+      {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{err}</div>}
+
+      {/* Bill header */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div>
+          <L>Supplier</L>
+          <input value={supplier} onChange={e => setSupplier(e.target.value)} list="liq-bill-suppliers"
+                 placeholder="Type a supplier…" className={inputCls} />
+          <datalist id="liq-bill-suppliers">
+            {suppliers.map(s => <option key={s} value={s} />)}
+          </datalist>
+        </div>
+        <div>
+          <L>Invoice no.</L>
+          <input value={invoiceRef} onChange={e => setInvoiceRef(e.target.value)} placeholder="INV-…" className={inputCls} />
+        </div>
+        <div>
+          <L>Date</L>
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} className={inputCls} />
+        </div>
+        <div>
+          <L>Vendor (optional)</L>
+          <select value={vendorId} onChange={e => setVendorId(e.target.value)} className={inputCls}>
+            <option value="">—</option>
+            {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* Lines */}
+      <div className="space-y-2">
+        {lines.map((l, i) => {
+          const { mat, recipe, total } = lineCalc(l);
+          const cf = mat ? caseFactor(mat) : 1;
+          return (
+            <div key={l.key} className="border border-[#E8D5C4] rounded-lg p-2.5 space-y-2 bg-[#FFFDF9]">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-semibold text-[#8B7355] shrink-0">#{i + 1}</span>
+                <div className="flex-1 min-w-0">
+                  <MaterialTypeahead materials={materials as MaterialLite[]} value={l.material_id}
+                                     onPick={id => setLine(l.key, { material_id: id, cbl: CBL_EMPTY })}
+                                     showStock={false} compact
+                                     placeholder="Material — name, SKU or category…" />
+                </div>
+                <button onClick={() => removeLine(l.key)} disabled={lines.length === 1}
+                        className="shrink-0 text-[#8B7355] hover:text-red-700 disabled:opacity-30" title="Remove line">
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+              <CBLEntry mat={mat} value={l.cbl} onChange={v => setLine(l.key, { cbl: v })} />
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end">
+                <div>
+                  <L>₹ / {l.perCase ? 'case' : (mat?.purchase_unit || mat?.unit || 'btl')}</L>
+                  <div className="flex gap-1">
+                    <input type="number" min={0} step="any" inputMode="decimal" value={l.price}
+                           onChange={e => setLine(l.key, { price: e.target.value })}
+                           placeholder="0" className={inputCls} />
+                    {cf > 1 && (
+                      <button type="button" onClick={() => setLine(l.key, { perCase: !l.perCase })}
+                              title="Toggle price per bottle / per case"
+                              className={`shrink-0 px-1.5 rounded border text-[10px] font-medium ${l.perCase
+                                ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
+                        /cs
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <L>Batch no.</L>
+                  <input value={l.batch} onChange={e => setLine(l.key, { batch: e.target.value })}
+                         placeholder="optional" className={inputCls} />
+                </div>
+                <div>
+                  <L>Expiry</L>
+                  <input type="date" value={l.expiry} onChange={e => setLine(l.key, { expiry: e.target.value })} className={inputCls} />
+                </div>
+                <div className="text-right">
+                  <L>Line total</L>
+                  <div className="px-2 py-1.5 text-sm font-semibold text-[#2D1B0E]">
+                    {recipe > 0 && l.price !== '' ? inr(total) : '—'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        <button onClick={addLine}
+                className="w-full px-3 py-2 border border-dashed border-[#D4B896] hover:border-[#af4408] hover:text-[#af4408] text-[#6B5744] rounded-lg text-sm font-medium flex items-center justify-center gap-1.5">
+          <Plus className="w-4 h-4" /> Add line
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
+/* ── Central-stock migration modal (admin) ─────────────────────────────── */
+
+function MigrateModal({ storeId, storeName, candidates, blockedCount, onClose, onDone }: {
+  storeId: string; storeName: string;
+  candidates: StockRow[]; blockedCount: number;
+  onClose: () => void; onDone: (msg: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // Preview: central qty at central average_price (exactly what the API posts).
+  const eligible = candidates.filter(r => (Number(r.central_stock) || 0) > 0 && !r.has_ledger);
+  const ineligible = candidates.filter(r => !((Number(r.central_stock) || 0) > 0) || r.has_ledger);
+  const totalValue = eligible.reduce(
+    (s, r) => s + (Number(r.central_stock) || 0) * (Number(r.average_price) || 0), 0);
+
+  const run = async () => {
+    setErr(null); setBusy(true);
+    try {
+      const r = await api(`/api/stores/${storeId}/migrate`, {
+        method: 'POST',
+        body: { material_ids: eligible.map(m => m.material_id) },
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      const skippedNote = (j.skipped || []).length ? ` · ${(j.skipped || []).length} skipped` : '';
+      onDone(`Migrated ${(j.migrated || []).length} material${(j.migrated || []).length === 1 ? '' : 's'} (${inr(j.total_value)}) from Central Store into ${storeName}${skippedNote}`);
+    } catch (e: any) { setErr(e.message); setBusy(false); }
+  };
+
+  return (
+    <ModalShell title="Migrate central stock" icon={<ArrowRightLeft className="w-5 h-5 text-[#af4408]" />} onClose={onClose}
+      footer={<>
+        <button onClick={onClose} disabled={busy}
+                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Cancel</button>
+        <button onClick={run} disabled={busy || eligible.length === 0}
+                className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowRightLeft className="w-4 h-4" />}
+          Migrate {eligible.length} material{eligible.length === 1 ? '' : 's'} — {inr(totalValue)}
+        </button>
+      </>}>
+      <p className="text-[11px] text-[#8B7355] -mt-1">
+        Moves each material&apos;s CENTRAL stock into the {storeName} ledger as its <b>opening</b> row
+        (valued at central average price), then zeroes the central stock with an audit-trail
+        adjustment. Materials that already have {storeName} history are skipped.
+      </p>
+      {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{err}</div>}
+
+      {eligible.length === 0 ? (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-900">
+          Nothing to migrate — no central stock on materials without store history.
+        </div>
+      ) : (
+        <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
+          <div className="overflow-x-auto max-h-72 overflow-y-auto">
+            <table className="w-full text-xs">
+              <thead className="bg-[#FFF1E3] text-[#8B7355] sticky top-0">
+                <tr>
+                  <th className="text-left px-3 py-2 font-medium">Material</th>
+                  <th className="text-right px-3 py-2 font-medium">Central stock</th>
+                  <th className="text-right px-3 py-2 font-medium">Value</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#F0E4D6]">
+                {eligible.map(r => (
+                  <tr key={r.material_id}>
+                    <td className="px-3 py-1.5 text-[#2D1B0E]">{r.material_name}</td>
+                    <td className="px-3 py-1.5 text-right whitespace-nowrap font-mono text-[#6B5744]">
+                      {fmtBreakdown(r.central_stock, r) || `${fq(r.central_stock)} ${r.unit}`}
+                      <span className="text-[10px]"> · {fq(r.central_stock)} {r.unit}</span>
+                    </td>
+                    <td className="px-3 py-1.5 text-right whitespace-nowrap font-medium text-[#2D1B0E]">
+                      {inr((Number(r.central_stock) || 0) * (Number(r.average_price) || 0))}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot className="bg-[#FFF1E3]">
+                <tr>
+                  <td className="px-3 py-2 font-semibold text-[#2D1B0E]">{eligible.length} material{eligible.length === 1 ? '' : 's'}</td>
+                  <td></td>
+                  <td className="px-3 py-2 text-right font-semibold text-[#2D1B0E]">{inr(totalValue)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {(ineligible.length > 0 || blockedCount > 0) && (
+        <div className="text-[11px] text-[#8B7355]">
+          {ineligible.length > 0 && <>⚠️ {ineligible.length} selected material{ineligible.length === 1 ? '' : 's'} will be skipped (no central stock or already has store history). </>}
+          {blockedCount > 0 && <>{blockedCount} material{blockedCount === 1 ? '' : 's'} with central stock also have store history — resolve those manually via Adjustment.</>}
+        </div>
+      )}
+    </ModalShell>
+  );
+}
+
 /* ── Closing Stock section (Phase C — independent store closing counts) ──
    Counts are a pure REGISTER (store_closing_counts) — saving never moves
    stock. Admin-only "adjust to physical" additionally posts 'adjustment'
@@ -929,6 +1413,7 @@ interface ClosingCount {
   material_id: string; date: string; system_qty: number; physical_qty: number;
   variance: number; variance_value: number; counted_by: string; note: string;
   material_name: string; unit: string; purchase_unit: string; pack_size: number;
+  case_size: number;
 }
 interface ClosingDay {
   date: string; item_count: number; shortage_count: number; excess_count: number;
@@ -944,6 +1429,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   const [counts, setCounts] = useState<ClosingCount[]>([]);
   const [systemAsof, setSystemAsof] = useState<Record<string, number>>({});
   const [dayLoading, setDayLoading] = useState(false);
+  const [cases, setCases] = useState<Record<string, string>>({});   // full cases (case_size × BTL)
   const [whole, setWhole] = useState<Record<string, string>>({});   // purchase units (BTL)
   const [loose, setLoose] = useState<Record<string, string>>({});   // recipe units (ml)
   const [note, setNote] = useState('');
@@ -980,7 +1466,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
     finally { setHistLoading(false); }
   }, [storeId]);
 
-  useEffect(() => { loadDay(date); setWhole({}); setLoose({}); }, [date, loadDay]);
+  useEffect(() => { loadDay(date); setCases({}); setWhole({}); setLoose({}); }, [date, loadDay]);
   useEffect(() => { if (view === 'history') { loadHistory(); setHistDate(''); } }, [view, loadHistory]);
 
   const countedBy = useMemo(() => {
@@ -989,13 +1475,15 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
     return m;
   }, [counts]);
 
-  // Physical qty in RECIPE units from the dual entry (null = untouched row).
+  // Physical qty in RECIPE units from the Cases/Bottles/loose entry (null =
+  // untouched row): cases × case_size × pack + bottles × pack + loose.
   const physicalFor = (r: StockRow): number | null => {
     const pc = packConv(r);
+    const cf = caseFactor(r);
     const num = (s?: string) => (s != null && s !== '' && !isNaN(Number(s))) ? Number(s) : null;
-    const w = num(whole[r.material_id]), l = num(loose[r.material_id]);
-    if (w == null && l == null) return null;
-    return (w ?? 0) * pc + (l ?? 0);
+    const c = num(cases[r.material_id]), w = num(whole[r.material_id]), l = num(loose[r.material_id]);
+    if (c == null && w == null && l == null) return null;
+    return (c ?? 0) * cf * pc + (w ?? 0) * pc + (l ?? 0);
   };
   const systemFor = (r: StockRow): number =>
     systemAsof[r.material_id] !== undefined ? systemAsof[r.material_id] : (Number(r.qty) || 0);
@@ -1026,7 +1514,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      setWhole({}); setLoose({}); setNote(''); setAdjust(false);
+      setCases({}); setWhole({}); setLoose({}); setNote(''); setAdjust(false);
       await loadDay(date);
       onSaved(`Saved ${j.summary.items} closing count${j.summary.items === 1 ? '' : 's'} for ${date}` +
         (j.summary.adjusted_count ? ` — ${j.summary.adjusted_count} adjusted to physical` : ''));
@@ -1095,6 +1583,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                     <tbody className="divide-y divide-[#F0E4D6]">
                       {rows.map(r => {
                         const pc = packConv(r);
+                        const cf = caseFactor(r);
                         const sys = systemFor(r);
                         const phys = physicalFor(r);
                         const existing = countedBy.get(r.material_id);
@@ -1109,11 +1598,19 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                             </td>
                             <td className="px-3 py-2 text-right whitespace-nowrap font-mono text-[#6B5744]">
                               {pc > 1
-                                ? <>{fq(sys / pc)} {r.purchase_unit}<div className="text-[10px]">{fq(sys)} {r.unit}</div></>
+                                ? <>{fmtBreakdown(sys, r)}<div className="text-[10px]">{fq(sys)} {r.unit}</div></>
                                 : <>{fq(sys)} {r.unit}</>}
                             </td>
                             <td className="px-3 py-2">
                               <div className="flex items-center gap-1 flex-wrap">
+                                {pc > 1 && cf > 1 && (<>
+                                  <input type="number" step="any" min={0} value={cases[r.material_id] ?? ''}
+                                         onChange={e => setCases(p => ({ ...p, [r.material_id]: e.target.value }))}
+                                         placeholder="0" title={`Full cases — 1 = ${fq(cf)} ${r.purchase_unit} = ${fq(cf * pc)} ${r.unit}`}
+                                         className={box} />
+                                  <span className="text-[10px] text-[#8B7355]">cs</span>
+                                  <span className="text-[10px] text-[#8B7355]">+</span>
+                                </>)}
                                 {pc > 1 && (<>
                                   <input type="number" step="any" min={0} value={whole[r.material_id] ?? ''}
                                          onChange={e => setWhole(p => ({ ...p, [r.material_id]: e.target.value }))}
@@ -1160,19 +1657,20 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
               <div className="md:hidden space-y-2">
                 {rows.map(r => {
                   const pc = packConv(r);
+                  const cf = caseFactor(r);
                   const sys = systemFor(r);
                   const phys = physicalFor(r);
                   const existing = countedBy.get(r.material_id);
                   const v = phys != null ? Math.round((phys - sys) * 1000) / 1000 : null;
                   const vv = v != null ? v * (Number(r.avg_cost) || 0) : null;
-                  const box = 'w-16 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white';
+                  const box = 'w-14 px-1.5 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white';
                   return (
                     <div key={r.material_id} className="bg-white border border-[#E8D5C4] rounded-xl p-3 text-xs">
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
                           <div className="text-sm font-medium text-[#2D1B0E] break-words">{r.material_name}</div>
                           <div className="text-[10px] text-[#8B7355]">
-                            System: {pc > 1 ? `${fq(sys / pc)} ${r.purchase_unit} (${fq(sys)} ${r.unit})` : `${fq(sys)} ${r.unit}`}
+                            System: {pc > 1 ? `${fmtBreakdown(sys, r)} (${fq(sys)} ${r.unit})` : `${fq(sys)} ${r.unit}`}
                           </div>
                         </div>
                         {existing && (
@@ -1182,6 +1680,13 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                         )}
                       </div>
                       <div className="mt-2 flex items-center gap-1 flex-wrap">
+                        {pc > 1 && cf > 1 && (<>
+                          <input type="number" step="any" min={0} inputMode="decimal" value={cases[r.material_id] ?? ''}
+                                 onChange={e => setCases(p => ({ ...p, [r.material_id]: e.target.value }))}
+                                 placeholder="0" className={box} />
+                          <span className="text-[10px] text-[#8B7355]">cs</span>
+                          <span className="text-[10px] text-[#8B7355]">+</span>
+                        </>)}
                         {pc > 1 && (<>
                           <input type="number" step="any" min={0} inputMode="decimal" value={whole[r.material_id] ?? ''}
                                  onChange={e => setWhole(p => ({ ...p, [r.material_id]: e.target.value }))}
@@ -1300,8 +1805,14 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                             <td className="px-3 py-2 text-[#2D1B0E]">{c.material_name}
                               {c.note && <div className="text-[10px] text-[#8B7355]">{c.note}</div>}
                             </td>
-                            <td className="px-3 py-2 text-right font-mono text-[#6B5744]">{fq(c.system_qty)} {c.unit}</td>
-                            <td className="px-3 py-2 text-right font-mono text-[#2D1B0E]">{fq(c.physical_qty)} {c.unit}</td>
+                            <td className="px-3 py-2 text-right font-mono text-[#6B5744]">
+                              {fq(c.system_qty)} {c.unit}
+                              {fmtBreakdown(c.system_qty, c) && <div className="text-[10px]">{fmtBreakdown(c.system_qty, c)}</div>}
+                            </td>
+                            <td className="px-3 py-2 text-right font-mono text-[#2D1B0E]">
+                              {fq(c.physical_qty)} {c.unit}
+                              {fmtBreakdown(c.physical_qty, c) && <div className="text-[10px]">{fmtBreakdown(c.physical_qty, c)}</div>}
+                            </td>
                             <td className={`px-3 py-2 text-right font-mono ${c.variance < 0 ? 'text-red-700' : c.variance > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
                               {c.variance > 0 ? '+' : ''}{fq(c.variance)} {c.unit}
                             </td>
@@ -1336,18 +1847,20 @@ interface ReportDef { key: string; label: string; dated?: boolean; days?: boolea
 const REPORT_DEFS: ReportDef[] = [
   { key: 'current_stock', label: 'Current Stock', cols: [
     { k: 'material', l: 'Material' }, { k: 'sku', l: 'SKU' }, { k: 'category', l: 'Category' },
-    { k: 'qty_purchase', l: 'On hand', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
+    { k: 'qty_cbl', l: 'On hand (cs/btl)' },
     { k: 'qty', l: 'Recipe qty', fmt: 'qty' }, { k: 'unit', l: 'R.unit' },
     { k: 'avg_cost', l: 'Avg cost', fmt: 'inr4' }, { k: 'value', l: 'Value', fmt: 'inr' },
   ] },
   { key: 'ledger', label: 'Stock Ledger', dated: true, cols: [
     { k: 'date', l: 'Date' }, { k: 'txn_type', l: 'Type' }, { k: 'material', l: 'Material' },
+    { k: 'qty_cbl', l: 'Cs/Btl' },
     { k: 'qty', l: 'Qty', fmt: 'qty' }, { k: 'unit', l: 'Unit' },
     { k: 'unit_cost', l: 'Unit cost', fmt: 'inr4' }, { k: 'running_balance', l: 'Balance', fmt: 'qty' },
     { k: 'supplier', l: 'Supplier' }, { k: 'ref', l: 'Ref' }, { k: 'by', l: 'By' },
   ] },
   { key: 'purchases', label: 'Purchase Register', dated: true, cols: [
     { k: 'date', l: 'Date' }, { k: 'material', l: 'Material' },
+    { k: 'qty_cbl', l: 'Qty (cs/btl)' },
     { k: 'qty_purchase', l: 'Qty', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
     { k: 'rate_purchase', l: 'Rate', fmt: 'inr' }, { k: 'cost', l: 'Cost', fmt: 'inr' },
     { k: 'supplier', l: 'Supplier' }, { k: 'vendor', l: 'Vendor' },

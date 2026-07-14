@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { getStoreById, storeStock, userStoreAccess } from '@/lib/store-engine';
+import { fmtBreakdown } from '@/lib/pack-units';
 
 /**
  * GET /api/stores/[id]/reports?type=…&from=&to=&days= — store-scoped reports
@@ -73,12 +74,12 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     if (to)   { winWhere.push('date(l.created_at) <= date(?)'); winArgs.push(to); }
     const win = winWhere.length ? ` AND ${winWhere.join(' AND ')}` : '';
 
-    /** Enriched current stock (engine rows + sku/pack/reorder meta). */
+    /** Enriched current stock (engine rows + sku/pack/case/reorder meta). */
     const stockRows = () => {
       const base = storeStock(db, storeId);
       const meta = new Map<string, any>();
       for (const m of db.prepare(`
-        SELECT rm.id, rm.sku, rm.purchase_unit, rm.pack_size, rm.reorder_level
+        SELECT rm.id, rm.sku, rm.purchase_unit, rm.pack_size, rm.case_size, rm.reorder_level
         FROM raw_materials rm
         JOIN store_category_map scm
           ON scm.store_id = ? AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
@@ -88,6 +89,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         const pack = n(m.pack_size) || 1;
         const pu = m.purchase_unit || r.unit;
         const pc = (pack > 1 && String(pu).toLowerCase().trim() !== String(r.unit).toLowerCase().trim()) ? pack : 1;
+        const pm = { unit: r.unit, purchase_unit: pu, pack_size: pack, case_size: n(m.case_size) || 1 };
         return {
           material_id: r.material_id,
           material: r.material_name,
@@ -97,6 +99,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
           unit: r.unit,
           qty_purchase: pc > 1 ? r3(r.qty / pc) : r3(r.qty),
           purchase_unit: pu,
+          qty_cbl: fmtBreakdown(r.qty, pm) || '',
           avg_cost: r4(r.avg_cost),
           value: r2(r.value),
           reorder_level: n(m.reorder_level),
@@ -127,7 +130,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         const raw = db.prepare(`
           SELECT l.created_at, l.txn_type, l.material_id, l.quantity, l.unit_cost,
                  l.supplier, l.ref, l.notes, l.created_by,
-                 rm.name AS material, rm.unit
+                 rm.name AS material, rm.unit, rm.purchase_unit, rm.pack_size, rm.case_size
           FROM store_stock_ledger l
           JOIN raw_materials rm ON rm.id = l.material_id
           WHERE l.store_id = ?${win}
@@ -144,6 +147,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
             material: l.material,
             qty: r3(l.quantity),
             unit: l.unit,
+            qty_cbl: fmtBreakdown(n(l.quantity), l) || '',
             unit_cost: r4(l.unit_cost),
             running_balance: bal,
             supplier: l.supplier || '',
@@ -164,7 +168,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         const raw = db.prepare(`
           SELECT l.created_at, l.quantity, l.unit_cost, l.supplier, l.vendor_id,
                  l.ref, l.batch_no, l.created_by,
-                 rm.name AS material, rm.unit, rm.purchase_unit, rm.pack_size,
+                 rm.name AS material, rm.unit, rm.purchase_unit, rm.pack_size, rm.case_size,
                  v.name AS vendor_name
           FROM store_stock_ledger l
           JOIN raw_materials rm ON rm.id = l.material_id
@@ -173,7 +177,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
           ORDER BY l.created_at ASC, l.rowid ASC
           LIMIT ${ROW_CAP}
         `).all(storeId, ...winArgs) as any[];
-        rows = raw.map(l => {
+        const purchaseRows = raw.map(l => {
           const pack = n(l.pack_size) || 1;
           const pu = l.purchase_unit || l.unit;
           const pc = (pack > 1 && String(pu).toLowerCase().trim() !== String(l.unit).toLowerCase().trim()) ? pack : 1;
@@ -184,6 +188,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
             purchase_unit: pu,
             qty: r3(l.quantity),
             unit: l.unit,
+            qty_cbl: fmtBreakdown(n(l.quantity), l) || '',
             rate_purchase: r2(n(l.unit_cost) * pc),
             cost: r2(n(l.quantity) * n(l.unit_cost)),
             supplier: l.supplier || '',
@@ -193,9 +198,36 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
             by: (l.created_by || '').split('@')[0],
           };
         });
+        // Invoice grouping: bill lines are posted together (same created_at),
+        // so rows sharing a non-empty invoice ref sit consecutively in the
+        // chronological register. Append a subtotal row after every multi-line
+        // bill (totals below are computed from REAL rows only).
+        const grouped: any[] = [];
+        let gi = 0;
+        while (gi < purchaseRows.length) {
+          const ref = purchaseRows[gi].invoice;
+          let gj = gi;
+          while (gj < purchaseRows.length && ref !== '' && purchaseRows[gj].invoice === ref) gj++;
+          if (gj === gi) gj = gi + 1;                    // ref-less rows stand alone
+          const group = purchaseRows.slice(gi, gj);
+          grouped.push(...group);
+          if (ref !== '' && group.length > 1) {
+            grouped.push({
+              date: '', material: `— Bill ${ref} total (${group.length} lines)`,
+              qty_purchase: '', purchase_unit: '', qty: '', unit: '', qty_cbl: '',
+              rate_purchase: '',
+              cost: r2(group.reduce((s, r) => s + n(r.cost), 0)),
+              supplier: group[0].supplier, vendor: group[0].vendor,
+              invoice: ref, batch: '', by: '', is_subtotal: 1,
+            });
+          }
+          gi = gj;
+        }
+        rows = grouped;
         totals = {
-          purchases: rows.length,
-          total_value: r2(rows.reduce((s, r) => s + n(r.cost), 0)),
+          purchases: purchaseRows.length,
+          bills: new Set(purchaseRows.map(r => r.invoice).filter(Boolean)).size,
+          total_value: r2(purchaseRows.reduce((s, r) => s + n(r.cost), 0)),
         };
         break;
       }

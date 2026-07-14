@@ -9,7 +9,12 @@ import { getStoreById, storeCategories, storeStock, userStoreAccess } from '@/li
  *
  * → {
  *     store, access,
- *     stock:   [storeStock row + purchase_unit/pack_size/reorder_level/sku],
+ *     stock:   [ONE row per mapped material (zero-ledger materials included at
+ *               qty 0) + any material with ledger history whose category was
+ *               since unmapped. Enriched with purchase_unit/pack_size/case_size/
+ *               reorder_level/sku + central_stock (raw_materials.current_stock),
+ *               average_price and has_ledger — the page shows an "In central"
+ *               hint + admin Migrate action from those],
  *     materials: [all materials whose category is mapped to this store — the
  *                 procure/adjust typeahead source],
  *     categories: [mapped category names],
@@ -39,27 +44,50 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     const base = storeStock(db, storeId);
     const meta = new Map<string, any>();
     for (const m of db.prepare(`
-      SELECT rm.id, rm.sku, rm.purchase_unit, rm.pack_size, rm.reorder_level
+      SELECT rm.id, rm.name, rm.category, rm.unit, rm.sku, rm.purchase_unit,
+             rm.pack_size, rm.case_size, rm.reorder_level,
+             rm.current_stock, rm.average_price
       FROM raw_materials rm
       JOIN store_category_map scm
         ON scm.store_id = ? AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
     `).all(storeId) as any[]) meta.set(m.id, m);
-    const stock = base.map(r => {
-      const m = meta.get(r.material_id) || {};
-      return {
-        ...r,
-        sku: m.sku || '',
-        purchase_unit: m.purchase_unit || r.unit,
-        pack_size: Number(m.pack_size) || 1,
-        reorder_level: Number(m.reorder_level) || 0,
-      };
+
+    // ONE row per mapped material: ledger-backed rows keep their engine qty /
+    // weighted-avg cost; mapped-but-empty materials appear at qty 0 (their
+    // valuation basis is central average_price). Materials with ledger history
+    // whose category was since unmapped stay visible (engine row, no meta).
+    const ledgered = new Map(base.map(r => [r.material_id, r]));
+    const enrich = (r: any, m: any) => ({
+      ...r,
+      sku: m.sku ?? r.sku ?? '',
+      purchase_unit: m.purchase_unit || r.unit,
+      pack_size: Number(m.pack_size) || 1,
+      case_size: Number(m.case_size) || 1,
+      reorder_level: Number(m.reorder_level) || 0,
+      central_stock: Number(m.current_stock) || 0,
+      average_price: Number(m.average_price) || 0,
+      has_ledger: ledgered.has(r.material_id),
     });
+    const stock = [
+      ...base.map(r => enrich(r, meta.get(r.material_id) || {})),
+      ...Array.from(meta.values())
+        .filter(m => !ledgered.has(m.id))
+        .map(m => enrich({
+          material_id: m.id,
+          material_name: m.name,
+          category: m.category,
+          unit: m.unit,
+          qty: 0,
+          avg_cost: Math.round((Number(m.average_price) || 0) * 10000) / 10000,
+          value: 0,
+        }, m)),
+    ].sort((a, b) => String(a.material_name).localeCompare(String(b.material_name)));
 
     // Typeahead source: every material in a mapped category (active stores only
     // claim categories — this store was found by id, so filter on its own map).
     const materials = db.prepare(`
       SELECT rm.id, rm.name, rm.sku, rm.category, rm.unit, rm.purchase_unit,
-             rm.pack_size, rm.reorder_level, rm.average_price
+             rm.pack_size, rm.case_size, rm.reorder_level, rm.average_price
       FROM raw_materials rm
       JOIN store_category_map scm
         ON scm.store_id = ? AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE

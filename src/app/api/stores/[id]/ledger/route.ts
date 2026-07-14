@@ -47,7 +47,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     const rows = db.prepare(`
       SELECT l.id, l.txn_type, l.quantity, l.unit_cost, l.batch_no, l.supplier,
              l.vendor_id, l.expiry_date, l.ref, l.notes, l.created_by, l.created_at,
-             rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size
+             rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size, rm.case_size
       FROM store_stock_ledger l
       JOIN raw_materials rm ON rm.id = l.material_id
       WHERE ${where.join(' AND ')}

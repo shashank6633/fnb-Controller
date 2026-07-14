@@ -100,7 +100,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     const counts = db.prepare(`
       SELECT c.id, c.material_id, c.date, c.system_qty, c.physical_qty, c.variance,
              c.variance_value, c.counted_by, c.note, c.created_at,
-             rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size, rm.category
+             rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size, rm.case_size, rm.category
       FROM store_closing_counts c
       JOIN raw_materials rm ON rm.id = c.material_id
       WHERE c.store_id = ? AND c.date = ?

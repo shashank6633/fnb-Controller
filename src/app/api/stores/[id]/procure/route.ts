@@ -9,14 +9,18 @@ import { getStoreById, materialStoreId, postLedger, userStoreAccess } from '@/li
  * store_stock_ledger 'purchase' row. Gate: userStoreAccess(...).can_procure.
  *
  * body: {
- *   material_id, quantity (PURCHASE units, e.g. bottles),
- *   unit_price (₹ per PURCHASE unit), supplier?, vendor_id?,
+ *   EITHER quantity (PURCHASE units, e.g. bottles — legacy single-input form)
+ *   OR     cases / bottles / loose (bar counting convention: cases×case_size
+ *          bottles + bottles + loose RECIPE units, any of the three omitted = 0),
+ *   material_id, unit_price (₹ per PURCHASE unit), supplier?, vendor_id?,
  *   batch_no?, expiry_date?, invoice_ref?, notes?, date? (YYYY-MM-DD backdate)
  * }
  *
  * House unit convention (see purchases POST / updateMaterialPrice):
  *   ledger quantity  = quantity × pack_size   (RECIPE units, when recipe ≠ purchase unit)
  *   ledger unit_cost = unit_price ÷ pack_size (₹ per RECIPE unit)
+ *   cases entry      = cases×case_size×pack + bottles×pack + loose (EXACT — whole
+ *                      counts × whole factors; never routed through fractional bottles)
  *
  * ⚠️ ISOLATION (deliberate, per spec): store purchases live ONLY in the store
  * ledger. NO `purchases` row, NO inventory_transactions, NO raw_materials
@@ -43,10 +47,23 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
     const b = await request.json();
     const materialId = String(b.material_id || '').trim();
-    const quantity = Number(b.quantity);
     const unitPrice = Number(b.unit_price);
+    // Cases + Bottles + loose triple entry (any field present ⇒ CBL mode).
+    const cblMode = b.cases !== undefined || b.bottles !== undefined || b.loose !== undefined;
+    const nCases = Number(b.cases ?? 0) || 0;
+    const nBottles = Number(b.bottles ?? 0) || 0;
+    const nLoose = Number(b.loose ?? 0) || 0;
+    const quantity = Number(b.quantity);
     if (!materialId) return Response.json({ error: 'material_id is required' }, { status: 400 });
-    if (!Number.isFinite(quantity) || quantity <= 0) {
+    if (cblMode) {
+      if (nCases < 0 || nBottles < 0 || nLoose < 0 ||
+          ![b.cases, b.bottles, b.loose].every(v => v === undefined || v === null || v === '' || Number.isFinite(Number(v)))) {
+        return Response.json({ error: 'cases, bottles and loose must be numbers ≥ 0' }, { status: 400 });
+      }
+      if (nCases + nBottles + nLoose <= 0) {
+        return Response.json({ error: 'Enter a quantity — cases, bottles and/or loose' }, { status: 400 });
+      }
+    } else if (!Number.isFinite(quantity) || quantity <= 0) {
       return Response.json({ error: 'quantity must be a positive number (purchase units)' }, { status: 400 });
     }
     if (!Number.isFinite(unitPrice) || unitPrice < 0) {
@@ -54,7 +71,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     }
 
     const mat = db.prepare(`
-      SELECT id, name, category, unit, purchase_unit, pack_size FROM raw_materials WHERE id = ?
+      SELECT id, name, category, unit, purchase_unit, pack_size, case_size FROM raw_materials WHERE id = ?
     `).get(materialId) as any;
     if (!mat) return Response.json({ error: 'Material not found' }, { status: 404 });
 
@@ -76,7 +93,16 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const ru = String(mat.unit || '').toLowerCase().trim();
     const pu = String(mat.purchase_unit || mat.unit || '').toLowerCase().trim();
     const packConv = (packSize > 1 && ru !== pu) ? packSize : 1;
-    const recipeQty = quantity * packConv;
+    const caseSize = (Number(mat.case_size) || 1) > 1 ? Number(mat.case_size) : 1;
+    // CBL: exact whole-count math (cases×case×pack + bottles×pack + loose ml).
+    // Legacy: purchase units × pack. purchaseQty (bottles incl. fraction for
+    // loose) is only used for ₹ totals + the audit note, never the ledger qty.
+    const recipeQty = cblMode
+      ? nCases * caseSize * packConv + nBottles * packConv + nLoose
+      : quantity * packConv;
+    const purchaseQty = cblMode
+      ? nCases * caseSize + nBottles + (packConv > 1 ? nLoose / packConv : nLoose)
+      : quantity;
     const unitCost = packConv > 1 ? unitPrice / packConv : unitPrice;
 
     // Optional backdate: keep time-of-day so same-day ordering survives.
@@ -115,20 +141,23 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       after: {
         store_id: storeId, store: store.name,
         material_id: materialId, material: mat.name,
-        purchase_qty: quantity, purchase_unit: mat.purchase_unit || mat.unit,
+        purchase_qty: purchaseQty, purchase_unit: mat.purchase_unit || mat.unit,
+        ...(cblMode ? { cases: nCases, bottles: nBottles, loose: nLoose } : {}),
         unit_price: unitPrice,
         recipe_qty: recipeQty, recipe_unit: mat.unit, unit_cost: unitCost,
         supplier, vendor_id: vendorId,
         batch_no: String(b.batch_no || '').trim(), expiry_date: String(b.expiry_date || '').trim(),
         invoice_ref: String(b.invoice_ref || '').trim(), date: backdate || undefined,
       },
-      note: `${store.name}: +${quantity} ${mat.purchase_unit || mat.unit} ${mat.name} @ ₹${unitPrice}/${mat.purchase_unit || mat.unit}${supplier ? ` from ${supplier}` : ''}`,
+      note: `${store.name}: +${cblMode
+        ? `${nCases} cs + ${nBottles} ${mat.purchase_unit || mat.unit} + ${nLoose} ${mat.unit}`
+        : `${quantity} ${mat.purchase_unit || mat.unit}`} ${mat.name} @ ₹${unitPrice}/${mat.purchase_unit || mat.unit}${supplier ? ` from ${supplier}` : ''}`,
     });
 
     return Response.json({
       ok: true, ledger_id: ledgerId,
       recipe_qty: recipeQty, unit_cost: unitCost,
-      total: Math.round(quantity * unitPrice * 100) / 100,
+      total: Math.round(purchaseQty * unitPrice * 100) / 100,
     }, { status: 201 });
   } catch (e: any) {
     console.error('[/api/stores/[id]/procure POST]', e);
