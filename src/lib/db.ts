@@ -2388,6 +2388,23 @@ function initializeSchema(db: Database.Database) {
       INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_access_token', '');
       INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_webhook_verify_token', '');
       INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_notifications_enabled', '0');
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_notify_recipients', '{}');
+    `);
+    // Default notification templates — one per notify event, looked up BY NAME
+    // (convention: whatsapp_templates.name === event key) by notifyEvent() in
+    // lib/whatsapp.ts. INSERT OR IGNORE: admin edits in the Templates tab are
+    // never overwritten. Bodies mirror WA_DEFAULT_EVENT_BODIES (the code-side
+    // fallback used if a template is deleted or deactivated).
+    db.exec(`
+      INSERT OR IGNORE INTO whatsapp_templates (id, name, category, language, body) VALUES
+        ('watpl_requisition_approved', 'requisition_approved', 'notification', 'en',
+         '✅ Requisition {{req_number}} ({{department}}) has been approved by {{approved_by}}.'),
+        ('watpl_discount_decided', 'discount_decided', 'notification', 'en',
+         'Discount request for order #{{order}} — {{pct}}% {{decision}} by {{decided_by}}.'),
+        ('watpl_low_stock_daily', 'low_stock_daily', 'notification', 'en',
+         '📦 Low-stock summary ({{date}}) — {{count}} material(s) to reorder:' || char(10) || '{{summary}}'),
+        ('watpl_digest_daily', 'digest_daily', 'notification', 'en',
+         '📋 AKAN Daily Digest — {{date}}' || char(10) || char(10) || '{{content}}');
     `);
   } catch (e) { console.error('whatsapp schema failed:', e); }
 

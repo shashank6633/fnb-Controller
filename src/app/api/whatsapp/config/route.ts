@@ -1,6 +1,7 @@
 import { requireRole } from '@/lib/auth';
 import {
   getWaConfig, setWaConfig, isWaSecretKey, sendWhatsAppMessage, WA_CONFIG_KEYS,
+  WA_NOTIFY_EVENTS, getWaNotifyRecipients, setWaNotifyRecipients,
 } from '@/lib/whatsapp';
 import { getDb } from '@/lib/db';
 
@@ -22,9 +23,6 @@ import { getDb } from '@/lib/db';
  */
 export const dynamic = 'force-dynamic';
 
-/** Per-event notification toggles (UI-only until a provider is configured). */
-const WA_NOTIFY_EVENTS = ['requisition_approved', 'discount_decided', 'low_stock_daily', 'digest_daily'] as const;
-
 function readNotifyPrefs(): Record<string, boolean> {
   const db = getDb();
   const out: Record<string, boolean> = {};
@@ -39,7 +37,7 @@ export async function GET() {
   try {
     const gate = await requireRole('admin');
     if (!gate.ok) return Response.json({ error: gate.message }, { status: gate.status });
-    return Response.json({ ...getWaConfig(), notify: readNotifyPrefs() });
+    return Response.json({ ...getWaConfig(), notify: readNotifyPrefs(), recipients: getWaNotifyRecipients() });
   } catch (e: any) {
     return Response.json({ error: e.message }, { status: 500 });
   }
@@ -82,7 +80,13 @@ export async function POST(request: Request) {
           saved.push(`wa_notify_${ev}`);
         }
       }
-      return Response.json({ ok: true, saved, ...getWaConfig(), notify: readNotifyPrefs() });
+      // Per-event recipient lists (comma-separated strings or arrays; partial
+      // maps merge — only the events present are overwritten)
+      if (cfg.notify_recipients && typeof cfg.notify_recipients === 'object') {
+        setWaNotifyRecipients(cfg.notify_recipients);
+        saved.push('wa_notify_recipients');
+      }
+      return Response.json({ ok: true, saved, ...getWaConfig(), notify: readNotifyPrefs(), recipients: getWaNotifyRecipients() });
     }
 
     return Response.json({ error: 'Unknown action. Use action:"save" or action:"test".' }, { status: 400 });

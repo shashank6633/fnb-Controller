@@ -37,6 +37,7 @@ interface WaConfigDto {
   wa_notifications_enabled: boolean;
   configured: boolean;
   notify: Record<string, boolean>;
+  recipients: Record<string, string[]>;
 }
 
 interface WaTemplate {
@@ -497,6 +498,7 @@ function NotificationsTab({ cfg, reload, onError, onOk }: {
 }) {
   const [master, setMaster] = useState(false);
   const [prefs, setPrefs] = useState<Record<string, boolean>>({});
+  const [recips, setRecips] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [seeded, setSeeded] = useState(false);
 
@@ -504,6 +506,9 @@ function NotificationsTab({ cfg, reload, onError, onOk }: {
     if (cfg && !seeded) {
       setMaster(cfg.wa_notifications_enabled);
       setPrefs(cfg.notify || {});
+      const r: Record<string, string> = {};
+      for (const ev of NOTIFY_EVENTS) r[ev.key] = (cfg.recipients?.[ev.key] || []).join(', ');
+      setRecips(r);
       setSeeded(true);
     }
   }, [cfg, seeded]);
@@ -513,7 +518,15 @@ function NotificationsTab({ cfg, reload, onError, onOk }: {
     try {
       const r = await api('/api/whatsapp/config', {
         method: 'POST',
-        body: { action: 'save', config: { wa_notifications_enabled: master ? '1' : '0', notify: prefs } },
+        body: {
+          action: 'save',
+          config: {
+            wa_notifications_enabled: master ? '1' : '0',
+            notify: prefs,
+            // Comma-separated per-event mobiles — server splits + trims.
+            notify_recipients: recips,
+          },
+        },
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
@@ -548,14 +561,23 @@ function NotificationsTab({ cfg, reload, onError, onOk }: {
       </label>
 
       {NOTIFY_EVENTS.map(ev => (
-        <label key={ev.key} className={`flex items-start gap-3 cursor-pointer text-sm ${!master ? 'opacity-50' : ''}`}>
-          <input type="checkbox" checked={!!prefs[ev.key]} disabled={!master}
-                 onChange={e => setPrefs({ ...prefs, [ev.key]: e.target.checked })} className="mt-0.5" />
-          <div className="flex-1">
-            <div className="font-medium text-[#2D1B0E]">{ev.label}</div>
-            <div className="text-[11px] text-[#8B7355] mt-0.5">{ev.hint}</div>
-          </div>
-        </label>
+        <div key={ev.key} className={`text-sm ${!master ? 'opacity-50' : ''}`}>
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input type="checkbox" checked={!!prefs[ev.key]} disabled={!master}
+                   onChange={e => setPrefs({ ...prefs, [ev.key]: e.target.checked })} className="mt-0.5" />
+            <div className="flex-1">
+              <div className="font-medium text-[#2D1B0E]">{ev.label}</div>
+              <div className="text-[11px] text-[#8B7355] mt-0.5">{ev.hint}</div>
+            </div>
+          </label>
+          <label className="block mt-1.5 ml-7 text-[11px] text-[#6B5744]">
+            Recipients — comma-separated mobiles (used when the event has no direct target)
+            <input value={recips[ev.key] || ''} disabled={!master}
+                   onChange={e => setRecips({ ...recips, [ev.key]: e.target.value })}
+                   placeholder="e.g. 98xxxxxxxx, 91xxxxxxxxxx"
+                   className="mt-1 w-full px-2.5 py-1.5 border border-[#D4B896] rounded bg-[#FFF1E3] text-xs font-mono disabled:cursor-not-allowed" />
+          </label>
+        </div>
       ))}
 
       <button onClick={save} disabled={busy}

@@ -2,6 +2,7 @@ import { refreshUpcomingParties } from '@/lib/party-refresh';
 import { checkDeferDueSoon } from '@/lib/defer-due-check';
 import { getCurrentUser } from '@/lib/auth';
 import { getSchedulerStatus } from '@/lib/scheduler';
+import { runWaDailyNotifications } from '@/lib/whatsapp';
 
 /**
  * Manual / external trigger for the party-sheet refresh + audit + notify
@@ -32,6 +33,17 @@ export async function POST(request: Request) {
     }
   }
 
+  // WhatsApp daily jobs (low-stock summary + owner digest) — each guarded by
+  // its Notifications-tab toggle + the master switch, deduped to once per day,
+  // and fully best-effort. Runs FIRST so a Sheets refresh failure can never
+  // starve the daily pings; equally, these can never fail the refresh.
+  let wa_daily: any = null;
+  try {
+    wa_daily = await runWaDailyNotifications();
+  } catch (e: any) {
+    console.error('[/api/cron/refresh-parties] whatsapp daily jobs failed:', e?.message);
+  }
+
   try {
     const result = await refreshUpcomingParties(tokenOk ? 'external_cron' : 'admin_manual');
     // Feature 4 — same pipeline also checks deferred items coming due. Fully
@@ -42,9 +54,11 @@ export async function POST(request: Request) {
     } catch (e: any) {
       console.error('[/api/cron/refresh-parties] defer-due check failed:', e?.message);
     }
-    return Response.json({ ok: true, result, defer_due });
+    return Response.json({ ok: true, result, defer_due, wa_daily });
   } catch (e: any) {
     console.error('[/api/cron/refresh-parties]', e);
-    return Response.json({ error: e.message }, { status: 500 });
+    // wa_daily ran before the refresh — report it even on failure so external
+    // cron logs show whether the daily pings dispatched.
+    return Response.json({ error: e.message, wa_daily }, { status: 500 });
   }
 }

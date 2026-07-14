@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { round2 } from '@/lib/bill-calc';
 import { canDecideDiscount, listDiscountRequests } from '@/lib/discount-requests';
+import { notifyEvent } from '@/lib/whatsapp';
 
 /**
  * POST /api/dine-in/discount-requests/[id]/decide  { approve: boolean, note? }
@@ -79,6 +80,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         WHERE id = ?
       `).run(me.name, note, id);
     }
+
+    // WhatsApp ping (fire-and-forget, AFTER the decision committed). The
+    // requester's mobile isn't captured on discount_requests (requested_by is
+    // an email), so this goes to the configured 'discount_decided' recipients.
+    // Gated by the Notifications-tab toggles inside notifyEvent(); must NEVER
+    // block or fail the decision.
+    try {
+      void notifyEvent('discount_decided', {
+        order: order.order_number || order.id,
+        pct: Number(request.requested_pct),
+        decision: approve ? 'approved' : 'rejected',
+        decided_by: me.name,
+      });
+    } catch { /* notification must never break the action */ }
 
     const rows = listDiscountRequests(db, 'WHERE dr.id = ?', [id]);
     return Response.json({ request: rows[0] || null });
