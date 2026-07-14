@@ -17,6 +17,11 @@ export async function GET(request: Request) {
     // contract with that vendor (vendor_contracts table). Empty filter when
     // the vendor has no contracts at all — caller should fall back to scope=all.
     const vendorId = url.searchParams.get('vendor_id');
+    // exclude_store_mapped=1 — hide materials whose category belongs to an
+    // ACTIVE store location (store_category_map, NOCASE). Opt-in: only Central
+    // closing-stock surfaces pass it (store-mapped liquor is counted in its own
+    // store's closing). All other callers see the full list as before.
+    const excludeStoreMapped = url.searchParams.get('exclude_store_mapped') === '1';
     // Department-scoped material visibility:
     // - admin / store manager → see everything (they buy for every department)
     // - scope=all → see everything (callers like /grn must opt in)
@@ -84,6 +89,13 @@ export async function GET(request: Request) {
           AND (valid_to IS NULL OR date('now') <= valid_to)
       )`;
       params.push(vendorId);
+    }
+    if (excludeStoreMapped) {
+      query += ` AND NOT EXISTS (
+        SELECT 1 FROM store_category_map scm
+        JOIN store_locations sl ON sl.id = scm.store_id
+        WHERE sl.is_active = 1 AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
+      )`;
     }
     if (search) {
       query += ' AND rm.name LIKE ?';

@@ -1,5 +1,6 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { centralFlowBlock } from '@/lib/store-engine';
 
 /**
  * Opening-stock import — seed go-live stock + cost from a filled template.
@@ -53,6 +54,9 @@ export async function POST(request: Request) {
 
     const created: any[] = [];
     const skipped: any[] = [];
+    // Store guard (liquor) — rows skipped because the material is store-mapped.
+    // Per-line skip + report, mirroring inward-import: never fail the batch.
+    const store_blocked: Array<{ row: number; material: string; error: string }> = [];
 
     const run = db.transaction(() => {
       for (let i = 0; i < rows.length; i++) {
@@ -69,6 +73,12 @@ export async function POST(request: Request) {
 
         const m = (skuKey && bySku.get(skuKey)) || (nameKey && byName.get(nameKey)) || null;
         if (!m) { skipped.push({ row: rowNo, reason: `material not found (sku="${r.sku || ''}" name="${r.name || ''}")` }); continue; }
+
+        // Store guard: store-mapped materials (liquor) never enter Central
+        // purchases/stock via opening-stock — skip the line, report, keep going.
+        const storeMsg = centralFlowBlock(db, m.id);
+        if (storeMsg) { store_blocked.push({ row: rowNo, material: m.name, error: storeMsg }); continue; }
+
         if (!(qty > 0) || !(rate > 0)) { skipped.push({ row: rowNo, name: m.name, reason: 'qty and rate must both be > 0' }); continue; }
 
         const packSize = Number(m.pack_size) || 1;
@@ -96,8 +106,10 @@ export async function POST(request: Request) {
       success: created.length,
       skipped: skipped.length,
       skipped_rows: skipped.slice(0, 200),
+      store_blocked,
       message: `Created ${created.length} opening-stock entr${created.length === 1 ? 'y' : 'ies'}`
-             + (skipped.length ? ` · ${skipped.length} skipped` : '') + '.',
+             + (skipped.length ? ` · ${skipped.length} skipped` : '')
+             + (store_blocked.length ? ` · ${store_blocked.length} store-mapped (use the store's own procurement)` : '') + '.',
     }, { status: 201 });
   } catch (e: any) {
     console.error('[/api/purchases/opening-stock]', e);

@@ -1,4 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
+import { materialStoreId, getStoreById } from '@/lib/store-engine';
 
 export async function GET(request: Request) {
   try {
@@ -162,13 +163,27 @@ export async function POST(request: Request) {
         if (!item.material_id) continue;
         // Per-item department_id overrides the top-level one when present.
         const deptId = item.department_id !== undefined ? normDept(item.department_id) : topDeptId;
-        delOne.run(date, item.material_id, deptId);
 
         const material = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(item.material_id) as any;
         if (!material) {
           results.errors.push(`Material not found: ${item.material_id}`);
           continue;
         }
+
+        // Store guard: store-mapped materials (liquor) are counted in their OWN
+        // store's closing (/api/stores/[id]/closing) — reject per item, before
+        // the upsert-delete so an existing count is never clobbered. Other
+        // items in the same submit still save normally.
+        const storeId = materialStoreId(db, material);
+        if (storeId) {
+          const storeName = getStoreById(db, storeId)?.name || 'store';
+          results.errors.push(
+            `${material.name}: ${storeName.toUpperCase()} material — use ${storeName} closing (Inventory → ${storeName}), not Central closing stock.`
+          );
+          continue;
+        }
+
+        delOne.run(date, item.material_id, deptId);
 
         const systemStock = material.current_stock;
         const physicalStock = Number(item.physical_stock);

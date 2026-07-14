@@ -46,9 +46,15 @@ export async function POST(req: Request) {
     const outletId = await getCurrentOutletId();
     if (!outletId) return Response.json({ error: 'No current outlet' }, { status: 400 });
 
-    // Cache lookups so we don't re-query on every row
-    const matByKey = new Map<string, { id: string; name: string; unit: string }>();
-    for (const m of db.prepare('SELECT id, name, unit FROM raw_materials').all() as any[]) {
+    // Cache lookups so we don't re-query on every row.
+    // pack_size + purchase_unit are REQUIRED by the stock conversion below
+    // (packConv) — omitting them silently made packConv=1 for every material,
+    // bumping pack materials' stock in PURCHASE units instead of recipe units.
+    const matByKey = new Map<string, {
+      id: string; name: string; unit: string;
+      purchase_unit: string | null; pack_size: number | null;
+    }>();
+    for (const m of db.prepare('SELECT id, name, unit, purchase_unit, pack_size FROM raw_materials').all() as any[]) {
       matByKey.set(m.name.toLowerCase().trim(), m);
     }
     const vendorByName = new Map<string, string>();
@@ -126,7 +132,7 @@ export async function POST(req: Request) {
             const caseSize     = lock?.case_size     ?? 1;
             const category     = lock?.category      || mapCategory(r.category);
             insertMaterial.run(id, r.itemName, category, unit, purchaseUnit, packSize, caseSize);
-            mat = { id, name: r.itemName, unit };
+            mat = { id, name: r.itemName, unit, purchase_unit: purchaseUnit, pack_size: packSize };
             matByKey.set(key, mat);
             stats.newMaterials++;
             // If incoming differs from locked unit, surface a warning so admin

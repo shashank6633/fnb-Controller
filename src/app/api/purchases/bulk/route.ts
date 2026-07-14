@@ -1,4 +1,5 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
+import { centralFlowBlock } from '@/lib/store-engine';
 
 interface BulkPurchaseItem {
   item_name: string;
@@ -40,11 +41,19 @@ export async function POST(request: Request) {
       return (packSize > 1 && ru !== pu) ? qty * packSize : qty;
     };
 
-    const results: { success: number; skipped: number; errors: string[] } = {
+    const results: {
+      success: number; skipped: number; errors: string[];
+      // Store guard (liquor) — rows skipped because the material is store-mapped.
+      // Per-line skip + report, mirroring inward-import: never fail the batch.
+      store_blocked: Array<{ material: string; error: string }>;
+    } = {
       success: 0,
       skipped: 0,
       errors: [],
+      store_blocked: [],
     };
+    // Only materials that actually received a purchase row get a price recompute.
+    const touchedMaterials = new Set<string>();
 
     const insertPurchase = db.prepare(`
       INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, created_at)
@@ -80,6 +89,15 @@ export async function POST(request: Request) {
           continue;
         }
         const materialId = mat.id;
+
+        // Store guard: store-mapped materials (liquor) never enter Central
+        // purchases/stock via bulk import — skip the line, report it, keep going.
+        const storeMsg = centralFlowBlock(db, materialId);
+        if (storeMsg) {
+          results.store_blocked.push({ material: item.item_name, error: storeMsg });
+          results.skipped++;
+          continue;
+        }
 
         let quantity = Number(item.quantity) || 0;
         let unitPrice = Number(item.unit_price) || 0;
@@ -119,19 +137,16 @@ export async function POST(request: Request) {
           `Bulk import: ${item.vendor || 'unknown'}`
         );
 
+        touchedMaterials.add(materialId);
         results.success++;
       }
     });
 
     batchInsert();
 
-    // Update prices for all affected materials (batch at end for performance)
-    const affectedMaterials = new Set<string>();
-    for (const item of purchases) {
-      const mat = materialMap.get(item.item_name.toLowerCase().trim());
-      if (mat) affectedMaterials.add(mat.id);
-    }
-    for (const materialId of affectedMaterials) {
+    // Update prices for all affected materials (batch at end for performance).
+    // Uses the touched set so store-blocked / skipped lines never trigger a recompute.
+    for (const materialId of touchedMaterials) {
       updateMaterialPrice(db, materialId);
     }
 

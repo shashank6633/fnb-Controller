@@ -282,7 +282,11 @@ export default function ClosingStockByLocationPage() {
       // - Privileged (dept picker): keep scope=all and client-filter by the
       //   SELECTED department via deptScopedMaterials, so switching depts
       //   re-filters live without refetching.
-      const res = await fetch(hasDeptChoice ? '/api/inventory?scope=all' : '/api/inventory');
+      // exclude_store_mapped=1 — store-mapped liquor is counted in its own
+      // store's closing, so the CENTRAL Record modal must never list it.
+      const res = await fetch(hasDeptChoice
+        ? '/api/inventory?scope=all&exclude_store_mapped=1'
+        : '/api/inventory?exclude_store_mapped=1');
       if (res.ok) {
         const json = await res.json();
         setMaterials(json.materials ?? []);

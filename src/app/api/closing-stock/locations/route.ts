@@ -29,6 +29,13 @@ export async function GET(request: Request) {
       FROM raw_materials rm
       LEFT JOIN closing_stock cs
              ON cs.material_id = rm.id AND cs.date = ?
+      -- Store-mapped materials (liquor) are counted in their OWN store's
+      -- closing (/api/stores/[id]/closing) — never on Central surfaces.
+      WHERE NOT EXISTS (
+        SELECT 1 FROM store_category_map scm
+        JOIN store_locations sl ON sl.id = scm.store_id
+        WHERE sl.is_active = 1 AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
+      )
       GROUP BY location
       ORDER BY location
     `).all(date) as any[];
