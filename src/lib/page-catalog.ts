@@ -131,6 +131,29 @@ export const PAGE_CATALOG: PageSection[] = [
     ],
   },
   {
+    // Task Management — checklists, maintenance, hygiene, training, approvals,
+    // reporting. Additive module. No hodOnly: dept staff need My Tasks etc.;
+    // page + API handlers gate management surfaces (canManageTasks) themselves.
+    label: 'Task Management',
+    pages: [
+      { path: '/tasks',                label: 'Dashboard' },
+      { path: '/tasks/my',             label: 'My Tasks' },
+      { path: '/tasks/checklists',     label: 'Daily Checklists' },
+      { path: '/tasks/board',          label: 'Task Board' },
+      { path: '/tasks/maintenance',    label: 'Maintenance' },
+      { path: '/tasks/hygiene',        label: 'Hygiene Audits' },
+      { path: '/tasks/training',       label: 'Training Tasks' },
+      { path: '/tasks/knowledge-tests', label: 'Knowledge Tests' },
+      { path: '/tasks/approvals',      label: 'Approvals' },
+      { path: '/tasks/reports',        label: 'Reports' },
+      { path: '/tasks/calendar',       label: 'Calendar' },
+      { path: '/tasks/templates',      label: 'Templates' },
+      { path: '/tasks/departments',    label: 'Departments' },
+      { path: '/tasks/notifications',  label: 'Notifications' },
+      { path: '/tasks/settings',       label: 'Settings' },
+    ],
+  },
+  {
     // AKAN CRM — AI assistant / training / quizzes for the Front Office & GRE
     // team (ported from the standalone Flask app). Grant per user/role like any
     // other page. Quiz Links + CRM Settings are HOD/admin surfaces.

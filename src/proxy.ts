@@ -75,6 +75,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/crm',                 // AKAN CRM (chat/training/quiz/settings) — guest-quiz is carved out in isPublic
   '/api/whatsapp',            // WhatsApp Integration (config/templates) — webhook is carved out in isPublic
   '/api/stores',              // Store Locations (multi-store engine config: stores/categories/access)
+  '/api/tasks',               // Task Management module (tasks/checklists/maintenance/hygiene/training/approvals/etc.) — all mutations CSRF-protected
 ];
 
 function isPublic(pathname: string): boolean {

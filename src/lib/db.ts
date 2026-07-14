@@ -2676,6 +2676,402 @@ function initializeSchema(db: Database.Database) {
     }
     db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('config_fingerprint', ?)").run(fingerprint);
   } catch (e) { console.error('config fingerprint audit failed:', e); }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TASK MANAGEMENT MODULE (2026-07) — purely additive. All 19 tables + seeds
+  // live inside ONE labeled try/catch so any failure here never blocks boot and
+  // never touches existing tables. Idempotent: CREATE TABLE/INDEX IF NOT EXISTS,
+  // INSERT OR IGNORE, existence-guarded seeds.
+  // ══════════════════════════════════════════════════════════════════════════
+  try {
+    db.exec(`
+      -- 1. task_categories
+      CREATE TABLE IF NOT EXISTS task_categories (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        color       TEXT NOT NULL DEFAULT '',
+        icon        TEXT NOT NULL DEFAULT '',
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      -- 2. task_departments
+      CREATE TABLE IF NOT EXISTS task_departments (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        code        TEXT NOT NULL DEFAULT '',
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      -- 3. tasks
+      CREATE TABLE IF NOT EXISTS tasks (
+        id                 TEXT PRIMARY KEY,
+        title              TEXT NOT NULL,
+        description        TEXT NOT NULL DEFAULT '',
+        category           TEXT NOT NULL DEFAULT 'Operations',
+        department         TEXT NOT NULL DEFAULT '',
+        priority           TEXT NOT NULL DEFAULT 'medium',
+        status             TEXT NOT NULL DEFAULT 'draft',
+        assignee_email     TEXT NOT NULL DEFAULT '',
+        assignee_name      TEXT NOT NULL DEFAULT '',
+        created_by         TEXT NOT NULL DEFAULT '',
+        due_date           TEXT NOT NULL DEFAULT '',
+        due_time           TEXT NOT NULL DEFAULT '',
+        estimated_minutes  INTEGER NOT NULL DEFAULT 0,
+        parent_task_id     TEXT NOT NULL DEFAULT '',
+        recurring_rule_id  TEXT NOT NULL DEFAULT '',
+        template_id        TEXT NOT NULL DEFAULT '',
+        source             TEXT NOT NULL DEFAULT 'manual',
+        checklist_json     TEXT NOT NULL DEFAULT '[]',
+        started_at         TEXT,
+        paused_at          TEXT,
+        completed_at       TEXT,
+        approved_at        TEXT,
+        approved_by        TEXT,
+        is_archived        INTEGER NOT NULL DEFAULT 0,
+        sort_order         INTEGER NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_tasks_status         ON tasks(status);
+      CREATE INDEX IF NOT EXISTS idx_tasks_assignee_email ON tasks(assignee_email);
+      CREATE INDEX IF NOT EXISTS idx_tasks_department     ON tasks(department);
+      CREATE INDEX IF NOT EXISTS idx_tasks_due_date       ON tasks(due_date);
+      CREATE INDEX IF NOT EXISTS idx_tasks_parent         ON tasks(parent_task_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_category       ON tasks(category);
+
+      -- 4. task_assignees
+      CREATE TABLE IF NOT EXISTS task_assignees (
+        id          TEXT PRIMARY KEY,
+        task_id     TEXT NOT NULL,
+        user_email  TEXT NOT NULL DEFAULT '',
+        user_name   TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_assignees_task ON task_assignees(task_id);
+
+      -- 5. task_comments
+      CREATE TABLE IF NOT EXISTS task_comments (
+        id            TEXT PRIMARY KEY,
+        task_id       TEXT NOT NULL,
+        author_email  TEXT NOT NULL DEFAULT '',
+        author_name   TEXT NOT NULL DEFAULT '',
+        body          TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_comments_task ON task_comments(task_id);
+
+      -- 6. task_attachments
+      CREATE TABLE IF NOT EXISTS task_attachments (
+        id          TEXT PRIMARY KEY,
+        task_id     TEXT NOT NULL,
+        comment_id  TEXT NOT NULL DEFAULT '',
+        kind        TEXT NOT NULL DEFAULT 'file',
+        url         TEXT NOT NULL DEFAULT '',
+        filename    TEXT NOT NULL DEFAULT '',
+        created_by  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_attachments_task ON task_attachments(task_id);
+
+      -- 7. task_mentions
+      CREATE TABLE IF NOT EXISTS task_mentions (
+        id               TEXT PRIMARY KEY,
+        task_id          TEXT NOT NULL,
+        comment_id       TEXT NOT NULL DEFAULT '',
+        mentioned_email  TEXT NOT NULL DEFAULT '',
+        mentioned_name   TEXT NOT NULL DEFAULT '',
+        mentioned_by     TEXT NOT NULL DEFAULT '',
+        is_read          INTEGER NOT NULL DEFAULT 0,
+        created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_mentions_email ON task_mentions(mentioned_email);
+      CREATE INDEX IF NOT EXISTS idx_task_mentions_task  ON task_mentions(task_id);
+
+      -- 8. task_status_history
+      CREATE TABLE IF NOT EXISTS task_status_history (
+        id           TEXT PRIMARY KEY,
+        task_id      TEXT NOT NULL,
+        from_status  TEXT NOT NULL DEFAULT '',
+        to_status    TEXT NOT NULL DEFAULT '',
+        changed_by   TEXT NOT NULL DEFAULT '',
+        note         TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_status_history_task ON task_status_history(task_id);
+
+      -- 9. checklist_templates
+      CREATE TABLE IF NOT EXISTS checklist_templates (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        role        TEXT NOT NULL DEFAULT '',
+        department  TEXT NOT NULL DEFAULT '',
+        category    TEXT NOT NULL DEFAULT 'Operations',
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      -- 10. checklist_items
+      CREATE TABLE IF NOT EXISTS checklist_items (
+        id             TEXT PRIMARY KEY,
+        template_id    TEXT NOT NULL,
+        label          TEXT NOT NULL,
+        sort_order     INTEGER NOT NULL DEFAULT 0,
+        requires_image INTEGER NOT NULL DEFAULT 0,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_checklist_items_template ON checklist_items(template_id);
+
+      -- 11. daily_checklist_records
+      CREATE TABLE IF NOT EXISTS daily_checklist_records (
+        id                TEXT PRIMARY KEY,
+        template_id       TEXT NOT NULL DEFAULT '',
+        item_id           TEXT NOT NULL DEFAULT '',
+        date              TEXT NOT NULL DEFAULT '',
+        result            TEXT NOT NULL DEFAULT 'na',
+        comment           TEXT NOT NULL DEFAULT '',
+        image_url         TEXT NOT NULL DEFAULT '',
+        corrective_action TEXT NOT NULL DEFAULT '',
+        created_task_id   TEXT NOT NULL DEFAULT '',
+        department        TEXT NOT NULL DEFAULT '',
+        recorded_by       TEXT NOT NULL DEFAULT '',
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_daily_checklist_records_tpl_date ON daily_checklist_records(template_id, date);
+      CREATE INDEX IF NOT EXISTS idx_daily_checklist_records_date     ON daily_checklist_records(date);
+
+      -- 12. maintenance_schedules
+      CREATE TABLE IF NOT EXISTS maintenance_schedules (
+        id                  TEXT PRIMARY KEY,
+        name                TEXT NOT NULL,
+        category            TEXT NOT NULL DEFAULT 'Maintenance',
+        frequency           TEXT NOT NULL DEFAULT 'daily',
+        department          TEXT NOT NULL DEFAULT 'Maintenance',
+        assignee_email      TEXT NOT NULL DEFAULT '',
+        next_due_date       TEXT NOT NULL DEFAULT '',
+        last_generated_date TEXT NOT NULL DEFAULT '',
+        is_active           INTEGER NOT NULL DEFAULT 1,
+        created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      -- 13. maintenance_logs
+      CREATE TABLE IF NOT EXISTS maintenance_logs (
+        id           TEXT PRIMARY KEY,
+        schedule_id  TEXT NOT NULL,
+        task_id      TEXT NOT NULL DEFAULT '',
+        performed_by TEXT NOT NULL DEFAULT '',
+        performed_at TEXT NOT NULL DEFAULT '',
+        status       TEXT NOT NULL DEFAULT 'done',
+        notes        TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_maintenance_logs_schedule ON maintenance_logs(schedule_id);
+
+      -- 14. hygiene_audits
+      CREATE TABLE IF NOT EXISTS hygiene_audits (
+        id                TEXT PRIMARY KEY,
+        area              TEXT NOT NULL DEFAULT '',
+        item              TEXT NOT NULL DEFAULT '',
+        date              TEXT NOT NULL DEFAULT '',
+        result            TEXT NOT NULL DEFAULT 'na',
+        image_url         TEXT NOT NULL DEFAULT '',
+        corrective_action TEXT NOT NULL DEFAULT '',
+        created_task_id   TEXT NOT NULL DEFAULT '',
+        score             REAL NOT NULL DEFAULT 0,
+        auditor           TEXT NOT NULL DEFAULT '',
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hygiene_audits_area_date ON hygiene_audits(area, date);
+      CREATE INDEX IF NOT EXISTS idx_hygiene_audits_date      ON hygiene_audits(date);
+
+      -- 15. training_sessions
+      CREATE TABLE IF NOT EXISTS training_sessions (
+        id               TEXT PRIMARY KEY,
+        title            TEXT NOT NULL,
+        trainer          TEXT NOT NULL DEFAULT '',
+        department       TEXT NOT NULL DEFAULT '',
+        session_date     TEXT NOT NULL DEFAULT '',
+        duration_minutes INTEGER NOT NULL DEFAULT 0,
+        attendees_json   TEXT NOT NULL DEFAULT '[]',
+        status           TEXT NOT NULL DEFAULT 'scheduled',
+        feedback         TEXT NOT NULL DEFAULT '',
+        created_by       TEXT NOT NULL DEFAULT '',
+        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      -- 16. knowledge_tests
+      CREATE TABLE IF NOT EXISTS knowledge_tests (
+        id                 TEXT PRIMARY KEY,
+        title              TEXT NOT NULL,
+        description        TEXT NOT NULL DEFAULT '',
+        questions_json     TEXT NOT NULL DEFAULT '[]',
+        time_limit_minutes INTEGER NOT NULL DEFAULT 0,
+        pass_score         INTEGER NOT NULL DEFAULT 60,
+        is_active          INTEGER NOT NULL DEFAULT 1,
+        created_by         TEXT NOT NULL DEFAULT '',
+        created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      -- 17. knowledge_test_results
+      CREATE TABLE IF NOT EXISTS knowledge_test_results (
+        id           TEXT PRIMARY KEY,
+        test_id      TEXT NOT NULL,
+        user_email   TEXT NOT NULL DEFAULT '',
+        user_name    TEXT NOT NULL DEFAULT '',
+        score        REAL NOT NULL DEFAULT 0,
+        answers_json TEXT NOT NULL DEFAULT '[]',
+        passed       INTEGER NOT NULL DEFAULT 0,
+        reviewed     INTEGER NOT NULL DEFAULT 0,
+        taken_at     TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_knowledge_test_results_test ON knowledge_test_results(test_id);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_test_results_user ON knowledge_test_results(user_email);
+
+      -- 18. task_notifications
+      CREATE TABLE IF NOT EXISTS task_notifications (
+        id               TEXT PRIMARY KEY,
+        recipient_email  TEXT NOT NULL DEFAULT '',
+        kind             TEXT NOT NULL DEFAULT '',
+        title            TEXT NOT NULL DEFAULT '',
+        body             TEXT NOT NULL DEFAULT '',
+        task_id          TEXT NOT NULL DEFAULT '',
+        href             TEXT NOT NULL DEFAULT '',
+        is_read          INTEGER NOT NULL DEFAULT 0,
+        created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_notifications_recipient ON task_notifications(recipient_email, is_read);
+
+      -- 19. task_approvals
+      CREATE TABLE IF NOT EXISTS task_approvals (
+        id             TEXT PRIMARY KEY,
+        task_id        TEXT NOT NULL,
+        requested_by   TEXT NOT NULL DEFAULT '',
+        approver_email TEXT NOT NULL DEFAULT '',
+        decision       TEXT NOT NULL DEFAULT 'pending',
+        note           TEXT NOT NULL DEFAULT '',
+        decided_at     TEXT,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_approvals_task     ON task_approvals(task_id);
+      CREATE INDEX IF NOT EXISTS idx_task_approvals_decision ON task_approvals(decision);
+
+      -- 20. recurring_task_rules
+      CREATE TABLE IF NOT EXISTS recurring_task_rules (
+        id             TEXT PRIMARY KEY,
+        title          TEXT NOT NULL,
+        description    TEXT NOT NULL DEFAULT '',
+        category       TEXT NOT NULL DEFAULT 'Operations',
+        department     TEXT NOT NULL DEFAULT '',
+        assignee_email TEXT NOT NULL DEFAULT '',
+        priority       TEXT NOT NULL DEFAULT 'medium',
+        frequency      TEXT NOT NULL DEFAULT 'daily',
+        day_of_week    INTEGER NOT NULL DEFAULT 0,
+        day_of_month   INTEGER NOT NULL DEFAULT 1,
+        next_run_date  TEXT NOT NULL DEFAULT '',
+        last_run_date  TEXT NOT NULL DEFAULT '',
+        is_active      INTEGER NOT NULL DEFAULT 1,
+        created_by     TEXT NOT NULL DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+
+    // ── SEED: task_categories (13) — name is UNIQUE, INSERT OR IGNORE is safe ──
+    {
+      const cats: [string, string, string][] = [
+        // [name, color, icon]
+        ['Hygiene',     'emerald', 'SprayCan'],
+        ['Maintenance', 'amber',   'Wrench'],
+        ['Repairs',     'orange',  'Hammer'],
+        ['Operations',  'blue',    'Settings2'],
+        ['HR',          'violet',  'Users'],
+        ['Training',    'indigo',  'GraduationCap'],
+        ['Kitchen',     'red',     'ChefHat'],
+        ['Housekeeping','teal',    'Sparkles'],
+        ['Store',       'yellow',  'Package'],
+        ['Bar',         'purple',  'Wine'],
+        ['Admin',       'slate',   'FileText'],
+        ['Compliance',  'cyan',    'ShieldCheck'],
+        ['Safety',      'rose',    'AlertTriangle'],
+      ];
+      const ins = db.prepare(`INSERT OR IGNORE INTO task_categories (id, name, color, icon, sort_order) VALUES (?, ?, ?, ?, ?)`);
+      cats.forEach(([name, color, icon], i) => ins.run(generateId(), name, color, icon, i));
+    }
+
+    // ── SEED: task_departments (10) — name UNIQUE ──
+    {
+      const depts: [string, string][] = [
+        ['Operations', 'OPS'], ['Kitchen', 'KIT'], ['Bar', 'BAR'],
+        ['Housekeeping', 'HK'], ['Maintenance', 'MNT'], ['Store', 'STR'],
+        ['HR', 'HR'], ['Accounts', 'ACC'], ['Security', 'SEC'], ['Administration', 'ADM'],
+      ];
+      const ins = db.prepare(`INSERT OR IGNORE INTO task_departments (id, name, code) VALUES (?, ?, ?)`);
+      depts.forEach(([name, code]) => ins.run(generateId(), name, code));
+    }
+
+    // ── SEED: checklist_templates + checklist_items ──
+    // Guarded by name (checklist_templates.name is NOT unique) so admin edits
+    // are never clobbered and re-runs are idempotent.
+    {
+      const templates: { name: string; role: string; department: string; category: string; items: string[] }[] = [
+        {
+          name: 'Operations Manager Daily Checklist', role: 'Operations Manager', department: 'Operations', category: 'Operations',
+          items: ['Restaurant Cleanliness', 'Washrooms', 'Dining Area', 'Kitchen Inspection', 'Store Inspection', 'Bar Inspection', 'Fire Safety', 'Emergency Exit', 'Music', 'Lighting', 'AC Temperature', 'Guest Complaints', 'Opening Checklist', 'Closing Checklist'],
+        },
+        {
+          name: 'Floor Manager Daily Checklist', role: 'Floor Manager', department: 'Operations', category: 'Operations',
+          items: ['Table Setup', 'Cutlery & Crockery', 'Menu Cards', 'Staff Grooming', 'Guest Greeting', 'Service Standards', 'Order Accuracy', 'Billing Process', 'Feedback Collection', 'Table Turnaround', 'Reservation Management', 'Closing Floor Check'],
+        },
+        {
+          name: 'HR Manager Daily Checklist', role: 'HR Manager', department: 'HR', category: 'HR',
+          items: ['Attendance Register', 'Staff Grooming', 'Uniform Check', 'Shift Roster', 'Leave Records', 'Training Schedule', 'Staff Welfare', 'Discipline Log', 'New Joinee Documentation', 'Payroll Inputs'],
+        },
+        {
+          name: 'Store Manager Daily Checklist', role: 'Store Manager', department: 'Store', category: 'Store',
+          items: ['Stock Levels', 'Expiry Check', 'FIFO Compliance', 'Storage Hygiene', 'Temperature Logs', 'Receiving Inspection', 'Indent Processing', 'Wastage Record', 'Vendor Delivery Check', 'Inventory Reconciliation'],
+        },
+        {
+          name: 'Bar Manager Daily Checklist', role: 'Bar Manager', department: 'Bar', category: 'Bar',
+          items: ['Bar Cleanliness', 'Liquor Stock', 'Glassware', 'Ice Machine', 'Garnish Station', 'Beverage Expiry', 'POS Check', 'Bar Opening', 'Bar Closing', 'Wastage & Spillage Log'],
+        },
+      ];
+      const findTpl = db.prepare(`SELECT id FROM checklist_templates WHERE name = ?`);
+      const insTpl = db.prepare(`INSERT INTO checklist_templates (id, name, role, department, category) VALUES (?, ?, ?, ?, ?)`);
+      const insItem = db.prepare(`INSERT INTO checklist_items (id, template_id, label, sort_order) VALUES (?, ?, ?, ?)`);
+      for (const t of templates) {
+        const existing = findTpl.get(t.name) as { id: string } | undefined;
+        if (existing) continue; // already seeded — leave admin edits alone
+        const tplId = generateId();
+        insTpl.run(tplId, t.name, t.role, t.department, t.category);
+        t.items.forEach((label, i) => insItem.run(generateId(), tplId, label, i));
+      }
+    }
+
+    // ── SEED: maintenance_schedules (7 daily + 8 weekly + 6 monthly) ──
+    // Guarded by name (not unique) so re-runs are idempotent and edits survive.
+    {
+      const scheds: [string, 'daily' | 'weekly' | 'monthly'][] = [
+        ['Generator', 'daily'], ['Lighting', 'daily'], ['Electrical Panel', 'daily'], ['Water Tank', 'daily'], ['Washrooms', 'daily'], ['Water Leakage', 'daily'], ['Garbage Disposal', 'daily'],
+        ['AC Cleaning', 'weekly'], ['Water Filter Inspection', 'weekly'], ['Refrigerator Cleaning', 'weekly'], ['Exhaust Cleaning', 'weekly'], ['Table Fittings', 'weekly'], ['Chair Fittings', 'weekly'], ['Door Closers', 'weekly'], ['CCTV Check', 'weekly'],
+        ['Fire Extinguishers', 'monthly'], ['Plumbing', 'monthly'], ['Electrical Audit', 'monthly'], ['Pest Control', 'monthly'], ['Deep Cleaning', 'monthly'], ['Freezer Service', 'monthly'],
+      ];
+      const findSched = db.prepare(`SELECT id FROM maintenance_schedules WHERE name = ?`);
+      const insSched = db.prepare(`INSERT INTO maintenance_schedules (id, name, category, frequency, department) VALUES (?, ?, 'Maintenance', ?, 'Maintenance')`);
+      for (const [name, freq] of scheds) {
+        if (findSched.get(name)) continue;
+        insSched.run(generateId(), name, freq);
+      }
+    }
+  } catch (e) { console.error('task-module schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

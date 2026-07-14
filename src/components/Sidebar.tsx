@@ -48,6 +48,13 @@ import {
   GraduationCap,
   HelpCircle,
   Wine,
+  ListTodo,
+  KanbanSquare,
+  Wrench,
+  Sparkles,
+  CheckCheck,
+  CalendarClock,
+  Settings2,
   type LucideIcon,
 } from "lucide-react";
 
@@ -168,6 +175,31 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "KOT Data Points",    href: "/dine-in/kot-analytics",  icon: BarChart3 },
       { kind: "link", label: "Captain Response Times", href: "/dine-in/captain-performance", icon: Timer },
       { kind: "link", label: "Production Reports", href: "/kitchen-production/reports", icon: BarChart3 },
+    ],
+  },
+
+  // Task Management — checklists, maintenance, hygiene, training tasks,
+  // approvals + reporting. Additive module; links show per page-catalog grants.
+  {
+    kind: "section",
+    label: "Task Management",
+    icon: ListTodo,
+    items: [
+      { kind: "link", label: "Dashboard",        href: "/tasks",                 icon: LayoutDashboard },
+      { kind: "link", label: "My Tasks",          href: "/tasks/my",              icon: ListTodo },
+      { kind: "link", label: "Daily Checklists",  href: "/tasks/checklists",      icon: ClipboardCheck },
+      { kind: "link", label: "Task Board",        href: "/tasks/board",           icon: KanbanSquare },
+      { kind: "link", label: "Maintenance",       href: "/tasks/maintenance",     icon: Wrench },
+      { kind: "link", label: "Hygiene Audits",    href: "/tasks/hygiene",         icon: Sparkles },
+      { kind: "link", label: "Training Tasks",    href: "/tasks/training",        icon: GraduationCap },
+      { kind: "link", label: "Knowledge Tests",   href: "/tasks/knowledge-tests", icon: BookOpen },
+      { kind: "link", label: "Approvals",         href: "/tasks/approvals",       icon: CheckCheck },
+      { kind: "link", label: "Reports",           href: "/tasks/reports",         icon: BarChart3 },
+      { kind: "link", label: "Calendar",          href: "/tasks/calendar",        icon: CalendarClock },
+      { kind: "link", label: "Templates",         href: "/tasks/templates",       icon: FileText },
+      { kind: "link", label: "Departments",       href: "/tasks/departments",     icon: Building2 },
+      { kind: "link", label: "Notifications",     href: "/tasks/notifications",   icon: Bell },
+      { kind: "link", label: "Settings",          href: "/tasks/settings",        icon: Settings2 },
     ],
   },
 

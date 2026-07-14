@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canProcessAsStore } from '@/lib/auth';
 import { requisitionVisibility } from '@/lib/dept-hierarchy';
+import { canApproveTasks } from '@/lib/tasks';
 
 /**
  * Action Inbox — the global notification bell.
@@ -159,6 +160,44 @@ export async function GET() {
         own(`r.status IN ('chef_approved', 'mgmt_approved', 'store_processed')`), '/requisitions');
       push('my_req_fulfilled', 'My requisitions fulfilled today',
         own(`r.status = 'fulfilled' AND date(COALESCE(r.fulfilled_at, r.updated_at)) = date('now')`), '/requisitions');
+    }
+
+    // ── Task Management buckets (additive; isolated so a task-schema issue
+    //    can never break the existing inbox) ───────────────────────────────
+    try {
+      const email = me.email || '';
+
+      // Tasks due today assigned to me (still open).
+      push('tasks_due_today', 'Tasks due today assigned to me', one(
+        `SELECT COUNT(*) AS n FROM tasks
+         WHERE lower(assignee_email) = lower(?) AND due_date = date('now')
+           AND is_archived = 0
+           AND status NOT IN ('completed', 'approved', 'cancelled')`,
+        [email],
+      ), '/tasks/my');
+
+      // Tasks awaiting my approval (approvers only).
+      if (canApproveTasks(me)) {
+        push('tasks_awaiting_approval', 'Tasks awaiting my approval', one(
+          `SELECT COUNT(*) AS n FROM tasks
+           WHERE status = 'waiting_verification' AND is_archived = 0`,
+          [],
+        ), '/tasks/approvals');
+      }
+
+      // Unread @mentions for me — counted off task_notifications (kind='mention'),
+      // NOT task_mentions. Every deliverable @mention (an @email token) fans out to
+      // BOTH a task_mentions row and a kind='mention' task_notifications row, and the
+      // /tasks/notifications page's mark-read flow clears task_notifications. Counting
+      // task_mentions.is_read here left the bell stuck forever, because no endpoint
+      // ever sets task_mentions.is_read = 1 — so the badge could never return to zero.
+      push('tasks_mentions', '@mentions for me (unread)', one(
+        `SELECT COUNT(*) AS n FROM task_notifications
+         WHERE lower(recipient_email) = lower(?) AND kind = 'mention' AND is_read = 0`,
+        [email],
+      ), '/tasks/notifications');
+    } catch (taskErr) {
+      console.error('[/api/notifications/inbox] task buckets failed:', taskErr);
     }
 
     const total = items.reduce((s, i) => s + i.count, 0);
