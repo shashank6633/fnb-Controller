@@ -34,6 +34,11 @@ interface Material {
   category?: string;
 }
 interface Department { id: string; name: string; code?: string; }
+/** Minimal /api/department-stock row — what the "With dept" line needs. */
+export interface DeptStockLite { on_hand_est: number; never_counted: boolean; }
+/** The dept-stock map + the department it was computed for (so a stale map
+ *  is never shown against a different department). */
+export interface DeptStockProp { deptId: string; byId: Map<string, DeptStockLite>; }
 /** Minimal shape of a draft requisition being edited (subset of page.tsx's
  *  Requisition — structurally compatible, so the page can pass it straight in). */
 interface DraftItem {
@@ -74,7 +79,7 @@ function pu(m: Material): string { return m.purchase_unit || m.unit || ''; }
 const inr = (v: number, dp = 0) =>
   '₹' + (v || 0).toLocaleString('en-IN', { minimumFractionDigits: dp, maximumFractionDigits: dp });
 
-export default function StaffCatalogPicker({ materials, me, departments, editDraft, onClose, onCreated }: {
+export default function StaffCatalogPicker({ materials, me, departments, editDraft, deptStock, onClose, onCreated }: {
   materials: Material[];
   me: {
     role?: string; email?: string; department_id?: string | null;
@@ -83,6 +88,10 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
   departments: Department[];
   /** When set, the picker edits this draft (PUT) instead of creating (POST). */
   editDraft?: EditDraft | null;
+  /** Department-stock rows pre-fetched by the page for the requisition's
+   *  department. The picker refetches itself if its dept differs (privileged
+   *  users can switch departments in the header). */
+  deptStock?: DeptStockProp | null;
   onClose: () => void;
   onCreated: () => void;
 }) {
@@ -108,6 +117,27 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me?.department_id]);
   const dept = departments.find(d => d.id === deptId);
+
+  // Department's OWN computed stock (/api/department-stock) — shown per item
+  // instead of the central-store figure. Seeded from the page's pre-fetch;
+  // refetched here only when the picker's dept differs from the pre-fetch's.
+  const [ds, setDs] = useState<DeptStockProp>({ deptId: deptStock?.deptId || '', byId: deptStock?.byId || new Map() });
+  useEffect(() => {
+    if (!deptId) { setDs({ deptId: '', byId: new Map() }); return; }
+    if (deptStock && deptStock.deptId === deptId) { setDs(deptStock); return; }
+    let live = true;
+    fetch(`/api/department-stock?department_id=${encodeURIComponent(deptId)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(j => {
+        if (!live) return;
+        const byId = new Map<string, DeptStockLite>(
+          ((j?.rows || []) as any[]).map(r => [r.material_id, { on_hand_est: r.on_hand_est, never_counted: !!r.never_counted }]));
+        setDs({ deptId, byId });
+      })
+      .catch(() => { if (live) setDs({ deptId, byId: new Map() }); });
+    return () => { live = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deptId, deptStock]);
 
   const [search, setSearch] = useState('');
   const [category, setCategory] = useState('All');
@@ -308,18 +338,27 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
             </div>
           ) : visible.map(m => {
             const qty = cart[m.id] || 0;
-            // Stock is stored in RECIPE units; show it in the purchase unit.
-            const stockInPU = (m.current_stock || 0) / packFactor(m);
+            // The DEPARTMENT's own computed balance (recipe units → purchase
+            // units, same ÷ pack convention as the old central-store line).
+            const dr = ds.byId.get(m.id);
+            const inPUq = (v: number) => (v / packFactor(m)).toLocaleString('en-IN', { maximumFractionDigits: 1 });
             return (
               <div key={m.id} className="bg-white rounded-lg border border-[#E8D5C4] p-3 flex items-center gap-2">
                 <div className="flex-1 min-w-0">
                   <div className="text-[13px] font-bold text-[#2D1B0E] uppercase leading-snug break-words">{m.name}</div>
-                  {m.current_stock > 0 ? (
+                  {dr && !dr.never_counted && dr.on_hand_est > 0 ? (
                     <div className="text-[11px] text-emerald-600 font-medium mt-0.5">
-                      Stock : {stockInPU.toLocaleString('en-IN', { maximumFractionDigits: 1 })} / {pu(m)}
+                      With dept : {inPUq(dr.on_hand_est)} / {pu(m)}
                     </div>
                   ) : (
-                    <div className="text-[11px] text-red-500 font-medium mt-0.5">Stock : - / -</div>
+                    <div className="text-[11px] text-red-500 font-medium mt-0.5">With dept : – / –</div>
+                  )}
+                  {dr?.never_counted && (
+                    // Not counted yet — receipts over the last 30 days only,
+                    // informational (NOT a balance).
+                    <div className="text-[11px] text-sky-600 font-medium mt-0.5">
+                      Recd 30d : {inPUq(dr.on_hand_est)} / {pu(m)}
+                    </div>
                   )}
                   <div className="text-[11px] text-[#6B5744] mt-0.5">
                     {inr(pricePerPU(m), 2)} / {pu(m)}

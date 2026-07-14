@@ -20,7 +20,7 @@ import { api } from '@/lib/api';
 import { fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import TabScroller from '@/components/TabScroller';
-import StaffCatalogPicker from './StaffCatalogPicker';
+import StaffCatalogPicker, { type DeptStockLite, type DeptStockProp } from './StaffCatalogPicker';
 
 const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 
@@ -144,6 +144,29 @@ export default function RequisitionsPage() {
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user || null)).catch(() => {});
   }, []);
+  // Department-stock map for the requisition's department — the picker shows
+  // "With dept: N / PU" (the dept's own computed balance) instead of the
+  // central-store stock. Fetched alongside the /api/inventory load for the
+  // dept a new/edited requisition resolves to: the draft's department, else
+  // the viewer's own (same resolution as StaffCatalogPicker's deptId init).
+  const [deptStock, setDeptStock] = useState<DeptStockProp>({ deptId: '', byId: new Map() });
+  useEffect(() => {
+    const deptId = editDraft?.department_id || me?.department_id || '';
+    if (!deptId) return;
+    if (deptStock.deptId === deptId) return;
+    let live = true;
+    fetch(`/api/department-stock?department_id=${encodeURIComponent(deptId)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(j => {
+        if (!live || !j) return;
+        const byId = new Map<string, DeptStockLite>(
+          (j.rows || []).map((r: any) => [r.material_id, { on_hand_est: r.on_hand_est, never_counted: !!r.never_counted }]));
+        setDeptStock({ deptId, byId });
+      })
+      .catch(() => {});
+    return () => { live = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me?.department_id, editDraft?.department_id]);
   // Mgmt-approval setting — when OFF, the Mgmt inbox banner and tab on this
   // page should disappear entirely (chef approval is the only gate). When ON,
   // legacy Chef → Mgmt → Store flow applies and the indigo banner reappears.
@@ -345,7 +368,7 @@ export default function RequisitionsPage() {
           && !me.is_head_chef && !me.is_store_manager;
         return (!editDraft || isStaff) ? (
           <StaffCatalogPicker materials={materials} me={me} departments={departments}
-                              editDraft={editDraft}
+                              editDraft={editDraft} deptStock={deptStock}
                               onClose={() => { setCreating(false); setEditDraft(null); }}
                               onCreated={reload} />
         ) : (

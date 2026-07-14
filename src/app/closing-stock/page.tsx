@@ -140,6 +140,25 @@ export default function ClosingStockByLocationPage() {
   }, [departments, canSeeAllDepts, visibleDeptIds, ownDeptId]);
   // The department_id sent on POST to scope saved counts. Pinned users → own dept.
   const activeDeptId: string = hasDeptChoice ? selectedDept : (ownDeptId || '');
+  // Non-privileged users only count their department's ITEM SET (materials
+  // issued to or already counted by the dept — /api/department-stock rows).
+  // Intersects the Record modal list + CSV template below. null = no
+  // restriction (privileged viewers, or the fetch failed → old behaviour;
+  // the by-location API is server-scoped regardless).
+  const [deptItemIds, setDeptItemIds] = useState<Set<string> | null>(null);
+  useEffect(() => {
+    if (!me || canSeeAllDepts || !activeDeptId) { setDeptItemIds(null); return; }
+    let live = true;
+    fetch(`/api/department-stock?department_id=${encodeURIComponent(activeDeptId)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(j => {
+        if (!live) return;
+        setDeptItemIds(j ? new Set<string>((j.rows || []).map((r: any) => String(r.material_id))) : null);
+      })
+      .catch(() => { if (live) setDeptItemIds(null); });
+    return () => { live = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me, canSeeAllDepts, activeDeptId]);
   // Category whitelist (lowercased) of the ACTIVE department, resolved to its
   // MAIN department — sub-depts inherit the main's material_categories, so walk
   // parent_id via the departments payload. null = no filter: Store/Overall ('')
@@ -232,9 +251,17 @@ export default function ClosingStockByLocationPage() {
      category set — re-filters live when the dropdown changes. Store/Overall
      ('') or a dept with no configured categories → no filter (full list). */
   const deptScopedMaterials = useMemo(() => {
-    if (!hasDeptChoice || !deptCategorySet) return materials;
-    return materials.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()));
-  }, [materials, hasDeptChoice, deptCategorySet]);
+    let list = materials;
+    if (hasDeptChoice && deptCategorySet) {
+      list = list.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()));
+    }
+    // Non-privileged: further intersect with the dept's item set so staff
+    // only count what was actually issued to (or counted by) their dept.
+    if (!canSeeAllDepts && deptItemIds) {
+      list = list.filter((m: any) => deptItemIds.has(String(m.id)));
+    }
+    return list;
+  }, [materials, hasDeptChoice, deptCategorySet, canSeeAllDepts, deptItemIds]);
   // Is a real category whitelist in effect for the active dept? Gates the base
   // CATEGORIES union below (no point offering categories outside the whitelist)
   // and the "no filter configured" fallback hint in the modal.
@@ -408,6 +435,10 @@ export default function ClosingStockByLocationPage() {
       mats = (hasDeptChoice && deptCategorySet)
         ? all.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()))
         : all;
+      // Same dept item-set intersection as deptScopedMaterials.
+      if (!canSeeAllDepts && deptItemIds) {
+        mats = mats.filter((m: any) => deptItemIds.has(String(m.id)));
+      }
     }
     const lines = [CSV_COLS.join(',')];
     for (const m of mats) {

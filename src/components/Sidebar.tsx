@@ -129,6 +129,7 @@ const navTree: NavEntry[] = [
     items: [
       { kind: "link", label: "Raw Materials",      href: "/inventory",          icon: Package },
       { kind: "link", label: "Liquor Store",       href: "/inventory/liquor-store", icon: Wine },
+      { kind: "link", label: "Department Stock",   href: "/inventory/department-stock", icon: Warehouse },
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
       { kind: "link", label: "Issue Requisitions", href: "/store-requisitions", icon: Package },
       { kind: "link", label: "Closing Stock",      href: "/closing-stock",      icon: ClipboardCheck },

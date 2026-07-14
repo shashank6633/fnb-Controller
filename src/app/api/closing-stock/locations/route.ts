@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
-import { getCurrentOutletId } from '@/lib/auth';
+import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
+import { allowedDeptSetExpanded, canSeeAllDeptStock, DEPT_ITEM_SET_SQL, deptItemSetParams } from '@/lib/dept-stock';
 
 /**
  * Storage-location summary for the EOD count workflow.
@@ -20,6 +21,20 @@ export async function GET(request: Request) {
     const date = url.searchParams.get('date') || new Date().toISOString().slice(0, 10);
     const outletId = await getCurrentOutletId();
 
+    // Dept item-set scope for non-privileged callers — same restriction as
+    // /api/closing-stock/by-location, so staff location cards count only THEIR
+    // items (locations with none of their items disappear entirely).
+    const params: any[] = [date];
+    let deptScopeSql = '';
+    const me = await getCurrentUser();
+    if (me && !canSeeAllDeptStock(me)) {
+      const deptSet = allowedDeptSetExpanded(db, me);
+      if (deptSet.length > 0) {
+        deptScopeSql = ` AND ${DEPT_ITEM_SET_SQL}`;
+        params.push(...deptItemSetParams(deptSet));
+      }
+    }
+
     const rows = db.prepare(`
       SELECT
         COALESCE(NULLIF(TRIM(rm.storage_location), ''), '— Unassigned —') AS location,
@@ -35,10 +50,10 @@ export async function GET(request: Request) {
         SELECT 1 FROM store_category_map scm
         JOIN store_locations sl ON sl.id = scm.store_id
         WHERE sl.is_active = 1 AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
-      )
+      )${deptScopeSql}
       GROUP BY location
       ORDER BY location
-    `).all(date) as any[];
+    `).all(...params) as any[];
 
     const totals = {
       locations: rows.length,

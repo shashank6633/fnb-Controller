@@ -93,6 +93,7 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/inventory',           label: 'Raw Materials' },
       { path: '/inventory/liquor-store', label: 'Liquor Store' },
+      { path: '/inventory/department-stock', label: 'Department Stock' },
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
       { path: '/store-requisitions',  label: 'Store Requisitions (Issue)' },
       { path: '/closing-stock',       label: 'Closing Stock' },

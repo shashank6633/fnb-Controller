@@ -1,8 +1,14 @@
 import { getDb } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
+import { allowedDeptSetExpanded, canSeeAllDeptStock, DEPT_ITEM_SET_SQL, deptItemSetParams } from '@/lib/dept-stock';
 
 /**
  * Materials in a specific storage location, with their current system stock
  * and today's closing count (if any). Drives the per-location count screen.
+ *
+ * Non-privileged users (not admin / manager / HOD / store manager) only see
+ * their department's item set (materials issued to OR counted by their dept)
+ * — a Tandoor cook counting a chiller must not see the whole catalogue.
  *
  * Query: ?location=Walk-in%20chiller&date=YYYY-MM-DD
  *        Use location=__unassigned__ for materials without a storage_location set.
@@ -21,7 +27,19 @@ export async function GET(request: Request) {
     const where = isUnassigned
       ? `(rm.storage_location IS NULL OR TRIM(rm.storage_location) = '')`
       : `TRIM(rm.storage_location) = ?`;
-    const params = isUnassigned ? [date] : [date, location];
+    const params: any[] = isUnassigned ? [date] : [date, location];
+
+    // Dept item-set scope for non-privileged callers. A dept-less staff user
+    // keeps the old full list (nothing sensible to intersect with).
+    let deptScopeSql = '';
+    const me = await getCurrentUser();
+    if (me && !canSeeAllDeptStock(me)) {
+      const deptSet = allowedDeptSetExpanded(db, me);
+      if (deptSet.length > 0) {
+        deptScopeSql = ` AND ${DEPT_ITEM_SET_SQL}`;
+        params.push(...deptItemSetParams(deptSet));
+      }
+    }
 
     const rows = db.prepare(`
       SELECT rm.id, rm.sku, rm.name, rm.unit, rm.purchase_unit, rm.pack_size,
@@ -41,7 +59,7 @@ export async function GET(request: Request) {
           SELECT 1 FROM store_category_map scm
           JOIN store_locations sl ON sl.id = scm.store_id
           WHERE sl.is_active = 1 AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
-        )
+        )${deptScopeSql}
       ORDER BY rm.super_category, rm.category, rm.name
     `).all(...params) as any[];
 
