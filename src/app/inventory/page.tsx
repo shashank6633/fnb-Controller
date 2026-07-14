@@ -208,6 +208,8 @@ export default function InventoryPage() {
   const [showRates, setShowRates] = useState(false);
   // Bulk priority-star tool (admin / store manager only)
   const [showPriority, setShowPriority] = useState(false);
+  // Inline per-row priority save in flight (material id)
+  const [savingPriorityId, setSavingPriorityId] = useState<string | null>(null);
   const [me, setMe] = useState<any>(null);
 
   useEffect(() => {
@@ -217,6 +219,26 @@ export default function InventoryPage() {
       .catch(() => setMe(null));
   }, []);
   const canBulkPriority = !!me && (me.role === 'admin' || me.is_store_manager);
+
+  // Inline per-row priority setter — same apply path as the bulk tool, so a
+  // single item's level can be set straight from the list (optimistic; reverts
+  // on failure). Gated to the same roles as the bulk tool via canBulkPriority.
+  async function setItemPriority(id: string, priority: number) {
+    const prev = materials;
+    setSavingPriorityId(id);
+    setMaterials((ms) => ms.map((m) => (m.id === id ? { ...m, priority } : m)));
+    try {
+      const res = await api('/api/inventory/priority', {
+        method: 'POST',
+        body: { mode: 'apply', rows: [{ id, priority }] },
+      });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Failed to set priority');
+    } catch {
+      setMaterials(prev); // revert on failure
+    } finally {
+      setSavingPriorityId(null);
+    }
+  }
 
   /* ---- Fetch ---- */
 
@@ -814,10 +836,26 @@ export default function InventoryPage() {
                         <td className="px-4 py-3 text-[#2D1B0E] font-medium">
                           <div className="flex items-center gap-1.5 flex-wrap">
                             <span>{m.name}</span>
-                            <span className="text-[10px] tracking-tighter"
-                                  title={`Priority: ${(m.priority ?? 2) === 3 ? 'Critical — counted in the alert bell + WhatsApp daily ping' : (m.priority ?? 2) === 1 ? 'Low' : 'Standard'} (edit via the pencil)`}>
-                              {'⭐'.repeat((m.priority ?? 2) === 3 ? 3 : (m.priority ?? 2) === 1 ? 1 : 2)}
-                            </span>
+                            {canBulkPriority ? (
+                              <select
+                                value={m.priority ?? 2}
+                                disabled={savingPriorityId === m.id}
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={(e) => { e.stopPropagation(); setItemPriority(m.id, Number(e.target.value)); }}
+                                title="Set this item's priority — 3★ Critical is counted in the alert bell + WhatsApp daily low-stock ping"
+                                aria-label={`Priority for ${m.name}`}
+                                className="text-[10px] leading-none bg-[#FFF1E3] border border-[#D4B896] rounded px-1 py-0.5 cursor-pointer disabled:opacity-50"
+                              >
+                                {PRIORITY_OPTIONS.map((p) => (
+                                  <option key={p.v} value={p.v}>{p.stars} {p.label}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="text-[10px] tracking-tighter"
+                                    title={`Priority: ${(m.priority ?? 2) === 3 ? 'Critical — counted in the alert bell + WhatsApp daily ping' : (m.priority ?? 2) === 1 ? 'Low' : 'Standard'}`}>
+                                {'⭐'.repeat((m.priority ?? 2) === 3 ? 3 : (m.priority ?? 2) === 1 ? 1 : 2)}
+                              </span>
+                            )}
                             {m.is_auto_discovered ? (
                               <span title={`Auto-discovered from ${m.discovered_source || 'import'} — review price/unit/category before relying on this material.`}
                                     className="text-[9px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200 font-medium uppercase tracking-wide">

@@ -128,6 +128,7 @@ const navTree: NavEntry[] = [
     icon: Boxes,
     items: [
       { kind: "link", label: "Raw Materials",      href: "/inventory",          icon: Package },
+      { kind: "link", label: "Categories",         href: "/settings/categories", icon: Boxes },
       { kind: "link", label: "Liquor Store",       href: "/inventory/liquor-store", icon: Wine },
       { kind: "link", label: "Department Stock",   href: "/inventory/department-stock", icon: Warehouse },
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
@@ -198,7 +199,6 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Users",          href: "/users",                  icon: Users },
       { kind: "link", label: "Roles",          href: "/settings/roles",         icon: Users },
       { kind: "link", label: "Print Design",   href: "/settings/print-design",  icon: Printer },
-      { kind: "link", label: "Categories",     href: "/settings/categories",    icon: Boxes },
       { kind: "link", label: "Store Locations", href: "/settings/stores",       icon: Warehouse },
       { kind: "link", label: "Page Access",    href: "/settings/page-access",   icon: ShieldAlert },
       { kind: "link", label: "Integrations",   href: "/settings/integrations",  icon: ShieldAlert },

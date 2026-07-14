@@ -92,6 +92,7 @@ export const PAGE_CATALOG: PageSection[] = [
     label: 'Inventory',
     pages: [
       { path: '/inventory',           label: 'Raw Materials' },
+      { path: '/settings/categories', label: 'Categories' },
       { path: '/inventory/liquor-store', label: 'Liquor Store' },
       { path: '/inventory/department-stock', label: 'Department Stock' },
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
@@ -157,7 +158,6 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/users',               label: 'Users' },
       { path: '/settings/roles',      label: 'Settings — Roles' },
       { path: '/settings/print-design', label: 'Settings — Print Design' },
-      { path: '/settings/categories', label: 'Settings — Category Manager' },
       { path: '/settings/stores',     label: 'Settings — Store Locations' },
       { path: '/settings/page-access', label: 'Settings — Page Access' },
       { path: '/settings/integrations', label: 'Settings — Integrations' },
