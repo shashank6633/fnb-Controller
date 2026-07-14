@@ -77,6 +77,8 @@ interface MaterialRow {
   id: string; name: string; sku: string | null; category: string;
   current_stock: number; unit: string; purchase_unit: string | null;
   pack_size: number; reorder_level: number; average_price: number;
+  /** Priority stars: 3 = critical, 2 = standard, 1 = low. */
+  priority: number;
 }
 
 function activeMaterials(db: DB): MaterialRow[] {
@@ -84,7 +86,8 @@ function activeMaterials(db: DB): MaterialRow[] {
     SELECT id, name, sku, COALESCE(NULLIF(category,''),'other') AS category,
            current_stock, unit, purchase_unit,
            COALESCE(pack_size,1) AS pack_size,
-           reorder_level, average_price
+           reorder_level, average_price,
+           COALESCE(priority,2) AS priority
     FROM raw_materials
     WHERE COALESCE(is_active,1) = 1
   `).all() as MaterialRow[];
@@ -109,6 +112,7 @@ export function stockAlerts(db: DB) {
     const daysLeft = avg > 0 ? r2(Math.max(0, m.current_stock) / avg) : null;
     return {
       name: m.name, sku: m.sku || '', category: m.category,
+      priority: m.priority,                  // 3★ critical first (see sort)
       current_stock: r3(m.current_stock), unit: m.unit,
       in_purchase_units: purchaseEquivalent(m),
       reorder_level: r3(m.reorder_level),
@@ -116,6 +120,7 @@ export function stockAlerts(db: DB) {
       days_of_stock_left: daysLeft,          // null = no recent usage recorded
     };
   }).sort((a, b) => {
+    if (b.priority !== a.priority) return b.priority - a.priority; // 3★ first
     const ax = a.days_of_stock_left == null ? 9e9 : a.days_of_stock_left;
     const bx = b.days_of_stock_left == null ? 9e9 : b.days_of_stock_left;
     return ax - bx;
@@ -123,8 +128,9 @@ export function stockAlerts(db: DB) {
   return {
     as_of: today(),
     low_stock_count: mats.length,
+    critical_3star_count: mats.filter(m => m.priority === 3).length,
     latest_issue_date: latestIssueDate(db),  // if older than 14d, usage averages read 0 (stale data)
-    note: 'Materials at/below their reorder level. days_of_stock_left = on-hand ÷ avg daily issued qty (last 14 days). null = no recent usage data.',
+    note: 'Materials at/below their reorder level, CRITICAL (priority 3★) first. days_of_stock_left = on-hand ÷ avg daily issued qty (last 14 days). null = no recent usage data.',
     rows,
   };
 }
@@ -146,6 +152,7 @@ export function reorderSuggestions(db: DB) {
     if (packs <= 0) continue;
     out.push({
       name: m.name, sku: m.sku || '', category: m.category,
+      priority: m.priority,                  // 3★ critical first (see sort)
       current_stock: r3(m.current_stock), unit: m.unit,
       avg_daily_use_14d: r3(avg),
       days_of_stock_left: daysLeft == null ? null : r2(daysLeft),
@@ -155,6 +162,7 @@ export function reorderSuggestions(db: DB) {
     });
   }
   out.sort((a, b) => {
+    if (b.priority !== a.priority) return b.priority - a.priority; // 3★ first
     const ax = a.days_of_stock_left == null ? 9e9 : a.days_of_stock_left;
     const bx = b.days_of_stock_left == null ? 9e9 : b.days_of_stock_left;
     return ax - bx || b.est_cost - a.est_cost;
@@ -593,6 +601,7 @@ export function reorderSuggestionsEnriched(db: DB) {
     out.push({
       material_id: m.id,
       name: m.name, sku: m.sku || '', category: m.category,
+      priority: m.priority,                  // 3★/2★/1★ — page pre-ticks 3★
       current_stock: r3(m.current_stock), unit: m.unit,
       purchase_unit: m.purchase_unit || m.unit,
       pack_size: pack,
@@ -610,6 +619,9 @@ export function reorderSuggestionsEnriched(db: DB) {
     });
   }
   out.sort((a, b) => {
+    // 3★ critical first — otherwise the 60-row cap below could push a critical
+    // material off the page entirely while 2★ rows with usage data fill it.
+    if (b.priority !== a.priority) return b.priority - a.priority;
     const ax = a.days_of_stock_left == null ? 9e9 : a.days_of_stock_left;
     const bx = b.days_of_stock_left == null ? 9e9 : b.days_of_stock_left;
     return ax - bx || b.line_estimate - a.line_estimate;
@@ -617,7 +629,7 @@ export function reorderSuggestionsEnriched(db: DB) {
   return {
     as_of: today(),
     latest_issue_date: latestIssueDate(db),
-    note: 'Suggested qty = ceil((7-day need − on-hand) ÷ pack size), in PURCHASE units. unit_price is ₹/purchase-unit (contract → last purchase → average×pack).',
+    note: 'Suggested qty = ceil((7-day need − on-hand) ÷ pack size), in PURCHASE units, CRITICAL (3★) materials first. unit_price is ₹/purchase-unit (contract → last purchase → average×pack).',
     rows: out.slice(0, 60),
   };
 }

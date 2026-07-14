@@ -109,13 +109,17 @@ export async function GET() {
     }
 
     // ── Low stock (same trigger math as Smart Reorder: level > 0 & at/below) ──
+    // CRITICAL (3★ priority) materials ONLY — with 1000+ materials the bell
+    // must mean "act today". 2★/1★ tiers stay visible on /store-dashboard
+    // and /crm/reorder, just not counted here.
     if (isAdmin || me.is_head_chef || me.is_store_manager) {
       const n = one(
         `SELECT COUNT(*) AS n FROM raw_materials
-         WHERE reorder_level > 0 AND current_stock <= reorder_level`,
+         WHERE reorder_level > 0 AND current_stock <= reorder_level
+           AND COALESCE(priority, 2) = 3`,
         [],
       );
-      push('reorder', 'Items below reorder level', n, '/crm/reorder');
+      push('reorder', 'Critical items below reorder level', n, '/crm/reorder');
     }
 
     // ── Bill discounts awaiting REMOTE approval ──────────────────────────

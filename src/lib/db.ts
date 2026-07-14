@@ -1962,6 +1962,12 @@ function initializeSchema(db: Database.Database) {
     // material stays active. Without this column the re-upload route throws
     // "no such column: is_active" (long-standing gap — the route always assumed it).
     if (!has('is_active'))              db.exec(`ALTER TABLE raw_materials ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1`);
+    // Priority stars — 3 = critical / 2 = standard / 1 = low (values 1-3 only).
+    // Drives tiered low-stock alerting: the notification bell + WhatsApp daily
+    // low-stock job count 3★ items ONLY; store-dashboard / smart-reorder group
+    // and pre-tick by stars. Default 2 keeps all 1000+ existing materials at
+    // "standard" until someone deliberately promotes/demotes them.
+    if (!has('priority'))               db.exec(`ALTER TABLE raw_materials ADD COLUMN priority INTEGER NOT NULL DEFAULT 2`);
     // One-shot backfills — only run once, idempotent via the settings flag.
     const phase1Backfilled = db.prepare("SELECT value FROM settings WHERE key='phase1_master_backfill_v1'").get() as any;
     if (!phase1Backfilled) {

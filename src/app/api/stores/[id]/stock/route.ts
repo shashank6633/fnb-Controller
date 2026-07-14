@@ -46,6 +46,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     for (const m of db.prepare(`
       SELECT rm.id, rm.name, rm.category, rm.unit, rm.sku, rm.purchase_unit,
              rm.pack_size, rm.case_size, rm.reorder_level,
+             COALESCE(rm.priority, 2) AS priority,
              rm.current_stock, rm.average_price
       FROM raw_materials rm
       JOIN store_category_map scm
@@ -64,6 +65,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       pack_size: Number(m.pack_size) || 1,
       case_size: Number(m.case_size) || 1,
       reorder_level: Number(m.reorder_level) || 0,
+      priority: Number(m.priority) || 2,
       central_stock: Number(m.current_stock) || 0,
       average_price: Number(m.average_price) || 0,
       has_ledger: ledgered.has(r.material_id),

@@ -17,6 +17,8 @@ import {
   Upload,
   CheckCircle,
   ClipboardCheck,
+  Star,
+  Sparkles,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
@@ -42,6 +44,8 @@ interface RawMaterial {
   updated_at: string;
   is_auto_discovered?: number;
   discovered_source?: string;
+  /** Priority stars: 3 = critical, 2 = standard, 1 = low (default 2). */
+  priority?: number;
 }
 
 interface FormData {
@@ -68,6 +72,7 @@ interface FormData {
   is_semifinished?: number;
   storage_location?: string;   // where it lives (cold room A, dry store, bar fridge)
   shelf_life_days?: number;    // days from receipt; 0 = none / undefined
+  priority?: number;           // 3★ critical / 2★ standard / 1★ low
   /** Editable in purchase-unit terms (e.g. ₹/kg). On save we divide by
    *  pack_size and store the per-recipe-unit value in raw_materials.average_price. */
   avg_price_per_purchase_unit?: number;
@@ -129,7 +134,15 @@ const EMPTY_FORM: FormData = {
   is_semifinished: 0,
   storage_location: '',
   shelf_life_days: 0,
+  priority: 2,
 };
+
+/** Priority-star options — order matters (3★ first, like the alert tiers). */
+const PRIORITY_OPTIONS = [
+  { v: 3, stars: '⭐⭐⭐', label: 'Critical', hint: 'counted in the alert bell + WhatsApp daily low-stock ping' },
+  { v: 2, stars: '⭐⭐',  label: 'Standard', hint: 'shown on dashboards, not in the bell' },
+  { v: 1, stars: '⭐',   label: 'Low',      hint: 'lowest tier — dashboards only' },
+] as const;
 
 const SUPER_CATEGORIES = ['', 'Meat', 'Seafood', 'Dairy', 'Vegetables', 'Fruits', 'Liquor', 'Beverages', 'Grocery', 'Housekeeping', 'Stationery', 'Fuel', 'Other'] as const;
 const CLOSING_CADENCES = [
@@ -193,6 +206,17 @@ export default function InventoryPage() {
   const [roundtripImporting, setRoundtripImporting] = useState(false);
   // Bulk rate-correction tool
   const [showRates, setShowRates] = useState(false);
+  // Bulk priority-star tool (admin / store manager only)
+  const [showPriority, setShowPriority] = useState(false);
+  const [me, setMe] = useState<any>(null);
+
+  useEffect(() => {
+    fetch('/api/auth/me')
+      .then(r => r.json())
+      .then(j => setMe(j?.user ?? null))
+      .catch(() => setMe(null));
+  }, []);
+  const canBulkPriority = !!me && (me.role === 'admin' || me.is_store_manager);
 
   /* ---- Fetch ---- */
 
@@ -344,6 +368,7 @@ export default function InventoryPage() {
       is_semifinished:        (m as any).is_semifinished        ?? 0,
       storage_location:       (m as any).storage_location       || '',
       shelf_life_days:        (m as any).shelf_life_days        ?? 0,
+      priority:               (m as any).priority               ?? 2,
       // Show price in purchase-unit terms (₹/kg) for editing — easier to read off invoices
       avg_price_per_purchase_unit: Number(
         (((m as any).average_price || 0) * ((m as any).pack_size || 1)).toFixed(4)
@@ -590,6 +615,16 @@ export default function InventoryPage() {
               <ClipboardCheck className="w-4 h-4" />
               Update Rates
             </button>
+            {canBulkPriority && (
+              <button
+                onClick={() => setShowPriority(true)}
+                className="flex items-center gap-2 px-4 py-2.5 border border-amber-500 text-amber-700 hover:bg-amber-50 rounded-lg text-sm font-medium transition-colors"
+                title="Bulk-set priority stars (3★ critical / 2★ standard / 1★ low) by category, or let Smart Suggest compute them from consumption + recipe usage."
+              >
+                <Star className="w-4 h-4" />
+                Set Priority
+              </button>
+            )}
             <button
               onClick={openAddModal}
               className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium transition-colors"
@@ -776,6 +811,10 @@ export default function InventoryPage() {
                         <td className="px-4 py-3 text-[#2D1B0E] font-medium">
                           <div className="flex items-center gap-1.5 flex-wrap">
                             <span>{m.name}</span>
+                            <span className="text-[10px] tracking-tighter"
+                                  title={`Priority: ${(m.priority ?? 2) === 3 ? 'Critical — counted in the alert bell + WhatsApp daily ping' : (m.priority ?? 2) === 1 ? 'Low' : 'Standard'} (edit via the pencil)`}>
+                              {'⭐'.repeat((m.priority ?? 2) === 3 ? 3 : (m.priority ?? 2) === 1 ? 1 : 2)}
+                            </span>
                             {m.is_auto_discovered ? (
                               <span title={`Auto-discovered from ${m.discovered_source || 'import'} — review price/unit/category before relying on this material.`}
                                     className="text-[9px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200 font-medium uppercase tracking-wide">
@@ -1279,6 +1318,35 @@ export default function InventoryPage() {
                 </div>
               </div>
 
+              {/* Priority stars — drives tiered low-stock alerting */}
+              <div>
+                <label className="block text-sm font-medium text-[#6B5744] mb-1.5"
+                       title="3★ items are counted in the notification bell and the WhatsApp daily low-stock ping. 2★/1★ stay visible on dashboards only.">
+                  Priority
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {PRIORITY_OPTIONS.map(p => (
+                    <button
+                      key={p.v}
+                      type="button"
+                      onClick={() => setFormData(f => ({ ...f, priority: p.v }))}
+                      title={p.hint}
+                      className={`flex flex-col items-center gap-0.5 px-2 py-2 rounded-lg border text-xs transition-colors ${
+                        (formData.priority ?? 2) === p.v
+                          ? 'border-[#af4408] bg-[#af4408]/10 text-[#af4408] font-semibold'
+                          : 'border-[#D4B896] bg-[#FFF1E3] text-[#6B5744] hover:border-[#af4408]'
+                      }`}
+                    >
+                      <span className="text-sm leading-none">{p.stars}</span>
+                      <span>{p.label}</span>
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[10px] text-[#8B7355] mt-1">
+                  Only <b>⭐⭐⭐ Critical</b> items count in the alert bell &amp; WhatsApp daily low-stock summary.
+                </p>
+              </div>
+
               {/* ============================================================ */}
               {/* Phase 1 Master Fields (Inventory Management SOP §1)           */}
               {/* ============================================================ */}
@@ -1410,6 +1478,14 @@ export default function InventoryPage() {
 
       {showRates && (
         <UpdateRatesModal onClose={() => setShowRates(false)} onApplied={fetchMaterials} />
+      )}
+
+      {showPriority && (
+        <SetPriorityModal
+          categories={availableCategories}
+          onClose={() => setShowPriority(false)}
+          onApplied={fetchMaterials}
+        />
       )}
     </div>
   );
@@ -1646,5 +1722,253 @@ function EditableRate({ m, onSaved }: { m: RawMaterial; onSaved: () => void }) {
       {ps > 1 && <span className="ml-0.5 text-[10px] text-[#8B7355]">/ {pu}</span>}
       <Edit className="w-3 h-3 opacity-0 group-hover:opacity-100 text-[#af4408]" />
     </button>
+  );
+}
+
+// ─── Bulk priority stars ─────────────────────────────────────────────────
+// Two modes against POST /api/inventory/priority (admin / store manager):
+//   By category  — tick categories + pick a star level → preview count → apply.
+//   Smart suggest — pure-SQL heuristic (consumption frequency + recipe usage,
+//   NO LLM call): preview table with per-row untick → apply selected.
+interface SuggestRow {
+  id: string; sku: string; name: string; category: string;
+  current: number; suggested: number; reason: string; ticked: boolean;
+}
+const starsOf = (n: number) => '⭐'.repeat(n === 3 ? 3 : n === 1 ? 1 : 2);
+
+function SetPriorityModal({ categories, onClose, onApplied }: {
+  categories: string[]; onClose: () => void; onApplied: () => void;
+}) {
+  const [tab, setTab] = useState<'category' | 'suggest'>('category');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+
+  // By-category state
+  const [selCats, setSelCats] = useState<Set<string>>(new Set());
+  const [level, setLevel] = useState<1 | 2 | 3>(3);
+  const [catPreview, setCatPreview] = useState<number | null>(null);
+
+  // Smart-suggest state
+  const [sugRows, setSugRows] = useState<SuggestRow[] | null>(null);
+
+  const toggleCat = (c: string) => {
+    setCatPreview(null);
+    setSelCats(prev => {
+      const next = new Set(prev);
+      if (next.has(c)) next.delete(c); else next.add(c);
+      return next;
+    });
+  };
+
+  const post = async (body: any) => {
+    const r = await api('/api/inventory/priority', { method: 'POST', body });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    return j;
+  };
+
+  const previewCategory = async () => {
+    if (selCats.size === 0) { setError('Pick at least one category'); return; }
+    setBusy(true); setError(null); setDone(null);
+    try {
+      const j = await post({ mode: 'category', categories: [...selCats], priority: level, dryRun: true });
+      setCatPreview(Number(j.count) || 0);
+    } catch (e: any) { setError(e?.message || 'Preview failed'); }
+    finally { setBusy(false); }
+  };
+
+  const applyCategory = async () => {
+    setBusy(true); setError(null);
+    try {
+      const j = await post({ mode: 'category', categories: [...selCats], priority: level });
+      setDone(`Set ${j.applied} material${j.applied === 1 ? '' : 's'} to ${starsOf(level)}.`);
+      setCatPreview(null);
+      onApplied();
+    } catch (e: any) { setError(e?.message || 'Apply failed'); }
+    finally { setBusy(false); }
+  };
+
+  const runSuggest = async () => {
+    setBusy(true); setError(null); setDone(null);
+    try {
+      const j = await post({ mode: 'suggest' });
+      setSugRows((j.rows || []).map((r: any) => ({ ...r, ticked: true })));
+    } catch (e: any) { setError(e?.message || 'Suggest failed'); }
+    finally { setBusy(false); }
+  };
+
+  const applySuggest = async () => {
+    const picked = (sugRows || []).filter(r => r.ticked);
+    if (picked.length === 0) { setError('No rows ticked'); return; }
+    setBusy(true); setError(null);
+    try {
+      const j = await post({ mode: 'apply', rows: picked.map(r => ({ id: r.id, priority: r.suggested })) });
+      setDone(`Applied ${j.applied} suggestion${j.applied === 1 ? '' : 's'}.`);
+      setSugRows(null);
+      onApplied();
+    } catch (e: any) { setError(e?.message || 'Apply failed'); }
+    finally { setBusy(false); }
+  };
+
+  const tickedCount = (sugRows || []).filter(r => r.ticked).length;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-2xl shadow-xl flex flex-col overflow-hidden"
+           style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+            <Star className="w-5 h-5 text-amber-500" /> Set Priority Stars
+          </div>
+          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+        </div>
+
+        {/* Mode tabs */}
+        <div className="px-5 pt-3 flex gap-2 text-sm shrink-0">
+          <button onClick={() => { setTab('category'); setError(null); }}
+                  className={`px-3 py-1.5 rounded-lg border ${tab === 'category' ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
+            By category
+          </button>
+          <button onClick={() => { setTab('suggest'); setError(null); }}
+                  className={`px-3 py-1.5 rounded-lg border flex items-center gap-1.5 ${tab === 'suggest' ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
+            <Sparkles className="w-3.5 h-3.5" /> Smart suggest
+          </button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
+          <p className="text-xs text-[#8B7355]">
+            <b>⭐⭐⭐ Critical</b> items are the ONLY ones counted in the notification bell and the WhatsApp
+            daily low-stock ping. <b>⭐⭐ Standard</b> / <b>⭐ Low</b> stay visible on the Store Dashboard
+            and Smart Reorder, grouped below critical.
+          </p>
+
+          {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
+          {done && <div className="bg-green-50 border border-green-200 rounded-lg p-2.5 text-sm text-green-800 flex items-center gap-2"><CheckCircle className="w-4 h-4" /> {done}</div>}
+
+          {tab === 'category' ? (
+            <>
+              <div>
+                <div className="text-xs font-medium text-[#6B5744] mb-1.5">1. Pick categories ({selCats.size} selected)</div>
+                <div className="flex flex-wrap gap-1.5 max-h-40 overflow-y-auto border border-[#E8D5C4] rounded-lg p-2">
+                  {categories.map(c => (
+                    <button key={c} onClick={() => toggleCat(c)}
+                            className={`px-2 py-1 rounded-full border text-xs ${selCats.has(c) ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-[#FFF8F0] text-[#6B5744] border-[#E8D5C4]'}`}>
+                      {categoryLabel(c)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs font-medium text-[#6B5744] mb-1.5">2. Star level to apply</div>
+                <div className="grid grid-cols-3 gap-2 max-w-sm">
+                  {PRIORITY_OPTIONS.map(p => (
+                    <button key={p.v} onClick={() => { setLevel(p.v); setCatPreview(null); }} title={p.hint}
+                            className={`flex flex-col items-center gap-0.5 px-2 py-2 rounded-lg border text-xs ${level === p.v ? 'border-[#af4408] bg-[#af4408]/10 text-[#af4408] font-semibold' : 'border-[#D4B896] bg-[#FFF1E3] text-[#6B5744]'}`}>
+                      <span className="text-sm leading-none">{p.stars}</span>
+                      <span>{p.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {catPreview != null && (
+                <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-sm text-amber-900">
+                  <b>{catPreview}</b> material{catPreview === 1 ? '' : 's'} in {selCats.size} categor{selCats.size === 1 ? 'y' : 'ies'} will
+                  be set to <b>{starsOf(level)} {PRIORITY_OPTIONS.find(p => p.v === level)?.label}</b>.
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              {sugRows === null ? (
+                <div className="text-center py-6 space-y-3">
+                  <p className="text-xs text-[#8B7355] max-w-md mx-auto">
+                    Computes a suggestion per material from the last 30/90 days of issues &amp; consumption
+                    plus recipe usage — instant and free (pure SQL, no AI tokens):
+                    <br />⭐⭐⭐ top-25% consumption OR in ≥3 active recipes, with a reorder level set
+                    <br />⭐ nothing consumed in 90 days AND not in any recipe
+                    <br />⭐⭐ everything else
+                  </p>
+                  <button onClick={runSuggest} disabled={busy}
+                          className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50">
+                    {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                    Compute suggestions
+                  </button>
+                </div>
+              ) : sugRows.length === 0 ? (
+                <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-sm text-green-800">
+                  Every material already matches its suggested star level — nothing to change.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs text-[#6B5744]">
+                    <span><b>{sugRows.length}</b> change{sugRows.length === 1 ? '' : 's'} suggested · {tickedCount} ticked</span>
+                    <span className="flex gap-2">
+                      <button onClick={() => setSugRows(rs => (rs || []).map(r => ({ ...r, ticked: true })))} className="text-[#af4408] hover:underline">tick all</button>
+                      <button onClick={() => setSugRows(rs => (rs || []).map(r => ({ ...r, ticked: false })))} className="text-[#af4408] hover:underline">untick all</button>
+                    </span>
+                  </div>
+                  <div className="overflow-x-auto rounded-lg border border-[#E8D5C4] max-h-72 overflow-y-auto">
+                    <table className="w-full text-xs">
+                      <thead className="bg-[#FFF1E3] text-[#8B7355] sticky top-0"><tr>
+                        <th className="px-2 py-1.5 w-8"></th>
+                        <th className="text-left px-2 py-1.5">Material</th>
+                        <th className="text-center px-2 py-1.5 whitespace-nowrap">Current → Suggested</th>
+                        <th className="text-left px-2 py-1.5">Reason</th>
+                      </tr></thead>
+                      <tbody className="divide-y divide-[#F0E4D6]">
+                        {sugRows.map(r => (
+                          <tr key={r.id} className={r.ticked ? '' : 'opacity-50'}>
+                            <td className="px-2 py-1.5">
+                              <input type="checkbox" checked={r.ticked}
+                                     onChange={e => setSugRows(rs => (rs || []).map(x => x.id === r.id ? { ...x, ticked: e.target.checked } : x))}
+                                     className="w-3.5 h-3.5 accent-[#af4408]" />
+                            </td>
+                            <td className="px-2 py-1.5">
+                              <div className="text-[#2D1B0E] font-medium">{r.name}</div>
+                              <div className="text-[9px] font-mono text-[#8B7355]">{r.sku}{r.sku && r.category ? ' · ' : ''}{r.category}</div>
+                            </td>
+                            <td className="px-2 py-1.5 text-center whitespace-nowrap">
+                              {starsOf(r.current)} <span className="text-[#8B7355]">→</span> <b>{starsOf(r.suggested)}</b>
+                            </td>
+                            <td className="px-2 py-1.5 text-[#6B5744]">{r.reason}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
+          <button onClick={onClose} disabled={busy} className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Close</button>
+          {tab === 'category' ? (
+            <>
+              <button onClick={previewCategory} disabled={busy || selCats.size === 0}
+                      className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5 disabled:opacity-50">
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Preview
+              </button>
+              <button onClick={applyCategory} disabled={busy || catPreview == null || catPreview === 0}
+                      title={catPreview == null ? 'Preview first' : ''}
+                      className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+                Apply {catPreview != null ? `(${catPreview})` : ''}
+              </button>
+            </>
+          ) : (
+            sugRows !== null && sugRows.length > 0 && (
+              <button onClick={applySuggest} disabled={busy || tickedCount === 0}
+                      className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+                Apply selected ({tickedCount})
+              </button>
+            )
+          )}
+        </div>
+      </div>
+    </div>
   );
 }

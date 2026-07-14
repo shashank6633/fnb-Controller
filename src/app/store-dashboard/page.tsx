@@ -19,18 +19,21 @@
  *   - "Raise Requisition" deep-link to /requisitions
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import {
   AlertTriangle, Loader2, Search, RefreshCw, Download, ShoppingCart, Package,
   CheckCircle2, Calendar, IndianRupee,
 } from 'lucide-react';
+import TabScroller from '@/components/TabScroller';
 
 interface BuyRow {
   id: string; sku?: string; name: string; category: string;
   recipe_unit: string; purchase_unit: string;
   pack_size: number; case_size: number;
   current_stock: number; reorder_level: number; deficit: number;
+  /** Priority stars: 3 = critical, 2 = standard, 1 = low. */
+  priority: number;
   suggest_recipe_qty: number; suggest_purchase_qty: number;
   last_vendor: string; last_unit_price: number;
   last_purchase_date: string; days_since_last_purchase: number | null;
@@ -62,6 +65,8 @@ export default function StoreDashboardPage() {
   const [includeOk, setIncludeOk] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [severityFilter, setSeverityFilter] = useState<'all' | 'critical' | 'low'>('all');
+  // Priority-star filter: 0 = all tiers, 3/2/1 = that tier only.
+  const [starFilter, setStarFilter] = useState<0 | 1 | 2 | 3>(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -85,20 +90,36 @@ export default function StoreDashboardPage() {
 
   const filtered = useMemo(() => {
     if (!data) return [];
-    if (severityFilter === 'all') return data.items;
-    return data.items.filter(i => i.severity === severityFilter);
+    let list = severityFilter === 'all' ? data.items : data.items.filter(i => i.severity === severityFilter);
+    if (starFilter !== 0) list = list.filter(i => (i.priority || 2) === starFilter);
+    return list;
+  }, [data, severityFilter, starFilter]);
+
+  // Star-tier counts for the chips (severity slice, before the star filter).
+  const starCounts = useMemo(() => {
+    const base = !data ? [] : severityFilter === 'all' ? data.items : data.items.filter(i => i.severity === severityFilter);
+    const c: { 1: number; 2: number; 3: number } = { 1: 0, 2: 0, 3: 0 };
+    for (const i of base) c[(i.priority || 2) as 1 | 2 | 3] += 1;
+    return { ...c, all: base.length };
   }, [data, severityFilter]);
+
+  // Grouped view: 3★ → 2★ → 1★ sections (each keeps the API's severity order).
+  const starGroups = useMemo(() =>
+    ([3, 2, 1] as const)
+      .map(p => ({ p, rows: filtered.filter(r => (r.priority || 2) === p) }))
+      .filter(g => g.rows.length > 0),
+  [filtered]);
 
   const downloadCsv = () => {
     if (!data) return;
-    const headers = ['SKU', 'Material', 'Category', 'Current Stock', 'Recipe Unit',
+    const headers = ['SKU', 'Material', 'Category', 'Priority (3=critical)', 'Current Stock', 'Recipe Unit',
       'Buffer (Reorder Level)', 'Suggested Buy (recipe)', 'Suggested Buy (packs)',
       'Purchase Unit', 'Pack Size', 'Last Vendor', 'Last Unit ₹', 'Est. Cost ₹',
       'Last Purchase Date', 'Days Since', 'Severity'];
     const lines = [headers.join(',')];
     for (const r of filtered) {
       lines.push([
-        r.sku, r.name, r.category,
+        r.sku, r.name, r.category, r.priority || 2,
         r.current_stock, r.recipe_unit,
         r.reorder_level, r.suggest_recipe_qty, r.suggest_purchase_qty,
         r.purchase_unit, r.pack_size,
@@ -182,6 +203,26 @@ export default function StoreDashboardPage() {
         ))}
       </div>
 
+      {/* Priority-star chips — 3★ critical / 2★ standard / 1★ low */}
+      <TabScroller className="gap-2 text-xs">
+        {([
+          { k: 0 as const, label: 'All stars',    n: starCounts.all },
+          { k: 3 as const, label: '⭐⭐⭐ Critical', n: starCounts[3] },
+          { k: 2 as const, label: '⭐⭐ Standard',  n: starCounts[2] },
+          { k: 1 as const, label: '⭐ Low',        n: starCounts[1] },
+        ]).map(t => (
+          <button key={t.k} onClick={() => setStarFilter(t.k)}
+                  title="Priority stars are set per material on the Raw Materials page"
+                  className={`px-3 py-1.5 rounded-full border ${
+                    starFilter === t.k
+                      ? 'bg-[#af4408] text-white border-[#af4408]'
+                      : 'bg-white text-[#6B5744] border-[#E8D5C4]'
+                  }`}>
+            {t.label} <span className="ml-1 font-mono">{t.n}</span>
+          </button>
+        ))}
+      </TabScroller>
+
       {/* Filters */}
       <div className="flex flex-wrap items-center gap-2 bg-white border border-[#E8D5C4] rounded-xl p-3">
         <div className="relative flex-1 min-w-[200px]">
@@ -236,7 +277,15 @@ export default function StoreDashboardPage() {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map(r => {
+                {starGroups.map(g => (<Fragment key={g.p}>
+                {/* ⭐ section header — groups stay in stars-desc order */}
+                <tr className="bg-[#FFF8F0] border-t border-[#E8D5C4]">
+                  <td colSpan={11} className="py-1.5 px-2 text-[11px] font-semibold text-[#6B5744]">
+                    {g.p === 3 ? '⭐⭐⭐ Critical' : g.p === 2 ? '⭐⭐ Standard' : '⭐ Low'}
+                    <span className="ml-1.5 font-mono font-normal text-[#8B7355]">({g.rows.length})</span>
+                  </td>
+                </tr>
+                {g.rows.map(r => {
                   const sevColor = r.severity === 'critical' ? 'bg-red-50/50'
                                   : r.severity === 'low' ? 'bg-amber-50/30' : '';
                   return (
@@ -278,6 +327,7 @@ export default function StoreDashboardPage() {
                     </tr>
                   );
                 })}
+                </Fragment>))}
               </tbody>
               <tfoot className="bg-[#FFF1E3]/60 text-[#6B5744] font-semibold">
                 <tr>

@@ -34,7 +34,8 @@ export const dynamic = 'force-dynamic';
 const FIELD_TYPES: Record<string, 'string' | 'number' | 'bool'> = {
   name: 'string', sku: 'string', category: 'string', unit: 'string',
   purchase_unit: 'string', pack_size: 'number', case_size: 'number',
-  reorder_level: 'number', costing_method: 'string', average_price: 'number',
+  reorder_level: 'number', priority: 'number',
+  costing_method: 'string', average_price: 'number',
   super_category: 'string', brand: 'string',
   yield_percent: 'number', tax_percent: 'number', cess_percent: 'number',
   standard_purchase_rate: 'number',
@@ -107,6 +108,17 @@ export async function POST(request: Request) {
         const name = String(r.name || '').trim();
         if (!name) { skipped.push({ row: idx + 1, reason: 'name is empty' }); continue; }
 
+        // Priority stars are strictly 1-3 (3★ critical / 2★ standard / 1★ low).
+        // A wrong value (e.g. 5) rejects the ROW so Excel typos never silently
+        // land as bogus star levels. Blank = leave existing / default 2.
+        if (r.priority != null && String(r.priority).trim() !== '') {
+          const p = Number(r.priority);
+          if (!Number.isInteger(p) || p < 1 || p > 3) {
+            skipped.push({ row: idx + 1, name, reason: `priority must be 1, 2 or 3 (got "${r.priority}")` });
+            continue;
+          }
+        }
+
         const id = String(r.id || '').trim();
         // Per-row SKU uniqueness vs DB (excluding the same id we're updating)
         const newSku = String(r.sku || '').trim();
@@ -151,12 +163,12 @@ export async function POST(request: Request) {
           }
           db.prepare(`
             INSERT INTO raw_materials (id, sku, name, category, unit, purchase_unit, pack_size, case_size,
-              reorder_level, costing_method, average_price, super_category, brand,
+              reorder_level, priority, costing_method, average_price, super_category, brand,
               yield_percent, tax_percent, cess_percent, standard_purchase_rate,
               closing_cadence, is_recipe_item, is_direct_sell, is_semifinished,
               storage_location, shelf_life_days, is_active, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
           `).run(
@@ -167,6 +179,7 @@ export async function POST(request: Request) {
             coerce('pack_size', r.pack_size) ?? 1,
             coerce('case_size', r.case_size) ?? 1,
             coerce('reorder_level', r.reorder_level) ?? 0,
+            coerce('priority', r.priority) ?? 2,
             coerce('costing_method', r.costing_method) ?? 'average',
             coerce('average_price', r.average_price) ?? 0,
             coerce('super_category', r.super_category) ?? '',

@@ -327,12 +327,16 @@ export async function runWaDailyNotifications(): Promise<Record<string, string>>
   const out: Record<string, string> = { low_stock_daily: 'skipped', digest_daily: 'skipped' };
   const date = new Date().toISOString().slice(0, 10);
 
-  // 1. Low-stock daily summary — top 10 reorder suggestions (same math as CRM Smart Reorder)
+  // 1. Low-stock daily summary — top 10 reorder suggestions (same math as CRM
+  //    Smart Reorder), CRITICAL (3★ priority) materials ONLY so the daily ping
+  //    stays actionable across 1000+ materials.
   try {
     if (!isWaNotifyEnabled('low_stock_daily')) out.low_stock_daily = 'disabled';
     else if (waAttemptedToday('low_stock_daily')) out.low_stock_daily = 'already_sent_today';
     else {
-      const rows = (reorderSuggestions(getDb())?.rows || []).slice(0, 10);
+      const rows = (reorderSuggestions(getDb())?.rows || [])
+        .filter((r: any) => Number(r.priority) === 3)
+        .slice(0, 10);
       if (rows.length === 0) out.low_stock_daily = 'nothing_low';
       else {
         const summary = rows.map((r: any, i: number) =>

@@ -26,6 +26,7 @@ const COLUMNS = [
   'pack_size',
   'case_size',
   'reorder_level',            // in recipe units
+  'priority',                 // 3 = critical / 2 = standard / 1 = low
   'costing_method',
   'average_price',            // ₹ per recipe unit
   'current_stock',            // read-only on import (informational)

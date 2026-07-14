@@ -21,6 +21,7 @@ import {
   RefreshCw, ShoppingCart, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import TabScroller from '@/components/TabScroller';
 
 /* ── types (mirror /api/crm/reorder GET) ──────────────────────────────── */
 
@@ -35,6 +36,8 @@ interface SuggestionRow {
   name: string;
   sku: string;
   category: string;
+  /** Priority stars: 3 = critical, 2 = standard, 1 = low. */
+  priority: number;
   current_stock: number;
   unit: string;
   purchase_unit: string;
@@ -87,6 +90,19 @@ function daysBadge(d: number | null) {
   return <span className={`inline-block text-[10px] font-semibold px-1.5 py-0.5 rounded-full border ${cls}`}>{d.toFixed(1)}d left</span>;
 }
 
+/** Priority stars badge — 3★ critical / 2★ standard / 1★ low. */
+function starBadge(p: number) {
+  const n = p === 3 ? 3 : p === 1 ? 1 : 2;
+  const label = n === 3 ? 'Critical priority' : n === 1 ? 'Low priority' : 'Standard priority';
+  const cls = n === 3 ? 'bg-red-50 border-red-200' : n === 1 ? 'bg-gray-50 border-gray-200' : 'bg-amber-50 border-amber-200';
+  return (
+    <span title={label}
+          className={`inline-block text-[10px] px-1.5 py-0.5 rounded-full border ${cls}`}>
+      {'⭐'.repeat(n)}
+    </span>
+  );
+}
+
 export default function CrmReorderPage() {
   const router = useRouter();
   const [me, setMe] = useState<any>(undefined); // undefined = loading, null = signed out
@@ -116,8 +132,9 @@ export default function CrmReorderPage() {
         const suggestions: SuggestionRow[] = j.rows || [];
         setRows(suggestions.map(s => ({
           ...s,
-          // Urgent rows (≤3 days of stock) come pre-ticked.
-          selected: s.days_of_stock_left != null && s.days_of_stock_left <= 3,
+          // Pre-ticked: urgent rows (≤3 days of stock) AND 3★ critical materials.
+          selected: (s.days_of_stock_left != null && s.days_of_stock_left <= 3)
+            || Number(s.priority) === 3,
           qty: s.suggested_order_qty,
           vendor_id: s.preferred_vendor_id || '',
           price: s.unit_price,
@@ -145,7 +162,13 @@ export default function CrmReorderPage() {
 
   const selectedRows = rows.filter(r => r.selected && r.qty > 0);
   const estTotal = selectedRows.reduce((s, r) => s + r.qty * (r.price || 0), 0);
-  const allSelected = rows.length > 0 && rows.every(r => r.selected);
+
+  // Priority-star filter chips: 0 = all tiers. Filtering only hides rows from
+  // view — ticked rows stay selected (and counted in the footer) either way.
+  const [starFilter, setStarFilter] = useState<0 | 1 | 2 | 3>(0);
+  const visibleRows = starFilter === 0 ? rows : rows.filter(r => (r.priority || 2) === starFilter);
+  const starCount = (p: number) => rows.filter(r => (r.priority || 2) === p).length;
+  const allSelected = visibleRows.length > 0 && visibleRows.every(r => r.selected);
 
   const createPos = async () => {
     if (creating || selectedRows.length === 0) return;
@@ -283,9 +306,28 @@ export default function CrmReorderPage() {
         </div>
       ) : (
         <>
+          {/* ── Priority-star chips ── */}
+          <TabScroller className="gap-2 text-xs">
+            {([
+              { k: 0 as const, label: 'All stars',    n: rows.length },
+              { k: 3 as const, label: '⭐⭐⭐ Critical', n: starCount(3) },
+              { k: 2 as const, label: '⭐⭐ Standard',  n: starCount(2) },
+              { k: 1 as const, label: '⭐ Low',        n: starCount(1) },
+            ]).map(t => (
+              <button key={t.k} onClick={() => setStarFilter(t.k)}
+                      className={`px-3 py-1.5 rounded-full border ${
+                        starFilter === t.k
+                          ? 'bg-[#af4408] text-white border-[#af4408]'
+                          : 'bg-white text-[#6B5744] border-[#E8D5C4]'
+                      }`}>
+                {t.label} <span className="ml-1 font-mono">{t.n}</span>
+              </button>
+            ))}
+          </TabScroller>
+
           {/* ── Mobile cards (< md) ── */}
           <div className="md:hidden space-y-2.5">
-            {rows.map(r => (
+            {visibleRows.map(r => (
               <div
                 key={r.material_id}
                 className={`bg-white border rounded-xl p-3 space-y-2.5 ${r.selected ? 'border-[#af4408]' : 'border-[#E8D5C4]'}`}
@@ -300,6 +342,7 @@ export default function CrmReorderPage() {
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-semibold text-[#2D1B0E] break-words">{r.name}</div>
                     <div className="flex flex-wrap items-center gap-1.5 mt-0.5 text-[11px] text-[#8B7355]">
+                      {starBadge(r.priority)}
                       {r.sku && <span>{r.sku}</span>}
                       <span>· stock {r.current_stock_pu.toLocaleString('en-IN')} {r.purchase_unit}</span>
                       {daysBadge(r.days_of_stock_left)}
@@ -359,7 +402,11 @@ export default function CrmReorderPage() {
                     <input
                       type="checkbox"
                       checked={allSelected}
-                      onChange={e => setRows(prev => prev.map(r => ({ ...r, selected: e.target.checked })))}
+                      onChange={e => setRows(prev => prev.map(r =>
+                        (starFilter === 0 || (r.priority || 2) === starFilter)
+                          ? { ...r, selected: e.target.checked }
+                          : r,
+                      ))}
                       className="w-4 h-4 accent-[#af4408]"
                       aria-label="Select all"
                     />
@@ -374,7 +421,7 @@ export default function CrmReorderPage() {
                 </tr>
               </thead>
               <tbody>
-                {rows.map(r => (
+                {visibleRows.map(r => (
                   <tr key={r.material_id} className={`border-t border-[#F3E7DA] ${r.selected ? 'bg-[#FFF8F0]/60' : ''}`}>
                     <td className="px-3 py-2 align-top">
                       <input
@@ -387,7 +434,10 @@ export default function CrmReorderPage() {
                     </td>
                     <td className="px-3 py-2 align-top">
                       <div className="font-medium text-[#2D1B0E]">{r.name}</div>
-                      <div className="text-[10px] text-[#8B7355]">{r.sku ? `${r.sku} · ` : ''}{r.category}</div>
+                      <div className="flex items-center gap-1.5 text-[10px] text-[#8B7355]">
+                        {starBadge(r.priority)}
+                        <span>{r.sku ? `${r.sku} · ` : ''}{r.category}</span>
+                      </div>
                     </td>
                     <td className="px-3 py-2 align-top text-right whitespace-nowrap tabular-nums">
                       {r.current_stock_pu.toLocaleString('en-IN')} <span className="text-[10px] text-[#8B7355]">{r.purchase_unit}</span>

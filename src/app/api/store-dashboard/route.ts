@@ -62,6 +62,7 @@ export async function GET(request: Request) {
         COALESCE(rm.case_size, 1)        AS case_size,
         rm.current_stock,
         rm.reorder_level,
+        COALESCE(rm.priority, 2)         AS priority,
         rm.average_price,
         (SELECT vendor FROM purchases WHERE material_id = rm.id
             ORDER BY date DESC, created_at DESC LIMIT 1) AS last_vendor,
@@ -104,6 +105,7 @@ export async function GET(request: Request) {
         case_size: r.case_size,
         current_stock: r.current_stock,
         reorder_level: r.reorder_level,
+        priority: Number(r.priority) || 2,
         deficit,
         suggest_recipe_qty: suggestRecipeQty,
         suggest_purchase_qty: suggestPurchaseQty,

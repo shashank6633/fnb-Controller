@@ -153,9 +153,13 @@ export async function POST(request: Request) {
       standard_purchase_rate, closing_cadence,
       is_recipe_item, is_direct_sell, is_semifinished,
       storage_location, shelf_life_days,
+      priority,       // 3★ critical / 2★ standard / 1★ low (default 2)
     } = body;
 
     if (!name) return Response.json({ error: 'name is required' }, { status: 400 });
+    if (priority != null && ![1, 2, 3].includes(Number(priority))) {
+      return Response.json({ error: 'priority must be 1, 2 or 3' }, { status: 400 });
+    }
     if (isDuplicateName(db, String(name).trim())) {
       return Response.json({ error: `Duplicate material name: "${name}" already exists. Phase 1 SOP: no duplicates.` }, { status: 409 });
     }
@@ -176,9 +180,9 @@ export async function POST(request: Request) {
         id, sku, name, category, unit, purchase_unit, pack_size, case_size, reorder_level, costing_method,
         super_category, brand, yield_percent, tax_percent, cess_percent,
         standard_purchase_rate, closing_cadence, is_recipe_item, is_direct_sell, is_semifinished,
-        storage_location, shelf_life_days,
+        storage_location, shelf_life_days, priority,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     `).run(
       id, sku, name, category || 'other', unit || 'kg',
       purchase_unit || unit || 'kg',
@@ -194,6 +198,7 @@ export async function POST(request: Request) {
       is_recipe_item ? 1 : 0, is_direct_sell ? 1 : 0, is_semifinished ? 1 : 0,
       storage_location || '',
       shelf_life_days != null ? Number(shelf_life_days) : 0,
+      priority != null ? Number(priority) : 2,
     );
 
     const material = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(id);
@@ -213,10 +218,14 @@ export async function PUT(request: Request) {
       standard_purchase_rate, closing_cadence,
       is_recipe_item, is_direct_sell, is_semifinished,
       storage_location, shelf_life_days,
+      priority,        // 3★ critical / 2★ standard / 1★ low
       average_price,   // optional manual override; expected per recipe-unit
     } = body;
 
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
+    if (priority != null && ![1, 2, 3].includes(Number(priority))) {
+      return Response.json({ error: 'priority must be 1, 2 or 3' }, { status: 400 });
+    }
     const existing = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(id) as any;
     if (!existing) return Response.json({ error: 'Material not found' }, { status: 404 });
 
@@ -238,7 +247,7 @@ export async function PUT(request: Request) {
           super_category = ?, brand = ?, yield_percent = ?, tax_percent = ?, cess_percent = ?,
           standard_purchase_rate = ?, closing_cadence = ?,
           is_recipe_item = ?, is_direct_sell = ?, is_semifinished = ?,
-          storage_location = ?, shelf_life_days = ?,
+          storage_location = ?, shelf_life_days = ?, priority = ?,
           average_price = CASE WHEN ? IS NOT NULL THEN ? ELSE average_price END,
           updated_at = datetime('now')
       WHERE id = ?
@@ -263,6 +272,7 @@ export async function PUT(request: Request) {
       is_semifinished  != null ? (is_semifinished  ? 1 : 0) : existing.is_semifinished,
       storage_location ?? existing.storage_location ?? '',
       shelf_life_days != null ? Number(shelf_life_days) : (existing.shelf_life_days ?? 0),
+      priority != null ? Number(priority) : (existing.priority ?? 2),
       // Two placeholders for the CASE expression on average_price
       overrideAvgPrice, overrideAvgPrice,
       id
