@@ -220,9 +220,12 @@ export default function InventoryPage() {
 
   /* ---- Fetch ---- */
 
-  const fetchMaterials = useCallback(async () => {
+  /** silent = refresh data without flipping to the page skeleton (which would
+   *  unmount any open modal and wipe its state — e.g. the Update Rates
+   *  success message / audit list). */
+  const fetchMaterials = useCallback(async (silent = false) => {
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       setError(null);
       const res = await fetch('/api/inventory');
       if (!res.ok) throw new Error('Failed to fetch inventory');
@@ -459,7 +462,7 @@ export default function InventoryPage() {
           <AlertTriangle className="w-12 h-12 text-amber-500 mx-auto" />
           <p className="text-[#6B5744] text-lg">Error: {error}</p>
           <button
-            onClick={fetchMaterials}
+            onClick={() => fetchMaterials()}
             className="px-4 py-2 bg-[#FFF1E3] text-[#2D1B0E] rounded-lg hover:bg-[#FFF1E3] transition-colors"
           >
             Retry
@@ -1477,7 +1480,7 @@ export default function InventoryPage() {
       )}
 
       {showRates && (
-        <UpdateRatesModal onClose={() => setShowRates(false)} onApplied={fetchMaterials} />
+        <UpdateRatesModal onClose={() => setShowRates(false)} onApplied={() => fetchMaterials(true)} canAudit={canBulkPriority} />
       )}
 
       {showPriority && (
@@ -1533,17 +1536,61 @@ function SummaryCard({
 // average_price with each material's pack_size, then written in place. Because
 // requisition/party costs read average_price LIVE, every past requisition
 // recomputes at the corrected rate. Preview first, then apply.
-interface RateMatch { sku: string; name: string; unit: string; pack_size: number; old: number; new: number; }
-function UpdateRatesModal({ onClose, onApplied }: { onClose: () => void; onApplied: () => void }) {
+//
+// Guardrails (added after a real prod incident where per-BOTTLE rates were
+// applied in per-recipe mode and re-baked a ×pack corruption):
+//   1. Dual-unit preview — every row shows the new/old avg in BOTH bases,
+//      e.g. "₹3.44/ml = ₹2,580/BTL", so a wrong basis is visually obvious.
+//   2. Wrong-mode detector — if the pasted rates match the items' latest
+//      PER-PURCHASE-UNIT purchase prices while per-recipe mode is selected
+//      (or vice versa), a banner warns and offers a one-click mode switch.
+//   3. "Audit price bases" — scans the whole DB for materials whose stored
+//      average_price looks ~pack× too big vs their latest real purchase and
+//      offers a one-click repair.
+interface RateMatch {
+  sku: string; name: string; unit: string; purchase_unit: string;
+  pack_size: number; old: number; new: number;
+  /** Basis-safe latest purchase price per PURCHASE unit (0 = never purchased). */
+  latest_ppu: number;
+}
+interface AuditRow {
+  id: string; sku: string; name: string; unit: string; purchase_unit: string;
+  pack: number; stored_avg: number; expected_avg: number; latest_ppu: number;
+  ratio: number; checked: boolean;
+}
+
+/** "₹3.44" / "₹2,580" — more decimals for small per-recipe values. */
+const fmtRate = (n: number) =>
+  '₹' + (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: Math.abs(n) < 100 ? 4 : 2 });
+
+/** Dual-basis rendering: "₹3.44/ml = ₹2,580/BTL" (pack>1) or "₹458/pcs". */
+function DualAvg({ perRecipe, unit, pack, pu, className }: {
+  perRecipe: number; unit: string; pack: number; pu: string; className?: string;
+}) {
+  const v = Number(perRecipe) || 0;
+  return (
+    <span className={`whitespace-nowrap ${className || ''}`}>
+      {fmtRate(v)}/{unit}
+      {pack > 1 && <span> = {fmtRate(v * pack)}/{pu || unit}</span>}
+    </span>
+  );
+}
+
+function UpdateRatesModal({ onClose, onApplied, canAudit }: { onClose: () => void; onApplied: () => void; canAudit?: boolean }) {
   const [text, setText] = useState('');
   const [basis, setBasis] = useState<'purchase' | 'recipe'>('purchase');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<null | {
+    basis: 'purchase' | 'recipe';
     matched: RateMatch[]; matchedCount: number; unmatched: string[];
     ambiguous: { key: string; count: number }[]; invalid: { key: string; reason: string }[];
   }>(null);
   const [done, setDone] = useState<string | null>(null);
+  // Basis-corruption audit tool
+  const [auditRows, setAuditRows] = useState<AuditRow[] | null>(null);
+  const [auditScanned, setAuditScanned] = useState(0);
+  const [auditBusy, setAuditBusy] = useState(false);
 
   // Parse "identifier <comma|tab> rate" per line. Ignores a header row.
   const parseRows = () => {
@@ -1568,12 +1615,12 @@ function UpdateRatesModal({ onClose, onApplied }: { onClose: () => void; onAppli
     e.target.value = '';
   };
 
-  const run = async (dryRun: boolean) => {
+  const run = async (dryRun: boolean, basisOverride?: 'purchase' | 'recipe') => {
     const rows = parseRows();
     if (!rows.length) { setError('Paste at least one line: SKU-or-name, rate'); return; }
     setBusy(true); setError(null); if (!dryRun) setDone(null);
     try {
-      const r = await api('/api/inventory/update-rates', { method: 'POST', body: { rows, basis, dryRun } });
+      const r = await api('/api/inventory/update-rates', { method: 'POST', body: { rows, basis: basisOverride ?? basis, dryRun } });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
       if (dryRun) { setPreview(j); }
@@ -1585,6 +1632,73 @@ function UpdateRatesModal({ onClose, onApplied }: { onClose: () => void; onAppli
     } catch (e: any) { setError(e?.message || 'Failed'); }
     finally { setBusy(false); }
   };
+
+  /** Switching the basis invalidates the current preview (apply always uses the
+   *  previewed basis — never a silently flipped one). */
+  const pickBasis = (b: 'purchase' | 'recipe') => { setBasis(b); setPreview(null); };
+  /** One-click fix from the wrong-mode banner: switch AND re-preview. */
+  const switchModeAndRerun = (b: 'purchase' | 'recipe') => { setBasis(b); run(true, b); };
+
+  // ── Wrong-mode detector ─────────────────────────────────────────────────
+  // Compares each pasted rate against the item's basis-safe latest purchase
+  // price per PURCHASE unit (from the API). Simple + effective:
+  //  · per-RECIPE mode: >30% of pack>1 rows have rate > 20 AND within ±20% of
+  //    the latest ₹/purchase-unit → these are almost certainly BOTTLE prices.
+  //  · per-PURCHASE mode (mirror): >30% of pack>1 rows have rate < latest/20
+  //    → these look like per-recipe (₹/ml) values.
+  const modeWarning = useMemo(() => {
+    if (!preview || !preview.matched?.length) return null;
+    const eligible = preview.matched.filter(m => (m.pack_size || 1) > 1 && (m.latest_ppu || 0) > 0);
+    if (!eligible.length) return null;
+    if (preview.basis === 'recipe') {
+      const hits = eligible.filter(m => {
+        const rate = m.new; // recipe basis stores the pasted rate as-is
+        return rate > 20 && Math.abs(rate - m.latest_ppu) <= 0.2 * m.latest_ppu;
+      });
+      if (hits.length / eligible.length > 0.3) {
+        return { to: 'purchase' as const, hits: hits.length, eligible: eligible.length, example: hits[0] };
+      }
+    } else {
+      const hits = eligible.filter(m => (m.new * m.pack_size) < m.latest_ppu / 20);
+      if (hits.length / eligible.length > 0.3) {
+        return { to: 'recipe' as const, hits: hits.length, eligible: eligible.length, example: hits[0] };
+      }
+    }
+    return null;
+  }, [preview]);
+
+  // ── Basis-corruption audit ──────────────────────────────────────────────
+  const runAudit = async () => {
+    setAuditBusy(true); setError(null); setDone(null);
+    try {
+      const r = await api('/api/inventory/update-rates?audit=1');
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setAuditScanned(Number(j.scanned) || 0);
+      setAuditRows((j.rows || []).map((x: any) => ({ ...x, checked: true })));
+    } catch (e: any) { setError(e?.message || 'Audit failed'); }
+    finally { setAuditBusy(false); }
+  };
+
+  const repairSelected = async () => {
+    const picked = (auditRows || []).filter(r => r.checked);
+    if (!picked.length) { setError('No audit rows ticked'); return; }
+    setAuditBusy(true); setError(null);
+    try {
+      const r = await api('/api/inventory/update-rates', {
+        method: 'POST',
+        body: { repair: picked.map(p => ({ material_id: p.id, new_avg: p.expected_avg })) },
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      onApplied();
+      await runAudit(); // refresh the list (repaired rows drop out)
+      setDone(`Repaired ${j.repaired} material${j.repaired === 1 ? '' : 's'} — averages now stored per recipe unit.`);
+    } catch (e: any) { setError(e?.message || 'Repair failed'); }
+    finally { setAuditBusy(false); }
+  };
+
+  const auditTicked = (auditRows || []).filter(r => r.checked).length;
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
@@ -1603,8 +1717,8 @@ function UpdateRatesModal({ onClose, onApplied }: { onClose: () => void; onAppli
 
           <div className="flex flex-wrap items-center gap-3 text-sm">
             <span className="text-[#8B7355]">Rate is:</span>
-            <label className="flex items-center gap-1.5"><input type="radio" checked={basis === 'purchase'} onChange={() => setBasis('purchase')} className="accent-[#af4408]" /> per purchase unit (₹/kg, ₹/L…)</label>
-            <label className="flex items-center gap-1.5"><input type="radio" checked={basis === 'recipe'} onChange={() => setBasis('recipe')} className="accent-[#af4408]" /> per recipe unit (₹/g, ₹/ml…)</label>
+            <label className="flex items-center gap-1.5"><input type="radio" checked={basis === 'purchase'} onChange={() => pickBasis('purchase')} className="accent-[#af4408]" /> per purchase unit (₹/kg, ₹/BTL…)</label>
+            <label className="flex items-center gap-1.5"><input type="radio" checked={basis === 'recipe'} onChange={() => pickBasis('recipe')} className="accent-[#af4408]" /> per recipe unit (₹/g, ₹/ml…)</label>
           </div>
 
           <textarea value={text} onChange={e => { setText(e.target.value); setPreview(null); }}
@@ -1618,25 +1732,66 @@ function UpdateRatesModal({ onClose, onApplied }: { onClose: () => void; onAppli
           {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
           {done && <div className="bg-green-50 border border-green-200 rounded-lg p-2.5 text-sm text-green-800 flex items-center gap-2"><CheckCircle className="w-4 h-4" /> {done}</div>}
 
+          {/* Wrong-mode banner — fires when the pasted rates clearly match the
+              other basis. No hard block: one click switches mode + re-previews. */}
+          {preview && modeWarning && (
+            <div className={`rounded-lg border p-3 text-sm space-y-2 ${modeWarning.to === 'purchase' ? 'bg-red-50 border-red-300 text-red-800' : 'bg-amber-50 border-amber-300 text-amber-900'}`}>
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                <div>
+                  {modeWarning.to === 'purchase' ? (
+                    <>
+                      <b>These rates match these items&apos; PER-BOTTLE/PACK purchase prices</b> — you probably
+                      want <b>per PURCHASE unit</b> mode. {modeWarning.hits} of {modeWarning.eligible} pack
+                      items are within ±20% of their latest ₹/{modeWarning.example.purchase_unit || 'pack'} purchase price.
+                      <div className="text-xs mt-1">
+                        e.g. {modeWarning.example.name}: pasted <b>{fmtRate(modeWarning.example.new)}</b> ≈ its latest{' '}
+                        {fmtRate(modeWarning.example.latest_ppu)}/{modeWarning.example.purchase_unit}. In per-purchase mode it
+                        would store <b><DualAvg perRecipe={modeWarning.example.new / (modeWarning.example.pack_size || 1)} unit={modeWarning.example.unit} pack={modeWarning.example.pack_size} pu={modeWarning.example.purchase_unit} /></b>{' '}
+                        — as previewed below it would store {fmtRate(modeWarning.example.new)}/{modeWarning.example.unit} instead.
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <b>These rates look ~pack× too small vs these items&apos; latest purchase prices</b> — they
+                      may be per RECIPE unit (₹/g, ₹/ml). {modeWarning.hits} of {modeWarning.eligible} pack items
+                      are under 1/20th of their latest ₹/{modeWarning.example.purchase_unit || 'pack'} purchase price.
+                    </>
+                  )}
+                </div>
+              </div>
+              <button onClick={() => switchModeAndRerun(modeWarning.to)} disabled={busy}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-50 ${modeWarning.to === 'purchase' ? 'bg-red-600 hover:bg-red-700' : 'bg-amber-600 hover:bg-amber-700'}`}>
+                {`Switch to per ${modeWarning.to === 'purchase' ? 'PURCHASE' : 'RECIPE'} unit & re-preview`}
+              </button>
+            </div>
+          )}
+
           {preview && (
             <div className="space-y-2">
-              <div className="text-sm font-semibold text-[#2D1B0E]">{preview.matchedCount} matched</div>
+              <div className="text-sm font-semibold text-[#2D1B0E]">
+                {preview.matchedCount} matched
+                <span className="ml-2 text-xs font-normal text-[#8B7355]">(previewed as per {preview.basis === 'recipe' ? 'RECIPE' : 'PURCHASE'} unit)</span>
+              </div>
               {preview.matched.length > 0 && (
                 <div className="overflow-x-auto rounded-lg border border-[#E8D5C4] max-h-64 overflow-y-auto">
                   <table className="w-full text-xs">
                     <thead className="bg-[#FFF1E3] text-[#8B7355] sticky top-0"><tr>
                       <th className="text-left px-2 py-1.5">SKU</th><th className="text-left px-2 py-1.5">Name</th>
-                      <th className="text-right px-2 py-1.5">Old avg</th><th className="text-right px-2 py-1.5">New avg</th>
-                      <th className="text-left px-2 py-1.5">/unit</th>
+                      <th className="text-right px-2 py-1.5">Old avg (both units)</th>
+                      <th className="text-right px-2 py-1.5">New avg (both units)</th>
                     </tr></thead>
                     <tbody className="divide-y divide-[#F0E4D6]">
                       {preview.matched.map((m, i) => (
                         <tr key={i}>
                           <td className="px-2 py-1.5 font-mono text-[#8B7355]">{m.sku}</td>
                           <td className="px-2 py-1.5 text-[#2D1B0E]">{m.name}</td>
-                          <td className="px-2 py-1.5 text-right text-[#8B7355]">{(Number(m.old)||0).toFixed(4)}</td>
-                          <td className="px-2 py-1.5 text-right font-semibold text-emerald-700">{(Number(m.new)||0).toFixed(4)}</td>
-                          <td className="px-2 py-1.5 text-[#8B7355]">{m.unit}{m.pack_size > 1 ? ` (÷${m.pack_size})` : ''}</td>
+                          <td className="px-2 py-1.5 text-right text-[#8B7355]">
+                            <DualAvg perRecipe={m.old} unit={m.unit} pack={m.pack_size} pu={m.purchase_unit} />
+                          </td>
+                          <td className="px-2 py-1.5 text-right font-semibold text-emerald-700">
+                            <DualAvg perRecipe={m.new} unit={m.unit} pack={m.pack_size} pu={m.purchase_unit} />
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -1648,9 +1803,82 @@ function UpdateRatesModal({ onClose, onApplied }: { onClose: () => void; onAppli
               {preview.invalid.length > 0 && <div className="text-xs text-red-700">✗ {preview.invalid.length} invalid rate(s): {preview.invalid.map(i => i.key).slice(0, 10).join(', ')}</div>}
             </div>
           )}
+
+          {/* Basis-corruption audit results */}
+          {auditRows !== null && (
+            <div className="space-y-2 border-t border-[#E8D5C4] pt-3">
+              <div className="text-sm font-semibold text-[#2D1B0E]">
+                Price-basis audit
+                <span className="ml-2 text-xs font-normal text-[#8B7355]">
+                  {auditScanned} pack materials scanned · {auditRows.length} suspicious
+                </span>
+              </div>
+              {auditRows.length === 0 ? (
+                <div className="bg-green-50 border border-green-200 rounded-lg p-2.5 text-sm text-green-800 flex items-center gap-2">
+                  <CheckCircle className="w-4 h-4" /> No basis corruption detected — every stored average is plausible vs its latest purchase.
+                </div>
+              ) : (
+                <>
+                  <p className="text-xs text-[#8B7355]">
+                    These stored averages look like <b>per-bottle/pack prices</b> sitting in the
+                    per-recipe-unit field (~pack× too big vs the latest real purchase). Repair rewrites each
+                    to <b>latest purchase price ÷ pack size</b>.
+                  </p>
+                  <div className="overflow-x-auto rounded-lg border border-[#E8D5C4] max-h-64 overflow-y-auto">
+                    <table className="w-full text-xs">
+                      <thead className="bg-[#FFF1E3] text-[#8B7355] sticky top-0"><tr>
+                        <th className="px-2 py-1.5 w-8"></th>
+                        <th className="text-left px-2 py-1.5">Material</th>
+                        <th className="text-right px-2 py-1.5">Stored avg (both units)</th>
+                        <th className="text-right px-2 py-1.5">Will become (both units)</th>
+                        <th className="text-right px-2 py-1.5">Off by</th>
+                      </tr></thead>
+                      <tbody className="divide-y divide-[#F0E4D6]">
+                        {auditRows.map(r => (
+                          <tr key={r.id} className={r.checked ? '' : 'opacity-50'}>
+                            <td className="px-2 py-1.5">
+                              <input type="checkbox" checked={r.checked}
+                                     onChange={e => setAuditRows(rs => (rs || []).map(x => x.id === r.id ? { ...x, checked: e.target.checked } : x))}
+                                     className="w-3.5 h-3.5 accent-[#af4408]" />
+                            </td>
+                            <td className="px-2 py-1.5">
+                              <div className="text-[#2D1B0E] font-medium">{r.name}</div>
+                              <div className="text-[9px] font-mono text-[#8B7355]">{r.sku} · pack {r.pack} {r.unit}/{r.purchase_unit} · latest {fmtRate(r.latest_ppu)}/{r.purchase_unit}</div>
+                            </td>
+                            <td className="px-2 py-1.5 text-right text-red-700">
+                              <DualAvg perRecipe={r.stored_avg} unit={r.unit} pack={r.pack} pu={r.purchase_unit} />
+                            </td>
+                            <td className="px-2 py-1.5 text-right font-semibold text-emerald-700">
+                              <DualAvg perRecipe={r.expected_avg} unit={r.unit} pack={r.pack} pu={r.purchase_unit} />
+                            </td>
+                            <td className="px-2 py-1.5 text-right font-mono text-red-700">≈{r.ratio}×</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="flex justify-end">
+                    <button onClick={repairSelected} disabled={auditBusy || auditTicked === 0}
+                      className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50">
+                      {auditBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />}
+                      Repair selected ({auditTicked})
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
         </div>
 
-        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex flex-wrap items-center gap-2 shrink-0">
+          {canAudit && (
+            <button onClick={runAudit} disabled={auditBusy}
+              title="Scan all pack materials for averages that look per-bottle/pack instead of per-recipe-unit (compared against the latest real purchase)."
+              className="px-3 py-2 bg-white border border-amber-500 text-amber-700 hover:bg-amber-50 rounded-lg text-sm font-medium flex items-center gap-1.5 disabled:opacity-50">
+              {auditBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />} Audit price bases
+            </button>
+          )}
+          <div className="flex-1" />
           <button onClick={onClose} disabled={busy} className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Close</button>
           <button onClick={() => run(true)} disabled={busy} className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5 disabled:opacity-50">
             {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : null} Preview
