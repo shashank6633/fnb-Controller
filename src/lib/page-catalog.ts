@@ -97,6 +97,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/inventory/stock-overview', label: 'Stock Overview' },
       { path: '/inventory/transfers', label: 'Store Transfers' },
       { path: '/inventory/department-stock', label: 'Department Stock' },
+      { path: '/inventory/reconciliation', label: 'Sales vs Consumption' },
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
       { path: '/store-requisitions',  label: 'Store Requisitions (Issue)' },
       { path: '/closing-stock',       label: 'Closing Stock' },

@@ -15,7 +15,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Warehouse, Loader2, Plus, X, Save, AlertCircle, CheckCircle2, Edit2,
-  Users as UsersIcon, Tags, Power,
+  Users as UsersIcon, Tags, Power, MapPin,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 
@@ -27,6 +27,7 @@ interface AccessRow {
 interface StoreRow {
   id: string; name: string; code: string; description: string;
   is_active: number; requires_authorization: number; created_at: string;
+  floor_label: string;
   categories: CatMap[];
   access?: AccessRow[];
 }
@@ -187,12 +188,15 @@ function StoreCard({ store, materialCats, users, busy, run }: {
 }) {
   const [name, setName] = useState(store.name);
   const [code, setCode] = useState(store.code);
+  const [floorLabel, setFloorLabel] = useState(store.floor_label || '');
   const [catPick, setCatPick] = useState('');
   const [catFree, setCatFree] = useState('');
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [userPick, setUserPick] = useState('');
 
-  useEffect(() => { setName(store.name); setCode(store.code); setRenames({}); }, [store]);
+  useEffect(() => {
+    setName(store.name); setCode(store.code); setFloorLabel(store.floor_label || ''); setRenames({});
+  }, [store]);
 
   const mapped = useMemo(
     () => new Set(store.categories.map(c => c.category.trim().toLowerCase())),
@@ -213,6 +217,11 @@ function StoreCard({ store, materialCats, users, busy, run }: {
   const saveHeader = () => run(
     () => api(`/api/stores/${store.id}`, { method: 'PUT', body: { name: name.trim(), code: code.trim() } }),
     `Saved "${name.trim()}"`,
+  );
+  const floorDirty = floorLabel.trim() !== (store.floor_label || '').trim();
+  const saveFloorLabel = () => run(
+    () => api(`/api/stores/${store.id}`, { method: 'PUT', body: { floor_label: floorLabel.trim() } }),
+    floorLabel.trim() ? `Mapped ${store.name} to zone(s): ${floorLabel.trim()}` : `Cleared floor mapping for ${store.name}`,
   );
   const toggleActive = () => run(
     () => api(`/api/stores/${store.id}`, { method: 'PUT', body: { is_active: !store.is_active } }),
@@ -298,6 +307,31 @@ function StoreCard({ store, materialCats, users, busy, run }: {
       </div>
 
       <div className="p-3 sm:p-4 space-y-4">
+        {/* ── Floor / zone mapping (Multi-floor bar reconciliation) ── */}
+        <div>
+          <div className="text-xs font-semibold text-[#2D1B0E] flex items-center gap-1.5 mb-1.5">
+            <MapPin className="w-3.5 h-3.5 text-[#af4408]" />
+            Floor / zone mapping
+            <span className="text-[10px] font-normal text-[#8B7355]">(for sales-vs-consumption reconciliation)</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <input value={floorLabel} onChange={e => setFloorLabel(e.target.value)}
+                   placeholder="e.g. Rooftop  (or: Ground Floor, Terrace)"
+                   className="flex-1 min-w-[200px] px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]" />
+            {floorDirty && (
+              <button onClick={saveFloorLabel} disabled={busy}
+                      className="px-2.5 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded text-xs flex items-center gap-1 disabled:opacity-50">
+                <Save className="w-3.5 h-3.5" /> Save mapping
+              </button>
+            )}
+          </div>
+          <p className="text-[10px] text-[#8B7355] mt-1">
+            Match this floor bar to the table <strong>zone</strong> its sales come from (comma-separated for
+            several zones). Sales in a mapped zone are attributed to this store for leak reconciliation. Leave
+            blank for a non-floor store like the central Liquor Store.
+          </p>
+        </div>
+
         {/* ── Category mapping ── */}
         <div>
           <div className="text-xs font-semibold text-[#2D1B0E] flex items-center gap-1.5 mb-1.5">

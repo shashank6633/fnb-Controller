@@ -1,6 +1,7 @@
 import { getDb, deductInventoryForSale } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { emitKds } from '@/lib/kds-bus';
+import { resolveFloorStore } from '@/lib/store-engine';
 
 const FLOW = ['new', 'preparing', 'ready', 'served'];
 
@@ -39,8 +40,23 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       //   - a voided order is skipped (nothing was really cooked/served).
       if (next === 'served') {
         db.prepare("UPDATE order_items SET status = 'served' WHERE kot_id = ?").run(id);
-        const order = db.prepare("SELECT bill_type, status FROM orders WHERE id = ?").get(kot.order_id) as any;
+        const order = db.prepare(`
+          SELECT o.bill_type, o.status, t.zone AS zone
+          FROM orders o
+          LEFT JOIN restaurant_tables t ON t.id = o.table_id
+          WHERE o.id = ?
+        `).get(kot.order_id) as any;
         if (order && order.status !== 'void') {
+          // FAIL-SAFE floor routing: map this order's table zone → floor bar store
+          // once. Any failure (or an unmapped zone) → undefined → central deduct.
+          // deductInventoryForSale still gates the store path on tm_floor_autodeduct.
+          let floorStoreId: string | undefined;
+          try {
+            floorStoreId = resolveFloorStore(db, order.zone) || undefined;
+          } catch (e) {
+            console.error('[kds bump floor-resolve]', kot.order_id, e);
+            floorStoreId = undefined;
+          }
           const cook = db.prepare(`
             SELECT id, recipe_id, quantity FROM order_items
             WHERE kot_id = ? AND recipe_id IS NOT NULL AND recipe_id != '' AND recipe_deducted_at IS NULL
@@ -48,7 +64,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           const stamp = db.prepare("UPDATE order_items SET recipe_deducted_at = datetime('now') WHERE id = ?");
           for (const it of cook) {
             try {
-              deductInventoryForSale(db, it.recipe_id, it.quantity, it.id, order.bill_type || 'normal');
+              deductInventoryForSale(
+                db, it.recipe_id, it.quantity, it.id, order.bill_type || 'normal',
+                floorStoreId ? { storeId: floorStoreId } : undefined,
+              );
               stamp.run(it.id);   // stamp only on success → settle backstops any that threw
             } catch (e) { console.error('[kds bump recipe-deduct]', it.id, e); }
           }

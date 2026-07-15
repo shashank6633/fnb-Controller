@@ -2,6 +2,7 @@ import { getDb, recordSale } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { todayIST } from '@/lib/format-date';
 import { computeBill, sumItemTax } from '@/lib/bill-calc';
+import { resolveFloorStore } from '@/lib/store-engine';
 
 const VALID_METHODS = ['cash', 'upi', 'card'];
 
@@ -69,6 +70,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     );
     const taxTotal = Math.round((bill.cgst + bill.sgst) * 100) / 100;
 
+    // FAIL-SAFE floor routing (Multi-floor bar Phase 2/3): resolve this order's
+    // floor bar store from its table zone ONCE. The settle deduct is only a
+    // backstop for items not already deducted at KOT-complete; recordSale gates
+    // the actual store posting on tm_floor_autodeduct and ignores store_id when
+    // skip_inventory is set. Any failure / unmapped zone → undefined → central.
+    let floorStoreId: string | undefined;
+    try {
+      const zoneRow = order.table_id
+        ? db.prepare('SELECT zone FROM restaurant_tables WHERE id = ?').get(order.table_id) as any
+        : null;
+      floorStoreId = resolveFloorStore(db, zoneRow?.zone) || undefined;
+    } catch (e) {
+      console.error('[settle floor-resolve]', id, e);
+      floorStoreId = undefined;
+    }
+
     const settle = db.transaction(() => {
       for (const it of items) {
         // pos_id from the menu item (stable link); fall back to none.
@@ -83,6 +100,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // deduct stock again. Not-yet-completed items (e.g. quick-settled without
           // a KDS bump) still deduct here as the backstop.
           skip_inventory: !!it.recipe_deducted_at,
+          // Route the backstop deduct to the floor bar store (no-op unless
+          // tm_floor_autodeduct is on and skip_inventory is false).
+          store_id: floorStoreId,
           bill_type: order.bill_type || 'normal',
           selling_price: it.unit_price,
           date,

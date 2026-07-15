@@ -1,6 +1,6 @@
 import type { Database } from 'better-sqlite3';
 import type { SessionUser } from './auth';
-import { generateId } from './db';
+import { generateId, convertToMaterialUnit } from './db';
 
 /**
  * Multi-Store Inventory Engine — Phase A foundation (LIQUOR STORE first).
@@ -33,6 +33,9 @@ export interface StoreLocation {
   is_active: number;                 // 1 | 0
   requires_authorization: number;    // 1 = only granted users may see/use it
   created_at: string;
+  /** Multi-floor bar Phase 2: comma-separated restaurant_tables.zone value(s)
+   *  whose dine-in sales this floor bar holds. '' = no floor attribution. */
+  floor_label: string;
 }
 
 export interface StoreAccess {
@@ -91,14 +94,16 @@ export interface StoreStockRow {
 /** All store locations (active AND inactive — callers filter). */
 export function listStores(db: Database): StoreLocation[] {
   return db.prepare(`
-    SELECT id, name, code, description, is_active, requires_authorization, created_at
+    SELECT id, name, code, description, is_active, requires_authorization, created_at,
+           COALESCE(floor_label, '') AS floor_label
     FROM store_locations ORDER BY name COLLATE NOCASE
   `).all() as StoreLocation[];
 }
 
 export function getStoreById(db: Database, id: string): StoreLocation | null {
   const row = db.prepare(`
-    SELECT id, name, code, description, is_active, requires_authorization, created_at
+    SELECT id, name, code, description, is_active, requires_authorization, created_at,
+           COALESCE(floor_label, '') AS floor_label
     FROM store_locations WHERE id = ?
   `).get(id) as StoreLocation | undefined;
   return row || null;
@@ -106,7 +111,8 @@ export function getStoreById(db: Database, id: string): StoreLocation | null {
 
 export function getStoreByName(db: Database, name: string): StoreLocation | null {
   const row = db.prepare(`
-    SELECT id, name, code, description, is_active, requires_authorization, created_at
+    SELECT id, name, code, description, is_active, requires_authorization, created_at,
+           COALESCE(floor_label, '') AS floor_label
     FROM store_locations WHERE TRIM(name) = TRIM(?) COLLATE NOCASE
   `).get(String(name || '')) as StoreLocation | undefined;
   return row || null;
@@ -1000,4 +1006,538 @@ export function listTransfers(
       total_in_transit: Math.round((totalIss - totalRec) * 10000) / 10000,
     };
   });
+}
+
+// ── Multi-floor bar Phase 2/3 — zone→floor mapping, auto-deduct switch,
+//    sales-vs-consumption reconciliation (the leak catcher) ──────────────────
+
+/**
+ * Resolve a dine-in order's floor bar store from its table zone
+ * (restaurant_tables.zone). A floor store carries a `floor_label` — a single
+ * value or a comma-separated list of the zone value(s) whose sales it holds.
+ * Matching is TRIM + case-insensitive, mirroring the store-engine category
+ * convention. Only ACTIVE stores with a non-empty floor_label are considered;
+ * the first match (name order) wins. Returns the store_id, or null when the zone
+ * maps to no floor store (→ no floor attribution, central behaviour).
+ */
+export function resolveFloorStore(db: Database, zone: string | null | undefined): string | null {
+  const z = String(zone || '').trim().toLowerCase();
+  if (!z) return null;
+  const rows = db.prepare(`
+    SELECT id, floor_label
+    FROM store_locations
+    WHERE is_active = 1 AND TRIM(COALESCE(floor_label, '')) <> ''
+    ORDER BY name COLLATE NOCASE
+  `).all() as { id: string; floor_label: string }[];
+  for (const r of rows) {
+    const labels = String(r.floor_label || '')
+      .split(',')
+      .map(s => s.trim().toLowerCase())
+      .filter(Boolean);
+    if (labels.includes(z)) return r.id;
+  }
+  return null;
+}
+
+/**
+ * The fail-safe master switch for floor auto-deduct (settings.tm_floor_autodeduct).
+ * "1" = ON (dine-in sales route their liquor deduction to the floor store
+ * ledger); anything else (including missing) = OFF = central behaviour. Default
+ * seeded "0". deductInventoryForSale() gates ALL floor routing on this.
+ */
+export function floorAutoDeductEnabled(db: Database): boolean {
+  try {
+    const row = db.prepare(`SELECT value FROM settings WHERE key = 'tm_floor_autodeduct'`).get() as { value: string } | undefined;
+    return String(row?.value ?? '0') === '1';
+  } catch {
+    return false;
+  }
+}
+
+// ── Reconciliation types ─────────────────────────────────────────────────────
+
+export interface FloorReconRow {
+  store_id: string;
+  store_name: string;
+  floor_label: string;
+  material_id: string;
+  material_name: string;
+  category: string;
+  unit: string;
+  pack_size: number;
+  /** EXPECTED consumption from sales (recipe-units, pegs exploded to materials). */
+  expected_qty: number;
+  /** ACTUAL floor consumption (recipe-units). Physical branch: opening+inflow−closing.
+   *  Ledger branch (auto-deduct on): Σ outward ledger magnitude. */
+  actual_qty: number;
+  /** Physical-branch components (recipe-units). */
+  opening_qty: number;
+  inflow_qty: number;
+  closing_qty: number;
+  /** Whether opening/closing came from a physical count (true) or a ledger
+   *  system-qty fallback (false) — surfaces trust of the ACTUAL figure. */
+  opening_counted: boolean;
+  closing_counted: boolean;
+  /** Ledger-branch actual (recipe-units): Σ |outward| sale rows in the period. */
+  ledger_out_qty: number;
+  /** Known non-sale reduction (recipe-units) from bar_empties breakage/spillage
+   *  logged in the period — already subtracted from the PHYSICAL actual_qty so a
+   *  broken bottle is not mistaken for an unbilled leak. Always 0 in ledger
+   *  mode. Surfaced as its own column so the loss is visible, not hidden. */
+  known_non_sale_qty: number;
+  /** actual_qty − expected_qty. > 0 = more left the floor than sales explain
+   *  (unbilled gap / leak); < 0 = sales exceed measured consumption. */
+  variance_qty: number;
+  /** ₹ per recipe-unit (raw_materials.average_price). */
+  avg_price: number;
+  expected_value: number;
+  actual_value: number;
+  known_non_sale_value: number;
+  variance_value: number;
+  /** 'ledger' when auto-deduct is ON, else 'physical'. */
+  mode: 'physical' | 'ledger';
+}
+
+export interface FloorReconResult {
+  from: string;
+  to: string;
+  store_id: string | null;
+  autodeduct: boolean;
+  mode: 'physical' | 'ledger';
+  rows: FloorReconRow[];
+  summary: {
+    stores: number;
+    materials: number;
+    total_expected_qty: number;
+    total_actual_qty: number;
+    total_variance_qty: number;
+    total_expected_value: number;
+    total_actual_value: number;
+    total_variance_value: number;
+    /** Σ known non-sale reduction (breakage/spillage) subtracted from actual. */
+    total_known_non_sale_qty: number;
+    total_known_non_sale_value: number;
+    /** Σ variance_value over rows where variance_qty > 0 (the unbilled leak). */
+    unbilled_value: number;
+  };
+  /**
+   * party_consumption is a pure P&L register with NO floor/zone attribution
+   * (event_name/event_date + material_id only), so it cannot be assigned to a
+   * floor store without guessing. It is surfaced here per-material (already
+   * material-level, no recipe explosion needed) so the report can show party
+   * liquor draw alongside the floors WITHOUT polluting per-floor variance.
+   */
+  unattributed_party: Array<{
+    material_id: string;
+    material_name: string;
+    category: string;
+    unit: string;
+    qty: number;
+    value: number;
+  }>;
+}
+
+/**
+ * Explode one recipe to its raw-material quantities per ONE sold unit, in
+ * recipe-units (the same units as raw_materials.current_stock). This mirrors
+ * deductInventoryForSale EXACTLY — convertToMaterialUnit + wastage/yield on
+ * direct ingredients, and the sub-recipe ratio (link qty / sub yield) — so the
+ * EXPECTED side of the reconciliation equals what the deduct path actually
+ * removes. Cached per recipe id for the life of one reconciliation call.
+ */
+function explodeRecipeUnit(
+  db: Database,
+  recipeId: string,
+  cache: Map<string, Map<string, number>>,
+): Map<string, number> {
+  const cached = cache.get(recipeId);
+  if (cached) return cached;
+  const out = new Map<string, number>();
+  const add = (mid: string, q: number) => out.set(mid, (out.get(mid) || 0) + q);
+
+  const ingredients = db.prepare(`
+    SELECT ri.quantity, ri.unit, ri.yield_percent, ri.wastage_percent, ri.material_id,
+           rm.unit AS material_unit, rm.name AS material_name, rm.pack_size AS material_pack_size
+    FROM recipe_ingredients ri
+    JOIN raw_materials rm ON ri.material_id = rm.id
+    WHERE ri.recipe_id = ? AND ri.is_default = 1
+  `).all(recipeId) as any[];
+  for (const ing of ingredients) {
+    const qtyInMatUnit = convertToMaterialUnit(ing.quantity, ing.unit, ing.material_unit, ing.material_name, ing.material_pack_size);
+    const effectiveQty = qtyInMatUnit * (1 + ing.wastage_percent / 100) / (ing.yield_percent / 100);
+    add(ing.material_id, effectiveQty);
+  }
+
+  const subRecipes = db.prepare(`
+    SELECT rs.quantity, rs.sub_recipe_id, sr.yield_quantity
+    FROM recipe_sub_recipes rs
+    JOIN sub_recipes sr ON rs.sub_recipe_id = sr.id
+    WHERE rs.recipe_id = ?
+  `).all(recipeId) as any[];
+  for (const sr of subRecipes) {
+    const ratio = sr.quantity / (sr.yield_quantity || 1);
+    const subIng = db.prepare(`
+      SELECT sri.quantity, sri.unit, sri.yield_percent, sri.wastage_percent, sri.material_id,
+             rm.unit AS material_unit, rm.name AS material_name, rm.pack_size AS material_pack_size
+      FROM sub_recipe_ingredients sri
+      JOIN raw_materials rm ON sri.material_id = rm.id
+      WHERE sri.sub_recipe_id = ? AND sri.is_default = 1
+    `).all(sr.sub_recipe_id) as any[];
+    for (const ing of subIng) {
+      const qtyInMatUnit = convertToMaterialUnit(ing.quantity, ing.unit, ing.material_unit, ing.material_name, ing.material_pack_size);
+      const effectiveQty = qtyInMatUnit * (1 + ing.wastage_percent / 100) / (ing.yield_percent / 100);
+      add(ing.material_id, effectiveQty * ratio);
+    }
+  }
+
+  cache.set(recipeId, out);
+  return out;
+}
+
+const r4 = (n: number) => Math.round((Number(n) || 0) * 10000) / 10000;
+const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/**
+ * Sales-vs-Consumption RECONCILIATION per floor bar — THE leak catcher.
+ *
+ * For each floor store in scope and each material:
+ *   EXPECTED = sold-through from `sales` (join orders → restaurant_tables.zone →
+ *              resolveFloorStore) exploded recipe→materials (pegs), summed over
+ *              [from,to]. All bill types (normal|nc|comp) count — every pour
+ *              drains the floor, matching deductInventoryForSale. Sales with no
+ *              recipe_id, no order_id, or an unmapped zone contribute nothing.
+ *              Only materials the floor store actually HOLDS (owns the category,
+ *              or has a ledger row / closing count there) enter EXPECTED — food
+ *              or cocktail mixers the bar never stocks are dropped, so they
+ *              don't surface as phantom expected>0 / actual=0 leak rows.
+ *   ACTUAL   = the floor's physical stock decrease over the period:
+ *                • auto-deduct OFF (default) → mode 'physical':
+ *                    opening + inflow − closing − known_non_sale
+ *                    known_non_sale = Σ bar_empties breakage/spillage in period
+ *                    (legit losses netted out so they don't read as leak).
+ *                    opening/closing = physical store_closing_counts (latest
+ *                    before `from` / latest within [from,to]); when a count is
+ *                    missing, fall back to the ledger system-qty as-of that
+ *                    boundary (opening_counted / closing_counted flag which).
+ *                    inflow = Σ positive store_stock_ledger quantity in period
+ *                    (transfers/inward/purchase/opening/adjustment credits).
+ *                • auto-deduct ON → mode 'ledger':
+ *                    Σ |outward| store_stock_ledger sale rows in the period
+ *                    (the auto-posted floor consumption).
+ *   VARIANCE = actual − expected. > 0 ⇒ more stock left the floor than sales
+ *              explain (unbilled gap / leak). Valued at raw_materials.average_price
+ *              (₹/recipe-unit): variance_value = variance_qty × avg_price.
+ *
+ * party_consumption has no floor attribution → returned separately in
+ * `unattributed_party` (never folded into per-floor variance).
+ *
+ * Read-only: touches no stock. `from`/`to` are inclusive YYYY-MM-DD (IST).
+ */
+export function floorReconciliation(
+  db: Database,
+  opts: { from: string; to: string; storeId?: string },
+): FloorReconResult {
+  const from = String(opts?.from || '').trim();
+  const to = String(opts?.to || '').trim();
+  const scopeStoreId = opts?.storeId ? String(opts.storeId).trim() : '';
+  const autodeduct = floorAutoDeductEnabled(db);
+  const mode: 'physical' | 'ledger' = autodeduct ? 'ledger' : 'physical';
+
+  const empty: FloorReconResult = {
+    from, to, store_id: scopeStoreId || null, autodeduct, mode, rows: [],
+    summary: {
+      stores: 0, materials: 0,
+      total_expected_qty: 0, total_actual_qty: 0, total_variance_qty: 0,
+      total_expected_value: 0, total_actual_value: 0, total_variance_value: 0,
+      total_known_non_sale_qty: 0, total_known_non_sale_value: 0,
+      unbilled_value: 0,
+    },
+    unattributed_party: [],
+  };
+  if (!from || !to) return empty;
+
+  // Stores in scope: the requested store, else every active store. (An active
+  // store with an empty floor_label simply gets zero EXPECTED — it still shows
+  // any ACTUAL movement, which is itself a signal.)
+  const scopeStores: StoreLocation[] = scopeStoreId
+    ? [getStoreById(db, scopeStoreId)].filter((s): s is StoreLocation => !!s)
+    : listStores(db).filter(s => !!s.is_active);
+  if (scopeStores.length === 0) return empty;
+  const inScope = new Set(scopeStores.map(s => s.id));
+
+  const floorLabelOf = new Map(scopeStores.map(s => [s.id, s.floor_label ?? '']));
+
+  // ── EXPECTED: explode floor-attributed sales ────────────────────────────────
+  // expected[storeId] → Map<material_id, qty>
+  const expected = new Map<string, Map<string, number>>();
+  const bumpExpected = (sid: string, mid: string, q: number) => {
+    let m = expected.get(sid);
+    if (!m) { m = new Map(); expected.set(sid, m); }
+    m.set(mid, (m.get(mid) || 0) + q);
+  };
+  const recipeCache = new Map<string, Map<string, number>>();
+
+  // Material meta cache (used by the EXPECTED store-held filter AND the row
+  // build below).
+  const metaStmt = db.prepare(`
+    SELECT id, name, category, unit, COALESCE(pack_size, 1) AS pack_size,
+           COALESCE(average_price, 0) AS average_price
+    FROM raw_materials WHERE id = ?
+  `);
+  const metaCache = new Map<string, any>();
+  const metaOf = (mid: string) => {
+    let m = metaCache.get(mid);
+    if (!m) { m = metaStmt.get(mid) || { id: mid, name: mid, category: '', unit: '', pack_size: 1, average_price: 0 }; metaCache.set(mid, m); }
+    return m;
+  };
+
+  // Is a material actually HELD by a given floor store — i.e. bar-relevant? A
+  // material is store-held when the store OWNS its category (materialStoreId),
+  // OR it carries a ledger row / closing count in that store. This keeps
+  // EXPECTED (and the per-store material universe) restricted to bar stock: food
+  // ordered at a bar-zone table, or a cocktail's mixers/garnishes the floor
+  // never stocks, must NOT generate phantom per-floor rows (expected>0,
+  // actual=0, large negative variance). Cached per (store, material).
+  const ledgerHasRowStmt = db.prepare(
+    `SELECT 1 FROM store_stock_ledger WHERE store_id = ? AND material_id = ? LIMIT 1`,
+  );
+  const countHasRowStmt = db.prepare(
+    `SELECT 1 FROM store_closing_counts WHERE store_id = ? AND material_id = ? LIMIT 1`,
+  );
+  const heldCache = new Map<string, boolean>();
+  const isStoreHeld = (sid: string, mid: string): boolean => {
+    const key = sid + '|' + mid;
+    const c = heldCache.get(key);
+    if (c !== undefined) return c;
+    let held = materialStoreId(db, metaOf(mid)) === sid;
+    if (!held) held = !!ledgerHasRowStmt.get(sid, mid);
+    if (!held) held = !!countHasRowStmt.get(sid, mid);
+    heldCache.set(key, held);
+    return held;
+  };
+
+  const saleRows = db.prepare(`
+    SELECT s.recipe_id AS recipe_id, s.quantity_sold AS quantity_sold, rt.zone AS zone
+    FROM sales s
+    JOIN orders o ON o.id = s.order_id
+    JOIN restaurant_tables rt ON rt.id = o.table_id
+    WHERE s.date >= ? AND s.date <= ?
+      AND s.recipe_id IS NOT NULL AND s.order_id IS NOT NULL
+  `).all(from, to) as { recipe_id: string; quantity_sold: number; zone: string }[];
+
+  for (const s of saleRows) {
+    const sid = resolveFloorStore(db, s.zone);
+    if (!sid || !inScope.has(sid)) continue;
+    const qty = Number(s.quantity_sold) || 0;
+    if (!qty) continue;
+    const perUnit = explodeRecipeUnit(db, s.recipe_id, recipeCache);
+    for (const [mid, per] of perUnit) {
+      // Only bar/store-held materials belong on a floor's reconciliation.
+      if (!isStoreHeld(sid, mid)) continue;
+      bumpExpected(sid, mid, per * qty);
+    }
+  }
+
+  // ── Prepared ACTUAL queries ─────────────────────────────────────────────────
+  // store_stock_ledger.created_at is UTC (datetime('now')); `from`/`to` and
+  // store_closing_counts.date / sales.date are IST calendar days. Shift the
+  // ledger timestamp by +330 minutes so ACTUAL is bucketed on the SAME IST day
+  // as EXPECTED — otherwise late-night bar hours (00:00–05:30 IST) land on the
+  // previous UTC day and misalign the two sides at every day boundary.
+  const inflowStmt = db.prepare(`
+    SELECT material_id, SUM(quantity) AS q
+    FROM store_stock_ledger
+    WHERE store_id = ? AND quantity > 0
+      AND date(created_at, '+330 minutes') >= ? AND date(created_at, '+330 minutes') <= ?
+    GROUP BY material_id
+  `);
+  const outwardStmt = db.prepare(`
+    SELECT material_id, SUM(-quantity) AS q
+    FROM store_stock_ledger
+    WHERE store_id = ? AND txn_type = 'outward' AND quantity < 0
+      AND date(created_at, '+330 minutes') >= ? AND date(created_at, '+330 minutes') <= ?
+    GROUP BY material_id
+  `);
+  const openCountStmt = db.prepare(`
+    SELECT physical_qty FROM store_closing_counts
+    WHERE store_id = ? AND material_id = ? AND date < ?
+    ORDER BY date DESC LIMIT 1
+  `);
+  const closeCountStmt = db.prepare(`
+    SELECT physical_qty FROM store_closing_counts
+    WHERE store_id = ? AND material_id = ? AND date >= ? AND date <= ?
+    ORDER BY date DESC LIMIT 1
+  `);
+  const ledgerAsOfBeforeStmt = db.prepare(`
+    SELECT COALESCE(SUM(quantity), 0) AS q FROM store_stock_ledger
+    WHERE store_id = ? AND material_id = ? AND date(created_at, '+330 minutes') < ?
+  `);
+  const ledgerAsOfAtStmt = db.prepare(`
+    SELECT COALESCE(SUM(quantity), 0) AS q FROM store_stock_ledger
+    WHERE store_id = ? AND material_id = ? AND date(created_at, '+330 minutes') <= ?
+  `);
+  // Materials with any closing count in the period (part of the universe).
+  const countedMaterialsStmt = db.prepare(`
+    SELECT DISTINCT material_id FROM store_closing_counts
+    WHERE store_id = ? AND date >= ? AND date <= ?
+  `);
+
+  // ── Known non-sale reductions (bar_empties) ─────────────────────────────────
+  // Logged breakage / spillage are LEGIT non-sale losses — the bottle is
+  // physically absent at closing, inflating the physical decrease. Subtract them
+  // from the PHYSICAL actual so a broken bottle reads as a known loss, not an
+  // unbilled leak. Excluded on purpose: 'complimentary' (comp pours are POS
+  // sales already counted in EXPECTED → would double-subtract) and 'empty' (an
+  // empty bottle is the physical trace of product already poured & sold, not an
+  // extra loss). Bucketed on bar_empties.date (IST), matching sales.date.
+  const emptiesByStore = new Map<string, Map<string, number>>();
+  for (const e of db.prepare(`
+    SELECT store_id, material_id, SUM(qty) AS q
+    FROM bar_empties
+    WHERE kind IN ('breakage','spillage') AND date >= ? AND date <= ?
+    GROUP BY store_id, material_id
+  `).all(from, to) as { store_id: string; material_id: string; q: number }[]) {
+    let m = emptiesByStore.get(e.store_id);
+    if (!m) { m = new Map(); emptiesByStore.set(e.store_id, m); }
+    m.set(e.material_id, (m.get(e.material_id) || 0) + (Number(e.q) || 0));
+  }
+
+  const rows: FloorReconRow[] = [];
+  let tExpQ = 0, tActQ = 0, tVarQ = 0, tExpV = 0, tActV = 0, tVarV = 0, tUnbilled = 0, tKnownQ = 0, tKnownV = 0;
+
+  for (const store of scopeStores) {
+    const sid = store.id;
+    const inflowMap = new Map<string, number>();
+    for (const r of inflowStmt.all(sid, from, to) as any[]) inflowMap.set(r.material_id, Number(r.q) || 0);
+    const outMap = new Map<string, number>();
+    for (const r of outwardStmt.all(sid, from, to) as any[]) outMap.set(r.material_id, Number(r.q) || 0);
+    const empByMat = emptiesByStore.get(sid) || new Map<string, number>();
+
+    // Material universe for this store: expected ∪ inflow ∪ outward ∪ counted
+    // ∪ known-non-sale (breakage/spillage logged even with no other movement).
+    const universe = new Set<string>();
+    for (const mid of (expected.get(sid)?.keys() || [])) universe.add(mid);
+    for (const mid of inflowMap.keys()) universe.add(mid);
+    for (const mid of outMap.keys()) universe.add(mid);
+    for (const r of countedMaterialsStmt.all(sid, from, to) as any[]) universe.add(r.material_id);
+    for (const mid of empByMat.keys()) universe.add(mid);
+
+    for (const mid of universe) {
+      const meta = metaOf(mid);
+      const avg = Number(meta.average_price) || 0;
+      const expQ = expected.get(sid)?.get(mid) || 0;
+      const inflowQ = inflowMap.get(mid) || 0;
+      const ledgerOutQ = outMap.get(mid) || 0;
+      // Known non-sale loss only nets against the PHYSICAL decrease; in ledger
+      // mode ACTUAL = Σ outward sale rows, which never includes an 'adjustment'.
+      const knownNonSaleQ = mode === 'physical' ? (empByMat.get(mid) || 0) : 0;
+
+      // Physical opening/closing (fall back to ledger system qty as-of boundary).
+      const openRow = openCountStmt.get(sid, mid, from) as { physical_qty: number } | undefined;
+      const openingCounted = openRow != null;
+      const openingQ = openingCounted
+        ? Number(openRow!.physical_qty) || 0
+        : Number((ledgerAsOfBeforeStmt.get(sid, mid, from) as { q: number }).q) || 0;
+      const closeRow = closeCountStmt.get(sid, mid, from, to) as { physical_qty: number } | undefined;
+      const closingCounted = closeRow != null;
+      const closingQ = closingCounted
+        ? Number(closeRow!.physical_qty) || 0
+        : Number((ledgerAsOfAtStmt.get(sid, mid, to) as { q: number }).q) || 0;
+
+      const actualQ = mode === 'ledger'
+        ? ledgerOutQ
+        : openingQ + inflowQ - closingQ - knownNonSaleQ;
+      const varianceQ = actualQ - expQ;
+
+      // Skip a fully-empty row: nothing expected, nothing moved, no count, no
+      // known non-sale loss.
+      if (expQ === 0 && actualQ === 0 && inflowQ === 0 && ledgerOutQ === 0 && knownNonSaleQ === 0 && !openingCounted && !closingCounted) continue;
+
+      const expV = expQ * avg;
+      const actV = actualQ * avg;
+      const varV = varianceQ * avg;
+      const knownV = knownNonSaleQ * avg;
+
+      rows.push({
+        store_id: sid,
+        store_name: store.name,
+        floor_label: String(floorLabelOf.get(sid) || ''),
+        material_id: mid,
+        material_name: meta.name,
+        category: meta.category || '',
+        unit: meta.unit || '',
+        pack_size: Number(meta.pack_size) || 1,
+        expected_qty: r4(expQ),
+        actual_qty: r4(actualQ),
+        opening_qty: r4(openingQ),
+        inflow_qty: r4(inflowQ),
+        closing_qty: r4(closingQ),
+        opening_counted: openingCounted,
+        closing_counted: closingCounted,
+        ledger_out_qty: r4(ledgerOutQ),
+        known_non_sale_qty: r4(knownNonSaleQ),
+        variance_qty: r4(varianceQ),
+        avg_price: Math.round(avg * 10000) / 10000,
+        expected_value: r2(expV),
+        actual_value: r2(actV),
+        known_non_sale_value: r2(knownV),
+        variance_value: r2(varV),
+        mode,
+      });
+
+      tExpQ += expQ; tActQ += actualQ; tVarQ += varianceQ;
+      tExpV += expV; tActV += actV; tVarV += varV;
+      tKnownQ += knownNonSaleQ; tKnownV += knownV;
+      if (varianceQ > 0) tUnbilled += varV;
+    }
+  }
+
+  rows.sort((a, b) =>
+    a.store_name.localeCompare(b.store_name, undefined, { sensitivity: 'base' }) ||
+    Math.abs(b.variance_value) - Math.abs(a.variance_value) ||
+    a.material_name.localeCompare(b.material_name, undefined, { sensitivity: 'base' }),
+  );
+
+  // ── party_consumption (unattributed) ────────────────────────────────────────
+  const partyRows = db.prepare(`
+    SELECT material_id, SUM(qty_consumed) AS qty
+    FROM party_consumption
+    WHERE event_date >= ? AND event_date <= ?
+    GROUP BY material_id
+  `).all(from, to) as { material_id: string; qty: number }[];
+  const unattributed_party = partyRows
+    .filter(p => (Number(p.qty) || 0) !== 0)
+    .map(p => {
+      const meta = metaOf(p.material_id);
+      const avg = Number(meta.average_price) || 0;
+      const qty = Number(p.qty) || 0;
+      return {
+        material_id: p.material_id,
+        material_name: meta.name,
+        category: meta.category || '',
+        unit: meta.unit || '',
+        qty: r4(qty),
+        value: r2(qty * avg),
+      };
+    })
+    .sort((a, b) => a.material_name.localeCompare(b.material_name, undefined, { sensitivity: 'base' }));
+
+  const storesWithRows = new Set(rows.map(r => r.store_id));
+  return {
+    from, to, store_id: scopeStoreId || null, autodeduct, mode, rows,
+    summary: {
+      stores: storesWithRows.size,
+      materials: rows.length,
+      total_expected_qty: r4(tExpQ),
+      total_actual_qty: r4(tActQ),
+      total_variance_qty: r4(tVarQ),
+      total_expected_value: r2(tExpV),
+      total_actual_value: r2(tActV),
+      total_variance_value: r2(tVarV),
+      total_known_non_sale_qty: r4(tKnownQ),
+      total_known_non_sale_value: r2(tKnownV),
+      unbilled_value: r2(tUnbilled),
+    },
+    unattributed_party,
+  };
 }

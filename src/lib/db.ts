@@ -2754,6 +2754,53 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('store_transfers schema failed:', e); }
 
+  // ── Multi-floor bar Phase 2/3 (leak-proof automation, additive) ───────────
+  // Three purely-additive pieces, all guarded so a redeploy is a no-op:
+  //   1. store_locations.floor_label — a TEXT label (or comma-separated list of
+  //      labels) mapping a floor bar store to the restaurant_tables.zone value(s)
+  //      its sales come from. Empty by default → no floor attribution, byte-
+  //      identical to today. resolveFloorStore() (store-engine.ts) matches a
+  //      sale's zone (NOCASE/TRIM) to the active store whose floor_label CSV
+  //      contains it. Admin edits it on /settings/stores.
+  //   2. bar_empties — a log of non-sale floor stock reductions (empties returned,
+  //      breakage, complimentary, spillage). Pure register; a breakage/spillage
+  //      row may ALSO post an 'adjustment' ledger row (handled by its API), but
+  //      this table itself moves no stock. Feeds the reconciliation report as a
+  //      legit non-sale reduction.
+  //   3. tm_floor_autodeduct setting — the FAIL-SAFE OPT-IN master switch for
+  //      routing a dine-in sale's liquor deduction to the floor store ledger
+  //      instead of central raw_materials.current_stock. Default "0" = OFF =
+  //      today's exact behaviour (deductInventoryForSale ignores floor routing
+  //      unless the setting is "1" AND a caller passes opts.storeId).
+  try {
+    const slCols = db.prepare("PRAGMA table_info(store_locations)").all() as any[];
+    if (!slCols.some((c: any) => c.name === 'floor_label')) {
+      db.exec(`ALTER TABLE store_locations ADD COLUMN floor_label TEXT DEFAULT ''`);
+    }
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS bar_empties (
+        id          TEXT PRIMARY KEY,
+        store_id    TEXT NOT NULL,
+        material_id TEXT NOT NULL,
+        qty         REAL NOT NULL DEFAULT 0,           -- recipe units (magnitude ≥ 0)
+        kind        TEXT NOT NULL DEFAULT 'empty',     -- empty|breakage|complimentary|spillage
+        note        TEXT DEFAULT '',
+        recorded_by TEXT DEFAULT '',                   -- actor email
+        date        TEXT NOT NULL,                     -- YYYY-MM-DD (IST) event date
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (store_id)    REFERENCES store_locations(id),
+        FOREIGN KEY (material_id) REFERENCES raw_materials(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_bar_empties_store_date ON bar_empties(store_id, date);
+      CREATE INDEX IF NOT EXISTS idx_bar_empties_material   ON bar_empties(material_id);
+    `);
+
+    // Fail-safe master switch — OFF by default so nothing changes until an admin
+    // opts in. OR IGNORE never clobbers an admin's chosen value on redeploy.
+    db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('tm_floor_autodeduct', '0')`);
+  } catch (e) { console.error('multi-floor bar phase 2/3 schema failed:', e); }
+
   // ── Config-audit fingerprint (evidence instrumentation, 2026-07-13) ────────
   // Prod complaint: "user roles & permission settings change on every deploy."
   // A byte-diff boot test proved the boot path does NOT mutate users/roles, but
@@ -3497,11 +3544,85 @@ export function updateMaterialPrice(db: Database.Database, materialId: string): 
   }
 }
 
-// Deduct inventory for a sale
-export function deductInventoryForSale(db: Database.Database, recipeId: string, quantity: number, saleId: string, billType: string): void {
+// Deduct inventory for a sale.
+//
+// FAIL-SAFE OPT-IN FLOOR ROUTING (Multi-floor bar, Phase 2/3):
+// `opts.storeId` is passed ONLY by the two dine-in call sites (KDS bump + settle
+// backstop), resolved from the order → table.zone → floor store. The other three
+// call sites (/api/sales, /api/sales-import, /api/seed) pass nothing → unchanged.
+// For each ingredient, IF the setting tm_floor_autodeduct == "1" AND opts.storeId
+// is set AND the material is store-held (owned by a store via its category OR
+// already has a ledger row in that floor store), the deduction is posted as an
+// OUTWARD store_stock_ledger row on opts.storeId INSTEAD of decrementing central
+// raw_materials.current_stock. On ANY error the code FALLS BACK to the central
+// UPDATE (a sale must never fail because of floor routing). Setting OFF (default)
+// or no storeId => byte-identical to the original behaviour. The
+// inventory_transactions audit row is ALWAYS written, on either path.
+export function deductInventoryForSale(
+  db: Database.Database,
+  recipeId: string,
+  quantity: number,
+  saleId: string,
+  billType: string,
+  opts?: { storeId?: string },
+): void {
+  const floorStoreId = opts?.storeId ? String(opts.storeId).trim() : '';
+
+  // Resolve the floor-routing helpers + master switch ONCE, lazily, and only
+  // when a caller actually asked to route to a store (keeps the 3 non-dine-in
+  // call sites on the exact original code path). Any failure here disables
+  // routing entirely → central path, so a sale can never break.
+  let routeEnabled = false;
+  let se: typeof import('./store-engine') | null = null;
+  if (floorStoreId) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      se = require('./store-engine') as typeof import('./store-engine');
+      routeEnabled = se.floorAutoDeductEnabled(db);
+    } catch (e) {
+      console.error('floor auto-deduct: helper load / setting read failed, using central path', e);
+      routeEnabled = false;
+      se = null;
+    }
+  }
+  const ledgerHasRow = db.prepare(
+    'SELECT 1 FROM store_stock_ledger WHERE store_id = ? AND material_id = ? LIMIT 1',
+  );
+
+  /**
+   * Deduct `totalDeduct` recipe-units of a material for this sale. Prefers the
+   * floor store ledger when routing is enabled and the material is store-held;
+   * on any problem (including a store-held check miss) falls back to the central
+   * raw_materials.current_stock UPDATE. Always safe to call.
+   */
+  const applyDeduct = (materialId: string, category: string | null, totalDeduct: number): void => {
+    if (routeEnabled && se && floorStoreId && totalDeduct > 0) {
+      try {
+        const owned = se.materialStoreId(db, { category }) != null;
+        const held = owned || !!ledgerHasRow.get(floorStoreId, materialId);
+        if (held) {
+          se.postLedger(db, {
+            store_id: floorStoreId,
+            material_id: materialId,
+            txn_type: 'outward',
+            quantity: -totalDeduct,
+            ref: saleId,
+            notes: `Floor auto-deduct (sale ${saleId})`,
+          });
+          return; // routed to floor ledger — skip the central UPDATE
+        }
+      } catch (e) {
+        console.error(`floor auto-deduct failed for material ${materialId}, falling back to central`, e);
+        // fall through to central UPDATE below
+      }
+    }
+    db.prepare('UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime(\'now\') WHERE id = ?')
+      .run(totalDeduct, materialId);
+  };
+
   // Deduct raw ingredients
   const ingredients = db.prepare(`
-    SELECT ri.*, rm.current_stock, rm.unit AS material_unit, rm.name AS material_name, rm.pack_size AS material_pack_size
+    SELECT ri.*, rm.current_stock, rm.unit AS material_unit, rm.name AS material_name, rm.pack_size AS material_pack_size, rm.category AS material_category
     FROM recipe_ingredients ri
     JOIN raw_materials rm ON ri.material_id = rm.id
     WHERE ri.recipe_id = ? AND ri.is_default = 1
@@ -3514,8 +3635,7 @@ export function deductInventoryForSale(db: Database.Database, recipeId: string, 
     const effectiveQty = qtyInMatUnit * (1 + ing.wastage_percent / 100) / (ing.yield_percent / 100);
     const totalDeduct = effectiveQty * quantity;
 
-    db.prepare('UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime(\'now\') WHERE id = ?')
-      .run(totalDeduct, ing.material_id);
+    applyDeduct(ing.material_id, ing.material_category, totalDeduct);
 
     db.prepare(`
       INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
@@ -3533,7 +3653,7 @@ export function deductInventoryForSale(db: Database.Database, recipeId: string, 
 
   for (const sr of subRecipes) {
     const subIngredients = db.prepare(`
-      SELECT sri.*, rm.current_stock, rm.unit AS material_unit, rm.name AS material_name, rm.pack_size AS material_pack_size
+      SELECT sri.*, rm.current_stock, rm.unit AS material_unit, rm.name AS material_name, rm.pack_size AS material_pack_size, rm.category AS material_category
       FROM sub_recipe_ingredients sri
       JOIN raw_materials rm ON sri.material_id = rm.id
       WHERE sri.sub_recipe_id = ? AND sri.is_default = 1
@@ -3546,8 +3666,7 @@ export function deductInventoryForSale(db: Database.Database, recipeId: string, 
       const effectiveQty = qtyInMatUnit * (1 + ing.wastage_percent / 100) / (ing.yield_percent / 100);
       const totalDeduct = effectiveQty * ratio * quantity;
 
-      db.prepare('UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime(\'now\') WHERE id = ?')
-        .run(totalDeduct, ing.material_id);
+      applyDeduct(ing.material_id, ing.material_category, totalDeduct);
 
       db.prepare(`
         INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
@@ -3577,6 +3696,12 @@ export interface SaleInput {
   // when the item's recipe was already deducted at KOT-complete (see the KDS bump
   // route). Prevents double-deduction under the "consume on KOT complete" model.
   skip_inventory?: boolean;
+  // FAIL-SAFE FLOOR ROUTING (Multi-floor bar Phase 2/3): the resolved floor bar
+  // store (order → table.zone → resolveFloorStore) for the dine-in settle
+  // backstop only. Forwarded verbatim to deductInventoryForSale's opts.storeId;
+  // absent (the default, and for /api/sales/-import/seed) => central behaviour,
+  // byte-identical to before. Routing is still gated on tm_floor_autodeduct.
+  store_id?: string;
 }
 
 /**
@@ -3619,7 +3744,13 @@ export function recordSale(db: Database.Database, s: SaleInput): string {
   );
 
   if (s.recipe_id && !s.skip_inventory) {
-    deductInventoryForSale(db, s.recipe_id, s.quantity_sold, id, billType);
+    // Forward the caller-resolved floor store (settle backstop) verbatim. When
+    // s.store_id is absent (all non-dine-in callers) the opts arg is undefined →
+    // deductInventoryForSale takes its exact original central path.
+    deductInventoryForSale(
+      db, s.recipe_id, s.quantity_sold, id, billType,
+      s.store_id ? { storeId: s.store_id } : undefined,
+    );
   }
   return id;
 }

@@ -57,6 +57,7 @@ import {
   CheckCheck,
   CalendarClock,
   Settings2,
+  Scale,
   type LucideIcon,
 } from "lucide-react";
 
@@ -142,6 +143,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Stock Overview",     href: "/inventory/stock-overview", icon: Layers },
       { kind: "link", label: "Store Transfers",    href: "/inventory/transfers", icon: ArrowLeftRight },
       { kind: "link", label: "Department Stock",   href: "/inventory/department-stock", icon: Warehouse },
+      { kind: "link", label: "Sales vs Consumption", href: "/inventory/reconciliation", icon: Scale },
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
       { kind: "link", label: "Issue Requisitions", href: "/store-requisitions", icon: Package },
       { kind: "link", label: "Closing Stock",      href: "/closing-stock",      icon: ClipboardCheck },

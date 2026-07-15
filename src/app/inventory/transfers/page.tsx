@@ -32,15 +32,18 @@
  * src/lib/pack-units.ts is used for both entry and display. Mobile-first 375px.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   ArrowRightLeft, ArrowLeft, Plus, Search, X, Loader2, AlertCircle, AlertTriangle,
   CheckCircle2, Wine, Warehouse, Download, Send, PackageCheck, Ban, Trash2,
-  ChevronRight, PackageOpen, ShoppingBasket,
+  ChevronRight, PackageOpen, ShoppingBasket, ScanLine, Camera, CameraOff, PackageX,
 } from 'lucide-react';
 import Papa from 'papaparse';
+import { BrowserMultiFormatReader } from '@zxing/browser';
+import { BarcodeFormat, DecodeHintType } from '@zxing/library';
 import { api } from '@/lib/api';
+import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead';
 import {
@@ -176,6 +179,186 @@ function CBLEntry({ mat, value, onChange, compact }: {
   );
 }
 
+/* ── Barcode / SKU scanner (optional affordance) ─────────────────────────────
+
+   A mobile-first camera scanner (reused from Kitchen Production) that resolves a
+   scanned barcode / SKU to a raw material. Resolution is done against the full
+   raw_materials universe (GET /api/inventory?scope=all, read-only) so a code
+   resolves even before the source catalog is narrowed; the caller decides what
+   to do with the resolved material (e.g. only accept it if it's in the source
+   catalog). Purely additive — nothing changes if the button is never used.
+*/
+
+interface ResolvedMaterial { id: string; name: string; sku: string; category: string; }
+
+type ScanVerdict = { kind: 'ok' | 'warn' | 'err'; text: string };
+
+function BarcodeScanModal({ title, onResolved, onClose, note }: {
+  title: string;
+  /** Return a verdict to override the default "Matched …" status (e.g. reject a
+   *  material that isn't in the source catalog). Return nothing to keep it. */
+  onResolved: (m: ResolvedMaterial) => ScanVerdict | void;
+  onClose: () => void;
+  note?: string;
+}) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const readerRef = useRef<BrowserMultiFormatReader | null>(null);
+  const controlsRef = useRef<{ stop: () => void } | null>(null);
+  const lastRef = useRef<{ code: string; at: number }>({ code: '', at: 0 });
+
+  const [scanning, setScanning] = useState(false);
+  const [camError, setCamError] = useState<string | null>(null);
+  const [manual, setManual] = useState('');
+  const [status, setStatus] = useState<{ kind: 'ok' | 'warn' | 'err'; text: string } | null>(null);
+  const [index, setIndex] = useState<{ bySku: Map<string, ResolvedMaterial>; byId: Map<string, ResolvedMaterial> } | null>(null);
+  const [loadingIndex, setLoadingIndex] = useState(true);
+
+  // Build the code→material index once (SKU + id lookups).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch('/api/inventory?scope=all');
+        const j = await r.json().catch(() => ({}));
+        const bySku = new Map<string, ResolvedMaterial>();
+        const byId = new Map<string, ResolvedMaterial>();
+        for (const m of (j.materials || [])) {
+          const rm: ResolvedMaterial = {
+            id: String(m.id), name: String(m.name || ''),
+            sku: String(m.sku || ''), category: String(m.category || ''),
+          };
+          byId.set(rm.id, rm);
+          if (rm.sku) bySku.set(rm.sku.trim().toUpperCase(), rm);
+        }
+        if (!cancelled) setIndex({ bySku, byId });
+      } catch { if (!cancelled) setIndex({ bySku: new Map(), byId: new Map() }); }
+      finally { if (!cancelled) setLoadingIndex(false); }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const resolve = useCallback((raw: string) => {
+    const code = (raw || '').trim();
+    if (!code || !index) return;
+    // Try SKU (e.g. MAT-00123) first — accept an embedded MAT-#### too — then id.
+    const up = code.toUpperCase();
+    const matSku = up.match(/MAT-\d{3,}/);
+    const hit =
+      index.bySku.get(up) ||
+      (matSku ? index.bySku.get(matSku[0]) : undefined) ||
+      index.byId.get(code);
+    if (!hit) {
+      setStatus({ kind: 'err', text: `No material matches "${code}".` });
+      return;
+    }
+    const verdict = onResolved(hit);
+    setStatus(verdict || { kind: 'ok', text: `Matched ${hit.name}${hit.sku ? ` (${hit.sku})` : ''}` });
+  }, [index, onResolved]);
+
+  const stopScan = useCallback(() => {
+    try { controlsRef.current?.stop(); } catch { /* ignore */ }
+    controlsRef.current = null;
+    setScanning(false);
+  }, []);
+
+  const startScan = useCallback(async () => {
+    setCamError(null);
+    if (!videoRef.current) return;
+    try {
+      if (!readerRef.current) {
+        const hints = new Map<DecodeHintType, unknown>();
+        hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+          BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.EAN_13, BarcodeFormat.QR_CODE,
+        ]);
+        readerRef.current = new BrowserMultiFormatReader(hints as any);
+      }
+      const controls = await readerRef.current.decodeFromConstraints(
+        { video: { facingMode: { ideal: 'environment' } } },
+        videoRef.current,
+        (res) => {
+          if (!res) return;
+          const code = res.getText();
+          const now = Date.now();
+          if (lastRef.current.code === code && now - lastRef.current.at < 2000) return;
+          lastRef.current = { code, at: now };
+          resolve(code);
+        },
+      );
+      controlsRef.current = controls;
+      setScanning(true);
+    } catch (e: any) {
+      const name = e?.name || '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') setCamError('Camera permission denied. Allow camera access, then retry.');
+      else if (name === 'NotFoundError' || name === 'OverconstrainedError') setCamError('No camera found on this device.');
+      else if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost') setCamError('Camera needs a secure (HTTPS) connection.');
+      else setCamError(e?.message || 'Could not start the camera.');
+      setScanning(false);
+    }
+  }, [resolve]);
+
+  useEffect(() => () => { try { controlsRef.current?.stop(); } catch {} }, []);
+
+  return (
+    <ModalShell title={title} icon={<ScanLine className="w-5 h-5 text-[#af4408]" />} onClose={() => { stopScan(); onClose(); }}
+      footer={<button onClick={() => { stopScan(); onClose(); }}
+                      className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm">Done</button>}>
+      {note && <div className="text-xs text-[#6B5744] bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg px-2.5 py-1.5">{note}</div>}
+
+      <div className="relative w-full aspect-[4/3] bg-black rounded-lg overflow-hidden">
+        <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
+        {scanning && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <div className="w-[70%] max-w-[300px] h-24 border-2 border-white/80 rounded-lg shadow-[0_0_0_9999px_rgba(0,0,0,0.35)]" />
+          </div>
+        )}
+        {!scanning && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-4 gap-3 bg-[#1C0F05]/80">
+            {camError ? (<><CameraOff className="w-9 h-9 text-red-300" /><div className="text-sm text-red-200 max-w-xs">{camError}</div></>)
+              : (<><Camera className="w-9 h-9 text-[#E8D5C4]" /><div className="text-sm text-[#E8D5C4]">Camera is off</div></>)}
+            <button onClick={startScan} disabled={loadingIndex}
+                    className="mt-1 px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-50">
+              <Camera className="w-4 h-4" /> {camError ? 'Retry camera' : loadingIndex ? 'Loading…' : 'Start scanning'}
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2">
+        {scanning && (
+          <button onClick={stopScan}
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm font-medium flex items-center gap-2">
+            <CameraOff className="w-4 h-4" /> Stop
+          </button>
+        )}
+      </div>
+
+      {/* Manual fallback */}
+      <form onSubmit={e => { e.preventDefault(); resolve(manual); setManual(''); }} className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <Search className="w-4 h-4 absolute left-2.5 top-2.5 text-[#8B7355]" />
+          <input value={manual} onChange={e => setManual(e.target.value)}
+                 placeholder="Type a SKU e.g. MAT-00123"
+                 autoCapitalize="characters"
+                 className="w-full pl-8 pr-2 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-[#FFF8F0] text-[#2D1B0E] font-mono focus:outline-none focus:border-[#af4408]" />
+        </div>
+        <button type="submit" disabled={!manual.trim() || loadingIndex}
+                className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center gap-1.5 disabled:opacity-50">
+          <Search className="w-4 h-4" /> Find
+        </button>
+      </form>
+
+      {status && (
+        <div className={`text-sm font-medium rounded-lg px-2.5 py-1.5 border ${
+          status.kind === 'ok' ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+            : status.kind === 'warn' ? 'bg-amber-50 border-amber-200 text-amber-800'
+              : 'bg-red-50 border-red-200 text-red-700'}`}>
+          {status.text}
+        </div>
+      )}
+    </ModalShell>
+  );
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
    Page
    ══════════════════════════════════════════════════════════════════════════ */
@@ -203,6 +386,7 @@ export default function TransfersPage() {
 
   // Modals
   const [showCreate, setShowCreate] = useState(false);
+  const [showEmpties, setShowEmpties] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
 
   const viewable = useMemo(
@@ -373,6 +557,13 @@ export default function TransfersPage() {
                 className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm font-medium flex items-center gap-1.5 disabled:opacity-50">
           <Download className="w-4 h-4" /> Export
         </button>
+        {elevated && (
+          <button onClick={() => setShowEmpties(true)}
+                  title="Log empty bottles, breakage, complimentary pours or spillage"
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm font-medium flex items-center gap-1.5">
+            <PackageX className="w-4 h-4" /> Empties
+          </button>
+        )}
         {canCreate && (
           <button onClick={() => setShowCreate(true)}
                   className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5">
@@ -573,6 +764,13 @@ export default function TransfersPage() {
           onSaved={msg => { setShowCreate(false); afterWrite(msg); }}
         />
       )}
+      {showEmpties && (
+        <EmptiesModal
+          stores={stores}
+          onClose={() => setShowEmpties(false)}
+          onSaved={msg => { setShowEmpties(false); afterWrite(msg); }}
+        />
+      )}
       {detailId && (
         <DetailModal
           transferId={detailId} accessByStore={accessByStore} elevated={elevated}
@@ -625,6 +823,7 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
   const [itemsLoading, setItemsLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [showScan, setShowScan] = useState(false);
 
   // Source catalog (what the source can issue).
   //  • CENTRAL GROCERY: the raw_materials universe held in the central grocery
@@ -678,6 +877,23 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
 
   const setLine = (key: string, patch: Partial<Line>) =>
     setLines(ls => ls.map(l => l.key === key ? { ...l, ...patch } : l));
+
+  // Scan → select a material. Only accept materials actually offered by the
+  // chosen source; otherwise tell the user (verdict shown in the scan modal).
+  const scanIntoLines = (m: ResolvedMaterial): ScanVerdict => {
+    if (!metaById.has(m.id)) {
+      return { kind: 'warn', text: `${m.name} isn't available from this source.` };
+    }
+    const already = lines.some(l => l.material_id === m.id);
+    if (already) return { kind: 'warn', text: `${m.name} is already added.` };
+    setLines(ls => {
+      if (ls.some(l => l.material_id === m.id)) return ls;
+      const empty = ls.find(l => !l.material_id);
+      if (empty) return ls.map(l => l.key === empty.key ? { ...l, material_id: m.id, cbl: { ...CBL_EMPTY } } : l);
+      return [...ls, { ...newLine(), material_id: m.id }];
+    });
+    return { kind: 'ok', text: `Added ${m.name} — enter a quantity.` };
+  };
 
   const validLines = lines.filter(l => {
     const m = metaById.get(l.material_id) || null;
@@ -745,7 +961,16 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
       <div>
         <div className="flex items-center justify-between mb-1">
           <L>Items requested</L>
-          {from && <span className="text-[10px] text-[#8B7355]">{itemsLoading ? 'loading catalog…' : `${items.length} available`}</span>}
+          <div className="flex items-center gap-2">
+            {from && (
+              <button type="button" onClick={() => setShowScan(true)} disabled={itemsLoading}
+                      className="text-[11px] text-[#af4408] hover:underline flex items-center gap-1 disabled:opacity-50"
+                      title="Scan a bottle barcode / SKU to add it">
+                <ScanLine className="w-3.5 h-3.5" /> Scan
+              </button>
+            )}
+            {from && <span className="text-[10px] text-[#8B7355]">{itemsLoading ? 'loading catalog…' : `${items.length} available`}</span>}
+          </div>
         </div>
         {!from ? (
           <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3">Pick a source store to choose materials.</div>
@@ -795,6 +1020,15 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
         <input value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. Friday restock"
                className={inputCls} />
       </div>
+
+      {showScan && (
+        <BarcodeScanModal
+          title="Scan a bottle"
+          note="Scan or type a bottle barcode / SKU to add it to this request. Only materials the selected source stocks can be added."
+          onResolved={scanIntoLines}
+          onClose={() => setShowScan(false)}
+        />
+      )}
     </ModalShell>
   );
 }
@@ -1003,6 +1237,198 @@ function DetailModal({ transferId, accessByStore, elevated, onClose, onChanged }
             )}
           </div>
         </>
+      )}
+    </ModalShell>
+  );
+}
+
+/* ── Empties / breakage / spillage logger ────────────────────────────────────
+
+   A lightweight register of non-sale floor stock reductions (empty bottles
+   returned, breakage, complimentary pours, spillage). Pure log by default; a
+   breakage/spillage MAY also reduce the floor's stock (adjust_ledger) when the
+   actor can adjust store stock. Feeds the reconciliation report so a genuine
+   loss isn't mistaken for a billing leak. POSTs to /api/stores/empties.
+*/
+
+const EMPTY_KINDS: { key: 'empty' | 'breakage' | 'complimentary' | 'spillage'; label: string; hint: string }[] = [
+  { key: 'empty',         label: 'Empty returned', hint: 'Empty bottle handed back — a record only, moves no stock.' },
+  { key: 'breakage',      label: 'Breakage',       hint: 'Bottle broken. Optionally reduce floor stock below.' },
+  { key: 'complimentary', label: 'Complimentary',  hint: 'On-the-house pour — record only.' },
+  { key: 'spillage',      label: 'Spillage',       hint: 'Spilled / wasted. Optionally reduce floor stock below.' },
+];
+
+function EmptiesModal({ stores, onClose, onSaved }: {
+  stores: StoreLite[]; onClose: () => void; onSaved: (msg: string) => void;
+}) {
+  const [storeId, setStoreId] = useState('');
+  const [items, setItems] = useState<ItemMeta[]>([]);
+  const [itemsLoading, setItemsLoading] = useState(false);
+  const [materialId, setMaterialId] = useState('');
+  const [cbl, setCbl] = useState<CBL>({ ...CBL_EMPTY });
+  const [kind, setKind] = useState<'empty' | 'breakage' | 'complimentary' | 'spillage'>('empty');
+  const [note, setNote] = useState('');
+  const [date, setDate] = useState(todayIST());
+  const [adjustLedger, setAdjustLedger] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [showScan, setShowScan] = useState(false);
+
+  const canLedger = kind === 'breakage' || kind === 'spillage';
+  useEffect(() => { if (!canLedger) setAdjustLedger(false); }, [canLedger]);
+
+  // Load the selected store's held catalog for the material picker.
+  useEffect(() => {
+    if (!storeId) { setItems([]); setMaterialId(''); return; }
+    let cancelled = false;
+    setItemsLoading(true); setMaterialId('');
+    (async () => {
+      try {
+        const r = await fetch(`/api/stores/${storeId}/stock`);
+        const j = await r.json().catch(() => ({}));
+        const list: ItemMeta[] = (j.materials || []).map((m: any) => ({
+          material_id: m.id, name: m.name, category: m.category, unit: m.unit,
+          pack_size: Number(m.pack_size) || 1, case_size: Number(m.case_size) || 1,
+          average_price: Number(m.average_price) || 0,
+        }));
+        if (!cancelled) setItems(list);
+      } catch { if (!cancelled) setItems([]); }
+      finally { if (!cancelled) setItemsLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [storeId]);
+
+  const matLite: MaterialLite[] = useMemo(
+    () => items.map(m => ({ id: m.material_id, name: m.name, category: m.category, unit: m.unit })),
+    [items],
+  );
+  const metaById = useMemo(() => new Map(items.map(m => [m.material_id, m])), [items]);
+  const m = metaById.get(materialId) || null;
+  const recipe = cblRecipe(m, cbl);
+
+  const scanInto = (rm: ResolvedMaterial): ScanVerdict => {
+    if (!metaById.has(rm.id)) return { kind: 'warn', text: `${rm.name} isn't stocked in this store.` };
+    setMaterialId(rm.id); setCbl({ ...CBL_EMPTY });
+    return { kind: 'ok', text: `Selected ${rm.name} — enter a quantity.` };
+  };
+
+  const save = async () => {
+    setErr(null);
+    if (!storeId) { setErr('Pick a store'); return; }
+    if (!materialId) { setErr('Pick a material'); return; }
+    if (recipe <= 0) { setErr('Enter a quantity greater than 0'); return; }
+    setBusy(true);
+    try {
+      const r = await api('/api/stores/empties', {
+        method: 'POST',
+        body: {
+          store_id: storeId, material_id: materialId, qty: recipe,
+          kind, note: note.trim(), date, adjust_ledger: adjustLedger,
+        },
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      const label = EMPTY_KINDS.find(k => k.key === kind)?.label || kind;
+      const mName = metaById.get(materialId)?.name || 'material';
+      onSaved(`Logged ${label.toLowerCase()} — ${qtyText(recipe, m as PackMeta)} ${mName}${j.ledger_id ? ' (stock reduced)' : ''}`);
+    } catch (e: any) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const kindHint = EMPTY_KINDS.find(k => k.key === kind)?.hint || '';
+
+  return (
+    <ModalShell title="Log empties / breakage" icon={<PackageX className="w-5 h-5 text-[#af4408]" />} onClose={onClose}
+      footer={<>
+        <button onClick={onClose} disabled={busy}
+                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Cancel</button>
+        <button onClick={save} disabled={busy || !storeId || !materialId || recipe <= 0}
+                className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Log
+        </button>
+      </>}>
+      {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{err}</div>}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div>
+          <L>Store</L>
+          <select value={storeId} onChange={e => setStoreId(e.target.value)} className={inputCls}>
+            <option value="">Select store…</option>
+            {stores.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <L>Date</L>
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} max={todayIST()} className={inputCls} />
+        </div>
+      </div>
+
+      <div>
+        <div className="flex items-center justify-between mb-1">
+          <L>Material</L>
+          {storeId && (
+            <button type="button" onClick={() => setShowScan(true)} disabled={itemsLoading}
+                    className="text-[11px] text-[#af4408] hover:underline flex items-center gap-1 disabled:opacity-50">
+              <ScanLine className="w-3.5 h-3.5" /> Scan
+            </button>
+          )}
+        </div>
+        {!storeId ? (
+          <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3">Pick a store first.</div>
+        ) : (
+          <MaterialTypeahead
+            materials={matLite} value={materialId}
+            onPick={id => { setMaterialId(id); setCbl({ ...CBL_EMPTY }); }}
+            showStock={false} compact={false}
+            placeholder={itemsLoading ? 'loading catalog…' : 'Type a material name or category…'} />
+        )}
+      </div>
+
+      {materialId && (
+        <div>
+          <L>Quantity</L>
+          <CBLEntry mat={m} value={cbl} onChange={setCbl} />
+        </div>
+      )}
+
+      <div>
+        <L>Reason</L>
+        <div className="grid grid-cols-2 gap-1.5">
+          {EMPTY_KINDS.map(k => (
+            <button key={k.key} type="button" onClick={() => setKind(k.key)}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border text-left ${
+                      kind === k.key ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF1E3]'}`}>
+              {k.label}
+            </button>
+          ))}
+        </div>
+        <p className="text-[10px] text-[#8B7355] mt-1">{kindHint}</p>
+      </div>
+
+      {canLedger && (
+        <label className="flex items-start gap-2 text-xs text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5 cursor-pointer">
+          <input type="checkbox" checked={adjustLedger} onChange={e => setAdjustLedger(e.target.checked)}
+                 className="accent-[#af4408] w-4 h-4 mt-0.5" />
+          <span>
+            <b className="text-[#2D1B0E]">Also reduce floor stock</b> — post a matching stock adjustment on this store’s
+            ledger. Leave off to record the loss without moving stock. (Requires store-adjust rights.)
+          </span>
+        </label>
+      )}
+
+      <div>
+        <L>Note (optional)</L>
+        <input value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. dropped at bar, table 12 comp"
+               className={inputCls} />
+      </div>
+
+      {showScan && (
+        <BarcodeScanModal
+          title="Scan a bottle"
+          note="Scan or type a bottle barcode / SKU. Only materials stocked in the selected store can be logged."
+          onResolved={scanInto}
+          onClose={() => setShowScan(false)}
+        />
       )}
     </ModalShell>
   );
