@@ -37,7 +37,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  AlertCircle, ClipboardList, Loader2, Plus, Repeat, Save, Send, X,
+  AlertCircle, ClipboardList, Link2, Loader2, Paperclip, Plus, Repeat, Save, Send, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import {
@@ -46,6 +46,7 @@ import {
 } from '@/lib/tasks';
 import UserPicker, { useTaskUsers, type TaskUser } from './UserPicker';
 import ImageUpload, { ImageThumb } from './ImageUpload';
+import MediaUpload, { type MediaItem } from './MediaUpload';
 
 interface Assignee { email: string; name: string }
 interface ChecklistItem { label: string; done: boolean }
@@ -250,6 +251,13 @@ export default function TaskModal({
   const [checklistInput, setChecklistInput] = useState('');
   const [newImages, setNewImages] = useState<string[]>([]);
   const [existingAttachments, setExistingAttachments] = useState<string[]>([]);
+  // SOP reference links (persisted as task_attachments kind="sop_link").
+  const [sopLinks, setSopLinks] = useState<string[]>(['']);
+  // Video / voice media (uploaded to /api/tasks/files, persisted as kind=video|voice).
+  const [mediaItems, setMediaItems] = useState<MediaItem[]>([]);
+  // Existing non-image attachments (sop links + media), shown read-only on edit.
+  const [existingLinks, setExistingLinks] = useState<{ url: string; filename: string }[]>([]);
+  const [existingMedia, setExistingMedia] = useState<MediaItem[]>([]);
 
   // Recurring (create-only).
   const [recurringOn, setRecurringOn] = useState(false);
@@ -279,6 +287,10 @@ export default function TaskModal({
     setSavedWithWarning(false);
     setChecklistInput('');
     setNewImages([]);
+    setSopLinks(['']);
+    setMediaItems([]);
+    setExistingLinks([]);
+    setExistingMedia([]);
     setCommentText('');
     setCommentImages([]);
     setCommentNotice(null);
@@ -316,13 +328,23 @@ export default function TaskModal({
         const parsed = JSON.parse(task.checklist_json || '[]');
         setChecklist(Array.isArray(parsed) ? parsed.map((c: any) => ({ label: String(c.label ?? c ?? ''), done: !!c.done })).filter((c: ChecklistItem) => c.label) : []);
       } catch { setChecklist([]); }
-      // Existing image attachments (only present when the caller passes them).
+      // Existing attachments (only present when the caller passes them).
       const atts = Array.isArray(task.attachments) ? task.attachments : [];
       setExistingAttachments(
         atts
           .filter((a: any) => (a?.kind === 'image' || String(a?.url || '').startsWith('data:image')))
           .map((a: any) => String(a.url || ''))
           .filter(Boolean),
+      );
+      setExistingLinks(
+        atts
+          .filter((a: any) => a?.kind === 'sop_link' && String(a?.url || '').trim())
+          .map((a: any) => ({ url: String(a.url || '').trim(), filename: String(a.filename || '').trim() })),
+      );
+      setExistingMedia(
+        atts
+          .filter((a: any) => (a?.kind === 'video' || a?.kind === 'voice' || a?.kind === 'file') && String(a?.url || '').trim())
+          .map((a: any) => ({ kind: a.kind as MediaItem['kind'], url: String(a.url || '').trim(), filename: String(a.filename || '').trim() })),
       );
     } else {
       setForm({ ...emptyForm(), department: defaultDepartment || '', status: defaultStatus || 'draft' });
@@ -365,24 +387,34 @@ export default function TaskModal({
     return out;
   };
 
-  /** Persist newly-added images through the existing comment-attachment path.
-   *  Best-effort — never throws (a failed photo must not fail the task save). */
-  const persistImages = async (taskId: string, imgs: string[]): Promise<boolean> => {
-    const urls = imgs.filter((u) => u && u.startsWith('data:'));
-    if (!urls.length) return true;
+  /** Persist newly-added attachments (images, SOP links, video/voice media)
+   *  through the existing comment-attachment path, batched into one call.
+   *  Best-effort — never throws (a failed attachment must not fail the task). */
+  const persistAttachments = async (
+    taskId: string,
+    atts: { kind: string; url: string; filename: string }[],
+  ): Promise<boolean> => {
+    if (!atts.length) return true;
     try {
       const res = await api(`/api/tasks/${taskId}/comments`, {
         method: 'POST',
-        body: {
-          body: '',
-          attachments: urls.map((url, i) => ({ kind: 'image', url, filename: `photo-${i + 1}.jpg` })),
-        },
+        body: { body: '', attachments: atts },
       });
       return res.ok;
     } catch {
       return false;
     }
   };
+
+  /** Add / remove / edit a SOP link input row. */
+  const setSopLink = (i: number, v: string) =>
+    setSopLinks((prev) => prev.map((s, idx) => (idx === i ? v : s)));
+  const addSopLink = () => setSopLinks((prev) => [...prev, '']);
+  const removeSopLink = (i: number) =>
+    setSopLinks((prev) => {
+      const next = prev.filter((_, idx) => idx !== i);
+      return next.length ? next : [''];
+    });
 
   /** Create the recurring rule mirroring this task. Best-effort. */
   const createRecurringRule = async (assignees: Assignee[]): Promise<boolean> => {
@@ -453,9 +485,32 @@ export default function TaskModal({
       const savedId = savedTask?.id || task?.id;
       const warnings: string[] = [];
 
-      if (newImages.length && savedId) {
-        const ok = await persistImages(savedId, newImages);
-        if (!ok) warnings.push('some photos could not be attached');
+      if (savedId) {
+        const newAtts: { kind: string; url: string; filename: string }[] = [];
+        newImages
+          .filter((u) => u && u.startsWith('data:'))
+          .forEach((url, i) => newAtts.push({ kind: 'image', url, filename: `photo-${i + 1}.jpg` }));
+        // SOP reference links — normalise + de-dupe, prepend a scheme if missing.
+        const seenLinks = new Set<string>();
+        sopLinks
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map((s) => (/^https?:\/\//i.test(s) || /^\//.test(s) ? s : `https://${s}`))
+          .forEach((url) => {
+            const k = url.toLowerCase();
+            if (seenLinks.has(k)) return;
+            seenLinks.add(k);
+            newAtts.push({ kind: 'sop_link', url, filename: url });
+          });
+        // Video / voice media (already uploaded to the file store).
+        mediaItems
+          .filter((m) => m && m.url)
+          .forEach((m) => newAtts.push({ kind: m.kind, url: m.url, filename: m.filename || '' }));
+
+        if (newAtts.length) {
+          const ok = await persistAttachments(savedId, newAtts);
+          if (!ok) warnings.push('some attachments could not be saved');
+        }
       }
       if (!editing && recurringOn) {
         const ok = await createRecurringRule(assignees);
@@ -667,6 +722,63 @@ export default function TaskModal({
             </div>
           )}
           <ImageUpload multiple value={newImages} onChange={setNewImages} label="Add photo" />
+        </div>
+
+        {/* SOP links */}
+        <div className="space-y-1">
+          <label className={labelCls}>SOP links</label>
+          {existingLinks.length > 0 && (
+            <ul className="space-y-1 pb-1">
+              {existingLinks.map((l, i) => (
+                <li key={`exl-${i}`} className="flex items-center gap-2 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 text-sm">
+                  <Link2 size={13} className="shrink-0 text-[#af4408]" />
+                  <a href={l.url} target="_blank" rel="noreferrer" className="truncate text-[#af4408] hover:underline">{l.filename || l.url}</a>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="space-y-1.5">
+            {sopLinks.map((s, i) => (
+              <div key={`sop-${i}`} className="flex gap-2">
+                <input
+                  type="url" inputMode="url" value={s}
+                  onChange={(e) => setSopLink(i, e.target.value)}
+                  placeholder="https://link-to-sop-or-doc…"
+                  className={inputCls}
+                />
+                <button
+                  type="button" onClick={() => removeSopLink(i)}
+                  aria-label="Remove link"
+                  className="shrink-0 inline-flex items-center justify-center border border-[#E8D5C4] hover:border-[#af4408] text-[#8B7355] hover:text-[#af4408] rounded-lg px-2.5"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            ))}
+            <button
+              type="button" onClick={addSopLink}
+              className="inline-flex items-center gap-1 bg-white border border-[#E8D5C4] hover:border-[#af4408] text-[#2D1B0E] text-sm rounded-lg px-3 py-1.5"
+            >
+              <Plus size={14} /> Add another link
+            </button>
+          </div>
+        </div>
+
+        {/* Video / voice attachments */}
+        <div className="space-y-1">
+          <label className={labelCls}>Video / voice</label>
+          {existingMedia.length > 0 && (
+            <ul className="space-y-1 pb-1">
+              {existingMedia.map((m, i) => (
+                <li key={`exm-${i}`} className="flex items-center gap-2 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 text-sm">
+                  <Paperclip size={13} className="shrink-0 text-[#af4408]" />
+                  <a href={m.url} target="_blank" rel="noreferrer" className="truncate text-[#af4408] hover:underline">{m.filename || m.url}</a>
+                  <span className="ml-auto shrink-0 text-[10px] uppercase text-[#8B7355]">{m.kind}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <MediaUpload modes={['video', 'voice']} value={mediaItems} onChange={setMediaItems} />
         </div>
 
         {/* Recurring (create-only) */}

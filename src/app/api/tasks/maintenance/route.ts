@@ -8,6 +8,25 @@ import {
   type RecurrenceFrequency,
   type MaintenanceSchedule,
 } from '@/lib/tasks';
+import { sendPushToUser } from '@/lib/push';
+
+/**
+ * Best-effort web-push mirroring a just-inserted task_notification. Deferred to
+ * a microtask so it runs after the surrounding better-sqlite3 transaction
+ * commits and can never block or break the insert. sendPushToUser never throws.
+ */
+function firePush(
+  db: ReturnType<typeof getDb>,
+  email: string,
+  payload: { title: string; body: string; url?: string },
+): void {
+  try {
+    if (!email) return;
+    Promise.resolve().then(() => sendPushToUser(db, email, payload)).catch(() => {});
+  } catch {
+    /* never throw */
+  }
+}
 
 /**
  * Maintenance schedules + logs API (Task Management slice).
@@ -252,6 +271,7 @@ export async function POST(request: Request) {
               `INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href)
                VALUES (?, ?, 'assigned', ?, ?, ?, ?)`,
             ).run(generateId(), s.assignee_email, title, `Maintenance task assigned for ${dueDate}`, taskId, `/tasks/${taskId}`);
+            firePush(db, s.assignee_email, { title, body: `Maintenance task assigned for ${dueDate}`, url: `/tasks/${taskId}` });
           }
 
           // Advance the schedule.

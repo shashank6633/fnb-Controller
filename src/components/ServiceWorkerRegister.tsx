@@ -13,10 +13,25 @@ import { useEffect } from 'react';
  * but it now actively UNREGISTERS any installed SW and purges its caches.
  * Every page load self-heals affected browsers.
  *
- * If you ever want to re-introduce a SW, do it with:
+ * ⚠️ ONE EXCEPTION: the push-only worker (public/push-sw.js, registered by
+ * PushEnable.tsx) is SPARED. It has ONLY push + notificationclick handlers and
+ * NO fetch/cache logic, so it can never reintroduce the stale-chunk bug this
+ * component exists to prevent. We identify it by "push-sw" in its scriptURL and
+ * leave it registered; the old caching sw.js (and anything else) is still
+ * unregistered on every load.
+ *
+ * If you ever want to re-introduce a caching SW, do it with:
  *   - network-first for /_next/static/* (NOT cache-first)
  *   - or a hash-aware purge on activate that aggressively kills old chunks
  */
+
+/** A registration is the spared push worker if any of its SW scripts is push-sw. */
+function isPushWorker(r: ServiceWorkerRegistration): boolean {
+  const url =
+    r.active?.scriptURL || r.waiting?.scriptURL || r.installing?.scriptURL || '';
+  return url.includes('push-sw');
+}
+
 export default function ServiceWorkerRegister() {
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -25,11 +40,16 @@ export default function ServiceWorkerRegister() {
     (async () => {
       try {
         const regs = await navigator.serviceWorker.getRegistrations();
+        let unregistered = 0;
         for (const r of regs) {
+          // Spare the push-only worker; unregister everything else (incl. the
+          // old caching sw.js).
+          if (isPushWorker(r)) continue;
           await r.unregister();
+          unregistered++;
         }
-        if (regs.length > 0) {
-          console.log(`[sw] unregistered ${regs.length} service worker(s)`);
+        if (unregistered > 0) {
+          console.log(`[sw] unregistered ${unregistered} service worker(s)`);
         }
         // Purge every cache the old SW created so stale chunks don't linger.
         if (typeof caches !== 'undefined') {

@@ -51,6 +51,28 @@ type Result = 'pass' | 'fail' | 'na' | '';
 interface ItemState { result: Result; image_url: string; corrective_action: string; assignee_email: string; assignee_name: string }
 type FormState = Record<string, ItemState>; // key = `${area}|||${item}`
 
+/**
+ * Hygiene area → operational-department name, mirroring the server's
+ * departmentForArea() in /api/tasks/hygiene so a fail's corrective task can be
+ * defaulted to the same department's lead (HOD / head chef).
+ */
+const AREA_DEPT: Record<string, string> = {
+  Kitchen: 'Kitchen',
+  Bar: 'Bar',
+  Restaurant: 'Housekeeping',
+  Washrooms: 'Housekeeping',
+};
+
+/**
+ * Items where a photo is strongly recommended on a FAIL (visible evidence of a
+ * hygiene lapse). Soft nudge only — never blocks saving, so scoring + auto-task
+ * creation stay intact.
+ */
+const PHOTO_RECOMMENDED = new Set<string>([
+  'Pest Control', 'Chiller & Freezer Hygiene', 'Waste Bins', 'Hand Wash Station',
+  'Toilets & Urinals', 'Waste Disposal', 'Ice Well',
+]);
+
 const blankItem = (): ItemState => ({ result: '', image_url: '', corrective_action: '', assignee_email: '', assignee_name: '' });
 
 /**
@@ -149,6 +171,7 @@ export default function HygieneAuditsPage() {
   const [savingArea, setSavingArea] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [depts, setDepts] = useState<any[]>([]);
 
   const allowed = !!me && (me.role === 'admin' || me.role === 'manager' || me.is_head_chef || me.is_store_manager);
 
@@ -158,6 +181,33 @@ export default function HygieneAuditsPage() {
       .then(d => setMe(d?.user ?? null))
       .catch(() => setMe(null));
   }, []);
+
+  // Operational departments (with HOD / head-chef contacts) — used to default a
+  // fail's corrective-task assignee to the area's department lead. Best-effort.
+  useEffect(() => {
+    fetch('/api/departments')
+      .then(r => r.json())
+      .then(j => setDepts(Array.isArray(j?.departments) ? j.departments : []))
+      .catch(() => setDepts([]));
+  }, []);
+
+  /** Resolve an area's department lead (HOD, else head chef) by mapped dept name,
+   *  then by raw area. Returns email+name, or null when unresolvable. */
+  const hodForArea = useCallback((area: string): { email: string; name: string } | null => {
+    if (!depts.length) return null;
+    for (const raw of [AREA_DEPT[area] || '', area]) {
+      const q = (raw || '').trim().toLowerCase();
+      if (!q) continue;
+      const d = depts.find((x: any) => (x.name || '').toLowerCase() === q)
+        || depts.find((x: any) => (x.area || '').toLowerCase() === q);
+      if (d) {
+        const email = d.head_user_email || d.head_chef_email || '';
+        const name = d.head_user_name || d.head_chef_name || '';
+        if (email) return { email, name };
+      }
+    }
+    return null;
+  }, [depts]);
 
   const load = useCallback((d: string) => {
     setLoading(true);
@@ -195,6 +245,18 @@ export default function HygieneAuditsPage() {
       const prev = f[k] || blankItem();
       return { ...f, [k]: { ...prev, ...patch } };
     });
+  };
+
+  /** Toggle a result; when an item first turns FAIL, default the corrective-task
+   *  assignee to the area's department lead if resolvable and none chosen yet. */
+  const onResult = (area: string, item: string, nextResult: Result) => {
+    const cur = form[keyOf(area, item)] || blankItem();
+    const patch: Partial<ItemState> = { result: nextResult };
+    if (nextResult === 'fail' && !cur.assignee_email) {
+      const hod = hodForArea(area);
+      if (hod) { patch.assignee_email = hod.email; patch.assignee_name = hod.name; }
+    }
+    setItem(area, item, patch);
   };
 
   const saveArea = async (area: string) => {
@@ -401,15 +463,24 @@ export default function HygieneAuditsPage() {
             <div className="divide-y divide-[#F0E4D6]">
               {AREA_ITEMS[area].map(item => {
                 const st = form[keyOf(area, item)] || blankItem();
+                const photoRec = PHOTO_RECOMMENDED.has(item);
+                const photoNudge = photoRec && st.result === 'fail' && !st.image_url.trim();
                 return (
                   <div key={item} className="px-3 sm:px-4 py-2.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="text-sm text-[#2D1B0E] font-medium min-w-0 flex-1">{item}</div>
+                      <div className="text-sm text-[#2D1B0E] font-medium min-w-0 flex-1">
+                        {item}
+                        {photoRec && (
+                          <span className="ml-2 inline-flex items-center gap-0.5 text-[10px] text-[#af4408] align-middle">
+                            📷 photo on fail
+                          </span>
+                        )}
+                      </div>
                       <div className="flex gap-1 shrink-0">
                         {RESULT_BTNS.map(b => (
                           <button
                             key={b.key}
-                            onClick={() => setItem(area, item, { result: st.result === b.key ? '' : b.key })}
+                            onClick={() => onResult(area, item, st.result === b.key ? '' : b.key)}
                             className={`text-xs font-semibold rounded-lg px-2.5 py-1 border transition-colors ${st.result === b.key ? b.on : b.off}`}
                           >
                             {b.label}
@@ -421,14 +492,19 @@ export default function HygieneAuditsPage() {
                     {(st.result === 'fail' || st.image_url || st.corrective_action) && (
                       <div className="mt-2 space-y-2">
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 items-start">
-                          <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-2">
-                            <span className="block text-[10px] font-semibold uppercase tracking-wide text-[#8B7355] mb-1.5">Photo (optional)</span>
+                          <div className={`rounded-lg border p-2 ${photoNudge ? 'border-[#af4408] bg-[#FFF3E6]' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`}>
+                            <span className="block text-[10px] font-semibold uppercase tracking-wide text-[#8B7355] mb-1.5">
+                              Photo {photoRec ? <span className="text-[#af4408]">(recommended on fail)</span> : '(optional)'}
+                            </span>
                             <ImageUpload
                               value={st.image_url ? [st.image_url] : []}
                               onChange={list => setItem(area, item, { image_url: list[0] || '' })}
                               label="Add photo"
                               thumbSize={48}
                             />
+                            {photoNudge && (
+                              <p className="mt-1 text-[10px] text-[#af4408]">Add a photo as evidence for this fail.</p>
+                            )}
                           </div>
                           <input
                             type="text"
@@ -452,6 +528,11 @@ export default function HygieneAuditsPage() {
                                 placeholder="Assign to… (optional)"
                               />
                             </div>
+                            {!!st.assignee_email && hodForArea(area)?.email === st.assignee_email && (
+                              <p className="mt-1 text-[10px] text-[#8B7355]">
+                                Defaulted to {AREA_DEPT[area] || area} lead — change if needed.
+                              </p>
+                            )}
                           </div>
                         )}
                       </div>

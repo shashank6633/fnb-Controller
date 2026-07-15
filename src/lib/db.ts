@@ -3077,6 +3077,35 @@ function initializeSchema(db: Database.Database) {
       }
     }
   } catch (e) { console.error('task-module schema failed:', e); }
+
+  // ── Task Phase-3: blob file store + web-push subscriptions ──
+  // Purely additive. Isolated try/catch, idempotent CREATE IF NOT EXISTS,
+  // touches no existing table. task_files holds video/voice/large attachment
+  // BLOBs (images stay on the inline-base64 path via ImageUpload).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS task_files (
+        id         TEXT PRIMARY KEY,
+        mime       TEXT NOT NULL DEFAULT '',
+        filename   TEXT NOT NULL DEFAULT '',
+        data       BLOB NOT NULL,
+        size       INTEGER NOT NULL DEFAULT 0,
+        created_by TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_files_created ON task_files(created_at);
+
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id         TEXT PRIMARY KEY,
+        user_email TEXT NOT NULL DEFAULT '',
+        endpoint   TEXT NOT NULL UNIQUE,
+        p256dh     TEXT NOT NULL DEFAULT '',
+        auth       TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_push_subscriptions_email ON push_subscriptions(user_email);
+    `);
+  } catch (e) { console.error('task push/files schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

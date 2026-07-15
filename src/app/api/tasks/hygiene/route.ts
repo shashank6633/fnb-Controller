@@ -7,6 +7,25 @@ import {
   parseMentions,
   type HygieneAudit,
 } from '@/lib/tasks';
+import { sendPushToUser } from '@/lib/push';
+
+/**
+ * Best-effort web-push mirroring a just-inserted task_notification. Deferred to
+ * a microtask so it runs after the surrounding better-sqlite3 transaction
+ * commits and can never block or break the insert. sendPushToUser never throws.
+ */
+function firePush(
+  db: ReturnType<typeof getDb>,
+  email: string,
+  payload: { title: string; body: string; url?: string },
+): void {
+  try {
+    if (!email) return;
+    Promise.resolve().then(() => sendPushToUser(db, email, payload)).catch(() => {});
+  } catch {
+    /* never throw */
+  }
+}
 
 /**
  * Hygiene Audits (/api/tasks/hygiene).
@@ -206,6 +225,11 @@ export async function POST(request: Request) {
               `${auditorName} mentioned you: ${a.item} (${a.area})`,
               createdTaskId, `/tasks/hygiene?date=${date}`,
             );
+            firePush(db, token, {
+              title: `Mentioned in hygiene corrective action`,
+              body: `${auditorName} mentioned you: ${a.item} (${a.area})`,
+              url: `/tasks/hygiene?date=${date}`,
+            });
           }
           createdTasks++;
         }

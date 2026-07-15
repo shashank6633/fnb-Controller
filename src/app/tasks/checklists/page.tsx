@@ -69,12 +69,43 @@ export default function ChecklistsPage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [depts, setDepts] = useState<any[]>([]);
 
   const allowed = !!me; // any signed-in user may run checklists
 
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user ?? null)).catch(() => setMe(null));
   }, []);
+
+  // Operational departments (with HOD / head-chef contacts) — used to default
+  // a fail's corrective-task assignee to the department lead. Best-effort.
+  useEffect(() => {
+    fetch('/api/departments')
+      .then(r => r.json())
+      .then(j => setDepts(Array.isArray(j?.departments) ? j.departments : []))
+      .catch(() => setDepts([]));
+  }, []);
+
+  /**
+   * Resolve a department lead (HOD, else head chef) from a list of candidate
+   * department names/areas. Matches a department by exact name, then by area.
+   * Returns the lead's email+name, or null when unresolvable (→ manual pick).
+   */
+  const hodFor = useCallback((candidates: string[]): { email: string; name: string } | null => {
+    if (!depts.length) return null;
+    for (const raw of candidates) {
+      const q = (raw || '').trim().toLowerCase();
+      if (!q) continue;
+      const d = depts.find((x: any) => (x.name || '').toLowerCase() === q)
+        || depts.find((x: any) => (x.area || '').toLowerCase() === q);
+      if (d) {
+        const email = d.head_user_email || d.head_chef_email || '';
+        const name = d.head_user_name || d.head_chef_name || '';
+        if (email) return { email, name };
+      }
+    }
+    return null;
+  }, [depts]);
 
   const activeTemplate = useMemo(
     () => templates.find(t => t.id === templateId) || null,
@@ -129,6 +160,19 @@ export default function ChecklistsPage() {
 
   const setItem = (itemId: string, patch: Partial<ItemState>) =>
     setState(s => ({ ...s, [itemId]: { ...(s[itemId] || blankState()), ...patch } }));
+
+  /** Toggle a result; when an item first turns FAIL, default its corrective-task
+   *  assignee to the checklist department's lead (HOD/head chef) if we can
+   *  resolve one and the user hasn't already chosen someone. */
+  const onResult = (itemId: string, nextResult: Result) => {
+    const cur = state[itemId] || blankState();
+    const patch: Partial<ItemState> = { result: nextResult };
+    if (nextResult === 'fail' && !cur.assignee_email && !cur.created_task_id) {
+      const hod = hodFor([activeTemplate?.department || '']);
+      if (hod) { patch.assignee_email = hod.email; patch.assignee_name = hod.name; }
+    }
+    setItem(itemId, patch);
+  };
 
   const items = activeTemplate?.items || [];
   const answered = items.filter(it => (state[it.id]?.result || '') !== '').length;
@@ -330,7 +374,7 @@ export default function ChecklistsPage() {
                       const active = st.result === b.key;
                       const Icon = b.icon;
                       return (
-                        <button key={b.key} onClick={() => setItem(it.id, { result: active ? '' : b.key })}
+                        <button key={b.key} onClick={() => onResult(it.id, active ? '' : b.key)}
                           className={`inline-flex items-center gap-1 text-xs font-semibold rounded-lg px-2.5 py-1.5 border ${active ? b.on : b.off}`}>
                           <Icon size={13} /> <span className="hidden sm:inline">{b.label}</span>
                         </button>
@@ -388,6 +432,11 @@ export default function ChecklistsPage() {
                                     onClear={() => setItem(it.id, { assignee_email: '', assignee_name: '' })}
                                     placeholder="Assign to… (optional)"
                                   />
+                                  {!!st.assignee_email && hodFor([activeTemplate?.department || ''])?.email === st.assignee_email && (
+                                    <p className="mt-1 text-[10px] text-[#8B7355]">
+                                      Defaulted to {activeTemplate?.department || 'department'} lead — change if needed.
+                                    </p>
+                                  )}
                                 </div>
                                 <div>
                                   <label className="block text-[10px] font-semibold uppercase tracking-wide text-[#8B7355] mb-1">Priority</label>

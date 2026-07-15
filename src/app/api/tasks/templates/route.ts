@@ -2,6 +2,25 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { canManageTasks } from '@/lib/tasks';
+import { sendPushToUser } from '@/lib/push';
+
+/**
+ * Best-effort web-push mirroring a just-inserted task_notification. Deferred to
+ * a microtask so it runs after any surrounding better-sqlite3 transaction
+ * commits and can never block or break the insert. sendPushToUser never throws.
+ */
+function firePush(
+  db: ReturnType<typeof getDb>,
+  email: string,
+  payload: { title: string; body: string; url?: string },
+): void {
+  try {
+    if (!email) return;
+    Promise.resolve().then(() => sendPushToUser(db, email, payload)).catch(() => {});
+  } catch {
+    /* never throw */
+  }
+}
 
 /**
  * Checklist / reusable-task Templates (/api/tasks/templates).
@@ -163,6 +182,7 @@ export async function POST(request: Request) {
           generateId(), assigneeEmail, `Task assigned: ${src.name}`,
           `You have been assigned "${src.name}"`, taskId, `/tasks/my`,
         );
+        firePush(db, assigneeEmail, { title: `Task assigned: ${src.name}`, body: `You have been assigned "${src.name}"`, url: '/tasks/my' });
       }
       return Response.json({ task_id: taskId });
     }

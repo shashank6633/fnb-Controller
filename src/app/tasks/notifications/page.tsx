@@ -18,6 +18,7 @@ import {
   Loader2, RefreshCw, RotateCcw, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import PushEnable from '@/components/PushEnable';
 import type { TaskNotification } from '@/lib/tasks';
 
 const fmtWhen = (s: string | null | undefined) => {
@@ -176,6 +177,9 @@ export default function TaskNotificationsPage() {
           </button>
         </div>
       </div>
+
+      {/* Opt into browser / mobile push for task alerts */}
+      <PushEnable />
 
       {/* Error */}
       {error && (

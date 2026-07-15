@@ -26,8 +26,36 @@ import {
   nextRecurrence,
   type RecurrenceFrequency,
 } from '@/lib/tasks';
+import { sendPushToUser } from '@/lib/push';
 
 type Db = ReturnType<typeof getDb>;
+
+/**
+ * Fire a best-effort web-push mirroring a just-inserted task_notification.
+ *
+ * Deferred to a microtask so it runs AFTER any surrounding better-sqlite3
+ * transaction has committed — the synchronous prefix of sendPushToUser (its
+ * settings/subscription reads) never executes inside the caller's transaction,
+ * and the send never blocks the response. sendPushToUser itself never throws;
+ * the try/catch + .catch() here are belt-and-braces so a push failure can never
+ * surface to — or break — the notification insert.
+ */
+function firePush(
+  db: Db,
+  email: string,
+  payload: { title: string; body: string; url?: string },
+): void {
+  try {
+    if (!email) return;
+    Promise.resolve()
+      .then(() => sendPushToUser(db, email, payload))
+      .catch(() => {
+        /* never */
+      });
+  } catch {
+    /* never throw */
+  }
+}
 
 const FREQS: readonly RecurrenceFrequency[] = ['daily', 'weekly', 'monthly'];
 
@@ -128,6 +156,8 @@ export function notifyTaskAssignment(
     // route, so linking to /tasks/${taskId} would 404 — the assignee's task
     // list (/tasks/my) is the valid Phase-1 destination.
     ).run(generateId(), email, `New task: ${title}`, `${who} assigned you a task.`, taskId, `/tasks/my`);
+    // Best-effort push mirror (same title/body/href as the in-app row).
+    firePush(db, email, { title: `New task: ${title}`, body: `${who} assigned you a task.`, url: '/tasks/my' });
   } catch {
     /* never throw */
   }
@@ -444,6 +474,11 @@ export function detectOverdueAndEscalate(
             // own task list rather than a 404.
             `/tasks/my`,
           );
+          firePush(db, assignee, {
+            title: `Overdue: ${t.title || 'Task'}`,
+            body: `This task was due ${ageTxt} and is still open.`,
+            url: '/tasks/my',
+          });
           assigneeNotified++;
         } catch {
           /* never */
@@ -456,20 +491,23 @@ export function detectOverdueAndEscalate(
         for (const rcpt of targets) {
           if (hasNotifToday(db, rcpt, 'escalation', t.id)) continue;
           try {
+            const escTitle = `Escalation: ${t.title || 'Task'} overdue`;
+            const escBody = `A task assigned to ${assignee || 'an unassigned owner'} is ${overdueDays} day${overdueDays === 1 ? '' : 's'} overdue.`;
             db.prepare(
               `INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href)
                VALUES (?, ?, 'escalation', ?, ?, ?, ?)`,
             ).run(
               generateId(),
               rcpt,
-              `Escalation: ${t.title || 'Task'} overdue`,
-              `A task assigned to ${assignee || 'an unassigned owner'} is ${overdueDays} day${overdueDays === 1 ? '' : 's'} overdue.`,
+              escTitle,
+              escBody,
               t.id,
               // Escalation recipients are managers/admins; the board shows all
               // tasks (not just their own), so it is the right landing page.
               // There is no /tasks/[id] detail route to link directly.
               `/tasks/board`,
             );
+            firePush(db, rcpt, { title: escTitle, body: escBody, url: '/tasks/board' });
             escalated++;
           } catch {
             /* never */

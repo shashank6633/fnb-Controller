@@ -2,6 +2,30 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { parseMentions } from '@/lib/tasks';
+import { sendPushToUser } from '@/lib/push';
+
+/**
+ * Fire a best-effort web-push mirroring a just-inserted task_notification.
+ * Deferred to a microtask so it runs AFTER the surrounding better-sqlite3
+ * transaction commits and never blocks or breaks the insert/response.
+ * sendPushToUser never throws; the guards here are belt-and-braces.
+ */
+function firePush(
+  db: ReturnType<typeof getDb>,
+  email: string,
+  payload: { title: string; body: string; url?: string },
+): void {
+  try {
+    if (!email) return;
+    Promise.resolve()
+      .then(() => sendPushToUser(db, email, payload))
+      .catch(() => {
+        /* never */
+      });
+  } catch {
+    /* never throw */
+  }
+}
 
 /**
  * Task comment thread (/api/tasks/:id/comments) — CORE TASKS slice.
@@ -123,6 +147,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         if (!m.recipient) continue;
         db.prepare(`INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href) VALUES (?, ?, 'mention', ?, ?, ?, '/tasks/notifications')`)
           .run(generateId(), m.recipient, `You were mentioned on: ${task.title}`, `${actorName}: ${text}`, id);
+        firePush(db, m.recipient, { title: `You were mentioned on: ${task.title}`, body: `${actorName}: ${text}`, url: '/tasks/notifications' });
       }
     });
     tx();

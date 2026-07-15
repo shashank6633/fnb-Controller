@@ -3,6 +3,31 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { canManageTasks, canApproveTasks, parseMentions, TASK_STATUSES, TASK_PRIORITIES } from '@/lib/tasks';
 import { notifyTaskAssignment } from '@/lib/task-automation';
+import { sendPushToUser } from '@/lib/push';
+
+/**
+ * Fire a best-effort web-push mirroring a just-inserted task_notification.
+ * Deferred to a microtask so it runs AFTER the surrounding better-sqlite3
+ * transaction commits and never blocks or breaks the insert/response.
+ * sendPushToUser never throws; the guards here are belt-and-braces.
+ * (Assignment pushes on PUT reassign are handled inside notifyTaskAssignment.)
+ */
+function firePush(
+  db: ReturnType<typeof getDb>,
+  email: string,
+  payload: { title: string; body: string; url?: string },
+): void {
+  try {
+    if (!email) return;
+    Promise.resolve()
+      .then(() => sendPushToUser(db, email, payload))
+      .catch(() => {
+        /* never */
+      });
+  } catch {
+    /* never throw */
+  }
+}
 
 /**
  * Single task (/api/tasks/:id) — CORE TASKS slice.
@@ -291,6 +316,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
         if (!recipient || recipient.toLowerCase() === actorEmail.toLowerCase()) return;
         db.prepare(`INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href) VALUES (?, ?, ?, ?, ?, ?, ?)`)
           .run(generateId(), recipient, kind, title, nbody, id, href);
+        firePush(db, recipient, { title, body: nbody, url: href });
       };
       if (assignee && !manage) {
         notify(task.created_by, 'status', `Task ${to.replace(/_/g, ' ')}: ${task.title}`, `${actorName} moved the task to ${to.replace(/_/g, ' ')}.`, '/tasks/board');
@@ -305,6 +331,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
         if (!m.recipient) continue;
         db.prepare(`INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href) VALUES (?, ?, 'mention', ?, ?, ?, '/tasks/notifications')`)
           .run(generateId(), m.recipient, `You were mentioned on: ${task.title}`, `${actorName} mentioned you: ${note}`, id);
+        firePush(db, m.recipient, { title: `You were mentioned on: ${task.title}`, body: `${actorName} mentioned you: ${note}`, url: '/tasks/notifications' });
       }
     });
     tx();
