@@ -1,5 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, canApproveTableOp } from '@/lib/auth';
 import { canDecideDiscount, listDiscountRequests } from '@/lib/discount-requests';
 
 /**
@@ -33,8 +33,11 @@ export async function GET(req: Request) {
     // Requester poll: latest request for one order (no approver gate — it only
     // exposes the discount state of an order the caller can already open).
     if (orderId) {
-      const rows = listDiscountRequests(db, 'WHERE dr.order_id = ? ORDER BY dr.created_at DESC, dr.rowid DESC LIMIT 1', [orderId]);
-      return Response.json({ request: rows[0] || null });
+      // Return recent requests for the order so a caller can see BOTH a pending
+      // discount and a pending service-charge waiver at once. `request` (latest)
+      // is kept for the captain's existing single-request poll.
+      const rows = listDiscountRequests(db, 'WHERE dr.order_id = ? ORDER BY dr.created_at DESC, dr.rowid DESC LIMIT 6', [orderId]);
+      return Response.json({ request: rows[0] || null, requests: rows });
     }
 
     // Approver queue.
@@ -67,37 +70,53 @@ export async function POST(req: Request) {
     const db = getDb();
 
     const b = await req.json().catch(() => ({}));
+    const kind = b.kind === 'service_charge' ? 'service_charge' : 'discount';
     const orderId = String(b.order_id || '');
     const pct = Number(b.pct);
     const reason = String(b.reason || '').trim();
     if (!orderId) return Response.json({ error: 'order_id is required' }, { status: 400 });
-    if (!(pct > 0)) return Response.json({ error: 'pct must be a positive number' }, { status: 400 });
+    if (kind === 'discount' && !(pct > 0)) return Response.json({ error: 'pct must be a positive number' }, { status: 400 });
+    if (kind === 'service_charge' && !reason) return Response.json({ error: 'A reason is required to waive the service charge' }, { status: 400 });
 
     const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId) as any;
     if (!order) return Response.json({ error: 'Order not found' }, { status: 404 });
     if (order.status !== 'open') return Response.json({ error: 'Order is not open' }, { status: 409 });
 
-    // Requester rules — same semantics as the sync discount route's gate 1,
-    // read from the resolved SessionUser (admin → true / 100).
-    if (!me.can_request_discount) {
-      return Response.json({ error: 'Your role is not allowed to request a discount' }, { status: 403 });
-    }
-    const maxPct = Number(me.max_discount_pct) || 0;
-    if (pct > maxPct) {
-      return Response.json({ error: `Discount exceeds your limit of ${maxPct}%` }, { status: 400 });
+    if (kind === 'discount') {
+      // Requester rules — same semantics as the sync discount route's gate 1,
+      // read from the resolved SessionUser (admin → true / 100).
+      if (!me.can_request_discount) {
+        return Response.json({ error: 'Your role is not allowed to request a discount' }, { status: 403 });
+      }
+      const maxPct = Number(me.max_discount_pct) || 0;
+      if (pct > maxPct) {
+        return Response.json({ error: `Discount exceeds your limit of ${maxPct}%` }, { status: 400 });
+      }
+    } else {
+      // Service-charge waiver: any cashier-console operator may REQUEST; a
+      // manager/admin/HOD is still the gate at decide time (approval always).
+      if (!canApproveTableOp(me) && !me.can_request_discount) {
+        return Response.json({ error: 'Your role is not allowed to request a service-charge waiver' }, { status: 403 });
+      }
+      if (order.service_charge_reason) {
+        return Response.json({ error: 'Service charge is already waived on this bill' }, { status: 409 });
+      }
     }
 
-    // One pending request per order.
-    const dup = db.prepare(`SELECT id FROM discount_requests WHERE order_id = ? AND status = 'pending'`).get(orderId) as any;
+    // One pending request per order PER KIND (a table can have both a discount
+    // and a service-charge waiver awaiting approval).
+    const dup = db.prepare(
+      `SELECT id FROM discount_requests WHERE order_id = ? AND COALESCE(kind,'discount') = ? AND status = 'pending'`
+    ).get(orderId, kind) as any;
     if (dup) {
-      return Response.json({ error: 'A discount request for this order is already awaiting approval' }, { status: 409 });
+      return Response.json({ error: `A ${kind === 'service_charge' ? 'service-charge waiver' : 'discount'} request for this order is already awaiting approval` }, { status: 409 });
     }
 
     const id = generateId();
     db.prepare(`
-      INSERT INTO discount_requests (id, order_id, outlet_id, requested_by, requested_pct, reason)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(id, orderId, order.outlet_id || null, me.email, pct, reason);
+      INSERT INTO discount_requests (id, order_id, outlet_id, requested_by, requested_pct, reason, kind)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, orderId, order.outlet_id || null, me.email, kind === 'discount' ? pct : 0, reason, kind);
 
     const rows = listDiscountRequests(db, 'WHERE dr.id = ?', [id]);
     return Response.json({ request: rows[0] || null });

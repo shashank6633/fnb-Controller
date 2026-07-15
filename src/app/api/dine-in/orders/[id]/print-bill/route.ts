@@ -13,7 +13,7 @@ import { emitKds } from '@/lib/kds-bus';
  * Purely additive: this does NOT settle the order and the desktop POS never
  * calls it, so existing bill printing is unchanged (no double-print).
  */
-export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
@@ -34,6 +34,12 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
     ).all(id) as any[];
     if (items.length === 0) return Response.json({ error: 'Order has no items' }, { status: 400 });
 
+    // Optional target counter (multi-floor): the cashier's counter label. The
+    // print-agent bound to that counter prints it; only the main/catch-all agent
+    // handles an untargeted job. Empty → current single-counter behaviour.
+    const b = await req.json().catch(() => ({}));
+    const counter = String(b?.counter || '').trim();
+
     const bill = {
       id: order.id,
       order_number: order.order_number,
@@ -51,8 +57,14 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
       payment_method: order.payment_method || undefined,
       items,
     };
-    emitKds({ type: 'bill.print', outlet_id: order.outlet_id, station: 'bill', bill });
-    return Response.json({ success: true });
+    // Mark that a bill was printed for this (still-open) table so the cashier
+    // floor can highlight it as "asked for the bill / about to free up".
+    if (order.status === 'open') {
+      db.prepare("UPDATE orders SET bill_printed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").run(id);
+    }
+
+    emitKds({ type: 'bill.print', outlet_id: order.outlet_id, station: 'bill', counter, bill });
+    return Response.json({ success: true, counter: counter || null });
   } catch (e: any) {
     console.error('[/api/dine-in/orders/[id]/print-bill]', e);
     return Response.json({ error: e.message }, { status: 500 });

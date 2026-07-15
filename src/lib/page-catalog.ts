@@ -44,6 +44,7 @@ export const PAGE_CATALOG: PageSection[] = [
     label: 'Dine-In',
     pages: [
       { path: '/dine-in/floor',       label: 'Order Floor' },
+      { path: '/cashier',             label: 'Cashier' },
       { path: '/dine-in/requests',    label: 'Customer Orders & Requests' },
       { path: '/dine-in/discount-approvals', label: 'Discount Approvals' },
       { path: '/dine-in/kitchen',     label: 'Kitchen Display' },
@@ -120,6 +121,7 @@ export const PAGE_CATALOG: PageSection[] = [
   {
     label: 'Reports',
     pages: [
+      { path: '/sales-dashboard',     label: 'Sales Dashboard' },
       { path: '/reports',             label: 'Reports' },
       { path: '/menu-engineering',    label: 'Menu Engineering', hodOnly: true },
       { path: '/variance-report',     label: 'Variance Report' },

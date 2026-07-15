@@ -13,7 +13,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { printFiredKots, printBill, copyLabel } from '@/lib/offline-print/print';
 import { api } from '@/lib/api';
-import { probeBridge, getBridgeUrl, setBridgeUrl, type BridgeHealth } from '@/lib/offline-print/bridge-client';
+import { probeBridge, getBridgeUrl, setBridgeUrl, getPrintCounter, setPrintCounter, getPrintCatchAll, setPrintCatchAll, getPrintKots, setPrintKots, shouldPrintBillHere, type BridgeHealth } from '@/lib/offline-print/bridge-client';
 import { ensureDrainLoop, drainOutbox, counts, retryFailed, prunePrinted } from '@/lib/offline-print/outbox';
 import { pushCache, replayOnce } from '@/lib/offline-print/lan-sync';
 import { Printer, Wifi, WifiOff, CheckCircle2, AlertTriangle, RefreshCw, Receipt, ChefHat, Settings, ArrowLeft, Copy } from 'lucide-react';
@@ -27,6 +27,9 @@ export default function PrintAgent() {
   const [log, setLog] = useState<LogRow[]>([]);
   const [urlInput, setUrlInput] = useState('');
   const [showCfg, setShowCfg] = useState(false);
+  const [counter, setCounter] = useState('');       // this counter's label (matches a BILL printer's Floor)
+  const [catchAll, setCatchAll] = useState(true);   // print jobs not addressed to a specific counter
+  const [handleKots, setHandleKots] = useState(true); // print kitchen tickets on this PC
   const esRef = useRef<EventSource | null>(null);
   const seen = useRef<Set<string>>(new Set());
   // Cloud-reachable signal for the LAN offline loops. Seeded from the SSE `live`
@@ -60,6 +63,9 @@ export default function PrintAgent() {
   useEffect(() => {
     ensureDrainLoop();
     setUrlInput(getBridgeUrl());
+    setCounter(getPrintCounter());
+    setCatchAll(getPrintCatchAll());
+    setHandleKots(getPrintKots());
 
     const es = new EventSource('/api/dine-in/kds/stream?station=all');
     es.onopen = () => { setLive(true); cloudUp.current = true; };
@@ -68,13 +74,17 @@ export default function PrintAgent() {
       let evt: any;
       try { evt = JSON.parse(e.data); } catch { return; }
       if (evt?.type === 'kot.new' && evt.kot) {
-        printKot(evt.kot);
+        if (getPrintKots()) printKot(evt.kot);   // floor cash-counters can opt out of KOTs
       } else if (evt?.type === 'bill.print' && evt.bill) {
         const bl = evt.bill;
+        // Multi-counter: print bills addressed to THIS counter only; unaddressed
+        // (auto-print) jobs print on the catch-all/main PC only.
+        if (!shouldPrintBillHere(evt.counter)) return;
         const key = `bill:${bl.id}:${bl.total}`;
         if (seen.current.has(key)) return;
         seen.current.add(key);
-        const res = await printBill(bl).catch(() => ({ ok: false, reason: 'error' }));
+        const target = String(evt.counter || '').trim();
+        const res = await printBill(bl, undefined, target || undefined).catch(() => ({ ok: false, reason: 'error' }));
         pushLog({ id: bl.id, kind: 'BILL', label: `Bill #${bl.order_number ?? '—'}${bl.table_number ? ` · Table ${bl.table_number}` : ''}`,
           detail: res.ok ? `₹${Math.round(bl.total || 0)}` : `not printed — ${res.reason || 'no bill printer'}` });
         refreshQueue();
@@ -84,6 +94,7 @@ export default function PrintAgent() {
 
     // Backup poll every 9s — fetch active KOTs and print any not yet seen.
     const poll = async () => {
+      if (!getPrintKots()) return;   // this counter doesn't handle kitchen tickets
       try {
         const r = await fetch('/api/dine-in/kds?station=all', { cache: 'no-store' });
         if (!r.ok) return;
@@ -261,6 +272,20 @@ export default function PrintAgent() {
                 className="flex-1 bg-black/40 border border-white/15 rounded-lg px-3 py-2 text-sm" placeholder="http://localhost:9920" />
               <button onClick={saveUrl} className="px-4 py-2 bg-[#FF6B35] rounded-lg text-sm font-semibold">Save</button>
             </div>
+
+            <label className="text-xs text-white/60 mt-4 block">This counter (multi-floor billing)</label>
+            <input value={counter} onChange={(e) => { setCounter(e.target.value); setPrintCounter(e.target.value); }}
+              className="w-full bg-black/40 border border-white/15 rounded-lg px-3 py-2 text-sm mt-1" placeholder="e.g. Floor 1 — match a BILL printer's Floor" />
+            <p className="text-[11px] text-white/40 mt-1">Bills the cashier addresses to this counter print here. Leave blank on a single-counter venue.</p>
+
+            <label className="flex items-start gap-2 mt-3 text-sm text-white/80">
+              <input type="checkbox" className="mt-1" checked={catchAll} onChange={(e) => { setCatchAll(e.target.checked); setPrintCatchAll(e.target.checked); }} />
+              <span>Catch-all — also print bills not addressed to any counter (turn ON for the <b>main / 1st-floor PC</b> only)</span>
+            </label>
+            <label className="flex items-start gap-2 mt-2 text-sm text-white/80">
+              <input type="checkbox" className="mt-1" checked={handleKots} onChange={(e) => { setHandleKots(e.target.checked); setPrintKots(e.target.checked); }} />
+              <span>Print kitchen tickets (KOTs) on this PC (turn <b>OFF</b> on a floor cash-counter that only prints bills)</span>
+            </label>
           </div>
         )}
 

@@ -23,6 +23,50 @@ export function setBridgeUrl(url: string): void {
   localStorage.setItem(LS_KEY, url.trim().replace(/\/+$/, '') || DEFAULT_URL);
 }
 
+// ── Multi-counter routing (per DEVICE, in localStorage) ──────────────────────
+// A venue can run one Print Agent per floor cash-counter. Each agent is bound to
+// a COUNTER label (matching a BILL printer's Floor). A bill.print event carries a
+// target counter; an agent prints it only if it's addressed to THIS counter, or —
+// for untargeted jobs (auto-print) — only if this agent is the CATCH-ALL (the main
+// PC). PRINT KOTS lets floor cash-counters opt out of kitchen tickets so they
+// don't triple-print. Defaults keep a single-counter venue working unchanged.
+const COUNTER_KEY = 'fnb:print:counter';
+const CATCHALL_KEY = 'fnb:print:catchall';
+const KOTS_KEY = 'fnb:print:kots';
+
+export function getPrintCounter(): string {
+  if (typeof window === 'undefined') return '';
+  return (localStorage.getItem(COUNTER_KEY) || '').trim();
+}
+export function setPrintCounter(v: string): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(COUNTER_KEY, (v || '').trim());
+}
+export function getPrintCatchAll(): boolean {
+  if (typeof window === 'undefined') return true;
+  return localStorage.getItem(CATCHALL_KEY) !== '0'; // default ON
+}
+export function setPrintCatchAll(v: boolean): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(CATCHALL_KEY, v ? '1' : '0');
+}
+export function getPrintKots(): boolean {
+  if (typeof window === 'undefined') return true;
+  return localStorage.getItem(KOTS_KEY) !== '0'; // default ON
+}
+export function setPrintKots(v: boolean): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(KOTS_KEY, v ? '1' : '0');
+}
+
+/** Should THIS agent print a bill addressed to `target`? */
+export function shouldPrintBillHere(target: string | null | undefined): boolean {
+  const mine = getPrintCounter();
+  const t = (target || '').trim();
+  if (t) return t.toLowerCase() === mine.toLowerCase(); // addressed → only that counter
+  return getPrintCatchAll();                            // unaddressed → only the catch-all
+}
+
 async function withTimeout<T>(p: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);

@@ -23,7 +23,7 @@ const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 
 interface DiscReq {
   id: string; order_id: string; requested_by: string; requester_name: string;
-  requested_pct: number; reason: string; status: string;
+  kind?: string; requested_pct: number; reason: string; status: string;
   decided_by: string; decided_note: string; decided_at: string | null; created_at: string;
   order_number: number; order_type: string; order_status: string;
   order_subtotal: number; order_total: number; order_discount_pct: number;
@@ -153,8 +153,14 @@ export default function DiscountApprovalsPage() {
                   </p>
                 </div>
                 <div className="text-right shrink-0">
-                  <p className="text-lg font-extrabold text-[#af4408] leading-tight">{req.requested_pct}%</p>
-                  <p className="text-[11px] text-[#8B7355]">−{fmt(req.impact_amount)}</p>
+                  {req.kind === 'service_charge' ? (
+                    <p className="text-sm font-extrabold text-[#af4408] leading-tight">Waive<br />Service Charge</p>
+                  ) : (
+                    <>
+                      <p className="text-lg font-extrabold text-[#af4408] leading-tight">{req.requested_pct}%</p>
+                      <p className="text-[11px] text-[#8B7355]">−{fmt(req.impact_amount)}</p>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -187,7 +193,7 @@ export default function DiscountApprovalsPage() {
                   </button>
                   <button onClick={() => decide(req, true)} disabled={busy === req.id}
                     className="flex-[2] flex items-center justify-center gap-1.5 bg-green-700 text-white py-2.5 rounded-xl text-sm font-bold active:scale-95 disabled:opacity-50">
-                    {busy === req.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Approve {req.requested_pct}%
+                    {busy === req.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Approve {req.kind === 'service_charge' ? 'waiver' : `${req.requested_pct}%`}
                   </button>
                 </div>
               )}

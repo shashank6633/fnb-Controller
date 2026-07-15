@@ -22,6 +22,7 @@ export interface KdsEvent {
   station: string;
   kot?: any;           // the KOT row (+ items/order context for kot.new / kot.bumped)
   bill?: any;          // the bill payload (BillOrder shape) for bill.print
+  counter?: string;    // multi-floor: target cash-counter label for bill.print (empty = catch-all)
 }
 
 function getEmitter(): EventEmitter {

@@ -58,6 +58,7 @@ import {
   CalendarClock,
   Settings2,
   Scale,
+  Wallet,
   type LucideIcon,
 } from "lucide-react";
 
@@ -81,6 +82,7 @@ const navTree: NavEntry[] = [
     icon: UtensilsCrossed,
     items: [
       { kind: "link", label: "Order Floor",        href: "/dine-in/floor",             icon: ShoppingCart },
+      { kind: "link", label: "Cashier",            href: "/cashier",                   icon: Wallet },
       { kind: "link", label: "Customer Orders & Requests", href: "/dine-in/requests",  icon: Bell },
       { kind: "link", label: "Discount Approvals", href: "/dine-in/discount-approvals", icon: BadgePercent },
       { kind: "link", label: "Kitchen Display",    href: "/dine-in/kitchen",           icon: ChefHat },
@@ -173,6 +175,7 @@ const navTree: NavEntry[] = [
     label: "Reports",
     icon: BarChart3,
     items: [
+      { kind: "link", label: "Sales Dashboard",    href: "/sales-dashboard",        icon: BarChart3 },
       { kind: "link", label: "Reports",            href: "/reports",                icon: BarChart3 },
       { kind: "link", label: "Menu Engineering",   href: "/menu-engineering",       icon: BarChart3 },
       { kind: "link", label: "Variance Report",    href: "/variance-report",        icon: ClipboardCheck },

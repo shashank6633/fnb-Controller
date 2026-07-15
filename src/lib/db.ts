@@ -1702,6 +1702,9 @@ function initializeSchema(db: Database.Database) {
     if (!hasOrd('service_charge_reason')) db.exec(`ALTER TABLE orders ADD COLUMN service_charge_reason TEXT DEFAULT ''`);
     if (!hasOrd('discount_pct'))          db.exec(`ALTER TABLE orders ADD COLUMN discount_pct REAL NOT NULL DEFAULT 0`);
     if (!hasOrd('discount_approved_by'))  db.exec(`ALTER TABLE orders ADD COLUMN discount_approved_by TEXT DEFAULT ''`);
+    // When the bill was last printed for this order — highlights the table on the
+    // cashier floor as "asked for the bill / about to free up".
+    if (!hasOrd('bill_printed_at'))       db.exec(`ALTER TABLE orders ADD COLUMN bill_printed_at TEXT`);
     // Per-item prep timer + completion: prep_minutes snapshot from the menu item,
     // fired_at when it went to the kitchen (timer start), completed_at when the
     // captain marks it received. Bill is gated until every fired item completes.
@@ -1897,6 +1900,13 @@ function initializeSchema(db: Database.Database) {
       -- ref_id. Both tables grow unbounded, so keep these scans off full-table.
       CREATE INDEX IF NOT EXISTS idx_kots_created ON kots(created_at);
       CREATE INDEX IF NOT EXISTS idx_print_jobs_ref ON print_jobs(ref_id);
+      -- Sales-dashboard filters settled/void orders by IST calendar day via
+      -- date(settled_at,'+330 minutes'); expression+partial indexes let those
+      -- range scans prune to the requested days instead of scanning all history.
+      CREATE INDEX IF NOT EXISTS idx_orders_settled_ist
+        ON orders(date(settled_at, '+330 minutes')) WHERE status = 'settled';
+      CREATE INDEX IF NOT EXISTS idx_orders_void_ist
+        ON orders(date(COALESCE(voided_at, updated_at), '+330 minutes')) WHERE status = 'void';
     `);
 
     // Add fleet columns to print_stations if an older deployment created it first.
@@ -2523,6 +2533,30 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_discount_requests_order  ON discount_requests(order_id);
     `);
   } catch (e) { console.error('discount_requests schema failed:', e); }
+
+  // ── Cashier console (additive) ───────────────────────────────────────────
+  // (1) service-charge waivers ride the SAME approval queue as discounts via a
+  //     `kind` column (existing rows default to 'discount'); (2) split payments
+  //     are recorded one row per method in order_payments (the sales dashboard's
+  //     payment-category breakup reads this when present).
+  try {
+    const drCols = db.prepare("PRAGMA table_info(discount_requests)").all() as any[];
+    if (!drCols.some((c: any) => c.name === 'kind')) {
+      db.exec(`ALTER TABLE discount_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'discount'`);
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS order_payments (
+        id         TEXT PRIMARY KEY,
+        order_id   TEXT NOT NULL,
+        outlet_id  TEXT,
+        method     TEXT NOT NULL,
+        amount     REAL NOT NULL DEFAULT 0,
+        created_by TEXT DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_order_payments_order ON order_payments(order_id);
+    `);
+  } catch (e) { console.error('cashier billing schema failed:', e); }
 
   // ── Multi-Store Inventory Engine — FOUNDATION (Phase A, additive) ─────────
   // Named store locations (first: LIQUOR STORE) that own their own stock,

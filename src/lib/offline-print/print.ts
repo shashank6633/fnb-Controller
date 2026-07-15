@@ -457,10 +457,12 @@ async function getBillDesign(): Promise<BillDesign> {
   } catch { return billDesignCache?.d || DEFAULT_BILL_DESIGN; }
 }
 
-export async function printBill(order: BillOrder, printedBy?: string): Promise<{ ok: boolean; reason?: string }> {
+export async function printBill(order: BillOrder, printedBy?: string, targetFloor?: string): Promise<{ ok: boolean; reason?: string }> {
   ensureDrainLoop();
   const stations = await getStations();
-  const st = resolveBillStation(stations, order.zone);
+  // A specific counter/floor target (multi-counter routing) wins over the table's
+  // own zone, so a cashier can print another floor's bill at their own counter.
+  const st = resolveBillStation(stations, (targetFloor && targetFloor.trim()) || order.zone);
   if (!st) return { ok: false, reason: 'No bill printer configured' };
   const shop = await getShop();
   const design = await getBillDesign();

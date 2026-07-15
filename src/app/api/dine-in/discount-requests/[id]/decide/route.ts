@@ -58,16 +58,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       );
     }
 
+    const kind = request.kind === 'service_charge' ? 'service_charge' : 'discount';
     if (approve) {
-      const pct = Number(request.requested_pct);
-      // Apply EXACTLY as the sync route does (same columns, same math), plus
-      // mark the request approved — atomically.
+      // Apply + mark approved atomically. Discount → same columns/math as the
+      // sync route. Service-charge waiver → set service_charge_reason (which
+      // computeBill/settle/print all honour to zero the charge).
       const tx = db.transaction(() => {
-        const amount = round2((Number(order.subtotal) || 0) * pct / 100);
-        db.prepare(`
-          UPDATE orders SET discount_pct = ?, discount = ?, discount_approved_by = ?, updated_at = datetime('now')
-          WHERE id = ?
-        `).run(pct, amount, me.name, order.id);
+        if (kind === 'service_charge') {
+          db.prepare(`
+            UPDATE orders SET service_charge_reason = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `).run(request.reason || `Waived (approved by ${me.name})`, order.id);
+        } else {
+          const pct = Number(request.requested_pct);
+          const amount = round2((Number(order.subtotal) || 0) * pct / 100);
+          db.prepare(`
+            UPDATE orders SET discount_pct = ?, discount = ?, discount_approved_by = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `).run(pct, amount, me.name, order.id);
+        }
         db.prepare(`
           UPDATE discount_requests SET status = 'approved', decided_by = ?, decided_note = ?, decided_at = datetime('now')
           WHERE id = ?

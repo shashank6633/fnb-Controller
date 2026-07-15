@@ -1,10 +1,14 @@
-import { getDb, recordSale } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getDb, recordSale, generateId } from '@/lib/db';
+import { getCurrentUser, getCurrentOutletId, canApproveTableOp } from '@/lib/auth';
+import { canWorkTable } from '@/lib/captain-area';
 import { todayIST } from '@/lib/format-date';
-import { computeBill, sumItemTax } from '@/lib/bill-calc';
+import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
 import { resolveFloorStore } from '@/lib/store-engine';
 
-const VALID_METHODS = ['cash', 'upi', 'card'];
+// Payment methods the cashier can settle with. Split payments record one
+// order_payments row per method; the sales dashboard's payment-category breakup
+// aggregates these (falling back to orders.payment_method for legacy rows).
+const VALID_METHODS = ['cash', 'upi', 'card', 'zomato', 'swiggy', 'dineout', 'cheque', 'other'];
 
 /**
  * Read the 'bill_design' setting (JSON) and pull out the numbers computeBill
@@ -40,14 +44,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     if (!order) return Response.json({ error: 'Order not found' }, { status: 404 });
     if (order.status !== 'open') return Response.json({ error: 'Order is not open' }, { status: 409 });
 
+    // Authorization — settling closes the bill, writes sales rows + deducts stock,
+    // so it must be gated (it previously only checked sign-in). Allow a
+    // cashier/manager/admin (canApproveTableOp) OR anyone allowed to work this
+    // table (canWorkTable: true for unrestricted operators, and for a captain
+    // only within their assigned area) — preserving every existing settle flow
+    // while stopping an area-restricted captain from closing arbitrary bills.
+    if (!canApproveTableOp(me) && !canWorkTable(db, me, order.table_id)) {
+      return Response.json({ error: 'You are not allowed to settle this bill' }, { status: 403 });
+    }
+
     const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(id) as any[];
     if (items.length === 0) return Response.json({ error: 'Order has no items' }, { status: 400 });
 
     const b = await req.json().catch(() => ({}));
-    const method = String(b.payment_method || '').toLowerCase();
-    if (!VALID_METHODS.includes(method)) {
-      return Response.json({ error: `payment_method must be one of ${VALID_METHODS.join(', ')}` }, { status: 400 });
-    }
 
     const date = todayIST();
     const saleTime = new Intl.DateTimeFormat('en-GB', {
@@ -69,6 +79,35 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       billDesign,
     );
     const taxTotal = Math.round((bill.cgst + bill.sgst) * 100) / 100;
+    const grand = Math.round(bill.total); // GRAND TOTAL (rounded) — what's collected
+
+    // Resolve payment(s): either a split { payments: [{method, amount}] } that must
+    // total the grand amount, or a single { payment_method }. Validated here so a
+    // mistyped split can never settle for the wrong money.
+    let payments: { method: string; amount: number }[];
+    const raw = Array.isArray(b.payments) ? b.payments : null;
+    if (raw && raw.length) {
+      payments = raw
+        .map((p: any) => ({ method: String(p?.method || '').toLowerCase(), amount: round2(Number(p?.amount) || 0) }))
+        .filter((p: any) => p.amount > 0);
+      if (!payments.length) return Response.json({ error: 'No valid payment amounts' }, { status: 400 });
+      for (const p of payments) {
+        if (!VALID_METHODS.includes(p.method)) {
+          return Response.json({ error: `Invalid payment method "${p.method}". Allowed: ${VALID_METHODS.join(', ')}` }, { status: 400 });
+        }
+      }
+      const sum = round2(payments.reduce((s, p) => s + p.amount, 0));
+      if (Math.abs(sum - grand) > 1) {
+        return Response.json({ error: `Split payments total ₹${sum} but the bill is ₹${grand}` }, { status: 400 });
+      }
+    } else {
+      const method = String(b.payment_method || '').toLowerCase();
+      if (!VALID_METHODS.includes(method)) {
+        return Response.json({ error: `payment_method must be one of ${VALID_METHODS.join(', ')}` }, { status: 400 });
+      }
+      payments = [{ method, amount: grand }];
+    }
+    const primaryMethod = payments.length === 1 ? payments[0].method : 'split';
 
     // FAIL-SAFE floor routing (Multi-floor bar Phase 2/3): resolve this order's
     // floor bar store from its table zone ONCE. The settle deduct is only a
@@ -123,11 +162,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           service_charge = ?, discount = ?, tax_total = ?, total = ?,
           settled_at = datetime('now'), updated_at = datetime('now')
         WHERE id = ?
-      `).run(method, bill.serviceCharge, bill.discount, taxTotal, bill.total, id);
+      `).run(primaryMethod, bill.serviceCharge, bill.discount, taxTotal, bill.total, id);
+      // Record each tender line (clear any prior rows first so a retry can't
+      // double-insert). Powers the dashboard's payment-category breakup + split.
+      db.prepare('DELETE FROM order_payments WHERE order_id = ?').run(id);
+      const insP = db.prepare(
+        'INSERT INTO order_payments (id, order_id, outlet_id, method, amount, created_by) VALUES (?, ?, ?, ?, ?, ?)'
+      );
+      for (const p of payments) insP.run(generateId(), id, outletId, p.method, p.amount, me.email);
     });
     settle();
 
-    return Response.json({ success: true, order_id: id, total: bill.total, payment_method: method, lines: items.length });
+    return Response.json({ success: true, order_id: id, total: bill.total, payment_method: primaryMethod, payments, lines: items.length });
   } catch (e: any) {
     console.error('[/api/dine-in/orders/[id]/settle]', e);
     return Response.json({ error: e.message }, { status: 500 });
