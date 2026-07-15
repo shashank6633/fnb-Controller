@@ -51,7 +51,12 @@ export async function GET(request: Request) {
            FROM purchases p
            WHERE p.material_id = rm.id AND p.quantity > 0 AND COALESCE(p.total_price, 0) > 0
            ORDER BY p.date DESC, p.created_at DESC LIMIT 1), 0) as latest_price_purchase_unit,
-        COALESCE((SELECT SUM(ABS(quantity)) FROM inventory_transactions WHERE material_id = rm.id AND quantity < 0), 0) as total_consumed,
+        -- Exclude 'transfer' rows (Option B grocery→floor bridge writes a
+        -- negative type='transfer' row per grocery-source issue): a transfer
+        -- relocates stock, it is NOT consumption, so counting it here would
+        -- inflate the material's consumed metric. real consumption channels
+        -- (recipe/requisition/issue/sale/party/staff_meal/wastage) still count.
+        COALESCE((SELECT SUM(ABS(quantity)) FROM inventory_transactions WHERE material_id = rm.id AND quantity < 0 AND type != 'transfer'), 0) as total_consumed,
         ROUND(rm.current_stock * rm.average_price, 2) as stock_value,
         -- Recency view: rolling 30-day (monthly) weighted avg drives recipe / req cost.
         -- Also expose 90-day + all-time for the UI comparison column.

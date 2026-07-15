@@ -21,10 +21,16 @@ import {
  *   → { transfers: TransferSummary[] }
  *
  * POST /api/stores/transfers
- *   { from_store_id, to_store_id, items:[{material_id, qty_requested, note?}], note? }
- *   Raise a transfer REQUEST (status='requested', no stock moves). Gate:
- *   dest-floor access (userStoreAccess(to).can_view) — the floor asking for
- *   stock. Admin/manager bypass. → { ok, transfer: TransferRow }
+ *   { from_store_id?, to_store_id, from_central?, items:[{material_id, qty_requested, note?}], note? }
+ *   Raise a transfer REQUEST (status='requested', no stock moves). Two sources:
+ *     • STORE source (default): from_store_id required. Gate: dest-floor access
+ *       (userStoreAccess(to).can_view) — the floor asking for stock. Admin/
+ *       manager bypass.
+ *     • CENTRAL GROCERY source (from_central=true): from_store_id ignored/empty;
+ *       the source is the central grocery (raw_materials.current_stock). Grocery
+ *       has NO per-store access, so gate on elevation (admin / manager /
+ *       store-manager / HOD) — mirrors who may later issue from grocery.
+ *   → { ok, transfer: TransferRow }
  *
  * CSRF: '/api/stores' is in proxy.ts CSRF_REQUIRED_PREFIXES — POST must carry
  * the double-submit header (use the api() client helper).
@@ -75,11 +81,16 @@ export async function GET(request: Request) {
     }
 
     // Non-elevated: keep only transfers touching a store the user can view.
+    // Grocery-source (from_central) transfers have no source store to grant on,
+    // so they qualify only via the destination floor the user can view.
     if (!elevated) {
-      list = list.filter(t => access(t.from_store_id).can_view || access(t.to_store_id).can_view);
+      list = list.filter(t => (!t.from_central && access(t.from_store_id).can_view) || access(t.to_store_id).can_view);
     }
 
-    return Response.json({ transfers: list });
+    // Source label: 'Grocery' for a central-grocery source, else the store name.
+    const transfers = list.map(t => ({ ...t, source_label: t.from_central ? 'Grocery' : t.from_store_name }));
+
+    return Response.json({ transfers });
   } catch (e: any) {
     console.error('[/api/stores/transfers GET]', e);
     return Response.json({ error: e.message }, { status: 500 });
@@ -93,19 +104,30 @@ export async function POST(request: Request) {
     const db = getDb();
 
     const b = await request.json().catch(() => ({}));
+    const fromCentral = !!b?.from_central;
     const fromStoreId = String(b?.from_store_id || '').trim();
     const toStoreId = String(b?.to_store_id || '').trim();
     const rawItems = Array.isArray(b?.items) ? b.items : [];
 
-    if (!fromStoreId || !toStoreId) {
+    if (!toStoreId) {
+      return Response.json({ error: 'to_store_id is required' }, { status: 400 });
+    }
+    if (!fromCentral && !fromStoreId) {
       return Response.json({ error: 'from_store_id and to_store_id are required' }, { status: 400 });
     }
     if (rawItems.length === 0) {
       return Response.json({ error: 'A transfer needs at least one item' }, { status: 400 });
     }
 
-    // Gate: the requesting floor must have dest-store access (admin/manager bypass).
-    if (!isElevated(me) && !userStoreAccess(db, me, toStoreId).can_view) {
+    if (fromCentral) {
+      // Central-grocery source: no per-store access exists to grant on, so only
+      // an elevated user (admin / manager / store-manager / HOD) may raise a
+      // grocery-source transfer — the same set that may issue it.
+      if (!isElevated(me)) {
+        return Response.json({ error: 'You are not authorized to transfer stock from the central grocery' }, { status: 403 });
+      }
+    } else if (!isElevated(me) && !userStoreAccess(db, me, toStoreId).can_view) {
+      // Store source: the requesting floor must have dest-store access.
       return Response.json({ error: 'You are not authorized to request stock for the destination store' }, { status: 403 });
     }
 
@@ -120,6 +142,7 @@ export async function POST(request: Request) {
       transfer = createTransfer(db, {
         from: fromStoreId,
         to: toStoreId,
+        from_central: fromCentral,
         items,
         by: me.email,
         note: String(b?.note || ''),
@@ -135,6 +158,7 @@ export async function POST(request: Request) {
       entity_id: transfer.id,
       actor_email: me.email,
       after: {
+        from_central: transfer.from_central,
         from_store_id: transfer.from_store_id, from_store: transfer.from_store_name,
         to_store_id: transfer.to_store_id, to_store: transfer.to_store_name,
         item_count: transfer.items.length, total_requested: transfer.total_requested,

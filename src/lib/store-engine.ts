@@ -337,9 +337,13 @@ export interface ConsolidatedStockRow {
   case_size: number;
   /** store_id → qty (recipe units). Every ACTIVE store has an entry (0 if none). */
   by_store: Record<string, number>;
-  /** Σ by_store qty (recipe units). */
+  /** Central grocery backstock = raw_materials.current_stock (recipe units). */
+  grocery_qty: number;
+  /** grocery_qty × raw_materials.average_price, 2dp. */
+  grocery_value: number;
+  /** Σ by_store qty + grocery_qty (recipe units). */
   total_qty: number;
-  /** Σ per-store (qty × that store's weighted-avg ₹/recipe-unit), 2dp. */
+  /** Σ per-store (qty × store weighted-avg ₹/recipe-unit) + grocery_value, 2dp. */
   total_value: number;
 }
 
@@ -396,7 +400,8 @@ export function consolidatedStock(db: Database): ConsolidatedStockRow[] {
   const metaRows = db.prepare(`
     SELECT id AS material_id, name, category, unit,
            COALESCE(pack_size, 1) AS pack_size, COALESCE(case_size, 1) AS case_size,
-           COALESCE(average_price, 0) AS average_price
+           COALESCE(average_price, 0) AS average_price,
+           COALESCE(current_stock, 0) AS current_stock
     FROM raw_materials WHERE id IN (${metaPh})
   `).all(...idList) as any[];
 
@@ -413,6 +418,14 @@ export function consolidatedStock(db: Database): ConsolidatedStockRow[] {
       totalQty += qty;
       totalValue += qty * avg;
     }
+    // Central grocery backstock column — raw_materials.current_stock valued at
+    // raw_materials.average_price. Included in the grand totals so the board
+    // reflects the whole bar system (floors + liquor store + central backstock).
+    const groceryQty = Number(m.current_stock) || 0;
+    const avgPrice = Number(m.average_price) || 0;
+    const groceryValue = groceryQty * avgPrice;
+    totalQty += groceryQty;
+    totalValue += groceryValue;
     return {
       material_id: m.material_id,
       name: m.name,
@@ -421,6 +434,8 @@ export function consolidatedStock(db: Database): ConsolidatedStockRow[] {
       pack_size: Number(m.pack_size) || 1,
       case_size: Number(m.case_size) || 1,
       by_store: byStore,
+      grocery_qty: Math.round(groceryQty * 10000) / 10000,
+      grocery_value: Math.round(groceryValue * 100) / 100,
       total_qty: Math.round(totalQty * 10000) / 10000,
       total_value: Math.round(totalValue * 100) / 100,
     };
@@ -501,6 +516,9 @@ export interface TransferRow {
   id: string;
   from_store_id: string;
   from_store_name: string;
+  /** True when the source is the CENTRAL grocery (raw_materials.current_stock)
+   *  rather than a store_location; from_store_id is empty in that case. */
+  from_central: boolean;
   to_store_id: string;
   to_store_name: string;
   status: TransferStatus;
@@ -524,6 +542,8 @@ export interface TransferSummary {
   id: string;
   from_store_id: string;
   from_store_name: string;
+  /** True when the source is the CENTRAL grocery, not a store_location. */
+  from_central: boolean;
   to_store_id: string;
   to_store_name: string;
   status: TransferStatus;
@@ -559,25 +579,41 @@ function assertActive(db: Database, storeId: string, label: string): StoreLocati
 
 /**
  * Create a transfer REQUEST (floor → wants stock from a store, or any
- * store→store). Validates from≠to, both active, each material exists and its
- * qty_requested ≥ 0. Header status = 'requested'. Returns the full transfer.
+ * store→store; OR from the CENTRAL grocery when from_central is set). Validates
+ * from≠to, both active, each material exists and its qty_requested ≥ 0. When
+ * from_central=true the SOURCE is the central grocery (raw_materials.
+ * current_stock) — from_store_id is stored empty and only the destination store
+ * is validated (must be active). Header status = 'requested'. Returns the full
+ * transfer.
  */
 export function createTransfer(
   db: Database,
   input: {
     from: string;
     to: string;
+    /** When true, source is the CENTRAL grocery (raw_materials.current_stock),
+     *  NOT a store_location — `from` is ignored and stored empty. */
+    from_central?: boolean;
     items: Array<{ material_id: string; qty_requested?: number; qty?: number; note?: string }>;
     by?: string;
     note?: string;
   },
 ): TransferRow {
-  const fromId = String(input.from || '').trim();
+  const fromCentral = !!input.from_central;
   const toId = String(input.to || '').trim();
-  if (!fromId || !toId) throw new Error('from and to store are required');
-  if (fromId === toId) throw new Error('Source and destination store must differ');
-  assertActive(db, fromId, 'Source');
-  assertActive(db, toId, 'Destination');
+  if (!toId) throw new Error('Destination store is required');
+  let fromId = '';
+  if (fromCentral) {
+    // Source is the central grocery — no source store to validate; just the
+    // destination floor/store must be a real, active store_location.
+    assertActive(db, toId, 'Destination');
+  } else {
+    fromId = String(input.from || '').trim();
+    if (!fromId) throw new Error('from and to store are required');
+    if (fromId === toId) throw new Error('Source and destination store must differ');
+    assertActive(db, fromId, 'Source');
+    assertActive(db, toId, 'Destination');
+  }
 
   const rawItems = Array.isArray(input.items) ? input.items : [];
   const clean: Array<{ material_id: string; qty: number; note: string }> = [];
@@ -596,9 +632,9 @@ export function createTransfer(
   const tx = db.transaction(() => {
     db.prepare(`
       INSERT INTO store_transfers
-        (id, from_store_id, to_store_id, status, note, requested_by, requested_at, created_at, updated_at)
-      VALUES (?, ?, ?, 'requested', ?, ?, datetime('now'), datetime('now'), datetime('now'))
-    `).run(transferId, fromId, toId, String(input.note || ''), String(input.by || ''));
+        (id, from_store_id, to_store_id, from_central, status, note, requested_by, requested_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'requested', ?, ?, datetime('now'), datetime('now'), datetime('now'))
+    `).run(transferId, fromCentral ? null : fromId, toId, fromCentral ? 1 : 0, String(input.note || ''), String(input.by || ''));
     const insItem = db.prepare(`
       INSERT INTO store_transfer_items
         (id, transfer_id, material_id, qty_requested, note, created_at)
@@ -611,11 +647,19 @@ export function createTransfer(
 }
 
 /**
- * ISSUE a requested transfer: debits the FROM store. For every payload item
- * (a subset of the transfer's items) sets qty_issued and, when > 0, posts a
- * NEGATIVE 'transfer' ledger row on the source store carrying the source
- * store's weighted-avg unit_cost (ref = transfer id). Header → 'issued'.
- * Only a 'requested' transfer can be issued.
+ * ISSUE a requested transfer: debits the SOURCE. For every payload item (a
+ * subset of the transfer's items) sets qty_issued and, when > 0, moves stock
+ * out of the source. Two source kinds:
+ *   • STORE source (from_central=0): posts a NEGATIVE 'transfer' ledger row on
+ *     the source store carrying its weighted-avg unit_cost (ref = transfer id).
+ *   • CENTRAL GROCERY source (from_central=1): DEBITs raw_materials.
+ *     current_stock (recipe units) and writes an inventory_transactions row
+ *     (type 'transfer', quantity = −qty_issued, reference_id = transfer id) for
+ *     auditability — NO source-store ledger row is posted.
+ * Both paths enforce the SAME bounds: qty_issued ≤ qty_requested AND
+ * qty_issued ≤ source on-hand (store ledger qty, or grocery current_stock), so
+ * the source can never go negative. Header → 'issued'. Only a 'requested'
+ * transfer can be issued.
  */
 export function issueTransfer(
   db: Database,
@@ -625,52 +669,83 @@ export function issueTransfer(
   const t = db.prepare('SELECT * FROM store_transfers WHERE id = ?').get(transferId) as any;
   if (!t) throw new Error('Transfer not found');
   if (t.status !== 'requested') throw new Error(`Only a requested transfer can be issued (status is ${t.status})`);
+  const fromCentral = Number(t.from_central) === 1;
 
   const itemRows = db.prepare('SELECT id, material_id, qty_requested FROM store_transfer_items WHERE transfer_id = ?').all(transferId) as { id: string; material_id: string; qty_requested: number }[];
   const byMaterial = new Map(itemRows.map(r => [r.material_id, r]));
-  const costMap = storeAvgCostMap(db, t.from_store_id);
+  const costMap = fromCentral ? new Map<string, number>() : storeAvgCostMap(db, t.from_store_id);
   // Current source on-hand per material — a transfer moves REAL stock, so an
   // issue may never exceed what the source physically holds (which would drive
-  // the source ledger negative) nor exceed what the floor requested.
+  // the source negative) nor exceed what the floor requested. For a store
+  // source that bound is the ledger qty; for the central grocery it is
+  // raw_materials.current_stock (recipe units).
   const onHand = new Map<string, number>();
-  for (const r of storeStock(db, t.from_store_id)) onHand.set(r.material_id, r.qty);
-  const sourceName = getStoreById(db, t.from_store_id)?.name || t.from_store_id;
+  const getCentralStock = db.prepare('SELECT current_stock FROM raw_materials WHERE id = ?');
+  if (!fromCentral) {
+    for (const r of storeStock(db, t.from_store_id)) onHand.set(r.material_id, r.qty);
+  }
+  const sourceName = fromCentral ? 'the central grocery' : (getStoreById(db, t.from_store_id)?.name || t.from_store_id);
   const nameOf = (mid: string) =>
     (db.prepare('SELECT name FROM raw_materials WHERE id = ?').get(mid) as { name: string } | undefined)?.name || mid;
 
-  const updates: Array<{ itemId: string; material_id: string; qty: number }> = [];
+  // Aggregate the payload by material FIRST. A material listed twice must not
+  // bypass the per-material caps: with a per-entry snapshot read each duplicate
+  // would independently pass `qty <= available`, and the debit runs once PER
+  // entry → double-debit (grocery current_stock driven NEGATIVE, or a store
+  // ledger over-issued) while qty_issued records only the last value. Summing to
+  // one qty-per-material means one cap check, one qty_issued write, one debit.
+  const wanted = new Map<string, number>();
   for (const it of (payload?.items || [])) {
     const materialId = String(it?.material_id || '').trim();
     if (!materialId) continue;
-    const row = byMaterial.get(materialId);
-    if (!row) throw new Error('Item is not part of this transfer');
+    if (!byMaterial.has(materialId)) throw new Error('Item is not part of this transfer');
     const qty = Number(it?.qty_issued ?? it?.qty ?? 0);
     if (!Number.isFinite(qty) || qty < 0) throw new Error('qty_issued must be a number ≥ 0');
+    wanted.set(materialId, (wanted.get(materialId) ?? 0) + qty);
+  }
+
+  const updates: Array<{ itemId: string; material_id: string; qty: number }> = [];
+  for (const [materialId, qty] of wanted) {
+    const row = byMaterial.get(materialId)!;
     const requested = Number(row.qty_requested) || 0;
     if (qty > requested) {
       throw new Error(`Cannot issue more than requested for ${nameOf(materialId)} (requested ${requested}, tried to issue ${qty})`);
     }
-    const available = onHand.get(materialId) ?? 0;
+    const available = fromCentral
+      ? (Number((getCentralStock.get(materialId) as { current_stock: number } | undefined)?.current_stock) || 0)
+      : (onHand.get(materialId) ?? 0);
     if (qty > available) {
       throw new Error(`Cannot issue ${qty} of ${nameOf(materialId)} — only ${available} on hand in ${sourceName}`);
     }
     updates.push({ itemId: row.id, material_id: materialId, qty });
   }
 
+  const destName = getStoreById(db, t.to_store_id)?.name || t.to_store_id;
   const tx = db.transaction(() => {
     for (const u of updates) {
       db.prepare('UPDATE store_transfer_items SET qty_issued = ? WHERE id = ?').run(u.qty, u.itemId);
       if (u.qty > 0) {
-        postLedger(db, {
-          store_id: t.from_store_id,
-          material_id: u.material_id,
-          txn_type: 'transfer',
-          quantity: -u.qty,
-          unit_cost: costMap.get(u.material_id) ?? 0,
-          ref: transferId,
-          notes: `Transfer issue → ${getStoreById(db, t.to_store_id)?.name || t.to_store_id}`,
-          created_by: String(payload?.by || ''),
-        });
+        if (fromCentral) {
+          // Debit the central grocery (recipe units) + audit trail. The bound
+          // check above guarantees current_stock never goes negative.
+          db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now') WHERE id = ?`).run(u.qty, u.material_id);
+          db.prepare(`
+            INSERT INTO inventory_transactions
+              (id, material_id, type, quantity, reference_id, notes, created_at)
+            VALUES (?, ?, 'transfer', ?, ?, ?, datetime('now'))
+          `).run(generateId(), u.material_id, -u.qty, transferId, `Grocery transfer issue → ${destName}`);
+        } else {
+          postLedger(db, {
+            store_id: t.from_store_id,
+            material_id: u.material_id,
+            txn_type: 'transfer',
+            quantity: -u.qty,
+            unit_cost: costMap.get(u.material_id) ?? 0,
+            ref: transferId,
+            notes: `Transfer issue → ${destName}`,
+            created_by: String(payload?.by || ''),
+          });
+        }
       }
     }
     db.prepare(`
@@ -700,9 +775,18 @@ export function receiveTransfer(
   if (!t) throw new Error('Transfer not found');
   if (t.status !== 'issued') throw new Error(`Only an issued transfer can be received (status is ${t.status})`);
 
+  const fromCentral = Number(t.from_central) === 1;
   const itemRows = db.prepare('SELECT id, material_id, qty_issued FROM store_transfer_items WHERE transfer_id = ?').all(transferId) as { id: string; material_id: string; qty_issued: number }[];
   const byMaterial = new Map(itemRows.map(r => [r.material_id, r]));
-  const fallbackCost = storeAvgCostMap(db, t.from_store_id);
+  // Store source → receive cost rides the matching issue ledger row
+  // (getIssueCost), falling back to the source store's weighted-avg. A CENTRAL
+  // grocery source posts NO source ledger row (from_store_id is NULL), so both
+  // getIssueCost and storeAvgCostMap would be empty and the floor would credit
+  // the stock at ₹0. Use the grocery's ₹/recipe-unit (raw_materials.
+  // average_price) so the floor ledger carries a correct cost.
+  const fallbackCost = fromCentral ? new Map<string, number>() : storeAvgCostMap(db, t.from_store_id);
+  const getCentralAvg = db.prepare('SELECT average_price FROM raw_materials WHERE id = ?');
+  const sourceLabel = fromCentral ? 'Central Grocery' : (getStoreById(db, t.from_store_id)?.name || t.from_store_id);
   const nameOf = (mid: string) =>
     (db.prepare('SELECT name FROM raw_materials WHERE id = ?').get(mid) as { name: string } | undefined)?.name || mid;
   const getIssueCost = db.prepare(`
@@ -711,14 +795,22 @@ export function receiveTransfer(
     ORDER BY created_at DESC LIMIT 1
   `);
 
-  const updates: Array<{ itemId: string; material_id: string; qty: number }> = [];
+  // Aggregate the payload by material FIRST (same reason as issueTransfer): a
+  // material listed twice must not post two credit ledger rows and over-credit
+  // the floor beyond what was issued — one receive per material, one credit.
+  const wanted = new Map<string, number>();
   for (const it of (payload?.items || [])) {
     const materialId = String(it?.material_id || '').trim();
     if (!materialId) continue;
-    const row = byMaterial.get(materialId);
-    if (!row) throw new Error('Item is not part of this transfer');
+    if (!byMaterial.has(materialId)) throw new Error('Item is not part of this transfer');
     const qty = Number(it?.qty_received ?? it?.qty ?? 0);
     if (!Number.isFinite(qty) || qty < 0) throw new Error('qty_received must be a number ≥ 0');
+    wanted.set(materialId, (wanted.get(materialId) ?? 0) + qty);
+  }
+
+  const updates: Array<{ itemId: string; material_id: string; qty: number }> = [];
+  for (const [materialId, qty] of wanted) {
+    const row = byMaterial.get(materialId)!;
     // Received may never exceed what was issued: the destination cannot credit
     // more stock than the source debited (conservation), and an item that was
     // never issued (qty_issued = 0) cannot be received. discrepancy
@@ -737,8 +829,14 @@ export function receiveTransfer(
     for (const u of updates) {
       db.prepare('UPDATE store_transfer_items SET qty_received = ? WHERE id = ?').run(u.qty, u.itemId);
       if (u.qty > 0) {
-        const issueRow = getIssueCost.get(t.from_store_id, u.material_id, transferId) as { unit_cost: number } | undefined;
-        const unitCost = issueRow ? Number(issueRow.unit_cost) || 0 : (fallbackCost.get(u.material_id) ?? 0);
+        let unitCost: number;
+        if (fromCentral) {
+          const rm = getCentralAvg.get(u.material_id) as { average_price: number } | undefined;
+          unitCost = Number(rm?.average_price) || 0;
+        } else {
+          const issueRow = getIssueCost.get(t.from_store_id, u.material_id, transferId) as { unit_cost: number } | undefined;
+          unitCost = issueRow ? Number(issueRow.unit_cost) || 0 : (fallbackCost.get(u.material_id) ?? 0);
+        }
         postLedger(db, {
           store_id: t.to_store_id,
           material_id: u.material_id,
@@ -746,7 +844,7 @@ export function receiveTransfer(
           quantity: u.qty,
           unit_cost: unitCost,
           ref: transferId,
-          notes: `Transfer receive ← ${getStoreById(db, t.from_store_id)?.name || t.from_store_id}`,
+          notes: `Transfer receive ← ${sourceLabel}`,
           created_by: String(payload?.by || ''),
         });
       }
@@ -821,10 +919,12 @@ export function getTransfer(db: Database, id: string): TransferRow | null {
     };
   });
 
+  const fromCentral = Number(t.from_central) === 1;
   return {
     id: t.id,
-    from_store_id: t.from_store_id,
-    from_store_name: t.from_store_name || t.from_store_id,
+    from_store_id: t.from_store_id || '',
+    from_store_name: fromCentral ? 'Central Grocery' : (t.from_store_name || t.from_store_id),
+    from_central: fromCentral,
     to_store_id: t.to_store_id,
     to_store_name: t.to_store_name || t.to_store_id,
     status: t.status,
@@ -875,10 +975,12 @@ export function listTransfers(
   return rows.map(r => {
     const totalIss = Number(r.total_issued) || 0;
     const totalRec = Number(r.total_received) || 0;
+    const fromCentral = Number(r.from_central) === 1;
     return {
       id: r.id,
-      from_store_id: r.from_store_id,
-      from_store_name: r.from_store_name || r.from_store_id,
+      from_store_id: r.from_store_id || '',
+      from_store_name: fromCentral ? 'Central Grocery' : (r.from_store_name || r.from_store_id),
+      from_central: fromCentral,
       to_store_id: r.to_store_id,
       to_store_name: r.to_store_name || r.to_store_id,
       status: r.status,

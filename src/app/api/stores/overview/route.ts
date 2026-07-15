@@ -17,13 +17,18 @@ import { listStores, consolidatedStock } from '@/lib/store-engine';
  *                                      in the same order consolidatedStock uses,
  *     rows:   [ConsolidatedStockRow + { sku, purchase_unit }]  — enriched so the
  *             page can search by SKU and render the Cases/Bottles/loose (CBL)
- *             breakdown (fmtBreakdown needs purchase_unit to label bottles),
+ *             breakdown (fmtBreakdown needs purchase_unit to label bottles).
+ *             Each row also carries grocery_qty / grocery_value (central grocery
+ *             backstock = raw_materials.current_stock @ average_price) straight
+ *             from consolidatedStock(); already folded into total_qty/total_value,
+ *             surfaced by the page as a leftmost "Grocery" location column,
  *     generated_at,
  *   }
  *
  * Valuation + qty come straight from the engine's consolidatedStock() (each
- * store's OWN weighted-avg cost, matching storeStock()); this route only adds
- * display metadata + the store column list. No writes.
+ * store's OWN weighted-avg cost, matching storeStock(); central grocery valued
+ * at raw_materials.average_price); this route only adds display metadata + the
+ * store column list. No writes.
  */
 export const dynamic = 'force-dynamic';
 

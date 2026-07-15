@@ -2659,7 +2659,11 @@ function initializeSchema(db: Database.Database) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS store_transfers (
         id           TEXT PRIMARY KEY,
-        from_store_id TEXT NOT NULL,
+        -- NULLABLE for Option B: a from_central transfer sources the CENTRAL
+        -- grocery (raw_materials.current_stock) and has NO source store, so it
+        -- stores NULL here. NULL is exempt from the FK below; store→store rows
+        -- still carry a real, referentially-checked store_locations.id.
+        from_store_id TEXT,
         to_store_id   TEXT NOT NULL,
         status        TEXT NOT NULL DEFAULT 'requested',  -- requested|issued|received|cancelled
         note          TEXT DEFAULT '',
@@ -2693,6 +2697,61 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_store_transfers_to     ON store_transfers(to_store_id);
       CREATE INDEX IF NOT EXISTS idx_store_transfer_items_transfer ON store_transfer_items(transfer_id);
     `);
+    // Multi-floor bar Option B (grocery→floor bridge, additive): a transfer may
+    // source from the CENTRAL grocery (raw_materials.current_stock) instead of a
+    // store_location. When from_central=1, from_store_id is empty/ignored and
+    // issueTransfer debits raw_materials.current_stock + writes an
+    // inventory_transactions row (see store-engine.ts). Default 0 keeps every
+    // existing store→store transfer unchanged.
+    const stCols = db.prepare("PRAGMA table_info(store_transfers)").all() as any[];
+    if (!stCols.some((c: any) => c.name === 'from_central')) {
+      db.exec(`ALTER TABLE store_transfers ADD COLUMN from_central INTEGER NOT NULL DEFAULT 0`);
+    }
+    // Option B migration: a DB created before this change still has
+    // from_store_id declared NOT NULL, so a from_central transfer (which must
+    // store NULL as its source) fails the constraint. SQLite can't drop NOT
+    // NULL via ALTER, so rebuild the table with a NULLABLE from_store_id
+    // (following the SQLite safe table-rebuild procedure — foreign_keys OFF
+    // around the swap). Guarded on notnull so it runs at most once.
+    const fromCol = stCols.find((c: any) => c.name === 'from_store_id');
+    if (fromCol && Number(fromCol.notnull) === 1) {
+      db.pragma('foreign_keys = OFF');
+      const rebuild = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE store_transfers_ob_new (
+            id           TEXT PRIMARY KEY,
+            from_store_id TEXT,
+            to_store_id   TEXT NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'requested',
+            note          TEXT DEFAULT '',
+            requested_by  TEXT DEFAULT '',
+            requested_at  TEXT,
+            issued_by     TEXT DEFAULT '',
+            issued_at     TEXT,
+            received_by   TEXT DEFAULT '',
+            received_at   TEXT,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            from_central  INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (from_store_id) REFERENCES store_locations(id),
+            FOREIGN KEY (to_store_id)   REFERENCES store_locations(id)
+          );
+          INSERT INTO store_transfers_ob_new
+            (id, from_store_id, to_store_id, status, note, requested_by, requested_at,
+             issued_by, issued_at, received_by, received_at, created_at, updated_at, from_central)
+          SELECT id, from_store_id, to_store_id, status, note, requested_by, requested_at,
+             issued_by, issued_at, received_by, received_at, created_at, updated_at, COALESCE(from_central, 0)
+          FROM store_transfers;
+          DROP TABLE store_transfers;
+          ALTER TABLE store_transfers_ob_new RENAME TO store_transfers;
+          CREATE INDEX IF NOT EXISTS idx_store_transfers_status ON store_transfers(status);
+          CREATE INDEX IF NOT EXISTS idx_store_transfers_from   ON store_transfers(from_store_id);
+          CREATE INDEX IF NOT EXISTS idx_store_transfers_to     ON store_transfers(to_store_id);
+        `);
+      });
+      rebuild();
+      db.pragma('foreign_keys = ON');
+    }
   } catch (e) { console.error('store_transfers schema failed:', e); }
 
   // ── Config-audit fingerprint (evidence instrumentation, 2026-07-13) ────────

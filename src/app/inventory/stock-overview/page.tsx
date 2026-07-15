@@ -18,7 +18,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Wine, Search, X, Loader2, AlertCircle, Download, Layers,
-  IndianRupee, Store as StoreIcon, AlertTriangle, PackageX,
+  IndianRupee, Store as StoreIcon, AlertTriangle, PackageX, Warehouse,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { fmtBreakdown, PackMeta } from '@/lib/pack-units';
@@ -36,6 +36,10 @@ interface Row {
   sku: string;
   purchase_unit: string;
   by_store: Record<string, number>;
+  /** Central grocery backstock (recipe units) = raw_materials.current_stock. */
+  grocery_qty: number;
+  /** grocery_qty × raw_materials.average_price. Folded into total_value. */
+  grocery_value: number;
   total_qty: number;
   total_value: number;
 }
@@ -125,19 +129,21 @@ export default function StockOverviewPage() {
 
   // Summary over the FILTERED set (what the user is looking at).
   const summary = useMemo(() => {
-    let value = 0, negative = 0, out = 0;
+    let value = 0, grocery = 0, negative = 0, out = 0;
     for (const r of filtered) {
       value += r.total_value;
+      grocery += r.grocery_value;
       if (r.total_qty < 0) negative++;
       else if (r.total_qty === 0) out++;
     }
-    return { value, negative, out, items: filtered.length };
+    return { value, grocery, negative, out, items: filtered.length };
   }, [filtered]);
 
   const exportCsv = () => {
-    const header = ['Material', 'SKU', 'Category', 'Unit', ...stores.map(s => s.name), 'Total Qty', 'Total Value'];
+    const header = ['Material', 'SKU', 'Category', 'Unit', 'Grocery (central)', ...stores.map(s => s.name), 'Total Qty', 'Total Value'];
     const body = filtered.map(r => [
       r.name, r.sku || '', r.category || '', r.unit || '',
+      Number(r.grocery_qty),
       ...stores.map(s => Number(r.by_store[s.id] ?? 0)),
       Number(r.total_qty), Number(r.total_value),
     ]);
@@ -184,7 +190,7 @@ export default function StockOverviewPage() {
             <Wine className="w-6 h-6 text-[#af4408]" /> Consolidated Stock
           </h1>
           <p className="text-xs text-[#6B5744] mt-0.5">
-            Every material across the Liquor Store and each floor bar, with total qty and value.
+            Central grocery backstock plus every material across the Liquor Store and each floor bar, with total qty and value.
             {generatedAt && <span className="text-[#B9A896]"> · as of {new Date(generatedAt).toLocaleString('en-IN')}</span>}
           </p>
         </div>
@@ -195,8 +201,9 @@ export default function StockOverviewPage() {
       </div>
 
       {/* Summary cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2.5">
         <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label="Total value" value={inr(summary.value)} />
+        <SummaryCard icon={<Warehouse className="w-4 h-4" />} label="Grocery value" value={inr(summary.grocery)} />
         <SummaryCard icon={<StoreIcon className="w-4 h-4" />} label="Locations" value={String(stores.length)} />
         <SummaryCard icon={<Layers className="w-4 h-4" />} label="Materials" value={summary.items.toLocaleString('en-IN')} />
         <SummaryCard
@@ -248,6 +255,10 @@ export default function StockOverviewPage() {
                 <tr className="bg-[#FFF1E3] text-[#6B5744] text-xs">
                   <th className="text-left font-semibold px-3 py-2 sticky left-0 bg-[#FFF1E3] z-10 min-w-[200px]">Material</th>
                   <th className="text-left font-semibold px-3 py-2 min-w-[110px]">Category</th>
+                  <th className="text-right font-semibold px-3 py-2 min-w-[90px] whitespace-nowrap bg-[#FBF0E6] border-l border-[#F0E4D6]">
+                    Grocery
+                    <div className="text-[9px] font-normal text-[#B9A896] leading-none">central</div>
+                  </th>
                   {stores.map(s => (
                     <th key={s.id} className="text-right font-semibold px-3 py-2 min-w-[90px] whitespace-nowrap">{s.name}</th>
                   ))}
@@ -263,6 +274,7 @@ export default function StockOverviewPage() {
                       {r.sku && <div className="text-[10px] text-[#B9A896]">{r.sku}</div>}
                     </td>
                     <td className="px-3 py-2 text-[#6B5744] text-xs">{r.category}</td>
+                    <td className="px-3 py-2 bg-[#FDF7F1] border-l border-[#F0E4D6]"><QtyCell qty={r.grocery_qty} r={r} /></td>
                     {stores.map(s => (
                       <td key={s.id} className="px-3 py-2"><QtyCell qty={Number(r.by_store[s.id] ?? 0)} r={r} /></td>
                     ))}
@@ -275,6 +287,9 @@ export default function StockOverviewPage() {
                 <tr className="border-t-2 border-[#E8D5C4] bg-[#FFF1E3] font-semibold text-[#2D1B0E]">
                   <td className="px-3 py-2 sticky left-0 bg-[#FFF1E3] z-10">Page total</td>
                   <td className="px-3 py-2" />
+                  <td className="px-3 py-2 text-right tabular-nums text-xs text-[#6B5744] bg-[#FBF0E6] border-l border-[#F0E4D6]">
+                    {fq(paged.reduce((a, r) => a + r.grocery_qty, 0))}
+                  </td>
                   {stores.map(s => (
                     <td key={s.id} className="px-3 py-2 text-right tabular-nums text-xs text-[#6B5744]">
                       {fq(paged.reduce((a, r) => a + Number(r.by_store[s.id] ?? 0), 0))}
@@ -307,6 +322,10 @@ export default function StockOverviewPage() {
                   </div>
                 </div>
                 <div className="mt-2 pt-2 border-t border-[#F0E4D6] grid grid-cols-2 gap-x-3 gap-y-1">
+                  <div className="flex items-center justify-between gap-2 text-xs min-w-0">
+                    <span className="text-[#8B7355] font-medium truncate min-w-0">Grocery</span>
+                    <QtyCell qty={r.grocery_qty} r={r} />
+                  </div>
                   {stores.map(s => (
                     <div key={s.id} className="flex items-center justify-between gap-2 text-xs min-w-0">
                       <span className="text-[#6B5744] truncate min-w-0">{s.name}</span>

@@ -37,7 +37,7 @@ import Link from 'next/link';
 import {
   ArrowRightLeft, ArrowLeft, Plus, Search, X, Loader2, AlertCircle, AlertTriangle,
   CheckCircle2, Wine, Warehouse, Download, Send, PackageCheck, Ban, Trash2,
-  ChevronRight, PackageOpen,
+  ChevronRight, PackageOpen, ShoppingBasket,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
@@ -66,6 +66,9 @@ interface TransferItem {
 interface TransferBase {
   id: string;
   from_store_id: string; from_store_name: string;
+  /** True when the SOURCE is the central grocery (raw_materials.current_stock),
+   *  not a store_location — from_store_id is empty in that case. */
+  from_central: boolean;
   to_store_id: string; to_store_name: string;
   status: TransferStatus; note: string;
   requested_by: string; requested_at: string | null;
@@ -85,6 +88,15 @@ const numOr0 = (s?: string) => {
   return s != null && s !== '' && Number.isFinite(n) ? n : 0;
 };
 const PAGE_SIZE = 20;
+
+/** Sentinel `from` value selecting the CENTRAL GROCERY as the transfer source
+ *  (raw_materials.current_stock) rather than a store_location. */
+const CENTRAL_SRC = '__central__';
+
+/** Human label for a transfer's source — 'Grocery' for a central-grocery
+ *  source, else the source store's name. */
+const sourceLabel = (t: { from_central: boolean; from_store_name: string }) =>
+  t.from_central ? 'Grocery' : t.from_store_name;
 
 /** A quantity rendered in the bar convention when the material packs, else plain. */
 function qtyText(qty: number, m: PackMeta): string {
@@ -171,6 +183,9 @@ function CBLEntry({ mat, value, onChange, compact }: {
 export default function TransfersPage() {
   const [stores, setStores] = useState<StoreLite[]>([]);
   const [accessByStore, setAccessByStore] = useState<Record<string, Access>>({});
+  // Elevated = admin / manager / store-manager / HOD — the set allowed to raise
+  // and issue a CENTRAL GROCERY source transfer (grocery has no per-store grant).
+  const [elevated, setElevated] = useState(false);
   const [bootLoading, setBootLoading] = useState(true);
   const [bootError, setBootError] = useState<string | null>(null);
 
@@ -200,9 +215,15 @@ export default function TransfersPage() {
     let cancelled = false;
     (async () => {
       try {
-        const r = await fetch('/api/stores');
+        const [r, meR] = await Promise.all([
+          fetch('/api/stores'),
+          fetch('/api/auth/me'),
+        ]);
         const j = await r.json();
         if (j.error) throw new Error(j.error);
+        const meJ = await meR.json().catch(() => ({}));
+        const u = meJ.user || null;
+        const isElevated = !!u && (u.role === 'admin' || u.role === 'manager' || u.is_store_manager || u.is_head_chef);
         const active: StoreLite[] = (j.stores || []).filter((s: any) => s.is_active);
         const accEntries = await Promise.all(active.map(async s => {
           const ar = await fetch(`/api/stores/${s.id}/my-access`);
@@ -211,6 +232,7 @@ export default function TransfersPage() {
         }));
         if (cancelled) return;
         setStores(active);
+        setElevated(isElevated);
         setAccessByStore(Object.fromEntries(accEntries));
       } catch (e: any) {
         if (!cancelled) setBootError(e.message);
@@ -248,10 +270,13 @@ export default function TransfersPage() {
   const filtered = useMemo(() => {
     const raw = q.trim().toLowerCase();
     return transfers.filter(t => {
-      if (fromFilter && t.from_store_id !== fromFilter) return false;
+      if (fromFilter) {
+        if (fromFilter === CENTRAL_SRC) { if (!t.from_central) return false; }
+        else if (t.from_central || t.from_store_id !== fromFilter) return false;
+      }
       if (toFilter && t.to_store_id !== toFilter) return false;
       if (!raw) return true;
-      return `${t.from_store_name} ${t.to_store_name} ${t.note} ${t.requested_by} ${t.id}`.toLowerCase().includes(raw);
+      return `${sourceLabel(t)} ${t.to_store_name} ${t.note} ${t.requested_by} ${t.id}`.toLowerCase().includes(raw);
     });
   }, [transfers, fromFilter, toFilter, q]);
 
@@ -272,7 +297,7 @@ export default function TransfersPage() {
   const exportCsv = () => {
     const rows = filtered.map(t => ({
       id: t.id,
-      from: t.from_store_name,
+      from: sourceLabel(t),
       to: t.to_store_name,
       status: t.status,
       items: t.item_count,
@@ -385,6 +410,7 @@ export default function TransfersPage() {
           <select value={fromFilter} onChange={e => setFromFilter(e.target.value)}
                   className="px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0]">
             <option value="">Any source</option>
+            <option value={CENTRAL_SRC}>Grocery (central)</option>
             {stores.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </label>
@@ -461,7 +487,10 @@ export default function TransfersPage() {
                       <tr key={t.id} className="hover:bg-[#FFF8F0] cursor-pointer" onClick={() => setDetailId(t.id)}>
                         <td className="px-3 py-2">
                           <div className="text-[#2D1B0E] font-medium flex items-center gap-1.5">
-                            <Wine className="w-3.5 h-3.5 text-[#af4408]" /> {t.from_store_name}
+                            {t.from_central
+                              ? <ShoppingBasket className="w-3.5 h-3.5 text-[#af4408]" />
+                              : <Wine className="w-3.5 h-3.5 text-[#af4408]" />}
+                            {sourceLabel(t)}
                             <ChevronRight className="w-3.5 h-3.5 text-[#8B7355]" /> {t.to_store_name}
                           </div>
                           {t.note && <div className="text-[10px] text-[#8B7355] mt-0.5 truncate max-w-[280px]">{t.note}</div>}
@@ -499,7 +528,10 @@ export default function TransfersPage() {
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="text-sm font-medium text-[#2D1B0E] flex items-center gap-1 flex-wrap">
-                        <Wine className="w-3.5 h-3.5 text-[#af4408]" /> {t.from_store_name}
+                        {t.from_central
+                          ? <ShoppingBasket className="w-3.5 h-3.5 text-[#af4408]" />
+                          : <Wine className="w-3.5 h-3.5 text-[#af4408]" />}
+                        {sourceLabel(t)}
                         <ChevronRight className="w-3.5 h-3.5 text-[#8B7355]" /> {t.to_store_name}
                       </div>
                       {t.note && <div className="text-[10px] text-[#8B7355] mt-0.5 break-words">{t.note}</div>}
@@ -536,14 +568,14 @@ export default function TransfersPage() {
 
       {showCreate && (
         <CreateModal
-          stores={stores} accessByStore={accessByStore}
+          stores={stores} accessByStore={accessByStore} elevated={elevated}
           onClose={() => setShowCreate(false)}
           onSaved={msg => { setShowCreate(false); afterWrite(msg); }}
         />
       )}
       {detailId && (
         <DetailModal
-          transferId={detailId} accessByStore={accessByStore}
+          transferId={detailId} accessByStore={accessByStore} elevated={elevated}
           onClose={() => setDetailId(null)}
           onChanged={msg => { setDetailId(null); afterWrite(msg); }}
         />
@@ -579,12 +611,13 @@ interface Line { key: string; material_id: string; cbl: CBL; note: string; }
 let lineSeq = 0;
 const newLine = (): Line => ({ key: `l${++lineSeq}`, material_id: '', cbl: { ...CBL_EMPTY }, note: '' });
 
-function CreateModal({ stores, accessByStore, onClose, onSaved }: {
-  stores: StoreLite[]; accessByStore: Record<string, Access>;
+function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
+  stores: StoreLite[]; accessByStore: Record<string, Access>; elevated: boolean;
   onClose: () => void; onSaved: (msg: string) => void;
 }) {
   const viewable = stores.filter(s => accessByStore[s.id]?.can_view);
   const [from, setFrom] = useState('');
+  const fromCentral = from === CENTRAL_SRC;
   const [to, setTo] = useState('');
   const [note, setNote] = useState('');
   const [lines, setLines] = useState<Line[]>([newLine()]);
@@ -593,8 +626,12 @@ function CreateModal({ stores, accessByStore, onClose, onSaved }: {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // Source-store catalog (what it can issue). Prefer the items route; fall back
-  // to the store's /stock `materials` when items isn't available.
+  // Source catalog (what the source can issue).
+  //  • CENTRAL GROCERY: the raw_materials universe held in the central grocery
+  //    (beverages + groceries). scope=all bypasses the dept whitelist and
+  //    exclude_store_mapped=1 drops liquor (which lives in the store ledger, not
+  //    grocery) so the picker stays grocery-relevant.
+  //  • STORE source: prefer the store's items route; fall back to /stock.
   useEffect(() => {
     if (!from) { setItems([]); return; }
     let cancelled = false;
@@ -602,25 +639,35 @@ function CreateModal({ stores, accessByStore, onClose, onSaved }: {
     (async () => {
       try {
         let list: ItemMeta[] = [];
-        const r = await fetch(`/api/stores/${from}/items`);
-        if (r.ok) {
-          const j = await r.json();
-          list = (j.items || []) as ItemMeta[];
-        } else {
-          const sr = await fetch(`/api/stores/${from}/stock`);
-          const sj = await sr.json().catch(() => ({}));
-          list = (sj.materials || []).map((m: any) => ({
+        if (fromCentral) {
+          const r = await fetch('/api/inventory?scope=all&exclude_store_mapped=1');
+          const j = await r.json().catch(() => ({}));
+          list = (j.materials || []).map((m: any) => ({
             material_id: m.id, name: m.name, category: m.category, unit: m.unit,
             pack_size: Number(m.pack_size) || 1, case_size: Number(m.case_size) || 1,
             average_price: Number(m.average_price) || 0,
           }));
+        } else {
+          const r = await fetch(`/api/stores/${from}/items`);
+          if (r.ok) {
+            const j = await r.json();
+            list = (j.items || []) as ItemMeta[];
+          } else {
+            const sr = await fetch(`/api/stores/${from}/stock`);
+            const sj = await sr.json().catch(() => ({}));
+            list = (sj.materials || []).map((m: any) => ({
+              material_id: m.id, name: m.name, category: m.category, unit: m.unit,
+              pack_size: Number(m.pack_size) || 1, case_size: Number(m.case_size) || 1,
+              average_price: Number(m.average_price) || 0,
+            }));
+          }
         }
         if (!cancelled) setItems(list);
       } catch { if (!cancelled) setItems([]); }
       finally { if (!cancelled) setItemsLoading(false); }
     })();
     return () => { cancelled = true; };
-  }, [from]);
+  }, [from, fromCentral]);
 
   const matLite: MaterialLite[] = useMemo(
     () => items.map(m => ({ id: m.material_id, name: m.name, category: m.category, unit: m.unit })),
@@ -639,14 +686,17 @@ function CreateModal({ stores, accessByStore, onClose, onSaved }: {
 
   const save = async () => {
     setErr(null);
-    if (!from) { setErr('Pick a source store'); return; }
+    if (!from) { setErr('Pick a source'); return; }
     if (!to) { setErr('Pick a destination floor'); return; }
-    if (from === to) { setErr('Source and destination must differ'); return; }
+    if (!fromCentral && from === to) { setErr('Source and destination must differ'); return; }
     if (validLines.length === 0) { setErr('Add at least one material with a quantity'); return; }
     setBusy(true);
     try {
       const payload = {
-        from, to, note: note.trim(),
+        from_store_id: fromCentral ? '' : from,
+        to_store_id: to,
+        from_central: fromCentral,
+        note: note.trim(),
         items: validLines.map(l => {
           const m = metaById.get(l.material_id) || null;
           return { material_id: l.material_id, qty_requested: cblRecipe(m, l.cbl), note: l.note.trim() };
@@ -676,9 +726,10 @@ function CreateModal({ stores, accessByStore, onClose, onSaved }: {
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
-          <L>From (source store)</L>
+          <L>From (source)</L>
           <select value={from} onChange={e => { setFrom(e.target.value); setLines([newLine()]); }} className={inputCls}>
             <option value="">Select source…</option>
+            {elevated && <option value={CENTRAL_SRC}>Grocery (central)</option>}
             {viewable.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </div>
@@ -752,8 +803,8 @@ function CreateModal({ stores, accessByStore, onClose, onSaved }: {
 
 type Mode = 'view' | 'issue' | 'receive';
 
-function DetailModal({ transferId, accessByStore, onClose, onChanged }: {
-  transferId: string; accessByStore: Record<string, Access>;
+function DetailModal({ transferId, accessByStore, elevated, onClose, onChanged }: {
+  transferId: string; accessByStore: Record<string, Access>; elevated: boolean;
   onClose: () => void; onChanged: (msg: string) => void;
 }) {
   const [t, setT] = useState<TransferFull | null>(null);
@@ -777,10 +828,15 @@ function DetailModal({ transferId, accessByStore, onClose, onChanged }: {
 
   const fromAcc = t ? accessByStore[t.from_store_id] : undefined;
   const toAcc = t ? accessByStore[t.to_store_id] : undefined;
-  const canIssue = t?.status === 'requested' && !!(fromAcc?.can_procure || fromAcc?.can_adjust);
+  // Grocery source (from_central) has no per-store grant — issuing/cancelling it
+  // is gated on elevation (admin/manager/store-manager/HOD), mirroring the API.
+  const canIssue = t?.status === 'requested' &&
+    (t.from_central ? elevated : !!(fromAcc?.can_procure || fromAcc?.can_adjust));
   const canReceive = t?.status === 'issued' && !!(toAcc?.can_close_stock || toAcc?.can_adjust);
   const canCancel = t?.status === 'requested' &&
-    !!(fromAcc?.can_procure || fromAcc?.can_adjust || toAcc?.can_view);
+    (t.from_central
+      ? (elevated || !!toAcc?.can_view)
+      : !!(fromAcc?.can_procure || fromAcc?.can_adjust || toAcc?.can_view));
 
   // Seed the qty form when entering issue/receive.
   const startMode = (next: Mode) => {
@@ -823,7 +879,7 @@ function DetailModal({ transferId, accessByStore, onClose, onChanged }: {
     } catch (e: any) { setErr(e.message); setBusy(false); }
   };
 
-  const title = t ? `${t.from_store_name} → ${t.to_store_name}` : 'Transfer';
+  const title = t ? `${sourceLabel(t)} → ${t.to_store_name}` : 'Transfer';
 
   return (
     <ModalShell title={title} icon={<ArrowRightLeft className="w-5 h-5 text-[#af4408]" />} onClose={onClose} wide
@@ -882,7 +938,9 @@ function DetailModal({ transferId, accessByStore, onClose, onChanged }: {
           {mode !== 'view' && (
             <div className="text-xs text-[#6B5744] bg-blue-50 border border-blue-200 rounded-lg px-2.5 py-1.5">
               {mode === 'issue'
-                ? 'Set the quantity issued per line (defaults to requested). This debits the source store ledger.'
+                ? (t.from_central
+                    ? 'Set the quantity issued per line (defaults to requested). This debits the central grocery stock.'
+                    : 'Set the quantity issued per line (defaults to requested). This debits the source store ledger.')
                 : 'Set the quantity received per line (defaults to issued). Any shortfall is recorded as a discrepancy.'}
             </div>
           )}

@@ -16,8 +16,11 @@ import {
  *
  * PATCH /api/stores/transfers/[id]
  *   { action: 'issue' | 'receive' | 'cancel', items?: [...] }
- *     issue   — items:[{material_id, qty_issued}]  (debits SOURCE store).
- *               Gate: source can_procure OR can_adjust. Only 'requested'.
+ *     issue   — items:[{material_id, qty_issued}]  (debits SOURCE).
+ *               Store source → gate: source can_procure OR can_adjust.
+ *               Grocery source (from_central) → gate: elevated (admin/manager/
+ *               store-manager/HOD); issue debits raw_materials.current_stock.
+ *               Only 'requested'.
  *     receive — items:[{material_id, qty_received}] (credits DEST store).
  *               Gate: dest can_close_stock OR can_adjust. Only 'issued'.
  *     cancel  — no items. Gate: view on source or dest. Only 'requested'.
@@ -72,9 +75,17 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     const items = Array.isArray(b?.items) ? b.items : [];
 
     if (action === 'issue') {
-      const src = userStoreAccess(db, me, existing.from_store_id);
-      if (!(src.can_procure || src.can_adjust)) {
-        return Response.json({ error: `You are not authorized to issue stock from ${existing.from_store_name}` }, { status: 403 });
+      if (existing.from_central) {
+        // Grocery source has no per-store access — issuing debits the central
+        // grocery, so require elevation (admin / manager / store-manager / HOD).
+        if (!isElevated(me)) {
+          return Response.json({ error: 'You are not authorized to issue stock from the central grocery' }, { status: 403 });
+        }
+      } else {
+        const src = userStoreAccess(db, me, existing.from_store_id);
+        if (!(src.can_procure || src.can_adjust)) {
+          return Response.json({ error: `You are not authorized to issue stock from ${existing.from_store_name}` }, { status: 403 });
+        }
       }
     } else if (action === 'receive') {
       const dst = userStoreAccess(db, me, existing.to_store_id);
