@@ -24,12 +24,13 @@ import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   AlertCircle, ArrowLeft, CalendarClock, CheckCircle2, ChevronDown, ChevronUp,
-  ClipboardList, Download, Loader2, Pause, Play, Search, Send, RefreshCw, X,
+  ClipboardList, Download, Loader2, Pause, Play, Search, Send, RefreshCw, Wrench, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { priorityMeta, statusMeta } from '@/lib/tasks';
+import RequestModal from '../_components/RequestModal';
 
-type TabKey = 'assigned' | 'mentioned' | 'today' | 'upcoming' | 'overdue' | 'completed';
+type TabKey = 'assigned' | 'mentioned' | 'today' | 'upcoming' | 'overdue' | 'completed' | 'requests';
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'assigned', label: 'Assigned' },
@@ -38,6 +39,7 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: 'upcoming', label: 'Upcoming' },
   { key: 'overdue', label: 'Overdue' },
   { key: 'completed', label: 'Completed' },
+  { key: 'requests', label: 'My Requests' },
 ];
 
 const ACTIVE_STATES = 'draft,assigned,accepted,in_progress,reopened,on_hold';
@@ -88,6 +90,7 @@ export default function MyTasksPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [showRequest, setShowRequest] = useState(false);
 
   // Expanded card detail (comments + evidence form).
   const [openId, setOpenId] = useState<string | null>(null);
@@ -107,6 +110,22 @@ export default function MyTasksPage() {
     if (!myEmail) return;
     setLoading(true);
     setError(null);
+
+    // "My Requests" is a distinct feed: the repair/maintenance requests THIS
+    // user raised (any status), served by the self-service intake slice keyed
+    // off the session — not the shared /api/tasks assignee/mention query.
+    if (tab === 'requests') {
+      fetch('/api/tasks/request')
+        .then((r) => r.json())
+        .then((j) => {
+          if (j.error) { setError(j.error); setRows([]); return; }
+          setRows(j.rows || []);
+        })
+        .catch((e) => { setError(e?.message || 'Failed to load requests'); setRows([]); })
+        .finally(() => setLoading(false));
+      return;
+    }
+
     const p = new URLSearchParams();
     p.set('pageSize', '200');
     if (tab === 'mentioned') {
@@ -250,9 +269,19 @@ export default function MyTasksPage() {
             <h1 className="text-xl sm:text-2xl font-bold text-[#2D1B0E]">My Tasks</h1>
             <p className="text-xs text-[#8B7355]">Your assigned work — start, pause, complete & log evidence</p>
           </div>
-          <button onClick={load} disabled={loading} className="inline-flex items-center gap-1.5 bg-white border border-[#E8D5C4] hover:border-[#af4408] text-[#2D1B0E] text-sm rounded-lg px-3 py-2 disabled:opacity-50">
-            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> Refresh
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {/* Open to EVERYONE — self-service repair/maintenance intake, not the
+                manager-only full task create. */}
+            <button
+              onClick={() => setShowRequest(true)}
+              className="inline-flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3606] text-white text-sm rounded-lg px-3 py-2"
+            >
+              <Wrench size={14} /> Raise a Request
+            </button>
+            <button onClick={load} disabled={loading} className="inline-flex items-center gap-1.5 bg-white border border-[#E8D5C4] hover:border-[#af4408] text-[#2D1B0E] text-sm rounded-lg px-3 py-2 disabled:opacity-50">
+              <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> <span className="hidden sm:inline">Refresh</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -315,9 +344,13 @@ export default function MyTasksPage() {
       )}
       {!loading && filtered.length === 0 && !error && (
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-8 text-center text-sm text-[#8B7355]">
-          {needle
-            ? `No ${TABS.find((t) => t.key === tab)?.label.toLowerCase()} tasks match "${q.trim()}".`
-            : `Nothing here — you have no ${TABS.find((t) => t.key === tab)?.label.toLowerCase()} tasks.`}
+          {tab === 'requests'
+            ? (needle
+                ? `No requests match "${q.trim()}".`
+                : 'You haven’t raised any requests yet. Tap "Raise a Request" to report a repair or maintenance issue.')
+            : (needle
+                ? `No ${TABS.find((t) => t.key === tab)?.label.toLowerCase()} tasks match "${q.trim()}".`
+                : `Nothing here — you have no ${TABS.find((t) => t.key === tab)?.label.toLowerCase()} tasks.`)}
         </div>
       )}
 
@@ -326,7 +359,9 @@ export default function MyTasksPage() {
         {filtered.map((t) => {
           const pm = priorityMeta(t.priority);
           const sm = statusMeta(t.status);
-          const actions = actionsFor(t.status);
+          // On the "My Requests" feed the viewer is the requester, not the
+          // assignee, so start/pause/complete controls don't apply.
+          const actions = tab === 'requests' ? [] : actionsFor(t.status);
           const overdue = t.due_date && t.due_date < todayISO() && !['completed', 'approved', 'cancelled'].includes(t.status);
           const isOpen = openId === t.id;
           return (
@@ -461,6 +496,20 @@ export default function MyTasksPage() {
           );
         })}
       </div>
+
+      {/* Self-service repair/maintenance intake — open to every signed-in user. */}
+      {showRequest && (
+        <RequestModal
+          onClose={() => setShowRequest(false)}
+          onSubmitted={(msg) => {
+            setShowRequest(false);
+            setNotice(msg);
+            // Surface the new request immediately: jump to (and reload) the feed.
+            if (tab === 'requests') load();
+            else { setOpenId(null); setDetail(null); setTab('requests'); }
+          }}
+        />
+      )}
     </div>
   );
 }
