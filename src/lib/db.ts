@@ -1880,6 +1880,25 @@ function initializeSchema(db: Database.Database) {
       );
       CREATE INDEX IF NOT EXISTS idx_print_jobs_created ON print_jobs(created_at DESC);
     `);
+    // Print-agent (dispatcher) heartbeat — one row per outlet. Lets the Kitchen
+    // board tell "a dispatcher is alive and sending KOTs to the printers" apart
+    // from the bridge PROCESS being up. See src/lib/print-agent.ts.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS print_agent_heartbeat (
+        outlet_id  TEXT PRIMARY KEY,            -- '' for the NULL/default outlet
+        last_seen  TEXT NOT NULL,
+        bridge_ok  INTEGER NOT NULL DEFAULT 0,  -- was the local bridge healthy at the last ping
+        agent_url  TEXT DEFAULT '',
+        user_agent TEXT DEFAULT '',
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      -- Hot-path indexes: getPrintAgentStatus (recent-fire count) runs on every
+      -- kitchen poll; the KOT-alert sweep + auto-resolve probe print_jobs by
+      -- ref_id. Both tables grow unbounded, so keep these scans off full-table.
+      CREATE INDEX IF NOT EXISTS idx_kots_created ON kots(created_at);
+      CREATE INDEX IF NOT EXISTS idx_print_jobs_ref ON print_jobs(ref_id);
+    `);
+
     // Add fleet columns to print_stations if an older deployment created it first.
     const psCols = db.prepare("PRAGMA table_info(print_stations)").all() as any[];
     if (!psCols.some((c: any) => c.name === 'floor'))         db.exec(`ALTER TABLE print_stations ADD COLUMN floor TEXT DEFAULT ''`);

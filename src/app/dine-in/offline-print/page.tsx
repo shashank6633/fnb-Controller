@@ -6,7 +6,7 @@ import { probeBridge, bridgePrint, bridgeStatus, getBridgeUrl, setBridgeUrl, typ
 import { counts as outboxCounts, retryFailed, drainOutbox, ensureDrainLoop } from '@/lib/offline-print/outbox';
 import {
   Printer, Plus, Trash2, Loader2, X, Wifi, WifiOff, RefreshCw, Save,
-  CheckCircle2, XCircle, FlaskConical, ChevronDown, ChevronRight, Download,
+  CheckCircle2, XCircle, FlaskConical, ChevronDown, ChevronRight, Download, AlertTriangle,
 } from 'lucide-react';
 
 interface Station {
@@ -53,6 +53,9 @@ export default function OfflinePrintPage() {
   // internet outage so KOTs still print. Stored in settings under 'counter_offline_url'.
   const [counterOfflineUrl, setCounterOfflineUrl] = useState('');
   const [savingOfflineUrl, setSavingOfflineUrl] = useState(false);
+  // Dispatcher liveness — is a /print/agent open and sending KOTs? Distinct from
+  // the bridge PROCESS being up (the "connected" dot above).
+  const [agentStatus, setAgentStatus] = useState<{ online: boolean; secondsAgo: number | null; lastSeen: string | null } | null>(null);
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 4000); };
 
@@ -78,6 +81,9 @@ export default function OfflinePrintPage() {
     setProbing(false);
   }, []);
   const refreshQueue = useCallback(async () => { try { setQueue(await outboxCounts()); } catch { /* idb unavailable */ } }, []);
+  const loadAgentStatus = useCallback(async () => {
+    try { const r = await api('/api/dine-in/print-agent/status'); if (r.ok) setAgentStatus((await r.json()).agent || null); } catch { /* ignore */ }
+  }, []);
 
   useEffect(() => {
     setBridgeUrlState(getBridgeUrl());
@@ -86,14 +92,16 @@ export default function OfflinePrintPage() {
       .then((r) => r.json())
       .then((d) => setCounterOfflineUrl(d?.value || ''))
       .catch(() => {});
-    loadStations(); loadJobs(); loadMenuStations(); checkBridge(); refreshQueue();
+    loadStations(); loadJobs(); loadMenuStations(); checkBridge(); refreshQueue(); loadAgentStatus();
     ensureDrainLoop();
     // Auto-reconnect: silently re-probe the bridge every 4s (no "Checking…"
     // flicker), so when the bridge starts/restarts the page connects itself —
     // the operator never has to click Refresh.
     const t = setInterval(() => { refreshQueue(); probeBridge().then(setHealth); }, 4000);
-    return () => clearInterval(t);
-  }, [loadStations, loadJobs, loadMenuStations, checkBridge, refreshQueue]);
+    // Dispatcher liveness moves slower than the bridge probe — poll it every 10s.
+    const ta = setInterval(loadAgentStatus, 10000);
+    return () => { clearInterval(t); clearInterval(ta); };
+  }, [loadStations, loadJobs, loadMenuStations, checkBridge, refreshQueue, loadAgentStatus]);
 
   const retryQueue = async () => {
     await retryFailed();
@@ -244,6 +252,25 @@ export default function OfflinePrintPage() {
         <div className="mt-3 flex items-center gap-2">
           <input value={bridgeUrl} onChange={(e) => setBridgeUrlState(e.target.value)} placeholder="http://localhost:9920" className={`${inputCls} flex-1`} />
           <button onClick={saveBridgeUrl} className="flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-3 py-2 rounded-lg text-sm font-medium"><Save className="w-4 h-4" /> Set</button>
+        </div>
+      </div>
+
+      {/* Print Agent (dispatcher) liveness — SEPARATE from the bridge PROCESS
+          above. The bridge dot proves the bridge is running; this proves a
+          /print/agent page is open and actually sending KOTs to it. */}
+      <div className={`bg-white border rounded-xl p-4 flex items-start gap-3 ${agentStatus && !agentStatus.online ? 'border-red-300' : 'border-[#E8D5C4]'}`}>
+        {agentStatus?.online
+          ? <CheckCircle2 className="w-5 h-5 text-green-600 shrink-0 mt-0.5" />
+          : <AlertTriangle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />}
+        <div>
+          <p className="font-semibold text-[#2D1B0E]">
+            {agentStatus?.online ? 'Print Agent running' : 'Print Agent not detected'}
+          </p>
+          <p className="text-xs text-[#8B7355]">
+            {agentStatus?.online
+              ? `A dispatcher is open and sending KOTs to the printers${typeof agentStatus.secondsAgo === 'number' ? ` · last check-in ${agentStatus.secondsAgo}s ago` : ''}.`
+              : <>No dispatcher has checked in{agentStatus?.lastSeen ? ' recently' : ' yet'}. Open <code className="bg-[#FFF1E3] px-1 rounded">/print/agent</code> on this counter PC and leave the tab open — it&apos;s what actually sends KOTs to the printers.</>}
+          </p>
         </div>
       </div>
 

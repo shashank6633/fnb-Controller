@@ -97,9 +97,17 @@ export default function PrintAgent() {
     return () => { es.close(); clearInterval(pollTimer); };
   }, [printKot, pushLog, refreshQueue]);
 
-  // Poll bridge health + queue + housekeeping.
+  // Poll bridge health + queue + housekeeping, and beat the dispatcher heartbeat
+  // so the Kitchen board knows a /print/agent is alive on this counter PC (the
+  // bridge dot only proves the bridge PROCESS is up, not that this page is open).
   useEffect(() => {
-    const tick = async () => { setHealth(await probeBridge()); refreshQueue(); prunePrinted().catch(() => {}); };
+    const tick = async () => {
+      const h = await probeBridge();
+      setHealth(h);
+      refreshQueue();
+      prunePrinted().catch(() => {});
+      api('/api/dine-in/print-agent/heartbeat', { method: 'POST', body: { bridgeOk: !!h, url: getBridgeUrl() } }).catch(() => {});
+    };
     tick();
     const t = setInterval(tick, 5000);
     return () => clearInterval(t);

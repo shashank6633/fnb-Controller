@@ -42,6 +42,7 @@ export default function KitchenPage() {
   const [live, setLive] = useState(false);
   const [, setTick] = useState(0);
   const [alerts, setAlerts] = useState<KotAlert[]>([]);
+  const [agent, setAgent] = useState<{ online: boolean; watchdog: boolean; secondsAgo: number | null } | null>(null);
   const esRef = useRef<EventSource | null>(null);
 
   const load = useCallback(async (st: string) => {
@@ -58,6 +59,7 @@ export default function KitchenPage() {
       const r = await api('/api/dine-in/kot-alerts?open=1');
       const j = await r.json();
       setAlerts(j.alerts || []);
+      setAgent(j.agent || null);
     } catch (_) {}
   }, []);
 
@@ -127,6 +129,24 @@ export default function KitchenPage() {
           </button>
         ))}
       </TabScroller>
+
+      {agent?.watchdog && (
+        <div className="mb-4 rounded-xl border-2 border-red-600 bg-red-700 text-white shadow-lg p-4">
+          <div className="flex items-start gap-3">
+            <AlertTriangle size={22} className="animate-pulse shrink-0 mt-0.5" />
+            <div className="text-sm">
+              <p className="font-bold tracking-wide">PRINT AGENT NOT RUNNING — orders are not reaching the printers.</p>
+              <p className="text-[13px] text-red-100/90 mt-1">
+                Open the Print Agent on the counter PC and leave it running:{' '}
+                <span className="font-mono bg-red-900/50 px-1.5 py-0.5 rounded">/print/agent</span>.
+                {typeof agent.secondsAgo === 'number'
+                  ? ` No dispatcher has checked in for ${agent.secondsAgo >= 120 ? `${Math.round(agent.secondsAgo / 60)} min` : `${agent.secondsAgo}s`}.`
+                  : ' No dispatcher has checked in yet.'}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {alerts.length > 0 && (
         <div className="mb-4 rounded-xl border-2 border-red-500 bg-red-600 text-white shadow-lg overflow-hidden">

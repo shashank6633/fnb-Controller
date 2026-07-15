@@ -117,15 +117,66 @@ export function sweepDirectKotDeliveries(db: Database.Database, outletId: string
     return 0; // never let the sweep break the alerts list
   }
 
+  // Is ANY kitchen (KOT-role, non-master) printer actually configured? If not,
+  // every KOT is silently dropped at print time (resolveKotPrinter → null) — so
+  // say exactly that instead of "check the X printer" (there is no X printer).
+  let hasKotPrinter = true;
+  try {
+    hasKotPrinter = !!db.prepare(
+      `SELECT 1 FROM print_stations
+       WHERE role = 'kot' AND is_active = 1 AND COALESCE(is_master, 0) = 0
+         AND (outlet_id = ? OR outlet_id IS NULL) LIMIT 1`
+    ).get(outletId); // outlet-scoped, like the stale-KOT query above — one outlet's
+  } catch { hasKotPrinter = true; } // printer must not mask another's missing one
+
   let n = 0;
   for (const k of stale) {
     const ok = raiseKotAlert(db, {
       kotId: k.kot_id, orderId: k.order_id, outletId: k.outlet_id,
       kotNumber: k.kot_number, station: k.station, tableNumber: k.table_number, serverId: k.server_id,
-      reason: `Self-order KOT #${k.kot_number} not confirmed at the printer — please check ${k.station || 'the kitchen'} printer.`,
+      reason: hasKotPrinter
+        ? `Self-order KOT #${k.kot_number} not confirmed at the printer — please check ${k.station || 'the kitchen'} printer.`
+        : `Self-order KOT #${k.kot_number} could not print — no kitchen (KOT) printer is set up. Add one under Printers.`,
       kind: 'unprinted', createdBy: 'system',
     });
     if (ok) n++;
   }
   return n;
+}
+
+/**
+ * Auto-close alerts that have since sorted themselves out, so the Kitchen board
+ * doesn't accumulate stale "action needed" rows a human must dismiss by hand.
+ * An 'unprinted'/'print_failed' alert clears once EITHER the KOT actually printed
+ * (a print_jobs row for it reached 'printed') OR the kitchen picked it up (its
+ * status advanced past 'new' — they clearly saw it on the KDS). Human-raised
+ * ('manual') and hard fire failures ('fire_failed') are left for a human to
+ * close. Scoped to the outlet; idempotent; never throws. Returns #rows resolved.
+ */
+export function autoResolveKotAlerts(db: Database.Database, outletId: string | null): number {
+  try {
+    const r = db.prepare(`
+      UPDATE kot_alerts
+      SET resolved_at = datetime('now')
+      WHERE resolved_at IS NULL
+        AND kind IN ('unprinted', 'print_failed')
+        AND kot_id IS NOT NULL
+        AND (outlet_id = ? OR outlet_id IS NULL)
+        AND (
+          -- THIS KOT's own station ticket printed. Exclude the master/expediter
+          -- consolidated copy: it is journaled under ref_id = fireKey (a real KOT
+          -- id, the batch's smallest) with id 'master_…', so without this filter a
+          -- printed expediter copy would clear that one KOT's alert even if its own
+          -- station never printed. Per-station jobs are id 'kot_…'.
+          EXISTS (SELECT 1 FROM print_jobs j
+                    WHERE j.ref_id = kot_alerts.kot_id AND j.status = 'printed'
+                      AND j.id NOT LIKE 'master_%')
+          -- …or the kitchen has clearly picked it up (advanced past 'new').
+          OR EXISTS (SELECT 1 FROM kots k WHERE k.id = kot_alerts.kot_id AND k.status <> 'new')
+        )
+    `).run(outletId);
+    return r.changes || 0;
+  } catch {
+    return 0; // never let auto-resolve break the alerts list
+  }
 }

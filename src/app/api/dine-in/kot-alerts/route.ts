@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { sweepDirectKotDeliveries } from '@/lib/kot-alerts';
+import { sweepDirectKotDeliveries, autoResolveKotAlerts } from '@/lib/kot-alerts';
+import { getPrintAgentStatus } from '@/lib/print-agent';
 
 /**
  * GET  /api/dine-in/kot-alerts?open=1 — list UNRESOLVED KOT escalations for the
@@ -18,8 +19,10 @@ export async function GET(request: Request) {
     const outletId = await getCurrentOutletId();
     const open = new URL(request.url).searchParams.get('open');
 
-    // Auto-detect self-order KOTs that fired but never confirmed at the printer.
+    // Auto-detect self-order KOTs that fired but never confirmed at the printer,
+    // then clear any alert that has since printed / been picked up by the kitchen.
     sweepDirectKotDeliveries(db, outletId);
+    autoResolveKotAlerts(db, outletId);
 
     let where = '(outlet_id = ? OR outlet_id IS NULL)';
     const params: any[] = [outletId];
@@ -33,7 +36,11 @@ export async function GET(request: Request) {
       ORDER BY created_at DESC
     `).all(...params) as any[];
 
-    return Response.json({ alerts });
+    // Dispatcher liveness rides along so the Kitchen board can raise a watchdog
+    // banner (orders flowing but no /print/agent running) without a second poll.
+    const agent = getPrintAgentStatus(db, outletId);
+
+    return Response.json({ alerts, agent });
   } catch (e: any) {
     console.error('[/api/dine-in/kot-alerts GET]', e);
     return Response.json({ error: e.message }, { status: 500 });
