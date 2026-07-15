@@ -55,8 +55,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       SELECT id, name, category, unit, purchase_unit, pack_size FROM raw_materials WHERE id = ?
     `).get(materialId) as any;
     if (!mat) return Response.json({ error: 'Material not found' }, { status: 404 });
+    // Owned (category-mapped) OR actually held via this store's ledger — a
+    // receiving FLOOR owns no categories but must be able to adjust (e.g. write
+    // off a broken bottle) the stock transferred into it. 'opening' still
+    // requires zero ledger history below, so it stays owner-only in practice.
     if (materialStoreId(db, mat) !== storeId) {
-      return Response.json({ error: `"${mat.name}" is not a ${store.name} material — its category "${mat.category}" is not mapped to this store (Settings → Store Locations)` }, { status: 400 });
+      const held = db.prepare('SELECT 1 FROM store_stock_ledger WHERE store_id = ? AND material_id = ? LIMIT 1').get(storeId, materialId);
+      if (!held) {
+        return Response.json({ error: `"${mat.name}" is not a ${store.name} material — its category "${mat.category}" is not mapped to this store (Settings → Store Locations)` }, { status: 400 });
+      }
     }
 
     if (txnType === 'opening') {

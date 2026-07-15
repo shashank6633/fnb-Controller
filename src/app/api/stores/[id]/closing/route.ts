@@ -191,8 +191,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       }
       const mat = db.prepare('SELECT id, name, category, unit FROM raw_materials WHERE id = ?').get(materialId) as any;
       if (!mat) return Response.json({ error: `Material not found: ${materialId}` }, { status: 404 });
+      // A store may count a material it OWNS (category-mapped) OR one it actually
+      // HOLDS via its ledger — receiving FLOORS own no categories, so a
+      // transferred-in bottle is only reachable through its ledger history. This
+      // mirrors the union storeItemList() uses to build the count list.
       if (materialStoreId(db, mat) !== storeId) {
-        return Response.json({ error: `"${mat.name}" is not a ${store.name} material — its category "${mat.category}" is not mapped to this store` }, { status: 400 });
+        const held = db.prepare('SELECT 1 FROM store_stock_ledger WHERE store_id = ? AND material_id = ? LIMIT 1').get(storeId, materialId);
+        if (!held) {
+          return Response.json({ error: `"${mat.name}" is not a ${store.name} material — its category "${mat.category}" is not mapped to this store and it holds no stock here` }, { status: 400 });
+        }
       }
       // Optional per-item note (per-row Notes column). Absent/blank → fall back
       // to the batch-level note (which itself defaults to '').

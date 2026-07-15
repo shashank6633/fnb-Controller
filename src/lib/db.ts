@@ -2643,6 +2643,58 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('store_closing_counts schema failed:', e); }
 
+  // ── Store→Store transfers (Multi-floor bar, Phase 1, additive) ────────────
+  // A REQUISITION/TRANSFER header + its line items moving stock between two
+  // store_locations (central LIQUOR STORE → floor bars). Lifecycle:
+  //   requested → issued → received   (or requested → cancelled)
+  // NO stock moves live here — the header/items are a workflow register. The
+  // actual stock movement is TWO signed store_stock_ledger rows (txn_type
+  // 'transfer', ref = transfer id): a NEGATIVE row on the FROM store at ISSUE
+  // and a POSITIVE row on the TO store at RECEIVE (see store-engine.ts
+  // issueTransfer / receiveTransfer). In-transit = qty_issued − qty_received;
+  // per-item discrepancy (loss in transit) = qty_issued − qty_received. The
+  // from-store weighted-avg unit_cost rides the ledger rows so valuation
+  // follows the stock. Purely additive — no existing table is touched.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS store_transfers (
+        id           TEXT PRIMARY KEY,
+        from_store_id TEXT NOT NULL,
+        to_store_id   TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'requested',  -- requested|issued|received|cancelled
+        note          TEXT DEFAULT '',
+        requested_by  TEXT DEFAULT '',                    -- actor email
+        requested_at  TEXT,
+        issued_by     TEXT DEFAULT '',
+        issued_at     TEXT,
+        received_by   TEXT DEFAULT '',
+        received_at   TEXT,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (from_store_id) REFERENCES store_locations(id),
+        FOREIGN KEY (to_store_id)   REFERENCES store_locations(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS store_transfer_items (
+        id            TEXT PRIMARY KEY,
+        transfer_id   TEXT NOT NULL,
+        material_id   TEXT NOT NULL,
+        qty_requested REAL NOT NULL DEFAULT 0,   -- recipe units
+        qty_issued    REAL NOT NULL DEFAULT 0,   -- recipe units (set at issue)
+        qty_received  REAL NOT NULL DEFAULT 0,   -- recipe units (set at receive)
+        note          TEXT DEFAULT '',
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (transfer_id) REFERENCES store_transfers(id),
+        FOREIGN KEY (material_id) REFERENCES raw_materials(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_store_transfers_status ON store_transfers(status);
+      CREATE INDEX IF NOT EXISTS idx_store_transfers_from   ON store_transfers(from_store_id);
+      CREATE INDEX IF NOT EXISTS idx_store_transfers_to     ON store_transfers(to_store_id);
+      CREATE INDEX IF NOT EXISTS idx_store_transfer_items_transfer ON store_transfer_items(transfer_id);
+    `);
+  } catch (e) { console.error('store_transfers schema failed:', e); }
+
   // ── Config-audit fingerprint (evidence instrumentation, 2026-07-13) ────────
   // Prod complaint: "user roles & permission settings change on every deploy."
   // A byte-diff boot test proved the boot path does NOT mutate users/roles, but

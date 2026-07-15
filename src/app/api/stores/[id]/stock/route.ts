@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { getStoreById, storeCategories, storeStock, userStoreAccess } from '@/lib/store-engine';
+import { getStoreById, storeCategories, storeStock, storeItemList, userStoreAccess } from '@/lib/store-engine';
 
 /**
  * GET /api/stores/[id]/stock — everything the store inventory page needs.
@@ -9,14 +9,15 @@ import { getStoreById, storeCategories, storeStock, userStoreAccess } from '@/li
  *
  * → {
  *     store, access,
- *     stock:   [ONE row per mapped material (zero-ledger materials included at
- *               qty 0) + any material with ledger history whose category was
- *               since unmapped. Enriched with purchase_unit/pack_size/case_size/
- *               reorder_level/sku + central_stock (raw_materials.current_stock),
- *               average_price and has_ledger — the page shows an "In central"
- *               hint + admin Migrate action from those],
- *     materials: [all materials whose category is mapped to this store — the
- *                 procure/adjust typeahead source],
+ *     stock:   [ONE row per store material — the union of category-mapped
+ *               materials (owner store) and any material with a ledger row here
+ *               (so a RECEIVING floor lists what it holds/received). Zero-ledger
+ *               mapped materials appear at qty 0. Enriched with purchase_unit/
+ *               pack_size/case_size/reorder_level/sku + central_stock
+ *               (raw_materials.current_stock), average_price and has_ledger — the
+ *               page shows an "In central" hint + admin Migrate action],
+ *     materials: [the store's material universe (mapped UNION ledger) — the
+ *                 procure/adjust/closing typeahead source],
  *     categories: [mapped category names],
  *     recent_suppliers: [latest distinct ledger suppliers],
  *     vendors: [{id,name}] active vendor master for the optional vendor select,
@@ -39,24 +40,46 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       return Response.json({ error: `You are not authorized to view ${store.name}` }, { status: 403 });
     }
 
-    // Base stock rows (recipe-unit qty + weighted-avg cost) from the engine,
-    // enriched with the display fields the page needs (pack conversion, low-stock).
+    // Base stock rows (recipe-unit qty + weighted-avg cost) from the engine.
     const base = storeStock(db, storeId);
-    const meta = new Map<string, any>();
-    for (const m of db.prepare(`
-      SELECT rm.id, rm.name, rm.category, rm.unit, rm.sku, rm.purchase_unit,
-             rm.pack_size, rm.case_size, rm.reorder_level,
-             COALESCE(rm.priority, 2) AS priority,
-             rm.current_stock, rm.average_price
-      FROM raw_materials rm
-      JOIN store_category_map scm
-        ON scm.store_id = ? AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
-    `).all(storeId) as any[]) meta.set(m.id, m);
 
-    // ONE row per mapped material: ledger-backed rows keep their engine qty /
-    // weighted-avg cost; mapped-but-empty materials appear at qty 0 (their
-    // valuation basis is central average_price). Materials with ledger history
-    // whose category was since unmapped stay visible (engine row, no meta).
+    // Material universe for THIS store = category-mapped (owner store) UNION any
+    // material with a ledger row here (so a RECEIVING floor lists exactly what it
+    // has been transferred → enables per-floor closing + stock display). The
+    // central Liquor Store is unaffected: its union ≈ its mapped set.
+    const items = storeItemList(db, storeId);
+    // Display-only columns the engine helper doesn't carry (sku / purchase_unit /
+    // reorder_level / central current_stock / priority), fetched per union id.
+    const extra = new Map<string, any>();
+    const ids = items.map(i => i.material_id);
+    if (ids.length) {
+      const ph = ids.map(() => '?').join(',');
+      for (const x of db.prepare(`
+        SELECT id, sku, purchase_unit, reorder_level, current_stock,
+               COALESCE(priority, 2) AS priority
+        FROM raw_materials WHERE id IN (${ph})
+      `).all(...ids) as any[]) extra.set(x.id, x);
+    }
+    // meta = one enrichment record per union material (merges engine item meta
+    // with the display-only columns above), keyed by material id.
+    const meta = new Map<string, any>();
+    for (const i of items) {
+      const x = extra.get(i.material_id) || {};
+      meta.set(i.material_id, {
+        id: i.material_id, name: i.name, category: i.category, unit: i.unit,
+        sku: x.sku ?? '',
+        purchase_unit: x.purchase_unit || i.unit,
+        pack_size: i.pack_size, case_size: i.case_size,
+        reorder_level: Number(x.reorder_level) || 0,
+        priority: Number(x.priority) || 2,
+        current_stock: Number(x.current_stock) || 0,
+        average_price: i.average_price,
+      });
+    }
+
+    // ONE row per union material: ledger-backed rows keep their engine qty /
+    // weighted-avg cost; mapped-but-empty (or not-yet-received) materials appear
+    // at qty 0 (their valuation basis is central average_price).
     const ledgered = new Map(base.map(r => [r.material_id, r]));
     const enrich = (r: any, m: any) => ({
       ...r,
@@ -85,16 +108,18 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
         }, m)),
     ].sort((a, b) => String(a.material_name).localeCompare(String(b.material_name)));
 
-    // Typeahead source: every material in a mapped category (active stores only
-    // claim categories — this store was found by id, so filter on its own map).
-    const materials = db.prepare(`
-      SELECT rm.id, rm.name, rm.sku, rm.category, rm.unit, rm.purchase_unit,
-             rm.pack_size, rm.case_size, rm.reorder_level, rm.average_price
-      FROM raw_materials rm
-      JOIN store_category_map scm
-        ON scm.store_id = ? AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
-      ORDER BY rm.name COLLATE NOCASE
-    `).all(storeId) as any[];
+    // Typeahead source: the store's material universe (mapped UNION ledger),
+    // already name-sorted by storeItemList. A receiving floor lists what it
+    // holds; the central Liquor Store still lists its mapped categories.
+    const materials = items.map(i => {
+      const m = meta.get(i.material_id)!;
+      return {
+        id: m.id, name: m.name, sku: m.sku, category: m.category, unit: m.unit,
+        purchase_unit: m.purchase_unit, pack_size: m.pack_size,
+        case_size: m.case_size, reorder_level: m.reorder_level,
+        average_price: m.average_price,
+      };
+    });
 
     const recent_suppliers = (db.prepare(`
       SELECT supplier FROM store_stock_ledger
