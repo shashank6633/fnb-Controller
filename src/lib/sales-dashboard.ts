@@ -132,6 +132,44 @@ export interface SalesDashboard {
   byPaymentCategory: Bucket[];
   byPaymentStatus: { sales: number; refund: number; cancelled: { amount: number; count: number } };
   cancelBreakup: { itemCancel: { amount: number; count: number }; orderCancel: { amount: number; count: number } };
+  floorPnl: FloorPnl[];
+}
+
+export interface FloorPnl { floor: string; sales: number; cost: number; grossProfit: number; gpPct: number; orders: number }
+
+/**
+ * Per-floor profit & loss for the range: menu SALES vs food COST (COGS) → gross
+ * profit, grouped by the table's zone. Revenue + cost come from the `sales`
+ * item-fact table (total_revenue / total_cost) joined to the order's table zone;
+ * only 'normal' bill types count (NC/comp excluded). Sales with no order/table
+ * (imports, parcels) fall into an 'Other'/'Takeaway/Delivery' bucket so the
+ * totals still reconcile. sales.date is already the IST settle day.
+ */
+export function getFloorPnl(
+  db: Database.Database, outletId: string | null, from: string, to: string,
+): FloorPnl[] {
+  const rows = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(TRIM(rt.zone), ''),
+        CASE WHEN o.id IS NULL THEN 'Other'
+             WHEN o.order_type = 'dine-in' THEN 'Unassigned'
+             ELSE 'Takeaway/Delivery' END) AS floor,
+      COALESCE(SUM(s.total_revenue), 0) AS sales,
+      COALESCE(SUM(s.total_cost), 0)    AS cost,
+      COUNT(DISTINCT s.order_id)        AS orders
+    FROM sales s
+    LEFT JOIN orders o ON o.id = s.order_id
+    LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
+    WHERE s.date BETWEEN ? AND ? AND (s.outlet_id = ? OR s.outlet_id IS NULL)
+      AND COALESCE(s.bill_type, 'normal') = 'normal'
+    GROUP BY floor
+    ORDER BY sales DESC
+  `).all(from, to, outletId) as any[];
+  return rows.map((r) => {
+    const sales = r2(r.sales), cost = r2(r.cost);
+    const gp = r2(sales - cost);
+    return { floor: String(r.floor), sales, cost, grossProfit: gp, gpPct: sales ? r2((gp / sales) * 100) : 0, orders: Number(r.orders) || 0 };
+  });
 }
 
 export interface ItemWiseRow { name: string; type: string; qty: number; amount: number }
@@ -237,5 +275,6 @@ export function getSalesDashboard(
       itemCancel: { amount: 0, count: 0 }, // no per-item cancel log today; order-level below
       orderCancel: { amount: r2(orderCancel.amount), count: Number(orderCancel.count) || 0 },
     },
+    floorPnl: getFloorPnl(db, outletId, from, to),
   };
 }

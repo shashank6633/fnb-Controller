@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { resolveTableByToken, priceLookup, getCustomerMenuDesign } from '@/lib/customer';
+import { normMobile, otpChannelReady, hasVerifiedMobile } from '@/lib/customer-otp';
 import { fireStagingOrder } from '@/lib/kot-fire';
 import { raiseKotAlert } from '@/lib/kot-alerts';
 import { emitKds } from '@/lib/kds-bus';
@@ -62,6 +63,29 @@ export async function POST(req: Request) {
     const note = String(body?.note || '').slice(0, 300);
     const orderId = generateId();
 
+    // ── WhatsApp OTP gate (Settings → Customer Menu, otpMode) ────────────────
+    // Require a verified mobile before a captain-less order fires. If the OTP
+    // channel isn't ready (WhatsApp not connected / no template / provider down)
+    // we NEVER block — the order falls back to captain approval instead.
+    const design = getCustomerMenuDesign();
+    const orderMode = design.orderMode;
+    const reqMobile = normMobile(body?.mobile);
+    const otpRequired = design.otpMode === 'all' || (design.otpMode === 'direct' && orderMode === 'direct');
+    let guestMobile = '';
+    let forceCaptain = false;
+    if (otpRequired) {
+      if (otpChannelReady()) {
+        if (reqMobile && hasVerifiedMobile(db, table.id, reqMobile)) {
+          guestMobile = reqMobile;
+        } else {
+          return Response.json({ ok: false, needs_otp: true, error: 'Please verify your mobile number to place this order.' }, { status: 428 });
+        }
+      } else {
+        forceCaptain = true;             // fall back to captain approval, never block
+        guestMobile = reqMobile || '';   // keep the typed number (unverified) for reference
+      }
+    }
+
     const create = db.transaction(() => {
       // Staging order: order_number 0 until the Captain approves (a real daily
       // number is only assigned on approval so rejected orders don't burn one).
@@ -70,8 +94,8 @@ export async function POST(req: Request) {
                             covers, server_id, server_name, guest_name, guest_mobile,
                             origin, notes, subtotal, tax_total, total, created_at, updated_at)
         VALUES (?, ?, 0, ?, 'pending_approval', 'dine-in', 'normal',
-                0, '', 'Customer', '', '', 'customer', ?, 0, 0, 0, datetime('now'), datetime('now'))
-      `).run(orderId, table.outlet_id, table.id, note);
+                0, '', 'Customer', '', ?, 'customer', ?, 0, 0, 0, datetime('now'), datetime('now'))
+      `).run(orderId, table.outlet_id, table.id, guestMobile, note);
 
       const insItem = db.prepare(`
         INSERT INTO order_items (id, order_id, menu_item_id, recipe_id, name, station,
@@ -94,9 +118,8 @@ export async function POST(req: Request) {
     const subtotal = create();
 
     // Direct ordering: the guest confirmed on their phone → fire the KOT now.
-    // Captain mode: leave it pending for the captain to review + send.
-    const { orderMode } = getCustomerMenuDesign();
-    if (orderMode === 'direct') {
+    // Captain mode (or OTP fallback): leave it pending for the captain to review.
+    if (orderMode === 'direct' && !forceCaptain) {
       try {
         const fired = fireStagingOrder(db, orderId, { firedBy: 'QR Order', serverId: '' });
         for (const k of fired.firedKots) emitKds({ type: 'kot.new', outlet_id: k.outlet_id, station: k.station, kot: k });

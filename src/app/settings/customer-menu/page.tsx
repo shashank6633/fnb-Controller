@@ -5,6 +5,7 @@ import { api, apiJson } from '@/lib/api';
 
 type Style = 'thumbnails' | 'chips';
 type Mode = 'captain' | 'direct';
+type OtpMode = 'off' | 'direct' | 'all';
 
 // QR-menu design tokens (QR Code menu/atoms.jsx `C`).
 const C = {
@@ -21,6 +22,7 @@ const FONTS_HREF = 'https://fonts.googleapis.com/css2?family=Instrument+Serif:it
 export default function CustomerMenuDesignPage() {
   const [style, setStyle] = useState<Style>('thumbnails');
   const [mode, setMode] = useState<Mode>('captain');
+  const [otpMode, setOtpMode] = useState<OtpMode>('off');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -34,6 +36,7 @@ export default function CustomerMenuDesignPage() {
         const j = JSON.parse(d.value || '{}');
         if (j.categoryStyle === 'chips' || j.categoryStyle === 'thumbnails') setStyle(j.categoryStyle);
         if (j.orderMode === 'direct' || j.orderMode === 'captain') setMode(j.orderMode);
+        if (j.otpMode === 'direct' || j.otpMode === 'all' || j.otpMode === 'off') setOtpMode(j.otpMode);
       } catch {}
     } catch (e: any) { setErr(e.message || 'Failed to load'); }
     finally { setLoading(false); }
@@ -41,7 +44,7 @@ export default function CustomerMenuDesignPage() {
   useEffect(() => { load(); }, [load]);
 
   // Persist the whole design object (categoryStyle + orderMode) in one setting.
-  const save = async (next: { categoryStyle: Style; orderMode: Mode }) => {
+  const save = async (next: { categoryStyle: Style; orderMode: Mode; otpMode: OtpMode }) => {
     setSaving(true); setErr(''); setSaved(false);
     try {
       await api('/api/settings', { method: 'PUT', body: { key: 'customer_menu_design', value: JSON.stringify(next) } });
@@ -49,8 +52,9 @@ export default function CustomerMenuDesignPage() {
     } catch (e: any) { setErr(e.message || 'Could not save'); }
     finally { setSaving(false); }
   };
-  const chooseStyle = (s: Style) => { setStyle(s); save({ categoryStyle: s, orderMode: mode }); };
-  const chooseMode = (m: Mode) => { setMode(m); save({ categoryStyle: style, orderMode: m }); };
+  const chooseStyle = (s: Style) => { setStyle(s); save({ categoryStyle: s, orderMode: mode, otpMode }); };
+  const chooseMode = (m: Mode) => { setMode(m); save({ categoryStyle: style, orderMode: m, otpMode }); };
+  const chooseOtp = (o: OtpMode) => { setOtpMode(o); save({ categoryStyle: style, orderMode: mode, otpMode: o }); };
 
   return (
     <div style={{ maxWidth: 860, margin: '0 auto', padding: '24px 20px 80px', fontFamily: SANS, color: C.ink }}>
@@ -95,6 +99,25 @@ export default function CustomerMenuDesignPage() {
             </div>
           )}
 
+          {/* ── WhatsApp OTP for self-orders ─────────────────────────────── */}
+          <SectionHead
+            title="WhatsApp OTP (Self-orders)"
+            desc="Require a WhatsApp-verified mobile before a self-order is accepted, so an unpaid or abandoned bill always has a real number you can call."
+          />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 18, marginBottom: 14 }}>
+            <Option active={otpMode === 'off'} disabled={saving} onClick={() => chooseOtp('off')}
+              title="Off" tagline="No OTP" desc="Guests order without verifying a number (current behaviour)." />
+            <Option active={otpMode === 'direct'} disabled={saving} onClick={() => chooseOtp('direct')}
+              title="Direct only" tagline="Recommended" desc="OTP required only for Direct (captain-less) orders — the ones with no staff checkpoint." />
+            <Option active={otpMode === 'all'} disabled={saving} onClick={() => chooseOtp('all')}
+              title="All QR orders" tagline="Strictest" desc="Every QR self-order needs a verified number, including captain-approval orders." />
+          </div>
+          {otpMode !== 'off' && (
+            <div style={{ background: C.terraTint, color: C.terraDeep, padding: '10px 14px', borderRadius: 10, margin: '0 0 34px', fontSize: 12.5, lineHeight: 1.5 }}>
+              <b>Needs WhatsApp:</b> connect WhatsApp and set an approved <b>OTP template</b> in Settings → Integrations → WhatsApp. Until that&apos;s live, self-orders safely fall back to captain approval — nothing breaks.
+            </div>
+          )}
+
           {/* ── Category display ─────────────────────────────────────────── */}
           <SectionHead
             title="Category Display"
@@ -134,7 +157,7 @@ function SectionHead({ title, desc }: { title: string; desc: string }) {
 }
 
 function Option({ active, disabled, onClick, title, tagline, desc, preview }: {
-  active: boolean; disabled: boolean; onClick: () => void; title: string; tagline: string; desc: string; preview: React.ReactNode;
+  active: boolean; disabled: boolean; onClick: () => void; title: string; tagline: string; desc: string; preview?: React.ReactNode;
 }) {
   return (
     <button onClick={onClick} disabled={disabled} style={{
@@ -149,7 +172,7 @@ function Option({ active, disabled, onClick, title, tagline, desc, preview }: {
         </div>
         <span style={{ width: 22, height: 22, borderRadius: '50%', border: `2px solid ${active ? C.terra : C.rule}`, background: active ? C.terra : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 13, flex: 'none' }}>{active ? '✓' : ''}</span>
       </div>
-      <div style={{ borderRadius: 12, overflow: 'hidden', border: `1px solid ${C.ruleSoft}`, background: C.paper }}>{preview}</div>
+      {preview && <div style={{ borderRadius: 12, overflow: 'hidden', border: `1px solid ${C.ruleSoft}`, background: C.paper }}>{preview}</div>}
       <p style={{ color: C.inkSoft, fontSize: 13, lineHeight: 1.45, margin: '12px 2px 0' }}>{desc}</p>
     </button>
   );

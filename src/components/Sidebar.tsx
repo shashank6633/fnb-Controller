@@ -238,6 +238,7 @@ const navTree: NavEntry[] = [
     items: [
       { kind: "link", label: "Departments",    href: "/departments",            icon: Building },
       { kind: "link", label: "Users",          href: "/users",                  icon: Users },
+      { kind: "link", label: "Dashboard",      href: "/settings/dashboard",     icon: BarChart3 },
       { kind: "link", label: "Roles",          href: "/settings/roles",         icon: Users },
       { kind: "link", label: "Print Design",   href: "/settings/print-design",  icon: Printer },
       { kind: "link", label: "Store Locations", href: "/settings/stores",       icon: Warehouse },

@@ -23,6 +23,7 @@ interface OrderItem { id: string; name: string; quantity: number; unit_price: nu
 interface Order {
   id: string; order_number: number; order_type: string; table_number: string | null; zone: string | null;
   covers: number; server_name: string | null; created_at: string;
+  status: string; total: number; payment_method: string | null;
   subtotal: number; discount: number; discount_pct: number; service_charge_reason: string | null;
   items: OrderItem[];
 }
@@ -46,6 +47,8 @@ export default function CashierPage() {
   const [payOpen, setPayOpen] = useState(false);
   const [billStations, setBillStations] = useState<{ floor: string }[] | null>(null); // active BILL printers
   const [printCounter, setPrintCounterState] = useState('');                          // where Print Bill sends
+  const [tab, setTab] = useState<'open' | 'online' | 'closed' | 'outstanding'>('open');
+  const [listOrders, setListOrders] = useState<any[]>([]);                             // online/closed/outstanding lists
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 3500); };
   // Contextual back: from a bill → the table list; from the list → leave the page.
@@ -87,6 +90,21 @@ export default function CashierPage() {
     setBarOpen(false);   // collapse the floating Table View so the bill fills the screen
     loadOrder(t.open_order_id);
   };
+  const selectOrder = (o: any) => { setSelId(o.id); setDiscForm(null); setScForm(null); setPayOpen(false); loadOrder(o.id); };
+
+  // Online Open (takeaway/delivery), Closed (settled) + Outstanding (on_hold) tabs.
+  const loadList = useCallback(async () => {
+    if (tab === 'open') { setListOrders([]); return; }
+    const status = tab === 'closed' ? 'settled' : tab === 'outstanding' ? 'on_hold' : 'open';
+    try {
+      const r = await api(`/api/dine-in/orders?status=${status}`);
+      const j = await r.json();
+      let its = j.items || [];
+      if (tab === 'online') its = its.filter((o: any) => !o.table_id || (o.order_type && o.order_type !== 'dine-in'));
+      setListOrders(its);
+    } catch { setListOrders([]); }
+  }, [tab]);
+  useEffect(() => { loadList(); const t = setInterval(loadList, 10000); return () => clearInterval(t); }, [loadList]);
 
   // Live breakdown via the SAME computeBill the printer/settle/PDF use.
   const items = order?.items || [];
@@ -95,7 +113,8 @@ export default function CashierPage() {
     { subtotal, itemTax: sumItemTax(items), serviceRemoved: !!order.service_charge_reason, discount_pct: order.discount_pct, discount: order.discount },
     { serviceChargeOn: design.serviceChargeOn !== false, serviceChargePct: Number(design.serviceChargePct) || 0, cgstPct: design.cgstPct == null ? 2.5 : Number(design.cgstPct), sgstPct: design.sgstPct == null ? 2.5 : Number(design.sgstPct) },
   ) : null;
-  const grand = bill ? Math.round(bill.total) : 0;
+  // A held bill's total was frozen at hold — collect exactly that, not a recompute.
+  const grand = order?.status === 'on_hold' ? Math.round(Number(order.total) || 0) : (bill ? Math.round(bill.total) : 0);
   const counters = Array.from(new Set((billStations || []).map(s => (s.floor || '').trim()).filter(Boolean)));
   const noBillPrinter = billStations !== null && billStations.length === 0;
   const pendingDisc = reqs.find(r => r.kind !== 'service_charge' && r.status === 'pending');
@@ -106,12 +125,13 @@ export default function CashierPage() {
     try {
       const r = await fn(); const j = await r.json().catch(() => ({}));
       if (!r.ok) flash(false, j.error || 'Failed');
-      else { flash(true, 'Done'); after?.(); if (selId) loadOrder(selId); loadTables(); }
+      else { flash(true, 'Done'); after?.(); if (selId) loadOrder(selId); loadTables(); loadList(); }
     } catch (e: any) { flash(false, e.message || 'Failed'); }
     setBusy('');
   };
 
   const printBill = () => selId && act('print', () => api(`/api/dine-in/orders/${selId}/print-bill`, { method: 'POST', body: { counter: printCounter } }));
+  const holdBill = () => selId && act('hold', () => api(`/api/dine-in/orders/${selId}/hold`, { method: 'POST', body: {} }), () => { setSelId(null); setOrder(null); flash(true, 'Bill held — moved to Outstanding Payment'); });
   const downloadBill = () => { if (selId) window.open(`/api/dine-in/orders/${selId}/bill-pdf`, '_blank'); };
   const submitDiscount = () => {
     if (!selId || !discForm) return;
@@ -165,12 +185,22 @@ export default function CashierPage() {
                 </select>
               </label>
             )}
-            <button onClick={loadTables} className="flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-2 rounded-lg text-sm font-medium"><RefreshCw className="w-4 h-4" /> Refresh</button>
+            <button onClick={() => { loadTables(); loadList(); }} className="flex items-center gap-1.5 text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-2 rounded-lg text-sm font-medium"><RefreshCw className="w-4 h-4" /> Refresh</button>
           </div>
         </div>
 
-        {/* No selection → occupied-table overview */}
+        {/* Tabs */}
         {!order && (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {([['open', 'Open Orders'], ['online', 'Online Open'], ['closed', 'Closed'], ['outstanding', 'Outstanding Payment']] as const).map(([k, label]) => (
+              <button key={k} onClick={() => { setTab(k); setBarOpen(false); }}
+                className={`text-sm px-3 py-1.5 rounded-full ${tab === k ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'}`}>{label}</button>
+            ))}
+          </div>
+        )}
+
+        {/* OPEN ORDERS → occupied dine-in tables */}
+        {!order && tab === 'open' && (
           <div>
             <p className="text-sm text-[#8B7355] mb-2">{occupied.length} table{occupied.length === 1 ? '' : 's'} with an open bill. Pick one here or from the Table View.</p>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
@@ -192,6 +222,28 @@ export default function CashierPage() {
                 </button>
                 );
               })}
+            </div>
+          </div>
+        )}
+
+        {/* ONLINE OPEN / CLOSED / OUTSTANDING → order lists */}
+        {!order && tab !== 'open' && (
+          <div>
+            <p className="text-sm text-[#8B7355] mb-2">{listOrders.length} {tab === 'online' ? 'online / takeaway order' : tab === 'closed' ? 'closed bill' : 'outstanding bill'}{listOrders.length === 1 ? '' : 's'}.</p>
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+              {listOrders.length === 0 && <div className="col-span-full text-center text-[#8B7355] py-12 bg-white border border-[#E8D5C4] rounded-xl">Nothing here.</div>}
+              {listOrders.map(o => (
+                <button key={o.id} onClick={() => selectOrder(o)}
+                  className={`text-left rounded-xl p-3 border bg-white hover:border-[#af4408] ${tab === 'outstanding' ? 'border-amber-300 ring-1 ring-amber-100' : 'border-[#E8D5C4]'}`}>
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="font-bold text-[#2D1B0E] truncate">{o.table_number || `#${o.order_number}`}</span>
+                    <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded shrink-0 ${tab === 'closed' ? 'text-emerald-700 bg-emerald-50' : tab === 'outstanding' ? 'text-amber-700 bg-amber-100' : 'text-sky-700 bg-sky-50'}`}>{tab === 'closed' ? 'Paid' : tab === 'outstanding' ? 'On hold' : (o.order_type || 'online')}</span>
+                  </div>
+                  <div className="text-xs text-[#8B7355] mt-0.5 truncate">#{o.order_number}{o.server_name ? ` · ${o.server_name}` : ''}</div>
+                  <div className={`text-lg font-bold mt-1 ${tab === 'outstanding' ? 'text-amber-700' : 'text-[#af4408]'}`}>{money(o.total || 0)}</div>
+                  {tab === 'closed' && o.payment_method && <div className="text-[11px] text-[#8B7355] uppercase">{o.payment_method}</div>}
+                </button>
+              ))}
             </div>
           </div>
         )}
@@ -251,13 +303,21 @@ export default function CashierPage() {
               </div>
             )}
 
-            {/* actions */}
+            {/* actions — status-aware */}
             <div className="px-4 py-3 border-t border-[#E8D5C4] flex flex-wrap items-center gap-2">
               <button onClick={printBill} disabled={!!busy} className="flex items-center gap-1.5 border border-[#af4408]/40 text-[#af4408] hover:bg-[#af4408]/10 px-3 py-2 rounded-lg text-sm font-medium disabled:opacity-50"><Printer className="w-4 h-4" /> Print Bill{printCounter ? ` · ${printCounter}` : ''}</button>
               <button onClick={downloadBill} className="flex items-center gap-1.5 border border-[#af4408]/40 text-[#af4408] hover:bg-[#af4408]/10 px-3 py-2 rounded-lg text-sm font-medium"><Download className="w-4 h-4" /> Download Bill</button>
-              <button onClick={() => { setDiscForm(discForm ? null : { pct: '', reason: '' }); setScForm(null); }} disabled={!!pendingDisc || bill.discount > 0} className="flex items-center gap-1.5 border border-[#D4B896] text-[#6B5744] hover:bg-[#FFF1E3] px-3 py-2 rounded-lg text-sm font-medium disabled:opacity-40"><Percent className="w-4 h-4" /> Request Discount</button>
-              <button onClick={() => { setScForm(scForm ? null : { reason: '' }); setDiscForm(null); }} disabled={!!pendingSc || !!order.service_charge_reason || bill.serviceCharge === 0} className="flex items-center gap-1.5 border border-[#D4B896] text-[#6B5744] hover:bg-[#FFF1E3] px-3 py-2 rounded-lg text-sm font-medium disabled:opacity-40"><BadgePercent className="w-4 h-4" /> Waive Service Charge</button>
-              <button onClick={() => setPayOpen(true)} disabled={!!busy || items.length === 0} className="flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2 rounded-lg text-sm font-semibold ml-auto disabled:opacity-50"><Wallet className="w-4 h-4" /> Pay {money(grand)}</button>
+              {order.status === 'open' && (
+                <>
+                  <button onClick={() => { setDiscForm(discForm ? null : { pct: '', reason: '' }); setScForm(null); }} disabled={!!pendingDisc || bill.discount > 0} className="flex items-center gap-1.5 border border-[#D4B896] text-[#6B5744] hover:bg-[#FFF1E3] px-3 py-2 rounded-lg text-sm font-medium disabled:opacity-40"><Percent className="w-4 h-4" /> Request Discount</button>
+                  <button onClick={() => { setScForm(scForm ? null : { reason: '' }); setDiscForm(null); }} disabled={!!pendingSc || !!order.service_charge_reason || bill.serviceCharge === 0} className="flex items-center gap-1.5 border border-[#D4B896] text-[#6B5744] hover:bg-[#FFF1E3] px-3 py-2 rounded-lg text-sm font-medium disabled:opacity-40"><BadgePercent className="w-4 h-4" /> Waive Service Charge</button>
+                  <button onClick={holdBill} disabled={!!busy || items.length === 0} className="flex items-center gap-1.5 border border-amber-400 text-amber-700 hover:bg-amber-50 px-3 py-2 rounded-lg text-sm font-medium disabled:opacity-50"><Clock className="w-4 h-4" /> Hold Bill</button>
+                </>
+              )}
+              {(order.status === 'open' || order.status === 'on_hold') && (
+                <button onClick={() => setPayOpen(true)} disabled={!!busy || items.length === 0} className="flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2 rounded-lg text-sm font-semibold ml-auto disabled:opacity-50"><Wallet className="w-4 h-4" /> {order.status === 'on_hold' ? 'Collect' : 'Pay'} {money(grand)}</button>
+              )}
+              {order.status === 'settled' && <span className="ml-auto text-sm font-semibold text-emerald-700 inline-flex items-center gap-1"><CheckCircle2 className="w-4 h-4" /> Paid · {(order.payment_method || '').toUpperCase()}</span>}
             </div>
 
             {/* discount request form */}

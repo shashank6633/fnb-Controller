@@ -29,6 +29,8 @@ export const WA_CONFIG_KEYS = [
   'wa_webhook_verify_token',  // secret — masked on read
   'wa_interakt_api_key',      // secret — masked on read (Interakt Basic auth key)
   'wa_notifications_enabled', // '1' | '0' master switch
+  'wa_otp_template',          // approved OTP/authentication template name (for QR OTP)
+  'wa_otp_template_lang',     // OTP template language code (default 'en')
 ] as const;
 export type WaConfigKey = typeof WA_CONFIG_KEYS[number];
 
@@ -223,7 +225,7 @@ export async function sendWhatsAppTemplate(
   templateName: string,
   languageCode: string,
   bodyParams: (string | number)[],
-  opts?: { headerParams?: (string | number)[] },
+  opts?: { headerParams?: (string | number)[]; otpButtonCode?: string },
 ): Promise<WaSendResult> {
   const raw = getWaConfigRaw();
   if (!isWaConfigured(raw)) return { ok: false, reason: 'not_configured' };
@@ -242,6 +244,10 @@ export async function sendWhatsAppTemplate(
       }
       if (bodyParams && bodyParams.length) {
         components.push({ type: 'body', parameters: bodyParams.map(v => ({ type: 'text', text: String(v) })) });
+      }
+      if (opts?.otpButtonCode) {
+        // Meta AUTHENTICATION (OTP) template — the copy-code button carries the code.
+        components.push({ type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: String(opts.otpButtonCode) }] });
       }
 
       const template: any = { name: templateName, language: { code: lang } };

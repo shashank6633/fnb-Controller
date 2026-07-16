@@ -1705,6 +1705,10 @@ function initializeSchema(db: Database.Database) {
     // When the bill was last printed for this order — highlights the table on the
     // cashier floor as "asked for the bill / about to free up".
     if (!hasOrd('bill_printed_at'))       db.exec(`ALTER TABLE orders ADD COLUMN bill_printed_at TEXT`);
+    // Bill-on-hold: a finalised bill the cashier parked as UNPAID (status
+    // 'on_hold'); it frees the table and shows under Outstanding Payment until
+    // settled. held_at = when it was parked.
+    if (!hasOrd('held_at'))               db.exec(`ALTER TABLE orders ADD COLUMN held_at TEXT`);
     // Per-item prep timer + completion: prep_minutes snapshot from the menu item,
     // fired_at when it went to the kitchen (timer start), completed_at when the
     // captain marks it received. Bill is gated until every fired item completes.
@@ -2557,6 +2561,27 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_order_payments_order ON order_payments(order_id);
     `);
   } catch (e) { console.error('cashier billing schema failed:', e); }
+
+  // ── Customer QR OTP (additive) ───────────────────────────────────────────
+  // WhatsApp OTP for QR self-orders: capture a verified mobile before a captain-
+  // less order fires, so an abandoned/unpaid bill has a real number to call.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS customer_otps (
+        id          TEXT PRIMARY KEY,
+        outlet_id   TEXT,
+        table_id    TEXT,
+        mobile      TEXT NOT NULL,
+        code_hash   TEXT NOT NULL,
+        attempts    INTEGER NOT NULL DEFAULT 0,
+        sent_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at  TEXT NOT NULL,
+        verified_at TEXT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_customer_otps_lookup ON customer_otps(table_id, mobile, created_at);
+    `);
+  } catch (e) { console.error('customer_otps schema failed:', e); }
 
   // ── Multi-Store Inventory Engine — FOUNDATION (Phase A, additive) ─────────
   // Named store locations (first: LIQUOR STORE) that own their own stock,

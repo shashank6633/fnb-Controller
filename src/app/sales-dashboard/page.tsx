@@ -20,6 +20,7 @@ interface Totals { gross: number; discount: number; charges: number; netBeforeTa
 interface Perf { orders: number; avgOrderValue: number; avgOrderTimeMin: number; covers: number; avgPerCover: number }
 interface Bucket { label: string; amount: number; count: number; pct: number }
 interface ItemType { type: string; amount: number; pct: number }
+interface FloorPnl { floor: string; sales: number; cost: number; grossProfit: number; gpPct: number; orders: number }
 interface Dash {
   range: { from: string; to: string; monthFrom: string };
   day: Totals; mtd: Totals;
@@ -28,6 +29,7 @@ interface Dash {
   collectionByBusiness: Bucket[]; bySession: Bucket[]; byPaymentCategory: Bucket[];
   byPaymentStatus: { sales: number; refund: number; cancelled: { amount: number; count: number } };
   cancelBreakup: { itemCancel: { amount: number; count: number }; orderCancel: { amount: number; count: number } };
+  floorPnl: FloorPnl[];
 }
 
 // ── small presentational pieces (styled like the reference) ──────────────────
@@ -97,6 +99,108 @@ function BucketCard({ title, rows, totalLabel }: { title: string; rows: Bucket[]
   );
 }
 
+const gpColor = (p: number) => (p >= 65 ? 'text-emerald-700' : p >= 55 ? 'text-amber-600' : 'text-red-600');
+function FloorSalesCard({ rows, showPnl }: { rows: FloorPnl[]; showPnl: boolean }) {
+  const tSales = rows.reduce((s, r) => s + r.sales, 0);
+  const tCost = rows.reduce((s, r) => s + r.cost, 0);
+  const tGp = tSales - tCost;
+  const tOrders = rows.reduce((s, r) => s + r.orders, 0);
+  const cols = showPnl ? 6 : 3;
+  return (
+    <div className={`bg-white border border-[#E8D5C4] rounded-xl overflow-hidden break-inside-avoid ${showPnl ? '' : 'max-w-xl'}`}>
+      <div className="px-4 py-2 bg-[#F5EDE2] text-center text-[11px] font-bold tracking-wide text-[#6B5744] uppercase">{showPnl ? 'P&L by Floor — Sales, Cost & Gross Profit' : 'Sales by Floor'}</div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-[13px]">
+          <thead className="text-[10px] uppercase text-[#8B7355] border-b border-[#F0E6D8]">
+            <tr>
+              <th className="text-left px-4 py-2">Floor</th>
+              <th className="text-right px-4 py-2">Sales</th>
+              {showPnl && <th className="text-right px-4 py-2">Food Cost</th>}
+              {showPnl && <th className="text-right px-4 py-2">Gross Profit</th>}
+              {showPnl && <th className="text-right px-4 py-2">GP %</th>}
+              <th className="text-right px-4 py-2">Orders</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#F0E6D8]">
+            {rows.length === 0 && <tr><td colSpan={cols} className="text-center text-[#8B7355] py-6">No sales in this range.</td></tr>}
+            {rows.map((r) => (
+              <tr key={r.floor}>
+                <td className="px-4 py-2 font-medium text-[#2D1B0E]">{r.floor}</td>
+                <td className="px-4 py-2 text-right tabular-nums font-semibold text-[#af4408]">{money(r.sales)}</td>
+                {showPnl && <td className="px-4 py-2 text-right tabular-nums text-[#8B7355]">{money(r.cost)}</td>}
+                {showPnl && <td className="px-4 py-2 text-right tabular-nums font-semibold text-[#2D1B0E]">{money(r.grossProfit)}</td>}
+                {showPnl && <td className={`px-4 py-2 text-right tabular-nums font-semibold ${gpColor(r.gpPct)}`}>{pctS(r.gpPct)}</td>}
+                <td className="px-4 py-2 text-right tabular-nums text-[#8B7355]">{r.orders}</td>
+              </tr>
+            ))}
+          </tbody>
+          {rows.length > 0 && (
+            <tfoot>
+              <tr className="bg-[#FAF4EC] font-bold text-[#2D1B0E] border-t border-[#E8D5C4]">
+                <td className="px-4 py-2">Total</td>
+                <td className="px-4 py-2 text-right tabular-nums">{money(tSales)}</td>
+                {showPnl && <td className="px-4 py-2 text-right tabular-nums">{money(tCost)}</td>}
+                {showPnl && <td className="px-4 py-2 text-right tabular-nums">{money(tGp)}</td>}
+                {showPnl && <td className={`px-4 py-2 text-right tabular-nums ${gpColor(tSales ? (tGp / tSales) * 100 : 0)}`}>{pctS(tSales ? (tGp / tSales) * 100 : 0)}</td>}
+                <td className="px-4 py-2 text-right tabular-nums">{tOrders}</td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Running (open) orders grouped by floor — from the open-orders list, client-side.
+// Open orders aren't costed yet, so this is the running amount only (no P&L).
+function RunningByFloorCard({ orders }: { orders: any[] }) {
+  const map = new Map<string, { floor: string; amount: number; orders: number }>();
+  for (const o of orders) {
+    const f = String(o.zone || '').trim() || (o.table_number ? 'Unassigned' : 'Parcel/Other');
+    const cur = map.get(f) || { floor: f, amount: 0, orders: 0 };
+    cur.amount += Number(o.total) || 0; cur.orders += 1; map.set(f, cur);
+  }
+  const rows = [...map.values()].sort((a, b) => b.amount - a.amount);
+  const tAmount = rows.reduce((s, r) => s + r.amount, 0);
+  const tOrders = rows.reduce((s, r) => s + r.orders, 0);
+  return (
+    <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden max-w-xl">
+      <div className="px-4 py-2 bg-[#F5EDE2] text-center text-[11px] font-bold tracking-wide text-[#6B5744] uppercase">Running Orders by Floor</div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-[13px]">
+          <thead className="text-[10px] uppercase text-[#8B7355] border-b border-[#F0E6D8]">
+            <tr>
+              <th className="text-left px-4 py-2">Floor</th>
+              <th className="text-right px-4 py-2">Running Amount</th>
+              <th className="text-right px-4 py-2">Orders</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#F0E6D8]">
+            {rows.length === 0 && <tr><td colSpan={3} className="text-center text-[#8B7355] py-6">No running orders.</td></tr>}
+            {rows.map((r) => (
+              <tr key={r.floor}>
+                <td className="px-4 py-2 font-medium text-[#2D1B0E]">{r.floor}</td>
+                <td className="px-4 py-2 text-right tabular-nums font-semibold text-[#af4408]">{money(r.amount)}</td>
+                <td className="px-4 py-2 text-right tabular-nums text-[#8B7355]">{r.orders}</td>
+              </tr>
+            ))}
+          </tbody>
+          {rows.length > 0 && (
+            <tfoot>
+              <tr className="bg-[#FAF4EC] font-bold text-[#2D1B0E] border-t border-[#E8D5C4]">
+                <td className="px-4 py-2">Total</td>
+                <td className="px-4 py-2 text-right tabular-nums">{money(tAmount)}</td>
+                <td className="px-4 py-2 text-right tabular-nums">{tOrders}</td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+    </div>
+  );
+}
+
 // ── page ─────────────────────────────────────────────────────────────────────
 type Tab = 'daily' | 'running' | 'items';
 
@@ -104,6 +208,7 @@ export default function SalesDashboardPage() {
   const [from, setFrom] = useState(todayISO());
   const [to, setTo] = useState(todayISO());
   const [tab, setTab] = useState<Tab>('daily');
+  const [pnlOn, setPnlOn] = useState(false);   // admin enables floor P&L detail (cost/GP/GP%) in Settings → Dashboard
   const [data, setData] = useState<Dash | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
@@ -130,6 +235,11 @@ export default function SalesDashboardPage() {
   }, [from, to]);
 
   useEffect(() => { load(); }, [load]);
+
+  // Admin can enable floor P&L detail (food cost / gross profit / GP%) in Settings → Dashboard.
+  useEffect(() => {
+    fetch('/api/settings?key=floor_pnl_enabled').then(r => r.json()).then(d => setPnlOn(d?.value === '1')).catch(() => {});
+  }, []);
 
   useEffect(() => {
     let ignore = false;
@@ -166,7 +276,7 @@ export default function SalesDashboardPage() {
         </div>
 
         {/* Tabs */}
-        <div className="flex items-center gap-1.5 print:hidden">
+        <div className="flex items-center gap-1.5 print:hidden flex-wrap">
           {([['daily', 'Daily Dashboard', BarChart3], ['running', 'Running Orders', ListOrdered], ['items', 'Item-wise Sales', Utensils]] as const).map(([k, label, Icon]) => (
             <button key={k} onClick={() => setTab(k)}
               className={`flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-full ${tab === k ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'}`}>
@@ -218,7 +328,11 @@ export default function SalesDashboardPage() {
           </div>
         )}
 
+        {/* Sales by Floor — completed sales, inside the Daily Dashboard */}
+        {tab === 'daily' && data && <FloorSalesCard rows={data.floorPnl} showPnl={pnlOn} />}
+
         {/* RUNNING ORDERS */}
+        {tab === 'running' && <RunningByFloorCard orders={running} />}
         {tab === 'running' && (
           <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
             <div className="overflow-x-auto">

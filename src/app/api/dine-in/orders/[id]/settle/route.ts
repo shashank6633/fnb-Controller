@@ -42,7 +42,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as any;
     if (!order) return Response.json({ error: 'Order not found' }, { status: 404 });
-    if (order.status !== 'open') return Response.json({ error: 'Order is not open' }, { status: 409 });
+    // 'open' → full settle. 'on_hold' → payment-only (the sales/inventory + totals
+    // were already finalised when the bill was put on hold).
+    const fromHold = order.status === 'on_hold';
+    if (order.status !== 'open' && !fromHold) return Response.json({ error: 'Order is not open' }, { status: 409 });
 
     // Authorization — settling closes the bill, writes sales rows + deducts stock,
     // so it must be gated (it previously only checked sign-in). Allow a
@@ -79,7 +82,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       billDesign,
     );
     const taxTotal = Math.round((bill.cgst + bill.sgst) * 100) / 100;
-    const grand = Math.round(bill.total); // GRAND TOTAL (rounded) — what's collected
+    // A held bill's total was frozen at hold time — collect exactly that.
+    const grand = Math.round(fromHold ? Number(order.total) : bill.total);
 
     // Resolve payment(s): either a split { payments: [{method, amount}] } that must
     // total the grand amount, or a single { payment_method }. Validated here so a
@@ -126,7 +130,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
 
     const settle = db.transaction(() => {
-      for (const it of items) {
+      // A held bill already wrote its sales/inventory rows — don't double-write.
+      for (const it of (fromHold ? [] : items)) {
         // pos_id from the menu item (stable link); fall back to none.
         const mi = it.menu_item_id
           ? db.prepare('SELECT pos_id FROM menu_items WHERE id = ?').get(it.menu_item_id) as any
@@ -156,13 +161,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         });
       }
       // Store the computed breakdown before marking settled so the settled row
-      // is the single source of truth for the charged amounts.
-      db.prepare(`
-        UPDATE orders SET status = 'settled', payment_method = ?,
-          service_charge = ?, discount = ?, tax_total = ?, total = ?,
-          settled_at = datetime('now'), updated_at = datetime('now')
-        WHERE id = ?
-      `).run(primaryMethod, bill.serviceCharge, bill.discount, taxTotal, bill.total, id);
+      // is the single source of truth for the charged amounts. A held bill's
+      // totals were frozen at hold time → only record the payment + close it.
+      if (fromHold) {
+        db.prepare(`UPDATE orders SET status = 'settled', payment_method = ?, settled_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`)
+          .run(primaryMethod, id);
+      } else {
+        db.prepare(`
+          UPDATE orders SET status = 'settled', payment_method = ?,
+            service_charge = ?, discount = ?, tax_total = ?, total = ?,
+            settled_at = datetime('now'), updated_at = datetime('now')
+          WHERE id = ?
+        `).run(primaryMethod, bill.serviceCharge, bill.discount, taxTotal, bill.total, id);
+      }
       // Record each tender line (clear any prior rows first so a retry can't
       // double-insert). Powers the dashboard's payment-category breakup + split.
       db.prepare('DELETE FROM order_payments WHERE order_id = ?').run(id);

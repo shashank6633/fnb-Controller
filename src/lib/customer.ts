@@ -27,6 +27,11 @@ export interface CustomerMenuDesign {
    *  - 'direct'  : guest confirms → KOT fires straight to the kitchen, no captain step.
    */
   orderMode: 'captain' | 'direct';
+  /** WhatsApp-OTP requirement for QR self-orders:
+   *  - 'off'    : no OTP (default).
+   *  - 'direct' : OTP required only for direct (captain-less) orders.
+   *  - 'all'    : OTP required for every QR self-order. */
+  otpMode: 'off' | 'direct' | 'all';
 }
 
 /**
@@ -37,11 +42,12 @@ export interface CustomerMenuDesign {
 export function getCustomerMenuDesign(): CustomerMenuDesign {
   const db = getDb();
   const row = db.prepare("SELECT value FROM settings WHERE key = 'customer_menu_design'").get() as any;
-  const out: CustomerMenuDesign = { categoryStyle: 'thumbnails', orderMode: 'captain' };
+  const out: CustomerMenuDesign = { categoryStyle: 'thumbnails', orderMode: 'captain', otpMode: 'off' };
   try {
     const d = JSON.parse(row?.value || '{}');
     if (d.categoryStyle === 'chips' || d.categoryStyle === 'thumbnails') out.categoryStyle = d.categoryStyle;
     if (d.orderMode === 'direct' || d.orderMode === 'captain') out.orderMode = d.orderMode;
+    if (d.otpMode === 'direct' || d.otpMode === 'all' || d.otpMode === 'off') out.otpMode = d.otpMode;
   } catch {}
   return out;
 }

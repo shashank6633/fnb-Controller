@@ -9,7 +9,6 @@
 import { useEffect, useState, useCallback, useMemo, useRef, createContext } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
-import NotificationBell from '@/components/NotificationBell';
 import {
   ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search, Loader2,
   MapPin, ChevronDown, Users, WifiOff, Bell,
@@ -36,6 +35,8 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   // Customer QR-menu orders + service requests scoped to THIS captain's tables:
   // a live badge on the sidebar tab + a toast when new ones arrive.
   const [reqCount, setReqCount] = useState(0);
+  const [reqItems, setReqItems] = useState<{ id: string; text: string }[]>([]);
+  const [bellOpen, setBellOpen] = useState(false);
   const [toast, setToast] = useState<{ key: number; text: string } | null>(null);
   const seenReq = useRef<Set<string>>(new Set());
   const firstReq = useRef(true);
@@ -125,13 +126,21 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
       try {
         const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
         if (!AC) return;
-        const ctx = new AC(); const o = ctx.createOscillator(); const g = ctx.createGain();
-        o.connect(g); g.connect(ctx.destination); o.type = 'sine'; o.frequency.value = 880;
-        g.gain.setValueAtTime(0.0001, ctx.currentTime);
-        g.gain.exponentialRampToValueAtTime(0.06, ctx.currentTime + 0.02);
-        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.25);
-        o.start(); o.stop(ctx.currentTime + 0.26);
-        setTimeout(() => { try { ctx.close(); } catch {} }, 400);
+        const ctx = new AC();
+        // Louder, repeating two-tone chime (3 pulses, B5/G5) so it carries across
+        // a busy floor — the soft single beep was too easy to miss.
+        const now = ctx.currentTime;
+        [0, 0.32, 0.64].forEach((t0, i) => {
+          const o = ctx.createOscillator(); const g = ctx.createGain();
+          o.connect(g); g.connect(ctx.destination); o.type = 'sine';
+          o.frequency.value = i % 2 === 0 ? 988 : 784;   // B5 / G5 ding-dong
+          const t = now + t0;
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.exponentialRampToValueAtTime(0.3, t + 0.02);   // ~5× the old volume
+          g.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+          o.start(t); o.stop(t + 0.3);
+        });
+        setTimeout(() => { try { ctx.close(); } catch {} }, 1200);
       } catch {}
     };
     const poll = async () => {
@@ -150,6 +159,7 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
         // KOT trouble (self-order didn't print / reach the kitchen) — urgent.
         for (const al of (a?.alerts || [])) if (mine(al.server_id)) items.push({ id: 'a:' + al.id, text: `⚠ Kitchen issue · Table ${al.table_number || '—'}` });
         setReqCount(items.length);
+        setReqItems(items);
         const fresh = items.filter((it) => !seenReq.current.has(it.id));
         const present = new Set(items.map((it) => it.id));
         seenReq.current = present; // seen == currently present (so a completed+returning id can re-alert)
@@ -312,8 +322,31 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
           </div>
         </div>
         <div className="flex items-center gap-1">
-          {/* Action-inbox bell (icon-only; panel opens rightward over the main area) */}
-          <NotificationBell dark align="left" />
+          {/* Captain bell — the captain's OWN tables' orders / service requests /
+              KOT issues only, NOT the back-office requisition inbox. */}
+          <div className="relative">
+            <button onClick={() => setBellOpen((o) => !o)} className="relative p-2 text-white/60 hover:text-white active:scale-95" aria-label={reqCount > 0 ? `Notifications: ${reqCount} need your action` : 'Notifications'}>
+              <Bell className="w-4 h-4" />
+              {reqCount > 0 && <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-[#af4408] text-white text-[10px] font-bold flex items-center justify-center">{reqCount}</span>}
+            </button>
+            {bellOpen && (
+              <>
+                <div className="fixed inset-0 z-20" onClick={() => setBellOpen(false)} />
+                <div className="absolute right-0 mt-1 z-30 w-72 bg-white text-[#2D1B0E] rounded-xl shadow-lg overflow-hidden">
+                  <div className="px-4 py-2 text-[11px] font-bold uppercase tracking-wide text-[#8B7355] bg-[#FFF7EF] border-b border-[#F0E4D6]">Needs your action</div>
+                  {reqItems.length === 0 ? (
+                    <p className="px-4 py-6 text-sm text-[#8B7355] text-center">You&apos;re all caught up.</p>
+                  ) : (
+                    <div className="max-h-80 overflow-y-auto divide-y divide-[#F0E4D6]">
+                      {reqItems.map((it) => (
+                        <button key={it.id} onClick={() => { setBellOpen(false); router.push('/captain/requests'); }} className="w-full text-left px-4 py-2.5 text-sm hover:bg-[#FFF1E3]">{it.text}</button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
           <button onClick={load} className="p-2 text-white/60 hover:text-white active:scale-95"><RefreshCw className="w-4 h-4" /></button>
           <div className="relative">
             <button onClick={() => setMenuOpen((o) => !o)} className="p-2 text-white/60 hover:text-white"><MoreVertical className="w-4 h-4" /></button>
