@@ -57,7 +57,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
              rm.category, rm.current_stock, rm.average_price
       FROM raw_materials rm
       JOIN store_category_map scm
-        ON scm.store_id = ? AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
+        ON scm.store_id = ? AND REPLACE(REPLACE(REPLACE(LOWER(TRIM(scm.category)),' ',''),'-',''),'_','') = REPLACE(REPLACE(REPLACE(LOWER(TRIM(rm.category)),' ',''),'-',''),'_','')
     `).all(storeId) as any[];
     const mappedById = new Map(mapped.map(m => [m.id, m]));
 

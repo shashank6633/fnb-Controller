@@ -99,7 +99,7 @@ export async function GET(request: Request) {
       query += ` AND NOT EXISTS (
         SELECT 1 FROM store_category_map scm
         JOIN store_locations sl ON sl.id = scm.store_id
-        WHERE sl.is_active = 1 AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
+        WHERE sl.is_active = 1 AND REPLACE(REPLACE(REPLACE(LOWER(TRIM(scm.category)),' ',''),'-',''),'_','') = REPLACE(REPLACE(REPLACE(LOWER(TRIM(rm.category)),' ',''),'-',''),'_','')
       )`;
     }
     if (search) {

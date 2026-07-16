@@ -82,7 +82,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         SELECT rm.id, rm.sku, rm.purchase_unit, rm.pack_size, rm.case_size, rm.reorder_level
         FROM raw_materials rm
         JOIN store_category_map scm
-          ON scm.store_id = ? AND TRIM(scm.category) = TRIM(rm.category) COLLATE NOCASE
+          ON scm.store_id = ? AND REPLACE(REPLACE(REPLACE(LOWER(TRIM(scm.category)),' ',''),'-',''),'_','') = REPLACE(REPLACE(REPLACE(LOWER(TRIM(rm.category)),' ',''),'-',''),'_','')
       `).all(storeId) as any[]) meta.set(m.id, m);
       return base.map(r => {
         const m = meta.get(r.material_id) || {};

@@ -11,8 +11,11 @@ import { generateId, convertToMaterialUnit } from './db';
  * its stock is the SUM of signed `store_stock_ledger` quantities (recipe
  * units). Adding a Wine Cellar / Beer Store / Mini Bar later is pure data.
  *
- * Category matching is COLLATE NOCASE + TRIM everywhere (the column itself is
- * NOCASE; we still TRIM both sides so '  Rum ' matches 'rum').
+ * Category matching is separator- AND case-insensitive everywhere (see catNorm):
+ * a store mapped to 'blended malt' / 'single-malt-whiskey' matches materials
+ * spelled 'blended-malt' / 'single malt whiskey' / 'Single Malt Whiskey' — TRIM +
+ * COLLATE NOCASE alone missed internal space-vs-hyphen, silently hiding whole
+ * liquor categories from the store's material list.
  *
  * ⚠️ PHASE B GUARD (not yet enforced): store-mapped materials (liquor) must
  * never enter Central Store flows — purchases, GRN, requisition issue. Phase A
@@ -22,6 +25,14 @@ import { generateId, convertToMaterialUnit } from './db';
  * these helpers. Do not "helpfully" call these from existing flows to block
  * anything before Phase B lands.
  */
+
+// SQL expression that normalises a category for matching: lower-case, and strip
+// spaces / hyphens / underscores. So 'Single-Malt Whiskey', 'single malt whiskey'
+// and 'singlemaltwhiskey' all compare equal. Use on BOTH sides of every
+// store_category_map ↔ raw_materials.category comparison. (SQLite has no regexp;
+// nested REPLACE covers the separators real category names use.)
+export const catNorm = (col: string) =>
+  `REPLACE(REPLACE(REPLACE(LOWER(TRIM(${col})), ' ', ''), '-', ''), '_', '')`;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -141,7 +152,7 @@ export function materialStoreId(
     SELECT m.store_id
     FROM store_category_map m
     JOIN store_locations s ON s.id = m.store_id
-    WHERE s.is_active = 1 AND TRIM(m.category) = TRIM(?) COLLATE NOCASE
+    WHERE s.is_active = 1 AND ${catNorm('m.category')} = ${catNorm('?')}
     LIMIT 1
   `).get(cat) as { store_id: string } | undefined;
   return row?.store_id || null;
@@ -383,7 +394,7 @@ export function consolidatedStock(db: Database): ConsolidatedStockRow[] {
   const mappedRows = db.prepare(`
     SELECT DISTINCT rm.id AS material_id
     FROM raw_materials rm
-    JOIN store_category_map m ON TRIM(m.category) = TRIM(rm.category) COLLATE NOCASE
+    JOIN store_category_map m ON ${catNorm('m.category')} = ${catNorm('rm.category')}
     WHERE m.store_id IN (${ph})
   `).all(...activeIds) as { material_id: string }[];
 
@@ -476,7 +487,7 @@ export function storeItemList(db: Database, storeId: string): StoreItemMeta[] {
     FROM raw_materials rm
     WHERE EXISTS (
             SELECT 1 FROM store_category_map m
-            WHERE m.store_id = ? AND TRIM(m.category) = TRIM(rm.category) COLLATE NOCASE
+            WHERE m.store_id = ? AND ${catNorm('m.category')} = ${catNorm('rm.category')}
           )
        OR EXISTS (
             SELECT 1 FROM store_stock_ledger l
