@@ -19,11 +19,14 @@ export async function POST(req: Request) {
 
     const res = verifyOtp(getDb(), { tableId: table.id, mobile, code });
     if (!res.ok) {
+      // 'no_code' and 'wrong_code' return the SAME message + reason: a public
+      // endpoint must not reveal whether a given number has a live OTP at this
+      // table (presence-enumeration oracle). Granular reasons stay server-side.
       const msg = res.reason === 'expired' ? 'That code has expired — request a new one.'
         : res.reason === 'too_many_attempts' ? 'Too many wrong tries — request a new code.'
-        : res.reason === 'no_code' ? 'No code was sent — request one first.'
         : 'Incorrect code — please try again.';
-      return Response.json({ ok: false, verified: false, error: msg, reason: res.reason }, { status: 400 });
+      const publicReason = (res.reason === 'expired' || res.reason === 'too_many_attempts') ? res.reason : 'invalid';
+      return Response.json({ ok: false, verified: false, error: msg, reason: publicReason }, { status: 400 });
     }
     return Response.json({ ok: true, verified: true });
   } catch (e: any) {

@@ -109,6 +109,12 @@ export function buildBillPdf(
   doc.text('Order No:' + (order.order_number ?? '—'), M, doc.y); doc.moveDown(0.2);
   doc.text('Date:' + istDateTime(order.settled_at || order.created_at), M, doc.y); doc.moveDown(0.2);
   if (order.server_name) { doc.text('Captain Name:' + order.server_name, M, doc.y); doc.moveDown(0.2); }
+  // Guest details (QR self-order details page / captain-entered) — printed for
+  // the cashier's reference on unpaid/hold bills.
+  if (order.guest_name || order.guest_mobile) {
+    doc.text('Guest:' + [order.guest_name, order.guest_mobile].filter(Boolean).join(' · '), M, doc.y);
+    doc.moveDown(0.2);
+  }
   rule();
   doc.text('No. Of Guest: ' + (order.covers || 0), M, doc.y); doc.moveDown(0.2);
   rule();

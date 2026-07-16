@@ -1,6 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
-import { resolveTableByToken, priceLookup, getCustomerMenuDesign } from '@/lib/customer';
-import { normMobile, otpChannelReady, hasVerifiedMobile } from '@/lib/customer-otp';
+import { resolveTableByToken, priceLookup, getCustomerMenuDesign, otpAppliesToTable } from '@/lib/customer';
+import { normMobile, otpChannelReady, hasVerifiedMobile, recentSendFailed, otpSendExhausted } from '@/lib/customer-otp';
 import { fireStagingOrder } from '@/lib/kot-fire';
 import { raiseKotAlert } from '@/lib/kot-alerts';
 import { emitKds } from '@/lib/kds-bus';
@@ -70,13 +70,27 @@ export async function POST(req: Request) {
     const design = getCustomerMenuDesign();
     const orderMode = design.orderMode;
     const reqMobile = normMobile(body?.mobile);
-    const otpRequired = design.otpMode === 'all' || (design.otpMode === 'direct' && orderMode === 'direct');
+    // Guest name from the details page — for the bill/captain's reference. Saved
+    // whenever provided (any mode), never trusted for anything security-relevant.
+    const guestName = String(body?.name || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    // OTP is MANDATORY only where a captain-less order would fire: direct mode,
+    // on a table the admin put in scope (all / selected floors / selected tables).
+    // Everywhere else the details page is an optional ask — never a gate.
+    const otpRequired = design.otpMode === 'direct' && orderMode === 'direct'
+      && otpAppliesToTable(design, { id: table.id, zone: table.zone, section: table.section });
     let guestMobile = '';
     let forceCaptain = false;
     if (otpRequired) {
       if (otpChannelReady()) {
         if (reqMobile && hasVerifiedMobile(db, table.id, reqMobile)) {
           guestMobile = reqMobile;
+        } else if (reqMobile && (recentSendFailed(db, table.id, reqMobile) || otpSendExhausted(db, table.id, reqMobile))) {
+          // Channel LOOKS ready but this guest genuinely cannot verify right now:
+          // either the provider just bounced their code (expired token / paused
+          // template) or the send rate caps are exhausted. Don't 428 them into a
+          // verify loop they can never pass — fall back to captain approval.
+          forceCaptain = true;
+          guestMobile = reqMobile;       // unverified, kept for reference
         } else {
           return Response.json({ ok: false, needs_otp: true, error: 'Please verify your mobile number to place this order.' }, { status: 428 });
         }
@@ -84,6 +98,8 @@ export async function POST(req: Request) {
         forceCaptain = true;             // fall back to captain approval, never block
         guestMobile = reqMobile || '';   // keep the typed number (unverified) for reference
       }
+    } else {
+      guestMobile = reqMobile || '';     // OTP off — still keep a shared number if the guest gave one
     }
 
     const create = db.transaction(() => {
@@ -94,8 +110,8 @@ export async function POST(req: Request) {
                             covers, server_id, server_name, guest_name, guest_mobile,
                             origin, notes, subtotal, tax_total, total, created_at, updated_at)
         VALUES (?, ?, 0, ?, 'pending_approval', 'dine-in', 'normal',
-                0, '', 'Customer', '', ?, 'customer', ?, 0, 0, 0, datetime('now'), datetime('now'))
-      `).run(orderId, table.outlet_id, table.id, guestMobile, note);
+                0, '', 'Customer', ?, ?, 'customer', ?, 0, 0, 0, datetime('now'), datetime('now'))
+      `).run(orderId, table.outlet_id, table.id, guestName, guestMobile, note);
 
       const insItem = db.prepare(`
         INSERT INTO order_items (id, order_id, menu_item_id, recipe_id, name, station,

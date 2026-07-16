@@ -44,6 +44,7 @@ interface Order {
 // flags here; captains lack can_request_discount and never see the control.
 interface Me {
   id: string; name: string; role: string;
+  is_head_chef?: number | boolean;
   can_request_discount?: number | boolean;
   max_discount_pct?: number | null;
 }
@@ -123,6 +124,7 @@ export default function CaptainOrder() {
 
   // ── Upsell suggestions ("often ordered with") for the current cart ──
   const [upsell, setUpsell] = useState<UpsellItem[]>([]);
+  const [regulars, setRegulars] = useState<{ id: string; name: string; price: number; times: number }[]>([]);
 
   // Modifier sheet
   const [sheet, setSheet] = useState<MenuItem | null>(null);
@@ -179,6 +181,21 @@ export default function CaptainOrder() {
   const upsellChips = useMemo(() => upsell
     .map((u) => ({ u, m: menu.find((mi) => mi.id === u.menu_item_id) }))
     .filter((x): x is { u: UpsellItem; m: MenuItem } => !!x.m), [upsell, menu]);
+
+  // "Usually orders" — this returning guest's own most-frequent items, so the
+  // captain can add the regulars in one tap. Keyed on the order's guest mobile.
+  const guestMobile = order?.guest_mobile || '';
+  useEffect(() => {
+    if (!guestMobile || order?.status !== 'open') { setRegulars([]); return; }
+    api(`/api/dine-in/guest-regulars?mobile=${encodeURIComponent(guestMobile)}&exclude=${encodeURIComponent(id)}`)
+      .then((r) => r.json())
+      .then((j) => setRegulars(Array.isArray(j?.items) ? j.items : []))
+      .catch(() => {});
+  }, [guestMobile, order?.status, id]);
+  const regularChips = useMemo(() => regulars
+    .map((g) => ({ g, m: menu.find((mi) => mi.id === g.id) }))
+    .filter((x): x is { g: { id: string; name: string; price: number; times: number }; m: MenuItem } => !!x.m)
+    .slice(0, 6), [regulars, menu]);
 
   // 1s ticker so every fired-item count-up timer stays live. Only runs while the
   // order is open (no point ticking on a settled/closed order).
@@ -709,6 +726,20 @@ export default function CaptainOrder() {
         // (w-72 = 18rem) on md+ so it never sits over the sidebar.
         <div className="fixed bottom-0 left-0 right-0 md:left-72 bg-white border-t border-[#E8D5C4] px-3 py-2.5 z-10">
           <div className="max-w-3xl mx-auto">
+            {/* "Usually orders" — this returning guest's own regulars (from their
+                order history). One tap opens the modifier sheet like the menu. */}
+            {regularChips.length > 0 && (
+              <div className="flex flex-nowrap overflow-x-auto no-scrollbar items-center gap-1.5 mb-1.5 -mx-1 px-1 [&>*]:shrink-0 [&>*]:whitespace-nowrap">
+                <span className="text-[10px] font-semibold text-[#2D4A3A]">{order.guest_name ? `${order.guest_name.split(' ')[0]} usually orders:` : 'Usually orders:'}</span>
+                {regularChips.map(({ g, m }) => (
+                  <button key={g.id} onClick={() => openSheet(m)}
+                    className="flex items-center gap-1 bg-[#E3EEE6] border border-[#CFE0D4] text-[#2D4A3A] rounded-full px-2.5 py-1 text-[11px] font-medium active:scale-95">
+                    <Plus className="w-3 h-3 text-[#2D4A3A]" /> {g.name} · ₹{Math.round(g.price)}
+                    <span className="text-[9px] opacity-70">×{g.times}</span>
+                  </button>
+                ))}
+              </div>
+            )}
             {/* Upsell chips — "often ordered with" the current cart. One-row
                 horizontal scroll (TabScroller-style); hidden when no suggestions. */}
             {upsellChips.length > 0 && (

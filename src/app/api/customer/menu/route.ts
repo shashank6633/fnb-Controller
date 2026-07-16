@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
-import { resolveTableByToken, buildCustomerMenu, getCustomerMenuDesign } from '@/lib/customer';
+import { resolveTableByToken, buildCustomerMenu, getCustomerMenuDesign, otpAppliesToTable } from '@/lib/customer';
+import { otpChannelReady } from '@/lib/customer-otp';
 
 /**
  * GET /api/customer/menu?t=<qr_token>
@@ -24,8 +25,20 @@ export async function GET(req: Request) {
     const brand = { name: (brandRow?.value || 'Akan').toString() };
 
     // How the customer menu presents categories + which ordering workflow runs —
-    // set on Settings → Customer Menu Page Design.
-    const design = getCustomerMenuDesign();
+    // set on Settings → Customer Menu Page Design. otpReady tells the client
+    // whether the WhatsApp OTP step can actually run (provider + template set);
+    // when false the guest-details page still captures name+mobile but skips
+    // the code screen (orders fall back to captain approval server-side).
+    // otpApplies = is THIS table inside the admin's OTP scope (mirrors the
+    // orders route's enforcement so the client shows the right variant:
+    // mandatory gate vs skippable ask). The raw scope lists stay server-side.
+    const fullDesign = getCustomerMenuDesign();
+    const { otpScope: _scope, ...designPublic } = fullDesign;
+    const design = {
+      ...designPublic,
+      otpReady: otpChannelReady(),
+      otpApplies: otpAppliesToTable(fullDesign, { id: table.id, zone: table.zone, section: table.section }),
+    };
 
     const menu = buildCustomerMenu(table.outlet_id);
 

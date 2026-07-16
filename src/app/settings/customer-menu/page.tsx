@@ -5,7 +5,18 @@ import { api, apiJson } from '@/lib/api';
 
 type Style = 'thumbnails' | 'chips';
 type Mode = 'captain' | 'direct';
-type OtpMode = 'off' | 'direct' | 'all';
+type OtpMode = 'off' | 'direct';
+type ScopeKind = 'all' | 'zones' | 'sections' | 'tables';
+interface OtpScope { kind: ScopeKind; zones: string[]; sections: string[]; tableIds: string[] }
+interface TableRow { id: string; table_number: string; zone: string; section: string }
+
+// Default guest-details-page copy (mirror of GUEST_TEXT_DEFAULTS in
+// src/lib/customer.ts — that lib touches the DB so a client page can't import it).
+const TXT_DEFAULTS = {
+  guestHeading: 'A pleasure to host you',
+  guestMessage: 'May we have your name and WhatsApp number? It’s just for our billing records — and so we can reach you if your order needs a quick word. Thank you!',
+  guestFootnote: 'Your details stay with us — used only for this visit.',
+};
 
 // QR-menu design tokens (QR Code menu/atoms.jsx `C`).
 const C = {
@@ -23,6 +34,12 @@ export default function CustomerMenuDesignPage() {
   const [style, setStyle] = useState<Style>('thumbnails');
   const [mode, setMode] = useState<Mode>('captain');
   const [otpMode, setOtpMode] = useState<OtpMode>('off');
+  const [guestHeading, setGuestHeading] = useState('');
+  const [guestMessage, setGuestMessage] = useState('');
+  const [guestFootnote, setGuestFootnote] = useState('');
+  const [textDirty, setTextDirty] = useState(false);
+  const [scope, setScope] = useState<OtpScope>({ kind: 'all', zones: [], sections: [], tableIds: [] });
+  const [tables, setTables] = useState<TableRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -36,25 +53,87 @@ export default function CustomerMenuDesignPage() {
         const j = JSON.parse(d.value || '{}');
         if (j.categoryStyle === 'chips' || j.categoryStyle === 'thumbnails') setStyle(j.categoryStyle);
         if (j.orderMode === 'direct' || j.orderMode === 'captain') setMode(j.orderMode);
-        if (j.otpMode === 'direct' || j.otpMode === 'all' || j.otpMode === 'off') setOtpMode(j.otpMode);
+        // Legacy 'all' → 'direct' (captain orders are no longer force-blocked).
+        if (j.otpMode === 'off') setOtpMode('off');
+        else if (j.otpMode === 'direct' || j.otpMode === 'all') setOtpMode('direct');
+        setGuestHeading(String(j.guestHeading || ''));
+        setGuestMessage(String(j.guestMessage || ''));
+        setGuestFootnote(String(j.guestFootnote || ''));
+        const sc = j.otpScope || {};
+        if (sc.kind === 'zones' || sc.kind === 'sections' || sc.kind === 'tables' || sc.kind === 'all') {
+          setScope({
+            kind: sc.kind,
+            zones: Array.isArray(sc.zones) ? sc.zones.map(String) : [],
+            sections: Array.isArray(sc.sections) ? sc.sections.map(String) : [],
+            tableIds: Array.isArray(sc.tableIds) ? sc.tableIds.map(String) : [],
+          });
+        }
       } catch {}
     } catch (e: any) { setErr(e.message || 'Failed to load'); }
     finally { setLoading(false); }
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  // Persist the whole design object (categoryStyle + orderMode) in one setting.
-  const save = async (next: { categoryStyle: Style; orderMode: Mode; otpMode: OtpMode }) => {
+  // Tables (with their floor/section) for the scope picker — every table, so the
+  // admin can scope OTP to any floor or table set regardless of captain areas.
+  useEffect(() => {
+    apiJson<{ items: TableRow[] }>('/api/dine-in/tables?scope=all')
+      .then(r => setTables((r.items || []).map(t => ({ id: t.id, table_number: String(t.table_number), zone: String(t.zone || ''), section: String(t.section || '') }))))
+      .catch(() => {});
+  }, []);
+
+  // Persist the whole design object in one setting. Every save carries every
+  // field (incl. the guest-page text) so a mode click never wipes the copy.
+  const save = async (partial: Partial<{ categoryStyle: Style; orderMode: Mode; otpMode: OtpMode; guestHeading: string; guestMessage: string; guestFootnote: string; otpScope: OtpScope }>): Promise<boolean> => {
     setSaving(true); setErr(''); setSaved(false);
+    const next = {
+      categoryStyle: style, orderMode: mode, otpMode, otpScope: scope,
+      guestHeading: guestHeading.trim(), guestMessage: guestMessage.trim(), guestFootnote: guestFootnote.trim(),
+      ...partial,
+    };
     try {
-      await api('/api/settings', { method: 'PUT', body: { key: 'customer_menu_design', value: JSON.stringify(next) } });
+      const res = await api('/api/settings', { method: 'PUT', body: { key: 'customer_menu_design', value: JSON.stringify(next) } });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
       setSaved(true); setTimeout(() => setSaved(false), 2200);
-    } catch (e: any) { setErr(e.message || 'Could not save'); }
+      return true;
+    } catch (e: any) { setErr(e.message || 'Could not save'); return false; }
     finally { setSaving(false); }
   };
-  const chooseStyle = (s: Style) => { setStyle(s); save({ categoryStyle: s, orderMode: mode, otpMode }); };
-  const chooseMode = (m: Mode) => { setMode(m); save({ categoryStyle: style, orderMode: m, otpMode }); };
-  const chooseOtp = (o: OtpMode) => { setOtpMode(o); save({ categoryStyle: style, orderMode: mode, otpMode: o }); };
+  const chooseStyle = (s: Style) => { setStyle(s); save({ categoryStyle: s }); };
+  const chooseMode = (m: Mode) => { setMode(m); save({ orderMode: m }); };
+  const chooseOtp = (o: OtpMode) => { setOtpMode(o); save({ otpMode: o }); };
+  const chooseScopeKind = (kind: ScopeKind) => { const next = { ...scope, kind }; setScope(next); save({ otpScope: next }); };
+  const toggleZone = (zone: string) => {
+    const zones = scope.zones.includes(zone) ? scope.zones.filter(z => z !== zone) : [...scope.zones, zone];
+    const next = { ...scope, zones }; setScope(next); save({ otpScope: next });
+  };
+  const toggleSection = (section: string) => {
+    const sections = scope.sections.includes(section) ? scope.sections.filter(s => s !== section) : [...scope.sections, section];
+    const next = { ...scope, sections }; setScope(next); save({ otpScope: next });
+  };
+  const toggleTable = (id: string) => {
+    const tableIds = scope.tableIds.includes(id) ? scope.tableIds.filter(t => t !== id) : [...scope.tableIds, id];
+    const next = { ...scope, tableIds }; setScope(next); save({ otpScope: next });
+  };
+  const allZones = [...new Set(tables.map(t => t.zone).filter(Boolean))];
+  const allSections = [...new Set(tables.map(t => t.section).filter(Boolean))].sort();
+  // Grouping list for the per-table picker INCLUDES unzoned ('') so those tables
+  // can still be selected (otherwise they'd silently fire captain-less with no OTP).
+  const groupZones = [...new Set(tables.map(t => t.zone))].sort();
+  const hasUnzoned = tables.some(t => !t.zone);
+  // Empty non-'all' scope means "no tables listed" → the server treats it as ALL
+  // tables (safe: never leaves a direct table unverified). Surface that so the
+  // admin isn't surprised.
+  const scopeEmpty = (scope.kind === 'zones' && scope.zones.length === 0)
+    || (scope.kind === 'sections' && scope.sections.length === 0)
+    || (scope.kind === 'tables' && scope.tableIds.length === 0);
+  // Only clear the dirty flag when the save actually landed — a failed save
+  // must keep "Save text" active so the admin can retry.
+  const saveTexts = async () => { if (await save({})) setTextDirty(false); };
 
   return (
     <div style={{ maxWidth: 860, margin: '0 auto', padding: '24px 20px 80px', fontFamily: SANS, color: C.ink }}>
@@ -99,24 +178,152 @@ export default function CustomerMenuDesignPage() {
             </div>
           )}
 
-          {/* ── WhatsApp OTP for self-orders ─────────────────────────────── */}
+          {/* ── WhatsApp OTP for direct self-orders ──────────────────────── */}
           <SectionHead
-            title="WhatsApp OTP (Self-orders)"
-            desc="Require a WhatsApp-verified mobile before a self-order is accepted, so an unpaid or abandoned bill always has a real number you can call."
+            title="WhatsApp OTP (Direct self-orders)"
+            desc="For Direct ordering, require a WhatsApp-verified mobile before a captain-less order fires — so an unpaid or abandoned bill always has a real number you can call. Captain-Confirmation orders are never blocked: guests are politely asked for a number and can skip it."
           />
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 18, marginBottom: 14 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 18, marginBottom: 14 }}>
             <Option active={otpMode === 'off'} disabled={saving} onClick={() => chooseOtp('off')}
-              title="Off" tagline="No OTP" desc="Guests order without verifying a number (current behaviour)." />
+              title="Off" tagline="No OTP" desc="Guests order without sharing a number (current behaviour)." />
             <Option active={otpMode === 'direct'} disabled={saving} onClick={() => chooseOtp('direct')}
-              title="Direct only" tagline="Recommended" desc="OTP required only for Direct (captain-less) orders — the ones with no staff checkpoint." />
-            <Option active={otpMode === 'all'} disabled={saving} onClick={() => chooseOtp('all')}
-              title="All QR orders" tagline="Strictest" desc="Every QR self-order needs a verified number, including captain-approval orders." />
+              title="On — Direct orders" tagline="Recommended" desc="Direct (captain-less) orders on the tables you choose below need a WhatsApp-verified number before they fire." />
           </div>
           {otpMode !== 'off' && (
-            <div style={{ background: C.terraTint, color: C.terraDeep, padding: '10px 14px', borderRadius: 10, margin: '0 0 34px', fontSize: 12.5, lineHeight: 1.5 }}>
-              <b>Needs WhatsApp:</b> connect WhatsApp and set an approved <b>OTP template</b> in Settings → Integrations → WhatsApp. Until that&apos;s live, self-orders safely fall back to captain approval — nothing breaks.
+            <div style={{ background: C.terraTint, color: C.terraDeep, padding: '10px 14px', borderRadius: 10, margin: '0 0 18px', fontSize: 12.5, lineHeight: 1.5 }}>
+              <b>Needs WhatsApp:</b> connect WhatsApp and set an approved <b>OTP template</b> in Settings → Integrations → WhatsApp. Until that&apos;s live, in-scope direct orders safely fall back to captain approval — nothing breaks.
             </div>
           )}
+
+          {/* ── OTP table scope (Direct-OTP only) ────────────────────────── */}
+          {otpMode === 'direct' && (
+            <div style={{ marginBottom: 34 }}>
+              {mode !== 'direct' && (
+                <div style={{ background: C.cardElev, color: C.inkSoft, border: `1px solid ${C.rule}`, padding: '10px 14px', borderRadius: 10, marginBottom: 14, fontSize: 12.5, lineHeight: 1.5 }}>
+                  You&apos;re in <b>Captain Confirmation</b> mode, so nothing fires without a captain and OTP stays idle. Switch <b>QR Ordering Mode</b> to <b>Direct</b> for these tables to enforce it. Meanwhile guests are still asked (optionally) for their number.
+                </div>
+              )}
+              <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 1.2, textTransform: 'uppercase', color: C.inkMute, marginBottom: 10 }}>Which tables need OTP?</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
+                {([['all', 'All tables'], ['zones', 'By floor'], ['sections', 'By section'], ['tables', 'Specific tables']] as [ScopeKind, string][]).map(([k, label]) => (
+                  <button key={k} onClick={() => chooseScopeKind(k)} disabled={saving} style={{
+                    fontFamily: MONO, fontSize: 12, padding: '8px 16px', borderRadius: 999, cursor: saving ? 'default' : 'pointer',
+                    background: scope.kind === k ? C.terra : C.card, color: scope.kind === k ? '#fff' : C.inkSoft,
+                    border: `1px solid ${scope.kind === k ? C.terra : C.rule}`, fontWeight: scope.kind === k ? 600 : 400,
+                  }}>{label}</button>
+                ))}
+              </div>
+
+              {scopeEmpty && (
+                <div style={{ background: C.terraTint, color: C.terraDeep, padding: '9px 13px', borderRadius: 10, marginBottom: 12, fontSize: 12.5, lineHeight: 1.5 }}>
+                  Nothing selected yet — until you pick {scope.kind === 'zones' ? 'a floor' : scope.kind === 'sections' ? 'a section' : 'a table'}, OTP applies to <b>every table</b>. Pick some below, or choose <b>All tables</b>.
+                </div>
+              )}
+              {scope.kind === 'zones' && (
+                <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 16, padding: 16, maxWidth: 640 }}>
+                  <div style={{ fontSize: 12.5, color: C.inkSoft, marginBottom: 10 }}>Tap the floors whose tables need OTP:</div>
+                  {allZones.length === 0 ? <div style={{ color: C.inkMute, fontSize: 13 }}>No floors found — set a Floor on your tables (Dine-In → Tables) first.</div> : (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                      {allZones.map(z => {
+                        const on = scope.zones.includes(z);
+                        const n = tables.filter(t => t.zone === z).length;
+                        return (
+                          <button key={z} onClick={() => toggleZone(z)} disabled={saving} style={{
+                            fontFamily: SANS, fontSize: 13.5, padding: '9px 15px', borderRadius: 12, cursor: 'pointer', textAlign: 'left',
+                            background: on ? C.forest : C.cardElev, color: on ? '#fff' : C.ink, border: `1px solid ${on ? C.forest : C.rule}`,
+                          }}>{on ? '✓ ' : ''}{z} <span style={{ fontFamily: MONO, fontSize: 10, opacity: 0.7 }}>· {n}</span></button>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {hasUnzoned && (
+                    <div style={{ fontSize: 12, color: C.inkMute, marginTop: 12, lineHeight: 1.5 }}>
+                      Some tables have no floor, so they can&apos;t be picked here. Use <b>Specific tables</b> to include them.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {scope.kind === 'sections' && (
+                <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 16, padding: 16, maxWidth: 640 }}>
+                  <div style={{ fontSize: 12.5, color: C.inkSoft, marginBottom: 10 }}>Tap the sections whose tables need OTP (e.g. FA, SA):</div>
+                  {allSections.length === 0 ? <div style={{ color: C.inkMute, fontSize: 13 }}>No sections found — add a Section to your tables on Dine-In → Tables first.</div> : (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                      {allSections.map(sec => {
+                        const on = scope.sections.includes(sec);
+                        const n = tables.filter(t => t.section === sec).length;
+                        return (
+                          <button key={sec} onClick={() => toggleSection(sec)} disabled={saving} style={{
+                            fontFamily: MONO, fontSize: 13, padding: '9px 15px', borderRadius: 12, cursor: 'pointer',
+                            background: on ? C.forest : C.cardElev, color: on ? '#fff' : C.ink, border: `1px solid ${on ? C.forest : C.rule}`, fontWeight: on ? 600 : 400,
+                          }}>{on ? '✓ ' : ''}{sec} <span style={{ fontSize: 10, opacity: 0.7 }}>· {n}</span></button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {scope.kind === 'tables' && (
+                <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 16, padding: 16, maxWidth: 640 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 12 }}>
+                    <div style={{ fontSize: 12.5, color: C.inkSoft }}>Tap the exact tables that need OTP:</div>
+                    <div style={{ fontFamily: MONO, fontSize: 10.5, color: C.terra }}>{scope.tableIds.length} selected</div>
+                  </div>
+                  {tables.length === 0 ? <div style={{ color: C.inkMute, fontSize: 13 }}>No tables found.</div> : groupZones.map(z => (
+                    <div key={z || '__unzoned'} style={{ marginBottom: 14 }}>
+                      <div style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: 1, textTransform: 'uppercase', color: C.inkMute, marginBottom: 7 }}>{z || 'No floor'}</div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+                        {tables.filter(t => t.zone === z).map(t => {
+                          const on = scope.tableIds.includes(t.id);
+                          return (
+                            <button key={t.id} onClick={() => toggleTable(t.id)} disabled={saving} style={{
+                              fontFamily: MONO, fontSize: 13, minWidth: 42, padding: '9px 12px', borderRadius: 10, cursor: 'pointer',
+                              background: on ? C.terra : C.cardElev, color: on ? '#fff' : C.ink, border: `1px solid ${on ? C.terra : C.rule}`, fontWeight: on ? 600 : 400,
+                            }}>{t.table_number}</button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Guest details page — editable copy ───────────────────────── */}
+          <SectionHead
+            title="Guest Details Page — Text"
+            desc="The wording on the page where guests share their name and WhatsApp number (shown after “View Menu” when OTP is on). The Table No., Name and WhatsApp number fields are fixed — you edit the message around them. Leave a box empty to use our default line."
+          />
+          <div style={{ background: C.card, border: `1px solid ${C.rule}`, borderRadius: 18, padding: 18, marginBottom: 10, maxWidth: 640 }}>
+            <TextField
+              label="Heading (top)" value={guestHeading} maxLength={60}
+              placeholder={TXT_DEFAULTS.guestHeading}
+              onChange={(v) => { setGuestHeading(v); setTextDirty(true); }}
+            />
+            <TextField
+              label="Request message (below the heading)" value={guestMessage} maxLength={240} multiline
+              placeholder={TXT_DEFAULTS.guestMessage}
+              onChange={(v) => { setGuestMessage(v); setTextDirty(true); }}
+            />
+            <TextField
+              label="Reassurance line (bottom)" value={guestFootnote} maxLength={120}
+              placeholder={TXT_DEFAULTS.guestFootnote}
+              onChange={(v) => { setGuestFootnote(v); setTextDirty(true); }}
+            />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 14 }}>
+              <button onClick={saveTexts} disabled={saving || !textDirty} style={{
+                background: textDirty ? C.terra : C.rule, color: textDirty ? '#fff' : C.inkMute,
+                border: 'none', borderRadius: 999, padding: '10px 22px', fontSize: 14, fontWeight: 600,
+                cursor: textDirty && !saving ? 'pointer' : 'default', fontFamily: SANS,
+              }}>{saving ? 'Saving…' : 'Save text'}</button>
+              <span style={{ fontSize: 12.5, color: C.inkMute }}>
+                Preview it live: open any table&apos;s QR link with <b>&amp;preview_gate=1</b> added.
+              </span>
+            </div>
+          </div>
+          <div style={{ marginBottom: 34 }} />
 
           {/* ── Category display ─────────────────────────────────────────── */}
           <SectionHead
@@ -143,6 +350,26 @@ export default function CustomerMenuDesignPage() {
       <p style={{ color: C.inkMute, fontSize: 12.5, marginTop: 20 }}>
         Tip: preview the live menu by scanning any table's standee, or open <b>Settings → QR Standees</b> to print them.
       </p>
+    </div>
+  );
+}
+
+function TextField({ label, value, placeholder, maxLength, multiline, onChange }: {
+  label: string; value: string; placeholder: string; maxLength: number; multiline?: boolean; onChange: (v: string) => void;
+}) {
+  const common: React.CSSProperties = {
+    width: '100%', background: C.cardElev, border: `1px solid ${C.rule}`, borderRadius: 12,
+    padding: '11px 13px', fontSize: 14, color: C.ink, outline: 'none', fontFamily: SANS, resize: 'vertical',
+  };
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+        <label style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 1.2, textTransform: 'uppercase', color: C.inkMute }}>{label}</label>
+        <span style={{ fontFamily: MONO, fontSize: 10, color: value.length > maxLength - 15 ? C.terraDeep : C.inkMute }}>{value.length}/{maxLength}</span>
+      </div>
+      {multiline
+        ? <textarea rows={3} value={value} placeholder={placeholder} maxLength={maxLength} onChange={(e) => onChange(e.target.value)} style={common} />
+        : <input type="text" value={value} placeholder={placeholder} maxLength={maxLength} onChange={(e) => onChange(e.target.value)} style={common} />}
     </div>
   );
 }

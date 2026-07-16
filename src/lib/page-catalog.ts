@@ -24,6 +24,12 @@ export interface PageEntry {
    * regardless of the user's page_access map. First catalog-level tier gate.
    */
   hodOnly?: boolean;
+  /**
+   * When true, only management — Admin, any Manager, or an HOD (is_head_chef) —
+   * may see/open this page. Broader than hodOnly (which excludes managers). Used
+   * for sensitive customer PII (the Customers page).
+   */
+  mgmtOnly?: boolean;
 }
 
 export interface PageSection {
@@ -50,6 +56,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/dine-in/kitchen',     label: 'Kitchen Display' },
       { path: '/dine-in/offline-print', label: 'KOT & Bill Printers' },
       { path: '/dine-in/tables',      label: 'Tables' },
+      { path: '/customers',           label: 'Customers' },
       { path: '/dine-in/order',       label: 'Order Terminal' },
       { path: '/captain',             label: 'Captain (Tablet POS)' },
       { path: '/print/agent',         label: 'Print Agent (Counter)' },
@@ -207,7 +214,7 @@ export const ALL_PAGE_PATHS: string[] = PAGE_CATALOG.flatMap(s => s.pages.map(p 
  * non-restricted child (e.g. /kitchen-production/scan) can sit under a
  * restricted parent (/kitchen-production) without inheriting the lock.
  */
-export function isHodOnlyPath(pathname: string): boolean {
+function bestEntry(pathname: string): PageEntry | null {
   let best: PageEntry | null = null;
   for (const section of PAGE_CATALOG) {
     for (const p of section.pages) {
@@ -216,7 +223,14 @@ export function isHodOnlyPath(pathname: string): boolean {
       }
     }
   }
-  return !!best?.hodOnly;
+  return best;
+}
+export function isHodOnlyPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.hodOnly;
+}
+/** Is `pathname` under a management-only catalog entry (admin/manager/HOD)? */
+export function isMgmtOnlyPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.mgmtOnly;
 }
 
 /**
@@ -251,7 +265,9 @@ export function firstAllowedPath(user: { role?: string; page_access?: string | n
   // a non-HOD isn't redirected to a page that immediately re-blocks them.
   for (const section of PAGE_CATALOG) {
     for (const p of section.pages) {
-      if (allowed.includes(p.path) && !(p.hodOnly && !user.is_head_chef)) return p.path;
+      if (allowed.includes(p.path)
+        && !(p.hodOnly && !user.is_head_chef)
+        && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef))) return p.path;
     }
   }
   return '/login';
@@ -279,6 +295,11 @@ export function canAccessPage(
   // page_access map says. MUST run before the null-map backward-compat grant
   // below, so legacy full-access staff are still locked out of these pages.
   if (isHodOnlyPath(pathname) && !user.is_head_chef) return false;
+
+  // Management-only pages (customer PII): a non-admin must be a Manager or an
+  // HOD. Also runs before the null-map grant so legacy full-access staff can't
+  // reach the Customers page.
+  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)) return false;
 
   // No explicit map → grant everything (backward compat)
   if (!user.page_access) return true;

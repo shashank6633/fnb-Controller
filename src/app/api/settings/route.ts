@@ -2,6 +2,12 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 
 export async function GET(req: Request) {
+  // SECURITY: settings expose tax %, service charge, branding AND the OTP table
+  // scope (which tables run captain-less). The proxy only checks that a session
+  // cookie is PRESENT — real validation is delegated here. Without this, a forged
+  // cookie could read every setting. Any signed-in staff may read (non-secret).
+  const me = await getCurrentUser();
+  if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
   const db = getDb();
   const url = new URL(req.url);
   const key = url.searchParams.get('key');

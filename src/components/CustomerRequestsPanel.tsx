@@ -17,7 +17,7 @@ import { api, apiJson } from '@/lib/api';
  */
 
 interface OrderItem { id: string; name: string; station: string; qty: number; unit_price: number; line_total: number; note?: string; }
-interface PendingOrder { id: string; subtotal: number; note: string; created_at: string; table: { number: string; zone: string }; items: OrderItem[]; table_owner_id?: string | null; }
+interface PendingOrder { id: string; subtotal: number; note: string; created_at: string; table: { number: string; zone: string }; items: OrderItem[]; table_owner_id?: string | null; guest_name?: string; guest_mobile?: string; }
 interface ServiceReq { id: string; type: string; status: string; note: string; created_at: string; table_number: string; zone: string; table_owner_id?: string | null; }
 interface KotAlert { id: string; kot_number: number; station: string; table_number: string; reason: string; kind: string; server_id?: string | null; created_at: string; }
 
@@ -211,6 +211,12 @@ export default function CustomerRequestsPanel({ variant = 'page' }: { variant?: 
                   <div style={{ fontFamily: SERIF, fontWeight: 400, fontSize: 24, color: C.ink }}>Table {o.table.number} {o.table.zone && <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 0.8, color: C.inkMute, textTransform: 'uppercase' }}>· {o.table.zone}</span>}{scopeMine && unclaimed && <span style={{ fontFamily: MONO, fontSize: 9, letterSpacing: 0.6, color: C.terra, textTransform: 'uppercase', marginLeft: 6, border: `1px solid ${C.terraTint}`, borderRadius: 4, padding: '1px 5px' }}>unclaimed</span>}</div>
                   <div style={{ fontFamily: MONO, fontSize: 11, color: C.inkMute }}>{ago(o.created_at)}</div>
                 </div>
+                {(o.guest_name || o.guest_mobile) && (
+                  <div style={{ fontFamily: SANS, fontSize: 12.5, color: C.inkSoft, margin: '4px 0 0' }}>
+                    Guest: <b style={{ color: C.ink }}>{o.guest_name || '—'}</b>
+                    {o.guest_mobile && <> · <a href={`tel:+91${o.guest_mobile}`} style={{ color: C.terra, textDecoration: 'none', fontFamily: MONO, fontSize: 12 }}>{o.guest_mobile}</a></>}
+                  </div>
+                )}
                 {o.note && <div style={{ fontFamily: SANS, fontSize: 12.5, color: C.terraDeep, background: C.cardElev, borderLeft: `2px solid ${C.egg}`, borderRadius: 6, padding: '5px 9px', margin: '8px 0' }}>“{o.note}”</div>}
                 <div style={{ margin: '10px 0' }}>
                   {o.items.map(it => {

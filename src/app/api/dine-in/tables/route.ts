@@ -34,7 +34,9 @@ export async function GET(request: Request) {
       FROM restaurant_tables t
       LEFT JOIN orders o ON o.table_id = t.id AND o.status = 'open'
       WHERE t.is_active = 1 AND (t.outlet_id = ? OR t.outlet_id IS NULL)${area ? ` AND ${area.sql}` : ''}
-      ORDER BY t.zone, CAST(t.table_number AS INTEGER), t.table_number
+      ORDER BY t.zone, t.section,
+               CAST(substr(t.table_number, length(COALESCE(t.section,'')) + 1) AS INTEGER),
+               t.table_number
     `).all(outletId, ...(area ? area.params : []));
     return Response.json({ items: tables });
   } catch (e: any) {
@@ -56,6 +58,7 @@ export async function POST(request: Request) {
     const b = await request.json();
     const outletId = await getCurrentOutletId();
     const zone = String(b.zone ?? '').trim();
+    const section = String(b.section ?? '').trim().slice(0, 40);
     const seats = Number(b.seats) || 2;
 
     // Normalise to a list (single or bulk), de-duped + trimmed, cap the batch.
@@ -76,8 +79,8 @@ export async function POST(request: Request) {
       "SELECT 1 FROM restaurant_tables WHERE table_number = ? AND (outlet_id = ? OR (outlet_id IS NULL AND ? IS NULL)) LIMIT 1",
     );
     const ins = db.prepare(`
-      INSERT INTO restaurant_tables (id, outlet_id, table_number, zone, seats, qr_token, is_active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+      INSERT INTO restaurant_tables (id, outlet_id, table_number, zone, section, seats, qr_token, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
     `);
     const skippedNumbers: string[] = [];
     let created = 0;
@@ -86,7 +89,7 @@ export async function POST(request: Request) {
       for (const n of wanted) {
         if (existsStmt.get(n, outletId, outletId)) { skippedNumbers.push(n); continue; }
         const id = generateId();
-        ins.run(id, outletId, n, zone, seats, generateId());
+        ins.run(id, outletId, n, zone, section, seats, generateId());
         if (!firstId) firstId = id;
         created++;
       }
@@ -115,11 +118,12 @@ export async function PUT(request: Request) {
     if (!existing) return Response.json({ error: 'Table not found' }, { status: 404 });
     db.prepare(`
       UPDATE restaurant_tables
-      SET table_number = ?, zone = ?, seats = ?, is_active = ?, updated_at = datetime('now')
+      SET table_number = ?, zone = ?, section = ?, seats = ?, is_active = ?, updated_at = datetime('now')
       WHERE id = ?
     `).run(
       String(b.table_number ?? existing.table_number).trim(),
       String(b.zone ?? existing.zone).trim(),
+      String(b.section ?? existing.section ?? '').trim().slice(0, 40),
       Number(b.seats) || existing.seats,
       b.is_active === undefined ? existing.is_active : (b.is_active ? 1 : 0),
       b.id,

@@ -202,7 +202,8 @@ function RunningByFloorCard({ orders }: { orders: any[] }) {
 }
 
 // ── page ─────────────────────────────────────────────────────────────────────
-type Tab = 'daily' | 'running' | 'items';
+type Tab = 'daily' | 'running' | 'items' | 'tables';
+interface TableSalesRow { table_id: string; table_number: string; floor: string; section: string; orders: number; covers: number; sales: number; }
 
 export default function SalesDashboardPage() {
   const [from, setFrom] = useState(todayISO());
@@ -214,6 +215,9 @@ export default function SalesDashboardPage() {
   const [err, setErr] = useState('');
   const [running, setRunning] = useState<any[]>([]);
   const [items, setItems] = useState<any[]>([]);
+  const [me, setMe] = useState<any>(null);
+  const [tableRows, setTableRows] = useState<TableSalesRow[] | null>(null);
+  const isMgmt = !!me && (me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef);
 
   // Monotonic request id — only the latest load() may paint, so a slow wide-range
   // response can't overwrite a newer fast one (out-of-order race → wrong money).
@@ -239,12 +243,14 @@ export default function SalesDashboardPage() {
   // Admin can enable floor P&L detail (food cost / gross profit / GP%) in Settings → Dashboard.
   useEffect(() => {
     fetch('/api/settings?key=floor_pnl_enabled').then(r => r.json()).then(d => setPnlOn(d?.value === '1')).catch(() => {});
+    fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user || null)).catch(() => {});
   }, []);
 
   useEffect(() => {
     let ignore = false;
     if (tab === 'running') api('/api/dine-in/orders?status=open').then(r => r.json()).then(j => { if (!ignore) setRunning(j.items || []); }).catch(() => { if (!ignore) setRunning([]); });
     if (tab === 'items') api(`/api/dine-in/sales-dashboard/items?from=${from}&to=${to}`).then(r => r.json()).then(j => { if (!ignore) setItems(j.items || []); }).catch(() => { if (!ignore) setItems([]); });
+    if (tab === 'tables') { setTableRows(null); api(`/api/dine-in/sales-dashboard/table-wise?from=${from}&to=${to}`).then(r => r.json()).then(j => { if (!ignore) setTableRows(Array.isArray(j.rows) ? j.rows : []); }).catch(() => { if (!ignore) setTableRows([]); }); }
     return () => { ignore = true; };
   }, [tab, from, to]);
 
@@ -283,6 +289,13 @@ export default function SalesDashboardPage() {
               <Icon size={14} /> {label}
             </button>
           ))}
+          {/* Table-wise sales — the access point, shown only to Admin / Manager / HOD. */}
+          {isMgmt && (
+            <button onClick={() => setTab('tables')}
+              className={`flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-full ${tab === 'tables' ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'}`}>
+              <ListOrdered size={14} /> Table-wise Sales
+            </button>
+          )}
         </div>
 
         {err && <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 text-sm">{err}</div>}
@@ -383,6 +396,52 @@ export default function SalesDashboardPage() {
                       <td className="px-4 py-2 text-right tabular-nums">{money(it.amount)}</td>
                     </tr>
                   ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* TABLE-WISE SALES (management only) */}
+        {tab === 'tables' && isMgmt && (
+          <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+            <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-[#E8D5C4] flex-wrap">
+              <div className="text-sm text-[#6B5744]">Settled bills per table for <b>{from}</b> → <b>{to}</b>. Manager / HOD / Admin only.</div>
+              <a href={`/api/dine-in/sales-dashboard/table-wise?from=${from}&to=${to}&format=csv`}
+                 className="flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-3 py-1.5 rounded-lg text-sm font-medium">
+                <Printer className="w-4 h-4" /> Download CSV
+              </a>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-[#F5EDE2] text-[#6B5744] text-[11px] uppercase">
+                  <tr>
+                    <th className="text-left px-4 py-2">Floor</th><th className="text-left px-4 py-2">Section</th>
+                    <th className="text-left px-4 py-2">Table</th><th className="text-right px-4 py-2">Bills</th>
+                    <th className="text-right px-4 py-2">Covers</th><th className="text-right px-4 py-2">Sales</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#F0E6D8]">
+                  {tableRows === null && <tr><td colSpan={6} className="text-center text-[#8B7355] py-10"><Loader2 className="w-4 h-4 animate-spin inline" /> Loading…</td></tr>}
+                  {tableRows !== null && tableRows.length === 0 && <tr><td colSpan={6} className="text-center text-[#8B7355] py-10">No settled sales in this range.</td></tr>}
+                  {(tableRows || []).map((r) => (
+                    <tr key={r.table_id}>
+                      <td className="px-4 py-2">{r.floor}</td>
+                      <td className="px-4 py-2">{r.section || '—'}</td>
+                      <td className="px-4 py-2 font-medium">{r.table_number}</td>
+                      <td className="px-4 py-2 text-right tabular-nums">{r.orders}</td>
+                      <td className="px-4 py-2 text-right tabular-nums">{r.covers}</td>
+                      <td className="px-4 py-2 text-right tabular-nums font-medium">{money(r.sales)}</td>
+                    </tr>
+                  ))}
+                  {tableRows && tableRows.length > 0 && (
+                    <tr className="bg-[#FBF4DF] font-semibold">
+                      <td className="px-4 py-2" colSpan={3}>Total</td>
+                      <td className="px-4 py-2 text-right tabular-nums">{tableRows.reduce((a, r) => a + r.orders, 0)}</td>
+                      <td className="px-4 py-2 text-right tabular-nums">{tableRows.reduce((a, r) => a + r.covers, 0)}</td>
+                      <td className="px-4 py-2 text-right tabular-nums">{money(tableRows.reduce((a, r) => a + r.sales, 0))}</td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>

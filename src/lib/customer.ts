@@ -12,7 +12,8 @@ import { getDb } from '@/lib/db';
 export interface ResolvedTable {
   id: string;
   table_number: string;
-  zone: string;
+  zone: string;       // = Floor
+  section: string;    // = section code within the floor (FA / SA)
   seats: number;
   outlet_id: string | null;
   outlet_name: string;
@@ -29,10 +30,45 @@ export interface CustomerMenuDesign {
   orderMode: 'captain' | 'direct';
   /** WhatsApp-OTP requirement for QR self-orders:
    *  - 'off'    : no OTP (default).
-   *  - 'direct' : OTP required only for direct (captain-less) orders.
-   *  - 'all'    : OTP required for every QR self-order. */
-  otpMode: 'off' | 'direct' | 'all';
+   *  - 'direct' : OTP required only for direct (captain-less) orders, on the
+   *               tables in otpScope. Captain-confirmation orders are never
+   *               blocked (they get the optional, skippable ask instead).
+   *  (A legacy 'all' value is migrated to 'direct' on read — see below.) */
+  otpMode: 'off' | 'direct';
+  /** Which tables the OTP requirement covers (otpMode 'direct' only):
+   *  - 'all'      : every table (default).
+   *  - 'zones'    : only tables whose floor (zone) is listed.
+   *  - 'sections' : only tables whose section code is listed.
+   *  - 'tables'   : only the explicitly selected tables. */
+  otpScope: { kind: 'all' | 'zones' | 'sections' | 'tables'; zones: string[]; sections: string[]; tableIds: string[] };
+  /** Guest-details page (the screen after "View Menu" where the guest shares
+   *  Name + WhatsApp number). The field labels are fixed; the surrounding
+   *  copy is editable on Settings → Customer Menu Page Design. */
+  guestHeading: string;   // serif heading at the top
+  guestMessage: string;   // the polite requesting-manner note under the heading
+  guestFootnote: string;  // small reassurance line at the bottom
 }
+
+/**
+ * Does the OTP requirement cover THIS table? Only meaningful when
+ * otpMode === 'direct' — 'all' mode covers everything and 'off' covers nothing.
+ * Unknown/edited-away zones or table ids simply fall out of scope (safe: those
+ * tables degrade to the optional ask, never to a hard block).
+ */
+export function otpAppliesToTable(design: CustomerMenuDesign, table: { id: string; zone: string; section?: string }): boolean {
+  const s = design.otpScope;
+  if (!s || s.kind === 'all') return true;
+  if (s.kind === 'zones') return s.zones.includes(String(table.zone || ''));
+  if (s.kind === 'sections') return s.sections.includes(String(table.section || ''));
+  return s.tableIds.includes(String(table.id || ''));
+}
+
+/** Default guest-page copy — used when the admin hasn't customised the text. */
+export const GUEST_TEXT_DEFAULTS = {
+  guestHeading: 'A pleasure to host you',
+  guestMessage: 'May we have your name and WhatsApp number? It’s just for our billing records — and so we can reach you if your order needs a quick word. Thank you!',
+  guestFootnote: 'Your details stay with us — used only for this visit.',
+} as const;
 
 /**
  * Read the customer-menu design settings (categoryStyle + orderMode) from the
@@ -42,12 +78,42 @@ export interface CustomerMenuDesign {
 export function getCustomerMenuDesign(): CustomerMenuDesign {
   const db = getDb();
   const row = db.prepare("SELECT value FROM settings WHERE key = 'customer_menu_design'").get() as any;
-  const out: CustomerMenuDesign = { categoryStyle: 'thumbnails', orderMode: 'captain', otpMode: 'off' };
+  const out: CustomerMenuDesign = {
+    categoryStyle: 'thumbnails', orderMode: 'captain', otpMode: 'off',
+    otpScope: { kind: 'all', zones: [], sections: [], tableIds: [] },
+    ...GUEST_TEXT_DEFAULTS,
+  };
   try {
     const d = JSON.parse(row?.value || '{}');
     if (d.categoryStyle === 'chips' || d.categoryStyle === 'thumbnails') out.categoryStyle = d.categoryStyle;
     if (d.orderMode === 'direct' || d.orderMode === 'captain') out.orderMode = d.orderMode;
-    if (d.otpMode === 'direct' || d.otpMode === 'all' || d.otpMode === 'off') out.otpMode = d.otpMode;
+    // Legacy 'all' (require OTP for EVERY QR order, incl. captain) is retired —
+    // the owner rule is "captain orders are never blocked". Migrate it to
+    // 'direct' so those venues keep OTP on their direct tables without blocking
+    // captain-confirmation orders.
+    if (d.otpMode === 'off') out.otpMode = 'off';
+    else if (d.otpMode === 'direct' || d.otpMode === 'all') out.otpMode = 'direct';
+    // OTP table scope — malformed input degrades to 'all' (the safe default).
+    const sc = d.otpScope || {};
+    const strArr = (v: unknown, cap: number) =>
+      (Array.isArray(v) ? v : []).map(x => String(x || '').trim()).filter(Boolean).slice(0, cap);
+    if (sc.kind === 'zones' || sc.kind === 'sections' || sc.kind === 'tables' || sc.kind === 'all') {
+      out.otpScope = { kind: sc.kind, zones: strArr(sc.zones, 50), sections: strArr(sc.sections, 200), tableIds: strArr(sc.tableIds, 500) };
+      // An empty selection would silently exempt EVERY table — treat as 'all'.
+      if ((sc.kind === 'zones' && !out.otpScope.zones.length)
+        || (sc.kind === 'sections' && !out.otpScope.sections.length)
+        || (sc.kind === 'tables' && !out.otpScope.tableIds.length)) {
+        out.otpScope.kind = 'all';
+      }
+    }
+    // Editable guest-page copy — blank/whitespace falls back to the default.
+    const txt = (v: unknown, cap: number, dflt: string) => {
+      const s = String(v ?? '').trim().slice(0, cap);
+      return s || dflt;
+    };
+    out.guestHeading = txt(d.guestHeading, 60, GUEST_TEXT_DEFAULTS.guestHeading);
+    out.guestMessage = txt(d.guestMessage, 240, GUEST_TEXT_DEFAULTS.guestMessage);
+    out.guestFootnote = txt(d.guestFootnote, 120, GUEST_TEXT_DEFAULTS.guestFootnote);
   } catch {}
   return out;
 }
@@ -58,7 +124,7 @@ export function resolveTableByToken(token: string): ResolvedTable | null {
   if (!t) return null;
   const db = getDb();
   const row = db.prepare(`
-    SELECT rt.id, rt.table_number, rt.zone, rt.seats, rt.outlet_id,
+    SELECT rt.id, rt.table_number, rt.zone, COALESCE(rt.section,'') AS section, rt.seats, rt.outlet_id,
            COALESCE(o.name, '') AS outlet_name
     FROM restaurant_tables rt
     LEFT JOIN outlets o ON o.id = rt.outlet_id
@@ -69,6 +135,7 @@ export function resolveTableByToken(token: string): ResolvedTable | null {
     id: row.id,
     table_number: String(row.table_number),
     zone: row.zone || '',
+    section: row.section || '',
     seats: Number(row.seats) || 0,
     outlet_id: row.outlet_id || null,
     outlet_name: row.outlet_name || '',

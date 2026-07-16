@@ -1,9 +1,9 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, isManagement } from '@/lib/auth';
 import { todayIST } from '@/lib/format-date';
 import { getItemWiseSales } from '@/lib/sales-dashboard';
 
-/** GET /api/dine-in/sales-dashboard/items?from&to — per-item settled sales. Admin/manager. */
+/** GET /api/dine-in/sales-dashboard/items?from&to — per-item settled sales. Admin/manager/HOD. */
 export const dynamic = 'force-dynamic';
 const isDate = (s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s);
 
@@ -11,8 +11,8 @@ export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (me.role !== 'admin' && me.role !== 'manager') {
-      return Response.json({ error: 'Manager or admin role required' }, { status: 403 });
+    if (!isManagement(me)) {
+      return Response.json({ error: 'Manager, HOD or admin role required' }, { status: 403 });
     }
     const db = getDb();
     const outletId = await getCurrentOutletId();

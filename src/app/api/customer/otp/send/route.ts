@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db';
 import { resolveTableByToken } from '@/lib/customer';
-import { canSendOtp, createOtp, otpChannelReady, normMobile } from '@/lib/customer-otp';
+import { canSendOtp, createOtp, otpChannelReady, normMobile, markSendFailed } from '@/lib/customer-otp';
 import { getWaConfigRaw, sendWhatsAppTemplate } from '@/lib/whatsapp';
 
 /**
@@ -25,16 +25,33 @@ export async function POST(req: Request) {
     const db = getDb();
     const rl = canSendOtp(db, table.id, mobile);
     if (!rl.ok) {
-      return Response.json({ ok: false, error: `Please wait ${rl.retryAfter}s before requesting another code.`, retryAfter: rl.retryAfter }, { status: 429 });
+      // Cooldown (45s): a fresh code is already out — the guest should type it.
+      if (rl.reason === 'cooldown') {
+        return Response.json({ ok: false, error: `Please wait ${rl.retryAfter} seconds before requesting another code.`, retryAfter: rl.retryAfter, reason: rl.reason }, { status: 429 });
+      }
+      // Hourly / table cap exhausted: no more codes can go out for a long time —
+      // don't dead-end the guest on a resend loop; fall back to captain approval
+      // (the orders route mirrors this via otpSendExhausted()).
+      return Response.json({ ok: true, sent: false, fallback: true, reason: rl.reason });
     }
 
-    const { code } = createOtp(db, { outletId: table.outlet_id, tableId: table.id, mobile });
+    const { code, id: otpId } = createOtp(db, { outletId: table.outlet_id, tableId: table.id, mobile });
     const raw = getWaConfigRaw();
     const tpl = String(raw.wa_otp_template || '').trim();
     const lang = String(raw.wa_otp_template_lang || 'en').trim() || 'en';
-    const res = await sendWhatsAppTemplate(mobile, tpl, lang, [code], { otpButtonCode: code });
-    if (!res.ok) {
-      console.error('[/api/customer/otp/send] provider send failed:', res.reason, res.detail);
+    // Any provider failure (rejected OR thrown) → mark THIS code send_failed so
+    // the orders route knows this guest CAN'T verify and falls back to captain
+    // approval instead of 428-ing them in a loop.
+    let sendOk = false;
+    try {
+      const res = await sendWhatsAppTemplate(mobile, tpl, lang, [code], { otpButtonCode: code });
+      sendOk = !!res.ok;
+      if (!res.ok) console.error('[/api/customer/otp/send] provider send failed:', res.reason, res.detail);
+    } catch (se) {
+      console.error('[/api/customer/otp/send] provider send threw:', se);
+    }
+    if (!sendOk) {
+      try { markSendFailed(db, otpId); } catch (me) { console.error('[/api/customer/otp/send] markSendFailed:', me); }
       return Response.json({ ok: true, sent: false, fallback: true }); // don't block ordering
     }
     return Response.json({ ok: true, sent: true });

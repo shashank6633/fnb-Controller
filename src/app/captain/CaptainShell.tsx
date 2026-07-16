@@ -6,9 +6,10 @@
  * the routed page in the main area. The sidebar is the table selector and
  * quick-switcher; it polls live status and highlights the open table.
  */
-import { useEffect, useState, useCallback, useMemo, useRef, createContext } from 'react';
+import { useEffect, useState, useCallback, useMemo, createContext } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
+import { useCaptainAlerts } from '@/components/CaptainAlertsProvider';
 import {
   ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search, Loader2,
   MapPin, ChevronDown, Users, WifiOff, Bell,
@@ -32,14 +33,10 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   const pathname = usePathname();
   const [tables, setTables] = useState<TableTile[]>([]);
   const [me, setMe] = useState<{ name?: string; email?: string; id?: string } | null>(null);
-  // Customer QR-menu orders + service requests scoped to THIS captain's tables:
-  // a live badge on the sidebar tab + a toast when new ones arrive.
-  const [reqCount, setReqCount] = useState(0);
-  const [reqItems, setReqItems] = useState<{ id: string; text: string }[]>([]);
-  const [bellOpen, setBellOpen] = useState(false);
-  const [toast, setToast] = useState<{ key: number; text: string } | null>(null);
-  const seenReq = useRef<Set<string>>(new Set());
-  const firstReq = useRef(true);
+  // The captain's live alert count comes from the GLOBAL CaptainAlertsProvider
+  // (AppShell) — one poll for the whole app. The floating bell + toast it renders
+  // work on every screen; here we only badge the sidebar's "Orders & Requests" tab.
+  const { count: reqCount } = useCaptainAlerts();
   const [drawer, setDrawer] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -116,68 +113,6 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
 
   // Close the drawer whenever the route changes (a table was opened).
   useEffect(() => { setDrawer(false); }, [pathname]);
-
-  // Poll customer orders + service requests for MY tables (+ unclaimed). Keeps the
-  // sidebar badge live and raises a toast (+ soft beep) when a NEW one arrives, so
-  // the captain is alerted on any screen without a panel hijacking the page.
-  useEffect(() => {
-    let stop = false;
-    const beep = () => {
-      try {
-        const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
-        if (!AC) return;
-        const ctx = new AC();
-        // Louder, repeating two-tone chime (3 pulses, B5/G5) so it carries across
-        // a busy floor — the soft single beep was too easy to miss.
-        const now = ctx.currentTime;
-        [0, 0.32, 0.64].forEach((t0, i) => {
-          const o = ctx.createOscillator(); const g = ctx.createGain();
-          o.connect(g); g.connect(ctx.destination); o.type = 'sine';
-          o.frequency.value = i % 2 === 0 ? 988 : 784;   // B5 / G5 ding-dong
-          const t = now + t0;
-          g.gain.setValueAtTime(0.0001, t);
-          g.gain.exponentialRampToValueAtTime(0.3, t + 0.02);   // ~5× the old volume
-          g.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
-          o.start(t); o.stop(t + 0.3);
-        });
-        setTimeout(() => { try { ctx.close(); } catch {} }, 1200);
-      } catch {}
-    };
-    const poll = async () => {
-      try {
-        const [o, r, a] = await Promise.all([
-          api('/api/dine-in/customer-orders').then((x) => x.json()).catch(() => ({})),
-          api('/api/dine-in/service-requests').then((x) => x.json()).catch(() => ({})),
-          api('/api/dine-in/kot-alerts?open=1').then((x) => x.json()).catch(() => ({})),
-        ]);
-        if (stop) return;
-        const myId = me?.id;
-        const mine = (owner?: string | null) => !owner || owner === myId;
-        const items: { id: string; text: string }[] = [];
-        for (const ord of (o?.orders || [])) if (mine(ord.table_owner_id)) items.push({ id: 'o:' + ord.id, text: `New order · Table ${ord.table?.number ?? '—'}` });
-        for (const req of (r?.requests || [])) if (mine(req.table_owner_id)) items.push({ id: 's:' + req.id, text: `Table ${req.table_number} · ${req.type}` });
-        // KOT trouble (self-order didn't print / reach the kitchen) — urgent.
-        for (const al of (a?.alerts || [])) if (mine(al.server_id)) items.push({ id: 'a:' + al.id, text: `⚠ Kitchen issue · Table ${al.table_number || '—'}` });
-        setReqCount(items.length);
-        setReqItems(items);
-        const fresh = items.filter((it) => !seenReq.current.has(it.id));
-        const present = new Set(items.map((it) => it.id));
-        seenReq.current = present; // seen == currently present (so a completed+returning id can re-alert)
-        if (firstReq.current) { firstReq.current = false; return; } // seed silently on first load
-        // Alert on new items — but not while the captain is already on the board.
-        if (fresh.length && !window.location.pathname.endsWith('/captain/requests')) {
-          setToast({ key: Date.now(), text: fresh.length === 1 ? fresh[0].text : `${fresh.length} new orders / requests` });
-          beep();
-        }
-      } catch {}
-    };
-    poll();
-    const t = setInterval(poll, 8000);
-    return () => { stop = true; clearInterval(t); };
-  }, [me?.id]);
-
-  // Auto-dismiss the toast.
-  useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 6000); return () => clearTimeout(t); }, [toast]);
 
   const currentOrderId = useMemo(() => pathname.match(/\/captain\/order\/([^/]+)/)?.[1] || null, [pathname]);
   const occupiedCount = tables.filter((t) => t.open_order_id).length;
@@ -322,31 +257,9 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
           </div>
         </div>
         <div className="flex items-center gap-1">
-          {/* Captain bell — the captain's OWN tables' orders / service requests /
-              KOT issues only, NOT the back-office requisition inbox. */}
-          <div className="relative">
-            <button onClick={() => setBellOpen((o) => !o)} className="relative p-2 text-white/60 hover:text-white active:scale-95" aria-label={reqCount > 0 ? `Notifications: ${reqCount} need your action` : 'Notifications'}>
-              <Bell className="w-4 h-4" />
-              {reqCount > 0 && <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-[#af4408] text-white text-[10px] font-bold flex items-center justify-center">{reqCount}</span>}
-            </button>
-            {bellOpen && (
-              <>
-                <div className="fixed inset-0 z-20" onClick={() => setBellOpen(false)} />
-                <div className="absolute right-0 mt-1 z-30 w-72 bg-white text-[#2D1B0E] rounded-xl shadow-lg overflow-hidden">
-                  <div className="px-4 py-2 text-[11px] font-bold uppercase tracking-wide text-[#8B7355] bg-[#FFF7EF] border-b border-[#F0E4D6]">Needs your action</div>
-                  {reqItems.length === 0 ? (
-                    <p className="px-4 py-6 text-sm text-[#8B7355] text-center">You&apos;re all caught up.</p>
-                  ) : (
-                    <div className="max-h-80 overflow-y-auto divide-y divide-[#F0E4D6]">
-                      {reqItems.map((it) => (
-                        <button key={it.id} onClick={() => { setBellOpen(false); router.push('/captain/requests'); }} className="w-full text-left px-4 py-2.5 text-sm hover:bg-[#FFF1E3]">{it.text}</button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
+          {/* Captain alerts (new orders / service requests / KOT issues) are now
+              shown by the GLOBAL floating bell + toast (CaptainAlertsProvider),
+              which follows the captain onto every screen — no header bell here. */}
           <button onClick={load} className="p-2 text-white/60 hover:text-white active:scale-95"><RefreshCw className="w-4 h-4" /></button>
           <div className="relative">
             <button onClick={() => setMenuOpen((o) => !o)} className="p-2 text-white/60 hover:text-white"><MoreVertical className="w-4 h-4" /></button>
@@ -500,17 +413,8 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   return (
     <CaptainUI.Provider value={{ openTables: () => setDrawer(true) }}>
     {offlineBanner}
-    {/* New-order / new-request toast — tap to jump to the Orders & Requests view. */}
-    {toast && (
-      <button
-        onClick={() => { setToast(null); router.push('/captain/requests'); }}
-        className="fixed top-3 left-1/2 -translate-x-1/2 z-[80] flex items-center gap-2 max-w-[92vw] bg-[#af4408] text-white pl-3 pr-2 py-2.5 rounded-full shadow-2xl ring-1 ring-white/20 active:scale-95"
-      >
-        <Bell className="w-4 h-4 shrink-0" />
-        <span className="text-sm font-semibold truncate">{toast.text}</span>
-        <span className="shrink-0 text-[11px] font-bold bg-white/20 px-2 py-0.5 rounded-full">View</span>
-      </button>
-    )}
+    {/* The new-order / new-request toast is rendered globally by
+        CaptainAlertsProvider (AppShell), so it appears on every screen. */}
     <div className="md:flex min-h-screen">
       {/* Persistent sidebar (tablet/desktop, md+). z-40: sticky creates a stacking
           context, so without a z-index the bell's dropdown (inside the sidebar)

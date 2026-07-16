@@ -172,6 +172,48 @@ export function getFloorPnl(
   });
 }
 
+export interface TableSalesRow {
+  table_id: string; table_number: string; floor: string; section: string;
+  orders: number; covers: number; sales: number;
+}
+
+/**
+ * Table-wise SETTLED sales for the range (management-only export). One row per
+ * table: paid bills, covers and revenue (bill total). Grouped by table, so a
+ * manager can see which tables earn most. Only settled, normal (non-party) bills.
+ */
+export function getTableWiseSales(
+  db: Database.Database, outletId: string | null, from: string, to: string,
+): TableSalesRow[] {
+  const rows = db.prepare(`
+    SELECT
+      rt.id AS table_id,
+      rt.table_number AS table_number,
+      COALESCE(NULLIF(TRIM(rt.zone), ''), '—') AS floor,
+      COALESCE(rt.section, '') AS section,
+      COUNT(*) AS orders,
+      SUM(COALESCE(o.covers, 0)) AS covers,
+      SUM(COALESCE(o.total, 0)) AS sales
+    FROM orders o
+    JOIN restaurant_tables rt ON rt.id = o.table_id
+    WHERE o.status = 'settled'
+      AND date(o.settled_at, '+330 minutes') BETWEEN ? AND ?
+      AND (o.outlet_id = ? OR o.outlet_id IS NULL)
+      AND COALESCE(o.bill_type, 'normal') = 'normal'
+    GROUP BY rt.id
+    ORDER BY sales DESC
+  `).all(from, to, outletId) as any[];
+  return rows.map((r) => ({
+    table_id: String(r.table_id),
+    table_number: String(r.table_number),
+    floor: String(r.floor),
+    section: String(r.section || ''),
+    orders: Number(r.orders) || 0,
+    covers: Number(r.covers) || 0,
+    sales: r2(r.sales),
+  }));
+}
+
 export interface ItemWiseRow { name: string; type: string; qty: number; amount: number }
 
 /** Per-item settled-sales for the range (Item-wise Sales tab). */

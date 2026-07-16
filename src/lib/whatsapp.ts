@@ -281,6 +281,10 @@ export async function sendWhatsAppTemplate(
 
       const template: any = { name: templateName, languageCode: lang, bodyValues: bodyParams.map(String) };
       if (headerParams && headerParams.length) template.headerValues = headerParams.map(String);
+      // Authentication (OTP) template — the copy-code button's URL suffix must
+      // carry the code (mirrors the Meta branch's button component). Without it
+      // Interakt rejects the send and the OTP never reaches the guest.
+      if (opts?.otpButtonCode) template.buttonValues = { '0': [String(opts.otpButtonCode)] };
 
       const r = await fetch('https://api.interakt.ai/v1/public/message/', {
         method: 'POST',

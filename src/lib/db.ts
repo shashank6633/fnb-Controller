@@ -1753,6 +1753,16 @@ function initializeSchema(db: Database.Database) {
       }
     } catch (e) { console.error('restaurant_tables qr_printed_at migration failed:', e); }
 
+    // restaurant_tables.section — free-text section code (e.g. "FA", "SA") within
+    // a floor (zone). Floor→Section→Table hierarchy: `zone` is the floor, `section`
+    // groups tables inside it, `table_number` is the full label (e.g. "FA1").
+    try {
+      const rtCols2 = db.prepare("PRAGMA table_info(restaurant_tables)").all() as any[];
+      if (!rtCols2.some((x: any) => x.name === 'section')) {
+        db.exec("ALTER TABLE restaurant_tables ADD COLUMN section TEXT NOT NULL DEFAULT ''");
+      }
+    } catch (e) { console.error('restaurant_tables section migration failed:', e); }
+
     // order_items.recipe_deducted_at — set when the item's recipe was deducted
     // from stock (on KOT "served"/complete). NULL = not yet consumed. The settle
     // path skips inventory for already-stamped items so stock never double-drops.
@@ -2581,6 +2591,14 @@ function initializeSchema(db: Database.Database) {
       );
       CREATE INDEX IF NOT EXISTS idx_customer_otps_lookup ON customer_otps(table_id, mobile, created_at);
     `);
+    // send_failed: the provider REJECTED this code's WhatsApp send (bad token /
+    // template). The orders route treats a fresh failed send as "channel down"
+    // and falls back to captain approval instead of 428-ing the guest into a
+    // verify loop they can never pass.
+    const otpCols = db.prepare('PRAGMA table_info(customer_otps)').all() as any[];
+    if (!otpCols.some((c: any) => c.name === 'send_failed')) {
+      db.exec('ALTER TABLE customer_otps ADD COLUMN send_failed INTEGER NOT NULL DEFAULT 0');
+    }
   } catch (e) { console.error('customer_otps schema failed:', e); }
 
   // ── Multi-Store Inventory Engine — FOUNDATION (Phase A, additive) ─────────

@@ -13,7 +13,7 @@
     --paper:#F3E9D2; --paper2:#EFE3C5; --card:#FBF5E4; --cardElev:#FFFAEC;
     --ink:#241C10; --inkSoft:#5B4F3A; --inkMute:#93876C;
     --rule:rgba(36,28,16,.10); --ruleSoft:rgba(36,28,16,.055);
-    --terra:#B4502E; --terraDeep:#8E3A1E;
+    --terra:#B4502E; --terraDeep:#8E3A1E; --terraTint:#EFD9C0;
     --forest:#2D4A3A;
     --blush:#DCA9A1; --blush2:#CE938B; --blushInk:#5A2E2A;
     --veg:#3E8E5A; --nonveg:#B3382E; --egg:#C9911E;
@@ -67,6 +67,35 @@
   .land-body p{color:var(--inkSoft);font-size:14.5px;line-height:1.55;margin:12px 0 0;max-width:34ch}
   .land-cta{margin-top:auto;padding-top:26px}
   .land-foot{margin-top:16px;text-align:center}
+
+  /* ---------- GUEST GATE (details + WhatsApp OTP, pages 2 & 3) ---------- */
+  .gate{min-height:100dvh;display:flex;flex-direction:column;padding:0 22px calc(26px + var(--safe-b))}
+  .gate-top{display:flex;align-items:center;justify-content:space-between;padding:18px 0 8px}
+  .gback{width:38px;height:38px;border-radius:50%;border:1px solid var(--rule);background:var(--card);display:flex;align-items:center;justify-content:center;flex:none}
+  .gate-badge{width:64px;height:64px;border-radius:50%;background:var(--card);border:1px solid var(--rule);display:flex;align-items:center;justify-content:center;font-size:30px;box-shadow:var(--shadowSoft);margin-top:22px}
+  .gate h1{font-family:var(--serif);font-size:35px;line-height:1.06;margin:12px 0 0;font-weight:400;overflow-wrap:anywhere}
+  .gate .msg{color:var(--inkSoft);font-size:14.5px;line-height:1.6;margin:12px 0 0;max-width:36ch;overflow-wrap:anywhere;white-space:pre-line}
+  .gfield{margin-top:18px}
+  .gfield label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--inkMute);margin-bottom:8px}
+  .gfield .gin{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--rule);border-radius:16px;padding:0 16px;height:58px;transition:border-color .15s}
+  .gfield .gin:focus-within{border-color:var(--terra)}
+  .gfield input{flex:1;min-width:0;border:none;background:none;outline:none;font-size:16px;color:var(--ink)}
+  .gfield input::placeholder{color:var(--inkMute)}
+  .gfield .cc{font-family:var(--mono);font-size:15px;color:var(--inkSoft);border-right:1px solid var(--rule);padding-right:10px;flex:none}
+  .gate-cta{margin-top:auto;padding-top:26px}
+  /* editable footnote: readable (not the 10.5px uppercase kicker) — merchants
+     put real sentences/URLs here, so keep case + AA contrast + wrapping */
+  .gate-foot{margin-top:14px;text-align:center;line-height:1.6;padding:0 10px;
+    font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;color:var(--inkSoft);
+    text-transform:none;overflow-wrap:anywhere}
+  .gerr{color:var(--terraDeep);background:var(--terraTint);border-radius:12px;padding:10px 14px;font-size:13.5px;margin-top:14px;display:none}
+  .gerr.on{display:block;animation:fade .25s ease}
+  .otp-in{margin-top:20px}
+  .otp-in input{width:100%;background:var(--card);border:1px solid var(--rule);border-radius:18px;height:72px;text-align:center;font-family:var(--mono);font-size:29px;letter-spacing:.4em;text-indent:.4em;color:var(--ink);outline:none;font-weight:500}
+  .otp-in input:focus{border-color:var(--terra)}
+  .otp-in input::placeholder{color:var(--inkMute);letter-spacing:.28em}
+  .glink{background:none;border:none;color:var(--terra);font-size:13.5px;font-weight:600;padding:2px 4px;text-decoration:underline;text-underline-offset:3px}
+  .gsub{color:var(--inkSoft);font-size:14px;margin-top:10px;line-height:1.55}
 
   /* ---------- BUTTONS ---------- */
   .btn{width:100%;height:56px;border:none;border-radius:999px;background:var(--ink);color:var(--paper);
@@ -332,18 +361,22 @@
     {id:'cutlery',ic:'🍴',t:'Extra cutlery',s:'Spoons, forks, napkins',otw:'Bringing your cutlery'},
     {id:'bill',ic:'🧾',t:'Request bill',s:"We'll bring the cheque",otw:'Bringing your bill'}];
 
-  var S={screen:'loading',table:null,brand:{name:'Akan'},menu:null,design:{categoryStyle:'thumbnails',orderMode:'captain'},section:'food',cat:'',q:'',vegOnly:false,cart:{},scannedAt:nowTime(),lastOrder:null,orders:[],svcReqs:{}};
+  var S={screen:'loading',table:null,brand:{name:'Akan'},menu:null,design:{categoryStyle:'thumbnails',orderMode:'captain'},section:'food',cat:'',q:'',vegOnly:false,cart:{},scannedAt:nowTime(),lastOrder:null,orders:[],svcReqs:{},
+    guest:{name:'',mobile:'',verifiedAt:0,capturedAt:0,skippedAt:0},resumeOrder:false,resendWait:45,gateOptional:false};
   var SEC=[{id:'food',label:'Food',station:'Kitchen',unit:'dishes'},{id:'bev',label:'Beverages',station:'Bar',unit:'drinks'},{id:'liquor',label:'Liquor',station:'Bar',unit:'pours'}];
   function secMeta(id){return SEC.filter(function(s){return s.id===id;})[0]||SEC[0];}
   function secCount(id){var m=(S.menu&&S.menu[id])||{sub:[]};return m.sub.reduce(function(n,s){return n+s.items.length;},0);}
-  loadCart();
+  // ?preview_gate=1 — design preview: always show the details + code pages,
+  // even when OTP is off / WhatsApp isn't connected (codes won't verify).
+  var PREVIEW_GATE=qs.get('preview_gate')==='1';
+  loadCart();loadGuest();
 
   // ---------- utils ----------
   function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]});}
   function money(n){return '₹'+Math.round(Number(n)||0).toLocaleString('en-IN');}
   function nowTime(){try{return new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true});}catch(e){return '';}}
   function hueGrad(h){return 'linear-gradient(150deg,hsl('+h+' 46% 80%),hsl('+((h+24)%360)+' 40% 66%))';}
-  function api(path,opts){return fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opts||{})).then(function(r){return r.json().catch(function(){return{};}).then(function(j){if(!r.ok||j.ok===false)throw new Error(j.error||('HTTP '+r.status));return j;});});}
+  function api(path,opts){return fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},opts||{})).then(function(r){return r.json().catch(function(){return{};}).then(function(j){if(!r.ok||j.ok===false){var e=new Error(j.error||('HTTP '+r.status));e.data=j;e.status=r.status;throw e;}return j;});});}
   var toastT;
   function toast(msg){toastEl.textContent=msg;toastEl.classList.add('on');clearTimeout(toastT);toastT=setTimeout(function(){toastEl.classList.remove('on');},2600);}
 
@@ -366,6 +399,42 @@
   function saveCart(){try{localStorage.setItem('akan_cart_'+TOKEN,JSON.stringify(S.cart));}catch(e){}}
   function loadCart(){try{var r=localStorage.getItem('akan_cart_'+TOKEN);if(r)S.cart=JSON.parse(r)||{};}catch(e){S.cart={};}}
   function clearCart(){S.cart={};saveCart();}
+
+  // ---------- guest session (details page + WhatsApp verification) ----------
+  // verifiedAt = OTP passed; capturedAt = details taken while WhatsApp couldn't
+  // send (orders go via the captain). Both live per-table in localStorage.
+  function saveGuest(){try{localStorage.setItem('akan_guest_'+TOKEN,JSON.stringify(S.guest));}catch(e){}}
+  function loadGuest(){try{var r=localStorage.getItem('akan_guest_'+TOKEN);if(r){var g=JSON.parse(r)||{};S.guest={name:String(g.name||'').slice(0,60),mobile:String(g.mobile||'').replace(/\D/g,'').slice(-10),verifiedAt:Number(g.verifiedAt)||0,capturedAt:Number(g.capturedAt)||0,skippedAt:Number(g.skippedAt)||0};}}catch(e){}}
+  // 5.5h — a shade under the server's 6h window, so we re-verify BEFORE the
+  // server would start rejecting the number.
+  var VERIFY_WINDOW=19800000;
+  // STRICT gate (OTP mandatory): only where a captain-less order would fire —
+  // direct mode on a table the admin put in scope (otpApplies from the server).
+  function gateRequired(){var d=S.design||{};var applies=d.otpApplies!==false;return d.otpMode==='direct'&&d.orderMode==='direct'&&applies;}
+  // SOFT ask (captain-confirmed / out-of-scope tables): politely request the
+  // details once, fully skippable, never an OTP.
+  function softAskOn(){var d=S.design||{};return d.otpMode!=='off'&&!gateRequired();}
+  function needsSoftAsk(){
+    if(!softAskOn())return false;
+    var g=S.guest||{},now=Date.now();
+    if(g.name||g.mobile)return false;                                    // already shared something
+    if(g.skippedAt&&(now-g.skippedAt)<VERIFY_WINDOW)return false;        // asked already — don't nag
+    return true;
+  }
+  function needsGate(){
+    if(PREVIEW_GATE)return true;
+    if(!gateRequired())return false;
+    var g=S.guest||{},now=Date.now();
+    if(!g.mobile||!g.name)return true;
+    if(g.verifiedAt&&(now-g.verifiedAt)<VERIFY_WINDOW)return false;
+    // Captured WITHOUT a code (WhatsApp couldn't send): honour it for the full
+    // window while the channel is down, but only briefly (30 min) when the
+    // channel looks up — if it truly recovered, the order's 428 → verify →
+    // auto-resume flow will demand a real OTP anyway.
+    var capWindow=(S.design&&S.design.otpReady)?540000:VERIFY_WINDOW; // 9 min — inside the server's 10-min recentSendFailed window
+    if(g.capturedAt&&(now-g.capturedAt)<capWindow)return false;
+    return true;
+  }
 
   // ---------- menu helpers ----------
   function sectionData(){return (S.menu&&S.menu[S.section])||{sub:[]};}
@@ -390,6 +459,8 @@
     if(S.screen==='loading')return app.innerHTML='<div style="min-height:100dvh;display:flex;align-items:center;justify-content:center"><div class="spin"></div></div>';
     if(S.screen==='error')return renderError();
     if(S.screen==='landing')return renderLanding();
+    if(S.screen==='guest')return renderGuest();
+    if(S.screen==='otp')return renderOtp();
     if(S.screen==='menu')return renderMenu();
     if(S.screen==='track')return renderTrack();
   }
@@ -400,6 +471,7 @@
       '<div class="bigserif">Scan your table</div>'+
       '<p style="color:var(--inkSoft);margin-top:8px;max-width:30ch">'+esc(S.errmsg||"This link isn't linked to a table. Please scan the QR standee on your table.")+'</p>'+
       '</div></div>';
+    mountFloat();
   }
 
   // ---------- LANDING ----------
@@ -421,7 +493,178 @@
       '<div class="land-cta"><button class="btn between" id="enter"><span>View Menu</span><span>&rsaquo;</span></button>'+
         '<div class="land-foot kicker">Scanned at '+esc(S.scannedAt)+' · Tap anytime for service</div></div>'+
     '</div>';
-    document.getElementById('enter').onclick=function(){S.screen='menu';render();};
+    mountFloat();
+    document.getElementById('enter').onclick=function(){
+      if(needsGate()){S.gateOptional=false;S.screen='guest';}
+      else if(needsSoftAsk()){S.gateOptional=true;S.screen='guest';}
+      else{S.screen='menu';}
+      render();
+    };
+  }
+
+  // ---------- PAGE 2: GUEST DETAILS (name + WhatsApp number) ----------
+  function renderGuest(){
+    var t=S.table||{},d=S.design||{};
+    var head=d.guestHeading||'A pleasure to host you';
+    var msg=d.guestMessage||'May we have your name and WhatsApp number? It’s just for our billing records — and so we can reach you if your order needs a quick word. Thank you!';
+    var foot=d.guestFootnote||'Your details stay with us — used only for this visit.';
+    app.innerHTML=
+    '<div class="gate fade">'+
+      '<div class="gate-top"><button class="gback" id="gb" aria-label="Back">'+ICON.back+'</button><span class="kicker">Table No. '+esc(t.number!=null?t.number:'—')+'</span></div>'+
+      '<div class="gate-badge">🙏</div>'+
+      '<div class="kicker terra" style="margin-top:16px">'+(S.gateOptional?'If you don’t mind':'Before you browse')+'</div>'+
+      '<h1>'+esc(head)+'</h1>'+
+      '<p class="msg">'+esc(msg)+'</p>'+
+      '<div class="gfield"><label for="gname">Your name</label><div class="gin"><input id="gname" type="text" autocomplete="name" maxlength="60" placeholder="Your good name" value="'+esc(S.guest.name)+'"></div></div>'+
+      '<div class="gfield"><label for="gmob">WhatsApp number</label><div class="gin"><span class="cc">+91</span><input id="gmob" type="tel" inputmode="numeric" autocomplete="tel-national" placeholder="10-digit mobile" value="'+esc(S.guest.mobile)+'"></div></div>'+
+      '<div class="gerr" id="gerr" role="alert"></div>'+
+      '<div class="gate-cta"><button class="btn terra between" id="gnext"><span>Continue</span><span>&rsaquo;</span></button>'+
+        (S.gateOptional?'<div style="text-align:center;margin-top:6px"><button class="glink" id="gskip" style="padding:12px 10px;min-height:44px">Skip for now — take me to the menu</button></div>':'')+
+        '<div class="gate-foot">'+esc(foot)+'</div></div>'+
+    '</div>';
+    mountFloat();
+    var sk=document.getElementById('gskip');
+    if(sk)sk.onclick=function(){S.guest.skippedAt=Date.now();saveGuest();S.gateOptional=false;proceedToMenu();};
+    document.getElementById('gb').onclick=function(){S.resumeOrder=false;S.screen='landing';render();};
+    var mob=document.getElementById('gmob');
+    mob.oninput=function(){var v=mob.value.replace(/\D/g,'');if(v.length>10)v=v.slice(-10);if(v!==mob.value)mob.value=v;};   // pasted +91/0-prefixed numbers keep their last 10 digits
+    mob.onkeydown=function(e){if(e.key==='Enter')guestNext();};
+    document.getElementById('gname').onkeydown=function(e){if(e.key==='Enter'){mob.focus();}};
+    document.getElementById('gnext').onclick=guestNext;
+  }
+  function gateErr(msg){var el=document.getElementById('gerr');if(!el)return;if(!msg){el.classList.remove('on');el.textContent='';return;}el.textContent=msg;el.classList.add('on');}
+  function guestNext(){
+    var btn=document.getElementById('gnext');
+    if(!btn||btn.disabled)return;                    // in-flight guard (Enter key path)
+    var nameEl=document.getElementById('gname'),mobEl=document.getElementById('gmob');
+    var name=(nameEl.value||'').replace(/\s+/g,' ').trim();
+    var mob=(mobEl.value||'').replace(/\D/g,'');
+    // Optional ask (captain-confirmed / out-of-scope): whatever the guest shares
+    // is welcome — validate only what's filled, store it, and NEVER run an OTP.
+    if(S.gateOptional&&!PREVIEW_GATE){
+      if(mob&&!/^[6-9]\d{9}$/.test(mob)){gateErr('That mobile number doesn’t look right — 10 digits, or leave it empty.');mobEl.focus();return;}
+      if(name&&name.length<2){gateErr('Please enter your name, or leave it empty.');nameEl.focus();return;}
+      gateErr('');
+      if(name)S.guest.name=name;
+      if(mob)S.guest.mobile=mob;
+      if(name||mob){S.guest.capturedAt=Date.now();}else{S.guest.skippedAt=Date.now();}
+      saveGuest();S.gateOptional=false;proceedToMenu();return;
+    }
+    if(name.length<2){gateErr('Please tell us your name.');nameEl.focus();return;}
+    if(!/^[6-9]\d{9}$/.test(mob)){gateErr('Please enter a valid 10-digit mobile number.');mobEl.focus();return;}
+    gateErr('');
+    S.guest.name=name;S.guest.mobile=mob;saveGuest();
+    // Design preview: walk pages 2→3 without real sends/verifications.
+    if(PREVIEW_GATE){S.resendWait=45;S.screen='otp';render();toast('Preview — any 6-digit code works here');return;}
+    btn.disabled=true;btn.querySelector('span').textContent='Sending code…';
+    api('/api/customer/otp/send',{method:'POST',body:JSON.stringify({t:TOKEN,mobile:mob})}).then(function(r){
+      if(r.sent){S.resendWait=45;S.screen='otp';render();return;}
+      // WhatsApp can't send right now (channel down or send caps exhausted) —
+      // details are captured; orders go via the captain instead.
+      S.guest.capturedAt=Date.now();saveGuest();
+      toast('We couldn’t send a WhatsApp code — our captain will confirm your order instead');
+      proceedToMenu();
+    }).catch(function(e){
+      var d=(e&&e.data)||{};
+      // Short cooldown (45s window): a still-valid code is already out — let the
+      // guest type that one. Longer waits stay on this page with the message.
+      if(e.status===429&&d.retryAfter&&Number(d.retryAfter)<=120&&(S.design&&S.design.otpReady)){S.resendWait=Math.max(5,Number(d.retryAfter)||45);S.screen='otp';render();return;}
+      btn.disabled=false;btn.querySelector('span').textContent='Continue';
+      gateErr(e.message||'Could not send the code — please try again.');
+    });
+  }
+  function proceedToMenu(){
+    var resume=S.resumeOrder&&cartCount()>0;S.resumeOrder=false;
+    S.screen='menu';render();
+    if(resume){toast('Sending your order…');sendOrder();}
+  }
+
+  // ---------- PAGE 3: WHATSAPP CODE ----------
+  var resendTimer=null;
+  function renderOtp(){
+    var t=S.table||{};
+    var mob=S.guest.mobile||'';
+    var pretty='+91 '+mob.slice(0,5)+' '+mob.slice(5);
+    app.innerHTML=
+    '<div class="gate fade">'+
+      '<div class="gate-top"><button class="gback" id="gb" aria-label="Back">'+ICON.back+'</button><span class="kicker">Table No. '+esc(t.number!=null?t.number:'—')+'</span></div>'+
+      '<div class="gate-badge">💬</div>'+
+      '<div class="kicker terra" style="margin-top:16px">WhatsApp verification</div>'+
+      '<h1>Enter the code</h1>'+
+      '<p class="gsub">We’ve sent a 6-digit code on WhatsApp to <b style="white-space:nowrap">'+esc(pretty)+'</b> <button class="glink" id="gchg">Change</button></p>'+
+      '<div class="otp-in"><input id="gcode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="••••••" aria-label="6-digit code"></div>'+
+      '<div class="gerr" id="gerr" role="alert"></div>'+
+      '<div class="gsub">Didn’t get it? <span id="gresend"></span></div>'+
+      '<div class="gate-cta"><button class="btn forest between" id="gver" disabled><span>Verify &amp; view menu</span><span>&rsaquo;</span></button>'+
+        '<div class="gate-foot">The code expires in 5 minutes</div></div>'+
+    '</div>';
+    mountFloat();
+    document.getElementById('gb').onclick=function(){S.screen='guest';render();};
+    document.getElementById('gchg').onclick=function(){S.screen='guest';render();};
+    var inp=document.getElementById('gcode');
+    inp.oninput=function(){
+      var v=inp.value.replace(/\D/g,'').slice(0,6);if(v!==inp.value)inp.value=v;
+      document.getElementById('gver').disabled=v.length!==6;
+      gateErr('');
+      if(v.length===6)otpVerify();     // auto-verify the moment 6 digits land
+    };
+    inp.onkeydown=function(e){if(e.key==='Enter'&&inp.value.length===6)otpVerify();};
+    document.getElementById('gver').onclick=otpVerify;
+    startResendCountdown(S.resendWait||45);
+    setTimeout(function(){try{inp.focus();}catch(e){}},80);
+  }
+  function startResendCountdown(sec){
+    if(resendTimer){clearInterval(resendTimer);resendTimer=null;}
+    var left=Math.max(1,Math.round(sec));
+    function paint(){
+      var el=document.getElementById('gresend');
+      if(!el){clearInterval(resendTimer);resendTimer=null;return;}
+      if(left>0){el.innerHTML='<span class="kicker">Resend in '+left+'s</span>';}
+      else{clearInterval(resendTimer);resendTimer=null;el.innerHTML='<button class="glink" id="gres">Resend code</button>';
+        var b=document.getElementById('gres');if(b)b.onclick=resendOtp;}
+    }
+    paint();
+    resendTimer=setInterval(function(){left--;paint();},1000);
+  }
+  function resendOtp(){
+    if(PREVIEW_GATE){toast('Preview — no real code is sent');startResendCountdown(45);return;}
+    var el=document.getElementById('gresend');if(el)el.innerHTML='<span class="kicker">Sending…</span>';
+    api('/api/customer/otp/send',{method:'POST',body:JSON.stringify({t:TOKEN,mobile:S.guest.mobile})}).then(function(r){
+      if(r.sent){toast('Code re-sent on WhatsApp');startResendCountdown(45);return;}
+      // Channel died / caps exhausted mid-flow — tell the guest, then continue
+      // via the captain (details are captured for the bill).
+      S.guest.capturedAt=Date.now();saveGuest();
+      toast('WhatsApp is unavailable right now — our captain will confirm your order instead');
+      proceedToMenu();
+    }).catch(function(e){
+      var d=(e&&e.data)||{};
+      if(e.status===429&&d.retryAfter){startResendCountdown(Math.max(5,Number(d.retryAfter)||45));gateErr(e.message);return;}
+      startResendCountdown(10);
+      gateErr(e.message||'Could not resend — please try again.');
+    });
+  }
+  var otpBusy=false;   // in-flight latch: auto-verify + Enter must not double-POST (each wrong try burns an attempt)
+  function otpVerify(){
+    if(otpBusy)return;
+    var inp=document.getElementById('gcode');if(!inp)return;
+    var code=(inp.value||'').replace(/\D/g,'');
+    if(code.length!==6)return;
+    if(PREVIEW_GATE){toast('Preview — code accepted');S.guest.capturedAt=Date.now();saveGuest();proceedToMenu();return;}
+    otpBusy=true;
+    var btn=document.getElementById('gver');btn.disabled=true;btn.querySelector('span').textContent='Verifying…';
+    gateErr('');
+    api('/api/customer/otp/verify',{method:'POST',body:JSON.stringify({t:TOKEN,mobile:S.guest.mobile,code:code})}).then(function(){
+      otpBusy=false;
+      var now=Date.now();S.guest.verifiedAt=now;S.guest.capturedAt=now;saveGuest();
+      var first=(S.guest.name||'').split(' ')[0];
+      toast('✓ Verified — welcome'+(first?', '+first:'')+'!');
+      proceedToMenu();
+    }).catch(function(e){
+      otpBusy=false;
+      btn.disabled=false;btn.querySelector('span').textContent='Verify & view menu';
+      gateErr(e.message||'Incorrect code — please try again.');
+      try{inp.focus();inp.select();}catch(x){}
+    });
   }
 
   // ---------- MENU ----------
@@ -530,6 +773,7 @@
     // legacy floating elements (superseded by the tab bar) — remove if present
     var oldf=document.getElementById('floatwrap');if(oldf)oldf.remove();
     var oldbell=document.getElementById('bell');if(oldbell)oldbell.remove();
+    var oldc=document.getElementById('cartfloat');if(oldc)oldc.remove();
     var old=document.getElementById('tabbar');if(old)old.remove();
     if(S.screen!=='menu'&&S.screen!=='track')return;   // persistent nav on menu + order tracking
     var n=cartCount();
@@ -552,6 +796,17 @@
       else{toast('Add items to start your order');}
     };
     bar.querySelector('[data-tab="table"]').onclick=openService;
+    // Floating "View cart" bar — always visible above the tab bar while the
+    // cart has items, so guests never hunt for where their selection went.
+    if(S.screen==='menu'&&n>0){
+      var fw=document.createElement('div');fw.className='floatwrap';fw.id='cartfloat';
+      fw.style.paddingBottom='calc(76px + var(--safe-b))';
+      fw.innerHTML='<button class="cartbar" style="width:100%;border:none;cursor:pointer">'+
+        '<span class="n">'+n+'</span><span class="lbl" style="text-align:left">View cart</span>'+
+        '<span class="go">'+money(cartSub()+cartGst())+' &rsaquo;</span></button>';
+      document.body.appendChild(fw);
+      fw.querySelector('.cartbar').onclick=openCart;
+    }
   }
 
   // ---------- SHEETS ----------
@@ -674,9 +929,24 @@
   function sendOrder(){
     var btn=document.getElementById('place');if(btn){btn.disabled=true;btn.querySelector('span').textContent='Sending…';}
     var items=cartArr().map(function(x){return{id:x.item.id,qty:x.qty,note:x.note||''};});
-    api('/api/customer/orders',{method:'POST',body:JSON.stringify({t:TOKEN,items:items,note:(S.orderNote||'').slice(0,300)})}).then(function(r){
+    var payload={t:TOKEN,items:items,note:(S.orderNote||'').slice(0,300)};
+    // Attach the guest's verified details (details page) — the server matches
+    // the mobile against its own OTP record; the name rides along for the bill.
+    if(S.guest&&S.guest.mobile)payload.mobile=S.guest.mobile;
+    if(S.guest&&S.guest.name)payload.name=S.guest.name;
+    api('/api/customer/orders',{method:'POST',body:JSON.stringify(payload)}).then(function(r){
       S.lastOrder={id:r.orderId,total:r.subtotal,mode:r.mode};clearCart();S.orderNote='';closeSheet();S.screen='track';render();pollOrders();
-    }).catch(function(e){toast(e.message||'Could not place order');if(btn){btn.disabled=false;btn.querySelector('span').textContent='Place order';}});
+    }).catch(function(e){
+      // Verification lapsed (or was reset server-side) — run the gate pages,
+      // then auto-resume this order once the guest verifies.
+      if(e&&e.data&&e.data.needs_otp){
+        S.guest.verifiedAt=0;S.guest.capturedAt=0;saveGuest();
+        S.resumeOrder=true;S.gateOptional=false;closeSheet();S.screen='guest';render();
+        toast('Please verify your WhatsApp number to send this order');
+        return;
+      }
+      toast(e.message||'Could not place order');if(btn){btn.disabled=false;btn.querySelector('span').textContent='Place order';}
+    });
   }
   // Centered "send to kitchen?" confirmation (direct ordering only). Layers above
   // the open cart sheet; cancel returns to the cart, confirm fires the order.
@@ -705,7 +975,7 @@
   }
   function renderTrack(){
     var orders=S.orders||[];
-    var direct=(S.design&&S.design.orderMode==='direct');
+    var direct=(S.design&&S.design.orderMode==='direct')&&!(S.lastOrder&&S.lastOrder.mode==='captain');
     var anyOpen=orders.some(function(o){return o.status==='open';});
     var allPending=orders.length&&orders.every(function(o){return o.status==='pending_approval';});
     // stage: 0 received,1 preparing,2 ready,3 served — we know up to preparing from status.

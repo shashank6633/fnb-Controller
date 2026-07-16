@@ -3,6 +3,7 @@ import { usePathname } from 'next/navigation';
 import Sidebar from '@/components/Sidebar';
 import UserBar from '@/components/UserBar';
 import MobileTopBar from '@/components/MobileTopBar';
+import CaptainAlertsProvider from '@/components/CaptainAlertsProvider';
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -14,9 +15,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const isPrintView = /\/print(\/|$)/.test(pathname);
   const bare = pathname === '/login' || isPrintView || pathname.startsWith('/captain');
 
-  if (bare) return <>{children}</>;
-
-  return (
+  // The floating captain-alert bell + toast wraps EVERY route (bare or not) so a
+  // captain who has left the board still gets their table alerts on top of any
+  // screen. It renders nothing (no bell) until there's an alert.
+  const inner = bare ? (
+    <>{children}</>
+  ) : (
     <div className="flex min-h-screen">
       <Sidebar />
       <main className="flex-1 min-w-0 relative">
@@ -37,4 +41,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       </main>
     </div>
   );
+
+  return <CaptainAlertsProvider>{inner}</CaptainAlertsProvider>;
 }

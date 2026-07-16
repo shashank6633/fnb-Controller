@@ -20,7 +20,7 @@ export async function GET() {
     // captain; NULL = table not yet opened by anyone (any captain may claim it).
     const orders = db.prepare(`
       SELECT o.id, o.status, o.subtotal, o.total, o.notes, o.created_at,
-             o.table_id, rt.table_number, rt.zone,
+             o.table_id, o.guest_name, o.guest_mobile, rt.table_number, rt.zone,
              oo.server_id AS table_owner_id, oo.server_name AS table_owner_name
       FROM orders o
       LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
@@ -41,6 +41,10 @@ export async function GET() {
       subtotal: o.subtotal,
       total: o.total,
       note: o.notes || '',
+      // Guest details captured on the QR details page — shown on the approval
+      // card so the captain knows who ordered and can call back if needed.
+      guest_name: o.guest_name || '',
+      guest_mobile: o.guest_mobile || '',
       created_at: o.created_at,
       table_owner_id: o.table_owner_id || null,
       table_owner_name: o.table_owner_name || '',

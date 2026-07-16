@@ -23,6 +23,7 @@ interface OrderItem { id: string; name: string; quantity: number; unit_price: nu
 interface Order {
   id: string; order_number: number; order_type: string; table_number: string | null; zone: string | null;
   covers: number; server_name: string | null; created_at: string;
+  guest_name?: string | null; guest_mobile?: string | null;
   status: string; total: number; payment_method: string | null;
   subtotal: number; discount: number; discount_pct: number; service_charge_reason: string | null;
   items: OrderItem[];
@@ -255,7 +256,7 @@ export default function CashierPage() {
               <div className="flex items-center gap-2">
                 <span className="text-xs font-bold bg-[#2D1B0E] text-white px-2 py-1 rounded">{order.table_number ? `${order.zone ? order.zone + ' · ' : ''}${order.table_number}` : 'PARCEL'}</span>
                 <span className="text-xs uppercase font-semibold text-emerald-700">{order.order_type}</span>
-                <span className="text-xs text-[#8B7355]">#{order.order_number} · {order.server_name || '—'} · <Users className="inline w-3 h-3" /> {order.covers || 0}</span>
+                <span className="text-xs text-[#8B7355]">#{order.order_number} · {order.server_name || '—'} · <Users className="inline w-3 h-3" /> {order.covers || 0}{order.guest_name ? <> · {order.guest_name}</> : null}{order.guest_mobile ? <> · {order.guest_mobile}</> : null}</span>
               </div>
               <button onClick={goBack} className="flex items-center gap-1 text-sm text-[#8B7355] hover:text-[#af4408]"><ArrowLeft className="w-4 h-4" /> Back to tables</button>
             </div>

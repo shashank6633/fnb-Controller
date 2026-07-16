@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, isManagement } from '@/lib/auth';
 import { todayIST } from '@/lib/format-date';
 import { getSalesDashboard } from '@/lib/sales-dashboard';
 
@@ -17,8 +17,8 @@ export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (me.role !== 'admin' && me.role !== 'manager') {
-      return Response.json({ error: 'Manager or admin role required' }, { status: 403 });
+    if (!isManagement(me)) {
+      return Response.json({ error: 'Manager, HOD or admin role required' }, { status: 403 });
     }
     const db = getDb();
     const outletId = await getCurrentOutletId();

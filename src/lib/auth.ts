@@ -178,6 +178,16 @@ export function canApproveTableOp(user: { role?: string; role_name?: string | nu
   return user.role === 'admin' || user.role === 'manager' || user.role_name === 'Cashier';
 }
 
+/** Management tier: Admin, any Manager, or a Head of Department (is_head_chef).
+ *  Used to gate management-only reports/exports (e.g. the table-wise Sales
+ *  download). NOTE: customer data (guest name/mobile/history) is deliberately
+ *  NOT gated by this — staff/cashiers see it while taking orders + billing, and
+ *  the guest history is open to all members. */
+export function isManagement(user: { role?: string; is_head_chef?: boolean } | null): boolean {
+  if (!user) return false;
+  return user.role === 'admin' || user.role === 'manager' || !!user.is_head_chef;
+}
+
 /**
  * Verify an approver's login (email + password) for an on-the-spot manager/cashier
  * override. Returns the resolved user (with effective tier + role_name) if the

@@ -58,6 +58,15 @@ export function fireStagingOrder(
           notes = TRIM(COALESCE(notes,'') || ' [merged into order #' || CAST(? AS INTEGER) || ']')
         WHERE id = ?
       `).run(live.order_number, orderId);
+      // Carry the guest's name/mobile (QR details page) onto the live bill —
+      // backfill ONLY when the target's fields are empty, never overwrite what
+      // a captain already recorded.
+      db.prepare(`
+        UPDATE orders SET
+          guest_name   = CASE WHEN COALESCE(guest_name,'')   = '' THEN ? ELSE guest_name   END,
+          guest_mobile = CASE WHEN COALESCE(guest_mobile,'') = '' THEN ? ELSE guest_mobile END
+        WHERE id = ?
+      `).run(String(staging.guest_name || ''), String(staging.guest_mobile || ''), live.id);
       targetId = live.id; targetOutlet = live.outlet_id;
       targetNumber = live.order_number; targetServer = live.server_name; merged = true;
     } else {
