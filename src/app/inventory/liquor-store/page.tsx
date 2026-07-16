@@ -126,10 +126,13 @@ function CBLEntry({ mat, value, onChange }: {
       </div>
     );
   }
+  const showCases = mode === 'cbl' || mode === 'cb';
+  const showLoose = mode === 'cbl' || mode === 'bl';
+  const cols = (showCases ? 1 : 0) + 1 + (showLoose ? 1 : 0);   // Cases? + Bottles + Loose?
   return (
     <div>
-      <div className={`grid gap-2 ${mode === 'cbl' ? 'grid-cols-3' : 'grid-cols-2'}`}>
-        {mode === 'cbl' && (
+      <div className={`grid gap-2 ${cols === 3 ? 'grid-cols-3' : 'grid-cols-2'}`}>
+        {showCases && (
           <div>
             <L>Cases</L>
             <input type="number" min={0} step="any" inputMode="decimal" value={value.cases}
@@ -145,17 +148,20 @@ function CBLEntry({ mat, value, onChange }: {
                  placeholder="0" className={box}
                  title={mat ? `1 ${bu} = ${fq(packFactor(mat))} ${ru}` : undefined} />
         </div>
-        <div>
-          <L>Loose ({ru})</L>
-          <input type="number" min={0} step="any" inputMode="decimal" value={value.loose}
-                 onChange={e => onChange({ ...value, loose: e.target.value })}
-                 placeholder="0" className={box} />
-        </div>
+        {showLoose && (
+          <div>
+            <L>Loose ({ru})</L>
+            <input type="number" min={0} step="any" inputMode="decimal" value={value.loose}
+                   onChange={e => onChange({ ...value, loose: e.target.value })}
+                   placeholder="0" className={box} />
+          </div>
+        )}
       </div>
       {mat && touched && (
         <div className="mt-1 text-[11px] text-[#6B5744] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-2 py-1">
-          {mode === 'cbl' ? `${numOr0(value.cases)} cs + ` : ''}
-          {`${numOr0(value.bottles)} ${bu.toLowerCase()} + ${numOr0(value.loose)} ${ru}`}
+          {showCases ? `${numOr0(value.cases)} cs + ` : ''}
+          {`${numOr0(value.bottles)} ${bu.toLowerCase()}`}
+          {showLoose ? ` + ${numOr0(value.loose)} ${ru}` : ''}
           {' = '}<b>{fq(recipe)} {ru}</b>
         </div>
       )}
@@ -2160,6 +2166,13 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                       {rows.map(r => {
                         const pc = packConv(r);
                         const cf = caseFactor(r);
+                        // Show a Cases box whenever there IS a case size (incl.
+                        // piece-counted beer, pc=1 cf=24); hide Loose for those
+                        // 'cb' items (pieces are whole). Loose stays the single
+                        // box for plain items.
+                        const showCasesBox = cf > 1;
+                        const showWholeBox = pc > 1 || cf > 1;
+                        const showLooseBox = pc > 1 || cf <= 1;
                         const sys = systemFor(r);
                         const phys = physicalFor(r);
                         const existing = countedBy.get(r.material_id);
@@ -2184,7 +2197,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                             <td className="px-3 py-2 text-right text-xs text-[#8B7355] whitespace-nowrap">{r.unit}</td>
                             <td className="px-3 py-2">
                               <div className="flex items-center gap-1 flex-wrap">
-                                {pc > 1 && cf > 1 && (<>
+                                {showCasesBox && (<>
                                   <input type="number" step="any" min={0} value={cases[r.material_id] ?? ''}
                                          onChange={e => setCases(p => ({ ...p, [r.material_id]: e.target.value }))}
                                          placeholder="0" aria-label={`${r.material_name} — cases`}
@@ -2193,22 +2206,24 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                                   <span className="text-[10px] text-[#8B7355]">cs</span>
                                   <span className="text-[10px] text-[#8B7355]">+</span>
                                 </>)}
-                                {pc > 1 && (<>
+                                {showWholeBox && (<>
                                   <input type="number" step="any" min={0} value={whole[r.material_id] ?? ''}
                                          onChange={e => setWhole(p => ({ ...p, [r.material_id]: e.target.value }))}
                                          placeholder="0" aria-label={`${r.material_name} — ${r.purchase_unit}`}
                                          title={`Full ${r.purchase_unit} — 1 = ${fq(r.pack_size)} ${r.unit}`}
                                          className={box} />
                                   <span className="text-[10px] text-[#8B7355]">{r.purchase_unit}</span>
-                                  <span className="text-[10px] text-[#8B7355]">+</span>
+                                  {showLooseBox && <span className="text-[10px] text-[#8B7355]">+</span>}
                                 </>)}
-                                <input type="number" step="any" min={0} value={loose[r.material_id] ?? ''}
-                                       onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
-                                       placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : r.unit}`}
-                                       title={pc > 1 ? `Loose / open ${r.unit}` : `Count in ${r.unit}`}
-                                       className={box} />
-                                <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
-                                {phys != null && pc > 1 && (
+                                {showLooseBox && (<>
+                                  <input type="number" step="any" min={0} value={loose[r.material_id] ?? ''}
+                                         onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
+                                         placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : r.unit}`}
+                                         title={pc > 1 ? `Loose / open ${r.unit}` : `Count in ${r.unit}`}
+                                         className={box} />
+                                  <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
+                                </>)}
+                                {phys != null && (pc > 1 || cf > 1) && (
                                   <span className="text-[10px] font-mono text-[#af4408] whitespace-nowrap">= {fq(phys)} {r.unit}</span>
                                 )}
                               </div>
@@ -2240,6 +2255,9 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                 {rows.map(r => {
                   const pc = packConv(r);
                   const cf = caseFactor(r);
+                  const showCasesBox = cf > 1;
+                  const showWholeBox = pc > 1 || cf > 1;
+                  const showLooseBox = pc > 1 || cf <= 1;
                   const sys = systemFor(r);
                   const phys = physicalFor(r);
                   const existing = countedBy.get(r.material_id);
@@ -2262,24 +2280,26 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                         )}
                       </div>
                       <div className="mt-2 flex items-center gap-1 flex-wrap">
-                        {pc > 1 && cf > 1 && (<>
+                        {showCasesBox && (<>
                           <input type="number" step="any" min={0} inputMode="decimal" value={cases[r.material_id] ?? ''}
                                  onChange={e => setCases(p => ({ ...p, [r.material_id]: e.target.value }))}
                                  placeholder="0" aria-label={`${r.material_name} — cases`} className={boxM} />
                           <span className="text-[10px] text-[#8B7355]">cs</span>
                           <span className="text-[10px] text-[#8B7355]">+</span>
                         </>)}
-                        {pc > 1 && (<>
+                        {showWholeBox && (<>
                           <input type="number" step="any" min={0} inputMode="decimal" value={whole[r.material_id] ?? ''}
                                  onChange={e => setWhole(p => ({ ...p, [r.material_id]: e.target.value }))}
                                  placeholder="0" aria-label={`${r.material_name} — ${r.purchase_unit}`} className={boxM} />
                           <span className="text-[10px] text-[#8B7355]">{r.purchase_unit}</span>
-                          <span className="text-[10px] text-[#8B7355]">+</span>
+                          {showLooseBox && <span className="text-[10px] text-[#8B7355]">+</span>}
                         </>)}
-                        <input type="number" step="any" min={0} inputMode="decimal" value={loose[r.material_id] ?? ''}
-                               onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
-                               placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : r.unit}`} className={boxM} />
-                        <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
+                        {showLooseBox && (<>
+                          <input type="number" step="any" min={0} inputMode="decimal" value={loose[r.material_id] ?? ''}
+                                 onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
+                                 placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : r.unit}`} className={boxM} />
+                          <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
+                        </>)}
                         {v != null && (
                           <span className={`ml-auto font-mono ${v < 0 ? 'text-red-700' : v > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
                             {fmtBreakdown(v, r) || `${v > 0 ? '+' : ''}${fq(v)} ${r.unit}`}{vv != null && vv !== 0 ? ` · ${vv > 0 ? '+' : '−'}${inr(Math.abs(vv))}` : ''}

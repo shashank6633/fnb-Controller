@@ -58,7 +58,7 @@ const PAGE_SIZE = 50;
 /* One qty cell: raw recipe qty, with the CBL breakdown beneath when packed. */
 function QtyCell({ qty, r, strong }: { qty: number; r: Row; strong?: boolean }) {
   const neg = qty < 0;
-  const dual = r.pack_size > 1 ? fmtBreakdown(qty, packMeta(r)) : null;
+  const dual = (r.pack_size > 1 || (r.case_size ?? 1) > 1) ? fmtBreakdown(qty, packMeta(r)) : null;
   const zero = qty === 0;
   return (
     <div className={`text-right tabular-nums ${neg ? 'text-red-700' : zero ? 'text-[#B9A896]' : 'text-[#2D1B0E]'}`}>

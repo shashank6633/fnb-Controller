@@ -24,7 +24,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Scale, Search, X, Loader2, AlertCircle, Download, Layers,
   IndianRupee, Store as StoreIcon, AlertTriangle, PackageX, TrendingUp,
-  TrendingDown, PartyPopper, Info,
+  TrendingDown, PartyPopper, Info, ChevronDown, ChevronRight, CheckCircle2, Stethoscope,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { fmtBreakdown, PackMeta } from '@/lib/pack-units';
@@ -118,7 +118,7 @@ function QtyCell({ qty, r, strong, tone }: {
   qty: number; r: { unit: string; purchase_unit: string; pack_size?: number; case_size: number };
   strong?: boolean; tone?: 'expected' | 'actual' | 'variance';
 }) {
-  const packed = (r.pack_size ?? 1) > 1;
+  const packed = (r.pack_size ?? 1) > 1 || (r.case_size ?? 1) > 1;   // incl. piece-counted cases (cb)
   const dual = packed ? fmtBreakdown(qty, packMetaOf(r)) : null;
   const zero = qty === 0;
   let color = 'text-[#2D1B0E]';
@@ -134,6 +134,161 @@ function QtyCell({ qty, r, strong, tone }: {
 }
 
 /* ── Page ──────────────────────────────────────────────────────────────────── */
+
+/* ── Floor setup health — read-only diagnostic for why variance is off ─────── */
+
+interface FloorReadiness {
+  ready: boolean;
+  autodeduct: { enabled: boolean; mode: 'ledger' | 'physical'; needs: string[] };
+  floor_stores: { id: string; name: string; code: string; labels: string[]; held_materials: number; has_stock: boolean; closing_counts: number; last_count_date: string | null }[];
+  zones: { zone: string; tables: number; mapped: boolean; store_id: string | null; store_name: string | null }[];
+  unmapped_zones: { zone: string; tables: number }[];
+  orphan_labels: { store: string; label: string }[];
+  recipe_coverage: { liquor_materials: number; in_recipe: number; missing_recipe: number; sample_missing: string[] };
+  issues: { severity: 'error' | 'warn' | 'info'; message: string }[];
+}
+
+function FloorHealthPanel() {
+  const [data, setData] = useState<FloorReadiness | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const r = await fetch('/api/stores/floor-readiness', { credentials: 'same-origin' });
+        const j = await r.json();
+        if (!alive) return;
+        if (!r.ok) { setErr(j?.error || `HTTP ${r.status}`); return; }
+        setData(j);
+        if (!j.ready) setOpen(true);   // auto-expand when something needs attention
+      } catch (e: any) { if (alive) setErr(e?.message || 'Failed to load'); }
+      finally { if (alive) setLoading(false); }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const errors = data?.issues.filter(i => i.severity === 'error').length ?? 0;
+  const warns = data?.issues.filter(i => i.severity === 'warn').length ?? 0;
+  const tone = !data ? 'muted' : data.ready && warns === 0 ? 'ok' : errors > 0 ? 'error' : 'warn';
+  const toneCls = {
+    ok: 'bg-emerald-50 border-emerald-200 text-emerald-800',
+    warn: 'bg-amber-50 border-amber-200 text-amber-900',
+    error: 'bg-red-50 border-red-200 text-red-800',
+    muted: 'bg-[#FFF8F0] border-[#E8D5C4] text-[#6B5744]',
+  }[tone];
+
+  return (
+    <div className={`border rounded-lg ${toneCls}`}>
+      <button onClick={() => setOpen(o => !o)} aria-expanded={open} className="w-full flex items-center gap-2 px-3 py-2.5 text-left">
+        {open ? <ChevronDown className="w-4 h-4 shrink-0" /> : <ChevronRight className="w-4 h-4 shrink-0" />}
+        <Stethoscope className="w-4 h-4 shrink-0" />
+        <span className="text-sm font-semibold">Floor setup health</span>
+        {loading ? (
+          <Loader2 className="w-4 h-4 animate-spin ml-1" />
+        ) : err ? (
+          <span className="text-xs">— {err}</span>
+        ) : data ? (
+          <span className="ml-1 text-xs font-medium inline-flex items-center gap-1.5">
+            {data.ready && warns === 0
+              ? <><CheckCircle2 className="w-3.5 h-3.5" /> Ready — pours will attribute to floors</>
+              : <>{errors > 0 && <span className="inline-flex items-center gap-0.5"><AlertCircle className="w-3.5 h-3.5" /> {errors} to fix</span>}
+                  {warns > 0 && <span className="inline-flex items-center gap-0.5"><AlertTriangle className="w-3.5 h-3.5" /> {warns} to review</span>}</>}
+          </span>
+        ) : null}
+        <span className="ml-auto text-[11px] opacity-70">
+          {data && `auto-deduct ${data.autodeduct.enabled ? 'ON' : 'OFF'} · ${data.autodeduct.mode} mode`}
+        </span>
+      </button>
+
+      {open && data && (
+        <div className="px-3 pb-3 space-y-3 text-[#2D1B0E]">
+          {/* Issues */}
+          {data.issues.length > 0 ? (
+            <div className="space-y-1.5">
+              {data.issues.map((it, i) => (
+                <div key={i} className={`text-xs flex items-start gap-1.5 rounded px-2 py-1.5 border ${
+                  it.severity === 'error' ? 'bg-red-50 border-red-200 text-red-700'
+                  : it.severity === 'warn' ? 'bg-amber-50 border-amber-200 text-amber-800'
+                  : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
+                  {it.severity === 'error' ? <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" /> : <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />}
+                  <span>{it.message}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-xs text-emerald-700 flex items-center gap-1.5 bg-white border border-emerald-200 rounded px-2 py-1.5">
+              <CheckCircle2 className="w-3.5 h-3.5" /> Every table zone maps to a floor bar and the reconciliation has what it needs.
+            </div>
+          )}
+
+          <div className="grid md:grid-cols-2 gap-3">
+            {/* Zone → floor mapping */}
+            <div className="bg-white rounded-lg border border-[#E8D5C4] overflow-hidden">
+              <div className="px-3 py-1.5 text-[11px] font-bold uppercase tracking-wide text-[#8B7355] bg-[#FFF7EF] border-b border-[#F0E4D6]">Table zone → floor bar</div>
+              {data.zones.length === 0 ? (
+                <div className="px-3 py-2 text-xs text-[#8B7355]">No table zones defined.</div>
+              ) : (
+                <table className="w-full text-xs">
+                  <tbody className="divide-y divide-[#F0E4D6]">
+                    {data.zones.map(z => (
+                      <tr key={z.zone}>
+                        <td className="px-3 py-1.5 text-[#2D1B0E]">{z.zone} <span className="text-[10px] text-[#8B7355]">· {z.tables} table{z.tables === 1 ? '' : 's'}</span></td>
+                        <td className="px-3 py-1.5 text-right">
+                          {z.mapped
+                            ? <span className="text-emerald-700 inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> {z.store_name}</span>
+                            : <span className="text-red-700 inline-flex items-center gap-1"><AlertCircle className="w-3 h-3" /> unmapped</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            {/* Floor stores */}
+            <div className="bg-white rounded-lg border border-[#E8D5C4] overflow-hidden">
+              <div className="px-3 py-1.5 text-[11px] font-bold uppercase tracking-wide text-[#8B7355] bg-[#FFF7EF] border-b border-[#F0E4D6]">Floor bars</div>
+              {data.floor_stores.length === 0 ? (
+                <div className="px-3 py-2 text-xs text-[#8B7355]">No floor bars — set a Floor label on Settings → Store Locations.</div>
+              ) : (
+                <table className="w-full text-xs">
+                  <tbody className="divide-y divide-[#F0E4D6]">
+                    {data.floor_stores.map(s => (
+                      <tr key={s.id}>
+                        <td className="px-3 py-1.5">
+                          <div className="text-[#2D1B0E] font-medium">{s.name}</div>
+                          <div className="text-[10px] text-[#8B7355]">label: {s.labels.join(', ') || '—'}</div>
+                        </td>
+                        <td className="px-3 py-1.5 text-right text-[10px] text-[#6B5744] whitespace-nowrap">
+                          {s.has_stock ? `${s.held_materials} items held` : <span className="text-amber-700">no stock</span>}
+                          <div>{s.closing_counts > 0 ? `${s.closing_counts} counts` : <span className="text-amber-700">no counts</span>}</div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+
+          {/* Recipe coverage + mode help */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-[#6B5744]">
+            <span>Liquor items in a recipe: <b className="text-[#2D1B0E]">{data.recipe_coverage.in_recipe}/{data.recipe_coverage.liquor_materials}</b></span>
+            {data.recipe_coverage.missing_recipe > 0 && (
+              <span className="text-amber-800" title={data.recipe_coverage.sample_missing.join(', ')}>
+                {data.recipe_coverage.missing_recipe} not in any recipe (hover)
+              </span>
+            )}
+            <span className="ml-auto">This {data.autodeduct.mode} mode needs: {data.autodeduct.needs.join(' · ')}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function ReconciliationPage() {
   const today = useMemo(() => localDate(new Date()), []);
@@ -290,6 +445,9 @@ export default function ReconciliationPage() {
           <Download className="w-4 h-4" /> Export CSV
         </button>
       </div>
+
+      {/* Setup health — surfaces why floor variance might be wrong/missing. */}
+      <FloorHealthPanel />
 
       {/* Filters: floor + date range */}
       <div className="flex flex-wrap items-end gap-2 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3">

@@ -155,10 +155,13 @@ function CBLEntry({ mat, value, onChange, compact }: {
              placeholder={`Qty (${ru})`} className={box} aria-label={`Quantity in ${ru}`} />
     );
   }
+  const showCases = mode === 'cbl' || mode === 'cb';
+  const showLoose = mode === 'cbl' || mode === 'bl';
+  const cols = (showCases ? 1 : 0) + 1 + (showLoose ? 1 : 0);
   return (
     <div>
-      <div className={`grid gap-1.5 ${mode === 'cbl' ? 'grid-cols-3' : 'grid-cols-2'}`}>
-        {mode === 'cbl' && (
+      <div className={`grid gap-1.5 ${cols === 3 ? 'grid-cols-3' : 'grid-cols-2'}`}>
+        {showCases && (
           <input type="number" min={0} step="any" inputMode="decimal" value={value.cases}
                  onChange={e => onChange({ ...value, cases: e.target.value })}
                  placeholder="cs" className={box} aria-label="Cases"
@@ -168,9 +171,11 @@ function CBLEntry({ mat, value, onChange, compact }: {
                onChange={e => onChange({ ...value, bottles: e.target.value })}
                placeholder={bu.toLowerCase()} className={box} aria-label={bu}
                title={mat ? `1 ${bu} = ${fq(packFactor(mat))} ${ru}` : undefined} />
-        <input type="number" min={0} step="any" inputMode="decimal" value={value.loose}
-               onChange={e => onChange({ ...value, loose: e.target.value })}
-               placeholder={`loose ${ru}`} className={box} aria-label={`Loose ${ru}`} />
+        {showLoose && (
+          <input type="number" min={0} step="any" inputMode="decimal" value={value.loose}
+                 onChange={e => onChange({ ...value, loose: e.target.value })}
+                 placeholder={`loose ${ru}`} className={box} aria-label={`Loose ${ru}`} />
+        )}
       </div>
       {mat && touched && (
         <div className="mt-1 text-[10px] text-[#6B5744]">= <b>{qtyText(recipe, mat)}</b></div>

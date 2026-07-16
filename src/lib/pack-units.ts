@@ -12,7 +12,13 @@
  * closing-stock page / procure route). Entry/display modes degrade:
  *   pack factor > 1 && case factor > 1 → Cases + Bottles + loose   ('cbl')
  *   pack factor > 1 && case factor ≤ 1 → Bottles + loose           ('bl')
- *   pack factor ≤ 1                    → plain recipe units        ('plain')
+ *   pack factor ≤ 1 && case factor > 1 → Cases + pieces            ('cb')
+ *   pack factor ≤ 1 && case factor ≤ 1 → plain recipe units        ('plain')
+ *
+ * 'cb' is the beer/can case: a piece-counted item (pack_size 1) that is BOUGHT
+ * by the case — e.g. Budweiser 330ml, recipe unit pcs, case_size 24. It still
+ * gets a Cases box so you can enter "10 cases" (= 240 pcs), even though there
+ * is no bottle→ml pack conversion.
  *
  * e.g. whisky case 12 × 750 ml: 2 cs + 9 btl + 450 ml
  *        = 2×12×750 + 9×750 + 450 = 25,200 ml  (exact integer math — never
@@ -40,12 +46,14 @@ export function caseFactor(m: PackMeta): number {
   return cs > 1 ? cs : 1;
 }
 
-export type EntryMode = 'cbl' | 'bl' | 'plain';
+export type EntryMode = 'cbl' | 'cb' | 'bl' | 'plain';
 
 /** Which quantity-entry inputs this material gets. */
 export function entryMode(m: PackMeta): EntryMode {
-  if (packFactor(m) <= 1) return 'plain';
-  return caseFactor(m) > 1 ? 'cbl' : 'bl';
+  const pf = packFactor(m);
+  const cf = caseFactor(m);
+  if (pf > 1) return cf > 1 ? 'cbl' : 'bl';   // volume/pack items
+  return cf > 1 ? 'cb' : 'plain';             // piece items: Cases+pieces, or plain
 }
 
 /**
@@ -57,7 +65,10 @@ export function tripleToRecipe(cases: number, bottles: number, loose: number, m:
   const cf = caseFactor(m);
   const c = Number(cases) || 0;
   const b = Number(bottles) || 0;
-  const l = Number(loose) || 0;
+  // Loose only exists when there's a real pack conversion (ml/g remainder).
+  // Piece-counted items (pf ≤ 1: plain / 'cb' cases) have NO fractional loose —
+  // ignore any stray loose so a malformed CSV can't add an invisible fraction.
+  const l = pf > 1 ? (Number(loose) || 0) : 0;
   return c * cf * pf + b * pf + l;
 }
 
@@ -76,14 +87,16 @@ export interface QtyBreakdown {
  */
 export function breakdownQty(qty: number, m: PackMeta): QtyBreakdown | null {
   const pf = packFactor(m);
-  if (pf <= 1) return null;
   const cf = caseFactor(m);
-  const mode: EntryMode = cf > 1 ? 'cbl' : 'bl';
+  // Plain items (no pack conversion AND no case size) have no breakdown.
+  if (pf <= 1 && cf <= 1) return null;
+  const hasCases = cf > 1;
+  const mode: EntryMode = hasCases ? (pf > 1 ? 'cbl' : 'cb') : 'bl';
   const sign: 1 | -1 = (Number(qty) || 0) < 0 ? -1 : 1;
   let rem = Math.abs(Number(qty) || 0);
   const EPS = 1e-9;
   const perCase = cf * pf;
-  const cases = mode === 'cbl' ? Math.floor((rem + EPS) / perCase) : 0;
+  const cases = hasCases ? Math.floor((rem + EPS) / perCase) : 0;
   rem -= cases * perCase;
   const bottles = Math.floor((rem + EPS) / pf);
   rem -= bottles * pf;
