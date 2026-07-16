@@ -34,6 +34,10 @@ interface AuditMaterial {
   purchase_count: number; recipe_use_count: number;
   is_auto_discovered?: number;
   flags: string[]; severity: 'high' | 'medium' | 'low' | 'ok';
+  /** Set by the API: this item has a unit-audit lock and its live units differ from it. */
+  locked?: boolean;
+  drifted?: boolean;
+  lock?: { unit: string | null; purchase_unit: string | null; pack_size: number | null; case_size: number | null } | null;
 }
 
 /** Best-effort pack-size suggestion from material name.
@@ -57,6 +61,8 @@ function suggestPackSizeFromName(name: string, recipeUnit: string): number | nul
 }
 
 const FLAG_META: Record<string, { label: string; tone: string; help: string }> = {
+  unit_reverted:          { label: '⚠ Reverted from saved units', tone: 'bg-red-600 text-white border-red-700',
+                            help: 'This item\'s live units differ from the units you saved in Unit Audit — it was reverted (usually by an old import/edit before lock protection). Click "Restore saved units" to put your saved units back.' },
   volume_in_name_not_pcs: { label: 'Volume in name, unit ≠ pcs', tone: 'bg-red-100 text-red-700 border-red-200',
                             help: 'Name contains ML or LTR but the unit is kg/g — usually means a bottled item should be tracked in pieces.' },
   pack_in_name_not_pcs:   { label: 'Pack in name, unit ≠ pcs',   tone: 'bg-red-100 text-red-700 border-red-200',
@@ -244,6 +250,24 @@ export default function UnitAuditPage() {
       alert(`Saved ${j.updated} update(s).`);
       setEdits({});
       setSelected(new Set());
+      setRefreshKey(k => k + 1);
+    } finally { setSaving(false); }
+  };
+
+  // One-click heal of a reverted item: re-apply its saved (locked) units through
+  // the curation route (which updates both the material AND the lock).
+  const restore = async (m: AuditMaterial) => {
+    if (!m.lock) return;
+    const upd: any = { id: m.id };
+    if (m.lock.unit != null)          upd.recipe_unit   = m.lock.unit;
+    if (m.lock.purchase_unit != null) upd.purchase_unit = m.lock.purchase_unit;
+    if (m.lock.pack_size != null)     upd.pack_size     = m.lock.pack_size;
+    if (m.lock.case_size != null)     upd.case_size     = m.lock.case_size;
+    setSaving(true);
+    try {
+      const r = await api('/api/unit-audit', { method: 'PUT', body: { updates: [upd] } });
+      const j = await r.json();
+      if (!r.ok) { alert(j.error || 'Failed'); return; }
       setRefreshKey(k => k + 1);
     } finally { setSaving(false); }
   };
@@ -604,7 +628,7 @@ export default function UnitAuditPage() {
                         {m.purchase_count} buy · {m.recipe_use_count} rec
                       </td>
                       <td className="py-1.5 px-2">
-                        <div className="flex flex-wrap gap-1">
+                        <div className="flex flex-wrap gap-1 items-center">
                           {m.flags.map(f => {
                             const meta = FLAG_META[f];
                             if (!meta) return <span key={f} className="text-[10px] px-1 rounded bg-[#E8D5C4] text-[#6B5744]">{f}</span>;
@@ -615,6 +639,13 @@ export default function UnitAuditPage() {
                               </span>
                             );
                           })}
+                          {m.drifted && m.lock && (
+                            <button onClick={() => restore(m)} disabled={saving}
+                                    title={`Saved units → recipe ${m.lock.unit ?? '—'} · buy ${m.lock.purchase_unit ?? '—'} · pack ${m.lock.pack_size ?? '—'} · case ${m.lock.case_size ?? '—'}`}
+                                    className="text-[10px] px-1.5 py-0.5 rounded border border-red-300 bg-white text-red-700 hover:bg-red-50 disabled:opacity-50 font-medium">
+                              ↺ Restore saved units
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>

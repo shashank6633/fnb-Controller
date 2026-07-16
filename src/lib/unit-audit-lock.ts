@@ -75,3 +75,40 @@ export function findUnitLock(db: Database.Database, opts: { sku?: string | null;
   }
   return null;
 }
+
+export type LockedUnits = {
+  /** raw_materials.unit — the lock stores this as recipe_unit. */
+  unit: string | null;
+  purchase_unit: string | null;
+  pack_size: number | null;
+  case_size: number | null;
+};
+
+/**
+ * The AUTHORITATIVE unit fields for a material from its unit-audit lock, or
+ * null if the material was never audited (unlocked). This is what makes the
+ * Unit Audit the single source of truth: every writer of raw_materials unit
+ * fields consults this so a locked material's pack/case/units can NOT be
+ * reverted by a purchase, a CSV import or an inventory edit.
+ *
+ * Usage:
+ *   - UPDATE (existing row): for any locked field, keep the row unchanged —
+ *     don't let the caller's value overwrite it ("protect").
+ *   - INSERT (new / post-wipe row): seed the field FROM the lock ("recover"),
+ *     so a wipe + re-import restores the curated units instead of a bad default.
+ * Curation (the /unit-audit routes) is the ONLY writer that intentionally
+ * changes these — it updates both raw_materials AND the lock together.
+ */
+export function lockedUnitFields(
+  db: Database.Database,
+  ref: { sku?: string | null; name?: string | null },
+): LockedUnits | null {
+  const lock = findUnitLock(db, ref);
+  if (!lock) return null;
+  return {
+    unit:          lock.recipe_unit != null ? String(lock.recipe_unit) : null,
+    purchase_unit: lock.purchase_unit != null ? String(lock.purchase_unit) : null,
+    pack_size:     lock.pack_size != null ? Number(lock.pack_size) : null,
+    case_size:     lock.case_size != null ? Number(lock.case_size) : null,
+  };
+}

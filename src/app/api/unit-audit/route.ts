@@ -132,10 +132,51 @@ export async function GET(request: Request) {
       recipeByMat.get(r.material_id)!.push(r);
     }
 
+    // Preload all locks once (keyed sku + name) so drift detection is in-memory
+    // rather than 2 queries per material across the whole catalog.
+    const lockBySku = new Map<string, any>();
+    const lockByName = new Map<string, any>();
+    for (const l of db.prepare('SELECT sku, name_key, recipe_unit, purchase_unit, pack_size, case_size FROM unit_audit_locks').all() as any[]) {
+      if (l.sku) lockBySku.set(String(l.sku).trim(), l);
+      if (l.name_key) lockByName.set(String(l.name_key), l);
+    }
+    const lockFor = (sku: any, name: any) => {
+      const s = sku ? String(sku).trim() : '';
+      if (s && lockBySku.has(s)) return lockBySku.get(s);
+      return lockByName.get(String(name || '').toLowerCase().trim()) || null;
+    };
+
     const audited = materials.map(m => {
       const uses = recipeByMat.get(m.id) || [];
       const { flags, severity } = detectFlags(m, uses);
-      return { ...m, flags, severity, recipe_use_count: uses.length };
+      // Drift = the material's LIVE units differ from the unit-audit lock (the
+      // curated source of truth). This is exactly a "silently reverted" item —
+      // surface it prominently so the owner can find and re-fix it. Now that all
+      // writers respect the lock, drift only lingers for items last reverted
+      // BEFORE this protection, or whose lock itself needs updating.
+      const lr = lockFor(m.sku, m.name);
+      const lock = lr ? {
+        unit: lr.recipe_unit != null ? String(lr.recipe_unit) : null,
+        purchase_unit: lr.purchase_unit != null ? String(lr.purchase_unit) : null,
+        pack_size: lr.pack_size != null ? Number(lr.pack_size) : null,
+        case_size: lr.case_size != null ? Number(lr.case_size) : null,
+      } : null;
+      const drifted = !!lock && (
+        (lock.unit != null && String(lock.unit) !== String(m.recipe_unit ?? '')) ||
+        (lock.purchase_unit != null && String(lock.purchase_unit) !== String(m.purchase_unit ?? '')) ||
+        (lock.pack_size != null && Number(lock.pack_size) !== Number(m.pack_size)) ||
+        (lock.case_size != null && Number(lock.case_size) !== Number(m.case_size))
+      );
+      const outFlags = drifted ? [...flags, 'unit_reverted'] : flags;
+      return {
+        ...m,
+        flags: outFlags,
+        severity: drifted ? 'high' : severity,
+        recipe_use_count: uses.length,
+        locked: !!lock,
+        drifted,
+        lock: lock || null,
+      };
     });
 
     const filtered = only.length > 0

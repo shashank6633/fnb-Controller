@@ -3,6 +3,7 @@ import {
   getDb, generateId, recalculateRecipeCost, recalculateSubRecipeCost,
 } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
+import { lockedUnitFields } from '@/lib/unit-audit-lock';
 import {
   parseRecipeWorkbook, buildMaterialResolver, normName, categorizeRecipeName,
 } from '@/lib/recipe-workbook';
@@ -64,8 +65,8 @@ export async function POST(req: Request) {
       for (const m of existing) idByName.set(normName(m.name), m.id);
 
       const insertMat = db.prepare(`
-        INSERT INTO raw_materials (id, name, category, unit, purchase_unit, pack_size, reorder_level, costing_method, average_price, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 1, 0, 'average', ?, datetime('now'), datetime('now'))
+        INSERT INTO raw_materials (id, name, category, unit, purchase_unit, pack_size, case_size, reorder_level, costing_method, average_price, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'average', ?, datetime('now'), datetime('now'))
       `);
       const updateMatPrice = db.prepare(`UPDATE raw_materials SET average_price = ?, updated_at = datetime('now') WHERE id = ?`);
 
@@ -77,7 +78,15 @@ export async function POST(req: Request) {
           if (overwrite && price > 0) { updateMatPrice.run(price, existingId); report.materials_price_updated++; }
         } else {
           const id = generateId();
-          insertMat.run(id, m.name, m.category || 'other', m.baseUnit || 'g', m.purchaseUnit || '', price);
+          // Recover units from the unit-audit lock (source of truth) so a
+          // wipe + workbook re-import restores curated pack/case/units instead
+          // of the workbook's default pack_size=1.
+          const lock = lockedUnitFields(db, { name: m.name });
+          const unit = lock?.unit ?? (m.baseUnit || 'g');
+          const purchaseUnit = lock?.purchase_unit ?? (m.purchaseUnit || '');
+          const packSize = lock?.pack_size ?? 1;
+          const caseSize = lock?.case_size ?? 1;
+          insertMat.run(id, m.name, m.category || 'other', unit, purchaseUnit, packSize, caseSize, price);
           idByName.set(key, id);
           report.materials_created++;
         }

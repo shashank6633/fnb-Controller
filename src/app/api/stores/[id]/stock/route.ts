@@ -47,7 +47,15 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     // material with a ledger row here (so a RECEIVING floor lists exactly what it
     // has been transferred → enables per-floor closing + stock display). The
     // central Liquor Store is unaffected: its union ≈ its mapped set.
-    const items = storeItemList(db, storeId);
+    //
+    // A FLOOR bar owns ZERO categories: on its own it would list only items
+    // already transferred in, so a fresh floor could set no opening/closing. For
+    // those stores we widen the universe to the FULL catalog of every
+    // category-owning store (all liquor), so the floor's bulk-adjust / closing
+    // can set opening/closing for any liquor item. Category-owning stores (the
+    // Liquor Store) keep their exact narrow universe.
+    const ownsNoCategories = storeCategories(db, storeId).length === 0;
+    const items = storeItemList(db, storeId, ownsNoCategories);
     // Display-only columns the engine helper doesn't carry (sku / purchase_unit /
     // reorder_level / central current_stock / priority), fetched per union id.
     const extra = new Map<string, any>();
@@ -93,7 +101,11 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       average_price: Number(m.average_price) || 0,
       has_ledger: ledgered.has(r.material_id),
     });
-    const stock = [
+    // `catalog` = the FULL universe as stock rows (held items at their qty +
+    // every other mapped/catalog material at qty 0). For a floor this includes
+    // the whole liquor catalog; it feeds the bulk-adjust + closing lists so you
+    // can set opening/closing for any liquor item.
+    const catalog = [
       ...base.map(r => enrich(r, meta.get(r.material_id) || {})),
       ...Array.from(meta.values())
         .filter(m => !ledgered.has(m.id))
@@ -107,6 +119,13 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
           value: 0,
         }, m)),
     ].sort((a, b) => String(a.material_name).localeCompare(String(b.material_name)));
+
+    // `stock` = what the plain Stock tab shows. A FLOOR bar (owns no categories)
+    // shows only what it actually HOLDS — NOT the widened catalog, which would
+    // otherwise fill the tab with hundreds of qty-0 rows and raise phantom
+    // "low stock" alerts. Category-owning stores (Liquor Store) show the full
+    // set exactly as before (catalog == stock for them).
+    const stock = ownsNoCategories ? catalog.filter(r => r.has_ledger) : catalog;
 
     // Typeahead source: the store's material universe (mapped UNION ledger),
     // already name-sorted by storeItemList. A receiving floor lists what it
@@ -133,6 +152,9 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
 
     return Response.json({
       store, access, stock, materials,
+      // Full catalog (held + all mapped/liquor at qty 0) for the bulk-adjust +
+      // closing lists. Equals `stock` for category-owning stores.
+      catalog,
       categories: storeCategories(db, storeId),
       recent_suppliers, vendors,
     });

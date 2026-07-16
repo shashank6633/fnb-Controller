@@ -185,6 +185,11 @@ export default function LiquorStorePage() {
 
   // Selected-store data
   const [stock, setStock] = useState<StockRow[]>([]);
+  // Full catalog (held + all mapped/liquor at qty 0) — for bulk-adjust + closing
+  // lists so a floor can set opening/closing for any liquor item. Equals `stock`
+  // for the category-owning Liquor Store. Falls back to `stock` if a store's API
+  // response predates this field.
+  const [catalog, setCatalog] = useState<StockRow[]>([]);
   const [materials, setMaterials] = useState<MatRow[]>([]);
   const [suppliers, setSuppliers] = useState<string[]>([]);
   const [vendors, setVendors] = useState<VendorLite[]>([]);
@@ -211,6 +216,7 @@ export default function LiquorStorePage() {
   // Modals
   const [showPurchase, setShowPurchase] = useState(false);
   const [showAdjust, setShowAdjust] = useState(false);
+  const [showBulkAdjust, setShowBulkAdjust] = useState(false);
   const [showBill, setShowBill] = useState(false);
   // Migration modal target: material_ids to preview, or 'all'
   const [migrateTarget, setMigrateTarget] = useState<string[] | 'all' | null>(null);
@@ -266,6 +272,7 @@ export default function LiquorStorePage() {
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
       setStock(j.stock || []);
+      setCatalog(j.catalog || j.stock || []);
       setMaterials(j.materials || []);
       setSuppliers(j.recent_suppliers || []);
       setVendors(j.vendors || []);
@@ -431,6 +438,13 @@ export default function LiquorStorePage() {
           <button onClick={() => setShowAdjust(true)}
                   className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5">
             <SlidersHorizontal className="w-4 h-4" /> Adjustment
+          </button>
+        )}
+        {access.can_adjust && (
+          <button onClick={() => setShowBulkAdjust(true)}
+                  title="Set / correct many materials' stock at once (opening or adjustment) via CSV"
+                  className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5">
+            <Upload className="w-4 h-4" /> Bulk Adjust
           </button>
         )}
         {access.can_procure && (
@@ -657,7 +671,7 @@ export default function LiquorStorePage() {
       ) : tab === 'closing' && store ? (
         <ClosingSection
           storeId={store.id} storeName={store.name}
-          stock={stock} isAdmin={meRole === 'admin'}
+          stock={catalog} isAdmin={meRole === 'admin'}
           onSaved={afterWrite}
         />
       ) : tab === 'reports' && store ? (
@@ -831,6 +845,14 @@ export default function LiquorStorePage() {
           materials={materials} hasHistory={hasHistory}
           onClose={() => setShowAdjust(false)}
           onSaved={msg => { setShowAdjust(false); afterWrite(msg); }}
+        />
+      )}
+      {showBulkAdjust && store && (
+        <BulkAdjustModal
+          storeId={store.id} storeName={store.name}
+          stock={catalog} materials={materials}
+          onClose={() => setShowBulkAdjust(false)}
+          onSaved={msg => { setShowBulkAdjust(false); afterWrite(msg); }}
         />
       )}
       {showBill && store && (
@@ -1320,6 +1342,301 @@ function BillModal({ storeId, storeName, materials, suppliers, vendors, onClose,
   );
 }
 
+/* ── Bulk Adjustment / Opening Stock modal (CSV + manual lines) ────────────
+   Set / correct many materials' stock for this store in ONE save. Each line
+   carries a TARGET quantity (what's physically there now); the server posts
+   'opening' for a brand-new material or an 'adjustment' delta for one that
+   already has stock, so the ledger becomes that target. Mirrors BillModal's
+   multi-line entry + ClosingSection's Template / Upload-CSV convention. */
+
+interface BulkLine { key: number; material_id: string; cbl: CBLValue; cost: string; }
+const newBulkLine = (key: number): BulkLine => ({ key, material_id: '', cbl: CBL_EMPTY, cost: '' });
+
+function BulkAdjustModal({ storeId, storeName, stock, materials, onClose, onSaved }: {
+  storeId: string; storeName: string;
+  stock: StockRow[]; materials: MatRow[];
+  onClose: () => void; onSaved: (msg: string) => void;
+}) {
+  const [reason, setReason] = useState('');
+  const [lines, setLines] = useState<BulkLine[]>([newBulkLine(1)]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [tplCat, setTplCat] = useState('');
+  const [importNote, setImportNote] = useState<string | null>(null);
+  const [importErrors, setImportErrors] = useState<string[]>([]);
+
+  const matById = useMemo(() => new Map(materials.map(m => [m.id, m])), [materials]);
+  const stockById = useMemo(() => new Map(stock.map(r => [String(r.material_id), r])), [stock]);
+  const cats = useMemo(
+    () => Array.from(new Set(stock.map(r => r.category).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
+    [stock]);
+
+  const setLine = (key: number, patch: Partial<BulkLine>) =>
+    setLines(ls => ls.map(l => l.key === key ? { ...l, ...patch } : l));
+  const addLine = () => setLines(ls => [...ls, newBulkLine(Math.max(0, ...ls.map(l => l.key)) + 1)]);
+  const removeLine = (key: number) => setLines(ls => ls.length > 1 ? ls.filter(l => l.key !== key) : [newBulkLine(1)]);
+
+  /** Per-line plan mirroring the server: opening (new material) vs adjustment
+   *  (delta to target) vs no-change. `touched` = the counter entered something. */
+  const calc = (l: BulkLine) => {
+    const mat = matById.get(l.material_id) || null;
+    const srow = stockById.get(l.material_id) || null;
+    const touched = l.cbl.cases !== '' || l.cbl.bottles !== '' || l.cbl.loose !== '';
+    const target = mat ? cblRecipe(mat, l.cbl) : 0;
+    const current = srow ? Number(srow.qty) || 0 : 0;
+    const hasHist = srow ? !!srow.has_ledger : false;
+    const delta = Math.round((target - current) * 1000) / 1000;
+    let action: 'opening' | 'adjust' | 'nochange' | 'none';
+    if (!l.material_id || !touched) action = 'none';
+    else if (!hasHist) action = target > 0 ? 'opening' : 'nochange';
+    else action = delta === 0 ? 'nochange' : 'adjust';
+    return { mat, srow, touched, target, current, hasHist, delta, action };
+  };
+
+  const filled = lines.filter(l => l.material_id && (l.cbl.cases !== '' || l.cbl.bottles !== '' || l.cbl.loose !== ''));
+  const willChange = lines.reduce((n, l) => n + (['opening', 'adjust'].includes(calc(l).action) ? 1 : 0), 0);
+
+  const save = async () => {
+    setErr(null);
+    if (!reason.trim()) { setErr('A reason is required'); return; }
+    if (filled.length === 0) { setErr('Add at least one material with a target quantity'); return; }
+    const ids = filled.map(l => l.material_id);
+    if (new Set(ids).size !== ids.length) { setErr('The same material is on more than one line — combine them into one'); return; }
+    for (const l of filled) {
+      const c = calc(l);
+      if (c.target < 0) { setErr(`${c.mat?.name || 'A line'}: target quantity cannot be negative`); return; }
+    }
+    if (willChange === 0) { setErr('Nothing to change — every target already matches current stock'); return; }
+    setBusy(true);
+    try {
+      const r = await api(`/api/stores/${storeId}/adjust-bulk`, {
+        method: 'POST',
+        body: {
+          reason: reason.trim(),
+          lines: filled.map(l => {
+            const c = calc(l);
+            return {
+              material_id: l.material_id,
+              quantity: c.target,
+              // Cost basis only meaningful when this is the material's first
+              // (opening) entry — server ignores it for adjustments.
+              unit_price: (!c.hasHist && l.cost !== '') ? Number(l.cost) : undefined,
+            };
+          }),
+        },
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      const s = j.summary || {};
+      onSaved(`Bulk stock set in ${storeName} — ${s.opened || 0} opening, ${s.adjusted || 0} adjusted` +
+        (s.unchanged ? `, ${s.unchanged} unchanged` : ''));
+    } catch (e: any) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  /* CSV template: filtered materials with current stock + blank target CBL. */
+  const downloadTemplate = () => {
+    const rows = stock
+      .filter(r => !tplCat || r.category === tplCat)
+      .sort((a, b) => a.material_name.localeCompare(b.material_name));
+    const out = [CSV_COLS_BULKADJ.join(',')];
+    for (const r of rows) {
+      out.push([
+        r.material_id, r.sku || '', r.material_name || '', r.category || '', r.unit || '',
+        r.qty, '', '', '', '',   // Cases / Bottles / Loose / Cost — blank to fill
+      ].map(csvEscape).join(','));
+    }
+    const blob = new Blob([out.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${storeName.replace(/\s+/g, '-').toLowerCase()}-bulk-adjust-template.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  /* CSV upload: match id → SKU → Name, load Cases/Bottles/Loose as the TARGET
+     into editable lines for review before Save (this moves stock, so we never
+     fire straight from the file). */
+  const uploadCsv = async (file: File) => {
+    setErr(null); setImportNote(null); setImportErrors([]);
+    try {
+      const byId = new Map(stock.map(r => [String(r.material_id), r]));
+      const bySku = new Map(stock.filter(r => r.sku).map(r => [String(r.sku).trim().toLowerCase(), r]));
+      const byName = new Map(stock.map(r => [String(r.material_name).trim().toLowerCase(), r]));
+      const text = await file.text();
+      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+      if (parsed.errors?.length) { setImportErrors(['CSV parse error: ' + parsed.errors[0].message]); return; }
+      const get = (row: any, ...keys: string[]) => {
+        for (const k of keys) if (row[k] != null && String(row[k]).trim() !== '') return String(row[k]).trim();
+        return '';
+      };
+      const imported: BulkLine[] = [];
+      const errors: string[] = [];
+      const usedIds = new Set<string>();
+      let key = 1;
+      for (const row of parsed.data as any[]) {
+        const casesRaw = get(row, 'Cases', 'cases', 'Case', 'cs');
+        const btlRaw = get(row, 'Bottles', 'bottles', 'Bottle', 'btl', 'Btl');
+        const looseRaw = get(row, 'Loose', 'loose', 'Loose (ml)', 'ml');
+        const costRaw = get(row, 'Cost/unit (opening only)', 'Cost/unit', 'Cost', 'cost', 'Price', 'price');
+        const label = get(row, 'Name', 'name') || get(row, 'material_id') || get(row, 'SKU', 'sku') || 'row';
+        if (casesRaw === '' && btlRaw === '' && looseRaw === '') continue;   // untouched row
+        const idKey = get(row, 'material_id');
+        const skuKey = get(row, 'SKU', 'sku').toLowerCase();
+        const nameKey = get(row, 'Name', 'name').toLowerCase();
+        const m = (idKey && byId.get(idKey)) || (skuKey && bySku.get(skuKey)) || (nameKey && byName.get(nameKey));
+        if (!m) { errors.push(`${label}: material not found (check material_id / SKU / Name)`); continue; }
+        if (usedIds.has(m.material_id)) { errors.push(`${label}: duplicate material in file — kept the first row`); continue; }
+        // Non-numeric → SKIP the row (never silently coerce a bad token to 0),
+        // mirroring the proven ClosingSection upload.
+        let bad = false;
+        for (const [v, nm] of [[casesRaw, 'Cases'], [btlRaw, 'Bottles'], [looseRaw, 'Loose'], [costRaw, 'Cost']] as const) {
+          if (v !== '' && !Number.isFinite(Number(v))) { errors.push(`${label}: ${nm} must be a number`); bad = true; }
+        }
+        if (bad) continue;
+        if ([casesRaw, btlRaw, looseRaw, costRaw].some(v => v !== '' && Number(v) < 0)) { errors.push(`${label}: values cannot be negative`); continue; }
+        usedIds.add(m.material_id);
+        // Normalise the CSV triple to the material's NATIVE entry mode via
+        // breakdownQty (same round-trip ClosingSection uses to seed counts) so
+        // the editable line shows exactly what will post — a plain/bl material
+        // never hides a Cases/Loose value the single-box UI can't display.
+        const rt = tripleToRecipe(numOr0(casesRaw), numOr0(btlRaw), numOr0(looseRaw), m);
+        const bd = breakdownQty(rt, m);
+        const cbl: CBLValue = bd
+          ? { cases: bd.cases ? String(bd.cases) : '', bottles: bd.bottles ? String(bd.bottles) : '', loose: bd.loose ? String(bd.loose) : '' }
+          : { cases: '', bottles: String(rt), loose: '' };
+        // An explicit target of 0 (write stock down to zero) must stay "touched".
+        if (!cbl.cases && !cbl.bottles && !cbl.loose) cbl.loose = '0';
+        imported.push({ key: key++, material_id: m.material_id, cbl, cost: costRaw });
+      }
+      if (imported.length === 0) {
+        setImportErrors(errors.length ? errors : ['No target quantities found — fill Cases / Bottles / Loose in the template']);
+        return;
+      }
+      setLines(imported);
+      setImportErrors(errors);
+      setImportNote(`Loaded ${imported.length} material${imported.length === 1 ? '' : 's'} from CSV — review below, then Save.`);
+    } catch (e: any) { setImportErrors([e.message]); }
+  };
+
+  const badge = (c: ReturnType<typeof calc>) => {
+    if (c.action === 'opening') return <span className="inline-flex items-center gap-1 text-[10px] font-semibold bg-sky-50 border border-sky-200 text-sky-800 rounded-full px-2 py-0.5">Opening +{fq(c.target)} {c.mat?.unit}</span>;
+    if (c.action === 'adjust') return <span className={`inline-flex items-center gap-1 text-[10px] font-semibold rounded-full px-2 py-0.5 border ${c.delta < 0 ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'}`}>{c.delta > 0 ? '+' : ''}{fq(c.delta)} {c.mat?.unit}</span>;
+    if (c.action === 'nochange') return <span className="text-[10px] text-[#8B7355]">No change</span>;
+    return <span className="text-[10px] text-[#8B7355]">—</span>;
+  };
+
+  return (
+    <ModalShell wide title="Bulk Adjustment / Opening Stock" icon={<SlidersHorizontal className="w-5 h-5 text-[#af4408]" />} onClose={onClose}
+      footer={<>
+        <span className="mr-auto text-sm text-[#6B5744]">
+          <b className="text-[#2D1B0E]">{willChange}</b> line{willChange === 1 ? '' : 's'} will change
+        </span>
+        <button onClick={onClose} disabled={busy}
+                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Cancel</button>
+        <button onClick={save} disabled={busy || willChange === 0}
+                className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+          Apply {willChange > 0 ? willChange : ''} change{willChange === 1 ? '' : 's'}
+        </button>
+      </>}>
+      <p className="text-[11px] text-[#8B7355] -mt-1">
+        Set each material's stock to the quantity physically on the floor. A brand-new material gets an
+        <b> opening</b> entry; one that already has stock gets an <b>adjustment</b> to that target. {storeName} ledger only —
+        Central Store is untouched.
+      </p>
+      {stock.length === 0 && (
+        <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-lg p-2.5 text-xs">
+          No materials are mapped to {storeName} yet — map its categories on Settings → Store Locations first,
+          then they will appear here to set opening stock.
+        </div>
+      )}
+      {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{err}</div>}
+
+      {/* Reason + CSV toolbar */}
+      <div className="flex flex-wrap gap-3 items-end">
+        <div className="flex-1 min-w-[200px]">
+          <L>Reason (required — applies to every line)</L>
+          <input value={reason} onChange={e => setReason(e.target.value)}
+                 aria-label="Adjustment reason" aria-required="true"
+                 placeholder="e.g. monthly physical count / store handover" className={inputCls} />
+        </div>
+        <div>
+          <L>Template category</L>
+          <select value={tplCat} onChange={e => setTplCat(e.target.value)} className={inputCls}>
+            <option value="">All categories</option>
+            {cats.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+        <button onClick={downloadTemplate} type="button"
+                className="px-3 py-2 text-xs font-medium rounded-lg bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4] inline-flex items-center gap-1.5">
+          <Download className="w-3.5 h-3.5" /> Template
+        </button>
+        <label className="px-3 py-2 text-xs font-medium rounded-lg bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4] inline-flex items-center gap-1.5 cursor-pointer focus-within:outline-none focus-within:ring-2 focus-within:ring-[#af4408]">
+          <Upload className="w-3.5 h-3.5" /> Upload CSV
+          <input type="file" accept=".csv,text/csv" className="sr-only" aria-label="Upload bulk-adjust CSV"
+                 onChange={e => { const f = e.target.files?.[0]; if (f) uploadCsv(f); e.target.value = ''; }} />
+        </label>
+      </div>
+
+      {importNote && (
+        <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-lg p-2.5 text-xs flex items-start gap-2">
+          <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" /> {importNote}
+        </div>
+      )}
+      {importErrors.length > 0 && (
+        <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-lg p-2.5 text-xs space-y-0.5">
+          {importErrors.map((e, i) => <div key={i}>{e}</div>)}
+        </div>
+      )}
+
+      {/* Lines */}
+      <div className="space-y-2">
+        {lines.map((l, i) => {
+          const c = calc(l);
+          return (
+            <div key={l.key} className="border border-[#E8D5C4] rounded-lg p-2.5 space-y-2 bg-[#FFFDF9]">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-semibold text-[#8B7355] shrink-0">#{i + 1}</span>
+                <div className="flex-1 min-w-0">
+                  <MaterialTypeahead materials={materials as MaterialLite[]} value={l.material_id}
+                                     onPick={id => setLine(l.key, { material_id: id, cbl: CBL_EMPTY, cost: '' })}
+                                     showStock={false} compact
+                                     placeholder="Material — name, SKU or category…" />
+                </div>
+                <button type="button" onClick={() => removeLine(l.key)} disabled={lines.length === 1 && !l.material_id}
+                        className="shrink-0 text-[#8B7355] hover:text-red-700 disabled:opacity-30" title="Remove line">
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+              <CBLEntry mat={c.mat} value={l.cbl} onChange={v => setLine(l.key, { cbl: v })} />
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-[#6B5744]">
+                {l.material_id && (
+                  <span>Current: <b className="text-[#2D1B0E]">{c.srow ? (fmtBreakdown(c.current, c.srow) || `${fq(c.current)} ${c.mat?.unit || ''}`) : '—'}</b></span>
+                )}
+                {c.touched && <span>Change: {badge(c)}</span>}
+                {c.action === 'opening' && (
+                  <span className="flex items-center gap-1.5">
+                    <label className="text-[10px] uppercase tracking-wide text-[#8B7355]">Cost / {c.mat?.purchase_unit || c.mat?.unit || 'unit'} (₹, optional)</label>
+                    <input type="number" min={0} step="any" inputMode="decimal" value={l.cost}
+                           onChange={e => setLine(l.key, { cost: e.target.value })}
+                           aria-label={`Opening cost per ${c.mat?.purchase_unit || c.mat?.unit || 'unit'}`}
+                           placeholder="0" className="w-24 px-2 py-1 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]" />
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        <button onClick={addLine} type="button"
+                className="w-full px-3 py-2 border border-dashed border-[#D4B896] hover:border-[#af4408] hover:text-[#af4408] text-[#6B5744] rounded-lg text-sm font-medium flex items-center justify-center gap-1.5">
+          <Plus className="w-4 h-4" /> Add line
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
 /* ── Central-stock migration modal (admin) ─────────────────────────────── */
 
 function MigrateModal({ storeId, storeName, candidates, blockedCount, onClose, onDone }: {
@@ -1438,6 +1755,11 @@ interface ClosingDay {
 /* Closing-stock CSV template columns — keeps the liquor Cases+Bottles+loose
    entry convention (blank for the counter to fill). */
 const CSV_COLS_CLOSE = ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Cases', 'Bottles', 'Loose'];
+
+/* Bulk-adjust CSV template columns — Cases/Bottles/Loose is the TARGET stock
+   to set (blank row = untouched); Cost/unit is optional, used only when the
+   material is getting its first (opening) entry. */
+const CSV_COLS_BULKADJ = ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'Current stock', 'Cases', 'Bottles', 'Loose', 'Cost/unit (opening only)'];
 
 /* ── Closing Stock section — category-wise "Record Closing Stock" ──────────
    Mirrors the central /closing-stock modal (header + Template / Upload CSV /

@@ -1,6 +1,6 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { getStoreById, materialStoreId, postLedger, userStoreAccess } from '@/lib/store-engine';
+import { getStoreById, materialStoreId, postLedger, userStoreAccess, isStoreMappedMaterial, storeCategories } from '@/lib/store-engine';
 
 /**
  * /api/stores/[id]/closing — INDEPENDENT store closing stock (Phase C, spec F6).
@@ -170,6 +170,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     if (!Array.isArray(b.items) || b.items.length === 0) {
       return Response.json({ error: 'items array is required' }, { status: 400 });
     }
+    // A FLOOR bar owns no categories: it may count ANY catalog (liquor) item,
+    // not just ones already transferred in.
+    const floorStore = storeCategories(db, storeId).length === 0;
 
     // Validate everything BEFORE writing anything (all-or-nothing save).
     const prepared: {
@@ -197,7 +200,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       // mirrors the union storeItemList() uses to build the count list.
       if (materialStoreId(db, mat) !== storeId) {
         const held = db.prepare('SELECT 1 FROM store_stock_ledger WHERE store_id = ? AND material_id = ? LIMIT 1').get(storeId, materialId);
-        if (!held) {
+        // A floor bar (owns no categories) may count ANY catalog (liquor) item.
+        const catalogOk = floorStore && isStoreMappedMaterial(db, materialId);
+        if (!held && !catalogOk) {
           return Response.json({ error: `"${mat.name}" is not a ${store.name} material — its category "${mat.category}" is not mapped to this store and it holds no stock here` }, { status: 400 });
         }
       }

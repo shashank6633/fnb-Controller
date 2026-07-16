@@ -1,4 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
+import { lockedUnitFields } from '@/lib/unit-audit-lock';
 
 // Map POS categories to our system categories
 function mapCategory(posCategory: string): string {
@@ -165,7 +166,7 @@ export async function POST(request: Request) {
           (id, sku, name, category, unit, purchase_unit, pack_size, case_size,
            current_stock, reorder_level, costing_method, average_price,
            created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'average', ?, datetime('now'), datetime('now'))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'average', ?, datetime('now'), datetime('now'))
       `);
       // Seed the SKU counter once; increment in JS so we don't re-query per row.
       let skuCounter = nextSku(db);
@@ -199,11 +200,21 @@ export async function POST(request: Request) {
         const category = mapCategory(mat.category || 'other');
         // Recipe unit comes from the CONSUMPTION column (what recipes deduct in),
         // falling back to a sensible map of the purchase unit if consumption is blank.
-        const recipeUnit   = mat.consumptionUnit?.trim()
+        const recipeUnitRaw   = mat.consumptionUnit?.trim()
           ? mapRecipeUnit(mat.consumptionUnit)
           : mapRecipeUnit(mat.purchaseUnit || 'pcs');
-        const purchaseUnit = cleanPurchaseUnit(mat.purchaseUnit || recipeUnit);
-        const packSize     = computePackSize(mat.purchaseUnit || '', recipeUnit);
+        const purchaseUnitRaw = cleanPurchaseUnit(mat.purchaseUnit || recipeUnitRaw);
+        const packSizeRaw     = computePackSize(mat.purchaseUnit || '', recipeUnitRaw);
+        // Unit-audit lock is the source of truth: if this material was audited
+        // before, recover its curated units instead of re-deriving from the CSV
+        // (name-parse) — this is what makes a wipe + re-import safe. Fixes the
+        // old bug where case_size was hardcoded to 1 and pack_size parsed 330
+        // from a "(330ML)" name. SKU may be present on the row; else match name.
+        const impLock = lockedUnitFields(db, { sku: (mat as any).sku, name });
+        const recipeUnit   = impLock?.unit ?? recipeUnitRaw;
+        const purchaseUnit = impLock?.purchase_unit ?? purchaseUnitRaw;
+        const packSize     = impLock?.pack_size ?? packSizeRaw;
+        const caseSize     = impLock?.case_size ?? 1;
         // The CSV's rate is per PURCHASE unit (e.g. ₹141.75/KG). Prices are
         // stored in RECIPE units (g/ml/pcs), so: price_recipe = rate ÷ pack_size.
         // OPENING STOCK IS NOT IMPORTED — the CSV's "Usable Inventory" column is
@@ -222,7 +233,7 @@ export async function POST(request: Request) {
         // reorder threshold, reference price). No opening stock and no purchase
         // record: current_stock stays 0 until real purchases / counts are entered.
         insertMaterial.run(
-          materialId, sku, name, category, recipeUnit, purchaseUnit, packSize,
+          materialId, sku, name, category, recipeUnit, purchaseUnit, packSize, caseSize,
           stock, reorderLevel, price
         );
 

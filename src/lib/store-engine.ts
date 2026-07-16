@@ -479,7 +479,25 @@ export interface StoreItemMeta {
  * floor lists exactly what it has been transferred). Category match is
  * TRIM + NOCASE, consistent with materialStoreId().
  */
-export function storeItemList(db: Database, storeId: string): StoreItemMeta[] {
+export function storeItemList(
+  db: Database,
+  storeId: string,
+  /**
+   * When true, ALSO include every material whose category is mapped to ANY
+   * active category-owning store (the full store catalog, e.g. all liquor).
+   * Used for a FLOOR bar (which owns no categories) so its bulk-adjust /
+   * closing lists can offer the whole liquor catalog to set opening/closing —
+   * not just items already transferred in. Off by default so the Liquor
+   * Store's own lists and the consolidated board are unchanged.
+   */
+  includeAllStoreMapped = false,
+): StoreItemMeta[] {
+  const allMappedBranch = includeAllStoreMapped ? `
+       OR EXISTS (
+            SELECT 1 FROM store_category_map m2
+            JOIN store_locations s2 ON s2.id = m2.store_id AND s2.is_active = 1
+            WHERE ${catNorm('m2.category')} = ${catNorm('rm.category')}
+          )` : '';
   const rows = db.prepare(`
     SELECT rm.id AS material_id, rm.name, rm.category, rm.unit,
            COALESCE(rm.pack_size, 1) AS pack_size, COALESCE(rm.case_size, 1) AS case_size,
@@ -492,7 +510,7 @@ export function storeItemList(db: Database, storeId: string): StoreItemMeta[] {
        OR EXISTS (
             SELECT 1 FROM store_stock_ledger l
             WHERE l.store_id = ? AND l.material_id = rm.id
-          )
+          )${allMappedBranch}
     ORDER BY rm.name COLLATE NOCASE
   `).all(storeId, storeId) as any[];
   return rows.map(r => ({

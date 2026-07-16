@@ -23,6 +23,8 @@ interface User {
   email: string;
   name: string;
   role: 'admin' | 'manager' | 'staff';
+  role_id?: string | null;
+  role_name?: string | null;
   department_id?: string | null;
   department_name?: string;
   is_active: number;
@@ -73,6 +75,33 @@ export default function PageAccessSettingsPage() {
 
   // Non-admin users that we can manage. Admins are not editable (always full access).
   const managedUsers = useMemo(() => users.filter(u => u.role !== 'admin'), [users]);
+
+  // A user has a PERSONAL page override when their SAVED page_access is a
+  // non-empty set — that override wins over their role, so editing the role
+  // won't change what they see until it's cleared. (Empty/null = follow role.)
+  const hasOverride = (u: User) => parseAccess(u.page_access).size > 0;
+
+  // Clear a user's personal page override so they FOLLOW THEIR ROLE again
+  // (save empty page_access → server stores NULL → role's pages apply). Keeps
+  // their saved department visibility untouched.
+  const followRole = async (userId: string) => {
+    const u = users.find(x => x.id === userId);
+    setBusy(userId); setError(null); setSavedFor(null);
+    try {
+      const r = await api('/api/auth/users', {
+        method: 'PUT',
+        body: {
+          id: userId,
+          page_access: [],
+          visible_department_ids: Array.from(parseAccess(u?.visible_department_ids)),
+        },
+      });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); setError(j.error || `HTTP ${r.status}`); return; }
+      setSavedFor(userId);
+      await load();
+      setTimeout(() => setSavedFor(null), 2500);
+    } finally { setBusy(null); }
+  };
 
   const toggleSection = (label: string) =>
     setExpanded(p => {
@@ -184,8 +213,19 @@ export default function PageAccessSettingsPage() {
           <h1 className="text-xl font-semibold text-[#2D1B0E]">Page Access</h1>
           <p className="text-xs text-[#8B7355]">
             Per-user page visibility. Tick the pages each user should see in the sidebar.
-            Empty selection = full access (backward compat). Admins always see everything.
+            Empty selection = follow the user's role. Admins always see everything.
           </p>
+        </div>
+      </div>
+
+      {/* Precedence warning — the #1 cause of "I changed the role but it didn't apply". */}
+      <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-900 flex items-start gap-2">
+        <AlertTriangle size={15} className="shrink-0 mt-0.5" />
+        <div>
+          <b>Ticking pages here creates a personal override that beats the user's role.</b> While a user has a
+          personal override, editing their <a href="/settings/roles" className="underline">role's</a> pages will
+          <b> not</b> change what they see. To make a user follow their role again, use
+          <b> “Follow role”</b> on their row (clears the override).
         </div>
       </div>
 
@@ -211,12 +251,37 @@ export default function PageAccessSettingsPage() {
               <div key={u.id} className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
                 <div className="px-4 py-3 border-b border-[#E8D5C4] bg-[#FFF1E3] flex items-center gap-3 flex-wrap">
                   <div className="flex-1 min-w-0">
-                    <div className="text-sm font-semibold text-[#2D1B0E]">{u.name || u.email}</div>
+                    <div className="text-sm font-semibold text-[#2D1B0E] flex items-center gap-2 flex-wrap">
+                      {u.name || u.email}
+                      {hasOverride(u) ? (
+                        <span title="This user has a personal page override that beats their role. Editing their role won't change what they see until you clear it."
+                              className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200 font-semibold">
+                          ⚠ Personal override — ignores role
+                        </span>
+                      ) : u.role_id ? (
+                        <span title={`This user follows their role${u.role_name ? ` "${u.role_name}"` : ''}'s page set.`}
+                              className="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium">
+                          Follows role{u.role_name ? ` · ${u.role_name}` : ''}
+                        </span>
+                      ) : (
+                        <span title="This user has no named role and no personal override — so they can currently see EVERY page. Assign a role (Settings → Roles) or tick specific pages to restrict them."
+                              className="text-[9px] px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 border border-red-200 font-semibold">
+                          ⚠ Full access — no role
+                        </span>
+                      )}
+                    </div>
                     <div className="text-[10px] text-[#8B7355]">{u.email} · {u.role}{u.department_name ? ` · ${u.department_name}` : ''}</div>
                   </div>
                   <div className="text-[10px] text-[#8B7355]">
-                    {cur.size === 0 ? 'Full access (no map)' : `${cur.size} pages granted`}
+                    {cur.size === 0 ? (u.role_id ? 'Follows role' : 'Full access') : `${cur.size} pages granted`}
                   </div>
+                  {hasOverride(u) && (
+                    <button onClick={() => followRole(u.id)} disabled={busy === u.id}
+                            title="Clear this user's personal override so they follow their role's pages again"
+                            className="text-[10px] text-[#af4408] hover:underline disabled:opacity-50">
+                      Follow role
+                    </button>
+                  )}
                   <button onClick={() => selectAll(u.id)} className="text-[10px] text-[#af4408] hover:underline">All</button>
                   <button onClick={() => clearAll(u.id)} className="text-[10px] text-[#af4408] hover:underline">None</button>
                   {dirty && (

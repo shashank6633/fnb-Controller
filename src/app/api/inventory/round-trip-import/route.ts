@@ -1,5 +1,9 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { lockedUnitFields } from '@/lib/unit-audit-lock';
+
+/** raw_materials unit-of-measure fields that Unit Audit owns. */
+const LOCKED_UNIT_FIELDS = new Set(['unit', 'purchase_unit', 'pack_size', 'case_size']);
 
 /**
  * Round-trip inventory import. Designed to receive a CSV exported from
@@ -132,16 +136,22 @@ export async function POST(request: Request) {
         }
         if (id) {
           seenIds.add(id);
-          const existing = db.prepare(`SELECT id FROM raw_materials WHERE id = ?`).get(id);
+          const existing = db.prepare(`SELECT id, sku, name FROM raw_materials WHERE id = ?`).get(id) as any;
           if (!existing) {
             skipped.push({ row: idx + 1, name, reason: `id "${id}" not found — keep blank to create new` });
             continue;
           }
+          // Unit Audit owns the unit-of-measure fields: if this material is
+          // locked, a round-tripped CSV can NEVER overwrite its units (that was
+          // a top reverter). Skip those fields for locked rows.
+          const lock = lockedUnitFields(db, { sku: existing.sku, name: existing.name });
+          let unitsSkipped = false;
           // Build dynamic UPDATE from present fields
           const sets: string[] = [];
           const params: any[] = [];
           for (const f of WRITABLE_FIELDS) {
             if (!(f in r)) continue;
+            if (lock && LOCKED_UNIT_FIELDS.has(f)) { unitsSkipped = true; continue; }
             const v = coerce(f, r[f]);
             if (v === undefined) continue;
             sets.push(`${f} = ?`); params.push(v);
@@ -161,6 +171,9 @@ export async function POST(request: Request) {
             const n = last?.sku ? parseInt(last.sku.split('-')[1], 10) : 0;
             sku = `MAT-${String(n + 1).padStart(5, '0')}`;
           }
+          // Recover units from the unit-audit lock (source of truth) if this
+          // name/SKU was audited before — a re-import restores curated units.
+          const insLock = lockedUnitFields(db, { sku, name });
           db.prepare(`
             INSERT INTO raw_materials (id, sku, name, category, unit, purchase_unit, pack_size, case_size,
               reorder_level, priority, costing_method, average_price, super_category, brand,
@@ -174,10 +187,10 @@ export async function POST(request: Request) {
           `).run(
             newId, sku, name,
             coerce('category', r.category) ?? 'other',
-            coerce('unit', r.unit) ?? 'kg',
-            coerce('purchase_unit', r.purchase_unit) ?? 'kg',
-            coerce('pack_size', r.pack_size) ?? 1,
-            coerce('case_size', r.case_size) ?? 1,
+            insLock?.unit ?? coerce('unit', r.unit) ?? 'kg',
+            insLock?.purchase_unit ?? coerce('purchase_unit', r.purchase_unit) ?? 'kg',
+            insLock?.pack_size ?? coerce('pack_size', r.pack_size) ?? 1,
+            insLock?.case_size ?? coerce('case_size', r.case_size) ?? 1,
             coerce('reorder_level', r.reorder_level) ?? 0,
             coerce('priority', r.priority) ?? 2,
             coerce('costing_method', r.costing_method) ?? 'average',

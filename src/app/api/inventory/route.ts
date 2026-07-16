@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
+import { lockedUnitFields } from '@/lib/unit-audit-lock';
 
 export async function GET(request: Request) {
   try {
@@ -180,6 +181,13 @@ export async function POST(request: Request) {
     }
 
     const id = generateId();
+    // Recover units from the unit-audit lock if this name/SKU was audited before
+    // (e.g. re-creating a deleted material) — the lock is the source of truth.
+    const newLock = lockedUnitFields(db, { sku, name });
+    const newUnit = newLock?.unit ?? (unit || 'kg');
+    const newPurchaseUnit = newLock?.purchase_unit ?? (purchase_unit || unit || 'kg');
+    const newPackSize = newLock?.pack_size ?? (pack_size != null ? Number(pack_size) : 1);
+    const newCaseSize = newLock?.case_size ?? (case_size != null ? Number(case_size) : 1);
     db.prepare(`
       INSERT INTO raw_materials (
         id, sku, name, category, unit, purchase_unit, pack_size, case_size, reorder_level, costing_method,
@@ -189,10 +197,10 @@ export async function POST(request: Request) {
         created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     `).run(
-      id, sku, name, category || 'other', unit || 'kg',
-      purchase_unit || unit || 'kg',
-      pack_size != null ? Number(pack_size) : 1,
-      case_size != null ? Number(case_size) : 1,
+      id, sku, name, category || 'other', newUnit,
+      newPurchaseUnit,
+      newPackSize,
+      newCaseSize,
       reorder_level ?? 0, costing_method || 'average',
       super_category || '', brand || '',
       yield_percent != null ? Number(yield_percent) : 100,
@@ -245,6 +253,22 @@ export async function PUT(request: Request) {
     const overrideAvgPrice = (average_price != null && Number.isFinite(Number(average_price)))
       ? Number(average_price) : null;
 
+    // Unit-audit lock is authoritative: if this material has been audited, its
+    // unit-of-measure fields are the source of truth and CANNOT be changed here
+    // — only via the /unit-audit page. We keep the existing values (protect) and
+    // flag it so the UI can tell the user to edit units in Unit Audit instead.
+    const lock = lockedUnitFields(db, { sku: existing.sku, name: existing.name });
+    const unitVal = lock?.unit != null ? existing.unit : (unit || existing.unit);
+    const purchaseUnitVal = lock?.purchase_unit != null ? existing.purchase_unit : (purchase_unit ?? existing.purchase_unit);
+    const packSizeVal = lock?.pack_size != null ? existing.pack_size : (pack_size != null ? Number(pack_size) : existing.pack_size);
+    const caseSizeVal = lock?.case_size != null ? (existing.case_size ?? 1) : (case_size != null ? Number(case_size) : (existing.case_size ?? 1));
+    const unitsLockedIgnored = !!lock && (
+      (unit != null && unit !== existing.unit) ||
+      (purchase_unit != null && purchase_unit !== existing.purchase_unit) ||
+      (pack_size != null && Number(pack_size) !== Number(existing.pack_size)) ||
+      (case_size != null && Number(case_size) !== Number(existing.case_size ?? 1))
+    );
+
     db.prepare(`
       UPDATE raw_materials
       SET name = ?, category = ?, unit = ?, purchase_unit = ?, pack_size = ?, case_size = ?,
@@ -259,10 +283,10 @@ export async function PUT(request: Request) {
     `).run(
       name || existing.name,
       category || existing.category,
-      unit || existing.unit,
-      purchase_unit ?? existing.purchase_unit,
-      pack_size != null ? Number(pack_size) : existing.pack_size,
-      case_size != null ? Number(case_size) : (existing.case_size ?? 1),
+      unitVal,
+      purchaseUnitVal,
+      packSizeVal,
+      caseSizeVal,
       reorder_level ?? existing.reorder_level,
       costing_method || existing.costing_method,
       super_category ?? existing.super_category ?? '',
@@ -297,7 +321,13 @@ export async function PUT(request: Request) {
     }
 
     const material = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(id);
-    return Response.json({ material });
+    return Response.json({
+      material,
+      // True when the caller tried to change unit-of-measure fields on a material
+      // whose units are locked by Unit Audit — the change was ignored on purpose.
+      units_locked: unitsLockedIgnored,
+      ...(unitsLockedIgnored ? { units_locked_note: 'Units are locked by Unit Audit and were left unchanged. Edit them on the Unit Audit page.' } : {}),
+    });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });
   }
