@@ -1,4 +1,5 @@
 import { getDb, generateId, recalculateRecipeCost } from '@/lib/db';
+import { rollUpAllergens } from '@/lib/allergens';
 
 export async function GET(request: Request) {
   try {
@@ -36,9 +37,23 @@ export async function GET(request: Request) {
         FROM recipe_sub_recipes rs
         JOIN sub_recipes sr ON rs.sub_recipe_id = sr.id
         WHERE rs.recipe_id = ?
-      `).all(recipe.id);
+      `).all(recipe.id) as any[];
 
-      return { ...recipe, ingredients, sub_recipes };
+      // Cookbook: roll up allergens from every ingredient name — direct
+      // ingredients AND the ingredients of any linked sub-recipe.
+      const names: string[] = (ingredients as any[]).map((i) => i.material_name).filter(Boolean);
+      for (const sr of sub_recipes) {
+        const subMats = db.prepare(`
+          SELECT rm.name as material_name
+          FROM sub_recipe_ingredients sri
+          JOIN raw_materials rm ON sri.material_id = rm.id
+          WHERE sri.sub_recipe_id = ?
+        `).all(sr.sub_recipe_id) as any[];
+        for (const m of subMats) if (m.material_name) names.push(m.material_name);
+      }
+      const allergens = rollUpAllergens(names);
+
+      return { ...recipe, ingredients, sub_recipes, allergens };
     });
 
     return Response.json({ recipes: result });
@@ -51,7 +66,7 @@ export async function POST(request: Request) {
   try {
     const db = getDb();
     const body = await request.json();
-    const { name, category, selling_price, ingredients, sub_recipes, menu_item_id } = body;
+    const { name, category, selling_price, ingredients, sub_recipes, menu_item_id, instructions, image_url } = body;
 
     if (!name) {
       return Response.json({ error: 'name is required' }, { status: 400 });
@@ -61,9 +76,9 @@ export async function POST(request: Request) {
 
     const create = db.transaction(() => {
       db.prepare(`
-        INSERT INTO recipes (id, name, category, selling_price, version, is_active, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))
-      `).run(id, name, category || '', selling_price || 0);
+        INSERT INTO recipes (id, name, category, selling_price, instructions, image_url, version, is_active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, 1, datetime('now'), datetime('now'))
+      `).run(id, name, category || '', selling_price || 0, (instructions || '').toString(), (image_url || '').toString());
 
       // Link menu item → this recipe (and clear any previous recipe link from that menu item)
       if (menu_item_id) {
@@ -124,7 +139,7 @@ export async function PUT(request: Request) {
   try {
     const db = getDb();
     const body = await request.json();
-    const { id, name, category, selling_price, ingredients, sub_recipes, menu_item_id } = body;
+    const { id, name, category, selling_price, ingredients, sub_recipes, menu_item_id, instructions, image_url } = body;
 
     if (!id) {
       return Response.json({ error: 'id is required' }, { status: 400 });
@@ -138,13 +153,15 @@ export async function PUT(request: Request) {
     const update = db.transaction(() => {
       db.prepare(`
         UPDATE recipes
-        SET name = ?, category = ?, selling_price = ?,
+        SET name = ?, category = ?, selling_price = ?, instructions = ?, image_url = ?,
             version = version + 1, updated_at = datetime('now')
         WHERE id = ?
       `).run(
         name || existing.name,
         category ?? existing.category,
         selling_price ?? existing.selling_price,
+        instructions !== undefined ? (instructions || '').toString() : (existing.instructions ?? ''),
+        image_url !== undefined ? (image_url || '').toString() : (existing.image_url ?? ''),
         id
       );
 

@@ -17,11 +17,10 @@ import {
   Edit,
   Trash2,
   FileSpreadsheet,
-  Link2,
-  Package,
-  ChefHat,
-  Leaf,
-  Beef,
+  ChevronDown,
+  MoreVertical,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 
 function formatCurrency(value: number): string {
@@ -59,6 +58,15 @@ interface Summary {
   noPrice: number; noCategory: number; noStation: number; noDietaryTag: number;
 }
 
+const PAGE_SIZE = 25;
+const TOP_CATS = 8;   // category chips shown inline before the "All N categories" dropdown
+
+const NEW_ITEM: MenuItem = {
+  id: '', name: '', category: '', station: '', item_type: 'foods', dietary_tag: '',
+  selling_price: 0, listing_price: 0, item_code: '', tax_value: 5, prep_minutes: 15,
+  is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '',
+};
+
 export default function MenuItemsPage() {
   const [items, setItems] = useState<MenuItem[]>([]);
   const [summary, setSummary] = useState<Summary>({ total: 0, active: 0, inactive: 0, foods: 0, liquors: 0, beverages: 0, withRecipe: 0, withMaterial: 0, noPrice: 0, noCategory: 0, noStation: 0, noDietaryTag: 0 });
@@ -92,12 +100,18 @@ export default function MenuItemsPage() {
 
   const [toast, setToast] = useState<string | null>(null);
 
+  // Pagination + category dropdown + search focus
+  const [page, setPage] = useState(1);
+  const [catMenuOpen, setCatMenuOpen] = useState(false);
+  const [catSearch, setCatSearch] = useState('');
+  const searchRef = useRef<HTMLInputElement>(null);
+
   const fetchItems = useCallback(async () => {
     try {
       const res = await fetch('/api/menu-items');
       const json = await res.json();
       setItems(json.items || []);
-      setSummary(json.summary || summary);
+      setSummary(prev => json.summary || prev);
       setCategories(json.categories || []);
       setStations(json.stations || []);
     } catch (_) {}
@@ -131,11 +145,57 @@ export default function MenuItemsPage() {
           case 'noStation': if (it.station) return false; break;
           case 'noDietaryTag': if (it.item_type !== 'foods' || it.dietary_tag) return false; break;
           case 'noRecipe': if (it.recipe_id || it.material_id) return false; break;
+          case 'any': {
+            const bad = !(it.selling_price > 0)
+              || (it.item_type === 'foods' && !it.dietary_tag)
+              || (!it.recipe_id && !it.material_id);
+            if (!bad) return false;
+            break;
+          }
         }
       }
       return true;
     });
   }, [items, searchQuery, categoryFilter, stationFilter, typeFilter, vegFilter, statusFilter, issueFilter]);
+
+  // Attention counts — distinct items + per-issue (drives the banner)
+  const attn = useMemo(() => {
+    let noPrice = 0, noVeg = 0, noLink = 0; const bad = new Set<string>();
+    for (const it of items) {
+      let issue = false;
+      if (!(it.selling_price > 0)) { noPrice++; issue = true; }
+      if (it.item_type === 'foods' && !it.dietary_tag) { noVeg++; issue = true; }
+      if (!it.recipe_id && !it.material_id) { noLink++; issue = true; }
+      if (issue) bad.add(it.id);
+    }
+    return { noPrice, noVeg, noLink, total: bad.size };
+  }, [items]);
+
+  // Activating a health filter also drops the active-only scope, so the drill-down
+  // reveals every flagged item the banner counted (incl. inactive ones).
+  const reviewIssue = (key: string) => {
+    if (issueFilter === key) { setIssueFilter(null); }
+    else { setIssueFilter(key); setStatusFilter('all'); }
+  };
+
+  // Pagination (reset to page 1 whenever the filtered set changes)
+  useEffect(() => { setPage(1); }, [searchQuery, categoryFilter, stationFilter, typeFilter, vegFilter, statusFilter, issueFilter]);
+  const pageCount = Math.max(1, Math.ceil(filteredItems.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount);
+  const pageItems = filteredItems.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  // "/" focuses the search box (but never while a modal is open)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (editItem || importOpen) return;
+      const tag = (document.activeElement?.tagName || '').toLowerCase();
+      if (e.key === '/' && tag !== 'input' && tag !== 'textarea' && tag !== 'select') {
+        e.preventDefault(); searchRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [editItem, importOpen]);
 
   // Import handling
   const openImport = () => {
@@ -354,227 +414,194 @@ export default function MenuItemsPage() {
 
   return (
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
-      <div className="max-w-[100rem] mx-auto px-4 sm:px-6 py-6 space-y-5">
+      <div className="max-w-[100rem] mx-auto px-3 sm:px-6 py-5 sm:py-6 space-y-4 sm:space-y-5">
         {/* Header */}
-        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408] flex items-center gap-3">
-              <Utensils className="w-8 h-8" />
-              Menu Items
-            </h1>
-            <p className="text-[#8B7355] text-sm mt-1">Complete product catalog — food, liquor, beverages</p>
+            <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">Dine-In</p>
+            <h1 className="text-2xl sm:text-3xl font-bold text-[#2D1B0E] mt-0.5">Menu Items</h1>
           </div>
-          <div className="flex gap-2 flex-wrap">
-            <button onClick={openImport} className="flex items-center gap-2 px-4 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium">
-              <FileSpreadsheet className="w-4 h-4" />Import from Akan POS
+          <div className="flex gap-2">
+            <button onClick={openImport} className="flex items-center gap-2 px-3 sm:px-4 py-2.5 bg-white border border-[#E0D0BE] hover:border-purple-400 hover:bg-purple-50/40 text-purple-700 rounded-xl text-sm font-medium shadow-sm transition-colors">
+              <Download className="w-4 h-4" /><span className="hidden sm:inline">Import from Akan POS</span><span className="sm:hidden">Import</span>
             </button>
-            <button onClick={() => setEditItem({ id: '', name: '', category: '', station: '', item_type: 'foods', dietary_tag: '', selling_price: 0, listing_price: 0, item_code: '', tax_value: 5, prep_minutes: 15, is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '' })} className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
+            <button onClick={() => setEditItem(NEW_ITEM)} className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-xl text-sm font-semibold shadow-sm transition-colors">
               <Plus className="w-4 h-4" />New Item
             </button>
           </div>
         </div>
 
-        {/* Summary cards */}
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
-          <StatCard label="Total" value={summary.total} color="text-[#2D1B0E]" />
-          <StatCard label="Active" value={summary.active} color="text-green-600" />
-          <StatCard label="Foods" value={summary.foods} color="text-orange-500" icon={<Utensils className="w-3.5 h-3.5" />} />
-          <StatCard label="Liquor" value={summary.liquors} color="text-purple-600" icon={<Package className="w-3.5 h-3.5" />} />
-          <StatCard label="Beverages" value={summary.beverages} color="text-blue-500" />
-          <StatCard label="With Recipe" value={summary.withRecipe} color="text-indigo-600" icon={<ChefHat className="w-3.5 h-3.5" />} />
+        {/* Stat bar */}
+        <div className="bg-white border border-[#E8D5C4] rounded-2xl shadow-sm overflow-hidden grid grid-cols-3 sm:grid-cols-6">
+          <Stat label="Total" value={summary.total} className="text-[#2D1B0E]" />
+          <Stat label="Active" value={summary.active} className="text-green-600" />
+          <Stat label="Foods" value={summary.foods} className="text-orange-500" />
+          <Stat label="Liquor" value={summary.liquors} className="text-purple-600" />
+          <Stat label="Beverages" value={summary.beverages} className="text-[#B9A48C]" />
+          <Stat label="With Recipe" value={summary.withRecipe} className="text-blue-600" />
         </div>
 
-        {/* Issue chips */}
-        {(summary.noPrice + summary.noCategory + summary.noStation + summary.noDietaryTag) > 0 && (
-          <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-semibold text-[#2D1B0E] flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 text-amber-500" />
-                Menu Health Check
-              </h3>
-              {issueFilter && <button onClick={() => setIssueFilter(null)} className="text-xs text-[#af4408] hover:underline">Clear filter</button>}
+        {/* Attention banner */}
+        {attn.total > 0 && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3">
+            <span className="flex items-center gap-2 text-sm font-semibold text-amber-900">
+              <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+              {attn.total} items need attention
+            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              {attn.noPrice > 0 && <AttnPill tone="red" count={attn.noPrice} label="no selling price" active={issueFilter === 'noPrice'} onClick={() => reviewIssue('noPrice')} />}
+              {attn.noVeg > 0 && <AttnPill tone="amber" count={attn.noVeg} label="missing veg/non-veg" active={issueFilter === 'noDietaryTag'} onClick={() => reviewIssue('noDietaryTag')} />}
+              {attn.noLink > 0 && <AttnPill tone="blue" count={attn.noLink} label="no recipe link" active={issueFilter === 'noRecipe'} onClick={() => reviewIssue('noRecipe')} />}
             </div>
-            <TabScroller className="gap-2">
-              {summary.noPrice > 0 && <IssueChip active={issueFilter === 'noPrice'} onClick={() => setIssueFilter(issueFilter === 'noPrice' ? null : 'noPrice')} color="red" count={summary.noPrice} label="No Selling Price" />}
-              {summary.noCategory > 0 && <IssueChip active={issueFilter === 'noCategory'} onClick={() => setIssueFilter(issueFilter === 'noCategory' ? null : 'noCategory')} color="amber" count={summary.noCategory} label="No Category" />}
-              {summary.noStation > 0 && <IssueChip active={issueFilter === 'noStation'} onClick={() => setIssueFilter(issueFilter === 'noStation' ? null : 'noStation')} color="amber" count={summary.noStation} label="No Station" />}
-              {summary.noDietaryTag > 0 && <IssueChip active={issueFilter === 'noDietaryTag'} onClick={() => setIssueFilter(issueFilter === 'noDietaryTag' ? null : 'noDietaryTag')} color="orange" count={summary.noDietaryTag} label="Foods Missing Veg/Non-Veg" />}
-              {(summary.total - summary.withRecipe - summary.withMaterial) > 0 && (
-                <IssueChip active={issueFilter === 'noRecipe'} onClick={() => setIssueFilter(issueFilter === 'noRecipe' ? null : 'noRecipe')} color="blue" count={summary.total - summary.withRecipe - summary.withMaterial} label="No Recipe / Material Link" />
-              )}
-            </TabScroller>
+            <button onClick={() => reviewIssue('any')} className="ml-auto text-sm font-medium text-[#af4408] hover:underline whitespace-nowrap">
+              {issueFilter ? 'Clear filter' : 'Review all →'}
+            </button>
           </div>
         )}
 
-        {/* Filters */}
-        <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
-          {/* Category chips — always-visible, click to filter. Counts honour the
-              other active filters so the user knows how many they'll see. */}
-          {categories.length > 0 && (() => {
-            const baseList = items.filter(it => {
-              if (statusFilter === 'active'   && !it.is_active) return false;
-              if (statusFilter === 'inactive' &&  it.is_active) return false;
-              if (stationFilter && it.station !== stationFilter) return false;
-              if (typeFilter    && it.item_type !== typeFilter) return false;
-              if (vegFilter     && it.dietary_tag !== vegFilter) return false;
-              if (searchQuery) {
-                const q = searchQuery.toLowerCase();
-                if (!it.name.toLowerCase().includes(q) && !(it.item_code || '').toLowerCase().includes(q)) return false;
-              }
-              return true;
-            });
-            const countByCat: Record<string, number> = {};
-            for (const it of baseList) {
-              const k = it.category || 'Uncategorised';
-              countByCat[k] = (countByCat[k] || 0) + 1;
-            }
-            const sortedCats = [...categories].sort((a, b) => (countByCat[b] || 0) - (countByCat[a] || 0));
-            return (
-              <TabScroller className="gap-1.5">
-                <button onClick={() => setCategoryFilter('')}
-                        className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
-                          !categoryFilter ? 'bg-[#af4408] text-white'
-                                          : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'}`}>
-                  All <span className="opacity-70">({baseList.length})</span>
-                </button>
-                {sortedCats.map(c => {
-                  const n = countByCat[c] || 0;
-                  const active = categoryFilter === c;
-                  return (
-                    <button key={c}
-                            onClick={() => setCategoryFilter(active ? '' : c)}
-                            className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
-                              active ? 'bg-[#af4408] text-white'
-                                     : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'}`}>
-                      {c} <span className="opacity-70">({n})</span>
-                    </button>
-                  );
-                })}
-              </TabScroller>
-            );
-          })()}
-
-          {/* Search + secondary dropdowns (station / type / veg / status).
-              Category dropdown removed — chips above replace it. */}
-          <div className="flex flex-col lg:flex-row gap-3">
-            <div className="flex-1 relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />
-              <input type="text" placeholder="Search by name or item code..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="w-full pl-10 pr-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
-            </div>
-            <select value={stationFilter} onChange={e => setStationFilter(e.target.value)} className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
+        {/* Search + filters */}
+        <div className="flex flex-col lg:flex-row gap-2.5">
+          <div className="relative flex-1 min-w-0">
+            <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />
+            <input ref={searchRef} type="text" placeholder="Search by name or item code…" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+                   className="w-full pl-10 pr-9 py-2.5 bg-white border border-[#E0D0BE] rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]/40 focus:border-[#af4408] shadow-sm" />
+            <kbd className="hidden sm:flex absolute right-3 top-1/2 -translate-y-1/2 h-5 w-5 items-center justify-center rounded border border-[#E0D0BE] bg-[#FFF8F0] text-[11px] text-[#8B7355]">/</kbd>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <select value={stationFilter} onChange={e => setStationFilter(e.target.value)} className="px-3 py-2.5 bg-white border border-[#E0D0BE] rounded-xl text-sm shadow-sm">
               <option value="">All Stations ({stations.length})</option>
               {stations.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
-            <select value={typeFilter} onChange={e => setTypeFilter(e.target.value)} className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
+            <select value={typeFilter} onChange={e => setTypeFilter(e.target.value)} className="px-3 py-2.5 bg-white border border-[#E0D0BE] rounded-xl text-sm shadow-sm">
               <option value="">All Types</option>
               <option value="foods">Foods</option>
               <option value="liquors">Liquor</option>
               <option value="beverages">Beverages</option>
             </select>
-            <select value={vegFilter} onChange={e => setVegFilter(e.target.value)} className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
-              <option value="">Veg/Non-Veg: All</option>
-              <option value="Veg">Veg</option>
-              <option value="Non-Veg">Non-Veg</option>
-              <option value="Egg">Egg</option>
-            </select>
-            <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
-              <option value="active">Active only</option>
-              <option value="inactive">Inactive only</option>
-              <option value="all">All</option>
-            </select>
+            <SegmentedVeg value={vegFilter} onChange={setVegFilter} />
+            <ActiveToggle on={statusFilter === 'active'} onToggle={() => setStatusFilter(statusFilter === 'active' ? 'all' : 'active')} />
           </div>
-          <p className="text-xs text-[#8B7355] mt-2">Showing {filteredItems.length} of {items.length} items</p>
         </div>
 
-        {/* Items table */}
-        <div className="bg-white border border-[#E8D5C4] rounded-xl shadow overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-[#8B7355] border-b border-[#E8D5C4] bg-[#FFF1E3]/50">
-                  <th className="text-left py-3 px-3 font-medium">Name</th>
-                  <th className="text-left py-3 px-3 font-medium">Category</th>
-                  <th className="text-left py-3 px-3 font-medium">Station</th>
-                  <th className="text-left py-3 px-3 font-medium">Type</th>
-                  <th className="text-left py-3 px-3 font-medium">V/NV</th>
-                  <th className="text-right py-3 px-3 font-medium">Sell Price</th>
-                  <th className="text-right py-3 px-3 font-medium">Cost</th>
-                  <th className="text-right py-3 px-3 font-medium">FC %</th>
-                  <th className="text-left py-3 px-3 font-medium">Link</th>
-                  <th className="text-center py-3 px-3 font-medium">Active</th>
-                  <th className="text-center py-3 px-3 font-medium">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredItems.length === 0 ? (
-                  <tr>
-                    <td colSpan={11} className="py-12 text-center text-[#8B7355]">
-                      <Utensils className="w-10 h-10 mx-auto mb-3 opacity-40" />
-                      <p>No menu items found</p>
-                      <p className="text-xs mt-1">Import from Akan POS or add manually</p>
-                    </td>
-                  </tr>
-                ) : filteredItems.slice(0, 500).map((it) => (
-                  <tr key={it.id} className={`border-b border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30 ${!it.is_active ? 'opacity-50' : ''}`}>
-                    <td className="py-2 px-3 text-[#2D1B0E] font-medium text-xs">
-                      {it.name}
-                      {it.item_code && <span className="ml-2 text-[10px] text-[#8B7355] font-mono">[{it.item_code}]</span>}
-                    </td>
-                    <td className="py-2 px-3 text-xs text-[#6B5744]">{it.category || <span className="text-red-400">—</span>}</td>
-                    <td className="py-2 px-3 text-xs text-[#6B5744]">{it.station || <span className="text-red-400">—</span>}</td>
-                    <td className="py-2 px-3">
-                      <TypeBadge type={it.item_type} />
-                    </td>
-                    <td className="py-2 px-3">
-                      {it.dietary_tag === 'Veg' && <span className="inline-flex items-center gap-1 text-[10px] text-green-700 font-medium"><Leaf className="w-3 h-3" />Veg</span>}
-                      {it.dietary_tag === 'Non-Veg' && <span className="inline-flex items-center gap-1 text-[10px] text-red-600 font-medium"><Beef className="w-3 h-3" />NV</span>}
-                      {it.dietary_tag === 'Egg' && <span className="text-[10px] text-amber-600 font-medium">Egg</span>}
-                      {!it.dietary_tag && it.item_type === 'foods' && <span className="text-red-400 text-xs">—</span>}
-                    </td>
-                    <td className="py-2 px-3 text-right text-xs font-mono font-semibold text-[#2D1B0E]">
-                      {it.selling_price > 0 ? formatCurrency(it.selling_price) : <span className="text-red-400">₹0</span>}
-                    </td>
-                    <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744]">
-                      {it.recipe_cost ? formatCurrency(it.recipe_cost) : it.material_cost ? formatCurrency(it.material_cost) : '—'}
-                    </td>
-                    <td className="py-2 px-3 text-right text-xs font-mono">
-                      {it.recipe_food_cost_percent ? (
-                        <span className={it.recipe_food_cost_percent > 50 ? 'text-red-500' : it.recipe_food_cost_percent > 30 ? 'text-amber-600' : 'text-green-600'}>
-                          {it.recipe_food_cost_percent}%
-                        </span>
-                      ) : '—'}
-                    </td>
-                    <td className="py-2 px-3">
-                      {it.recipe_id ? (
-                        <span className="inline-flex items-center gap-1 text-[10px] text-indigo-600"><ChefHat className="w-3 h-3" />Recipe</span>
-                      ) : it.material_id ? (
-                        <span className="inline-flex items-center gap-1 text-[10px] text-purple-600"><Package className="w-3 h-3" />Direct</span>
-                      ) : (
-                        <span className="text-[10px] text-[#C4B09A]">—</span>
-                      )}
-                    </td>
-                    <td className="py-2 px-3 text-center">
-                      <button onClick={() => toggleActive(it)} className={`text-[10px] px-2 py-0.5 rounded-full border ${it.is_active ? 'bg-green-100 text-green-700 border-green-200' : 'bg-gray-100 text-gray-600 border-gray-200'}`}>
-                        {it.is_active ? 'Active' : 'Inactive'}
-                      </button>
-                    </td>
-                    <td className="py-2 px-3">
-                      <div className="flex items-center justify-center gap-1">
-                        <button onClick={() => setEditItem(it)} className="p-1 text-[#6B5744] hover:text-[#af4408]"><Edit className="w-3.5 h-3.5" /></button>
-                        <button onClick={() => deleteItem(it.id)} className="p-1 text-red-400 hover:text-red-600"><Trash2 className="w-3.5 h-3.5" /></button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {filteredItems.length > 500 && (
-            <div className="p-3 bg-amber-50 border-t border-amber-200 text-xs text-amber-800 text-center">
-              Showing first 500 of {filteredItems.length} results. Use filters to narrow down.
+        {/* Category chips + "All N categories" dropdown */}
+        {categories.length > 0 && (() => {
+          const baseList = items.filter(it => {
+            if (statusFilter === 'active'   && !it.is_active) return false;
+            if (statusFilter === 'inactive' &&  it.is_active) return false;
+            if (stationFilter && it.station !== stationFilter) return false;
+            if (typeFilter    && it.item_type !== typeFilter) return false;
+            if (vegFilter     && it.dietary_tag !== vegFilter) return false;
+            const q = searchQuery.toLowerCase().trim();
+            if (q && !it.name.toLowerCase().includes(q) && !(it.item_code || '').toLowerCase().includes(q)) return false;
+            return true;
+          });
+          const countByCat: Record<string, number> = {};
+          for (const it of baseList) { const k = it.category; if (k) countByCat[k] = (countByCat[k] || 0) + 1; }
+          const sortedCats = [...categories].sort((a, b) => (countByCat[b] || 0) - (countByCat[a] || 0));
+          const inline = sortedCats.slice(0, TOP_CATS);
+          if (categoryFilter && !inline.includes(categoryFilter)) inline.unshift(categoryFilter);
+          return (
+            <div className="flex items-center gap-2">
+              <TabScroller className="gap-1.5 flex-1 min-w-0">
+                <CatChip active={!categoryFilter} label="All" count={baseList.length} onClick={() => setCategoryFilter('')} />
+                {inline.map(c => <CatChip key={c} active={categoryFilter === c} label={c} count={countByCat[c] || 0} onClick={() => setCategoryFilter(categoryFilter === c ? '' : c)} />)}
+              </TabScroller>
+              <div className="relative shrink-0">
+                <button onClick={() => setCatMenuOpen(!catMenuOpen)} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium whitespace-nowrap transition-colors ${catMenuOpen ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E0D0BE] hover:bg-[#FFF1E3]'}`}>
+                  All {categories.length} categories <ChevronDown className="w-3.5 h-3.5" />
+                </button>
+                {catMenuOpen && (
+                  <CategoryMenu categories={sortedCats} counts={countByCat} current={categoryFilter} search={catSearch} setSearch={setCatSearch}
+                                onPick={(c) => { setCategoryFilter(c); setCatMenuOpen(false); setCatSearch(''); }}
+                                onClose={() => { setCatMenuOpen(false); setCatSearch(''); }} />
+                )}
+              </div>
             </div>
-          )}
-        </div>
+          );
+        })()}
+
+        {/* ---- Items: table on desktop, cards on mobile ---- */}
+        {filteredItems.length === 0 ? (
+          <div className="bg-white border border-[#E8D5C4] rounded-2xl py-16 text-center text-[#8B7355]">
+            <Utensils className="w-10 h-10 mx-auto mb-3 opacity-40" />
+            <p>No menu items found</p>
+            <p className="text-xs mt-1">Try clearing filters, or import from Akan POS</p>
+          </div>
+        ) : (
+          <>
+            {/* Desktop table */}
+            <div className="hidden md:block bg-white border border-[#E8D5C4] rounded-2xl shadow-sm overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-[11px] uppercase tracking-wide text-[#8B7355] border-b border-[#E8D5C4] bg-[#FFF8F0]">
+                      <th className="text-left py-3 px-4 font-semibold">Name</th>
+                      <th className="text-left py-3 px-3 font-semibold">Category / Station</th>
+                      <th className="text-left py-3 px-3 font-semibold">Type</th>
+                      <th className="text-left py-3 px-3 font-semibold">V/NV</th>
+                      <th className="text-right py-3 px-3 font-semibold">Sell ₹</th>
+                      <th className="text-right py-3 px-3 font-semibold">Cost ₹</th>
+                      <th className="text-right py-3 px-3 font-semibold">FC %</th>
+                      <th className="text-left py-3 px-3 font-semibold">Link</th>
+                      <th className="text-center py-3 px-3 font-semibold">Active</th>
+                      <th className="w-10" aria-label="Actions"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageItems.map((it) => (
+                      <tr key={it.id} className={`border-b border-[#F0E4D6] last:border-0 hover:bg-[#FFF8F0] ${!it.is_active ? 'opacity-55' : ''}`}>
+                        <td className="py-2.5 px-4">
+                          <div className="flex items-center gap-3">
+                            <Avatar name={it.name} type={it.item_type} />
+                            <div className="min-w-0">
+                              <p className="font-semibold text-[#2D1B0E] text-[13px] truncate max-w-[240px]">{it.name}</p>
+                              {it.item_code && <p className="text-[11px] text-[#8B7355] font-mono">{it.item_code}</p>}
+                            </div>
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-3">
+                          <p className="text-[13px] text-[#3D2614]">{it.category || <span className="text-red-400">—</span>}</p>
+                          {it.station && <p className="text-[11px] text-[#8B7355]">{it.station}</p>}
+                        </td>
+                        <td className="py-2.5 px-3"><TypeBadge type={it.item_type} /></td>
+                        <td className="py-2.5 px-3"><VegSquare tag={it.dietary_tag} type={it.item_type} /></td>
+                        <td className="py-2.5 px-3 text-right font-semibold text-[#2D1B0E]">
+                          {it.selling_price > 0 ? formatCurrency(it.selling_price) : <span className="text-red-400 font-normal">₹0</span>}
+                        </td>
+                        <td className="py-2.5 px-3 text-right text-[#6B5744]">
+                          {it.recipe_cost ? formatCurrency(it.recipe_cost) : it.material_cost ? formatCurrency(it.material_cost) : <span className="text-[#C4B09A]">—</span>}
+                        </td>
+                        <td className="py-2.5 px-3 text-right">
+                          {it.recipe_food_cost_percent
+                            ? <span className={`font-medium ${fcColor(it.recipe_food_cost_percent)}`}>{it.recipe_food_cost_percent}</span>
+                            : <span className="text-[#C4B09A]">—</span>}
+                        </td>
+                        <td className="py-2.5 px-3"><LinkBadge item={it} /></td>
+                        <td className="py-2.5 px-3 text-center"><RowToggle on={!!it.is_active} onClick={() => toggleActive(it)} /></td>
+                        <td className="py-2.5 px-2 text-center"><RowMenu onEdit={() => setEditItem(it)} onDelete={() => deleteItem(it.id)} /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Mobile cards */}
+            <div className="md:hidden space-y-2.5">
+              {pageItems.map((it) => (
+                <MobileCard key={it.id} it={it} onEdit={() => setEditItem(it)} onDelete={() => deleteItem(it.id)} onToggle={() => toggleActive(it)} />
+              ))}
+            </div>
+
+            {/* Pagination */}
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-1">
+              <p className="text-xs text-[#8B7355]">
+                Showing {(safePage - 1) * PAGE_SIZE + 1}–{Math.min(safePage * PAGE_SIZE, filteredItems.length)} of {filteredItems.length} items
+              </p>
+              <Pagination page={safePage} pageCount={pageCount} onPage={setPage} />
+            </div>
+          </>
+        )}
       </div>
 
       {/* Toast */}
@@ -693,12 +720,91 @@ export default function MenuItemsPage() {
   );
 }
 
-function StatCard({ label, value, color, icon }: { label: string; value: number; color: string; icon?: React.ReactNode }) {
+function Stat({ label, value, className }: { label: string; value: number; className: string }) {
   return (
-    <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 shadow-sm">
-      <p className="text-[10px] text-[#8B7355] uppercase tracking-wide flex items-center gap-1">{icon}{label}</p>
-      <p className={`text-xl font-bold ${color} mt-1`}>{value}</p>
+    <div className="px-2 sm:px-3 py-3 text-center border-r border-b sm:border-b-0 border-[#F0E4D6]">
+      <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide truncate">{label}</p>
+      <p className={`text-xl sm:text-2xl font-bold mt-1 ${className}`}>{value}</p>
     </div>
+  );
+}
+
+function fcColor(pct: number): string {
+  return pct > 50 ? 'text-red-500' : pct > 30 ? 'text-amber-600' : 'text-green-600';
+}
+
+function Avatar({ name, type }: { name: string; type: string }) {
+  const initials = (name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase() || '?';
+  const tone = type === 'liquors' ? 'bg-purple-100 text-purple-700'
+    : type === 'beverages' ? 'bg-blue-100 text-blue-700'
+    : 'bg-[#F3E2D0] text-[#a8632b]';
+  return <div className={`w-9 h-9 rounded-full flex items-center justify-center text-[11px] font-bold shrink-0 ${tone}`}>{initials}</div>;
+}
+
+// FSSAI-style veg/non-veg marker. Shape (not just colour) distinguishes each state
+// for colour-blind users: Veg = dot, Non-Veg = triangle, Egg = ring; plus role/aria
+// so screen readers announce it. "?" when a food is missing its tag.
+function VegSquare({ tag, type }: { tag: string; type: string }) {
+  if (tag === 'Veg')
+    return <span role="img" aria-label="Veg" title="Veg" className="inline-flex items-center justify-center w-[18px] h-[18px] rounded border-2 border-green-600"><span className="w-2 h-2 rounded-full bg-green-600" /></span>;
+  if (tag === 'Non-Veg')
+    return <span role="img" aria-label="Non-Veg" title="Non-Veg" className="inline-flex items-center justify-center w-[18px] h-[18px] rounded border-2 border-red-600"><span className="w-0 h-0 border-l-[4px] border-r-[4px] border-b-[7px] border-l-transparent border-r-transparent border-b-red-600" /></span>;
+  if (tag === 'Egg')
+    return <span role="img" aria-label="Egg" title="Egg" className="inline-flex items-center justify-center w-[18px] h-[18px] rounded border-2 border-amber-500"><span className="w-2 h-2 rounded-full border-2 border-amber-500" /></span>;
+  if (type === 'foods')
+    return <span role="img" aria-label="Veg/Non-Veg not set" className="inline-flex items-center justify-center w-[18px] h-[18px] rounded border-2 border-amber-400 text-[11px] font-bold text-amber-500 leading-none" title="Veg/Non-Veg not set">?</span>;
+  return <span className="text-[#C4B09A]" aria-hidden>—</span>;
+}
+
+function LinkBadge({ item }: { item: MenuItem }) {
+  if (item.recipe_id) return <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200">Recipe</span>;
+  if (item.material_id) return <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-purple-50 text-purple-700 border border-purple-200">Direct</span>;
+  return <span className="text-[#C4B09A]">—</span>;
+}
+
+function RowToggle({ on, onClick }: { on: boolean; onClick: () => void }) {
+  return (
+    <button onClick={onClick} role="switch" aria-checked={on} aria-label={on ? 'Active' : 'Inactive'}
+            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${on ? 'bg-green-500' : 'bg-gray-300'}`}>
+      <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${on ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+    </button>
+  );
+}
+
+// ⋮ row menu. The dropdown is fixed-positioned so it isn't clipped by the
+// table's horizontal-scroll container.
+function RowMenu({ onEdit, onDelete }: { onEdit: () => void; onDelete: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const openMenu = () => {
+    const r = btnRef.current?.getBoundingClientRect();
+    if (r) setPos({ top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) });
+    setOpen(true);
+  };
+  // Fixed dropdown can't follow the row, so close it on any scroll/resize.
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => { window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+  }, [open]);
+  return (
+    <>
+      <button ref={btnRef} onClick={() => (open ? setOpen(false) : openMenu())} className="p-1.5 rounded-lg text-[#8B7355] hover:bg-[#FFF1E3]" aria-label="Row actions">
+        <MoreVertical className="w-4 h-4" />
+      </button>
+      {open && pos && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div style={{ top: pos.top, right: pos.right }} className="fixed z-50 w-32 bg-white border border-[#E8D5C4] rounded-lg shadow-xl py-1 text-sm">
+            <button onClick={() => { setOpen(false); onEdit(); }} className="w-full text-left px-3 py-1.5 hover:bg-[#FFF1E3] flex items-center gap-2 text-[#2D1B0E]"><Edit className="w-3.5 h-3.5" />Edit</button>
+            <button onClick={() => { setOpen(false); onDelete(); }} className="w-full text-left px-3 py-1.5 hover:bg-red-50 flex items-center gap-2 text-red-600"><Trash2 className="w-3.5 h-3.5" />Delete</button>
+          </div>
+        </>
+      )}
+    </>
   );
 }
 
@@ -722,18 +828,124 @@ function TypeBadge({ type }: { type: string }) {
   return <span className={`text-[10px] px-2 py-0.5 rounded-full ${m.bg} ${m.text} font-medium`}>{m.label}</span>;
 }
 
-function IssueChip({ active, onClick, color, count, label }: { active: boolean; onClick: () => void; color: string; count: number; label: string }) {
-  const colors: Record<string, string> = {
-    red: active ? 'bg-red-600 text-white border-red-600' : 'bg-red-50 text-red-700 border-red-200 hover:bg-red-100',
-    amber: active ? 'bg-amber-500 text-white border-amber-500' : 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100',
-    orange: active ? 'bg-orange-500 text-white border-orange-500' : 'bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100',
-    blue: active ? 'bg-blue-600 text-white border-blue-600' : 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100',
+function AttnPill({ tone, count, label, active, onClick }: { tone: 'red' | 'amber' | 'blue'; count: number; label: string; active: boolean; onClick: () => void }) {
+  const tones: Record<string, string> = {
+    red: active ? 'bg-red-600 text-white border-red-600' : 'bg-white text-red-700 border-red-200 hover:bg-red-50',
+    amber: active ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-amber-800 border-amber-300 hover:bg-amber-50',
+    blue: active ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-blue-700 border-blue-200 hover:bg-blue-50',
   };
   return (
-    <button onClick={onClick} className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-colors ${colors[color]}`}>
-      <span className={`inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full text-[10px] font-bold ${active ? 'bg-white/25' : 'bg-white'}`}>{count}</span>
-      {label}
+    <button onClick={onClick} className={`text-xs font-medium px-2.5 py-1 rounded-full border transition-colors ${tones[tone]}`}>
+      <span className="font-bold">{count}</span> {label}
     </button>
+  );
+}
+
+function SegmentedVeg({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const opts: [string, string][] = [['', 'All'], ['Veg', 'Veg'], ['Non-Veg', 'Non-Veg']];
+  return (
+    <div className="inline-flex rounded-xl border border-[#E0D0BE] bg-white p-0.5 shadow-sm">
+      {opts.map(([v, label]) => {
+        const on = value === v;
+        const activeCls = v === '' ? 'bg-[#af4408] text-white' : v === 'Veg' ? 'bg-green-600 text-white' : 'bg-red-600 text-white';
+        const idleCls = v === 'Veg' ? 'text-green-700 hover:bg-[#FFF1E3]' : v === 'Non-Veg' ? 'text-red-600 hover:bg-[#FFF1E3]' : 'text-[#6B5744] hover:bg-[#FFF1E3]';
+        return <button key={v || 'all'} onClick={() => onChange(v)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${on ? activeCls : idleCls}`}>{label}</button>;
+      })}
+    </div>
+  );
+}
+
+function ActiveToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+  return (
+    <button onClick={onToggle} role="switch" aria-checked={on} className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-[#E0D0BE] bg-white text-sm text-[#6B5744] shadow-sm">
+      <span className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${on ? 'bg-green-500' : 'bg-gray-300'}`}>
+        <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${on ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+      </span>
+      Active only
+    </button>
+  );
+}
+
+function CatChip({ active, label, count, onClick }: { active: boolean; label: string; count: number; onClick: () => void }) {
+  return (
+    <button onClick={onClick} className={`text-xs px-3 py-1.5 rounded-full whitespace-nowrap transition-colors ${active ? 'bg-[#af4408] text-white' : 'bg-white border border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF1E3]'}`}>
+      {label} <span className={active ? 'opacity-75' : 'text-[#8B7355]'}>· {count}</span>
+    </button>
+  );
+}
+
+function CategoryMenu({ categories, counts, current, search, setSearch, onPick, onClose }: {
+  categories: string[]; counts: Record<string, number>; current: string; search: string;
+  setSearch: (s: string) => void; onPick: (c: string) => void; onClose: () => void;
+}) {
+  const list = categories.filter(c => c.toLowerCase().includes(search.toLowerCase()));
+  return (
+    <>
+      <div className="fixed inset-0 z-30" onClick={onClose} />
+      <div className="absolute right-0 top-full mt-2 z-40 w-64 max-w-[85vw] bg-white border border-[#E8D5C4] rounded-xl shadow-xl overflow-hidden">
+        <div className="p-2 border-b border-[#F0E4D6]">
+          <input autoFocus value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter categories…"
+                 className="w-full px-2.5 py-1.5 bg-[#FFF8F0] border border-[#E0D0BE] rounded-lg text-xs focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+        </div>
+        <div className="max-h-72 overflow-y-auto py-1 text-sm">
+          <button onClick={() => onPick('')} className={`w-full text-left px-3 py-1.5 hover:bg-[#FFF1E3] ${!current ? 'text-[#af4408] font-semibold' : 'text-[#3D2614]'}`}>All categories</button>
+          {list.map(c => (
+            <button key={c} onClick={() => onPick(c)} className={`w-full flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-[#FFF1E3] ${current === c ? 'text-[#af4408] font-semibold' : 'text-[#3D2614]'}`}>
+              <span className="truncate">{c}</span><span className="text-[11px] text-[#8B7355] shrink-0">{counts[c] || 0}</span>
+            </button>
+          ))}
+          {list.length === 0 && <p className="px-3 py-2 text-xs text-[#8B7355]">No matches</p>}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function MobileCard({ it, onEdit, onDelete, onToggle }: { it: MenuItem; onEdit: () => void; onDelete: () => void; onToggle: () => void }) {
+  return (
+    <div className={`bg-white border border-[#E8D5C4] rounded-2xl p-3 shadow-sm ${!it.is_active ? 'opacity-60' : ''}`}>
+      <div className="flex items-start gap-3">
+        <Avatar name={it.name} type={it.item_type} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <p className="font-semibold text-[#2D1B0E] text-sm leading-snug">{it.name}</p>
+              <p className="text-[11px] text-[#8B7355] truncate">
+                {it.category || '—'}{it.station ? ` · ${it.station}` : ''}{it.item_code ? ` · ${it.item_code}` : ''}
+              </p>
+            </div>
+            <RowMenu onEdit={onEdit} onDelete={onDelete} />
+          </div>
+          <div className="flex items-center flex-wrap gap-2 mt-2">
+            <TypeBadge type={it.item_type} />
+            <VegSquare tag={it.dietary_tag} type={it.item_type} />
+            <LinkBadge item={it} />
+            <span className="ml-auto font-bold text-[#2D1B0E]">{it.selling_price > 0 ? formatCurrency(it.selling_price) : <span className="text-red-400">₹0</span>}</span>
+          </div>
+          <div className="flex items-center justify-between mt-2 pt-2 border-t border-[#F0E4D6] text-[11px] text-[#8B7355]">
+            <span>Cost {it.recipe_cost ? formatCurrency(it.recipe_cost) : it.material_cost ? formatCurrency(it.material_cost) : '—'}{it.recipe_food_cost_percent ? ` · FC ${it.recipe_food_cost_percent}%` : ''}</span>
+            <span className="flex items-center gap-1.5">{it.is_active ? 'Active' : 'Inactive'}<RowToggle on={!!it.is_active} onClick={onToggle} /></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Pagination({ page, pageCount, onPage }: { page: number; pageCount: number; onPage: (n: number) => void }) {
+  if (pageCount <= 1) return null;
+  const set = new Set<number>([1, 2, 3, page - 1, page, page + 1, pageCount]);
+  const nums = [...set].filter(n => n >= 1 && n <= pageCount).sort((a, b) => a - b);
+  const items: (number | string)[] = [];
+  nums.forEach((n, i) => { if (i > 0 && n - nums[i - 1] > 1) items.push(`gap${i}`); items.push(n); });
+  return (
+    <div className="flex items-center gap-1">
+      <button disabled={page <= 1} onClick={() => onPage(page - 1)} className="h-9 w-9 flex items-center justify-center rounded-lg border border-[#E8D5C4] text-[#6B5744] disabled:opacity-40 hover:bg-[#FFF1E3]" aria-label="Previous page"><ChevronLeft className="w-4 h-4" /></button>
+      {items.map((n) => typeof n === 'string'
+        ? <span key={n} className="px-1 text-[#8B7355]">…</span>
+        : <button key={n} onClick={() => onPage(n)} aria-current={n === page ? 'page' : undefined} className={`min-w-[36px] h-9 px-2 rounded-lg text-sm font-medium ${n === page ? 'bg-[#af4408] text-white' : 'border border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF1E3]'}`}>{n}</button>)}
+      <button disabled={page >= pageCount} onClick={() => onPage(page + 1)} className="h-9 w-9 flex items-center justify-center rounded-lg border border-[#E8D5C4] text-[#6B5744] disabled:opacity-40 hover:bg-[#FFF1E3]" aria-label="Next page"><ChevronRight className="w-4 h-4" /></button>
+    </div>
   );
 }
 

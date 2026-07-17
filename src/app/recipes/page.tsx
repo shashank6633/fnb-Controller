@@ -26,8 +26,16 @@ import {
   Copy,
   Tags,
   Pencil,
+  LayoutGrid,
+  List as ListIcon,
+  ShieldAlert,
+  ChevronDown,
+  MoreVertical,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 import Papa from 'papaparse';
+import { allergenLabel, allergenEmoji } from '@/lib/allergens';
 import { api } from '@/lib/api';
 
 // ---------------------------------------------------------------------------
@@ -68,6 +76,11 @@ interface Recipe {
   is_active: number;
   ingredients: Ingredient[];
   sub_recipes: SubRecipeRef[];
+  instructions?: string;   // Cookbook: cooking method
+  image_url?: string;      // Cookbook: recipe photo
+  yield_quantity?: number;
+  yield_unit?: string;
+  allergens?: string[];    // Cookbook: auto-detected allergen keys
   created_at: string;
   updated_at: string;
 }
@@ -178,11 +191,17 @@ export default function RecipesPage() {
 
   // --- UI state ---
   const [activeTab, setActiveTab] = useState<'main' | 'sub' | 'direct'>('main');
+  const [recipeView, setRecipeView] = useState<'list' | 'gallery'>('list');  // Cookbook: card gallery
+  const [recipePage, setRecipePage] = useState(1);       // list pagination
+  const [showAllIssues, setShowAllIssues] = useState(false);  // health banner "+N more"
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
   type SortKey = 'category' | 'name' | 'fcAsc' | 'fcDesc' | 'costDesc' | 'priceDesc';
   const [sortBy, setSortBy] = useState<SortKey>('category');
   const [selectedRecipe, setSelectedRecipe] = useState<Recipe | null>(null);
+  const [scale, setScale] = useState(1);          // Cookbook: portion-scale factor
+  const [scaleInput, setScaleInput] = useState('1');  // raw input string (allows typing "1.5")
+  const setScaleTo = (n: number) => { setScale(n); setScaleInput(String(n)); };
   const [selectedSubRecipe, setSelectedSubRecipe] = useState<SubRecipe | null>(null);
 
   // --- modal state ---
@@ -208,6 +227,8 @@ export default function RecipesPage() {
   const [formPosItemId, setFormPosItemId] = useState<string>('');     // POS item code (display only)
   const [formIngredients, setFormIngredients] = useState<Ingredient[]>([]);
   const [formSubRecipes, setFormSubRecipes] = useState<SubRecipeRef[]>([]);
+  const [formInstructions, setFormInstructions] = useState('');   // Cookbook: cooking method
+  const [formImageUrl, setFormImageUrl] = useState('');           // Cookbook: recipe photo URL
 
   // --- menu items (for recipe-name combobox) ---
   const [menuItems, setMenuItems] = useState<Array<{
@@ -342,6 +363,17 @@ export default function RecipesPage() {
           case 'zeroCost': matchIssue = hasIngredients && (!r.total_cost || r.total_cost === 0); break;
           case 'noMenuLink': matchIssue = !menuItems.some(mi => mi.recipe_id === r.id); break;
           case 'priceless_ingredients': matchIssue = !!r.ingredients?.some((i: any) => !i.average_price || i.average_price === 0); break;
+          case 'anyIssue': matchIssue = (
+            !hasIngredients ||
+            !r.selling_price || r.selling_price === 0 ||
+            (r.selling_price > 0 && r.total_cost > r.selling_price) ||
+            (r.food_cost_percent > 20 && r.selling_price > 0) ||
+            (r.selling_price > 0 && r.food_cost_percent > 0 && r.food_cost_percent < 5) ||
+            !r.category || r.category.trim() === '' || r.category === 'other' ||
+            (hasIngredients && (!r.total_cost || r.total_cost === 0)) ||
+            !menuItems.some(mi => mi.recipe_id === r.id) ||
+            !!r.ingredients?.some((i: any) => !i.average_price || i.average_price === 0)
+          ); break;
         }
       }
 
@@ -360,6 +392,23 @@ export default function RecipesPage() {
     }
     return sorted;
   }, [recipes, searchQuery, categoryFilter, issueFilter, sortBy]);
+
+  // List pagination (25/page). Gallery view shows everything (photo grid).
+  const R_PAGE_SIZE = 25;
+  // Reset to page 1 when the filter/sort signature changes — done during render
+  // (guarded by a ref) so the correct page paints in the SAME frame, with no
+  // stale-page flash and no post-paint effect.
+  const _recipeSig = `${searchQuery}|${categoryFilter}|${issueFilter}|${sortBy}|${activeTab}`;
+  const _recipeSigRef = useRef(_recipeSig);
+  if (_recipeSigRef.current !== _recipeSig) {
+    _recipeSigRef.current = _recipeSig;
+    if (recipePage !== 1) setRecipePage(1);
+  }
+  const recipePageCount = Math.max(1, Math.ceil(filteredRecipes.length / R_PAGE_SIZE));
+  const recipeSafePage = Math.min(recipePage, recipePageCount);
+  const pagedRecipes = recipeView === 'gallery'
+    ? filteredRecipes
+    : filteredRecipes.slice((recipeSafePage - 1) * R_PAGE_SIZE, recipeSafePage * R_PAGE_SIZE);
 
   const filteredSubRecipes = useMemo(() => {
     return subRecipes.filter((sr) => {
@@ -390,7 +439,7 @@ export default function RecipesPage() {
   // Summary stats
   const summaryStats = useMemo(() => {
     if (!recipes.length) return {
-      total: 0, avgFoodCost: 0, mostProfitable: '-', highestCost: '-',
+      total: 0, avgFoodCost: 0, mostProfitable: '-', mostProfitableGpm: 0, highestCost: '-', highestCostFc: 0,
       issues: { total: 0, noPrice: [], noIngredients: [], noCategory: [], highFC: [], borderlineFC: [], suspicious: [], lossMaking: [], zeroCost: [], noMenuLink: [], pricelessIngredients: [] }
     };
     const total = recipes.length;
@@ -401,8 +450,11 @@ export default function RecipesPage() {
       return pb - pa;
     });
     const mostProfitable = sorted[0]?.name || '-';
+    const mp = sorted[0];
+    const mostProfitableGpm = mp && mp.selling_price > 0 ? ((mp.selling_price - mp.total_cost) / mp.selling_price) * 100 : 0;
     const highestCostRecipe = [...recipes].sort((a, b) => (b.food_cost_percent || 0) - (a.food_cost_percent || 0));
     const highestCost = highestCostRecipe[0]?.name || '-';
+    const highestCostFc = highestCostRecipe[0]?.food_cost_percent || 0;
 
     // Health check — recipes needing attention
     const noPrice = recipes.filter(r => !r.selling_price || r.selling_price === 0);
@@ -432,7 +484,7 @@ export default function RecipesPage() {
      ...zeroCost, ...noMenuLink, ...pricelessIngredients].forEach(r => issueSet.add(r.id));
 
     return {
-      total, avgFoodCost, mostProfitable, highestCost,
+      total, avgFoodCost, mostProfitable, mostProfitableGpm, highestCost, highestCostFc,
       issues: {
         total: issueSet.size,
         noPrice, noIngredients, noCategory, highFC, borderlineFC, lossMaking, suspicious,
@@ -914,6 +966,8 @@ export default function RecipesPage() {
     setFormPosItemId('');
     setFormIngredients([]);
     setFormSubRecipes([]);
+    setFormInstructions('');
+    setFormImageUrl('');
     setShowRecipeModal(true);
   }
 
@@ -922,6 +976,8 @@ export default function RecipesPage() {
     setFormName(recipe.name);
     setFormCategory(recipe.category);
     setFormSellingPrice(recipe.selling_price);
+    setFormInstructions((recipe as any).instructions || '');
+    setFormImageUrl((recipe as any).image_url || '');
     // Find any menu_item already linked to this recipe
     const linked = menuItems.find(mi => mi.recipe_id === recipe.id);
     setFormMenuItemId(linked?.id || '');
@@ -1052,6 +1108,8 @@ export default function RecipesPage() {
         name: formName,
         category: formCategory,
         selling_price: formSellingPrice,
+        instructions: formInstructions,
+        image_url: formImageUrl,
         menu_item_id: formMenuItemId || undefined,  // link menu_items.recipe_id on save
         ingredients: formIngredients
           .filter((i) => i.material_id)
@@ -1317,6 +1375,13 @@ export default function RecipesPage() {
           </div>
         </div>
 
+        {/* Cookbook photo */}
+        {r.image_url && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={r.image_url} alt={r.name} className="w-full max-h-60 object-cover rounded-xl border border-[#E8D5C4] mb-6"
+               onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />
+        )}
+
         {/* Cost summary cards */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4 mb-6">
           <div className="card">
@@ -1339,11 +1404,60 @@ export default function RecipesPage() {
           </div>
         </div>
 
+        {/* Cookbook: allergen roll-up (auto-detected from ingredient names) */}
+        {(r.allergens && r.allergens.length > 0) ? (
+          <div className="card mb-6 border-l-4 border-l-amber-400">
+            <div className="flex items-start gap-2 flex-wrap">
+              <h2 className="text-sm font-semibold text-[#2D1B0E] flex items-center gap-2">
+                <ShieldAlert size={16} className="text-amber-500" /> Allergens
+              </h2>
+              <div className="flex flex-wrap gap-2 flex-1">
+                {r.allergens.map((k) => (
+                  <span key={k} className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-amber-50 text-amber-900 border border-amber-200">
+                    <span aria-hidden>{allergenEmoji(k)}</span> {allergenLabel(k)}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <p className="text-[11px] text-[#8B7355] mt-2 leading-relaxed">
+              Auto-detected from ingredient names — a kitchen aid, not a guarantee. Verify with the chef before relying on this for a guest allergy.
+            </p>
+          </div>
+        ) : (
+          <div className="card mb-6">
+            <p className="text-xs text-[#8B7355] flex items-center gap-2">
+              <ShieldAlert size={14} className="text-[#B9A48C]" /> No common allergens auto-detected from the ingredient names. This is advisory only — always confirm with the chef.
+            </p>
+          </div>
+        )}
+
         {/* Ingredients table */}
         <div className="card mb-6">
-          <h2 className="text-lg font-semibold text-[#2D1B0E] mb-4 flex items-center gap-2">
-            <Layers size={18} /> Ingredients ({r.ingredients.length})
-          </h2>
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+            <h2 className="text-lg font-semibold text-[#2D1B0E] flex items-center gap-2">
+              <Layers size={18} /> Ingredients ({r.ingredients.length})
+            </h2>
+            {/* Cookbook: portion scaling — multiplies the prep quantities (and line
+                costs) below. The summary cards above stay per base recipe. */}
+            <div className="flex items-center gap-1.5 text-xs text-[#6B5744]">
+              <span className="uppercase tracking-wide text-[#8B7355] mr-0.5">Scale</span>
+              {[0.5, 1, 2, 4].map((s) => (
+                <button key={s} onClick={() => setScaleTo(s)}
+                        className={`px-2 py-1 rounded border ${scale === s ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF1E3]'}`}>×{s}</button>
+              ))}
+              {/* Mirror the raw string so mid-typing states like "1." survive; only
+                  commit to `scale` when the parse is a positive number. */}
+              <input type="number" min={0.1} step="any" value={scaleInput} aria-label="Scale factor"
+                     onChange={(e) => {
+                       setScaleInput(e.target.value);
+                       const v = parseFloat(e.target.value);
+                       if (Number.isFinite(v) && v > 0) setScale(v);
+                     }}
+                     onBlur={() => { const v = parseFloat(scaleInput); if (!Number.isFinite(v) || v <= 0) setScaleTo(1); }}
+                     className="w-16 px-2 py-1 border border-[#E8D5C4] rounded text-right bg-white" />
+              {r.yield_quantity ? <span className="text-[10px] text-[#8B7355] whitespace-nowrap">≈ {+(r.yield_quantity * scale).toFixed(2)} {r.yield_unit}</span> : null}
+            </div>
+          </div>
           {r.ingredients.length === 0 ? (
             <p className="text-[#8B7355] text-sm">No ingredients added.</p>
           ) : (
@@ -1366,12 +1480,12 @@ export default function RecipesPage() {
                     return (
                       <tr key={i} className="border-b border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30">
                         <td className="py-2 px-2 text-[#3D2614]">{ing.material_name || ing.material_id}</td>
-                        <td className="py-2 px-2 text-right text-[#6B5744]">{ing.quantity}</td>
+                        <td className="py-2 px-2 text-right text-[#6B5744] tabular-nums">{+(Number(ing.quantity) * scale).toFixed(3)}</td>
                         <td className="py-2 px-2 text-[#8B7355]">{ing.unit}</td>
                         <td className="py-2 px-2 text-right text-[#6B5744]">{ing.yield_percent}%</td>
                         <td className="py-2 px-2 text-right text-[#6B5744]">{ing.wastage_percent}%</td>
                         <td className="py-2 px-2 text-right text-[#6B5744]">{formatCurrency(ing.average_price || 0)}</td>
-                        <td className="py-2 px-2 text-right font-medium text-[#2D1B0E]">{formatCurrency(effCost)}</td>
+                        <td className="py-2 px-2 text-right font-medium text-[#2D1B0E]">{formatCurrency(effCost * scale)}</td>
                       </tr>
                     );
                   })}
@@ -1380,6 +1494,16 @@ export default function RecipesPage() {
             </div>
           )}
         </div>
+
+        {/* Cookbook: cooking method */}
+        {(r.instructions || '').trim() && (
+          <div className="card mb-6">
+            <h2 className="text-lg font-semibold text-[#2D1B0E] mb-3 flex items-center gap-2">
+              <ChefHat size={18} /> Method
+            </h2>
+            <div className="text-sm text-[#3D2614] whitespace-pre-wrap leading-relaxed">{r.instructions}</div>
+          </div>
+        )}
 
         {/* Sub-recipes used */}
         {r.sub_recipes.length > 0 && (
@@ -1510,37 +1634,17 @@ export default function RecipesPage() {
   return (
     <div>
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-[#af4408]/10 rounded-lg">
-            <ChefHat className="w-6 h-6 text-[#af4408]" />
-          </div>
-          <div>
-            <h1 className="text-2xl font-bold text-[#af4408]">Recipe Management</h1>
-            <p className="text-sm text-[#8B7355]">Manage recipes, ingredients, and food costing</p>
-          </div>
+      <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3 mb-5">
+        <div>
+          <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">Dine-In</p>
+          <h1 className="text-2xl sm:text-3xl font-bold text-[#2D1B0E] mt-0.5">Recipe Management</h1>
+          <p className="text-sm text-[#8B7355] mt-1">Recipes, ingredients &amp; food costing</p>
         </div>
-        <div className="flex gap-2 flex-wrap">
+        <div className="flex flex-wrap items-center gap-2">
           {activeTab === 'main' && (
             <>
-              <button
-                onClick={openWorkbookModal}
-                className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
-                title="Import Food-Costing workbook (Purchase Rates, Sub-Recipe Cards, Recipe Cost Cards, Recipe Summary)"
-              >
-                <FileSpreadsheet size={18} />
-                Import Recipe Workbook
-              </button>
-              <button
-                onClick={openBarModal}
-                className="flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
-                title="Import Bar Costing Excel (3-sheet format: Liquor Raw, Receipe, BAR PRODUCTS)"
-              >
-                <FileSpreadsheet size={18} />
-                Import Bar Costing Excel
-              </button>
               <label
-                className="flex items-center gap-2 border border-[#D4B896] text-[#6B5744] px-3 py-2.5 rounded-lg text-sm font-medium"
+                className="flex items-center gap-2 border border-[#E0D0BE] bg-white text-[#6B5744] px-3 py-2 rounded-xl text-sm font-medium shadow-sm"
                 title="Target food-cost %. Drives the suggested 'Menu Price @ Target' and the high-FC flag."
               >
                 Target FC%
@@ -1548,67 +1652,22 @@ export default function RecipesPage() {
                   type="number" min={1} max={99} step={1}
                   value={Math.round(targetFcPct * 100)}
                   onChange={(e) => { const p = Number(e.target.value); if (p > 0 && p < 100) saveTargetFcPct(p / 100); }}
-                  className="w-16 px-2 py-1 border border-[#E8D5C4] rounded text-sm text-right"
+                  className="w-14 px-2 py-1 border border-[#E8D5C4] rounded-lg text-sm text-right"
                 />
               </label>
-              <button
-                onClick={exportAllRecipes}
-                className="flex items-center gap-2 border border-blue-600 text-blue-700 hover:bg-blue-50 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
-                title="Download Excel workbook with 4 sheets — Summary, Recipes, Sub-Recipes, Direct Items"
-              >
-                <Download size={18} />
-                Export Recipe Book
-              </button>
-              <button
-                onClick={refreshAllCosts}
-                disabled={refreshing}
-                className="flex items-center gap-2 border border-emerald-600 text-emerald-700 hover:bg-emerald-50 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                title="Recompute material prices + recipe costs from current data — fixes stale numbers like 'card shows 159% but live calc shows 12%'"
-              >
-                {refreshing ? <Loader2 size={18} className="animate-spin" /> : <RefreshCw size={18} />}
-                {refreshing ? 'Refreshing…' : 'Refresh All Costs'}
-              </button>
-              <button
-                onClick={restorePrices}
-                disabled={normalizing}
-                className="flex items-center gap-2 border border-amber-600 text-amber-700 hover:bg-amber-50 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                title="Recompute every material's average_price from the Purchases table. Safe — purely a source-of-truth recompute. Use this to recover from any bad bulk price action."
-              >
-                {normalizing ? <Loader2 size={18} className="animate-spin" /> : <AlertTriangle size={18} />}
-                {normalizing ? 'Restoring…' : 'Restore Prices from Purchases'}
-              </button>
-              <button
-                onClick={() => downloadTemplate(true)}
-                className="flex items-center gap-2 border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
-                title="Download CSV template with sample bar recipes and all inventory materials"
-              >
-                <Download size={18} />
-                Download Template
-              </button>
-              <button
-                onClick={autoCategorize}
-                disabled={categorizing}
-                className="flex items-center gap-2 border border-indigo-600 text-indigo-700 hover:bg-indigo-50 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                title="Auto-assign categories from recipe names for recipes that have none (manual categories are kept)"
-              >
-                {categorizing ? <Loader2 size={18} className="animate-spin" /> : <Tags size={18} />}
-                {categorizing ? 'Categorising…' : 'Auto-categorise'}
-              </button>
-              <button
-                onClick={() => setCatModalOpen(true)}
-                className="flex items-center gap-2 border border-indigo-600 text-indigo-700 hover:bg-indigo-50 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
-                title="Rename or merge recipe categories across all recipes at once"
-              >
-                <Pencil size={18} />
-                Manage Categories
-              </button>
-              <button
-                onClick={openBulkModal}
-                className="flex items-center gap-2 border border-green-600 text-green-700 hover:bg-green-50 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
-              >
-                <Upload size={18} />
-                Bulk Upload
-              </button>
+              <HeaderMenu label="Import" icon={<FileSpreadsheet size={16} />} items={[
+                { label: 'Import Recipe Workbook', icon: <FileSpreadsheet size={15} />, onClick: openWorkbookModal },
+                { label: 'Import Bar Costing Excel', icon: <FileSpreadsheet size={15} />, onClick: openBarModal },
+                { label: 'Bulk Upload (CSV)', icon: <Upload size={15} />, onClick: openBulkModal },
+                { label: 'Download CSV Template', icon: <Download size={15} />, onClick: () => downloadTemplate(true) },
+              ]} />
+              <HeaderMenu label="Tools" icon={<RefreshCw size={16} />} items={[
+                { label: 'Export Recipe Book', icon: <Download size={15} />, onClick: exportAllRecipes },
+                { label: refreshing ? 'Refreshing…' : 'Refresh All Costs', icon: <RefreshCw size={15} />, onClick: refreshAllCosts, disabled: refreshing },
+                { label: normalizing ? 'Restoring…' : 'Restore Prices from Purchases', icon: <AlertTriangle size={15} />, onClick: restorePrices, disabled: normalizing },
+                { label: categorizing ? 'Categorising…' : 'Auto-categorise', icon: <Tags size={15} />, onClick: autoCategorize, disabled: categorizing },
+                { label: 'Manage Categories', icon: <Pencil size={15} />, onClick: () => setCatModalOpen(true) },
+              ]} />
             </>
           )}
           {/* Direct items aren't created manually — they're auto-discovered from
@@ -1617,9 +1676,9 @@ export default function RecipesPage() {
           {activeTab !== 'direct' && (
             <button
               onClick={activeTab === 'main' ? openAddRecipe : openAddSubRecipe}
-              className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-colors"
+              className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2.5 rounded-xl text-sm font-semibold shadow-sm transition-colors"
             >
-              <Plus size={18} />
+              <Plus size={16} />
               {activeTab === 'main' ? 'Add Recipe' : 'Add Sub-Recipe'}
             </button>
           )}
@@ -1627,196 +1686,82 @@ export default function RecipesPage() {
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 mb-6 bg-white border border-[#E8D5C4] rounded-lg p-1 w-fit">
-        <button
-          onClick={() => { setActiveTab('main'); setSearchQuery(''); setCategoryFilter(''); }}
-          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-            activeTab === 'main'
-              ? 'bg-[#af4408] text-white'
-              : 'text-[#8B7355] hover:text-[#3D2614] hover:bg-[#FFF1E3]'
-          }`}
-        >
-          <span className="flex items-center gap-2"><ChefHat size={16} /> Main Recipes</span>
-        </button>
-        <button
-          onClick={() => { setActiveTab('sub'); setSearchQuery(''); setCategoryFilter(''); }}
-          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-            activeTab === 'sub'
-              ? 'bg-[#af4408] text-white'
-              : 'text-[#8B7355] hover:text-[#3D2614] hover:bg-[#FFF1E3]'
-          }`}
-        >
-          <span className="flex items-center gap-2"><Layers size={16} /> Sub-Recipes</span>
-        </button>
-        <button
-          onClick={() => { setActiveTab('direct'); setSearchQuery(''); setCategoryFilter(''); }}
-          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-            activeTab === 'direct'
-              ? 'bg-[#af4408] text-white'
-              : 'text-[#8B7355] hover:text-[#3D2614] hover:bg-[#FFF1E3]'
-          }`}
-        >
-          <span className="flex items-center gap-2"><Link2 size={16} /> Direct Items</span>
-        </button>
+      <div className="flex gap-6 border-b border-[#E8D5C4] mb-5 overflow-x-auto">
+        {([['main', 'Main Recipes', recipes.length], ['sub', 'Sub-Recipes', subRecipes.length], ['direct', 'Direct Items', null]] as const).map(([key, label, count]) => (
+          <button
+            key={key}
+            onClick={() => { setActiveTab(key as any); setSearchQuery(''); setCategoryFilter(''); }}
+            className={`relative pb-3 -mb-px text-sm font-semibold whitespace-nowrap transition-colors ${activeTab === key ? 'text-[#af4408]' : 'text-[#8B7355] hover:text-[#3D2614]'}`}
+          >
+            {label}{count != null && <span className="font-normal opacity-70"> · {count}</span>}
+            {activeTab === key && <span className="absolute left-0 right-0 -bottom-px h-0.5 bg-[#af4408] rounded-full" />}
+          </button>
+        ))}
       </div>
 
       {activeTab === 'direct' && (
         <DirectItemsPanel materials={materials} />
       )}
 
-      {/* Summary Cards (main tab only) */}
+      {/* Stat bar + health (main tab only) */}
       {activeTab === 'main' && (
         <>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-4">
-            <div className="card">
-              <p className="text-xs text-[#8B7355] uppercase tracking-wide">Total Active Recipes</p>
+          <div className="bg-white border border-[#E8D5C4] rounded-2xl shadow-sm grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 overflow-hidden mb-3">
+            <div className="px-4 py-3.5 border-r border-b lg:border-b-0 border-[#F0E4D6]">
+              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Active Recipes</p>
               <p className="text-2xl font-bold text-[#2D1B0E] mt-1">{summaryStats.total}</p>
             </div>
-            <div className="card">
-              <p className="text-xs text-[#8B7355] uppercase tracking-wide">Avg Food Cost %</p>
-              <p className={`text-2xl font-bold mt-1 ${foodCostColor(summaryStats.avgFoodCost)}`}>
-                {summaryStats.avgFoodCost.toFixed(1)}%
-              </p>
+            <div className="px-4 py-3.5 border-r border-b lg:border-b-0 border-[#F0E4D6]">
+              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Avg Food Cost</p>
+              <div className="flex items-baseline gap-2 mt-1 flex-wrap">
+                <span className={`text-2xl font-bold ${foodCostColor(summaryStats.avgFoodCost)}`}>{summaryStats.avgFoodCost.toFixed(1)}%</span>
+                {summaryStats.total > 0 && summaryStats.avgFoodCost > Math.round(targetFcPct * 100) && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-50 text-red-600 whitespace-nowrap">{Math.round(summaryStats.avgFoodCost - Math.round(targetFcPct * 100))} pts over {Math.round(targetFcPct * 100)}% target</span>
+                )}
+              </div>
             </div>
-            <div className="card">
-              <p className="text-xs text-[#8B7355] uppercase tracking-wide">Most Profitable</p>
-              <p className="text-lg font-bold text-green-400 mt-1 truncate">{summaryStats.mostProfitable}</p>
+            <div className="px-4 py-3.5 border-r border-b lg:border-b-0 border-[#F0E4D6]">
+              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Most Profitable</p>
+              <p className="text-sm font-bold text-green-600 mt-1.5 truncate">{summaryStats.mostProfitable}{summaryStats.mostProfitableGpm ? <span className="text-[#8B7355] font-normal"> · GPM {summaryStats.mostProfitableGpm.toFixed(0)}%</span> : null}</p>
             </div>
-            <div className="card">
-              <p className="text-xs text-[#8B7355] uppercase tracking-wide">Highest Food Cost</p>
-              <p className="text-lg font-bold text-red-400 mt-1 truncate">{summaryStats.highestCost}</p>
+            <div className="px-4 py-3.5 border-r border-b md:border-b-0 border-[#F0E4D6]">
+              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Highest Food Cost</p>
+              <p className="text-sm font-bold text-red-500 mt-1.5 truncate">{summaryStats.highestCost}{summaryStats.highestCostFc ? <span className="text-[#8B7355] font-normal"> · FC {summaryStats.highestCostFc.toFixed(0)}%</span> : null}</p>
             </div>
-            <div className={`card border-2 ${summaryStats.issues.total > 0 ? 'border-amber-400 bg-amber-50' : 'border-green-400 bg-green-50'}`}>
-              <p className="text-xs text-[#8B7355] uppercase tracking-wide flex items-center gap-1">
-                <AlertTriangle className="w-3 h-3" /> Needs Attention
-              </p>
-              <p className={`text-2xl font-bold mt-1 ${summaryStats.issues.total > 0 ? 'text-amber-700' : 'text-green-700'}`}>
-                {summaryStats.issues.total}
-              </p>
-              <p className="text-[10px] text-[#8B7355] mt-0.5">
-                {summaryStats.issues.total === 0 ? 'All recipes look good!' : `of ${summaryStats.total} recipes`}
-              </p>
+            <div className={`px-4 py-3.5 col-span-2 md:col-span-1 lg:col-span-1 ${summaryStats.issues.total > 0 ? 'bg-amber-50' : 'bg-green-50'}`}>
+              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide flex items-center gap-1"><AlertTriangle className="w-3 h-3 text-amber-500" /> Needs Attention</p>
+              <p className={`text-2xl font-bold mt-1 ${summaryStats.issues.total > 0 ? 'text-amber-700' : 'text-green-700'}`}>{summaryStats.issues.total}<span className="text-xs font-normal text-[#8B7355]"> {summaryStats.issues.total > 0 ? `of ${summaryStats.total}` : 'all good'}</span></p>
             </div>
           </div>
 
-          {/* Issue breakdown chips */}
-          {summaryStats.issues.total > 0 && (
-            <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 mb-6">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-sm font-semibold text-[#2D1B0E] flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 text-amber-500" />
-                  Recipe Health Check — Click a category to filter
-                </h3>
-                {issueFilter && (
-                  <button onClick={() => setIssueFilter(null)} className="text-xs text-[#af4408] hover:underline">
-                    Clear filter
-                  </button>
-                )}
+          {/* Recipe health banner */}
+          {summaryStats.issues.total > 0 && (() => {
+            const all = [
+              { key: 'noPrice', label: 'missing selling price', count: summaryStats.issues.noPrice.length, tone: 'amber' },
+              { key: 'lossMaking', label: 'loss-making', count: summaryStats.issues.lossMaking.length, tone: 'red' },
+              { key: 'highFC', label: 'below 65% GPM', count: summaryStats.issues.highFC.length, tone: 'orange' },
+              { key: 'noMenuLink', label: 'no menu link', count: summaryStats.issues.noMenuLink.length, tone: 'blue' },
+              { key: 'noIngredients', label: 'no ingredients', count: summaryStats.issues.noIngredients.length, tone: 'red' },
+              { key: 'suspicious', label: 'suspiciously cheap', count: summaryStats.issues.suspicious.length, tone: 'blue' },
+              { key: 'zeroCost', label: 'cost ₹0', count: summaryStats.issues.zeroCost.length, tone: 'red' },
+              { key: 'borderlineFC', label: 'borderline margin', count: summaryStats.issues.borderlineFC.length, tone: 'amber' },
+              { key: 'noCategory', label: 'missing category', count: summaryStats.issues.noCategory.length, tone: 'gray' },
+              { key: 'priceless_ingredients', label: 'ingredient never purchased', count: summaryStats.issues.pricelessIngredients.length, tone: 'orange' },
+            ].filter(x => x.count > 0);
+            const shown = showAllIssues ? all : all.slice(0, 4);
+            return (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-2 bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 mb-5">
+                <span className="flex items-center gap-2 text-sm font-semibold text-amber-900"><AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" /> Recipe health</span>
+                <div className="flex flex-wrap items-center gap-2">
+                  {shown.map(x => <HealthPill key={x.key} label={x.label} count={x.count} tone={x.tone} active={issueFilter === x.key} onClick={() => setIssueFilter(issueFilter === x.key ? null : x.key)} />)}
+                  {!showAllIssues && all.length > 4 && (
+                    <button onClick={() => setShowAllIssues(true)} className="text-xs font-medium text-[#6B5744] hover:underline">+{all.length - 4} more</button>
+                  )}
+                </div>
+                <button onClick={() => setIssueFilter(issueFilter ? null : 'anyIssue')} className="ml-auto text-sm font-medium text-[#af4408] hover:underline whitespace-nowrap">{issueFilter ? 'Clear filter' : 'Review all →'}</button>
               </div>
-              <div className="flex flex-wrap gap-2">
-                {summaryStats.issues.noIngredients.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'noIngredients'}
-                    onClick={() => setIssueFilter(issueFilter === 'noIngredients' ? null : 'noIngredients')}
-                    color="red"
-                    count={summaryStats.issues.noIngredients.length}
-                    label="No Ingredients"
-                    tooltip="Recipes with zero ingredients — they won't calculate cost"
-                  />
-                )}
-                {summaryStats.issues.noPrice.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'noPrice'}
-                    onClick={() => setIssueFilter(issueFilter === 'noPrice' ? null : 'noPrice')}
-                    color="amber"
-                    count={summaryStats.issues.noPrice.length}
-                    label="Missing Selling Price"
-                    tooltip="Recipes with ₹0 selling price — won't generate revenue"
-                  />
-                )}
-                {summaryStats.issues.lossMaking.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'lossMaking'}
-                    onClick={() => setIssueFilter(issueFilter === 'lossMaking' ? null : 'lossMaking')}
-                    color="red"
-                    count={summaryStats.issues.lossMaking.length}
-                    label="Loss-Making"
-                    tooltip="Cost is higher than selling price — losing money on every sale"
-                  />
-                )}
-                {summaryStats.issues.highFC.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'highFC'}
-                    onClick={() => setIssueFilter(issueFilter === 'highFC' ? null : 'highFC')}
-                    color="orange"
-                    count={summaryStats.issues.highFC.length}
-                    label="Below 65% GPM"
-                    tooltip="Food cost exceeds 50% — margin is too thin"
-                  />
-                )}
-                {summaryStats.issues.suspicious.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'suspicious'}
-                    onClick={() => setIssueFilter(issueFilter === 'suspicious' ? null : 'suspicious')}
-                    color="blue"
-                    count={summaryStats.issues.suspicious.length}
-                    label="Suspiciously Cheap (<5%)"
-                    tooltip="Food cost is under 5% — likely missing ingredients in recipe"
-                  />
-                )}
-                {summaryStats.issues.noCategory.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'noCategory'}
-                    onClick={() => setIssueFilter(issueFilter === 'noCategory' ? null : 'noCategory')}
-                    color="gray"
-                    count={summaryStats.issues.noCategory.length}
-                    label="Missing Category"
-                    tooltip="Recipes without proper category — can't be grouped in reports"
-                  />
-                )}
-                {summaryStats.issues.zeroCost.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'zeroCost'}
-                    onClick={() => setIssueFilter(issueFilter === 'zeroCost' ? null : 'zeroCost')}
-                    color="red"
-                    count={summaryStats.issues.zeroCost.length}
-                    label="Cost = ₹0 (with ingredients)"
-                    tooltip="Recipe has ingredients but total cost is ₹0 — ingredient prices are not set or never recalculated"
-                  />
-                )}
-                {summaryStats.issues.pricelessIngredients.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'priceless_ingredients'}
-                    onClick={() => setIssueFilter(issueFilter === 'priceless_ingredients' ? null : 'priceless_ingredients')}
-                    color="orange"
-                    count={summaryStats.issues.pricelessIngredients.length}
-                    label="Ingredient never purchased"
-                    tooltip="Recipe uses one or more ingredients with no purchase history (no inward entry, so no cost). Sub-recipe placeholders ('… SF') and unimported SKUs both land here."
-                  />
-                )}
-                {summaryStats.issues.borderlineFC.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'borderlineFC'}
-                    onClick={() => setIssueFilter(issueFilter === 'borderlineFC' ? null : 'borderlineFC')}
-                    color="amber"
-                    count={summaryStats.issues.borderlineFC.length}
-                    label="Borderline Margin (65-80% GPM)"
-                    tooltip="Food cost 20-35% — GPM healthy but watch closely"
-                  />
-                )}
-                {summaryStats.issues.noMenuLink.length > 0 && (
-                  <IssueChip
-                    active={issueFilter === 'noMenuLink'}
-                    onClick={() => setIssueFilter(issueFilter === 'noMenuLink' ? null : 'noMenuLink')}
-                    color="gray"
-                    count={summaryStats.issues.noMenuLink.length}
-                    label="No Menu Link"
-                    tooltip="Recipe is not linked to any menu item — POS sales can't resolve to it"
-                  />
-                )}
-              </div>
-            </div>
-          )}
+            );
+          })()}
         </>
       )}
 
@@ -1841,7 +1786,7 @@ export default function RecipesPage() {
               className="bg-white border border-[#E8D5C4] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408] transition-colors"
               title="Filter by category"
             >
-              <option value="">All categories</option>
+              <option value="">All categories ({recipeCategories.length})</option>
               {recipeCategories.map((c) => <option key={c} value={c}>{c}</option>)}
               {recipes.some((r) => !r.category || !r.category.trim()) && <option value={UNCAT}>Uncategorised</option>}
             </select>
@@ -1859,67 +1804,49 @@ export default function RecipesPage() {
               <option value="costDesc">Sort: Cost (high → low)</option>
               <option value="priceDesc">Sort: Price (high → low)</option>
             </select>
+            {/* Cookbook: list ⇄ photo-gallery toggle */}
+            <div className="flex items-center rounded-lg border border-[#E8D5C4] overflow-hidden bg-white shrink-0" role="group" aria-label="Recipe view">
+              <button
+                type="button"
+                onClick={() => setRecipeView('list')}
+                aria-pressed={recipeView === 'list'}
+                title="List view"
+                className={`flex items-center gap-1 px-3 py-2.5 text-sm transition-colors ${recipeView === 'list' ? 'bg-[#af4408] text-white' : 'text-[#6B5744] hover:bg-[#FFF1E3]'}`}
+              >
+                <ListIcon size={16} /> <span className="hidden sm:inline">List</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setRecipeView('gallery')}
+                aria-pressed={recipeView === 'gallery'}
+                title="Gallery view"
+                className={`flex items-center gap-1 px-3 py-2.5 text-sm transition-colors ${recipeView === 'gallery' ? 'bg-[#af4408] text-white' : 'text-[#6B5744] hover:bg-[#FFF1E3]'}`}
+              >
+                <LayoutGrid size={16} /> <span className="hidden sm:inline">Gallery</span>
+              </button>
+            </div>
           </>
         )}
       </div>
 
-      {/* Category chips — always visible, click to filter, counts live-update with search */}
-      {activeTab === 'main' && recipes.length > 0 && (() => {
-        // Compute counts respecting the current text search but ignoring the active category
-        const baseList = recipes.filter((r) => {
-          const matchSearch = !searchQuery ||
-            r.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            (r.category || '').toLowerCase().includes(searchQuery.toLowerCase());
-          return matchSearch;
-        });
-        const countByCat: Record<string, number> = {};
-        for (const r of baseList) {
-          const k = r.category || 'Uncategorised';
-          countByCat[k] = (countByCat[k] || 0) + 1;
-        }
-        const cats = [...recipeCategories].sort((a, b) => (countByCat[b] || 0) - (countByCat[a] || 0));
-        return (
-          <div className="flex flex-wrap gap-1.5">
-            <button
-              onClick={() => setCategoryFilter('')}
-              className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
-                !categoryFilter
-                  ? 'bg-[#af4408] text-white'
-                  : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'
-              }`}>
-              All <span className="opacity-70">({baseList.length})</span>
-            </button>
-            {cats.map((c) => {
-              const n = countByCat[c] || 0;
-              const active = categoryFilter === c;
-              return (
-                <button
-                  key={c}
-                  onClick={() => setCategoryFilter(active ? '' : c)}
-                  className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
-                    active
-                      ? 'bg-[#af4408] text-white'
-                      : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'
-                  }`}>
-                  {c} <span className="opacity-70">({n})</span>
-                </button>
-              );
-            })}
-            {countByCat['Uncategorised'] > 0 && (() => {
-              const active = categoryFilter === UNCAT;
-              return (
-                <button
-                  onClick={() => setCategoryFilter(active ? '' : UNCAT)}
-                  className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
-                    active ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'
-                  }`}>
-                  Uncategorised <span className="opacity-70">({countByCat['Uncategorised']})</span>
-                </button>
-              );
-            })()}
-          </div>
-        );
-      })()}
+      {/* Active category filter pill (chips row removed — the dropdown above is
+          the single, decluttered category control) */}
+      {activeTab === 'main' && (categoryFilter || issueFilter) && (
+        <div className="flex flex-wrap items-center gap-2 mb-1">
+          {categoryFilter && (
+            <span className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-[#af4408] text-white">
+              {categoryFilter === UNCAT ? 'Uncategorised' : categoryFilter}
+              <button onClick={() => setCategoryFilter('')} aria-label="Clear category" className="hover:opacity-80"><X size={12} /></button>
+            </span>
+          )}
+          {issueFilter && (
+            <span className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full bg-amber-500 text-white">
+              Health filter
+              <button onClick={() => setIssueFilter(null)} aria-label="Clear health filter" className="hover:opacity-80"><X size={12} /></button>
+            </span>
+          )}
+        </div>
+      )}
 
       {/* ---- Main Recipes Grid ---- */}
       {activeTab === 'main' && (
@@ -1932,101 +1859,186 @@ export default function RecipesPage() {
                 + Add your first recipe
               </button>
             </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          ) : recipeView === 'gallery' ? (
+            /* ---- Cookbook photo-card gallery ---- */
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
               {filteredRecipes.map((recipe) => {
-                const profit = (recipe.selling_price || 0) - (recipe.total_cost || 0);
                 const fcp = recipe.food_cost_percent || 0;
                 const link = menuLinkMap.get(recipe.id);
                 const isLinked = !!link && link.count > 0;
+                const allg = recipe.allergens || [];
                 return (
-                  <div key={recipe.id} className={`card card-hover flex flex-col ${isLinked ? 'border-l-4 border-l-emerald-500' : ''}`}>
-                    <div className="flex items-start justify-between mb-3">
-                      <div className="flex-1 min-w-0">
-                        <h3 className="text-lg font-semibold text-[#2D1B0E] truncate flex items-center gap-1.5">
-                          {recipe.name}
-                          {isLinked && (
-                            <CheckCircle2
-                              size={16}
-                              className="text-emerald-600 shrink-0"
-                              aria-label="Linked to menu item"
-                              data-tooltip="linked"
-                            />
-                          )}
-                        </h3>
-                        <div className="flex items-center gap-2 mt-1 flex-wrap">
-                          {recipe.category && (
-                            <span className="badge badge-primary">{recipe.category}</span>
-                          )}
-                          {isLinked ? (
-                            <span
-                              className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200 inline-flex items-center gap-1"
-                              title={link!.names.slice(0, 4).join(' · ') + (link!.count > 4 ? ` · +${link!.count - 4} more` : '')}
-                            >
-                              <CheckCircle2 size={10} />
-                              Linked
-                              {link!.count > 1 && <span className="opacity-70">×{link!.count}</span>}
-                            </span>
-                          ) : (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200"
-                                  title="No menu item points at this recipe — sales won't deduct ingredients">
-                              No menu link
-                            </span>
-                          )}
-                          <span className="text-xs text-[#8B7355]">v{recipe.version}</span>
+                  // Card is a real <article> so the recipe name stays an <h3> heading
+                  // (matches List view for screen-reader heading nav); a stretched-link
+                  // <button> overlay makes the whole card clickable without nesting flow
+                  // content inside a <button>.
+                  <article
+                    key={recipe.id}
+                    className="group relative text-left rounded-xl overflow-hidden border border-[#E8D5C4] bg-white hover:shadow-lg hover:border-[#af4408]/40 focus-within:ring-2 focus-within:ring-[#af4408]/40 transition-all flex flex-col"
+                  >
+                    {/* Photo (placeholder sits behind so a broken image simply reveals it) */}
+                    <div className="relative h-36 sm:h-40 bg-gradient-to-br from-[#FFE9D5] to-[#F0D2B4] flex items-center justify-center overflow-hidden">
+                      <ChefHat className="text-[#D9A679]" size={40} />
+                      {recipe.image_url && (
+                        // key on the URL → a corrected URL remounts a fresh <img> (so a
+                        // previously error-hidden photo re-appears without a reload).
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          key={recipe.image_url}
+                          src={recipe.image_url}
+                          alt=""
+                          className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                          onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+                        />
+                      )}
+                      <span className={`absolute bottom-2 left-2 text-[11px] font-bold px-2 py-0.5 rounded-full shadow-sm ${foodCostBg(fcp)}`}>
+                        {fcp.toFixed(0)}% FC
+                      </span>
+                      {isLinked
+                        ? <span className="absolute top-2 right-2 bg-emerald-500 text-white rounded-full p-1 shadow-sm" title="Linked to menu"><CheckCircle2 size={12} /></span>
+                        : <span className="absolute top-2 right-2 bg-amber-400 text-white rounded-full p-1 shadow-sm" title="No menu link"><AlertTriangle size={12} /></span>}
+                    </div>
+                    {/* Body */}
+                    <div className="p-3 flex flex-col gap-1.5 flex-1">
+                      <h3 className="text-sm font-semibold text-[#2D1B0E] line-clamp-2 leading-snug">{recipe.name}</h3>
+                      <div className="flex items-center justify-between text-xs text-[#8B7355]">
+                        <span>{recipe.category || 'Uncategorised'}</span>
+                        <span className="font-medium text-[#3D2614]">{formatCurrency(recipe.selling_price || 0)}</span>
+                      </div>
+                      {allg.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-0.5" title={`Contains (auto-detected): ${allg.map(allergenLabel).join(', ')}`}>
+                          {allg.slice(0, 6).map((k) => (
+                            <span key={k} className="text-[13px] leading-none" aria-label={allergenLabel(k)}>{allergenEmoji(k)}</span>
+                          ))}
+                          {allg.length > 6 && <span className="text-[10px] text-[#8B7355]">+{allg.length - 6}</span>}
                         </div>
-                      </div>
+                      )}
                     </div>
-
-                    <div className="space-y-2 flex-1">
-                      <div className="flex justify-between text-sm">
-                        <span className="text-[#8B7355]">Selling Price</span>
-                        <span className="text-[#3D2614] font-medium">{formatCurrency(recipe.selling_price || 0)}</span>
-                      </div>
-                      <div className="flex justify-between text-sm">
-                        <span className="text-[#8B7355]">Cost</span>
-                        <span className="text-[#3D2614] font-medium">{formatCurrency(recipe.total_cost || 0)}</span>
-                      </div>
-                      <div className="flex justify-between text-sm">
-                        <span className="text-[#8B7355]">Profit</span>
-                        <span className={`font-medium ${profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                          {formatCurrency(profit)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between text-sm items-center">
-                        <span className="text-[#8B7355]">Food Cost %</span>
-                        <span className={`font-bold text-sm px-2 py-0.5 rounded-full ${foodCostBg(fcp)}`}>
-                          {fcp.toFixed(1)}%
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="flex gap-2 mt-4 pt-3 border-t border-[#E8D5C4]">
-                      <button
-                        onClick={() => setSelectedRecipe(recipe)}
-                        className="flex-1 flex items-center justify-center gap-1.5 bg-[#FFF1E3] hover:bg-[#F5EDE2] text-[#6B5744] hover:text-[#2D1B0E] px-2 py-2 rounded-lg text-xs transition-colors"
-                        title="View ingredients"
-                      >
-                        <Eye size={14} /> View
-                      </button>
-                      <button
-                        onClick={() => openEditRecipe(recipe)}
-                        className="flex-1 flex items-center justify-center gap-1.5 bg-[#af4408]/15 hover:bg-[#af4408]/25 text-[#af4408] px-2 py-2 rounded-lg text-xs transition-colors"
-                        title="Edit recipe"
-                      >
-                        <Edit size={14} /> Edit
-                      </button>
-                      <button
-                        onClick={() => openCopyRecipe(recipe)}
-                        className="flex items-center justify-center gap-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 px-2 py-2 rounded-lg text-xs transition-colors"
-                        title="Copy this recipe — auto-detects Veg / Non Veg split"
-                      >
-                        <Copy size={14} /> Copy
-                      </button>
-                    </div>
-                  </div>
+                    {/* Stretched-link overlay: whole-card click target, name as its label */}
+                    <button
+                      type="button"
+                      onClick={() => { setSelectedRecipe(recipe); setScaleTo(1); }}
+                      aria-label={`Open ${recipe.name}`}
+                      className="absolute inset-0 w-full h-full rounded-xl focus:outline-none"
+                    />
+                  </article>
                 );
               })}
+            </div>
+          ) : (
+            <>
+              {/* Desktop table */}
+              <div className="hidden md:block bg-white border border-[#E8D5C4] rounded-2xl shadow-sm overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-[11px] uppercase tracking-wide text-[#8B7355] border-b border-[#E8D5C4] bg-[#FFF8F0]">
+                        <th className="text-left py-3 px-4 font-semibold">Recipe</th>
+                        <th className="text-left py-3 px-3 font-semibold">Category</th>
+                        <th className="text-left py-3 px-3 font-semibold">Menu Link</th>
+                        <th className="text-right py-3 px-3 font-semibold">Sell ₹</th>
+                        <th className="text-right py-3 px-3 font-semibold">Cost ₹</th>
+                        <th className="text-left py-3 px-3 font-semibold w-56">FC% vs target {Math.round(targetFcPct * 100)}</th>
+                        <th className="text-right py-3 px-3 font-semibold">GPM</th>
+                        <th className="w-10" aria-label="Actions"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pagedRecipes.map((recipe) => {
+                        const fcp = recipe.food_cost_percent || 0;
+                        const gpm = recipe.selling_price > 0 ? ((recipe.selling_price - recipe.total_cost) / recipe.selling_price) * 100 : null;
+                        const link = menuLinkMap.get(recipe.id);
+                        const isLinked = !!link && link.count > 0;
+                        const noPrice = !recipe.selling_price;
+                        const ingCount = recipe.ingredients?.length || 0;
+                        return (
+                          <tr key={recipe.id} className="border-b border-[#F0E4D6] last:border-0 hover:bg-[#FFF8F0]">
+                            <td className="py-2.5 px-4">
+                              <p className="font-semibold text-[#2D1B0E] text-[13px] truncate max-w-[280px]">{recipe.name}</p>
+                              <p className="text-[11px] text-[#8B7355]">v{recipe.version} · {ingCount} ingredient{ingCount === 1 ? '' : 's'}</p>
+                            </td>
+                            <td className="py-2.5 px-3 text-[13px] text-[#3D2614]">{recipe.category || <span className="text-[#C4B09A]">—</span>}</td>
+                            <td className="py-2.5 px-3">
+                              {isLinked
+                                ? <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200" title={link!.names.slice(0, 4).join(' · ')}>Linked{link!.count > 1 ? ` ×${link!.count}` : ''}</span>
+                                : noPrice
+                                  ? <button onClick={() => openEditRecipe(recipe)} className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-[#af4408] text-white hover:bg-[#8a3506]">Set price</button>
+                                  : <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-200">Not linked</span>}
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-semibold text-[#2D1B0E]">{noPrice ? <span className="text-red-400 font-normal">—</span> : formatCurrency(recipe.selling_price)}</td>
+                            <td className="py-2.5 px-3 text-right text-[#6B5744]">{formatCurrency(recipe.total_cost || 0)}</td>
+                            <td className="py-2.5 px-3">
+                              {noPrice
+                                ? <span className="text-xs text-[#8B7355]">— needs selling price</span>
+                                : <div className="flex items-center gap-2"><FcBar fc={fcp} target={Math.round(targetFcPct * 100)} /><span className={`text-xs font-bold shrink-0 ${foodCostColor(fcp)}`}>{fcp.toFixed(0)}%</span></div>}
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-bold">{gpm == null ? <span className="text-[#C4B09A]">—</span> : <span className={gpm >= 65 ? 'text-green-600' : gpm >= 50 ? 'text-amber-600' : 'text-red-500'}>{gpm.toFixed(0)}%</span>}</td>
+                            <td className="py-2.5 px-2 text-center">
+                              <RRowMenu items={[
+                                { label: 'View', icon: <Eye size={14} />, onClick: () => { setSelectedRecipe(recipe); setScaleTo(1); } },
+                                { label: 'Edit', icon: <Edit size={14} />, onClick: () => openEditRecipe(recipe) },
+                                { label: 'Copy', icon: <Copy size={14} />, onClick: () => openCopyRecipe(recipe) },
+                              ]} />
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Mobile cards */}
+              <div className="md:hidden space-y-2.5">
+                {pagedRecipes.map((recipe) => {
+                  const fcp = recipe.food_cost_percent || 0;
+                  const gpm = recipe.selling_price > 0 ? ((recipe.selling_price - recipe.total_cost) / recipe.selling_price) * 100 : null;
+                  const link = menuLinkMap.get(recipe.id);
+                  const isLinked = !!link && link.count > 0;
+                  const noPrice = !recipe.selling_price;
+                  const ingCount = recipe.ingredients?.length || 0;
+                  return (
+                    <div key={recipe.id} className="bg-white border border-[#E8D5C4] rounded-2xl p-3 shadow-sm">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="font-semibold text-[#2D1B0E] text-sm leading-snug">{recipe.name}</p>
+                          <p className="text-[11px] text-[#8B7355]">{recipe.category || 'Uncategorised'} · v{recipe.version} · {ingCount} ingredient{ingCount === 1 ? '' : 's'}</p>
+                        </div>
+                        <RRowMenu items={[
+                          { label: 'View', icon: <Eye size={14} />, onClick: () => { setSelectedRecipe(recipe); setScaleTo(1); } },
+                          { label: 'Edit', icon: <Edit size={14} />, onClick: () => openEditRecipe(recipe) },
+                          { label: 'Copy', icon: <Copy size={14} />, onClick: () => openCopyRecipe(recipe) },
+                        ]} />
+                      </div>
+                      <div className="flex items-center flex-wrap gap-2 mt-2">
+                        {isLinked
+                          ? <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200">Linked{link!.count > 1 ? ` ×${link!.count}` : ''}</span>
+                          : noPrice
+                            ? <button onClick={() => openEditRecipe(recipe)} className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-[#af4408] text-white">Set price</button>
+                            : <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-200">Not linked</span>}
+                        <span className="ml-auto font-bold text-[#2D1B0E]">{noPrice ? <span className="text-red-400">—</span> : formatCurrency(recipe.selling_price)}</span>
+                      </div>
+                      <div className="flex items-center justify-between mt-2 pt-2 border-t border-[#F0E4D6] text-[11px] text-[#8B7355]">
+                        <span>Cost {formatCurrency(recipe.total_cost || 0)}</span>
+                        {!noPrice && (
+                          <span className="flex items-center gap-2">
+                            <span className={`font-bold ${foodCostColor(fcp)}`}>FC {fcp.toFixed(0)}%</span>
+                            {gpm != null && <span className={`font-bold ${gpm >= 65 ? 'text-green-600' : gpm >= 50 ? 'text-amber-600' : 'text-red-500'}`}>GPM {gpm.toFixed(0)}%</span>}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {/* Pagination (list view only; gallery shows all) */}
+          {recipeView === 'list' && filteredRecipes.length > 0 && (
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-3 mt-4">
+              <p className="text-xs text-[#8B7355]">Showing {(recipeSafePage - 1) * R_PAGE_SIZE + 1}–{Math.min(recipeSafePage * R_PAGE_SIZE, filteredRecipes.length)} of {filteredRecipes.length} recipes</p>
+              <RPagination page={recipeSafePage} pageCount={recipePageCount} onPage={setRecipePage} />
             </div>
           )}
         </>
@@ -2180,6 +2192,37 @@ export default function RecipesPage() {
                     className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
                     value={formSellingPrice || ''}
                     onChange={(e) => setFormSellingPrice(parseFloat(e.target.value) || 0)}
+                  />
+                </div>
+              </div>
+
+              {/* Cookbook: photo + cooking method */}
+              <div className="grid sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm text-[#6B5744] mb-1">Photo URL (optional)</label>
+                  <input
+                    type="url"
+                    className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
+                    value={formImageUrl}
+                    onChange={(e) => setFormImageUrl(e.target.value)}
+                    placeholder="https://…/dish.jpg"
+                  />
+                  {formImageUrl.trim() && (
+                    // key on the URL → a corrected URL remounts a fresh <img>
+                    // (so a previously-hidden broken preview re-appears).
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img key={formImageUrl} src={formImageUrl} alt="recipe" className="mt-2 h-24 w-full object-cover rounded-lg border border-[#E8D5C4]"
+                         onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />
+                  )}
+                </div>
+                <div>
+                  <label className="block text-sm text-[#6B5744] mb-1">Method / Instructions</label>
+                  <textarea
+                    rows={4}
+                    className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408] resize-y"
+                    value={formInstructions}
+                    onChange={(e) => setFormInstructions(e.target.value)}
+                    placeholder={'1. Prep…\n2. Cook…\n3. Plate…'}
                   />
                 </div>
               </div>
@@ -3252,32 +3295,132 @@ function RecipeCategoryManager({ items, renaming, onRename, onClose }: {
 }
 
 
-function IssueChip({ active, onClick, color, count, label, tooltip }: {
-  active: boolean;
-  onClick: () => void;
-  color: 'red' | 'amber' | 'orange' | 'blue' | 'gray';
-  count: number;
-  label: string;
-  tooltip?: string;
-}) {
-  const colors: Record<string, string> = {
-    red: active ? 'bg-red-600 text-white border-red-600' : 'bg-red-50 text-red-700 border-red-200 hover:bg-red-100',
-    amber: active ? 'bg-amber-500 text-white border-amber-500' : 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100',
-    orange: active ? 'bg-orange-500 text-white border-orange-500' : 'bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100',
-    blue: active ? 'bg-blue-600 text-white border-blue-600' : 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100',
-    gray: active ? 'bg-gray-600 text-white border-gray-600' : 'bg-gray-50 text-gray-700 border-gray-200 hover:bg-gray-100',
+// Header dropdown (Import ▾ / Tools ▾). Fixed-positioned menu so it never clips.
+type MenuItemDef = { label: string; onClick: () => void; icon?: any; disabled?: boolean; danger?: boolean };
+function HeaderMenu({ label, icon, items, primary }: { label: string; icon?: any; items: MenuItemDef[]; primary?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const openMenu = () => {
+    const r = btnRef.current?.getBoundingClientRect();
+    if (r) setPos({ top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) });
+    setOpen(true);
+  };
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => { window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+  }, [open]);
+  const base = primary
+    ? 'bg-[#af4408] hover:bg-[#8a3506] text-white border-transparent'
+    : 'bg-white hover:bg-[#FFF1E3] text-[#6B5744] border-[#E0D0BE]';
+  return (
+    <>
+      <button ref={btnRef} onClick={() => (open ? setOpen(false) : openMenu())}
+              className={`flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border text-sm font-medium shadow-sm transition-colors ${base}`}>
+        {icon}{label}<ChevronDown size={15} className="opacity-70" />
+      </button>
+      {open && pos && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div style={{ top: pos.top, right: pos.right }} className="fixed z-50 w-60 bg-white border border-[#E8D5C4] rounded-xl shadow-xl py-1 text-sm">
+            {items.map((it, i) => (
+              <button key={i} disabled={it.disabled} onClick={() => { setOpen(false); it.onClick(); }}
+                      className={`w-full text-left px-3 py-2 flex items-center gap-2.5 disabled:opacity-40 ${it.danger ? 'text-red-600 hover:bg-red-50' : 'text-[#3D2614] hover:bg-[#FFF1E3]'}`}>
+                {it.icon && <span className="shrink-0 text-[#8B7355]">{it.icon}</span>}
+                <span className="truncate">{it.label}</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+// ⋮ per-row menu (View / Edit / Copy). Fixed-positioned to escape table overflow.
+function RRowMenu({ items }: { items: MenuItemDef[] }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const openMenu = () => {
+    const r = btnRef.current?.getBoundingClientRect();
+    if (r) setPos({ top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) });
+    setOpen(true);
+  };
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => { window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+  }, [open]);
+  return (
+    <>
+      <button ref={btnRef} onClick={() => (open ? setOpen(false) : openMenu())} className="p-1.5 rounded-lg text-[#8B7355] hover:bg-[#FFF1E3]" aria-label="Row actions">
+        <MoreVertical className="w-4 h-4" />
+      </button>
+      {open && pos && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div style={{ top: pos.top, right: pos.right }} className="fixed z-50 w-32 bg-white border border-[#E8D5C4] rounded-lg shadow-xl py-1 text-sm">
+            {items.map((it, i) => (
+              <button key={i} onClick={() => { setOpen(false); it.onClick(); }}
+                      className={`w-full text-left px-3 py-1.5 flex items-center gap-2 ${it.danger ? 'text-red-600 hover:bg-red-50' : 'text-[#2D1B0E] hover:bg-[#FFF1E3]'}`}>
+                {it.icon}{it.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+// FC% vs target progress bar (green under target, red well over) with a target tick.
+function FcBar({ fc, target }: { fc: number; target: number }) {
+  const w = Math.max(2, Math.min(100, fc));
+  const t = Math.max(0, Math.min(100, target));
+  const color = fc <= 0 ? 'bg-gray-300' : fc <= target ? 'bg-green-500' : fc <= 50 ? 'bg-amber-500' : 'bg-red-500';
+  return (
+    <div className="relative h-2 w-full min-w-[90px] rounded-full bg-[#EFE4D6]">
+      <div className={`h-full rounded-full ${color}`} style={{ width: `${w}%` }} />
+      <div className="absolute -top-0.5 h-3 w-0.5 bg-[#2D1B0E]/60 rounded" style={{ left: `${t}%` }} title={`Target ${target}%`} />
+    </div>
+  );
+}
+
+function HealthPill({ label, count, tone, active, onClick }: { label: string; count: number; tone: string; active: boolean; onClick: () => void }) {
+  const tones: Record<string, string> = {
+    red: active ? 'bg-red-600 text-white border-red-600' : 'bg-white text-red-700 border-red-200 hover:bg-red-50',
+    amber: active ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-amber-800 border-amber-300 hover:bg-amber-50',
+    orange: active ? 'bg-orange-500 text-white border-orange-500' : 'bg-white text-orange-700 border-orange-200 hover:bg-orange-50',
+    blue: active ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-blue-700 border-blue-200 hover:bg-blue-50',
+    gray: active ? 'bg-gray-600 text-white border-gray-600' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50',
   };
   return (
-    <button
-      onClick={onClick}
-      title={tooltip}
-      className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-colors ${colors[color]}`}
-    >
-      <span className={`inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full text-[10px] font-bold ${active ? 'bg-white/25' : 'bg-white'}`}>
-        {count}
-      </span>
-      {label}
+    <button onClick={onClick} className={`text-xs font-medium px-2.5 py-1 rounded-full border transition-colors ${tones[tone] || tones.gray}`}>
+      <span className="font-bold">{count}</span> {label}
     </button>
+  );
+}
+
+function RPagination({ page, pageCount, onPage }: { page: number; pageCount: number; onPage: (n: number) => void }) {
+  if (pageCount <= 1) return null;
+  const set = new Set<number>([1, 2, 3, page - 1, page, page + 1, pageCount]);
+  const nums = [...set].filter(n => n >= 1 && n <= pageCount).sort((a, b) => a - b);
+  const items: (number | string)[] = [];
+  nums.forEach((n, i) => { if (i > 0 && n - nums[i - 1] > 1) items.push(`gap${i}`); items.push(n); });
+  return (
+    <div className="flex items-center gap-1">
+      <button disabled={page <= 1} onClick={() => onPage(page - 1)} className="h-9 w-9 flex items-center justify-center rounded-lg border border-[#E8D5C4] text-[#6B5744] disabled:opacity-40 hover:bg-[#FFF1E3]" aria-label="Previous page"><ChevronLeft className="w-4 h-4" /></button>
+      {items.map((n) => typeof n === 'string'
+        ? <span key={n} className="px-1 text-[#8B7355]">…</span>
+        : <button key={n} onClick={() => onPage(n)} aria-current={n === page ? 'page' : undefined} className={`min-w-[36px] h-9 px-2 rounded-lg text-sm font-medium ${n === page ? 'bg-[#af4408] text-white' : 'border border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF1E3]'}`}>{n}</button>)}
+      <button disabled={page >= pageCount} onClick={() => onPage(page + 1)} className="h-9 w-9 flex items-center justify-center rounded-lg border border-[#E8D5C4] text-[#6B5744] disabled:opacity-40 hover:bg-[#FFF1E3]" aria-label="Next page"><ChevronRight className="w-4 h-4" /></button>
+    </div>
   );
 }
 

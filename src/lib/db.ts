@@ -527,6 +527,10 @@ function initializeSchema(db: Database.Database) {
     const has = (n: string) => cols.some((c: any) => c.name === n);
     if (!has('yield_quantity')) db.exec(`ALTER TABLE recipes ADD COLUMN yield_quantity REAL DEFAULT 0`);
     if (!has('yield_unit'))     db.exec(`ALTER TABLE recipes ADD COLUMN yield_unit TEXT DEFAULT 'g'`);
+    // Cookbook (Phase 1): a recipe becomes a usable kitchen document — cooking
+    // METHOD + a photo. Additive; does NOT affect recalculateRecipeCost.
+    if (!has('instructions')) db.exec(`ALTER TABLE recipes ADD COLUMN instructions TEXT DEFAULT ''`);
+    if (!has('image_url'))    db.exec(`ALTER TABLE recipes ADD COLUMN image_url TEXT DEFAULT ''`);
   } catch (e) { console.error('recipes yield migration failed:', e); }
 
   // ============================================================
