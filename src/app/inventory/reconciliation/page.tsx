@@ -296,7 +296,7 @@ export default function ReconciliationPage() {
 
   const [from, setFrom] = useState(weekAgo);
   const [to, setTo] = useState(today);
-  const [storeId, setStoreId] = useState('');
+  const [storeId, setStoreId] = useState('__overall__');   // default to the whole-outlet view
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -435,8 +435,9 @@ export default function ReconciliationPage() {
             <Scale className="w-6 h-6 text-[#af4408]" /> Sales vs Consumption
           </h1>
           <p className="text-xs text-[#6B5744] mt-0.5">
-            Per floor bar: what sales should have poured (Expected) versus what actually left the floor (Actual). A positive
-            variance is stock unaccounted for by sales — the unbilled gap.
+            {storeId === '__overall__'
+              ? 'Whole outlet: total liquor poured from all sales (Expected) versus total stock that actually left across every store (Actual). Inter-store transfers net out. A positive variance is stock unaccounted for by sales — the unbilled gap.'
+              : 'Per floor bar: what sales should have poured (Expected) versus what actually left the floor (Actual). A positive variance is stock unaccounted for by sales — the unbilled gap.'}
             {generatedAt && <span className="text-[#B9A896]"> · as of {new Date(generatedAt).toLocaleString('en-IN')}</span>}
           </p>
         </div>
@@ -455,7 +456,8 @@ export default function ReconciliationPage() {
           Floor bar
           <select value={storeId} onChange={e => setStoreId(e.target.value)}
                   className="px-2.5 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-white text-[#2D1B0E] min-w-[180px]">
-            <option value="">All floors</option>
+            <option value="__overall__">🌐 Overall (whole outlet)</option>
+            <option value="">All floors (per floor)</option>
             {stores.map(s => <option key={s.id} value={s.id}>{s.name}{s.floor_label ? ` (${s.floor_label})` : ''}</option>)}
           </select>
         </label>
@@ -545,7 +547,9 @@ export default function ReconciliationPage() {
             <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-8 text-center text-sm text-[#8B7355]">
               <PackageX className="w-6 h-6 mx-auto mb-2 text-[#B9A896]" />
               {rows.length === 0
-                ? 'No floor-attributed sales or movement in this period. Map each floor bar’s zone (Settings → Stores) so sales attribute to a floor.'
+                ? (storeId === '__overall__'
+                    ? 'No liquor sales or stock movement in this period. Ring drinks up on POS (with recipes) and take opening + closing counts to see consumption vs stock.'
+                    : 'No floor-attributed sales or movement in this period. Map each floor bar’s zone (Settings → Stores) so sales attribute to a floor.')
                 : 'No rows match your filters.'}
             </div>
           ) : (

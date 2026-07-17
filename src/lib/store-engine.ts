@@ -1570,3 +1570,159 @@ export function floorReconciliation(
     unattributed_party,
   };
 }
+
+/**
+ * OVERALL (whole-outlet) reconciliation — total liquor poured (from ALL sales,
+ * no floor attribution) vs total physical stock movement across every store, as
+ * ONE pool. For when you don't need per-floor leak attribution.
+ *
+ * EXPECTED[material] = Σ over ALL sales in [from,to], recipe exploded to pegs,
+ *   kept to store-mapped (liquor) materials. No zone→floor gating (unmapped-zone
+ *   sales count too).
+ * ACTUAL[material], summed across all active stores with INTER-STORE TRANSFERS
+ *   NETTED OUT (a transfer is internal to the outlet, never consumption):
+ *     physical (auto-deduct OFF): Σ(opening) + Σ(external PURCHASE inflow)
+ *       − Σ(closing) − Σ(known breakage/spillage). Transfers (txn_type
+ *       'transfer') are EXCLUDED from inflow but flow through opening/closing
+ *       (physical counts, or ledger SUM as-of fallback), so a store's −30
+ *       transfer-out and the receiver's +30 transfer-in cancel in the totals.
+ *     ledger (auto-deduct ON): Σ |sale 'outward' rows| across stores — pours
+ *       only; transfers ('transfer') are excluded by txn_type.
+ * VARIANCE = actual − expected. Returned as ONE virtual "Whole outlet" store so
+ * the existing report renders unchanged. Read-only.
+ */
+export function overallReconciliation(db: Database, opts: { from: string; to: string }): FloorReconResult {
+  const from = String(opts?.from || '').trim();
+  const to = String(opts?.to || '').trim();
+  const autodeduct = floorAutoDeductEnabled(db);
+  const mode: 'physical' | 'ledger' = autodeduct ? 'ledger' : 'physical';
+  const empty: FloorReconResult = {
+    from, to, store_id: '__overall__', autodeduct, mode, rows: [],
+    summary: { stores: 0, materials: 0, total_expected_qty: 0, total_actual_qty: 0, total_variance_qty: 0, total_expected_value: 0, total_actual_value: 0, total_variance_value: 0, total_known_non_sale_qty: 0, total_known_non_sale_value: 0, unbilled_value: 0 },
+    unattributed_party: [],
+  };
+  if (!from || !to) return empty;
+  const stores = listStores(db).filter(s => !!s.is_active);
+  if (stores.length === 0) return empty;
+
+  const metaStmt = db.prepare(`SELECT id, name, category, unit, COALESCE(pack_size,1) AS pack_size, COALESCE(average_price,0) AS average_price FROM raw_materials WHERE id = ?`);
+  const metaCache = new Map<string, any>();
+  const metaOf = (mid: string) => { let m = metaCache.get(mid); if (!m) { m = metaStmt.get(mid) || { id: mid, name: mid, category: '', unit: '', pack_size: 1, average_price: 0 }; metaCache.set(mid, m); } return m; };
+  const liquorCache = new Map<string, boolean>();
+  const isLiquor = (mid: string) => { let c = liquorCache.get(mid); if (c === undefined) { c = materialStoreId(db, metaOf(mid)) != null; liquorCache.set(mid, c); } return c; };
+
+  // EXPECTED — all sales, un-gated by zone, liquor materials only.
+  const recipeCache = new Map<string, Map<string, number>>();
+  const expected = new Map<string, number>();
+  const saleRows = db.prepare(`SELECT recipe_id, quantity_sold FROM sales WHERE date >= ? AND date <= ? AND recipe_id IS NOT NULL`).all(from, to) as { recipe_id: string; quantity_sold: number }[];
+  for (const s of saleRows) {
+    const qty = Number(s.quantity_sold) || 0;
+    if (!qty) continue;
+    for (const [mid, per] of explodeRecipeUnit(db, s.recipe_id, recipeCache)) {
+      if (!isLiquor(mid)) continue;
+      expected.set(mid, (expected.get(mid) || 0) + per * qty);
+    }
+  }
+
+  // ACTUAL prepared statements. External inflow = every POSITIVE row that is NOT
+  // an inter-store transfer (purchase + opening + inward + positive adjustment);
+  // sale outward EXCLUDES transfers by txn_type. opening/closing SUM the ledger
+  // (incl. transfers) so a transfer's −q / +q cancel across stores. CRITICAL:
+  // inflow must credit ALL non-transfer positives — opening/closing subtract
+  // them, so counting only 'purchase' would deflate ACTUAL by every opening/
+  // adjustment/inward load (phantom negative variance).
+  const purchaseStmt = db.prepare(`SELECT material_id, SUM(quantity) AS q FROM store_stock_ledger WHERE store_id = ? AND quantity > 0 AND txn_type <> 'transfer' AND date(created_at,'+330 minutes') >= ? AND date(created_at,'+330 minutes') <= ? GROUP BY material_id`);
+  const saleOutStmt = db.prepare(`SELECT material_id, SUM(-quantity) AS q FROM store_stock_ledger WHERE store_id = ? AND txn_type = 'outward' AND quantity < 0 AND date(created_at,'+330 minutes') >= ? AND date(created_at,'+330 minutes') <= ? GROUP BY material_id`);
+  const countedStmt = db.prepare(`SELECT DISTINCT material_id FROM store_closing_counts WHERE store_id = ? AND date >= ? AND date <= ?`);
+  const movedStmt = db.prepare(`SELECT DISTINCT material_id FROM store_stock_ledger WHERE store_id = ? AND date(created_at,'+330 minutes') >= ? AND date(created_at,'+330 minutes') <= ?`);
+  const openCountStmt = db.prepare(`SELECT physical_qty FROM store_closing_counts WHERE store_id = ? AND material_id = ? AND date < ? ORDER BY date DESC LIMIT 1`);
+  const closeCountStmt = db.prepare(`SELECT physical_qty FROM store_closing_counts WHERE store_id = ? AND material_id = ? AND date >= ? AND date <= ? ORDER BY date DESC LIMIT 1`);
+  const ledgerBeforeStmt = db.prepare(`SELECT COALESCE(SUM(quantity),0) AS q FROM store_stock_ledger WHERE store_id = ? AND material_id = ? AND date(created_at,'+330 minutes') < ?`);
+  const ledgerAtStmt = db.prepare(`SELECT COALESCE(SUM(quantity),0) AS q FROM store_stock_ledger WHERE store_id = ? AND material_id = ? AND date(created_at,'+330 minutes') <= ?`);
+
+  const knownT = new Map<string, number>();
+  for (const e of db.prepare(`SELECT material_id, SUM(qty) AS q FROM bar_empties WHERE kind IN ('breakage','spillage') AND date >= ? AND date <= ? GROUP BY material_id`).all(from, to) as any[]) {
+    knownT.set(e.material_id, (knownT.get(e.material_id) || 0) + (Number(e.q) || 0));
+  }
+
+  // Accumulate purchase + sale-out per material and build the material universe.
+  const purchaseT = new Map<string, number>();
+  const saleOutT = new Map<string, number>();
+  const universe = new Set<string>();
+  for (const mid of expected.keys()) universe.add(mid);
+  for (const mid of knownT.keys()) universe.add(mid);
+  for (const store of stores) {
+    for (const r of purchaseStmt.all(store.id, from, to) as any[]) { purchaseT.set(r.material_id, (purchaseT.get(r.material_id) || 0) + (Number(r.q) || 0)); universe.add(r.material_id); }
+    for (const r of saleOutStmt.all(store.id, from, to) as any[]) { saleOutT.set(r.material_id, (saleOutT.get(r.material_id) || 0) + (Number(r.q) || 0)); universe.add(r.material_id); }
+    for (const r of countedStmt.all(store.id, from, to) as any[]) universe.add(r.material_id);
+    for (const r of movedStmt.all(store.id, from, to) as any[]) universe.add(r.material_id);
+  }
+
+  // Opening/closing per (store, universe-material), summed across stores (nets transfers).
+  const openingT = new Map<string, number>();
+  const closingT = new Map<string, number>();
+  const openCountedT = new Map<string, boolean>();
+  const closeCountedT = new Map<string, boolean>();
+  for (const store of stores) {
+    for (const mid of universe) {
+      const openRow = openCountStmt.get(store.id, mid, from) as any;
+      const opening = openRow != null ? (Number(openRow.physical_qty) || 0) : (Number((ledgerBeforeStmt.get(store.id, mid, from) as any).q) || 0);
+      const closeRow = closeCountStmt.get(store.id, mid, from, to) as any;
+      const closing = closeRow != null ? (Number(closeRow.physical_qty) || 0) : (Number((ledgerAtStmt.get(store.id, mid, to) as any).q) || 0);
+      openingT.set(mid, (openingT.get(mid) || 0) + opening);
+      closingT.set(mid, (closingT.get(mid) || 0) + closing);
+      if (openRow != null) openCountedT.set(mid, true);
+      if (closeRow != null) closeCountedT.set(mid, true);
+    }
+  }
+
+  const rows: FloorReconRow[] = [];
+  let tExpQ = 0, tActQ = 0, tVarQ = 0, tExpV = 0, tActV = 0, tVarV = 0, tUnbilled = 0, tKnownQ = 0, tKnownV = 0;
+  for (const mid of universe) {
+    if (!isLiquor(mid)) continue;
+    const meta = metaOf(mid);
+    const avg = Number(meta.average_price) || 0;
+    const expQ = expected.get(mid) || 0;
+    const purchaseQ = purchaseT.get(mid) || 0;
+    const saleOutQ = saleOutT.get(mid) || 0;
+    const knownQ = mode === 'physical' ? (knownT.get(mid) || 0) : 0;
+    const openingQ = openingT.get(mid) || 0;
+    const closingQ = closingT.get(mid) || 0;
+    const actualQ = mode === 'ledger' ? saleOutQ : openingQ + purchaseQ - closingQ - knownQ;
+    const varianceQ = actualQ - expQ;
+    if (expQ === 0 && actualQ === 0 && purchaseQ === 0 && saleOutQ === 0 && knownQ === 0 && !openCountedT.get(mid) && !closeCountedT.get(mid)) continue;
+    const expV = expQ * avg, actV = actualQ * avg, varV = varianceQ * avg, knownV = knownQ * avg;
+    rows.push({
+      store_id: '__overall__', store_name: 'Whole outlet', floor_label: '—',
+      material_id: mid, material_name: meta.name, category: meta.category || '', unit: meta.unit || '',
+      pack_size: Number(meta.pack_size) || 1,
+      expected_qty: r4(expQ), actual_qty: r4(actualQ),
+      opening_qty: r4(openingQ), inflow_qty: r4(purchaseQ), closing_qty: r4(closingQ),
+      opening_counted: !!openCountedT.get(mid), closing_counted: !!closeCountedT.get(mid),
+      ledger_out_qty: r4(saleOutQ), known_non_sale_qty: r4(knownQ),
+      variance_qty: r4(varianceQ), avg_price: Math.round(avg * 10000) / 10000,
+      expected_value: r2(expV), actual_value: r2(actV), known_non_sale_value: r2(knownV),
+      variance_value: r2(varV), mode,
+    });
+    tExpQ += expQ; tActQ += actualQ; tVarQ += varianceQ; tExpV += expV; tActV += actV; tVarV += varV;
+    tKnownQ += knownQ; tKnownV += knownV; if (varianceQ > 0) tUnbilled += varV;
+  }
+  rows.sort((a, b) => Math.abs(b.variance_value) - Math.abs(a.variance_value) || a.material_name.localeCompare(b.material_name, undefined, { sensitivity: 'base' }));
+
+  const partyRows = db.prepare(`SELECT material_id, SUM(qty_consumed) AS qty FROM party_consumption WHERE event_date >= ? AND event_date <= ? GROUP BY material_id`).all(from, to) as { material_id: string; qty: number }[];
+  const unattributed_party = partyRows.filter(p => (Number(p.qty) || 0) !== 0).map(p => {
+    const meta = metaOf(p.material_id); const avg = Number(meta.average_price) || 0; const qty = Number(p.qty) || 0;
+    return { material_id: p.material_id, material_name: meta.name, category: meta.category || '', unit: meta.unit || '', qty: r4(qty), value: r2(qty * avg) };
+  }).sort((a, b) => a.material_name.localeCompare(b.material_name, undefined, { sensitivity: 'base' }));
+
+  return {
+    from, to, store_id: '__overall__', autodeduct, mode, rows,
+    summary: {
+      stores: rows.length > 0 ? 1 : 0, materials: rows.length,
+      total_expected_qty: r4(tExpQ), total_actual_qty: r4(tActQ), total_variance_qty: r4(tVarQ),
+      total_expected_value: r2(tExpV), total_actual_value: r2(tActV), total_variance_value: r2(tVarV),
+      total_known_non_sale_qty: r4(tKnownQ), total_known_non_sale_value: r2(tKnownV), unbilled_value: r2(tUnbilled),
+    },
+    unattributed_party,
+  };
+}

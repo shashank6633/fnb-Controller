@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { listStores, floorReconciliation } from '@/lib/store-engine';
+import { listStores, floorReconciliation, overallReconciliation } from '@/lib/store-engine';
 
 /**
  * GET /api/stores/reconciliation — the Sales-vs-Consumption RECONCILIATION
@@ -66,7 +66,11 @@ export async function GET(req: Request) {
 
     let result = null as ReturnType<typeof floorReconciliation> | null;
     if (from && to) {
-      result = floorReconciliation(db, { from, to, storeId: storeId || undefined });
+      // storeId '__overall__' → whole-outlet pool (all sales vs all stock, no
+      // floor attribution); else the per-floor report.
+      result = storeId === '__overall__'
+        ? overallReconciliation(db, { from, to })
+        : floorReconciliation(db, { from, to, storeId: storeId || undefined });
 
       // Enrich each material row + the party rows with purchase_unit / case_size
       // / sku (not carried by the engine row) so the page can render the
