@@ -24,15 +24,20 @@ function clampPct(input: unknown): number {
   return n > 100 ? 100 : n;
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
   const db = getDb();
+  // include_inactive=1 → also return deactivated roles. A deactivated role still
+  // governs its users' pages (getCurrentUser joins roles WITHOUT the is_active
+  // filter), so admin screens that resolve a user's effective access (Page
+  // Access) need the full list or they'd misread those users as "no role".
+  const includeInactive = new URL(req.url).searchParams.get('include_inactive') === '1';
   // r.* already includes can_request_discount + max_discount_pct (schema columns),
   // but list them explicitly-adjacent via r.* so future SELECTs stay in sync.
   const roles = db.prepare(`
     SELECT r.*, (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id AND u.is_active = 1) AS user_count
-    FROM roles r WHERE r.is_active = 1
+    FROM roles r ${includeInactive ? '' : 'WHERE r.is_active = 1'}
     ORDER BY r.sort_order ASC, r.name ASC
   `).all();
   return Response.json({ roles });

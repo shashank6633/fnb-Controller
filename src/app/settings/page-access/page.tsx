@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { Shield, Save, Loader2, ChevronDown, ChevronRight, AlertTriangle, CheckCircle2, X } from 'lucide-react';
+import { Shield, Save, Loader2, ChevronDown, ChevronRight, ChevronLeft, AlertTriangle, CheckCircle2, X, Search } from 'lucide-react';
 import { PAGE_CATALOG, ALL_PAGE_PATHS } from '@/lib/page-catalog';
 import { api } from '@/lib/api';
 
@@ -33,9 +33,33 @@ interface User {
 }
 interface Department { id: string; name: string; code?: string }
 
+/** The pages a user EFFECTIVELY sees (mirrors getCurrentUser/proxy resolution):
+ *  personal override → its pages; else assigned role → the role's pages
+ *  (role with no restriction = every page); no role → every page.
+ *  The checkbox grid is seeded from THIS, so "Follow role" shows the role's
+ *  pages ticked instead of an empty grid that looks like a total reset. */
+function effectivePages(u: User, rolesArr: any[]): Set<string> {
+  const own = parseAccess(u.page_access);
+  if (own.size > 0) return own;
+  if (u.role_id) {
+    const r = rolesArr.find((x: any) => x.id === u.role_id);
+    if (r) {
+      const rp = parseAccess(r.page_access);
+      return rp.size > 0 ? rp : new Set(ALL_PAGE_PATHS);
+    }
+    // Role assigned but not resolvable client-side (roles fetch failed?):
+    // FAIL CLOSED — show no inherited ticks rather than a full-access grid a
+    // Save could accidentally persist as a near-ALL override. save() also
+    // refuses page writes for this state.
+    return new Set();
+  }
+  return new Set(ALL_PAGE_PATHS);
+}
+
 export default function PageAccessSettingsPage() {
   const [me, setMe] = useState<any>(null);
   const [users, setUsers] = useState<User[]>([]);
+  const [roles, setRoles] = useState<any[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -46,27 +70,57 @@ export default function PageAccessSettingsPage() {
   const [deptDraft, setDeptDraft] = useState<Record<string, Set<string>>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['Parties', 'Purchasing', 'Inventory', 'Production', 'Reports'])); // default-expand likely-used sections
   const [busy, setBusy] = useState<string | null>(null);
+  // Master-detail: pick an employee, then edit their pages. Far less clutter than
+  // rendering every user's full catalogue at once.
+  const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const [userSearch, setUserSearch] = useState('');   // find an employee
+  const [pageSearch, setPageSearch] = useState('');    // find a page within the selected employee
+  // False when the roles list failed to load — the grid then can't know a
+  // role-user's real pages, so page edits are blocked (fail closed).
+  const [rolesReady, setRolesReady] = useState(true);
 
-  const load = async () => {
-    setLoading(true);
-    const [m, u, d] = await Promise.all([
+  // reseedOnly: after saving ONE user, refresh data but keep every OTHER
+  // user's unsaved draft edits instead of silently discarding them.
+  const load = async (reseedOnly?: string) => {
+    if (!reseedOnly) setLoading(true);
+    const [m, u, d, rl] = await Promise.all([
       fetch('/api/auth/me').then(r => r.json()),
       fetch('/api/auth/users').then(r => r.json()),
       fetch('/api/departments').then(r => r.json()),
+      // include_inactive: a deactivated role still governs its users' pages, so
+      // we must resolve it here too. null = fetch failed → editing is blocked.
+      fetch('/api/auth/roles?include_inactive=1').then(r => (r.ok ? r.json() : null)).catch(() => null),
     ]);
     setMe(m?.user);
     const list = (u.users || []).filter((x: User) => x.is_active);
     setUsers(list);
+    const rolesArr = rl?.roles || [];
+    setRoles(rolesArr);
+    setRolesReady(!!rl);
+    if (!rl) setError('Roles could not be loaded — page-access editing is disabled so no wrong grants can be saved. Reload the page to retry.');
     setDepartments((d.departments || []).filter((x: any) => x.is_active !== 0));
-    // Seed draft state from current values
-    const pages: Record<string, Set<string>> = {};
-    const depts: Record<string, Set<string>> = {};
-    for (const usr of list) {
-      pages[usr.id] = parseAccess(usr.page_access);
-      depts[usr.id] = parseAccess(usr.visible_department_ids);
-    }
-    setDraft(pages);
-    setDeptDraft(depts);
+    // Seed draft state from EFFECTIVE access (override, else role's pages) so
+    // the grid always shows the truth — a follows-role user's boxes come
+    // pre-ticked with the role's pages, and any edit starts FROM that set
+    // (ticking one extra page no longer wipes the role's pages).
+    setDraft(prev => {
+      const pages: Record<string, Set<string>> = {};
+      for (const usr of list) {
+        pages[usr.id] = (reseedOnly && usr.id !== reseedOnly && prev[usr.id])
+          ? prev[usr.id]
+          : effectivePages(usr, rolesArr);
+      }
+      return pages;
+    });
+    setDeptDraft(prev => {
+      const depts: Record<string, Set<string>> = {};
+      for (const usr of list) {
+        depts[usr.id] = (reseedOnly && usr.id !== reseedOnly && prev[usr.id])
+          ? prev[usr.id]
+          : parseAccess(usr.visible_department_ids);
+      }
+      return depts;
+    });
     setLoading(false);
   };
   useEffect(() => { load(); }, []);
@@ -81,11 +135,34 @@ export default function PageAccessSettingsPage() {
   // won't change what they see until it's cleared. (Empty/null = follow role.)
   const hasOverride = (u: User) => parseAccess(u.page_access).size > 0;
 
+  // Resolve what a user's assigned named role grants, so we can warn the admin
+  // BEFORE clearing an override (roles like "Captain"/"Staff" may grant only 1
+  // page — following them then looks like "all access was wiped").
+  const roleInfo = (roleId?: string | null) => {
+    if (!roleId) return null;
+    const r = roles.find((x: any) => x.id === roleId);
+    if (!r) return null;
+    const paths = parseAccess(r.page_access); // empty set = role grants FULL access
+    return { name: `${r.name || 'role'}${r.is_active === 0 ? ' (deactivated)' : ''}`, count: paths.size };
+  };
+
   // Clear a user's personal page override so they FOLLOW THEIR ROLE again
   // (save empty page_access → server stores NULL → role's pages apply). Keeps
-  // their saved department visibility untouched.
+  // the on-screen department visibility as-is. Confirms first, spelling out
+  // exactly what the role grants so it's never a surprise "reset".
   const followRole = async (userId: string) => {
     const u = users.find(x => x.id === userId);
+    const ri = roleInfo(u?.role_id);
+    // Don't act (or claim "full access") while the role can't be resolved.
+    if (!rolesReady || (u?.role_id && !ri)) {
+      setError('Roles could not be loaded — reload the page before changing access.'); return;
+    }
+    const consequence = !u?.role_id
+      ? `They have no assigned role, so they will get FULL access to every page. Assign a role in Settings → Roles to restrict them.`
+      : ri && ri.count > 0
+        ? `They will then follow the “${ri.name}” role, which grants only ${ri.count} page${ri.count === 1 ? '' : 's'} — they will lose access to every other page.`
+        : `They will then follow the “${ri?.name || 'their'}” role, which currently grants FULL access (no pages are restricted on that role).`;
+    if (!confirm(`Remove ${u?.name || 'this user'}'s custom page access?\n\n${consequence}\n\nYou can re-grant pages any time: tick the pages below and click Save.`)) return;
     setBusy(userId); setError(null); setSavedFor(null);
     try {
       const r = await api('/api/auth/users', {
@@ -93,12 +170,14 @@ export default function PageAccessSettingsPage() {
         body: {
           id: userId,
           page_access: [],
-          visible_department_ids: Array.from(parseAccess(u?.visible_department_ids)),
+          // Send the on-screen dept draft (falls back to the saved value) so an
+          // unsaved Department Visibility edit isn't silently reverted by load().
+          visible_department_ids: Array.from(deptDraft[userId] ?? parseAccess(u?.visible_department_ids)),
         },
       });
       if (!r.ok) { const j = await r.json().catch(() => ({})); setError(j.error || `HTTP ${r.status}`); return; }
       setSavedFor(userId);
-      await load();
+      await load(userId);
       setTimeout(() => setSavedFor(null), 2500);
     } finally { setBusy(null); }
   };
@@ -140,7 +219,7 @@ export default function PageAccessSettingsPage() {
   };
   const resetUser = (userId: string) => {
     const u = users.find(x => x.id === userId);
-    setDraft(p => ({ ...p, [userId]: parseAccess(u?.page_access) }));
+    setDraft(p => ({ ...p, [userId]: u ? effectivePages(u, roles) : new Set<string>() }));
     setDeptDraft(p => ({ ...p, [userId]: parseAccess(u?.visible_department_ids) }));
   };
 
@@ -161,7 +240,9 @@ export default function PageAccessSettingsPage() {
   };
   const isDirty = (userId: string) => {
     const u = users.find(x => x.id === userId);
-    const savedPages = parseAccess(u?.page_access);
+    // Baseline = EFFECTIVE pages (override, else role's set) — the same thing
+    // the draft was seeded from, so an untouched grid is never "dirty".
+    const savedPages = u ? effectivePages(u, roles) : new Set<string>();
     const savedDepts = parseAccess(u?.visible_department_ids);
     const curPages = draft[userId] || new Set();
     const curDepts = deptDraft[userId] || new Set();
@@ -169,12 +250,33 @@ export default function PageAccessSettingsPage() {
   };
 
   const save = async (userId: string) => {
+    const u = users.find(x => x.id === userId);
+    const curPages = draft[userId] || new Set<string>();
+    // Fail closed while role data is unavailable — the grid can't know a
+    // role-user's real pages, so any page write risks a wrong grant.
+    if (!rolesReady) { setError('Roles could not be loaded — reload the page before editing access.'); return; }
+    if (u?.role_id && !roles.some((x: any) => x.id === u.role_id)) {
+      setError(`${u.name || 'This user'}'s role couldn't be resolved — reload the page before editing their access.`); return;
+    }
+    // If the user follows their role and the ticked pages still equal the
+    // role's set (e.g. only Department Visibility was edited), keep them
+    // following the role — don't freeze the role's pages into an override.
+    const keepFollowingRole = !!u && !hasOverride(u) && setsEqual(curPages, effectivePages(u, roles));
+    // Zero ticks can NOT be saved: on the wire [] means "follow role" (or full
+    // access with no role), so "None + Save" would silently GRANT access, not
+    // revoke it. Force an explicit path instead.
+    if (curPages.size === 0 && !keepFollowingRole) {
+      setError(u && hasOverride(u)
+        ? `Zero pages can't be saved. To remove ${u.name || 'this user'}'s custom pages use “Follow role” (it explains exactly what they'll get). To block them entirely, deactivate them on /users.`
+        : `Zero pages can't be saved — with no ticks this user would simply follow their role (or get full access if they have no role). Tick the pages they should have, or restrict their role in Settings → Roles.`);
+      return;
+    }
     setBusy(userId); setError(null); setSavedFor(null);
     try {
-      const pageArr = Array.from(draft[userId] || []);
+      const pageArr = keepFollowingRole ? [] : Array.from(curPages);
       const deptArr = Array.from(deptDraft[userId] || []);
       // Empty arrays → server stores NULL → defaults apply:
-      //   page_access null    = full page access
+      //   page_access null    = follow role (or full access if no role)
       //   visible_dept null   = only own dept
       const r = await api('/api/auth/users', {
         method: 'PUT',
@@ -189,7 +291,7 @@ export default function PageAccessSettingsPage() {
         setError(j.error || `HTTP ${r.status}`); return;
       }
       setSavedFor(userId);
-      await load();
+      await load(userId);
       setTimeout(() => setSavedFor(null), 2500);
     } finally { setBusy(null); }
   };
@@ -205,6 +307,39 @@ export default function PageAccessSettingsPage() {
     );
   }
 
+  const selectedUser = selectedUserId ? managedUsers.find(u => u.id === selectedUserId) || null : null;
+  const userQuery = userSearch.trim().toLowerCase();
+  const filteredUsers = userQuery
+    ? managedUsers.filter(u =>
+        (u.name || '').toLowerCase().includes(userQuery) ||
+        (u.email || '').toLowerCase().includes(userQuery) ||
+        (u.role || '').toLowerCase().includes(userQuery))
+    : managedUsers;
+
+  const initials = (u: User) => (u.name || u.email || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase() || '?';
+
+  // Compact status pill — reused in the list and the detail header.
+  const StatusBadge = ({ u }: { u: User }) => {
+    if (hasOverride(u)) return (
+      <span title="This user has a personal page override that beats their role. Editing their role won't change what they see until you clear it."
+            className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200 font-semibold whitespace-nowrap">
+        ⚠ Personal override
+      </span>
+    );
+    if (u.role_id) { const ri = roleInfo(u.role_id); return (
+      <span title={`Follows their role${u.role_name ? ` "${u.role_name}"` : ''}'s page set.`}
+            className="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium whitespace-nowrap">
+        Follows role{u.role_name ? ` · ${u.role_name}` : ''}{ri ? ` · ${ri.count > 0 ? `${ri.count} pg` : 'full'}` : ''}
+      </span>
+    ); }
+    return (
+      <span title="No named role and no personal override — currently sees EVERY page. Assign a role or tick specific pages."
+            className="text-[9px] px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 border border-red-200 font-semibold whitespace-nowrap">
+        ⚠ Full access — no role
+      </span>
+    );
+  };
+
   return (
     <div className="p-6 space-y-5">
       <div className="flex items-center gap-3">
@@ -212,8 +347,9 @@ export default function PageAccessSettingsPage() {
         <div>
           <h1 className="text-xl font-semibold text-[#2D1B0E]">Page Access</h1>
           <p className="text-xs text-[#8B7355]">
-            Per-user page visibility. Tick the pages each user should see in the sidebar.
-            Empty selection = follow the user's role. Admins always see everything.
+            Pick an employee, then tick the pages they can see. The ticks show their
+            <b> current effective access</b> — a user on a role starts with that role's pages.
+            Changing the ticks creates a personal override for that user. Admins always see everything.
           </p>
         </div>
       </div>
@@ -242,12 +378,17 @@ export default function PageAccessSettingsPage() {
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-10 text-center text-sm text-[#8B7355]">
           No non-admin users yet. <a href="/users" className="text-[#af4408] underline">Create users on /users</a> first.
         </div>
-      ) : (
-        <div className="space-y-3">
-          {managedUsers.map(u => {
-            const cur = draft[u.id] || new Set<string>();
-            const dirty = isDirty(u.id);
-            return (
+      ) : selectedUser ? (() => {
+        const u = selectedUser;
+        const cur = draft[u.id] || new Set<string>();
+        const dirty = isDirty(u.id);
+        const pq = pageSearch.trim().toLowerCase();
+        return (
+          <div className="space-y-3">
+            <button onClick={() => { setSelectedUserId(null); setPageSearch(''); }}
+                    className="inline-flex items-center gap-1 text-sm text-[#af4408] hover:underline">
+              <ChevronLeft size={16} /> All employees
+            </button>
               <div key={u.id} className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
                 <div className="px-4 py-3 border-b border-[#E8D5C4] bg-[#FFF1E3] flex items-center gap-3 flex-wrap">
                   <div className="flex-1 min-w-0">
@@ -261,7 +402,7 @@ export default function PageAccessSettingsPage() {
                       ) : u.role_id ? (
                         <span title={`This user follows their role${u.role_name ? ` "${u.role_name}"` : ''}'s page set.`}
                               className="text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium">
-                          Follows role{u.role_name ? ` · ${u.role_name}` : ''}
+                          Follows role{u.role_name ? ` · ${u.role_name}` : ''}{(() => { const ri = roleInfo(u.role_id); return ri ? ` · ${ri.count > 0 ? `${ri.count} page${ri.count === 1 ? '' : 's'}` : 'full access'}` : ''; })()}
                         </span>
                       ) : (
                         <span title="This user has no named role and no personal override — so they can currently see EVERY page. Assign a role (Settings → Roles) or tick specific pages to restrict them."
@@ -273,7 +414,18 @@ export default function PageAccessSettingsPage() {
                     <div className="text-[10px] text-[#8B7355]">{u.email} · {u.role}{u.department_name ? ` · ${u.department_name}` : ''}</div>
                   </div>
                   <div className="text-[10px] text-[#8B7355]">
-                    {cur.size === 0 ? (u.role_id ? 'Follows role' : 'Full access') : `${cur.size} pages granted`}
+                    {hasOverride(u)
+                      ? `${cur.size} pages granted`
+                      : u.role_id
+                        ? (() => {
+                            // Reflect the LIVE draft: once the admin changes ticks,
+                            // "its N pages ticked below" would be a lie.
+                            const eff = effectivePages(u, roles);
+                            if (!setsEqual(cur, eff)) return `${cur.size} page${cur.size === 1 ? '' : 's'} ticked — unsaved changes`;
+                            const ri = roleInfo(u.role_id);
+                            return ri && ri.count > 0 ? `Follows role — its ${ri.count} page${ri.count === 1 ? '' : 's'} ticked below` : 'Follows role · full access';
+                          })()
+                        : 'Full access — no role'}
                   </div>
                   {hasOverride(u) && (
                     <button onClick={() => followRole(u.id)} disabled={busy === u.id}
@@ -328,16 +480,30 @@ export default function PageAccessSettingsPage() {
                       </div>
                     );
                   })()}
+                  {/* Find a page quickly */}
+                  <div className="px-4 py-2 bg-white">
+                    <div className="relative">
+                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[#8B7355]" size={14} />
+                      <input value={pageSearch} onChange={e => setPageSearch(e.target.value)} placeholder="Search a page…"
+                             className="w-full pl-8 pr-3 py-1.5 bg-[#FFF8F0] border border-[#E8D5C4] rounded text-xs focus:outline-none focus:border-[#af4408]" />
+                    </div>
+                  </div>
                   {PAGE_CATALOG.map(section => {
-                    const paths = section.pages.map(p => p.path);
+                    const matchPages = pq ? section.pages.filter(p => p.label.toLowerCase().includes(pq) || p.path.toLowerCase().includes(pq)) : section.pages;
+                    if (pq && matchPages.length === 0) return null;
+                    // While searching, the header checkbox + count act on the VISIBLE
+                    // subset only — never silently grant/revoke hidden pages.
+                    const paths = matchPages.map(p => p.path);
                     const checkedCount = paths.filter(p => cur.has(p)).length;
-                    const allChecked = checkedCount === paths.length;
+                    const allChecked = checkedCount === paths.length && paths.length > 0;
                     const someChecked = checkedCount > 0 && !allChecked;
-                    const isExpanded = expanded.has(section.label);
+                    const isExpanded = pq ? true : expanded.has(section.label);
                     return (
                       <div key={section.label}>
-                        <div className="px-4 py-2 flex items-center gap-2 bg-[#FFF8F0] cursor-pointer hover:bg-[#FFF1E3]"
-                             onClick={() => toggleSection(section.label)}>
+                        <div role="button" tabIndex={pq ? -1 : 0} aria-expanded={isExpanded}
+                             className={`px-4 py-2 flex items-center gap-2 bg-[#FFF8F0] ${pq ? '' : 'cursor-pointer hover:bg-[#FFF1E3]'}`}
+                             onClick={() => { if (!pq) toggleSection(section.label); }}
+                             onKeyDown={e => { if (!pq && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggleSection(section.label); } }}>
                           {isExpanded ? <ChevronDown size={14} className="text-[#6B5744]" /> : <ChevronRight size={14} className="text-[#6B5744]" />}
                           <input type="checkbox" checked={allChecked}
                                  ref={el => { if (el) el.indeterminate = someChecked; }}
@@ -348,7 +514,7 @@ export default function PageAccessSettingsPage() {
                         </div>
                         {isExpanded && (
                           <div className="px-4 py-2 grid grid-cols-2 md:grid-cols-3 gap-1.5 text-xs">
-                            {section.pages.map(p => (
+                            {matchPages.map(p => (
                               <label key={p.path} title={p.hodOnly ? 'Only HODs (Is HOD) and admins can open this page — this grant is ignored for non-HODs' : p.mgmtOnly ? 'Only Admins, Managers and HODs can open this page — this grant is ignored for other roles' : undefined}
                                      className="flex items-center gap-1.5 cursor-pointer hover:bg-[#FFF8F0] px-1 py-0.5 rounded min-w-0">
                                 <input type="checkbox" checked={cur.has(p.path)}
@@ -364,10 +530,47 @@ export default function PageAccessSettingsPage() {
                       </div>
                     );
                   })}
+                  {pq && !PAGE_CATALOG.some(s => s.pages.some(p => p.label.toLowerCase().includes(pq) || p.path.toLowerCase().includes(pq))) && (
+                    <div className="px-4 py-8 text-center text-sm text-[#8B7355]">No pages match “{pageSearch}”.</div>
+                  )}
                 </div>
               </div>
-            );
-          })}
+          </div>
+        );
+      })() : (
+        /* ===== LIST: pick an employee, then edit their pages ===== */
+        <div className="space-y-3">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-[#8B7355]" size={16} />
+            <input value={userSearch} onChange={e => setUserSearch(e.target.value)}
+                   placeholder="Search employee by name, email or role…"
+                   className="w-full pl-10 pr-3 py-2.5 bg-white border border-[#E8D5C4] rounded-lg text-sm focus:outline-none focus:border-[#af4408]" />
+          </div>
+          <p className="text-[11px] text-[#8B7355] px-1">{filteredUsers.length} employee{filteredUsers.length === 1 ? '' : 's'} · tap one to set the pages they can see.</p>
+          <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden divide-y divide-[#E8D5C4]/60">
+            {filteredUsers.length === 0 ? (
+              <div className="p-8 text-center text-sm text-[#8B7355]">No employees match “{userSearch}”.</div>
+            ) : filteredUsers.map(u => {
+              const savedCount = parseAccess(u.page_access).size;
+              return (
+                <button key={u.id} onClick={() => { setSelectedUserId(u.id); setPageSearch(''); }}
+                        className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-[#FFF8F0] transition-colors">
+                  <div className="w-9 h-9 rounded-full bg-[#F3E2D0] text-[#a8632b] flex items-center justify-center text-[11px] font-bold shrink-0">{initials(u)}</div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-semibold text-[#2D1B0E] flex items-center gap-2 flex-wrap">
+                      <span className="truncate">{u.name || u.email}</span>
+                      <StatusBadge u={u} />
+                    </div>
+                    <div className="text-[11px] text-[#8B7355] truncate">{u.email} · {u.role}{u.department_name ? ` · ${u.department_name}` : ''}</div>
+                  </div>
+                  <div className="text-[11px] text-[#8B7355] whitespace-nowrap hidden sm:block">
+                    {savedCount > 0 ? `${savedCount} pages` : (u.role_id ? 'Follows role' : 'Full access')}
+                  </div>
+                  <ChevronRight size={16} className="text-[#C4B09A] shrink-0" />
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
     </div>
