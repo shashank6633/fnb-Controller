@@ -3364,6 +3364,161 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_push_subscriptions_email ON push_subscriptions(user_email);
     `);
   } catch (e) { console.error('task push/files schema failed:', e); }
+
+  // ── CRM Call-to-Table (ct_) — TeleCMI telephony CRM ──
+  // Purely additive; isolated try/catch; namespaced ct_ to avoid the existing
+  // AKAN-CRM crm_* tables. JSON-as-TEXT, UTC ISO timestamps. See
+  // docs/CRM_DECISIONS.md for the full contract.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ct_guests (
+        id          TEXT PRIMARY KEY,
+        outlet_id   TEXT NOT NULL DEFAULT '',
+        phone_e164  TEXT NOT NULL UNIQUE,
+        name        TEXT NOT NULL DEFAULT '',
+        alt_phone   TEXT NOT NULL DEFAULT '',
+        email       TEXT NOT NULL DEFAULT '',
+        tags        TEXT NOT NULL DEFAULT '[]',
+        source      TEXT NOT NULL DEFAULT 'call',
+        notes       TEXT NOT NULL DEFAULT '',
+        dob         TEXT NOT NULL DEFAULT '',
+        anniversary TEXT NOT NULL DEFAULT '',
+        preferences TEXT NOT NULL DEFAULT '{}',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_guests_phone ON ct_guests(phone_e164);
+
+      CREATE TABLE IF NOT EXISTS ct_calls (
+        id               TEXT PRIMARY KEY,
+        telecmi_call_id  TEXT UNIQUE,
+        guest_id         TEXT,
+        phone_e164       TEXT NOT NULL DEFAULT '',
+        direction        TEXT NOT NULL DEFAULT 'inbound',
+        status           TEXT NOT NULL DEFAULT 'ringing',
+        agent_user       TEXT NOT NULL DEFAULT '',
+        queue            TEXT NOT NULL DEFAULT '',
+        started_at       TEXT,
+        answered_at      TEXT,
+        ended_at         TEXT,
+        duration_sec     INTEGER NOT NULL DEFAULT 0,
+        recording_url    TEXT NOT NULL DEFAULT '',
+        raw_payload      TEXT NOT NULL DEFAULT '{}',
+        disposition      TEXT NOT NULL DEFAULT '',
+        disposition_note TEXT NOT NULL DEFAULT '',
+        created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_calls_phone   ON ct_calls(phone_e164);
+      CREATE INDEX IF NOT EXISTS idx_ct_calls_guest   ON ct_calls(guest_id);
+      CREATE INDEX IF NOT EXISTS idx_ct_calls_started ON ct_calls(started_at);
+      CREATE INDEX IF NOT EXISTS idx_ct_calls_status  ON ct_calls(status);
+
+      CREATE TABLE IF NOT EXISTS ct_bookings (
+        id             TEXT PRIMARY KEY,
+        guest_id       TEXT NOT NULL,
+        source_call_id TEXT,
+        booking_date   TEXT NOT NULL DEFAULT '',
+        slot_time      TEXT NOT NULL DEFAULT '',
+        party_size     INTEGER NOT NULL DEFAULT 2,
+        occasion       TEXT NOT NULL DEFAULT '',
+        section_pref   TEXT NOT NULL DEFAULT '',
+        status         TEXT NOT NULL DEFAULT 'pending',
+        created_by     TEXT NOT NULL DEFAULT '',
+        channel        TEXT NOT NULL DEFAULT 'call',
+        advance_amount REAL NOT NULL DEFAULT 0,
+        notes          TEXT NOT NULL DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_bookings_guest ON ct_bookings(guest_id);
+      CREATE INDEX IF NOT EXISTS idx_ct_bookings_date  ON ct_bookings(booking_date);
+      CREATE INDEX IF NOT EXISTS idx_ct_bookings_src   ON ct_bookings(source_call_id);
+
+      CREATE TABLE IF NOT EXISTS ct_follow_ups (
+        id          TEXT PRIMARY KEY,
+        guest_id    TEXT NOT NULL,
+        call_id     TEXT,
+        due_at      TEXT NOT NULL DEFAULT '',
+        assigned_to TEXT NOT NULL DEFAULT '',
+        status      TEXT NOT NULL DEFAULT 'open',
+        note        TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_followups_guest ON ct_follow_ups(guest_id);
+      CREATE INDEX IF NOT EXISTS idx_ct_followups_due   ON ct_follow_ups(status, due_at);
+
+      CREATE TABLE IF NOT EXISTS ct_recoveries (
+        id                  TEXT PRIMARY KEY,
+        call_id             TEXT NOT NULL UNIQUE,
+        guest_id            TEXT,
+        phone_e164          TEXT NOT NULL DEFAULT '',
+        missed_at           TEXT NOT NULL,
+        detected_via        TEXT NOT NULL DEFAULT 'cdr',
+        sla_due_at          TEXT NOT NULL,
+        status              TEXT NOT NULL DEFAULT 'pending',
+        assigned_to         TEXT NOT NULL DEFAULT '',
+        attempts            TEXT NOT NULL DEFAULT '[]',
+        first_attempt_at    TEXT,
+        recovered_at        TEXT,
+        recovery_call_id    TEXT,
+        recovery_booking_id TEXT,
+        escalated           INTEGER NOT NULL DEFAULT 0,
+        escalated_at        TEXT,
+        resolution_note     TEXT NOT NULL DEFAULT '',
+        created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_recov_status ON ct_recoveries(status, sla_due_at);
+      CREATE INDEX IF NOT EXISTS idx_ct_recov_phone  ON ct_recoveries(phone_e164);
+
+      CREATE TABLE IF NOT EXISTS ct_webhook_log (
+        id              TEXT PRIMARY KEY,
+        kind            TEXT NOT NULL DEFAULT '',
+        telecmi_call_id TEXT NOT NULL DEFAULT '',
+        phone_e164      TEXT NOT NULL DEFAULT '',
+        event           TEXT NOT NULL DEFAULT '',
+        received_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        payload         TEXT NOT NULL DEFAULT '{}',
+        processed       INTEGER NOT NULL DEFAULT 0,
+        error           TEXT NOT NULL DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_whlog_call ON ct_webhook_log(telecmi_call_id);
+      CREATE INDEX IF NOT EXISTS idx_ct_whlog_recv ON ct_webhook_log(received_at);
+
+      CREATE TABLE IF NOT EXISTS ct_settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL DEFAULT ''
+      );
+    `);
+    // Defaults (INSERT OR IGNORE = idempotent, admin edits survive re-runs)
+    const seedCt = db.prepare(`INSERT OR IGNORE INTO ct_settings (key, value) VALUES (?, ?)`);
+    seedCt.run('sla_minutes', '30');
+    seedCt.run('attribution_hours', '48');
+    seedCt.run('business_open', '12:00');
+    seedCt.run('business_close', '23:30');
+    seedCt.run('auto_assign', 'off');
+    seedCt.run('after_hours_whatsapp', '0');
+    seedCt.run('after_hours_template', 'Sorry we missed your call! We open at {open}. Book a table: {link}');
+    seedCt.run('agent_map', '{}');
+    seedCt.run('auto_analyze', '0'); // AI call-scoring: off by default (opt-in, controls LLM spend)
+    seedCt.run('analysis_retention', 'permanent'); // 'permanent' (keep scorecards) | 'ephemeral' (view-on-click, not stored)
+
+    // AI call-analysis columns on ct_calls (additive; ALTER is idempotent via
+    // the per-column try/catch — a re-run throws "duplicate column" which we
+    // swallow). Holds the CallPilot-style scorecard from analyzeCallRecording.
+    const addCtCol = (col: string, decl: string) => {
+      try { db.exec(`ALTER TABLE ct_calls ADD COLUMN ${col} ${decl}`); } catch { /* already exists */ }
+    };
+    addCtCol('analysis_json',    `TEXT NOT NULL DEFAULT ''`);   // full CallAnalysisStructured JSON
+    addCtCol('analysis_score',   `INTEGER`);                    // overall_score 0-100, NULL if unscored
+    addCtCol('analysis_outcome', `TEXT NOT NULL DEFAULT ''`);   // resolved|escalate|follow_up|lost
+    addCtCol('analysis_summary', `TEXT NOT NULL DEFAULT ''`);
+    addCtCol('analysis_status',  `TEXT NOT NULL DEFAULT ''`);   // ''|pending|done|error|skipped
+    addCtCol('analysis_error',   `TEXT NOT NULL DEFAULT ''`);
+    addCtCol('analyzed_at',      `TEXT`);
+    addCtCol('analyzed_by',      `TEXT NOT NULL DEFAULT ''`);   // user email or 'auto'
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_calls_analysis_status ON ct_calls(analysis_status)`);
+  } catch (e) { console.error('ct (call-to-table CRM) schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

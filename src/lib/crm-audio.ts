@@ -26,6 +26,26 @@ const TRANSCRIBE_PROMPT =
   "Preserve the original language(s) spoken. Prefix the transcript with a first line " +
   "'Language: <detected language>'. Output only that line and the transcript, no commentary.";
 
+/** English-output transcription: auto-detect the spoken language (English /
+ *  Telugu / Hindi / mix) but return the transcript TRANSLATED into English. */
+const TRANSCRIBE_PROMPT_EN =
+  "Transcribe this call recording. Label each speaker as STAFF or CUSTOMER. " +
+  "Auto-detect the spoken language — it will be English, Telugu, or Hindi, or a mix. " +
+  "Write the transcript TRANSLATED INTO NATURAL ENGLISH (translate meaning; do NOT " +
+  "transliterate and do NOT keep Telugu/Devanagari script). Prefix with a first line " +
+  "'Language: <detected spoken language>'. Output only that line and the English transcript, no commentary.";
+
+/** Highest-priority language override appended to the analysis prompt when the
+ *  caller wants an all-English scorecard (spoken language still auto-detected +
+ *  reported in the `language` field). Used by the CRM Call-to-Table telephony
+ *  analysis so managers always read English regardless of call language. */
+const ENGLISH_OUTPUT_OVERRIDE =
+  '\n\n## LANGUAGE — HIGHEST PRIORITY, OVERRIDES EVERY LANGUAGE INSTRUCTION ABOVE\n' +
+  'The call may be in English, Telugu, or Hindi (or a mix). AUTO-DETECT the spoken language ' +
+  'and report it in the "language" field. But write EVERYTHING you output — every "transcript" ' +
+  'text entry, all "coaching", "summary", "moments" and "flags" — in ENGLISH. Translate any ' +
+  'Telugu/Hindi speech into natural English; do NOT transliterate and do NOT keep the original script.';
+
 /**
  * Hard override appended to buildCallAnalysisPrompt() so the model returns a
  * machine-parseable scorecard instead of markdown. If the model ignores it,
@@ -238,15 +258,20 @@ export async function analyzeCallRecording(opts: {
   base64: string;
   mimeType: string;
   language: string;
+  /** 'english' → detect spoken language (English/Telugu/Hindi) but return the
+   *  transcript + scorecard in English. Default 'auto' keeps the original
+   *  language (unchanged behavior for existing callers). */
+  outputLanguage?: 'auto' | 'english';
 }): Promise<CallAnalysisResult> {
   const { base64, mimeType, language } = opts;
+  const english = opts.outputLanguage === 'english';
   const kbText = formatKbForPrompt(getKnowledge());
-  const prompt = buildCallAnalysisPrompt(kbText, language) + JSON_OUTPUT_INSTRUCTION;
+  const prompt = buildCallAnalysisPrompt(kbText, language) + JSON_OUTPUT_INSTRUCTION + (english ? ENGLISH_OUTPUT_OVERRIDE : '');
 
   let content: string;
   if (getProvider() === 'claude') {
     // Claude cannot ingest audio — Gemini transcribes, Claude coaches.
-    const transcript = await callGeminiAudio(base64, mimeType, TRANSCRIBE_PROMPT);
+    const transcript = await callGeminiAudio(base64, mimeType, english ? TRANSCRIBE_PROMPT_EN : TRANSCRIBE_PROMPT);
     content = await callCrmLlm({
       messages: [{ role: 'user', content: 'CALL TRANSCRIPT:\n' + transcript }],
       system: prompt,

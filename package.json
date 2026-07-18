@@ -11,6 +11,8 @@
     "dev:lan": "next dev --turbopack -H 0.0.0.0",
     "dev:localhost": "next dev --turbopack",
     "dev:webpack": "next dev -H 0.0.0.0",
+    "simulate:call": "npx tsx scripts/simulate-call.ts",
+    "test:ct": "npx tsx scripts/ct-tests.ts",
     "test": "node scripts/run-tests.js",
     "backup": "bash scripts/backup-db.sh"
   },

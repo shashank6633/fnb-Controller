@@ -76,6 +76,8 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/whatsapp',            // WhatsApp Integration (config/templates) — webhook is carved out in isPublic
   '/api/stores',              // Store Locations (multi-store engine config: stores/categories/access)
   '/api/tasks',               // Task Management module (tasks/checklists/maintenance/hygiene/training/approvals/etc.) — all mutations CSRF-protected
+  '/api/crm-calls',           // CRM Call-to-Table: guests/calls/bookings/recoveries/settings/seed mutations
+  '/api/telecmi',             // TeleCMI actions (click-to-call, backfill) — webhooks are carved out in isPublic (matched there first)
 ];
 
 function isPublic(pathname: string): boolean {
@@ -96,6 +98,11 @@ function isPublic(pathname: string): boolean {
   // the payload into whatsapp_events_log. Exact match — nothing else under
   // /api/whatsapp is public.
   if (pathname === '/api/whatsapp/webhook') return true;
+  // TeleCMI webhooks (CRM Call-to-Table): TeleCMI's cloud POSTs live events +
+  // CDRs with no session/CSRF. Security = the unguessable token path segment,
+  // validated inside the routes (403 on mismatch). ONLY the webhook subtree is
+  // public — click-to-call/recording/backfill under /api/telecmi stay authed.
+  if (pathname.startsWith('/api/telecmi/webhook/')) return true;
   if (pathname.includes('/print')) return true;            // PO print pages render via cookie if present
   if (pathname.startsWith('/_next')) return true;
   if (pathname.startsWith('/favicon')) return true;

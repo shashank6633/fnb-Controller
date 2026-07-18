@@ -200,6 +200,29 @@ export async function GET() {
       console.error('[/api/notifications/inbox] task buckets failed:', taskErr);
     }
 
+    // ── CRM Call-to-Table: pending missed-call recoveries (additive; isolated
+    //    so a ct-schema issue can never break the existing inbox). Visible to
+    //    admins and anyone explicitly granted the Recovery Queue page — same
+    //    "explicit page list only" rule as the KDS bucket above. ─────────────
+    try {
+      let seesCt = isAdmin;
+      if (!seesCt && me.page_access) {
+        try {
+          const pages = JSON.parse(me.page_access) as string[];
+          seesCt = pages.includes('/crm-calls/recovery') || pages.includes('/crm-calls');
+        } catch { /* ignore */ }
+      }
+      if (seesCt) {
+        const n = one(
+          `SELECT COUNT(*) AS n FROM ct_recoveries WHERE status IN ('pending', 'attempting')`,
+          [],
+        );
+        push('ct_recoveries', 'Missed calls awaiting callback', n, '/crm-calls/recovery');
+      }
+    } catch (ctErr) {
+      console.error('[/api/notifications/inbox] ct bucket failed:', ctErr);
+    }
+
     const total = items.reduce((s, i) => s + i.count, 0);
     return Response.json({ total, items });
   } catch (e: any) {

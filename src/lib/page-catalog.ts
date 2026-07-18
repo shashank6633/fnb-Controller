@@ -166,6 +166,21 @@ export const PAGE_CATALOG: PageSection[] = [
     ],
   },
   {
+    // CRM — Call-to-Table: TeleCMI telephony guest CRM (screen-pop, missed-call
+    // recovery queue, guest 360, call log). Grant to GRE/front-office users.
+    // Settings is admin-only (server-gated too). See docs/CRM_DECISIONS.md.
+    label: 'CRM',
+    pages: [
+      { path: '/crm-calls',          label: 'CRM Dashboard' },
+      { path: '/crm-calls/live',     label: 'Live Calls' },
+      { path: '/crm-calls/recovery', label: 'Recovery Queue' },
+      { path: '/crm-calls/guests',   label: 'CRM Guests' },
+      { path: '/crm-calls/log',      label: 'Call Log' },
+      { path: '/crm-calls/bookings', label: 'CRM Bookings' },
+      { path: '/crm-calls/settings', label: 'CRM Call Settings', mgmtOnly: true },
+    ],
+  },
+  {
     // AKAN CRM — AI assistant / training / quizzes for the Front Office & GRE
     // team (ported from the standalone Flask app). Grant per user/role like any
     // other page. Quiz Links + CRM Settings are HOD/admin surfaces.

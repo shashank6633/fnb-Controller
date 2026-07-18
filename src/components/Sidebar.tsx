@@ -59,6 +59,11 @@ import {
   Settings2,
   Scale,
   Wallet,
+  Phone,
+  PhoneMissed,
+  PhoneCall,
+  PhoneIncoming,
+  CalendarCheck,
   type LucideIcon,
 } from "lucide-react";
 
@@ -210,6 +215,23 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Departments",       href: "/tasks/departments",     icon: Building2 },
       { kind: "link", label: "Notifications",     href: "/tasks/notifications",   icon: Bell },
       { kind: "link", label: "Settings",          href: "/tasks/settings",        icon: Settings2 },
+    ],
+  },
+
+  // CRM — Call-to-Table: TeleCMI telephony guest CRM (screen-pop, missed-call
+  // recovery, guest 360). Distinct from AKAN CRM below. See docs/CRM_DECISIONS.md.
+  {
+    kind: "section",
+    label: "CRM",
+    icon: Phone,
+    items: [
+      { kind: "link", label: "CRM Dashboard",   href: "/crm-calls",          icon: BarChart3 },
+      { kind: "link", label: "Live Calls",      href: "/crm-calls/live",     icon: PhoneIncoming },
+      { kind: "link", label: "Recovery Queue",  href: "/crm-calls/recovery", icon: PhoneMissed },
+      { kind: "link", label: "Guests",          href: "/crm-calls/guests",   icon: Users },
+      { kind: "link", label: "Call Log",        href: "/crm-calls/log",      icon: PhoneCall },
+      { kind: "link", label: "Bookings",        href: "/crm-calls/bookings", icon: CalendarCheck },
+      { kind: "link", label: "CRM Settings",    href: "/crm-calls/settings", icon: Settings2 },
     ],
   },
 
