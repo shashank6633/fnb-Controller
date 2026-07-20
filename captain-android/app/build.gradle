@@ -26,13 +26,13 @@ def twaManifest = [
     launchUrl: '/launch', // The start path for the TWA. Must be relative to the domain.
     name: 'AKAN Captain', // The application name.
     launcherName: 'Captain', // The name shown on the Android Launcher.
-    themeColor: '#1C0F05', // The color used for the status bar.
-    themeColorDark: '#1C0F05', // The color used for the dark status bar.
-    navigationColor: '#1C0F05', // The color used for the navigation bar.
-    navigationColorDark: '#1C0F05', // The color used for the dark navbar.
-    navigationDividerColor: '#1C0F05', // The navbar divider color.
-    navigationDividerColorDark: '#1C0F05', // The dark navbar divider color.
-    backgroundColor: '#FBF6F0', // The color used for the splash screen background.
+    themeColor: '#af4408', // The color used for the status bar.
+    themeColorDark: '#af4408', // The color used for the dark status bar.
+    navigationColor: '#FFF8F0', // The color used for the navigation bar.
+    navigationColorDark: '#FFF8F0', // The color used for the dark navbar.
+    navigationDividerColor: '#E8D5C4', // The navbar divider color.
+    navigationDividerColorDark: '#E8D5C4', // The dark navbar divider color.
+    backgroundColor: '#FFF8F0', // The color used for the splash screen background.
     enableNotifications: false, // Set to true to enable notification delegation.
     // Every shortcut must include the following fields:
     // - name: String that will show up in the shortcut.
