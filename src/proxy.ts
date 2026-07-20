@@ -103,6 +103,11 @@ function isPublic(pathname: string): boolean {
   // validated inside the routes (403 on mismatch). ONLY the webhook subtree is
   // public — click-to-call/recording/backfill under /api/telecmi stay authed.
   if (pathname.startsWith('/api/telecmi/webhook/')) return true;
+  // Crash reporter: the client error boundaries + global handlers POST here, and
+  // a crash can happen before login / in a state where the CSRF cookie isn't
+  // available — so POST is public + CSRF-exempt. It's rate-limited, size-capped
+  // and write-only; the GET/PATCH admin console self-checks role==='admin'.
+  if (pathname === '/api/error-report') return true;
   if (pathname.includes('/print')) return true;            // PO print pages render via cookie if present
   if (pathname.startsWith('/_next')) return true;
   if (pathname.startsWith('/favicon')) return true;

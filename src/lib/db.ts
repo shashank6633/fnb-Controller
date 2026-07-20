@@ -1259,6 +1259,38 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('notifications schema failed:', e); }
 
+  // ── Crash-proofing: captured production errors (web + captain + server) ──────
+  // Every uncaught client error, unhandled rejection, React error-boundary hit,
+  // and server-side onRequestError is POSTed to /api/error-report and stored
+  // here. Identical errors (same digest) collapse into one OPEN row with a bumped
+  // count, so a crash loop can't flood the table or the admin bell. Admins see an
+  // "App errors" bucket in the notification bell + the /settings/errors page.
+  // Isolated so a schema hiccup can never break the rest of initializeSchema.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS error_reports (
+        id           TEXT PRIMARY KEY,
+        digest       TEXT NOT NULL,               -- hash(source|message|where) for dedup
+        source       TEXT NOT NULL DEFAULT 'web', -- 'web' | 'captain' | 'server' | 'client'
+        message      TEXT NOT NULL DEFAULT '',
+        stack        TEXT NOT NULL DEFAULT '',
+        url          TEXT NOT NULL DEFAULT '',
+        user_email   TEXT NOT NULL DEFAULT '',
+        user_role    TEXT NOT NULL DEFAULT '',
+        user_agent   TEXT NOT NULL DEFAULT '',
+        count        INTEGER NOT NULL DEFAULT 1,
+        first_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen    TEXT NOT NULL DEFAULT (datetime('now')),
+        resolved_at  TEXT,
+        resolved_by  TEXT NOT NULL DEFAULT '',
+        notified_at  TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_error_digest    ON error_reports(digest);
+      CREATE INDEX IF NOT EXISTS idx_error_last_seen ON error_reports(last_seen);
+      CREATE INDEX IF NOT EXISTS idx_error_unresolved ON error_reports(resolved_at);
+    `);
+  } catch (e) { console.error('error_reports schema failed:', e); }
+
   // Migration: per-line department on requisition items so a single party
   // requisition can span kitchen + bar + housekeeping with each item tagged
   // to the owning department. Backfills from parent requisition.department_id.

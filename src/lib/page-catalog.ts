@@ -30,6 +30,12 @@ export interface PageEntry {
    * for sensitive customer PII (the Customers page).
    */
   mgmtOnly?: boolean;
+  /**
+   * When true, ONLY an Admin (role === 'admin') may see/open this page —
+   * stricter than mgmtOnly/hodOnly. Used for admin-only consoles like the App
+   * Errors page. Non-admins are blocked even with an explicit page_access grant.
+   */
+  adminOnly?: boolean;
 }
 
 export interface PageSection {
@@ -215,6 +221,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/settings/integrations/whatsapp', label: 'Settings — WhatsApp' },
       { path: '/settings/qr-standees', label: 'Settings — QR Standees' },
       { path: '/settings/customer-menu', label: 'Settings — Menu Design' },
+      { path: '/settings/errors', label: 'Settings — App Errors', adminOnly: true },
       { path: '/admin/data-hygiene',  label: 'Admin — Data Hygiene' },
       { path: '/admin/reset',         label: 'Admin — Reset' },
     ],
@@ -246,6 +253,10 @@ export function isHodOnlyPath(pathname: string): boolean {
 /** Is `pathname` under a management-only catalog entry (admin/manager/HOD)? */
 export function isMgmtOnlyPath(pathname: string): boolean {
   return !!bestEntry(pathname)?.mgmtOnly;
+}
+/** Is `pathname` under an admin-only catalog entry (role === 'admin' only)? */
+export function isAdminOnlyPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.adminOnly;
 }
 
 /**
@@ -328,7 +339,8 @@ export function firstAllowedPath(user: { role?: string; page_access?: string | n
     for (const p of section.pages) {
       if (allowed.includes(p.path)
         && !(p.hodOnly && !user.is_head_chef)
-        && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef))) return p.path;
+        && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef))
+        && !(p.adminOnly && user.role !== 'admin')) return p.path;
     }
   }
   return '/login';
@@ -361,6 +373,12 @@ export function canAccessPage(
   // HOD. Also runs before the null-map grant so legacy full-access staff can't
   // reach the Customers page.
   if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)) return false;
+
+  // Admin-only pages (App Errors console): a non-admin is blocked outright,
+  // whatever their page_access map says — runs before the null-map grant so
+  // legacy full-access staff can't reach it either. (Admins already returned
+  // true above, so this only ever affects non-admins.)
+  if (isAdminOnlyPath(pathname)) return false;
 
   // No explicit map → grant everything (backward compat)
   if (!user.page_access) return true;

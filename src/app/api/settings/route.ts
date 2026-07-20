@@ -11,11 +11,17 @@ export async function GET(req: Request) {
   const db = getDb();
   const url = new URL(req.url);
   const key = url.searchParams.get('key');
+  // error_alert_phone (crash-alert WhatsApp number) is admin-only — don't leak
+  // it to non-admin staff via the generic settings read.
+  const isAdmin = me.role === 'admin';
+  const ADMIN_ONLY_KEYS = new Set(['error_alert_phone']);
   if (key) {
+    if (ADMIN_ONLY_KEYS.has(key) && !isAdmin) return Response.json({ key, value: null });
     const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as any;
     return Response.json({ key, value: r?.value ?? null });
   }
-  const all = db.prepare('SELECT key, value FROM settings').all();
+  const all = (db.prepare('SELECT key, value FROM settings').all() as any[])
+    .filter((row) => isAdmin || !ADMIN_ONLY_KEYS.has(row.key));
   return Response.json({ settings: all });
 }
 
@@ -37,6 +43,12 @@ export async function PUT(req: Request) {
   // self-lift the block — restrict this one key to admins.
   if (key === 'purchase_backdate_limit_days' && me.role !== 'admin') {
     return Response.json({ error: 'Admin role required to change the backdate limit' }, { status: 403 });
+  }
+  // The crash-alert WhatsApp number decides WHO gets production error alerts —
+  // a manager must not redirect or silence it (the /api/error-report console is
+  // admin-only, so this second door must be too).
+  if (key === 'error_alert_phone' && me.role !== 'admin') {
+    return Response.json({ error: 'Admin role required to change the error alert number' }, { status: 403 });
   }
   db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, String(value ?? ''));
   return Response.json({ key, value });

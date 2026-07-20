@@ -223,6 +223,18 @@ export async function GET() {
       console.error('[/api/notifications/inbox] ct bucket failed:', ctErr);
     }
 
+    // ── App errors (crash-proofing): ADMIN-ONLY bucket. Count of unresolved
+    //    captured production errors → deep-links to the errors console. Isolated
+    //    so an error_reports schema issue can never break the whole inbox. ──────
+    if (isAdmin) {
+      try {
+        const { unresolvedErrorCount } = await import('@/lib/error-alerts');
+        push('app_errors', 'App errors need attention', unresolvedErrorCount(db), '/settings/errors');
+      } catch (errBucket) {
+        console.error('[/api/notifications/inbox] app-error bucket failed:', errBucket);
+      }
+    }
+
     const total = items.reduce((s, i) => s + i.count, 0);
     return Response.json({ total, items });
   } catch (e: any) {

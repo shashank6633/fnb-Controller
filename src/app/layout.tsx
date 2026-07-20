@@ -3,6 +3,7 @@ import { Inter } from "next/font/google";
 import AppShell from "@/components/AppShell";
 import ServiceWorkerRegister from "@/components/ServiceWorkerRegister";
 import BuildVersionWatcher from "@/components/BuildVersionWatcher";
+import GlobalErrorReporter from "@/components/GlobalErrorReporter";
 import "./globals.css";
 
 const inter = Inter({
@@ -47,6 +48,9 @@ export default function RootLayout({
     <html lang="en" className={`${inter.className} h-full antialiased`}>
       <body className="min-h-full bg-bg text-text">
         <ServiceWorkerRegister />
+        {/* Reports uncaught errors + unhandled rejections (that React error
+            boundaries can't catch) so an admin is alerted. Renders nothing. */}
+        <GlobalErrorReporter />
         {/* Detects post-deploy stale-bundle state and auto-reloads. Prevents
             the "Failed to find Server Action" / Safari "This page couldn't load"
             error class entirely. */}
