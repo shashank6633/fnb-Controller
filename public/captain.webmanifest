@@ -3,7 +3,7 @@
   "short_name": "Captain",
   "description": "Take dine-in & takeaway orders, send KOTs and print bills — AKAN restaurant.",
   "id": "/captain",
-  "start_url": "/captain",
+  "start_url": "/launch",
   "display": "standalone",
   "orientation": "any",
   "theme_color": "#1C0F05",

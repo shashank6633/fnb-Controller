@@ -140,6 +140,18 @@ export default function CrmDashboardPage() {
     () => Math.max(1, ...(stats?.byHour || []).map(h => h.total)),
     [stats]
   );
+  // Peak day / hour — surfaced as visible summary lines so the counts are
+  // readable on touch devices (title tooltips never fire on a phone).
+  const peakDay = useMemo(() => {
+    let best: DayPoint | null = null;
+    for (const d of stats?.byDay || []) if (d.total > 0 && (!best || d.total > best.total)) best = d;
+    return best;
+  }, [stats]);
+  const peakHour = useMemo(() => {
+    let best: HourPoint | null = null;
+    for (const h of stats?.byHour || []) if (h.total > 0 && (!best || h.total > best.total)) best = h;
+    return best;
+  }, [stats]);
 
   if (loading && !stats) {
     return (
@@ -238,7 +250,7 @@ export default function CrmDashboardPage() {
               {breached > 0 && <span aria-hidden className="mr-1 text-base align-middle">🔴</span>}
               {fmtNum(today.pending_recoveries)}
             </p>
-            <p className={`text-[11px] mt-0.5 ${breached > 0 ? 'text-red-600 font-semibold' : 'text-[#B9A48C]'}`}>
+            <p className={`text-[11px] mt-0.5 ${breached > 0 ? 'text-red-600 font-semibold' : 'text-[#8B7355]'}`}>
               {breached > 0 ? `${breached} breached SLA` : today.pending_recoveries > 0 ? 'within SLA' : 'all clear'}
             </p>
           </Link>
@@ -329,7 +341,7 @@ export default function CrmDashboardPage() {
                   const step = stats.byDay.length > 10 ? 5 : 1;
                   const show = i % step === 0 || i === stats.byDay.length - 1;
                   return (
-                    <div key={d.date} className="flex-1 min-w-0 text-center text-[9px] sm:text-[10px] text-[#B9A48C] truncate">
+                    <div key={d.date} className="flex-1 min-w-0 text-center text-[9px] sm:text-[10px] text-[#8B7355] whitespace-nowrap">
                       {show ? shortDate(d.date) : ''}
                     </div>
                   );
@@ -340,6 +352,11 @@ export default function CrmDashboardPage() {
                 <LegendDot className="bg-red-400" label="Missed" />
                 <LegendDot className="bg-[#E8D5C4]" label="Other" />
               </div>
+              {peakDay && (
+                <p className="mt-2 text-[11px] text-[#8B7355]">
+                  Peak day: <span className="font-semibold text-[#6B5744]">{shortDate(peakDay.date)}</span> ({fmtNum(peakDay.total)} {peakDay.total === 1 ? 'call' : 'calls'})
+                </p>
+              )}
             </>
           )}
 
@@ -348,33 +365,44 @@ export default function CrmDashboardPage() {
             <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide mb-2">
               By hour of day (IST) — staffing view
             </p>
-            <div className="flex gap-[2px]">
-              {stats.byHour.map(h => {
-                const alpha = h.total > 0 ? 0.15 + (h.total / maxHour) * 0.8 : 0;
-                return (
-                  <div
-                    key={h.hour}
-                    className="flex-1 min-w-0 h-8 sm:h-9 rounded-sm relative border border-[#F0E4D6]"
-                    style={{ backgroundColor: h.total > 0 ? `rgba(175, 68, 8, ${alpha})` : '#FAF3EA' }}
-                    title={`${String(h.hour).padStart(2, '0')}:00 — ${h.total} calls, ${h.missed} missed`}
-                  >
-                    {h.missed > 0 && (
-                      <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-red-500" aria-hidden />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-            <div className="flex gap-[2px] mt-1">
-              {stats.byHour.map(h => (
-                <div key={h.hour} className="flex-1 min-w-0 text-center text-[9px] text-[#B9A48C]">
-                  {h.hour % 6 === 0 || h.hour === 23 ? h.hour : ''}
+            {stats.byHour.every(h => h.total === 0) ? (
+              <Empty text="No calls in this window yet." />
+            ) : (
+              <>
+                <div className="flex gap-[2px]">
+                  {stats.byHour.map(h => {
+                    const alpha = h.total > 0 ? 0.15 + (h.total / maxHour) * 0.8 : 0;
+                    return (
+                      <div
+                        key={h.hour}
+                        className="flex-1 min-w-0 h-8 sm:h-9 rounded-sm relative border border-[#F0E4D6]"
+                        style={{ backgroundColor: h.total > 0 ? `rgba(175, 68, 8, ${alpha})` : '#FAF3EA' }}
+                        title={`${String(h.hour).padStart(2, '0')}:00 — ${h.total} calls, ${h.missed} missed`}
+                      >
+                        {h.missed > 0 && (
+                          <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-red-500" aria-hidden />
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
-              ))}
-            </div>
-            <p className="mt-1.5 text-[11px] text-[#B9A48C]">
-              Darker = more calls · <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500 align-middle" /> = missed calls in that hour
-            </p>
+                <div className="flex gap-[2px] mt-1">
+                  {stats.byHour.map(h => (
+                    <div key={h.hour} className="flex-1 min-w-0 text-center text-[9px] text-[#8B7355]">
+                      {h.hour % 6 === 0 || h.hour === 23 ? h.hour : ''}
+                    </div>
+                  ))}
+                </div>
+                {peakHour && (
+                  <p className="mt-1.5 text-[11px] text-[#8B7355]">
+                    Peak hour: <span className="font-semibold text-[#6B5744]">{String(peakHour.hour).padStart(2, '0')}:00</span> ({fmtNum(peakHour.total)} {peakHour.total === 1 ? 'call' : 'calls'}{peakHour.missed > 0 ? `, ${fmtNum(peakHour.missed)} missed` : ''})
+                  </p>
+                )}
+                <p className="mt-1.5 text-[11px] text-[#8B7355]">
+                  Darker = more calls · <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500 align-middle" /> = missed calls in that hour
+                </p>
+              </>
+            )}
           </div>
         </Card>
 
@@ -480,7 +508,7 @@ function Stat({ icon, label, value, sub, className }: {
         {icon}{label}
       </p>
       <p className={`text-xl sm:text-2xl font-bold mt-1 ${className}`}>{value}</p>
-      {sub ? <p className="text-[11px] text-[#B9A48C] mt-0.5">{sub}</p> : null}
+      {sub ? <p className="text-[11px] text-[#8B7355] mt-0.5">{sub}</p> : null}
     </div>
   );
 }
@@ -497,7 +525,7 @@ function Card({ icon, title, subtitle, children }: {
         <h2 className="text-sm font-bold text-[#2D1B0E] flex items-center gap-2">
           <span className="text-[#af4408]">{icon}</span>{title}
         </h2>
-        {subtitle ? <p className="text-[11px] text-[#B9A48C] truncate">{subtitle}</p> : null}
+        {subtitle ? <p className="text-[11px] text-[#8B7355] truncate">{subtitle}</p> : null}
       </div>
       {children}
     </div>
@@ -529,7 +557,7 @@ function FunnelChart({ stages, barClasses }: {
               <span className="text-[#8B7355]">
                 <span className="font-bold text-[#2D1B0E]">{fmtNum(s.value)}</span>
                 <span className="ml-1.5">{i === 0 ? '100%' : `${ofFirst}%`}</span>
-                {step !== null && <span className="ml-1.5 text-[10px] text-[#B9A48C]">({step}% of prev)</span>}
+                {step !== null && <span className="ml-1.5 text-[10px] text-[#8B7355]">({step}% of prev)</span>}
               </span>
             </div>
             <div className="h-5 bg-[#FAF3EA] rounded-md overflow-hidden">
@@ -582,5 +610,5 @@ function LegendDot({ className, label }: { className: string; label: string }) {
 }
 
 function Empty({ text }: { text: string }) {
-  return <p className="py-8 text-center text-sm text-[#B9A48C]">{text}</p>;
+  return <p className="py-8 text-center text-sm text-[#8B7355]">{text}</p>;
 }

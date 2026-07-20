@@ -17,7 +17,14 @@ export default function LoginPage() {
 function LoginForm() {
   const router = useRouter();
   const params = useSearchParams();
-  const next = params.get('next') || '/';
+  // Default to the role-aware launcher so every user lands on their own home
+  // (management → dashboard, GRE → recovery, captain → POS…), not a fixed page.
+  // Restrict `next` to a LOCAL absolute path — reject cross-origin (//host),
+  // backslash tricks, and javascript: URIs so ?next= can't open-redirect.
+  const rawNext = params.get('next');
+  const next = rawNext && rawNext.startsWith('/') && !rawNext.startsWith('//') && !rawNext.startsWith('/\\')
+    ? rawNext
+    : '/launch';
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);

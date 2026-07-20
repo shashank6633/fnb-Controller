@@ -106,6 +106,10 @@ function isPublic(pathname: string): boolean {
   if (pathname.includes('/print')) return true;            // PO print pages render via cookie if present
   if (pathname.startsWith('/_next')) return true;
   if (pathname.startsWith('/favicon')) return true;
+  // App downloads (the AKAN Captain APK): staff install it on fresh phones that
+  // aren't signed in yet, so the file must be reachable without auth. It's just
+  // the TWA wrapper (no secrets — those live in server env), so public is safe.
+  if (pathname.startsWith('/downloads/')) return true;
   // manifest.json + sw.js + offline.html must be reachable without auth so the
   // browser can install the PWA shell / unregister the SW even before login.
   if (pathname === '/manifest.json') return true;

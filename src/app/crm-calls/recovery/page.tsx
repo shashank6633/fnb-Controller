@@ -380,7 +380,7 @@ export default function RecoveryQueuePage() {
         {/* Header */}
         <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
           <div>
-            <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">CRM — Call-to-Table</p>
+            <p className="text-[11px] font-semibold text-[#6B5744] uppercase tracking-wider">CRM — Call-to-Table</p>
             <div className="flex items-center gap-3 mt-0.5">
               <h1 className="text-2xl sm:text-3xl font-bold flex items-center gap-2.5">
                 <PhoneMissed className="w-7 h-7 text-[#af4408]" />
@@ -448,7 +448,7 @@ export default function RecoveryQueuePage() {
                   }`}
                 >
                   {t.label}
-                  <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${on ? 'bg-white/25' : 'bg-[#FFF1E3] text-[#8B7355]'}`}>
+                  <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${on ? 'bg-white/25' : 'bg-[#FFF1E3] text-[#6B5744]'}`}>
                     {tabCount(t.key)}
                   </span>
                 </button>
@@ -476,7 +476,19 @@ export default function RecoveryQueuePage() {
         {/* Queue */}
         {filteredRows.length === 0 ? (
           <div className="bg-white border border-[#E8D5C4] rounded-xl py-16 text-center text-[#8B7355]">
-            {tab === 'open' && !search ? (
+            {loadError ? (
+              <>
+                <AlertCircle className="w-10 h-10 mx-auto mb-3 text-red-500" />
+                <p className="font-medium text-[#2D1B0E]">Couldn&apos;t load the recovery queue</p>
+                <p className="text-xs mt-1 text-[#6B5744]">This is a load error, not an empty queue — please retry.</p>
+                <button
+                  onClick={() => fetchList(false)}
+                  className="mt-3 inline-flex items-center gap-2 px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium transition-colors"
+                >
+                  <RefreshCw className="w-4 h-4" /> Retry
+                </button>
+              </>
+            ) : tab === 'open' && !search ? (
               <>
                 <CheckCircle className="w-10 h-10 mx-auto mb-3 text-green-500" />
                 <p className="font-medium text-[#2D1B0E]">All clear — no missed calls waiting</p>
@@ -497,7 +509,7 @@ export default function RecoveryQueuePage() {
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="text-[11px] uppercase tracking-wide text-[#8B7355] border-b border-[#E8D5C4] bg-[#FFF8F0]">
+                    <tr className="text-[11px] uppercase tracking-wide text-[#6B5744] border-b border-[#E8D5C4] bg-[#FFF8F0]">
                       <th className="w-8" aria-label="Expand"></th>
                       <th className="text-left py-3 px-2 font-semibold">Caller</th>
                       <th className="text-left py-3 px-3 font-semibold">Missed (IST)</th>
@@ -610,8 +622,16 @@ function RowGroup(props: RowActions & { showStatusCol: boolean }) {
         onClick={onToggle}
         className={`border-b border-[#F0E4D6] last:border-0 cursor-pointer transition-colors ${expanded ? 'bg-[#FFF8F0]' : 'hover:bg-[#FFF8F0]'}`}
       >
-        <td className="py-2.5 pl-3 pr-1 text-[#8B7355]">
-          {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+        <td className="py-2.5 pl-3 pr-1">
+          <button
+            type="button"
+            aria-expanded={expanded}
+            aria-label={expanded ? 'Collapse details' : 'Expand details'}
+            onClick={e => { e.stopPropagation(); onToggle(); }}
+            className="flex items-center justify-center text-[#8B7355] hover:text-[#af4408] transition-colors"
+          >
+            {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          </button>
         </td>
         <td className="py-2.5 px-2">
           <CallerCell r={r} />
@@ -621,8 +641,10 @@ function RowGroup(props: RowActions & { showStatusCol: boolean }) {
         <td className="py-2.5 px-3 text-center">
           <AttemptsBadge count={r.attempts.length} />
         </td>
-        <td className="py-2.5 px-3 text-[13px] text-[#6B5744] max-w-[160px] truncate">
-          {r.assigned_to || <span className="text-[#C4B09A]">Unassigned</span>}
+        <td className="py-2.5 px-3 text-[13px] text-[#6B5744]">
+          <div className="max-w-[160px] truncate" title={r.assigned_to || undefined}>
+            {r.assigned_to || <span className="text-[#C4B09A]">Unassigned</span>}
+          </div>
         </td>
         {showStatusCol && <td className="py-2.5 px-3"><StatusBadge status={r.status} /></td>}
         <td className="py-2.5 px-4">
@@ -677,7 +699,7 @@ function MobileCard(props: RowActions) {
           <CallerCell r={r} />
           <SlaChip r={r} nowMs={nowMs} />
         </div>
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-[11px] text-[#8B7355]">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-[11px] text-[#6B5744]">
           <span className="inline-flex items-center gap-1"><Clock className="w-3 h-3" />Missed {istDateTime(r.missed_at)}</span>
           <span>{r.attempts.length} attempt{r.attempts.length === 1 ? '' : 's'}</span>
           <span className="truncate">{r.assigned_to ? `→ ${r.assigned_to}` : 'Unassigned'}</span>
@@ -715,11 +737,11 @@ function DetailPanel(props: RowActions) {
 
       {/* Attempts timeline */}
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
-        <h3 className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider mb-3">
+        <h3 className="text-[11px] font-semibold text-[#6B5744] uppercase tracking-wider mb-3">
           Attempts ({r.attempts.length})
         </h3>
         {r.attempts.length === 0 ? (
-          <p className="text-xs text-[#C4B09A]">No callback attempts yet — the SLA clock is running.</p>
+          <p className="text-xs text-[#6B5744]">No callback attempts yet — the SLA clock is running.</p>
         ) : (
           <ol className="space-y-2.5">
             {r.attempts.map((a, i) => (
@@ -736,14 +758,14 @@ function DetailPanel(props: RowActions) {
                     <span className="font-semibold capitalize">{a.method}</span>
                     {a.outcome ? <span className="text-[#6B5744]"> — {a.outcome}</span> : null}
                   </p>
-                  <p className="text-[11px] text-[#8B7355]">{istDateTime(a.at)}{a.by ? ` · ${a.by}` : ''}</p>
+                  <p className="text-[11px] text-[#6B5744]">{istDateTime(a.at)}{a.by ? ` · ${a.by}` : ''}</p>
                 </div>
               </li>
             ))}
           </ol>
         )}
         {r.first_attempt_at && (
-          <p className="text-[11px] text-[#8B7355] mt-3 pt-2 border-t border-[#F0E4D6]">
+          <p className="text-[11px] text-[#6B5744] mt-3 pt-2 border-t border-[#F0E4D6]">
             First attempt {istDateTime(r.first_attempt_at)}
           </p>
         )}
@@ -756,7 +778,7 @@ function DetailPanel(props: RowActions) {
 
       {/* Source call info */}
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
-        <h3 className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider mb-3">Missed call</h3>
+        <h3 className="text-[11px] font-semibold text-[#6B5744] uppercase tracking-wider mb-3">Missed call</h3>
         {r.call ? (
           <dl className="space-y-1.5 text-[13px]">
             <DetailRow label="Direction">
@@ -773,10 +795,10 @@ function DetailPanel(props: RowActions) {
             {r.call.disposition ? <DetailRow label="Disposition"><span className="capitalize">{r.call.disposition.replace(/_/g, ' ')}</span></DetailRow> : null}
           </dl>
         ) : (
-          <p className="text-xs text-[#C4B09A]">Call record not found (detected via {r.detected_via.replace(/_/g, ' ')}).</p>
+          <p className="text-xs text-[#6B5744]">Call record not found (detected via {r.detected_via.replace(/_/g, ' ')}).</p>
         )}
         <div className="flex flex-wrap gap-1.5 mt-3 pt-2 border-t border-[#F0E4D6] text-[11px]">
-          <span className="px-2 py-0.5 rounded-full bg-[#FFF1E3] text-[#8B7355]">via {r.detected_via.replace(/_/g, ' ')}</span>
+          <span className="px-2 py-0.5 rounded-full bg-[#FFF1E3] text-[#6B5744]">via {r.detected_via.replace(/_/g, ' ')}</span>
           {!!r.escalated && (
             <span className="px-2 py-0.5 rounded-full bg-red-50 text-red-700 border border-red-200 font-medium">
               Escalated{r.escalated_at ? ` ${istTime(r.escalated_at)}` : ''}
@@ -797,7 +819,7 @@ function DetailPanel(props: RowActions) {
 
       {/* Guest link / inline create + manual resolve */}
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 flex flex-col">
-        <h3 className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider mb-3">Guest</h3>
+        <h3 className="text-[11px] font-semibold text-[#6B5744] uppercase tracking-wider mb-3">Guest</h3>
         {knownGuest ? (
           <div className="space-y-2">
             <p className="text-[13px] font-semibold flex items-center gap-1.5">
@@ -809,7 +831,7 @@ function DetailPanel(props: RowActions) {
             {r.guest_tags.length > 0 && (
               <div className="flex flex-wrap gap-1">
                 {r.guest_tags.map(t => (
-                  <span key={t} className="px-1.5 py-0.5 rounded-full bg-[#FFF1E3] text-[#8B7355] text-[10px] font-medium">{t}</span>
+                  <span key={t} className="px-1.5 py-0.5 rounded-full bg-[#FFF1E3] text-[#6B5744] text-[10px] font-medium">{t}</span>
                 ))}
               </div>
             )}
@@ -856,7 +878,7 @@ function DetailPanel(props: RowActions) {
               {busy === `${r.id}:resolve` ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
               Mark Recovered (guest reached)
             </button>
-            <p className="text-[10px] text-[#C4B09A] mt-1.5 text-center">
+            <p className="text-[10px] text-[#6B5744] mt-1.5 text-center">
               Answered callbacks auto-recover via the call log — this is the manual fallback.
             </p>
           </div>
@@ -869,7 +891,7 @@ function DetailPanel(props: RowActions) {
 function DetailRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex items-baseline gap-2">
-      <dt className="w-24 shrink-0 text-[11px] text-[#8B7355] uppercase tracking-wide">{label}</dt>
+      <dt className="w-24 shrink-0 text-[11px] text-[#6B5744] uppercase tracking-wide">{label}</dt>
       <dd className="text-[#3D2614] min-w-0">{children}</dd>
     </div>
   );
@@ -891,7 +913,7 @@ function CallerCell({ r }: { r: Recovery }) {
           <span className="truncate">{known ? (r.guest_name || '').trim() : formatPhone(r.phone_e164)}</span>
           {r.is_vip && <VipBadge />}
         </p>
-        <p className="text-[11px] text-[#8B7355] font-mono truncate">
+        <p className="text-[11px] text-[#6B5744] font-mono truncate">
           {known ? formatPhone(r.phone_e164) : 'Unknown caller'}
         </p>
       </div>

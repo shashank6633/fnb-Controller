@@ -31,6 +31,7 @@ import {
   Phone,
   CalendarDays,
 } from 'lucide-react';
+import CollapsibleToolbar from '@/components/ct/CollapsibleToolbar';
 
 const PAGE_SIZE = 25;
 
@@ -160,6 +161,40 @@ export default function CtGuestsPage() {
     return () => clearTimeout(t);
   }, [searchInput]);
 
+  // Seed the Tag filter with the full tag vocabulary once on mount, so tags on
+  // guests beyond the current 25-row page are still selectable. The API has no
+  // distinct-tags endpoint, so we pull a broad unfiltered page and union its
+  // tags; `tags=1` is sent so this also works if that mode is added later
+  // (returning a top-level { tags: [] }). Per-page accumulation stays as a
+  // harmless supplement.
+  useEffect(() => {
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch('/api/crm-calls/guests?tags=1&pageSize=200', { signal: ctrl.signal, cache: 'no-store' });
+        if (!res.ok) return;
+        let json: any = {};
+        try { json = await res.json(); } catch { return; }
+        const collected = new Set<string>();
+        if (Array.isArray(json?.tags)) {
+          for (const t of json.tags) { const v = String(t).trim(); if (v) collected.add(v); }
+        }
+        if (Array.isArray(json?.guests)) {
+          for (const g of json.guests) {
+            if (Array.isArray(g?.tags)) for (const t of g.tags) { const v = String(t).trim(); if (v) collected.add(v); }
+          }
+        }
+        if (collected.size === 0) return;
+        setKnownTags(prev => {
+          const s = new Set(prev);
+          for (const v of collected) s.add(v);
+          return s.size === prev.length ? prev : Array.from(s).sort((a, b) => a.localeCompare(b));
+        });
+      } catch { /* best-effort; per-page accumulation still populates the filter */ }
+    })();
+    return () => ctrl.abort();
+  }, []);
+
   // Filter/sort params shared by the list fetch and the CSV export
   const buildQuery = useCallback((): URLSearchParams => {
     const p = new URLSearchParams();
@@ -236,6 +271,9 @@ export default function CtGuestsPage() {
   };
 
   const hasFilters = !!(search || badgeFilter || tagFilter || convertedFilter || lastCallFrom || lastCallTo);
+  // Secondary filters that live inside the mobile "Filters & options" dropdown
+  // (search stays visible outside it, so it is excluded from the badge count).
+  const filterCount = [badgeFilter, tagFilter, convertedFilter, lastCallFrom, lastCallTo].filter(Boolean).length;
   const clearFilters = () => {
     setSearchInput(''); setSearch('');
     setBadgeFilter(''); setTagFilter(''); setConvertedFilter('');
@@ -263,7 +301,7 @@ export default function CtGuestsPage() {
         {/* Header */}
         <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
           <div>
-            <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">CRM · Call to Table</p>
+            <p className="text-[11px] font-semibold text-[#6B5744] uppercase tracking-wider">CRM · Call to Table</p>
             <h1 className="text-2xl sm:text-3xl font-bold text-[#2D1B0E] mt-0.5">Guests</h1>
           </div>
           <div className="flex gap-2">
@@ -285,12 +323,14 @@ export default function CtGuestsPage() {
             <input
               type="text"
               placeholder="Search by name, phone or email…"
+              aria-label="Search guests by name, phone or email"
               value={searchInput}
               onChange={e => setSearchInput(e.target.value)}
               className="w-full pl-10 pr-9 py-2.5 bg-white border border-[#E0D0BE] rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]/40 focus:border-[#af4408] shadow-sm"
             />
             {fetching && <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355] animate-spin" />}
           </div>
+          <CollapsibleToolbar activeCount={filterCount}>
           <div className="flex flex-wrap items-center gap-2">
             <select value={badgeFilter} onChange={e => { setBadgeFilter(e.target.value); setPage(1); }}
                     className="px-3 py-2.5 bg-white border border-[#E0D0BE] rounded-xl text-sm shadow-sm"
@@ -326,20 +366,21 @@ export default function CtGuestsPage() {
               </button>
             )}
           </div>
-        </div>
 
-        {/* Mobile sort control (desktop sorts via column headers) */}
-        <div className="md:hidden flex items-center gap-2">
-          <label className="text-xs text-[#8B7355] shrink-0">Sort by</label>
-          <select value={sort} onChange={e => { const v = e.target.value; setSort(v); setDir(v === 'name' ? 'asc' : 'desc'); setPage(1); }}
-                  className="flex-1 px-3 py-2 bg-white border border-[#E0D0BE] rounded-xl text-sm shadow-sm">
-            {SORT_OPTIONS.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
-          </select>
-          <button onClick={() => { setDir(d => (d === 'asc' ? 'desc' : 'asc')); setPage(1); }}
-                  className="px-3 py-2 bg-white border border-[#E0D0BE] rounded-xl text-sm text-[#6B5744] shadow-sm"
-                  aria-label="Toggle sort direction">
-            {dir === 'asc' ? '↑ Asc' : '↓ Desc'}
-          </button>
+          {/* Mobile sort control (desktop sorts via column headers) */}
+          <div className="md:hidden flex items-center gap-2 mt-2">
+            <label className="text-xs text-[#8B7355] shrink-0">Sort by</label>
+            <select value={sort} onChange={e => { const v = e.target.value; setSort(v); setDir(v === 'name' ? 'asc' : 'desc'); setPage(1); }}
+                    className="flex-1 px-3 py-2 bg-white border border-[#E0D0BE] rounded-xl text-sm shadow-sm">
+              {SORT_OPTIONS.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+            </select>
+            <button onClick={() => { setDir(d => (d === 'asc' ? 'desc' : 'asc')); setPage(1); }}
+                    className="px-3 py-2 bg-white border border-[#E0D0BE] rounded-xl text-sm text-[#6B5744] shadow-sm"
+                    aria-label="Toggle sort direction">
+              {dir === 'asc' ? '↑ Asc' : '↓ Desc'}
+            </button>
+          </div>
+          </CollapsibleToolbar>
         </div>
 
         {/* Error */}
@@ -387,7 +428,7 @@ export default function CtGuestsPage() {
                             <GuestAvatar name={g.name} phone={g.phone_e164} />
                             <div className="min-w-0">
                               <p className="font-semibold text-[#2D1B0E] text-[13px] truncate max-w-[220px]">{g.name || 'Unknown caller'}</p>
-                              <p className="text-[11px] text-[#8B7355] flex items-center gap-1">
+                              <p className="text-[11px] text-[#6B5744] flex items-center gap-1">
                                 <Phone className="w-3 h-3" />{formatPhone(g.phone_e164)}
                               </p>
                             </div>
@@ -397,7 +438,7 @@ export default function CtGuestsPage() {
                         <td className="py-2.5 px-3"><TagChips tags={g.tags} /></td>
                         <td className="py-2.5 px-3 text-right">
                           <span className="font-semibold text-[#2D1B0E]">{g.metrics.calls_30d}</span>
-                          <span className="text-[11px] text-[#8B7355]"> / {g.metrics.total_calls}</span>
+                          <span className="text-[11px] text-[#6B5744]"> / {g.metrics.total_calls}</span>
                           {g.metrics.missed_calls > 0 && (
                             <p className="text-[11px] text-red-500">{g.metrics.missed_calls} missed</p>
                           )}
@@ -434,7 +475,7 @@ export default function CtGuestsPage() {
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
                           <p className="font-semibold text-[#2D1B0E] text-sm leading-snug truncate">{g.name || 'Unknown caller'}</p>
-                          <p className="text-[11px] text-[#8B7355]">{formatPhone(g.phone_e164)}</p>
+                          <p className="text-[11px] text-[#6B5744]">{formatPhone(g.phone_e164)}</p>
                         </div>
                         <BadgeChip badge={g.metrics.badge} />
                       </div>
@@ -443,19 +484,19 @@ export default function CtGuestsPage() {
                       )}
                       <div className="grid grid-cols-3 gap-2 mt-2 pt-2 border-t border-[#F0E4D6] text-center">
                         <div>
-                          <p className="text-[10px] text-[#8B7355] uppercase tracking-wide">Calls 30d</p>
+                          <p className="text-[10px] text-[#6B5744] uppercase tracking-wide">Calls 30d</p>
                           <p className="text-sm font-bold text-[#2D1B0E]">{g.metrics.calls_30d}</p>
                         </div>
                         <div>
-                          <p className="text-[10px] text-[#8B7355] uppercase tracking-wide">Bookings</p>
+                          <p className="text-[10px] text-[#6B5744] uppercase tracking-wide">Bookings</p>
                           <p className="text-sm font-bold text-[#2D1B0E]">{g.metrics.total_bookings}</p>
                         </div>
                         <div>
-                          <p className="text-[10px] text-[#8B7355] uppercase tracking-wide">Conv</p>
+                          <p className="text-[10px] text-[#6B5744] uppercase tracking-wide">Conv</p>
                           <p className="text-sm font-bold text-[#2D1B0E]">{convPct(g.metrics.conversion_rate)}</p>
                         </div>
                       </div>
-                      <div className="flex items-center justify-between mt-2 text-[11px] text-[#8B7355]">
+                      <div className="flex items-center justify-between mt-2 text-[11px] text-[#6B5744]">
                         <span>Last call: {istDateTime(g.metrics.last_call_at) || '—'}</span>
                         <span>Visit: {istDate(g.metrics.last_visit_at) || '—'}</span>
                       </div>
@@ -467,7 +508,7 @@ export default function CtGuestsPage() {
 
             {/* Pagination */}
             <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-1">
-              <p className="text-xs text-[#8B7355]">
+              <p className="text-xs text-[#6B5744]">
                 Showing {total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, total)} of {total} guests
               </p>
               <Pagination page={page} pageCount={pageCount} onPage={setPage} />
@@ -574,6 +615,13 @@ function NewGuestModal({ onClose, onGoto }: { onClose: () => void; onGoto: (id: 
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // Close on Escape (standard dismiss gesture for keyboard users)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   const canSave = form.name.trim().length > 0 && form.phone.trim().length > 0;
 
   const submit = async () => {
@@ -617,9 +665,10 @@ function NewGuestModal({ onClose, onGoto }: { onClose: () => void; onGoto: (id: 
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
       <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+           role="dialog" aria-modal="true" aria-labelledby="newguest-title"
            className="relative w-full max-w-md bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl flex flex-col overflow-hidden">
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4] shrink-0">
-          <h2 className="text-lg font-semibold text-[#2D1B0E]">New Guest</h2>
+          <h2 id="newguest-title" className="text-lg font-semibold text-[#2D1B0E]">New Guest</h2>
           <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[#FFF1E3]" aria-label="Close"><X className="w-5 h-5" /></button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5 space-y-4">

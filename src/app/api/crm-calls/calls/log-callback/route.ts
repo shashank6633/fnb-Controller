@@ -77,6 +77,11 @@ export async function POST(req: Request) {
   const connected = body.connected === undefined ? duration > 0 : !!body.connected;
   const outcome = OUTCOMES.has(String(body.outcome)) ? String(body.outcome) : '';
   const note = String(body.note || '').slice(0, 2000);
+  // Where the duration came from: 'call_log' = exact (Captain APK read the
+  // device call log), 'approx' = APK wall-time fallback, 'timer' = web
+  // time-away timer, 'manual' = typed. Stored for trust/reporting.
+  const SOURCES = new Set(['call_log', 'approx', 'timer', 'manual']);
+  const source = SOURCES.has(String(body.source)) ? String(body.source) : 'manual';
   const endedAt = (() => {
     const t = body.at ? new Date(body.at) : new Date();
     return isNaN(t.getTime()) ? new Date().toISOString() : t.toISOString();
@@ -105,7 +110,7 @@ export async function POST(req: Request) {
   `).run(
     callId, guestId || null, phone, status, me.email,
     startedAt, connected ? startedAt : null, endedAt, duration,
-    JSON.stringify({ source: 'device_manual', by: me.email }),
+    JSON.stringify({ source: 'device_manual', duration_source: source, by: me.email }),
     outcome, note, endedAt,
   );
 
@@ -114,7 +119,7 @@ export async function POST(req: Request) {
   if (recovery) {
     let attempts: any[] = [];
     try { const a = JSON.parse(recovery.attempts || '[]'); if (Array.isArray(a)) attempts = a; } catch { /* keep [] */ }
-    attempts.push({ at: endedAt, by: me.email, method: 'callback', outcome: outcome || (connected ? 'answered' : 'no_answer'), duration_sec: duration, connected });
+    attempts.push({ at: endedAt, by: me.email, method: 'callback', outcome: outcome || (connected ? 'answered' : 'no_answer'), duration_sec: duration, connected, source });
     const now = new Date().toISOString();
 
     if (RESOLVED.has(recovery.status)) {

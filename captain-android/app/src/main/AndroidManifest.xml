@@ -22,6 +22,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.akanhyd.fnb.captainapp">
 
+    <!-- CRM Call-to-Table exact callback durations: CallLoggerActivity reads
+         the device call log after a GRE callback and reports the real talk
+         time back to the web app. Both are runtime-requested (API 23+); the
+         APK is distributed directly (not Play), so Play's call-log policy
+         does not apply. -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+
     
 
     
@@ -155,6 +163,23 @@
             
 
             
+        </activity>
+
+        <!-- Exact callback-duration bridge: the web app opens
+             akancall://log?phone=..&recovery=..&ret=.. ; the activity places
+             the call, reads the call-log entry, and deep-links back with the
+             measured duration. -->
+        <activity android:name=".CallLoggerActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="akancall" android:host="log" />
+            </intent-filter>
         </activity>
 
         <activity android:name="com.google.androidbrowserhelper.trusted.FocusActivity" />

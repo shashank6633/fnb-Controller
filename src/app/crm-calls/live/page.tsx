@@ -51,6 +51,8 @@ export default function LiveCallsPage() {
   const [ringing, setRinging] = useState<RingingCall[]>([]);
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [liveMode, setLiveMode] = useState<'sse' | 'poll' | 'connecting'>('connecting');
+  const [statsUpdatedAt, setStatsUpdatedAt] = useState<number | null>(null);
+  const [statsError, setStatsError] = useState(false);
   const [nowTick, setNowTick] = useState(Date.now());
   const seqRef = useRef(0);
   const esRef = useRef<EventSource | null>(null);
@@ -72,11 +74,13 @@ export default function LiveCallsPage() {
   const refreshStats = useCallback(async () => {
     try {
       const r = await fetch('/api/crm-calls/dashboard?days=1');
-      if (!r.ok) return;
+      if (!r.ok) { setStatsError(true); return; }
       const j = await r.json();
       if (j?.today) setToday(j.today);
       if (Array.isArray(j?.byHour)) setByHour(j.byHour);
-    } catch { /* transient */ }
+      setStatsError(false);
+      setStatsUpdatedAt(Date.now());
+    } catch { setStatsError(true); }
   }, []);
 
   const pollLive = useCallback(async () => {
@@ -190,13 +194,15 @@ export default function LiveCallsPage() {
   };
 
   const maxHour = Math.max(1, ...byHour.map(h => h.total));
+  const statsStale = statsUpdatedAt != null && nowTick - statsUpdatedAt > 120000;
+  const statsBroken = statsError && statsUpdatedAt == null; // never succeeded
 
   return (
     <div className="p-4 sm:p-6 space-y-5 min-h-screen bg-[#FFF8F0]">
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">CRM · Call to Table</p>
+          <p className="text-[11px] font-semibold text-[#6B5744] uppercase tracking-wider">CRM · Call to Table</p>
           <h1 className="text-2xl sm:text-3xl font-bold text-[#2D1B0E] flex items-center gap-3">
             Live Calls
             <span className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full ${liveMode === 'sse' ? 'bg-green-100 text-green-700' : liveMode === 'poll' ? 'bg-amber-100 text-amber-700' : 'bg-gray-100 text-gray-500'}`}>
@@ -205,9 +211,22 @@ export default function LiveCallsPage() {
             </span>
           </h1>
         </div>
-        <p className="text-sm text-[#8B7355]">
-          {new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'long', day: 'numeric', month: 'long' })}
-        </p>
+        <div className="text-right">
+          <p className="text-sm text-[#6B5744]">
+            {new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'long', day: 'numeric', month: 'long' })}
+          </p>
+          {statsError ? (
+            <span role="status" aria-live="polite" className="mt-1 inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700">
+              stats unavailable
+            </span>
+          ) : statsStale ? (
+            <span role="status" aria-live="polite" className="mt-1 inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">
+              stats may be stale · {istTime(new Date(statsUpdatedAt!).toISOString())}
+            </span>
+          ) : statsUpdatedAt != null ? (
+            <p className="mt-0.5 text-[11px] text-[#6B5744] tabular-nums">stats updated {istTime(new Date(statsUpdatedAt).toISOString())}</p>
+          ) : null}
+        </div>
       </div>
 
       {/* Today counters — big, glanceable */}
@@ -220,8 +239,8 @@ export default function LiveCallsPage() {
           { label: 'Pending recoveries', value: today?.pending_recoveries ?? '—', cls: (today?.pending_recoveries || 0) > 0 ? 'text-amber-600' : 'text-green-600', icon: <Users className="w-4 h-4" /> },
           { label: 'Bookings from calls', value: today?.bookings_from_calls ?? '—', cls: 'text-[#af4408]', icon: <CalendarCheck className="w-4 h-4" /> },
         ].map((s) => (
-          <div key={s.label} className="px-3 py-4 text-center border-r border-b sm:border-b-0 border-[#F0E4D6]">
-            <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide flex items-center justify-center gap-1">{s.icon}{s.label}</p>
+          <div key={s.label} className="px-3 py-4 text-center border-r border-b lg:border-b-0 border-[#F0E4D6]">
+            <p className="text-[10px] sm:text-[11px] text-[#6B5744] uppercase tracking-wide flex items-center justify-center gap-1">{s.icon}{s.label}</p>
             <p className={`text-3xl sm:text-4xl font-bold mt-1 tabular-nums ${s.cls}`}>{s.value}</p>
           </div>
         ))}
@@ -234,7 +253,7 @@ export default function LiveCallsPage() {
           {ringing.length > 0 && <span className="text-xs bg-red-100 text-red-700 rounded-full px-2 py-0.5 font-bold animate-pulse">{ringing.length}</span>}
         </h2>
         {ringing.length === 0 ? (
-          <p className="text-sm text-[#8B7355] py-4 text-center">No calls ringing right now — they'll appear here the moment TeleCMI signals a ring.</p>
+          <p className="text-sm text-[#6B5744] py-4 text-center">No calls ringing right now — they'll appear here the moment TeleCMI signals a ring.</p>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {ringing.map((r, i) => {
@@ -242,17 +261,17 @@ export default function LiveCallsPage() {
               const secs = ringSeconds(r);
               return (
                 <div key={r.telecmi_call_id || r.id || `${phone}-${i}`}
-                     className="relative rounded-xl border-2 border-red-300 bg-red-50/60 p-4 animate-pulse">
+                     className="relative rounded-xl border-2 border-red-300 bg-red-50/60 p-4">
                   <div className="flex items-center justify-between">
                     <div className="min-w-0">
                       <p className="font-bold text-[#2D1B0E] truncate">{r.guest_name || 'Unknown caller'}</p>
-                      <p className="text-sm text-[#6B5744] font-mono">{formatPhone(phone) || phone || '—'}</p>
+                      <p className="text-sm text-[#6B5744] font-mono truncate">{formatPhone(phone) || phone || '—'}</p>
                       {(r.queue || r.agent_user) && (
                         <p className="text-[11px] text-[#8B7355] mt-0.5 truncate">{[r.queue, r.agent_user].filter(Boolean).join(' · ')}</p>
                       )}
                     </div>
                     <div className="text-right shrink-0 ml-3">
-                      <PhoneIncoming className="w-6 h-6 text-red-500 ml-auto" />
+                      <PhoneIncoming className="w-6 h-6 text-red-500 ml-auto animate-pulse" />
                       <p className="text-xs text-red-600 font-semibold tabular-nums mt-1">{secs}s</p>
                     </div>
                   </div>
@@ -270,7 +289,12 @@ export default function LiveCallsPage() {
             <Radio className="w-4 h-4 text-[#af4408]" /> Live feed
           </h2>
           {feed.length === 0 ? (
-            <p className="text-sm text-[#8B7355] py-4 text-center">Waiting for events… (test with <code className="font-mono bg-[#FFF1E3] px-1 rounded">npm run simulate:call</code>)</p>
+            <p className="text-sm text-[#8B7355] py-4 text-center">
+              Waiting for call activity — new calls will appear here live.
+              {process.env.NODE_ENV !== 'production' && (
+                <> (test with <code className="font-mono bg-[#FFF1E3] px-1 rounded">npm run simulate:call</code>)</>
+              )}
+            </p>
           ) : (
             <ul className="divide-y divide-[#F0E4D6] max-h-[420px] overflow-y-auto">
               {feed.map(f => (
@@ -294,8 +318,10 @@ export default function LiveCallsPage() {
         {/* Today by hour */}
         <div className="bg-white border border-[#E8D5C4] rounded-2xl p-4">
           <h2 className="text-sm font-semibold text-[#2D1B0E] mb-3">Today by hour <span className="text-[11px] font-normal text-[#8B7355]">(red = missed)</span></h2>
-          {byHour.length === 0 ? (
-            <p className="text-sm text-[#8B7355] py-4 text-center">No calls yet today.</p>
+          {byHour.every(h => h.total === 0) ? (
+            <p className="text-sm text-[#8B7355] py-4 text-center">
+              {statsBroken ? "Couldn't load call stats — retrying automatically…" : 'No calls yet today.'}
+            </p>
           ) : (
             <div className="flex items-end gap-1 h-40">
               {byHour.map(h => (

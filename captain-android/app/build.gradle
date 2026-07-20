@@ -23,7 +23,7 @@ plugins {
 def twaManifest = [
     applicationId: 'com.akanhyd.fnb.captainapp',
     hostName: 'fnb.akanhyd.com', // The domain being opened in the TWA.
-    launchUrl: '/captain', // The start path for the TWA. Must be relative to the domain.
+    launchUrl: '/launch', // The start path for the TWA. Must be relative to the domain.
     name: 'AKAN Captain', // The application name.
     launcherName: 'Captain', // The name shown on the Android Launcher.
     themeColor: '#1C0F05', // The color used for the status bar.
@@ -57,8 +57,8 @@ android {
         applicationId "com.akanhyd.fnb.captainapp"
         minSdkVersion 21
         targetSdkVersion 35
-        versionCode 1
-        versionName "1.0.0"
+        versionCode 2
+        versionName "1.1.0"
 
         // The name for the application
         resValue "string", "appName", twaManifest.name

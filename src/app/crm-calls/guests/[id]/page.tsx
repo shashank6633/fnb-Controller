@@ -110,6 +110,17 @@ function fmtIst(iso?: string | null): string {
   });
 }
 
+/** Date-only formatter (IST) for stored dob/anniversary — no time component. */
+function fmtDateOnly(s?: string | null): string {
+  if (!s) return '—';
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return s;
+  return d.toLocaleDateString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit', month: 'short', year: 'numeric',
+  });
+}
+
 function fmtDuration(sec?: number): string {
   const s = Math.max(0, Math.round(Number(sec) || 0));
   if (s === 0) return '0s';
@@ -567,6 +578,9 @@ export default function GuestProfilePage() {
       {/* Toast */}
       {toast && (
         <div
+          role="status"
+          aria-live={toast.kind === 'err' ? 'assertive' : 'polite'}
+          aria-atomic="true"
           className={`fixed top-4 right-4 z-50 px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium border ${
             toast.kind === 'ok'
               ? 'bg-green-50 text-green-800 border-green-200'
@@ -589,7 +603,7 @@ export default function GuestProfilePage() {
         <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
           <div className="min-w-0">
             <div className="flex items-center gap-3 flex-wrap">
-              <h1 className="text-2xl font-bold text-[#2D1B0E] truncate">
+              <h1 className="text-2xl font-bold text-[#2D1B0E] truncate" title={guest.name || 'Unknown Caller'}>
                 {guest.name || 'Unknown Caller'}
               </h1>
               <span className={`inline-flex items-center text-xs font-semibold px-2.5 py-1 rounded-full border ${badgeStyle}`}>
@@ -720,9 +734,9 @@ export default function GuestProfilePage() {
               <Cake size={15} className="text-[#8B7355] mt-0.5 shrink-0" />
               <div>
                 <span className="text-[#8B7355]">Birthday: </span>
-                <span className="text-[#2D1B0E]">{guest.dob || '—'}</span>
+                <span className="text-[#2D1B0E]">{fmtDateOnly(guest.dob)}</span>
                 <span className="text-[#8B7355] ml-4">Anniversary: </span>
-                <span className="text-[#2D1B0E]">{guest.anniversary || '—'}</span>
+                <span className="text-[#2D1B0E]">{fmtDateOnly(guest.anniversary)}</span>
               </div>
             </div>
             <div className="flex items-start gap-2 text-sm">
@@ -857,8 +871,8 @@ export default function GuestProfilePage() {
       {/* ── Metrics strip ── */}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3 sm:gap-4 mb-6">
         {[
-          { label: 'Calls', value: metrics?.total_calls ?? 0, sub: `${metrics?.missed_calls ?? 0} missed` },
-          { label: 'Bookings', value: metrics?.total_bookings ?? 0, sub: fmtIst(metrics?.last_call_at).split(',')[0] !== '—' ? `last call ${fmtIst(metrics?.last_call_at)}` : '' },
+          { label: 'Calls', value: metrics?.total_calls ?? 0, sub: metrics?.last_call_at ? `${metrics?.missed_calls ?? 0} missed · last call ${fmtIst(metrics.last_call_at).split(',')[0]}` : `${metrics?.missed_calls ?? 0} missed` },
+          { label: 'Bookings', value: metrics?.total_bookings ?? 0, sub: '' },
           { label: 'Visits', value: metrics?.completed_visits ?? 0, sub: metrics?.last_visit_at ? `last ${fmtIst(metrics.last_visit_at)}` : '' },
           { label: 'No-shows', value: metrics?.no_shows ?? 0, sub: '' },
           { label: 'Conversion', value: `${Math.round((metrics?.conversion_rate ?? 0) * 100)}%`, sub: 'answered → booked' },
@@ -866,7 +880,7 @@ export default function GuestProfilePage() {
           <div key={m.label} className="bg-white border border-[#E8D5C4] rounded-xl p-3 sm:p-4">
             <p className="text-xs text-[#8B7355] uppercase tracking-wide">{m.label}</p>
             <p className="text-xl font-bold text-[#2D1B0E] mt-1">{m.value}</p>
-            {m.sub && <p className="text-[10px] text-[#B9A48C] mt-0.5 truncate">{m.sub}</p>}
+            {m.sub && <p className="text-[11px] text-[#8B7355] mt-0.5 truncate">{m.sub}</p>}
           </div>
         ))}
       </div>

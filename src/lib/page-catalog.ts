@@ -259,13 +259,59 @@ export function isMgmtOnlyPath(pathname: string): boolean {
  * to the first allowed path from their page_access array (see firstAllowedPath
  * helper below).
  */
-export const ALWAYS_ALLOWED: string[] = ['/login'];
+export const ALWAYS_ALLOWED: string[] = ['/login', '/launch'];
 
 /**
  * Pick a landing path for a user whose page_access map exists and does NOT
  * include `/`. Returns the first allowed path in their map (in catalog order
  * so the UX is predictable), or '/login' as a final fallback.
  */
+/**
+ * Role-aware landing for a freshly-opened session. The Captain APK (and any PWA
+ * install) opens /launch, and the post-login redirect resolves through here, so
+ * ONE app drops each user on their natural home:
+ *   management → dashboard, GRE → Recovery Queue, captain → POS, kitchen → KDS…
+ * Picks the FIRST preferred candidate the user can actually access, then falls
+ * back to firstAllowedPath() so nobody lands on a page that immediately
+ * re-blocks them. Purely a routing convenience — every page still enforces its
+ * own access; this never grants anything.
+ */
+export function homePathFor(user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null): string {
+  if (!user) return '/login';
+  const isMgmt = user.role === 'admin' || user.role === 'manager' || user.is_head_chef;
+  // Legacy full-access (null map) NON-management users: canAccessPage grants
+  // them everything via backward-compat, so the pref list below would land them
+  // on /captain (the POS) via that backdoor. Send them to the dashboard '/'
+  // instead — a genuine captain has an EXPLICIT /captain grant (or captain-tier
+  // role) and so has a non-null map, unaffected by this.
+  if (!user.page_access && !isMgmt) return '/';
+  const prefs: string[] = [];
+  // Management wants the whole-outlet dashboard first.
+  if (isMgmt) prefs.push('/');
+  // Then role homes, most-specific first. A GRE has CRM but not Captain access
+  // (and vice-versa), so each lands correctly; someone with both is POS-primary.
+  prefs.push(
+    '/captain',              // captains → tablet POS
+    '/crm-calls/recovery',   // GREs → missed-call recovery home base
+    '/crm-calls',            // (CRM without recovery grant)
+    '/dine-in/kitchen',      // kitchen → KDS
+    '/dine-in/floor',        // floor staff → order floor
+    '/cashier',
+    '/requisitions',
+    '/tasks/my',
+    '/',                     // anyone with dashboard access
+  );
+  for (const p of prefs) if (canAccessPage(p, user)) return p;
+  // Fallback: first catalog page (display order) the user can ACTUALLY open,
+  // decided by canAccessPage — the SAME authority the proxy enforces, so
+  // homePathFor can never return a page the proxy then bounces (no loop). A
+  // user with no openable page → '/login' (LaunchPage shows a friendly notice).
+  for (const section of PAGE_CATALOG) {
+    for (const pg of section.pages) if (canAccessPage(pg.path, user)) return pg.path;
+  }
+  return '/login';
+}
+
 export function firstAllowedPath(user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null): string {
   if (!user) return '/login';
   if (user.role === 'admin') return '/';

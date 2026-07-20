@@ -108,6 +108,7 @@ export default function CtSettingsPage() {
   const [flash, setFlash] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<'live' | 'cdr' | null>(null);
+  const [apkCopyState, setApkCopyState] = useState<'idle' | 'ok' | 'err'>('idle');
 
   // Data tools
   const [seeding, setSeeding] = useState(false);
@@ -234,6 +235,29 @@ export default function CtSettingsPage() {
     }
     setCopied(which);
     setTimeout(() => setCopied(prev => (prev === which ? null : prev)), 2000);
+  };
+
+  // APK share link — local, in-place feedback (the top-of-page flash is far
+  // above this button). Only report success when a copy actually happened;
+  // http:// LAN often lacks the Clipboard API, so fall back to execCommand.
+  const copyApkLink = async () => {
+    const link = `${origin}/downloads/AKAN-Captain.apk`;
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(link);
+      ok = true;
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = link;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { ok = document.execCommand('copy'); } catch { /* best effort */ }
+      document.body.removeChild(ta);
+    }
+    setApkCopyState(ok ? 'ok' : 'err');
+    setTimeout(() => setApkCopyState('idle'), 2000);
   };
 
   const loadDemoData = async (force: boolean) => {
@@ -425,7 +449,7 @@ export default function CtSettingsPage() {
   }
 
   const inputCls = 'w-full mt-0.5 px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]';
-  const labelCls = 'text-[10px] uppercase tracking-wide text-[#8B7355]';
+  const labelCls = 'text-[10px] uppercase tracking-wide text-[#6B5744]';
   const whatsappOn = form.after_hours_whatsapp === '1';
   const autoAnalyzeOn = form.auto_analyze === '1';
   const ephemeral = form.analysis_retention === 'ephemeral';
@@ -469,7 +493,7 @@ export default function CtSettingsPage() {
           </span>
         </div>
         <div className="p-3 sm:p-4 space-y-3">
-          <p className="text-xs text-[#8B7355]">
+          <p className="text-xs text-[#6B5744]">
             The TeleCMI <strong>appid</strong> and <strong>secret</strong> live only in server
             environment variables (<code className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">TELECMI_APPID</code>,{' '}
             <code className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">TELECMI_SECRET</code>) — they are
@@ -481,7 +505,7 @@ export default function CtSettingsPage() {
             <input value={form.telecmi_base_url ?? ''} onChange={e => set('telecmi_base_url', e.target.value)}
                    placeholder="https://rest.telecmi.com/v2 (leave blank for default)"
                    className={inputCls} />
-            <p className="text-[10px] text-[#8B7355] mt-1">
+            <p className="text-[10px] text-[#6B5744] mt-1">
               Only needed if your TeleCMI account uses a regional / non-default REST endpoint.
             </p>
           </div>
@@ -495,7 +519,7 @@ export default function CtSettingsPage() {
           <h2 className="text-sm font-semibold text-[#2D1B0E]">Webhook URLs</h2>
         </div>
         <div className="p-3 sm:p-4 space-y-3">
-          <p className="text-xs text-[#8B7355]">
+          <p className="text-xs text-[#6B5744]">
             Paste these into the TeleCMI <strong>CHUB dashboard</strong> under your business number
             → webhooks (method <strong>POST</strong>). The long token in the path is the shared
             secret — treat these URLs like passwords.
@@ -517,7 +541,7 @@ export default function CtSettingsPage() {
             <div key={w.key} className="border border-[#E8D5C4] rounded-lg p-2.5 bg-[#FFF8F0]">
               <div className="flex flex-wrap items-center gap-2 mb-1">
                 <span className="text-xs font-semibold text-[#2D1B0E]">{w.title}</span>
-                <span className="text-[10px] text-[#8B7355]">{w.hint}</span>
+                <span className="text-[10px] text-[#6B5744]">{w.hint}</span>
               </div>
               {w.path ? (
                 <div className="flex items-stretch gap-2">
@@ -535,13 +559,13 @@ export default function CtSettingsPage() {
                   </button>
                 </div>
               ) : (
-                <p className="text-xs text-[#8B7355] italic">
+                <p className="text-xs text-[#6B5744] italic">
                   URL unavailable — the settings API did not return a webhook token.
                 </p>
               )}
             </div>
           ))}
-          <ol className="text-[11px] text-[#8B7355] list-decimal ml-4 space-y-0.5">
+          <ol className="text-[11px] text-[#6B5744] list-decimal ml-4 space-y-0.5">
             <li>CHUB dashboard → your business number → call flow / webhooks.</li>
             <li>Add a webhook node of type <strong>call report</strong> → paste the CDR URL.</li>
             <li>Add a webhook node of type <strong>notify</strong> → paste the Live events URL.</li>
@@ -579,7 +603,7 @@ export default function CtSettingsPage() {
                      onChange={e => set('attribution_hours', e.target.value)} className={inputCls} />
             </div>
           </div>
-          <p className="text-[10px] text-[#8B7355] mt-2">
+          <p className="text-[10px] text-[#6B5744] mt-2">
             The callback SLA clock runs inside business hours: a call missed after closing is due
             at <em>next opening + SLA</em>. The attribution window links a booking back to the
             guest&apos;s most recent answered call (default 48h) — that link is the
@@ -612,12 +636,13 @@ export default function CtSettingsPage() {
                 stub — logged only, not sent in Phase 1
               </span>
               <button type="button" role="switch" aria-checked={whatsappOn}
+                      aria-label="After-hours auto-WhatsApp to missed callers"
                       onClick={() => set('after_hours_whatsapp', whatsappOn ? '0' : '1')}
                       className={`ml-auto relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${whatsappOn ? 'bg-[#af4408]' : 'bg-gray-300'}`}>
                 <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform ${whatsappOn ? 'translate-x-4' : 'translate-x-0.5'}`} />
               </button>
             </div>
-            <p className="text-[10px] text-[#8B7355] mt-1">
+            <p className="text-[10px] text-[#6B5744] mt-1">
               When ON (and once WhatsApp sending is wired up in a later phase), callers missed
               outside business hours get this message automatically. Placeholders:{' '}
               <code className="bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">{'{open}'}</code>{' '}
@@ -644,7 +669,7 @@ export default function CtSettingsPage() {
           )}
         </div>
         <div className="p-3 sm:p-4 space-y-3">
-          <p className="text-xs text-[#8B7355]">
+          <p className="text-xs text-[#6B5744]">
             Map each TeleCMI agent id / extension to a staff member so the{' '}
             <strong>Call Log</strong>, <strong>Guest 360</strong> and the{' '}
             <strong>leaderboard</strong> show their name instead of a raw id — this also feeds
@@ -653,7 +678,7 @@ export default function CtSettingsPage() {
           </p>
 
           {agentRows.length === 0 ? (
-            <p className="text-xs text-[#8B7355] italic">
+            <p className="text-xs text-[#6B5744] italic">
               No TeleCMI agents have appeared on a call yet. Add ids manually below, or run a
               backfill / take a call first, then refresh.
             </p>
@@ -671,15 +696,16 @@ export default function CtSettingsPage() {
                 const emailKnown = row.email
                   && staff.some(s => s.email.toLowerCase() === row.email.toLowerCase());
                 return (
-                  <div key={idx} className="flex flex-wrap items-center gap-2">
-                    <div className="flex-1 min-w-[8rem]">
+                  <div key={idx} className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+                    <div className="flex-1 min-w-[8rem] w-full sm:w-auto">
                       <input value={row.id} onChange={e => setAgentRow(idx, { id: e.target.value })}
-                             placeholder="e.g. 101 or gre.ravi"
+                             placeholder="e.g. 101 or gre.ravi" aria-label="TeleCMI agent id"
                              className={`${inputCls} ${isUnmappedSeen ? 'border-amber-300' : ''}`} />
                     </div>
-                    <span className="text-[#C9A98A] shrink-0 text-sm">→</span>
-                    <div className="flex-1 min-w-[10rem]">
+                    <span className="text-[#C9A98A] shrink-0 text-sm hidden sm:inline">→</span>
+                    <div className="flex-1 min-w-[10rem] w-full sm:w-auto">
                       <select value={row.email} onChange={e => setAgentRow(idx, { email: e.target.value })}
+                              aria-label="Staff member"
                               className={`${inputCls} ${isUnmappedSeen ? 'border-amber-300 bg-amber-50/50' : ''}`}>
                         <option value="">— Unmapped —</option>
                         {staff.map(s => (
@@ -717,7 +743,7 @@ export default function CtSettingsPage() {
               Save mapping
             </button>
             {agentDirty && !savingAgents && (
-              <span className="text-[10px] text-[#8B7355]">unsaved changes</span>
+              <span className="text-[10px] text-[#6B5744]">unsaved changes</span>
             )}
           </div>
 
@@ -750,7 +776,7 @@ export default function CtSettingsPage() {
               <option value="permanent">Keep permanently (Recommended)</option>
               <option value="ephemeral">On-demand only</option>
             </select>
-            <p className="text-[10px] text-[#8B7355] mt-1">
+            <p className="text-[10px] text-[#6B5744] mt-1">
               {ephemeral
                 ? 'On-demand only — click Enhance to view a scorecard; it is NOT saved (re-runs the AI each time, so auto-scoring is off).'
                 : 'Keep permanently — analyzed scorecards are saved and viewable anytime, and auto-scoring is available.'}
@@ -762,12 +788,13 @@ export default function CtSettingsPage() {
             <div className="flex flex-wrap items-center gap-2">
               <span className={`text-xs font-semibold text-[#2D1B0E] ${ephemeral ? 'opacity-50' : ''}`}>Auto-score every recorded call</span>
               <button type="button" role="switch" aria-checked={autoAnalyzeOn} disabled={ephemeral}
+                      aria-label="Auto-score every recorded call"
                       onClick={() => set('auto_analyze', autoAnalyzeOn ? '0' : '1')}
                       className={`ml-auto relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${autoAnalyzeOn ? 'bg-[#af4408]' : 'bg-gray-300'} ${ephemeral ? 'opacity-50 cursor-not-allowed' : ''}`}>
                 <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform ${autoAnalyzeOn ? 'translate-x-4' : 'translate-x-0.5'}`} />
               </button>
             </div>
-            <p className="text-[10px] text-[#8B7355] mt-1">
+            <p className="text-[10px] text-[#6B5744] mt-1">
               Automatically score every recorded call with AI (transcript, /100 score, coaching). Uses
               your existing Gemini/Claude provider — incurs an LLM cost per call. Off = score on demand
               from the Call Log.
@@ -785,14 +812,11 @@ export default function CtSettingsPage() {
                 {analyzing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
                 Analyze recent recordings now
               </button>
-              <span className="text-[10px] text-[#8B7355]">
+              <span className="text-[10px] text-[#6B5744]">
                 Scores up to 5 recent recorded calls that have not been analysed yet. Handy for a
                 one-off backfill, or right after turning auto-scoring on — run it again to score more.
               </span>
             </div>
-            {ephemeral && (
-              <p className="text-[10px] text-amber-700 mt-1">Turn on permanent storage to enable auto-scoring.</p>
-            )}
             {analyzeResult && (
               <div className="mt-2 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5 text-xs text-[#2D1B0E] flex items-start gap-1.5">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-0.5" /> {analyzeResult}
@@ -802,13 +826,50 @@ export default function CtSettingsPage() {
 
           {/* Provider note */}
           <div className="border-t border-[#E8D5C4]/60 pt-3">
-            <p className="text-[10px] text-[#8B7355]">
+            <p className="text-[10px] text-[#6B5744]">
               The AI provider and API keys are configured under the existing{' '}
               <strong>AKAN CRM settings</strong> (<code className="bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">crm_llm_provider</code>{' '}
               / Gemini keys). When Claude is the provider it uses Gemini to transcribe the recording
               first, then scores the transcript.
             </p>
           </div>
+        </div>
+      </section>
+
+      {/* ── Mobile app (Android) download ── */}
+      <section className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+        <div className="px-3 sm:px-4 py-2.5 bg-[#FFF1E3] border-b border-[#E8D5C4] flex items-center gap-2">
+          <DownloadCloud className="w-4 h-4 text-[#af4408]" />
+          <h2 className="text-sm font-semibold text-[#2D1B0E]">Mobile app (Android)</h2>
+        </div>
+        <div className="p-3 sm:p-4 space-y-2">
+          <p className="text-sm text-[#3D2614]">
+            One app for all staff — everyone signs in with their own account and lands on their role&apos;s home
+            (captains → POS, GREs → Recovery Queue, managers → dashboard). Exact call-back durations are captured on Android.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <a href="/downloads/AKAN-Captain.apk" download
+               className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded text-sm inline-flex items-center gap-1.5">
+              <DownloadCloud className="w-3.5 h-3.5" /> Download APK
+            </a>
+            <button
+              onClick={copyApkLink}
+              className={`px-3 py-1.5 border rounded text-sm inline-flex items-center gap-1.5 ${
+                apkCopyState === 'ok'
+                  ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                  : apkCopyState === 'err'
+                  ? 'bg-red-50 border-red-300 text-red-700'
+                  : 'border-[#E0D0BE] hover:bg-[#FFF1E3] text-[#6B5744]'
+              }`}>
+              {apkCopyState === 'ok' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+              {apkCopyState === 'ok' ? 'Copied' : apkCopyState === 'err' ? 'Copy failed — copy manually below' : 'Copy link to share'}
+            </button>
+          </div>
+          <p className="text-[11px] text-[#6B5744] font-mono break-all">{origin}/downloads/AKAN-Captain.apk</p>
+          <p className="text-[11px] text-[#6B5744]">
+            On the phone: open the link → Download → tap the file → allow &quot;install from this source&quot; → Install.
+            Updates the existing app in place; on the first callback, tap Allow for call-log access.
+          </p>
         </div>
       </section>
 
@@ -827,7 +888,7 @@ export default function CtSettingsPage() {
                 {seeding ? <Loader2 className="w-4 h-4 animate-spin" /> : <Database className="w-4 h-4" />}
                 Load demo data
               </button>
-              <span className="text-[10px] text-[#8B7355]">
+              <span className="text-[10px] text-[#6B5744]">
                 ~25 guests · ~120 calls · ~40 bookings · recoveries in mixed states. Idempotent —
                 safe to click twice.
               </span>
@@ -867,7 +928,7 @@ export default function CtSettingsPage() {
                 {backfilling ? <Loader2 className="w-4 h-4 animate-spin" /> : <DownloadCloud className="w-4 h-4" />}
                 Run backfill
               </button>
-              <span className="text-[10px] text-[#8B7355]">
+              <span className="text-[10px] text-[#6B5744]">
                 Pull historical CDRs from TeleCMI and ingest them (idempotent — never duplicates
                 calls; creates recoveries for untracked missed calls). Mocked without env credentials.
               </span>

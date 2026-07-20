@@ -21,9 +21,11 @@ import Link from 'next/link';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
 import QuickBookingModal from '@/components/ct/QuickBookingModal';
+import CollapsibleToolbar from '@/components/ct/CollapsibleToolbar';
 import {
   CalendarCheck, CalendarX2, Plus, Search, Users, Clock, PhoneIncoming,
   CheckCircle, AlertCircle, Loader2, ChevronLeft, ChevronRight, Star, RefreshCw,
+  StickyNote,
 } from 'lucide-react';
 
 interface BookingRow {
@@ -211,6 +213,11 @@ export default function BookingsBoardPage() {
   const safePage = Math.min(page, pageCount);
   const pageRows = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
+  // The date window lives inside the mobile "Date range" dropdown; badge it (and
+  // keep the dropdown open) only when it differs from the default today → +7d.
+  const defaultTo = istDate(new Date(Date.now() + 7 * 86400000));
+  const filterCount = from === todayYmd && to === defaultTo ? 0 : 1;
+
   const advance = useCallback(async (b: BookingRow, action: StatusAction) => {
     if (action.confirmMsg && !window.confirm(action.confirmMsg)) return;
     const key = `${b.id}:${action.to}`;
@@ -275,8 +282,10 @@ export default function BookingsBoardPage() {
             <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />
             <input type="text" placeholder="Search guest by name or phone…" value={search}
                    onChange={e => setSearch(e.target.value)}
+                   aria-label="Search bookings by guest name or phone"
                    className="w-full pl-10 pr-4 py-2.5 bg-white border border-[#E0D0BE] rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]/40 focus:border-[#af4408] shadow-sm" />
           </div>
+          <CollapsibleToolbar activeCount={filterCount} label="Date range">
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center gap-1.5 bg-white border border-[#E0D0BE] rounded-xl px-2.5 py-1.5 shadow-sm">
               <input type="date" value={from} onChange={e => setFrom(e.target.value)} aria-label="From date"
@@ -302,6 +311,7 @@ export default function BookingsBoardPage() {
               })}
             </div>
           </div>
+          </CollapsibleToolbar>
         </div>
 
         {/* Status tabs with counts */}
@@ -313,7 +323,7 @@ export default function BookingsBoardPage() {
               <button key={s} onClick={() => setStatusTab(s)}
                       className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium whitespace-nowrap transition-colors ${on ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E0D0BE] hover:bg-[#FFF1E3]'}`}>
                 {label}
-                <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${on ? 'bg-white/20 text-white' : 'bg-[#FFF1E3] text-[#8B7355]'}`}>
+                <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${on ? 'bg-white/20 text-white' : 'bg-[#FFF1E3] text-[#6B5744]'}`}>
                   {counts[s] || 0}
                 </span>
               </button>
@@ -391,6 +401,12 @@ export default function BookingsBoardPage() {
                               {b.advance_amount > 0 ? `₹${b.advance_amount.toLocaleString('en-IN')} adv` : ''}
                             </p>
                           )}
+                          {b.notes && (
+                            <p className="text-[11px] text-[#8B7355] flex items-center gap-1 max-w-[220px]" title={b.notes}>
+                              <StickyNote className="w-3 h-3 shrink-0" />
+                              <span className="truncate min-w-0">{b.notes}</span>
+                            </p>
+                          )}
                         </td>
                         <td className="py-2.5 px-3"><ChannelChip channel={b.channel} /></td>
                         <td className="py-2.5 px-3">
@@ -407,7 +423,7 @@ export default function BookingsBoardPage() {
                           <div className="flex items-center justify-end gap-1.5">
                             {(STATUS_ACTIONS[b.status] || []).map(a => (
                               <ActionButton key={a.to} action={a} busy={acting === `${b.id}:${a.to}`}
-                                            disabled={acting !== null} onClick={() => advance(b, a)} />
+                                            disabled={acting !== null && acting.startsWith(`${b.id}:`)} onClick={() => advance(b, a)} />
                             ))}
                           </div>
                         </td>
@@ -456,12 +472,18 @@ export default function BookingsBoardPage() {
                         <PhoneIncoming className="w-3.5 h-3.5" />from call
                       </Link>
                     )}
+                    {b.notes && (
+                      <span className="w-full text-[#8B7355] flex items-start gap-1" title={b.notes}>
+                        <StickyNote className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                        <span>{b.notes}</span>
+                      </span>
+                    )}
                   </div>
                   {(STATUS_ACTIONS[b.status] || []).length > 0 && (
                     <div className="flex flex-wrap gap-1.5 pt-0.5">
                       {(STATUS_ACTIONS[b.status] || []).map(a => (
                         <ActionButton key={a.to} action={a} busy={acting === `${b.id}:${a.to}`}
-                                      disabled={acting !== null} onClick={() => advance(b, a)} />
+                                      disabled={acting !== null && acting.startsWith(`${b.id}:`)} onClick={() => advance(b, a)} />
                       ))}
                     </div>
                   )}
@@ -494,7 +516,8 @@ export default function BookingsBoardPage() {
 
       {/* Toast */}
       {toast && (
-        <div className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3 rounded-lg shadow-lg text-white ${toast.error ? 'bg-red-600' : 'bg-green-600'}`}>
+        <div role="status" aria-live={toast.error ? 'assertive' : 'polite'} aria-atomic="true"
+             className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3 rounded-lg shadow-lg text-white ${toast.error ? 'bg-red-600' : 'bg-green-600'}`}>
           {toast.error ? <AlertCircle className="w-4 h-4" /> : <CheckCircle className="w-4 h-4" />}
           <span className="text-sm font-medium">{toast.msg}</span>
         </div>

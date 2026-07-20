@@ -21,6 +21,7 @@ import {
   Sparkles, AlertTriangle,
 } from 'lucide-react';
 import CallAnalysisCard, { type CallAnalysisData } from '@/app/crm/assistant/CallAnalysisCard';
+import CollapsibleToolbar from '@/components/ct/CollapsibleToolbar';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -140,6 +141,7 @@ export default function CallLogPage() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [fetching, setFetching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   // Filters
   const [direction, setDirection] = useState('');        // '' | inbound | outbound
@@ -199,9 +201,11 @@ export default function CallLogPage() {
   const fetchCalls = useCallback(async (silent = false) => {
     const seq = ++fetchSeq.current;
     if (!silent) setFetching(true);
+    setError(null);
     try {
       const res = await fetch(`/api/crm-calls/calls?${buildQuery(page)}`);
-      if (!res.ok) return;
+      if (seq !== fetchSeq.current) return; // a newer fetch superseded this one
+      if (!res.ok) { setError("Couldn't load calls"); return; }
       const json = await res.json();
       if (seq !== fetchSeq.current) return; // a newer fetch superseded this one
       const list: CallRow[] = Array.isArray(json?.calls) ? json.calls : [];
@@ -213,7 +217,10 @@ export default function CallLogPage() {
         for (const c of list) if (c.agent_user) map.set(c.agent_user, { value: c.agent_user, label: c.agent_display || c.agent_user });
         return [...map.values()].sort((a, b) => a.label.localeCompare(b.label));
       });
-    } catch { /* transient network error — keep last data */ }
+    } catch {
+      // transient network error — keep last data, surface a retryable error state
+      if (seq === fetchSeq.current) setError("Couldn't load calls");
+    }
     finally {
       if (seq === fetchSeq.current) { setFetching(false); setLoading(false); }
     }
@@ -228,6 +235,9 @@ export default function CallLogPage() {
     setDirection(''); setStatus(''); setNeedsDisposition(false);
     setAgent(''); setFrom(''); setTo(''); setPhoneInput('');
   };
+  // Secondary filters inside the mobile "Filters & options" dropdown (the phone
+  // search + the summary chips stay visible above it, so they're not counted).
+  const filterCount = [status, agent, from, to].filter(Boolean).length;
 
   // Chip togglers (chips + selects share the same state, so they stay in sync)
   const pickAll = () => { setDirection(''); setStatus(''); setNeedsDisposition(false); };
@@ -419,6 +429,7 @@ export default function CallLogPage() {
               </button>
             )}
           </div>
+          <CollapsibleToolbar activeCount={filterCount}>
           <div className="flex flex-wrap items-center gap-2">
             <select value={status} onChange={e => { setStatus(e.target.value); setNeedsDisposition(false); }}
                     className="px-3 py-2.5 bg-white border border-[#E0D0BE] rounded-xl text-sm shadow-sm" aria-label="Status filter">
@@ -446,10 +457,23 @@ export default function CallLogPage() {
               </button>
             )}
           </div>
+          </CollapsibleToolbar>
         </div>
 
         {/* ---- Calls: table on desktop, cards on mobile ---- */}
-        {calls.length === 0 ? (
+        {error && calls.length === 0 ? (
+          <div className="bg-white border border-[#E8D5C4] rounded-2xl py-16 text-center text-[#6B5744]">
+            <AlertTriangle className="w-10 h-10 mx-auto mb-3 text-[#af4408] opacity-70" />
+            <p className="font-medium">Couldn&apos;t load calls</p>
+            <p className="text-xs mt-1 text-[#8B7355]">Check your connection and try again.</p>
+            <button
+              onClick={() => fetchCalls()}
+              className="mt-4 inline-flex items-center gap-2 px-4 py-2.5 bg-white border border-[#E0D0BE] hover:bg-[#FFF1E3] text-[#6B5744] rounded-xl text-sm font-medium shadow-sm transition-colors"
+            >
+              <RefreshCw className={`w-4 h-4 ${fetching ? 'animate-spin' : ''}`} /> Try again
+            </button>
+          </div>
+        ) : calls.length === 0 ? (
           <div className="bg-white border border-[#E8D5C4] rounded-2xl py-16 text-center text-[#8B7355]">
             <Phone className="w-10 h-10 mx-auto mb-3 opacity-40" />
             <p>No calls found</p>
@@ -484,7 +508,7 @@ export default function CallLogPage() {
                           <tr className="border-b border-[#F0E4D6] last:border-0 hover:bg-[#FFF8F0]">
                             <td className="py-2.5 px-4 whitespace-nowrap">
                               <p className="font-semibold text-[13px] text-[#2D1B0E]">{when.time}</p>
-                              <p className="text-[11px] text-[#8B7355]">{when.date}</p>
+                              <p className="text-[11px] text-[#6B5744]">{when.date}</p>
                             </td>
                             <td className="py-2.5 px-2 text-center"><DirectionIcon direction={c.direction} /></td>
                             <td className="py-2.5 px-3">
@@ -492,7 +516,7 @@ export default function CallLogPage() {
                             </td>
                             <td className="py-2.5 px-3 text-[13px] text-[#3D2614]">
                               {c.agent_display || c.agent_user || <span className="text-[#C4B09A]">—</span>}
-                              {c.queue && <p className="text-[11px] text-[#8B7355]">{c.queue}</p>}
+                              {c.queue && <p className="text-[11px] text-[#6B5744]">{c.queue}</p>}
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono text-[13px] text-[#3D2614]">
                               {c.status === 'answered' || c.duration_sec > 0 ? mmss(c.duration_sec) : <span className="text-[#C4B09A]">—</span>}
@@ -507,7 +531,7 @@ export default function CallLogPage() {
                                   onClick={() => setAudioId(prev => (prev === c.id ? null : c.id))}
                                   aria-label={audioId === c.id ? 'Hide recording' : 'Play recording'}
                                   title={audioId === c.id ? 'Hide recording' : 'Play recording'}
-                                  className={`p-1.5 rounded-lg transition-colors ${audioId === c.id ? 'bg-[#af4408] text-white' : 'text-[#af4408] hover:bg-[#FFF1E3]'}`}
+                                  className={`inline-flex items-center justify-center min-h-[36px] min-w-[36px] p-1.5 rounded-lg transition-colors ${audioId === c.id ? 'bg-[#af4408] text-white' : 'text-[#af4408] hover:bg-[#FFF1E3]'}`}
                                 >
                                   {audioId === c.id ? <Square className="w-4 h-4" /> : <Play className="w-4 h-4" />}
                                 </button>
@@ -569,7 +593,7 @@ export default function CallLogPage() {
                       </div>
                       <StatusChip status={c.status} />
                     </div>
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[#8B7355]">
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[#6B5744]">
                       <span>{when.time} · {when.date}</span>
                       {(c.agent_display || c.agent_user) && <span>Agent: {c.agent_display || c.agent_user}</span>}
                       {(c.status === 'answered' || c.duration_sec > 0) && <span className="font-mono">{mmss(c.duration_sec)}</span>}
@@ -693,7 +717,7 @@ function CallerCell({ call, onQuickCreate }: { call: CallRow; onQuickCreate: () 
               className="font-semibold text-[13px] text-[#af4408] hover:underline truncate block max-w-[220px]">
           {call.guest_name || phone}
         </Link>
-        <p className="text-[11px] text-[#8B7355] font-mono">{phone}</p>
+        <p className="text-[11px] text-[#6B5744] font-mono">{phone}</p>
       </div>
     );
   }
@@ -722,8 +746,13 @@ function DispositionCell({ call, saving, onPick }: {
     const r = btnRef.current?.getBoundingClientRect();
     if (r) {
       const width = 260;
+      const estH = 160; // popover header + wrapped disposition chips
       const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8));
-      setPos({ top: r.bottom + 6, left });
+      // Flip upward when opening below the button would run off the bottom, then
+      // clamp into the viewport so bottom-row pickers stay fully on-screen.
+      let top = r.bottom + 6 + estH > window.innerHeight ? r.top - estH - 6 : r.bottom + 6;
+      top = Math.max(8, Math.min(top, window.innerHeight - estH - 8));
+      setPos({ top, left });
     }
     setOpen(true);
   };
@@ -747,8 +776,8 @@ function DispositionCell({ call, saving, onPick }: {
         title={call.disposition_note || (meta ? 'Change disposition' : 'Set disposition')}
         className={
           meta
-            ? `inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full border font-medium whitespace-nowrap ${meta.chip} hover:opacity-80 transition-opacity`
-            : 'inline-flex items-center gap-1 text-[11px] px-2.5 py-1 rounded-full border border-dashed border-[#D4B896] font-medium text-[#8B7355] hover:text-[#af4408] hover:border-[#af4408] transition-colors whitespace-nowrap'
+            ? `inline-flex items-center justify-center min-h-[36px] gap-1 text-[11px] px-2 py-1.5 rounded-full border font-medium whitespace-nowrap ${meta.chip} hover:opacity-80 transition-opacity`
+            : 'inline-flex items-center justify-center min-h-[36px] gap-1 text-[11px] px-2.5 py-1.5 rounded-full border border-dashed border-[#D4B896] font-medium text-[#8B7355] hover:text-[#af4408] hover:border-[#af4408] transition-colors whitespace-nowrap'
         }
       >
         {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
@@ -832,7 +861,7 @@ function AiCell({ call, analyzing, panelOpen, onEnhance, onTogglePanel }: {
       <button
         onClick={onTogglePanel}
         title={panelOpen ? 'Hide AI analysis' : 'View AI analysis'}
-        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] font-semibold whitespace-nowrap transition-colors ${scoreChipCls(score, panelOpen)}`}
+        className={`inline-flex items-center justify-center min-h-[36px] gap-1 px-2 py-1.5 rounded-full border text-[11px] font-semibold whitespace-nowrap transition-colors ${scoreChipCls(score, panelOpen)}`}
       >
         <Sparkles className="w-3 h-3" /> AI {score}
       </button>
@@ -847,7 +876,7 @@ function AiCell({ call, analyzing, panelOpen, onEnhance, onTogglePanel }: {
       <button
         onClick={onEnhance}
         title="Analyze this call with AI"
-        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full border border-dashed border-purple-300 text-[11px] font-medium text-purple-700 hover:bg-purple-50 hover:border-purple-400 transition-colors whitespace-nowrap"
+        className="inline-flex items-center justify-center min-h-[36px] gap-1 px-2.5 py-1.5 rounded-full border border-dashed border-purple-300 text-[11px] font-medium text-purple-700 hover:bg-purple-50 hover:border-purple-400 transition-colors whitespace-nowrap"
       >
         <Sparkles className="w-3 h-3" /> {status === 'error' || status === 'pending' ? 'Retry' : 'Enhance'}
       </button>
@@ -856,7 +885,7 @@ function AiCell({ call, analyzing, panelOpen, onEnhance, onTogglePanel }: {
           onClick={onTogglePanel}
           title="View analysis error"
           aria-label="View analysis error"
-          className={`inline-flex items-center justify-center p-1 rounded-full border transition-colors ${panelOpen ? 'bg-red-600 text-white border-red-600' : 'text-red-600 border-red-200 hover:bg-red-50'}`}
+          className={`inline-flex items-center justify-center min-h-[36px] min-w-[36px] p-1 rounded-full border transition-colors ${panelOpen ? 'bg-red-600 text-white border-red-600' : 'text-red-600 border-red-200 hover:bg-red-50'}`}
         >
           <AlertTriangle className="w-3.5 h-3.5" />
         </button>
@@ -952,6 +981,13 @@ function QuickGuestModal({ phone, onClose, onCreate }: {
 
   useEffect(() => { inputRef.current?.focus(); }, []);
 
+  // Close on Escape — the standard dismiss gesture and the keyboard-only path.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   const submit = async () => {
     if (saving) return;
     setSaving(true);
@@ -962,11 +998,12 @@ function QuickGuestModal({ phone, onClose, onCreate }: {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="fixed inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-sm bg-white rounded-2xl shadow-xl border border-[#E8D5C4]">
+      <div role="dialog" aria-modal="true" aria-labelledby="quick-guest-title"
+           className="relative w-full max-w-sm bg-white rounded-2xl shadow-xl border border-[#E8D5C4]">
         <div className="flex items-center justify-between px-5 py-4 border-b border-[#E8D5C4]">
           <div className="flex items-center gap-2.5">
             <div className="p-2 rounded-lg bg-[#F3E2D0]"><UserPlus className="w-4 h-4 text-[#af4408]" /></div>
-            <h2 className="text-base font-semibold text-[#2D1B0E]">New Guest</h2>
+            <h2 id="quick-guest-title" className="text-base font-semibold text-[#2D1B0E]">New Guest</h2>
           </div>
           <button onClick={onClose} className="p-1 text-[#8B7355] hover:text-[#2D1B0E]" aria-label="Close">
             <X className="w-5 h-5" />

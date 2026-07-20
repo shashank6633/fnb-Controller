@@ -6,9 +6,10 @@ import type { Metadata, Viewport } from 'next';
  * Backed entirely by the existing FNB Controller dine-in APIs.
  *
  * Installable as its OWN home-screen app: this layout overrides the site
- * manifest with /captain.webmanifest (id "/captain", start_url "/captain", own
- * icon), so "Add to Home Screen" / PWABuilder installs a dedicated "Captain"
- * app launching straight here — distinct from the F&B Controller PWA.
+ * manifest with /captain.webmanifest (id "/captain", own icon). The app is now
+ * shared by ALL staff, so its start_url is "/launch" — the role-aware entry
+ * (see src/app/launch/page.tsx / homePathFor) that routes each user to their
+ * home (captains → here, GREs → recovery, managers → dashboard).
  */
 export const metadata: Metadata = {
   title: 'AKAN Captain',
