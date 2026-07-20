@@ -15,10 +15,14 @@
  *
  * Mounted once in AppShell so it wraps every route (main app + the /captain app).
  */
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { Bell, X } from 'lucide-react';
+import { Bell, X, CheckCheck } from 'lucide-react';
 import { api } from '@/lib/api';
+import {
+  loadAck, saveAck, ackInboxItem, ackAlertId, ackEverything, refreshInboxAcks, pruneAck,
+  isInboxAcked, isAlertAcked, type AckState,
+} from '@/lib/notif-ack';
 
 export interface CaptainAlert { id: string; text: string }
 /** Action-Inbox bucket (approvals / requisitions / tasks) from /api/notifications/inbox. */
@@ -35,6 +39,19 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
   const [inbox, setInbox] = useState<InboxItem[]>([]);
   const [meId, setMeId] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
+  // Acknowledged (=user-cleared) notifications — badge counts only UN-acked work.
+  // Loaded on the client; synced across tabs via the 'storage' event.
+  const [ack, setAck] = useState<AckState>({ inbox: {}, alerts: [] });
+  const prevInboxCounts = useRef<Record<string, number>>({});
+  const firstInbox = useRef(true);
+  useEffect(() => {
+    setAck(loadAck());
+    const onStorage = (e: StorageEvent) => { if (e.key === 'akan_notif_ack') setAck(loadAck()); };
+    const onLocal = () => setAck(loadAck());   // same-tab sync (see saveAck)
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('akan-notif-ack', onLocal);
+    return () => { window.removeEventListener('storage', onStorage); window.removeEventListener('akan-notif-ack', onLocal); };
+  }, []);
   const [toast, setToast] = useState<{ key: number; text: string } | null>(null);
   const [flying, setFlying] = useState(false);   // toast animating INTO the bell
   const seen = useRef<Set<string>>(new Set());
@@ -102,7 +119,22 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
       const r = await fetch('/api/notifications/inbox', { cache: 'no-store', credentials: 'same-origin' });
       if (!r.ok) return;                       // signed out / error → keep last state
       const d = await r.json();
-      setInbox(Array.isArray(d.items) ? d.items : []);
+      const list: InboxItem[] = Array.isArray(d.items) ? d.items : [];
+      // Re-surface acked buckets with NEW activity (count rose since last poll, or
+      // reappeared after resolving) + drop acks for vanished buckets. Skip the very
+      // first poll so we don't wipe the acks just restored from localStorage.
+      if (!firstInbox.current) {
+        setAck((a) => {
+          const next = refreshInboxAcks(a, prevInboxCounts.current, list);
+          if (next !== a) saveAck(next);
+          return next;
+        });
+      }
+      const counts: Record<string, number> = {};
+      for (const it of list) counts[it.key] = Number(it.count) || 0;
+      prevInboxCounts.current = counts;
+      firstInbox.current = false;
+      setInbox(list);
     } catch { /* offline — keep last state */ }
   }, []);
   useEffect(() => {
@@ -197,11 +229,37 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
     return () => { clearTimeout(t1); clearTimeout(t2); };
   }, [toast]);
 
-  const count = items.length;                                        // live captain/table alerts
-  const inboxTotal = inbox.reduce((s, i) => s + (Number(i.count) || 0), 0);   // Action Inbox pending
-  const totalCount = count + inboxTotal;                             // one badge for the single bell
-  const goRequests = () => { setOpen(false); setToast(null); router.push('/captain/requests'); };
-  const goInbox = (href: string) => { setOpen(false); router.push(href); };
+  const count = items.length;                                        // live captain/table alerts (raw; feeds the sidebar tab badge)
+  // The BELL badge counts only what the user hasn't cleared. Acked buckets stop
+  // counting until their count grows again; acked live alerts until a new id.
+  const unackedAlerts = items.filter((it) => !isAlertAcked(ack, it.id));
+  const unackedInbox = inbox.filter((it) => !isInboxAcked(ack, it.key, it.count));
+  const totalCount = unackedAlerts.length + unackedInbox.reduce((s, i) => s + (Number(i.count) || 0), 0);
+  const goRequests = (id?: string) => {
+    if (id) { const n = ackAlertId(ack, id); setAck(n); saveAck(n); }
+    setOpen(false); setToast(null); router.push('/captain/requests');
+  };
+  const goInbox = (item: InboxItem) => {
+    const n = ackInboxItem(ack, item.key, item.count); setAck(n); saveAck(n);
+    setOpen(false); router.push(item.href);
+  };
+  // "Clear all" — acknowledge everything currently showing; the badge goes to 0
+  // and the floating bell hides until there's genuinely new activity.
+  const clearAll = () => {
+    const n = ackEverything(ack, inbox.map((i) => ({ key: i.key, count: i.count })), items.map((i) => ({ id: i.id })));
+    setAck(n); saveAck(n); setOpen(false);
+  };
+  // Prune stale ack entries (resolved buckets / old alert ids) when the user
+  // opens the bell — low-frequency, so no per-poll churn.
+  useEffect(() => {
+    if (!open) return;
+    setAck((prev) => {
+      const pruned = pruneAck(prev, inbox.map((i) => i.key), items.map((i) => i.id));
+      const shrunk = Object.keys(pruned.inbox).length < Object.keys(prev.inbox).length || pruned.alerts.length < prev.alerts.length;
+      if (shrunk) saveAck(pruned);
+      return shrunk ? pruned : prev;
+    });
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps -- snapshot prune on open only
 
   // Which way the panel opens, based on where the (draggable) bell sits. The
   // `pos ? … : true` guards keep `window` off the SSR path.
@@ -211,15 +269,19 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
   if (rightSide) dropStyle.right = 0; else dropStyle.left = 0;
   if (bottomSide) dropStyle.bottom = BELL + 8; else dropStyle.top = BELL + 8;
 
+  // Stable context value so consumers (e.g. CaptainShell's sidebar badge) don't
+  // re-render on every bell drag/toast/open state change — only when items change.
+  const ctxValue = useMemo(() => ({ items, count }), [items, count]);
+
   return (
-    <Ctx.Provider value={{ items, count }}>
+    <Ctx.Provider value={ctxValue}>
       {children}
 
       {/* New-alert toast — pops at TOP-CENTER, then FLIES into the bell icon.
           z-40 keeps it below the app's modal layer (z-50); the chime still fires. */}
       {toast && !suppressed && pos && (
         <button
-          onClick={goRequests}
+          onClick={() => goRequests()}
           style={{
             transform: flying
               ? `translate(calc(-50% + ${Math.round(pos.x + BELL / 2 - window.innerWidth / 2)}px), ${Math.round(pos.y + BELL / 2 - 28)}px) scale(0.1)`
@@ -245,15 +307,23 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
                  style={dropStyle}>
               <div className="flex items-center justify-between px-4 py-2 bg-[#FFF7EF] border-b border-[#F0E4D6]">
                 <span className="text-[11px] font-bold uppercase tracking-wide text-[#8B7355]">Needs your action</span>
-                <button onClick={() => setOpen(false)} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-4 h-4" /></button>
+                <div className="flex items-center gap-2.5">
+                  {(items.length > 0 || inbox.length > 0) && (
+                    <button onClick={clearAll} title="Clear all notifications"
+                            className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#af4408] hover:underline active:scale-95">
+                      <CheckCheck className="w-3.5 h-3.5" /> Clear all
+                    </button>
+                  )}
+                  <button onClick={() => setOpen(false)} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-4 h-4" /></button>
+                </div>
               </div>
               <div className="max-h-80 overflow-y-auto divide-y divide-[#F0E4D6]">
                 {/* Live table alerts first (time-sensitive), then Action Inbox. */}
                 {items.map((it) => (
-                  <button key={it.id} onClick={goRequests} className="w-full text-left px-4 py-2.5 text-sm hover:bg-[#FFF1E3]">{it.text}</button>
+                  <button key={it.id} onClick={() => goRequests(it.id)} className="w-full text-left px-4 py-2.5 text-sm hover:bg-[#FFF1E3]">{it.text}</button>
                 ))}
                 {inbox.map((it) => (
-                  <button key={it.key} onClick={() => goInbox(it.href)}
+                  <button key={it.key} onClick={() => goInbox(it)}
                           className="w-full flex items-center gap-2 text-left px-4 py-2.5 text-sm hover:bg-[#FFF1E3]">
                     <span className="flex-1 min-w-0">{it.label}</span>
                     <span className="shrink-0 min-w-[22px] h-[22px] px-1.5 rounded-full bg-[#af4408] text-white text-[11px] font-bold flex items-center justify-center">

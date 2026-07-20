@@ -6,9 +6,10 @@
  * the routed page in the main area. The sidebar is the table selector and
  * quick-switcher; it polls live status and highlights the open table.
  */
-import { useEffect, useState, useCallback, useMemo, createContext } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef, createContext } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
+import { writeMenuCache } from '@/lib/menu-cache';
 import { useCaptainAlerts } from '@/components/CaptainAlertsProvider';
 import {
   ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search, Loader2,
@@ -76,6 +77,25 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   useEffect(() => {
     try { const saved = localStorage.getItem(AREA_KEY); if (saved) setActiveZone(saved); } catch {}
   }, []);
+
+  // ── Speed: warm the menu cache once + prefetch open-table order routes ───────
+  // The order screen's biggest fetch is the menu; warming it here means the first
+  // order opens with the menu already painted. Prefetching each open table's
+  // order route makes tapping it navigate in a fraction of a second.
+  useEffect(() => {
+    fetch('/api/menu-items').then((r) => r.json()).then((j) => {
+      if (j?.items) writeMenuCache(j.items, j.categories || []);
+    }).catch(() => {});
+  }, []);
+  const prefetched = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const t of tables) {
+      if (t.open_order_id && !prefetched.current.has(t.open_order_id)) {
+        prefetched.current.add(t.open_order_id);
+        try { router.prefetch(`/captain/order/${t.open_order_id}`); } catch { /* ignore */ }
+      }
+    }
+  }, [tables, router]);
 
   // Cache the counter PC's offline address ONCE while we're still online, so the
   // offline banner's button has a target even after the internet drops.

@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback, useMemo, useContext, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
+import { readMenuCache, writeMenuCache } from '@/lib/menu-cache';
 import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
   ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu, Filter, ChevronDown,
@@ -143,9 +144,19 @@ export default function CaptainOrder() {
 
   useEffect(() => {
     loadOrder();
+    // Menu: paint the cached copy INSTANTLY, then revalidate in the background.
+    const cached = readMenuCache();
+    if (cached) {
+      setMenu(cached.items.filter((m: MenuItem) => m.is_active && m.selling_price > 0));
+      setCats(['All', ...cached.categories]);
+    }
     fetch('/api/menu-items').then((r) => r.json()).then((j) => {
-      setMenu((j.items || []).filter((m: MenuItem) => m.is_active && m.selling_price > 0));
-      setCats(['All', ...(j.categories || [])]);
+      if (!Array.isArray(j?.items)) return;   // bad response (500 / auth) → keep the cached menu, don't blank it
+      const rawItems = j.items;
+      const cats = Array.isArray(j.categories) ? j.categories : [];
+      setMenu(rawItems.filter((m: MenuItem) => m.is_active && m.selling_price > 0));
+      setCats(['All', ...cats]);
+      writeMenuCache(rawItems, cats);
     }).catch(() => {});
     // Who am I? Only cashiers/managers (can_request_discount) get the bill controls.
     fetch('/api/auth/me').then((r) => r.json()).then((j) => { if (j.user) setMe(j.user); }).catch(() => {});
