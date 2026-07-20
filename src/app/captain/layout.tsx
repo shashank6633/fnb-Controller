@@ -14,13 +14,13 @@ import type { Metadata, Viewport } from 'next';
 export const metadata: Metadata = {
   title: 'AKAN Captain',
   manifest: '/captain.webmanifest',
-  appleWebApp: { capable: true, title: 'Captain', statusBarStyle: 'black-translucent' },
+  appleWebApp: { capable: true, title: 'Captain', statusBarStyle: 'default' },
   icons: { apple: [{ url: '/captain-apple-touch.png', sizes: '180x180' }] },
 };
 
 // Lock zoom for a native-feeling touch POS (root layout allows 5× — captain doesn't).
 export const viewport: Viewport = {
-  themeColor: '#1C0F05',
+  themeColor: '#af4408',
   width: 'device-width',
   initialScale: 1,
   maximumScale: 1,
@@ -31,7 +31,7 @@ import CaptainShell from './CaptainShell';
 
 export default function CaptainLayout({ children }: { children: React.ReactNode }) {
   return (
-    <div className="min-h-screen bg-[#FBF6F0] text-[#2D1B0E] select-none">
+    <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E] select-none">
       <CaptainShell>{children}</CaptainShell>
     </div>
   );

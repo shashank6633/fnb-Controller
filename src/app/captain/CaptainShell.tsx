@@ -234,17 +234,17 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
   ) : null;
 
   const sidebar = (
-    <div className="flex flex-col h-full bg-[#1C0F05] text-white w-72">
+    <div className="flex flex-col h-full bg-white text-[#2D1B0E] w-72 border-r border-[#E8D5C4]">
       {/* Brand + menu */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-[#E8D5C4]">
         <div className="flex items-center gap-2 min-w-0">
-          <ChefHat className="w-5 h-5 text-[#FF8A4C] shrink-0" />
+          <ChefHat className="w-5 h-5 text-[#af4408] shrink-0" />
           <div className="min-w-0">
             <p className="font-bold leading-tight">Captain</p>
             {activeZone && availableZones.length > 1 ? (
               <button
                 onClick={() => setPicking(true)}
-                className="flex items-center gap-1 text-[11px] text-[#FF8A4C] leading-tight -ml-0.5 active:scale-95"
+                className="flex items-center gap-1 text-[11px] text-[#af4408] leading-tight -ml-0.5 active:scale-95"
                 title="Switch area"
               >
                 <MapPin className="w-3 h-3 shrink-0" />
@@ -252,7 +252,7 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
                 <ChevronDown className="w-3 h-3 shrink-0" />
               </button>
             ) : (
-              <p className="text-[11px] text-white/50 leading-tight truncate">{me?.name || me?.email || ''}</p>
+              <p className="text-[11px] text-[#6B5744] leading-tight truncate">{me?.name || me?.email || ''}</p>
             )}
           </div>
         </div>
@@ -260,9 +260,9 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
           {/* Captain alerts (new orders / service requests / KOT issues) are now
               shown by the GLOBAL floating bell + toast (CaptainAlertsProvider),
               which follows the captain onto every screen — no header bell here. */}
-          <button onClick={load} className="p-2 text-white/60 hover:text-white active:scale-95"><RefreshCw className="w-4 h-4" /></button>
+          <button onClick={load} className="p-2 text-[#6B5744] hover:text-[#2D1B0E] active:scale-95"><RefreshCw className="w-4 h-4" /></button>
           <div className="relative">
-            <button onClick={() => setMenuOpen((o) => !o)} className="p-2 text-white/60 hover:text-white"><MoreVertical className="w-4 h-4" /></button>
+            <button onClick={() => setMenuOpen((o) => !o)} className="p-2 text-[#6B5744] hover:text-[#2D1B0E]"><MoreVertical className="w-4 h-4" /></button>
             {menuOpen && (
               <>
                 <div className="fixed inset-0 z-20" onClick={() => setMenuOpen(false)} />
@@ -273,20 +273,20 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
               </>
             )}
           </div>
-          <button onClick={() => setDrawer(false)} className="p-2 text-white/60 hover:text-white md:hidden"><X className="w-5 h-5" /></button>
+          <button onClick={() => setDrawer(false)} className="p-2 text-[#6B5744] hover:text-[#2D1B0E] md:hidden"><X className="w-5 h-5" /></button>
         </div>
       </div>
 
       {/* Search + filter */}
       <div className="px-3 pt-3 pb-2 space-y-2">
         <div className="relative">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" />
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Find table…"
-            className="w-full bg-white/10 rounded-lg pl-8 pr-2 py-2 text-sm placeholder:text-white/40" />
+            className="w-full bg-white border border-[#D4B896] rounded-lg pl-8 pr-2 py-2 text-sm placeholder:text-[#8B7355]" />
         </div>
-        <div className="flex bg-white/10 rounded-lg p-0.5 text-xs">
-          <button onClick={() => setOnlyOpen(false)} className={`flex-1 py-1.5 rounded-md font-medium ${!onlyOpen ? 'bg-[#af4408] text-white' : 'text-white/60'}`}>All ({tables.length})</button>
-          <button onClick={() => setOnlyOpen(true)} className={`flex-1 py-1.5 rounded-md font-medium ${onlyOpen ? 'bg-[#af4408] text-white' : 'text-white/60'}`}>Open ({occupiedCount})</button>
+        <div className="flex bg-[#FFF1E3] rounded-lg p-0.5 text-xs">
+          <button onClick={() => setOnlyOpen(false)} className={`flex-1 py-1.5 rounded-md font-medium ${!onlyOpen ? 'bg-[#af4408] text-white' : 'text-[#6B5744]'}`}>All ({tables.length})</button>
+          <button onClick={() => setOnlyOpen(true)} className={`flex-1 py-1.5 rounded-md font-medium ${onlyOpen ? 'bg-[#af4408] text-white' : 'text-[#6B5744]'}`}>Open ({occupiedCount})</button>
         </div>
       </div>
 
@@ -298,13 +298,13 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
             pathname === '/captain/requests'
               ? 'bg-[#af4408] text-white'
               : reqCount > 0
-                ? 'bg-[#af4408]/25 text-[#FFC79A] ring-1 ring-[#af4408]/60'
-                : 'bg-white/5 text-white/70 hover:text-white'}`}
+                ? 'bg-[#FFF1E3] text-[#af4408] ring-1 ring-[#af4408]/40'
+                : 'bg-[#FFF1E3] text-[#6B5744] hover:text-[#2D1B0E]'}`}
         >
           <Bell className={`w-4 h-4 shrink-0 ${reqCount > 0 && pathname !== '/captain/requests' ? 'animate-pulse' : ''}`} />
           <span className="flex-1 text-left truncate">Orders &amp; Requests</span>
           {reqCount > 0 && (
-            <span className="shrink-0 min-w-[20px] h-5 px-1.5 rounded-full bg-[#FF6B35] text-white text-[11px] font-bold flex items-center justify-center">{reqCount}</span>
+            <span className="shrink-0 min-w-[20px] h-5 px-1.5 rounded-full bg-[#af4408] text-white text-[11px] font-bold flex items-center justify-center">{reqCount}</span>
           )}
         </button>
       </div>
@@ -312,14 +312,14 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
       {/* Tables by floor */}
       <div className="flex-1 overflow-y-auto px-3 pb-3 space-y-3">
         {zones.length === 0 ? (
-          <p className="text-center text-white/40 text-sm py-8">{tables.length === 0 ? 'No tables yet. Add them in Dine-In → Tables.' : 'No tables match.'}</p>
+          <p className="text-center text-[#8B7355] text-sm py-8">{tables.length === 0 ? 'No tables yet. Add them in Dine-In → Tables.' : 'No tables match.'}</p>
         ) : zones.map(([zone, list]) => {
           const c = zoneCounts(zone);
           return (
           <div key={zone}>
-            <p className="text-[11px] font-semibold text-white/40 uppercase tracking-wide px-1 mb-1.5 flex items-center justify-between gap-1">
+            <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide px-1 mb-1.5 flex items-center justify-between gap-1">
               <span className="truncate">{zone}</span>
-              <span className="normal-case tracking-normal shrink-0 text-white/35">(Free {c.free} / Occ {c.occ})</span>
+              <span className="normal-case tracking-normal shrink-0 text-[#8B7355]">(Free {c.free} / Occ {c.occ})</span>
             </p>
             <div className="grid grid-cols-3 gap-1.5">
               {list.map((t) => {
@@ -328,12 +328,12 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
                 return (
                   <button key={t.id} onClick={() => openTable(t)} disabled={busy === t.id}
                     className={`relative rounded-lg p-2 text-center border transition active:scale-95 disabled:opacity-50 ${
-                      active ? 'bg-[#FF6B35] border-[#FF8A4C]' : occupied ? 'bg-amber-500/15 border-amber-500/40' : 'bg-emerald-500/10 border-emerald-500/30'}`}>
-                    <span className={`absolute top-1 right-1 w-1.5 h-1.5 rounded-full ${occupied ? 'bg-amber-400' : 'bg-emerald-400'}`} />
+                      active ? 'bg-[#af4408] border-[#af4408] text-white' : occupied ? 'bg-amber-50 border-amber-300' : 'bg-emerald-50 border-emerald-200'}`}>
+                    <span className={`absolute top-1 right-1 w-1.5 h-1.5 rounded-full ${occupied ? 'bg-amber-500' : 'bg-emerald-500'}`} />
                     <p className="font-bold text-sm leading-none">{t.table_number}</p>
                     {occupied
-                      ? <p className="text-[10px] text-amber-200 mt-1 leading-none">₹{Math.round(t.open_order_total || 0)}</p>
-                      : <p className="text-[10px] text-emerald-300 mt-1 leading-none">{t.seats}p</p>}
+                      ? <p className={`text-[10px] mt-1 leading-none ${active ? 'text-white/90' : 'text-amber-700'}`}>₹{Math.round(t.open_order_total || 0)}</p>
+                      : <p className="text-[10px] text-emerald-700 mt-1 leading-none">{t.seats}p</p>}
                   </button>
                 );
               })}
@@ -344,12 +344,12 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
       </div>
 
       {/* Takeaway */}
-      <div className="p-3 border-t border-white/10">
-        <button onClick={newTakeaway} disabled={tkBusy} className="w-full flex items-center justify-center gap-2 bg-[#af4408] py-2.5 rounded-lg text-sm font-semibold active:scale-95 disabled:opacity-60">
+      <div className="p-3 border-t border-[#E8D5C4]">
+        <button onClick={newTakeaway} disabled={tkBusy} className="w-full flex items-center justify-center gap-2 bg-[#af4408] text-white py-2.5 rounded-lg text-sm font-semibold active:scale-95 disabled:opacity-60">
           {tkBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} Takeaway / Parcel
         </button>
         {installEvt && (
-          <button onClick={installApp} className="w-full flex items-center justify-center gap-2 mt-2 bg-white/10 py-2 rounded-lg text-xs font-medium active:scale-95">
+          <button onClick={installApp} className="w-full flex items-center justify-center gap-2 mt-2 bg-[#FFF1E3] py-2 rounded-lg text-xs font-medium active:scale-95">
             <Download className="w-4 h-4" /> Install app
           </button>
         )}
@@ -363,23 +363,23 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
     return (
       <>
       {offlineBanner}
-      <div className="min-h-screen bg-[#1C0F05] text-white flex flex-col">
-        <div className="flex items-center gap-2 px-5 py-4 border-b border-white/10">
-          <ChefHat className="w-6 h-6 text-[#FF8A4C] shrink-0" />
+      <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E] flex flex-col">
+        <div className="flex items-center gap-2 px-5 py-4 border-b border-[#E8D5C4]">
+          <ChefHat className="w-6 h-6 text-[#af4408] shrink-0" />
           <div className="min-w-0">
             <p className="font-bold leading-tight">Captain</p>
-            <p className="text-[11px] text-white/50 leading-tight truncate">{me?.name || me?.email || ''}</p>
+            <p className="text-[11px] text-[#6B5744] leading-tight truncate">{me?.name || me?.email || ''}</p>
           </div>
           {picking && activeZone && availableZones.includes(activeZone) && (
-            <button onClick={() => setPicking(false)} className="ml-auto p-2 text-white/50 hover:text-white active:scale-95">
+            <button onClick={() => setPicking(false)} className="ml-auto p-2 text-[#6B5744] hover:text-[#2D1B0E] active:scale-95">
               <X className="w-5 h-5" />
             </button>
           )}
         </div>
         <div className="flex-1 overflow-y-auto px-5 py-6">
           <div className="max-w-2xl mx-auto">
-            <h1 className="text-xl font-bold flex items-center gap-2"><MapPin className="w-5 h-5 text-[#FF8A4C]" /> Choose your area</h1>
-            <p className="text-sm text-white/50 mt-1">Pick the section you are serving. You can switch anytime from the sidebar.</p>
+            <h1 className="text-xl font-bold flex items-center gap-2"><MapPin className="w-5 h-5 text-[#af4408]" /> Choose your area</h1>
+            <p className="text-sm text-[#6B5744] mt-1">Pick the section you are serving. You can switch anytime from the sidebar.</p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-6">
               {availableZones.map((zone) => {
                 const c = zoneCounts(zone);
@@ -389,16 +389,16 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
                     key={zone}
                     onClick={() => chooseZone(zone)}
                     className={`text-left rounded-2xl border p-5 transition active:scale-[0.98] ${
-                      isActive ? 'bg-[#FF6B35] border-[#FF8A4C]' : 'bg-[#2D1B0E] border-white/10 hover:border-[#af4408]'}`}
+                      isActive ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] hover:border-[#af4408]'}`}
                   >
                     <div className="flex items-center gap-2">
-                      <MapPin className="w-5 h-5 text-[#FF8A4C] shrink-0" />
+                      <MapPin className="w-5 h-5 text-[#af4408] shrink-0" />
                       <span className="font-bold text-lg truncate">{zone}</span>
                     </div>
-                    <p className={`text-sm mt-2 ${isActive ? 'text-white/90' : 'text-white/60'}`}>
+                    <p className={`text-sm mt-2 ${isActive ? 'text-white/90' : 'text-[#6B5744]'}`}>
                       (Free {c.free} / Occ {c.occ})
                     </p>
-                    <p className={`text-[11px] mt-0.5 ${isActive ? 'text-white/70' : 'text-white/35'}`}>{c.total} table{c.total === 1 ? '' : 's'}</p>
+                    <p className={`text-[11px] mt-0.5 ${isActive ? 'text-white/70' : 'text-[#8B7355]'}`}>{c.total} table{c.total === 1 ? '' : 's'}</p>
                   </button>
                 );
               })}
@@ -435,45 +435,45 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
       {guestTable && (
         <div className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center bg-black/60 p-0 sm:p-4"
              onClick={() => { if (!gBusy) setGuestTable(null); }}>
-          <div className="w-full sm:max-w-sm bg-[#2D1B0E] text-white rounded-t-3xl sm:rounded-3xl border border-white/10 p-5"
+          <div className="w-full sm:max-w-sm bg-white text-[#2D1B0E] rounded-t-3xl sm:rounded-3xl border border-[#E8D5C4] p-5"
                onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-4">
               <div>
-                <p className="text-[11px] uppercase tracking-wide text-white/40">Open table</p>
+                <p className="text-[11px] uppercase tracking-wide text-[#8B7355]">Open table</p>
                 <p className="font-bold text-lg leading-tight">Table {guestTable.table_number}
-                  <span className="text-white/40 font-normal text-sm"> · {zoneOf(guestTable)}</span></p>
+                  <span className="text-[#8B7355] font-normal text-sm"> · {zoneOf(guestTable)}</span></p>
               </div>
-              <button onClick={() => { if (!gBusy) setGuestTable(null); }} className="p-2 text-white/50 hover:text-white active:scale-95">
+              <button onClick={() => { if (!gBusy) setGuestTable(null); }} className="p-2 text-[#6B5744] hover:text-[#2D1B0E] active:scale-95">
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             <label className="block mb-3">
-              <span className="text-xs text-white/60">Full name <span className="text-[#FF8A4C]">*</span></span>
+              <span className="text-xs text-[#6B5744]">Full name <span className="text-[#af4408]">*</span></span>
               <input autoFocus value={gName} onChange={(e) => setGName(e.target.value)} placeholder="Guest name"
-                className="mt-1 w-full bg-white/10 rounded-xl px-3 py-3 text-base placeholder:text-white/30 focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
+                className="mt-1 w-full bg-white border border-[#D4B896] rounded-xl px-3 py-3 text-base placeholder:text-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
             </label>
 
             <label className="block mb-3">
-              <span className="text-xs text-white/60">Mobile <span className="text-white/30">(optional)</span></span>
+              <span className="text-xs text-[#6B5744]">Mobile <span className="text-[#8B7355]">(optional)</span></span>
               <input value={gMobile} onChange={(e) => setGMobile(e.target.value)} inputMode="tel" placeholder="Phone number"
-                className="mt-1 w-full bg-white/10 rounded-xl px-3 py-3 text-base placeholder:text-white/30 focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
+                className="mt-1 w-full bg-white border border-[#D4B896] rounded-xl px-3 py-3 text-base placeholder:text-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
             </label>
 
             <label className="block mb-5">
-              <span className="text-xs text-white/60 flex items-center gap-1"><Users className="w-3.5 h-3.5" /> No. of guests <span className="text-[#FF8A4C]">*</span></span>
+              <span className="text-xs text-[#6B5744] flex items-center gap-1"><Users className="w-3.5 h-3.5" /> No. of guests <span className="text-[#af4408]">*</span></span>
               <div className="mt-1 flex items-center gap-2">
                 <button type="button" onClick={() => setGCovers(String(Math.max(1, (Number(gCovers) || 1) - 1)))}
-                  className="w-11 h-11 rounded-xl bg-white/10 text-xl font-bold active:scale-95 shrink-0">−</button>
+                  className="w-11 h-11 rounded-xl bg-[#FFF1E3] text-xl font-bold active:scale-95 shrink-0">−</button>
                 <input value={gCovers} onChange={(e) => setGCovers(e.target.value.replace(/[^0-9]/g, ''))} inputMode="numeric"
-                  className="flex-1 min-w-0 bg-white/10 rounded-xl px-3 py-3 text-base text-center focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
+                  className="flex-1 min-w-0 bg-white border border-[#D4B896] rounded-xl px-3 py-3 text-base text-center focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
                 <button type="button" onClick={() => setGCovers(String((Number(gCovers) || 0) + 1))}
-                  className="w-11 h-11 rounded-xl bg-white/10 text-xl font-bold active:scale-95 shrink-0">+</button>
+                  className="w-11 h-11 rounded-xl bg-[#FFF1E3] text-xl font-bold active:scale-95 shrink-0">+</button>
               </div>
             </label>
 
             <button onClick={startDineIn} disabled={!guestValid || gBusy}
-              className="w-full flex items-center justify-center gap-2 bg-[#af4408] py-3.5 rounded-xl text-base font-semibold active:scale-95 disabled:opacity-40 disabled:active:scale-100">
+              className="w-full flex items-center justify-center gap-2 bg-[#af4408] text-white py-3.5 rounded-xl text-base font-semibold active:scale-95 disabled:opacity-40 disabled:active:scale-100">
               {gBusy ? <Loader2 className="w-5 h-5 animate-spin" /> : null} Start
             </button>
           </div>

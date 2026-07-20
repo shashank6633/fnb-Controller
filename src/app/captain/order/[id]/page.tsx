@@ -506,24 +506,24 @@ export default function CaptainOrder() {
   return (
     <div className="flex flex-col min-h-screen">
       {/* Header */}
-      <header className="sticky top-0 z-20 bg-[#1C0F05] text-white px-3 py-2.5 flex items-center gap-3">
+      <header className="sticky top-0 z-20 bg-white text-[#2D1B0E] border-b border-[#E8D5C4] px-3 py-2.5 flex items-center gap-3">
         <button onClick={openTables} className="md:hidden p-2 -ml-1 active:scale-95" aria-label="Open tables"><Menu className="w-5 h-5" /></button>
         <button onClick={() => router.push('/captain')} className="p-2 active:scale-95"><ArrowLeft className="w-5 h-5" /></button>
         <div className="flex-1 min-w-0">
           <p className="font-bold leading-tight truncate">{order.table_number ? `Table ${order.table_number}` : 'Takeaway'} · #{order.order_number}</p>
-          <p className="text-[11px] text-white/60 leading-tight truncate flex items-center gap-1.5">
+          <p className="text-[11px] text-[#6B5744] leading-tight truncate flex items-center gap-1.5">
             <span>{order.zone || order.order_type}{order.status !== 'open' ? ` · ${order.status}` : ''}</span>
-            {order.guest_name ? <span className="text-white/80">· {order.guest_name}</span> : null}
+            {order.guest_name ? <span className="text-[#2D1B0E]">· {order.guest_name}</span> : null}
             {order.covers ? <span className="inline-flex items-center gap-0.5"><Users className="w-3 h-3" />{order.covers}</span> : null}
           </p>
         </div>
         {order.status === 'open' && order.table_number && (
           <button onClick={() => openTableAction('move')} title="Move / merge table"
-            className="p-2 text-white/70 hover:text-white active:scale-95"><ArrowLeftRight className="w-5 h-5" /></button>
+            className="p-2 text-[#8B7355] hover:text-[#af4408] active:scale-95"><ArrowLeftRight className="w-5 h-5" /></button>
         )}
         <div className="text-right">
-          <p className="text-[10px] text-white/60 leading-none">Amount</p>
-          <p className="font-extrabold text-[#FF8A4C]">₹{Math.round(order.total)}</p>
+          <p className="text-[10px] text-[#6B5744] leading-none">Amount</p>
+          <p className="font-extrabold text-[#af4408]">₹{Math.round(order.total)}</p>
         </div>
       </header>
 
@@ -766,7 +766,7 @@ export default function CaptainOrder() {
                 <Receipt className="w-4 h-4" /> Bill
               </button>
               <button onClick={sendKot} disabled={firing || pendingCount === 0}
-                className="flex-1 flex items-center justify-center gap-2 bg-[#FF6B35] disabled:opacity-40 text-white py-3 rounded-xl text-sm font-bold active:scale-95">
+                className="flex-1 flex items-center justify-center gap-2 bg-[#af4408] disabled:opacity-40 text-white py-3 rounded-xl text-sm font-bold active:scale-95">
                 {firing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
                 Send KOT{pendingCount > 0 ? ` (${pendingCount})` : ''}
               </button>
@@ -1046,7 +1046,7 @@ export default function CaptainOrder() {
         </div>
       )}
 
-      {toast && <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-50 bg-[#2D1B0E] text-white text-sm px-4 py-2.5 rounded-full shadow-lg">{toast}</div>}
+      {toast && <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-50 bg-white text-[#2D1B0E] text-sm px-4 py-2.5 rounded-full border border-[#E8D5C4] shadow-lg">{toast}</div>}
     </div>
   );
 }

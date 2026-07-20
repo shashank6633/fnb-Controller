@@ -43,7 +43,7 @@ export default function CaptainHome() {
     <div className="p-4 sm:p-6 pb-24 lg:pb-6 max-w-4xl">
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <button onClick={openTables} className="md:hidden p-2 -ml-2 rounded-lg bg-[#1C0F05] text-white active:scale-95" aria-label="Open tables">
+          <button onClick={openTables} className="md:hidden p-2 -ml-2 rounded-lg bg-white text-[#2D1B0E] border border-[#E8D5C4] active:scale-95" aria-label="Open tables">
             <Menu className="w-5 h-5" />
           </button>
           <h1 className="text-xl sm:text-2xl font-bold text-[#2D1B0E]">My tables</h1>
