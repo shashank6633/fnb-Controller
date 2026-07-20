@@ -1,5 +1,25 @@
 import { getDb, generateId } from '@/lib/db';
 
+/**
+ * Reconcile an item's GST fields so they always agree (the bill engine sums the
+ * combined tax_value per line). If explicit CGST/SGST are provided, the combined
+ * value is their sum; if only a combined value arrives (e.g. CSV import), it is
+ * split 50/50. Liquor is typically 0 (already taxed at source).
+ */
+function splitGst(
+  cgstIn: unknown, sgstIn: unknown, combinedIn: unknown, r2: (n: number) => number,
+): { cgst: number; sgst: number; combined: number } {
+  const hasSplit = cgstIn !== undefined && cgstIn !== null || sgstIn !== undefined && sgstIn !== null;
+  if (hasSplit) {
+    const cgst = Math.max(0, r2(Number(cgstIn) || 0));
+    const sgst = Math.max(0, r2(Number(sgstIn) || 0));
+    return { cgst, sgst, combined: r2(cgst + sgst) };
+  }
+  const combined = Math.max(0, r2(Number(combinedIn) || 0));
+  const cgst = r2(combined / 2);
+  return { cgst, sgst: r2(combined - cgst), combined };
+}
+
 export async function GET(request: Request) {
   try {
     const db = getDb();
@@ -64,21 +84,26 @@ export async function POST(request: Request) {
   try {
     const db = getDb();
     const body = await request.json();
-    const { name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, prep_minutes, is_active, recipe_id, material_id, notes,
+    const { name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, cgst_percent, sgst_percent, prep_minutes, is_active, recipe_id, material_id, notes,
             image_url, spice_level, tags, taste_sour, taste_sweet, taste_spicy, taste_tangy, serves, options } = body;
 
     if (!name) return Response.json({ error: 'name is required' }, { status: 400 });
     const clamp = (v: any, max: number) => Math.max(0, Math.min(max, Math.floor(Number(v) || 0)));
     const asJson = (v: any) => Array.isArray(v) ? JSON.stringify(v) : (typeof v === 'string' ? v : '');
+    const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+    // Per-item GST. If explicit CGST/SGST come in, tax_value = their sum (kept in
+    // sync for the bill engine). If only a combined tax_value arrives (import),
+    // split it 50/50. Liquor typically 0 (already taxed at source).
+    const tax = splitGst(cgst_percent, sgst_percent, tax_value, r2);
 
     const id = generateId();
     db.prepare(`
-      INSERT INTO menu_items (id, name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, prep_minutes, is_active, recipe_id, material_id, source, notes,
+      INSERT INTO menu_items (id, name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, cgst_percent, sgst_percent, prep_minutes, is_active, recipe_id, material_id, source, notes,
                               image_url, spice_level, tags, taste_sour, taste_sweet, taste_spicy, taste_tangy, serves, options, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     `).run(
       id, name, category || '', station || '', item_type || 'foods', dietary_tag || '',
-      Number(selling_price) || 0, Number(listing_price) || 0, item_code || '', Number(tax_value) || 0,
+      Number(selling_price) || 0, Number(listing_price) || 0, item_code || '', tax.combined, tax.cgst, tax.sgst,
       Number(prep_minutes) || 0, is_active === false ? 0 : 1, recipe_id || null, material_id || null, notes || '',
       (image_url || '').toString(), clamp(spice_level, 3), asJson(tags),
       clamp(taste_sour, 4), clamp(taste_sweet, 4), clamp(taste_spicy, 4), clamp(taste_tangy, 4), (serves || '').toString(), asJson(options)
@@ -99,7 +124,7 @@ export async function PUT(request: Request) {
 
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
 
-    const allowed = ['name', 'category', 'station', 'item_type', 'dietary_tag', 'selling_price', 'listing_price', 'item_code', 'tax_value', 'prep_minutes', 'is_active', 'recipe_id', 'material_id', 'notes',
+    const allowed = ['name', 'category', 'station', 'item_type', 'dietary_tag', 'selling_price', 'listing_price', 'item_code', 'tax_value', 'cgst_percent', 'sgst_percent', 'prep_minutes', 'is_active', 'recipe_id', 'material_id', 'notes',
       'image_url', 'spice_level', 'tags', 'taste_sour', 'taste_sweet', 'taste_spicy', 'taste_tangy', 'serves', 'options'];
     const updates: string[] = [];
     const values: any[] = [];
@@ -112,6 +137,18 @@ export async function PUT(request: Request) {
       }
     }
     if (updates.length === 0) return Response.json({ error: 'no fields to update' }, { status: 400 });
+
+    // Keep tax_value = cgst_percent + sgst_percent whenever either half is edited,
+    // so the per-item bill engine (which sums tax_value per line) stays correct.
+    if (fields.cgst_percent !== undefined || fields.sgst_percent !== undefined) {
+      const cur = db.prepare('SELECT cgst_percent, sgst_percent FROM menu_items WHERE id = ?').get(id) as any;
+      const cg = Math.max(0, Number(fields.cgst_percent ?? cur?.cgst_percent ?? 0) || 0);
+      const sg = Math.max(0, Number(fields.sgst_percent ?? cur?.sgst_percent ?? 0) || 0);
+      const txIdx = updates.findIndex(u => u.startsWith('tax_value ='));  // drop any caller-sent tax_value; we derive it
+      if (txIdx >= 0) { updates.splice(txIdx, 1); values.splice(txIdx, 1); }
+      updates.push('tax_value = ?');
+      values.push(Math.round((cg + sg) * 100) / 100);
+    }
 
     values.push(id);
     db.prepare(`UPDATE menu_items SET ${updates.join(', ')}, updated_at = datetime('now') WHERE id = ?`).run(...values);

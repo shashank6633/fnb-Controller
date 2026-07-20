@@ -234,6 +234,7 @@ export function getItemWiseSales(
     LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
     WHERE o.status = 'settled' AND (o.outlet_id = ? OR o.outlet_id IS NULL)
       AND date(o.settled_at, ${IST}) BETWEEN ? AND ?
+      AND COALESCE(o.bill_type, 'normal') = 'normal'
     GROUP BY oi.name, type
     ORDER BY amount DESC
   `).all(outletId, from, to) as any[];

@@ -142,10 +142,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
               .run(newQty, Math.round(existing.unit_price * newQty * 100) / 100, existing.id);
           } else {
             db.prepare(`
-              INSERT INTO order_items (id, order_id, menu_item_id, recipe_id, name, station, quantity, unit_price, tax_value, line_total, status, notes, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, datetime('now'))
+              INSERT INTO order_items (id, order_id, menu_item_id, recipe_id, name, station, quantity, unit_price, tax_value, cgst_value, sgst_value, line_total, status, notes, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, datetime('now'))
             `).run(generateId(), id, mi.id, mi.recipe_id || null, mi.name, mi.station || '', qty,
-                   mi.selling_price, mi.tax_value || 0, Math.round(mi.selling_price * qty * 100) / 100, notes);
+                   mi.selling_price, mi.tax_value || 0, mi.cgst_percent || 0, mi.sgst_percent || 0, Math.round(mi.selling_price * qty * 100) / 100, notes);
           }
           break;
         }

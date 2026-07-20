@@ -163,16 +163,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // Store the computed breakdown before marking settled so the settled row
       // is the single source of truth for the charged amounts. A held bill's
       // totals were frozen at hold time → only record the payment + close it.
+      // Store `grand` (the whole-rupee amount actually collected, validated and
+      // printed) as orders.total — NOT the unrounded bill.total — so the settled
+      // row, order_payments and the printed bill all agree, and reports equal what
+      // was charged.
       if (fromHold) {
-        db.prepare(`UPDATE orders SET status = 'settled', payment_method = ?, settled_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`)
-          .run(primaryMethod, id);
+        db.prepare(`UPDATE orders SET status = 'settled', payment_method = ?, total = ?, settled_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`)
+          .run(primaryMethod, grand, id);
       } else {
         db.prepare(`
           UPDATE orders SET status = 'settled', payment_method = ?,
             service_charge = ?, discount = ?, tax_total = ?, total = ?,
             settled_at = datetime('now'), updated_at = datetime('now')
           WHERE id = ?
-        `).run(primaryMethod, bill.serviceCharge, bill.discount, taxTotal, bill.total, id);
+        `).run(primaryMethod, bill.serviceCharge, bill.discount, taxTotal, grand, id);
       }
       // Record each tender line (clear any prior rows first so a retry can't
       // double-insert). Powers the dashboard's payment-category breakup + split.

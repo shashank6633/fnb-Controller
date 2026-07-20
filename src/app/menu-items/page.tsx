@@ -38,6 +38,8 @@ interface MenuItem {
   listing_price: number;
   item_code: string;
   tax_value: number;
+  cgst_percent: number;
+  sgst_percent: number;
   prep_minutes: number;
   is_active: number;
   recipe_id: string | null;
@@ -63,7 +65,7 @@ const TOP_CATS = 8;   // category chips shown inline before the "All N categorie
 
 const NEW_ITEM: MenuItem = {
   id: '', name: '', category: '', station: '', item_type: 'foods', dietary_tag: '',
-  selling_price: 0, listing_price: 0, item_code: '', tax_value: 5, prep_minutes: 15,
+  selling_price: 0, listing_price: 0, item_code: '', tax_value: 5, cgst_percent: 2.5, sgst_percent: 2.5, prep_minutes: 15,
   is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '',
 };
 
@@ -1020,7 +1022,7 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
             <div>
               <label className="block text-xs font-medium text-[#6B5744] mb-1">Type</label>
               <select value={form.item_type}
-                      onChange={e => { const t = e.target.value; setForm({ ...form, item_type: t, tax_value: t === 'liquors' ? 0 : 5 }); }}
+                      onChange={e => { const t = e.target.value; const half = t === 'liquors' ? 0 : 2.5; setForm({ ...form, item_type: t, cgst_percent: half, sgst_percent: half, tax_value: half * 2 }); }}
                       className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
                 <option value="foods">Foods</option>
                 <option value="liquors">Liquor</option>
@@ -1051,9 +1053,20 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
               <input type="number" step="0.01" value={form.listing_price} onChange={e => setForm({ ...form, listing_price: Number(e.target.value) })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
             </div>
             <div>
-              <label className="block text-xs font-medium text-[#6B5744] mb-1">GST %</label>
-              <input type="number" step="0.01" value={form.tax_value} onChange={e => setForm({ ...form, tax_value: Number(e.target.value) })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
-              <p className="text-[10px] text-[#8B7355] mt-0.5">Food &amp; Beverages 5% · Liquor 0%. Auto-set by Type; override if needed.</p>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">GST % (CGST + SGST)</label>
+              <div className="flex gap-2">
+                <input type="number" step="0.01" min="0" placeholder="CGST" aria-label="CGST %"
+                       value={form.cgst_percent}
+                       onChange={e => setForm({ ...form, cgst_percent: Number(e.target.value) })}
+                       className="w-full px-2 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+                <input type="number" step="0.01" min="0" placeholder="SGST" aria-label="SGST %"
+                       value={form.sgst_percent}
+                       onChange={e => setForm({ ...form, sgst_percent: Number(e.target.value) })}
+                       className="w-full px-2 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+              </div>
+              <p className="text-[10px] text-[#8B7355] mt-0.5">
+                Total GST {Math.round(((Number(form.cgst_percent) || 0) + (Number(form.sgst_percent) || 0)) * 100) / 100}% · added to the bill per item · Liquor 0%. Auto-set by Type.
+              </p>
             </div>
           </div>
           <div className="grid grid-cols-3 gap-3">

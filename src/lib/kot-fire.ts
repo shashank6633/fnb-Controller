@@ -55,9 +55,13 @@ export function fireStagingOrder(
       db.prepare('UPDATE order_items SET order_id = ? WHERE order_id = ?').run(live.id, orderId);
       db.prepare(`
         UPDATE orders SET status = 'void', voided_at = datetime('now'), updated_at = datetime('now'),
+          subtotal = 0, tax_total = 0, total = 0,
           notes = TRIM(COALESCE(notes,'') || ' [merged into order #' || CAST(? AS INTEGER) || ']')
         WHERE id = ?
       `).run(live.order_number, orderId);
+      // ^ zero the merged shell's totals: its items now belong to the live order,
+      // so a void with a non-zero total would be double-counted as a cancellation
+      // in the Sales Dashboard's cancel breakup.
       // Carry the guest's name/mobile (QR details page) onto the live bill —
       // backfill ONLY when the target's fields are empty, never overwrite what
       // a captain already recorded.

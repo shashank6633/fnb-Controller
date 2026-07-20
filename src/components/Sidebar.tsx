@@ -183,6 +183,7 @@ const navTree: NavEntry[] = [
     items: [
       { kind: "link", label: "Sales Dashboard",    href: "/sales-dashboard",        icon: BarChart3 },
       { kind: "link", label: "Reports",            href: "/reports",                icon: BarChart3 },
+      { kind: "link", label: "Sales Reports",      href: "/reports/sales",          icon: BarChart3 },
       { kind: "link", label: "Menu Engineering",   href: "/menu-engineering",       icon: BarChart3 },
       { kind: "link", label: "Variance Report",    href: "/variance-report",        icon: ClipboardCheck },
       { kind: "link", label: "Dept Consumption",   href: "/department-consumption", icon: BarChart3 },

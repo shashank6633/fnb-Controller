@@ -1291,6 +1291,36 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('error_reports schema failed:', e); }
 
+  // ── Per-item CGST/SGST (India GST split) ────────────────────────────────────
+  // Restaurants set CGST% + SGST% per menu item (liquor = 0, already taxed at
+  // source). tax_value is kept = cgst_percent + sgst_percent so the per-item bill
+  // engine (src/lib/bill-calc.ts, which applies each line's tax_value) is
+  // UNCHANGED — this only adds explicit entry/display of the two halves. Backfill
+  // splits the existing combined tax_value 50/50 so current items keep their tax.
+  try {
+    const cols = db.prepare('PRAGMA table_info(menu_items)').all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    if (!has('cgst_percent')) db.exec('ALTER TABLE menu_items ADD COLUMN cgst_percent REAL DEFAULT 0');
+    if (!has('sgst_percent')) db.exec('ALTER TABLE menu_items ADD COLUMN sgst_percent REAL DEFAULT 0');
+    db.exec(`UPDATE menu_items
+             SET cgst_percent = ROUND(tax_value / 2.0, 2),
+                 sgst_percent = ROUND(tax_value - tax_value / 2.0, 2)
+             WHERE COALESCE(cgst_percent, 0) = 0 AND COALESCE(sgst_percent, 0) = 0 AND COALESCE(tax_value, 0) > 0`);
+  } catch (e) { console.error('menu_items cgst/sgst migration failed:', e); }
+
+  // Snapshot the per-line CGST/SGST split at add time (for exact bill display +
+  // tax reporting). tax_value (combined) remains the value the bill engine sums.
+  try {
+    const cols = db.prepare('PRAGMA table_info(order_items)').all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    if (!has('cgst_value')) db.exec('ALTER TABLE order_items ADD COLUMN cgst_value REAL DEFAULT 0');
+    if (!has('sgst_value')) db.exec('ALTER TABLE order_items ADD COLUMN sgst_value REAL DEFAULT 0');
+    db.exec(`UPDATE order_items
+             SET cgst_value = ROUND(tax_value / 2.0, 2),
+                 sgst_value = ROUND(tax_value - tax_value / 2.0, 2)
+             WHERE COALESCE(cgst_value, 0) = 0 AND COALESCE(sgst_value, 0) = 0 AND COALESCE(tax_value, 0) > 0`);
+  } catch (e) { console.error('order_items cgst/sgst migration failed:', e); }
+
   // Migration: per-line department on requisition items so a single party
   // requisition can span kitchen + bar + housekeeping with each item tagged
   // to the owning department. Backfills from parent requisition.department_id.

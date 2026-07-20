@@ -109,13 +109,21 @@ export async function POST(request: Request) {
     for (const m of materials) materialMap.set(m.name.toLowerCase().trim(), m.id);
 
     const insertItem = db.prepare(`
-      INSERT INTO menu_items (id, name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, is_active, recipe_id, material_id, source, pos_id, notes, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pos', ?, '', datetime('now'), datetime('now'))
+      INSERT INTO menu_items (id, name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, cgst_percent, sgst_percent, is_active, recipe_id, material_id, source, pos_id, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pos', ?, '', datetime('now'), datetime('now'))
     `);
 
     const updateItem = db.prepare(`
-      UPDATE menu_items SET category = ?, station = ?, item_type = ?, dietary_tag = ?, selling_price = ?, listing_price = ?, item_code = ?, tax_value = ?, is_active = ?, recipe_id = COALESCE(?, recipe_id), material_id = COALESCE(?, material_id), pos_id = ?, updated_at = datetime('now') WHERE id = ?
+      UPDATE menu_items SET category = ?, station = ?, item_type = ?, dietary_tag = ?, selling_price = ?, listing_price = ?, item_code = ?, tax_value = ?, cgst_percent = ?, sgst_percent = ?, is_active = ?, recipe_id = COALESCE(?, recipe_id), material_id = COALESCE(?, material_id), pos_id = ?, updated_at = datetime('now') WHERE id = ?
     `);
+    // Keep the invariant tax_value = cgst_percent + sgst_percent (the bill engine
+    // sums tax_value; the menu form re-derives tax_value from the two halves on
+    // edit, so leaving them 0 would zero out an item's GST on the next save).
+    const gstSplit = (tv: number) => {
+      const t = Math.max(0, Math.round((Number(tv) || 0) * 100) / 100);
+      const cg = Math.round((t / 2) * 100) / 100;
+      return { tax: t, cgst: cg, sgst: Math.round((t - cg) * 100) / 100 };
+    };
 
     // Track what we've inserted in this batch (by normalized name) to detect in-batch duplicates
     const batchNames = new Map<string, number>();
@@ -200,20 +208,22 @@ export async function POST(request: Request) {
             report.items_skipped_duplicate++;
             continue;
           }
+          const ug = gstSplit(Number(row.tax_value) || 0);
           updateItem.run(
             row.category || '', row.station || '', row.item_type || 'foods', row.dietary_tag || '',
             sellingPrice, Number(row.listing_price) || 0, row.item_code || '',
-            Number(row.tax_value) || 0, isActive ? 1 : 0, recipeId, materialId, row.pos_id || '',
+            ug.tax, ug.cgst, ug.sgst, isActive ? 1 : 0, recipeId, materialId, row.pos_id || '',
             existing.id
           );
           report.items_updated++;
         } else {
           const id = generateId();
+          const ig = gstSplit(Number(row.tax_value) || 0);
           insertItem.run(
             id, normalized, row.category || '', row.station || '',
             row.item_type || 'foods', row.dietary_tag || '',
             sellingPrice, Number(row.listing_price) || 0, row.item_code || '',
-            Number(row.tax_value) || 0, isActive ? 1 : 0, recipeId, materialId, row.pos_id || ''
+            ig.tax, ig.cgst, ig.sgst, isActive ? 1 : 0, recipeId, materialId, row.pos_id || ''
           );
           report.items_created++;
           existingMap.set(nameKey, { id, name: normalized });

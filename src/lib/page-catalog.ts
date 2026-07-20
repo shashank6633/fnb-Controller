@@ -136,6 +136,7 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/sales-dashboard',     label: 'Sales Dashboard' },
       { path: '/reports',             label: 'Reports' },
+      { path: '/reports/sales',       label: 'Sales Reports', mgmtOnly: true },
       { path: '/menu-engineering',    label: 'Menu Engineering', hodOnly: true },
       { path: '/variance-report',     label: 'Variance Report' },
       { path: '/department-consumption', label: 'Dept Consumption' },
