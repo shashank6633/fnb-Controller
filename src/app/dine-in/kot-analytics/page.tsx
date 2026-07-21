@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  RefreshCw, Loader2, ChefHat, Users, Timer, Printer, Ban, Flame, Clock,
+  RefreshCw, Loader2, ChefHat, Users, Timer, Printer, Ban, Flame, Clock, Route, Download,
 } from 'lucide-react';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
@@ -18,14 +18,49 @@ const hourLabel = (h: number) => {
   const am = h < 12; const h12 = h % 12 === 0 ? 12 : h % 12;
   return `${h12} ${am ? 'AM' : 'PM'}`;
 };
+// Seconds → m:ss (e.g. 222 → "3:42"); null/undefined → "—".
+const fmtDur = (s: number | null | undefined) => {
+  if (s == null) return '—';
+  const sec = Math.max(0, Math.round(s));
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+};
+// SQLite UTC stamp ("2026-07-21 10:30:00") → IST wall-clock time.
+const istClock = (iso: string | null | undefined) => {
+  if (!iso) return '—';
+  const d = new Date(iso.replace(' ', 'T') + 'Z');
+  if (isNaN(d.getTime())) return '—';
+  return d.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true });
+};
 
 interface Row { [k: string]: any }
+interface JStation {
+  station: string; items: number;
+  prep_avg: number | null; prep_min: number | null; prep_max: number | null; prep_n: number;
+  k2t_avg: number | null; k2t_min: number | null; k2t_max: number | null; k2t_n: number;
+  total_avg: number | null; total_min: number | null; total_max: number | null; total_n: number;
+}
+interface JSlow {
+  name: string; table: string;
+  created_at: string | null; fired_at: string | null; kitchen_sent_at: string | null; completed_at: string | null;
+  prep_secs: number | null; k2t_secs: number | null; total_secs: number | null;
+}
+interface ItemJourney {
+  overall: {
+    items: number; completed: number;
+    prep_avg: number | null; prep_n: number;
+    k2t_avg: number | null; k2t_n: number;
+    total_avg: number | null; total_n: number;
+  };
+  by_station: JStation[];
+  slowest: JSlow[];
+}
 interface Data {
   range: { from: string; to: string; isToday: boolean };
   totals: { kots: number; items: number; sales: number; reprints: number; voids: number };
   byStation: Row[]; byHour: Row[]; byCaptain: Row[]; prep: Row[];
   reprints: { totalReprints: number; kotsReprinted: number; topReprinted: Row[] };
   voids: { count: number; value: number };
+  item_journey?: ItemJourney;
 }
 
 export default function KotAnalyticsPage() {
@@ -62,6 +97,22 @@ export default function KotAnalyticsPage() {
 
   const maxHour = useMemo(() => Math.max(1, ...(data?.byHour || []).map((h) => h.kots)), [data]);
   const maxStation = useMemo(() => Math.max(1, ...(data?.byStation || []).map((s) => s.kots)), [data]);
+
+  // Item Journey → CSV (station summary; durations kept in whole seconds).
+  const exportJourneyCsv = () => {
+    const j = data?.item_journey;
+    if (!j || j.by_station.length === 0) return;
+    const head = ['Station', 'Items', 'Avg prep (s)', 'Min prep', 'Max prep', 'Prep samples',
+      'Avg kitchen→table (s)', 'Min k→t', 'Max k→t', 'K→t samples', 'Avg total (s)', 'Min total', 'Max total', 'Total samples'];
+    const rows = j.by_station.map((s) => [s.station, s.items, s.prep_avg, s.prep_min, s.prep_max, s.prep_n,
+      s.k2t_avg, s.k2t_min, s.k2t_max, s.k2t_n, s.total_avg, s.total_min, s.total_max, s.total_n]);
+    const esc = (c: any) => `"${String(c ?? '').replace(/"/g, '""')}"`;
+    const csv = [head, ...rows].map((r) => r.map(esc).join(',')).join('\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = `item-journey_${data?.range.from}_${data?.range.to}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const t = data?.totals;
 
@@ -187,6 +238,93 @@ export default function KotAnalyticsPage() {
             )}
           </Section>
 
+          {/* Item Journey — punch → kitchen → table timing */}
+          {data.item_journey && (
+            <Section icon={<Route className="w-4 h-4" />} title="Item Journey (punch → kitchen → table)">
+              <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+                <div className="flex flex-wrap gap-x-6 gap-y-2">
+                  <JMetric label="Items" value={String(data.item_journey.overall.items)} />
+                  <JMetric label="Received" value={String(data.item_journey.overall.completed)} />
+                  <JMetric label="Avg prep" value={fmtDur(data.item_journey.overall.prep_avg)} accent />
+                  <JMetric label="Avg kitchen→table" value={fmtDur(data.item_journey.overall.k2t_avg)} accent />
+                  <JMetric label="Avg total" value={fmtDur(data.item_journey.overall.total_avg)} accent />
+                </div>
+                {data.item_journey.by_station.length > 0 && (
+                  <button onClick={exportJourneyCsv} className="px-2.5 py-1.5 text-xs font-semibold rounded-lg bg-white border border-[#E8DFD3] text-[#2D1B0E] inline-flex items-center gap-1">
+                    <Download className="w-3.5 h-3.5" /> CSV
+                  </button>
+                )}
+              </div>
+
+              <p className="text-[11px] text-[#8B7355] mb-3">
+                Kitchen→table needs the kitchen <b>Scan-Out</b>; items not yet scanned show prep as —. Durations shown as m:ss (min:sec).
+              </p>
+
+              {/* By station summary */}
+              {data.item_journey.by_station.length === 0 ? <Empty /> : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead><tr className="text-left text-xs text-[#8B7355] border-b border-[#E8DFD3]">
+                      <th className="py-1.5 pr-3">Station</th>
+                      <th className="py-1.5 px-3 text-right">Items</th>
+                      <th className="py-1.5 px-3 text-right">Avg prep</th>
+                      <th className="py-1.5 px-3 text-right">Avg kitchen→table</th>
+                      <th className="py-1.5 pl-3 text-right">Avg total</th>
+                    </tr></thead>
+                    <tbody>
+                      {data.item_journey.by_station.map((s, i) => (
+                        <tr key={i} className="border-b border-[#F0E9DF] last:border-0">
+                          <td className="py-2 pr-3 font-medium text-[#2D1B0E] capitalize">{s.station}</td>
+                          <td className="py-2 px-3 text-right">{s.items}</td>
+                          <td className="py-2 px-3 text-right" title={s.prep_n ? `min ${fmtDur(s.prep_min)} · max ${fmtDur(s.prep_max)} · ${s.prep_n} item${s.prep_n === 1 ? '' : 's'}` : 'no kitchen scan-outs yet'}>{s.prep_n ? fmtDur(s.prep_avg) : '—'}</td>
+                          <td className="py-2 px-3 text-right" title={s.k2t_n ? `min ${fmtDur(s.k2t_min)} · max ${fmtDur(s.k2t_max)} · ${s.k2t_n} item${s.k2t_n === 1 ? '' : 's'}` : 'none received yet'}>{s.k2t_n ? fmtDur(s.k2t_avg) : '—'}</td>
+                          <td className="py-2 pl-3 text-right font-semibold text-[#af4408]" title={s.total_n ? `min ${fmtDur(s.total_min)} · max ${fmtDur(s.total_max)} · ${s.total_n} item${s.total_n === 1 ? '' : 's'}` : ''}>{s.total_n ? fmtDur(s.total_avg) : '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Slowest individual items */}
+              {data.item_journey.slowest.length > 0 && (
+                <div className="mt-4">
+                  <p className="text-xs font-semibold text-[#8B7355] mb-2">Slowest items (by total time)</p>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm whitespace-nowrap">
+                      <thead><tr className="text-left text-xs text-[#8B7355] border-b border-[#E8DFD3]">
+                        <th className="py-1.5 pr-3">Item</th>
+                        <th className="py-1.5 px-3">Table</th>
+                        <th className="py-1.5 px-3">Punched</th>
+                        <th className="py-1.5 px-3">Fired</th>
+                        <th className="py-1.5 px-3">Kitchen out</th>
+                        <th className="py-1.5 px-3">Received</th>
+                        <th className="py-1.5 px-3 text-right">Prep</th>
+                        <th className="py-1.5 px-3 text-right">K→Table</th>
+                        <th className="py-1.5 pl-3 text-right">Total</th>
+                      </tr></thead>
+                      <tbody>
+                        {data.item_journey.slowest.map((r, i) => (
+                          <tr key={i} className="border-b border-[#F0E9DF] last:border-0">
+                            <td className="py-2 pr-3 font-medium text-[#2D1B0E]">{r.name}</td>
+                            <td className="py-2 px-3 text-[#8B7355]">{r.table}</td>
+                            <td className="py-2 px-3 text-[#8B7355]">{istClock(r.created_at)}</td>
+                            <td className="py-2 px-3 text-[#8B7355]">{istClock(r.fired_at)}</td>
+                            <td className="py-2 px-3 text-[#8B7355]">{istClock(r.kitchen_sent_at)}</td>
+                            <td className="py-2 px-3 text-[#8B7355]">{istClock(r.completed_at)}</td>
+                            <td className="py-2 px-3 text-right">{fmtDur(r.prep_secs)}</td>
+                            <td className="py-2 px-3 text-right">{fmtDur(r.k2t_secs)}</td>
+                            <td className="py-2 pl-3 text-right font-semibold text-[#af4408]">{fmtDur(r.total_secs)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </Section>
+          )}
+
           {/* Reprints & voids */}
           <Section icon={<Printer className="w-4 h-4" />} title="Reprints & voids">
             <div className="grid md:grid-cols-2 gap-5">
@@ -230,6 +368,15 @@ function Kpi({ label, value, accent, muted }: { label: string; value: string; ac
     <div className={`rounded-xl border p-3 ${accent ? 'border-[#af4408] bg-[#FFF3EC]' : 'border-[#E8DFD3] bg-white'}`}>
       <p className="text-[11px] text-[#8B7355] leading-none">{label}</p>
       <p className={`text-2xl font-extrabold mt-1 leading-none ${muted ? 'text-[#B8A88F]' : accent ? 'text-[#af4408]' : 'text-[#2D1B0E]'}`}>{value}</p>
+    </div>
+  );
+}
+
+function JMetric({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
+  return (
+    <div>
+      <p className="text-[11px] text-[#8B7355] leading-none mb-1">{label}</p>
+      <p className={`text-xl font-extrabold leading-none ${accent ? 'text-[#af4408]' : 'text-[#2D1B0E]'}`}>{value}</p>
     </div>
   );
 }

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
+import Toggle from '@/components/Toggle';
 import { BarChart3, Building2, Loader2 } from 'lucide-react';
 
 /**
@@ -56,10 +57,7 @@ export default function DashboardSettingsPage() {
                 <p className="font-semibold text-[#2D1B0E] flex items-center gap-1.5"><Building2 className="w-4 h-4 text-[#af4408]" /> Floor P&amp;L detail</p>
                 <p className="text-sm text-[#8B7355] mt-0.5">Show <b>Food Cost, Gross Profit and GP%</b> on the Sales-by-Floor breakdown (Daily Dashboard). Off shows sales only. Off by default.</p>
               </div>
-              <label className="relative inline-flex items-center cursor-pointer shrink-0 mt-1">
-                <input type="checkbox" className="sr-only peer" checked={floorSales} disabled={!canEdit || saving} onChange={(e) => save(e.target.checked)} />
-                <div className="w-11 h-6 bg-[#E8D5C4] rounded-full peer peer-checked:bg-[#af4408] peer-disabled:opacity-50 transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-transform peer-checked:after:translate-x-5" />
-              </label>
+              <Toggle checked={floorSales} onChange={(v) => save(v)} disabled={!canEdit || saving} label="Floor P&L detail" className="mt-1 shrink-0" />
             </div>
           </div>
         )}

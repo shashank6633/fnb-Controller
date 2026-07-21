@@ -10,6 +10,7 @@ import { api } from '@/lib/api';
 import { computeBill } from '@/lib/bill-calc';
 import { enqueue, drainOutbox, ensureDrainLoop } from './outbox';
 import type { PrinterTarget } from './bridge-client';
+import { buildKotStickerESCPOS, normalizeStickerDesign, DEFAULT_STICKER_DESIGN, type StickerDesign } from './kot-sticker';
 
 export interface PrintStation {
   id: string; name: string; role: 'bill' | 'kot'; station: string;
@@ -216,7 +217,43 @@ export interface FiredKot {
   captain?: string | null;        // 1st captain — who opened the table
   fired_by?: string | null;       // captain who punched this KOT
   reprint_count?: number;         // 0 = ORIGINAL, ≥1 = DUPLICATE N
-  items: Array<{ name: string; quantity: number; notes?: string; item_type?: string }>;
+  items: Array<{ id?: string; scan_code?: string; name: string; quantity: number; notes?: string; item_type?: string }>;
+}
+
+// ── Sticker-KOT toggle (leak-proof serving) ───────────────────────────────────
+// When ON, each fired item prints as its own sticker on the SAME KOT printer
+// (load a sticker roll). When OFF, the normal grouped KOT prints as before.
+interface StickerConfig { enabled: boolean; granularity: 'per_unit' | 'per_line'; codeType: 'qr' | 'barcode' }
+let stickerCache: { at: number; c: StickerConfig } | null = null;
+/** Sticker toggle: on/off + per-unit vs per-line + QR vs barcode (settings key kot_item_labels). */
+async function getStickerConfig(force = false): Promise<StickerConfig> {
+  if (!force && stickerCache && Date.now() - stickerCache.at < 30000) return stickerCache.c;
+  const dflt: StickerConfig = { enabled: false, granularity: 'per_unit', codeType: 'qr' };
+  try {
+    const r = await api('/api/settings?key=kot_item_labels');
+    const v = r.ok ? (await r.json()).value : null;
+    const parsed = v ? JSON.parse(v) : {};
+    const c: StickerConfig = {
+      enabled: !!parsed?.enabled,
+      granularity: parsed?.granularity === 'per_line' ? 'per_line' : 'per_unit',
+      codeType: parsed?.codeType === 'barcode' ? 'barcode' : 'qr',
+    };
+    stickerCache = { at: Date.now(), c };
+    return c;
+  } catch { return stickerCache?.c || dflt; }
+}
+
+let stickerDesignCache: { at: number; d: StickerDesign } | null = null;
+/** Sticker field order/size/visibility (settings key sticker_design). */
+async function getStickerDesign(force = false): Promise<StickerDesign> {
+  if (!force && stickerDesignCache && Date.now() - stickerDesignCache.at < 30000) return stickerDesignCache.d;
+  try {
+    const r = await api('/api/settings?key=sticker_design');
+    const v = r.ok ? (await r.json()).value : null;
+    const d = v ? normalizeStickerDesign(JSON.parse(v)) : DEFAULT_STICKER_DESIGN;
+    stickerDesignCache = { at: Date.now(), d };
+    return d;
+  } catch { return stickerDesignCache?.d || DEFAULT_STICKER_DESIGN; }
 }
 
 export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
@@ -225,7 +262,12 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
   const stations = await getStations();
   const design = await getKotDesign();
   const shop = await getShop();
+  const sticker = await getStickerConfig();   // ON → per-item stickers; OFF → normal KOT
+  const stickerDesign = sticker.enabled ? await getStickerDesign() : DEFAULT_STICKER_DESIGN;   // field order/size/visibility
   const time = new Date().toISOString();
+  const stickerTime = new Date().toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true,
+  });
   // Items accumulated per kind (food/bar) for the MASTER/expediter copy; each
   // carries its station's floor so a floor-scoped master takes only its floor.
   const byKind: Record<string, Array<{ qty: number; name: string; notes?: string; floor: string }>> = {};
@@ -265,12 +307,55 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
     // again; the original (reprint_count 0) keeps its stable id → never doubles.
     const rc = Number(k.reprint_count) || 0;
     const baseId = rc > 0 ? `kot_${k.id}_r${rc}` : `kot_${k.id}`;
-    for (let c = 0; c < copies; c++) {
-      await enqueue({
-        id: copies > 1 ? `${baseId}_c${c}` : baseId,  // stable per KOT(+reprint+copy) → dedup
-        printer: targetOf(st), backup: st.backup_target || undefined, doc,
-        meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
-      });
+
+    if (sticker.enabled) {
+      // STICKER-KOT: one sticker per fired item (or per unit) to the SAME KOT
+      // printer — dish name, Table, KOT#, time, and a QR of the order_item id the
+      // kitchen scans out. Replaces the grouped KOT for this station. Items with
+      // no id (shouldn't happen post-fire) fall back into the normal KOT below.
+      const withId = (k.items || []).filter((it) => it.id);
+      const noId = (k.items || []).filter((it) => !it.id);
+      for (const it of withId) {
+        const units = sticker.granularity === 'per_unit' ? Math.max(1, Math.floor(Number(it.quantity) || 1)) : 1;
+        const payload = buildKotStickerESCPOS({
+          itemName: it.name,
+          tableLabel: String(k.table_number || k.order_number || '-'),
+          kotNumber: k.kot_number,
+          timeLabel: stickerTime,
+          captain: k.fired_by || k.captain || undefined,   // captain who fired this KOT
+          code: it.scan_code || (it.id as string),   // short scan code (fallback to id)
+          notes: it.notes,
+          codeType: sticker.codeType,
+          design: stickerDesign,
+        });
+        for (let n = 0; n < units; n++) {
+          const stkId = rc > 0 ? `stk_${k.id}_${it.id}_${n}_r${rc}` : `stk_${k.id}_${it.id}_${n}`;
+          await enqueue({
+            id: stkId,   // stable per KOT+item+unit(+reprint) → dedups across triple-send
+            printer: targetOf(st), backup: st.backup_target || undefined,
+            doc: { type: 'raw', payload },
+            meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
+          });
+        }
+      }
+      // Anything without an id still prints as a normal grouped KOT so it's never lost.
+      if (noId.length) {
+        const fbDoc = { ...doc, items: noId.map((it) => ({ qty: it.quantity, name: it.name, notes: it.notes || undefined })) };
+        await enqueue({
+          id: `${baseId}_noid`,
+          printer: targetOf(st), backup: st.backup_target || undefined, doc: fbDoc,
+          meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
+        });
+      }
+    } else {
+      // NORMAL KOT — unchanged.
+      for (let c = 0; c < copies; c++) {
+        await enqueue({
+          id: copies > 1 ? `${baseId}_c${c}` : baseId,  // stable per KOT(+reprint+copy) → dedup
+          printer: targetOf(st), backup: st.backup_target || undefined, doc,
+          meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
+        });
+      }
     }
     // Expediter copy — ONLY if this station is configured to mirror to the Main
     // printer ("Send duplicate KOT to Main Kitchen"). Stations on other floors /

@@ -2,11 +2,13 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
+import Toggle from '@/components/Toggle';
 import { probeBridge, bridgePrint, bridgeStatus, getBridgeUrl, setBridgeUrl, type BridgeHealth, type PrinterStatus } from '@/lib/offline-print/bridge-client';
 import { counts as outboxCounts, retryFailed, drainOutbox, ensureDrainLoop } from '@/lib/offline-print/outbox';
 import {
   Printer, Plus, Trash2, Loader2, X, Wifi, WifiOff, RefreshCw, Save,
   CheckCircle2, XCircle, FlaskConical, ChevronDown, ChevronRight, Download, AlertTriangle,
+  Barcode, ScanLine,
 } from 'lucide-react';
 
 interface Station {
@@ -56,6 +58,12 @@ export default function OfflinePrintPage() {
   // Dispatcher liveness — is a /print/agent open and sending KOTs? Distinct from
   // the bridge PROCESS being up (the "connected" dot above).
   const [agentStatus, setAgentStatus] = useState<{ online: boolean; secondsAgo: number | null; lastSeen: string | null } | null>(null);
+  // Item Sticker KOT — barcode tracking. Two settings keys:
+  //   kot_item_labels  → JSON string {"enabled":boolean,"granularity":"per_unit"|"per_line"}
+  //   kot_scan_enforce → the string 'true' | 'false'
+  const [kotLabels, setKotLabels] = useState<{ enabled: boolean; granularity: 'per_unit' | 'per_line'; codeType: 'qr' | 'barcode' }>({ enabled: false, granularity: 'per_unit', codeType: 'qr' });
+  const [kotScanEnforce, setKotScanEnforce] = useState(false);
+  const [labelStatus, setLabelStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 4000); };
 
@@ -135,6 +143,55 @@ export default function OfflinePrintPage() {
       flash(true, 'Counter offline address saved.');
     } catch (e: any) { flash(false, e.message || 'Save failed.'); }
     finally { setSavingOfflineUrl(false); }
+  };
+
+  // Load the Item Sticker KOT settings on mount. Both keys default to OFF /
+  // per_unit; null values or a malformed kot_item_labels JSON fall back to the
+  // defaults (parsed defensively in a try/catch).
+  useEffect(() => {
+    fetch('/api/settings?key=kot_item_labels')
+      .then((r) => r.json())
+      .then((d) => {
+        if (!d?.value) return;
+        try {
+          const parsed = JSON.parse(d.value);
+          setKotLabels({
+            enabled: !!parsed?.enabled,
+            granularity: parsed?.granularity === 'per_line' ? 'per_line' : 'per_unit',
+            codeType: parsed?.codeType === 'barcode' ? 'barcode' : 'qr',
+          });
+        } catch { /* keep defaults on parse error */ }
+      })
+      .catch(() => {});
+    fetch('/api/settings?key=kot_scan_enforce')
+      .then((r) => r.json())
+      .then((d) => setKotScanEnforce(d?.value === 'true'))
+      .catch(() => {});
+  }, []);
+
+  // Persist kot_item_labels (JSON string). Optimistic: state updates first, then
+  // the settings row is written; a small "Saved ✓" / error chip shows the result.
+  const persistKotLabels = async (next: { enabled: boolean; granularity: 'per_unit' | 'per_line'; codeType: 'qr' | 'barcode' }) => {
+    setKotLabels(next);
+    setLabelStatus('saving');
+    try {
+      const r = await api('/api/settings', { method: 'PUT', body: { key: 'kot_item_labels', value: JSON.stringify(next) } });
+      if (!r.ok) throw new Error();
+      setLabelStatus('saved');
+      setTimeout(() => setLabelStatus((s) => (s === 'saved' ? 'idle' : s)), 2500);
+    } catch { setLabelStatus('error'); }
+  };
+
+  // Persist kot_scan_enforce as the string 'true' | 'false'.
+  const persistScanEnforce = async (next: boolean) => {
+    setKotScanEnforce(next);
+    setLabelStatus('saving');
+    try {
+      const r = await api('/api/settings', { method: 'PUT', body: { key: 'kot_scan_enforce', value: next ? 'true' : 'false' } });
+      if (!r.ok) throw new Error();
+      setLabelStatus('saved');
+      setTimeout(() => setLabelStatus((s) => (s === 'saved' ? 'idle' : s)), 2500);
+    } catch { setLabelStatus('error'); }
   };
 
   const openNew = () => { setForm(blankForm); setShowForm(true); };
@@ -293,6 +350,113 @@ export default function OfflinePrintPage() {
             </button>
           </div>
         </label>
+      </div>
+
+      {/* Item Sticker KOT — barcode tracking. Additive settings card; writes the
+          settings keys kot_item_labels (JSON) and kot_scan_enforce (string). */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-5">
+        <div className="flex items-center justify-between gap-3 mb-4">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-[#af4408]/10 rounded-lg"><Barcode className="w-5 h-5 text-[#af4408]" /></div>
+            <div>
+              <h2 className="font-semibold text-[#2D1B0E]">Item Sticker KOT — Barcode Tracking</h2>
+              <p className="text-xs text-[#8B7355]">Print a scannable barcode sticker per item so the kitchen can scan each dish out to the captain.</p>
+            </div>
+          </div>
+          {labelStatus === 'saving' ? (
+            <span className="flex items-center gap-1.5 text-xs text-[#8B7355] shrink-0"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Saving…</span>
+          ) : labelStatus === 'saved' ? (
+            <span className="flex items-center gap-1.5 text-xs text-green-600 font-medium shrink-0"><CheckCircle2 className="w-3.5 h-3.5" /> Saved ✓</span>
+          ) : labelStatus === 'error' ? (
+            <span className="flex items-center gap-1.5 text-xs text-red-600 font-medium shrink-0"><XCircle className="w-3.5 h-3.5" /> Save failed</span>
+          ) : null}
+        </div>
+
+        {/* 1. Enable item stickers */}
+        <div className="flex items-start justify-between gap-4 border border-[#E8D5C4] rounded-lg px-4 py-3">
+          <div className="min-w-0">
+            <p className="font-medium text-[#2D1B0E]">Print a barcode sticker per item when a KOT fires</p>
+            <p className="text-xs text-[#8B7355] mt-0.5">Each item gets its own scannable label alongside the kitchen ticket.</p>
+          </div>
+          <Toggle
+            checked={kotLabels.enabled}
+            onChange={(v) => persistKotLabels({ ...kotLabels, enabled: v })}
+            label="Print a barcode sticker per item when a KOT fires"
+            className="mt-0.5"
+          />
+        </div>
+
+        {/* 2. Sticker granularity — only meaningful when stickers are enabled */}
+        <div className={`mt-3 border border-[#E8D5C4] rounded-lg px-4 py-3 ${kotLabels.enabled ? '' : 'opacity-60'}`}>
+          <p className="font-medium text-[#2D1B0E]">Sticker granularity</p>
+          <p className="text-xs text-[#8B7355] mt-0.5 mb-2">How many stickers to print for an item with quantity &gt; 1.</p>
+          <div className="inline-flex flex-wrap gap-2">
+            {([
+              { v: 'per_unit' as const, label: 'One per plate (per unit)', hint: 'recommended' },
+              { v: 'per_line' as const, label: 'One per line item', hint: '' },
+            ]).map((opt) => {
+              const active = kotLabels.granularity === opt.v;
+              return (
+                <button
+                  key={opt.v}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  onClick={() => persistKotLabels({ ...kotLabels, granularity: opt.v })}
+                  className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${active ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-[#FFF1E3] text-[#6B5744] border-[#D4B896] hover:bg-[#FFE8D6]'}`}
+                >
+                  {active ? <CheckCircle2 className="w-4 h-4" /> : <span className="inline-block w-3.5 h-3.5 rounded-full border border-current opacity-60" />}
+                  {opt.label}
+                  {opt.hint ? <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${active ? 'bg-white/25' : 'bg-[#af4408]/10 text-[#af4408]'}`}>{opt.hint}</span> : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* 2b. Scannable code type — QR (compact) vs 1D barcode */}
+        <div className={`mt-3 border border-[#E8D5C4] rounded-lg px-4 py-3 ${kotLabels.enabled ? '' : 'opacity-60'}`}>
+          <p className="font-medium text-[#2D1B0E]">Scannable code</p>
+          <p className="text-xs text-[#8B7355] mt-0.5 mb-2">Printed on each sticker for the kitchen to scan out.</p>
+          <div className="inline-flex flex-wrap gap-2">
+            {([
+              { v: 'qr' as const, label: 'QR code', hint: 'recommended' },
+              { v: 'barcode' as const, label: 'Barcode (below the code)', hint: '' },
+            ]).map((opt) => {
+              const active = kotLabels.codeType === opt.v;
+              return (
+                <button
+                  key={opt.v}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  onClick={() => persistKotLabels({ ...kotLabels, codeType: opt.v })}
+                  className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${active ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-[#FFF1E3] text-[#6B5744] border-[#D4B896] hover:bg-[#FFE8D6]'}`}
+                >
+                  {active ? <CheckCircle2 className="w-4 h-4" /> : <span className="inline-block w-3.5 h-3.5 rounded-full border border-current opacity-60" />}
+                  {opt.label}
+                  {opt.hint ? <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${active ? 'bg-white/25' : 'bg-[#af4408]/10 text-[#af4408]'}`}>{opt.hint}</span> : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* 3. Enforce scan-out before Received */}
+        <div className="mt-3 flex items-start justify-between gap-4 border border-[#E8D5C4] rounded-lg px-4 py-3">
+          <div className="min-w-0">
+            <p className="font-medium text-[#2D1B0E] flex items-center gap-1.5"><ScanLine className="w-4 h-4 text-[#af4408]" /> Enforce scan-out before Received</p>
+            <p className="text-xs text-[#8B7355] mt-0.5">When on, a captain can&apos;t mark an item Received until the kitchen scans it out. Leave off to keep it advisory (recommended to start).</p>
+          </div>
+          <Toggle
+            checked={kotScanEnforce}
+            onChange={(v) => persistScanEnforce(v)}
+            label="Enforce scan-out before Received"
+            className="mt-0.5"
+          />
+        </div>
+
+        <p className="text-xs text-[#8B7355] mt-3">Sticker KOTs print on your existing KOT printer — just load a sticker roll. No separate label printer needed. When off, KOTs print normally. See the live sticker preview &amp; <a href="/settings/print-design" className="text-[#af4408] font-medium hover:underline">Print a test sticker</a> on the Print Design page.</p>
       </div>
 
       {/* Print queue (offline outbox) */}

@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
+import Toggle from '@/components/Toggle';
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -706,34 +707,16 @@ export default function InventoryPage() {
               <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355] pointer-events-none" />
             </div>
 
-            {/* Low Stock Toggle */}
-            <label className="flex items-center gap-2 cursor-pointer select-none whitespace-nowrap">
-              <div className="relative">
-                <input
-                  type="checkbox"
-                  checked={showLowStock}
-                  onChange={(e) => setShowLowStock(e.target.checked)}
-                  className="sr-only peer"
-                />
-                <div className="w-9 h-5 bg-[#D4B896] rounded-full peer-checked:bg-red-600 transition-colors" />
-                <div className="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow peer-checked:translate-x-4 transition-transform" />
-              </div>
+            {/* Low Stock Toggle — label wrapper so the text is clickable too */}
+            <label className="flex items-center gap-2 select-none whitespace-nowrap cursor-pointer">
+              <Toggle checked={showLowStock} onChange={(v) => setShowLowStock(v)} label="Show Low Stock Only" />
               <span className="text-sm text-[#6B5744]">Show Low Stock Only</span>
             </label>
 
             {/* Auto-discovered Toggle — surfaces materials that need review */}
-            <label className="flex items-center gap-2 cursor-pointer select-none whitespace-nowrap"
-                   title="Materials auto-created from imports (e.g. Recaho transfers). Review price/unit/category before relying on them.">
-              <div className="relative">
-                <input
-                  type="checkbox"
-                  checked={showAutoDiscovered}
-                  onChange={(e) => setShowAutoDiscovered(e.target.checked)}
-                  className="sr-only peer"
-                />
-                <div className="w-9 h-5 bg-[#D4B896] rounded-full peer-checked:bg-amber-600 transition-colors" />
-                <div className="absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow peer-checked:translate-x-4 transition-transform" />
-              </div>
+            <label className="flex items-center gap-2 select-none whitespace-nowrap cursor-pointer"
+                 title="Materials auto-created from imports (e.g. Recaho transfers). Review price/unit/category before relying on them.">
+              <Toggle checked={showAutoDiscovered} onChange={(v) => setShowAutoDiscovered(v)} label="Needs Review" />
               <span className="text-sm text-[#6B5744]">⚠ Needs Review</span>
             </label>
           </div>

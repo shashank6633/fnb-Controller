@@ -1521,6 +1521,26 @@ function initializeSchema(db: Database.Database) {
     for (const s of seeds) seedRole.run(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
   } catch (e) { console.error('roles schema/seed migration failed:', e); }
 
+  // Unified Guests continuity: the CRM › Guests page (/crm-calls/guests) now
+  // supersedes the legacy "Guests & Loyalty" (/crm/guests) in the sidebar. So
+  // anyone previously granted only /crm/guests keeps a working guest nav link —
+  // add /crm-calls/guests to any role/user whose page_access lists /crm/guests
+  // but not the new path yet. Idempotent + additive: NULL page_access (= all
+  // access) is untouched, malformed JSON is skipped, and '/crm/guests' is NOT a
+  // substring of '/crm-calls/guests' so the quoted-element LIKE is exact.
+  try {
+    for (const tbl of ['roles', 'users']) {
+      db.prepare(
+        `UPDATE ${tbl}
+           SET page_access = json_insert(page_access, '$[#]', '/crm-calls/guests')
+         WHERE page_access IS NOT NULL
+           AND json_valid(page_access)
+           AND page_access LIKE '%"/crm/guests"%'
+           AND page_access NOT LIKE '%"/crm-calls/guests"%'`,
+      ).run();
+    }
+  } catch (e) { console.error('unified-guests page_access migration failed:', e); }
+
   // Mark the linked_po_id column on purchase_orders so we can navigate from PO → Requisition
   try {
     const cols = db.prepare("PRAGMA table_info(purchase_orders)").all() as any[];
@@ -1781,6 +1801,19 @@ function initializeSchema(db: Database.Database) {
     if (!oiCols.some((c: any) => c.name === 'prep_minutes')) db.exec(`ALTER TABLE order_items ADD COLUMN prep_minutes INTEGER NOT NULL DEFAULT 0`);
     if (!oiCols.some((c: any) => c.name === 'fired_at'))     db.exec(`ALTER TABLE order_items ADD COLUMN fired_at TEXT`);
     if (!oiCols.some((c: any) => c.name === 'completed_at')) db.exec(`ALTER TABLE order_items ADD COLUMN completed_at TEXT`);
+    // Item barcode tracking (leak-proof serving): kitchen_sent_at = when the
+    // kitchen supervisor SCANNED this item's sticker out of the kitchen; served_at
+    // = when its KOT was bumped 'served' on the KDS. These are purely additive
+    // tracking stamps — the stock-deduction trigger (kds bump, gated on
+    // recipe_deducted_at) and the bill gate (completed_at) are untouched. The
+    // item journey is created_at(punch) → fired_at → kitchen_sent_at → completed_at(received).
+    if (!oiCols.some((c: any) => c.name === 'kitchen_sent_at')) db.exec(`ALTER TABLE order_items ADD COLUMN kitchen_sent_at TEXT`);
+    if (!oiCols.some((c: any) => c.name === 'served_at'))       db.exec(`ALTER TABLE order_items ADD COLUMN served_at TEXT`);
+    // Short scannable code stamped at fire time; the sticker-KOT QR/barcode
+    // encodes it and the Scan-Out screen resolves it back to this item.
+    if (!oiCols.some((c: any) => c.name === 'scan_code'))       db.exec(`ALTER TABLE order_items ADD COLUMN scan_code TEXT`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_order_items_kitchen_sent ON order_items(kitchen_sent_at)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_order_items_scan_code ON order_items(scan_code)`);
     // KOT escalation: a captain flags a KOT that would not print, so the Manager
     // (in-app) and the Kitchen Display both see "not printed — action needed".
     db.exec(`
@@ -3642,6 +3675,25 @@ export function convertToMaterialUnit(
 
 export function generateId(): string {
   return crypto.randomUUID();
+}
+
+/**
+ * A short, scanner + human friendly code for a fired item's sticker-KOT
+ * (Crockford base32, no ambiguous I/L/O/U). 6 chars ≈ 1e9 combos; we retry on
+ * the rare collision against a live scan_code. Short enough to fit a 1D barcode
+ * on 80mm and to type as a manual fallback on the Scan-Out board.
+ */
+export function genScanCode(db: import('better-sqlite3').Database): string {
+  const A = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let c = '';
+    for (let i = 0; i < 6; i++) c += A[Math.floor(Math.random() * 32)];
+    try {
+      const hit = db.prepare('SELECT 1 FROM order_items WHERE scan_code = ?').get(c);
+      if (!hit) return c;
+    } catch { return c; }
+  }
+  return 'IT' + Date.now().toString(36).toUpperCase().slice(-6);
 }
 
 /**

@@ -3,9 +3,10 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
+import UISwitch from '@/components/Toggle';
 import {
   Printer, Loader2, Check, ChefHat, Receipt, ArrowLeft,
-  GripVertical, ChevronUp, ChevronDown, AlertTriangle,
+  GripVertical, ChevronUp, ChevronDown, AlertTriangle, Tag,
 } from 'lucide-react';
 import {
   DEFAULT_KOT_DESIGN, normalizeKotDesign, invalidateDesignCache, KOT_LINE_LABELS,
@@ -14,6 +15,20 @@ import {
   type BillDesign, type BillLine,
 } from '@/lib/offline-print/print';
 import { computeBill, round2 } from '@/lib/bill-calc';
+// Sticker KOT (per-item label) — same Rugtek 80mm KOT printer, sticker roll.
+import {
+  buildKotStickerESCPOS,
+  DEFAULT_STICKER_DESIGN, normalizeStickerDesign, STICKER_LINE_LABELS,
+  type StickerDesign, type StickerLine, type StickerLineSize,
+} from '@/lib/offline-print/kot-sticker';
+import { bridgePrint } from '@/lib/offline-print/bridge-client';
+
+// Per-item sticker-KOT config (settings key `kot_item_labels`). enabled +
+// granularity are set in KOT & Bill Printers; here we only surface codeType +
+// a live preview + a test print. Always persist the FULL object so we never
+// clobber the on/off toggle or per-plate/per-line choice made elsewhere.
+type StickerCfg = { enabled: boolean; granularity: 'per_unit' | 'per_line'; codeType: 'qr' | 'barcode' };
+const DEFAULT_STICKER: StickerCfg = { enabled: false, granularity: 'per_unit', codeType: 'qr' };
 
 const SAMPLE_KOT = {
   table: '7', floor: 'Rooftop', kotNumber: 12, station: 'TANDOOR', copyLabel: 'ORIGINAL', foodLiquor: 'FOOD',
@@ -188,13 +203,107 @@ function BillPreview({ d, businessName, gstin }: { d: BillDesign; businessName: 
   return <Ticket>{d.lines.filter((l) => l.enabled).map((ln) => <div key={ln.key}>{renderLine(ln)}</div>)}</Ticket>;
 }
 
+// ── Sticker KOT preview (one per-item label on the same 80mm thermal frame) ───
+// A tiny mock QR: 3 corner finder squares + a scatter of data modules. Not a
+// real QR (the printer renders the true one) — just faithful to the printed look.
+function QrGlyph({ scale = 1 }: { scale?: number }) {
+  const finders: Array<[number, number]> = [[0, 0], [52, 0], [0, 52]];
+  const modules: Array<[number, number]> = [
+    [28, 4], [36, 4], [28, 12], [44, 12], [28, 28], [36, 20], [44, 28],
+    [36, 36], [28, 44], [44, 44], [52, 28], [60, 36], [52, 44], [60, 60],
+    [28, 60], [36, 52], [44, 60], [52, 52], [20, 28], [12, 36], [4, 44],
+  ];
+  return (
+    <svg width={72 * scale} height={72 * scale} viewBox="0 0 72 72" className="shrink-0" aria-hidden>
+      <rect x="0" y="0" width="72" height="72" fill="white" />
+      {finders.map(([x, y], i) => (
+        <g key={i}>
+          <rect x={x} y={y} width="20" height="20" fill="black" />
+          <rect x={x + 4} y={y + 4} width="12" height="12" fill="white" />
+          <rect x={x + 7} y={y + 7} width="6" height="6" fill="black" />
+        </g>
+      ))}
+      {modules.map(([x, y], i) => <rect key={'m' + i} x={x} y={y} width="6" height="6" fill="black" />)}
+    </svg>
+  );
+}
+// A mock 1D barcode: ~24 black bars of varying widths with thin white gaps.
+function BarcodeGlyph({ scale = 1 }: { scale?: number }) {
+  const widths = [3, 1, 2, 4, 1, 2, 1, 3, 2, 1, 4, 2, 1, 3, 1, 2, 3, 1, 2, 1, 4, 2, 1, 3];
+  let x = 1;
+  const bars = widths.map((w, i) => {
+    const rect = <rect key={i} x={x} y={0} width={w} height="40" fill="black" />;
+    x += w + 2; // 2px white gap between bars
+    return rect;
+  });
+  return <svg width={x * scale} height={40 * scale} viewBox={`0 0 ${x} 40`} className="shrink-0" aria-hidden>{bars}</svg>;
+}
+
+// Per-line size → CSS font-size (text lines) and glyph scale (the QR/barcode),
+// approximating the sticker's 1x / 2x / 3x ESC-POS magnification on paper.
+const STICKER_SIZE_PX: Record<StickerLineSize, number> = { normal: 13, large: 19, xlarge: 26 };
+const STICKER_CODE_SCALE: Record<StickerLineSize, number> = { normal: 1, large: 1.35, xlarge: 1.7 };
+
+// Preview mirrors the printed sticker: iterates the design's lines (enabled only,
+// in order) so drag/resize/hide on the left reflect here immediately.
+function StickerPreview({ design, codeType }: { design: StickerDesign; codeType: 'qr' | 'barcode' }) {
+  const renderText = (ln: StickerLine) => {
+    const fontSize = STICKER_SIZE_PX[ln.size];
+    switch (ln.key) {
+      case 'name': return <div className="font-bold leading-tight" style={{ fontSize }}>Paneer Tikka</div>;
+      case 'tableKot': return <div style={{ fontSize }}>Table 7 | KOT #12</div>;
+      case 'timeCaptain': return <div style={{ fontSize }}>07:45 PM | Capt: Ramesh</div>;
+      case 'notes': return <div style={{ fontSize }}>* Less spicy</div>;   // sample has notes
+      default: return null;
+    }
+  };
+
+  const codeLine = design.lines.find((l) => l.key === 'code');
+  const textLines = design.lines.filter((l) => l.enabled && l.key !== 'code');
+
+  // QR mode → the QR sits BESIDE the details (details left, QR right column).
+  if (codeType === 'qr' && codeLine?.enabled) {
+    const sc = STICKER_CODE_SCALE[codeLine.size];
+    return (
+      <Ticket>
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex-1 min-w-0">
+            {textLines.map((ln) => <div key={ln.key} className="mt-1 first:mt-0">{renderText(ln)}</div>)}
+          </div>
+          <div className="shrink-0"><QrGlyph scale={sc} /></div>
+        </div>
+      </Ticket>
+    );
+  }
+
+  // Barcode (or QR hidden) → everything stacks top-to-bottom; barcode full-width.
+  const renderLine = (ln: StickerLine) => {
+    if (ln.key === 'code') {
+      if (codeType !== 'barcode') return null;
+      const sc = STICKER_CODE_SCALE[ln.size];
+      return (
+        <div>
+          <div className="text-[11px] mb-1">#7QF3K9</div>
+          <BarcodeGlyph scale={sc} />
+        </div>
+      );
+    }
+    return renderText(ln);
+  };
+  return (
+    <Ticket>
+      {design.lines.filter((l) => l.enabled).map((ln) => (
+        <div key={ln.key} className="mt-1 first:mt-0">{renderLine(ln)}</div>
+      ))}
+    </Ticket>
+  );
+}
+
 // ── Small form controls ──────────────────────────────────────────────────────
 const Toggle = ({ label, on, set }: { label: string; on: boolean; set: (v: boolean) => void }) => (
   <label className="flex items-center justify-between gap-3 py-2 border-b border-[#F0E4D6] cursor-pointer">
     <span className="text-sm text-[#2D1B0E]">{label}</span>
-    <button type="button" onClick={() => set(!on)} className={`w-10 h-6 rounded-full transition-colors relative ${on ? 'bg-[#af4408]' : 'bg-[#D4B896]'}`}>
-      <span className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-all ${on ? 'left-[18px]' : 'left-0.5'}`} />
-    </button>
+    <UISwitch checked={on} onChange={set} size="sm" label={label} />
   </label>
 );
 const Text = ({ label, value, set, placeholder }: { label: string; value: string; set: (v: string) => void; placeholder?: string }) => (
@@ -218,9 +327,15 @@ const Num = ({ label, value, set, suffix }: { label: string; value: number; set:
 
 export default function PrintDesign() {
   const router = useRouter();
-  const [tab, setTab] = useState<'kot' | 'bill'>('kot');
+  const [tab, setTab] = useState<'kot' | 'bill' | 'sticker'>('kot');
   const [kot, setKot] = useState<KotDesign>(DEFAULT_KOT_DESIGN);
   const [bill, setBill] = useState<BillDesign>(DEFAULT_BILL_DESIGN);
+  const [sticker, setSticker] = useState<StickerCfg>(DEFAULT_STICKER);
+  const [stickerDesign, setStickerDesign] = useState<StickerDesign>(DEFAULT_STICKER_DESIGN);
+  const [stkDragI, setStkDragI] = useState<number | null>(null);
+  const [stkOverI, setStkOverI] = useState<number | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testStatus, setTestStatus] = useState('');
   const [businessName, setBusinessName] = useState('');
   const [gstin, setGstin] = useState('');
   const [loading, setLoading] = useState(true);
@@ -240,6 +355,16 @@ export default function PrintDesign() {
       setGstin(get('gstin') || '');
       const kd = get('kot_design'); if (kd) try { setKot(normalizeKotDesign(JSON.parse(kd))); } catch {}
       const bd = get('bill_design'); if (bd) try { setBill(normalizeBillDesign(JSON.parse(bd))); } catch {}
+      const sk = get('kot_item_labels');
+      if (sk) try {
+        const p = JSON.parse(sk) || {};
+        setSticker({
+          enabled: !!p.enabled,
+          granularity: p.granularity === 'per_line' ? 'per_line' : 'per_unit',
+          codeType: p.codeType === 'barcode' ? 'barcode' : 'qr',
+        });
+      } catch {}
+      const sd = get('sticker_design'); if (sd) try { setStickerDesign(normalizeStickerDesign(JSON.parse(sd))); } catch {}
     } finally { setLoading(false); }
   }, []);
   useEffect(() => { load(); }, [load]);
@@ -249,11 +374,51 @@ export default function PrintDesign() {
     try {
       const r1 = await api('/api/settings', { method: 'PUT', body: { key: 'kot_design', value: JSON.stringify(kot) } });
       const r2 = await api('/api/settings', { method: 'PUT', body: { key: 'bill_design', value: JSON.stringify(bill) } });
-      if (!r1.ok || !r2.ok) { setError('Could not save — please try again.'); return; }
+      const r3 = await api('/api/settings', { method: 'PUT', body: { key: 'sticker_design', value: JSON.stringify(stickerDesign) } });
+      if (!r1.ok || !r2.ok || !r3.ok) { setError('Could not save — please try again.'); return; }
       invalidateDesignCache();   // so the very next print uses the new design, not a ≤30s cached one
       setSaved(true); setTimeout(() => setSaved(false), 2500);
     } catch { setError('Could not save — please try again.'); }
     finally { setSaving(false); }
+  }
+
+  // Persist the sticker config — optimistic, and ALWAYS write the FULL object
+  // (enabled + granularity preserved) so we never clobber the on/off toggle or
+  // per-plate/per-line choice made in KOT & Bill Printers.
+  async function persistSticker(next: StickerCfg) {
+    setSticker(next);
+    try {
+      await api('/api/settings', { method: 'PUT', body: { key: 'kot_item_labels', value: JSON.stringify(next) } });
+    } catch { /* optimistic — the next open re-reads the saved value */ }
+  }
+
+  // Fire ONE test sticker to the first active KOT station via the local bridge.
+  async function printTestSticker() {
+    setTesting(true); setTestStatus('');
+    try {
+      const j = await (await api('/api/dine-in/offline-print/stations')).json();
+      const stations: any[] = j.stations || [];
+      const st = stations.find((s) => s.role === 'kot' && s.is_active);
+      if (!st) { setTestStatus('No KOT printer configured (set one up in KOT & Bill Printers)'); return; }
+      const payload = buildKotStickerESCPOS({
+        itemName: 'Paneer Tikka',
+        tableLabel: '7',
+        kotNumber: 12,
+        timeLabel: new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true }),
+        captain: 'Ramesh',
+        code: 'TEST99',
+        notes: 'Less spicy',
+        codeType: sticker.codeType,
+        design: stickerDesign,
+      });
+      const res = await bridgePrint({ printer: { transport: st.transport, target: st.target }, doc: { type: 'raw', payload } });
+      if (res.ok) setTestStatus(`Test sticker sent to ${st.name} ✓`);
+      else setTestStatus('Printer/bridge not reachable — open /print/agent on the counter PC');
+    } catch {
+      setTestStatus('Printer/bridge not reachable — open /print/agent on the counter PC');
+    } finally {
+      setTesting(false);
+    }
   }
 
   // KOT line-list helpers (drag to reorder + up/down buttons + per-line size/enable)
@@ -273,6 +438,15 @@ export default function PrintDesign() {
   };
   const setBillLine = (i: number, patch: Partial<BillLine>) =>
     setBill({ ...bill, lines: bill.lines.map((l, j) => (j === i ? { ...l, ...patch } : l)) });
+
+  // Sticker line-list helpers (drag/reorder + per-line size/enable) — same as KOT.
+  const moveStickerLine = (from: number, to: number) => {
+    if (to < 0 || to >= stickerDesign.lines.length) return;
+    const a = [...stickerDesign.lines]; const [x] = a.splice(from, 1); a.splice(to, 0, x);
+    setStickerDesign({ ...stickerDesign, lines: a });
+  };
+  const setStickerLine = (i: number, patch: Partial<StickerLine>) =>
+    setStickerDesign({ ...stickerDesign, lines: stickerDesign.lines.map((l, j) => (j === i ? { ...l, ...patch } : l)) });
 
   if (loading) return <div className="py-16 text-center text-[#8B7355]"><Loader2 className="w-6 h-6 animate-spin mx-auto" /></div>;
 
@@ -300,7 +474,7 @@ export default function PrintDesign() {
       )}
 
       <div className="flex gap-1 mb-4 bg-[#FFF1E3] rounded-xl p-1 w-fit">
-        {([['kot', 'Food KOT', ChefHat], ['bill', 'Bill', Receipt]] as const).map(([k, label, Icon]) => (
+        {([['kot', 'Food KOT', ChefHat], ['bill', 'Bill', Receipt], ['sticker', 'Sticker KOT', Tag]] as const).map(([k, label, Icon]) => (
           <button key={k} onClick={() => setTab(k)}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold ${tab === k ? 'bg-[#af4408] text-white' : 'text-[#6B5744]'}`}>
             <Icon className="w-4 h-4" /> {label}
@@ -338,10 +512,7 @@ export default function PrintDesign() {
                       <option value="large">A+</option>
                       <option value="xlarge">A++</option>
                     </select>
-                    <button type="button" onClick={() => setLine(i, { enabled: !ln.enabled })} aria-label="Show or hide line"
-                      className={`w-9 h-5 rounded-full relative shrink-0 transition-colors ${ln.enabled ? 'bg-[#af4408]' : 'bg-[#D4B896]'}`}>
-                      <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-all ${ln.enabled ? 'left-[18px]' : 'left-0.5'}`} />
-                    </button>
+                    <UISwitch checked={ln.enabled} onChange={(v) => setLine(i, { enabled: v })} size="sm" label={`Show or hide ${KOT_LINE_LABELS[ln.key] ?? ln.key}`} />
                   </div>
                 ))}
               </div>
@@ -349,7 +520,7 @@ export default function PrintDesign() {
               <Text label="Header note (optional — enable the “Header note” line above)" value={kot.headerNote} set={(v) => setKot({ ...kot, headerNote: v })} placeholder="e.g. RUSH" />
               <Text label="Footer note (optional — enable the “Footer note” line above)" value={kot.footerNote} set={(v) => setKot({ ...kot, footerNote: v })} />
             </>
-          ) : (
+          ) : tab === 'bill' ? (
             <>
               <p className="text-xs text-[#8B7355] mb-2">
                 Reorder with the <b>↑ / ↓ arrows</b> (or drag the handle on desktop). <b>A / A+ / A++</b> sets each
@@ -376,10 +547,7 @@ export default function PrintDesign() {
                       <option value="large">A+</option>
                       <option value="xlarge">A++</option>
                     </select>
-                    <button type="button" onClick={() => setBillLine(i, { enabled: !ln.enabled })} aria-label="Show or hide line"
-                      className={`w-9 h-5 rounded-full relative shrink-0 transition-colors ${ln.enabled ? 'bg-[#af4408]' : 'bg-[#D4B896]'}`}>
-                      <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-all ${ln.enabled ? 'left-[18px]' : 'left-0.5'}`} />
-                    </button>
+                    <UISwitch checked={ln.enabled} onChange={(v) => setBillLine(i, { enabled: v })} size="sm" label={`Show or hide ${BILL_LINE_LABELS[ln.key] ?? ln.key}`} />
                   </div>
                 ))}
               </div>
@@ -403,13 +571,68 @@ export default function PrintDesign() {
               <Text label="Header note (optional)" value={bill.headerNote} set={(v) => setBill({ ...bill, headerNote: v })} />
               <Text label="Footer note" value={bill.footerNote} set={(v) => setBill({ ...bill, footerNote: v })} />
             </>
+          ) : (
+            <>
+              <p className="text-sm font-semibold text-[#2D1B0E] mb-1">Sticker KOT</p>
+              <p className="text-xs text-[#8B7355] mb-4">
+                This is how each item&apos;s sticker prints on your KOT printer. Turn stickers on/off and pick
+                per-plate vs per-line in <b>KOT &amp; Bill Printers</b>.
+              </p>
+
+              <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-1">Fields — reorder, resize &amp; show/hide</p>
+              <p className="text-[11px] text-[#8B7355] mb-2">Drag or use ↑/↓. A / A+ / A++ sets each line&apos;s letter size. Bigger sizes use more sticker.</p>
+              <div className="mb-4">
+                {stickerDesign.lines.map((ln, i) => (
+                  <div key={ln.key}
+                    draggable
+                    onDragStart={() => setStkDragI(i)}
+                    onDragOver={(e) => { e.preventDefault(); setStkOverI(i); }}
+                    onDrop={() => { if (stkDragI !== null) moveStickerLine(stkDragI, i); setStkDragI(null); setStkOverI(null); }}
+                    onDragEnd={() => { setStkDragI(null); setStkOverI(null); }}
+                    className={`flex items-center gap-2 py-2 border-b border-[#F0E4D6] ${stkOverI === i ? 'bg-[#FFF1E3]' : ''}`}>
+                    <GripVertical className="w-4 h-4 text-[#C4B09A] cursor-grab shrink-0" />
+                    <span className="text-sm text-[#2D1B0E] flex-1 truncate">{STICKER_LINE_LABELS[ln.key]}</span>
+                    <div className="flex flex-col -my-1 shrink-0">
+                      <button type="button" aria-label="Move up" disabled={i === 0} onClick={() => moveStickerLine(i, i - 1)} className="text-[#8B7355] disabled:opacity-25 leading-none"><ChevronUp className="w-3.5 h-3.5" /></button>
+                      <button type="button" aria-label="Move down" disabled={i === stickerDesign.lines.length - 1} onClick={() => moveStickerLine(i, i + 1)} className="text-[#8B7355] disabled:opacity-25 leading-none"><ChevronDown className="w-3.5 h-3.5" /></button>
+                    </div>
+                    <select value={ln.size} onChange={(e) => setStickerLine(i, { size: e.target.value as StickerLineSize })}
+                      className="border border-[#D4B896] rounded-lg px-1.5 py-1 text-xs shrink-0" aria-label="Line size">
+                      <option value="normal">A</option>
+                      <option value="large">A+</option>
+                      <option value="xlarge">A++</option>
+                    </select>
+                    <UISwitch checked={ln.enabled} onChange={(v) => setStickerLine(i, { enabled: v })} size="sm" label={`Show or hide ${STICKER_LINE_LABELS[ln.key]}`} />
+                  </div>
+                ))}
+              </div>
+
+              <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-1">Scannable code</p>
+              <div className="flex gap-1 bg-[#FFF1E3] rounded-xl p-1 mb-4">
+                {([['qr', 'QR code'], ['barcode', 'Barcode']] as const).map(([val, label]) => (
+                  <button key={val} type="button" onClick={() => persistSticker({ ...sticker, codeType: val })}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm font-semibold transition-colors ${sticker.codeType === val ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744]'}`}>
+                    {label}{val === 'qr' ? ' (recommended)' : ''}
+                  </button>
+                ))}
+              </div>
+
+              <button type="button" onClick={printTestSticker} disabled={testing}
+                className="w-full flex items-center justify-center gap-2 bg-[#af4408] text-white px-4 py-2.5 rounded-lg text-sm font-semibold disabled:opacity-50">
+                {testing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Printer className="w-4 h-4" />}
+                Print test sticker
+              </button>
+              {testStatus && <p className="text-xs text-[#8B7355] mt-2 text-center">{testStatus}</p>}
+            </>
           )}
         </div>
 
         {/* Live preview */}
         <div>
           <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide mb-2 text-center">Live preview (80mm)</p>
-          {tab === 'kot' ? <KotPreview d={kot} businessName={businessName} /> : <BillPreview d={bill} businessName={businessName} gstin={gstin} />}
+          {tab === 'kot' ? <KotPreview d={kot} businessName={businessName} />
+            : tab === 'bill' ? <BillPreview d={bill} businessName={businessName} gstin={gstin} />
+            : <StickerPreview design={stickerDesign} codeType={sticker.codeType} />}
         </div>
       </div>
     </div>

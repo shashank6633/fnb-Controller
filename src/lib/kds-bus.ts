@@ -17,12 +17,14 @@ declare global {
 const CHANNEL = 'kds';
 
 export interface KdsEvent {
-  type: 'kot.new' | 'kot.bumped' | 'bill.print';
+  type: 'kot.new' | 'kot.bumped' | 'bill.print' | 'item.sent';
   outlet_id: string | null;
   station: string;
   kot?: any;           // the KOT row (+ items/order context for kot.new / kot.bumped)
   bill?: any;          // the bill payload (BillOrder shape) for bill.print
   counter?: string;    // multi-floor: target cash-counter label for bill.print (empty = catch-all)
+  order_id?: string;   // item.sent: the order whose line was scanned out of the kitchen
+  item?: any;          // item.sent: { id, name, kitchen_sent_at } — the scanned line
 }
 
 function getEmitter(): EventEmitter {

@@ -39,7 +39,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       //   - a cancelled item never reaches a fired KOT, so it never deducts here;
       //   - a voided order is skipped (nothing was really cooked/served).
       if (next === 'served') {
-        db.prepare("UPDATE order_items SET status = 'served' WHERE kot_id = ?").run(id);
+        // Stamp served_at once (item-journey tracking) and advance status. A line
+        // already scanned 'kitchen_sent' still moves to 'served' here (terminal).
+        db.prepare("UPDATE order_items SET status = 'served', served_at = COALESCE(served_at, datetime('now')) WHERE kot_id = ?").run(id);
         const order = db.prepare(`
           SELECT o.bill_type, o.status, t.zone AS zone
           FROM orders o

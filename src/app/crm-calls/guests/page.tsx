@@ -62,6 +62,9 @@ interface Guest {
   created_at: string;
   updated_at: string;
   metrics: GuestMetrics;
+  loyalty: { points: number; tier: 'Bronze' | 'Silver' | 'Gold'; visit_count: number; total_spend: number } | null;
+  dining: { orders: number; visits: number; total_spent: number; qr_orders: number; last_seen: string | null };
+  synthetic?: boolean;
 }
 
 /** Same canonicalisation the API uses — punctuation-insensitive badge slug. */
@@ -74,6 +77,7 @@ const BADGE_STYLES: Record<string, string> = {
   enquired_not_converted: 'bg-amber-100 text-amber-800 border-amber-300',
   converted: 'bg-green-100 text-green-700 border-green-300',
   repeat_guest: 'bg-emerald-100 text-emerald-700 border-emerald-300',
+  dine_in_guest: 'bg-[#F3E9DC] text-[#8B5E34] border-[#E8D5C4]',
   lapsed: 'bg-red-100 text-red-700 border-red-300',
 };
 
@@ -82,6 +86,7 @@ const BADGE_SHORT: Record<string, string> = {
   enquired_not_converted: 'ENQUIRED',
   converted: 'CONVERTED',
   repeat_guest: 'REPEAT',
+  dine_in_guest: 'DINE-IN',
   lapsed: 'LAPSED',
 };
 
@@ -101,6 +106,9 @@ const SORT_OPTIONS: [string, string][] = [
   ['total_bookings', 'Bookings'],
   ['last_visit', 'Last visit'],
   ['conversion', 'Conversion'],
+  ['points', 'Loyalty points'],
+  ['spend', 'Dining spend'],
+  ['dining_visits', 'Dining visits'],
   ['name', 'Name'],
 ];
 
@@ -122,6 +130,21 @@ function istDate(iso: string | null): string {
 
 function convPct(rate: number): string {
   return `${Math.round((Number(rate) || 0) * 100)}%`;
+}
+
+const TIER_CHIP: Record<string, string> = {
+  Bronze: 'bg-amber-100 text-amber-800 border-amber-300',
+  Silver: 'bg-slate-100 text-slate-700 border-slate-300',
+  Gold: 'bg-yellow-100 text-yellow-800 border-yellow-300',
+};
+
+function TierChip({ tier }: { tier: 'Bronze' | 'Silver' | 'Gold' }) {
+  const cls = TIER_CHIP[tier] || 'bg-slate-100 text-slate-700 border-slate-300';
+  return (
+    <span className={`inline-block text-[10px] font-semibold px-1.5 py-0.5 rounded-full border whitespace-nowrap ${cls}`}>
+      {tier}
+    </span>
+  );
 }
 
 export default function CtGuestsPage() {
@@ -281,7 +304,7 @@ export default function CtGuestsPage() {
     setPage(1);
   };
 
-  const openGuest = (id: string) => router.push(`/crm-calls/guests/${id}`);
+  const openGuest = (id: string) => router.push(`/crm-calls/guests/${encodeURIComponent(id)}`);
 
   if (loading) {
     return (
@@ -396,7 +419,7 @@ export default function CtGuestsPage() {
           <div className="bg-white border border-[#E8D5C4] rounded-2xl py-16 text-center text-[#8B7355]">
             <Users className="w-10 h-10 mx-auto mb-3 opacity-40" />
             <p>No guests found</p>
-            <p className="text-xs mt-1">{hasFilters ? 'Try clearing the filters' : 'Guests appear here automatically as calls come in — or add one manually'}</p>
+            <p className="text-xs mt-1">{hasFilters ? 'Try clearing the filters' : 'Guests appear here from calls, QR/dine-in orders and loyalty — or add one manually.'}</p>
           </div>
         ) : !error && (
           <>
@@ -414,6 +437,8 @@ export default function CtGuestsPage() {
                       <SortTh label="Bookings" sortKey="total_bookings" sort={sort} dir={dir} onSort={onSort} className="text-right py-3 px-3" align="right" />
                       <SortTh label="Last Visit" sortKey="last_visit" sort={sort} dir={dir} onSort={onSort} className="text-left py-3 px-3" />
                       <SortTh label="Conv %" sortKey="conversion" sort={sort} dir={dir} onSort={onSort} className="text-right py-3 px-3" align="right" />
+                      <SortTh label="Loyalty" sortKey="points" sort={sort} dir={dir} onSort={onSort} className="text-right py-3 px-3" align="right" />
+                      <SortTh label="Dining" sortKey="spend" sort={sort} dir={dir} onSort={onSort} className="text-right py-3 px-3" align="right" />
                     </tr>
                   </thead>
                   <tbody>
@@ -427,7 +452,7 @@ export default function CtGuestsPage() {
                           <div className="flex items-center gap-3">
                             <GuestAvatar name={g.name} phone={g.phone_e164} />
                             <div className="min-w-0">
-                              <p className="font-semibold text-[#2D1B0E] text-[13px] truncate max-w-[220px]">{g.name || 'Unknown caller'}</p>
+                              <p className="font-semibold text-[#2D1B0E] text-[13px] truncate max-w-[220px]">{g.name || 'Unknown guest'}</p>
                               <p className="text-[11px] text-[#6B5744] flex items-center gap-1">
                                 <Phone className="w-3 h-3" />{formatPhone(g.phone_e164)}
                               </p>
@@ -456,6 +481,18 @@ export default function CtGuestsPage() {
                           {istDate(g.metrics.last_visit_at) || <span className="text-[#C4B09A]">—</span>}
                         </td>
                         <td className="py-2.5 px-3 text-right font-medium text-[#2D1B0E]">{convPct(g.metrics.conversion_rate)}</td>
+                        <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                          {g.loyalty ? (
+                            <span className="inline-flex items-center justify-end gap-1.5">
+                              <span className="font-semibold text-[#2D1B0E]">{Math.round(g.loyalty.points)} pts</span>
+                              <TierChip tier={g.loyalty.tier} />
+                            </span>
+                          ) : <span className="text-[#C4B09A]">—</span>}
+                        </td>
+                        <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                          <span className="font-semibold text-[#2D1B0E]">₹{(g.dining?.total_spent || 0).toLocaleString('en-IN')}</span>
+                          <p className="text-[11px] text-[#6B5744]">{g.dining?.visits || 0} visits · {g.dining?.orders || 0} orders</p>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -474,7 +511,7 @@ export default function CtGuestsPage() {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
-                          <p className="font-semibold text-[#2D1B0E] text-sm leading-snug truncate">{g.name || 'Unknown caller'}</p>
+                          <p className="font-semibold text-[#2D1B0E] text-sm leading-snug truncate">{g.name || 'Unknown guest'}</p>
                           <p className="text-[11px] text-[#6B5744]">{formatPhone(g.phone_e164)}</p>
                         </div>
                         <BadgeChip badge={g.metrics.badge} />
@@ -495,6 +532,16 @@ export default function CtGuestsPage() {
                           <p className="text-[10px] text-[#6B5744] uppercase tracking-wide">Conv</p>
                           <p className="text-sm font-bold text-[#2D1B0E]">{convPct(g.metrics.conversion_rate)}</p>
                         </div>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 mt-2 pt-2 border-t border-[#F0E4D6] text-[11px] text-[#6B5744]">
+                        <span className="min-w-0 truncate">
+                          Loyalty: {g.loyalty ? `${Math.round(g.loyalty.points)} pts · ${g.loyalty.tier}` : '—'}
+                        </span>
+                        <span className="min-w-0 truncate text-right shrink-0 max-w-[55%]">
+                          Dining: {(g.dining?.orders || 0) === 0 && (g.dining?.total_spent || 0) === 0
+                            ? '—'
+                            : `₹${(g.dining?.total_spent || 0).toLocaleString('en-IN')} · ${g.dining?.visits || 0} visits`}
+                        </span>
                       </div>
                       <div className="flex items-center justify-between mt-2 text-[11px] text-[#6B5744]">
                         <span>Last call: {istDateTime(g.metrics.last_call_at) || '—'}</span>

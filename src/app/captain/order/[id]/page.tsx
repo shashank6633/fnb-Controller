@@ -8,17 +8,18 @@ import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
   ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu, Filter, ChevronDown,
   AlertTriangle, Printer, Timer, Check, Users, BellRing, BadgePercent, Percent,
-  MessageCircle,
+  MessageCircle, Bike,
 } from 'lucide-react';
 import { CaptainUI } from '../../CaptainShell';
 
 interface MenuItem { id: string; name: string; category: string; station: string; item_type: string; dietary_tag: string; selling_price: number; is_active: number; recipe_id: string | null; }
-interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; notes: string; menu_item_id?: string | null; kot_status?: string | null; prep_minutes?: number | null; fired_at?: string | null; completed_at?: string | null; }
+interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; notes: string; menu_item_id?: string | null; kot_status?: string | null; prep_minutes?: number | null; fired_at?: string | null; completed_at?: string | null; kitchen_sent_at?: string | null; served_at?: string | null; }
 interface TableLite { id: string; table_number: string; zone: string; open_order_id: string | null; open_order_number: number | null; open_order_total: number | null; }
 
 // Per-item kitchen state badge from order_items.status + the KOT status.
 function itemState(it: OrderItem): { label: string; cls: string; Icon: any } | null {
   if (it.status === 'pending') return { label: 'New', cls: 'text-[#8B7355] bg-[#FFF1E3]', Icon: Plus };
+  if (it.status === 'kitchen_sent' || it.kitchen_sent_at) return { label: 'Out of kitchen', cls: 'text-emerald-700 bg-emerald-100', Icon: Bike };
   const k = it.kot_status;
   if (k === 'ready') return { label: 'Ready', cls: 'text-green-700 bg-green-100', Icon: CheckCircle2 };
   if (k === 'preparing') return { label: 'Cooking', cls: 'text-amber-700 bg-amber-100', Icon: Flame };
@@ -231,13 +232,31 @@ export default function CaptainOrder() {
   }, [order]);
   const allPrinted = !!order?.kots?.length && (order.kots || []).every((k) => k.print_status === 'printed');
 
-  // Poll while any KOT is still unconfirmed, so the alert surfaces within seconds.
+  // Poll while the order is open, so a print-failure alert surfaces within
+  // seconds AND a later kitchen scan-out (kitchen_sent) still shows up even after
+  // every KOT has confirmed printing.
   useEffect(() => {
     if (!order || order.status !== 'open') return;
-    if ((order.kots || []).every((k) => k.print_status === 'printed')) return;
     const t = setInterval(loadOrder, 6000);
     return () => clearInterval(t);
   }, [order, loadOrder]);
+
+  // Instant refresh on a kitchen scan-out: subscribe to the KDS SSE stream and
+  // reload the order the moment one of its lines is scanned out of the kitchen.
+  useEffect(() => {
+    if (!order?.id || order.status !== 'open') return;
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource('/api/dine-in/kds/stream');
+      es.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'item.sent' && msg.order_id === order.id) loadOrder();
+        } catch { /* ignore malformed frames */ }
+      };
+    } catch { /* EventSource unsupported — the 6s poll covers it */ }
+    return () => { es?.close(); };
+  }, [order?.id, order?.status, loadOrder]);
 
   // Buzz the tablet when a NEW print problem appears (operations must notice it).
   const prevAlerts = useRef(0);

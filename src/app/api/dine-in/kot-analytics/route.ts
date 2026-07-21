@@ -99,6 +99,79 @@ export async function GET(req: Request) {
             AND o.voided_at IS NOT NULL
             AND date(o.voided_at,${IST}) BETWEEN :from AND :to`).get(p) as any;
 
+    // ── Item Journey — how long each ordered item takes across its lifecycle ──
+    // Every order_items row now carries four stamps: created_at (captain punched),
+    // fired_at (KOT fired to kitchen), kitchen_sent_at (kitchen scanned the item's
+    // sticker out), completed_at (captain marked it received at the table). Legs:
+    //   PREP           = fired_at        → kitchen_sent_at
+    //   KITCHEN→TABLE  = kitchen_sent_at → completed_at
+    //   TOTAL          = created_at      → completed_at
+    // Each leg is averaged only over rows where BOTH its endpoints are non-null,
+    // so a missing kitchen scan-out never poisons the prep/total averages.
+    const secs = (a: string, b: string) => `(julianday(${a}) - julianday(${b})) * 86400`;
+    const dur  = (later: string, earlier: string) =>
+      `CASE WHEN ${later} IS NOT NULL AND ${earlier} IS NOT NULL THEN ${secs(later, earlier)} END`;
+    const prepD = dur('oi.kitchen_sent_at', 'oi.fired_at');
+    const k2tD  = dur('oi.completed_at', 'oi.kitchen_sent_at');
+    const totD  = dur('oi.completed_at', 'oi.created_at');
+    const round = (v: any) => (v == null ? null : Math.round(Number(v)));
+
+    // Items punched within the IST range, this outlet, on non-void orders.
+    const WJ = `(o.outlet_id = :outlet OR o.outlet_id IS NULL)
+                AND o.status != 'void'
+                AND date(oi.created_at,${IST}) BETWEEN :from AND :to`;
+
+    // (a) Summary grouped by station (KOT station, falling back to item snapshot).
+    // COUNT(<leg>) counts only rows where that leg's CASE resolved non-null.
+    const journeyByStation = (db.prepare(`
+      SELECT COALESCE(NULLIF(k.station,''), NULLIF(oi.station,''), '—') station,
+             COUNT(*)       items,
+             AVG(${prepD})  prep_avg, MIN(${prepD})  prep_min, MAX(${prepD})  prep_max, COUNT(${prepD})  prep_n,
+             AVG(${k2tD})   k2t_avg,  MIN(${k2tD})   k2t_min,  MAX(${k2tD})   k2t_max,  COUNT(${k2tD})   k2t_n,
+             AVG(${totD})   total_avg, MIN(${totD})  total_min, MAX(${totD})  total_max, COUNT(${totD})  total_n
+      FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id
+      LEFT JOIN kots k ON k.id = oi.kot_id
+      WHERE ${WJ}
+      GROUP BY station
+      ORDER BY items DESC`).all(p) as any[]).map((s) => ({
+        station: s.station,
+        items: s.items,
+        prep_avg: round(s.prep_avg), prep_min: round(s.prep_min), prep_max: round(s.prep_max), prep_n: s.prep_n,
+        k2t_avg: round(s.k2t_avg),   k2t_min: round(s.k2t_min),   k2t_max: round(s.k2t_max),   k2t_n: s.k2t_n,
+        total_avg: round(s.total_avg), total_min: round(s.total_min), total_max: round(s.total_max), total_n: s.total_n,
+      }));
+
+    // Overall roll-up across every item in the range.
+    const journeyOverall = db.prepare(`
+      SELECT COUNT(*) items,
+             SUM(CASE WHEN oi.completed_at IS NOT NULL THEN 1 ELSE 0 END) completed,
+             AVG(${prepD}) prep_avg, COUNT(${prepD}) prep_n,
+             AVG(${k2tD})  k2t_avg,  COUNT(${k2tD})  k2t_n,
+             AVG(${totD})  total_avg, COUNT(${totD}) total_n
+      FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id
+      WHERE ${WJ}`).get(p) as any;
+
+    // (b) Slowest individual completed items, by total journey time.
+    const journeySlowest = (db.prepare(`
+      SELECT oi.name name,
+             COALESCE(NULLIF(rt.table_number,''), 'Order #' || o.order_number) tableLabel,
+             oi.created_at, oi.fired_at, oi.kitchen_sent_at, oi.completed_at,
+             ${prepD} prep_secs, ${k2tD} k2t_secs, ${totD} total_secs
+      FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id
+      LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
+      WHERE ${WJ} AND oi.completed_at IS NOT NULL
+      ORDER BY total_secs DESC
+      LIMIT 12`).all(p) as any[]).map((r) => ({
+        name: r.name,
+        table: r.tableLabel,
+        created_at: r.created_at, fired_at: r.fired_at,
+        kitchen_sent_at: r.kitchen_sent_at, completed_at: r.completed_at,
+        prep_secs: round(r.prep_secs), k2t_secs: round(r.k2t_secs), total_secs: round(r.total_secs),
+      }));
+
     return Response.json({
       range: { from, to, isToday: from === today && to === today },
       totals: {
@@ -115,6 +188,17 @@ export async function GET(req: Request) {
         topReprinted,
       },
       voids: { count: voids.count || 0, value: voids.value || 0 },
+      item_journey: {
+        overall: {
+          items: journeyOverall?.items || 0,
+          completed: journeyOverall?.completed || 0,
+          prep_avg: round(journeyOverall?.prep_avg), prep_n: journeyOverall?.prep_n || 0,
+          k2t_avg: round(journeyOverall?.k2t_avg),   k2t_n: journeyOverall?.k2t_n || 0,
+          total_avg: round(journeyOverall?.total_avg), total_n: journeyOverall?.total_n || 0,
+        },
+        by_station: journeyByStation,
+        slowest: journeySlowest,
+      },
     });
   } catch (e: any) {
     console.error('[/api/dine-in/kot-analytics GET]', e);

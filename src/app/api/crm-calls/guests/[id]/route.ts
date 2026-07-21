@@ -1,8 +1,9 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, isManagement } from '@/lib/auth';
 import { normalizePhone } from '@/lib/ct/phone';
-import { guestMetrics } from '@/lib/ct/metrics';
+import { guestMetrics, guestMetricsByPhone } from '@/lib/ct/metrics';
 import { getAgentMap, getUserNamesByEmail, resolveAgentLabel } from '@/lib/ct/agents';
+import { norm10, loyaltyDetail, diningDetail } from '@/lib/ct/guest-unify';
 
 /**
  * GET /api/crm-calls/guests/[id]
@@ -73,14 +74,53 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
 
     const { id } = await params;
     const db = getDb();
-    const row = db.prepare('SELECT * FROM ct_guests WHERE id = ?').get(id) as GuestRow | undefined;
-    if (!row) return Response.json({ error: 'Guest not found' }, { status: 404 });
+    const outletId = await getCurrentOutletId();
 
+    // Resolve the guest. `id` is either a ct_guests.id OR a synthetic
+    // `phone:<10-digit>` handle (a guest who only exists in loyalty/dining). A
+    // phone handle upgrades to the real row if one was created in the meantime.
+    let row: GuestRow | undefined;
+    let synthetic = false;
+    let phone = '';
+    if (id.startsWith('phone:')) {
+      const k = norm10(id.slice('phone:'.length));
+      if (!k) return Response.json({ error: 'Guest not found' }, { status: 404 });
+      phone = normalizePhone(k);
+      row = db.prepare('SELECT * FROM ct_guests WHERE phone_e164 = ?').get(phone) as GuestRow | undefined;
+      if (!row) synthetic = true;
+    } else {
+      row = db.prepare('SELECT * FROM ct_guests WHERE id = ?').get(id) as GuestRow | undefined;
+      if (!row) return Response.json({ error: 'Guest not found' }, { status: 404 });
+      phone = row.phone_e164;
+    }
+
+    // Loyalty + dining 360 (both keyed by the last-10-digit phone). Loyalty is
+    // management-only (parity with /api/crm/guests); dining is open (parity with
+    // /api/customers).
+    const loyalty = isManagement(me) ? loyaltyDetail(db, phone) : null;
+    const dining = diningDetail(db, outletId, phone);
+
+    // A synthetic guest has no ct_guests row yet — synthesize a display object
+    // from the loyalty/dining names so the profile still renders.
+    if (synthetic) {
+      const name = (loyalty?.loyalty.name || dining.summary.name || '').trim();
+      row = {
+        id: `phone:${norm10(phone)}`, outlet_id: '', phone_e164: phone, name,
+        alt_phone: '', email: '', tags: '[]', source: loyalty ? 'loyalty' : 'dine-in',
+        notes: '', dob: '', anniversary: '', preferences: '{}',
+        created_at: dining.summary.first_seen || loyalty?.loyalty.first_visit_at || '',
+        updated_at: dining.summary.last_seen || loyalty?.loyalty.last_visit_at || '',
+      } as GuestRow;
+    }
+
+    const guestKey = synthetic ? '' : row!.id;
     let metrics: GuestMetrics = EMPTY_METRICS;
     try {
-      metrics = (guestMetrics(db, id) as GuestMetrics) || EMPTY_METRICS;
+      metrics = ((synthetic
+        ? guestMetricsByPhone(db, phone)
+        : guestMetrics(db, guestKey)) as GuestMetrics) || EMPTY_METRICS;
     } catch (e) {
-      console.error('GET /api/crm-calls/guests/[id]: guestMetrics failed, serving empty metrics:', e);
+      console.error('GET /api/crm-calls/guests/[id]: metrics failed, serving empty metrics:', e);
     }
 
     // ── Unified timeline ──
@@ -96,8 +136,9 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
               started_at, answered_at, ended_at, duration_sec, recording_url,
               disposition, disposition_note, created_at,
               analysis_status, analysis_score, analysis_outcome
-       FROM ct_calls WHERE guest_id = ? OR phone_e164 = ?`,
-    ).all(id, row.phone_e164) as any[];
+       FROM ct_calls
+       WHERE (guest_id = @gid AND @gid <> '') OR (phone_e164 = @phone AND @phone <> '')`,
+    ).all({ gid: guestKey, phone }) as any[];
     const seenCallIds = new Set<string>();
     for (const c of calls) {
       if (seenCallIds.has(c.id)) continue;
@@ -124,11 +165,11 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       });
     }
 
-    const bookings = db.prepare(
+    const bookings = guestKey ? db.prepare(
       `SELECT id, source_call_id, booking_date, slot_time, party_size, occasion, section_pref,
               status, created_by, channel, advance_amount, notes, created_at, updated_at
        FROM ct_bookings WHERE guest_id = ?`,
-    ).all(id) as any[];
+    ).all(guestKey) as any[] : [];
     for (const b of bookings) {
       timeline.push({
         type: 'booking',
@@ -148,10 +189,10 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       });
     }
 
-    const followUps = db.prepare(
+    const followUps = guestKey ? db.prepare(
       `SELECT id, call_id, due_at, assigned_to, status, note, created_at
        FROM ct_follow_ups WHERE guest_id = ?`,
-    ).all(id) as any[];
+    ).all(guestKey) as any[] : [];
     for (const f of followUps) {
       timeline.push({
         type: 'follow_up',
@@ -174,7 +215,15 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     });
 
     return Response.json(
-      { guest: serializeGuest(row), metrics, timeline },
+      {
+        guest: { ...serializeGuest(row!), synthetic },
+        metrics,
+        timeline,
+        loyalty: loyalty?.loyalty ?? null,
+        loyalty_visits: loyalty?.visits ?? [],
+        dining: dining.summary,
+        dining_orders: dining.orders,
+      },
       { headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (e: any) {
@@ -190,6 +239,15 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
 
     const { id } = await params;
     const db = getDb();
+    // A synthetic (loyalty/dining-only) guest has no ct_guests row yet — the
+    // client must POST /api/crm-calls/guests to save it before notes/follow-ups.
+    if (id.startsWith('phone:')) {
+      const k = norm10(id.slice('phone:'.length));
+      return Response.json(
+        { error: 'Save this guest to the CRM first', needs_create: true, phone: k ? normalizePhone(k) : '' },
+        { status: 409 },
+      );
+    }
     const row = db.prepare('SELECT * FROM ct_guests WHERE id = ?').get(id) as GuestRow | undefined;
     if (!row) return Response.json({ error: 'Guest not found' }, { status: 404 });
 

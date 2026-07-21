@@ -19,9 +19,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import {
-  AlertCircle, ArrowLeft, Cake, CalendarDays, CalendarPlus, Check, CheckCircle2, ChevronRight,
+  AlertCircle, ArrowLeft, Award, Cake, CalendarDays, CalendarPlus, Check, CheckCircle2, ChevronRight,
   Clock, Edit, Heart, Loader2, PhoneIncoming, PhoneMissed, PhoneOutgoing,
-  Plus, Save, Sparkles, StickyNote, Tag, User, Voicemail, X,
+  Plus, Save, Sparkles, StickyNote, Tag, User, Utensils, Voicemail, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
@@ -45,6 +45,52 @@ interface Guest {
   preferences: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+  synthetic?: boolean;
+}
+
+// ─── Unified 360 (loyalty + dining) — keyed by phone ────────────────────────
+
+interface Loyalty {
+  crm_guest_id: string;
+  name: string;
+  points: number;
+  tier: 'Bronze' | 'Silver' | 'Gold';
+  visit_count: number;
+  total_spend: number;
+  first_visit_at: string | null;
+  last_visit_at: string | null;
+}
+
+interface LoyaltyVisit {
+  id: string;
+  order_id: string;
+  bill_amount: number;
+  points_earned: number;
+  visited_at: string;
+  source: string;
+}
+
+interface DiningSummary {
+  name: string;
+  orders: number;
+  visits: number;
+  total_spent: number;
+  qr_orders: number;
+  first_seen: string | null;
+  last_seen: string | null;
+}
+
+interface DiningOrder {
+  id: string;
+  order_number: string;
+  status: string;
+  origin: string;
+  total: number;
+  created_at: string;
+  settled_at: string | null;
+  guest_name: string;
+  table_number: string | null;
+  item_count: number;
 }
 
 interface Metrics {
@@ -134,6 +180,7 @@ const BADGE_STYLES: Record<string, string> = {
   'ENQUIRED-NOT CONVERTED': 'bg-amber-50 text-amber-700 border-amber-200',
   CONVERTED: 'bg-green-50 text-green-700 border-green-200',
   'REPEAT GUEST': 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  'DINE-IN GUEST': 'bg-[#F3E9DC] text-[#8B5E34] border-[#E8D5C4]',
   LAPSED: 'bg-red-50 text-red-700 border-red-200',
 };
 
@@ -170,18 +217,40 @@ function aiScoreChipStyle(score?: number | null): string {
   return 'bg-red-50 text-red-700 border-red-200';
 }
 
+/** ₹ integer formatter (en-IN grouping, no decimals). */
+const inr = (n: unknown): string =>
+  '₹' + (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+
+/** Loyalty tier chip colours (light theme only). */
+const TIER_CHIP_STYLES: Record<string, string> = {
+  Bronze: 'bg-amber-100 text-amber-800 border-amber-300',
+  Silver: 'bg-slate-100 text-slate-700 border-slate-300',
+  Gold: 'bg-yellow-100 text-yellow-800 border-yellow-300',
+};
+
 // ─── Page ───────────────────────────────────────────────────────────────────
 
 export default function GuestProfilePage() {
   const params = useParams<{ id: string }>();
-  const guestId = typeof params?.id === 'string' ? params.id : '';
+  // useParams can hand back the raw (still-percent-encoded) segment, e.g. a
+  // synthetic `phone%3A9876543210` handle. Decode it once so `guestId` is the
+  // canonical `phone:9876543210`; load() re-encodes it for the fetch URL.
+  const rawId = typeof params?.id === 'string' ? params.id : '';
+  const guestId = rawId ? (() => { try { return decodeURIComponent(rawId); } catch { return rawId; } })() : '';
   const router = useRouter();
 
   const [guest, setGuest] = useState<Guest | null>(null);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
+  const [loyalty, setLoyalty] = useState<Loyalty | null>(null);
+  const [loyaltyVisits, setLoyaltyVisits] = useState<LoyaltyVisit[]>([]);
+  const [dining, setDining] = useState<DiningSummary | null>(null);
+  const [diningOrders, setDiningOrders] = useState<DiningOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
+
+  // Synthetic (phone-only) guest → save into CRM before write actions work
+  const [savingToCrm, setSavingToCrm] = useState(false);
 
   // Transient feedback (call fired, save failed, …)
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
@@ -235,7 +304,7 @@ export default function GuestProfilePage() {
   const load = useCallback(async () => {
     if (!guestId) return;
     try {
-      const res = await fetch(`/api/crm-calls/guests/${guestId}`, { cache: 'no-store' });
+      const res = await fetch(`/api/crm-calls/guests/${encodeURIComponent(guestId)}`, { cache: 'no-store' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         setLoadError(data?.error || `Failed to load guest (HTTP ${res.status})`);
@@ -244,6 +313,10 @@ export default function GuestProfilePage() {
       setGuest(data.guest || null);
       setMetrics(data.metrics || null);
       setTimeline(Array.isArray(data.timeline) ? data.timeline : []);
+      setLoyalty(data.loyalty || null);
+      setLoyaltyVisits(Array.isArray(data.loyalty_visits) ? data.loyalty_visits : []);
+      setDining(data.dining || null);
+      setDiningOrders(Array.isArray(data.dining_orders) ? data.dining_orders : []);
       setLoadError('');
     } catch {
       setLoadError('Network error — could not load this guest.');
@@ -285,6 +358,34 @@ export default function GuestProfilePage() {
   function removeTag(tag: string) {
     if (!guest) return;
     saveTags(guest.tags.filter((t) => t !== tag));
+  }
+
+  // ── Synthetic guest → save into CRM ─────────────────────────────────────────
+  // A loyalty/dining-only guest has no ct_guests row yet (id = "phone:…").
+  // Create it, then navigate to the real (saved) guest so write actions work.
+  async function saveToCrm() {
+    if (!guest || savingToCrm) return;
+    setSavingToCrm(true);
+    try {
+      const res = await api('/api/crm-calls/guests', {
+        method: 'POST',
+        body: { phone: guest.phone_e164, name: guest.name },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && json?.guest?.id) {
+        router.push(`/crm-calls/guests/${json.guest.id}`);
+        return;
+      }
+      if (res.status === 409 && json?.existing_guest_id) {
+        router.push(`/crm-calls/guests/${json.existing_guest_id}`);
+        return;
+      }
+      flash('err', json?.error || 'Could not save this guest to the CRM');
+    } catch {
+      flash('err', 'Could not save this guest to the CRM');
+    } finally {
+      setSavingToCrm(false);
+    }
   }
 
   // ── Edit mode ─────────────────────────────────────────────────────────────
@@ -598,13 +699,29 @@ export default function GuestProfilePage() {
         <ArrowLeft size={18} /> <span>Back to Guests</span>
       </button>
 
+      {/* Synthetic (loyalty/dining-only) guest — not yet saved to the CRM */}
+      {guest.synthetic && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-4 flex flex-col sm:flex-row sm:items-center gap-3">
+          <p className="text-sm text-amber-800 flex-1 min-w-0">
+            This guest was seen via loyalty/dining and isn&apos;t saved to the CRM yet. Save to add notes, tags &amp; follow-ups.
+          </p>
+          <button
+            onClick={saveToCrm}
+            disabled={savingToCrm}
+            className="flex items-center gap-2 shrink-0 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-60 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+          >
+            {savingToCrm ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />} Save to CRM
+          </button>
+        </div>
+      )}
+
       {/* ── Header card ── */}
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 sm:p-6 mb-6">
         <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
           <div className="min-w-0">
             <div className="flex items-center gap-3 flex-wrap">
-              <h1 className="text-2xl font-bold text-[#2D1B0E] truncate" title={guest.name || 'Unknown Caller'}>
-                {guest.name || 'Unknown Caller'}
+              <h1 className="text-2xl font-bold text-[#2D1B0E] truncate" title={guest.name || 'Unknown Guest'}>
+                {guest.name || 'Unknown Guest'}
               </h1>
               <span className={`inline-flex items-center text-xs font-semibold px-2.5 py-1 rounded-full border ${badgeStyle}`}>
                 {metrics?.badge || 'NEW CALLER'}
@@ -644,48 +761,52 @@ export default function GuestProfilePage() {
                   </button>
                 </span>
               ))}
-              <span className="inline-flex items-center gap-1">
-                <input
-                  value={newTag}
-                  onChange={(e) => setNewTag(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') addTag(); }}
-                  placeholder="Add tag"
-                  className="w-24 text-xs px-2 py-1 rounded-full border border-dashed border-[#E8D5C4] bg-white focus:outline-none focus:border-[#af4408] text-[#2D1B0E]"
-                />
-                <button
-                  onClick={addTag}
-                  disabled={savingTags || !newTag.trim()}
-                  className="text-[#af4408] hover:text-[#8a3506] disabled:opacity-40"
-                  aria-label="Add tag"
-                >
-                  {savingTags ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
-                </button>
-              </span>
+              {!guest.synthetic && (
+                <span className="inline-flex items-center gap-1">
+                  <input
+                    value={newTag}
+                    onChange={(e) => setNewTag(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') addTag(); }}
+                    placeholder="Add tag"
+                    className="w-24 text-xs px-2 py-1 rounded-full border border-dashed border-[#E8D5C4] bg-white focus:outline-none focus:border-[#af4408] text-[#2D1B0E]"
+                  />
+                  <button
+                    onClick={addTag}
+                    disabled={savingTags || !newTag.trim()}
+                    className="text-[#af4408] hover:text-[#8a3506] disabled:opacity-40"
+                    aria-label="Add tag"
+                  >
+                    {savingTags ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+                  </button>
+                </span>
+              )}
             </div>
           </div>
 
-          <div className="flex gap-2 shrink-0 flex-wrap">
-            <button
-              onClick={() => openQuickBooking()}
-              className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-            >
-              <CalendarPlus size={16} /> Quick Booking
-            </button>
-            <button
-              onClick={() => setFuOpen((v) => !v)}
-              className="flex items-center gap-2 bg-white hover:bg-[#FFF1E3] text-[#af4408] border border-[#E8D5C4] px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-            >
-              <Clock size={16} /> Follow-up
-            </button>
-            {!editing && (
+          {!guest.synthetic && (
+            <div className="flex gap-2 shrink-0 flex-wrap">
               <button
-                onClick={openEdit}
-                className="flex items-center gap-2 bg-white hover:bg-[#FFF1E3] text-[#6B5744] border border-[#E8D5C4] px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                onClick={() => openQuickBooking()}
+                className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
               >
-                <Edit size={16} /> Edit
+                <CalendarPlus size={16} /> Quick Booking
               </button>
-            )}
-          </div>
+              <button
+                onClick={() => setFuOpen((v) => !v)}
+                className="flex items-center gap-2 bg-white hover:bg-[#FFF1E3] text-[#af4408] border border-[#E8D5C4] px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+              >
+                <Clock size={16} /> Follow-up
+              </button>
+              {!editing && (
+                <button
+                  onClick={openEdit}
+                  className="flex items-center gap-2 bg-white hover:bg-[#FFF1E3] text-[#6B5744] border border-[#E8D5C4] px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                >
+                  <Edit size={16} /> Edit
+                </button>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Follow-up mini form */}
@@ -883,6 +1004,131 @@ export default function GuestProfilePage() {
             {m.sub && <p className="text-[11px] text-[#8B7355] mt-0.5 truncate">{m.sub}</p>}
           </div>
         ))}
+      </div>
+
+      {/* ── Loyalty & Dining (unified 360, keyed by phone) ── */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        {/* Loyalty card */}
+        <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 sm:p-6">
+          <h2 className="text-lg font-semibold text-[#2D1B0E] flex items-center gap-2 mb-4">
+            <Award size={18} /> Loyalty
+          </h2>
+
+          {loyalty ? (
+            <>
+              <div className="flex items-end gap-3 flex-wrap">
+                <div>
+                  <p className="text-3xl font-bold text-[#2D1B0E] leading-none">
+                    {Math.round(Number(loyalty.points) || 0).toLocaleString('en-IN')}
+                  </p>
+                  <p className="text-xs text-[#8B7355] uppercase tracking-wide mt-1">points</p>
+                </div>
+                <span
+                  className={`inline-flex items-center text-xs font-semibold px-2.5 py-1 rounded-full border ${
+                    TIER_CHIP_STYLES[loyalty.tier] || 'bg-[#FFF1E3] text-[#af4408] border-[#E8D5C4]'
+                  }`}
+                >
+                  {loyalty.tier || 'Bronze'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 mt-4">
+                <div className="rounded-lg bg-[#FFF8F0] border border-[#F4E8DA] p-3">
+                  <p className="text-xs text-[#8B7355] uppercase tracking-wide">Visits</p>
+                  <p className="text-lg font-bold text-[#2D1B0E] mt-0.5">{loyalty.visit_count ?? 0}</p>
+                </div>
+                <div className="rounded-lg bg-[#FFF8F0] border border-[#F4E8DA] p-3">
+                  <p className="text-xs text-[#8B7355] uppercase tracking-wide">Spend</p>
+                  <p className="text-lg font-bold text-[#2D1B0E] mt-0.5">{inr(loyalty.total_spend)}</p>
+                </div>
+              </div>
+
+              {(loyalty.first_visit_at || loyalty.last_visit_at) && (
+                <p className="text-[11px] text-[#8B7355] mt-3">
+                  {loyalty.first_visit_at && <>First visit {fmtDateOnly(loyalty.first_visit_at)}</>}
+                  {loyalty.first_visit_at && loyalty.last_visit_at && ' · '}
+                  {loyalty.last_visit_at && <>Last visit {fmtDateOnly(loyalty.last_visit_at)}</>}
+                </p>
+              )}
+
+              {loyaltyVisits.length > 0 && (
+                <div className="mt-4 pt-4 border-t border-[#F4E8DA] space-y-2">
+                  {loyaltyVisits.slice(0, 5).map((v) => (
+                    <div key={v.id} className="flex items-center justify-between gap-2 text-xs">
+                      <span className="text-[#6B5744] min-w-0 truncate">{fmtIst(v.visited_at)}</span>
+                      <span className="flex items-center gap-2 shrink-0">
+                        <span className="text-[#2D1B0E] font-medium">{inr(v.bill_amount)}</span>
+                        <span className="text-green-700 font-semibold">+{Math.round(Number(v.points_earned) || 0)} pts</span>
+                        {v.source && <span className="text-[#B9A48C]">{v.source}</span>}
+                      </span>
+                    </div>
+                  ))}
+                  {loyaltyVisits.length > 5 && (
+                    <p className="text-[11px] text-[#8B7355]">+{loyaltyVisits.length - 5} more</p>
+                  )}
+                </div>
+              )}
+            </>
+          ) : (
+            <p className="text-sm text-[#8B7355] py-6 text-center">No loyalty record yet.</p>
+          )}
+        </div>
+
+        {/* Dining card */}
+        <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 sm:p-6">
+          <h2 className="text-lg font-semibold text-[#2D1B0E] flex items-center gap-2 mb-4">
+            <Utensils size={18} /> Dining
+          </h2>
+
+          {dining ? (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {[
+                { label: 'Orders', value: dining.orders ?? 0 },
+                { label: 'Visits', value: dining.visits ?? 0 },
+                { label: 'Spend', value: inr(dining.total_spent) },
+                { label: 'QR', value: dining.qr_orders ?? 0 },
+              ].map((s) => (
+                <div key={s.label} className="rounded-lg bg-[#FFF8F0] border border-[#F4E8DA] p-3">
+                  <p className="text-xs text-[#8B7355] uppercase tracking-wide">{s.label}</p>
+                  <p className="text-lg font-bold text-[#2D1B0E] mt-0.5 truncate">{s.value}</p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-[#8B7355] py-6 text-center">No dine-in / QR orders yet.</p>
+          )}
+
+          {diningOrders.length > 0 ? (
+            <div className="mt-4 pt-4 border-t border-[#F4E8DA] overflow-x-auto">
+              <table className="w-full text-xs min-w-[420px]">
+                <thead>
+                  <tr className="text-left text-[#8B7355]">
+                    <th className="font-medium py-1.5 pr-3">Order</th>
+                    <th className="font-medium py-1.5 pr-3">Date</th>
+                    <th className="font-medium py-1.5 pr-3">Table</th>
+                    <th className="font-medium py-1.5 pr-3 text-right">Items</th>
+                    <th className="font-medium py-1.5 pr-3">Status</th>
+                    <th className="font-medium py-1.5 text-right">Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {diningOrders.slice(0, 6).map((o) => (
+                    <tr key={o.id} className="border-t border-[#F4E8DA]">
+                      <td className="py-1.5 pr-3 text-[#2D1B0E] font-medium whitespace-nowrap">{o.order_number || '—'}</td>
+                      <td className="py-1.5 pr-3 text-[#6B5744] whitespace-nowrap">{fmtIst(o.created_at)}</td>
+                      <td className="py-1.5 pr-3 text-[#6B5744] whitespace-nowrap">{o.table_number || '—'}</td>
+                      <td className="py-1.5 pr-3 text-[#6B5744] text-right">{o.item_count ?? 0}</td>
+                      <td className="py-1.5 pr-3 text-[#6B5744] whitespace-nowrap">{(o.status || '—').replace('_', ' ')}</td>
+                      <td className="py-1.5 text-[#2D1B0E] font-medium text-right whitespace-nowrap">{inr(o.total)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            dining && <p className="text-sm text-[#8B7355] mt-4 pt-4 border-t border-[#F4E8DA] text-center">No orders yet.</p>
+          )}
+        </div>
       </div>
 
       {/* ── Unified timeline ── */}

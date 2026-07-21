@@ -22,6 +22,7 @@ import {
   MessageCircle, RefreshCw, Sparkles, Zap, Users, Plus, Trash2,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import Toggle from '@/components/Toggle';
 
 // Mirrors CT_SETTING_DEFAULTS in src/lib/ct/settings.ts (that lib is
 // server-only — it imports node crypto — so we keep a local copy here).
@@ -635,12 +636,11 @@ export default function CtSettingsPage() {
               <span className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-medium">
                 stub — logged only, not sent in Phase 1
               </span>
-              <button type="button" role="switch" aria-checked={whatsappOn}
-                      aria-label="After-hours auto-WhatsApp to missed callers"
-                      onClick={() => set('after_hours_whatsapp', whatsappOn ? '0' : '1')}
-                      className={`ml-auto relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${whatsappOn ? 'bg-[#af4408]' : 'bg-gray-300'}`}>
-                <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform ${whatsappOn ? 'translate-x-4' : 'translate-x-0.5'}`} />
-              </button>
+              <Toggle checked={whatsappOn}
+                      onChange={(v) => set('after_hours_whatsapp', v ? '1' : '0')}
+                      size="sm"
+                      label="After-hours auto-WhatsApp to missed callers"
+                      className="ml-auto" />
             </div>
             <p className="text-[10px] text-[#6B5744] mt-1">
               When ON (and once WhatsApp sending is wired up in a later phase), callers missed
@@ -787,12 +787,12 @@ export default function CtSettingsPage() {
           <div className="border-t border-[#E8D5C4]/60 pt-3">
             <div className="flex flex-wrap items-center gap-2">
               <span className={`text-xs font-semibold text-[#2D1B0E] ${ephemeral ? 'opacity-50' : ''}`}>Auto-score every recorded call</span>
-              <button type="button" role="switch" aria-checked={autoAnalyzeOn} disabled={ephemeral}
-                      aria-label="Auto-score every recorded call"
-                      onClick={() => set('auto_analyze', autoAnalyzeOn ? '0' : '1')}
-                      className={`ml-auto relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${autoAnalyzeOn ? 'bg-[#af4408]' : 'bg-gray-300'} ${ephemeral ? 'opacity-50 cursor-not-allowed' : ''}`}>
-                <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform ${autoAnalyzeOn ? 'translate-x-4' : 'translate-x-0.5'}`} />
-              </button>
+              <Toggle checked={autoAnalyzeOn}
+                      onChange={(v) => set('auto_analyze', v ? '1' : '0')}
+                      disabled={ephemeral}
+                      size="sm"
+                      label="Auto-score every recorded call"
+                      className="ml-auto" />
             </div>
             <p className="text-[10px] text-[#6B5744] mt-1">
               Automatically score every recorded call with AI (transcript, /100 score, coaching). Uses

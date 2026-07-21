@@ -91,6 +91,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Customer Orders & Requests", href: "/dine-in/requests",  icon: Bell },
       { kind: "link", label: "Discount Approvals", href: "/dine-in/discount-approvals", icon: BadgePercent },
       { kind: "link", label: "Kitchen Display",    href: "/dine-in/kitchen",           icon: ChefHat },
+      { kind: "link", label: "Kitchen Scan-Out",   href: "/dine-in/kitchen/scan-out",  icon: ScanLine },
       { kind: "link", label: "KOT & Bill Printers", href: "/dine-in/offline-print",    icon: Printer },
       { kind: "link", label: "Captain (Tablet)",   href: "/captain",                   icon: Smartphone },
       { kind: "link", label: "Print Agent",        href: "/print/agent",               icon: Printer },
@@ -236,21 +237,23 @@ const navTree: NavEntry[] = [
     ],
   },
 
-  // AKAN CRM — AI assistant / training / quizzes for Front Office & GRE staff.
-  // Links only show for users granted the paths in page-catalog (AKAN CRM section).
+  // AI Training — AI assistant / analyst / training / quizzes for Front Office &
+  // GRE staff (was "AKAN CRM"; renamed to avoid a second "CRM" heading). Guest
+  // data now lives in the single unified CRM › Guests 360 above — the old
+  // "Guests & Loyalty" entry was folded in (loyalty is surfaced there by phone).
+  // Links only show for users granted the paths in page-catalog (AI Training).
   {
     kind: "section",
-    label: "AKAN CRM",
-    icon: Bot,
+    label: "AI Training",
+    icon: GraduationCap,
     items: [
       { kind: "link", label: "AI Assistant",     href: "/crm/assistant",  icon: Bot },
       { kind: "link", label: "AI Analyst",       href: "/crm/analyst",    icon: BarChart3 },
       { kind: "link", label: "Daily Digest",     href: "/crm/digest",     icon: FileText },
       { kind: "link", label: "Smart Reorder",    href: "/crm/reorder",    icon: ShoppingCart },
-      { kind: "link", label: "Guests & Loyalty", href: "/crm/guests",     icon: Users },
       { kind: "link", label: "Training",         href: "/crm/training",   icon: GraduationCap },
       { kind: "link", label: "Quiz",             href: "/crm/quiz",       icon: HelpCircle },
-      { kind: "link", label: "Guest Quiz Links", href: "/crm/quiz-links", icon: Link2 },
+      { kind: "link", label: "Staff Quiz Links", href: "/crm/quiz-links", icon: Link2 },
       { kind: "link", label: "CRM Settings",     href: "/crm/settings",   icon: ShieldAlert },
     ],
   },

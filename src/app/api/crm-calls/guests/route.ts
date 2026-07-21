@@ -1,7 +1,8 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, isManagement } from '@/lib/auth';
 import { normalizePhone } from '@/lib/ct/phone';
 import { listMetricsForGuests } from '@/lib/ct/metrics';
+import { norm10, buildLoyaltyMap, buildDiningMap, syntheticGuests } from '@/lib/ct/guest-unify';
 
 /**
  * GET  /api/crm-calls/guests
@@ -134,17 +135,83 @@ export async function GET(request: Request) {
       console.error('GET /api/crm-calls/guests: listMetricsForGuests failed, serving empty metrics:', e);
     }
 
-    let guests = rows.map(r => ({
+    let guests: any[] = rows.map(r => ({
       ...r,
       tags: parseJson<string[]>(r.tags, []),
       preferences: parseJson<Record<string, unknown>>(r.preferences, {}),
       metrics: metricsFor(metricsBag, r.id),
     }));
 
+    // ── Unify: one guest = one person across calls + loyalty + dining ──
+    // Enrich every caller with their loyalty (crm_guests) + dining (orders)
+    // rollup by last-10-digit phone, and append guests who exist ONLY in
+    // loyalty/dining (never called) so the single list is exhaustive.
+    const outletId = await getCurrentOutletId();
+    // Loyalty (points/tier/spend + visit ledger) stays management-only, matching
+    // the legacy /api/crm/guests gate — non-management users get dining only
+    // (dining/customer spend is intentionally open, per /api/customers).
+    const canLoyalty = isManagement(me);
+    const loyaltyMap = canLoyalty ? buildLoyaltyMap(db) : new Map();
+    const diningMap = buildDiningMap(db, outletId);
+    const compactLoyalty = (k: string) => {
+      const l = loyaltyMap.get(k);
+      return l ? { points: l.points, tier: l.tier, visit_count: l.visit_count, total_spend: l.total_spend } : null;
+    };
+    const compactDining = (k: string) => {
+      const d = diningMap.get(k);
+      return {
+        orders: d?.orders || 0, visits: d?.visits || 0,
+        total_spent: d?.total_spent || 0, qr_orders: d?.qr_orders || 0,
+        last_seen: d?.last_seen || null,
+      };
+    };
+    const ctKeys = new Set<string>();
+    for (const g of guests) {
+      const k = norm10(g.phone_e164);
+      if (k) ctKeys.add(k);
+      g.loyalty = compactLoyalty(k);
+      g.dining = compactDining(k);
+      if (!String(g.name || '').trim()) {
+        g.name = (loyaltyMap.get(k)?.name || diningMap.get(k)?.name || '').trim();
+      }
+    }
+    // Synthetic (never-called) guests — apply the same text search in JS since
+    // the SQL pre-filter above only saw ct_guests rows.
+    const sDigits = search.replace(/\D/g, '');
+    const matchesSearch = (name: string, phone: string) => {
+      if (!search) return true;
+      if (String(name || '').toLowerCase().includes(search.toLowerCase())) return true;
+      // Match phone on ANY non-empty digit fragment — mirrors the SQL pre-filter
+      // (which LIKEs the phone even for <4-digit queries) so synthetic guests
+      // aren't under-included on a short numeric search.
+      const ph = String(phone || '').replace(/\D/g, '');
+      return sDigits.length >= 1 && ph.includes(sDigits);
+    };
+    const synth = syntheticGuests(ctKeys, loyaltyMap, diningMap)
+      .filter(s => matchesSearch(s.name, s.phone_e164))
+      .map(s => {
+        const k = norm10(s.phone_e164);
+        const din = diningMap.get(k);
+        const loy = loyaltyMap.get(k);
+        const repeat = (din?.visits || 0) >= 2 || (loy?.visit_count || 0) >= 2;
+        return {
+          ...s,
+          preferences: {} as Record<string, unknown>,
+          metrics: {
+            ...EMPTY_METRICS,
+            badge: repeat ? 'REPEAT GUEST' : 'DINE-IN GUEST',
+            last_visit_at: din?.last_seen || loy?.last_visit_at || null,
+          },
+          loyalty: compactLoyalty(k),
+          dining: compactDining(k),
+        };
+      });
+    guests = guests.concat(synth);
+
     // ── Metric/tag filters ──
     const tag = (sp.get('tag') || '').trim().toLowerCase();
     if (tag) {
-      guests = guests.filter(g => Array.isArray(g.tags) && g.tags.some(t => String(t).toLowerCase() === tag));
+      guests = guests.filter(g => Array.isArray(g.tags) && g.tags.some((t: unknown) => String(t).toLowerCase() === tag));
     }
     const badge = badgeSlug(sp.get('badge') || '');
     if (badge) {
@@ -164,7 +231,7 @@ export async function GET(request: Request) {
     const sort = (sp.get('sort') || 'last_call').toLowerCase();
     const defaultDir = sort === 'name' ? 'asc' : 'desc';
     const dir = (sp.get('dir') || defaultDir).toLowerCase() === 'asc' ? 1 : -1;
-    const keyOf = (g: typeof guests[number]): string | number | null => {
+    const keyOf = (g: any): string | number | null => {
       switch (sort) {
         case 'name': return (g.name || '').toLowerCase();
         case 'total_calls': return g.metrics.total_calls;
@@ -174,6 +241,11 @@ export async function GET(request: Request) {
         case 'last_visit': return g.metrics.last_visit_at;
         case 'conversion': return g.metrics.conversion_rate;
         case 'created': return g.created_at;
+        // Unified loyalty / dining sorts
+        case 'points': return g.loyalty ? g.loyalty.points : null;
+        case 'spend': return g.dining ? g.dining.total_spent : null;
+        case 'dining_visits': return g.dining ? g.dining.visits : null;
+        case 'last_visit_any': return g.dining?.last_seen || g.metrics.last_visit_at || null;
         case 'last_call':
         default: return g.metrics.last_call_at;
       }
@@ -198,11 +270,16 @@ export async function GET(request: Request) {
         'Name', 'Phone', 'Alt Phone', 'Email', 'Tags', 'Badge', 'Source',
         'Total Calls', 'Calls 30d', 'Missed Calls', 'Last Call (IST)',
         'Bookings', 'Completed Visits', 'No Shows', 'Last Visit (IST)',
-        'Conversion %', 'DOB', 'Anniversary', 'Notes', 'Created (IST)',
+        'Conversion %',
+        'Loyalty Points', 'Loyalty Tier', 'Loyalty Visits', 'Loyalty Spend',
+        'Dining Orders', 'Dining Visits', 'Dining Spend', 'QR Orders', 'Last Seen (IST)',
+        'DOB', 'Anniversary', 'Notes', 'Created (IST)',
       ];
       const lines = [header.join(',')];
       for (const g of guests) {
         const m = g.metrics;
+        const loy = g.loyalty;
+        const din = g.dining || {};
         lines.push([
           g.name, g.phone_e164, g.alt_phone, g.email,
           Array.isArray(g.tags) ? g.tags.join('; ') : '',
@@ -210,6 +287,10 @@ export async function GET(request: Request) {
           m.total_calls, m.calls_30d, m.missed_calls, istDisplay(m.last_call_at),
           m.total_bookings, m.completed_visits, m.no_shows, istDisplay(m.last_visit_at),
           Math.round((Number(m.conversion_rate) || 0) * 100) / 100,
+          loy ? Math.round(loy.points) : '', loy ? loy.tier : '',
+          loy ? loy.visit_count : '', loy ? Math.round(loy.total_spend) : '',
+          din.orders || 0, din.visits || 0, din.total_spent || 0, din.qr_orders || 0,
+          istDisplay(din.last_seen || null),
           g.dob, g.anniversary, g.notes, istDisplay(g.created_at),
         ].map(csvCell).join(','));
       }

@@ -16,6 +16,7 @@ import {
   MessageCircle, ChevronDown, ChevronUp, ArrowLeft, XCircle, ShieldAlert, Clock,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import Toggle from '@/components/Toggle';
 
 interface QuizLink {
   id: string;
@@ -386,14 +387,13 @@ export default function QuizLinksPage() {
                     </div>
                     <div className="flex items-center gap-1.5 ml-auto">
                       {/* Active toggle */}
-                      <button
-                        onClick={() => toggleActive(l)}
+                      <Toggle
+                        checked={l.is_active}
+                        onChange={() => toggleActive(l)}
                         disabled={busyId === l.id}
-                        title={l.is_active ? 'Deactivate link' : 'Activate link'}
-                        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50 ${l.is_active ? 'bg-emerald-500' : 'bg-[#D4B896]'}`}
-                      >
-                        <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${l.is_active ? 'translate-x-[1.15rem]' : 'translate-x-1'}`} />
-                      </button>
+                        size="sm"
+                        label={l.is_active ? 'Deactivate link' : 'Activate link'}
+                      />
                       <button
                         onClick={() => { navigator.clipboard?.writeText(fullUrl(l)).then(() => setFlash(`Copied link for "${l.title}"`)).catch(() => {}); }}
                         title="Copy link"

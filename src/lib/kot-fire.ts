@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import { generateId } from '@/lib/db';
+import { generateId, genScanCode } from '@/lib/db';
 
 /**
  * Promote an order (a customer 'pending_approval' staging order, or one created
@@ -94,7 +94,7 @@ export function fireStagingOrder(
       const st = (it.station && String(it.station).trim()) || 'kitchen';
       (byStation[st] ||= []).push(it);
     }
-    const setKot = db.prepare("UPDATE order_items SET kot_id = ?, status = 'fired', fired_at = datetime('now'), prep_minutes = ? WHERE id = ?");
+    const setKot = db.prepare("UPDATE order_items SET kot_id = ?, status = 'fired', fired_at = datetime('now'), prep_minutes = ?, scan_code = ? WHERE id = ?");
     for (const [station, its] of Object.entries(byStation)) {
       const kseq = db.prepare(`
         SELECT COALESCE(MAX(kot_number), 0) + 1 AS n FROM kots
@@ -105,13 +105,13 @@ export function fireStagingOrder(
         INSERT INTO kots (id, outlet_id, order_id, kot_number, station, status, fired_by, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, 'new', ?, datetime('now'), datetime('now'))
       `).run(kotId, targetOutlet, targetId, kseq.n, station, firedBy);
-      for (const it of its) setKot.run(kotId, Number(it.mi_prep_minutes) || 15, it.id);
+      for (const it of its) { it.scan_code = genScanCode(db); setKot.run(kotId, Number(it.mi_prep_minutes) || 15, it.scan_code, it.id); }
       firedKots.push({
         id: kotId, outlet_id: targetOutlet, order_id: targetId, kot_number: kseq.n, station, status: 'new',
         order_number: targetNumber, order_type: 'dine-in',
         table_number: tableRow?.table_number || null, zone: tableRow?.zone || null,
         captain: targetServer || null, fired_by: firedBy, reprint_count: 0,
-        items: its.map((x) => ({ name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),
+        items: its.map((x) => ({ id: x.id, scan_code: x.scan_code, name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),
       });
     }
 

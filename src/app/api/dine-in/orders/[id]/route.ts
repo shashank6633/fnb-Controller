@@ -1,4 +1,4 @@
-import { getDb, generateId } from '@/lib/db';
+import { getDb, generateId, genScanCode } from '@/lib/db';
 import { getCurrentUser, canApproveTableOp, verifyApprover } from '@/lib/auth';
 import { emitKds } from '@/lib/kds-bus';
 import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
@@ -185,7 +185,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
           // snapshot the item's current menu prep_minutes onto the order line
           // (so later menu edits don't retro-change fired tickets).
           const setKot = db.prepare(
-            "UPDATE order_items SET kot_id = ?, status = 'fired', fired_at = datetime('now'), prep_minutes = ? WHERE id = ?"
+            "UPDATE order_items SET kot_id = ?, status = 'fired', fired_at = datetime('now'), prep_minutes = ?, scan_code = ? WHERE id = ?"
           );
           for (const [station, its] of Object.entries(byStation)) {
             const seq = db.prepare(`
@@ -198,7 +198,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
               INSERT INTO kots (id, outlet_id, order_id, kot_number, station, status, fired_by, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, 'new', ?, datetime('now'), datetime('now'))
             `).run(kotId, order.outlet_id, id, seq.n, station, firedBy);
-            for (const it of its) setKot.run(kotId, Number(it.mi_prep_minutes) || 15, it.id);   // default 15 min when the dish has no prep time set
+            for (const it of its) { it.scan_code = genScanCode(db); setKot.run(kotId, Number(it.mi_prep_minutes) || 15, it.scan_code, it.id); }   // default 15 min when the dish has no prep time set
             firedKots.push({
               id: kotId, outlet_id: order.outlet_id, order_id: id, kot_number: seq.n, station, status: 'new',
               order_number: order.order_number, order_type: order.order_type,
@@ -206,7 +206,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
               captain: order.server_name || null,   // captain who opened the table (1st captain)
               fired_by: firedBy,                     // captain who punched this KOT
               reprint_count: 0,                      // 0 = ORIGINAL
-              items: its.map((x) => ({ name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),
+              items: its.map((x) => ({ id: x.id, scan_code: x.scan_code, name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),
             });
           }
           // TODO Phase 2.1: socket-print each fired KOT to its station's LAN ESC/POS printer here.
@@ -234,9 +234,19 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
                  b.covers === undefined ? order.covers : Math.max(0, Number(b.covers) || 0), id);
           break;
         case 'complete_item': {
-          // Mark a fired line as served/done (stops its prep timer).
-          const item = db.prepare('SELECT id FROM order_items WHERE id = ? AND order_id = ?').get(b.item_id, id) as any;
+          // Mark a fired line as received at the table (stops its prep timer).
+          const item = db.prepare('SELECT id, kitchen_sent_at, served_at, status FROM order_items WHERE id = ? AND order_id = ?').get(b.item_id, id) as any;
           if (!item) throw new Error('Line item not found');
+          // Optional leak-proof enforcement: block "received" until the kitchen
+          // has RELEASED the item (scanned its sticker out OR the KDS bumped its
+          // KOT served). Toggled by settings.kot_scan_enforce; default off
+          // (advisory). The Scan-Out board's tap-to-send is the manual override
+          // for a scanner/printer outage.
+          const enforceRow = db.prepare("SELECT value FROM settings WHERE key = 'kot_scan_enforce'").get() as any;
+          if (enforceRow && (enforceRow.value === 'true' || enforceRow.value === '1')) {
+            const released = !!item.kitchen_sent_at || !!item.served_at || item.status === 'served';
+            if (!released) throw new Error('This item has not been scanned out of the kitchen yet.');
+          }
           db.prepare("UPDATE order_items SET completed_at = datetime('now') WHERE id = ? AND order_id = ?").run(b.item_id, id);
           break;
         }

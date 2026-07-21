@@ -3,6 +3,7 @@
 import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { api } from '@/lib/api';
 import TabScroller from '@/components/TabScroller';
+import Toggle from '@/components/Toggle';
 import {
   Utensils,
   Plus,
@@ -765,12 +766,7 @@ function LinkBadge({ item }: { item: MenuItem }) {
 }
 
 function RowToggle({ on, onClick }: { on: boolean; onClick: () => void }) {
-  return (
-    <button onClick={onClick} role="switch" aria-checked={on} aria-label={on ? 'Active' : 'Inactive'}
-            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${on ? 'bg-green-500' : 'bg-gray-300'}`}>
-      <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${on ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
-    </button>
-  );
+  return <Toggle checked={on} onChange={() => onClick()} size="sm" label={on ? 'Active' : 'Inactive'} />;
 }
 
 // ⋮ row menu. The dropdown is fixed-positioned so it isn't clipped by the
@@ -859,12 +855,10 @@ function SegmentedVeg({ value, onChange }: { value: string; onChange: (v: string
 
 function ActiveToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
   return (
-    <button onClick={onToggle} role="switch" aria-checked={on} className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-[#E0D0BE] bg-white text-sm text-[#6B5744] shadow-sm">
-      <span className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${on ? 'bg-green-500' : 'bg-gray-300'}`}>
-        <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${on ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
-      </span>
+    <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-[#E0D0BE] bg-white text-sm text-[#6B5744] shadow-sm cursor-pointer">
+      <Toggle checked={on} onChange={() => onToggle()} size="sm" label="Active only" />
       Active only
-    </button>
+    </label>
   );
 }
 

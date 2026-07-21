@@ -60,6 +60,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/dine-in/requests',    label: 'Customer Orders & Requests' },
       { path: '/dine-in/discount-approvals', label: 'Discount Approvals' },
       { path: '/dine-in/kitchen',     label: 'Kitchen Display' },
+      { path: '/dine-in/kitchen/scan-out', label: 'Kitchen Scan-Out' },
       { path: '/dine-in/offline-print', label: 'KOT & Bill Printers' },
       { path: '/dine-in/tables',      label: 'Tables' },
       { path: '/customers',           label: 'Customers' },
@@ -181,17 +182,18 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/crm-calls',          label: 'CRM Dashboard' },
       { path: '/crm-calls/live',     label: 'Live Calls' },
       { path: '/crm-calls/recovery', label: 'Recovery Queue' },
-      { path: '/crm-calls/guests',   label: 'CRM Guests' },
+      { path: '/crm-calls/guests',   label: 'Guests (unified 360)' },
       { path: '/crm-calls/log',      label: 'Call Log' },
       { path: '/crm-calls/bookings', label: 'CRM Bookings' },
       { path: '/crm-calls/settings', label: 'CRM Call Settings', mgmtOnly: true },
     ],
   },
   {
-    // AKAN CRM — AI assistant / training / quizzes for the Front Office & GRE
-    // team (ported from the standalone Flask app). Grant per user/role like any
+    // AI Training — AI assistant / analyst / training / quizzes for the Front
+    // Office & GRE team (ported from the standalone Flask app; was "AKAN CRM",
+    // renamed to avoid a second "CRM" heading). Grant per user/role like any
     // other page. Quiz Links + CRM Settings are HOD/admin surfaces.
-    label: 'AKAN CRM',
+    label: 'AI Training',
     pages: [
       { path: '/crm/assistant',  label: 'AI Assistant' },
       { path: '/crm/analyst',    label: 'AI Analyst — Data', hodOnly: true },
@@ -199,12 +201,13 @@ export const PAGE_CATALOG: PageSection[] = [
       // NOT hodOnly: store managers raise POs too — the page + API gate on
       // admin/HOD/store-manager themselves.
       { path: '/crm/reorder',    label: 'Smart Reorder' },
-      // NOT hodOnly: managers run the guest book / loyalty desk — the page +
-      // API gate on admin/manager-tier/HOD themselves.
-      { path: '/crm/guests',     label: 'Guests & Loyalty' },
+      // Legacy loyalty desk — folded into the unified CRM › Guests 360 (loyalty
+      // is surfaced there by phone). Kept accessible (deep links / points admin)
+      // but off the sidebar; the page + API gate on admin/manager-tier/HOD.
+      { path: '/crm/guests',     label: 'Guests & Loyalty (legacy → CRM › Guests)' },
       { path: '/crm/training',   label: 'Training' },
       { path: '/crm/quiz',       label: 'Quiz' },
-      { path: '/crm/quiz-links', label: 'Guest Quiz Links', hodOnly: true },
+      { path: '/crm/quiz-links', label: 'Staff Quiz Links', hodOnly: true },
       { path: '/crm/settings',   label: 'CRM Settings',     hodOnly: true },
     ],
   },
