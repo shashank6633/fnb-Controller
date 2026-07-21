@@ -62,9 +62,10 @@ export async function POST(req: Request) {
     // Outlet-scoped (mirrors the GET) so a user can't flip another outlet's item.
     const row = db.prepare(`
       SELECT oi.id, oi.name, oi.status, oi.kitchen_sent_at, oi.order_id,
-             o.status AS order_status, o.outlet_id, rt.table_number
+             o.status AS order_status, o.outlet_id, rt.table_number, k.station
       FROM order_items oi
       JOIN orders o ON o.id = oi.order_id
+      LEFT JOIN kots k ON k.id = oi.kot_id
       LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
       WHERE (oi.id = @code OR UPPER(oi.scan_code) = UPPER(@code))
         AND (o.outlet_id = @outlet OR o.outlet_id IS NULL)
@@ -87,11 +88,14 @@ export async function POST(req: Request) {
 
     const flipped = res.changes === 1;
     if (flipped) {
-      // Push to the captain tablet(s) after the write.
+      // Push to the captain tablet(s) AND the Kitchen Display after the write.
+      // Carry the KOT's real station: the KDS stream drops events whose station
+      // doesn't match its ?station=/section filter, so '' never reached a
+      // station-filtered Kitchen Display.
       emitKds({
         type: 'item.sent',
         outlet_id: row.outlet_id ?? null,
-        station: '',
+        station: row.station || '',
         order_id: row.order_id,
         item: { id: fresh.id, name: fresh.name, kitchen_sent_at: fresh.kitchen_sent_at },
       });

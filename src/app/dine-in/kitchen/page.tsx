@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '@/lib/api';
-import { ChefHat, Clock, Wifi, WifiOff, AlertTriangle } from 'lucide-react';
+import { ChefHat, Clock, Wifi, WifiOff, AlertTriangle, Check } from 'lucide-react';
 import TabScroller from '@/components/TabScroller';
 
 interface KotItem { name: string; quantity: number; notes: string; status: string; }
@@ -195,12 +195,25 @@ export default function KitchenPage() {
                 </div>
                 <p className="text-[11px] text-[#8B7355] mb-2 capitalize">{k.station} · KOT #{k.kot_number} · order #{k.order_number}</p>
                 <div className="space-y-1 mb-3">
-                  {k.items.map((it, i) => (
-                    <div key={i} className="text-sm text-[#2D1B0E]">
-                      <span className="font-semibold">{it.quantity}×</span> {it.name}
-                      {it.notes && <span className="block text-[11px] text-[#8B7355] ml-4">— {it.notes}</span>}
-                    </div>
-                  ))}
+                  {k.items.map((it, i) => {
+                    // Scanned out at the pass (or already served) → visibly done on
+                    // the ticket: struck through + an emerald "out" chip. Without
+                    // this a kitchen_sent item looked identical to a fired one.
+                    const out = it.status === 'kitchen_sent' || it.status === 'served';
+                    return (
+                      <div key={i} className={`text-sm ${out ? 'text-[#8B7355]' : 'text-[#2D1B0E]'}`}>
+                        <span className={out ? 'line-through decoration-emerald-600/50' : ''}>
+                          <span className="font-semibold">{it.quantity}×</span> {it.name}
+                        </span>
+                        {out && (
+                          <span className="ml-1.5 inline-flex items-center gap-0.5 align-middle text-[10px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-1.5 py-px">
+                            <Check size={9} strokeWidth={3} /> out
+                          </span>
+                        )}
+                        {it.notes && <span className="block text-[11px] text-[#8B7355] ml-4">— {it.notes}</span>}
+                      </div>
+                    );
+                  })}
                 </div>
                 <button onClick={() => bump(k)}
                   className="w-full py-2 rounded-lg text-sm font-medium bg-[#af4408] hover:bg-[#8a3506] text-white capitalize">
