@@ -5,6 +5,11 @@
  * their SIZE, and whether each shows are all driven by a `StickerDesign` the
  * owner edits on the Print Design page (mirrors the KOT/Bill design model).
  *
+ * This builder is the LEGACY fallback for bridges < v2.6 (text in-flow, QR
+ * right-aligned BELOW the text). The PRIMARY layout is sticker-raster.ts — a
+ * canvas-rendered GS v 0 raster with the QR truly BESIDE the details, sent as
+ * `payload_b64` to bridges that decode base64 (v2.6.0+).
+ *
  * Emitted as a `type:'raw'` payload the bridge forwards VERBATIM (same path it
  * uses for TSPL). Every byte stays in 0x00–0x7F (text is ASCII-folded, the code
  * is a short base32 token), so it survives JSON transport to the bridge intact.
@@ -156,45 +161,25 @@ export function buildKotStickerESCPOS(s: KotStickerInput): string {
     }
   };
 
-  const codeLine = design.lines.find((l) => l.key === 'code');
-  const qrBeside = codeType === 'qr' && !!code && !!codeLine?.enabled;
-
-  let one: string;
-  if (qrBeside) {
-    // PAGE MODE — the details stack in a LEFT column, the QR sits at the TOP-RIGHT,
-    // truly BESIDE the text (a receipt/line printer can't do this in normal mode).
-    // Every command byte is kept < 0x80 so it survives JSON transport to the bridge.
-    // Page mode is printer-dependent → the "Print test sticker" confirms the Rugtek.
-    const B = (n: number) => String.fromCharCode(n & 0xff);
-    const dx = 576, dy = 288;                                   // 72mm x 36mm area
-    const qrMod = codeLine!.size === 'xlarge' ? 6 : codeLine!.size === 'large' ? 5 : 4;
-    const qrX = 300;                                            // right column start
-    const leftText = design.lines.filter((l) => l.enabled && l.key !== 'code').map(textLine).join('');
-    one =
-      `${ESC}@${ESC}L` +                                                       // init + page mode
-      `${ESC}W\x00\x00\x00\x00${B(dx)}${B(dx >> 8)}${B(dy)}${B(dy >> 8)}` +     // print area
-      `${ESC}T\x00` +                                                           // direction normal
-      `${GS}$\x00\x00${ESC}$\x00\x00` +                                         // cursor top-left
-      leftText +                                                               // left column (LF-stacked)
-      `${GS}$\x08\x00${ESC}$${B(qrX)}${B(qrX >> 8)}${qrBlock(code, qrMod)}` +   // QR at top-right
-      `${ESC}\x0C` +                                                           // ESC FF: print page + exit page mode
-      `${GS}V\x01`;                                                            // cut
-  } else {
-    // STANDARD in-flow: text lines top-to-bottom + (a barcode below, full width).
-    const bodyLine = (line: StickerLine): string => {
-      if (!line.enabled) return '';
-      if (line.key === 'code') {
-        if (!code || codeType !== 'barcode') return '';
+  // STANDARD in-flow: text lines top-to-bottom + the code below, at its design
+  // position — a barcode full width, or a QR right-aligned under a '#code' line.
+  const bodyLine = (line: StickerLine): string => {
+    if (!line.enabled) return '';
+    if (line.key === 'code') {
+      if (!code) return '';
+      if (codeType === 'barcode') {
         const bH = line.size === 'xlarge' ? 100 : line.size === 'large' ? 76 : 56;
         return `#${code}\n${code128Block(code, bH)}\n`;
       }
-      return textLine(line);
-    };
-    one =
-      `${ESC}@${GS}L\x00\x00${ESC}a\x00` +   // init + left margin 0 + align left
-      design.lines.map(bodyLine).join('') +
-      `\n${GS}V\x01`;                        // partial cut
-  }
+      const qrMod = line.size === 'xlarge' ? 6 : line.size === 'large' ? 5 : 4;
+      return `#${code}\n${ESC}a\x02${qrBlock(code, qrMod)}${ESC}a\x00`;
+    }
+    return textLine(line);
+  };
+  const one =
+    `${ESC}@${GS}L\x00\x00${ESC}a\x00` +   // init + left margin 0 + align left
+    design.lines.map(bodyLine).join('') +
+    `\n${GS}V\x01`;                        // partial cut
 
   return one.repeat(copies);
 }

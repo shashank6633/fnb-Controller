@@ -87,6 +87,30 @@ export async function probeBridge(timeoutMs = 2500): Promise<BridgeHealth | null
   } catch { return null; }
 }
 
+// ── Raw base64 capability (bridge v2.6.0+) ───────────────────────────────────
+// v2.6.0 decodes `payload_b64` (base64) on raw/tspl docs, so binary bytes
+// (0x80–0xFF, e.g. raster stickers) survive JSON transport. An older bridge
+// would drop payload_b64 and print nothing — callers gate on this probe.
+let rawB64Cache: { at: number; ok: boolean; url: string } | null = null;
+
+/**
+ * True if the bridge accepts base64 raw payloads (v2.6+). Version is compared
+ * NUMERICALLY (major, minor) — a string compare would rank 2.10 below 2.6.
+ * Cached module-scope for 60s (10s while false, so a just-updated bridge is
+ * picked up quickly); keyed to the bridge URL so switching bridges via
+ * setBridgeUrl() always re-probes. Never throws; unreachable probes as false.
+ */
+export async function bridgeSupportsRawB64(): Promise<boolean> {
+  const url = getBridgeUrl();
+  const ttl = rawB64Cache?.ok ? 60000 : 10000;
+  if (rawB64Cache && rawB64Cache.url === url && Date.now() - rawB64Cache.at < ttl) return rawB64Cache.ok;
+  const health = await probeBridge();
+  const m = /^(\d+)\.(\d+)/.exec(String(health?.version || ''));
+  const ok = !!health && !!m && (Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 6));
+  rawB64Cache = { at: Date.now(), ok, url };
+  return ok;
+}
+
 export type PrinterStatus = { reachable: boolean; supported: boolean; paperOut: boolean; paperLow: boolean; coverOpen: boolean; error: boolean };
 
 /** Live status of a network printer via the bridge (paper/cover/reachable). null if the bridge itself is unreachable. */
@@ -119,6 +143,8 @@ export async function listBridgePrinters(timeoutMs = 6000): Promise<BridgePrinte
 export type PrinterTarget = { transport: 'ip' | 'usb' | 'file'; target: string; width?: 32 | 48 };
 // 'tspl'/'raw' carry a ready-made command string in `payload` that the bridge
 // (v2.4.0+) sends to the printer verbatim — used for TSPL2 label jobs (TSC TE210).
+// On v2.6.0+ they may instead carry `payload_b64` (base64-encoded bytes, a plain
+// string so the doc stays JSON/IndexedDB-safe) for binary jobs like raster stickers.
 export type PrintDoc = Record<string, any> & { type: 'kot' | 'bill' | 'tspl' | 'raw' };
 export type PrintResult = { ok: boolean; jobId: string; bytes?: number; error?: string };
 
@@ -136,8 +162,27 @@ export type BatchResult = { ok: boolean; results: Array<{ jobId: string; ok: boo
  * PC, just without the no-gap batching. We do NOT fall back on a network
  * error/timeout (the batch may have already printed on a new bridge → would
  * double-print); those just fail and the outbox retries.
+ *
+ * TIMEOUT: the bridge ACKs only after the WHOLE per-printer group has physically
+ * printed (one connection, markPrinted after printTo), and a raster-sticker chunk
+ * (up to 25 jobs / ~1MB) can take 30-60s+ on an 80mm thermal. Aborting early
+ * leaves those jobs "pending" while the printer is still working — the next drain
+ * re-sends them (mass duplicate stickers) and at 2 attempts fails over to the
+ * backup printer. So the default deadline SCALES with job count + payload bytes
+ * (~1.5s/job + ~20KB/s of payload over a 20s base, capped at 120s) rather than
+ * being a fixed 20s.
  */
-export async function bridgePrintBatch(jobs: BatchJob[], timeoutMs = 20000): Promise<BatchResult> {
+function batchTimeoutMs(jobs: BatchJob[]): number {
+  let bytes = 0;
+  for (const j of jobs) {
+    const p = j.doc.payload_b64 ?? j.doc.payload;
+    bytes += typeof p === 'string' ? p.length : 2048; // kot/bill docs render bridge-side → small
+  }
+  return Math.min(20000 + jobs.length * 1500 + Math.ceil(bytes / 20), 120000);
+}
+
+export async function bridgePrintBatch(jobs: BatchJob[], timeoutMs?: number): Promise<BatchResult> {
+  const deadlineMs = timeoutMs ?? batchTimeoutMs(jobs);
   let endpointMissing = false;
   try {
     const res = await withTimeout(async (signal) => {
@@ -148,7 +193,7 @@ export async function bridgePrintBatch(jobs: BatchJob[], timeoutMs = 20000): Pro
       if (r.status === 404 || r.status === 405) { endpointMissing = true; return null; } // old bridge
       const j = await r.json().catch(() => ({ ok: false, results: [] }));
       return { ok: !!j.ok, results: Array.isArray(j.results) ? j.results : [] } as BatchResult;
-    }, timeoutMs);
+    }, deadlineMs);
     if (res) return res;
   } catch {
     if (!endpointMissing) return { ok: false, results: jobs.map((j) => ({ jobId: j.jobId, ok: false, error: 'bridge unreachable' })) };

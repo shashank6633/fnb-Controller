@@ -1,6 +1,7 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentOutletId } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
+import { effectiveRole, effectiveActor, recalcTotal } from '@/lib/po-helpers';
 
 /** Phase B store guard for PO composition (create/edit are interactive, so we
  *  reject the request with a clear message instead of silently dropping lines).
@@ -29,26 +30,9 @@ function storeBlockedError(db: ReturnType<typeof getDb>, items: any[]): string |
  *   submit, approve, receive, reject, cancel
  */
 
-/** Role of the CURRENT SESSION, or null when there is no valid session.
- *  SECURITY: never falls back to a privileged role. The old settings-based
- *  `current_role` fallback meant a forged/expired cookie was treated as admin
- *  on every PO money/stock action — removed. Callers MUST 401 on null.
- *  Collapses 'staff' → 'manager' for the legacy two-tier callers in this file. */
-async function effectiveRole(): Promise<'admin' | 'manager' | null> {
-  const user = await getCurrentUser();
-  if (!user) return null;
-  return user.role === 'admin' ? 'admin' : 'manager';
-}
-/** Back-compat shim for callers that used the old sync currentRole(db): now
- *  session-based and nullable. */
-async function currentRole(): Promise<'admin' | 'manager' | null> {
-  return effectiveRole();
-}
-
-async function effectiveActor(): Promise<string> {
-  const user = await getCurrentUser();
-  return user ? user.email : 'system';
-}
+// effectiveRole / currentRole / effectiveActor / recalcTotal live in
+// @/lib/po-helpers (route modules may only export HTTP handlers, so the
+// helpers shared with the [id]/* action routes cannot be re-exported here).
 
 function nextPoNumber(db: ReturnType<typeof getDb>, isoDate: string): string {
   const year = isoDate.slice(0, 4);
@@ -59,13 +43,6 @@ function nextPoNumber(db: ReturnType<typeof getDb>, isoDate: string): string {
   `).get(year) as any;
   const last = lastRow?.po_number ? parseInt(lastRow.po_number.split('-').pop() || '0', 10) : 0;
   return `PO-${year}-${String(last + 1).padStart(4, '0')}`;
-}
-
-function recalcTotal(db: ReturnType<typeof getDb>, poId: string) {
-  const r = db.prepare(`
-    SELECT COALESCE(SUM(total_price), 0) AS t FROM purchase_order_items WHERE po_id = ?
-  `).get(poId) as any;
-  db.prepare(`UPDATE purchase_orders SET total_cost = ?, updated_at = datetime('now') WHERE id = ?`).run(r.t, poId);
 }
 
 /**
@@ -326,6 +303,3 @@ export async function DELETE(request: Request) {
     return Response.json({ error: error.message }, { status: 500 });
   }
 }
-
-// Re-exported helpers for action routes
-export { currentRole, effectiveRole, effectiveActor, recalcTotal };

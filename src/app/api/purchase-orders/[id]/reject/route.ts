@@ -1,5 +1,5 @@
 import { getDb, logAuditEvent } from '@/lib/db';
-import { effectiveRole, effectiveActor } from '@/app/api/purchase-orders/route';
+import { effectiveRole, effectiveActor } from '@/lib/po-helpers';
 
 // Admin-only: reject a pending PO with reason.
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {

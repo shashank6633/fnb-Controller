@@ -104,6 +104,10 @@ let draining = false;
 // after 2 failed attempts on the primary. Returns the resulting status.
 async function applyResult(job: PrintJob, ok: boolean, error?: string): Promise<'printed' | 'pending' | 'failed'> {
   if (ok) {
+    // Printed jobs are only kept for dedup/housekeeping — drop the payload so a
+    // raster sticker (~20-45KB of base64) doesn't sit in IndexedDB for the 6h
+    // prunePrinted window and get structured-cloned by every counts()/getAll poll.
+    delete job.doc.payload; delete job.doc.payload_b64;
     job.status = 'printed'; job.lastError = ''; await put(job);
     logJobResult(job, 'printed').catch(() => {});
     return 'printed';
@@ -130,6 +134,11 @@ async function applyResult(job: PrintJob, ok: boolean, error?: string): Promise<
  * on a single connection, back-to-back (no per-ticket reconnect gap, e.g. the
  * tandoor ticket lagging the first by ~2s). Different printers run in PARALLEL,
  * so a table that fires tandoor+chinese+bar prints in ~1× time, not N×.
+ *
+ * A big backlog is split into size/count-bounded chunks per printer (sequential,
+ * order preserved): the bridge hard-kills any /print-batch body over 4MB, and
+ * raster sticker docs run ~20-45KB of base64 each — one giant batch after an
+ * outage would be destroyed on every retry and could never print.
  */
 export async function drainOutbox(): Promise<{ printed: number; stillPending: number }> {
   if (draining) return { printed: 0, stillPending: 0 };
@@ -144,16 +153,31 @@ export async function drainOutbox(): Promise<{ printed: number; stillPending: nu
       const key = `${j.printer.transport}:${j.printer.target}`;
       (groups.get(key) || groups.set(key, []).get(key)!).push(j);
     }
+    const MAX_BATCH_JOBS = 25, MAX_BATCH_BYTES = 1_000_000; // well under the bridge's 4MB body cap
     const perPrinter = await Promise.allSettled([...groups.values()].map(async (jobs) => {
-      let batch: { ok: boolean; results: Array<{ jobId: string; ok: boolean; error?: string }> };
-      try { batch = await bridgePrintBatch(jobs.map((j) => ({ jobId: j.id, printer: j.printer, doc: j.doc }))); }
-      catch { batch = { ok: false, results: [] }; }
-      const byId = new Map(batch.results.map((r) => [r.jobId, r]));
       let p = 0, sp = 0;
-      for (const job of jobs) {            // tickets for this printer went out on one connection
-        const r = byId.get(job.id);
-        const status = await applyResult(job, !!r?.ok, r ? r.error : 'bridge unreachable');
-        if (status === 'printed') p++; else if (status === 'pending') sp++;
+      for (let i = 0; i < jobs.length; ) {
+        const chunk: PrintJob[] = [];
+        let bytes = 0;
+        while (i < jobs.length && chunk.length < MAX_BATCH_JOBS) {
+          const size = JSON.stringify({ jobId: jobs[i].id, printer: jobs[i].printer, doc: jobs[i].doc }).length;
+          if (chunk.length && bytes + size > MAX_BATCH_BYTES) break;
+          bytes += size; chunk.push(jobs[i]); i++;
+        }
+        let batch: { ok: boolean; results: Array<{ jobId: string; ok: boolean; error?: string }> };
+        try { batch = await bridgePrintBatch(chunk.map((j) => ({ jobId: j.id, printer: j.printer, doc: j.doc }))); }
+        catch { batch = { ok: false, results: [] }; }
+        const byId = new Map(batch.results.map((r) => [r.jobId, r]));
+        for (const job of chunk) {          // tickets for this chunk went out on one connection
+          const r = byId.get(job.id);
+          const status = await applyResult(job, !!r?.ok, r ? r.error : 'bridge unreachable');
+          if (status === 'printed') p++; else if (status === 'pending') sp++;
+        }
+        // Bridge itself unreachable → stop burning attempts on the rest of this
+        // printer's backlog; the untouched jobs stay pending for the next tick.
+        if (!batch.ok && (batch.results.length === 0 || batch.results.every((r) => !r.ok && r.error === 'bridge unreachable'))) {
+          sp += jobs.length - i; break;
+        }
       }
       return { p, sp };
     }));

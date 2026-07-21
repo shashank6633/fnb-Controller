@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { currentRole } from '@/app/api/purchase-orders/route';
+import { currentRole } from '@/lib/po-helpers';
 
 // Manager OR Admin can submit a draft for approval.
 export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {

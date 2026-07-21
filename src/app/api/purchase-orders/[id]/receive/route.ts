@@ -1,5 +1,5 @@
 import { getDb, generateId, updateMaterialPrice, logAuditEvent } from '@/lib/db';
-import { currentRole } from '@/app/api/purchase-orders/route';
+import { currentRole } from '@/lib/po-helpers';
 import { getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';

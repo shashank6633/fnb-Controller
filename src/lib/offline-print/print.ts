@@ -9,8 +9,9 @@
 import { api } from '@/lib/api';
 import { computeBill } from '@/lib/bill-calc';
 import { enqueue, drainOutbox, ensureDrainLoop } from './outbox';
-import type { PrinterTarget } from './bridge-client';
+import { bridgeSupportsRawB64, type PrinterTarget } from './bridge-client';
 import { buildKotStickerESCPOS, normalizeStickerDesign, DEFAULT_STICKER_DESIGN, type StickerDesign } from './kot-sticker';
+import { buildKotStickerRasterB64 } from './sticker-raster';
 
 export interface PrintStation {
   id: string; name: string; role: 'bill' | 'kot'; station: string;
@@ -119,14 +120,23 @@ export const DEFAULT_KOT_LINES: KotLine[] = [
   { key: 'footerNote', enabled: false, size: 'normal' },
 ];
 
+/** Paper-saver knobs (bridge v2.6+; older bridges ignore the doc field).
+ *  compactCut: GS V 66 — the PRINTER feeds the exact head-to-cutter distance
+ *  before cutting instead of our fixed 3-line feed (minimal bottom margin).
+ *  pullBackLines: ESC e n reverse-feed before printing, pulling the fresh paper
+ *  edge back toward the head (minimal TOP margin). Printer-dependent — some
+ *  clones ignore it — hence a setting, verified with the Print KOT test. */
+export interface KotPaperSaver { compactCut: boolean; pullBackLines: number }
 export interface KotDesign {
   lines: KotLine[];
   outletName: string;
   headerNote: string;
   footerNote: string;
+  paperSaver: KotPaperSaver;
 }
 export const DEFAULT_KOT_DESIGN: KotDesign = {
   lines: DEFAULT_KOT_LINES, outletName: '', headerNote: '', footerNote: '',
+  paperSaver: { compactCut: false, pullBackLines: 0 },
 };
 
 const VALID_KOT_KEYS = new Set<string>(DEFAULT_KOT_LINES.map((l) => l.key));
@@ -161,11 +171,16 @@ function legacyLines(src: any): KotLine[] {
  */
 export function normalizeKotDesign(raw: any): KotDesign {
   const src = raw && typeof raw === 'object' ? raw : {};
+  const ps = src.paperSaver && typeof src.paperSaver === 'object' ? src.paperSaver : {};
   const d: KotDesign = {
     lines: DEFAULT_KOT_LINES,
     outletName: typeof src.outletName === 'string' ? src.outletName : '',
     headerNote: typeof src.headerNote === 'string' ? src.headerNote : '',
     footerNote: typeof src.footerNote === 'string' ? src.footerNote : '',
+    paperSaver: {
+      compactCut: ps.compactCut === true,
+      pullBackLines: Math.max(0, Math.min(4, Math.round(Number(ps.pullBackLines) || 0))),
+    },
   };
   // Legacy flat design (no lines[]) → map the old show* booleans onto lines.
   if (!Array.isArray(src.lines) && (src.showOutlet !== undefined || src.showTable !== undefined || src.fontScale !== undefined)) {
@@ -300,6 +315,10 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       time,
       headerNote: design.headerNote || undefined,
       footerNote: design.footerNote || undefined,
+      // Paper saver (bridge v2.6+ honors it; older bridges ignore unknown doc
+      // fields). Omitted entirely when both knobs are off.
+      paperSaver: design.paperSaver.compactCut || design.paperSaver.pullBackLines > 0
+        ? design.paperSaver : undefined,
       items: (k.items || []).map((it) => ({ qty: it.quantity, name: it.name, notes: it.notes || undefined })),
     };
     const copies = Math.max(1, Math.min(5, Number(st.copies) || 1));
@@ -313,11 +332,13 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       // printer — dish name, Table, KOT#, time, and a QR of the order_item id the
       // kitchen scans out. Replaces the grouped KOT for this station. Items with
       // no id (shouldn't happen post-fire) fall back into the normal KOT below.
+      // Bridge down at enqueue time → legacy text layout (safe everywhere), by design.
+      const rasterOk = await bridgeSupportsRawB64();
       const withId = (k.items || []).filter((it) => it.id);
       const noId = (k.items || []).filter((it) => !it.id);
       for (const it of withId) {
         const units = sticker.granularity === 'per_unit' ? Math.max(1, Math.floor(Number(it.quantity) || 1)) : 1;
-        const payload = buildKotStickerESCPOS({
+        const input = {
           itemName: it.name,
           tableLabel: String(k.table_number || k.order_number || '-'),
           kotNumber: k.kot_number,
@@ -327,13 +348,20 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
           notes: it.notes,
           codeType: sticker.codeType,
           design: stickerDesign,
-        });
+        };
+        // v2.6+ bridge → raster sticker (QR truly BESIDE the text, base64 bytes);
+        // older bridge → legacy ASCII ESC/POS layout (QR below, JSON-safe as-is).
+        // Raster width follows the station's paper: 58mm (paper_width 32) heads
+        // are 384 dots — a 576-dot canvas there would clip the QR clean off.
+        const doc = rasterOk
+          ? { type: 'raw' as const, payload_b64: await buildKotStickerRasterB64(input, { widthDots: st.paper_width === 32 ? 384 : 576 }) }
+          : { type: 'raw' as const, payload: buildKotStickerESCPOS(input) };
         for (let n = 0; n < units; n++) {
           const stkId = rc > 0 ? `stk_${k.id}_${it.id}_${n}_r${rc}` : `stk_${k.id}_${it.id}_${n}`;
           await enqueue({
             id: stkId,   // stable per KOT+item+unit(+reprint) → dedups across triple-send
             printer: targetOf(st), backup: st.backup_target || undefined,
-            doc: { type: 'raw', payload },
+            doc,
             meta: { stationId: st.id, stationName: st.name, docType: 'kot', source: 'fire', refId: k.id },
           });
         }

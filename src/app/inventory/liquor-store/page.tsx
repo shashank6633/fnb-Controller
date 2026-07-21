@@ -57,6 +57,8 @@ interface LedgerRow {
   ref: string; notes: string; created_by: string; created_at: string;
   material_name: string; unit: string; purchase_unit: string; pack_size: number;
   case_size: number;
+  /** Synthetic closing-count register rows (ledger ?counts=1) — never move stock. */
+  is_count?: boolean; system_qty?: number; variance?: number; saved_at?: string;
 }
 interface VendorLite { id: string; name: string; }
 /** Ledger render item: a plain row, or a bill-subtotal marker after a group
@@ -204,6 +206,13 @@ export default function LiquorStorePage() {
   const [ledger, setLedger] = useState<LedgerRow[]>([]);
   const [ledgerLoading, setLedgerLoading] = useState(false);
 
+  // Which store the current `stock` belongs to (set on successful load) — gates
+  // the no-ledger closing-count banner so a store switch can't act on stale rows.
+  const [stockLoadedFor, setStockLoadedFor] = useState('');
+  // storeId → latest saved closing-count date (null = none); fetched only for
+  // stores with zero ledger history, keyed by store so it can't go stale.
+  const [latestCountByStore, setLatestCountByStore] = useState<Record<string, string | null>>({});
+
   const [tab, setTab] = useState<'stock' | 'ledger' | 'closing' | 'reports'>('stock');
   const [flash, setFlash] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -282,6 +291,7 @@ export default function LiquorStorePage() {
       setMaterials(j.materials || []);
       setSuppliers(j.recent_suppliers || []);
       setVendors(j.vendors || []);
+      setStockLoadedFor(storeId);
     } catch (e: any) { setError(e.message); }
     finally { setStockLoading(false); }
   }, [storeId, accessByStore]);
@@ -292,6 +302,7 @@ export default function LiquorStorePage() {
     setLedgerLoading(true); setError(null);
     try {
       const p = new URLSearchParams();
+      p.set('counts', '1');   // merge synthetic closing-count register rows (is_count)
       if (lType) p.set('type', lType);
       if (lQ.trim()) p.set('q', lQ.trim());
       if (lFrom) p.set('from', lFrom);
@@ -348,9 +359,28 @@ export default function LiquorStorePage() {
     [stock],
   );
 
+  // Store has NO ledger history at all: saved closing counts are a pure
+  // register (they never post ledger rows), so stock stays empty — look up the
+  // latest count date once per stock load and surface the explainer banner.
+  const noLedgerYet = stockLoadedFor === storeId && stock.every(r => !r.has_ledger);
+  useEffect(() => {
+    if (!storeId || stockLoadedFor !== storeId) return;
+    if (!stock.every(r => !r.has_ledger)) return;   // only fetch when the condition holds
+    let cancelled = false;
+    fetch(`/api/stores/${storeId}/closing`)
+      .then(r => r.json())
+      .then(j => {
+        if (!cancelled) setLatestCountByStore(prev => ({ ...prev, [storeId]: j?.dates?.[0]?.date || null }));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [stock, stockLoadedFor, storeId]);
+
   /* Ledger + bill subtotals: bulk-bill lines share ref + created_at, so they
      sit consecutively (newest first). A group of >1 purchase rows with the
-     same non-empty ref gets a subtotal marker appended. */
+     same non-empty ref gets a subtotal marker appended. Synthetic closing-count
+     rows (is_count, txn_type 'closing') can never be swallowed into a purchase
+     group — grouping only chains consecutive txn_type==='purchase' rows. */
   const ledgerItems = useMemo<LedgerItem[]>(() => {
     const out: LedgerItem[] = [];
     let i = 0;
@@ -550,6 +580,26 @@ export default function LiquorStorePage() {
               </button>
             )}
           </div>
+
+          {/* Counts-without-ledger explainer: counts are a register, not stock */}
+          {noLedgerYet && latestCountByStore[storeId] && (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl px-3 sm:px-4 py-2.5 text-xs text-amber-900 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+              <span className="flex-1 min-w-[240px]">
+                <AlertTriangle className="w-3.5 h-3.5 inline mr-1 -mt-0.5" />
+                Closing counts recorded (latest {latestCountByStore[storeId]}) — counts are a register and
+                never change stock. To make stock match the physical counts, open Closing Stock and,
+                starting from the <b>oldest</b> count date, re-save each date with “Adjust system stock”
+                ticked (admin) — always adjust oldest-first; adjusting an older date after a newer one
+                posts the variance twice. Or set opening stock via Adjustment / a transfer.
+              </span>
+              {access.can_close_stock && (
+                <button onClick={() => setTab('closing')}
+                        className="shrink-0 px-2.5 py-1 bg-white border border-amber-300 text-amber-900 hover:bg-amber-100 rounded-lg text-xs font-medium">
+                  Open Closing Stock
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Stock list */}
           {stockLoading ? (
@@ -759,16 +809,28 @@ export default function LiquorStorePage() {
                             <td className="px-3 py-2 whitespace-nowrap text-[#6B5744]">{String(l.created_at).slice(0, 16)}</td>
                             <td className="px-3 py-2">
                               <span className={`inline-block border rounded-full px-2 py-0.5 text-[10px] capitalize ${TXN_BADGE[l.txn_type] || 'bg-gray-50 border-gray-200 text-gray-600'}`}>
-                                {l.txn_type}
+                                {l.is_count ? 'closing count' : l.txn_type}
                               </span>
                             </td>
                             <td className="px-3 py-2 text-[#2D1B0E]">{l.material_name}</td>
-                            <td className={`px-3 py-2 text-right whitespace-nowrap font-medium ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`}>
-                              <DualQty qty={l.quantity} m={l} sign
-                                       boldCls={`font-medium ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`} />
-                            </td>
+                            {l.is_count ? (
+                              /* Register row: never moves stock — no sign/value semantics */
+                              <td className="px-3 py-2 text-right whitespace-nowrap">
+                                {/* Same cases+bottles breakdown as every other qty in the module */}
+                                <span className="font-medium text-[#2D1B0E]">Counted <DualQty qty={l.quantity} m={l} boldCls="font-medium text-[#2D1B0E]" /></span>
+                                <div className="text-[10px] text-[#8B7355]">
+                                  system {fq(l.system_qty ?? 0)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fq(l.variance ?? 0)}
+                                </div>
+                                <div className="text-[10px] italic text-[#8B7355]">count only — stock unchanged</div>
+                              </td>
+                            ) : (
+                              <td className={`px-3 py-2 text-right whitespace-nowrap font-medium ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`}>
+                                <DualQty qty={l.quantity} m={l} sign
+                                         boldCls={`font-medium ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`} />
+                              </td>
+                            )}
                             <td className="px-3 py-2 text-right whitespace-nowrap text-[#6B5744]">
-                              {l.unit_cost > 0 ? <>{inr(l.unit_cost, 4)}/{l.unit}</> : '—'}
+                              {!l.is_count && l.unit_cost > 0 ? <>{inr(l.unit_cost, 4)}/{l.unit}</> : '—'}
                             </td>
                             <td className="px-3 py-2 text-[#6B5744]">
                               {l.batch_no || '—'}
@@ -808,18 +870,29 @@ export default function LiquorStorePage() {
                     <div key={l.id} className="bg-white border border-[#E8D5C4] rounded-xl p-3 text-xs">
                       <div className="flex items-center justify-between gap-2">
                         <span className={`inline-block border rounded-full px-2 py-0.5 text-[10px] capitalize ${TXN_BADGE[l.txn_type] || 'bg-gray-50 border-gray-200 text-gray-600'}`}>
-                          {l.txn_type}
+                          {l.is_count ? 'closing count' : l.txn_type}
                         </span>
                         <span className="text-[10px] text-[#8B7355]">{String(l.created_at).slice(0, 16)}</span>
                       </div>
                       <div className="mt-1.5 text-sm font-medium text-[#2D1B0E] break-words">{l.material_name}</div>
-                      <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[#6B5744]">
-                        <span>
-                          <DualQty qty={l.quantity} m={l} sign
-                                   boldCls={`font-semibold ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`} />
-                        </span>
-                        {l.unit_cost > 0 && <span>{inr(l.unit_cost, 4)}/{l.unit}</span>}
-                      </div>
+                      {l.is_count ? (
+                        /* Register row: never moves stock — no sign/value semantics */
+                        <div className="mt-1 text-[#6B5744]">
+                          <span className="font-semibold text-[#2D1B0E]">Counted <DualQty qty={l.quantity} m={l} boldCls="font-semibold text-[#2D1B0E]" /></span>
+                          <div className="text-[10px] text-[#8B7355]">
+                            system {fq(l.system_qty ?? 0)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fq(l.variance ?? 0)}
+                          </div>
+                          <div className="text-[10px] italic text-[#8B7355]">count only — stock unchanged</div>
+                        </div>
+                      ) : (
+                        <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[#6B5744]">
+                          <span>
+                            <DualQty qty={l.quantity} m={l} sign
+                                     boldCls={`font-semibold ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`} />
+                          </span>
+                          {l.unit_cost > 0 && <span>{inr(l.unit_cost, 4)}/{l.unit}</span>}
+                        </div>
+                      )}
                       <div className="mt-1 text-[10px] text-[#8B7355] space-x-2">
                         {l.supplier && <span>{l.supplier}</span>}
                         {l.batch_no && <span>batch {l.batch_no}</span>}
@@ -1938,7 +2011,11 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
       setAdjust(false);
       await loadDay(date, true);
       onSaved(`Saved ${j.summary.items} closing count${j.summary.items === 1 ? '' : 's'} for ${date}` +
-        (j.summary.adjusted_count ? ` — ${j.summary.adjusted_count} adjusted to physical` : ''));
+        (j.summary.adjusted_count
+          ? ` — ${j.summary.adjusted_count} adjusted to physical`
+          : ' — count register only, stock unchanged' +
+            (isAdmin && !adjust && ((j.summary.shortage_count || 0) + (j.summary.excess_count || 0)) > 0
+              ? " (tick 'Adjust system stock' to set stock to physical)" : '')));
     } catch (e: any) { setErr(e.message); }
     finally { setBusy(false); }
   };
@@ -2120,6 +2197,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
             <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs">
               <AlertTriangle className="w-4 h-4 flex-shrink-0" />
               System stock will be updated to match each physical count. Variances are posted as adjustment ledger rows.
+              If earlier count dates are also unreconciled, adjust the oldest date first.
             </div>
           )}
 

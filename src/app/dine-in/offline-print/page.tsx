@@ -5,6 +5,7 @@ import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
 import { probeBridge, bridgePrint, bridgeStatus, getBridgeUrl, setBridgeUrl, type BridgeHealth, type PrinterStatus } from '@/lib/offline-print/bridge-client';
 import { counts as outboxCounts, retryFailed, drainOutbox, ensureDrainLoop } from '@/lib/offline-print/outbox';
+import { getKotDesign } from '@/lib/offline-print/print';
 import {
   Printer, Plus, Trash2, Loader2, X, Wifi, WifiOff, RefreshCw, Save,
   CheckCircle2, XCircle, FlaskConical, ChevronDown, ChevronRight, Download, AlertTriangle,
@@ -33,6 +34,15 @@ interface Job {
 }
 
 const blankForm = { id: '', name: '', role: 'kot' as 'kot' | 'bill', station: '', transport: 'ip' as 'ip' | 'usb', target: '', paper_width: 48, copies: 1, floor: '', backup_target: '', kind: 'food' as 'food' | 'bar', is_master: false, mirror_to_master: true };
+
+// Bridge v2.6+ prints item stickers as raster bytes (label-style, QR beside the
+// details); older bridges fall back to the text layout (QR below). Compare the
+// health version NUMERICALLY — a string compare fails on v2.10.
+function bridgeOlderThan26(version: string): boolean {
+  const parts = String(version || '').split('.').map((n) => parseInt(n, 10) || 0);
+  const maj = parts[0] || 0, min = parts[1] || 0;
+  return maj < 2 || (maj === 2 && min < 6);
+}
 
 export default function OfflinePrintPage() {
   const [stations, setStations] = useState<Station[]>([]);
@@ -260,6 +270,17 @@ export default function OfflinePrintPage() {
   const testPrint = async (s: Station) => {
     setTestingId(s.id);
     const { width, doc } = sampleDoc(s);
+    // Test KOTs carry the saved Print Design (line order/sizes + paper saver) so
+    // the test shows exactly what a real KOT will do — incl. compact cut/pull-back.
+    if (doc.type === 'kot') {
+      try {
+        const design = await getKotDesign(true);
+        (doc as any).lines = design.lines;
+        if (design.paperSaver.compactCut || design.paperSaver.pullBackLines > 0) {
+          (doc as any).paperSaver = design.paperSaver;
+        }
+      } catch { /* design unavailable → bridge falls back to its defaults */ }
+    }
     const jobId = `test_${Date.now()}`;
     let result: { ok: boolean; error?: string } = { ok: false, error: 'bridge unreachable' };
     try {
@@ -385,6 +406,14 @@ export default function OfflinePrintPage() {
             className="mt-0.5"
           />
         </div>
+
+        {/* Bridge too old for the label-style raster sticker (QR beside) — nudge an update */}
+        {kotLabels.enabled && health && bridgeOlderThan26(health.version) && (
+          <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 text-amber-800 px-3 py-2 text-xs">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>Bridge v{health.version} — update to v2.6 for label-style stickers (QR beside details). Open “Start / troubleshoot the print bridge” below, download the new print-bridge.mjs and restart the bridge.</span>
+          </div>
+        )}
 
         {/* 2. Sticker granularity — only meaningful when stickers are enabled */}
         <div className={`mt-3 border border-[#E8D5C4] rounded-lg px-4 py-3 ${kotLabels.enabled ? '' : 'opacity-60'}`}>

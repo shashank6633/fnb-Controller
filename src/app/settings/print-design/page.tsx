@@ -6,7 +6,7 @@ import { api } from '@/lib/api';
 import UISwitch from '@/components/Toggle';
 import {
   Printer, Loader2, Check, ChefHat, Receipt, ArrowLeft,
-  GripVertical, ChevronUp, ChevronDown, AlertTriangle, Tag,
+  GripVertical, ChevronUp, ChevronDown, AlertTriangle, Tag, Scissors,
 } from 'lucide-react';
 import {
   DEFAULT_KOT_DESIGN, normalizeKotDesign, invalidateDesignCache, KOT_LINE_LABELS,
@@ -21,7 +21,8 @@ import {
   DEFAULT_STICKER_DESIGN, normalizeStickerDesign, STICKER_LINE_LABELS,
   type StickerDesign, type StickerLine, type StickerLineSize,
 } from '@/lib/offline-print/kot-sticker';
-import { bridgePrint } from '@/lib/offline-print/bridge-client';
+import { buildKotStickerRasterB64 } from '@/lib/offline-print/sticker-raster';
+import { bridgePrint, bridgeSupportsRawB64 } from '@/lib/offline-print/bridge-client';
 
 // Per-item sticker-KOT config (settings key `kot_item_labels`). enabled +
 // granularity are set in KOT & Bill Printers; here we only surface codeType +
@@ -270,7 +271,11 @@ function StickerPreview({ design, codeType }: { design: StickerDesign; codeType:
           <div className="flex-1 min-w-0">
             {textLines.map((ln) => <div key={ln.key} className="mt-1 first:mt-0">{renderText(ln)}</div>)}
           </div>
-          <div className="shrink-0"><QrGlyph scale={sc} /></div>
+          {/* '#code' caption below the QR — the print carries it too */}
+          <div className="shrink-0 text-center">
+            <QrGlyph scale={sc} />
+            <div className="text-[10px] mt-0.5">#7QF3K9</div>
+          </div>
         </div>
       </Ticket>
     );
@@ -400,7 +405,7 @@ export default function PrintDesign() {
       const stations: any[] = j.stations || [];
       const st = stations.find((s) => s.role === 'kot' && s.is_active);
       if (!st) { setTestStatus('No KOT printer configured (set one up in KOT & Bill Printers)'); return; }
-      const payload = buildKotStickerESCPOS({
+      const input = {
         itemName: 'Paneer Tikka',
         tableLabel: '7',
         kotNumber: 12,
@@ -410,9 +415,20 @@ export default function PrintDesign() {
         notes: 'Less spicy',
         codeType: sticker.codeType,
         design: stickerDesign,
-      });
-      const res = await bridgePrint({ printer: { transport: st.transport, target: st.target }, doc: { type: 'raw', payload } });
-      if (res.ok) setTestStatus(`Test sticker sent to ${st.name} ✓`);
+      };
+      // Same gate as print.ts: bridge v2.6+ takes raster bytes (label-style, QR
+      // beside the details); older bridges get the legacy text layout (QR below).
+      // Raster width matches the station's paper (58mm heads are 384 dots).
+      const rasterOk = await bridgeSupportsRawB64();
+      const doc = rasterOk
+        ? { type: 'raw' as const, payload_b64: await buildKotStickerRasterB64(input, { widthDots: Number(st.paper_width) === 32 ? 384 : 576 }) }
+        : { type: 'raw' as const, payload: buildKotStickerESCPOS(input) };
+      const res = await bridgePrint({ printer: { transport: st.transport, target: st.target }, doc });
+      // The update hint only applies in QR mode — in barcode mode the legacy and
+      // raster layouts are positionally identical (text full width, strip below).
+      if (res.ok) setTestStatus(rasterOk || sticker.codeType === 'barcode'
+        ? `Test sticker sent to ${st.name} ✓`
+        : `Test sticker sent to ${st.name} ✓ — Printed with the compatible layout (QR below) — update the print bridge to v2.6 for the label-style QR-beside layout.`);
       else setTestStatus('Printer/bridge not reachable — open /print/agent on the counter PC');
     } catch {
       setTestStatus('Printer/bridge not reachable — open /print/agent on the counter PC');
@@ -519,6 +535,34 @@ export default function PrintDesign() {
               <Text label="Outlet name (blank = business name)" value={kot.outletName} set={(v) => setKot({ ...kot, outletName: v })} placeholder={businessName || 'Restaurant'} />
               <Text label="Header note (optional — enable the “Header note” line above)" value={kot.headerNote} set={(v) => setKot({ ...kot, headerNote: v })} placeholder="e.g. RUSH" />
               <Text label="Footer note (optional — enable the “Footer note” line above)" value={kot.footerNote} set={(v) => setKot({ ...kot, footerNote: v })} />
+
+              {/* ── Paper saver (bridge v2.6+) ─────────────────────────────── */}
+              <div className="mt-4 border border-[#E8D5C4] rounded-xl p-3 bg-[#FFFDF9]">
+                <div className="flex items-center gap-2 mb-1">
+                  <Scissors className="w-4 h-4 text-[#af4408]" />
+                  <span className="text-sm font-semibold text-[#2D1B0E]">Paper saver</span>
+                  <span className="text-[10px] text-[#8B7355] border border-[#E8D5C4] rounded-full px-2 py-0.5">bridge v2.6+</span>
+                </div>
+                <Toggle label="Compact cut — printer feeds the exact minimum before cutting"
+                  on={kot.paperSaver.compactCut}
+                  set={(v) => setKot({ ...kot, paperSaver: { ...kot.paperSaver, compactCut: v } })} />
+                <label className="flex items-center justify-between gap-3 py-2">
+                  <span className="text-sm text-[#2D1B0E]">Top pull-back (experimental) — reverse-feed before printing so the first line starts near the paper edge</span>
+                  <select value={kot.paperSaver.pullBackLines}
+                    onChange={(e) => setKot({ ...kot, paperSaver: { ...kot.paperSaver, pullBackLines: Number(e.target.value) } })}
+                    className="border border-[#D4B896] rounded-lg px-2 py-1.5 text-sm bg-white shrink-0">
+                    <option value={0}>Off</option>
+                    <option value={1}>1 line</option>
+                    <option value={2}>2 lines</option>
+                    <option value={3}>3 lines</option>
+                    <option value={4}>4 lines</option>
+                  </select>
+                </label>
+                <p className="text-[11px] text-[#8B7355] mt-1">
+                  Some printers ignore the pull-back — after saving, use <b>Print KOT test</b>: if the top margin
+                  shrinks, keep it; if the first line clips, reduce by one. Requires print bridge v2.6+ on the counter PC.
+                </p>
+              </div>
             </>
           ) : tab === 'bill' ? (
             <>

@@ -36,6 +36,10 @@
  *                  "width": 48 },                      // 48=80mm, 32=58mm
  *     "doc": { "type": "kot" | "bill", ... }           // see renderers below
  *            | { "type": "tspl" | "raw", "payload": "<bytes>" }  // sent verbatim
+ *              (raw/tspl may carry "payload_b64" — base64 bytes — instead of
+ *               "payload"; use it for binary-safe payloads like raster images)
+ *              (kot docs may carry "paperSaver": { compactCut, pullBackLines } —
+ *               minimal feed-before-cut / reverse-feed top margin, v2.6+)
  *   }
  *
  * This file has ZERO dependencies and never touches the app or its database.
@@ -56,7 +60,7 @@ const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.5.0';   // 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
+const VERSION = '2.6.0';   // 2.6.0 = raw/tspl jobs may carry doc.payload_b64 (base64) for binary-safe bytes — raster stickers; falls back to doc.payload utf8. KOT paper saver: doc.paperSaver { compactCut: GS V 66 feed-to-cut instead of feed3+cut; pullBackLines: ESC e reverse-feed before printing }. 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -164,6 +168,15 @@ function buildKot(doc, cols, doCut) {
 
   push(CMD.init);
 
+  // Paper saver (doc.paperSaver, from the app's KOT Print Design; absent = off).
+  // pullBackLines: ESC e n — reverse-feed n lines BEFORE printing so the first
+  // line lands near the fresh paper edge instead of a head-to-cutter gap below
+  // it. Clone-common but printer-dependent (unsupported printers ignore it) —
+  // that's why it's a setting the user verifies with the Print KOT test.
+  const ps = doc.paperSaver && typeof doc.paperSaver === 'object' ? doc.paperSaver : null;
+  const pullBack = ps ? Math.max(0, Math.min(4, Math.round(Number(ps.pullBackLines) || 0))) : 0;
+  if (pullBack > 0) push([ESC, 0x65, pullBack]);
+
   const cap = String(doc.captain || '').trim();
   const fb = String(doc.firedBy || '').trim();
 
@@ -208,8 +221,17 @@ function buildKot(doc, cols, doCut) {
 
   // Internal expediter banner (master ticket) — not user-configurable.
   if (doc.note) { line(''); push(CMD.alignCenter); push(CMD.boldOn); line(`** ${doc.note} **`); push(CMD.boldOff); push(CMD.alignLeft); }
-  push(CMD.feed3);
-  if (doCut) push(CMD.cut);
+  // compactCut: GS V 66 n — the PRINTER feeds exactly to its cutter position
+  // (+ n dots of safety) and cuts, replacing our fixed 3-line feed. Minimal
+  // bottom margin on any firmware that implements function B (near-universal).
+  if (ps && ps.compactCut === true && doCut) {
+    push([GS, 0x56, 0x42, 0x0c]);                  // feed-to-cut + ~1.5mm, partial cut
+  } else if (ps && ps.compactCut === true) {
+    push([ESC, 0x64, 0x01]);                       // no cut requested → 1-line gap
+  } else {
+    push(CMD.feed3);
+    if (doCut) push(CMD.cut);
+  }
   return Buffer.concat(chunks);
 }
 
@@ -367,6 +389,12 @@ function render(doc, width) {
   // straight to the same USB/IP transports the KOT/bill path uses. `width` is
   // irrelevant for raw jobs (the label geometry is baked into the TSPL itself).
   if (doc.type === 'tspl' || doc.type === 'raw') {
+    // payload_b64 (v2.6.0): base64-encoded bytes survive JSON transport intact,
+    // which plain utf8 payload cannot (0x80-0xFF corrupts) — used for ESC/POS
+    // raster sticker jobs. Falls back to the original utf8 payload path.
+    if (typeof doc.payload_b64 === 'string' && doc.payload_b64) {
+      return Buffer.from(doc.payload_b64, 'base64');
+    }
     const p = doc.payload != null ? doc.payload : '';
     return Buffer.isBuffer(p) ? p : Buffer.from(String(p), 'utf8');
   }

@@ -1,5 +1,5 @@
 import { getDb, logAuditEvent } from '@/lib/db';
-import { effectiveRole, effectiveActor } from '@/app/api/purchase-orders/route';
+import { effectiveRole, effectiveActor } from '@/lib/po-helpers';
 
 // Admin-only: approve a pending PO.
 // Optional body: { approval_note?: string } — recorded for audit when admin overrides flags.
