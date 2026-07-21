@@ -34,6 +34,10 @@ export const metadata: Metadata = {
 // Tells the browser to colour the URL bar (Android) and status bar (iOS) to match the brand.
 export const viewport: Viewport = {
   themeColor: "#af4408",
+  // The app is a LIGHT design. Declaring color-scheme:light opts out of Android
+  // WebView / Chrome "Force Dark" auto-darkening, which otherwise inverts the
+  // whole UI to dark on phones set to dark mode (the app has no dark theme).
+  colorScheme: "light",
   width: "device-width",
   initialScale: 1,
   maximumScale: 5,

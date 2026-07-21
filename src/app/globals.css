@@ -1,5 +1,9 @@
 @import "tailwindcss";
 
+/* Light-only app: opt out of Android WebView / Chrome "Force Dark" auto-inversion
+   (which otherwise darkens the whole UI on phones set to dark mode). */
+:root { color-scheme: light; }
+
 @theme inline {
   --color-primary: #af4408;
   --color-primary-light: #d4611a;

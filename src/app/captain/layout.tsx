@@ -21,6 +21,7 @@ export const metadata: Metadata = {
 // Lock zoom for a native-feeling touch POS (root layout allows 5× — captain doesn't).
 export const viewport: Viewport = {
   themeColor: '#af4408',
+  colorScheme: 'light',   // opt out of Android WebView "Force Dark" (light-only app)
   width: 'device-width',
   initialScale: 1,
   maximumScale: 1,
