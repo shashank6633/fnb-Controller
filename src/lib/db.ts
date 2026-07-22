@@ -1025,6 +1025,22 @@ function initializeSchema(db: Database.Database) {
       catch (e) { console.error('[db] price_basis_repair_v1 failed (rolled back, left unrepaired):', e); }
     }
 
+    // One-time: rebuild every stored recipe/sub-recipe total from CURRENT
+    // material rates. Rate fixes made before the cascade landed (rate editor,
+    // unit-audit rebase, workbook/bar imports) never recalculated dependent
+    // recipes, so stored totals could show costs at OLD prices (owner-reported:
+    // list ₹303.99 vs live lines ₹120.52). Prices themselves are not touched.
+    const costsResynced = db.prepare(`SELECT value FROM settings WHERE key = 'recipe_costs_resync_v1'`).get() as any;
+    if (!costsResynced) {
+      const runResync = db.transaction(() => {
+        for (const s of db.prepare(`SELECT id FROM sub_recipes`).all() as any[]) recalculateSubRecipeCost(db, s.id);
+        for (const r of db.prepare(`SELECT id FROM recipes`).all() as any[]) recalculateRecipeCost(db, r.id);
+        db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('recipe_costs_resync_v1', '1')`).run();
+      });
+      try { runResync(); console.log('[db] recipe_costs_resync_v1: stored recipe totals rebuilt from current rates'); }
+      catch (e) { console.error('[db] recipe_costs_resync_v1 failed (rolled back):', e); }
+    }
+
     db.exec(`
 
       CREATE TABLE IF NOT EXISTS requisitions (
