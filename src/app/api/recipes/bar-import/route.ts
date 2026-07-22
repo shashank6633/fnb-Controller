@@ -1,4 +1,4 @@
-import { getDb, generateId, recalculateRecipeCost, updateMaterialPrice } from '@/lib/db';
+import { getDb, generateId, recalculateRecipeCost, updateMaterialPrice, recalculateCostsForMaterials } from '@/lib/db';
 
 interface LiquorRawRow {
   name: string;
@@ -175,6 +175,9 @@ export async function POST(request: Request) {
     const updateMatPrice = db.prepare(`
       UPDATE raw_materials SET average_price = ?, updated_at = datetime('now') WHERE id = ?
     `);
+    // Materials whose price this import changed — their dependent recipes'
+    // stored totals must be recalculated after the import.
+    const priceTouchedIds: string[] = [];
 
     const importMaterials = db.transaction(() => {
       for (const raw of liquor_raw) {
@@ -247,6 +250,7 @@ export async function POST(request: Request) {
           // Update price if changed significantly
           if (Math.abs((existing.average_price || 0) - avgPrice) > 0.001 && avgPrice > 0) {
             updateMatPrice.run(avgPrice, existing.id);
+            priceTouchedIds.push(existing.id);
             report.materials_price_updated++;
           } else {
             report.materials_updated++;
@@ -261,6 +265,9 @@ export async function POST(request: Request) {
       }
     });
     importMaterials();
+    // Recipes/sub-recipes elsewhere in the book may use these materials too —
+    // keep their stored totals in sync with the imported prices.
+    recalculateCostsForMaterials(db, priceTouchedIds);
 
     // ---- 2) Build selling price lookup from BAR PRODUCTS ----
     const priceMap = new Map<string, number>();

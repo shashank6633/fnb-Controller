@@ -583,6 +583,23 @@ export default function RecipesPage() {
     } finally { setRefreshing(false); }
   }
 
+  // Recompute recipe & sub-recipe totals from CURRENT material rates only —
+  // never touches raw_materials.average_price, so manual rate fixes survive.
+  // This is the remedy when a recipe's Total Cost header disagrees with the
+  // sum of its ingredient lines (stored total computed at older prices).
+  const [recomputing, setRecomputing] = useState(false);
+  async function recomputeRecipeCosts() {
+    if (recomputing) return;
+    setRecomputing(true);
+    try {
+      const r = await api('/api/recipes/recompute-all', { method: 'POST' });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { alert(j.error || `HTTP ${r.status}`); return; }
+      await Promise.all([fetchRecipes(), fetchSubRecipes()]);
+      alert(`✓ Recomputed ${j.sub_recipes} sub-recipes and ${j.recipes} recipes from current rates.${j.zero_cost_recipes ? ` ${j.zero_cost_recipes} recipes still have ₹0 cost (no priced ingredients).` : ''}`);
+    } finally { setRecomputing(false); }
+  }
+
   // Restore prices from purchases — recomputes raw_materials.average_price
   // from the canonical source (purchases.unit_price) using the same logic
   // as updateMaterialPrice. Use this if a bad bulk action put prices into
@@ -1790,6 +1807,7 @@ export default function RecipesPage() {
               ]} />
               <HeaderMenu label="Tools" icon={<RefreshCw size={16} />} items={[
                 { label: 'Export Recipe Book', icon: <Download size={15} />, onClick: exportAllRecipes },
+                { label: recomputing ? 'Recomputing…' : 'Recompute Recipe Costs', icon: <Calculator size={15} />, onClick: recomputeRecipeCosts, disabled: recomputing },
                 { label: refreshing ? 'Refreshing…' : 'Refresh All Costs', icon: <RefreshCw size={15} />, onClick: refreshAllCosts, disabled: refreshing },
                 { label: normalizing ? 'Restoring…' : 'Restore Prices from Purchases', icon: <AlertTriangle size={15} />, onClick: restorePrices, disabled: normalizing },
                 { label: categorizing ? 'Categorising…' : 'Auto-categorise', icon: <Tags size={15} />, onClick: autoCategorize, disabled: categorizing },

@@ -1,4 +1,4 @@
-import { getDb, logAuditEvent } from '@/lib/db';
+import { getDb, logAuditEvent, recalculateCostsForMaterials } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 
 /**
@@ -149,7 +149,9 @@ export async function POST(request: Request) {
       const byId = db.prepare(`SELECT id, sku, name, unit, pack_size, average_price FROM raw_materials WHERE id = ?`);
       const upd = db.prepare(`UPDATE raw_materials SET average_price = ?, updated_at = datetime('now') WHERE id = ?`);
       const repaired: any[] = [];
+      const repairedIds: string[] = [];
       const skipped: { material_id: string; reason: string }[] = [];
+      let cascaded: { sub_recipes: number; recipes: number } = { sub_recipes: 0, recipes: 0 };
       db.transaction(() => {
         for (const r of repair) {
           const id = String(r?.material_id ?? '').trim();
@@ -171,9 +173,12 @@ export async function POST(request: Request) {
             note: `Basis-corruption repair: ${hit.name} avg ₹${hit.average_price}/${hit.unit} → ₹${newAvg}/${hit.unit}`,
           });
           repaired.push({ sku: hit.sku, name: hit.name, old: hit.average_price, new: newAvg });
+          repairedIds.push(id);
         }
+        // Keep stored recipe/sub-recipe costs in sync with the repaired rates
+        cascaded = recalculateCostsForMaterials(db, repairedIds);
       })();
-      return Response.json({ repaired: repaired.length, rows: repaired, skipped });
+      return Response.json({ repaired: repaired.length, rows: repaired, skipped, cascaded });
     }
 
     // ── Bulk rate-update branch ─────────────────────────────────────────────
@@ -231,9 +236,14 @@ export async function POST(request: Request) {
     }
 
     let applied = 0;
+    let cascaded: { sub_recipes: number; recipes: number } = { sub_recipes: 0, recipes: 0 };
     if (!dryRun && updates.length) {
       const upd = db.prepare(`UPDATE raw_materials SET average_price = ?, updated_at = datetime('now') WHERE id = ?`);
-      db.transaction(() => { for (const u of updates) { upd.run(u.newAvg, u.id); applied++; } })();
+      db.transaction(() => {
+        for (const u of updates) { upd.run(u.newAvg, u.id); applied++; }
+        // Keep stored recipe/sub-recipe costs in sync with the corrected rates
+        cascaded = recalculateCostsForMaterials(db, updates.map(u => u.id));
+      })();
       logAuditEvent(db, {
         event_type: 'rates.bulk_update',
         entity_type: 'raw_material',
@@ -248,6 +258,7 @@ export async function POST(request: Request) {
       dryRun,
       basis,
       applied,
+      cascaded,
       matchedCount: matched.length,
       matched: matched.slice(0, 500),
       unmatched,

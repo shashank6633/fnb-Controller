@@ -3835,6 +3835,33 @@ export function recalculateSubRecipeCost(db: Database.Database, subRecipeId: str
   }
 }
 
+// Cascade cost recalculation for a batch of materials whose average_price
+// (or unit/pack basis) was changed DIRECTLY — i.e. not via updateMaterialPrice,
+// which cascades on its own. Every route that writes raw_materials.average_price
+// (rate editors, importers, unit-audit rebase, admin normalizers) MUST call this
+// afterwards, or recipes.total_cost keeps showing costs at the OLD prices while
+// detail lines compute live — the "header says ₹303.99, lines sum ₹120.52" bug.
+// Dedupes across materials; sub-recipes first (each cascades to its parent
+// recipes), then direct recipes. Idempotent.
+export function recalculateCostsForMaterials(
+  db: Database.Database,
+  materialIds: Array<string | null | undefined>,
+): { sub_recipes: number; recipes: number } {
+  const ids = [...new Set(materialIds.filter(Boolean) as string[])];
+  if (!ids.length) return { sub_recipes: 0, recipes: 0 };
+  const subQ = db.prepare('SELECT DISTINCT sub_recipe_id AS id FROM sub_recipe_ingredients WHERE material_id = ?');
+  const recQ = db.prepare('SELECT DISTINCT recipe_id AS id FROM recipe_ingredients WHERE material_id = ?');
+  const subSet = new Set<string>();
+  const recSet = new Set<string>();
+  for (const mid of ids) {
+    for (const s of subQ.all(mid) as any[]) subSet.add(s.id);
+    for (const r of recQ.all(mid) as any[]) recSet.add(r.id);
+  }
+  for (const sid of subSet) recalculateSubRecipeCost(db, sid);
+  for (const rid of recSet) recalculateRecipeCost(db, rid);
+  return { sub_recipes: subSet.size, recipes: recSet.size };
+}
+
 // Update material average price after purchase
 export function updateMaterialPrice(db: Database.Database, materialId: string): void {
   const material = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(materialId) as any;

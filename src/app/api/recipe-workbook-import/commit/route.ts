@@ -1,6 +1,7 @@
 import * as XLSX from 'xlsx';
 import {
   getDb, generateId, recalculateRecipeCost, recalculateSubRecipeCost,
+  recalculateCostsForMaterials,
 } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { lockedUnitFields } from '@/lib/unit-audit-lock';
@@ -69,13 +70,16 @@ export async function POST(req: Request) {
         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'average', ?, datetime('now'), datetime('now'))
       `);
       const updateMatPrice = db.prepare(`UPDATE raw_materials SET average_price = ?, updated_at = datetime('now') WHERE id = ?`);
+      // Materials whose price this import changed — recipes OUTSIDE this
+      // workbook that use them must have their stored totals recalculated too.
+      const priceTouchedIds: string[] = [];
 
       for (const m of parsed.materials) {
         const key = normName(m.name);
         const existingId = idByName.get(key);
         const price = Math.round(m.avgRatePerBaseUnit * 10000) / 10000;
         if (existingId) {
-          if (overwrite && price > 0) { updateMatPrice.run(price, existingId); report.materials_price_updated++; }
+          if (overwrite && price > 0) { updateMatPrice.run(price, existingId); priceTouchedIds.push(existingId); report.materials_price_updated++; }
         } else {
           const id = generateId();
           // Recover units from the unit-audit lock (source of truth) so a
@@ -208,6 +212,10 @@ export async function POST(req: Request) {
           });
         }
       }
+
+      // ── 3b) Cascade the price updates to recipes NOT in this workbook ──
+      // (imported recipes were already recalculated above; this is idempotent)
+      recalculateCostsForMaterials(db, priceTouchedIds);
 
       // ── 4) Persist target food-cost % from the workbook ───────────
       if (parsed.targetFoodCostPct != null && parsed.targetFoodCostPct > 0) {

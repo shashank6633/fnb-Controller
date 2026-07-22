@@ -1,4 +1,4 @@
-import { getDb } from '@/lib/db';
+import { getDb, recalculateCostsForMaterials } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { upsertUnitLock } from '@/lib/unit-audit-lock';
 
@@ -307,6 +307,10 @@ export async function PUT(request: Request) {
         }
         updated += 1;
       }
+      // Unit/pack changes move the price-and-conversion basis, so stored
+      // recipe & sub-recipe costs must follow (rebased or not: pack_size also
+      // feeds pcs↔ml conversions inside the costing engine).
+      recalculateCostsForMaterials(db, updates.map((u: any) => u?.id));
     });
     txn();
     return Response.json({ success: true, updated, rebased });

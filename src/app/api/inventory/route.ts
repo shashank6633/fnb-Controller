@@ -317,14 +317,18 @@ export async function PUT(request: Request) {
       id
     );
 
-    // Cascade recipe + sub-recipe cost recalc if avg_price changed
-    if (overrideAvgPrice != null) {
+    // Cascade recipe + sub-recipe cost recalc if the price OR the unit/pack
+    // conversion basis changed (pack_size also feeds pcs↔ml conversions inside
+    // the costing engine, so a pack change alone moves recipe costs).
+    const costBasisChanged =
+      overrideAvgPrice != null ||
+      unitVal !== existing.unit ||
+      purchaseUnitVal !== existing.purchase_unit ||
+      Number(packSizeVal) !== Number(existing.pack_size);
+    if (costBasisChanged) {
       try {
-        const { recalculateSubRecipeCost, recalculateRecipeCost } = await import('@/lib/db');
-        const subRecipes = db.prepare(`SELECT DISTINCT sub_recipe_id FROM sub_recipe_ingredients WHERE material_id = ?`).all(id) as any[];
-        for (const sr of subRecipes) recalculateSubRecipeCost(db, sr.sub_recipe_id);
-        const recipes = db.prepare(`SELECT DISTINCT recipe_id FROM recipe_ingredients WHERE material_id = ?`).all(id) as any[];
-        for (const r of recipes) recalculateRecipeCost(db, r.recipe_id);
+        const { recalculateCostsForMaterials } = await import('@/lib/db');
+        recalculateCostsForMaterials(db, [id]);
       } catch (e: any) {
         console.warn('[/api/inventory PUT] cascade failed:', e?.message);
       }
