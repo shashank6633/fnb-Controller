@@ -85,8 +85,11 @@ export async function counts(): Promise<{ pending: number; failed: number; print
   };
 }
 
-/** Clear printed jobs older than `ms` (housekeeping). */
-export async function prunePrinted(ms = 6 * 3600_000): Promise<void> {
+/** Clear printed jobs older than `ms` (housekeeping). 72h, NOT less: printed
+ *  records are the durable re-print guard (enqueue dedups on record existence)
+ *  — a 6h window let stale KOTs re-print after an agent reload (incident
+ *  21-07). Records are tiny (payloads stripped on print), so 72h is cheap. */
+export async function prunePrinted(ms = 72 * 3600_000): Promise<void> {
   const all = await allJobs();
   const cutoff = Date.now() - ms;
   for (const j of all) if (j.status === 'printed' && j.createdAt < cutoff) await tx('readwrite', (s) => s.delete(j.id));

@@ -246,6 +246,15 @@ export default function RecipesPage() {
   const [bulkResult, setBulkResult] = useState<any>(null);
   const bulkFileRef = useRef<HTMLInputElement>(null);
 
+  // --- restore full book: Step 1 sub-recipes CSV (feeds /api/recipes/sub-bulk) ---
+  const [subBulkFileName, setSubBulkFileName] = useState<string | null>(null);
+  const [subBulkRows, setSubBulkRows] = useState<any[]>([]);
+  const [subBulkUploading, setSubBulkUploading] = useState(false);
+  const [subBulkOverwrite, setSubBulkOverwrite] = useState(true);
+  const [subBulkDragOver, setSubBulkDragOver] = useState(false);
+  const [subBulkResult, setSubBulkResult] = useState<any>(null);
+  const subBulkFileRef = useRef<HTMLInputElement>(null);
+
   // --- Recipe health check filter ---
   const [issueFilter, setIssueFilter] = useState<string | null>(null);
 
@@ -664,6 +673,10 @@ export default function RecipesPage() {
     setBulkRows([]);
     setBulkResult(null);
     setBulkOverwrite(false);
+    setSubBulkFileName(null);
+    setSubBulkRows([]);
+    setSubBulkResult(null);
+    setSubBulkOverwrite(true);
   }
 
   async function handleBulkFile(file: File) {
@@ -716,6 +729,9 @@ export default function RecipesPage() {
         body: { rows: bulkRows, overwrite_existing: bulkOverwrite },
       });
       const json = await res.json();
+      // Non-OK responses carry a singular { error } — surface it in the pane's
+      // errors list instead of rendering an empty "success" box.
+      if (!res.ok) { setBulkResult({ errors: [json.error || `HTTP ${res.status}`] }); return; }
       setBulkResult(json);
       if (json.recipes_created > 0 || json.recipes_updated > 0) {
         await fetchRecipes();
@@ -729,6 +745,59 @@ export default function RecipesPage() {
 
   // Count unique recipes in preview
   const previewRecipeCount = new Set(bulkRows.map(r => r.recipe_name)).size;
+
+  // --- restore full book: Step 1 sub-recipes CSV ---
+
+  function handleSubBulkFile(file: File) {
+    setSubBulkResult(null);
+    setSubBulkFileName(file.name);
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      comments: '#',
+      complete: (results) => {
+        const rows = (results.data as any[])
+          .map((r: any) => ({
+            sub_recipe_name: String(r.sub_recipe_name || r['Sub Recipe Name'] || '').trim(),
+            yield_qty: Number(r.yield_qty || r['Yield Qty'] || 0),
+            yield_unit: String(r.yield_unit || r['Yield Unit'] || '').trim(),
+            ingredient_name: String(r.ingredient_name || r['Ingredient Name'] || '').trim(),
+            quantity: Number(r.quantity || r.Quantity || 0),
+            unit: String(r.unit || r.Unit || 'g').trim(),
+          }))
+          .filter((r: any) => r.sub_recipe_name && r.ingredient_name);
+        setSubBulkRows(rows);
+      },
+    });
+  }
+
+  async function submitSubBulkUpload() {
+    setSubBulkUploading(true);
+    setSubBulkResult(null);
+    try {
+      const res = await api('/api/recipes/sub-bulk', {
+        method: 'POST',
+        body: { rows: subBulkRows, overwrite_existing: subBulkOverwrite },
+      });
+      const json = await res.json();
+      if (!res.ok) { setSubBulkResult({ errors: [json.error || `HTTP ${res.status}`] }); return; }
+      setSubBulkResult(json);
+      if (json.subs_created > 0 || json.subs_updated > 0) {
+        // Sub-recipe costs roll up into recipe costs — refresh both lists.
+        await Promise.all([fetchSubRecipes(), fetchRecipes()]);
+        // Step 2 of a restore MUST overwrite the damaged recipes — pre-tick it
+        // so the documented flow can't silently no-op with 140 "skipped".
+        setBulkOverwrite(true);
+      }
+    } catch (err: any) {
+      setSubBulkResult({ errors: [err.message] });
+    } finally {
+      setSubBulkUploading(false);
+    }
+  }
+
+  // Count unique sub-recipes in preview
+  const subBulkPreviewCount = new Set(subBulkRows.map(r => r.sub_recipe_name)).size;
 
   // -------------------------------------------------------------------------
   // Bar Costing Excel Importer (specialized — reads 3 sheets + auto-fixes)
@@ -3164,7 +3233,7 @@ export default function RecipesPage() {
                 <div className={`p-4 rounded-lg border ${
                   (bulkResult.errors?.length > 0 || bulkResult.ingredients_not_found?.length > 0) && !bulkResult.recipes_created
                     ? 'bg-red-50 border-red-200'
-                    : bulkResult.errors?.length > 0 || bulkResult.ingredients_not_found?.length > 0
+                    : bulkResult.errors?.length > 0 || bulkResult.ingredients_not_found?.length > 0 || bulkResult.subs_not_found?.length > 0
                     ? 'bg-amber-50 border-amber-200'
                     : 'bg-green-50 border-green-200'
                 }`}>
@@ -3178,6 +3247,7 @@ export default function RecipesPage() {
                       {bulkResult.recipes_updated > 0 && <p className="text-blue-700">{bulkResult.recipes_updated} recipe(s) updated</p>}
                       {bulkResult.recipes_skipped > 0 && <p className="text-amber-700">{bulkResult.recipes_skipped} recipe(s) skipped (already exist — enable overwrite to update)</p>}
                       {bulkResult.ingredients_added > 0 && <p className="text-[#6B5744]">{bulkResult.ingredients_added} ingredient(s) linked</p>}
+                      {bulkResult.subs_linked > 0 && <p className="text-[#6B5744]">{bulkResult.subs_linked} sub-recipe link(s) restored</p>}
 
                       {bulkResult.ingredients_not_found?.length > 0 && (
                         <div className="mt-2">
@@ -3197,11 +3267,32 @@ export default function RecipesPage() {
                         </div>
                       )}
 
+                      {bulkResult.subs_not_found?.length > 0 && (
+                        <div className="mt-2">
+                          <p className="text-amber-700 font-medium mb-1">
+                            <AlertTriangle className="w-3 h-3 inline mr-1" />
+                            {bulkResult.subs_not_found.length} sub-recipe(s) not found:
+                          </p>
+                          <div className="max-h-32 overflow-y-auto bg-white rounded border border-amber-200 p-2">
+                            {bulkResult.subs_not_found.slice(0, 30).map((err: string, i: number) => (
+                              <p key={i} className="text-xs font-mono text-amber-800">{err}</p>
+                            ))}
+                            {bulkResult.subs_not_found.length > 30 && (
+                              <p className="text-[10px] text-amber-600 mt-1">...and {bulkResult.subs_not_found.length - 30} more</p>
+                            )}
+                          </div>
+                          <p className="text-[10px] text-[#8B7355] mt-1">Import these via Step 1 (sub-recipes CSV) below, then re-upload.</p>
+                        </div>
+                      )}
+
                       {bulkResult.errors?.length > 0 && (
                         <div className="mt-2">
                           {bulkResult.errors.slice(0, 10).map((err: string, i: number) => (
                             <p key={i} className="text-red-600 text-xs">{err}</p>
                           ))}
+                          {bulkResult.errors.length > 10 && (
+                            <p className="text-[10px] text-red-500 mt-1">...and {bulkResult.errors.length - 10} more</p>
+                          )}
                         </div>
                       )}
                     </div>
@@ -3211,6 +3302,141 @@ export default function RecipesPage() {
                   </div>
                 </div>
               )}
+
+              {/* ----------------------------------------------------- */}
+              {/* RESTORE FULL BOOK (sub-recipes + recipes)             */}
+              {/* ----------------------------------------------------- */}
+              <div className="border-t border-[#E8D5C4] pt-4 space-y-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-[#2D1B0E] flex items-center gap-2">
+                    <RefreshCw className="w-4 h-4 text-[#af4408]" />
+                    Restore full book (sub-recipes + recipes)
+                  </h3>
+                  <p className="text-xs text-[#8B7355] mt-1">
+                    Restore order: Step 1 sub-recipes below, then Step 2 = the regular recipes upload above with
+                    <b> “Overwrite existing recipes with same name” TICKED</b> (Step 1 pre-ticks it for you).
+                    Use the two <i>restore CSVs</i> prepared for this (sub-recipes-restore…csv + recipes-restore…csv) — not the .xlsx export.
+                  </p>
+                </div>
+
+                {/* Step 1 — Sub-recipes CSV */}
+                <div
+                  onDragOver={(e) => { e.preventDefault(); setSubBulkDragOver(true); }}
+                  onDragLeave={() => setSubBulkDragOver(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setSubBulkDragOver(false);
+                    const f = e.dataTransfer.files?.[0];
+                    if (f) handleSubBulkFile(f);
+                  }}
+                  onClick={() => subBulkFileRef.current?.click()}
+                  className={`border-2 border-dashed rounded-xl p-4 text-center cursor-pointer transition-colors ${
+                    subBulkDragOver ? 'border-[#af4408] bg-[#FFF1E3]' : 'border-[#D4B896] hover:border-[#af4408] hover:bg-[#FFF1E3]/30'
+                  }`}
+                >
+                  <p className="text-sm text-[#6B5744] font-medium">
+                    Step 1 — Sub-recipes CSV: {subBulkFileName ? subBulkFileName : 'drag & drop, or click to browse'}
+                  </p>
+                  <p className="text-[10px] text-[#8B7355] mt-1">
+                    Columns: sub_recipe_name, yield_qty, yield_unit, ingredient_name, quantity, unit
+                  </p>
+                  <input
+                    ref={subBulkFileRef}
+                    type="file"
+                    accept=".csv"
+                    onChange={(e) => { const f = e.target.files?.[0]; if (f) handleSubBulkFile(f); }}
+                    className="hidden"
+                  />
+                </div>
+
+                {subBulkRows.length > 0 && (
+                  <div className="flex items-center justify-between flex-wrap gap-3">
+                    <label className="flex items-center gap-2 text-xs cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={subBulkOverwrite}
+                        onChange={(e) => setSubBulkOverwrite(e.target.checked)}
+                        className="accent-[#af4408] w-4 h-4"
+                      />
+                      <span className="text-[#6B5744]">Replace existing compositions</span>
+                    </label>
+                    <div className="flex gap-3">
+                      <button
+                        onClick={submitSubBulkUpload}
+                        disabled={subBulkUploading}
+                        className="flex items-center gap-2 px-5 py-2.5 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
+                      >
+                        {subBulkUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                        {subBulkUploading ? 'Uploading...' : `Upload ${subBulkPreviewCount} Sub-Recipe(s) • ${subBulkRows.length} row(s)`}
+                      </button>
+                      <button
+                        onClick={() => { setSubBulkRows([]); setSubBulkFileName(null); setSubBulkResult(null); }}
+                        className="px-4 py-2.5 bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm hover:bg-[#E8D5C4] transition-colors"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {subBulkResult && (
+                  <div className={`p-4 rounded-lg border ${
+                    (subBulkResult.errors?.length > 0 || subBulkResult.ingredients_not_found?.length > 0) && !subBulkResult.subs_created && !subBulkResult.subs_updated
+                      ? 'bg-red-50 border-red-200'
+                      : subBulkResult.errors?.length > 0 || subBulkResult.ingredients_not_found?.length > 0
+                      ? 'bg-amber-50 border-amber-200'
+                      : 'bg-green-50 border-green-200'
+                  }`}>
+                    <div className="flex items-start gap-3">
+                      {subBulkResult.subs_created > 0 || subBulkResult.subs_updated > 0
+                        ? <CheckCircle className="w-5 h-5 text-green-600 mt-0.5 shrink-0" />
+                        : <AlertCircle className="w-5 h-5 text-red-500 mt-0.5 shrink-0" />
+                      }
+                      <div className="flex-1 text-sm space-y-1">
+                        {subBulkResult.subs_created > 0 && <p className="text-green-700 font-medium">{subBulkResult.subs_created} sub-recipe(s) created</p>}
+                        {subBulkResult.subs_updated > 0 && <p className="text-blue-700">{subBulkResult.subs_updated} sub-recipe(s) updated</p>}
+                        {subBulkResult.subs_skipped > 0 && <p className="text-amber-700">{subBulkResult.subs_skipped} sub-recipe(s) skipped (already exist — enable “Replace existing compositions”)</p>}
+                        {subBulkResult.recipes_recosted > 0 && <p className="text-[#6B5744]">{subBulkResult.recipes_recosted} linked recipe(s) re-costed</p>}
+                        {subBulkResult.error && <p className="text-red-600">{subBulkResult.error}</p>}
+                        {subBulkResult.ingredients_added > 0 && <p className="text-[#6B5744]">{subBulkResult.ingredients_added} ingredient(s) linked</p>}
+
+                        {subBulkResult.ingredients_not_found?.length > 0 && (
+                          <div className="mt-2">
+                            <p className="text-amber-700 font-medium mb-1">
+                              <AlertTriangle className="w-3 h-3 inline mr-1" />
+                              {subBulkResult.ingredients_not_found.length} ingredient(s) not found in inventory:
+                            </p>
+                            <div className="max-h-32 overflow-y-auto bg-white rounded border border-amber-200 p-2">
+                              {subBulkResult.ingredients_not_found.slice(0, 30).map((err: string, i: number) => (
+                                <p key={i} className="text-xs font-mono text-amber-800">{err}</p>
+                              ))}
+                              {subBulkResult.ingredients_not_found.length > 30 && (
+                                <p className="text-[10px] text-amber-600 mt-1">...and {subBulkResult.ingredients_not_found.length - 30} more</p>
+                              )}
+                            </div>
+                            <p className="text-[10px] text-[#8B7355] mt-1">Add these materials to Raw Materials first, then re-upload.</p>
+                          </div>
+                        )}
+
+                        {subBulkResult.errors?.length > 0 && (
+                          <div className="mt-2">
+                            {subBulkResult.errors.slice(0, 10).map((err: string, i: number) => (
+                              <p key={i} className="text-red-600 text-xs">{err}</p>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <button onClick={() => setSubBulkResult(null)} className="text-[#8B7355] hover:text-[#2D1B0E] text-xs">
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <p className="text-[10px] text-[#8B7355]">
+                  Step 2 — Recipes CSV: use the regular upload above <b>with “Overwrite existing recipes with same name” ticked</b> (a successful Step 1 ticks it for you — without it every existing recipe is skipped). It understands <code className="bg-white px-1 rounded">[SUB]</code> ingredient rows and re-links sub-recipes automatically.
+                </p>
+              </div>
             </div>
           </div>
         </div>

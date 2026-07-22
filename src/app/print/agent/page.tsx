@@ -45,17 +45,26 @@ export default function PrintAgent() {
 
   const refreshQueue = useCallback(async () => { try { setQueue(await counts()); } catch {} }, []);
 
-  // Print a KOT once. Both the live stream and the backup poll call this; the
-  // `seen` set (this session) + the outbox (stable id, persisted) dedup, so a
-  // KOT never prints twice no matter how many times it's delivered.
+  // Print a KOT once. Three dedup layers so a KOT never prints twice no matter
+  // how many times it's delivered OR how often this page reloads (a deploy
+  // reloads every agent): the `seen` set is BACKED BY localStorage (survives
+  // reloads), the outbox record (stable id) persists 72h, and the bridge keeps
+  // its own 72h jobId ledger. A reload must never cause a re-print burst.
+  const persistSeen = useCallback(() => {
+    try {
+      const ids = Array.from(seen.current);
+      localStorage.setItem('fnb_agent_seen_v1', JSON.stringify(ids.slice(-600)));
+    } catch { /* storage full/blocked — outbox + bridge layers still dedup */ }
+  }, []);
   const printKot = useCallback(async (k: any) => {
     if (!k || seen.current.has(`kot:${k.id}`)) return;
     seen.current.add(`kot:${k.id}`);
+    persistSeen();
     await printFiredKots([k]).catch(() => {});
     pushLog({ id: k.id, kind: 'KOT', label: `KOT #${k.kot_number ?? '—'} · ${k.station || 'kitchen'}`,
       detail: `${k.table_number ? `Table ${k.table_number}` : k.order_type || ''} · ${(k.items || []).reduce((s: number, i: any) => s + (i.quantity || 0), 0)} items` });
     refreshQueue();
-  }, [pushLog, refreshQueue]);
+  }, [pushLog, refreshQueue, persistSeen]);
 
   // Live stream (instant) + a backup poll (catches anything the stream misses —
   // nginx buffering, pm2 cluster, a dropped connection, or the agent opening
@@ -66,6 +75,12 @@ export default function PrintAgent() {
     setCounter(getPrintCounter());
     setCatchAll(getPrintCatchAll());
     setHandleKots(getPrintKots());
+
+    // Restore the persisted seen-set FIRST — before any poll can run — so a
+    // page reload (deploy / PC restart) can't re-print already-printed KOTs.
+    try {
+      for (const id of JSON.parse(localStorage.getItem('fnb_agent_seen_v1') || '[]')) seen.current.add(String(id));
+    } catch { /* corrupt entry → other dedup layers cover */ }
 
     const es = new EventSource('/api/dine-in/kds/stream?station=all');
     es.onopen = () => { setLive(true); cloudUp.current = true; };
@@ -93,13 +108,37 @@ export default function PrintAgent() {
     esRef.current = es;
 
     // Backup poll every 9s — fetch active KOTs and print any not yet seen.
+    // AGE CAP: the poll exists to catch JUST-fired tickets the stream missed
+    // (dropped SSE, agent opened mid-service) — never to resurrect history.
+    // The KDS feed keeps un-bumped KOTs "active" for days; without this cap a
+    // reload after the dedup windows lapse mass-reprinted old tickets
+    // (production incident 21-07). Anything older prints only via an explicit
+    // reprint from the KDS.
+    const POLL_MAX_AGE_MS = 20 * 60_000;
     const poll = async () => {
       if (!getPrintKots()) return;   // this counter doesn't handle kitchen tickets
       try {
         const r = await fetch('/api/dine-in/kds?station=all', { cache: 'no-store' });
         if (!r.ok) return;
         const j = await r.json();
-        for (const k of (j.items || [])) await printKot(k);
+        let stale = 0;
+        for (const k of (j.items || [])) {
+          const age = Date.now() - new Date(String(k.created_at).replace(' ', 'T') + 'Z').getTime();
+          if (Number.isFinite(age) && age > POLL_MAX_AGE_MS) {
+            // Mark as seen so we log the skip exactly once per ticket.
+            if (!seen.current.has(`kot:${k.id}`)) {
+              seen.current.add(`kot:${k.id}`);
+              stale++;
+            }
+            continue;
+          }
+          await printKot(k);
+        }
+        if (stale > 0) {
+          persistSeen();
+          pushLog({ id: `stale_${Date.now()}`, kind: 'KOT', label: `Skipped ${stale} stale ticket(s) (>20 min old)`,
+            detail: 'Old unserved KOTs are never auto-printed — reprint from the Kitchen Display if needed.' });
+        }
       } catch { /* offline — try again next tick */ }
     };
     poll();

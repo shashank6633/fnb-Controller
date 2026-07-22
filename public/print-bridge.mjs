@@ -687,7 +687,7 @@ function writeJsonFile(file, obj) {
 // distinct ids for copies/reprints/master), so we remember printed jobIds for a
 // few hours and treat a repeat as an instant success WITHOUT touching the printer.
 // Legitimate reprints use a DIFFERENT id (…_r1) so they are never suppressed.
-const PRINTED_TTL_MS = 6 * 3600_000;   // a jobId is unique per service day; 6h window
+const PRINTED_TTL_MS = 72 * 3600_000;  // idempotency ledger: 72h, matching the app outbox's printed-record retention — a 6h window let re-sent stale jobs print again (incident 21-07)
 const PRINTED = new Map();             // jobId → printedAt (ms)
 
 function loadPrinted() {
