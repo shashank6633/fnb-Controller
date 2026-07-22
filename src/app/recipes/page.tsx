@@ -2082,7 +2082,13 @@ export default function RecipesPage() {
                                 : <div className="flex items-center gap-2"><FcBar fc={fcp} target={Math.round(targetFcPct * 100)} /><span className={`text-xs font-bold shrink-0 ${foodCostColor(fcp)}`}>{fcp.toFixed(0)}%</span></div>}
                             </td>
                             <td className="py-2.5 px-3 text-right font-bold">{gpm == null ? <span className="text-[#C4B09A]">—</span> : <span className={gpm >= 65 ? 'text-green-600' : gpm >= 50 ? 'text-amber-600' : 'text-red-500'}>{gpm.toFixed(0)}%</span>}</td>
-                            <td className="py-2.5 px-2 text-center">
+                            <td className="py-2.5 px-2 text-center whitespace-nowrap">
+                              {/* Visible pencil first — Edit hidden behind ⋮ alone kept
+                                  getting reported as "there is no edit option". */}
+                              <button onClick={() => openEditRecipe(recipe)} title="Edit recipe"
+                                      className="p-1.5 rounded-lg text-[#af4408] hover:bg-[#af4408]/10 align-middle">
+                                <Edit size={15} />
+                              </button>
                               <RRowMenu items={[
                                 { label: 'View', icon: <Eye size={14} />, onClick: () => { setSelectedRecipe(recipe); setScaleTo(1); } },
                                 { label: 'Edit', icon: <Edit size={14} />, onClick: () => openEditRecipe(recipe) },
@@ -2113,11 +2119,17 @@ export default function RecipesPage() {
                           <p className="font-semibold text-[#2D1B0E] text-sm leading-snug">{recipe.name}</p>
                           <p className="text-[11px] text-[#8B7355]">{recipe.category || 'Uncategorised'} · v{recipe.version} · {ingCount} ingredient{ingCount === 1 ? '' : 's'}</p>
                         </div>
-                        <RRowMenu items={[
-                          { label: 'View', icon: <Eye size={14} />, onClick: () => { setSelectedRecipe(recipe); setScaleTo(1); } },
-                          { label: 'Edit', icon: <Edit size={14} />, onClick: () => openEditRecipe(recipe) },
-                          { label: 'Copy', icon: <Copy size={14} />, onClick: () => openCopyRecipe(recipe) },
-                        ]} />
+                        <div className="flex items-center shrink-0">
+                          <button onClick={() => openEditRecipe(recipe)} title="Edit recipe"
+                                  className="p-1.5 rounded-lg text-[#af4408] hover:bg-[#af4408]/10">
+                            <Edit size={15} />
+                          </button>
+                          <RRowMenu items={[
+                            { label: 'View', icon: <Eye size={14} />, onClick: () => { setSelectedRecipe(recipe); setScaleTo(1); } },
+                            { label: 'Edit', icon: <Edit size={14} />, onClick: () => openEditRecipe(recipe) },
+                            { label: 'Copy', icon: <Copy size={14} />, onClick: () => openCopyRecipe(recipe) },
+                          ]} />
+                        </div>
                       </div>
                       <div className="flex items-center flex-wrap gap-2 mt-2">
                         {isLinked

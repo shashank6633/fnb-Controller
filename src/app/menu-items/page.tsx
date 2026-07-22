@@ -590,7 +590,15 @@ export default function MenuItemsPage() {
                         </td>
                         <td className="py-2.5 px-3"><LinkBadge item={it} /></td>
                         <td className="py-2.5 px-3 text-center"><RowToggle on={!!it.is_active} onClick={() => toggleActive(it)} /></td>
-                        <td className="py-2.5 px-2 text-center"><RowMenu onEdit={() => setEditItem(it)} onDelete={() => deleteItem(it.id)} /></td>
+                        <td className="py-2.5 px-2 text-center whitespace-nowrap">
+                          {/* Visible pencil first — Edit hidden behind ⋮ alone kept
+                              getting reported as "there is no edit option". */}
+                          <button onClick={() => setEditItem(it)} title="Edit item"
+                                  className="p-1.5 rounded-lg text-[#af4408] hover:bg-[#af4408]/10 align-middle">
+                            <Edit className="w-4 h-4" />
+                          </button>
+                          <RowMenu onEdit={() => setEditItem(it)} onDelete={() => deleteItem(it.id)} />
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -797,16 +805,29 @@ function RowMenu({ onEdit, onDelete }: { onEdit: () => void; onDelete: () => voi
   const btnRef = useRef<HTMLButtonElement>(null);
   const openMenu = () => {
     const r = btnRef.current?.getBoundingClientRect();
-    if (r) setPos({ top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) });
+    if (r) {
+      // Flip above the trigger near the viewport bottom (2 items ≈ 78px) so the
+      // menu never runs off-screen — same fix as the recipes row menu.
+      const menuH = 2 * 34 + 10;
+      const below = r.bottom + 4;
+      const top = below + menuH > window.innerHeight - 8 ? Math.max(8, r.top - menuH - 4) : below;
+      setPos({ top, right: Math.max(8, window.innerWidth - r.right) });
+    }
     setOpen(true);
   };
-  // Fixed dropdown can't follow the row, so close it on any scroll/resize.
+  // Fixed dropdown can't follow the row, so close it on any scroll/resize/Escape.
   useEffect(() => {
     if (!open) return;
     const close = () => setOpen(false);
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
     window.addEventListener('scroll', close, true);
     window.addEventListener('resize', close);
-    return () => { window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('keydown', onKey);
+    };
   }, [open]);
   return (
     <>
@@ -815,8 +836,8 @@ function RowMenu({ onEdit, onDelete }: { onEdit: () => void; onDelete: () => voi
       </button>
       {open && pos && (
         <>
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div style={{ top: pos.top, right: pos.right }} className="fixed z-50 w-32 bg-white border border-[#E8D5C4] rounded-lg shadow-xl py-1 text-sm">
+          <div className="fixed inset-0 z-[94]" onClick={() => setOpen(false)} />
+          <div style={{ top: pos.top, right: pos.right }} className="fixed z-[95] w-32 bg-white border border-[#E8D5C4] rounded-lg shadow-xl py-1 text-sm">
             <button onClick={() => { setOpen(false); onEdit(); }} className="w-full text-left px-3 py-1.5 hover:bg-[#FFF1E3] flex items-center gap-2 text-[#2D1B0E]"><Edit className="w-3.5 h-3.5" />Edit</button>
             <button onClick={() => { setOpen(false); onDelete(); }} className="w-full text-left px-3 py-1.5 hover:bg-red-50 flex items-center gap-2 text-red-600"><Trash2 className="w-3.5 h-3.5" />Delete</button>
           </div>
