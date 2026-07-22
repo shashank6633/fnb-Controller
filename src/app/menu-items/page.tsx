@@ -425,8 +425,14 @@ export default function MenuItemsPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-[#2D1B0E] mt-0.5">Menu Items</h1>
           </div>
           <div className="flex gap-2">
+            {/* Round-trip: download the CURRENT menu in the exact columns the
+                Import accepts → edit in a spreadsheet → re-import with Overwrite. */}
+            <a href="/api/menu-items/export" download
+               className="flex items-center gap-2 px-3 sm:px-4 py-2.5 bg-white border border-[#E0D0BE] hover:border-[#af4408] hover:bg-[#af4408]/5 text-[#6B5744] rounded-xl text-sm font-medium shadow-sm transition-colors">
+              <Download className="w-4 h-4" /><span className="hidden sm:inline">Download Menu (CSV)</span><span className="sm:hidden">Menu CSV</span>
+            </a>
             <button onClick={openImport} className="flex items-center gap-2 px-3 sm:px-4 py-2.5 bg-white border border-[#E0D0BE] hover:border-purple-400 hover:bg-purple-50/40 text-purple-700 rounded-xl text-sm font-medium shadow-sm transition-colors">
-              <Download className="w-4 h-4" /><span className="hidden sm:inline">Import from Akan POS</span><span className="sm:hidden">Import</span>
+              <Upload className="w-4 h-4" /><span className="hidden sm:inline">Import from Akan POS</span><span className="sm:hidden">Import</span>
             </button>
             <button onClick={() => setEditItem(NEW_ITEM)} className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-xl text-sm font-semibold shadow-sm transition-colors">
               <Plus className="w-4 h-4" />New Item
@@ -636,14 +642,25 @@ export default function MenuItemsPage() {
                 <p className="text-[#6B5744] font-medium mb-2">This importer expects Akan Brewing Co Products format with columns:</p>
                 <p className="text-xs text-[#8B7355]">Category Name, Product Name, Selling Price, Listing Price, Master Status, Item Type, Tax Value, Item Code, Station, Dietary Tag</p>
                 <p className="text-xs text-[#8B7355] mt-2">Will auto-fix: COSMOPOLTIAN → COSMOPOLITAN, HEINKEIN → HEINEKEN, VERMOTH → VERMOUTH, etc. Plus extra-space cleanup.</p>
+                <div className="flex flex-wrap gap-2 mt-3">
+                  <a href="/api/menu-items/export" download
+                     className="inline-flex items-center gap-1.5 text-xs font-medium text-[#af4408] border border-[#af4408]/40 hover:bg-[#af4408]/10 px-3 py-1.5 rounded-lg">
+                    <Download className="w-3.5 h-3.5" /> Download current menu (CSV)
+                  </a>
+                  <a href="/api/menu-items/export?sample=1" download
+                     className="inline-flex items-center gap-1.5 text-xs font-medium text-[#6B5744] border border-[#D4B896] hover:bg-[#FFF1E3] px-3 py-1.5 rounded-lg">
+                    <Download className="w-3.5 h-3.5" /> Download sample template
+                  </a>
+                  <span className="text-[11px] text-[#8B7355] self-center">edit in a spreadsheet → re-upload here (Overwrite updates matching items)</span>
+                </div>
               </div>
 
               {/* Drop zone */}
               <div onClick={() => importFileRef.current?.click()} className="border-2 border-dashed border-[#D4B896] hover:border-purple-600 hover:bg-purple-50/30 rounded-xl p-8 text-center cursor-pointer transition-colors">
                 <FileSpreadsheet className="w-10 h-10 text-purple-500 mx-auto mb-3" />
-                <p className="text-[#6B5744] font-medium">{importFileName || 'Click to select Excel file'}</p>
-                <p className="text-xs text-[#8B7355] mt-1">Looks for sheet named "Existing Product" or "Products"</p>
-                <input ref={importFileRef} type="file" accept=".xlsx,.xls" onChange={e => { const f = e.target.files?.[0]; if (f) handleImportFile(f); }} className="hidden" />
+                <p className="text-[#6B5744] font-medium">{importFileName || 'Click to select Excel / CSV file'}</p>
+                <p className="text-xs text-[#8B7355] mt-1">Excel: looks for sheet "Existing Product" / "Products" · CSV: the downloaded menu format above</p>
+                <input ref={importFileRef} type="file" accept=".xlsx,.xls,.csv" onChange={e => { const f = e.target.files?.[0]; if (f) handleImportFile(f); }} className="hidden" />
               </div>
 
               {importPreview && (
