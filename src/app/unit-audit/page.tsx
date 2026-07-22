@@ -247,7 +247,17 @@ export default function UnitAuditPage() {
       const r = await api('/api/unit-audit', { method: 'PUT', body: { updates } });
       const j = await r.json();
       if (!r.ok) { alert(j.error || 'Failed'); return; }
-      alert(`Saved ${j.updated} update(s).`);
+      // When a unit/pack change alters the conversion factor, the server
+      // re-bases price & stock so the ₹/purchase-unit reality is preserved —
+      // show exactly what it did so the numbers never change "silently".
+      const rb: any[] = j.rebased || [];
+      const rbNote = rb.length
+        ? `\n\nPrice & stock re-based to the new units (₹/purchase-unit preserved):\n` +
+          rb.slice(0, 8).map((x: any) =>
+            `• ${x.name}: avg ₹${x.old_avg} → ₹${x.new_avg}/unit · stock ${x.old_stock} → ${x.new_stock}`).join('\n') +
+          (rb.length > 8 ? `\n…and ${rb.length - 8} more` : '')
+        : '';
+      alert(`Saved ${j.updated} update(s).${rbNote}`);
       setEdits({});
       setSelected(new Set());
       setRefreshKey(k => k + 1);

@@ -254,6 +254,15 @@ export async function PUT(request: Request) {
     `);
     const me = await getCurrentUser();
     let updated = 0;
+    // Pack-factor for the price/stock basis: recipe-units per purchase-unit,
+    // active only when pack>1 AND the units differ (the house guard).
+    const factorOf = (unit: any, pu: any, pack: any) => {
+      const p = Number(pack) || 1;
+      const un = String(unit || '').toLowerCase().trim();
+      const pn = String(pu || unit || '').toLowerCase().trim();
+      return p > 1 && un !== pn ? p : 1;
+    };
+    const rebased: Array<{ id: string; name: string; old_avg: number; new_avg: number; old_stock: number; new_stock: number }> = [];
     const txn = db.transaction(() => {
       for (const u of updates) {
         if (!u?.id) continue;
@@ -263,10 +272,27 @@ export async function PUT(request: Request) {
         const caseSize     = u.case_size != null ? Number(u.case_size) : null;
         const category     = u.category ?? null;
         if (recipeUnit === null && purchaseUnit === null && packSize === null && caseSize === null && category === null) continue;
+        const before = db.prepare('SELECT name, unit, purchase_unit, pack_size, average_price, current_stock FROM raw_materials WHERE id = ?').get(u.id) as any;
         if (hasRecipeUnitCol) {
           updWithRecipe.run(recipeUnit, recipeUnit, purchaseUnit, packSize, caseSize, category, u.id);
         } else {
           updWithoutRecipe.run(recipeUnit, purchaseUnit, packSize, caseSize, category, u.id);
+        }
+        // REBASE price & stock when the pack factor changes, so the physical
+        // reality is preserved: ₹/purchase-unit and on-hand purchase-unit count
+        // stay constant. Without this, changing GREEN CURRY PASTE from
+        // TIN/pack 1 to g/pack 1000 left average_price meaning ₹384/GRAM —
+        // a silent 1000× price inflation (owner-reported 22-07).
+        if (before) {
+          const fOld = factorOf(before.unit, before.purchase_unit, before.pack_size);
+          const fNew = factorOf(recipeUnit ?? before.unit, purchaseUnit ?? before.purchase_unit, packSize ?? before.pack_size);
+          if (fOld !== fNew && ((Number(before.average_price) || 0) !== 0 || (Number(before.current_stock) || 0) !== 0)) {
+            const newAvg   = Math.round(((Number(before.average_price) || 0) * fOld / fNew) * 10000) / 10000;
+            const newStock = Math.round(((Number(before.current_stock) || 0) * fNew / fOld) * 1000) / 1000;
+            db.prepare('UPDATE raw_materials SET average_price = ?, current_stock = ? WHERE id = ?').run(newAvg, newStock, u.id);
+            rebased.push({ id: u.id, name: before.name, old_avg: Number(before.average_price) || 0, new_avg: newAvg,
+                           old_stock: Number(before.current_stock) || 0, new_stock: newStock });
+          }
         }
         // Snapshot the FULL post-update row to unit_audit_locks so the curation
         // survives wipes / re-uploads and acts as the source of truth defending
@@ -283,7 +309,7 @@ export async function PUT(request: Request) {
       }
     });
     txn();
-    return Response.json({ success: true, updated });
+    return Response.json({ success: true, updated, rebased });
   } catch (e: any) {
     return Response.json({ error: e.message }, { status: 500 });
   }
