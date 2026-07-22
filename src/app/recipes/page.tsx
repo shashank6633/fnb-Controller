@@ -1761,15 +1761,26 @@ export default function RecipesPage() {
           )}
           {/* Direct items aren't created manually — they're auto-discovered from
               sales and linked to a raw material in the panel below. So only show
-              the Add button on the Recipes / Sub-Recipes tabs. */}
+              the Add buttons on the Recipes / Sub-Recipes tabs. BOTH buttons show
+              on both tabs: a single tab-morphing button made "Add Sub-Recipe"
+              undiscoverable (owners on the Main tab never saw it existed). */}
           {activeTab !== 'direct' && (
-            <button
-              onClick={activeTab === 'main' ? openAddRecipe : openAddSubRecipe}
-              className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2.5 rounded-xl text-sm font-semibold shadow-sm transition-colors"
-            >
-              <Plus size={16} />
-              {activeTab === 'main' ? 'Add Recipe' : 'Add Sub-Recipe'}
-            </button>
+            <>
+              <button
+                onClick={openAddSubRecipe}
+                className="flex items-center gap-2 bg-white border border-[#af4408]/50 text-[#af4408] hover:bg-[#af4408]/10 px-4 py-2.5 rounded-xl text-sm font-semibold shadow-sm transition-colors"
+              >
+                <Plus size={16} />
+                Add Sub-Recipe
+              </button>
+              <button
+                onClick={openAddRecipe}
+                className="flex items-center gap-2 bg-[#af4408] hover:bg-[#8a3506] text-white px-4 py-2.5 rounded-xl text-sm font-semibold shadow-sm transition-colors"
+              >
+                <Plus size={16} />
+                Add Recipe
+              </button>
+            </>
           )}
         </div>
       </div>
