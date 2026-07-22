@@ -14,6 +14,8 @@ interface ImportRow {
   station?: string;
   dietary_tag?: string;
   pos_id?: string;
+  /** Stable menu_items.id from our own export — preferred match key (survives renames). */
+  item_id?: string;
 }
 
 // Typo fixes
@@ -97,6 +99,7 @@ export async function POST(request: Request) {
     const existingItems = db.prepare('SELECT id, name, item_code FROM menu_items').all() as any[];
     const existingMap = new Map<string, any>();
     for (const m of existingItems) existingMap.set(m.name.toLowerCase().trim(), m);
+    const existingById = new Map<string, any>(existingItems.map((m) => [String(m.id), m]));
 
     const recipes = db.prepare('SELECT id, name FROM recipes WHERE is_active = 1').all() as any[];
     // Fuzzy matcher: menu names are worded differently from recipe names
@@ -114,7 +117,7 @@ export async function POST(request: Request) {
     `);
 
     const updateItem = db.prepare(`
-      UPDATE menu_items SET category = ?, station = ?, item_type = ?, dietary_tag = ?, selling_price = ?, listing_price = ?, item_code = ?, tax_value = ?, cgst_percent = ?, sgst_percent = ?, is_active = ?, recipe_id = COALESCE(?, recipe_id), material_id = COALESCE(?, material_id), pos_id = ?, updated_at = datetime('now') WHERE id = ?
+      UPDATE menu_items SET name = ?, category = ?, station = ?, item_type = ?, dietary_tag = ?, selling_price = ?, listing_price = ?, item_code = ?, tax_value = ?, cgst_percent = ?, sgst_percent = ?, is_active = ?, recipe_id = COALESCE(?, recipe_id), material_id = COALESCE(?, material_id), pos_id = ?, updated_at = datetime('now') WHERE id = ?
     `);
     // Keep the invariant tax_value = cgst_percent + sgst_percent (the bill engine
     // sums tax_value; the menu form re-derives tax_value from the two halves on
@@ -201,8 +204,11 @@ export async function POST(request: Request) {
           report.unlinked_items.push(normalized);
         }
 
-        // Existing item?
-        const existing = existingMap.get(nameKey);
+        // Existing item? Prefer the STABLE Item ID (from our own menu export) —
+        // it survives renames; name matching is the legacy fallback for POS
+        // sheets that carry no id.
+        const byId = row.item_id ? existingById.get(String(row.item_id).trim()) : undefined;
+        const existing = byId || existingMap.get(nameKey);
         if (existing) {
           if (!overwrite_existing) {
             report.items_skipped_duplicate++;
@@ -210,11 +216,15 @@ export async function POST(request: Request) {
           }
           const ug = gstSplit(Number(row.tax_value) || 0);
           updateItem.run(
+            normalized,
             row.category || '', row.station || '', row.item_type || 'foods', row.dietary_tag || '',
             sellingPrice, Number(row.listing_price) || 0, row.item_code || '',
             ug.tax, ug.cgst, ug.sgst, isActive ? 1 : 0, recipeId, materialId, row.pos_id || '',
             existing.id
           );
+          // Keep the name index current so a rename can't spawn a duplicate
+          // from a later row in the same file.
+          existingMap.set(nameKey, existing);
           report.items_updated++;
         } else {
           const id = generateId();

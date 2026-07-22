@@ -70,7 +70,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }> = [];
 
     const items = db.prepare(`
-      SELECT poi.*, rm.id AS material_id, rm.name AS material_name
+      SELECT poi.*, rm.id AS material_id, rm.name AS material_name,
+             rm.unit AS material_unit, rm.purchase_unit AS material_purchase_unit,
+             COALESCE(rm.pack_size, 1) AS material_pack_size
       FROM purchase_order_items poi
       JOIN raw_materials rm ON rm.id = poi.material_id
       WHERE poi.po_id = ?
@@ -205,9 +207,27 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         if (accepted > 0) {
           const purchaseId = generateId();
           const lineVendor = (it.vendor && String(it.vendor).trim()) || po.vendor || '';
-          insPurchase.run(purchaseId, it.material_id, lineVendor, accepted, price, acceptedTotal, receivedAt,
+          // ── Unit-basis boundary (CORE CONVENTION) ──────────────────────
+          // PO lines carry qty in RECIPE units and price in ₹/recipe-unit
+          // ("material_unit is the canonical recipe / stock unit that the PO
+          // stores qty in" — /purchase-orders receive modal). The `purchases`
+          // table stores PURCHASE units: updateMaterialPrice ÷pack_size and
+          // the purchases GET ×pack_size both assume it. Convert exactly
+          // once here, under the SAME pack>1 + recipe≠purchase-unit
+          // condition updateMaterialPrice applies — otherwise average_price
+          // lands pack× too small (the price_basis_repair_v1 "bug A").
+          const packSize = Number(it.material_pack_size) || 1;
+          const ru = String(it.material_unit || '').toLowerCase().trim();
+          const pu = String(it.material_purchase_unit || it.material_unit || '').toLowerCase().trim();
+          const isPack = packSize > 1 && ru !== pu;
+          const purchQty   = isPack ? accepted / packSize : accepted;
+          const purchPrice = isPack ? Math.round(price * packSize * 10000) / 10000 : price;
+          insPurchase.run(purchaseId, it.material_id, lineVendor, purchQty, purchPrice, acceptedTotal, receivedAt,
             `Received against ${po.po_number} (GRN ${grnNumber})`);
-          bumpStock.run(accepted, price, receivedAt, it.material_id);
+          // current_stock stays in RECIPE units (accepted, no conversion);
+          // last_purchase_price is canonically ₹/purchase-unit (db.ts backfill
+          // derives it from purchases.unit_price; /api/grn writes the same).
+          bumpStock.run(accepted, purchPrice, receivedAt, it.material_id);
           insTx.run(generateId(), it.material_id, accepted, purchaseId, `PO ${po.po_number} received via GRN ${grnNumber}`);
           touchedMaterials.add(it.material_id);
         }

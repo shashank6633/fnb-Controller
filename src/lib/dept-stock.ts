@@ -26,8 +26,10 @@ import type { SessionUser } from './auth';
  *     (see store-issue route); one-shot store-process + Recaho imports leave
  *     issue_history EMPTY, so those fall back to r.date vs anchor_date.
  *   - quantities are in ri.unit → recipe units via the house pack-factor CASE
- *     (same as department-consumption / party-events/pnl): × pack_size only
- *     when the line was requested in the material's purchase unit.
+ *     (same as department-consumption / party-events/pnl): × pack_size when
+ *     the line was requested in the material's purchase unit — AND, unlike
+ *     the SQL CASE, also when ri.unit is BLANK (pre-unit-column legacy lines,
+ *     which were entered in purchase units — see reqPackFactor).
  */
 
 export interface DeptStockRow {
@@ -92,13 +94,21 @@ export function allowedDeptIds(user: SessionUser): Set<string> {
   return out;
 }
 
-/** Recipe-units per 1 ri.unit — the house pack-factor CASE, in JS. Kept
- *  byte-equivalent to department-consumption route.ts:150-152: emptiness is
- *  guarded with TRIM, but the purchase-/recipe-unit equality is on the RAW
- *  ri.unit (NOT trimmed) — so a padded unit like 'BTL ' fails `= 'BTL'` and
- *  stays ×1, exactly as the SQL CASE does. */
+/** Recipe-units per 1 ri.unit — the house pack-factor CASE, in JS, plus the
+ *  legacy-blank rule. Explicit units follow department-consumption
+ *  route.ts:150-152: × pack_size only when the RAW ri.unit (NOT trimmed — a
+ *  padded 'BTL ' fails `= 'BTL'` and stays ×1, like the SQL CASE) equals the
+ *  purchase unit and differs from the recipe unit. BLANK ri.unit is the
+ *  pre-unit-column era (≤2026-05, 14k+ lines): those quantities were entered
+ *  in PURCHASE units (butter issued=5 means 5 kg, not 5 g — DB-verified
+ *  2026-07-22: 3,769/3,883 blank g-lines have qty < 20), so a blank unit gets
+ *  the same × pack_size as an explicit purchase-unit request. This is a
+ *  deliberate departure from the SQL CASE's "blank stays ×1". */
 function reqPackFactor(riUnit: string | null, unit: string, purchaseUnit: string | null, packSize: number | null): number {
-  return (String(riUnit ?? '').trim() !== '' && riUnit === purchaseUnit && riUnit !== unit && (Number(packSize) || 1) > 1)
+  // Blank = legacy purchase-unit entry; non-blank must equal the purchase unit
+  // exactly (raw, untrimmed — same as the SQL CASE).
+  const asPurchase = String(riUnit ?? '').trim() === '' ? true : riUnit === purchaseUnit;
+  return (asPurchase && String(purchaseUnit ?? '').trim() !== '' && unit !== purchaseUnit && (Number(packSize) || 1) > 1)
     ? Number(packSize) : 1;
 }
 

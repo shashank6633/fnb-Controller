@@ -56,13 +56,17 @@ interface StoreLite { id: string; name: string; code: string; is_active: number;
 interface Access { can_view: boolean; can_procure: boolean; can_adjust: boolean; can_close_stock: boolean; }
 type TransferStatus = 'requested' | 'issued' | 'received' | 'cancelled';
 
+// purchase_unit is LOAD-BEARING for the CBL math: packFactor (pack-units.ts)
+// only applies pack_size when unit !== purchase_unit, so dropping it degrades
+// every packed material to a 1:1 conversion (2 cs + 9 btl of 750ml whisky
+// would post 33 ml instead of 24,750 ml). Every catalog map below MUST carry it.
 interface ItemMeta {
   material_id: string; name: string; category: string; unit: string;
-  pack_size: number; case_size: number; average_price: number;
+  purchase_unit: string; pack_size: number; case_size: number; average_price: number;
 }
 interface TransferItem {
   id: string; transfer_id: string; material_id: string; material_name: string;
-  category: string; unit: string; pack_size: number; case_size: number;
+  category: string; unit: string; purchase_unit: string; pack_size: number; case_size: number;
   qty_requested: number; qty_issued: number; qty_received: number;
   in_transit: number; discrepancy: number; note: string;
 }
@@ -848,6 +852,7 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
           const j = await r.json().catch(() => ({}));
           list = (j.materials || []).map((m: any) => ({
             material_id: m.id, name: m.name, category: m.category, unit: m.unit,
+            purchase_unit: m.purchase_unit || m.unit,
             pack_size: Number(m.pack_size) || 1, case_size: Number(m.case_size) || 1,
             average_price: Number(m.average_price) || 0,
           }));
@@ -855,12 +860,17 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
           const r = await fetch(`/api/stores/${from}/items`);
           if (r.ok) {
             const j = await r.json();
-            list = (j.items || []) as ItemMeta[];
+            // Normalize even the happy path: a missing purchase_unit would
+            // silently kill the pack conversion (see ItemMeta note above).
+            list = ((j.items || []) as any[]).map(m => ({
+              ...m, purchase_unit: m.purchase_unit || m.unit,
+            })) as ItemMeta[];
           } else {
             const sr = await fetch(`/api/stores/${from}/stock`);
             const sj = await sr.json().catch(() => ({}));
             list = (sj.materials || []).map((m: any) => ({
               material_id: m.id, name: m.name, category: m.category, unit: m.unit,
+              purchase_unit: m.purchase_unit || m.unit,
               pack_size: Number(m.pack_size) || 1, case_size: Number(m.case_size) || 1,
               average_price: Number(m.average_price) || 0,
             }));
@@ -1293,6 +1303,7 @@ function EmptiesModal({ stores, onClose, onSaved }: {
         const j = await r.json().catch(() => ({}));
         const list: ItemMeta[] = (j.materials || []).map((m: any) => ({
           material_id: m.id, name: m.name, category: m.category, unit: m.unit,
+          purchase_unit: m.purchase_unit || m.unit,
           pack_size: Number(m.pack_size) || 1, case_size: Number(m.case_size) || 1,
           average_price: Number(m.average_price) || 0,
         }));

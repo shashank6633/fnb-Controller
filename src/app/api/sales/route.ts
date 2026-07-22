@@ -65,10 +65,41 @@ export async function DELETE(request: Request) {
     const id = url.searchParams.get('id');
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
 
-    // Remove related inventory transactions (audit-aware: keep or clean?)
-    db.prepare('DELETE FROM inventory_transactions WHERE reference_id = ?').run(id);
-    const result = db.prepare('DELETE FROM sales WHERE id = ?').run(id);
-    return Response.json({ success: true, changes: result.changes });
+    const txn = db.transaction(() => {
+      // Reverse the sale's stock deduction BEFORE erasing its audit trail,
+      // otherwise current_stock stays deducted while the transactions that
+      // explain it vanish (ledger-vs-stock reconciliation breaks forever).
+      // Floor-routed portions (floor auto-deduct) live in store_stock_ledger
+      // (ref = sale id) and never touched raw_materials.current_stock, so
+      // restore only the central remainder and drop the ledger rows (store
+      // stock = SUM of ledger, so removing them restores the floor).
+      const floorRows = db.prepare(`
+        SELECT material_id, COALESCE(SUM(quantity), 0) AS qty
+        FROM store_stock_ledger WHERE ref = ? GROUP BY material_id
+      `).all(id) as any[];
+      const floorByMaterial = new Map<string, number>();
+      for (const r of floorRows) floorByMaterial.set(r.material_id, r.qty);
+
+      const txRows = db.prepare(`
+        SELECT material_id, COALESCE(SUM(quantity), 0) AS qty
+        FROM inventory_transactions WHERE reference_id = ? GROUP BY material_id
+      `).all(id) as any[];
+      const restoreStmt = db.prepare(
+        'UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime(\'now\') WHERE id = ?'
+      );
+      for (const r of txRows) {
+        const totalDeducted = -r.qty;                                   // deduction rows are negative
+        const floorDeducted = -(floorByMaterial.get(r.material_id) || 0); // ledger deductions are negative too
+        const centralDeducted = totalDeducted - floorDeducted;
+        if (centralDeducted !== 0) restoreStmt.run(centralDeducted, r.material_id);
+      }
+
+      db.prepare('DELETE FROM store_stock_ledger WHERE ref = ?').run(id);
+      db.prepare('DELETE FROM inventory_transactions WHERE reference_id = ?').run(id);
+      return db.prepare('DELETE FROM sales WHERE id = ?').run(id).changes;
+    });
+    const changes = txn();
+    return Response.json({ success: true, changes });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });
   }

@@ -150,6 +150,7 @@ export async function POST(request: Request) {
         INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
         VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
       `);
+      const getPackInfo = db.prepare(`SELECT pack_size, unit, purchase_unit FROM raw_materials WHERE id = ?`);
 
       let hasReject = false;
       for (const it of receivable) {
@@ -182,8 +183,24 @@ export async function POST(request: Request) {
             : `Ad-hoc GRN ${grnNumber}${invoice_number ? ' · invoice ' + invoice_number : ''}`;
           insPurchase.run(purchaseId, it.material_id, vendor || '', accepted, price, lineTotal, date,
                           noteTag, outletId);
-          bumpStock.run(accepted, price, date, it.material_id);
-          insTx.run(generateId(), it.material_id, accepted, purchaseId,
+          // ── Unit-basis boundary (CORE CONVENTION) ──────────────────────
+          // GRN lines are entered in PURCHASE units at ₹/purchase-unit (same
+          // basis as /api/purchases — also the only reading consistent with
+          // accepted × unit_price = line value). The `purchases` row above
+          // stays in purchase units (updateMaterialPrice ÷pack_size assumes
+          // it), but current_stock + inventory_transactions live in RECIPE
+          // units, so ×pack_size here under the SAME pack>1 + recipe≠purchase
+          // unit condition updateMaterialPrice applies. Negatives (back-
+          // corrections) convert identically. last_purchase_price stays
+          // ₹/purchase-unit (canonical — db.ts backfill derives it from
+          // purchases.unit_price).
+          const mat = getPackInfo.get(it.material_id) as any;
+          const packSize = Number(mat?.pack_size) || 1;
+          const ru = String(mat?.unit || '').toLowerCase().trim();
+          const pu = String(mat?.purchase_unit || mat?.unit || '').toLowerCase().trim();
+          const stockQty = (packSize > 1 && ru !== pu) ? accepted * packSize : accepted;
+          bumpStock.run(stockQty, price, date, it.material_id);
+          insTx.run(generateId(), it.material_id, stockQty, purchaseId,
                     accepted < 0 ? `BACK-CORRECTION ${grnNumber}` : `Ad-hoc GRN ${grnNumber}`,
                     outletId);
           touched.add(it.material_id);

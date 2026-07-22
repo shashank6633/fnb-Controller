@@ -1169,7 +1169,7 @@ export default function RecipesPage() {
   function addFormSubRecipe() {
     setFormSubRecipes((prev) => [
       ...prev,
-      { sub_recipe_id: '', quantity: 0, unit: 'kg' },
+      { sub_recipe_id: '', quantity: 0, unit: '' },
     ]);
   }
 
@@ -1177,6 +1177,13 @@ export default function RecipesPage() {
     setFormSubRecipes((prev) => {
       const copy = [...prev];
       (copy[index] as any)[field] = value;
+      // Costing everywhere is quantity × cost_per_unit, where cost_per_unit is
+      // ₹ per yield_unit with NO unit conversion — so the row's unit must
+      // always be the selected sub-recipe's yield unit.
+      if (field === 'sub_recipe_id') {
+        const sub = subRecipes.find((s) => s.id === value);
+        if (sub) copy[index].unit = sub.yield_unit;
+      }
       return copy;
     });
   }
@@ -1216,7 +1223,9 @@ export default function RecipesPage() {
           .map((sr) => ({
             sub_recipe_id: sr.sub_recipe_id,
             quantity: Number(sr.quantity),
-            unit: sr.unit,
+            // Persist the sub's yield unit — costing is quantity × cost_per_unit
+            // (₹ per yield_unit) with no conversion, so any other unit lies.
+            unit: subRecipes.find((s) => s.id === sr.sub_recipe_id)?.yield_unit || sr.unit,
           })),
       };
       if (editingRecipe) {
@@ -2396,17 +2405,11 @@ export default function RecipesPage() {
                       </div>
                       <div className="col-span-2">
                         {idx === 0 && <label className="block text-xs text-[#8B7355] mb-1">Unit</label>}
-                        <select
-                          className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-2 py-2 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
-                          value={sr.unit}
-                          onChange={(e) => updateFormSubRecipe(idx, 'unit', e.target.value)}
-                        >
-                          <option value="kg">kg</option>
-                          <option value="g">g</option>
-                          <option value="l">l</option>
-                          <option value="ml">ml</option>
-                          <option value="pcs">pcs</option>
-                        </select>
+                        {/* Unit is locked to the sub-recipe's yield unit: cost math is
+                            quantity × cost_per_unit (₹ per yield_unit), no conversion. */}
+                        <div className="w-full bg-[#FFF1E3]/60 border border-[#D4B896] rounded-lg px-2 py-2 text-sm text-[#8B7355]">
+                          {subRecipes.find((s) => s.id === sr.sub_recipe_id)?.yield_unit || sr.unit || '—'}
+                        </div>
                       </div>
                       <div className="col-span-2 flex items-center gap-2">
                         <span className="text-xs text-[#8B7355]">

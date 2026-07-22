@@ -20,8 +20,10 @@ import { getCurrentUser } from '@/lib/auth';
  *   body: { repair: [{ material_id: string, new_avg: number }] }
  *
  *   average_price is stored per RECIPE unit; a 'purchase'-basis rate is converted
- *   with the material's own pack_size (avg = rate / pack_size). 'recipe' basis is
- *   stored as-is.
+ *   with the material's own pack_size (avg = rate / pack_size) — but ONLY when
+ *   recipe unit ≠ purchase unit (same rule as updateMaterialPrice): when the two
+ *   units match (e.g. kg/kg with pack_size 15), the conversion factor is 1 and
+ *   the rate is stored as-is. 'recipe' basis is always stored as-is.
  *
  *   Every matched row also carries purchase_unit + latest_ppu (the basis-safe
  *   latest purchase price PER PURCHASE UNIT) so the client can render dual-unit
@@ -31,9 +33,11 @@ import { getCurrentUser } from '@/lib/auth';
  *       unmatched:[key], ambiguous:[{key,count}] }
  *
  * GET /api/inventory/update-rates?audit=1
- *   Basis-corruption scanner: flags materials with pack_size > 1 whose stored
- *   average_price looks like a PER-PURCHASE-UNIT price (i.e. ~pack× too big vs
- *   the latest real purchase). Rule: avg × pack > 5 × latest_ppu.
+ *   Basis-corruption scanner: flags materials with pack_size > 1 AND recipe
+ *   unit ≠ purchase unit whose stored average_price looks like a
+ *   PER-PURCHASE-UNIT price (i.e. ~pack× too big vs the latest real purchase).
+ *   Rule: avg × pack > 5 × latest_ppu. Same-unit rows (kg/kg pack 15) have
+ *   conversion factor 1 — avg ≡ ppu there is correct, never flagged.
  *   → { rows: [{ id, sku, name, unit, purchase_unit, pack, stored_avg,
  *                expected_avg (= latest_ppu / pack), latest_ppu, ratio }] }
  *
@@ -73,9 +77,12 @@ export async function GET(request: Request) {
     }
 
     const db = getDb();
-    // Every active material with a real pack (pack_size > 1), a stored avg and
-    // at least one purchase. Flag when the stored avg is implausibly PER-PURCHASE:
-    // avg × pack > 5 × latest real purchase price per purchase unit.
+    // Every active material with a real pack conversion (pack_size > 1 AND
+    // recipe unit ≠ purchase unit — same guard as updateMaterialPrice; kg/kg
+    // pack-15 rows have factor 1 so avg ≡ ppu is CORRECT, not corruption), a
+    // stored avg and at least one purchase. Flag when the stored avg is
+    // implausibly PER-PURCHASE: avg × pack > 5 × latest real purchase price
+    // per purchase unit.
     const candidates = db.prepare(`
       SELECT rm.id, rm.sku, rm.name, rm.unit, rm.purchase_unit, rm.pack_size, rm.average_price,
         (SELECT CASE
@@ -89,6 +96,7 @@ export async function GET(request: Request) {
       FROM raw_materials rm
       WHERE COALESCE(rm.is_active, 1) = 1
         AND COALESCE(rm.pack_size, 1) > 1
+        AND LOWER(rm.unit) <> LOWER(COALESCE(rm.purchase_unit, rm.unit))
         AND COALESCE(rm.average_price, 0) > 0
     `).all() as any[];
 
@@ -200,8 +208,15 @@ export async function POST(request: Request) {
       }
 
       const pack = Number(hit.pack_size) || 1;
-      const newAvg = basis === 'recipe' ? rate : (pack > 0 ? rate / pack : rate);
-      const lpRow = lpStmt.get(pack, pack, pack, pack, hit.id) as any;
+      // Pack conversion applies ONLY when recipe unit ≠ purchase unit (mirrors
+      // updateMaterialPrice): kg/kg with pack_size 15 has a conversion factor
+      // of 1, so a 'purchase' rate is already the recipe-unit rate.
+      const unitsDiffer =
+        String(hit.unit || '').toLowerCase() !==
+        String(hit.purchase_unit || hit.unit || '').toLowerCase();
+      const factor = pack > 1 && unitsDiffer ? pack : 1;
+      const newAvg = basis === 'recipe' ? rate : rate / factor;
+      const lpRow = lpStmt.get(factor, factor, factor, factor, hit.id) as any;
       matched.push({
         sku: hit.sku,
         name: hit.name,

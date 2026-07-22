@@ -30,15 +30,29 @@ export async function GET(request: Request) {
     const search = url.searchParams.get('search');
     const activeOnly = url.searchParams.get('active_only') === 'true';
 
+    // material_cost = per-SERVING cost for direct-sell items, mirroring how
+    // sales-import books cost (average_price × qty_per_unit). average_price is
+    // ₹ per RECIPE unit (g/ml/pcs), NOT per serving: for volume/weight materials
+    // it only becomes a serving cost once the pour size (direct_item_links.
+    // qty_per_unit, recipe units per item sold — e.g. 30 for a peg, 750 for a
+    // bottle) is configured; until then return NULL so the UI shows "—" instead
+    // of a ₹/ml price masquerading as a dish cost. pcs-style materials are
+    // 1 sold = 1 pc unless qty_per_unit overrides (e.g. bucket of 4).
     let query = `
       SELECT mi.*,
         r.total_cost as recipe_cost,
         r.food_cost_percent as recipe_food_cost_percent,
         rm.name as material_name,
-        rm.average_price as material_cost
+        CASE
+          WHEN LOWER(COALESCE(rm.unit, '')) IN ('ml', 'l', 'g', 'kg')
+            THEN CASE WHEN COALESCE(dil.qty_per_unit, 1) != 1
+                      THEN rm.average_price * dil.qty_per_unit END
+          ELSE rm.average_price * COALESCE(dil.qty_per_unit, 1)
+        END as material_cost
       FROM menu_items mi
       LEFT JOIN recipes r ON mi.recipe_id = r.id
       LEFT JOIN raw_materials rm ON mi.material_id = rm.id
+      LEFT JOIN direct_item_links dil ON dil.item_name = mi.name COLLATE NOCASE
       WHERE 1=1
     `;
     const params: any[] = [];

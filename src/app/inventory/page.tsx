@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
+import { packFactor } from '@/lib/pack-units';
 import Toggle from '@/components/Toggle';
 
 /* ------------------------------------------------------------------ */
@@ -395,13 +396,15 @@ export default function InventoryPage() {
       storage_location:       (m as any).storage_location       || '',
       shelf_life_days:        (m as any).shelf_life_days        ?? 0,
       priority:               (m as any).priority               ?? 2,
-      // Show price in purchase-unit terms (₹/kg) for editing — easier to read off invoices
+      // Show price in purchase-unit terms (₹/kg) for editing — easier to read off invoices.
+      // packFactor guards the conversion: it is 1 unless pack_size > 1 AND the
+      // recipe unit differs from the purchase unit (kg/kg rows convert by 1).
       avg_price_per_purchase_unit: Number(
-        (((m as any).average_price || 0) * ((m as any).pack_size || 1)).toFixed(4)
+        (((m as any).average_price || 0) * packFactor(m as any)).toFixed(4)
       ),
       // Show reorder level in purchase-unit terms (kg / BTL) — easier to think about
       reorder_level_purchase_unit: Number(
-        ((m.reorder_level || 0) / ((m as any).pack_size || 1)).toFixed(3)
+        ((m.reorder_level || 0) / packFactor(m as any)).toFixed(3)
       ),
     });
     setFormError(null);
@@ -420,9 +423,11 @@ export default function InventoryPage() {
       setFormError(null);
       const isEdit = !!formData.id;
       // Convert avg_price_per_purchase_unit (₹/kg) → average_price (₹/g) by
-      // dividing by pack_size. The stored value is always per recipe-unit so
-      // recipe-cost math (qty × average_price) stays correct.
-      const ps = Number(formData.pack_size) || 1;
+      // dividing by the guarded pack factor (1 when recipe unit = purchase
+      // unit, mirroring /api/inventory/update-rates). The stored value is
+      // always per recipe-unit so recipe-cost math (qty × average_price)
+      // stays correct.
+      const ps = packFactor(formData as any);
       const avgPerPurchase = formData.avg_price_per_purchase_unit;
       const reorderPerPurchase = formData.reorder_level_purchase_unit;
       const bodyToSend: any = { ...formData };
@@ -875,10 +880,13 @@ export default function InventoryPage() {
                         </td>
                         <td className="px-4 py-3 text-right text-[#6B5744] font-mono">
                           {(() => {
-                            const ps = (m as any).pack_size;
+                            // Guarded: kg/kg rows with a stray pack_size have no
+                            // real conversion — render them as plain 1:1, never
+                            // "15 kg per 1 kg".
+                            const ps = packFactor(m as any);
                             const ru = m.unit;
                             const pu = (m as any).purchase_unit || m.unit;
-                            if (ps && ps !== 1) {
+                            if (ps > 1) {
                               return (
                                 <>
                                   {ps} <span className="text-[10px] text-[#8B7355]">{ru}</span>
@@ -891,7 +899,7 @@ export default function InventoryPage() {
                         </td>
                         <td className="px-4 py-3 text-[#3D2614] font-mono">
                           {(() => {
-                            const ps = (m as any).pack_size || 1;
+                            const ps = packFactor(m as any);
                             const pu = (m as any).purchase_unit || m.unit;
                             if (ps > 1) {
                               return (
@@ -908,9 +916,9 @@ export default function InventoryPage() {
                           })()}
                         </td>
                         {/* Latest ₹ — most recent purchase price PER PURCHASE UNIT, right
-                            beside Current Stock. Derived server-side from total/qty of the
-                            last purchase (basis-safe against historical rows whose quantity
-                            was recorded in recipe units instead of purchase units). */}
+                            beside Current Stock. Derived server-side as total/qty of the
+                            last purchase (purchase rows record quantity in purchase units
+                            per the core convention). */}
                         <td className="px-4 py-3 text-right text-[#6B5744] font-mono"
                             title={(m as any).last_purchase_date ? `Last bought ${(m as any).last_purchase_date}` : 'Never purchased'}>
                           {(() => {
@@ -930,7 +938,7 @@ export default function InventoryPage() {
                         </td>
                         <td className="px-4 py-3 text-right text-[#8B7355] font-mono">
                           {(() => {
-                            const ps = (m as any).pack_size || 1;
+                            const ps = packFactor(m as any);
                             const pu = (m as any).purchase_unit || m.unit;
                             if (ps > 1) {
                               return (
@@ -1012,7 +1020,7 @@ export default function InventoryPage() {
                           </span>
                         </td>
                         {(() => {
-                          const ps = (m as any).pack_size || 1;
+                          const ps = packFactor(m as any);
                           const pu = (m as any).purchase_unit || m.unit;
                           const showAsPurchase = ps > 1;
                           const fmtQ = (q: number) =>
@@ -1196,7 +1204,7 @@ export default function InventoryPage() {
                   className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] font-mono focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
                 />
                 {(() => {
-                  const ps = Number(formData.pack_size) || 1;
+                  const ps = packFactor(formData as any);
                   const apu = Number(formData.avg_price_per_purchase_unit);
                   if (!Number.isFinite(apu) || apu <= 0 || ps <= 0) return null;
                   const perRecipe = apu / ps;
@@ -1288,7 +1296,7 @@ export default function InventoryPage() {
                 </div>
 
                 {(() => {
-                  const ps = Number(formData.pack_size) || 1;
+                  const ps = packFactor(formData as any);
                   const cs = Number(formData.case_size) || 1;
                   const rpu = Number(formData.reorder_level_purchase_unit);
                   if (!Number.isFinite(rpu) || rpu <= 0) return null;
@@ -1584,15 +1592,18 @@ interface AuditRow {
 const fmtRate = (n: number) =>
   '₹' + (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: Math.abs(n) < 100 ? 4 : 2 });
 
-/** Dual-basis rendering: "₹3.44/ml = ₹2,580/BTL" (pack>1) or "₹458/pcs". */
+/** Dual-basis rendering: "₹3.44/ml = ₹2,580/BTL" (real pack conversion) or
+ *  "₹458/pcs". Guarded via packFactor so a kg/kg row with a stray pack_size
+ *  never shows a bogus "= ₹2,655/kg" second basis. */
 function DualAvg({ perRecipe, unit, pack, pu, className }: {
   perRecipe: number; unit: string; pack: number; pu: string; className?: string;
 }) {
   const v = Number(perRecipe) || 0;
+  const pf = packFactor({ unit, purchase_unit: pu, pack_size: pack });
   return (
     <span className={`whitespace-nowrap ${className || ''}`}>
       {fmtRate(v)}/{unit}
-      {pack > 1 && <span> = {fmtRate(v * pack)}/{pu || unit}</span>}
+      {pf > 1 && <span> = {fmtRate(v * pf)}/{pu || unit}</span>}
     </span>
   );
 }
@@ -1669,7 +1680,7 @@ function UpdateRatesModal({ onClose, onApplied, canAudit }: { onClose: () => voi
   //    → these look like per-recipe (₹/ml) values.
   const modeWarning = useMemo(() => {
     if (!preview || !preview.matched?.length) return null;
-    const eligible = preview.matched.filter(m => (m.pack_size || 1) > 1 && (m.latest_ppu || 0) > 0);
+    const eligible = preview.matched.filter(m => packFactor(m) > 1 && (m.latest_ppu || 0) > 0);
     if (!eligible.length) return null;
     if (preview.basis === 'recipe') {
       const hits = eligible.filter(m => {
@@ -1922,7 +1933,10 @@ function UpdateRatesModal({ onClose, onApplied, canAudit }: { onClose: () => voi
 // Because requisition/party costs read average_price LIVE, the fix flows to all
 // past requisitions immediately.
 function EditableRate({ m, onSaved }: { m: RawMaterial; onSaved: () => void }) {
-  const ps = Number((m as any).pack_size) || 1;
+  // Guarded factor (1 when recipe unit = purchase unit) — must mirror the
+  // server's update-rates conversion or a kg/kg pack-15 row would display
+  // average_price × 15 and re-save it 15× inflated.
+  const ps = packFactor(m as any);
   const pu = (m as any).purchase_unit || m.unit;
   const current = (Number(m.average_price) || 0) * ps;   // ₹ per purchase unit
   const [editing, setEditing] = useState(false);

@@ -31,6 +31,7 @@ import {
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
+import { packFactor } from '@/lib/pack-units';
 import TabScroller from '@/components/TabScroller';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
@@ -587,7 +588,9 @@ export default function ClosingStockByLocationPage() {
   // Total physical count in RECIPE units:
   //   cases × (case_size × pack_size) + bottles × pack_size + loose units.
   const physicalFor = (it: Item, casesRaw?: string, bottlesRaw?: string, looseRaw?: string): number | null => {
-    const packSize = it.pack_size && it.pack_size > 1 ? it.pack_size : 1;
+    // packFactor guards pack_size with recipe-unit ≠ purchase-unit (same rule as
+    // /api/purchases) — kg/kg pack rows like BUTCHERY COVER 15KG convert ×1.
+    const packSize = packFactor(it);
     const caseSize = it.case_size && it.case_size > 1 ? it.case_size : 1;
     const num = (s?: string) => (s != null && s !== '' && !isNaN(Number(s))) ? Number(s) : null;
     const c = num(casesRaw), b = num(bottlesRaw), l = num(looseRaw);
@@ -737,13 +740,14 @@ export default function ClosingStockByLocationPage() {
                 </thead>
                 <tbody>
                   {visibleItems.map(it => {
-                    const inPurchase = !!(it.pack_size && it.pack_size > 1);
+                    const packConv = packFactor(it); // 1 when recipe unit ≡ purchase unit
+                    const inPurchase = packConv > 1;
                     const sysDisplay = inPurchase
-                      ? `${(it.current_stock / it.pack_size!).toFixed(2)} ${it.purchase_unit}`
+                      ? `${(it.current_stock / packConv).toFixed(2)} ${it.purchase_unit}`
                       : `${it.current_stock} ${it.unit}`;
                     const todayDisplay = it.today_count != null
                       ? (inPurchase
-                          ? `${(it.today_count / it.pack_size!).toFixed(2)} ${it.purchase_unit}`
+                          ? `${(it.today_count / packConv).toFixed(2)} ${it.purchase_unit}`
                           : `${it.today_count} ${it.unit}`)
                       : null;
                     const isLow = (it.current_stock || 0) < (it.reorder_level || 0);
@@ -766,7 +770,7 @@ export default function ClosingStockByLocationPage() {
                         <td className="py-1.5 px-3 text-right font-mono">{sysDisplay}</td>
                         <td className="py-1.5 px-3">
                           {(() => {
-                            const packSize = it.pack_size && it.pack_size > 1 ? it.pack_size : 1;
+                            const packSize = packFactor(it); // guarded: 1 when unit ≡ purchase_unit
                             const caseSize = it.case_size && it.case_size > 1 ? it.case_size : 1;
                             const showCases = caseSize > 1;   // outer case of bottles
                             const showLoose = packSize > 1;   // open/partial bottle (ml/g)

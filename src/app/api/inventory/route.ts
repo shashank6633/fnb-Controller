@@ -39,16 +39,16 @@ export async function GET(request: Request) {
       SELECT rm.*,
         COALESCE((SELECT unit_price FROM purchases WHERE material_id = rm.id ORDER BY date DESC, created_at DESC LIMIT 1), 0) as last_purchase_price,
         COALESCE((SELECT date FROM purchases WHERE material_id = rm.id ORDER BY date DESC, created_at DESC LIMIT 1), '') as last_purchase_date,
-        -- Latest price PER PURCHASE UNIT, derived from total/qty of the most
-        -- recent purchase. Historical rows mix quantity bases (some in purchase
-        -- units, some in recipe units) — detect: a qty that's a clean multiple
-        -- of pack_size (and >= one pack) was recorded in recipe units, so scale
-        -- total/qty back up by pack. Basis-safe where raw unit_price is not.
-        COALESCE((SELECT CASE
-             WHEN COALESCE(rm.pack_size, 1) > 1 AND p.quantity >= rm.pack_size AND (p.quantity % rm.pack_size) = 0
-               THEN (p.total_price / p.quantity) * rm.pack_size
-             ELSE (p.total_price / p.quantity)
-           END
+        -- Latest price PER PURCHASE UNIT = total/qty of the most recent purchase.
+        -- Purchase rows record quantity in PURCHASE units (core convention), so
+        -- total/qty already IS ₹/purchase-unit — no pack conversion here. The old
+        -- "qty is a clean multiple of pack ⇒ recorded in recipe units, ×pack"
+        -- repair guess false-positived on every legitimate qty that's a multiple
+        -- of a small pack (6 packs of a pack-2 cover → price shown ×2) and, via
+        -- SQLite's integer %, on ALL fractional packs — inflating this column.
+        -- Mis-based legacy rows are data corruption for the ₹-audit to repair,
+        -- not something to guess at per-row at display time.
+        COALESCE((SELECT p.total_price / p.quantity
            FROM purchases p
            WHERE p.material_id = rm.id AND p.quantity > 0 AND COALESCE(p.total_price, 0) > 0
            ORDER BY p.date DESC, p.created_at DESC LIMIT 1), 0) as latest_price_purchase_unit,

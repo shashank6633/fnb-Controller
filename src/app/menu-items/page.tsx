@@ -239,8 +239,10 @@ export default function MenuItemsPage() {
       header.forEach((h: any, i: number) => {
         if (!h) return;
         const key = String(h).toLowerCase().trim();
+        // Stable identifier from OUR export — matches the exact item even on rename
+        if ((key === 'item id' || key === 'menu item id') && colIdx.itemId === undefined) colIdx.itemId = i;
         // Category column — "Category Name" (POS) or "Category" (template)
-        if ((key === 'category name' || key === 'category') && colIdx.category === undefined) colIdx.category = i;
+        else if ((key === 'category name' || key === 'category') && colIdx.category === undefined) colIdx.category = i;
         // Name column — "Product Name" (POS) or "Menu Item" (template)
         else if ((key === 'product name' || key === 'menu item' || key === 'item name' || key === 'name') && colIdx.name === undefined) colIdx.name = i;
         else if (key === 'selling price' || key === 'selling price (₹)' || key === 'price') colIdx.sellingPrice = i;
@@ -301,6 +303,7 @@ export default function MenuItemsPage() {
         const cuisine = colIdx.cuisine !== undefined ? String(r[colIdx.cuisine] || '').trim() : '';
 
         parsedRows.push({
+          item_id: colIdx.itemId !== undefined ? String(r[colIdx.itemId] || '').trim() : '',
           name,
           category: isTemplate && rawCategory ? slugify(rawCategory) : rawCategory,
           selling_price: Number(r[colIdx.sellingPrice]) || 0,

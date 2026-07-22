@@ -11,7 +11,12 @@ import { getCurrentOutletId } from '@/lib/auth';
  *                                   = Purchases − Recipe − Closing Stock
  *
  * Where:
- *   - Purchases          = Σ quantity in `purchases` table up to & incl. count date
+ *   - Purchases          = Σ quantity in `purchases` table up to & incl. count date,
+ *                          converted purchase-units → RECIPE units (× pack_size under
+ *                          the same guard every purchase writer uses: pack_size > 1
+ *                          AND recipe unit ≠ purchase unit). `purchases.quantity` is
+ *                          stored in PURCHASE units (kg/BTL); everything else in this
+ *                          formula (recipe, wastage, physical) is RECIPE units (g/ml).
  *   - Recipe Consumption = Σ |qty| in `inventory_transactions` of type
  *                          ('sale' | 'party' | 'staff_meal') up to & incl. count date
  *   - Internal transfers (`type='issue'` or imported requisitions) are EXCLUDED.
@@ -69,8 +74,15 @@ export async function GET(request: Request) {
              cs.system_stock AS system_stock_snapshot,
              rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
              rm.category, rm.average_price,
+             -- purchases.quantity is PURCHASE units; convert to RECIPE units with the
+             -- same guarded pack factor every purchase writer applies to stock (see
+             -- /api/purchases POST). Factor is a per-material constant, so scaling
+             -- the SUM is exact.
              COALESCE((SELECT SUM(p.quantity) FROM purchases p
-                        WHERE p.material_id = cs.material_id AND p.date <= cs.date), 0) AS purchases_to_date,
+                        WHERE p.material_id = cs.material_id AND p.date <= cs.date), 0)
+               * CASE WHEN COALESCE(rm.pack_size, 1) > 1
+                           AND LOWER(rm.unit) <> LOWER(COALESCE(rm.purchase_unit, rm.unit))
+                      THEN rm.pack_size ELSE 1 END AS purchases_to_date,
              COALESCE((SELECT SUM(ABS(it.quantity)) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type IN ('sale', 'party', 'staff_meal')

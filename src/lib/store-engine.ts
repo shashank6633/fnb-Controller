@@ -535,6 +535,9 @@ export interface TransferItemRow {
   material_name: string;
   category: string;
   unit: string;
+  /** Needed by pack-units packFactor (pack applies only when unit ≠ purchase_unit) —
+   *  omitting it silently collapses the CBL conversion to 1:1 on the client. */
+  purchase_unit: string;
   pack_size: number;
   case_size: number;
   qty_requested: number;
@@ -922,6 +925,7 @@ export function getTransfer(db: Database, id: string): TransferRow | null {
 
   const itemRows = db.prepare(`
     SELECT ti.*, rm.name AS material_name, rm.category, rm.unit,
+           COALESCE(rm.purchase_unit, rm.unit) AS purchase_unit,
            COALESCE(rm.pack_size, 1) AS pack_size, COALESCE(rm.case_size, 1) AS case_size
     FROM store_transfer_items ti
     JOIN raw_materials rm ON rm.id = ti.material_id
@@ -943,6 +947,7 @@ export function getTransfer(db: Database, id: string): TransferRow | null {
       material_name: r.material_name,
       category: r.category,
       unit: r.unit,
+      purchase_unit: r.purchase_unit || r.unit,
       pack_size: Number(r.pack_size) || 1,
       case_size: Number(r.case_size) || 1,
       qty_requested: qReq,
@@ -1099,7 +1104,9 @@ export interface FloorReconRow {
   /** ACTUAL floor consumption (recipe-units). Physical branch: opening+inflow−closing.
    *  Ledger branch (auto-deduct on): Σ outward ledger magnitude. */
   actual_qty: number;
-  /** Physical-branch components (recipe-units). */
+  /** Physical-branch components (recipe-units). inflow_qty is NET of
+   *  transfer-OUT rows (may be negative) so internal transfers never inflate
+   *  actual_qty = opening + inflow − closing − known_non_sale. */
   opening_qty: number;
   inflow_qty: number;
   closing_qty: number;
@@ -1248,8 +1255,11 @@ const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
  *                    before `from` / latest within [from,to]); when a count is
  *                    missing, fall back to the ledger system-qty as-of that
  *                    boundary (opening_counted / closing_counted flag which).
- *                    inflow = Σ positive store_stock_ledger quantity in period
- *                    (transfers/inward/purchase/opening/adjustment credits).
+ *                    inflow = NET Σ store_stock_ledger quantity in period over
+ *                    positive rows (transfer-in/inward/purchase/opening/
+ *                    adjustment credits) AND negative 'transfer' rows —
+ *                    transfer-OUTs (returns to central, issues to floors) are
+ *                    netted out so internal movement never reads as leak.
  *                • auto-deduct ON → mode 'ledger':
  *                    Σ |outward| store_stock_ledger sale rows in the period
  *                    (the auto-posted floor consumption).
@@ -1373,10 +1383,17 @@ export function floorReconciliation(
   // ledger timestamp by +330 minutes so ACTUAL is bucketed on the SAME IST day
   // as EXPECTED — otherwise late-night bar hours (00:00–05:30 IST) land on the
   // previous UTC day and misalign the two sides at every day boundary.
+  // NET inflow: every positive row PLUS negative 'transfer' rows. A transfer-OUT
+  // (floor returns stock to central, or central issues to floors) reduces the
+  // store's closing but is NOT consumption — if it were left out of inflow it
+  // would inflate ACTUAL (= opening + inflow − closing) by the full transferred
+  // qty and read as an unbilled leak ₹. Netting it here keeps the row identity
+  // actual = opening + inflow − closing − known_non_sale intact (inflow can go
+  // negative, e.g. the central store in an unscoped run).
   const inflowStmt = db.prepare(`
     SELECT material_id, SUM(quantity) AS q
     FROM store_stock_ledger
-    WHERE store_id = ? AND quantity > 0
+    WHERE store_id = ? AND (quantity > 0 OR txn_type = 'transfer')
       AND date(created_at, '+330 minutes') >= ? AND date(created_at, '+330 minutes') <= ?
     GROUP BY material_id
   `);

@@ -16,6 +16,14 @@ import { generateId } from '@/lib/db';
  *       balance_after = new on_hand). This is what departments later draw down
  *       to record leftover balance / consumption post-party.
  *
+ * UNITS: requisition_items.quantity_issued is in ri.unit — the unit the line
+ * was REQUESTED in, which may be the material's PURCHASE unit (1 BTL = 750 ml)
+ * — while current_stock and department_materials.on_hand are RECIPE units
+ * (average_price is ₹/recipe-unit). Convert ONCE here with the house
+ * pack-factor CASE (byte-equivalent to department-consumption route.ts SQL and
+ * dept-stock reqPackFactor): × pack_size only when the line was requested in
+ * the purchase unit. Legacy rows with a blank ri.unit stay ×1.
+ *
  * The 'party_consumption' inventory_transactions row is the single source of
  * truth for de-duplication: if one already exists for this requisition, the
  * transfer has already happened and this is a no-op. That makes the helper safe
@@ -27,7 +35,7 @@ import { generateId } from '@/lib/db';
  * @param db         open better-sqlite3 database
  * @param reqId      requisition id
  * @param actorEmail the store person performing the fulfilment (stamped on dept ledger)
- * @returns { transferred: Array<{material_id, issued, department_id}>, total }
+ * @returns { transferred: Array<{material_id, issued, department_id}>, total } — issued in RECIPE units
  */
 export function applyPartyFulfillment(
   db: Database.Database,
@@ -54,7 +62,8 @@ export function applyPartyFulfillment(
 
   const items = db.prepare(`
     SELECT ri.id, ri.material_id, ri.quantity_issued, ri.department_id,
-           rm.current_stock
+           ri.unit AS req_unit,
+           rm.current_stock, rm.unit, rm.purchase_unit, rm.pack_size
     FROM requisition_items ri
     JOIN raw_materials rm ON rm.id = ri.material_id
     WHERE ri.req_id = ?
@@ -94,8 +103,19 @@ export function applyPartyFulfillment(
 
   const txn = db.transaction(() => {
     for (const it of items) {
-      const issued = Number(it.quantity_issued) || 0;
-      if (issued <= 0) continue;
+      const issuedReq = Number(it.quantity_issued) || 0; // in ri.unit
+      if (issuedReq <= 0) continue;
+      // ri.unit → RECIPE units: the house pack-factor CASE (see header). Kept
+      // byte-equivalent to department-consumption route.ts SQL and dept-stock
+      // reqPackFactor: emptiness guarded with trim, purchase-/recipe-unit
+      // equality on the RAW ri.unit.
+      const packFactor =
+        (String(it.req_unit ?? '').trim() !== '' &&
+         it.req_unit === it.purchase_unit &&
+         it.req_unit !== it.unit &&
+         (Number(it.pack_size) || 1) > 1)
+          ? Number(it.pack_size) : 1;
+      const issued = issuedReq * packFactor; // RECIPE units
       const deptId: string | null = it.department_id || req.department_id || null;
 
       // STORE: decrement current_stock + ledger row.

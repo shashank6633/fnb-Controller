@@ -79,29 +79,35 @@ export async function GET(req: Request) {
       const ids = new Set<string>();
       for (const r of result.rows) ids.add(r.material_id);
       for (const p of result.unattributed_party) ids.add(p.material_id);
-      const meta = new Map<string, { purchase_unit: string; case_size: number; sku: string }>();
+      const meta = new Map<string, { purchase_unit: string; pack_size: number; case_size: number; sku: string }>();
       if (ids.size > 0) {
         const idList = [...ids];
         const ph = idList.map(() => '?').join(',');
         for (const m of db.prepare(`
           SELECT id, COALESCE(purchase_unit, '') AS purchase_unit,
+                 COALESCE(pack_size, 1) AS pack_size,
                  COALESCE(case_size, 1) AS case_size, COALESCE(sku, '') AS sku
           FROM raw_materials WHERE id IN (${ph})
-        `).all(...idList) as { id: string; purchase_unit: string; case_size: number; sku: string }[]) {
+        `).all(...idList) as { id: string; purchase_unit: string; pack_size: number; case_size: number; sku: string }[]) {
           meta.set(m.id, {
             purchase_unit: m.purchase_unit || '',
+            pack_size: Number(m.pack_size) || 1,
             case_size: Number(m.case_size) || 1,
             sku: m.sku || '',
           });
         }
       }
-      const decorate = <T extends { material_id: string; unit: string }>(row: T) => {
+      const decorate = <T extends { material_id: string; unit: string; pack_size?: number }>(row: T) => {
         const m = meta.get(row.material_id);
         return {
           ...row,
           // fall back to the recipe unit when no distinct purchase unit is set,
           // matching pack-units' packFactor (unit === purchase_unit ⇒ no pack).
           purchase_unit: m?.purchase_unit || row.unit,
+          // main rows carry pack_size from the engine; party rows do NOT — fill
+          // it here so the page's CBL breakdown doesn't collapse to pack_size=1
+          // (which turned a 2cs+9btl+450ml party draw into "2,100 cs").
+          pack_size: Number(row.pack_size) || m?.pack_size || 1,
           case_size: m?.case_size || 1,
           sku: m?.sku || '',
         };

@@ -131,11 +131,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     const settle = db.transaction(() => {
       // A held bill already wrote its sales/inventory rows — don't double-write.
+      const freshDeduct = db.prepare('SELECT recipe_deducted_at FROM order_items WHERE id = ?');
+      const stampDeduct = db.prepare("UPDATE order_items SET recipe_deducted_at = datetime('now') WHERE id = ?");
       for (const it of (fromHold ? [] : items)) {
         // pos_id from the menu item (stable link); fall back to none.
         const mi = it.menu_item_id
           ? db.prepare('SELECT pos_id FROM menu_items WHERE id = ?').get(it.menu_item_id) as any
           : null;
+        // Re-read the deduction stamp INSIDE the transaction: a KDS bump can
+        // complete between the items read above and here (across the req.json()
+        // await), and the stale row would otherwise deduct a second time.
+        const alreadyDeducted = !!(freshDeduct.get(it.id) as any)?.recipe_deducted_at;
         recordSale(db, {
           item_name: it.name,
           recipe_id: it.recipe_id,
@@ -143,7 +149,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // Already consumed at KOT-complete? Record the sale (revenue) but don't
           // deduct stock again. Not-yet-completed items (e.g. quick-settled without
           // a KDS bump) still deduct here as the backstop.
-          skip_inventory: !!it.recipe_deducted_at,
+          skip_inventory: alreadyDeducted,
           // Route the backstop deduct to the floor bar store (no-op unless
           // tm_floor_autodeduct is on and skip_inventory is false).
           store_id: floorStoreId,
@@ -159,6 +165,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           pos_item_name: it.name,
           outlet_id: outletId,
         });
+        // Stamp the backstop deduct so a later KDS bump (the settled order still
+        // passes bump's status !== 'void' check) can't deduct these items again.
+        // Same recipe gate as recordSale's deduct ('' never deducts). Inside the
+        // transaction, so a recordSale throw rolls the stamp back too.
+        if (!alreadyDeducted && it.recipe_id) stampDeduct.run(it.id);
       }
       // Store the computed breakdown before marking settled so the settled row
       // is the single source of truth for the charged amounts. A held bill's

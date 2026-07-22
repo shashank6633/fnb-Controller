@@ -62,15 +62,24 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     } catch (e) { console.error('[hold floor-resolve]', id, e); floorStoreId = undefined; }
 
     const hold = db.transaction(() => {
+      const freshDeduct = db.prepare('SELECT recipe_deducted_at FROM order_items WHERE id = ?');
+      const stampDeduct = db.prepare("UPDATE order_items SET recipe_deducted_at = datetime('now') WHERE id = ?");
       for (const it of items) {
         const mi = it.menu_item_id ? db.prepare('SELECT pos_id FROM menu_items WHERE id = ?').get(it.menu_item_id) as any : null;
+        // Re-read the deduction stamp INSIDE the transaction (a KDS bump can land
+        // across the req.json() await), and stamp the backstop deduct so a later
+        // bump (an 'on_hold' order passes bump's status !== 'void' check) can't
+        // deduct these items again — settle-from-hold skips its item loop, so
+        // nothing downstream would ever repair a double-deduct here.
+        const alreadyDeducted = !!(freshDeduct.get(it.id) as any)?.recipe_deducted_at;
         recordSale(db, {
           item_name: it.name, recipe_id: it.recipe_id, quantity_sold: it.quantity,
-          skip_inventory: !!it.recipe_deducted_at, store_id: floorStoreId,
+          skip_inventory: alreadyDeducted, store_id: floorStoreId,
           bill_type: order.bill_type || 'normal', selling_price: it.unit_price, date, sale_time: saleTime,
           order_id: order.id, category: it.station || null, server: order.server_name || null,
           order_type: order.order_type || 'dine-in', pos_item_id: mi?.pos_id || null, pos_item_name: it.name, outlet_id: outletId,
         });
+        if (!alreadyDeducted && it.recipe_id) stampDeduct.run(it.id);
       }
       db.prepare(`
         UPDATE orders SET status = 'on_hold', service_charge = ?, discount = ?, tax_total = ?, total = ?,

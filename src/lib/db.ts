@@ -3823,7 +3823,7 @@ export function recalculateSubRecipeCost(db: Database.Database, subRecipeId: str
   db.prepare(`
     UPDATE sub_recipes SET total_cost = ?, cost_per_unit = ?, updated_at = datetime('now')
     WHERE id = ?
-  `).run(Math.round(totalCost * 100) / 100, Math.round(costPerUnit * 100) / 100, subRecipeId);
+  `).run(Math.round(totalCost * 100) / 100, Math.round(costPerUnit * 10000) / 10000, subRecipeId);
 
   // Cascade: update all recipes using this sub-recipe
   const linkedRecipes = db.prepare(`
