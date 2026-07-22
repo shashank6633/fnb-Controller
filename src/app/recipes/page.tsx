@@ -430,6 +430,11 @@ export default function RecipesPage() {
     return Array.from(cats).sort();
   }, [recipes]);
 
+  const subRecipeCategories = useMemo(() => {
+    const cats = new Set(subRecipes.map((s) => s.category).filter(Boolean));
+    return Array.from(cats).sort();
+  }, [subRecipes]);
+
   // Build a map: recipe_id → { count, names[] } so each card knows whether it's
   // linked to a menu item (and which one). A linked recipe shows a green ✓ badge;
   // an unlinked recipe shows an amber "no menu link" hint.
@@ -1279,6 +1284,21 @@ export default function RecipesPage() {
     }
   }
 
+  // Category-only quick update (list rows / cards / detail header).
+  // PUT with just {id, category} — the API leaves name, price, ingredients
+  // and sub-recipes untouched.
+  async function quickSetCategory(recipeId: string, category: string) {
+    await api('/api/recipes', { method: 'PUT', body: { id: recipeId, category } });
+    setSelectedRecipe((prev) => (prev && prev.id === recipeId ? { ...prev, category } : prev));
+    await fetchRecipes();
+  }
+
+  async function quickSetSubCategory(subId: string, category: string) {
+    await api('/api/sub-recipes', { method: 'PUT', body: { id: subId, category } });
+    setSelectedSubRecipe((prev) => (prev && prev.id === subId ? { ...prev, category } : prev));
+    await fetchSubRecipes();
+  }
+
   async function handleDeleteRecipe(id: string) {
     if (!confirm('Deactivate this recipe?')) return;
     await api(`/api/recipes?id=${id}`, { method: 'DELETE' });
@@ -1304,7 +1324,7 @@ export default function RecipesPage() {
     return list.map((ing, idx) => (
       <div key={idx} className="grid grid-cols-12 gap-2 items-end mb-2">
         {/* Material */}
-        <div className="col-span-3">
+        <div className="col-span-4">
           {idx === 0 && <label className="block text-xs text-[#8B7355] mb-1">Material</label>}
           <MaterialPicker
             value={ing.material_id}
@@ -1375,14 +1395,14 @@ export default function RecipesPage() {
           />
         </div>
         {/* Brand */}
-        <div className="col-span-2">
+        <div className="col-span-1">
           {idx === 0 && <label className="block text-xs text-[#8B7355] mb-1">Brand (opt)</label>}
           <input
             type="text"
             className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-2 py-2 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
             value={ing.brand_preference}
             onChange={(e) => updateFormIngredient(setter, idx, 'brand_preference', e.target.value)}
-            placeholder="Optional"
+            placeholder="Opt"
           />
         </div>
         {/* Default toggle */}
@@ -1453,7 +1473,11 @@ export default function RecipesPage() {
           <div>
             <h1 className="text-2xl font-bold text-[#2D1B0E]">{r.name}</h1>
             <div className="flex items-center gap-3 mt-2">
-              {r.category && <span className="badge badge-primary">{r.category}</span>}
+              <CategoryChip
+                value={r.category || ''}
+                categories={recipeCategories}
+                onPick={(c) => quickSetCategory(r.id, c)}
+              />
               <span className="badge badge-primary">v{r.version}</span>
             </div>
           </div>
@@ -1656,7 +1680,11 @@ export default function RecipesPage() {
           <div>
             <h1 className="text-2xl font-bold text-[#2D1B0E]">{sr.name}</h1>
             <div className="flex items-center gap-3 mt-2">
-              {sr.category && <span className="badge badge-primary">{sr.category}</span>}
+              <CategoryChip
+                value={sr.category || ''}
+                categories={subRecipeCategories}
+                onPick={(c) => quickSetSubCategory(sr.id, c)}
+              />
               <span className="badge badge-primary">v{sr.version}</span>
             </div>
           </div>
@@ -2066,7 +2094,13 @@ export default function RecipesPage() {
                               <p className="font-semibold text-[#2D1B0E] text-[13px] truncate max-w-[280px]">{recipe.name}</p>
                               <p className="text-[11px] text-[#8B7355]">v{recipe.version} · {ingCount} ingredient{ingCount === 1 ? '' : 's'}</p>
                             </td>
-                            <td className="py-2.5 px-3 text-[13px] text-[#3D2614]">{recipe.category || <span className="text-[#C4B09A]">—</span>}</td>
+                            <td className="py-2.5 px-3 text-[13px] text-[#3D2614]">
+                              <CategoryChip
+                                value={recipe.category || ''}
+                                categories={recipeCategories}
+                                onPick={(c) => quickSetCategory(recipe.id, c)}
+                              />
+                            </td>
                             <td className="py-2.5 px-3">
                               {isLinked
                                 ? <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200" title={link!.names.slice(0, 4).join(' · ')}>Linked{link!.count > 1 ? ` ×${link!.count}` : ''}</span>
@@ -2117,7 +2151,14 @@ export default function RecipesPage() {
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
                           <p className="font-semibold text-[#2D1B0E] text-sm leading-snug">{recipe.name}</p>
-                          <p className="text-[11px] text-[#8B7355]">{recipe.category || 'Uncategorised'} · v{recipe.version} · {ingCount} ingredient{ingCount === 1 ? '' : 's'}</p>
+                          <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                            <CategoryChip
+                              value={recipe.category || ''}
+                              categories={recipeCategories}
+                              onPick={(c) => quickSetCategory(recipe.id, c)}
+                            />
+                            <span className="text-[11px] text-[#8B7355]">v{recipe.version} · {ingCount} ingredient{ingCount === 1 ? '' : 's'}</span>
+                          </div>
                         </div>
                         <div className="flex items-center shrink-0">
                           <button onClick={() => openEditRecipe(recipe)} title="Edit recipe"
@@ -2183,7 +2224,11 @@ export default function RecipesPage() {
                   <div className="mb-3">
                     <h3 className="text-lg font-semibold text-[#2D1B0E] truncate">{sr.name}</h3>
                     <div className="flex items-center gap-2 mt-1">
-                      {sr.category && <span className="badge badge-primary">{sr.category}</span>}
+                      <CategoryChip
+                        value={sr.category || ''}
+                        categories={subRecipeCategories}
+                        onPick={(c) => quickSetSubCategory(sr.id, c)}
+                      />
                       <span className="text-xs text-[#8B7355]">v{sr.version}</span>
                     </div>
                   </div>
@@ -4311,7 +4356,7 @@ function MaterialPicker({
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const [onlyPurchased, setOnlyPurchased] = useState(true);  // hide ₹0 materials by default
+  const [onlyPurchased, setOnlyPurchased] = useState(false);  // show the FULL catalog by default; tick to hide ₹0 materials
   const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
 
@@ -4324,7 +4369,7 @@ function MaterialPicker({
     const dropH = 380;
     const spaceBelow = window.innerHeight - r.bottom;
     const top = spaceBelow >= dropH || r.top < dropH ? r.bottom + 4 : r.top - dropH - 4;
-    const width = Math.max(r.width, 360);
+    const width = Math.min(Math.max(r.width, 520), window.innerWidth - 16);
     let left = r.left;
     if (left + width > window.innerWidth - 8) left = window.innerWidth - width - 8;
     setPos({ top: Math.max(8, top), left: Math.max(8, left), width });
@@ -4364,7 +4409,7 @@ function MaterialPicker({
       }
       return an.localeCompare(bn);
     });
-    return list.slice(0, raw ? 200 : 80);  // higher cap when filtering
+    return list;  // no cap — the panel scrolls, search narrows
   }, [materials, query, onlyPurchased]);
 
   return (
@@ -4375,7 +4420,7 @@ function MaterialPicker({
         onClick={() => setOpen(!open)}
         className="w-full text-left bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-2 py-2 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408] hover:bg-[#FFE9D4] flex items-center justify-between gap-2"
       >
-        <span className="truncate">
+        <span className="truncate" title={selected ? `${selected.sku ? selected.sku + ' · ' : ''}${selected.name}` : undefined}>
           {selected ? (
             <>
               <span className="text-[10px] font-mono text-[#8B7355] mr-1">{selected.sku || ''}</span>
@@ -4421,7 +4466,7 @@ function MaterialPicker({
                   className={`w-full text-left px-2 py-1.5 rounded text-xs flex items-center gap-2 hover:bg-[#FFF1E3] ${m.id === value ? 'bg-[#FFF1E3]' : ''}`}
                 >
                   <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0">{m.sku || '·'}</span>
-                  <span className="flex-1 text-[#2D1B0E] truncate">{m.name}</span>
+                  <span className="flex-1 text-[#2D1B0E]" title={m.name}>{m.name}</span>
                   <span className="text-[10px] text-[#6B5744] shrink-0">{m.unit}</span>
                   <span className={`text-[10px] font-mono shrink-0 ${m.average_price > 0 ? 'text-[#6B5744]' : 'text-red-500'}`}>
                     ₹{m.average_price.toFixed(2)}
@@ -4433,6 +4478,112 @@ function MaterialPicker({
         </>
       )}
     </div>
+  );
+}
+
+/* ----------------------------------------------------------------- */
+/* CategoryChip — click-to-edit category pill (list rows, cards,      */
+/* detail header). Opens a fixed-position picker of existing          */
+/* categories plus a free-text "New category" input.                  */
+/* ----------------------------------------------------------------- */
+function CategoryChip({
+  value, categories, onPick,
+}: {
+  value: string;
+  categories: string[];
+  onPick: (category: string) => Promise<void> | void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const [custom, setCustom] = useState('');
+  const [saving, setSaving] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+
+  const MENU_W = 232;
+  const openMenu = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const r = btnRef.current!.getBoundingClientRect();
+    const menuH = Math.min(340, 96 + categories.length * 30);
+    const below = r.bottom + 4;
+    const top = below + menuH > window.innerHeight - 8 ? Math.max(8, r.top - menuH - 4) : below;
+    let left = r.left;
+    if (left + MENU_W > window.innerWidth - 8) left = window.innerWidth - MENU_W - 8;
+    setPos({ top, left });
+    setOpen(true);
+  };
+
+  const pick = async (c: string) => {
+    const next = c.trim();
+    if (!next || next === value) { setOpen(false); return; }
+    setSaving(true);
+    try {
+      await onPick(next);
+      setOpen(false);
+      setCustom('');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        type="button"
+        onClick={openMenu}
+        title="Click to change category"
+        className="inline-flex items-center gap-1 text-[12px] px-2 py-0.5 rounded-md bg-[#FFF1E3] border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] transition-colors"
+      >
+        <span className="truncate max-w-[160px]">{value || 'Set category'}</span>
+        <Pencil size={11} className="shrink-0 opacity-60" />
+      </button>
+      {open && pos && (
+        <>
+          <div className="fixed inset-0 z-[100]" onClick={(e) => { e.stopPropagation(); setOpen(false); }} />
+          <div
+            className="fixed z-[110] bg-white border border-[#D4B896] rounded-lg shadow-xl p-2 w-[232px]"
+            style={{ top: pos.top, left: pos.left }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-[10px] font-semibold text-[#8B7355] uppercase tracking-wide px-1 mb-1">Change category</div>
+            <div className="max-h-[220px] overflow-y-auto space-y-0.5">
+              {categories.length === 0 && (
+                <div className="text-xs text-[#8B7355] text-center py-2">No categories yet</div>
+              )}
+              {categories.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  disabled={saving}
+                  onClick={() => pick(c)}
+                  className={`w-full text-left px-2 py-1.5 rounded text-xs hover:bg-[#FFF1E3] disabled:opacity-50 ${c === value ? 'bg-[#FFF1E3] font-semibold text-[#af4408]' : 'text-[#2D1B0E]'}`}
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
+            <div className="flex items-center gap-1 mt-2 pt-2 border-t border-[#F0E4D6]">
+              <input
+                value={custom}
+                onChange={(e) => setCustom(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); pick(custom); } }}
+                placeholder="New category…"
+                className="flex-1 min-w-0 px-2 py-1.5 text-xs border border-[#E8D5C4] rounded-md focus:outline-none focus:border-[#af4408]"
+              />
+              <button
+                type="button"
+                disabled={saving || !custom.trim()}
+                onClick={() => pick(custom)}
+                className="text-xs px-2 py-1.5 rounded-md bg-[#af4408] text-white disabled:opacity-40"
+              >
+                {saving ? '…' : 'Set'}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+    </>
   );
 }
 
