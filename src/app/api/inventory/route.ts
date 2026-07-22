@@ -66,7 +66,12 @@ export async function GET(request: Request) {
         (SELECT ROUND(SUM(quantity * unit_price) / NULLIF(SUM(quantity), 0), 2)
            FROM purchases WHERE material_id = rm.id AND date >= date('now','-90 day')) AS avg_price_90d,
         (SELECT ROUND(SUM(quantity * unit_price) / NULLIF(SUM(quantity), 0), 2)
-           FROM purchases WHERE material_id = rm.id) AS avg_price_all_time
+           FROM purchases WHERE material_id = rm.id) AS avg_price_all_time,
+        -- Unit-audit lock: when set, the edit modal disables the unit fields and
+        -- points at /unit-audit (the only writer) instead of silently discarding.
+        EXISTS(SELECT 1 FROM unit_audit_locks ual
+               WHERE (rm.sku != '' AND ual.sku = rm.sku)
+                  OR ual.name_key = lower(trim(rm.name))) AS units_locked
       FROM raw_materials rm
       WHERE 1=1
     `;
@@ -160,6 +165,7 @@ export async function POST(request: Request) {
       is_recipe_item, is_direct_sell, is_semifinished,
       storage_location, shelf_life_days,
       priority,       // 3★ critical / 2★ standard / 1★ low (default 2)
+      average_price,  // ₹/recipe-unit (the form pre-converts from ₹/purchase-unit)
     } = body;
 
     if (!name) return Response.json({ error: 'name is required' }, { status: 400 });
@@ -193,9 +199,9 @@ export async function POST(request: Request) {
         id, sku, name, category, unit, purchase_unit, pack_size, case_size, reorder_level, costing_method,
         super_category, brand, yield_percent, tax_percent, cess_percent,
         standard_purchase_rate, closing_cadence, is_recipe_item, is_direct_sell, is_semifinished,
-        storage_location, shelf_life_days, priority,
+        storage_location, shelf_life_days, priority, average_price,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     `).run(
       id, sku, name, category || 'other', newUnit,
       newPurchaseUnit,
@@ -212,6 +218,10 @@ export async function POST(request: Request) {
       storage_location || '',
       shelf_life_days != null ? Number(shelf_life_days) : 0,
       priority != null ? Number(priority) : 2,
+      // The form pre-converts ₹/purchase-unit → ₹/recipe-unit before sending —
+      // the PUT has always honored this; the POST dropped it, so every new
+      // material landed at ₹0 until edited a second time.
+      (average_price != null && Number.isFinite(Number(average_price))) ? Number(average_price) : 0,
     );
 
     const material = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(id);

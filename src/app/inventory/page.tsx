@@ -59,6 +59,7 @@ interface FormData {
   purchase_unit?: string;   // how the vendor invoices (BTL, CASE, etc.)
   pack_size?: number;       // recipe-units per purchase-unit (e.g. 750 ml per BTL)
   case_size?: number;       // purchase-units per outer pack (e.g. 12 BTL per CASE; default 1)
+  units_locked?: number;    // unit-audit lock flag: unit fields are curated on /unit-audit
   reorder_level: number;
   costing_method: string;
   // ----- Phase 1 master fields -----
@@ -381,6 +382,7 @@ export default function InventoryPage() {
       purchase_unit: (m as any).purchase_unit || m.unit,
       pack_size:     (m as any).pack_size     || 1,
       case_size:     (m as any).case_size     || 1,
+      units_locked:  (m as any).units_locked  ?? 0,
       reorder_level: m.reorder_level,
       costing_method: m.costing_method,
       super_category:         (m as any).super_category         || '',
@@ -1131,6 +1133,16 @@ export default function InventoryPage() {
                 </p>
               </div>
 
+              {/* Unit-audit lock: these four fields are curated on /unit-audit and
+                  the server PROTECTS them (an edit here used to be silently
+                  discarded — the #1 "my case size won't save" confusion). */}
+              {!!formData.id && !!(formData as any).units_locked && (
+                <div className="sm:col-span-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-800">
+                  🔒 <b>Units locked by Unit Audit.</b> Recipe/Purchase Unit, Pack Size and Case Size are
+                  curated on the <a href="/unit-audit" className="underline font-medium">Unit Audit page</a> —
+                  change them there (it updates the lock + material together). Everything else here saves normally.
+                </div>
+              )}
               {/* Recipe Unit (canonical) */}
               <div>
                 <label className="block text-sm font-medium text-[#6B5744] mb-1.5" title="What recipes consume in. Drives recipe-deduction and recipe cost.">
@@ -1138,8 +1150,9 @@ export default function InventoryPage() {
                 </label>
                 <select
                   value={formData.unit}
+                  disabled={!!formData.id && !!(formData as any).units_locked}
                   onChange={(e) => setFormData((f) => ({ ...f, unit: e.target.value }))}
-                  className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
+                  className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent disabled:opacity-60 disabled:cursor-not-allowed"
                 >
                   {UNITS.map((u) => (
                     <option key={u} value={u}>
@@ -1156,8 +1169,9 @@ export default function InventoryPage() {
                 </label>
                 <select
                   value={formData.purchase_unit || formData.unit}
+                  disabled={!!formData.id && !!(formData as any).units_locked}
                   onChange={(e) => setFormData((f) => ({ ...f, purchase_unit: e.target.value }))}
-                  className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
+                  className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent disabled:opacity-60 disabled:cursor-not-allowed"
                 >
                   {['kg', 'g', 'L', 'ml', 'pcs', 'BTL', 'CASE', 'PKT', 'TIN', 'CAN', 'JAR', 'BOX', 'BAG', 'BUNCH'].map((u) => (
                     <option key={u} value={u}>{u}</option>
@@ -1176,8 +1190,9 @@ export default function InventoryPage() {
                     step="any"
                     min={0}
                     value={formData.pack_size ?? 1}
+                    disabled={!!formData.id && !!(formData as any).units_locked}
                     onChange={(e) => setFormData((f) => ({ ...f, pack_size: Number(e.target.value) || 1 }))}
-                    className="w-full px-3 py-2 pr-20 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent font-mono"
+                    className="w-full px-3 py-2 pr-20 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent font-mono disabled:opacity-60 disabled:cursor-not-allowed"
                   />
                   <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-[#8B7355] font-mono pointer-events-none">
                     {formData.unit || 'unit'} / 1 {formData.purchase_unit || formData.unit || 'unit'}
@@ -1226,8 +1241,9 @@ export default function InventoryPage() {
                 <input
                   type="number" step="any" min={1}
                   value={formData.case_size ?? 1}
+                  disabled={!!formData.id && !!(formData as any).units_locked}
                   onChange={(e) => setFormData((f) => ({ ...f, case_size: Number(e.target.value) || 1 }))}
-                  className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
+                  className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent disabled:opacity-60 disabled:cursor-not-allowed"
                 />
                 <p className="text-[10px] text-[#8B7355] mt-1">
                   e.g. <span className="font-mono">12</span> for a case of 12 bottles, <span className="font-mono">24</span> for a beer case.
