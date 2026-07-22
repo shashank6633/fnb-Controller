@@ -58,6 +58,7 @@ export async function GET(request: Request) {
              ri.quantity_requested, ri.chef_approved_qty, ri.quantity_issued, ri.is_rejected,
              ri.issue_history, ri.notes,
              rm.name AS material_name, rm.unit, rm.average_price, rm.last_purchase_price,
+             rm.purchase_unit AS rm_purchase_unit, COALESCE(rm.pack_size, 1) AS rm_pack_size,
              r.req_number, r.department_id AS req_dept_id, r.purpose, r.event_name,
              COALESCE(d_line.name, d_req.name) AS department_name
       FROM requisition_items ri
@@ -84,7 +85,15 @@ export async function GET(request: Request) {
         const isoDay = at.slice(0, 10);
         if (isoDay < from || isoDay > to) continue;
         if (issuer && !String(h.by || '').toLowerCase().includes(issuer)) continue;
-        const unitCost = Number(row.last_purchase_price) || Number(row.average_price) || 0;
+        // h.qty is RECIPE units; last_purchase_price is ₹/PURCHASE-unit — convert
+        // before valuing (mixed bases overstated packed lines by pack_size×).
+        const vPack = Number(row.rm_pack_size) || 1;
+        const vDiffer = String(row.unit || '').toLowerCase().trim()
+          !== String(row.rm_purchase_unit || row.unit || '').toLowerCase().trim();
+        const vLpp = (vPack > 1 && vDiffer)
+          ? (Number(row.last_purchase_price) || 0) / vPack
+          : Number(row.last_purchase_price) || 0;
+        const unitCost = vLpp || Number(row.average_price) || 0;
         const lineValue = Math.round((Number(h.qty) || 0) * unitCost * 100) / 100;
         totalValue += lineValue;
         dists.materials.add(row.material_id);

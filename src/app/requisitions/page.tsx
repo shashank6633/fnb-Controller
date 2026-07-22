@@ -1554,11 +1554,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       const buyQty = buyInPurchaseUnit
         ? (reqFactor > 1 ? Math.ceil(shortfall) : Math.ceil(shortfall / packSize))
         : shortfall;
-      // Convert recipe-unit-based last price to per-purchase-unit price.
-      // last_purchase_price on raw_materials is per recipe unit (the canonical),
-      // so for purchase-unit entry we multiply by pack_size.
-      const recipeUnitPrice = (it as any).last_purchase_price || it.average_price || 0;
-      const buyUnitPrice = buyInPurchaseUnit ? recipeUnitPrice * packSize : recipeUnitPrice;
+      // PRICE BASES (canon): last_purchase_price is ₹ per PURCHASE unit
+      // (PO-receive + db backfill write it that way); average_price is ₹ per
+      // RECIPE unit. The old code asserted the opposite and multiplied lpp by
+      // pack_size again — a 500 g line estimated at ₹89,825 instead of ₹89.82.
+      const lpp = Number((it as any).last_purchase_price) || 0;
+      const unitsDiffer = purchaseUnit !== '' && purchaseUnit !== (it.material_unit || '') && packSize > 1;
+      const buyUnitPrice = buyInPurchaseUnit
+        ? (lpp || (it.average_price || 0) * (unitsDiffer ? packSize : 1))
+        : (lpp && unitsDiffer ? lpp / packSize : (lpp || it.average_price || 0));
       return {
         id: it.id,
         material_id: it.material_id,         // needed to look up mapped vendors

@@ -277,7 +277,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             });
           } else {
             const reqItems = db.prepare(`
-              SELECT ri.*, rm.name AS material_name, rm.last_purchase_price, rm.average_price
+              SELECT ri.*, rm.name AS material_name, rm.last_purchase_price, rm.average_price,
+                     rm.unit AS rm_unit, rm.purchase_unit AS rm_purchase_unit,
+                     COALESCE(rm.pack_size, 1) AS rm_pack_size
               FROM requisition_items ri
               JOIN raw_materials rm ON rm.id = ri.material_id
               WHERE ri.req_id = ?
@@ -298,7 +300,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               if (issued <= 0) continue;
               decStock.run(issued, it.material_id);
               insPartyTx.run(generateId(), it.material_id, -issued, po.requisition_id, partyNote);
-              const unitCost = Number(it.last_purchase_price) || Number(it.average_price) || 0;
+              // `issued` is RECIPE units; last_purchase_price is ₹/PURCHASE-unit
+              // (canon, see line ~215) — convert before mixing bases.
+              const rPack = Number(it.rm_pack_size) || 1;
+              const rUnitsDiffer = String(it.rm_unit || '').toLowerCase().trim()
+                !== String(it.rm_purchase_unit || it.rm_unit || '').toLowerCase().trim();
+              const lppRecipe = (rPack > 1 && rUnitsDiffer)
+                ? (Number(it.last_purchase_price) || 0) / rPack
+                : Number(it.last_purchase_price) || 0;
+              const unitCost = lppRecipe || Number(it.average_price) || 0;
               const lineCost = Math.round(issued * unitCost * 100) / 100;
               totalCost += lineCost;
               auditItems.push({

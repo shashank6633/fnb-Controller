@@ -93,15 +93,20 @@ export async function GET(request: Request) {
         // is ₹/RECIPE-unit, so convert with the same reqPackFactor semantics the
         // requisition screens and party-events/pnl use: × pack_size only when the
         // line was requested in the material's PURCHASE unit (e.g. 1 BTL = 750 ml).
-        // Legacy rows with a blank ri.unit stay ×1.
+        // Blank ri.unit = legacy purchase-unit entry (× pack, same as dept-stock).
         // NEVER use last_purchase_price here: it is ₹/PURCHASE-unit, so
         // qty-in-requested/recipe-units × last_purchase_price mixes bases
         // (the old `last_purchase_price || average_price` fallback overvalued
         // e.g. 5 g of a material bought in 1 kg bags by ×1000).
+        // Blank ri.unit = legacy pre-unit-column entry in PURCHASE units — same
+        // deliberate rule as dept-stock.ts reqPackFactor (DB-verified 2026-07-22),
+        // so /department-consumption and /inventory/department-stock agree.
+        const asPurchase = String(row.req_unit || '').trim() === ''
+          ? true : row.req_unit === row.purchase_unit;
         const packFactor =
-          (String(row.req_unit || '').trim() !== '' &&
-           row.req_unit === row.purchase_unit &&
-           row.req_unit !== row.unit &&
+          (asPurchase &&
+           String(row.purchase_unit || '').trim() !== '' &&
+           row.unit !== row.purchase_unit &&
            (Number(row.pack_size) || 1) > 1)
             ? Number(row.pack_size) : 1;
         const unitCost = (Number(row.average_price) || 0) * packFactor;
@@ -139,7 +144,7 @@ export async function GET(request: Request) {
     // 750 ml) — while average_price is ₹/RECIPE-unit. Convert with the same pack
     // factor the requisition screens use (reqPackFactor, same CASE as
     // party-events/pnl): × pack_size only when the line was requested in the
-    // purchase unit. Legacy rows with a blank ri.unit stay ×1.
+    // purchase unit OR is blank (legacy purchase-unit era — matches dept-stock).
     const summary = db.prepare(`
       SELECT
         COUNT(DISTINCT r.id)             AS requisition_count,
@@ -147,8 +152,9 @@ export async function GET(request: Request) {
         COUNT(DISTINCT ri.material_id)   AS materials,
         COALESCE(SUM(ri.quantity_issued), 0)                                   AS total_qty,
         COALESCE(SUM(ri.quantity_issued
-          * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
-                       AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+          * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+                       AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
+                       AND COALESCE(rm.pack_size,1) > 1
                   THEN rm.pack_size ELSE 1 END)
           * rm.average_price), 0)                                              AS total_value
       FROM requisitions r
@@ -164,8 +170,9 @@ export async function GET(request: Request) {
              COUNT(*)                          AS line_count,
              COALESCE(SUM(ri.quantity_issued), 0)                              AS total_qty,
              COALESCE(SUM(ri.quantity_issued
-               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
-                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+               * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+                            AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
+                            AND COALESCE(rm.pack_size,1) > 1
                        THEN rm.pack_size ELSE 1 END)
                * rm.average_price), 0)                                         AS total_value
       FROM requisitions r
@@ -182,8 +189,9 @@ export async function GET(request: Request) {
              rm.id AS material_id, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit, rm.category,
              SUM(ri.quantity_issued)                                  AS qty,
              SUM(ri.quantity_issued
-               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
-                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+               * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+                            AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
+                            AND COALESCE(rm.pack_size,1) > 1
                        THEN rm.pack_size ELSE 1 END)
                * rm.average_price)                                    AS value,
              COUNT(*)                                                 AS line_count
@@ -201,8 +209,9 @@ export async function GET(request: Request) {
              rm.unit AS material_unit, rm.category, rm.average_price,
              SUM(ri.quantity_issued)                            AS total_qty,
              SUM(ri.quantity_issued
-               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
-                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+               * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+                            AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
+                            AND COALESCE(rm.pack_size,1) > 1
                        THEN rm.pack_size ELSE 1 END)
                * rm.average_price)                              AS total_value,
              COUNT(DISTINCT r.department_id)                    AS distinct_depts
@@ -218,8 +227,9 @@ export async function GET(request: Request) {
     const trendByDay = db.prepare(`
       SELECT r.date,
              SUM(ri.quantity_issued
-               * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
-                            AND ri.unit <> rm.unit AND COALESCE(rm.pack_size,1) > 1
+               * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+                            AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
+                            AND COALESCE(rm.pack_size,1) > 1
                        THEN rm.pack_size ELSE 1 END)
                * rm.average_price)                      AS total_value,
              COUNT(DISTINCT r.id)                       AS requisitions
