@@ -3665,31 +3665,38 @@ function RRowMenu({ items }: { items: MenuItemDef[] }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
-  const openMenu = () => {
+  const computePos = useCallback(() => {
     const r = btnRef.current?.getBoundingClientRect();
-    if (r) {
-      const menuH = items.length * 34 + 10;          // ~34px per row + padding
-      const below = r.bottom + 4;
-      const top = below + menuH > window.innerHeight - 8
-        ? Math.max(8, r.top - menuH - 4)             // flip above the trigger
-        : below;
-      setPos({ top, right: Math.max(8, window.innerWidth - r.right) });
-    }
+    if (!r) return;
+    // Trigger scrolled fully out of view → close instead of floating detached
+    if (r.bottom < 0 || r.top > window.innerHeight) { setOpen(false); return; }
+    const menuH = items.length * 34 + 10;            // ~34px per row + padding
+    const below = r.bottom + 4;
+    const top = below + menuH > window.innerHeight - 8
+      ? Math.max(8, r.top - menuH - 4)               // flip above the trigger
+      : below;
+    setPos({ top, right: Math.max(8, window.innerWidth - r.right) });
+  }, [items.length]);
+  const openMenu = () => {
+    computePos();
     setOpen(true);
   };
+  // Follow the trigger on scroll/resize so the menu stays glued to its row.
   useEffect(() => {
     if (!open) return;
-    const close = () => setOpen(false);
+    let raf = 0;
+    const onMove = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(computePos); };
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
-    window.addEventListener('scroll', close, true);
-    window.addEventListener('resize', close);
+    window.addEventListener('scroll', onMove, true);
+    window.addEventListener('resize', onMove);
     window.addEventListener('keydown', onKey);
     return () => {
-      window.removeEventListener('scroll', close, true);
-      window.removeEventListener('resize', close);
+      cancelAnimationFrame(raf);
+      window.removeEventListener('scroll', onMove, true);
+      window.removeEventListener('resize', onMove);
       window.removeEventListener('keydown', onKey);
     };
-  }, [open]);
+  }, [open, computePos]);
   return (
     <>
       <button ref={btnRef} onClick={() => (open ? setOpen(false) : openMenu())} className="p-1.5 rounded-lg text-[#8B7355] hover:bg-[#FFF1E3]" aria-label="Row actions">
@@ -4366,17 +4373,34 @@ function MaterialPicker({
 
   const selected = materials.find(m => m.id === value);
 
-  // Position the dropdown using fixed coords so it escapes overflow:auto modal parents
+  // Position the dropdown using fixed coords so it escapes overflow:auto modal
+  // parents — and keep it anchored to the trigger while the modal body or the
+  // page scrolls (recompute on scroll/resize; close if the trigger leaves view).
   useEffect(() => {
-    if (!open || !triggerRef.current) return;
-    const r = triggerRef.current.getBoundingClientRect();
-    const dropH = 380;
-    const spaceBelow = window.innerHeight - r.bottom;
-    const top = spaceBelow >= dropH || r.top < dropH ? r.bottom + 4 : r.top - dropH - 4;
-    const width = Math.min(Math.max(r.width, 520), window.innerWidth - 16);
-    let left = r.left;
-    if (left + width > window.innerWidth - 8) left = window.innerWidth - width - 8;
-    setPos({ top: Math.max(8, top), left: Math.max(8, left), width });
+    if (!open) return;
+    const computePos = () => {
+      const el = triggerRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      if (r.bottom < 0 || r.top > window.innerHeight) { setOpen(false); return; }
+      const dropH = 380;
+      const spaceBelow = window.innerHeight - r.bottom;
+      const top = spaceBelow >= dropH || r.top < dropH ? r.bottom + 4 : r.top - dropH - 4;
+      const width = Math.min(Math.max(r.width, 520), window.innerWidth - 16);
+      let left = r.left;
+      if (left + width > window.innerWidth - 8) left = window.innerWidth - width - 8;
+      setPos({ top: Math.max(8, top), left: Math.max(8, left), width });
+    };
+    computePos();
+    let raf = 0;
+    const onMove = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(computePos); };
+    window.addEventListener('scroll', onMove, true);
+    window.addEventListener('resize', onMove);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('scroll', onMove, true);
+      window.removeEventListener('resize', onMove);
+    };
   }, [open]);
 
   const filtered = useMemo(() => {
@@ -4507,18 +4531,41 @@ function CategoryChip({
   const btnRef = useRef<HTMLButtonElement>(null);
 
   const MENU_W = 232;
-  const openMenu = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    e.preventDefault();
-    const r = btnRef.current!.getBoundingClientRect();
+  const computePos = useCallback(() => {
+    const el = btnRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    // Trigger scrolled fully out of view → close instead of floating detached
+    if (r.bottom < 0 || r.top > window.innerHeight) { setOpen(false); return; }
     const menuH = Math.min(340, 96 + categories.length * 30);
     const below = r.bottom + 4;
     const top = below + menuH > window.innerHeight - 8 ? Math.max(8, r.top - menuH - 4) : below;
     let left = r.left;
     if (left + MENU_W > window.innerWidth - 8) left = window.innerWidth - MENU_W - 8;
     setPos({ top, left });
+  }, [categories.length]);
+
+  const openMenu = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    computePos();
     setOpen(true);
   };
+
+  // Keep the panel anchored to its trigger while the page (or any ancestor)
+  // scrolls or the window resizes.
+  useEffect(() => {
+    if (!open) return;
+    let raf = 0;
+    const onMove = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(computePos); };
+    window.addEventListener('scroll', onMove, true);
+    window.addEventListener('resize', onMove);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('scroll', onMove, true);
+      window.removeEventListener('resize', onMove);
+    };
+  }, [open, computePos]);
 
   const pick = async (c: string) => {
     const next = c.trim();

@@ -804,32 +804,38 @@ function RowMenu({ onEdit, onDelete }: { onEdit: () => void; onDelete: () => voi
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
-  const openMenu = () => {
+  const computePos = useCallback(() => {
     const r = btnRef.current?.getBoundingClientRect();
-    if (r) {
-      // Flip above the trigger near the viewport bottom (2 items ≈ 78px) so the
-      // menu never runs off-screen — same fix as the recipes row menu.
-      const menuH = 2 * 34 + 10;
-      const below = r.bottom + 4;
-      const top = below + menuH > window.innerHeight - 8 ? Math.max(8, r.top - menuH - 4) : below;
-      setPos({ top, right: Math.max(8, window.innerWidth - r.right) });
-    }
+    if (!r) return;
+    // Trigger scrolled fully out of view → close instead of floating detached
+    if (r.bottom < 0 || r.top > window.innerHeight) { setOpen(false); return; }
+    // Flip above the trigger near the viewport bottom (2 items ≈ 78px) so the
+    // menu never runs off-screen — same fix as the recipes row menu.
+    const menuH = 2 * 34 + 10;
+    const below = r.bottom + 4;
+    const top = below + menuH > window.innerHeight - 8 ? Math.max(8, r.top - menuH - 4) : below;
+    setPos({ top, right: Math.max(8, window.innerWidth - r.right) });
+  }, []);
+  const openMenu = () => {
+    computePos();
     setOpen(true);
   };
-  // Fixed dropdown can't follow the row, so close it on any scroll/resize/Escape.
+  // Follow the trigger on scroll/resize so the menu stays glued to its row.
   useEffect(() => {
     if (!open) return;
-    const close = () => setOpen(false);
+    let raf = 0;
+    const onMove = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(computePos); };
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
-    window.addEventListener('scroll', close, true);
-    window.addEventListener('resize', close);
+    window.addEventListener('scroll', onMove, true);
+    window.addEventListener('resize', onMove);
     window.addEventListener('keydown', onKey);
     return () => {
-      window.removeEventListener('scroll', close, true);
-      window.removeEventListener('resize', close);
+      cancelAnimationFrame(raf);
+      window.removeEventListener('scroll', onMove, true);
+      window.removeEventListener('resize', onMove);
       window.removeEventListener('keydown', onKey);
     };
-  }, [open]);
+  }, [open, computePos]);
   return (
     <>
       <button ref={btnRef} onClick={() => (open ? setOpen(false) : openMenu())} className="p-1.5 rounded-lg text-[#8B7355] hover:bg-[#FFF1E3]" aria-label="Row actions">
