@@ -18,6 +18,7 @@ import {
   Download, Upload,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { usePurchaseUnitOptions } from '@/lib/use-units';
 import TabScroller from '@/components/TabScroller';
 
 const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -84,10 +85,10 @@ const FLAG_META: Record<string, { label: string; tone: string; help: string }> =
                             help: 'Unit string is non-standard (we expect kg/g/L/ml/pcs).' },
 };
 
-/** Recipe / stock units — canonical, granular. Used by recipe-deduction. */
+/** Recipe / stock units — canonical, granular. Used by recipe-deduction.
+ *  Deliberately NOT registry-driven: the costing engine's conversions only
+ *  understand these five, so offering more here would silently break costs. */
 const RECIPE_UNIT_OPTIONS  = ['kg', 'g', 'L', 'ml', 'pcs'];
-/** All purchase-unit options that ever appear in the dropdown. */
-const PURCHASE_UNIT_OPTIONS = ['kg', 'g', 'L', 'ml', 'pcs', 'BTL', 'CASE', 'PKT', 'TIN', 'CAN', 'JAR', 'BOX', 'BAG', 'BUNCH'];
 
 /** Category-keyword → ranked suggestions. Match is by substring (case-insensitive),
  *  so "blended-scotch", "scotch-malt", "white-wine" all map to liquor units. */
@@ -146,6 +147,9 @@ function suggestedPurchaseUnits(category?: string): string[] {
 }
 
 export default function UnitAuditPage() {
+  // Registry-driven purchase units: built-ins + every custom unit added on
+  // the /units page (e.g. TRAY = 30 pcs) appear here automatically.
+  const PURCHASE_UNIT_OPTIONS = usePurchaseUnitOptions();
   const [data, setData] = useState<{ materials: AuditMaterial[]; total: number; filtered: number; flag_counts: Record<string, number>; severity_counts: Record<string, number>; categories?: string[] } | null>(null);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');

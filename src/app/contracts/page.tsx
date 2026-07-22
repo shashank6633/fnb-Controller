@@ -13,6 +13,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { FileText, Plus, Edit, Save, X, Loader2, Search, AlertTriangle } from 'lucide-react';
 import { api } from '@/lib/api';
+import { usePurchaseUnitOptions } from '@/lib/use-units';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 
 const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -367,6 +368,8 @@ function QuickCreateMaterial({ existingMaterials, onClose, onCreated, onPickedEx
   onCreated: (m: Material) => void;
   onPickedExisting: (m: Material) => void;
 }) {
+  // Registry-driven purchase units (built-ins + custom ones from /units)
+  const purchaseUnitOptions = usePurchaseUnitOptions();
   const [name, setName] = useState('');
   const [category, setCategory] = useState('other');
   const [unit, setUnit] = useState('kg');                  // recipe unit
@@ -476,7 +479,7 @@ function QuickCreateMaterial({ existingMaterials, onClose, onCreated, onPickedEx
             <label className="flex flex-col gap-1 text-xs text-[#6B5744]">Purchase Unit
               <select value={purchaseUnit} onChange={e => setPurchaseUnit(e.target.value)}
                       className="px-2 py-1.5 border border-[#D4B896] rounded bg-[#FFF1E3]">
-                {['kg','g','L','ml','pcs','BTL','CASE','PKT','TIN','CAN','JAR','BOX','BAG','BUNCH'].map(u => <option key={u} value={u}>{u}</option>)}
+                {purchaseUnitOptions.map(u => <option key={u} value={u}>{u}</option>)}
               </select>
             </label>
           </div>

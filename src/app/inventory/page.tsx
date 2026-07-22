@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
+import { usePurchaseUnitOptions } from '@/lib/use-units';
 import { packFactor } from '@/lib/pack-units';
 import Toggle from '@/components/Toggle';
 
@@ -182,6 +183,8 @@ function categoryLabel(cat: string): string {
 /* ------------------------------------------------------------------ */
 
 export default function InventoryPage() {
+  // Registry-driven purchase units (built-ins + custom ones from /units)
+  const purchaseUnitOptions = usePurchaseUnitOptions();
   const [materials, setMaterials] = useState<RawMaterial[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1173,7 +1176,7 @@ export default function InventoryPage() {
                   onChange={(e) => setFormData((f) => ({ ...f, purchase_unit: e.target.value }))}
                   className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  {['kg', 'g', 'L', 'ml', 'pcs', 'BTL', 'CASE', 'PKT', 'TIN', 'CAN', 'JAR', 'BOX', 'BAG', 'BUNCH'].map((u) => (
+                  {purchaseUnitOptions.map((u) => (
                     <option key={u} value={u}>{u}</option>
                   ))}
                 </select>
