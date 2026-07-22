@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { api } from '@/lib/api';
 import TabScroller from '@/components/TabScroller';
 import Toggle from '@/components/Toggle';
@@ -834,14 +835,17 @@ function RowMenu({ onEdit, onDelete }: { onEdit: () => void; onDelete: () => voi
       <button ref={btnRef} onClick={() => (open ? setOpen(false) : openMenu())} className="p-1.5 rounded-lg text-[#8B7355] hover:bg-[#FFF1E3]" aria-label="Row actions">
         <MoreVertical className="w-4 h-4" />
       </button>
-      {open && pos && (
+      {/* Portaled to <body>: ancestors carry transforms (card hover-lift,
+          fade-up animations) which re-anchor position:fixed to the card. */}
+      {open && pos && typeof document !== 'undefined' && createPortal(
         <>
           <div className="fixed inset-0 z-[94]" onClick={() => setOpen(false)} />
           <div style={{ top: pos.top, right: pos.right }} className="fixed z-[95] w-32 bg-white border border-[#E8D5C4] rounded-lg shadow-xl py-1 text-sm">
             <button onClick={() => { setOpen(false); onEdit(); }} className="w-full text-left px-3 py-1.5 hover:bg-[#FFF1E3] flex items-center gap-2 text-[#2D1B0E]"><Edit className="w-3.5 h-3.5" />Edit</button>
             <button onClick={() => { setOpen(false); onDelete(); }} className="w-full text-left px-3 py-1.5 hover:bg-red-50 flex items-center gap-2 text-red-600"><Trash2 className="w-3.5 h-3.5" />Delete</button>
           </div>
-        </>
+        </>,
+        document.body
       )}
     </>
   );

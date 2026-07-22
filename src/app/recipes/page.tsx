@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useMemo, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ChefHat,
   Plus,
@@ -3694,7 +3695,9 @@ function RRowMenu({ items }: { items: MenuItemDef[] }) {
       <button ref={btnRef} onClick={() => (open ? setOpen(false) : openMenu())} className="p-1.5 rounded-lg text-[#8B7355] hover:bg-[#FFF1E3]" aria-label="Row actions">
         <MoreVertical className="w-4 h-4" />
       </button>
-      {open && pos && (
+      {/* Portaled to <body>: ancestors carry transforms (card hover-lift,
+          fade-up animations) which re-anchor position:fixed to the card. */}
+      {open && pos && typeof document !== 'undefined' && createPortal(
         <>
           <div className="fixed inset-0 z-[94]" onClick={() => setOpen(false)} />
           <div style={{ top: pos.top, right: pos.right }} className="fixed z-[95] w-32 bg-white border border-[#E8D5C4] rounded-lg shadow-xl py-1 text-sm">
@@ -3705,7 +3708,8 @@ function RRowMenu({ items }: { items: MenuItemDef[] }) {
               </button>
             ))}
           </div>
-        </>
+        </>,
+        document.body
       )}
     </>
   );
@@ -4433,7 +4437,9 @@ function MaterialPicker({
         <span className="text-xs text-[#8B7355]">▾</span>
       </button>
 
-      {open && pos && (
+      {/* Portaled to <body> so ancestor transforms (modal animations, card
+          hover-lift) can't re-anchor the fixed-position panel. */}
+      {open && pos && typeof document !== 'undefined' && createPortal(
         <>
           {/* Click-outside backdrop */}
           <div className="fixed inset-0 z-[100]" onClick={() => setOpen(false)} />
@@ -4475,7 +4481,8 @@ function MaterialPicker({
               ))}
             </div>
           </div>
-        </>
+        </>,
+        document.body
       )}
     </div>
   );
@@ -4538,7 +4545,9 @@ function CategoryChip({
         <span className="truncate max-w-[160px]">{value || 'Set category'}</span>
         <Pencil size={11} className="shrink-0 opacity-60" />
       </button>
-      {open && pos && (
+      {/* Portaled to <body>: the card under the cursor carries a hover-lift
+          transform which would re-anchor position:fixed to the card. */}
+      {open && pos && typeof document !== 'undefined' && createPortal(
         <>
           <div className="fixed inset-0 z-[100]" onClick={(e) => { e.stopPropagation(); setOpen(false); }} />
           <div
@@ -4581,7 +4590,8 @@ function CategoryChip({
               </button>
             </div>
           </div>
-        </>
+        </>,
+        document.body
       )}
     </>
   );

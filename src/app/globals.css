@@ -121,8 +121,12 @@ body {
   to   { opacity: 1; }
 }
 
+/* fill-mode `backwards` (NOT `both`): `both` keeps the final keyframe's
+   transform (translateY(0)) applied forever, which silently turns the element
+   into the containing block for every position:fixed descendant — fixed
+   dropdowns inside it render offset from where they were measured. */
 .animate-fade-up {
-  animation: fade-up 0.35s ease-out both;
+  animation: fade-up 0.35s ease-out backwards;
 }
 
 .animate-fade-in {
@@ -153,7 +157,7 @@ body {
 /* Auto fade-up on first-level grid children inside a main area.
    This makes every page's KPI tiles and detail cards animate on load. */
 main > div > div.grid > * {
-  animation: fade-up 0.35s ease-out both;
+  animation: fade-up 0.35s ease-out backwards;
 }
 main > div > div.grid > *:nth-child(1) { animation-delay: 0.00s; }
 main > div > div.grid > *:nth-child(2) { animation-delay: 0.04s; }
@@ -177,7 +181,7 @@ main > div > div.grid > *:nth-child(6) { animation-delay: 0.20s; }
 }
 
 /* Stagger helpers for sequential card fade-ins */
-.stagger > * { animation: fade-up 0.35s ease-out both; }
+.stagger > * { animation: fade-up 0.35s ease-out backwards; }
 .stagger > *:nth-child(1) { animation-delay: 0.00s; }
 .stagger > *:nth-child(2) { animation-delay: 0.04s; }
 .stagger > *:nth-child(3) { animation-delay: 0.08s; }
