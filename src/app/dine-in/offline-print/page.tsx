@@ -5,7 +5,7 @@ import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
 import { probeBridge, bridgePrint, bridgeStatus, getBridgeUrl, setBridgeUrl, type BridgeHealth, type PrinterStatus } from '@/lib/offline-print/bridge-client';
 import { counts as outboxCounts, retryFailed, drainOutbox, ensureDrainLoop } from '@/lib/offline-print/outbox';
-import { getKotDesign } from '@/lib/offline-print/print';
+import { getKotDesign, resolveKotPrinter } from '@/lib/offline-print/print';
 import {
   Printer, Plus, Trash2, Loader2, X, Wifi, WifiOff, RefreshCw, Save,
   CheckCircle2, XCircle, FlaskConical, ChevronDown, ChevronRight, Download, AlertTriangle,
@@ -598,6 +598,61 @@ export default function OfflinePrintPage() {
               </div>
             ))}
           </div>
+
+          {/* ── Floor drink-routing check — simulates the LIVE resolver per floor ── */}
+          {tableZones.length > 0 && (() => {
+            const nrmZ = (s?: string | null) => String(s || '').toLowerCase().trim();
+            const routeFor = (zone: string) => {
+              const st = resolveKotPrinter(stations as any, {
+                id: 'sim', station: 'bar', zone,
+                items: [{ name: 'sim', quantity: 1, item_type: 'liquors' }],
+              } as any);
+              if (!st) return { st: null, verdict: 'none' as const };
+              const stationMatch = nrmZ(st.station) === 'bar' || nrmZ(st.name) === 'bar';
+              const floorMatch = nrmZ(st.floor) === nrmZ(zone);
+              const verdict = stationMatch && floorMatch ? 'exact' as const
+                : (st.kind === 'bar' && floorMatch) ? 'kind' as const
+                : (stationMatch || st.kind === 'bar') ? 'global' as const
+                : 'wrong' as const;
+              return { st, verdict };
+            };
+            const typoFloors = stations.filter((s) =>
+              s.role === 'kot' && s.is_active && nrmZ(s.floor) &&
+              !tableZones.some((z) => nrmZ(z) === nrmZ(s.floor)));
+            const DOT: Record<string, string> = { exact: 'bg-green-500', kind: 'bg-green-400', global: 'bg-amber-400', wrong: 'bg-red-500', none: 'bg-red-500' };
+            return (
+              <div className="mt-4 border-t border-[#F0E4D6] pt-3">
+                <h3 className="text-sm font-semibold text-[#2D1B0E]">Floor drink routing check</h3>
+                <p className="text-xs text-[#8B7355] mt-0.5 mb-2">
+                  Where a <b>liquor / beverage</b> KOT from each floor's tables will actually print — simulated with the live routing rules.
+                </p>
+                <div className="space-y-1.5">
+                  {tableZones.map((z) => {
+                    const r = routeFor(z);
+                    return (
+                      <div key={z} className="flex items-center gap-2 border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm">
+                        <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${DOT[r.verdict]}`}></span>
+                        <span className="font-medium text-[#2D1B0E] shrink-0">{z}</span>
+                        <span className="text-xs text-[#6B5744] min-w-0 truncate">
+                          {r.verdict === 'exact' && <>→ <b>{r.st!.name}</b> — this floor's own bar ✓</>}
+                          {r.verdict === 'kind' && <>→ <b>{r.st!.name}</b> — floor bar via type fallback (tip: set its Station to “bar” for an exact match)</>}
+                          {r.verdict === 'global' && <>→ <b>{r.st!.name}</b> — no bar printer on THIS floor; drinks travel to a shared bar</>}
+                          {r.verdict === 'wrong' && <>→ <b>{r.st!.name}</b> — ⚠ a FOOD printer! Add a KOT printer with Kind “bar” + Floor “{z}”</>}
+                          {r.verdict === 'none' && <>⚠ no active KOT printers configured</>}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+                {typoFloors.length > 0 && (
+                  <div className="mt-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-800">
+                    <b>Floor label mismatch:</b> {typoFloors.map((s) => `“${s.name}” has Floor “${s.floor}”`).join(', ')} — but no table uses that floor.
+                    Fix the printer's Floor to match the Tables page exactly, or drinks will skip it.
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
       )}
 

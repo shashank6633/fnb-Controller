@@ -48,7 +48,7 @@ function norm(s: string) { return String(s || '').toLowerCase().trim(); }
  * So drinks from a Floor-2 table land on the Floor-2 Bar without needing a
  * separate printer per drink station.
  */
-function resolveKotPrinter(stations: PrintStation[], k: FiredKot): PrintStation | null {
+export function resolveKotPrinter(stations: PrintStation[], k: FiredKot): PrintStation | null {
   const kots = stations.filter((s) => s.role === 'kot' && s.is_active && Number(s.is_master) !== 1);
   if (kots.length === 0) return null;
   const fl = norm(k.zone || '');
