@@ -3600,22 +3600,37 @@ function HeaderMenu({ label, icon, items, primary }: { label: string; icon?: any
   );
 }
 
-// ⋮ per-row menu (View / Edit / Copy). Fixed-positioned to escape table overflow.
+// ⋮ per-row menu (View / Edit / Copy). Fixed-positioned to escape table overflow;
+// flips UPWARD near the viewport bottom so it never runs off-screen, and sits
+// z-[95] — above the floating notification bell (z-[90]) which used to overlap it.
 function RRowMenu({ items }: { items: MenuItemDef[] }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
   const openMenu = () => {
     const r = btnRef.current?.getBoundingClientRect();
-    if (r) setPos({ top: r.bottom + 4, right: Math.max(8, window.innerWidth - r.right) });
+    if (r) {
+      const menuH = items.length * 34 + 10;          // ~34px per row + padding
+      const below = r.bottom + 4;
+      const top = below + menuH > window.innerHeight - 8
+        ? Math.max(8, r.top - menuH - 4)             // flip above the trigger
+        : below;
+      setPos({ top, right: Math.max(8, window.innerWidth - r.right) });
+    }
     setOpen(true);
   };
   useEffect(() => {
     if (!open) return;
     const close = () => setOpen(false);
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
     window.addEventListener('scroll', close, true);
     window.addEventListener('resize', close);
-    return () => { window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('keydown', onKey);
+    };
   }, [open]);
   return (
     <>
@@ -3624,8 +3639,8 @@ function RRowMenu({ items }: { items: MenuItemDef[] }) {
       </button>
       {open && pos && (
         <>
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div style={{ top: pos.top, right: pos.right }} className="fixed z-50 w-32 bg-white border border-[#E8D5C4] rounded-lg shadow-xl py-1 text-sm">
+          <div className="fixed inset-0 z-[94]" onClick={() => setOpen(false)} />
+          <div style={{ top: pos.top, right: pos.right }} className="fixed z-[95] w-32 bg-white border border-[#E8D5C4] rounded-lg shadow-xl py-1 text-sm">
             {items.map((it, i) => (
               <button key={i} onClick={() => { setOpen(false); it.onClick(); }}
                       className={`w-full text-left px-3 py-1.5 flex items-center gap-2 ${it.danger ? 'text-red-600 hover:bg-red-50' : 'text-[#2D1B0E] hover:bg-[#FFF1E3]'}`}>
