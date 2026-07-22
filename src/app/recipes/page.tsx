@@ -703,19 +703,32 @@ export default function RecipesPage() {
         .filter((r: any) => r.recipe_name && r.ingredient_name);
     };
 
+    // A file that parses to ZERO usable rows must say so — silently showing the
+    // filename with no preview/upload button reads as a broken page (and the
+    // costing-workbook .xlsx lands here by mistake: its first sheet has none of
+    // our columns, so everything filters out).
+    const applyRows = (rows: ReturnType<typeof mapRows>) => {
+      setBulkRows(rows);
+      if (rows.length === 0) {
+        setBulkResult({ errors: [
+          `No usable rows found in "${file.name}" — this upload needs recipe_name / ingredient_name / quantity columns (the recipes-restore CSV, the template, or a flat Excel sheet).`,
+          'The Food-Costing workbook (.xlsx with Purchase Rates / Cards sheets) is imported via “Import Recipe Workbook” instead.',
+        ] });
+      }
+    };
     if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
       const XLSX = await import('xlsx');
       const buffer = await file.arrayBuffer();
       const workbook = XLSX.read(buffer, { type: 'array' });
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json<any>(sheet);
-      setBulkRows(mapRows(rows));
+      applyRows(mapRows(rows));
     } else {
       Papa.parse(file, {
         header: true,
         skipEmptyLines: true,
         comments: '#',
-        complete: (results) => setBulkRows(mapRows(results.data as any[])),
+        complete: (results) => applyRows(mapRows(results.data as any[])),
       });
     }
   }
@@ -767,6 +780,13 @@ export default function RecipesPage() {
           }))
           .filter((r: any) => r.sub_recipe_name && r.ingredient_name);
         setSubBulkRows(rows);
+        // Zero usable rows must say so, not silently show a filename (same
+        // guard as the recipes upload above).
+        if (rows.length === 0) {
+          setSubBulkResult({ errors: [
+            `No usable rows found in "${file.name}" — Step 1 needs the sub-recipes-restore CSV with sub_recipe_name / ingredient_name / quantity columns.`,
+          ] });
+        }
       },
     });
   }
