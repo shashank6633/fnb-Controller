@@ -1041,6 +1041,29 @@ function initializeSchema(db: Database.Database) {
       catch (e) { console.error('[db] recipe_costs_resync_v1 failed (rolled back):', e); }
     }
 
+    // One-time: normalize dirty menu_items.item_type values. POS sheets shipped
+    // 'beverages.' (trailing dot, 46 live rows), so the Beverages type filter
+    // and stat-bar counts matched nothing. Write paths (/api/menu-items POST/PUT
+    // and the import) now normalize (lowercase + strip trailing non-alphanumerics);
+    // this repairs rows already stored.
+    const itemTypesNormalized = db.prepare(`SELECT value FROM settings WHERE key = 'menu_item_type_normalize_v1'`).get() as any;
+    if (!itemTypesNormalized) {
+      const runItemTypeFix = db.transaction(() => {
+        db.prepare(`UPDATE menu_items SET item_type = 'beverages' WHERE item_type = 'beverages.'`).run();
+        // Generic sweep for any other dirty value (SQLite has no regex — normalize in JS per distinct value).
+        const distinctTypes = db.prepare(`SELECT DISTINCT item_type FROM menu_items WHERE item_type IS NOT NULL AND item_type != ''`).all() as any[];
+        for (const t of distinctTypes) {
+          const clean = String(t.item_type).trim().toLowerCase().replace(/[^a-z0-9]+$/, '');
+          if (clean && clean !== t.item_type) {
+            db.prepare(`UPDATE menu_items SET item_type = ? WHERE item_type = ?`).run(clean, t.item_type);
+          }
+        }
+        db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('menu_item_type_normalize_v1', '1')`).run();
+      });
+      try { runItemTypeFix(); console.log('[db] menu_item_type_normalize_v1: menu_items.item_type values normalized'); }
+      catch (e) { console.error('[db] menu_item_type_normalize_v1 failed (rolled back):', e); }
+    }
+
     db.exec(`
 
       CREATE TABLE IF NOT EXISTS requisitions (

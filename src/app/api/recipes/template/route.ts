@@ -1,4 +1,5 @@
 import { getDb } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
 
 // Sample recipe rows — bar & kitchen examples
 // Format: recipe_name, category, selling_price, ingredient_name, quantity, unit, yield_percent, wastage_percent, notes
@@ -85,6 +86,11 @@ function csvEscape(val: any): string {
 
 export async function GET(request: Request) {
   try {
+    // SECURITY: the proxy only checks that a session cookie is PRESENT for GETs —
+    // real validation is delegated here (with_materials=true leaks the full
+    // materials list to a forged/expired cookie otherwise).
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const url = new URL(request.url);
     const format = url.searchParams.get('format') || 'csv';
     const includeMaterials = url.searchParams.get('with_materials') === 'true';

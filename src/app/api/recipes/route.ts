@@ -1,8 +1,14 @@
 import { getDb, generateId, recalculateRecipeCost } from '@/lib/db';
 import { rollUpAllergens } from '@/lib/allergens';
+import { getCurrentUser } from '@/lib/auth';
 
 export async function GET(request: Request) {
   try {
+    // SECURITY: the proxy only checks that a session cookie is PRESENT for GETs —
+    // real validation is delegated here. Without this, a forged/expired cookie
+    // could read the full costed recipe book.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const url = new URL(request.url);
     const category = url.searchParams.get('category');

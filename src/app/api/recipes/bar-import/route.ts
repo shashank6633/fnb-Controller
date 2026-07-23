@@ -1,4 +1,5 @@
 import { getDb, generateId, recalculateRecipeCost, updateMaterialPrice, recalculateCostsForMaterials } from '@/lib/db';
+import { requireRole } from '@/lib/auth';
 
 interface LiquorRawRow {
   name: string;
@@ -130,6 +131,8 @@ function findMaterialFuzzy(name: string, materialMap: Map<string, any>): any | n
 }
 
 export async function POST(request: Request) {
+  const auth = await requireRole('admin');
+  if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
   try {
     const db = getDb();
     const body = await request.json();
@@ -151,6 +154,7 @@ export async function POST(request: Request) {
       materials_created: 0,
       materials_updated: 0,
       materials_price_updated: 0,
+      materials_price_skipped_unit_mismatch: 0,
       recipes_created: 0,
       recipes_updated: 0,
       recipes_skipped_empty: 0,
@@ -247,15 +251,24 @@ export async function POST(request: Request) {
         avgPrice = Math.round(avgPrice * 10000) / 10000; // 4 decimal precision
 
         if (existing) {
-          // Update price if changed significantly
-          if (Math.abs((existing.average_price || 0) - avgPrice) > 0.001 && avgPrice > 0) {
-            updateMatPrice.run(avgPrice, existing.id);
-            priceTouchedIds.push(existing.id);
-            report.materials_price_updated++;
+          // avgPrice above is denominated in the sheet-derived base unit (ml/g/pcs).
+          // If the DB material is tracked in a different recipe unit (e.g. a beer
+          // stored as 'pcs' per bottle), writing a per-ml rate would deflate every
+          // dependent cost — skip the price write and leave the row for manual review.
+          // The material still participates in recipe matching below.
+          if ((existing.unit || '') !== baseUnit) {
+            report.materials_price_skipped_unit_mismatch++;
           } else {
-            report.materials_updated++;
+            // Update price if changed significantly
+            if (Math.abs((existing.average_price || 0) - avgPrice) > 0.001 && avgPrice > 0) {
+              updateMatPrice.run(avgPrice, existing.id);
+              priceTouchedIds.push(existing.id);
+              report.materials_price_updated++;
+            } else {
+              report.materials_updated++;
+            }
+            materialMap.set(key, { ...existing, average_price: avgPrice, unit: baseUnit });
           }
-          materialMap.set(key, { ...existing, average_price: avgPrice, unit: baseUnit });
         } else {
           const id = generateId();
           ingestMaterial.run(id, name, category, baseUnit, avgPrice);

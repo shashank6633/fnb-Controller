@@ -20,6 +20,17 @@ function splitGst(
   return { cgst, sgst: r2(combined - cgst), combined };
 }
 
+/**
+ * Canonical item_type: lowercase + trailing non-alphanumerics stripped
+ * ('Beverages.' → 'beverages'). POS sheets shipped a trailing dot which made
+ * the type filter and stat-bar counts match nothing; every write path and the
+ * summary counts share this normalizer (data repaired one-time in db.ts via
+ * menu_item_type_normalize_v1).
+ */
+function normalizeItemType(v: unknown): string {
+  return String(v ?? '').trim().toLowerCase().replace(/[^a-z0-9]+$/, '');
+}
+
 export async function GET(request: Request) {
   try {
     const db = getDb();
@@ -73,9 +84,9 @@ export async function GET(request: Request) {
       total: allItems.length,
       active: allItems.filter(i => i.is_active).length,
       inactive: allItems.filter(i => !i.is_active).length,
-      foods: allItems.filter(i => i.item_type === 'foods').length,
-      liquors: allItems.filter(i => i.item_type === 'liquors').length,
-      beverages: allItems.filter(i => i.item_type === 'beverages').length,
+      foods: allItems.filter(i => normalizeItemType(i.item_type) === 'foods').length,
+      liquors: allItems.filter(i => normalizeItemType(i.item_type) === 'liquors').length,
+      beverages: allItems.filter(i => normalizeItemType(i.item_type) === 'beverages').length,
       withRecipe: allItems.filter(i => i.recipe_id).length,
       withMaterial: allItems.filter(i => i.material_id).length,
       noPrice: allItems.filter(i => !i.selling_price || i.selling_price === 0).length,
@@ -116,7 +127,7 @@ export async function POST(request: Request) {
                               image_url, spice_level, tags, taste_sour, taste_sweet, taste_spicy, taste_tangy, serves, options, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     `).run(
-      id, name, category || '', station || '', item_type || 'foods', dietary_tag || '',
+      id, name, category || '', station || '', normalizeItemType(item_type) || 'foods', dietary_tag || '',
       Number(selling_price) || 0, Number(listing_price) || 0, item_code || '', tax.combined, tax.cgst, tax.sgst,
       Number(prep_minutes) || 0, is_active === false ? 0 : 1, recipe_id || null, material_id || null, notes || '',
       (image_url || '').toString(), clamp(spice_level, 3), asJson(tags),
@@ -147,6 +158,7 @@ export async function PUT(request: Request) {
         updates.push(`${key} = ?`);
         // tags/options may arrive as arrays from the form → store as JSON text.
         let v: any = (key === 'tags' || key === 'options') && Array.isArray(fields[key]) ? JSON.stringify(fields[key]) : fields[key];
+        if (key === 'item_type') v = normalizeItemType(v);
         values.push(typeof v === 'boolean' ? (v ? 1 : 0) : v);
       }
     }

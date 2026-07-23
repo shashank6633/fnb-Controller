@@ -29,6 +29,13 @@ function formatCurrency(value: number): string {
   return '₹' + value.toLocaleString('en-IN', { maximumFractionDigits: 0 });
 }
 
+// Legacy rows carry dirty item_type values like 'beverages.' (trailing dot).
+// Normalize (lowercase + strip trailing non-alphanumerics) wherever the page
+// filters/groups/counts by item_type so those rows match the clean options.
+function normalizeType(t: string): string {
+  return (t || '').toLowerCase().trim().replace(/[^a-z0-9]+$/, '');
+}
+
 interface MenuItem {
   id: string;
   name: string;
@@ -102,7 +109,12 @@ export default function MenuItemsPage() {
   // Edit modal
   const [editItem, setEditItem] = useState<MenuItem | null>(null);
 
-  const [toast, setToast] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ msg: string; error?: boolean } | null>(null);
+
+  const showToast = useCallback((msg: string, error = false) => {
+    setToast({ msg, error });
+    setTimeout(() => setToast(null), error ? 3500 : 2000);
+  }, []);
 
   // Pagination + category dropdown + search focus
   const [page, setPage] = useState(1);
@@ -113,13 +125,20 @@ export default function MenuItemsPage() {
   const fetchItems = useCallback(async () => {
     try {
       const res = await fetch('/api/menu-items');
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as any));
+        showToast(j.error || `Failed to load menu items (HTTP ${res.status})`, true);
+        return;
+      }
       const json = await res.json();
       setItems(json.items || []);
       setSummary(prev => json.summary || prev);
       setCategories(json.categories || []);
       setStations(json.stations || []);
-    } catch (_) {}
-  }, []);
+    } catch (_) {
+      showToast('Failed to load menu items — check your connection', true);
+    }
+  }, [showToast]);
 
   useEffect(() => {
     (async () => {
@@ -136,7 +155,7 @@ export default function MenuItemsPage() {
       if (q && !it.name.toLowerCase().includes(q) && !it.item_code.toLowerCase().includes(q)) return false;
       if (categoryFilter && it.category !== categoryFilter) return false;
       if (stationFilter && it.station !== stationFilter) return false;
-      if (typeFilter && it.item_type !== typeFilter) return false;
+      if (typeFilter && normalizeType(it.item_type) !== typeFilter) return false;
       if (vegFilter && it.dietary_tag !== vegFilter) return false;
       if (statusFilter === 'active' && !it.is_active) return false;
       if (statusFilter === 'inactive' && it.is_active) return false;
@@ -147,11 +166,11 @@ export default function MenuItemsPage() {
           case 'noPrice': if (it.selling_price > 0) return false; break;
           case 'noCategory': if (it.category) return false; break;
           case 'noStation': if (it.station) return false; break;
-          case 'noDietaryTag': if (it.item_type !== 'foods' || it.dietary_tag) return false; break;
+          case 'noDietaryTag': if (normalizeType(it.item_type) !== 'foods' || it.dietary_tag) return false; break;
           case 'noRecipe': if (it.recipe_id || it.material_id) return false; break;
           case 'any': {
             const bad = !(it.selling_price > 0)
-              || (it.item_type === 'foods' && !it.dietary_tag)
+              || (normalizeType(it.item_type) === 'foods' && !it.dietary_tag)
               || (!it.recipe_id && !it.material_id);
             if (!bad) return false;
             break;
@@ -168,7 +187,7 @@ export default function MenuItemsPage() {
     for (const it of items) {
       let issue = false;
       if (!(it.selling_price > 0)) { noPrice++; issue = true; }
-      if (it.item_type === 'foods' && !it.dietary_tag) { noVeg++; issue = true; }
+      if (normalizeType(it.item_type) === 'foods' && !it.dietary_tag) { noVeg++; issue = true; }
       if (!it.recipe_id && !it.material_id) { noLink++; issue = true; }
       if (issue) bad.add(it.id);
     }
@@ -252,6 +271,9 @@ export default function MenuItemsPage() {
         else if (key === 'item type' || key === 'type') colIdx.itemType = i;
         else if (key === 'tax value' || key === 'tax') colIdx.taxValue = i;
         else if (key === 'item code' || key === 'code') colIdx.itemCode = i;
+        // Recaho POS mapped code — exported as "POS ID"; without this the
+        // round-trip re-import drops pos_id and sales-import matching breaks.
+        else if (key === 'pos id' || key === 'pos_id' || key === 'mapped code') colIdx.posId = i;
         else if (key === 'station') colIdx.station = i;
         else if (key === 'dietary tag' || key === 'veg/non-veg' || key === 'veg / non-veg') colIdx.dietaryTag = i;
         else if (key === 'cuisine') colIdx.cuisine = i;
@@ -314,6 +336,9 @@ export default function MenuItemsPage() {
           tax_value: Number(r[colIdx.taxValue]) || (isTemplate ? 5 : 0),
           item_code: String(r[colIdx.itemCode] || '').trim() || (isTemplate ? name.split(' ').map((w: string) => w[0] || '').join('').toUpperCase().slice(0, 5) : ''),
           station: String(r[colIdx.station] || '').trim() || (isTemplate ? stationFor(rawCategory) : ''),
+          // Only send pos_id when the sheet has the column — absent stays
+          // undefined (dropped by JSON.stringify) so the server preserves it.
+          pos_id: colIdx.posId !== undefined ? String(r[colIdx.posId] || '').trim() : undefined,
           dietary_tag: vegNormalize(r[colIdx.dietaryTag]) || deriveDietary(rawCategory, name),
           notes: isTemplate && cuisine ? `Cuisine: ${cuisine}` : '',
         });
@@ -380,30 +405,61 @@ export default function MenuItemsPage() {
 
   const deleteItem = async (id: string) => {
     if (!confirm('Delete this menu item?')) return;
-    await api(`/api/menu-items?id=${id}`, { method: 'DELETE' });
+    try {
+      const res = await api(`/api/menu-items?id=${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as any));
+        showToast(j.error || `Delete failed (HTTP ${res.status})`, true);
+        return;
+      }
+    } catch {
+      showToast('Delete failed — check your connection', true);
+      return;
+    }
     await fetchItems();
-    setToast('Item deleted');
-    setTimeout(() => setToast(null), 2000);
+    showToast('Item deleted');
   };
 
   const toggleActive = async (item: MenuItem) => {
-    await api('/api/menu-items', {
-      method: 'PUT',
-      body: { id: item.id, is_active: !item.is_active },
-    });
+    try {
+      const res = await api('/api/menu-items', {
+        method: 'PUT',
+        body: { id: item.id, is_active: !item.is_active },
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as any));
+        showToast(j.error || `Update failed (HTTP ${res.status})`, true);
+        return;
+      }
+    } catch {
+      showToast('Update failed — check your connection', true);
+      return;
+    }
     await fetchItems();
   };
 
-  const saveEdit = async (updates: Partial<MenuItem>) => {
-    if (!editItem) return;
-    await api('/api/menu-items', {
-      method: 'PUT',
-      body: { id: editItem.id, ...updates },
-    });
+  // Handles both create (editItem.id === '') and update. Returns null on
+  // success, or an error message — the modal stays open and shows it, so a
+  // failed save never silently discards the user's edits.
+  const saveEdit = async (updates: Partial<MenuItem>): Promise<string | null> => {
+    if (!editItem) return null;
+    const isNew = !editItem.id;
+    try {
+      const res = await api('/api/menu-items', {
+        method: isNew ? 'POST' : 'PUT',
+        body: isNew ? updates : { id: editItem.id, ...updates },
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as any));
+        return j.error || `Save failed (HTTP ${res.status})`;
+      }
+    } catch {
+      return 'Save failed — check your connection';
+    }
     setEditItem(null);
     await fetchItems();
-    setToast('Saved');
-    setTimeout(() => setToast(null), 2000);
+    showToast(isNew ? 'Item created' : 'Saved');
+    return null;
   };
 
   if (loading) {
@@ -502,7 +558,7 @@ export default function MenuItemsPage() {
             if (statusFilter === 'active'   && !it.is_active) return false;
             if (statusFilter === 'inactive' &&  it.is_active) return false;
             if (stationFilter && it.station !== stationFilter) return false;
-            if (typeFilter    && it.item_type !== typeFilter) return false;
+            if (typeFilter    && normalizeType(it.item_type) !== typeFilter) return false;
             if (vegFilter     && it.dietary_tag !== vegFilter) return false;
             const q = searchQuery.toLowerCase().trim();
             if (q && !it.name.toLowerCase().includes(q) && !(it.item_code || '').toLowerCase().includes(q)) return false;
@@ -625,11 +681,11 @@ export default function MenuItemsPage() {
         )}
       </div>
 
-      {/* Toast */}
+      {/* Toast — z above modal backdrops so error toasts stay visible */}
       {toast && (
-        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3 bg-green-600 text-white rounded-lg shadow-lg">
-          <CheckCircle className="w-4 h-4" />
-          <span className="text-sm font-medium">{toast}</span>
+        <div className={`fixed bottom-6 right-6 z-[96] flex items-center gap-3 px-5 py-3 ${toast.error ? 'bg-red-600' : 'bg-green-600'} text-white rounded-lg shadow-lg`}>
+          {toast.error ? <AlertCircle className="w-4 h-4" /> : <CheckCircle className="w-4 h-4" />}
+          <span className="text-sm font-medium">{toast.msg}</span>
         </div>
       )}
 
@@ -1012,26 +1068,26 @@ function textToOptions(t: string): Array<{ label: string; choices: string[] }> {
   }).filter((x): x is { label: string; choices: string[] } => !!x);
 }
 
-function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => void; categories: string[]; stations: string[]; isNew: boolean }) {
-  const [form, setForm] = useState({ ...item });
+function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => Promise<string | null>; categories: string[]; stations: string[]; isNew: boolean }) {
+  // Normalize legacy dirty types ('beverages.') so the Type select never
+  // renders blank — and a save writes the clean value back.
+  const [form, setForm] = useState({ ...item, item_type: normalizeType(item.item_type) || item.item_type });
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [optsText, setOptsText] = useState(() => optionsToText((item as any).options));
   const F = form as any;
   const tagArr: string[] = Array.isArray(F.tags) ? F.tags : (F.tags ? (() => { try { const j = JSON.parse(F.tags); return Array.isArray(j) ? j : String(F.tags).split(','); } catch { return String(F.tags).split(','); } })() : []);
   const toggleTag = (tg: string) => setForm({ ...form, tags: (tagArr.indexOf(tg) >= 0 ? tagArr.filter(x => x !== tg) : tagArr.concat(tg)) } as any);
   const TAGS: [string, string][] = [['most-ordered', 'Most Ordered'], ['chef', "Chef's"], ['bestseller', 'Bestseller'], ['popular', 'Popular']];
 
+  // onSave (parent saveEdit) handles both create and update, checks res.ok,
+  // and returns an error message on failure — modal stays open with the
+  // user's edits intact and the error shown.
   const save = async () => {
     setSaving(true);
-    if (isNew) {
-      await api('/api/menu-items', {
-        method: 'POST',
-        body: form,
-      });
-      onSave(form);
-    } else {
-      await onSave(form);
-    }
+    setError(null);
+    const err = await onSave(form);
+    if (err) setError(err);
     setSaving(false);
   };
 
@@ -1172,6 +1228,12 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
             <span className="text-sm text-[#6B5744]">Active (shown on menu)</span>
           </label>
         </div>
+        {error && (
+          <div className="flex items-start gap-2 mx-6 mt-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg shrink-0">
+            <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+            <p className="text-xs text-red-700">{error}</p>
+          </div>
+        )}
         <div className="flex justify-end gap-3 px-6 py-3 border-t border-[#E8D5C4] shrink-0">
           <button onClick={onClose} className="px-4 py-2 text-sm text-[#6B5744] bg-[#FFF1E3] rounded-lg hover:bg-[#E8D5C4]">Cancel</button>
           <button onClick={save} disabled={saving || !form.name} className="flex items-center gap-2 px-5 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-sm font-medium">

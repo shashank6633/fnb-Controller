@@ -150,8 +150,11 @@ export async function POST(req: Request) {
         INSERT INTO recipes (id, name, category, selling_price, yield_quantity, yield_unit, version, is_active, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, 'g', 1, 1, datetime('now'), datetime('now'))
       `);
+      // Only overwrite selling_price when the workbook actually supplies a
+      // price > 0 for this recipe — a missing/renamed 'Recipe Summary' sheet
+      // (or a name that doesn't match it) must not zero real prices on re-import.
       const updateRecipeMeta = db.prepare(`
-        UPDATE recipes SET selling_price = ?, yield_quantity = ?, yield_unit = 'g', version = version + 1, updated_at = datetime('now') WHERE id = ?
+        UPDATE recipes SET selling_price = CASE WHEN ? > 0 THEN ? ELSE selling_price END, yield_quantity = ?, yield_unit = 'g', version = version + 1, updated_at = datetime('now') WHERE id = ?
       `);
       // Only fill the category when it's blank — never clobber a manual category.
       const fillRecipeCategory = db.prepare(`
@@ -175,7 +178,7 @@ export async function POST(req: Request) {
         const category = categorizeRecipeName(r.name);
         if (recipeId) {
           if (!overwrite) continue;
-          updateRecipeMeta.run(selling, r.yieldQty || 0, recipeId);
+          updateRecipeMeta.run(selling, selling, r.yieldQty || 0, recipeId);
           fillRecipeCategory.run(category, recipeId);   // backfills only if blank
           report.recipes_updated++;
         } else {

@@ -56,6 +56,16 @@ function normalizeName(name: string): string {
   return fixTypos(name.replace(/\s+/g, ' ').trim());
 }
 
+/**
+ * Canonical item_type: lowercase + trailing non-alphanumerics stripped
+ * ('Beverages.' → 'beverages'). POS sheets shipped a trailing dot which made
+ * the type filter and stat-bar counts match nothing; mirrors the normalizer in
+ * /api/menu-items (data repaired one-time in db.ts via menu_item_type_normalize_v1).
+ */
+function normalizeItemType(v: unknown): string {
+  return String(v ?? '').trim().toLowerCase().replace(/[^a-z0-9]+$/, '');
+}
+
 export async function POST(request: Request) {
   try {
     const db = getDb();
@@ -67,10 +77,10 @@ export async function POST(request: Request) {
       strip_spaces?: boolean;
       skip_inactive?: boolean;
       skip_zero_price?: boolean;
-      // Auto-link unmatched items to a raw material by name prefix. Right for the
-      // POS/liquor import (BUDWEISER → material), but wrong for a food menu where
-      // every item should be a recipe — a food menu sends link_materials=false so
-      // a soup never links to "TOMATO KETCHUP".
+      // Auto-link unmatched items to a raw material by EXACT name/SKU only.
+      // Right for the POS/liquor import (BUDWEISER → material), but wrong for a
+      // food menu where every item should be a recipe — a food menu sends
+      // link_materials=false so a soup never links to "TOMATO KETCHUP".
       link_materials?: boolean;
     };
 
@@ -87,6 +97,10 @@ export async function POST(request: Request) {
       items_linked_to_recipe: 0,
       items_linked_to_material: 0,
       items_unlinked: 0,
+      // Rows where material linking was requested but no EXACT name/SKU match
+      // existed — reported for manual review instead of prefix-guessing a link.
+      materials_unmatched: 0,
+      materials_unmatched_items: [] as string[],
       typos_fixed: [] as string[],
       spaces_fixed: 0,
       duplicates_found: [] as string[],
@@ -107,17 +121,26 @@ export async function POST(request: Request) {
     // it links only confident matches and leaves the rest for manual linking.
     const matchRecipe = buildRecipeMatcher(recipes);
 
-    const materials = db.prepare('SELECT id, name FROM raw_materials').all() as any[];
+    const materials = db.prepare('SELECT id, name, sku FROM raw_materials').all() as any[];
     const materialMap = new Map<string, string>();
     for (const m of materials) materialMap.set(m.name.toLowerCase().trim(), m.id);
+    // Exact SKU lookup (secondary match key; name equality wins on collision).
+    const materialSkuMap = new Map<string, string>();
+    for (const m of materials) {
+      const sku = (m.sku || '').toString().toLowerCase().trim();
+      if (sku && !materialSkuMap.has(sku)) materialSkuMap.set(sku, m.id);
+    }
 
     const insertItem = db.prepare(`
       INSERT INTO menu_items (id, name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, cgst_percent, sgst_percent, is_active, recipe_id, material_id, source, pos_id, notes, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pos', ?, '', datetime('now'), datetime('now'))
     `);
 
+    // pos_id: preserve on blank — the Recaho mapped code drives sales-import
+    // matching, and a CSV without the POS ID column must not wipe it (same
+    // COALESCE-preserve pattern as recipe_id/material_id).
     const updateItem = db.prepare(`
-      UPDATE menu_items SET name = ?, category = ?, station = ?, item_type = ?, dietary_tag = ?, selling_price = ?, listing_price = ?, item_code = ?, tax_value = ?, cgst_percent = ?, sgst_percent = ?, is_active = ?, recipe_id = COALESCE(?, recipe_id), material_id = COALESCE(?, material_id), pos_id = ?, updated_at = datetime('now') WHERE id = ?
+      UPDATE menu_items SET name = ?, category = ?, station = ?, item_type = ?, dietary_tag = ?, selling_price = ?, listing_price = ?, item_code = ?, tax_value = ?, cgst_percent = ?, sgst_percent = ?, is_active = ?, recipe_id = COALESCE(?, recipe_id), material_id = COALESCE(?, material_id), pos_id = COALESCE(NULLIF(?, ''), pos_id), updated_at = datetime('now') WHERE id = ?
     `);
     // Keep the invariant tax_value = cgst_percent + sgst_percent (the bill engine
     // sums tax_value; the menu form re-derives tax_value from the two halves on
@@ -181,22 +204,20 @@ export async function POST(request: Request) {
           report.recipe_links.push({ item: normalized, recipe: rm.name, score: rm.score });
         }
 
-        // Link to material for direct-sale items (beer/wine/bottles)
+        // Link to material for direct-sale items (beer/wine/bottles).
+        // EXACT-ONLY: case-insensitive full-name equality or exact SKU. The old
+        // first-word-prefix fallback mass-assigned wrong materials on round-trip
+        // ("Mango Kulfi" → "MANGO PICKLE 5 KG") — a miss is reported for manual
+        // linking instead of guessed.
         let materialId: string | null = null;
         if (!recipeId && link_materials) {
-          // Try exact match first
-          materialId = materialMap.get(nameKey) || null;
-          // Try matching first few words (e.g., "BUDWEISER 330 ML" → "BUDWEISER (330ML)")
-          if (!materialId) {
-            const firstWord = normalized.split(' ')[0].toLowerCase();
-            for (const [mname, mid] of materialMap) {
-              if (mname.startsWith(firstWord) && mname.length > 3) {
-                materialId = mid;
-                break;
-              }
-            }
+          materialId = materialMap.get(nameKey) || materialSkuMap.get(nameKey) || null;
+          if (materialId) {
+            report.items_linked_to_material++;
+          } else {
+            report.materials_unmatched++;
+            report.materials_unmatched_items.push(normalized);
           }
-          if (materialId) report.items_linked_to_material++;
         }
 
         if (!recipeId && !materialId) {
@@ -217,7 +238,7 @@ export async function POST(request: Request) {
           const ug = gstSplit(Number(row.tax_value) || 0);
           updateItem.run(
             normalized,
-            row.category || '', row.station || '', row.item_type || 'foods', row.dietary_tag || '',
+            row.category || '', row.station || '', normalizeItemType(row.item_type) || 'foods', row.dietary_tag || '',
             sellingPrice, Number(row.listing_price) || 0, row.item_code || '',
             ug.tax, ug.cgst, ug.sgst, isActive ? 1 : 0, recipeId, materialId, row.pos_id || '',
             existing.id
@@ -231,7 +252,7 @@ export async function POST(request: Request) {
           const ig = gstSplit(Number(row.tax_value) || 0);
           insertItem.run(
             id, normalized, row.category || '', row.station || '',
-            row.item_type || 'foods', row.dietary_tag || '',
+            normalizeItemType(row.item_type) || 'foods', row.dietary_tag || '',
             sellingPrice, Number(row.listing_price) || 0, row.item_code || '',
             ig.tax, ig.cgst, ig.sgst, isActive ? 1 : 0, recipeId, materialId, row.pos_id || ''
           );
@@ -247,6 +268,7 @@ export async function POST(request: Request) {
     report.typos_fixed = [...new Set(report.typos_fixed)];
     report.duplicates_found = [...new Set(report.duplicates_found)];
     report.unlinked_items = [...new Set(report.unlinked_items)];
+    report.materials_unmatched_items = [...new Set(report.materials_unmatched_items)];
 
     return Response.json(report);
   } catch (error: any) {

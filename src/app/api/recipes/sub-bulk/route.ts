@@ -1,4 +1,5 @@
 import { getDb, generateId, recalculateSubRecipeCost, recalculateRecipeCost } from '@/lib/db';
+import { requireRole } from '@/lib/auth';
 
 interface SubBulkRow {
   sub_recipe_name: string;
@@ -10,6 +11,8 @@ interface SubBulkRow {
 }
 
 export async function POST(request: Request) {
+  const auth = await requireRole('admin');
+  if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
   try {
     const db = getDb();
     const body = await request.json();
@@ -42,6 +45,9 @@ export async function POST(request: Request) {
       ingredients_added: 0,
       ingredients_not_found: [] as string[],
       recipes_recosted: 0,
+      // Overwrite-mode sub-recipes left completely untouched because one or
+      // more of their CSV lines didn't resolve — see the preflight below.
+      rejected: [] as { sub_recipe: string; unmatched: string[] }[],
       errors: [] as string[],
     };
 
@@ -61,6 +67,24 @@ export async function POST(request: Request) {
         if (existing) {
           if (!overwrite_existing) {
             results.subs_skipped++;
+            continue;
+          }
+          // PREFLIGHT before any destructive write: resolve EVERY line of this
+          // sub-recipe's group first. The old delete-then-match flow permanently
+          // dropped any line whose material name had drifted (the June "thinned
+          // recipe" incident class). If anything is unmatched, leave the
+          // sub-recipe completely untouched and report it in `rejected`.
+          const unmatched: string[] = [];
+          for (const row of groupRows) {
+            const ingName = String(row.ingredient_name).trim();
+            if (!materialByName.get(ingName.toLowerCase())) {
+              unmatched.push(ingName);
+              results.ingredients_not_found.push(`"${ingName}" (sub-recipe: ${subName})`);
+            }
+          }
+          if (unmatched.length > 0) {
+            results.rejected.push({ sub_recipe: subName, unmatched: [...new Set(unmatched)] });
+            results.errors.push(`Rejected "${subName}" — ${unmatched.length} unmatched line(s); existing sub-recipe left untouched. Fix the names and re-upload.`);
             continue;
           }
           subRecipeId = existing.id;

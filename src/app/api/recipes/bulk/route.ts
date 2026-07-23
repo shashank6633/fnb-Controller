@@ -1,4 +1,5 @@
 import { getDb, generateId, recalculateRecipeCost } from '@/lib/db';
+import { requireRole } from '@/lib/auth';
 
 interface BulkRow {
   recipe_name: string;
@@ -13,6 +14,8 @@ interface BulkRow {
 }
 
 export async function POST(request: Request) {
+  const auth = await requireRole('admin');
+  if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
   try {
     const db = getDb();
     const body = await request.json();
@@ -53,6 +56,9 @@ export async function POST(request: Request) {
       ingredients_not_found: [] as string[],
       subs_linked: 0,
       subs_not_found: [] as string[],
+      // Overwrite-mode recipes left completely untouched because one or more
+      // of their CSV lines didn't resolve — see the preflight below.
+      rejected: [] as { recipe: string; unmatched: string[] }[],
       errors: [] as string[],
     };
 
@@ -72,6 +78,31 @@ export async function POST(request: Request) {
         if (existing) {
           if (!overwrite_existing) {
             results.recipes_skipped++;
+            continue;
+          }
+          // PREFLIGHT before any destructive write: resolve EVERY line of this
+          // recipe's group first. The old delete-then-match flow permanently
+          // dropped any line whose material/sub name had drifted (the June
+          // "thinned recipe" incident class). If anything is unmatched, leave
+          // the recipe completely untouched and report it in `rejected`.
+          const unmatched: string[] = [];
+          for (const row of groupRows) {
+            const ingName = String(row.ingredient_name).trim();
+            const subMatch = ingName.match(/^\[sub\]\s*(.+)$/i);
+            if (subMatch) {
+              const subName = subMatch[1].trim();
+              if (!subRecipeByName.get(subName.toLowerCase())) {
+                unmatched.push(ingName);
+                results.subs_not_found.push(`"${subName}" (recipe: ${recipeName})`);
+              }
+            } else if (!materialByName.get(ingName.toLowerCase())) {
+              unmatched.push(ingName);
+              results.ingredients_not_found.push(`"${ingName}" (recipe: ${recipeName})`);
+            }
+          }
+          if (unmatched.length > 0) {
+            results.rejected.push({ recipe: recipeName, unmatched: [...new Set(unmatched)] });
+            results.errors.push(`Rejected "${recipeName}" — ${unmatched.length} unmatched line(s); existing recipe left untouched. Fix the names and re-upload.`);
             continue;
           }
           recipeId = existing.id;

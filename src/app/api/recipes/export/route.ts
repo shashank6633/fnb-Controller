@@ -1,5 +1,25 @@
-import { getDb } from '@/lib/db';
+import { getDb, convertToMaterialUnit } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
 import * as XLSX from 'xlsx';
+
+/**
+ * Effective line cost — the SAME per-line math recalculateRecipeCost /
+ * recalculateSubRecipeCost use (src/lib/db.ts): convert the recipe-declared
+ * qty into the material's stock unit (incl. the pcs↔ml/g pack_size bridge),
+ * apply wastage/yield, then multiply by average_price (₹ per RECIPE unit).
+ * Row must carry: quantity, unit, material_unit, material_name,
+ * material_pack_size, average_price, yield_percent, wastage_percent.
+ */
+function engineLineCost(ing: any): number {
+  const qtyInMatUnit = convertToMaterialUnit(
+    ing.quantity || 0, ing.unit, ing.material_unit, ing.material_name, ing.material_pack_size,
+  );
+  // Engine formula: qty × (1 + wastage%/100) ÷ (yield%/100). Guard yield<=0
+  // (engine would emit Infinity — never valid in a spreadsheet cell).
+  const yieldPct = ing.yield_percent > 0 ? ing.yield_percent : 100;
+  const effectiveQty = qtyInMatUnit * (1 + (ing.wastage_percent || 0) / 100) / (yieldPct / 100);
+  return Math.round(effectiveQty * (ing.average_price || 0) * 100) / 100;
+}
 
 /**
  * Export the full recipe book as a multi-sheet Excel workbook.
@@ -15,6 +35,11 @@ import * as XLSX from 'xlsx';
  *   ?include_inactive=true       → include is_active=0 rows
  */
 export async function GET(request: Request) {
+  // SECURITY: this export is the full costed recipe book (every ingredient qty,
+  // average_price, total_cost, profit, direct-item margins). The proxy only
+  // checks that a session cookie EXISTS for GETs — validate it in-handler.
+  const me = await getCurrentUser();
+  if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
   try {
     const db = getDb();
     const url = new URL(request.url);
@@ -37,7 +62,8 @@ export async function GET(request: Request) {
     let totalIngredients = 0;
     for (const r of recipes) {
       const ings = db.prepare(`
-        SELECT ri.*, rm.name AS material_name, rm.average_price, rm.unit AS material_unit
+        SELECT ri.*, rm.name AS material_name, rm.average_price, rm.unit AS material_unit,
+               rm.pack_size AS material_pack_size
         FROM recipe_ingredients ri JOIN raw_materials rm ON rm.id = ri.material_id
         WHERE ri.recipe_id = ? ORDER BY rm.name
       `).all(r.id) as any[];
@@ -59,7 +85,7 @@ export async function GET(request: Request) {
         continue;
       }
       for (const ing of ings) {
-        const lineCost = Math.round((ing.quantity || 0) * (ing.average_price || 0) * 100) / 100;
+        const lineCost = engineLineCost(ing);
         recipeRows.push({
           Recipe: r.name, Category: r.category || '',
           'Selling Price (₹)': Math.round(r.selling_price || 0),
@@ -92,7 +118,8 @@ export async function GET(request: Request) {
     let totalSubIngredients = 0;
     for (const sr of subRecipes) {
       const ings = db.prepare(`
-        SELECT sri.*, rm.name AS material_name, rm.average_price
+        SELECT sri.*, rm.name AS material_name, rm.average_price, rm.unit AS material_unit,
+               rm.pack_size AS material_pack_size
         FROM sub_recipe_ingredients sri JOIN raw_materials rm ON rm.id = sri.material_id
         WHERE sri.sub_recipe_id = ? ORDER BY rm.name
       `).all(sr.id) as any[];
@@ -109,7 +136,7 @@ export async function GET(request: Request) {
         continue;
       }
       for (const ing of ings) {
-        const lineCost = Math.round((ing.quantity || 0) * (ing.average_price || 0) * 100) / 100;
+        const lineCost = engineLineCost(ing);
         subRows.push({
           'Sub-Recipe': sr.name,
           'Yield Qty':   sr.yield_quantity || 1,
@@ -255,7 +282,8 @@ function emitCsv(db: any, recipes: any[]): Response {
   const lines: string[] = [headers.map(csvEscape).join(',')];
   for (const r of recipes) {
     const ings = db.prepare(`
-      SELECT ri.*, rm.name AS material_name, rm.average_price
+      SELECT ri.*, rm.name AS material_name, rm.average_price, rm.unit AS material_unit,
+             rm.pack_size AS material_pack_size
       FROM recipe_ingredients ri JOIN raw_materials rm ON rm.id = ri.material_id
       WHERE ri.recipe_id = ? ORDER BY rm.name
     `).all(r.id) as any[];
@@ -265,7 +293,7 @@ function emitCsv(db: any, recipes: any[]): Response {
       continue;
     }
     for (const ing of ings) {
-      const lc = Math.round((ing.quantity || 0) * (ing.average_price || 0) * 100) / 100;
+      const lc = engineLineCost(ing);
       lines.push([r.name, r.category, r.selling_price, r.total_cost, r.food_cost_percent,
         ing.material_name, ing.quantity, ing.unit, ing.yield_percent, ing.wastage_percent, lc, ''].map(csvEscape).join(','));
     }

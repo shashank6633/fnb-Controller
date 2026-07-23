@@ -1,7 +1,13 @@
 import { getDb, generateId, recalculateSubRecipeCost } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
 
 export async function GET(request: Request) {
   try {
+    // SECURITY: the proxy only checks that a session cookie is PRESENT for GETs —
+    // real validation is delegated here. Without this, a forged/expired cookie
+    // could read every costed sub-recipe.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const subRecipes = db.prepare(`
       SELECT * FROM sub_recipes WHERE is_active = 1 ORDER BY name ASC
@@ -31,6 +37,12 @@ export async function POST(request: Request) {
 
     if (!name || !ingredients || !ingredients.length) {
       return Response.json({ error: 'name and ingredients are required' }, { status: 400 });
+    }
+
+    // Guard: a zero/negative/NaN yield collapses cost_per_unit to 0 and cascades
+    // into every dependent recipe's total_cost. Reject before writing.
+    if (yield_quantity != null && (!Number.isFinite(Number(yield_quantity)) || Number(yield_quantity) <= 0)) {
+      return Response.json({ error: 'yield_quantity must be > 0' }, { status: 400 });
     }
 
     const id = generateId();
@@ -86,6 +98,12 @@ export async function PUT(request: Request) {
       return Response.json({ error: 'Sub-recipe not found' }, { status: 404 });
     }
 
+    // Guard: PUT used `yield_quantity ?? existing` so an explicit 0 was written,
+    // zeroing cost_per_unit and every dependent recipe's cost. Reject before writing.
+    if (yield_quantity != null && (!Number.isFinite(Number(yield_quantity)) || Number(yield_quantity) <= 0)) {
+      return Response.json({ error: 'yield_quantity must be > 0' }, { status: 400 });
+    }
+
     const update = db.transaction(() => {
       // Increment version
       db.prepare(`
@@ -101,8 +119,10 @@ export async function PUT(request: Request) {
         id
       );
 
-      // Replace ingredients if provided
-      if (ingredients && ingredients.length) {
+      // Replace ingredients if provided. An explicit EMPTY array is a valid
+      // "clear all rows" request (the edit modal sends [] when every row is
+      // removed); only skip when the field is absent entirely.
+      if (Array.isArray(ingredients)) {
         db.prepare('DELETE FROM sub_recipe_ingredients WHERE sub_recipe_id = ?').run(id);
         for (const ing of ingredients) {
           db.prepare(`

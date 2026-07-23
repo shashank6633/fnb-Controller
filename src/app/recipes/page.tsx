@@ -38,6 +38,7 @@ import {
 import Papa from 'papaparse';
 import { allergenLabel, allergenEmoji } from '@/lib/allergens';
 import { api } from '@/lib/api';
+import { convert } from '@/lib/units';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -107,6 +108,8 @@ interface RawMaterial {
   unit: string;
   average_price: number;
   category: string;
+  /** Recipe-units per purchase-unit — bridges count↔weight/volume in cost previews. */
+  pack_size?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,37 +133,23 @@ function foodCostBg(pct: number): string {
   return 'bg-red-500/15 text-red-600';
 }
 
-// Parse "(750ML)" → 750  ·  "1 LTR" → 1000
-function parseMaterialVolumeMl(name?: string | null): number | null {
-  if (!name) return null;
-  const s = String(name).toUpperCase();
-  const mMl = s.match(/(\d+(?:\.\d+)?)\s*ML\b/);
-  if (mMl) return parseFloat(mMl[1]);
-  const mLtr = s.match(/(\d+(?:\.\d+)?)\s*(?:LTR|LITRE|LITER|L)\b/);
-  if (mLtr) return parseFloat(mLtr[1]) * 1000;
-  return null;
-}
-
 // Convert a recipe ingredient qty into the material's stock unit (so cost = qty × price holds).
-// packSize (recipe-units per purchase-unit) takes precedence over the name regex, matching the
-// server engine's convertToMaterialUnit — keeps the live preview === the saved cost.
+// EXACT mirror of the server engine's convertToMaterialUnit (src/lib/db.ts): identical guards,
+// then the same delegation to the shared lib/units convert() — which handles all same-dimension
+// pairs, bridges count↔weight/volume via pack_size (with name-regex fallback), and applies the
+// density-1 ml↔g fallback. Unknown pairs return null → fall back to qty, exactly like the server.
+// This keeps the live preview / Eff. Cost columns === the saved cost from recalculateRecipeCost.
 function convertQtyToMaterialUnit(qty: number, recipeUnit: string | null | undefined,
                                    materialUnit: string, materialName?: string, packSize?: number | null): number {
   const r = (recipeUnit || materialUnit || '').toLowerCase().trim();
   const m = (materialUnit || '').toLowerCase().trim();
   if (!r || r === m) return qty;
-  const pack = packSize && packSize > 1 ? packSize : parseMaterialVolumeMl(materialName);
-  if (r === 'pcs' && (m === 'ml' || m === 'l')) {
-    if (pack) return m === 'l' ? (qty * pack) / 1000 : qty * pack;
-  }
-  if ((r === 'ml' || r === 'l') && m === 'pcs') {
-    if (pack) return (r === 'l' ? qty * 1000 : qty) / pack;
-  }
-  if (r === 'l'  && m === 'ml') return qty * 1000;
-  if (r === 'ml' && m === 'l')  return qty / 1000;
-  if (r === 'kg' && m === 'g')  return qty * 1000;
-  if (r === 'g'  && m === 'kg') return qty / 1000;
-  return qty;
+  const result = convert(qty, r, m, {
+    recipe_unit: m,
+    pack_size: packSize ?? undefined,
+    name: materialName,
+  });
+  return result == null ? qty : result;
 }
 
 function computeIngredientCost(ing: {
@@ -219,6 +208,15 @@ export default function RecipesPage() {
   const [editingRecipe, setEditingRecipe] = useState<Recipe | null>(null);
   const [editingSubRecipe, setEditingSubRecipe] = useState<SubRecipe | null>(null);
   const [saving, setSaving] = useState(false);
+  // Save-failure banners — a failed save keeps the modal open with the server error
+  // instead of silently closing and discarding every edit.
+  const [recipeModalError, setRecipeModalError] = useState<string | null>(null);
+  const [subRecipeModalError, setSubRecipeModalError] = useState<string | null>(null);
+  // True only when the user actually touched the menu link in THIS edit session.
+  // The PUT handler clears ALL menu items pointing at the recipe before relinking
+  // the single id sent — so sending it on an untouched re-save of a "Linked ×N"
+  // recipe would silently unlink N−1 items and kill their stock deduction.
+  const [menuLinkDirty, setMenuLinkDirty] = useState(false);
 
   // --- recipe form ---
   const [formName, setFormName] = useState('');
@@ -519,6 +517,7 @@ export default function RecipesPage() {
           average_price: mat.average_price,
           material_unit: mat.unit,
           material_name: mat.name,
+          pack_size: mat.pack_size,
         });
       }
     }
@@ -546,6 +545,7 @@ export default function RecipesPage() {
           average_price: mat.average_price,
           material_unit: mat.unit,
           material_name: mat.name,
+          pack_size: mat.pack_size,
         });
       }
     }
@@ -1080,6 +1080,8 @@ export default function RecipesPage() {
     setFormSubRecipes([]);
     setFormInstructions('');
     setFormImageUrl('');
+    setRecipeModalError(null);
+    setMenuLinkDirty(false);
     setShowRecipeModal(true);
   }
 
@@ -1090,10 +1092,13 @@ export default function RecipesPage() {
     setFormSellingPrice(recipe.selling_price);
     setFormInstructions((recipe as any).instructions || '');
     setFormImageUrl((recipe as any).image_url || '');
-    // Find any menu_item already linked to this recipe
+    // Find any menu_item already linked to this recipe (display only — the link
+    // is NOT re-sent on save unless the user changes it, see menuLinkDirty).
     const linked = menuItems.find(mi => mi.recipe_id === recipe.id);
     setFormMenuItemId(linked?.id || '');
     setFormPosItemId(linked?.item_code || '');
+    setRecipeModalError(null);
+    setMenuLinkDirty(false);
     setFormIngredients(
       recipe.ingredients.map((i) => ({
         material_id: i.material_id,
@@ -1127,6 +1132,7 @@ export default function RecipesPage() {
     setSrFormYieldQty(1);
     setSrFormYieldUnit('kg');
     setSrFormIngredients([]);
+    setSubRecipeModalError(null);
     setShowSubRecipeModal(true);
   }
 
@@ -1136,6 +1142,7 @@ export default function RecipesPage() {
     setSrFormCategory(sr.category);
     setSrFormYieldQty(sr.yield_quantity);
     setSrFormYieldUnit(sr.yield_unit);
+    setSubRecipeModalError(null);
     setSrFormIngredients(
       sr.ingredients.map((i) => ({
         material_id: i.material_id,
@@ -1222,6 +1229,7 @@ export default function RecipesPage() {
   async function handleSaveRecipe() {
     if (!formName.trim()) return;
     setSaving(true);
+    setRecipeModalError(null);
     try {
       const payload: any = {
         name: formName,
@@ -1251,16 +1259,30 @@ export default function RecipesPage() {
             unit: subRecipes.find((s) => s.id === sr.sub_recipe_id)?.yield_unit || sr.unit,
           })),
       };
+      let res: Response;
       if (editingRecipe) {
         payload.id = editingRecipe.id;
-        await api('/api/recipes', { method: 'PUT', body: payload });
+        // Only send menu_item_id when the user actually changed the link in this
+        // edit session — the PUT handler clears EVERY menu item pointing at the
+        // recipe before relinking the one sent, so an untouched re-save of a
+        // "Linked ×N" recipe would silently unlink N−1 items (killing their
+        // stock deduction). Untouched → omit → server preserves all links.
+        if (!menuLinkDirty) delete payload.menu_item_id;
+        res = await api('/api/recipes', { method: 'PUT', body: payload });
       } else {
-        await api('/api/recipes', { method: 'POST', body: payload });
+        res = await api('/api/recipes', { method: 'POST', body: payload });
+      }
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // Keep the modal open — closing it would silently discard every edit.
+        setRecipeModalError(j.error || `Save failed (HTTP ${res.status}). Your changes are NOT saved.`);
+        return;
       }
       setShowRecipeModal(false);
       await fetchRecipes();
-    } catch (e) {
+    } catch (e: any) {
       console.error('Save recipe failed', e);
+      setRecipeModalError(e?.message ? `Network error: ${e.message} — your changes are NOT saved.` : 'Network error — your changes are NOT saved.');
     } finally {
       setSaving(false);
     }
@@ -1268,7 +1290,15 @@ export default function RecipesPage() {
 
   async function handleSaveSubRecipe() {
     if (!srFormName.trim()) return;
+    // Yield Quantity must be > 0: cost_per_unit = total_cost ÷ yield_quantity, and a
+    // 0 yield saved via PUT would zero cost_per_unit and silently deflate every
+    // dependent recipe's cost (the server now 400s on this too).
+    if (!(Number(srFormYieldQty) > 0)) {
+      setSubRecipeModalError('Yield Quantity must be greater than 0 — it divides total cost to get the cost per unit.');
+      return;
+    }
     setSaving(true);
+    setSubRecipeModalError(null);
     try {
       const payload: any = {
         name: srFormName,
@@ -1287,16 +1317,24 @@ export default function RecipesPage() {
             brand_preference: i.brand_preference,
           })),
       };
+      let res: Response;
       if (editingSubRecipe) {
         payload.id = editingSubRecipe.id;
-        await api('/api/sub-recipes', { method: 'PUT', body: payload });
+        res = await api('/api/sub-recipes', { method: 'PUT', body: payload });
       } else {
-        await api('/api/sub-recipes', { method: 'POST', body: payload });
+        res = await api('/api/sub-recipes', { method: 'POST', body: payload });
+      }
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // Keep the modal open — closing it would silently discard every edit.
+        setSubRecipeModalError(j.error || `Save failed (HTTP ${res.status}). Your changes are NOT saved.`);
+        return;
       }
       setShowSubRecipeModal(false);
       await Promise.all([fetchSubRecipes(), fetchRecipes()]);
-    } catch (e) {
+    } catch (e: any) {
       console.error('Save sub-recipe failed', e);
+      setSubRecipeModalError(e?.message ? `Network error: ${e.message} — your changes are NOT saved.` : 'Network error — your changes are NOT saved.');
     } finally {
       setSaving(false);
     }
@@ -1306,29 +1344,54 @@ export default function RecipesPage() {
   // PUT with just {id, category} — the API leaves name, price, ingredients
   // and sub-recipes untouched.
   async function quickSetCategory(recipeId: string, category: string) {
-    await api('/api/recipes', { method: 'PUT', body: { id: recipeId, category } });
-    setSelectedRecipe((prev) => (prev && prev.id === recipeId ? { ...prev, category } : prev));
-    await fetchRecipes();
+    try {
+      const res = await api('/api/recipes', { method: 'PUT', body: { id: recipeId, category } });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { alert('Category update failed: ' + (j.error || `HTTP ${res.status}`)); return; }
+      // Patch the open detail view only AFTER the server confirmed the write.
+      setSelectedRecipe((prev) => (prev && prev.id === recipeId ? { ...prev, category } : prev));
+      await fetchRecipes();
+    } catch (e: any) {
+      alert('Category update failed: ' + (e?.message || 'network error'));
+    }
   }
 
   async function quickSetSubCategory(subId: string, category: string) {
-    await api('/api/sub-recipes', { method: 'PUT', body: { id: subId, category } });
-    setSelectedSubRecipe((prev) => (prev && prev.id === subId ? { ...prev, category } : prev));
-    await fetchSubRecipes();
+    try {
+      const res = await api('/api/sub-recipes', { method: 'PUT', body: { id: subId, category } });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { alert('Category update failed: ' + (j.error || `HTTP ${res.status}`)); return; }
+      setSelectedSubRecipe((prev) => (prev && prev.id === subId ? { ...prev, category } : prev));
+      await fetchSubRecipes();
+    } catch (e: any) {
+      alert('Category update failed: ' + (e?.message || 'network error'));
+    }
   }
 
   async function handleDeleteRecipe(id: string) {
     if (!confirm('Deactivate this recipe?')) return;
-    await api(`/api/recipes?id=${id}`, { method: 'DELETE' });
-    setSelectedRecipe(null);
-    await fetchRecipes();
+    try {
+      const res = await api(`/api/recipes?id=${id}`, { method: 'DELETE' });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { alert('Deactivate failed: ' + (j.error || `HTTP ${res.status}`)); return; }
+      setSelectedRecipe(null);
+      await fetchRecipes();
+    } catch (e: any) {
+      alert('Deactivate failed: ' + (e?.message || 'network error'));
+    }
   }
 
   async function handleDeleteSubRecipe(id: string) {
     if (!confirm('Deactivate this sub-recipe?')) return;
-    await api(`/api/sub-recipes?id=${id}`, { method: 'DELETE' });
-    setSelectedSubRecipe(null);
-    await fetchSubRecipes();
+    try {
+      const res = await api(`/api/sub-recipes?id=${id}`, { method: 'DELETE' });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { alert('Deactivate failed: ' + (j.error || `HTTP ${res.status}`)); return; }
+      setSelectedSubRecipe(null);
+      await fetchSubRecipes();
+    } catch (e: any) {
+      alert('Deactivate failed: ' + (e?.message || 'network error'));
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1445,6 +1508,7 @@ export default function RecipesPage() {
                 average_price: mat.average_price,
                 material_unit: mat.unit,
                 material_name: mat.name,
+                pack_size: mat.pack_size,
               }));
             })()}
           </span>
@@ -1616,7 +1680,17 @@ export default function RecipesPage() {
                 </thead>
                 <tbody>
                   {r.ingredients.map((ing, i) => {
-                    const effCost = computeIngredientCost(ing);
+                    // Pass the material's unit/name/pack_size (API row fields, with a
+                    // fallback lookup in the loaded materials list) so Eff. Cost runs the
+                    // exact same conversion as the saved cost engine (recalculateRecipeCost).
+                    const mat = materials.find((mm) => mm.id === ing.material_id);
+                    const effCost = computeIngredientCost({
+                      ...ing,
+                      average_price: ing.average_price ?? mat?.average_price,
+                      material_unit: (ing as any).material_unit || mat?.unit,
+                      material_name: ing.material_name || mat?.name,
+                      pack_size: (ing as any).material_pack_size ?? (ing as any).pack_size ?? mat?.pack_size,
+                    });
                     return (
                       <tr key={i} className="border-b border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30">
                         <td className="py-2 px-2 text-[#3D2614]">{ing.material_name || ing.material_id}</td>
@@ -2331,11 +2405,13 @@ export default function RecipesPage() {
                     // Drop the link as soon as the user starts editing
                     setFormMenuItemId('');
                     setFormPosItemId('');
+                    setMenuLinkDirty(true);   // user touched the link in this session
                   }}
                   onPick={(picked) => {
                     setFormName(picked.name);
                     setFormMenuItemId(picked.id);
                     setFormPosItemId(picked.item_code || '');
+                    setMenuLinkDirty(true);   // user touched the link in this session
                     if (picked.category) setFormCategory(picked.category);
                     if (picked.selling_price && !formSellingPrice) setFormSellingPrice(picked.selling_price);
                   }}
@@ -2576,6 +2652,17 @@ export default function RecipesPage() {
               </div>
             </div>
 
+            {/* Save-failure banner — shown when the API rejected the save; the modal
+                stays open so nothing the user typed is lost. */}
+            {recipeModalError && (
+              <div className="px-6 pt-3 shrink-0">
+                <div className="flex items-start gap-2 bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-xs text-red-700">
+                  <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                  <span>{recipeModalError}</span>
+                </div>
+              </div>
+            )}
+
             {/* Modal footer */}
             <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-[#E8D5C4] shrink-0">
               <button
@@ -2804,6 +2891,17 @@ export default function RecipesPage() {
                 </div>
               </div>
             </div>
+
+            {/* Save-failure / validation banner — the modal stays open so nothing
+                the user typed is lost. */}
+            {subRecipeModalError && (
+              <div className="px-6 pt-3 shrink-0">
+                <div className="flex items-start gap-2 bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-xs text-red-700">
+                  <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                  <span>{subRecipeModalError}</span>
+                </div>
+              </div>
+            )}
 
             {/* Modal footer */}
             <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-[#E8D5C4] shrink-0">
