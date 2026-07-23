@@ -218,6 +218,19 @@ function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
   const [seeding, setSeeding] = useState(false);
   const [seedResult, setSeedResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showAllSources, setShowAllSources] = useState(false);   // escape hatch for a mis-categorised carcass
+
+  // A butchering source is a whole protein/carcass — not the whole 1000-item
+  // catalog. Match meat/protein categories OR a protein keyword in name/SKU.
+  // The "Show all materials" checkbox is the fallback if a carcass isn't tagged.
+  const MEAT_CATS = ['meat', 'mutton', 'chicken', 'poultry', 'seafood', 'fish', 'prawn', 'lamb', 'goat', 'non-veg', 'nonveg', 'non veg'];
+  const isCarcassSource = (m: Material) => {
+    const cat = String((m as any).category || '').toLowerCase().trim();
+    if (MEAT_CATS.includes(cat)) return true;
+    const hay = `${m.name || ''} ${m.sku || ''}`.toLowerCase();
+    return /carcass|mutton|chicken|lamb|goat|poultry|seafood|prawn|\bmeat\b|\bfish\b/.test(hay);
+  };
+  const sourceMaterials = showAllSources ? materials : materials.filter(isCarcassSource);
 
   // Detect if the standard mutton cuts are missing — if so, surface a 1-click seed button
   const hasMuttonCarcass = materials.some(m =>
@@ -291,13 +304,17 @@ function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
         <Field label="Source carcass *" className="col-span-2">
           <select value={sourceId} onChange={e => { setSourceId(e.target.value); if (!batchId) setTimeout(suggestId, 0); }}
                   className="w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3]">
-            <option value="">— pick whole-carcass SKU —</option>
-            {materials.map(m => (
+            <option value="">— pick a carcass / meat item —</option>
+            {sourceMaterials.map(m => (
               <option key={m.id} value={m.id}>
                 {m.sku ? `[${m.sku}] ` : ''}{m.name} {m.unit ? `(${m.unit})` : ''}
               </option>
             ))}
           </select>
+          <label className="flex items-center gap-1.5 mt-1 text-[11px] text-[#8B7355]">
+            <input type="checkbox" checked={showAllSources} onChange={e => setShowAllSources(e.target.checked)} />
+            Show all materials {showAllSources ? '' : `(showing ${sourceMaterials.length} meat/carcass of ${materials.length})`}
+          </label>
         </Field>
         <Field label="Batch ID *" hint="auto-suggested when source is picked">
           <div className="flex gap-2">
