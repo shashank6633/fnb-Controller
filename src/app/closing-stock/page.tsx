@@ -524,12 +524,14 @@ export default function ClosingStockByLocationPage() {
 
   const reloadLocations = async () => {
     setLoading(true);
-    const d = await fetch(`/api/closing-stock/locations?date=${date}`).then(r => r.json());
+    // Scope the progress cards to the department we're recording under, so
+    // "counted today" matches the counts this user is actually saving.
+    const d = await fetch(`/api/closing-stock/locations?date=${date}&department_id=${encodeURIComponent(activeDeptId)}`).then(r => r.json());
     setLocations(d.locations || []);
     setTotals(d.totals || { locations: 0, items: 0, counted: 0 });
     setLoading(false);
   };
-  useEffect(() => { reloadLocations(); /* eslint-disable-next-line */ }, [date]);
+  useEffect(() => { reloadLocations(); /* eslint-disable-next-line */ }, [date, activeDeptId]);
 
   // Per-area rollup for the top-level date — admin / HOD / store-manager only.
   // Uses the summary.by_area block, which is date-scoped and independent of any
@@ -550,7 +552,7 @@ export default function ClosingStockByLocationPage() {
     setCases({});
     setLoose({});
     setSavedFlash('');
-    const qs = new URLSearchParams({ date, location: loc === '— Unassigned —' ? '__unassigned__' : loc });
+    const qs = new URLSearchParams({ date, location: loc === '— Unassigned —' ? '__unassigned__' : loc, department_id: activeDeptId });
     const d = await fetch(`/api/closing-stock/by-location?${qs}`).then(r => r.json());
     setItems(d.items || []);
     setItemsLoading(false);
@@ -558,6 +560,9 @@ export default function ClosingStockByLocationPage() {
 
   // Reset filters when switching to a different storage location
   useEffect(() => { setCategoryFilter(''); setItemSearch(''); }, [active]);
+  // Changing the active department re-scopes the open location's counts too, so
+  // today_count reflects the newly-selected department (not a stale one).
+  useEffect(() => { if (active) openLocation(active); /* eslint-disable-next-line */ }, [activeDeptId]);
 
   // List of distinct categories present in the current location, with item counts.
   // Powers the chip strip above the count table. Counts respect the search box

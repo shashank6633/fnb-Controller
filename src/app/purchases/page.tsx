@@ -22,6 +22,7 @@ import {
   FileSpreadsheet,
   CheckCircle,
   AlertCircle,
+  Download,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import type { Purchase, RawMaterial } from '@/types';
@@ -684,6 +685,83 @@ export default function PurchasesPage() {
     XLSX.writeFile(wb, `opening-stock-template-${todayString()}.xlsx`);
   };
 
+  // ---- Bulk Purchases: ready-to-fill template (matches the Generic CSV upload
+  // parser). Sheet 1 "Purchases" is what the upload reads (first sheet); sheet 2
+  // "How to fill" explains every column. Two sample rows use real material names
+  // so users learn the name must match an existing Raw Material exactly. ----
+  const downloadBulkPurchaseTemplate = async () => {
+    const XLSX = await import('xlsx');
+    const sample = [...materials].sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
+    const ex1: any = sample[0];
+    const ex2: any = sample.find((m: any) => (Number(m.pack_size) || 1) > 1) || sample[1];
+    const header = ['item_name', 'vendor', 'brand', 'quantity', 'unit_price', 'total_amount', 'gst_amount', 'date', 'notes'];
+    const rows = [
+      {
+        item_name: ex1?.name || 'Tomato',
+        vendor: 'ABC Traders', brand: '',
+        quantity: 10, unit_price: 25, total_amount: '', gst_amount: '',
+        date: todayString(), notes: 'SAMPLE — delete before uploading',
+      },
+      {
+        item_name: ex2?.name || 'Refined Oil',
+        vendor: 'XYZ Supplies', brand: '',
+        quantity: 5, unit_price: '', total_amount: 900, gst_amount: 45,
+        date: todayString(), notes: 'SAMPLE — unit price auto-derived from total + gst',
+      },
+    ];
+    const ws = XLSX.utils.json_to_sheet(rows, { header });
+    ws['!cols'] = header.map((h) => ({ wch: h === 'item_name' ? 28 : h === 'notes' ? 40 : 14 }));
+
+    const help = [
+      ['Column', 'Required?', 'What to put'],
+      ['item_name', 'YES', 'Must EXACTLY match a Raw Material already in the system (case-insensitive). Unknown names are skipped and reported.'],
+      ['quantity', 'YES', "Amount bought, in the material's PURCHASE unit (kg, L, BTL, PKT…). Stock is converted to recipe units by pack size automatically."],
+      ['unit_price', 'YES*', '₹ per PURCHASE unit. *Optional if you fill total_amount instead — the unit price is then derived.'],
+      ['total_amount', 'optional', '₹ line/invoice amount. If given without unit_price: unit_price = (total_amount + gst_amount) ÷ quantity.'],
+      ['gst_amount', 'optional', '₹ GST for the line. Folded into the effective unit price.'],
+      ['vendor', 'optional', 'Supplier name.'],
+      ['brand', 'optional', 'Brand, if you track it.'],
+      ['date', 'optional', 'DD-MM-YYYY, DD/MM/YYYY or YYYY-MM-DD. Defaults to today. Non-admins cannot backdate beyond the allowed window or use future dates.'],
+      ['notes', 'optional', 'Any remark.'],
+      ['', '', ''],
+      ['NOTE', '', 'Liquor / store-mapped items are NOT imported here — use the Liquor Store flow. They are reported as skipped, the batch still succeeds.'],
+      ['NOTE', '', 'Accepts .xlsx, .xls or .csv. Delete the two sample rows before uploading.'],
+    ];
+    const wsHelp = XLSX.utils.aoa_to_sheet(help);
+    wsHelp['!cols'] = [{ wch: 16 }, { wch: 12 }, { wch: 95 }];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Purchases');
+    XLSX.utils.book_append_sheet(wb, wsHelp, 'How to fill');
+    XLSX.writeFile(wb, `bulk-purchases-template-${todayString()}.xlsx`);
+  };
+
+  // ---- Export the purchase list currently in view (honours the applied
+  // search + date filters; with no filters that is every purchase). ----
+  const exportPurchases = async () => {
+    const XLSX = await import('xlsx');
+    const rows = sortedPurchases.map((p: any) => ({
+      date: p.date || '',
+      item_name: p.material_name || p.material_id || '',
+      vendor: p.vendor || '',
+      brand: p.brand || '',
+      quantity: Number(p.purchase_qty ?? p.quantity ?? 0),
+      purchase_unit: p.material_purchase_unit || p.material_unit || '',
+      unit_price: Number(p.purchase_unit_price ?? p.unit_price ?? 0),
+      total_amount: Number(p.total_price ?? 0),
+      notes: p.notes || '',
+    }));
+    const header = ['date', 'item_name', 'vendor', 'brand', 'quantity', 'purchase_unit', 'unit_price', 'total_amount', 'notes'];
+    const ws = XLSX.utils.json_to_sheet(rows, { header });
+    ws['!cols'] = header.map((h) => ({ wch: h === 'item_name' ? 28 : h === 'notes' ? 30 : 14 }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Purchases');
+    const tag = (appliedFilters.from || appliedFilters.to)
+      ? `${appliedFilters.from || 'start'}_to_${appliedFilters.to || 'end'}`
+      : 'all';
+    XLSX.writeFile(wb, `purchases-${tag}-${todayString()}.xlsx`);
+  };
+
   const handleOpeningFile = async (file: File) => {
     setOpeningBusy(true);
     try {
@@ -794,6 +872,14 @@ export default function PurchasesPage() {
             >
               <Upload className="w-4 h-4" />
               Recaho Inward Upload
+            </button>
+            <button
+              onClick={downloadBulkPurchaseTemplate}
+              className="flex items-center gap-2 px-4 py-2.5 border border-green-600 text-green-700 hover:bg-green-50 rounded-lg text-sm font-medium transition-colors"
+              title="Download a ready-to-fill Excel template (with a 'How to fill' guide) for bulk-uploading purchases"
+            >
+              <FileSpreadsheet className="w-4 h-4" />
+              Bulk Template
             </button>
             <button
               onClick={openBulkModal}
@@ -947,6 +1033,15 @@ export default function PurchasesPage() {
             >
               <Search className="w-4 h-4" />
               Filter
+            </button>
+            <button
+              onClick={exportPurchases}
+              disabled={sortedPurchases.length === 0}
+              className="flex items-center gap-2 px-4 py-2 border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors whitespace-nowrap"
+              title="Download all purchases below as Excel (matches your current search / date filters)"
+            >
+              <Download className="w-4 h-4" />
+              Export ({sortedPurchases.length})
             </button>
           </div>
         </div>

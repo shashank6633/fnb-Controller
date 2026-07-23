@@ -20,11 +20,18 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const date = url.searchParams.get('date') || new Date().toISOString().slice(0, 10);
     const outletId = await getCurrentOutletId();
+    // Department scope for the JOIN (2026-07): counts are written per department,
+    // so counted_today must be counted against the SAME department the client is
+    // recording under — else the progress cards over-count / show other depts'.
+    // '' / '__store__' / null = Store/Overall bucket.
+    const rawDept = url.searchParams.get('department_id');
+    const deptMatch = (() => { const s = (rawDept == null ? '' : String(rawDept)).trim(); return s === '' || s === '__store__' ? '' : s; })();
 
     // Dept item-set scope for non-privileged callers — same restriction as
     // /api/closing-stock/by-location, so staff location cards count only THEIR
     // items (locations with none of their items disappear entirely).
-    const params: any[] = [date];
+    // JOIN placeholders (date, deptMatch) bind before any WHERE dept-scope params.
+    const params: any[] = [date, deptMatch];
     let deptScopeSql = '';
     const me = await getCurrentUser();
     if (me && !canSeeAllDeptStock(me)) {
@@ -44,6 +51,7 @@ export async function GET(request: Request) {
       FROM raw_materials rm
       LEFT JOIN closing_stock cs
              ON cs.material_id = rm.id AND cs.date = ?
+            AND COALESCE(cs.department_id, '') = ?
       -- Store-mapped materials (liquor) are counted in their OWN store's
       -- closing (/api/stores/[id]/closing) — never on Central surfaces.
       WHERE NOT EXISTS (

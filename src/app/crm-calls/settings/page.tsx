@@ -621,32 +621,52 @@ export default function CtSettingsPage() {
           <h2 className="text-sm font-semibold text-[#2D1B0E]">Quick-send documents</h2>
         </div>
         <div className="p-3 sm:p-4 space-y-3">
-          <p className="text-[11px] text-[#6B5744]">
-            Links a GRE can WhatsApp a caller straight from Live Calls (the <b>Send</b> button) —
-            menu, band list, corporate menu, etc. Paste a public link to each (a PDF or online-menu URL).
-            A row with no link is hidden from the Send menu.
+          <p className="text-[11px] text-[#6B5744] leading-relaxed">
+            Things a GRE can WhatsApp a caller straight from Live Calls (the <b>Send</b> button).
+            Each row can carry a <b>link</b>, a <b>message</b>, or both:
           </p>
+          <ul className="text-[11px] text-[#6B5744] list-disc pl-4 space-y-0.5 -mt-1">
+            <li><b>Menu</b> → paste your online-menu <b>link</b> in the Link field.</li>
+            <li><b>Corporate Menu (PDF)</b> → upload the PDF somewhere public (your website, Google&nbsp;Drive/Dropbox “anyone with the link”) and paste that <b>link</b>.</li>
+            <li><b>Band List</b> → type the schedule as plain text in the <b>Message</b> field (a link is optional).</li>
+          </ul>
+          <p className="text-[10px] text-[#8B7355] -mt-1">A row needs a link <i>or</i> a message to appear in the Send menu. Leave the message blank and it auto-writes “Here’s our {'{label}'}: {'{link}'}”.</p>
           {(() => {
-            let rows: { label: string; url: string }[] = [];
-            try { const a = JSON.parse(form.quick_send_links || '[]'); if (Array.isArray(a)) rows = a.map((x: any) => ({ label: String(x?.label || ''), url: String(x?.url || '') })); } catch { /* keep [] */ }
-            const write = (next: { label: string; url: string }[]) => set('quick_send_links', JSON.stringify(next));
+            type Row = { label: string; url: string; message: string };
+            let rows: Row[] = [];
+            try { const a = JSON.parse(form.quick_send_links || '[]'); if (Array.isArray(a)) rows = a.map((x: any) => ({ label: String(x?.label || ''), url: String(x?.url || ''), message: String(x?.message || '') })); } catch { /* keep [] */ }
+            const write = (next: Row[]) => set('quick_send_links', JSON.stringify(next));
+            const upd = (i: number, patch: Partial<Row>) => { const n = rows.map((r, j) => j === i ? { ...r, ...patch } : r); write(n); };
             return (
-              <div className="space-y-2">
+              <div className="space-y-3">
                 {rows.map((r, i) => (
-                  <div key={i} className="flex gap-2 items-center">
-                    <input value={r.label} placeholder="Label (e.g. Menu)"
-                           onChange={e => { const n = [...rows]; n[i] = { ...n[i], label: e.target.value }; write(n); }}
-                           className={`${inputCls} w-40`} />
-                    <input value={r.url} placeholder="https://…"
-                           onChange={e => { const n = [...rows]; n[i] = { ...n[i], url: e.target.value }; write(n); }}
-                           className={`${inputCls} flex-1`} />
-                    <button type="button" onClick={() => write(rows.filter((_, j) => j !== i))}
-                            className="text-red-600 hover:text-red-700 p-1 shrink-0" aria-label="Remove document">
-                      <Trash2 className="w-4 h-4" />
-                    </button>
+                  <div key={i} className="rounded-lg border border-[#E8D5C4] bg-[#FFFDFB] p-3 space-y-2.5">
+                    <div className="flex items-start gap-2">
+                      <div className="flex-1 min-w-0 space-y-2.5">
+                        <div>
+                          <label className={labelCls}>Button label</label>
+                          <input value={r.label} placeholder="e.g. Menu"
+                                 onChange={e => upd(i, { label: e.target.value })} className={inputCls} />
+                        </div>
+                        <div>
+                          <label className={labelCls}>Link <span className="text-[#B0987F] normal-case">(online menu or public PDF URL — optional)</span></label>
+                          <input value={r.url} placeholder="https://…" inputMode="url"
+                                 onChange={e => upd(i, { url: e.target.value })} className={inputCls} />
+                        </div>
+                        <div>
+                          <label className={labelCls}>Message <span className="text-[#B0987F] normal-case">(free text, e.g. this week’s bands — optional)</span></label>
+                          <textarea value={r.message} placeholder="Leave blank to auto-write &ldquo;Here&rsquo;s our Menu: …&rdquo;" rows={2}
+                                    onChange={e => upd(i, { message: e.target.value })} className={`${inputCls} resize-y`} />
+                        </div>
+                      </div>
+                      <button type="button" onClick={() => write(rows.filter((_, j) => j !== i))}
+                              className="text-red-600 hover:text-red-700 p-1 shrink-0 mt-4" aria-label={`Remove ${r.label || 'document'}`}>
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
                   </div>
                 ))}
-                <button type="button" onClick={() => write([...rows, { label: '', url: '' }])}
+                <button type="button" onClick={() => write([...rows, { label: '', url: '', message: '' }])}
                         className="text-xs text-[#af4408] hover:underline inline-flex items-center gap-1">
                   <Plus className="w-3.5 h-3.5" /> Add document
                 </button>

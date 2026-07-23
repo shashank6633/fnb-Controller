@@ -22,12 +22,19 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const location = url.searchParams.get('location') || '';
     const date = url.searchParams.get('date') || new Date().toISOString().slice(0, 10);
+    // Department scope for the JOIN (2026-07): the count screen writes each row
+    // under a department (or '' = Store/Overall), so the read MUST match the same
+    // key — otherwise today_count fans out to / shows another department's count.
+    // '' / '__store__' / null all mean the Store/Overall bucket.
+    const rawDept = url.searchParams.get('department_id');
+    const deptMatch = (() => { const s = (rawDept == null ? '' : String(rawDept)).trim(); return s === '' || s === '__store__' ? '' : s; })();
 
     const isUnassigned = location === '__unassigned__' || location === '— Unassigned —';
     const where = isUnassigned
       ? `(rm.storage_location IS NULL OR TRIM(rm.storage_location) = '')`
       : `TRIM(rm.storage_location) = ?`;
-    const params: any[] = isUnassigned ? [date] : [date, location];
+    // JOIN placeholders (date, deptMatch) bind BEFORE the WHERE ones (location).
+    const params: any[] = isUnassigned ? [date, deptMatch] : [date, deptMatch, location];
 
     // Dept item-set scope for non-privileged callers. A dept-less staff user
     // keeps the old full list (nothing sensible to intersect with).
@@ -52,6 +59,7 @@ export async function GET(request: Request) {
       FROM raw_materials rm
       LEFT JOIN closing_stock cs
              ON cs.material_id = rm.id AND cs.date = ?
+            AND COALESCE(cs.department_id, '') = ?
       WHERE ${where}
         -- Store-mapped materials (liquor) are counted in their OWN store's
         -- closing (/api/stores/[id]/closing) — never on Central surfaces.

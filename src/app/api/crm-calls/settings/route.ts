@@ -160,19 +160,22 @@ function validate(key: string, value: any): { ok: true; value: string } | { ok: 
       return { ok: true, value: v };
     }
     case 'quick_send_links': {
-      // JSON array of { label, url }. Keep rows with a label; a URL, if present,
-      // must be http(s). Blank-URL rows are allowed (a "fill me in" placeholder)
-      // but won't be sendable in the Live feed. Cap at 20 docs.
+      // JSON array of { label, url?, message? }. Keep rows with a label; a URL,
+      // if present, must be http(s). A row is "sendable" in the Live feed when it
+      // has a URL OR a message (so a band list can go out as plain text, and a
+      // corporate menu as a PDF link). Blank rows (label only) are kept as a
+      // "fill me in" placeholder but won't appear in the Send menu. Cap at 20.
       let arr: any = value;
       if (typeof value === 'string') { try { arr = JSON.parse(value); } catch { return { ok: false, error: 'quick_send_links must be a JSON array' }; } }
-      if (!Array.isArray(arr)) return { ok: false, error: 'quick_send_links must be a JSON array of { label, url }' };
-      const clean: { label: string; url: string }[] = [];
+      if (!Array.isArray(arr)) return { ok: false, error: 'quick_send_links must be a JSON array of { label, url, message }' };
+      const clean: { label: string; url: string; message: string }[] = [];
       for (const it of arr.slice(0, 20)) {
         const label = String(it?.label ?? '').trim().slice(0, 80);
         const url = String(it?.url ?? '').trim().slice(0, 500);
+        const message = String(it?.message ?? '').trim().slice(0, 1000);
         if (!label) continue;
-        if (url && !/^https?:\/\/\S+$/.test(url)) return { ok: false, error: `"${label}" URL must start with http:// or https://` };
-        clean.push({ label, url });
+        if (url && !/^https?:\/\/\S+$/.test(url)) return { ok: false, error: `"${label}" link must start with http:// or https://` };
+        clean.push({ label, url, message });
       }
       return { ok: true, value: JSON.stringify(clean) };
     }

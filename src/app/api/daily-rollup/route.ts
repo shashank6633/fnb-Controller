@@ -58,12 +58,16 @@ export async function GET(request: Request) {
     //   - per-day received (purchases)
     //   - per-day consumed_recipe + consumed_wastage
     //   - closing-stock counts in range
+    // Purchases are stored in PURCHASE units; consumption in RECIPE units. Keep
+    // them separate here so we can scale ONLY purchases by the pack factor (below)
+    // before subtracting consumption — otherwise opening/closing mixes unit systems
+    // for pack-bought items (bottles/tins) and variance is meaningless.
     const openingStmt = db.prepare(`
       SELECT
-        COALESCE((SELECT SUM(quantity) FROM purchases WHERE material_id = ? AND date < ?), 0)
-        - COALESCE((SELECT SUM(ABS(quantity)) FROM inventory_transactions
+        COALESCE((SELECT SUM(quantity) FROM purchases WHERE material_id = ? AND date < ?), 0) AS purch_before,
+        COALESCE((SELECT SUM(ABS(quantity)) FROM inventory_transactions
                     WHERE material_id = ? AND type IN ('sale','party','staff_meal','wastage')
-                      AND DATE(created_at) < ?), 0) AS opening
+                      AND DATE(created_at) < ?), 0) AS cons_before
     `);
     const receivedStmt = db.prepare(`
       SELECT date, COALESCE(SUM(quantity), 0) AS qty
@@ -91,10 +95,19 @@ export async function GET(request: Request) {
 
     const rows: any[] = [];
     for (const m of materials) {
-      const openingRow = openingStmt.get(m.id, from, m.id, from) as any;
-      let running = Number(openingRow.opening) || 0;
+      // Recipe-units per purchase-unit: pack_size when the item is pack-bought
+      // (pack_size > 1) AND recipe unit ≠ purchase unit — the same guard every
+      // purchase writer + the variance report use.
+      const factor = (Number(m.pack_size) > 1
+        && String(m.unit || '').toLowerCase() !== String(m.purchase_unit || m.unit || '').toLowerCase())
+        ? Number(m.pack_size) : 1;
 
-      const recv = new Map((receivedStmt.all(m.id, from, to) as any[]).map(r => [r.date, Number(r.qty)]));
+      const openingRow = openingStmt.get(m.id, from, m.id, from) as any;
+      // Opening in RECIPE units: scale purchases-before by the factor, keep
+      // consumption-before as-is (already recipe units).
+      let running = (Number(openingRow.purch_before) || 0) * factor - (Number(openingRow.cons_before) || 0);
+
+      const recv = new Map((receivedStmt.all(m.id, from, to) as any[]).map(r => [r.date, Number(r.qty) * factor]));
       const rcp  = new Map((consumedRecipeStmt.all(m.id, from, to) as any[]).map(r => [r.date, Number(r.qty)]));
       const wst  = new Map((consumedWastageStmt.all(m.id, from, to) as any[]).map(r => [r.date, Number(r.qty)]));
       const cnt  = new Map((countStmt.all(m.id, from, to) as any[]).map(r => [r.date, Number(r.physical_stock)]));

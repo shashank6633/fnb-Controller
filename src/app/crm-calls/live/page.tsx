@@ -18,7 +18,7 @@ import {
 } from 'lucide-react';
 import { formatPhone } from '@/lib/ct/phone';
 
-interface QuickDoc { label: string; url: string }
+interface QuickDoc { label: string; url: string; message?: string }
 
 // Build a wa.me deep link to a number with pre-filled text — opens the GRE's
 // WhatsApp to that caller so a menu / band list / corporate menu goes out in
@@ -30,11 +30,19 @@ function waLink(phone: string, text: string): string {
   return d ? `https://wa.me/${d}${text ? `?text=${encodeURIComponent(text)}` : ''}` : '';
 }
 
+// Compose the WhatsApp text for one quick-send doc: greeting + (custom message
+// OR an auto "Here's our <label>:") + the link when present.
+function docText(d: QuickDoc, hi: string): string {
+  const msg = (d.message || '').trim();
+  const body = msg || `Here's our ${d.label}:`;
+  return `${hi}${body}${d.url ? ` ${d.url}` : ''}`.trim();
+}
+
 // "Send menu" popover — lists the admin-configured quick-send documents that
-// have a URL; each opens WhatsApp to the caller with a friendly message + link.
+// have a link OR a message; each opens WhatsApp to the caller pre-filled.
 function SendMenu({ phone, guestName, docs }: { phone: string; guestName?: string; docs: QuickDoc[] }) {
   const [open, setOpen] = useState(false);
-  const sendable = docs.filter(d => d.url);
+  const sendable = docs.filter(d => d.url || (d.message || '').trim());
   const hi = guestName && guestName !== 'Unknown caller' ? `Hi ${guestName}! ` : 'Hello! ';
   if (!phone) return null;
   return (
@@ -58,7 +66,7 @@ function SendMenu({ phone, guestName, docs }: { phone: string; guestName?: strin
               </a>
             ) : sendable.map((d, i) => (
               <button key={i}
-                      onClick={() => { window.open(waLink(phone, `${hi}Here's our ${d.label}: ${d.url}`), '_blank'); setOpen(false); }}
+                      onClick={() => { window.open(waLink(phone, docText(d, hi)), '_blank'); setOpen(false); }}
                       className="w-full text-left px-3 py-2 text-xs text-[#2D1B0E] hover:bg-[#FFF1E3] flex items-center gap-2">
                 <Send className="w-3.5 h-3.5 text-emerald-600 shrink-0" /> {d.label}
               </button>
@@ -122,7 +130,7 @@ export default function LiveCallsPage() {
   useEffect(() => {
     fetch('/api/crm-calls/settings')
       .then(r => r.json())
-      .then(j => { try { const a = JSON.parse(j?.settings?.quick_send_links || '[]'); if (Array.isArray(a)) setDocs(a); } catch { /* ignore */ } })
+      .then(j => { try { const a = JSON.parse(j?.settings?.quick_send_links || '[]'); if (Array.isArray(a)) setDocs(a.map((x: QuickDoc) => ({ label: String(x?.label || ''), url: String(x?.url || ''), message: String(x?.message || '') }))); } catch { /* ignore */ } })
       .catch(() => {});
   }, []);
 

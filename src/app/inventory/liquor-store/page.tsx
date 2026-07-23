@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
+import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead';
 import {
@@ -74,7 +75,9 @@ const fq = (v: number, dp = 2) =>
   Number((Number(v) || 0).toFixed(dp)).toLocaleString('en-IN');
 const inr = (v: number, dp = 2) =>
   '₹' + (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: dp });
-const today = () => new Date().toISOString().slice(0, 10);
+// IST calendar date (not UTC) — a post-midnight bar closing (00:00–05:30 IST)
+// must file under today, not yesterday's UTC date.
+const today = () => todayIST();
 const numOr0 = (s?: string) => {
   const n = Number(s);
   return s != null && s !== '' && Number.isFinite(n) ? n : 0;
@@ -2396,6 +2399,9 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
               {/* Save bar */}
               <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-[#6B5744]">
                 <span><b className="text-[#2D1B0E]">{pending.length}</b> of {stock.length} material{stock.length === 1 ? '' : 's'} counted</span>
+                <span className="basis-full text-[11px] text-[#8B7355]">
+                  To set a count to <b>zero</b>, type <b>0</b> — leaving all boxes blank keeps the previously saved count unchanged.
+                </span>
                 {pending.length > 0 && (
                   <span>Variance <b className={pendingVarianceValue < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}>
                     {pendingVarianceValue < 0 ? '−' : ''}{inr(Math.abs(pendingVarianceValue))}</b></span>

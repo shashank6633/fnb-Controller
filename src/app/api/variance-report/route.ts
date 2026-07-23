@@ -51,9 +51,11 @@ export async function GET(request: Request) {
 
     const where: string[] = [];
     const params: any[] = [];
-    // Outlet scoping
+    // Outlet scoping. NULL-tolerant: a freshly-saved count may briefly carry a
+    // NULL outlet_id (pre-backfill on older rows) — still show it in-outlet
+    // rather than making a just-recorded count vanish from this report.
     const outletId = await getCurrentOutletId();
-    if (outletId) { where.push('cs.outlet_id = ?'); params.push(outletId); }
+    if (outletId) { where.push('(cs.outlet_id = ? OR cs.outlet_id IS NULL)'); params.push(outletId); }
     if (single) { where.push('cs.date = ?'); params.push(single); }
     else { where.push('cs.date BETWEEN ? AND ?'); params.push(from, to); }
     if (category)   { where.push('rm.category = ?'); params.push(category); }
@@ -146,21 +148,30 @@ export async function GET(request: Request) {
                                   shrinkage: s.shrinkage, overcount: s.overcount, net_variance: s.net }))
       .sort((a, b) => b.shrinkage - a.shrinkage);
 
-    // Repeat offenders — materials whose ABSOLUTE variance > ₹X across multiple counts in range
-    const repeat = db.prepare(`
-      SELECT rm.id, rm.sku, rm.name, rm.unit,
-             COUNT(*) AS times_counted,
-             SUM(ABS(cs.variance_value)) AS total_abs_variance,
-             SUM(cs.variance_value) AS net_variance,
-             MAX(cs.date) AS last_count
-      FROM closing_stock cs
-      JOIN raw_materials rm ON rm.id = cs.material_id
-      WHERE cs.date BETWEEN ? AND ? AND ABS(cs.variance) > 0
-      GROUP BY rm.id
-      HAVING times_counted >= 2
-      ORDER BY total_abs_variance DESC
-      LIMIT 20
-    `).all(from, to);
+    // Repeat offenders — materials counted ≥2 times with real loss, aggregated
+    // from the SAME recomputed rows (Purchases − Recipe − Wastage − Physical) and
+    // the SAME outlet/category/date filters, so an offender's ranking can never
+    // contradict its own per-line Loss or mix outlets (old code read the stored
+    // snapshot cs.variance_value with no outlet filter).
+    const roMap = new Map<string, {
+      id: string; sku: string; name: string; unit: string;
+      times_counted: number; total_abs_variance: number; net_variance: number; last_count: string;
+    }>();
+    for (const r of rows as any[]) {
+      const slot = roMap.get(r.material_id) || {
+        id: r.material_id, sku: r.material_sku, name: r.material_name, unit: r.material_unit,
+        times_counted: 0, total_abs_variance: 0, net_variance: 0, last_count: r.date,
+      };
+      slot.times_counted += 1;
+      slot.total_abs_variance += Math.abs(r.loss_value || 0);
+      slot.net_variance += (r.variance_value || 0);   // legacy sign: physical − theoretical
+      if (r.date > slot.last_count) slot.last_count = r.date;
+      roMap.set(r.material_id, slot);
+    }
+    const repeat = Array.from(roMap.values())
+      .filter(o => o.times_counted >= 2 && o.total_abs_variance > 0)
+      .sort((a, b) => b.total_abs_variance - a.total_abs_variance)
+      .slice(0, 20);
 
     // Top-line summary — built from recomputed rows so it stays in sync with the formula
     let shrinkage = 0, overcount = 0, net_loss_value = 0, counted_stock_value = 0;

@@ -129,8 +129,13 @@ export async function POST(request: Request) {
     // but only admins can overwrite raw_materials.current_stock from the same
     // submit. Otherwise a store user could one-click reconcile away genuine
     // shrinkage. Counts themselves are unaffected and remain writable by all.
-    const me = await (await import('@/lib/auth')).getCurrentUser();
+    const authMod = await import('@/lib/auth');
+    const me = await authMod.getCurrentUser();
     const isAdmin = me?.role === 'admin';
+    // Tag every saved count with the current outlet so outlet-scoped reads (e.g.
+    // the Variance Report) see it immediately — without this the row is written
+    // outlet_id NULL and only appears after the next server-boot backfill.
+    const outletId = await authMod.getCurrentOutletId();
     const db = getDb();
     const body = await request.json();
     const { date, items } = body;
@@ -199,9 +204,9 @@ export async function POST(request: Request) {
         const id = generateId();
 
         db.prepare(`
-          INSERT INTO closing_stock (id, material_id, department_id, date, system_stock, physical_stock, variance, variance_value, notes, recorded_by, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        `).run(id, item.material_id, deptId, date, systemStock, physicalStock, variance, varianceValue, item.notes || '', item.recorded_by || '');
+          INSERT INTO closing_stock (id, material_id, department_id, date, system_stock, physical_stock, variance, variance_value, notes, recorded_by, outlet_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        `).run(id, item.material_id, deptId, date, systemStock, physicalStock, variance, varianceValue, item.notes || '', item.recorded_by || '', outletId || null);
 
         // Optionally adjust system stock to match physical count
         if (adjust_stock && variance !== 0) {
