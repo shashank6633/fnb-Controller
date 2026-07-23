@@ -17,6 +17,9 @@ export const CT_SETTING_DEFAULTS: Record<string, string> = {
   after_hours_whatsapp: '0',
   after_hours_template: 'Sorry we missed your call! We open at {open}. Book a table: {link}',
   agent_map: '{}',          // { telecmiAgentId: fnbUserEmail }
+  // Quick-send documents a GRE can WhatsApp a caller from the Live Calls feed
+  // (menu / band list / corporate menu …). JSON array of { label, url }.
+  quick_send_links: '[{"label":"Menu","url":""},{"label":"Band List","url":""},{"label":"Corporate Menu","url":""}]',
 };
 
 export function ctSetting(db: Database.Database, key: string): string {

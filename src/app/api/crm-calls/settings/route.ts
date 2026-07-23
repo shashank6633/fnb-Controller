@@ -159,6 +159,23 @@ function validate(key: string, value: any): { ok: true; value: string } | { ok: 
       if (v.length > 300) return { ok: false, error: 'telecmi_base_url too long' };
       return { ok: true, value: v };
     }
+    case 'quick_send_links': {
+      // JSON array of { label, url }. Keep rows with a label; a URL, if present,
+      // must be http(s). Blank-URL rows are allowed (a "fill me in" placeholder)
+      // but won't be sendable in the Live feed. Cap at 20 docs.
+      let arr: any = value;
+      if (typeof value === 'string') { try { arr = JSON.parse(value); } catch { return { ok: false, error: 'quick_send_links must be a JSON array' }; } }
+      if (!Array.isArray(arr)) return { ok: false, error: 'quick_send_links must be a JSON array of { label, url }' };
+      const clean: { label: string; url: string }[] = [];
+      for (const it of arr.slice(0, 20)) {
+        const label = String(it?.label ?? '').trim().slice(0, 80);
+        const url = String(it?.url ?? '').trim().slice(0, 500);
+        if (!label) continue;
+        if (url && !/^https?:\/\/\S+$/.test(url)) return { ok: false, error: `"${label}" URL must start with http:// or https://` };
+        clean.push({ label, url });
+      }
+      return { ok: true, value: JSON.stringify(clean) };
+    }
     default:
       return { ok: false, error: `Unknown setting '${key}'` };
   }

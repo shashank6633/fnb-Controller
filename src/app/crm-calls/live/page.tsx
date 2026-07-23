@@ -14,8 +14,61 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   PhoneIncoming, PhoneMissed, PhoneCall, Radio, Users, CalendarCheck, ArrowDownLeft, ArrowUpRight,
+  MessageCircle, Send, X,
 } from 'lucide-react';
 import { formatPhone } from '@/lib/ct/phone';
+
+interface QuickDoc { label: string; url: string }
+
+// Build a wa.me deep link to a number with pre-filled text — opens the GRE's
+// WhatsApp to that caller so a menu / band list / corporate menu goes out in
+// one tap. Mirrors normalizeWaNumber: bare 10-digit → +91; keep other codes.
+function waLink(phone: string, text: string): string {
+  let d = String(phone || '').replace(/\D/g, '');
+  if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
+  if (d.length === 10) d = '91' + d;
+  return d ? `https://wa.me/${d}${text ? `?text=${encodeURIComponent(text)}` : ''}` : '';
+}
+
+// "Send menu" popover — lists the admin-configured quick-send documents that
+// have a URL; each opens WhatsApp to the caller with a friendly message + link.
+function SendMenu({ phone, guestName, docs }: { phone: string; guestName?: string; docs: QuickDoc[] }) {
+  const [open, setOpen] = useState(false);
+  const sendable = docs.filter(d => d.url);
+  const hi = guestName && guestName !== 'Unknown caller' ? `Hi ${guestName}! ` : 'Hello! ';
+  if (!phone) return null;
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen(o => !o)}
+              className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-1 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100"
+              aria-label="Send a document on WhatsApp">
+        <MessageCircle className="w-3.5 h-3.5" /> Send
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-[60]" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 mt-1 z-[61] w-52 bg-white border border-[#E8D5C4] rounded-lg shadow-xl py-1">
+            <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#F0E4D6]">
+              <span className="text-[10px] font-semibold text-[#8B7355] uppercase tracking-wide">Send on WhatsApp</span>
+              <button onClick={() => setOpen(false)} aria-label="Close"><X className="w-3.5 h-3.5 text-[#8B7355]" /></button>
+            </div>
+            {sendable.length === 0 ? (
+              <a href="/crm-calls/settings" className="block px-3 py-2 text-xs text-[#af4408] hover:bg-[#FFF1E3]">
+                No documents set up — add links in CRM settings →
+              </a>
+            ) : sendable.map((d, i) => (
+              <button key={i}
+                      onClick={() => { window.open(waLink(phone, `${hi}Here's our ${d.label}: ${d.url}`), '_blank'); setOpen(false); }}
+                      className="w-full text-left px-3 py-2 text-xs text-[#2D1B0E] hover:bg-[#FFF1E3] flex items-center gap-2">
+                <Send className="w-3.5 h-3.5 text-emerald-600 shrink-0" /> {d.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 interface FeedItem {
   key: string;
@@ -54,6 +107,7 @@ export default function LiveCallsPage() {
   const [statsUpdatedAt, setStatsUpdatedAt] = useState<number | null>(null);
   const [statsError, setStatsError] = useState(false);
   const [nowTick, setNowTick] = useState(Date.now());
+  const [docs, setDocs] = useState<QuickDoc[]>([]);   // quick-send documents (menu, band list…)
   const seqRef = useRef(0);
   const esRef = useRef<EventSource | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -62,6 +116,14 @@ export default function LiveCallsPage() {
   useEffect(() => {
     const t = setInterval(() => setNowTick(Date.now()), 1000);
     return () => clearInterval(t);
+  }, []);
+
+  // Load the quick-send documents (menu / band list / corporate menu …) once.
+  useEffect(() => {
+    fetch('/api/crm-calls/settings')
+      .then(r => r.json())
+      .then(j => { try { const a = JSON.parse(j?.settings?.quick_send_links || '[]'); if (Array.isArray(a)) setDocs(a); } catch { /* ignore */ } })
+      .catch(() => {});
   }, []);
 
   const pushFeed = useCallback((item: FeedItem) => {
@@ -270,9 +332,10 @@ export default function LiveCallsPage() {
                         <p className="text-[11px] text-[#8B7355] mt-0.5 truncate">{[r.queue, r.agent_user].filter(Boolean).join(' · ')}</p>
                       )}
                     </div>
-                    <div className="text-right shrink-0 ml-3">
-                      <PhoneIncoming className="w-6 h-6 text-red-500 ml-auto animate-pulse" />
-                      <p className="text-xs text-red-600 font-semibold tabular-nums mt-1">{secs}s</p>
+                    <div className="text-right shrink-0 ml-3 flex flex-col items-end gap-1.5">
+                      <PhoneIncoming className="w-6 h-6 text-red-500 animate-pulse" />
+                      <p className="text-xs text-red-600 font-semibold tabular-nums">{secs}s</p>
+                      <SendMenu phone={phone} guestName={r.guest_name} docs={docs} />
                     </div>
                   </div>
                 </div>
@@ -308,6 +371,7 @@ export default function LiveCallsPage() {
                     <b>{f.guestName || formatPhone(f.phone || '') || 'System'}</b> — {f.label}
                     {f.agentName && <span className="text-[#8B7355]"> · answered by {f.agentName}</span>}
                   </span>
+                  {f.phone && <SendMenu phone={f.phone} guestName={f.guestName} docs={docs} />}
                   <span className="text-[11px] text-[#8B7355] tabular-nums shrink-0">{istTime(f.at)}</span>
                 </li>
               ))}

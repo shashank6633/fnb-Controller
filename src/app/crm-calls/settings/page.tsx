@@ -37,6 +37,7 @@ const DEFAULTS: Record<string, string> = {
   after_hours_template: 'Sorry we missed your call! We open at {open}. Book a table: {link}',
   auto_analyze: '0',
   analysis_retention: 'permanent',
+  quick_send_links: '[]',
 };
 
 const EDITABLE_KEYS = Object.keys(DEFAULTS);
@@ -610,6 +611,48 @@ export default function CtSettingsPage() {
             guest&apos;s most recent answered call (default 48h) — that link is the
             &ldquo;call-to-table&rdquo; conversion.
           </p>
+        </div>
+      </section>
+
+      {/* ── Quick-send documents (Live Calls "Send" action) ── */}
+      <section className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+        <div className="px-3 sm:px-4 py-2.5 bg-[#FFF1E3] border-b border-[#E8D5C4] flex items-center gap-2">
+          <MessageCircle className="w-4 h-4 text-[#af4408]" />
+          <h2 className="text-sm font-semibold text-[#2D1B0E]">Quick-send documents</h2>
+        </div>
+        <div className="p-3 sm:p-4 space-y-3">
+          <p className="text-[11px] text-[#6B5744]">
+            Links a GRE can WhatsApp a caller straight from Live Calls (the <b>Send</b> button) —
+            menu, band list, corporate menu, etc. Paste a public link to each (a PDF or online-menu URL).
+            A row with no link is hidden from the Send menu.
+          </p>
+          {(() => {
+            let rows: { label: string; url: string }[] = [];
+            try { const a = JSON.parse(form.quick_send_links || '[]'); if (Array.isArray(a)) rows = a.map((x: any) => ({ label: String(x?.label || ''), url: String(x?.url || '') })); } catch { /* keep [] */ }
+            const write = (next: { label: string; url: string }[]) => set('quick_send_links', JSON.stringify(next));
+            return (
+              <div className="space-y-2">
+                {rows.map((r, i) => (
+                  <div key={i} className="flex gap-2 items-center">
+                    <input value={r.label} placeholder="Label (e.g. Menu)"
+                           onChange={e => { const n = [...rows]; n[i] = { ...n[i], label: e.target.value }; write(n); }}
+                           className={`${inputCls} w-40`} />
+                    <input value={r.url} placeholder="https://…"
+                           onChange={e => { const n = [...rows]; n[i] = { ...n[i], url: e.target.value }; write(n); }}
+                           className={`${inputCls} flex-1`} />
+                    <button type="button" onClick={() => write(rows.filter((_, j) => j !== i))}
+                            className="text-red-600 hover:text-red-700 p-1 shrink-0" aria-label="Remove document">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+                <button type="button" onClick={() => write([...rows, { label: '', url: '' }])}
+                        className="text-xs text-[#af4408] hover:underline inline-flex items-center gap-1">
+                  <Plus className="w-3.5 h-3.5" /> Add document
+                </button>
+              </div>
+            );
+          })()}
         </div>
       </section>
 
