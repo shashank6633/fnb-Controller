@@ -309,6 +309,45 @@ function initializeSchema(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_closing_stock_date ON closing_stock(date);
     CREATE INDEX IF NOT EXISTS idx_closing_stock_material ON closing_stock(material_id);
 
+    -- Variance Approvals — a closing count with a non-zero variance NEVER changes
+    -- stock directly; it creates a PENDING approval here. An admin reviews (records
+    -- the staff's reason) and approves (stock → physical count) or rejects (stock
+    -- unchanged; the variance stands as an open loss to investigate). Covers both
+    -- central raw-material counts (source='central') and liquor/floor-bar counts
+    -- (source='liquor').
+    CREATE TABLE IF NOT EXISTS variance_approvals (
+      id TEXT PRIMARY KEY,
+      source TEXT NOT NULL,                     -- 'central' | 'liquor'
+      material_id TEXT NOT NULL,
+      store_id TEXT NOT NULL DEFAULT '',        -- liquor: the store/floor bar; central: ''
+      department_id TEXT NOT NULL DEFAULT '',   -- central: dept bucket ('' = Store/Overall); liquor: ''
+      date TEXT NOT NULL,                       -- closing count date (YYYY-MM-DD)
+      system_stock REAL NOT NULL DEFAULT 0,     -- what the system had at count time
+      physical_stock REAL NOT NULL DEFAULT 0,   -- what was counted
+      variance REAL NOT NULL DEFAULT 0,         -- physical - system (negative = shortage)
+      variance_value REAL NOT NULL DEFAULT 0,   -- variance × average_price
+      unit TEXT NOT NULL DEFAULT '',            -- recipe unit, for display
+      counted_by TEXT NOT NULL DEFAULT '',
+      count_note TEXT NOT NULL DEFAULT '',      -- optional note from whoever counted
+      status TEXT NOT NULL DEFAULT 'pending',   -- 'pending' | 'approved' | 'rejected'
+      reviewed_by TEXT NOT NULL DEFAULT '',
+      reviewed_at TEXT NOT NULL DEFAULT '',
+      review_reason TEXT NOT NULL DEFAULT '',   -- admin records the reason after asking staff
+      outlet_id TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (material_id) REFERENCES raw_materials(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_variance_appr_status ON variance_approvals(status);
+    CREATE INDEX IF NOT EXISTS idx_variance_appr_date ON variance_approvals(date);
+    CREATE INDEX IF NOT EXISTS idx_variance_appr_material ON variance_approvals(material_id);
+    -- At most ONE pending approval per (source, material, store, dept, date,
+    -- OUTLET): a re-count before approval refreshes the same pending row (see
+    -- upsertVarianceApproval). outlet_id is part of the key so two outlets can
+    -- each hold their own pending row for the same material/date.
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_variance_appr_pending
+      ON variance_approvals(source, material_id, store_id, department_id, date, outlet_id)
+      WHERE status = 'pending';
+
     -- Create indexes for performance
     CREATE INDEX IF NOT EXISTS idx_parties_date ON parties(date);
     CREATE INDEX IF NOT EXISTS idx_parties_status ON parties(status);

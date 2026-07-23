@@ -821,9 +821,11 @@ export default function LiquorStorePage() {
                               <td className="px-3 py-2 text-right whitespace-nowrap">
                                 {/* Same cases+bottles breakdown as every other qty in the module */}
                                 <span className="font-medium text-[#2D1B0E]">Counted <DualQty qty={l.quantity} m={l} boldCls="font-medium text-[#2D1B0E]" /></span>
-                                <div className="text-[10px] text-[#8B7355]">
-                                  system {fq(l.system_qty ?? 0)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fq(l.variance ?? 0)}
-                                </div>
+                                {isAdmin && (
+                                  <div className="text-[10px] text-[#8B7355]">
+                                    system {fq(l.system_qty ?? 0)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fq(l.variance ?? 0)}
+                                  </div>
+                                )}
                                 <div className="text-[10px] italic text-[#8B7355]">count only — stock unchanged</div>
                               </td>
                             ) : (
@@ -882,9 +884,11 @@ export default function LiquorStorePage() {
                         /* Register row: never moves stock — no sign/value semantics */
                         <div className="mt-1 text-[#6B5744]">
                           <span className="font-semibold text-[#2D1B0E]">Counted <DualQty qty={l.quantity} m={l} boldCls="font-semibold text-[#2D1B0E]" /></span>
-                          <div className="text-[10px] text-[#8B7355]">
-                            system {fq(l.system_qty ?? 0)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fq(l.variance ?? 0)}
-                          </div>
+                          {isAdmin && (
+                            <div className="text-[10px] text-[#8B7355]">
+                              system {fq(l.system_qty ?? 0)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fq(l.variance ?? 0)}
+                            </div>
+                          )}
                           <div className="text-[10px] italic text-[#8B7355]">count only — stock unchanged</div>
                         </div>
                       ) : (
@@ -1863,7 +1867,6 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   const [whole, setWhole] = useState<Record<string, string>>({});   // purchase units (BTL)
   const [loose, setLoose] = useState<Record<string, string>>({});   // recipe units (ml)
   const [notes, setNotes] = useState<Record<string, string>>({});   // per-row note
-  const [adjust, setAdjust] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [csvResult, setCsvResult] = useState<{ success: number; errors: string[] } | null>(null);
@@ -2006,19 +2009,15 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
             note: (notes[r.material_id] || '').trim(),
           })),
           note: '',
-          adjust_to_physical: isAdmin ? adjust : undefined,
         },
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      setAdjust(false);
       await loadDay(date, true);
       onSaved(`Saved ${j.summary.items} closing count${j.summary.items === 1 ? '' : 's'} for ${date}` +
-        (j.summary.adjusted_count
-          ? ` — ${j.summary.adjusted_count} adjusted to physical`
-          : ' — count register only, stock unchanged' +
-            (isAdmin && !adjust && ((j.summary.shortage_count || 0) + (j.summary.excess_count || 0)) > 0
-              ? " (tick 'Adjust system stock' to set stock to physical)" : '')));
+        (j.summary.pending_count
+          ? ` — ${j.summary.pending_count} sent to Variance Approvals for review`
+          : ' — all match the system, nothing to approve'));
     } catch (e: any) { setErr(e.message); }
     finally { setBusy(false); }
   };
@@ -2029,12 +2028,13 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
      converts the triple to recipe units and posts to the SAME endpoint with
      adjust_to_physical forced OFF (a bulk file must never reconcile stock). */
   const downloadTemplate = () => {
-    const lines = [CSV_COLS_CLOSE.join(',')];
+    // Blind count: non-admins get the template WITHOUT the System stock column.
+    const cols = isAdmin ? CSV_COLS_CLOSE : CSV_COLS_CLOSE.filter(c => c !== 'System stock');
+    const lines = [cols.join(',')];
     for (const r of rows) {
-      lines.push([
-        r.material_id, r.sku || '', r.material_name || '', r.category || '', r.unit || '',
-        systemFor(r), '', '', '',   // Cases / Bottles / Loose — blank for the counter
-      ].map(csvEscape).join(','));
+      const base = [r.material_id, r.sku || '', r.material_name || '', r.category || '', r.unit || ''];
+      // System stock only for admins; Cases / Bottles / Loose blank for the counter.
+      lines.push((isAdmin ? [...base, systemFor(r), '', '', ''] : [...base, '', '', '']).map(csvEscape).join(','));
     }
     const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -2182,27 +2182,14 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                        placeholder="Filter by name, SKU, category…" className={`${inCls} pl-10`} />
               </div>
             </div>
-            {isAdmin && (
-              <label className="flex items-center gap-2 cursor-pointer bg-amber-50 border border-amber-200 rounded-lg px-3 py-2"
-                     title="Admin-only: also post an adjustment ledger row per variance so store stock matches the count">
-                <input type="checkbox" checked={adjust} onChange={e => setAdjust(e.target.checked)} className="accent-[#af4408] w-4 h-4" />
-                <span className="text-xs text-amber-800 font-medium whitespace-nowrap">Adjust system stock</span>
-              </label>
-            )}
           </div>
 
           <p className="text-[11px] text-[#8B7355]">
-            Physical count for <b>{date}</b> — System Stock is the {storeName} ledger sum as of that date.
-            Saving records the count only; stock is never changed unless an admin ticks “Adjust system stock”.
+            Physical count for <b>{date}</b>. Saving records the count only — any difference from the system is
+            sent to <a href="/variance-approvals" className="text-[#af4408] underline">Variance Approvals</a> for an
+            admin to review; stock changes only after approval.
+            {!isAdmin && ' The system figure is hidden so your count is unbiased.'}
           </p>
-
-          {adjust && isAdmin && (
-            <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs">
-              <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-              System stock will be updated to match each physical count. Variances are posted as adjustment ledger rows.
-              If earlier count dates are also unreconciled, adjust the oldest date first.
-            </div>
-          )}
 
           {csvResult && (
             <div className={`p-3 rounded-lg border ${csvResult.errors.length > 0 && csvResult.success === 0 ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
@@ -2236,10 +2223,11 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                       <tr>
                         <th className="text-left px-3 py-2.5 font-medium">Material</th>
                         <th className="text-left px-3 py-2.5 font-medium">Category</th>
-                        <th className="text-right px-3 py-2.5 font-medium">System Stock</th>
+                        {/* Blind count: only admins see System Stock + Variance. */}
+                        {isAdmin && <th className="text-right px-3 py-2.5 font-medium">System Stock</th>}
                         <th className="text-right px-3 py-2.5 font-medium">Unit</th>
                         <th className="text-left px-3 py-2.5 font-medium w-[260px]">Physical Count *</th>
-                        <th className="text-right px-3 py-2.5 font-medium">Variance</th>
+                        {isAdmin && <th className="text-right px-3 py-2.5 font-medium">Variance</th>}
                         <th className="text-left px-3 py-2.5 font-medium w-40">Notes</th>
                       </tr>
                     </thead>
@@ -2261,20 +2249,22 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                         const vv = v != null ? v * (Number(r.avg_cost) || 0) : null;
                         const vTone = v == null ? '' : v < 0 ? 'text-red-700' : v > 0 ? 'text-blue-700' : 'text-emerald-700';
                         return (
-                          <tr key={r.material_id} className={`hover:bg-[#FFF8F0] align-top ${v != null && v < 0 ? 'bg-red-50/30' : v != null && v > 0 ? 'bg-blue-50/30' : ''}`}>
+                          <tr key={r.material_id} className={`hover:bg-[#FFF8F0] align-top ${isAdmin && v != null && v < 0 ? 'bg-red-50/30' : isAdmin && v != null && v > 0 ? 'bg-blue-50/30' : ''}`}>
                             <td className="px-3 py-2">
                               <div className="text-[#2D1B0E] font-medium">{r.material_name}</div>
                               {r.sku && <div className="text-[10px] font-mono text-[#8B7355]">{r.sku}</div>}
-                            </td>
-                            <td className="px-3 py-2 text-[#6B5744] text-xs">{r.category}</td>
-                            <td className="px-3 py-2 text-right whitespace-nowrap font-mono text-[#6B5744]">
-                              {fmtBreakdown(sys, r) || <>{fq(sys)} {r.unit}</>}
-                              {pc > 1 && <div className="text-[10px]">{fq(sys)} {r.unit}</div>}
                               {existing && (
                                 <div className="text-[10px] text-emerald-700 mt-0.5"
                                      title={`Counted by ${existing.counted_by}`}>✓ saved</div>
                               )}
                             </td>
+                            <td className="px-3 py-2 text-[#6B5744] text-xs">{r.category}</td>
+                            {isAdmin && (
+                              <td className="px-3 py-2 text-right whitespace-nowrap font-mono text-[#6B5744]">
+                                {fmtBreakdown(sys, r) || <>{fq(sys)} {r.unit}</>}
+                                {pc > 1 && <div className="text-[10px]">{fq(sys)} {r.unit}</div>}
+                              </td>
+                            )}
                             <td className="px-3 py-2 text-right text-xs text-[#8B7355] whitespace-nowrap">{r.unit}</td>
                             <td className="px-3 py-2">
                               <div className="flex items-center gap-1 flex-wrap">
@@ -2309,14 +2299,16 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                                 )}
                               </div>
                             </td>
-                            <td className={`px-3 py-2 text-right whitespace-nowrap font-mono ${vTone}`}>
-                              {v == null ? <span className="text-[#8B7355]">—</span> : (
-                                <>
-                                  {fmtBreakdown(v, r) || <>{v > 0 ? '+' : ''}{fq(v)} {r.unit}</>}
-                                  <div className="text-[10px]">{vv != null && vv !== 0 ? (vv > 0 ? '+' : '−') + inr(Math.abs(vv)) : inr(0)}</div>
-                                </>
-                              )}
-                            </td>
+                            {isAdmin && (
+                              <td className={`px-3 py-2 text-right whitespace-nowrap font-mono ${vTone}`}>
+                                {v == null ? <span className="text-[#8B7355]">—</span> : (
+                                  <>
+                                    {fmtBreakdown(v, r) || <>{v > 0 ? '+' : ''}{fq(v)} {r.unit}</>}
+                                    <div className="text-[10px]">{vv != null && vv !== 0 ? (vv > 0 ? '+' : '−') + inr(Math.abs(vv)) : inr(0)}</div>
+                                  </>
+                                )}
+                              </td>
+                            )}
                             <td className="px-3 py-2">
                               <input type="text" value={notes[r.material_id] ?? ''}
                                      onChange={e => setNotes(p => ({ ...p, [r.material_id]: e.target.value }))}
@@ -2352,9 +2344,11 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                           <div className="text-[10px] text-[#8B7355]">
                             {r.sku && <span className="font-mono">{r.sku} · </span>}{r.category}
                           </div>
-                          <div className="text-[10px] text-[#8B7355] mt-0.5">
-                            System: {fmtBreakdown(sys, r) || `${fq(sys)} ${r.unit}`}{pc > 1 ? ` (${fq(sys)} ${r.unit})` : ''}
-                          </div>
+                          {isAdmin && (
+                            <div className="text-[10px] text-[#8B7355] mt-0.5">
+                              System: {fmtBreakdown(sys, r) || `${fq(sys)} ${r.unit}`}{pc > 1 ? ` (${fq(sys)} ${r.unit})` : ''}
+                            </div>
+                          )}
                         </div>
                         {existing && (
                           <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">✓ saved</span>
@@ -2402,7 +2396,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                 <span className="basis-full text-[11px] text-[#8B7355]">
                   To set a count to <b>zero</b>, type <b>0</b> — leaving all boxes blank keeps the previously saved count unchanged.
                 </span>
-                {pending.length > 0 && (
+                {isAdmin && pending.length > 0 && (
                   <span>Variance <b className={pendingVarianceValue < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}>
                     {pendingVarianceValue < 0 ? '−' : ''}{inr(Math.abs(pendingVarianceValue))}</b></span>
                 )}
@@ -2432,9 +2426,10 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                     <tr>
                       <th className="text-left px-3 py-2 font-medium">Date</th>
                       <th className="text-right px-3 py-2 font-medium">Items</th>
-                      <th className="text-right px-3 py-2 font-medium">Short</th>
-                      <th className="text-right px-3 py-2 font-medium">Excess</th>
-                      <th className="text-right px-3 py-2 font-medium">Variance ₹</th>
+                      {/* Variance columns are admin-only (blind count). */}
+                      {isAdmin && <th className="text-right px-3 py-2 font-medium">Short</th>}
+                      {isAdmin && <th className="text-right px-3 py-2 font-medium">Excess</th>}
+                      {isAdmin && <th className="text-right px-3 py-2 font-medium">Variance ₹</th>}
                       <th className="px-3 py-2"></th>
                     </tr>
                   </thead>
@@ -2444,11 +2439,13 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                           onClick={() => openHistDate(d.date)}>
                         <td className="px-3 py-2 font-medium text-[#2D1B0E] whitespace-nowrap">{d.date}</td>
                         <td className="px-3 py-2 text-right">{d.item_count}</td>
-                        <td className="px-3 py-2 text-right text-red-700">{d.shortage_count || '—'}</td>
-                        <td className="px-3 py-2 text-right text-blue-700">{d.excess_count || '—'}</td>
-                        <td className={`px-3 py-2 text-right font-mono ${d.total_variance_value < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}`}>
-                          {d.total_variance_value < 0 ? '−' : ''}{inr(Math.abs(d.total_variance_value))}
-                        </td>
+                        {isAdmin && <td className="px-3 py-2 text-right text-red-700">{d.shortage_count || '—'}</td>}
+                        {isAdmin && <td className="px-3 py-2 text-right text-blue-700">{d.excess_count || '—'}</td>}
+                        {isAdmin && (
+                          <td className={`px-3 py-2 text-right font-mono ${(d.total_variance_value ?? 0) < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}`}>
+                            {(d.total_variance_value ?? 0) < 0 ? '−' : ''}{inr(Math.abs(d.total_variance_value ?? 0))}
+                          </td>
+                        )}
                         <td className="px-3 py-2 text-right text-[10px] text-[#af4408]">view</td>
                       </tr>
                     ))}
@@ -2482,35 +2479,41 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                         <tr>
                           <th className="text-left px-3 py-2 font-medium">Material</th>
                           <th className="text-left px-3 py-2 font-medium">Category</th>
-                          <th className="text-right px-3 py-2 font-medium">System</th>
+                          {isAdmin && <th className="text-right px-3 py-2 font-medium">System</th>}
                           <th className="text-right px-3 py-2 font-medium">Physical</th>
-                          <th className="text-right px-3 py-2 font-medium">Variance</th>
-                          <th className="text-right px-3 py-2 font-medium">Variance ₹</th>
+                          {isAdmin && <th className="text-right px-3 py-2 font-medium">Variance</th>}
+                          {isAdmin && <th className="text-right px-3 py-2 font-medium">Variance ₹</th>}
                           <th className="text-left px-3 py-2 font-medium">Notes</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-[#F0E4D6]">
                         {histRows.map(c => (
-                          <tr key={c.material_id} className={c.variance < 0 ? 'bg-red-50/40' : c.variance > 0 ? 'bg-blue-50/40' : ''}>
+                          <tr key={c.material_id} className={isAdmin && c.variance < 0 ? 'bg-red-50/40' : isAdmin && c.variance > 0 ? 'bg-blue-50/40' : ''}>
                             <td className="px-3 py-2 text-[#2D1B0E]">{c.material_name}</td>
                             <td className="px-3 py-2 text-[#6B5744]">{c.category || '—'}</td>
-                            <td className="px-3 py-2 text-right font-mono text-[#6B5744]">
-                              {fmtBreakdown(c.system_qty, c) || <>{fq(c.system_qty)} {c.unit}</>}
-                            </td>
+                            {isAdmin && (
+                              <td className="px-3 py-2 text-right font-mono text-[#6B5744]">
+                                {fmtBreakdown(c.system_qty, c) || <>{fq(c.system_qty)} {c.unit}</>}
+                              </td>
+                            )}
                             <td className="px-3 py-2 text-right font-mono text-[#2D1B0E]">
                               {fmtBreakdown(c.physical_qty, c) || <>{fq(c.physical_qty)} {c.unit}</>}
                             </td>
-                            <td className={`px-3 py-2 text-right font-mono ${c.variance < 0 ? 'text-red-700' : c.variance > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
-                              {fmtBreakdown(c.variance, c) || <>{c.variance > 0 ? '+' : ''}{fq(c.variance)} {c.unit}</>}
-                            </td>
-                            <td className={`px-3 py-2 text-right font-mono ${c.variance_value < 0 ? 'text-red-700' : 'text-[#6B5744]'}`}>
-                              {c.variance_value < 0 ? '−' : ''}{inr(Math.abs(c.variance_value))}
-                            </td>
+                            {isAdmin && (
+                              <td className={`px-3 py-2 text-right font-mono ${c.variance < 0 ? 'text-red-700' : c.variance > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
+                                {fmtBreakdown(c.variance, c) || <>{c.variance > 0 ? '+' : ''}{fq(c.variance)} {c.unit}</>}
+                              </td>
+                            )}
+                            {isAdmin && (
+                              <td className={`px-3 py-2 text-right font-mono ${c.variance_value < 0 ? 'text-red-700' : 'text-[#6B5744]'}`}>
+                                {c.variance_value < 0 ? '−' : ''}{inr(Math.abs(c.variance_value))}
+                              </td>
+                            )}
                             <td className="px-3 py-2 text-[#8B7355]">{c.note || '—'}</td>
                           </tr>
                         ))}
                         {histRows.length === 0 && (
-                          <tr><td colSpan={7} className="px-3 py-4 text-center text-[#8B7355]">No counts on this date.</td></tr>
+                          <tr><td colSpan={isAdmin ? 7 : 4} className="px-3 py-4 text-center text-[#8B7355]">No counts on this date.</td></tr>
                         )}
                       </tbody>
                     </table>

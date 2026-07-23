@@ -30,6 +30,11 @@ const daysAgoISO = (n: number) => { const d = new Date(); d.setDate(d.getDate() 
 export async function GET() {
   try {
     const db = getDb();
+    // Blind count: the closing-count variance (per-item and the ₹ tie-out total)
+    // is admin-only — a non-admin must not learn the system figure from the
+    // morning anomalies feed on the dashboard.
+    const me = await (await import('@/lib/auth')).getCurrentUser();
+    const isAdmin = me?.role === 'admin';
     const yesterday = yesterdayISO();
     const sevenAgo = daysAgoISO(7);
     const thirtyAgo = daysAgoISO(30);
@@ -99,7 +104,9 @@ export async function GET() {
       ORDER BY ABS(cs.variance_value) DESC
       LIMIT 5
     `).all(yesterday) as any[];
-    for (const v of variances) {
+    // Variance anomalies reveal the per-item system figure ("off by X vs system
+    // stock") — admin only.
+    if (isAdmin) for (const v of variances) {
       const tone = v.variance_value < 0 ? 'short' : 'over';
       anomalies.push({
         severity: Math.abs(v.variance_value) > 5000 ? 'high' : 'medium',
@@ -158,7 +165,8 @@ export async function GET() {
         (SELECT COALESCE(SUM(ABS(quantity)), 0) FROM inventory_transactions WHERE type='wastage' AND DATE(created_at) = ?) AS wasted
     `).get(yesterday, yesterday, yesterday) as any;
     const closingValue = (db.prepare(`SELECT COALESCE(SUM(ABS(variance_value)), 0) AS v FROM closing_stock WHERE date = ?`).get(yesterday) as any)?.v || 0;
-    if (closingValue > 10000) {
+    // The tie-out ₹ figure is a closing-count variance total — admin only.
+    if (isAdmin && closingValue > 10000) {
       anomalies.push({
         severity: 'high',
         category: 'Tie-out',
@@ -178,7 +186,8 @@ export async function GET() {
         received: tieOut.received || 0,
         recipe_consumed: tieOut.consumed || 0,
         wasted: tieOut.wasted || 0,
-        variance_value_total: closingValue,
+        // Variance ₹ total is admin-only; non-admins get just the balanced flag.
+        variance_value_total: isAdmin ? closingValue : null,
         balanced: closingValue < 1000,
       },
       anomaly_count: anomalies.length,

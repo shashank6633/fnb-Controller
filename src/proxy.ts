@@ -50,6 +50,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/purchases',           // legacy purchase entries
   '/api/import-materials',
   '/api/closing-stock',
+  '/api/variance-approvals',  // approve/reject variance (admin) — mutates stock
   '/api/direct-items',        // direct item link/unlink
   '/api/seed',                // seed sample data
   '/api/settings',            // settings updates

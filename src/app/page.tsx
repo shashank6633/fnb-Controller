@@ -1037,7 +1037,11 @@ function AnomalyTile() {
         </h3>
         <div className="flex gap-2 text-xs">
           <span className={`px-2 py-0.5 rounded ${data.tie_out.balanced ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
-            {data.tie_out.balanced ? '✓ Books balanced' : `⚠ Off by ₹${Math.round(data.tie_out.variance_value_total).toLocaleString('en-IN')}`}
+            {data.tie_out.balanced
+              ? '✓ Books balanced'
+              : data.tie_out.variance_value_total == null
+                ? '⚠ Variance flagged (admin review)'   /* blind count: ₹ hidden from non-admins */
+                : `⚠ Off by ₹${Math.round(data.tie_out.variance_value_total).toLocaleString('en-IN')}`}
           </span>
           <span className="px-2 py-0.5 rounded bg-[#FFF1E3] text-[#6B5744]">
             <strong className="text-[#2D1B0E]">{data.anomaly_count}</strong> anomal{data.anomaly_count === 1 ? 'y' : 'ies'}

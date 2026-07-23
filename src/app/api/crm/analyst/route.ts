@@ -78,7 +78,14 @@ export async function POST(request: Request) {
     // Build the deterministic data pack from the live DB.
     const viewsUsed = pickViews(question);
     const dataPack: Record<string, unknown> = {};
-    for (const v of viewsUsed) dataPack[v] = ANALYST_VIEWS[v](db);
+    // Blind count: varianceReport exposes the system figure — only admins get the
+    // real numbers; a HOD asking about "variance/theft" gets a restricted view.
+    const isAdmin = me.role === 'admin';
+    for (const v of viewsUsed) {
+      dataPack[v] = v === 'varianceReport'
+        ? (ANALYST_VIEWS[v] as (d: typeof db, admin?: boolean) => unknown)(db, isAdmin)
+        : ANALYST_VIEWS[v](db);
+    }
 
     // Chat history (≤10 prior messages, chronological).
     const prior = (db.prepare(`

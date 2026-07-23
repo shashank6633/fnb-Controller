@@ -1,6 +1,7 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
-import { getStoreById, materialStoreId, postLedger, userStoreAccess, isStoreMappedMaterial, storeCategories } from '@/lib/store-engine';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getStoreById, materialStoreId, userStoreAccess, isStoreMappedMaterial, storeCategories } from '@/lib/store-engine';
+import { upsertVarianceApproval } from '@/lib/variance-approval';
 
 /**
  * /api/stores/[id]/closing — INDEPENDENT store closing stock (Phase C, spec F6).
@@ -65,6 +66,9 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     if (!access.can_view) {
       return Response.json({ error: `You are not authorized to view ${store.name}` }, { status: 403 });
     }
+    // Blind count: only admins may see the system figure + variance. Everything
+    // that would reveal the expected number is stripped for everyone else.
+    const isAdmin = user.role === 'admin';
 
     const url = new URL(request.url);
     const date = (url.searchParams.get('date') || '').trim();
@@ -86,10 +90,11 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       `).all(storeId) as any[]).map(r => ({
         date: r.date,
         item_count: Number(r.item_count) || 0,
-        shortage_count: Number(r.shortage_count) || 0,
-        excess_count: Number(r.excess_count) || 0,
-        total_variance_value: Math.round((Number(r.total_variance_value) || 0) * 100) / 100,
-        abs_variance_value: Math.round((Number(r.abs_variance_value) || 0) * 100) / 100,
+        // Variance fields are admin-only (they reveal the system figure).
+        shortage_count: isAdmin ? (Number(r.shortage_count) || 0) : null,
+        excess_count: isAdmin ? (Number(r.excess_count) || 0) : null,
+        total_variance_value: isAdmin ? Math.round((Number(r.total_variance_value) || 0) * 100) / 100 : null,
+        abs_variance_value: isAdmin ? Math.round((Number(r.abs_variance_value) || 0) * 100) / 100 : null,
       }));
       return Response.json({ store: { id: store.id, name: store.name }, dates });
     }
@@ -123,13 +128,19 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 
     const summary = {
       items: counts.length,
-      shortage_count: counts.filter(c => c.variance < 0).length,
-      excess_count: counts.filter(c => c.variance > 0).length,
-      match_count: counts.filter(c => c.variance === 0).length,
-      total_variance_value: Math.round(counts.reduce((s, c) => s + (Number(c.variance_value) || 0), 0) * 100) / 100,
+      shortage_count: isAdmin ? counts.filter(c => c.variance < 0).length : null,
+      excess_count: isAdmin ? counts.filter(c => c.variance > 0).length : null,
+      match_count: isAdmin ? counts.filter(c => c.variance === 0).length : null,
+      total_variance_value: isAdmin ? Math.round(counts.reduce((s, c) => s + (Number(c.variance_value) || 0), 0) * 100) / 100 : null,
     };
 
-    return Response.json({ store: { id: store.id, name: store.name }, date, counts, system_asof, summary });
+    // Blind count: non-admins get NO system figure. Strip the as-of map entirely
+    // and the system/variance columns from each saved count (physical count +
+    // counted_by stay so they still see WHAT was counted, just not the expected).
+    const safeCounts = isAdmin ? counts : counts.map(c => ({ ...c, system_qty: null, variance: null, variance_value: null }));
+    const safeAsof = isAdmin ? system_asof : [];
+
+    return Response.json({ store: { id: store.id, name: store.name }, date, counts: safeCounts, system_asof: safeAsof, summary });
   } catch (e: any) {
     console.error('[/api/stores/[id]/closing GET]', e);
     return Response.json({ error: e.message }, { status: 500 });
@@ -154,11 +165,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const b = await request.json();
     const date = String(b.date || '').trim();
     const note = String(b.note || '').trim();
-    // Admin-only flag — silently ignored for everyone else (same pattern as the
-    // central closing module): a store user must never one-click reconcile away
-    // genuine shrinkage.
-    const isAdmin = user.role === 'admin';
-    const adjust = isAdmin ? !!b.adjust_to_physical : false;
+    // A non-zero variance NEVER moves stock here. It creates a PENDING variance
+    // approval; an admin reviews it and only then does stock reconcile to the
+    // count. (Previously an admin-only `adjust_to_physical` flag did this inline;
+    // that path is retired in favour of the review queue.)
+    const outletId = await getCurrentOutletId();
 
     if (!DATE_RE.test(date)) {
       return Response.json({ error: 'date must be YYYY-MM-DD' }, { status: 400 });
@@ -219,7 +230,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       });
     }
 
-    const adjusted: string[] = [];
+    let pendingCount = 0;
     const upsert = db.prepare(`
       INSERT INTO store_closing_counts
         (id, store_id, material_id, date, system_qty, physical_qty, variance,
@@ -234,9 +245,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         note           = excluded.note,
         created_at     = datetime('now')
     `);
-    const backdateLedger = db.prepare(`
-      UPDATE store_stock_ledger SET created_at = ? || ' ' || strftime('%H:%M:%S', 'now') WHERE id = ?
-    `);
 
     const txn = db.transaction(() => {
       for (const p of prepared) {
@@ -245,21 +253,21 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           p.system_qty, p.physical_qty, p.variance, p.variance_value,
           user.email, p.note,
         );
-        if (adjust && p.variance !== 0) {
-          const ledgerId = postLedger(db, {
-            store_id: storeId,
-            material_id: p.material_id,
-            txn_type: 'adjustment',
-            quantity: p.variance,
-            unit_cost: 0,
-            ref: `closing:${date}`,
-            notes: `Closing count ${date}: system ${p.system_qty} → physical ${p.physical_qty} ${p.unit} (adjusted to physical)`,
-            created_by: user.email,
-          });
-          // Keep the adjustment on the count date so as-of sums stay coherent.
-          if (date !== today) backdateLedger.run(date, ledgerId);
-          adjusted.push(p.material_id);
-        }
+        // Non-zero variance → PENDING approval (stock unchanged until approved);
+        // a corrected count that now matches clears any stale pending row.
+        const vaId = upsertVarianceApproval(db, {
+          source: 'liquor',
+          material_id: p.material_id,
+          store_id: storeId,
+          date,
+          system_stock: p.system_qty,
+          physical_stock: p.physical_qty,
+          unit: p.unit,
+          counted_by: user.email,
+          count_note: p.note,
+          outlet_id: outletId,
+        });
+        if (vaId) pendingCount++;
       }
     });
     txn();
@@ -270,7 +278,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       excess_count: prepared.filter(p => p.variance > 0).length,
       match_count: prepared.filter(p => p.variance === 0).length,
       total_variance_value: Math.round(prepared.reduce((s, p) => s + p.variance_value, 0) * 100) / 100,
-      adjusted_count: adjusted.length,
+      pending_count: pendingCount,
     };
 
     logAuditEvent(db, {
@@ -286,9 +294,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           system_qty: p.system_qty, physical_qty: p.physical_qty,
           variance: p.variance, variance_value: p.variance_value,
         })),
-        adjust_to_physical: adjust,
       },
-      note: `${store.name}: closing count ${date} — ${prepared.length} item(s), variance ₹${summary.total_variance_value}${adjust ? ` (adjusted ${adjusted.length} to physical)` : ''}`,
+      note: `${store.name}: closing count ${date} — ${prepared.length} item(s), variance ₹${summary.total_variance_value}${pendingCount ? ` (${pendingCount} sent for approval)` : ''}`,
     });
 
     return Response.json({
@@ -297,7 +304,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         material_id: p.material_id,
         system_qty: p.system_qty, physical_qty: p.physical_qty,
         variance: p.variance, variance_value: p.variance_value,
-        adjusted: adjusted.includes(p.material_id),
+        pending: p.variance !== 0,
       })),
     }, { status: 201 });
   } catch (e: any) {

@@ -71,10 +71,17 @@ export async function GET(request: Request) {
       ORDER BY rm.super_category, rm.category, rm.name
     `).all(...params) as any[];
 
+    // Blind count: only admins may see the system stock + variance. For everyone
+    // else strip both server-side so the expected number never reaches the browser
+    // (a counter must not be able to just type back the system figure).
+    const items = (me?.role === 'admin')
+      ? rows
+      : rows.map(r => ({ ...r, current_stock: null, today_variance: null }));
+
     return Response.json({
       date,
       location: isUnassigned ? '— Unassigned —' : location,
-      items: rows,
+      items,
     });
   } catch (e: any) {
     console.error('[closing-stock/by-location]', e);

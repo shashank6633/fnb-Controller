@@ -257,7 +257,13 @@ export function foodCost(db: DB) {
   };
 }
 
-export function varianceReport(db: DB) {
+export function varianceReport(db: DB, isAdmin: boolean = false) {
+  // Blind count: the system figure + per-item variance are admin-only. Never let
+  // a non-admin (e.g. a HOD asking the AI about "variance/theft") get the numbers
+  // quoted back — the whole point is that only admins see the expected figure.
+  if (!isAdmin) {
+    return { latest_count_date: null, rows: [], note: 'Variance detail (system stock vs physical count) is restricted to admins and is not available here.' };
+  }
   const latest = (db.prepare(`SELECT MAX(date) AS d FROM closing_stock`).get() as any)?.d || null;
   if (!latest) {
     return { latest_count_date: null, rows: [], note: 'No closing-stock physical counts recorded yet — variance cannot be computed.' };

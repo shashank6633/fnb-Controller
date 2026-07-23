@@ -95,7 +95,11 @@ export async function POST(request: Request) {
       salesSummary: salesSummary(db),
       foodCost: foodCost(db),
       stockAlerts: stockAlerts(db),
-      varianceReport: varianceReport(db),
+      // The digest is cached per-date and shared (an HOD can read a copy generated
+      // by an admin), so the shared artifact must NEVER contain the system figure /
+      // variance. Always restricted here; admins see variance on the admin-only
+      // Variance Approvals / Variance Report surfaces instead.
+      varianceReport: varianceReport(db, false),
       wastageSummary: wastageSummary(db),
       pendingApprovals: pendingApprovals(db),
     };

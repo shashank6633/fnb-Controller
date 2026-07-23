@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentOutletId } from '@/lib/auth';
+import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 
 /**
  * Closing-stock variance report.
@@ -194,10 +194,19 @@ export async function GET(request: Request) {
       counted_stock_value,
     };
 
+    // Blind count: the count-time system figure (system_stock_snapshot) is the
+    // raw "system stock" a counter must not learn. Strip it for non-admins; the
+    // recomputed theoretical/loss analysis remains (it's a derived model, not the
+    // closing count's system number).
+    const me = await getCurrentUser();
+    const safeRows = me?.role === 'admin'
+      ? rows
+      : (rows as any[]).map(r => ({ ...r, system_stock_snapshot: null }));
+
     return Response.json({
       range: single ? { date: single } : { from, to },
       summary,
-      rows,
+      rows: safeRows,
       dates,
       by_category: byCategory,
       repeat_offenders: repeat,

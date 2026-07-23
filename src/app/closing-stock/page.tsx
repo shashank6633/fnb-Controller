@@ -83,7 +83,7 @@ function categoryLabel(cat: string): string {
 interface LocSummary { location: string; items: number; counted_today: number; low_stock: number; }
 interface Item {
   id: string; sku?: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; case_size?: number;
-  current_stock: number; average_price: number; reorder_level?: number;
+  current_stock: number | null; average_price: number; reorder_level?: number;   // system stock — null for non-admins (blind count)
   super_category?: string; category?: string; closing_cadence?: string; shelf_life_days?: number;
   today_count: number | null; today_variance: number | null; today_by?: string;
 }
@@ -425,7 +425,10 @@ export default function ClosingStockByLocationPage() {
     const s = String(v);
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  const CSV_COLS = ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Physical count'];
+  // Blind count: non-admins get a template WITHOUT the system-stock column.
+  const CSV_COLS = isAdmin
+    ? ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Physical count']
+    : ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'Physical count'];
   const downloadClosingTemplate = async () => {
     // Export the FILTERED set — the rows this user/department is being asked
     // to count — not the full catalogue. (Upload stays global: it matches by
@@ -443,11 +446,9 @@ export default function ClosingStockByLocationPage() {
     }
     const lines = [CSV_COLS.join(',')];
     for (const m of mats) {
-      lines.push([
-        m.id, m.sku || '', m.name || '',
-        (m.super_category || m.category || ''), m.unit || '',
-        m.current_stock ?? 0, '',   // Physical count — left blank for the counter
-      ].map(csvEscape).join(','));
+      const base = [m.id, m.sku || '', m.name || '', (m.super_category || m.category || ''), m.unit || ''];
+      // Physical count column left blank for the counter; system stock only for admins.
+      lines.push((isAdmin ? [...base, m.current_stock ?? 0, ''] : [...base, '']).map(csvEscape).join(','));
     }
     const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -737,9 +738,11 @@ export default function ClosingStockByLocationPage() {
                   <tr>
                     <th className="text-left  py-2 px-3 font-medium">Material</th>
                     <th className="text-left  py-2 px-3 font-medium">Category</th>
-                    <th className="text-right py-2 px-3 font-medium">System</th>
+                    {/* Blind count: only admins see the system number + variance, so
+                        staff can't just type back the expected figure to hide a loss. */}
+                    {isAdmin && <th className="text-right py-2 px-3 font-medium">System</th>}
                     <th className="text-left  py-2 px-3 font-medium w-[280px]">Physical count <span className="font-normal text-[9px] text-[#8B7355]">(packs + loose)</span></th>
-                    <th className="text-right py-2 px-3 font-medium">Variance</th>
+                    {isAdmin && <th className="text-right py-2 px-3 font-medium">Variance</th>}
                     <th className="text-left  py-2 px-3 font-medium">Status</th>
                   </tr>
                 </thead>
@@ -747,15 +750,18 @@ export default function ClosingStockByLocationPage() {
                   {visibleItems.map(it => {
                     const packConv = packFactor(it); // 1 when recipe unit ≡ purchase unit
                     const inPurchase = packConv > 1;
+                    // Only rendered inside the admin-only System column; coerce the
+                    // (blind-count) null to 0 so the type is happy.
+                    const sysStock = it.current_stock ?? 0;
                     const sysDisplay = inPurchase
-                      ? `${(it.current_stock / packConv).toFixed(2)} ${it.purchase_unit}`
-                      : `${it.current_stock} ${it.unit}`;
+                      ? `${(sysStock / packConv).toFixed(2)} ${it.purchase_unit}`
+                      : `${sysStock} ${it.unit}`;
                     const todayDisplay = it.today_count != null
                       ? (inPurchase
                           ? `${(it.today_count / packConv).toFixed(2)} ${it.purchase_unit}`
                           : `${it.today_count} ${it.unit}`)
                       : null;
-                    const isLow = (it.current_stock || 0) < (it.reorder_level || 0);
+                    const isLow = it.current_stock != null && it.current_stock < (it.reorder_level || 0);
                     const cadenceTag = it.closing_cadence && !['monthly', 'none', ''].includes(String(it.closing_cadence).toLowerCase());
                     return (
                       <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${isLow ? 'bg-red-50/30' : ''}`}>
@@ -772,7 +778,7 @@ export default function ClosingStockByLocationPage() {
                         <td className="py-1.5 px-3 text-[10px] text-[#6B5744]">
                           {it.super_category || it.category || '—'}
                         </td>
-                        <td className="py-1.5 px-3 text-right font-mono">{sysDisplay}</td>
+                        {isAdmin && <td className="py-1.5 px-3 text-right font-mono">{sysDisplay}</td>}
                         <td className="py-1.5 px-3">
                           {(() => {
                             const packSize = packFactor(it); // guarded: 1 when unit ≡ purchase_unit
@@ -827,15 +833,17 @@ export default function ClosingStockByLocationPage() {
                             );
                           })()}
                         </td>
-                        <td className="py-1.5 px-3 text-right font-mono">
-                          {(() => {
-                            const phys = physicalFor(it, cases[it.id], entries[it.id], loose[it.id]) ?? it.today_count;
-                            if (phys == null) return <span className="text-[#8B7355]">—</span>;
-                            const v = Math.round((phys - it.current_stock) * 1000) / 1000;
-                            const tone = v < 0 ? 'text-amber-800' : v > 0 ? 'text-blue-800' : 'text-emerald-700';
-                            return <span className={tone}>{v > 0 ? '+' : ''}{v} {it.unit}</span>;
-                          })()}
-                        </td>
+                        {isAdmin && (
+                          <td className="py-1.5 px-3 text-right font-mono">
+                            {(() => {
+                              const phys = physicalFor(it, cases[it.id], entries[it.id], loose[it.id]) ?? it.today_count;
+                              if (phys == null || it.current_stock == null) return <span className="text-[#8B7355]">—</span>;
+                              const v = Math.round((phys - it.current_stock) * 1000) / 1000;
+                              const tone = v < 0 ? 'text-amber-800' : v > 0 ? 'text-blue-800' : 'text-emerald-700';
+                              return <span className={tone}>{v > 0 ? '+' : ''}{v} {it.unit}</span>;
+                            })()}
+                          </td>
+                        )}
                         <td className="py-1.5 px-3">
                           {it.today_count != null ? (
                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
@@ -1059,13 +1067,13 @@ export default function ClosingStockByLocationPage() {
                             <p className="text-xs text-[#8B7355]">{h.item_count} items recorded</p>
                           </div>
                           <div className="flex items-center gap-4 text-xs">
-                            {h.shortage_count > 0 && (
+                            {isAdmin && h.shortage_count > 0 && (
                               <span className="flex items-center gap-1 text-red-500"><TrendingDown className="w-3 h-3" />{h.shortage_count} shortage</span>
                             )}
-                            {h.excess_count > 0 && (
+                            {isAdmin && h.excess_count > 0 && (
                               <span className="flex items-center gap-1 text-blue-500"><TrendingUp className="w-3 h-3" />{h.excess_count} excess</span>
                             )}
-                            <span className="text-[#af4408] font-semibold">Variance: {formatCurrency(h.total_variance_value)}</span>
+                            {isAdmin && <span className="text-[#af4408] font-semibold">Variance: {formatCurrency(h.total_variance_value)}</span>}
                           </div>
                         </div>
                       </div>
@@ -1085,9 +1093,9 @@ export default function ClosingStockByLocationPage() {
                       {historySummary && (
                         <div className="flex gap-4 text-xs">
                           <span className="text-[#6B5744]">Items: <span className="font-bold">{historySummary.total_items}</span></span>
-                          <span className="text-red-500">Shortage: <span className="font-bold">{historySummary.shortage_count}</span></span>
-                          <span className="text-blue-500">Excess: <span className="font-bold">{historySummary.excess_count}</span></span>
-                          <span className="text-[#af4408]">Variance Value: <span className="font-bold">{formatCurrency(Math.abs(historySummary.total_variance_value))}</span></span>
+                          {isAdmin && <span className="text-red-500">Shortage: <span className="font-bold">{historySummary.shortage_count}</span></span>}
+                          {isAdmin && <span className="text-blue-500">Excess: <span className="font-bold">{historySummary.excess_count}</span></span>}
+                          {isAdmin && <span className="text-[#af4408]">Variance Value: <span className="font-bold">{formatCurrency(Math.abs(historySummary.total_variance_value))}</span></span>}
                         </div>
                       )}
                     </div>
@@ -1097,10 +1105,11 @@ export default function ClosingStockByLocationPage() {
                           <tr className="text-[#8B7355]">
                             <th className="text-left py-2.5 px-3 font-medium">Material</th>
                             <th className="text-left py-2.5 px-3 font-medium">Category</th>
-                            <th className="text-right py-2.5 px-3 font-medium">System Stock</th>
+                            {/* Blind count: System / Variance columns are admin-only. */}
+                            {isAdmin && <th className="text-right py-2.5 px-3 font-medium">System Stock</th>}
                             <th className="text-right py-2.5 px-3 font-medium">Physical Stock</th>
-                            <th className="text-right py-2.5 px-3 font-medium">Variance</th>
-                            <th className="text-right py-2.5 px-3 font-medium">Variance (₹)</th>
+                            {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance</th>}
+                            {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance (₹)</th>}
                             <th className="text-left py-2.5 px-3 font-medium">Notes</th>
                           </tr>
                         </thead>
@@ -1109,17 +1118,21 @@ export default function ClosingStockByLocationPage() {
                             const isShortage = item.variance < 0;
                             const isExcess = item.variance > 0;
                             return (
-                              <tr key={item.id} className={`border-t border-[#E8D5C4]/50 ${isShortage ? 'bg-red-50/50' : isExcess ? 'bg-blue-50/50' : ''}`}>
+                              <tr key={item.id} className={`border-t border-[#E8D5C4]/50 ${isAdmin && isShortage ? 'bg-red-50/50' : isAdmin && isExcess ? 'bg-blue-50/50' : ''}`}>
                                 <td className="py-2 px-3 text-[#2D1B0E] font-medium text-xs">{item.material_name}</td>
                                 <td className="py-2 px-3 text-xs text-[#6B5744]">{categoryLabel(item.category)}</td>
-                                <td className="py-2 px-3 text-right text-xs font-mono">{item.system_stock} {item.unit}</td>
+                                {isAdmin && <td className="py-2 px-3 text-right text-xs font-mono">{item.system_stock} {item.unit}</td>}
                                 <td className="py-2 px-3 text-right text-xs font-mono font-semibold">{item.physical_stock} {item.unit}</td>
-                                <td className={`py-2 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
-                                  {item.variance > 0 ? '+' : ''}{item.variance} {item.unit}
-                                </td>
-                                <td className={`py-2 px-3 text-right text-xs font-mono ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
-                                  {item.variance_value > 0 ? '+' : ''}{formatCurrency(item.variance_value)}
-                                </td>
+                                {isAdmin && (
+                                  <td className={`py-2 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
+                                    {item.variance > 0 ? '+' : ''}{item.variance} {item.unit}
+                                  </td>
+                                )}
+                                {isAdmin && (
+                                  <td className={`py-2 px-3 text-right text-xs font-mono ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
+                                    {item.variance_value > 0 ? '+' : ''}{formatCurrency(item.variance_value)}
+                                  </td>
+                                )}
                                 <td className="py-2 px-3 text-xs text-[#8B7355]">{item.notes || '-'}</td>
                               </tr>
                             );

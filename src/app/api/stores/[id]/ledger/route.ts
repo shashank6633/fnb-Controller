@@ -97,14 +97,17 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         LIMIT ?
       `).all(...cargs, limit) as any[];
 
+      // Blind count: only admins may see the system figure + variance on a
+      // closing register row (the UI hides it, but the raw JSON must too).
+      const isAdmin = user.role === 'admin';
       const synthetic = counts.map(c => ({
         id: `count:${c.id}`,
         txn_type: 'closing',
         is_count: true,
         quantity: c.physical_qty,
-        system_qty: c.system_qty,
-        variance: c.variance,
-        variance_value: c.variance_value,
+        system_qty: isAdmin ? c.system_qty : null,
+        variance: isAdmin ? c.variance : null,
+        variance_value: isAdmin ? c.variance_value : null,
         unit_cost: 0,
         batch_no: null,
         supplier: null,

@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentOutletId } from '@/lib/auth';
+import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 
 /**
  * Daily Closing Roll-up — Phase 1 §6 spec.
@@ -26,6 +26,13 @@ export const revalidate = 0;
 export async function GET(request: Request) {
   try {
     const db = getDb();
+    // Blind count: this whole report reconciles expected vs counted stock, so the
+    // system figure is derivable from opening+received-consumed. It is admin-only
+    // (the /daily-rollup page is adminOnly too) — 403 for everyone else.
+    const me = await getCurrentUser();
+    if (me?.role !== 'admin') {
+      return Response.json({ error: 'Daily roll-up is available to admins only.' }, { status: 403 });
+    }
     const url = new URL(request.url);
     const from = url.searchParams.get('from') || (() => { const d = new Date(); d.setDate(d.getDate() - 7); return d.toISOString().slice(0, 10); })();
     const to   = url.searchParams.get('to')   || new Date().toISOString().slice(0, 10);

@@ -293,16 +293,19 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         `).all(...ca) as any[]).map(d => ({
           date: d.date,
           items: n(d.items),
-          shortages: n(d.shortages),
-          excesses: n(d.excesses),
-          variance_value: r2(d.variance_value),
-          abs_variance_value: r2(d.abs_variance_value),
+          // Blind count: variance figures reveal the system total — admin only.
+          shortages: user?.role === 'admin' ? n(d.shortages) : null,
+          excesses: user?.role === 'admin' ? n(d.excesses) : null,
+          variance_value: user?.role === 'admin' ? r2(d.variance_value) : null,
+          abs_variance_value: user?.role === 'admin' ? r2(d.abs_variance_value) : null,
         }));
-        totals = {
-          dates: rows.length,
-          items: rows.reduce((s, r) => s + n(r.items), 0),
-          variance_value: r2(rows.reduce((s, r) => s + n(r.variance_value), 0)),
-        };
+        totals = user?.role === 'admin'
+          ? {
+              dates: rows.length,
+              items: rows.reduce((s, r) => s + n(r.items), 0),
+              variance_value: r2(rows.reduce((s, r) => s + n(r.variance_value), 0)),
+            }
+          : { dates: rows.length, items: rows.reduce((s, r) => s + n(r.items), 0) };
         break;
       }
 

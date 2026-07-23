@@ -1,9 +1,15 @@
 import { getDb, generateId } from '@/lib/db';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
+import { upsertVarianceApproval } from '@/lib/variance-approval';
 
 export async function GET(request: Request) {
   try {
     const db = getDb();
+    // Blind count: only admins may see the system figure + variance anywhere on
+    // the closing-stock surfaces (so a counter can't read back the expected
+    // number). Everything system/variance-related is stripped for non-admins.
+    const me = await (await import('@/lib/auth')).getCurrentUser();
+    const isAdmin = me?.role === 'admin';
     const url = new URL(request.url);
     const date = url.searchParams.get('date');
     const from = url.searchParams.get('from');
@@ -26,8 +32,14 @@ export async function GET(request: Request) {
         GROUP BY date
         ORDER BY date DESC
         LIMIT 50
-      `).all();
-      return Response.json({ dates });
+      `).all() as any[];
+      // Non-admins get item counts only — the variance/shortage figures reveal
+      // the system total, so they are admin-only.
+      const safeDates = isAdmin ? dates : dates.map(d => ({
+        date: d.date, item_count: d.item_count,
+        total_variance_value: null, shortage_count: null, excess_count: null,
+      }));
+      return Response.json({ dates: safeDates });
     }
 
     // Get closing stock for a specific date.
@@ -117,6 +129,19 @@ export async function GET(request: Request) {
       by_area,
     };
 
+    // Blind count: strip the system figure + variance from every payload for
+    // non-admins (items, the value/variance summary, and the area rollup).
+    if (!isAdmin) {
+      const safeItems = (items as any[]).map(i => ({
+        ...i, system_stock: null, variance: null, variance_value: null,
+      }));
+      const safeSummary = {
+        total_items: summary.total_items,
+        total_system_value: null, total_physical_value: null, total_variance_value: null,
+        shortage_count: null, excess_count: null, match_count: null, by_area: [],
+      };
+      return Response.json({ items: safeItems, summary: safeSummary });
+    }
     return Response.json({ items, summary });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });
@@ -131,7 +156,6 @@ export async function POST(request: Request) {
     // shrinkage. Counts themselves are unaffected and remain writable by all.
     const authMod = await import('@/lib/auth');
     const me = await authMod.getCurrentUser();
-    const isAdmin = me?.role === 'admin';
     // Tag every saved count with the current outlet so outlet-scoped reads (e.g.
     // the Variance Report) see it immediately — without this the row is written
     // outlet_id NULL and only appears after the next server-boot backfill.
@@ -139,7 +163,6 @@ export async function POST(request: Request) {
     const db = getDb();
     const body = await request.json();
     const { date, items } = body;
-    const adjust_stock = isAdmin ? !!body.adjust_stock : false;
     // Department-wise counts (2026-07): a top-level department_id applies to every
     // item unless the item carries its own. Normalize '' / null / '__store__' to
     // NULL so store/overall counts (no owning department) are stored consistently.
@@ -153,7 +176,7 @@ export async function POST(request: Request) {
       return Response.json({ error: 'date and items array are required' }, { status: 400 });
     }
 
-    const results = { success: 0, errors: [] as string[] };
+    const results = { success: 0, pending: 0, errors: [] as string[] };
 
     const recordClosingStock = db.transaction(() => {
       // Per-(material, department) upsert (do NOT wipe the whole day — counts may
@@ -208,20 +231,22 @@ export async function POST(request: Request) {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         `).run(id, item.material_id, deptId, date, systemStock, physicalStock, variance, varianceValue, item.notes || '', item.recorded_by || '', outletId || null);
 
-        // Optionally adjust system stock to match physical count
-        if (adjust_stock && variance !== 0) {
-          db.prepare('UPDATE raw_materials SET current_stock = ?, updated_at = datetime(\'now\') WHERE id = ?')
-            .run(physicalStock, item.material_id);
-
-          // Log the adjustment in inventory transactions
-          db.prepare(`
-            INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-            VALUES (?, ?, 'adjustment', ?, ?, ?, datetime('now'))
-          `).run(
-            generateId(), item.material_id, variance, id,
-            `Closing stock adjustment: System ${systemStock} → Physical ${physicalStock} (Variance: ${variance})`
-          );
-        }
+        // A non-zero variance NEVER changes stock here — it creates a PENDING
+        // approval for an admin to review. Stock moves only on approval. A
+        // re-count that now matches clears any stale pending row (handled inside).
+        upsertVarianceApproval(db, {
+          source: 'central',
+          material_id: item.material_id,
+          department_id: deptId || '',
+          date,
+          system_stock: systemStock,
+          physical_stock: physicalStock,
+          unit: material.unit,
+          counted_by: item.recorded_by || me?.email || '',
+          count_note: item.notes || '',
+          outlet_id: outletId,
+        });
+        if (variance !== 0) results.pending++;
 
         results.success++;
       }
