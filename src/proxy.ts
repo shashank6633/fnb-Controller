@@ -78,6 +78,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/stores',              // Store Locations (multi-store engine config: stores/categories/access)
   '/api/tasks',               // Task Management module (tasks/checklists/maintenance/hygiene/training/approvals/etc.) — all mutations CSRF-protected
   '/api/crm-calls',           // CRM Call-to-Table: guests/calls/bookings/recoveries/settings/seed mutations
+  '/api/crm-calls/entertainment', // GRE "What's On" entertainment calendar CRUD (management-gated writes)
   '/api/telecmi',             // TeleCMI actions (click-to-call, backfill) — webhooks are carved out in isPublic (matched there first)
 ];
 

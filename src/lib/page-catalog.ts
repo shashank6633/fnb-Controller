@@ -182,6 +182,7 @@ export const PAGE_CATALOG: PageSection[] = [
     label: 'CRM',
     pages: [
       { path: '/crm-calls',          label: 'CRM Dashboard' },
+      { path: '/crm-calls/whats-on', label: "What's On (GRE board)" },
       { path: '/crm-calls/live',     label: 'Live Calls' },
       { path: '/crm-calls/recovery', label: 'Recovery Queue' },
       { path: '/crm-calls/guests',   label: 'Guests (unified 360)' },

@@ -179,6 +179,38 @@ function validate(key: string, value: any): { ok: true; value: string } | { ok: 
       }
       return { ok: true, value: JSON.stringify(clean) };
     }
+    case 'whatson_panels': {
+      // Which panels show on the GRE "What's On" board. Accept an object or a
+      // JSON string; keep ONLY the 6 known boolean keys, coerce each to a real
+      // bool, and store canonical JSON so the board can parse it deterministically.
+      let obj: any = value;
+      if (typeof value === 'string') {
+        try { obj = JSON.parse(value || '{}'); } catch { return { ok: false, error: 'whatson_panels must be valid JSON' }; }
+      }
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+        return { ok: false, error: 'whatson_panels must be a JSON object of { panel: boolean }' };
+      }
+      const PANEL_KEYS = ['entertainment', 'parties', 'reservations', 'specials', 'capacity', 'call_context'] as const;
+      const clean: Record<string, boolean> = {};
+      for (const k of PANEL_KEYS) {
+        const v = obj[k];
+        // Default a missing panel to ON; only an explicit falsey value hides it.
+        clean[k] = v === undefined ? true : !(v === false || v === 0 || v === '0' || v === 'false');
+      }
+      return { ok: true, value: JSON.stringify(clean) };
+    }
+    case 'whatson_specials': {
+      const v = String(value ?? '');
+      if (v.length > 4000) return { ok: false, error: 'whatson_specials must be 4000 characters or fewer' };
+      return { ok: true, value: v };
+    }
+    case 'whatson_capacity': {
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 0 || n > 100000) {
+        return { ok: false, error: 'whatson_capacity must be a whole number between 0 and 100000 (0 = gauge hidden)' };
+      }
+      return { ok: true, value: String(n) };
+    }
     default:
       return { ok: false, error: `Unknown setting '${key}'` };
   }

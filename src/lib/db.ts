@@ -3623,6 +3623,25 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_ct_bookings_date  ON ct_bookings(booking_date);
       CREATE INDEX IF NOT EXISTS idx_ct_bookings_src   ON ct_bookings(source_call_id);
 
+      -- Entertainment & events calendar — the standalone "what's on" schedule
+      -- (live bands, DJ nights, special events) a manager fills per date; feeds
+      -- the GRE "What's On" board alongside party-function entertainment.
+      CREATE TABLE IF NOT EXISTS ct_entertainment (
+        id          TEXT PRIMARY KEY,
+        outlet_id   TEXT NOT NULL DEFAULT '',
+        event_date  TEXT NOT NULL DEFAULT '',        -- YYYY-MM-DD
+        type        TEXT NOT NULL DEFAULT 'band',     -- band | dj | live_music | event | offer | other
+        name        TEXT NOT NULL DEFAULT '',
+        start_time  TEXT NOT NULL DEFAULT '',         -- HH:mm (IST), free text ok
+        end_time    TEXT NOT NULL DEFAULT '',
+        area        TEXT NOT NULL DEFAULT '',         -- floor / section / hall
+        description TEXT NOT NULL DEFAULT '',
+        created_by  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_ent_date ON ct_entertainment(event_date);
+
       CREATE TABLE IF NOT EXISTS ct_follow_ups (
         id          TEXT PRIMARY KEY,
         guest_id    TEXT NOT NULL,

@@ -19,7 +19,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Settings as SettingsIcon, PlugZap, Webhook, Copy, Check, Clock, UserCheck,
   Loader2, AlertCircle, CheckCircle2, Save, Lock, Database, DownloadCloud,
-  MessageCircle, RefreshCw, Sparkles, Zap, Users, Plus, Trash2,
+  MessageCircle, RefreshCw, Sparkles, Zap, Users, Plus, Trash2, MonitorPlay,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
@@ -38,6 +38,10 @@ const DEFAULTS: Record<string, string> = {
   auto_analyze: '0',
   analysis_retention: 'permanent',
   quick_send_links: '[]',
+  // GRE "What's On" board config (mirrors CT_SETTING_DEFAULTS).
+  whatson_panels: '{"entertainment":true,"parties":true,"reservations":true,"specials":true,"capacity":true,"call_context":true}',
+  whatson_specials: '',
+  whatson_capacity: '0',
 };
 
 const EDITABLE_KEYS = Object.keys(DEFAULTS);
@@ -611,6 +615,83 @@ export default function CtSettingsPage() {
             guest&apos;s most recent answered call (default 48h) — that link is the
             &ldquo;call-to-table&rdquo; conversion.
           </p>
+        </div>
+      </section>
+
+      {/* ── What's On board (GRE) ── */}
+      <section className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+        <div className="px-3 sm:px-4 py-2.5 bg-[#FFF1E3] border-b border-[#E8D5C4] flex items-center gap-2">
+          <MonitorPlay className="w-4 h-4 text-[#af4408]" />
+          <h2 className="text-sm font-semibold text-[#2D1B0E]">What&apos;s On board</h2>
+        </div>
+        <div className="p-3 sm:p-4 space-y-4">
+          <p className="text-xs text-[#6B5744]">
+            Controls the GRE <strong>What&apos;s On</strong> board (<code className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">/crm-calls/whats-on</code>) —
+            the at-a-glance view of a day&apos;s entertainment, parties, reservations and specials for
+            call handlers. Pick which panels appear, set the day&apos;s talking points, and set the seat
+            capacity for the &ldquo;how full is this date&rdquo; gauge.
+          </p>
+
+          {/* Panels shown on the board */}
+          <div>
+            <label className={labelCls}>Panels shown on the board</label>
+            {(() => {
+              const PANELS: [string, string][] = [
+                ['entertainment', 'Entertainment'],
+                ['parties', 'Parties'],
+                ['reservations', 'Reservations'],
+                ['specials', 'Specials / talking points'],
+                ['capacity', 'Capacity gauge'],
+                ['call_context', 'Live call context'],
+              ];
+              let panels: Record<string, boolean> = {};
+              try {
+                const o = JSON.parse(form.whatson_panels || '{}');
+                if (o && typeof o === 'object' && !Array.isArray(o)) panels = o;
+              } catch { /* keep {} → all default ON */ }
+              const isOn = (k: string) => panels[k] !== false;
+              const toggle = (k: string, v: boolean) => {
+                const next: Record<string, boolean> = {};
+                for (const [pk] of PANELS) next[pk] = pk === k ? v : isOn(pk);
+                set('whatson_panels', JSON.stringify(next));
+              };
+              return (
+                <div className="mt-1.5 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {PANELS.map(([k, lbl]) => (
+                    <div key={k} className="flex items-center gap-2 border border-[#E8D5C4] rounded-lg bg-[#FFFDFB] px-3 py-2">
+                      <span className="text-xs text-[#2D1B0E] flex-1">{lbl}</span>
+                      <Toggle checked={isOn(k)} onChange={(v) => toggle(k, v)} size="sm" label={lbl} />
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* Specials / talking points */}
+          <div className="border-t border-[#E8D5C4]/60 pt-3">
+            <label className={labelCls}>Today&apos;s specials / talking points</label>
+            <textarea value={form.whatson_specials ?? ''}
+                      onChange={e => set('whatson_specials', e.target.value)}
+                      rows={4}
+                      placeholder={'e.g.\nChef’s special: Hyderabadi Haleem\nHappy hours 5–7pm on all cocktails\nPush the new rooftop seating'}
+                      className={`${inputCls} mt-0.5 resize-y`} />
+            <p className="text-[10px] text-[#6B5744] mt-1">
+              Free text shown on the board so GREs can mention the day&apos;s highlights on a call. Line
+              breaks are preserved. Up to 4000 characters.
+            </p>
+          </div>
+
+          {/* Daily seat capacity */}
+          <div className="border-t border-[#E8D5C4]/60 pt-3 max-w-xs">
+            <label className={labelCls}>Daily seat capacity</label>
+            <input type="number" min={0} max={100000} value={form.whatson_capacity ?? ''}
+                   onChange={e => set('whatson_capacity', e.target.value)} className={inputCls} />
+            <p className="text-[10px] text-[#6B5744] mt-1">
+              Total covers the outlet can seat in a day. The board&apos;s capacity gauge compares reserved
+              covers + party pax against this. Set to <strong>0</strong> to hide the gauge.
+            </p>
+          </div>
         </div>
       </section>
 

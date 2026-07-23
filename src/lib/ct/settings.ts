@@ -20,6 +20,12 @@ export const CT_SETTING_DEFAULTS: Record<string, string> = {
   // Quick-send documents a GRE can WhatsApp a caller from the Live Calls feed
   // (menu / band list / corporate menu …). JSON array of { label, url }.
   quick_send_links: '[{"label":"Menu","url":""},{"label":"Band List","url":""},{"label":"Corporate Menu","url":""}]',
+  // GRE "What's On" board — which panels show (managers toggle in CRM Settings).
+  whatson_panels: '{"entertainment":true,"parties":true,"reservations":true,"specials":true,"capacity":true,"call_context":true}',
+  // Talking points (offers / new menu / happy hours) a GRE reads out on calls.
+  whatson_specials: '',
+  // Daily seat capacity for the "how full is this date" gauge (0 = not set → gauge hidden).
+  whatson_capacity: '0',
 };
 
 export function ctSetting(db: Database.Database, key: string): string {
