@@ -404,7 +404,7 @@
   // verifiedAt = OTP passed; capturedAt = details taken while WhatsApp couldn't
   // send (orders go via the captain). Both live per-table in localStorage.
   function saveGuest(){try{localStorage.setItem('akan_guest_'+TOKEN,JSON.stringify(S.guest));}catch(e){}}
-  function loadGuest(){try{var r=localStorage.getItem('akan_guest_'+TOKEN);if(r){var g=JSON.parse(r)||{};S.guest={name:String(g.name||'').slice(0,60),mobile:String(g.mobile||'').replace(/\D/g,'').slice(-10),verifiedAt:Number(g.verifiedAt)||0,capturedAt:Number(g.capturedAt)||0,skippedAt:Number(g.skippedAt)||0};}}catch(e){}}
+  function loadGuest(){try{var r=localStorage.getItem('akan_guest_'+TOKEN);if(r){var g=JSON.parse(r)||{};S.guest={name:String(g.name||'').slice(0,60),mobile:String(g.mobile||'').replace(/\D/g,'').slice(0,10),verifiedAt:Number(g.verifiedAt)||0,capturedAt:Number(g.capturedAt)||0,skippedAt:Number(g.skippedAt)||0};}}catch(e){}}
   // 5.5h — a shade under the server's 6h window, so we re-verify BEFORE the
   // server would start rejecting the number.
   var VERIFY_WINDOW=19800000;
@@ -527,7 +527,7 @@
     if(sk)sk.onclick=function(){S.guest.skippedAt=Date.now();saveGuest();S.gateOptional=false;proceedToMenu();};
     document.getElementById('gb').onclick=function(){S.resumeOrder=false;S.screen='landing';render();};
     var mob=document.getElementById('gmob');
-    mob.oninput=function(){var v=mob.value.replace(/\D/g,'');if(v.length>10)v=v.slice(-10);if(v!==mob.value)mob.value=v;};   // pasted +91/0-prefixed numbers keep their last 10 digits
+    mob.oninput=function(){var v=mob.value.replace(/\D/g,'');if(v.length>=12&&v.slice(0,2)==='91')v=v.slice(2);else if(v.length===11&&v.charAt(0)==='0')v=v.slice(1);v=v.slice(0,10);if(v!==mob.value)mob.value=v;};   // strip a +91/0 prefix, then keep the FIRST 10 — never reinterpret a long number by its tail; hard-cap at 10
     mob.onkeydown=function(e){if(e.key==='Enter')guestNext();};
     document.getElementById('gname').onkeydown=function(e){if(e.key==='Enter'){mob.focus();}};
     document.getElementById('gnext').onclick=guestNext;
