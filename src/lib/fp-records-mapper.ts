@@ -90,7 +90,7 @@ const MONTHS: Record<string, number> = {
   jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
   jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
 };
-function toIsoDate(v: any): string | undefined {
+export function toIsoDate(v: any): string | undefined {
   if (v == null || v === '') return undefined;
   // Excel / Google Sheets serial date number (days since 1899-12-30). Sheets
   // returns a raw number when a date cell is formatted as plain number/general —

@@ -19,12 +19,34 @@
  */
 import { readSheet } from './sheets-client';
 import { mapRowToUpcomingParty, UpcomingParty } from './fp-records-mapper';
+import { mapRowToPartyBooking, PartyBooking } from './party-bookings-mapper';
 import { getDb, generateId } from './db';
 
 const SHEET_ID = '1VYpxSOjcHHRPkBb7f7s1bfBFcl-M25PnxkjpEdXFbJI';
 const TAB_NAME = 'F&P Records';
 const RANGE    = `${TAB_NAME}!A2:BO`;
+const BOOKINGS_TAB   = 'Party Bookings';
+const BOOKINGS_RANGE = `${BOOKINGS_TAB}!A2:U`;
 const AUDIT_RETENTION_DAYS = 90;
+
+/**
+ * Refresh the `party_bookings_cache` from the "Party Bookings" tab — the full
+ * enquiry→confirmed pipeline the GRE "What's On" board reads. Standalone +
+ * best-effort so it can run on the scheduler tick without touching the (more
+ * involved) F&P Records refresh above.
+ */
+export async function refreshPartyBookings(): Promise<{ fetched: number }> {
+  const rows = await readSheet(SHEET_ID, BOOKINGS_RANGE);
+  const bookings = rows
+    .map(mapRowToPartyBooking)
+    .filter((b): b is PartyBooking => b !== null);
+  const payload = { bookings, fetched_at: new Date().toISOString(), source: 'live' as const };
+  getDb()
+    .prepare(`INSERT INTO settings (key, value) VALUES ('party_bookings_cache', ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    .run(JSON.stringify(payload));
+  return { fetched: bookings.length };
+}
 
 export interface RefreshResult {
   fetched_parties: number;

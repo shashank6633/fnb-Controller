@@ -77,6 +77,15 @@ interface PartyRow {
   package: string;
   time: string;
   status: string;
+  company: string;
+  place: string;
+  handled_by: string;
+  occasion: string;
+  special_requirements: string;
+}
+interface PartyStatusCounts {
+  confirmed: number; enquiry: number; tentative: number;
+  completed: number; cancelled: number; other: number;
 }
 interface ReservationRow {
   id: string;
@@ -112,6 +121,7 @@ interface WhatsOn {
   specials: string;
   capacity: CapacityBlock | null;
   party_sync?: { source: 'sheet-cache' | 'db-fallback' | 'none'; fetched_at: string };
+  party_status?: PartyStatusCounts;
   summary: Summary;
 }
 
@@ -278,7 +288,12 @@ export default function WhatsOnPage() {
   // /api/upcoming-parties re-fetches the sheet + rewrites the cache the board reads.
   const refreshParties = useCallback(async () => {
     setRefreshingParties(true);
-    try { await api('/api/upcoming-parties', { method: 'POST' }); } catch { /* keep cache */ }
+    // Party Bookings tab feeds the list; F&P Records feeds party entertainment.
+    // Refresh both, in parallel, then reload the board.
+    await Promise.allSettled([
+      api('/api/party-bookings', { method: 'POST' }),
+      api('/api/upcoming-parties', { method: 'POST' }),
+    ]);
     try { await load(true); } catch { /* ignore */ }
     setRefreshingParties(false);
   }, [load]);
@@ -681,7 +696,19 @@ export default function WhatsOnPage() {
           <Card
             icon={<PartyPopper className="w-4 h-4" />}
             title="Parties & Events"
-            subtitle={`${fmtNum(data?.parties.length)} booked${s && s.party_pax > 0 ? ` · ${fmtNum(s.party_pax)} pax` : ''}`}
+            subtitle={(() => {
+              const ps = data?.party_status;
+              const bits: string[] = [];
+              if (ps) {
+                if (ps.confirmed) bits.push(`${ps.confirmed} confirmed`);
+                if (ps.enquiry) bits.push(`${ps.enquiry} enquiry`);
+                if (ps.tentative) bits.push(`${ps.tentative} tentative`);
+                if (ps.completed) bits.push(`${ps.completed} completed`);
+                if (ps.other) bits.push(`${ps.other} other`);
+                if (ps.cancelled) bits.push(`${ps.cancelled} cancelled`);
+              }
+              return `${fmtNum(data?.parties.length)} on this date${bits.length ? ' · ' + bits.join(' · ') : ''}`;
+            })()}
           >
             {/* Sync status + manual refresh (pulls the AKAN sheet). */}
             <div className="flex items-center justify-between gap-2 mb-2 text-[11px] text-[#8B7355]">
@@ -715,9 +742,19 @@ export default function WhatsOnPage() {
                       </div>
                       <p className="text-xs text-[#8B7355] mt-0.5 flex flex-wrap gap-x-2">
                         {p.time && <span>{p.time}</span>}
-                        {p.area && <span>· {p.area}</span>}
+                        {p.place && <span>· {p.place}</span>}
+                        {p.occasion && <span>· {p.occasion}</span>}
                         {p.package && <span>· {p.package}</span>}
                       </p>
+                      {(p.company || p.handled_by) && (
+                        <p className="text-xs text-[#8B7355] mt-0.5 flex flex-wrap gap-x-2">
+                          {p.company && <span>{p.company}</span>}
+                          {p.handled_by && <span className="text-[#af4408]">· Handled by {p.handled_by}</span>}
+                        </p>
+                      )}
+                      {p.special_requirements && (
+                        <p className="text-[11px] text-[#8B7355] italic mt-0.5 line-clamp-2">“{p.special_requirements}”</p>
+                      )}
                     </div>
                     <div className="text-right shrink-0">
                       <p className="text-sm font-bold text-[#af4408] flex items-center justify-end gap-1">

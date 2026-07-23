@@ -14,6 +14,7 @@
 import type Database from 'better-sqlite3';
 import { ctSettings } from '@/lib/ct/settings';
 import type { UpcomingParty } from '@/lib/fp-records-mapper';
+import type { PartyBooking } from '@/lib/party-bookings-mapper';
 
 export interface WhatsOnPanels {
   entertainment: boolean;
@@ -41,10 +42,24 @@ export interface WhatsOnParty {
   guest_name: string;
   phone: string;
   pax: number;
-  area: string;
+  area: string;        // = place
   package: string;
   time: string;
   status: string;
+  company: string;
+  place: string;
+  handled_by: string;
+  occasion: string;
+  special_requirements: string;
+}
+
+export interface PartyStatusCounts {
+  confirmed: number;
+  enquiry: number;
+  tentative: number;
+  completed: number;
+  cancelled: number;
+  other: number;
 }
 
 export interface WhatsOnReservation {
@@ -78,6 +93,9 @@ export interface WhatsOnResult {
   // Where the parties came from + when the sheet cache last synced, for the
   // board's "synced X ago / refresh" affordance.
   party_sync: { source: 'sheet-cache' | 'db-fallback' | 'none'; fetched_at: string };
+  // Breakdown of the day's bookings by status (so a GRE sees enquiries vs
+  // confirmed at a glance before promising a guest the place).
+  party_status: PartyStatusCounts;
   summary: {
     entertainment_count: number;
     parties_count: number;
@@ -135,7 +153,19 @@ function readPartyCache(
 }
 
 function isCancelled(status: string | undefined): boolean {
-  return (status || '').trim().toLowerCase() === 'cancelled';
+  return (status || '').trim().toLowerCase().includes('cancel');
+}
+
+/** Bucket a free-text booking status into the six the board summarises. */
+function classifyStatus(s: string | undefined): keyof PartyStatusCounts {
+  const t = (s || '').trim().toLowerCase();
+  if (!t) return 'other';
+  if (t.includes('cancel')) return 'cancelled';
+  if (t.includes('complet') || t.includes('done')) return 'completed';
+  if (t.includes('confirm')) return 'confirmed';
+  if (t.includes('tentat') || t.includes('hold') || t.includes('provisional')) return 'tentative';
+  if (t.includes('enquir') || t.includes('inquir') || t.includes('lead') || t.includes('new')) return 'enquiry';
+  return 'other';
 }
 
 /**
@@ -192,68 +222,17 @@ export function buildWhatsOn(
     /* leave calendar rows out on failure */
   }
 
-  // ── Parties (cached AKAN feed; DB `parties` fallback when cache is cold) ──
-  let cacheRead: { parties: UpcomingParty[]; fetched_at: string } = { parties: [], fetched_at: '' };
+  // ── Party FUNCTIONS from F&P Records (prepared) → used ONLY to fold their
+  //    entertainment (DJ / decor / notes) into the Entertainment panel. The
+  //    parties LIST itself comes from the fuller "Party Bookings" tab below. ──
+  let fpParties: UpcomingParty[] = [];
   try {
-    cacheRead = readPartyCache(db, date);
+    fpParties = readPartyCache(db, date).parties.filter((p) => !isCancelled(p.status));
   } catch {
-    cacheRead = { parties: [], fetched_at: '' };
+    fpParties = [];
   }
-  // A cancelled function is not "on" — drop it everywhere (list, count, pax,
-  // entertainment) so the at-a-glance count and pax figure never disagree.
-  const cachedParties = cacheRead.parties.filter((p) => !isCancelled(p.status));
-
-  let partySource: 'sheet-cache' | 'db-fallback' | 'none' =
-    cachedParties.length > 0 ? 'sheet-cache' : 'none';
-
-  let parties: WhatsOnParty[] = cachedParties.map((p) => ({
-    fp_id: p.fp_id,
-    name: (p.guest_name || p.company || p.fp_id || '').trim(),
-    guest_name: (p.guest_name || '').trim(),
-    phone: (p.phone || '').trim(),
-    pax: typeof p.pax_expected === 'number' ? p.pax_expected : 0,
-    area: (p.allocated_area || '').trim(),
-    package: (p.package_type || '').trim(),
-    time: (p.time_of_event || '').trim(),
-    status: (p.status || '').trim(),
-  }));
-
-  // Fallback: the sheet cache had NOTHING for this date (not synced yet, or the
-  // sheet is unreachable on this environment) → read the local `parties` table
-  // so the GRE still sees booked functions. Cache stays PRIMARY when it has data.
-  if (parties.length === 0) {
-    try {
-      const rows = db
-        .prepare(
-          `SELECT id, name, guest_count, status, venue, floor,
-                  akan_unique_id, akan_host_name, akan_phone, akan_package
-           FROM parties
-           WHERE date = ? AND LOWER(TRIM(status)) <> 'cancelled'
-           ORDER BY name`,
-        )
-        .all(date) as any[];
-      if (rows.length > 0) {
-        partySource = 'db-fallback';
-        parties = rows.map((p) => ({
-          fp_id: String(p.akan_unique_id || p.id || ''),
-          name: String(p.akan_host_name || p.name || '').trim(),
-          guest_name: String(p.akan_host_name || p.name || '').trim(),
-          phone: String(p.akan_phone || '').trim(),
-          pax: Number(p.guest_count) || 0,
-          area: String(p.venue || p.floor || '').trim(),
-          package: String(p.akan_package || '').trim(),
-          time: '',
-          status: String(p.status || '').trim(),
-        }));
-      }
-    } catch {
-      /* leave parties empty on failure */
-    }
-  }
-
-  // Party rows that carry entertainment → fold into the entertainment panel.
   try {
-    for (const p of cachedParties) {
+    for (const p of fpParties) {
       const dj = (p.dj || '').trim();
       const notes = (p.entertainment_notes || '').trim();
       const decor = (p.decor || '').trim();
@@ -275,6 +254,99 @@ export function buildWhatsOn(
   } catch {
     /* skip party entertainment on failure */
   }
+
+  // ── Parties & Events — the FULL booking pipeline from the "Party Bookings"
+  //    sheet tab (every enquiry / confirmed / tentative, ANY status), so a GRE
+  //    can see who's already booked the place before promising a guest. Falls
+  //    back to the local `parties` table when that cache hasn't synced yet. ────
+  let bookingsRead: { bookings: PartyBooking[]; fetched_at: string } = { bookings: [], fetched_at: '' };
+  try {
+    const row = db
+      .prepare(`SELECT value FROM settings WHERE key = 'party_bookings_cache'`)
+      .get() as { value: string } | undefined;
+    if (row?.value) {
+      const parsed = JSON.parse(row.value);
+      bookingsRead = {
+        bookings: Array.isArray(parsed?.bookings) ? parsed.bookings : [],
+        fetched_at: typeof parsed?.fetched_at === 'string' ? parsed.fetched_at : '',
+      };
+    }
+  } catch {
+    bookingsRead = { bookings: [], fetched_at: '' };
+  }
+  const dateBookings = bookingsRead.bookings.filter((b) => b && b.date === date);
+
+  let partySource: 'sheet-cache' | 'db-fallback' | 'none' =
+    dateBookings.length > 0 ? 'sheet-cache' : 'none';
+  let partyFetchedAt = bookingsRead.fetched_at;
+
+  let parties: WhatsOnParty[] = dateBookings.map((b) => ({
+    fp_id: (b.party_unique_id || '').trim(),
+    name: (b.host_name || b.company || b.party_unique_id || 'Party').trim(),
+    guest_name: (b.host_name || '').trim(),
+    phone: (b.phone || '').trim(),
+    pax: b.expected_pax || 0,
+    area: (b.place || '').trim(),
+    package: (b.package || '').trim(),
+    time: (b.party_time || '').trim(),
+    status: (b.status || '').trim(),
+    company: (b.company || '').trim(),
+    place: (b.place || '').trim(),
+    handled_by: (b.handled_by || '').trim(),
+    occasion: (b.occasion || '').trim(),
+    special_requirements: (b.special_requirements || '').trim(),
+  }));
+
+  // Fallback: the Party Bookings cache had NOTHING for this date → read the
+  // local `parties` table so the GRE still sees booked functions.
+  if (parties.length === 0) {
+    try {
+      const rows = db
+        .prepare(
+          `SELECT id, name, guest_count, status, venue, floor,
+                  akan_unique_id, akan_host_name, akan_company, akan_phone,
+                  akan_occasion, akan_package
+           FROM parties
+           WHERE date = ?
+           ORDER BY name`,
+        )
+        .all(date) as any[];
+      if (rows.length > 0) {
+        partySource = 'db-fallback';
+        partyFetchedAt = '';
+        parties = rows.map((p) => ({
+          fp_id: String(p.akan_unique_id || p.id || ''),
+          name: String(p.akan_host_name || p.name || '').trim(),
+          guest_name: String(p.akan_host_name || p.name || '').trim(),
+          phone: String(p.akan_phone || '').trim(),
+          pax: Number(p.guest_count) || 0,
+          area: String(p.venue || p.floor || '').trim(),
+          package: String(p.akan_package || '').trim(),
+          time: '',
+          status: String(p.status || '').trim(),
+          company: String(p.akan_company || '').trim(),
+          place: String(p.venue || p.floor || '').trim(),
+          handled_by: '',
+          occasion: String(p.akan_occasion || '').trim(),
+          special_requirements: '',
+        }));
+      }
+    } catch {
+      /* leave parties empty on failure */
+    }
+  }
+
+  // Status breakdown (enquiry vs confirmed vs …) + sort cancelled last.
+  const partyStatus: PartyStatusCounts = {
+    confirmed: 0, enquiry: 0, tentative: 0, completed: 0, cancelled: 0, other: 0,
+  };
+  for (const p of parties) partyStatus[classifyStatus(p.status)]++;
+  parties.sort((a, b) => {
+    const ca = isCancelled(a.status) ? 1 : 0;
+    const cb = isCancelled(b.status) ? 1 : 0;
+    if (ca !== cb) return ca - cb;
+    return (a.time || '').localeCompare(b.time || '') || (a.guest_name || '').localeCompare(b.guest_name || '');
+  });
 
   // ── Reservations (ct_bookings LEFT JOIN ct_guests) ───────────────────────
   const reservations: WhatsOnReservation[] = [];
@@ -315,8 +387,11 @@ export function buildWhatsOn(
     })
     .reduce((sum, r) => sum + (r.party_size || 0), 0);
 
-  // From the FINAL parties list (cache or DB fallback) — already cancelled-free.
-  const partyPax = parties.reduce((sum, p) => sum + (p.pax || 0), 0);
+  // Covers from parties = expected pax of NON-cancelled bookings (a cancelled
+  // party frees the place, so it doesn't occupy capacity).
+  const partyPax = parties
+    .filter((p) => !isCancelled(p.status))
+    .reduce((sum, p) => sum + (p.pax || 0), 0);
 
   let capacity: WhatsOnCapacity | null = null;
   if (capacitySeats > 0) {
@@ -351,7 +426,8 @@ export function buildWhatsOn(
     reservations: panels.reservations ? reservations : [],
     specials: panels.specials ? specials : '',
     capacity: panels.capacity ? capacity : null,
-    party_sync: { source: partySource, fetched_at: cacheRead.fetched_at },
+    party_sync: { source: partySource, fetched_at: partyFetchedAt },
+    party_status: partyStatus,
     summary,
   };
 }

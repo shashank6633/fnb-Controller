@@ -12,7 +12,7 @@
  * local testing.
  */
 
-import { refreshUpcomingParties } from './party-refresh';
+import { refreshUpcomingParties, refreshPartyBookings } from './party-refresh';
 import { checkDeferDueSoon } from './defer-due-check';
 import { checkKitchenExpiry } from './kitchen-expiry-check';
 
@@ -70,6 +70,15 @@ export function startSchedulerOnce(): void {
       globalThis.__fnbScheduler__!.lastRun = Date.now();
       globalThis.__fnbScheduler__!.lastResult = res;
       console.log(`[scheduler] refresh @ IST ${istHour()}h: ${res.fetched_parties} parties · ${res.status_changes} status changes · ${res.notifications_created} notifications · ${res.slack_sent} slack sent`);
+
+      // Party Bookings tab → feeds the GRE "What's On" board. Best-effort on the
+      // same cadence; a failure here must NEVER break the F&P refresh loop.
+      try {
+        const pb = await refreshPartyBookings();
+        console.log(`[scheduler] party-bookings @ IST ${istHour()}h: ${pb.fetched} bookings cached`);
+      } catch (e: any) {
+        console.error('[scheduler] party-bookings refresh failed:', e?.message);
+      }
 
       // Feature 4 — warn store managers about deferred requisition items coming
       // due within ~4h. Runs on the same cadence as the party refresh. Fully
