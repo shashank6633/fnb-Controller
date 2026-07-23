@@ -30,6 +30,7 @@ export async function GET(request: Request) {
       SELECT t.*,
              o.id AS open_order_id, o.order_number AS open_order_number, o.total AS open_order_total,
              o.server_id AS open_order_server_id, o.server_name AS open_order_captain,
+             o.guest_name AS open_order_guest, o.booking_id AS open_order_booking_id,
              o.bill_printed_at AS open_order_bill_printed_at
       FROM restaurant_tables t
       LEFT JOIN orders o ON o.table_id = t.id AND o.status = 'open'

@@ -4,6 +4,7 @@ import { canWorkTable } from '@/lib/captain-area';
 import { todayIST } from '@/lib/format-date';
 import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
 import { resolveFloorStore } from '@/lib/store-engine';
+import { completeBookingForOrder } from '@/lib/ct/seating';
 
 // Payment methods the cashier can settle with. Split payments record one
 // order_payments row per method; the sales dashboard's payment-category breakup
@@ -198,6 +199,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       for (const p of payments) insP.run(generateId(), id, outletId, p.method, p.amount, me.email);
     });
     settle();
+
+    // Order is now 'settled': if it came from a reservation, flip that booking
+    // seated → completed. Best-effort — the lib swallows errors so a booking
+    // hiccup can never fail an already-committed settle.
+    completeBookingForOrder(db, id);
 
     return Response.json({ success: true, order_id: id, total: bill.total, payment_method: primaryMethod, payments, lines: items.length });
   } catch (e: any) {

@@ -3,14 +3,19 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
-import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search, Send, CheckCircle2, MessageCircle } from 'lucide-react';
+import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search, Send, CheckCircle2, MessageCircle, Users, Star } from 'lucide-react';
 import { printFiredKots, printBill } from '@/lib/offline-print/print';
 import TabScroller from '@/components/TabScroller';
 import PhoneField from '@/components/PhoneField';
-import { parseStoredPhone } from '@/lib/mobile-input';
+import { parseStoredPhone, formatStoredPhone } from '@/lib/mobile-input';
 
 interface MenuItem { id: string; name: string; category: string; station: string; selling_price: number; recipe_id: string | null; is_active: number; }
 interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; }
+// One diner in the table party (GET /api/dine-in/orders/<id>/guests → listOrderGuests).
+interface PartyGuest {
+  id: string; name: string | null; mobile: string | null; phone10?: string | null;
+  is_primary: number | boolean; source?: string | null;
+}
 interface Order {
   id: string; order_number: number; status: string; order_type: string;
   table_number: string | null; zone: string | null;
@@ -47,11 +52,48 @@ export default function OrderTerminalPage() {
   const [toast, setToast] = useState<string | null>(null);
   const flash = (m: string) => { setToast(m); setTimeout(() => setToast(null), 2500); };
 
+  // ── Table party (every diner at this table) — GET/POST /guests ──
+  const [guests, setGuests] = useState<PartyGuest[]>([]);
+  const [pgName, setPgName] = useState('');
+  const [pgMobile, setPgMobile] = useState('');
+  const [pgBusy, setPgBusy] = useState(false);
+
   const loadOrder = useCallback(async () => {
     const r = await api(`/api/dine-in/orders/${id}`);
     const j = await r.json();
     if (j.order) setOrder(j.order);
   }, [id]);
+
+  // Table party — every diner at this table (primary first). Best-effort.
+  const loadGuests = useCallback(async () => {
+    try {
+      const r = await api(`/api/dine-in/orders/${id}/guests`);
+      if (!r.ok) return;
+      const j = await r.json();
+      const rows = Array.isArray(j?.guests) ? j.guests : Array.isArray(j?.items) ? j.items : [];
+      setGuests(rows as PartyGuest[]);
+    } catch { /* offline — keep last list */ }
+  }, [id]);
+
+  // Add a diner (name and/or mobile). Server is idempotent per (order, phone)
+  // and mirrors the guest into CRM; we refresh the list afterwards.
+  async function addGuest() {
+    const mobile = pgMobile.trim();
+    const name = pgName.trim();
+    if (!mobile && !name) return;
+    setPgBusy(true);
+    try {
+      const r = await api(`/api/dine-in/orders/${id}/guests`, {
+        method: 'POST', body: { mobile: mobile || undefined, name: name || undefined },
+      });
+      const j = await r.json();
+      if (j.error) { alert(j.error); return; }
+      setPgName(''); setPgMobile('');
+      const rows = Array.isArray(j?.guests) ? j.guests : Array.isArray(j?.items) ? j.items : null;
+      if (rows) setGuests(rows as PartyGuest[]); else await loadGuests();
+      flash('Guest added ✓');
+    } finally { setPgBusy(false); }
+  }
 
   useEffect(() => {
     loadOrder();
@@ -59,6 +101,14 @@ export default function OrderTerminalPage() {
     // Google review URL (crm_review_link) — powers the WhatsApp review button.
     fetch('/api/settings?key=crm_review_link').then((r) => r.json()).then((j) => setReviewLink(String(j?.value || '').trim())).catch(() => {});
   }, [loadOrder]);
+
+  // Load the party list on mount; refresh every 15s while open so QR-joiners appear.
+  useEffect(() => {
+    loadGuests();
+    if (order?.status && order.status !== 'open') return;
+    const t = setInterval(loadGuests, 15000);
+    return () => clearInterval(t);
+  }, [loadGuests, order?.status]);
 
   // Prefill the settle modal's guest fields from the order's opening capture
   // (never overwrites something the cashier already typed).
@@ -228,6 +278,49 @@ export default function OrderTerminalPage() {
               </button>
             )}
             {settled && <p className="mt-4 text-center text-sm text-green-700 font-medium">Order {order.status}</p>}
+          </div>
+
+          {/* ── Party — every diner at this table (primary + QR-joiners) ── */}
+          <div className="card p-4 mt-4">
+            <h2 className="font-semibold text-[#2D1B0E] mb-3 flex items-center gap-2">
+              <Users size={16} className="text-[#af4408]" /> Party
+              {guests.length > 0 && <span className="text-xs font-normal text-[#8B7355]">· {guests.length} {guests.length === 1 ? 'guest' : 'guests'}</span>}
+            </h2>
+            {guests.length === 0 ? (
+              <p className="text-sm text-[#8B7355] mb-3">No diners recorded yet.</p>
+            ) : (
+              <div className="space-y-2 mb-3">
+                {guests.map((g) => (
+                  <div key={g.id} className="flex items-center gap-2 text-sm">
+                    {g.is_primary ? (
+                      <span className="inline-flex items-center gap-0.5 text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-[#FFF1E3] text-[#af4408] border border-[#E8D5C4] shrink-0">
+                        <Star size={11} className="fill-current" /> Primary
+                      </span>
+                    ) : (
+                      <span className="w-1.5 h-1.5 rounded-full bg-[#D4B896] shrink-0 ml-1.5" />
+                    )}
+                    <span className="flex-1 min-w-0 truncate text-[#2D1B0E]">{g.name || 'Guest'}</span>
+                    <span className="text-[#6B5744] tabular-nums shrink-0">{formatStoredPhone(g.mobile) || '—'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {!settled && (
+              <div className="space-y-2">
+                <input value={pgName} onChange={(e) => setPgName(e.target.value)} placeholder="Name (optional)" maxLength={60}
+                  className="w-full border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+                <div className="flex gap-2">
+                  <PhoneField value={pgMobile} onChange={setPgMobile} placeholder="Guest mobile"
+                    className="flex-1 min-w-0"
+                    inputClassName="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm"
+                    selectClassName="shrink-0 border border-[#D4B896] rounded-lg px-2 py-2 text-sm" />
+                  <button onClick={addGuest} disabled={pgBusy || (!pgName.trim() && !pgMobile.trim())}
+                    className="shrink-0 flex items-center gap-1 bg-[#af4408] hover:bg-[#8a3506] text-white px-3.5 rounded-lg text-sm font-medium active:scale-95 disabled:opacity-40">
+                    {pgBusy ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} Add
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>

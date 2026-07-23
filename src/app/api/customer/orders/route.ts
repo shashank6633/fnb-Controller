@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { autoSaveCrmGuest } from '@/lib/ct/guest-autosave';
+import { addOrderGuest, listOrderGuests } from '@/lib/ct/seating';
 import { resolveTableByToken, priceLookup, getCustomerMenuDesign, otpAppliesToTable } from '@/lib/customer';
 import { normMobile, otpChannelReady, hasVerifiedMobile, recentSendFailed, otpSendExhausted } from '@/lib/customer-otp';
 import { fireStagingOrder } from '@/lib/kot-fire';
@@ -139,12 +140,27 @@ export async function POST(req: Request) {
     // can never roll back a placed order.
     if (guestMobile) autoSaveCrmGuest(db, { phone: guestMobile, name: guestName, source: 'dine-in', outletId: table.outlet_id });
 
+    // ── Part B: table party ─────────────────────────────────────────────────
+    // Record this QR guest as a diner on the table's party (order_guests) so the
+    // whole table is captured, not just one number. Best-effort — addOrderGuest
+    // swallows, and this must never block/roll back a placed order. Attach to the
+    // order that will actually carry the bill: the fired target after any
+    // one-bill-per-table merge, or the pending_approval staging order otherwise.
+    // Becomes the party primary only if the target session has no primary yet.
+    const recordPartyGuest = (targetOrderId: string) => {
+      try {
+        const hasPrimary = listOrderGuests(db, targetOrderId).some((g: any) => Number(g.is_primary) === 1);
+        addOrderGuest(db, { orderId: targetOrderId, mobile: guestMobile, name: guestName, isPrimary: !hasPrimary, source: 'qr' });
+      } catch { /* best-effort — never blocks the order */ }
+    };
+
     // Direct ordering: the guest confirmed on their phone → fire the KOT now.
     // Captain mode (or OTP fallback): leave it pending for the captain to review.
     if (orderMode === 'direct' && !forceCaptain) {
       try {
         const fired = fireStagingOrder(db, orderId, { firedBy: 'QR Order', serverId: '' });
         for (const k of fired.firedKots) emitKds({ type: 'kot.new', outlet_id: k.outlet_id, station: k.station, kot: k });
+        recordPartyGuest(fired.targetId);   // lands on the live bill after any merge
         return Response.json({
           ok: true,
           orderId: fired.targetId,
@@ -165,10 +181,12 @@ export async function POST(req: Request) {
             reason: `Self-order from Table ${table.table_number || '?'} could not reach the kitchen — needs manual firing.`,
           });
         } catch (ae) { console.error('[/api/customer/orders POST fire-alert]', ae); }
+        recordPartyGuest(orderId);   // order survives as pending_approval — still capture the diner
         return Response.json({ ok: false, error: 'Could not send your order to the kitchen. Please ask our staff.' }, { status: 500 });
       }
     }
 
+    recordPartyGuest(orderId);   // pending_approval stays as this order — capture the diner now
     return Response.json({
       ok: true,
       orderId,

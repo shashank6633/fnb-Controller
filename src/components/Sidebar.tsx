@@ -96,6 +96,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Captain (Tablet)",   href: "/captain",                   icon: Smartphone },
       { kind: "link", label: "Print Agent",        href: "/print/agent",               icon: Printer },
       { kind: "link", label: "Tables",             href: "/dine-in/tables",            icon: Utensils },
+      { kind: "link", label: "Reservations",       href: "/dine-in/reservations",      icon: CalendarCheck },
       { kind: "link", label: "Customers",          href: "/customers",                 icon: Users },
       { kind: "link", label: "Menu Items",         href: "/menu-items",                icon: BookOpen },
       { kind: "link", label: "Recipes",            href: "/recipes",                   icon: ChefHat },

@@ -1550,9 +1550,9 @@ function initializeSchema(db: Database.Database) {
       ['Administrator', 'admin',   null, 0, 0, 1, 0, 'Full access to everything'],
       ['Manager',       'manager', null, 0, 0, 1, 1, 'Full access; runs operations'],
       ['Staff',         'staff',   J(['/requisitions']), 0, 0, 1, 2, 'Raises requisitions only'],
-      ['Floor Manager', 'manager', J(['/', '/dine-in/floor', '/dine-in/tables', '/dine-in/kitchen', '/dine-in/order', '/dine-in/reconciliation', '/captain', '/print/agent', '/reports']), 0, 0, 0, 10, 'Runs the dining floor'],
+      ['Floor Manager', 'manager', J(['/', '/dine-in/floor', '/dine-in/tables', '/dine-in/reservations', '/dine-in/kitchen', '/dine-in/order', '/dine-in/reconciliation', '/captain', '/print/agent', '/reports']), 0, 0, 0, 10, 'Runs the dining floor'],
       ['Captain',       'staff',   J(['/captain']), 0, 0, 0, 11, 'Takes table orders on a tablet'],
-      ['Cashier',       'staff',   J(['/dine-in/floor', '/dine-in/tables', '/dine-in/order', '/captain']), 0, 0, 0, 12, 'Takes orders and settles bills'],
+      ['Cashier',       'staff',   J(['/dine-in/floor', '/dine-in/tables', '/dine-in/reservations', '/dine-in/order', '/captain']), 0, 0, 0, 12, 'Takes orders and settles bills'],
       ['Bar Manager',   'manager', J(['/dine-in/floor', '/dine-in/tables', '/dine-in/kitchen', '/dine-in/offline-print', '/print/agent', '/reports']), 0, 0, 0, 13, 'Runs the bar and its printers'],
       ['Head Chef',     'manager', J(['/dine-in/kitchen', '/requisitions', '/menu-items', '/recipes', '/department-consumption']), 1, 0, 0, 14, 'Runs the kitchen; approves requisitions'],
       ['Store Manager', 'manager', J(['/store-dashboard', '/store-requisitions', '/purchases', '/purchase-orders', '/grn', '/inventory', '/closing-stock', '/wastage', '/departments', '/vendors']), 0, 1, 0, 15, 'Runs the store; issues inventory'],
@@ -1579,6 +1579,22 @@ function initializeSchema(db: Database.Database) {
       ).run();
     }
   } catch (e) { console.error('unified-guests page_access migration failed:', e); }
+
+  // Nav continuity: the new host Seat board (/dine-in/reservations) — grant it to
+  // any role/user who can already see Tables, so existing scoped Floor/Cashier
+  // roles get Reservations without a manual regrant. Same idempotent pattern.
+  try {
+    for (const tbl of ['roles', 'users']) {
+      db.prepare(
+        `UPDATE ${tbl}
+           SET page_access = json_insert(page_access, '$[#]', '/dine-in/reservations')
+         WHERE page_access IS NOT NULL
+           AND json_valid(page_access)
+           AND page_access LIKE '%"/dine-in/tables"%'
+           AND page_access NOT LIKE '%"/dine-in/reservations"%'`,
+      ).run();
+    }
+  } catch (e) { console.error('reservations page_access migration failed:', e); }
 
   // Mark the linked_po_id column on purchase_orders so we can navigate from PO → Requisition
   try {
@@ -3652,6 +3668,38 @@ function initializeSchema(db: Database.Database) {
     addCtCol('analyzed_at',      `TEXT`);
     addCtCol('analyzed_by',      `TEXT NOT NULL DEFAULT ''`);   // user email or 'auto'
     db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_calls_analysis_status ON ct_calls(analysis_status)`);
+
+    // ── Reservation → table seating (Part A) + table party (Part B) ──────────
+    // Additive columns; per-column try/catch makes the ALTER idempotent.
+    const addBookingCol = (col: string, decl: string) => {
+      try { db.exec(`ALTER TABLE ct_bookings ADD COLUMN ${col} ${decl}`); } catch { /* exists */ }
+    };
+    addBookingCol('table_id',  `TEXT NOT NULL DEFAULT ''`);   // physical table a booking was seated at
+    addBookingCol('seated_at', `TEXT`);                       // when the host seated the party
+    try { db.exec(`ALTER TABLE orders ADD COLUMN booking_id TEXT NOT NULL DEFAULT ''`); } catch { /* exists */ }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_table ON ct_bookings(table_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_orders_booking ON orders(booking_id)`);
+
+    // Table party — every diner at a table for one visit (Part B). One primary
+    // (the reserved/registered member) + any number of additional QR-scan diners.
+    // Keyed by the last-10-digit phone so a re-scan updates rather than duplicates.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS order_guests (
+        id         TEXT PRIMARY KEY,
+        order_id   TEXT NOT NULL,
+        phone10    TEXT NOT NULL DEFAULT '',   -- last-10 join key (may be '' if name-only)
+        mobile     TEXT NOT NULL DEFAULT '',   -- stored form (bare +91 / E.164)
+        name       TEXT NOT NULL DEFAULT '',
+        is_primary INTEGER NOT NULL DEFAULT 0,
+        source     TEXT NOT NULL DEFAULT 'walk-in',  -- reservation | walk-in | qr
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+      );
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_order_guests_order ON order_guests(order_id)`);
+    // One party guest per (order, phone) — a re-scan/re-entry updates in place.
+    // PARTIAL (phone10 != '') so multiple name-only guests can coexist.
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_order_guests_uniq ON order_guests(order_id, phone10) WHERE phone10 != ''`);
 
     // One-time: materialize every existing dining + loyalty guest into ct_guests
     // so the CRM has real, editable records (notes/tags/follow-ups) instead of

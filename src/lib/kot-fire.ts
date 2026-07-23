@@ -53,6 +53,15 @@ export function fireStagingOrder(
     let targetId: string, targetOutlet: string | null, targetNumber: number, targetServer: string, merged: boolean;
     if (live) {
       db.prepare('UPDATE order_items SET order_id = ? WHERE order_id = ?').run(live.id, orderId);
+      // Move the table party (order_guests) onto the live bill too, so QR diners
+      // recorded on the staging shell aren't stranded on the voided order.
+      // OR IGNORE skips a diner already on the live order (partial-unique
+      // order_id+phone10); leftovers are then cleared. Demote moved rows to
+      // non-primary ONLY if the live order already has a primary (else keep it,
+      // so a reservation/first-scan primary survives a merge into an empty order).
+      const liveHasPrimary = db.prepare("SELECT 1 FROM order_guests WHERE order_id = ? AND is_primary = 1 LIMIT 1").get(live.id);
+      db.prepare(`UPDATE OR IGNORE order_guests SET order_id = ?${liveHasPrimary ? ', is_primary = 0' : ''} WHERE order_id = ?`).run(live.id, orderId);
+      db.prepare('DELETE FROM order_guests WHERE order_id = ?').run(orderId);
       db.prepare(`
         UPDATE orders SET status = 'void', voided_at = datetime('now'), updated_at = datetime('now'),
           subtotal = 0, tax_total = 0, total = 0,

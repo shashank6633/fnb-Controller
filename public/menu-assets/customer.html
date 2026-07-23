@@ -91,6 +91,11 @@
     text-transform:none;overflow-wrap:anywhere}
   .gerr{color:var(--terraDeep);background:var(--terraTint);border-radius:12px;padding:10px 14px;font-size:13.5px;margin-top:14px;display:none}
   .gerr.on{display:block;animation:fade .25s ease}
+  /* "Joining X's table" recognition banner (multi-guest QR join) */
+  .party-banner{display:flex;gap:10px;align-items:flex-start;margin-top:16px;background:var(--terraTint);border:1px solid var(--rule);border-radius:14px;padding:12px 14px;color:var(--terraDeep);font-size:13.5px;line-height:1.5;animation:fade .25s ease}
+  .party-banner .pb-ic{font-size:16px;line-height:1.35;flex:none}
+  .party-banner b{font-weight:600}
+  .party-banner .pb-cue{font-family:var(--mono);letter-spacing:.06em;white-space:nowrap}
   .otp-in{margin-top:20px}
   .otp-in input{width:100%;background:var(--card);border:1px solid var(--rule);border-radius:18px;height:72px;text-align:center;font-family:var(--mono);font-size:29px;letter-spacing:.4em;text-indent:.4em;color:var(--ink);outline:none;font-weight:500}
   .otp-in input:focus{border-color:var(--terra)}
@@ -363,7 +368,8 @@
     {id:'bill',ic:'🧾',t:'Request bill',s:"We'll bring the cheque",otw:'Bringing your bill'}];
 
   var S={screen:'loading',table:null,brand:{name:'Akan'},menu:null,design:{categoryStyle:'thumbnails',orderMode:'captain'},section:'food',cat:'',q:'',vegOnly:false,cart:{},scannedAt:nowTime(),lastOrder:null,orders:[],svcReqs:{},
-    guest:{name:'',mobile:'',verifiedAt:0,capturedAt:0,skippedAt:0},resumeOrder:false,resendWait:45,gateOptional:false};
+    guest:{name:'',mobile:'',verifiedAt:0,capturedAt:0,skippedAt:0},resumeOrder:false,resendWait:45,gateOptional:false,
+    tableParty:null,tablePartyFetched:false};
   var SEC=[{id:'food',label:'Food',station:'Kitchen',unit:'dishes'},{id:'bev',label:'Beverages',station:'Bar',unit:'drinks'},{id:'liquor',label:'Liquor',station:'Bar',unit:'pours'}];
   function secMeta(id){return SEC.filter(function(s){return s.id===id;})[0]||SEC[0];}
   function secCount(id){var m=(S.menu&&S.menu[id])||{sub:[]};return m.sub.reduce(function(n,s){return n+s.items.length;},0);}
@@ -516,6 +522,29 @@
   function storedPhone(cc,nat){nat=String(nat||'').replace(/\D/g,'');if(!nat)return'';return cc==='91'?nat:'+'+cc+nat;}
   function validPhone(cc,nat){nat=String(nat||'').replace(/\D/g,'');if(cc==='91')return /^[6-9]\d{9}$/.test(nat);var t=cc.length+nat.length;return nat.length>=6&&t>=8&&t<=15;}
 
+  // ---------- Table party recognition banner (multi-guest QR join) ----------
+  // If someone at this table already gave their number, greet the next scanner
+  // with "Joining X's table?" — a friendly recognition cue, NOT a gate. Purely
+  // informational: the guest still enters their own name + number below, and a
+  // fetch failure just skips the banner.
+  function loadTableParty(){
+    if(S.tablePartyFetched){fillPartyBanner();return;}
+    S.tablePartyFetched=true;
+    api('/api/customer/table-party?t='+encodeURIComponent(TOKEN)).then(function(r){
+      S.tableParty=r||null;fillPartyBanner();
+    }).catch(function(){/* endpoint down / no session — show no banner */});
+  }
+  function fillPartyBanner(){
+    var el=document.getElementById('gparty');if(!el)return;
+    var p=S.tableParty;
+    if(!p||!p.has_primary){el.innerHTML='';return;}
+    var name=String(p.primary_name||'').trim();
+    var last4=String(p.primary_last4||'').trim();
+    var cue=last4?' <span class="pb-cue">•••• '+esc(last4)+'</span>':'';
+    var line=name?('Joining <b>'+esc(name)+'</b>’s table'+cue+'?'):('Joining this table'+cue+'?');
+    el.innerHTML='<div class="party-banner"><span class="pb-ic">👥</span><span>'+line+' Add your number so we know you were here.</span></div>';
+  }
+
   // ---------- PAGE 2: GUEST DETAILS (name + WhatsApp number) ----------
   function renderGuest(){
     var t=S.table||{},d=S.design||{};
@@ -529,6 +558,7 @@
       '<div class="kicker terra" style="margin-top:16px">'+(S.gateOptional?'If you don’t mind':'Before you browse')+'</div>'+
       '<h1>'+esc(head)+'</h1>'+
       '<p class="msg">'+esc(msg)+'</p>'+
+      '<div id="gparty"></div>'+
       '<div class="gfield"><label for="gname">Your name</label><div class="gin"><input id="gname" type="text" autocomplete="name" maxlength="60" placeholder="Your good name" value="'+esc(S.guest.name)+'"></div></div>'+
       '<div class="gfield"><label for="gmob">WhatsApp number</label><div class="gin"><select id="gcc" class="cc-sel" aria-label="Country code">'+ccOptions(parsePhone(S.guest.mobile).cc)+'</select><input id="gmob" type="tel" inputmode="numeric" autocomplete="tel-national" placeholder="mobile number" value="'+esc(parsePhone(S.guest.mobile).nat)+'"></div></div>'+
       '<div class="gerr" id="gerr" role="alert"></div>'+
@@ -547,6 +577,7 @@
     mob.onkeydown=function(e){if(e.key==='Enter')guestNext();};
     document.getElementById('gname').onkeydown=function(e){if(e.key==='Enter'){mob.focus();}};
     document.getElementById('gnext').onclick=guestNext;
+    loadTableParty();   // fetch once, then paint the "Joining X's table?" banner (best-effort)
   }
   function gateErr(msg){var el=document.getElementById('gerr');if(!el)return;if(!msg){el.classList.remove('on');el.textContent='';return;}el.textContent=msg;el.classList.add('on');}
   function guestNext(){
