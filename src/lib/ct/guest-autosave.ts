@@ -24,8 +24,7 @@
  * row is materialized here it simply becomes a real entry in the unified list
  * with zero duplication.
  */
-import { normalizePhone } from '@/lib/ct/phone';
-import { norm10 } from '@/lib/ct/guest-unify';
+import { parseStoredPhone } from '@/lib/mobile-input';
 
 export interface GuestContact {
   phone: unknown;
@@ -42,10 +41,12 @@ export interface GuestContact {
  */
 export function autoSaveCrmGuest(db: any, contact: GuestContact): string | null {
   try {
-    const key = norm10(String(contact?.phone ?? ''));
-    if (!key) return null;                       // not a joinable 10-digit number
-    const e164 = normalizePhone(key);            // '9876543210' → '+919876543210'
-    if (!e164) return null;
+    // Country-aware: a bare +91 number → '+91<10>' (unchanged); a foreign value
+    // carrying its own country code → '+<cc><national>'. parseStoredPhone reads
+    // the self-describing stored form (bare = India, '+…' = that country).
+    const { dialCode, national } = parseStoredPhone(contact?.phone);
+    if (!national) return null;                  // not a usable number
+    const e164 = `+${dialCode}${national}`;      // +91 case === legacy output
     const name = String(contact?.name ?? '').trim();
 
     const existing = db

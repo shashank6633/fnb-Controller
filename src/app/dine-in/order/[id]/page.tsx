@@ -6,7 +6,8 @@ import { api } from '@/lib/api';
 import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search, Send, CheckCircle2, MessageCircle } from 'lucide-react';
 import { printFiredKots, printBill } from '@/lib/offline-print/print';
 import TabScroller from '@/components/TabScroller';
-import { capMobile10 } from '@/lib/mobile-input';
+import PhoneField from '@/components/PhoneField';
+import { parseStoredPhone } from '@/lib/mobile-input';
 
 interface MenuItem { id: string; name: string; category: string; station: string; selling_price: number; recipe_id: string | null; is_active: number; }
 interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; }
@@ -20,12 +21,11 @@ interface Order {
 
 function rupee(n: number) { return '₹' + (Math.round(n * 100) / 100).toLocaleString('en-IN'); }
 
-// Client-side mirror of normalizeMobile() — bare 10 digits for the wa.me link.
-function waMobile(raw: string): string {
-  let d = String(raw || '').replace(/\D/g, '');
-  if (d.length === 12 && d.startsWith('91')) d = d.slice(2);
-  if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
-  return d.length === 10 ? d : '';
+// Full wa.me digits (country code + national) — country-aware so the review
+// link works for foreign guests too, not just +91.
+function waDigits(raw: string): string {
+  const { dialCode, national } = parseStoredPhone(raw);
+  return national ? `${dialCode}${national}` : '';
 }
 
 export default function OrderTerminalPage() {
@@ -241,8 +241,9 @@ export default function OrderTerminalPage() {
                 exactly as before when left blank. */}
             <p className="text-[11px] font-semibold text-[#8B7355] mb-1">Guest (optional — earns loyalty points)</p>
             <div className="flex gap-2 mb-4">
-              <input value={gMobile} onChange={(e) => setGMobile(capMobile10(e.target.value))} type="tel" inputMode="tel" placeholder="Guest mobile"
-                className="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+              <PhoneField value={gMobile} onChange={setGMobile} placeholder="Guest mobile"
+                className="flex-1 min-w-0"
+                inputClassName="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
               <input value={gName} onChange={(e) => setGName(e.target.value)} placeholder="Name"
                 className="w-28 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
             </div>
@@ -267,8 +268,8 @@ export default function OrderTerminalPage() {
             <CheckCircle2 className="w-10 h-10 text-green-600 mx-auto mb-2" />
             <h2 className="font-semibold text-[#2D1B0E]">Order settled</h2>
             <p className="text-sm text-[#8B7355] mb-4">{rupee(settledInfo.total)} collected · guest {settledInfo.mobile}</p>
-            {reviewLink && waMobile(settledInfo.mobile) && (
-              <a href={`https://wa.me/91${waMobile(settledInfo.mobile)}?text=${encodeURIComponent(`Thank you for dining at AKAN! We'd love your feedback: ${reviewLink}`)}`}
+            {reviewLink && waDigits(settledInfo.mobile) && (
+              <a href={`https://wa.me/${waDigits(settledInfo.mobile)}?text=${encodeURIComponent(`Thank you for dining at AKAN! We'd love your feedback: ${reviewLink}`)}`}
                 target="_blank" rel="noopener noreferrer"
                 className="w-full flex items-center justify-center gap-2 bg-green-600 hover:bg-green-700 text-white py-2.5 rounded-lg text-sm font-medium mb-2">
                 <MessageCircle size={16} /> Send review request on WhatsApp

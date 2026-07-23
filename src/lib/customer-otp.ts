@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import { createHash, randomInt, randomBytes } from 'crypto';
 import { isWaConfigured, getWaConfigRaw } from '@/lib/whatsapp';
-import { capMobile10 } from '@/lib/mobile-input';
+import { parseStoredPhone } from '@/lib/mobile-input';
 
 /**
  * WhatsApp OTP for QR self-orders. A verified mobile is captured before a
@@ -17,12 +17,14 @@ export const MAX_SENDS_PER_HOUR = 6;         // spam / cost guard per number+tab
 export const MAX_TABLE_SENDS_PER_HOUR = 25;  // OTP-bombing guard: total sends per TABLE (any number)
 export const VERIFIED_TTL_SECONDS = 6 * 3600; // a verified number stays verified for the session
 
-/** Canonical mobile — capped to a 10-digit Indian number (drops 91/0 prefixes,
- *  keeps the last 10). The SAME normalisation runs on send, verify and order so
- *  they always match, and guarantees a stored guest_mobile never exceeds 10
- *  digits even if a client bypasses the input cap. */
+/** Canonical mobile for OTP + order storage. India (+91) → bare 10-digit,
+ *  EXACTLY as before (so OTP hash + guest_mobile are unchanged for the common
+ *  case); a foreign number carrying its own country code → E.164 ('+<cc><nsn>').
+ *  The SAME normalisation runs on send, verify and order so they always match. */
 export function normMobile(m: string): string {
-  return capMobile10(m);
+  const { dialCode, national } = parseStoredPhone(m);
+  if (!national) return '';
+  return dialCode === '91' ? national : `+${dialCode}${national}`;
 }
 
 function hashCode(mobile: string, code: string): string {

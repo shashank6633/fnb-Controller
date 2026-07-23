@@ -59,10 +59,16 @@ export function tierForPoints(points: number): GuestTier {
  */
 export function normalizeMobile(raw: string | null | undefined): string | null {
   if (raw == null) return null;
-  let d = String(raw).replace(/\D/g, '');       // strip +, spaces, dashes, etc.
+  const s = String(raw).trim();
+  let d = s.replace(/\D/g, '');                 // strip +, spaces, dashes, etc.
+  // India (bare, +91 or 0-trunk) → bare 10-digit key, EXACTLY as before.
   if (d.length === 12 && d.startsWith('91')) d = d.slice(2);
-  if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
-  return d.length === 10 ? d : null;
+  else if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
+  if (d.length === 10) return d;
+  // A foreign number carrying its own country code (stored as '+<cc><nsn>') →
+  // keep it as an E.164 key so non-Indian guests can be saved/matched.
+  if (s.startsWith('+') && d.length >= 8 && d.length <= 15) return `+${d}`;
+  return null;
 }
 
 /** Loyalty accrual rate: points per ₹100 billed (settings-driven, default 1). */

@@ -4,7 +4,8 @@ import { useEffect, useState, useCallback, useMemo, useContext, useRef } from 'r
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { readMenuCache, writeMenuCache } from '@/lib/menu-cache';
-import { capMobile10 } from '@/lib/mobile-input';
+import PhoneField from '@/components/PhoneField';
+import { parseStoredPhone } from '@/lib/mobile-input';
 import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
   ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu, Filter, ChevronDown,
@@ -82,12 +83,11 @@ const vegColor = (tag: string) => /non/i.test(tag) ? 'border-red-500' : /egg/i.t
 // "Often ordered with" suggestion returned by /api/dine-in/upsell.
 interface UpsellItem { menu_item_id: string; name: string; price: number; times_together: number; }
 
-// Client-side mirror of normalizeMobile() — bare 10 digits for the wa.me link.
-function waMobile(raw: string): string {
-  let d = String(raw || '').replace(/\D/g, '');
-  if (d.length === 12 && d.startsWith('91')) d = d.slice(2);
-  if (d.length === 11 && d.startsWith('0')) d = d.slice(1);
-  return d.length === 10 ? d : '';
+// Full wa.me digits (country code + national) — country-aware so the review
+// link works for foreign guests too, not just +91.
+function waDigits(raw: string): string {
+  const { dialCode, national } = parseStoredPhone(raw);
+  return national ? `${dialCode}${national}` : '';
 }
 
 export default function CaptainOrder() {
@@ -1033,8 +1033,10 @@ export default function CaptainOrder() {
                 exactly as before when left blank. */}
             <p className="text-xs font-semibold text-[#8B7355] mb-1.5">Guest (optional — earns loyalty points)</p>
             <div className="flex gap-2 mb-3">
-              <input value={gMobile} onChange={(e) => setGMobile(capMobile10(e.target.value))} type="tel" inputMode="tel" placeholder="Guest mobile"
-                className="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
+              <PhoneField value={gMobile} onChange={setGMobile} placeholder="Guest mobile"
+                className="flex-1 min-w-0"
+                inputClassName="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm"
+                selectClassName="shrink-0 border border-[#D4B896] rounded-lg px-2 py-2 text-sm" />
               <input value={gName} onChange={(e) => setGName(e.target.value)} placeholder="Name"
                 className="w-28 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
             </div>
@@ -1062,8 +1064,8 @@ export default function CaptainOrder() {
             <CheckCircle2 className="w-10 h-10 text-green-600 mx-auto mb-2" />
             <p className="font-bold text-lg text-[#2D1B0E]">Payment collected</p>
             <p className="text-sm text-[#8B7355] mb-4">₹{Math.round(settledInfo.total)} settled · guest {settledInfo.mobile}</p>
-            {reviewLink && waMobile(settledInfo.mobile) && (
-              <a href={`https://wa.me/91${waMobile(settledInfo.mobile)}?text=${encodeURIComponent(`Thank you for dining at AKAN! We'd love your feedback: ${reviewLink}`)}`}
+            {reviewLink && waDigits(settledInfo.mobile) && (
+              <a href={`https://wa.me/${waDigits(settledInfo.mobile)}?text=${encodeURIComponent(`Thank you for dining at AKAN! We'd love your feedback: ${reviewLink}`)}`}
                 target="_blank" rel="noopener noreferrer"
                 className="w-full flex items-center justify-center gap-2 bg-green-600 text-white py-3 rounded-xl text-sm font-bold active:scale-95 mb-2">
                 <MessageCircle className="w-4 h-4" /> Send review request on WhatsApp

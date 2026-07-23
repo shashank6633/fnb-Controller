@@ -10,7 +10,7 @@ import { useEffect, useState, useCallback, useMemo, useRef, createContext } from
 import { useRouter, usePathname } from 'next/navigation';
 import { api } from '@/lib/api';
 import { writeMenuCache } from '@/lib/menu-cache';
-import { capMobile10 } from '@/lib/mobile-input';
+import PhoneField from '@/components/PhoneField';
 import { useCaptainAlerts } from '@/components/CaptainAlertsProvider';
 import {
   ChefHat, RefreshCw, Plus, X, MoreVertical, LayoutDashboard, LogOut, Download, Search, Loader2,
@@ -477,8 +477,10 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
 
             <label className="block mb-3">
               <span className="text-xs text-[#6B5744]">Mobile <span className="text-[#8B7355]">(optional)</span></span>
-              <input value={gMobile} onChange={(e) => setGMobile(capMobile10(e.target.value))} inputMode="tel" placeholder="Phone number"
-                className="mt-1 w-full bg-white border border-[#D4B896] rounded-xl px-3 py-3 text-base placeholder:text-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
+              <PhoneField value={gMobile} onChange={setGMobile} placeholder="Phone number"
+                className="mt-1"
+                inputClassName="flex-1 min-w-0 bg-white border border-[#D4B896] rounded-xl px-3 py-3 text-base placeholder:text-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+                selectClassName="shrink-0 bg-white border border-[#D4B896] rounded-xl px-2 py-3 text-base focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
             </label>
 
             <label className="block mb-5">

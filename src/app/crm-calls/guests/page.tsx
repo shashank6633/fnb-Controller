@@ -15,7 +15,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
-import { capMobile10 } from '@/lib/mobile-input';
+import PhoneField from '@/components/PhoneField';
 import {
   Users,
   Plus,
@@ -728,12 +728,17 @@ function NewGuestModal({ onClose, onGoto }: { onClose: () => void; onGoto: (id: 
           </div>
           <div>
             <label className="block text-xs font-medium text-[#6B5744] mb-1">Phone *</label>
-            <input type="tel" value={form.phone} placeholder="98765 43210"
-                   inputMode="numeric"
-                   onChange={e => setForm({ ...form, phone: capMobile10(e.target.value) })}
-                   onKeyDown={e => { if (e.key === 'Enter') submit(); }}
-                   className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]/40" />
-            <p className="text-[10px] text-[#8B7355] mt-0.5">10-digit Indian numbers are saved as +91.</p>
+            <div onKeyDown={e => { if (e.key === 'Enter') submit(); }}>
+              <PhoneField
+                value={form.phone}
+                onChange={v => setForm({ ...form, phone: v })}
+                placeholder="98765 43210"
+                className="w-full"
+                inputClassName="flex-1 min-w-0 px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]/40"
+                selectClassName="shrink-0 px-2 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]/40"
+              />
+            </div>
+            <p className="text-[10px] text-[#8B7355] mt-0.5">Indian numbers are saved as +91; pick a country for others.</p>
           </div>
           <div>
             <label className="block text-xs font-medium text-[#6B5744] mb-1">Email</label>

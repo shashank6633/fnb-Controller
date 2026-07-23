@@ -82,6 +82,7 @@
   .gfield input{flex:1;min-width:0;border:none;background:none;outline:none;font-size:16px;color:var(--ink)}
   .gfield input::placeholder{color:var(--inkMute)}
   .gfield .cc{font-family:var(--mono);font-size:15px;color:var(--inkSoft);border-right:1px solid var(--rule);padding-right:10px;flex:none}
+  .gfield .cc-sel{font-family:var(--mono);font-size:15px;color:var(--inkSoft);background:transparent;border:none;border-right:1px solid var(--rule);padding:0 10px 0 0;flex:none;height:32px;outline:none;-webkit-appearance:none;appearance:none}
   .gate-cta{margin-top:auto;padding-top:26px}
   /* editable footnote: readable (not the 10.5px uppercase kicker) — merchants
      put real sentences/URLs here, so keep case + AA contrast + wrapping */
@@ -404,7 +405,7 @@
   // verifiedAt = OTP passed; capturedAt = details taken while WhatsApp couldn't
   // send (orders go via the captain). Both live per-table in localStorage.
   function saveGuest(){try{localStorage.setItem('akan_guest_'+TOKEN,JSON.stringify(S.guest));}catch(e){}}
-  function loadGuest(){try{var r=localStorage.getItem('akan_guest_'+TOKEN);if(r){var g=JSON.parse(r)||{};S.guest={name:String(g.name||'').slice(0,60),mobile:String(g.mobile||'').replace(/\D/g,'').slice(0,10),verifiedAt:Number(g.verifiedAt)||0,capturedAt:Number(g.capturedAt)||0,skippedAt:Number(g.skippedAt)||0};}}catch(e){}}
+  function loadGuest(){try{var r=localStorage.getItem('akan_guest_'+TOKEN);if(r){var g=JSON.parse(r)||{};S.guest={name:String(g.name||'').slice(0,60),mobile:(function(m){var p=parsePhone(m);return storedPhone(p.cc,p.nat);})(g.mobile),verifiedAt:Number(g.verifiedAt)||0,capturedAt:Number(g.capturedAt)||0,skippedAt:Number(g.skippedAt)||0};}}catch(e){}}
   // 5.5h — a shade under the server's 6h window, so we re-verify BEFORE the
   // server would start rejecting the number.
   var VERIFY_WINDOW=19800000;
@@ -502,6 +503,19 @@
     };
   }
 
+  // ---------- Country codes (mirror of src/lib/country-codes.ts) ----------
+  // [dial code, ISO, national-number length (0 = variable → fits E.164 15)].
+  var CC_LIST=[['91','IN',10],['971','AE',9],['966','SA',9],['974','QA',8],['968','OM',8],['965','KW',8],['973','BH',8],['1','US',10],['44','GB',10],['65','SG',8],['60','MY',0],['61','AU',9],['94','LK',9],['977','NP',10],['880','BD',10],['86','CN',11]];
+  function ccNsn(cc){for(var i=0;i<CC_LIST.length;i++)if(CC_LIST[i][0]===cc)return CC_LIST[i][2]||(15-cc.length);return 15-cc.length;}
+  function capNat(cc,v){return String(v||'').replace(/\D/g,'').slice(0,ccNsn(cc));}
+  function flagEmoji(iso){iso=String(iso||'').toUpperCase();if(!/^[A-Z]{2}$/.test(iso))return'';return String.fromCodePoint(iso.charCodeAt(0)+127397,iso.charCodeAt(1)+127397);}
+  function ccOptions(sel){var h='';for(var i=0;i<CC_LIST.length;i++){var c=CC_LIST[i];h+='<option value="'+c[0]+'"'+(c[0]===sel?' selected':'')+'>'+flagEmoji(c[1])+' +'+c[0]+' '+c[1]+'</option>';}return h;}
+  // Parse a stored value → {cc,nat}. Bare digits = India; '+…' = that country.
+  function parsePhone(v){v=String(v||'').trim();var digits=v.replace(/\D/g,'');if(!digits)return{cc:'91',nat:''};if(v.charAt(0)==='+'||digits.length>11){var srt=CC_LIST.slice().sort(function(a,b){return b[0].length-a[0].length;});for(var i=0;i<srt.length;i++){var cc=srt[i][0];if(digits.indexOf(cc)===0&&digits.length>cc.length)return{cc:cc,nat:capNat(cc,digits.slice(cc.length))};}}var d=digits;if(d.length===11&&d.charAt(0)==='0')d=d.slice(1);return{cc:'91',nat:capNat('91',d)};}
+  // Combine → stored form: India bare (unchanged), others '+cc<nat>'.
+  function storedPhone(cc,nat){nat=String(nat||'').replace(/\D/g,'');if(!nat)return'';return cc==='91'?nat:'+'+cc+nat;}
+  function validPhone(cc,nat){nat=String(nat||'').replace(/\D/g,'');if(cc==='91')return /^[6-9]\d{9}$/.test(nat);var t=cc.length+nat.length;return nat.length>=6&&t>=8&&t<=15;}
+
   // ---------- PAGE 2: GUEST DETAILS (name + WhatsApp number) ----------
   function renderGuest(){
     var t=S.table||{},d=S.design||{};
@@ -516,7 +530,7 @@
       '<h1>'+esc(head)+'</h1>'+
       '<p class="msg">'+esc(msg)+'</p>'+
       '<div class="gfield"><label for="gname">Your name</label><div class="gin"><input id="gname" type="text" autocomplete="name" maxlength="60" placeholder="Your good name" value="'+esc(S.guest.name)+'"></div></div>'+
-      '<div class="gfield"><label for="gmob">WhatsApp number</label><div class="gin"><span class="cc">+91</span><input id="gmob" type="tel" inputmode="numeric" autocomplete="tel-national" placeholder="10-digit mobile" value="'+esc(S.guest.mobile)+'"></div></div>'+
+      '<div class="gfield"><label for="gmob">WhatsApp number</label><div class="gin"><select id="gcc" class="cc-sel" aria-label="Country code">'+ccOptions(parsePhone(S.guest.mobile).cc)+'</select><input id="gmob" type="tel" inputmode="numeric" autocomplete="tel-national" placeholder="mobile number" value="'+esc(parsePhone(S.guest.mobile).nat)+'"></div></div>'+
       '<div class="gerr" id="gerr" role="alert"></div>'+
       '<div class="gate-cta"><button class="btn terra between" id="gnext"><span>Continue</span><span>&rsaquo;</span></button>'+
         (S.gateOptional?'<div style="text-align:center;margin-top:6px"><button class="glink" id="gskip" style="padding:12px 10px;min-height:44px">Skip for now — take me to the menu</button></div>':'')+
@@ -527,7 +541,9 @@
     if(sk)sk.onclick=function(){S.guest.skippedAt=Date.now();saveGuest();S.gateOptional=false;proceedToMenu();};
     document.getElementById('gb').onclick=function(){S.resumeOrder=false;S.screen='landing';render();};
     var mob=document.getElementById('gmob');
-    mob.oninput=function(){var v=mob.value.replace(/\D/g,'');if(v.length>=12&&v.slice(0,2)==='91')v=v.slice(2);else if(v.length===11&&v.charAt(0)==='0')v=v.slice(1);v=v.slice(0,10);if(v!==mob.value)mob.value=v;};   // strip a +91/0 prefix, then keep the FIRST 10 — never reinterpret a long number by its tail; hard-cap at 10
+    var ccSel=document.getElementById('gcc');
+    mob.oninput=function(){var cc=(ccSel&&ccSel.value)||'91';var v=capNat(cc,mob.value);if(v!==mob.value)mob.value=v;};   // cap national digits per selected country
+    if(ccSel)ccSel.onchange=function(){var v=capNat(ccSel.value,mob.value);if(v!==mob.value)mob.value=v;mob.focus();};      // re-cap when the country changes
     mob.onkeydown=function(e){if(e.key==='Enter')guestNext();};
     document.getElementById('gname').onkeydown=function(e){if(e.key==='Enter'){mob.focus();}};
     document.getElementById('gnext').onclick=guestNext;
@@ -538,26 +554,27 @@
     if(!btn||btn.disabled)return;                    // in-flight guard (Enter key path)
     var nameEl=document.getElementById('gname'),mobEl=document.getElementById('gmob');
     var name=(nameEl.value||'').replace(/\s+/g,' ').trim();
-    var mob=(mobEl.value||'').replace(/\D/g,'');
+    var ccEl=document.getElementById('gcc');var cc=(ccEl&&ccEl.value)||'91';
+    var nat=capNat(cc,mobEl.value);var stored=storedPhone(cc,nat);
     // Optional ask (captain-confirmed / out-of-scope): whatever the guest shares
     // is welcome — validate only what's filled, store it, and NEVER run an OTP.
     if(S.gateOptional&&!PREVIEW_GATE){
-      if(mob&&!/^[6-9]\d{9}$/.test(mob)){gateErr('That mobile number doesn’t look right — 10 digits, or leave it empty.');mobEl.focus();return;}
+      if(nat&&!validPhone(cc,nat)){gateErr('That mobile number doesn’t look right — check it, or leave it empty.');mobEl.focus();return;}
       if(name&&name.length<2){gateErr('Please enter your name, or leave it empty.');nameEl.focus();return;}
       gateErr('');
       if(name)S.guest.name=name;
-      if(mob)S.guest.mobile=mob;
-      if(name||mob){S.guest.capturedAt=Date.now();}else{S.guest.skippedAt=Date.now();}
+      if(nat)S.guest.mobile=stored;
+      if(name||nat){S.guest.capturedAt=Date.now();}else{S.guest.skippedAt=Date.now();}
       saveGuest();S.gateOptional=false;proceedToMenu();return;
     }
     if(name.length<2){gateErr('Please tell us your name.');nameEl.focus();return;}
-    if(!/^[6-9]\d{9}$/.test(mob)){gateErr('Please enter a valid 10-digit mobile number.');mobEl.focus();return;}
+    if(!validPhone(cc,nat)){gateErr(cc==='91'?'Please enter a valid 10-digit mobile number.':'Please enter a valid mobile number.');mobEl.focus();return;}
     gateErr('');
-    S.guest.name=name;S.guest.mobile=mob;saveGuest();
+    S.guest.name=name;S.guest.mobile=stored;saveGuest();
     // Design preview: walk pages 2→3 without real sends/verifications.
     if(PREVIEW_GATE){S.resendWait=45;S.screen='otp';render();toast('Preview — any 6-digit code works here');return;}
     btn.disabled=true;btn.querySelector('span').textContent='Sending code…';
-    api('/api/customer/otp/send',{method:'POST',body:JSON.stringify({t:TOKEN,mobile:mob})}).then(function(r){
+    api('/api/customer/otp/send',{method:'POST',body:JSON.stringify({t:TOKEN,mobile:stored})}).then(function(r){
       if(r.sent){S.resendWait=45;S.screen='otp';render();return;}
       // WhatsApp can't send right now (channel down or send caps exhausted) —
       // details are captured; orders go via the captain instead.
@@ -583,8 +600,8 @@
   var resendTimer=null;
   function renderOtp(){
     var t=S.table||{};
-    var mob=S.guest.mobile||'';
-    var pretty='+91 '+mob.slice(0,5)+' '+mob.slice(5);
+    var gpp=parsePhone(S.guest.mobile);
+    var pretty=gpp.cc==='91'?('+91 '+gpp.nat.slice(0,5)+' '+gpp.nat.slice(5)):('+'+gpp.cc+' '+gpp.nat);
     app.innerHTML=
     '<div class="gate fade">'+
       '<div class="gate-top"><button class="gback" id="gb" aria-label="Back">'+ICON.back+'</button><span class="kicker">Table No. '+esc(t.number!=null?t.number:'—')+'</span></div>'+

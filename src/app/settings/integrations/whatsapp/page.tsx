@@ -23,7 +23,7 @@ import {
   ArrowLeft, Bot, Workflow,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { capMobile10 } from '@/lib/mobile-input';
+import PhoneField from '@/components/PhoneField';
 
 type Tab = 'config' | 'templates' | 'notifications' | 'soon';
 
@@ -401,9 +401,9 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
               reports “not configured” — nothing is ever attempted blind.
             </p>
             <div className="flex flex-col sm:flex-row gap-2">
-              <input value={testTo} onChange={e => setTestTo(capMobile10(e.target.value))} placeholder="10-digit mobile"
-                     aria-label="Test recipient mobile number" inputMode="numeric"
-                     className="flex-1 px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+              <PhoneField value={testTo} onChange={setTestTo} placeholder="mobile number"
+                     ariaLabel="Test recipient mobile number" className="flex-1"
+                     inputClassName="flex-1 min-w-0 px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm text-[#2D1B0E] font-mono focus:outline-none focus:border-[#af4408]" />
               <button onClick={test} disabled={busy || !testTo.trim()}
                       className="inline-flex items-center justify-center gap-1.5 px-3 py-2 border border-emerald-600 text-emerald-700 hover:bg-emerald-50 text-sm rounded disabled:opacity-50">
                 <Send size={12} /> Send test message
@@ -437,9 +437,9 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
           Parameters map to <code className="bg-[#FFF1E3] px-1 rounded">{'{{1}},{{2}}…'}</code> in body order.
         </p>
         <div className="grid sm:grid-cols-2 gap-2">
-          <input value={tplTo} onChange={e => setTplTo(capMobile10(e.target.value))} placeholder="10-digit mobile"
-                 aria-label="Test template recipient mobile number" inputMode="numeric"
-                 className="px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+          <PhoneField value={tplTo} onChange={setTplTo} placeholder="mobile number"
+                 ariaLabel="Test template recipient mobile number"
+                 inputClassName="flex-1 min-w-0 px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm text-[#2D1B0E] font-mono focus:outline-none focus:border-[#af4408]" />
           <input value={tplName} onChange={e => setTplName(e.target.value)} placeholder="Approved template name"
                  aria-label="Approved template name"
                  className="px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm" />

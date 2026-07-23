@@ -14,7 +14,7 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/api';
-import { capMobile10 } from '@/lib/mobile-input';
+import PhoneField from '@/components/PhoneField';
 import {
   AlertTriangle, RefreshCw, CheckCircle2, Loader2, ShieldAlert, Bell, Save,
   ChevronDown, ChevronRight, Globe, Server, Smartphone, Monitor, Lock,
@@ -147,8 +147,10 @@ export default function AppErrorsPage() {
           <div className="flex items-center gap-2 text-sm font-semibold text-[#2D1B0E]"><Bell className="w-4 h-4 text-[#af4408]" />WhatsApp alert number (optional)</div>
           <p className="text-xs text-[#8B7355] mt-1">When a new error appears, ping this number (best-effort, throttled to avoid spam). Leave blank to rely on the in-app bell + this page only.</p>
           <div className="flex flex-wrap items-center gap-2 mt-2.5">
-            <input value={phoneInput} onChange={e => setPhoneInput(capMobile10(e.target.value))} inputMode="numeric" placeholder="10-digit mobile"
-                   className="flex-1 min-w-[180px] px-3 py-2.5 bg-white border border-[#D4B896] rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]/40" />
+            <PhoneField value={phoneInput} onChange={setPhoneInput} placeholder="mobile number"
+                   className="flex-1 min-w-[180px]"
+                   selectClassName="shrink-0 px-2 py-2.5 bg-white border border-[#D4B896] rounded-xl text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]/40"
+                   inputClassName="flex-1 min-w-0 px-3 py-2.5 bg-white border border-[#D4B896] rounded-xl text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]/40" />
             <button onClick={savePhone} disabled={savingPhone || phoneInput.trim() === alertPhone.trim()}
                     className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-xl text-sm font-semibold">
               {savingPhone ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}Save
