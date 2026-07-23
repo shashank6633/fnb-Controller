@@ -101,15 +101,15 @@ export function toIsoDate(v: any): string | undefined {
   }
   const s = String(v).trim();
   if (!s) return undefined;
-  // DD-MM-YYYY or DD/MM/YYYY
-  let m = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
-  if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+  // DD-MM-YYYY or DD/MM/YYYY — 2- or 4-digit year, optional trailing time
+  // (a sheet cell formatted as a datetime, e.g. "23/07/2026 19:00", or a
+  // 2-digit year "23/07/26" — both previously returned undefined and silently
+  // dropped the row).
+  let m = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2}|\d{4})(?:[ T].*)?$/);
+  if (m) { const yr = m[3].length === 2 ? '20' + m[3] : m[3]; return `${yr}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`; }
   // YYYY-MM-DD already (optionally followed by a time)
   m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  // M/D/YYYY (US format)
-  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (m) return `${m[3]}-${m[1].padStart(2,'0')}-${m[2].padStart(2,'0')}`;
   // Month-name formats: "10 Jul 2026", "10-July-2026", "10 July 2026"
   const norm = s.toLowerCase().replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
   let mm = norm.match(/^(\d{1,2})[ -]([a-z]{3,})[ -](\d{4})$/);

@@ -153,14 +153,16 @@ function readPartyCache(
 }
 
 function isCancelled(status: string | undefined): boolean {
-  return (status || '').trim().toLowerCase().includes('cancel');
+  // startsWith, not includes — so a status like "No-cancel guarantee" or
+  // "Confirmed (cancellation waived)" is NOT treated as a cancellation.
+  return (status || '').trim().toLowerCase().startsWith('cancel');
 }
 
 /** Bucket a free-text booking status into the six the board summarises. */
 function classifyStatus(s: string | undefined): keyof PartyStatusCounts {
   const t = (s || '').trim().toLowerCase();
   if (!t) return 'other';
-  if (t.includes('cancel')) return 'cancelled';
+  if (t.startsWith('cancel')) return 'cancelled';
   if (t.includes('complet') || t.includes('done')) return 'completed';
   if (t.includes('confirm')) return 'confirmed';
   if (t.includes('tentat') || t.includes('hold') || t.includes('provisional')) return 'tentative';
@@ -297,9 +299,10 @@ export function buildWhatsOn(
     special_requirements: (b.special_requirements || '').trim(),
   }));
 
-  // Fallback: the Party Bookings cache had NOTHING for this date → read the
-  // local `parties` table so the GRE still sees booked functions.
-  if (parties.length === 0) {
+  // Fallback: only when the Party Bookings cache has NEVER synced (no timestamp)
+  // → read the local `parties` table. Once the sheet has synced, an empty date
+  // is authoritatively empty (don't resurrect stale local rows as "ghost" parties).
+  if (parties.length === 0 && !bookingsRead.fetched_at) {
     try {
       const rows = db
         .prepare(
@@ -409,7 +412,10 @@ export function buildWhatsOn(
   // gauge stay correct even when a panel's list is hidden)…
   const summary = {
     entertainment_count: entertainment.length,
-    parties_count: parties.length,
+    // The at-a-glance headline counts ACTIVE bookings (non-cancelled) so it agrees
+    // with party_pax; the panel card subtitle shows the full "N on this date +
+    // status breakdown" including cancelled.
+    parties_count: parties.filter((p) => !isCancelled(p.status)).length,
     party_pax: partyPax,
     reservations_count: reservations.length,
     reserved_covers: reservedCovers,

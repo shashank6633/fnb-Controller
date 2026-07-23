@@ -733,8 +733,8 @@ export default function WhatsOnPage() {
               <Empty text="No party bookings for this day." />
             ) : (
               <div className="divide-y divide-[#F7EEE3] -my-1">
-                {data?.parties.map(p => (
-                  <div key={p.fp_id} className="py-2.5 flex items-start gap-3">
+                {data?.parties.map((p, idx) => (
+                  <div key={p.fp_id || `${p.guest_name}|${p.time}|${idx}`} className="py-2.5 flex items-start gap-3">
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2 flex-wrap">
                         <p className="font-semibold truncate">{p.guest_name || p.name || 'Party'}</p>
