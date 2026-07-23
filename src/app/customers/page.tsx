@@ -1,9 +1,11 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
+import Link from 'next/link';
 import { api } from '@/lib/api';
 import { fmtISTShort } from '@/lib/format-date';
-import { Users, Search, Loader2, X, Phone } from 'lucide-react';
+import { canAccessPage } from '@/lib/page-catalog';
+import { Users, Search, Loader2, X, Phone, ArrowUpRight } from 'lucide-react';
 
 interface Customer {
   mobile: string;
@@ -39,6 +41,14 @@ export default function CustomersPage() {
   const [selRegulars, setSelRegulars] = useState<{ name: string; times: number }[]>([]);
   const loadSeq = useRef(0);   // request tokens so a slow response can't overwrite a newer one
   const drillSeq = useRef(0);
+  // Effective access — used ONLY to decide whether to offer the "View full CRM
+  // profile" link (the CRM Guests 360 sits behind its own page-access gate; no
+  // point offering a link the viewer can't follow).
+  const [me, setMe] = useState<{ role?: string; page_access?: string | null; is_head_chef?: boolean } | null>(null);
+  useEffect(() => {
+    fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user || null)).catch(() => {});
+  }, []);
+  const canOpenCrm = canAccessPage('/crm-calls/guests', me);
 
   const load = useCallback(async (query: string) => {
     const seq = ++loadSeq.current;
@@ -139,6 +149,16 @@ export default function CustomersPage() {
               <div>
                 <h2 className="text-lg font-bold text-[#2D1B0E]">{sel.name || '(no name)'}</h2>
                 <a href={`tel:+91${sel.mobile}`} className="text-sm text-[#af4408] font-mono inline-flex items-center gap-1"><Phone size={13} /> +91 {sel.mobile}</a>
+                {canOpenCrm && sel.mobile && (
+                  // Cross-links to the unified CRM Guest 360. The [id] route
+                  // accepts a `phone:<digits>` handle, resolving to the person's
+                  // real CRM record if they've ever called, or a synthetic
+                  // dining/loyalty profile if not — so it works for every guest.
+                  <Link href={`/crm-calls/guests/phone:${sel.mobile}`}
+                        className="mt-1 flex items-center gap-1 text-xs text-[#6B5744] hover:text-[#af4408] w-fit">
+                    <ArrowUpRight size={12} /> View full CRM profile
+                  </Link>
+                )}
               </div>
               <button onClick={() => setSel(null)}><X size={18} className="text-[#8B7355]" /></button>
             </div>
