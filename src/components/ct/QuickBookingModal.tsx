@@ -23,6 +23,7 @@ import { useEffect, useState } from 'react';
 import { X, Search, UserPlus, Loader2, CheckCircle, CalendarCheck, Phone } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
+import { capMobile10 } from '@/lib/mobile-input';
 
 interface GuestLite {
   id: string;
@@ -227,7 +228,8 @@ export default function QuickBookingModal({
               <div className="space-y-2 p-3 bg-[#FFFBF5] border border-[#E8D5C4] rounded-lg">
                 <input type="text" value={newName} onChange={e => setNewName(e.target.value)}
                        placeholder="Guest name" className={inputCls} />
-                <input type="tel" value={newPhone} onChange={e => setNewPhone(e.target.value)}
+                <input type="tel" value={newPhone} onChange={e => setNewPhone(capMobile10(e.target.value))}
+                       inputMode="numeric"
                        placeholder="Phone (10-digit or +91…)" className={inputCls} />
                 <div className="flex gap-2">
                   <button onClick={createGuest} disabled={createBusy || !newPhone.trim()}

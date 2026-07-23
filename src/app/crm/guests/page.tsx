@@ -21,6 +21,7 @@ import {
   Gift, Loader2, Pencil, Phone, Plus, RefreshCw, Search, UserPlus, Users, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { capMobile10 } from '@/lib/mobile-input';
 
 /* ── types (mirror /api/crm/guests) ───────────────────────────────────── */
 
@@ -608,7 +609,7 @@ export default function CrmGuestsPage() {
             <div className="space-y-2">
               <input
                 type="tel" inputMode="numeric" placeholder="Mobile (10 digits) *" value={addForm.mobile}
-                onChange={e => setAddForm(f => ({ ...f, mobile: e.target.value }))}
+                onChange={e => setAddForm(f => ({ ...f, mobile: capMobile10(e.target.value) }))}
                 className="w-full border border-[#E8D5C4] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#af4408]"
               />
               <input

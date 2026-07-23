@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { createHash, randomInt, randomBytes } from 'crypto';
 import { isWaConfigured, getWaConfigRaw } from '@/lib/whatsapp';
+import { capMobile10 } from '@/lib/mobile-input';
 
 /**
  * WhatsApp OTP for QR self-orders. A verified mobile is captured before a
@@ -16,9 +17,12 @@ export const MAX_SENDS_PER_HOUR = 6;         // spam / cost guard per number+tab
 export const MAX_TABLE_SENDS_PER_HOUR = 25;  // OTP-bombing guard: total sends per TABLE (any number)
 export const VERIFIED_TTL_SECONDS = 6 * 3600; // a verified number stays verified for the session
 
-/** Digits only — the same normalisation on send, verify and order so they match. */
+/** Canonical mobile — capped to a 10-digit Indian number (drops 91/0 prefixes,
+ *  keeps the last 10). The SAME normalisation runs on send, verify and order so
+ *  they always match, and guarantees a stored guest_mobile never exceeds 10
+ *  digits even if a client bypasses the input cap. */
 export function normMobile(m: string): string {
-  return String(m || '').replace(/\D/g, '').slice(-15);
+  return capMobile10(m);
 }
 
 function hashCode(mobile: string, code: string): string {

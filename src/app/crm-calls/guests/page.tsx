@@ -15,6 +15,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
+import { capMobile10 } from '@/lib/mobile-input';
 import {
   Users,
   Plus,
@@ -728,7 +729,8 @@ function NewGuestModal({ onClose, onGoto }: { onClose: () => void; onGoto: (id: 
           <div>
             <label className="block text-xs font-medium text-[#6B5744] mb-1">Phone *</label>
             <input type="tel" value={form.phone} placeholder="98765 43210"
-                   onChange={e => setForm({ ...form, phone: e.target.value })}
+                   inputMode="numeric"
+                   onChange={e => setForm({ ...form, phone: capMobile10(e.target.value) })}
                    onKeyDown={e => { if (e.key === 'Enter') submit(); }}
                    className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]/40" />
             <p className="text-[10px] text-[#8B7355] mt-0.5">10-digit Indian numbers are saved as +91.</p>

@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, useMemo, useContext, useRef } from 'r
 import { useParams, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import { readMenuCache, writeMenuCache } from '@/lib/menu-cache';
+import { capMobile10 } from '@/lib/mobile-input';
 import {
   ArrowLeft, Search, Plus, Minus, Trash2, Loader2, Send, Receipt, X, ShoppingBag,
   ArrowLeftRight, GitMerge, ChefHat, Flame, CheckCircle2, Menu, Filter, ChevronDown,
@@ -1032,7 +1033,7 @@ export default function CaptainOrder() {
                 exactly as before when left blank. */}
             <p className="text-xs font-semibold text-[#8B7355] mb-1.5">Guest (optional — earns loyalty points)</p>
             <div className="flex gap-2 mb-3">
-              <input value={gMobile} onChange={(e) => setGMobile(e.target.value)} type="tel" inputMode="tel" placeholder="Guest mobile"
+              <input value={gMobile} onChange={(e) => setGMobile(capMobile10(e.target.value))} type="tel" inputMode="tel" placeholder="Guest mobile"
                 className="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
               <input value={gName} onChange={(e) => setGName(e.target.value)} placeholder="Name"
                 className="w-28 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />

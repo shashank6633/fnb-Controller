@@ -6,6 +6,7 @@ import { api } from '@/lib/api';
 import { ArrowLeft, Plus, Minus, Trash2, Loader2, Search, Send, CheckCircle2, MessageCircle } from 'lucide-react';
 import { printFiredKots, printBill } from '@/lib/offline-print/print';
 import TabScroller from '@/components/TabScroller';
+import { capMobile10 } from '@/lib/mobile-input';
 
 interface MenuItem { id: string; name: string; category: string; station: string; selling_price: number; recipe_id: string | null; is_active: number; }
 interface OrderItem { id: string; name: string; quantity: number; unit_price: number; line_total: number; status: string; }
@@ -240,7 +241,7 @@ export default function OrderTerminalPage() {
                 exactly as before when left blank. */}
             <p className="text-[11px] font-semibold text-[#8B7355] mb-1">Guest (optional — earns loyalty points)</p>
             <div className="flex gap-2 mb-4">
-              <input value={gMobile} onChange={(e) => setGMobile(e.target.value)} type="tel" inputMode="tel" placeholder="Guest mobile"
+              <input value={gMobile} onChange={(e) => setGMobile(capMobile10(e.target.value))} type="tel" inputMode="tel" placeholder="Guest mobile"
                 className="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
               <input value={gName} onChange={(e) => setGName(e.target.value)} placeholder="Name"
                 className="w-28 border border-[#D4B896] rounded-lg px-3 py-2 text-sm" />
