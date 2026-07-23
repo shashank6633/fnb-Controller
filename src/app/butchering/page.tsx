@@ -55,17 +55,36 @@ export default function ButcheringPage() {
   const [showNew, setShowNew] = useState(false);
   const [openBatchId, setOpenBatchId] = useState<string | null>(null);
 
+  const [pageError, setPageError] = useState<string | null>(null);
+
   const reload = async () => {
     setLoading(true);
-    const d = await fetch('/api/butchering').then(r => r.json());
-    setBatches(d.batches || []);
-    setLoading(false);
+    try {
+      const r = await fetch('/api/butchering');
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { setPageError(d.error || `Failed to load batches (HTTP ${r.status})`); setBatches([]); return; }
+      setPageError(null);
+      setBatches(Array.isArray(d.batches) ? d.batches : []);
+    } catch (e: any) {
+      setPageError(e?.message || 'Failed to load batches');
+      setBatches([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+  // scope=all — Butchering needs to pick source carcasses + cut SKUs from
+  // the full catalog, not the current user's dept-restricted view.
+  const reloadMaterials = async () => {
+    try {
+      const r = await fetch('/api/inventory?scope=all');
+      const d = await r.json().catch(() => ({}));
+      const list = Array.isArray(d.materials) ? d.materials : Array.isArray(d) ? d : [];
+      setMaterials(list);
+    } catch { /* keep previous list */ }
   };
   useEffect(() => {
     reload();
-    // scope=all — Butchering needs to pick source carcasses + cut SKUs from
-    // the full catalog, not the current user's dept-restricted view.
-    fetch('/api/inventory?scope=all').then(r => r.json()).then(d => setMaterials(d.materials || d || []));
+    reloadMaterials();
   }, []);
 
   return (
@@ -95,6 +114,13 @@ export default function ButcheringPage() {
           <BarChart3 size={12} className="inline mr-1" /> Yield Report
         </button>
       </div>
+
+      {pageError && (
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-xs flex items-center gap-2">
+          <AlertTriangle size={14} className="shrink-0" /> {pageError}
+          <button onClick={reload} className="ml-auto underline hover:no-underline">Retry</button>
+        </div>
+      )}
 
       {tab === 'batches' ? (
         <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
@@ -157,6 +183,7 @@ export default function ButcheringPage() {
       {showNew && (
         <NewBatchModal
           materials={materials}
+          onSeeded={reloadMaterials}
           onClose={() => setShowNew(false)}
           onCreated={(id) => { setShowNew(false); setOpenBatchId(id); reload(); }}
         />
@@ -174,8 +201,9 @@ export default function ButcheringPage() {
 
 /* ──────────────── New Batch Modal ──────────────── */
 
-function NewBatchModal({ materials, onClose, onCreated }: {
+function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
   materials: Material[];
+  onSeeded: () => void;
   onClose: () => void;
   onCreated: (id: string) => void;
 }) {
@@ -201,7 +229,8 @@ function NewBatchModal({ materials, onClose, onCreated }: {
       const r = await api('/api/butchering/seed-mutton-cuts', { method: 'POST', body: {} });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
-      setSeedResult(j.summary || 'Done. Reload the page to see them in the dropdown.');
+      setSeedResult(j.summary || 'Done.');
+      onSeeded();  // refresh the materials list in place — no manual page reload
     } finally { setSeeding(false); }
   };
 
@@ -217,7 +246,8 @@ function NewBatchModal({ materials, onClose, onCreated }: {
   const submit = async () => {
     if (!batchId.trim()) { setError('Batch ID required'); return; }
     if (!sourceId) { setError('Pick the source carcass material'); return; }
-    if (!Number(grossWeight)) { setError('Gross weight required'); return; }
+    if (!(Number(grossWeight) > 0)) { setError('Gross weight must be a number greater than 0'); return; }
+    if (invoiceWeight && !(Number(invoiceWeight) >= 0)) { setError('Invoice weight must be a number ≥ 0'); return; }
     setSaving(true); setError(null);
     try {
       const r = await api('/api/butchering', {
@@ -249,7 +279,7 @@ function NewBatchModal({ materials, onClose, onCreated }: {
               Click below to one-time create: <strong>Mutton Carcass</strong> (source) + Leg, Shoulder, Chops, Ribs, Mince, Offal, Bones.
               Idempotent — won't duplicate existing SKUs.
             </div>
-            {seedResult && <div className="mt-1 text-emerald-700">✓ {seedResult} — reload the page to see them.</div>}
+            {seedResult && <div className="mt-1 text-emerald-700">✓ {seedResult} They&apos;re in the dropdown now.</div>}
           </div>
           <button onClick={seedMuttonCuts} disabled={seeding}
                   className="text-xs px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded whitespace-nowrap disabled:opacity-50">
@@ -283,12 +313,12 @@ function NewBatchModal({ materials, onClose, onCreated }: {
                  className="w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3]" />
         </Field>
         <Field label="Gross dressed weight (kg) *">
-          <input type="number" step="any" value={grossWeight} onChange={e => setGrossWeight(e.target.value)}
+          <input type="number" step="any" min="0" value={grossWeight} onChange={e => setGrossWeight(e.target.value)}
                  placeholder="14.250"
                  className="w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-right font-mono" />
         </Field>
         <Field label="Invoice weight (kg)" hint="for variance check vs vendor">
-          <input type="number" step="any" value={invoiceWeight} onChange={e => setInvoiceWeight(e.target.value)}
+          <input type="number" step="any" min="0" value={invoiceWeight} onChange={e => setInvoiceWeight(e.target.value)}
                  className="w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-right font-mono" />
         </Field>
         <Field label="Head Chef">
@@ -326,21 +356,41 @@ function BatchDetailModal({ batchId, materials, onClose }: {
   const [outputs, setOutputs] = useState<OutputLine[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [savedTick, setSavedTick] = useState(false);
+  // Editable batch details (open batches only) — saved with every Save Draft
+  const [grossW, setGrossW] = useState('');
+  const [invoiceW, setInvoiceW] = useState('');
+  const [butcher, setButcher] = useState('');
+  const [headChef, setHeadChef] = useState('');
+  const [notes, setNotes] = useState('');
 
   const load = async () => {
-    const d = await fetch(`/api/butchering?id=${batchId}`).then(r => r.json());
-    setBatch(d.batch);
-    if (d.batch?.outputs?.length > 0) {
-      setOutputs(d.batch.outputs.map((o: any) => ({
-        output_type: o.output_type,
-        material_id: o.material_id || '',
-        waste_category: o.waste_category || 'other',
-        weight: String(o.weight),
-        notes: o.notes || '',
-      })));
-    } else {
-      // Seed with one blank line for each
-      setOutputs([{ output_type: 'cut', material_id: '', waste_category: '', weight: '', notes: '' }]);
+    setLoadError(null);
+    try {
+      const r = await fetch(`/api/butchering?id=${batchId}`);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.batch) { setLoadError(d.error || `Failed to load batch (HTTP ${r.status})`); return; }
+      setBatch(d.batch);
+      setGrossW(String(d.batch.gross_weight ?? ''));
+      setInvoiceW(d.batch.invoice_weight != null ? String(d.batch.invoice_weight) : '');
+      setButcher(d.batch.butcher || '');
+      setHeadChef(d.batch.head_chef || '');
+      setNotes(d.batch.notes || '');
+      if (d.batch?.outputs?.length > 0) {
+        setOutputs(d.batch.outputs.map((o: any) => ({
+          output_type: o.output_type,
+          material_id: o.material_id || '',
+          waste_category: o.waste_category || 'other',
+          weight: String(o.weight),
+          notes: o.notes || '',
+        })));
+      } else {
+        // Seed with one blank line for each
+        setOutputs([{ output_type: 'cut', material_id: '', waste_category: '', weight: '', notes: '' }]);
+      }
+    } catch (e: any) {
+      setLoadError(e?.message || 'Failed to load batch');
     }
   };
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [batchId]);
@@ -354,19 +404,43 @@ function BatchDetailModal({ batchId, materials, onClose }: {
   const totalCut = useMemo(() => outputs.filter(o => o.output_type === 'cut').reduce((a, o) => a + (Number(o.weight) || 0), 0), [outputs]);
   const totalWaste = useMemo(() => outputs.filter(o => o.output_type === 'waste').reduce((a, o) => a + (Number(o.weight) || 0), 0), [outputs]);
   const totalOut = totalCut + totalWaste;
-  const gross = batch?.gross_weight || 0;
+  // Live basis: the recon strip, per-line yields and costs all follow the
+  // EDITED gross weight so what you see is exactly what saving produces.
+  const gross = Number(grossW) > 0 ? Number(grossW) : 0;
+  const liveTotalCost = (batch?.cost_per_unit || 0) * gross;
   const gap = gross - totalOut;
   const gapPct = gross > 0 ? Math.abs(gap) / gross : 0;
   const wastePct = gross > 0 ? (totalWaste / gross) * 100 : 0;
   const withinTolerance = gapPct <= 0.015;
 
-  const saveAndAction = async (action?: 'close' | 'cancel') => {
+  // Foolproofing: never silently drop a line. Weight without material (or a
+  // negative weight) blocks the save with a clear message instead.
+  const validate = (): string | null => {
+    if (!(Number(grossW) > 0)) return 'Gross weight must be greater than 0.';
+    if (invoiceW && !(Number(invoiceW) >= 0)) return 'Invoice weight must be a number ≥ 0.';
+    for (const o of outputs) {
+      const w = Number(o.weight);
+      if (o.weight !== '' && !Number.isFinite(w)) return 'Weights must be numbers.';
+      if (w < 0) return 'Weights cannot be negative.';
+      if (o.output_type === 'cut' && w > 0 && !o.material_id) {
+        return 'A cut line has a weight but no material — pick the cut material or remove the line.';
+      }
+    }
+    return null;
+  };
+
+  const saveAndAction = async (action?: 'close') => {
+    const v = validate();
+    if (v) { setError(v); return; }
     setSaving(true); setError(null);
     try {
       const payload = {
         id: batchId,
+        gross_weight: Number(grossW),
+        invoice_weight: invoiceW === '' ? null : Number(invoiceW),
+        butcher, head_chef: headChef, notes,
         outputs: outputs
-          .filter(o => Number(o.weight) > 0 && (o.output_type === 'waste' || o.material_id))
+          .filter(o => Number(o.weight) > 0)
           .map(o => ({
             output_type: o.output_type,
             material_id: o.output_type === 'cut' ? o.material_id : null,
@@ -379,11 +453,33 @@ function BatchDetailModal({ batchId, materials, onClose }: {
       const r = await api('/api/butchering', { method: 'PUT', body: payload });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
-      if (action) onClose();
-      else load();
+      if (action) { onClose(); return; }
+      // Draft saved: keep the outputs EXACTLY as typed (incl. still-empty
+      // lines being drafted) — only refresh the batch header from the server.
+      if (j.batch) setBatch((prev: any) => ({ ...prev, ...j.batch }));
+      setSavedTick(true);
+      setTimeout(() => setSavedTick(false), 2500);
     } finally { setSaving(false); }
   };
 
+  const cancelBatch = async () => {
+    if (!confirm(`Cancel batch ${batch?.batch_id}? It stays in the list as "cancelled" and posts nothing to inventory.`)) return;
+    setSaving(true); setError(null);
+    try {
+      const r = await api('/api/butchering', { method: 'PUT', body: { id: batchId, action: 'cancel' } });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
+      onClose();
+    } finally { setSaving(false); }
+  };
+
+  if (loadError) {
+    return (
+      <ModalShell title="Batch" onClose={onClose}>
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded p-3 text-sm">{loadError}</div>
+      </ModalShell>
+    );
+  }
   if (!batch) {
     return <ModalShell title="Loading…" onClose={onClose}><div className="p-6 text-center"><Loader2 className="animate-spin inline" /></div></ModalShell>;
   }
@@ -398,6 +494,33 @@ function BatchDetailModal({ batchId, materials, onClose }: {
           {batch.status === 'closed' ? '✓ This batch is closed — inventory transactions posted.' : '✗ This batch was cancelled.'}
         </div>
       )}
+
+      {/* Batch details — editable while open; every Save Draft persists them
+          and re-bases yields/costs on the corrected gross weight. */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+        <Field label="Gross weight (kg) *">
+          <input type="number" step="any" min="0" value={grossW} readOnly={readOnly}
+                 onChange={e => setGrossW(e.target.value)}
+                 className={`w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono ${readOnly ? 'bg-[#F7F0E8] text-[#8B7355]' : 'bg-[#FFF1E3]'}`} />
+        </Field>
+        <Field label="Invoice weight (kg)">
+          <input type="number" step="any" min="0" value={invoiceW} readOnly={readOnly}
+                 onChange={e => setInvoiceW(e.target.value)}
+                 className={`w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono ${readOnly ? 'bg-[#F7F0E8] text-[#8B7355]' : 'bg-[#FFF1E3]'}`} />
+        </Field>
+        <Field label="Butcher">
+          <input value={butcher} readOnly={readOnly} onChange={e => setButcher(e.target.value)}
+                 className={`w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs ${readOnly ? 'bg-[#F7F0E8] text-[#8B7355]' : 'bg-[#FFF1E3]'}`} />
+        </Field>
+        <Field label="Head Chef">
+          <input value={headChef} readOnly={readOnly} onChange={e => setHeadChef(e.target.value)}
+                 className={`w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs ${readOnly ? 'bg-[#F7F0E8] text-[#8B7355]' : 'bg-[#FFF1E3]'}`} />
+        </Field>
+        <Field label="Notes" className="col-span-2 sm:col-span-4">
+          <input value={notes} readOnly={readOnly} onChange={e => setNotes(e.target.value)}
+                 className={`w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs ${readOnly ? 'bg-[#F7F0E8] text-[#8B7355]' : 'bg-[#FFF1E3]'}`} />
+        </Field>
+      </div>
 
       {/* Reconciliation strip */}
       <div className={`rounded-lg p-3 grid grid-cols-4 gap-3 text-xs border ${withinTolerance ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
@@ -423,7 +546,7 @@ function BatchDetailModal({ batchId, materials, onClose }: {
         </div>
         <div className="space-y-1 mt-1">
           {outputs.map((o, i) => o.output_type !== 'cut' ? null : (
-            <CutLine key={i} idx={i} line={o} batch={batch} materials={materials}
+            <CutLine key={i} idx={i} line={o} grossWeight={gross} totalCost={liveTotalCost} materials={materials}
                      totalCutWeight={totalCut} readOnly={readOnly} excludeIds={outputs.filter(x => x.output_type === 'cut' && x.material_id).map(x => x.material_id)}
                      onUpdate={(patch) => update(i, patch)} onRemove={() => removeLine(i)} />
           ))}
@@ -456,6 +579,11 @@ function BatchDetailModal({ batchId, materials, onClose }: {
       <ModalFooter onClose={onClose}>
         {!readOnly && (
           <>
+            {savedTick && <span className="text-xs text-emerald-700 self-center mr-1">✓ Draft saved</span>}
+            <button onClick={cancelBatch} disabled={saving}
+                    className="px-4 py-2 text-sm border border-red-200 text-red-600 hover:bg-red-50 rounded">
+              Cancel Batch
+            </button>
             <button onClick={() => saveAndAction()} disabled={saving}
                     className="px-4 py-2 text-sm border border-[#D4B896] text-[#6B5744] hover:bg-[#FFF1E3] rounded">
               {saving ? <Loader2 className="animate-spin inline" size={14} /> : <Save size={14} className="inline mr-1" />} Save Draft
@@ -472,14 +600,14 @@ function BatchDetailModal({ batchId, materials, onClose }: {
   );
 }
 
-function CutLine({ idx, line, batch, materials, totalCutWeight, readOnly, excludeIds, onUpdate, onRemove }: {
-  idx: number; line: OutputLine; batch: any; materials: Material[]; totalCutWeight: number;
+function CutLine({ idx, line, grossWeight, totalCost, materials, totalCutWeight, readOnly, excludeIds, onUpdate, onRemove }: {
+  idx: number; line: OutputLine; grossWeight: number; totalCost: number; materials: Material[]; totalCutWeight: number;
   readOnly: boolean; excludeIds: string[];
   onUpdate: (patch: Partial<OutputLine>) => void; onRemove: () => void;
 }) {
   const weight = Number(line.weight) || 0;
-  const yieldPct = batch.gross_weight > 0 ? (weight / batch.gross_weight) * 100 : 0;
-  const cost = totalCutWeight > 0 ? batch.total_cost * (weight / totalCutWeight) : 0;
+  const yieldPct = grossWeight > 0 ? (weight / grossWeight) * 100 : 0;
+  const cost = totalCutWeight > 0 ? totalCost * (weight / totalCutWeight) : 0;
   return (
     <div className="grid grid-cols-12 gap-2 items-start">
       <div className="col-span-6">
@@ -491,7 +619,7 @@ function CutLine({ idx, line, batch, materials, totalCutWeight, readOnly, exclud
                              excludeIds={excludeIds.filter(x => x !== line.material_id) as string[]} />
         )}
       </div>
-      <input type="number" step="any" value={line.weight} readOnly={readOnly}
+      <input type="number" step="any" min="0" value={line.weight} readOnly={readOnly}
              onChange={e => onUpdate({ weight: e.target.value })}
              className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
       <div className="col-span-1 text-right text-xs font-mono py-2 text-[#6B5744]">{yieldPct.toFixed(1)}%</div>
@@ -516,7 +644,7 @@ function WasteLine({ idx, line, readOnly, onUpdate, onRemove }: {
               className="col-span-6 px-2 py-1.5 border border-[#D4B896] rounded text-xs">
         {WASTE_CATEGORIES.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
       </select>
-      <input type="number" step="any" value={line.weight} readOnly={readOnly}
+      <input type="number" step="any" min="0" value={line.weight} readOnly={readOnly}
              onChange={e => onUpdate({ weight: e.target.value })}
              className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
       <input value={line.notes} readOnly={readOnly}
@@ -536,12 +664,25 @@ function YieldReportPanel() {
   const [to, setTo]     = useState(today());
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
   const load = async () => {
-    setLoading(true);
-    const d = await fetch(`/api/butchering/yield-report?from=${from}&to=${to}`).then(r => r.json());
-    setData(d);
-    setLoading(false);
+    setLoading(true); setErr(null);
+    try {
+      const r = await fetch(`/api/butchering/yield-report?from=${from}&to=${to}`);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !Array.isArray(d.sources)) {
+        setErr(d.error || `Failed to load report (HTTP ${r.status})`);
+        setData(null);
+        return;
+      }
+      setData(d);
+    } catch (e: any) {
+      setErr(e?.message || 'Failed to load report');
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
   };
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
 
@@ -559,10 +700,12 @@ function YieldReportPanel() {
         <button onClick={load} className="text-xs px-3 py-1 bg-[#af4408] text-white rounded">Run</button>
       </div>
 
-      {loading || !data ? (
+      {err ? (
+        <div className="p-6 text-center text-sm text-red-700">{err}</div>
+      ) : loading || !data ? (
         <div className="p-6 text-center text-sm text-[#8B7355]"><Loader2 className="animate-spin inline mr-1" size={14} />Loading…</div>
-      ) : data.sources?.length === 0 ? (
-        <div className="p-6 text-center text-sm text-[#8B7355]">No closed batches in this period.</div>
+      ) : data.sources.length === 0 ? (
+        <div className="p-6 text-center text-sm text-[#8B7355]">No closed batches in this period — only <strong>closed</strong> batches enter the yield report.</div>
       ) : (
         <div className="divide-y divide-[#E8D5C4]">
           {data.sources.map((src: any) => (

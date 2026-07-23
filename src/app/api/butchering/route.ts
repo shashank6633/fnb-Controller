@@ -153,7 +153,7 @@ export async function PUT(request: Request) {
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const b = await request.json();
-    const { id, outputs, butcher, head_chef, notes, action } = b;
+    const { id, outputs, butcher, head_chef, notes, gross_weight, invoice_weight, action } = b;
     if (!id) return Response.json({ error: 'id required' }, { status: 400 });
 
     const batch = db.prepare('SELECT * FROM butchering_batches WHERE id = ?').get(id) as any;
@@ -162,8 +162,20 @@ export async function PUT(request: Request) {
       return Response.json({ error: `Batch is ${batch.status}, cannot edit` }, { status: 400 });
     }
 
+    // Pre-validate outputs so bad lines get a clean 400 (never a silent drop
+    // or a mid-transaction throw).
+    if (Array.isArray(outputs)) {
+      for (const o of outputs) {
+        const w = Number(o.weight) || 0;
+        if (w < 0) return Response.json({ error: 'Output weights cannot be negative' }, { status: 400 });
+        if (w > 0 && o.output_type === 'cut' && !o.material_id) {
+          return Response.json({ error: 'Every cut line with a weight needs a material — pick one or remove the line' }, { status: 400 });
+        }
+      }
+    }
+
     // Meta updates always allowed while open
-    if (butcher !== undefined || head_chef !== undefined || notes !== undefined) {
+    if (batch.status === 'open' && (butcher !== undefined || head_chef !== undefined || notes !== undefined)) {
       db.prepare(`
         UPDATE butchering_batches
         SET butcher = COALESCE(?, butcher), head_chef = COALESCE(?, head_chef),
@@ -172,8 +184,45 @@ export async function PUT(request: Request) {
       `).run(butcher ?? null, head_chef ?? null, notes ?? null, id);
     }
 
-    // Replace outputs if provided
+    // Gross / invoice weight edits while open — the cost basis follows the
+    // gross weight (total_cost = snapshot cost_per_unit × gross), and every
+    // stored output's yield % + allocated cost is recomputed on the new basis.
+    if (batch.status === 'open' && invoice_weight !== undefined) {
+      const iw = invoice_weight === null || invoice_weight === '' ? null : Number(invoice_weight);
+      if (iw !== null && (!Number.isFinite(iw) || iw < 0)) {
+        return Response.json({ error: 'invoice_weight must be a number ≥ 0' }, { status: 400 });
+      }
+      db.prepare('UPDATE butchering_batches SET invoice_weight = ? WHERE id = ?').run(iw, id);
+    }
+    if (batch.status === 'open' && gross_weight !== undefined) {
+      const gw = Number(gross_weight);
+      if (!Number.isFinite(gw) || gw <= 0) {
+        return Response.json({ error: 'gross_weight must be > 0' }, { status: 400 });
+      }
+      const newTotalCost = batch.cost_per_unit * gw;
+      const txn = db.transaction(() => {
+        db.prepare('UPDATE butchering_batches SET gross_weight = ?, total_cost = ? WHERE id = ?')
+          .run(gw, newTotalCost, id);
+        // If this request does NOT also replace the outputs, re-base the
+        // stored rows now (the replacement block below re-bases anyway).
+        if (!Array.isArray(outputs)) {
+          const rows = db.prepare('SELECT * FROM butchering_outputs WHERE batch_id = ?').all(id) as any[];
+          const totalCutWeight = rows.filter(r => r.output_type === 'cut').reduce((a, r) => a + (r.weight || 0), 0);
+          const updOut = db.prepare('UPDATE butchering_outputs SET yield_pct = ?, cost_allocated = ? WHERE id = ?');
+          for (const r of rows) {
+            const yp = gw > 0 ? ((r.weight || 0) / gw) * 100 : 0;
+            const cost = r.output_type === 'cut' && totalCutWeight > 0 ? newTotalCost * ((r.weight || 0) / totalCutWeight) : 0;
+            updOut.run(yp, cost, r.id);
+          }
+        }
+      });
+      txn();
+    }
+
+    // Replace outputs if provided — always against the CURRENT (possibly
+    // just-updated) gross weight and total cost.
     if (Array.isArray(outputs)) {
+      const basis = db.prepare('SELECT gross_weight, total_cost FROM butchering_batches WHERE id = ?').get(id) as any;
       const txn = db.transaction(() => {
         db.prepare('DELETE FROM butchering_outputs WHERE batch_id = ?').run(id);
         const ins = db.prepare(`
@@ -181,14 +230,13 @@ export async function PUT(request: Request) {
                                           weight, cost_allocated, yield_pct, notes)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
-        // First pass: validate + compute total cut weight (waste is excluded from cost basis)
+        // First pass: compute total cut weight (waste is excluded from cost basis)
         const cuts: any[] = [];
         const wastes: any[] = [];
         for (const o of outputs) {
           const w = Number(o.weight) || 0;
           if (w <= 0) continue;
           if (o.output_type === 'cut') {
-            if (!o.material_id) throw new Error('cut output requires material_id');
             cuts.push({ ...o, weight: w });
           } else if (o.output_type === 'waste') {
             wastes.push({ ...o, weight: w });
@@ -197,12 +245,12 @@ export async function PUT(request: Request) {
         const totalCutWeight = cuts.reduce((a, c) => a + c.weight, 0);
         // Cost allocation: pro-rata by weight across CUTS only (waste absorbs no cost)
         for (const c of cuts) {
-          const yieldPct = batch.gross_weight > 0 ? (c.weight / batch.gross_weight) * 100 : 0;
-          const cost = totalCutWeight > 0 ? batch.total_cost * (c.weight / totalCutWeight) : 0;
+          const yieldPct = basis.gross_weight > 0 ? (c.weight / basis.gross_weight) * 100 : 0;
+          const cost = totalCutWeight > 0 ? basis.total_cost * (c.weight / totalCutWeight) : 0;
           ins.run(generateId(), id, 'cut', c.material_id, null, c.weight, cost, yieldPct, c.notes || '');
         }
         for (const w of wastes) {
-          const yieldPct = batch.gross_weight > 0 ? (w.weight / batch.gross_weight) * 100 : 0;
+          const yieldPct = basis.gross_weight > 0 ? (w.weight / basis.gross_weight) * 100 : 0;
           ins.run(generateId(), id, 'waste', null, w.waste_category || 'other', w.weight, 0, yieldPct, w.notes || '');
         }
       });
@@ -226,13 +274,11 @@ export async function PUT(request: Request) {
         // 1. Debit source carcass stock
         db.prepare(`UPDATE raw_materials SET current_stock = COALESCE(current_stock, 0) - ? WHERE id = ?`)
           .run(fresh.gross_weight, fresh.source_material_id);
-        try {
-          db.prepare(`
-            INSERT INTO inventory_transactions (id, material_id, type, quantity, unit_cost, reference_type, reference_id, notes, created_at)
-            VALUES (?, ?, 'butchering_input', ?, ?, 'butchering_batch', ?, ?, datetime('now'))
-          `).run(generateId(), fresh.source_material_id, -fresh.gross_weight, fresh.cost_per_unit, fresh.id,
-                  `Carcass breakdown: ${fresh.batch_id}`);
-        } catch { /* inventory_transactions schema may differ; soft-fail */ }
+        db.prepare(`
+          INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id)
+          VALUES (?, ?, 'butchering_input', ?, ?, ?, ?)
+        `).run(generateId(), fresh.source_material_id, -fresh.gross_weight, fresh.id,
+                `Carcass breakdown ${fresh.batch_id} @ ₹${fresh.cost_per_unit}/kg`, fresh.outlet_id || null);
 
         // 2. Credit each cut
         for (const o of outs) {
@@ -240,25 +286,22 @@ export async function PUT(request: Request) {
           db.prepare(`UPDATE raw_materials SET current_stock = COALESCE(current_stock, 0) + ? WHERE id = ?`)
             .run(o.weight, o.material_id);
           const unitCost = o.weight > 0 ? o.cost_allocated / o.weight : 0;
-          try {
-            db.prepare(`
-              INSERT INTO inventory_transactions (id, material_id, type, quantity, unit_cost, reference_type, reference_id, notes, created_at)
-              VALUES (?, ?, 'butchering_output', ?, ?, 'butchering_batch', ?, ?, datetime('now'))
-            `).run(generateId(), o.material_id, o.weight, unitCost, fresh.id,
-                    `Cut from ${fresh.batch_id} (${o.yield_pct.toFixed(1)}% yield)`);
-          } catch { /* soft */ }
+          db.prepare(`
+            INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id)
+            VALUES (?, ?, 'butchering_output', ?, ?, ?, ?)
+          `).run(generateId(), o.material_id, o.weight, fresh.id,
+                  `Cut from ${fresh.batch_id} (${o.yield_pct.toFixed(1)}% yield, ₹${unitCost.toFixed(2)}/kg)`, fresh.outlet_id || null);
         }
 
-        // 3. Log waste rows
+        // 3. Log waste rows against the source material
         for (const o of outs) {
           if (o.output_type !== 'waste') continue;
-          try {
-            db.prepare(`
-              INSERT INTO wastage (id, material_id, quantity, unit, reason, reference_type, reference_id, created_at, created_by)
-              VALUES (?, ?, ?, ?, ?, 'butchering_batch', ?, datetime('now'), ?)
-            `).run(generateId(), fresh.source_material_id, o.weight, 'kg',
-                    `Butchering waste: ${o.waste_category}`, fresh.id, me.email);
-          } catch { /* wastage table schema may differ; soft */ }
+          const reason = o.waste_category === 'spoilage' ? 'spoilage' : 'other';
+          db.prepare(`
+            INSERT INTO wastages (id, date, material_id, quantity, reason, recorded_by, notes, outlet_id)
+            VALUES (?, date('now'), ?, ?, ?, ?, ?, ?)
+          `).run(generateId(), fresh.source_material_id, o.weight, reason, me.email,
+                  `Butchering ${fresh.batch_id}: ${o.waste_category}`, fresh.outlet_id || null);
         }
 
         // 4. Close the batch
