@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { canWorkTable } from '@/lib/captain-area';
+import { autoSaveCrmGuest } from '@/lib/ct/guest-autosave';
 
 /** GET — list orders for the active outlet. ?status=open (default) | settled | all. */
 export async function GET(request: Request) {
@@ -66,6 +67,9 @@ export async function POST(request: Request) {
                           server_id, server_name, guest_name, guest_mobile, created_at, updated_at)
       VALUES (?, ?, ?, ?, 'open', ?, 'normal', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     `).run(id, outletId, seq?.n || 1, tableId, orderType, Number(b.covers) || 0, me.id, me.name || me.email, guestName, guestMobile);
+
+    // Auto-capture the guest into the CRM (idempotent, best-effort).
+    if (guestMobile) autoSaveCrmGuest(db, { phone: guestMobile, name: guestName, source: 'dine-in', outletId });
 
     return Response.json({ id, order_number: seq?.n || 1, success: true }, { status: 201 });
   } catch (e: any) {

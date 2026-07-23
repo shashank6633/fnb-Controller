@@ -1,5 +1,6 @@
 import { getDb, generateId, genScanCode } from '@/lib/db';
 import { getCurrentUser, canApproveTableOp, verifyApprover } from '@/lib/auth';
+import { autoSaveCrmGuest } from '@/lib/ct/guest-autosave';
 import { emitKds } from '@/lib/kds-bus';
 import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
 import type Database from 'better-sqlite3';
@@ -232,6 +233,13 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             .run(b.guest_name === undefined ? (order.guest_name || '') : String(b.guest_name),
                  b.guest_mobile === undefined ? (order.guest_mobile || '') : String(b.guest_mobile),
                  b.covers === undefined ? order.covers : Math.max(0, Number(b.covers) || 0), id);
+          // Captain captured a phone at the table → auto-save to the CRM
+          // (idempotent, best-effort).
+          {
+            const gm = b.guest_mobile === undefined ? (order.guest_mobile || '') : String(b.guest_mobile);
+            const gn = b.guest_name === undefined ? (order.guest_name || '') : String(b.guest_name);
+            if (gm) autoSaveCrmGuest(db, { phone: gm, name: gn, source: 'dine-in', outletId: order.outlet_id });
+          }
           break;
         case 'complete_item': {
           // Mark a fired line as received at the table (stops its prep timer).

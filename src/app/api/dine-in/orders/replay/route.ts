@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { autoSaveCrmGuest } from '@/lib/ct/guest-autosave';
 
 /**
  * POST /api/dine-in/orders/replay
@@ -94,6 +95,10 @@ export async function POST(request: Request) {
           me.id, captainName, String(guest.name || '').trim(), String(guest.mobile || '').trim(),
           clientRef, createdAt || null, createdAt || null,
         );
+
+        // Auto-capture the guest into the CRM (idempotent, best-effort).
+        const replayMobile = String(guest.mobile || '').trim();
+        if (replayMobile) autoSaveCrmGuest(db, { phone: replayMobile, name: String(guest.name || '').trim(), source: 'dine-in', outletId });
 
         // Group items by station — one KOT per station, mirroring the 'fire'
         // action in src/app/api/dine-in/orders/[id]/route.ts.

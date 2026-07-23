@@ -3652,6 +3652,27 @@ function initializeSchema(db: Database.Database) {
     addCtCol('analyzed_at',      `TEXT`);
     addCtCol('analyzed_by',      `TEXT NOT NULL DEFAULT ''`);   // user email or 'auto'
     db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_calls_analysis_status ON ct_calls(analysis_status)`);
+
+    // One-time: materialize every existing dining + loyalty guest into ct_guests
+    // so the CRM has real, editable records (notes/tags/follow-ups) instead of
+    // read-only "synthetic" phone:<10> rows. Ongoing capture happens at the order
+    // + loyalty write paths via autoSaveCrmGuest; this backfills the history.
+    // Guarded by a settings key + deferred require (cycle-safe, same pattern as
+    // convertToMaterialUnit's require('./units')).
+    const ctBackfilled = db.prepare(`SELECT value FROM settings WHERE key = 'ct_guests_autosave_backfill_v1'`).get() as any;
+    if (!ctBackfilled) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { backfillCrmGuestsFromDiningAndLoyalty } = require('./ct/guest-autosave') as typeof import('./ct/guest-autosave');
+        const run = db.transaction(() => {
+          const created = backfillCrmGuestsFromDiningAndLoyalty(db);
+          db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('ct_guests_autosave_backfill_v1', '1')`).run();
+          return created;
+        });
+        const created = run();
+        console.log(`[db] ct_guests_autosave_backfill_v1: materialized ${created} dining/loyalty guest(s) into the CRM`);
+      } catch (e) { console.error('[db] ct_guests_autosave_backfill_v1 failed (rolled back):', e); }
+    }
   } catch (e) { console.error('ct (call-to-table CRM) schema failed:', e); }
 }
 

@@ -1,4 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
+import { autoSaveCrmGuest } from '@/lib/ct/guest-autosave';
 import { resolveTableByToken, priceLookup, getCustomerMenuDesign, otpAppliesToTable } from '@/lib/customer';
 import { normMobile, otpChannelReady, hasVerifiedMobile, recentSendFailed, otpSendExhausted } from '@/lib/customer-otp';
 import { fireStagingOrder } from '@/lib/kot-fire';
@@ -132,6 +133,11 @@ export async function POST(req: Request) {
       return sub;
     });
     const subtotal = create();
+
+    // Auto-capture the guest into the CRM once the order is committed (idempotent,
+    // best-effort — never blocks the order). Runs post-transaction so CRM capture
+    // can never roll back a placed order.
+    if (guestMobile) autoSaveCrmGuest(db, { phone: guestMobile, name: guestName, source: 'dine-in', outletId: table.outlet_id });
 
     // Direct ordering: the guest confirmed on their phone → fire the KOT now.
     // Captain mode (or OTP fallback): leave it pending for the captain to review.

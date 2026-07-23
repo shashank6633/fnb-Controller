@@ -2,6 +2,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { normalizeMobile, searchGuests, tierForPoints } from '@/lib/crm-guests';
+import { autoSaveCrmGuest } from '@/lib/ct/guest-autosave';
 
 /**
  * Guest Database + Loyalty (/crm/guests).
@@ -84,6 +85,8 @@ export async function POST(request: Request) {
       INSERT INTO crm_guests (id, name, mobile, birthday, notes)
       VALUES (?, ?, ?, ?, ?)
     `).run(id, name, mobile, birthday, notes);
+    // Mirror the new loyalty guest into the unified CRM (idempotent, best-effort).
+    autoSaveCrmGuest(db, { phone: mobile, name, source: 'loyalty' });
     const guest = db.prepare(`SELECT * FROM crm_guests WHERE id = ?`).get(id) as any;
     return Response.json({ guest: withTier(guest), created: true });
   } catch (e: any) {
