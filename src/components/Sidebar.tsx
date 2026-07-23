@@ -229,6 +229,7 @@ const navTree: NavEntry[] = [
     icon: Phone,
     items: [
       { kind: "link", label: "CRM Dashboard",   href: "/crm-calls",          icon: BarChart3 },
+      { kind: "link", label: "What's On (GRE)", href: "/crm-calls/whats-on", icon: CalendarClock },
       { kind: "link", label: "Live Calls",      href: "/crm-calls/live",     icon: PhoneIncoming },
       { kind: "link", label: "Recovery Queue",  href: "/crm-calls/recovery", icon: PhoneMissed },
       { kind: "link", label: "Guests",          href: "/crm-calls/guests",   icon: Users },

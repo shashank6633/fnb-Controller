@@ -42,6 +42,7 @@ import {
   Trash2,
   Users,
   X,
+  RefreshCw,
 } from 'lucide-react';
 
 // ─── API shapes (mirror src/lib/ct/whats-on.ts response) ─────────────────────
@@ -110,6 +111,7 @@ interface WhatsOn {
   reservations: ReservationRow[];
   specials: string;
   capacity: CapacityBlock | null;
+  party_sync?: { source: 'sheet-cache' | 'db-fallback' | 'none'; fetched_at: string };
   summary: Summary;
 }
 
@@ -124,6 +126,17 @@ interface RingingCall {
 // ─── Date helpers (string math — no timezone surprises) ──────────────────────
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** "just now" / "3 min ago" / "2 h ago" from an ISO timestamp (client-side). */
+function syncAgo(iso?: string): string {
+  if (!iso) return '';
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return '';
+  const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  return `${Math.round(mins / 60)} h ago`;
+}
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 function addDays(iso: string, n: number): string {
@@ -240,6 +253,9 @@ export default function WhatsOnPage() {
   // Live call context
   const [ringing, setRinging] = useState<RingingCall[]>([]);
 
+  // Party sheet refresh (any signed-in user may pull the AKAN feed).
+  const [refreshingParties, setRefreshingParties] = useState(false);
+
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
@@ -257,6 +273,15 @@ export default function WhatsOnPage() {
       if (!silent) setLoading(false);
     }
   }, [date]);
+
+  // Force a fresh pull of the AKAN party sheet, then reload the board. POST
+  // /api/upcoming-parties re-fetches the sheet + rewrites the cache the board reads.
+  const refreshParties = useCallback(async () => {
+    setRefreshingParties(true);
+    try { await api('/api/upcoming-parties', { method: 'POST' }); } catch { /* keep cache */ }
+    try { await load(true); } catch { /* ignore */ }
+    setRefreshingParties(false);
+  }, [load]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -658,6 +683,25 @@ export default function WhatsOnPage() {
             title="Parties & Events"
             subtitle={`${fmtNum(data?.parties.length)} booked${s && s.party_pax > 0 ? ` · ${fmtNum(s.party_pax)} pax` : ''}`}
           >
+            {/* Sync status + manual refresh (pulls the AKAN sheet). */}
+            <div className="flex items-center justify-between gap-2 mb-2 text-[11px] text-[#8B7355]">
+              <span>
+                {data?.party_sync?.source === 'db-fallback'
+                  ? 'From local records — sheet not synced yet'
+                  : data?.party_sync?.fetched_at
+                    ? `Sheet synced ${syncAgo(data.party_sync.fetched_at)}`
+                    : 'Sheet not synced yet'}
+              </span>
+              <button
+                onClick={refreshParties}
+                disabled={refreshingParties}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF1E3] disabled:opacity-50"
+                title="Pull the latest parties from the AKAN sheet"
+              >
+                <RefreshCw className={`w-3 h-3 ${refreshingParties ? 'animate-spin' : ''}`} />
+                {refreshingParties ? 'Syncing…' : 'Refresh'}
+              </button>
+            </div>
             {(data?.parties.length ?? 0) === 0 ? (
               <Empty text="No party bookings for this day." />
             ) : (
