@@ -150,13 +150,30 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       SELECT id, name FROM vendors WHERE is_active = 1 ORDER BY name COLLATE NOCASE
     `).all();
 
+    // Auto-learned vendors for THIS store: any active vendor we've already used
+    // here — matched either by vendor_id on a ledger row, or by a ledger
+    // supplier name equal to the vendor's name (bills entered as free text).
+    // Ordered by most-recent use. The vendor picker shows these first and only
+    // falls back to the full list via a "show all" toggle (or when empty).
+    const store_vendors = db.prepare(`
+      SELECT v.id, v.name, MAX(l.created_at) AS last_used
+      FROM vendors v
+      JOIN store_stock_ledger l
+        ON l.store_id = ?
+       AND ( l.vendor_id = v.id
+             OR (TRIM(l.supplier) != '' AND LOWER(TRIM(l.supplier)) = LOWER(TRIM(v.name))) )
+      WHERE v.is_active = 1
+      GROUP BY v.id, v.name
+      ORDER BY last_used DESC
+    `).all(storeId).map((r: any) => ({ id: r.id, name: r.name }));
+
     return Response.json({
       store, access, stock, materials,
       // Full catalog (held + all mapped/liquor at qty 0) for the bulk-adjust +
       // closing lists. Equals `stock` for category-owning stores.
       catalog,
       categories: storeCategories(db, storeId),
-      recent_suppliers, vendors,
+      recent_suppliers, vendors, store_vendors,
     });
   } catch (e: any) {
     console.error('[/api/stores/[id]/stock GET]', e);

@@ -231,6 +231,7 @@ export default function LiquorStorePage() {
   const [materials, setMaterials] = useState<MatRow[]>([]);
   const [suppliers, setSuppliers] = useState<string[]>([]);
   const [vendors, setVendors] = useState<VendorLite[]>([]);
+  const [storeVendors, setStoreVendors] = useState<VendorLite[]>([]);
   const [stockLoading, setStockLoading] = useState(false);
 
   const [ledger, setLedger] = useState<LedgerRow[]>([]);
@@ -323,6 +324,7 @@ export default function LiquorStorePage() {
       setMaterials(j.materials || []);
       setSuppliers(j.recent_suppliers || []);
       setVendors(j.vendors || []);
+      setStoreVendors(j.store_vendors || []);
       setStockLoadedFor(storeId);
     } catch (e: any) { setError(e.message); }
     finally { setStockLoading(false); }
@@ -960,7 +962,7 @@ export default function LiquorStorePage() {
       {showPurchase && store && (
         <PurchaseModal
           storeId={store.id} storeName={store.name}
-          materials={materials} suppliers={suppliers} vendors={vendors}
+          materials={materials} suppliers={suppliers} vendors={vendors} storeVendors={storeVendors}
           onClose={() => setShowPurchase(false)}
           onSaved={msg => { setShowPurchase(false); afterWrite(msg); }}
         />
@@ -984,7 +986,7 @@ export default function LiquorStorePage() {
       {showBill && store && (
         <BillModal
           storeId={store.id} storeName={store.name}
-          materials={materials} suppliers={suppliers} vendors={vendors}
+          materials={materials} suppliers={suppliers} vendors={vendors} storeVendors={storeVendors}
           onClose={() => setShowBill(false)}
           onSaved={msg => { setShowBill(false); afterWrite(msg); }}
         />
@@ -992,7 +994,7 @@ export default function LiquorStorePage() {
       {showUpload && store && (
         <UploadBillModal
           storeId={store.id} storeName={store.name}
-          suppliers={suppliers} vendors={vendors}
+          suppliers={suppliers} vendors={vendors} storeVendors={storeVendors}
           onClose={() => setShowUpload(false)}
           onSaved={msg => { setShowUpload(false); afterWrite(msg); }}
           onRefresh={() => { loadStock(); loadLedger(); }}
@@ -1041,9 +1043,9 @@ const inputCls = 'w-full px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-
 
 /* ── New Purchase modal ────────────────────────────────────────────────── */
 
-function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, onClose, onSaved }: {
+function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, storeVendors, onClose, onSaved }: {
   storeId: string; storeName: string;
-  materials: MatRow[]; suppliers: string[]; vendors: VendorLite[];
+  materials: MatRow[]; suppliers: string[]; vendors: VendorLite[]; storeVendors: VendorLite[];
   onClose: () => void; onSaved: (msg: string) => void;
 }) {
   const [materialId, setMaterialId] = useState('');
@@ -1148,13 +1150,7 @@ function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, onCl
             {suppliers.map(s => <option key={s} value={s} />)}
           </datalist>
         </div>
-        <div>
-          <L>Vendor (optional)</L>
-          <select value={vendorId} onChange={e => setVendorId(e.target.value)} className={inputCls}>
-            <option value="">—</option>
-            {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-          </select>
-        </div>
+        <VendorSelect used={storeVendors} all={vendors} value={vendorId} onChange={setVendorId} />
       </div>
 
       <div className="grid grid-cols-2 gap-3">
@@ -1343,9 +1339,41 @@ function ChargesSection({ c, onChange, invoiceValue }: {
   );
 }
 
-function BillModal({ storeId, storeName, materials, suppliers, vendors, onClose, onSaved }: {
+/** Vendor picker with auto-learn: shows vendors already used for THIS store
+ *  (`used`) first, with a "show all" toggle to the full master (`all`). When no
+ *  vendor has been used here yet, it shows the full list so the first bill isn't
+ *  blocked. A selected vendor not in `used` forces the full list so it stays
+ *  visible. Self-populates: saving a bill with a vendor adds it to `used`. */
+function VendorSelect({ used, all, value, onChange }: {
+  used: VendorLite[]; all: VendorLite[]; value: string; onChange: (id: string) => void;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const hasUsed = used.length > 0;
+  const selectedNotInUsed = !!value && !used.some(v => v.id === value);
+  const list = (showAll || !hasUsed || selectedNotInUsed) ? all : used;
+  return (
+    <div>
+      <div className="flex items-center justify-between">
+        <L>Vendor (optional)</L>
+        {hasUsed && (
+          <button type="button" onClick={() => setShowAll(s => !s)}
+                  className="text-[10px] text-[#af4408] hover:underline">
+            {(showAll || selectedNotInUsed) ? 'used here only' : 'show all'}
+          </button>
+        )}
+      </div>
+      <select value={value} onChange={e => onChange(e.target.value)} className={inputCls}>
+        <option value="">—</option>
+        {list.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+      </select>
+      {!hasUsed && <div className="text-[10px] text-[#8B7355] mt-0.5">All vendors — none used for this store yet</div>}
+    </div>
+  );
+}
+
+function BillModal({ storeId, storeName, materials, suppliers, vendors, storeVendors, onClose, onSaved }: {
   storeId: string; storeName: string;
-  materials: MatRow[]; suppliers: string[]; vendors: VendorLite[];
+  materials: MatRow[]; suppliers: string[]; vendors: VendorLite[]; storeVendors: VendorLite[];
   onClose: () => void; onSaved: (msg: string) => void;
 }) {
   const [supplier, setSupplier] = useState('');
@@ -1449,13 +1477,7 @@ function BillModal({ storeId, storeName, materials, suppliers, vendors, onClose,
           <L>Date</L>
           <input type="date" value={date} onChange={e => setDate(e.target.value)} className={inputCls} />
         </div>
-        <div>
-          <L>Vendor (optional)</L>
-          <select value={vendorId} onChange={e => setVendorId(e.target.value)} className={inputCls}>
-            <option value="">—</option>
-            {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-          </select>
-        </div>
+        <VendorSelect used={storeVendors} all={vendors} value={vendorId} onChange={setVendorId} />
       </div>
 
       {/* Lines */}
@@ -1584,9 +1606,9 @@ function parseBillCsv(text: string): UploadRow[] {
   return out;
 }
 
-function UploadBillModal({ storeId, storeName, suppliers, vendors, onClose, onSaved, onRefresh }: {
+function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors, onClose, onSaved, onRefresh }: {
   storeId: string; storeName: string;
-  suppliers: string[]; vendors: VendorLite[];
+  suppliers: string[]; vendors: VendorLite[]; storeVendors: VendorLite[];
   onClose: () => void; onSaved: (msg: string) => void; onRefresh: () => void;
 }) {
   const [supplier, setSupplier] = useState('');
@@ -1750,13 +1772,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, onClose, onSa
           <L>Date</L>
           <input type="date" value={date} onChange={e => setDate(e.target.value)} className={inputCls} />
         </div>
-        <div>
-          <L>Vendor (optional)</L>
-          <select value={vendorId} onChange={e => setVendorId(e.target.value)} className={inputCls}>
-            <option value="">—</option>
-            {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-          </select>
-        </div>
+        <VendorSelect used={storeVendors} all={vendors} value={vendorId} onChange={setVendorId} />
       </div>
 
       {/* File + template */}
