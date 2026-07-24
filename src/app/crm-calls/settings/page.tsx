@@ -42,6 +42,7 @@ const DEFAULTS: Record<string, string> = {
   whatson_panels: '{"entertainment":true,"parties":true,"reservations":true,"specials":true,"capacity":true,"call_context":true}',
   whatson_specials: '',
   whatson_capacity: '0',
+  whatson_entertainment_mode: 'dj_only',
 };
 
 const EDITABLE_KEYS = Object.keys(DEFAULTS);
@@ -690,6 +691,27 @@ export default function CtSettingsPage() {
             <p className="text-[10px] text-[#6B5744] mt-1">
               Total covers the outlet can seat in a day. The board&apos;s capacity gauge compares reserved
               covers + party pax against this. Set to <strong>0</strong> to hide the gauge.
+            </p>
+          </div>
+
+          {/* Party entertainment on the board */}
+          <div className="border-t border-[#E8D5C4]/60 pt-3 max-w-md">
+            <label className={labelCls}>Party entertainment in the Entertainment panel</label>
+            <select
+              value={['manual_only', 'dj_only', 'all_notes'].includes(form.whatson_entertainment_mode) ? form.whatson_entertainment_mode : 'dj_only'}
+              onChange={e => set('whatson_entertainment_mode', e.target.value)}
+              className={inputCls}
+            >
+              <option value="manual_only">Only events I add manually (parties never appear)</option>
+              <option value="dj_only">Only parties with a booked DJ / artist</option>
+              <option value="all_notes">Any party with an entertainment / decor / note</option>
+            </select>
+            <p className="text-[10px] text-[#6B5744] mt-1">
+              Controls whether party functions show up as cards in the <strong>Entertainment</strong> panel.
+              &ldquo;Only events I add manually&rdquo; keeps it to the Add-event calendar;
+              &ldquo;booked DJ/artist&rdquo; also shows parties that have a DJ filled in;
+              &ldquo;any note&rdquo; shows every party carrying entertainment/decor text.
+              Parties always remain in the <strong>Parties &amp; Events</strong> panel regardless.
             </p>
           </div>
         </div>

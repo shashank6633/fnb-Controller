@@ -26,6 +26,11 @@ export const CT_SETTING_DEFAULTS: Record<string, string> = {
   whatson_specials: '',
   // Daily seat capacity for the "how full is this date" gauge (0 = not set → gauge hidden).
   whatson_capacity: '0',
+  // How the Entertainment panel pulls acts from party functions (F&P Records):
+  //   manual_only — only the manager's Add-event calendar; parties never appear
+  //   dj_only     — also show a party ONLY when it has a booked DJ/artist (default)
+  //   all_notes   — also show any party that has entertainment/decor/notes text
+  whatson_entertainment_mode: 'dj_only',
 };
 
 export function ctSetting(db: Database.Database, key: string): string {

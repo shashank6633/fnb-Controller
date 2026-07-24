@@ -211,6 +211,13 @@ function validate(key: string, value: any): { ok: true; value: string } | { ok: 
       }
       return { ok: true, value: String(n) };
     }
+    case 'whatson_entertainment_mode': {
+      const v = String(value ?? '').trim();
+      if (v !== 'manual_only' && v !== 'dj_only' && v !== 'all_notes') {
+        return { ok: false, error: 'whatson_entertainment_mode must be manual_only, dj_only, or all_notes' };
+      }
+      return { ok: true, value: v };
+    }
     default:
       return { ok: false, error: `Unknown setting '${key}'` };
   }

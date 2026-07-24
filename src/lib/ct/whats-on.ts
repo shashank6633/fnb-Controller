@@ -179,16 +179,20 @@ export function buildWhatsOn(
   date: string,
   outletId: string | null,
 ): WhatsOnResult {
-  // ── Settings (panels / specials / capacity) ──────────────────────────────
+  // ── Settings (panels / specials / capacity / entertainment mode) ─────────
   let panels: WhatsOnPanels = { ...DEFAULT_PANELS };
   let specials = '';
   let capacitySeats = 0;
+  let entMode: 'manual_only' | 'dj_only' | 'all_notes' = 'dj_only';
   try {
     const s = ctSettings(db);
     panels = parsePanels(s.whatson_panels);
     specials = typeof s.whatson_specials === 'string' ? s.whatson_specials : '';
     const cap = parseInt(s.whatson_capacity || '0', 10);
     capacitySeats = Number.isFinite(cap) && cap > 0 ? cap : 0;
+    if (s.whatson_entertainment_mode === 'manual_only' || s.whatson_entertainment_mode === 'all_notes') {
+      entMode = s.whatson_entertainment_mode;
+    }
   } catch {
     /* keep defaults */
   }
@@ -224,14 +228,17 @@ export function buildWhatsOn(
     /* leave calendar rows out on failure */
   }
 
-  // ── Party FUNCTIONS from F&P Records (prepared) → used ONLY to fold their
-  //    entertainment (DJ / decor / notes) into the Entertainment panel. The
-  //    parties LIST itself comes from the fuller "Party Bookings" tab below. ──
+  // ── Party FUNCTIONS from F&P Records (prepared) → optionally fold their
+  //    entertainment into the Entertainment panel, per whatson_entertainment_mode:
+  //    manual_only = never; dj_only = only a booked DJ/artist; all_notes = any
+  //    entertainment/decor/note. The parties LIST comes from "Party Bookings". ──
   let fpParties: UpcomingParty[] = [];
-  try {
-    fpParties = readPartyCache(db, date).parties.filter((p) => !isCancelled(p.status));
-  } catch {
-    fpParties = [];
+  if (entMode !== 'manual_only') {
+    try {
+      fpParties = readPartyCache(db, date).parties.filter((p) => !isCancelled(p.status));
+    } catch {
+      fpParties = [];
+    }
   }
   try {
     for (const p of fpParties) {
@@ -239,7 +246,10 @@ export function buildWhatsOn(
       const notes = (p.entertainment_notes || '').trim();
       const decor = (p.decor || '').trim();
       const mc = (p.mc || '').trim();
-      if (!dj && !notes && !decor && !mc) continue;
+      // dj_only: a party only counts as entertainment when a DJ/artist is booked.
+      // all_notes: any of dj / notes / decor / mc qualifies.
+      const qualifies = entMode === 'dj_only' ? !!dj : (!!dj || !!notes || !!decor || !!mc);
+      if (!qualifies) continue;
       const who = (p.guest_name || p.company || p.fp_id || 'Party').trim();
       const act = dj ? dj : 'Live entertainment';
       entertainment.push({
@@ -349,8 +359,13 @@ export function buildWhatsOn(
     confirmed: 0, enquiry: 0, tentative: 0, completed: 0, cancelled: 0, other: 0,
   };
   for (const p of parties) partyStatus[classifyStatus(p.status)]++;
-  parties.sort((a, b) =>
-    (a.time || '').localeCompare(b.time || '') || (a.guest_name || '').localeCompare(b.guest_name || ''));
+  // Confirmed parties float to the TOP, then by time, then host.
+  parties.sort((a, b) => {
+    const ca = classifyStatus(a.status) === 'confirmed' ? 0 : 1;
+    const cb = classifyStatus(b.status) === 'confirmed' ? 0 : 1;
+    if (ca !== cb) return ca - cb;
+    return (a.time || '').localeCompare(b.time || '') || (a.guest_name || '').localeCompare(b.guest_name || '');
+  });
 
   // ── Reservations (ct_bookings LEFT JOIN ct_guests) ───────────────────────
   const reservations: WhatsOnReservation[] = [];
