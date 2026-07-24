@@ -41,7 +41,7 @@ export default function ResetPage() {
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   // Quick one-click inventory repairs (moved here from the Raw Materials page).
-  const [quickBusy, setQuickBusy] = useState<'' | 'neg' | 'fresh'>('');
+  const [quickBusy, setQuickBusy] = useState<'' | 'neg' | 'fresh' | 'liquor'>('');
   const [quickMsg, setQuickMsg] = useState<{ text: string; type: 'ok' | 'err' } | null>(null);
 
   useEffect(() => {
@@ -156,6 +156,24 @@ export default function ResetPage() {
     } catch { setQuickMsg({ text: 'Network error — please try again.', type: 'err' }); }
     finally { setQuickBusy(''); }
   };
+  const resetLiquor = async () => {
+    if (typeof window === 'undefined') return;
+    const ans = window.prompt(
+      '⚠ RESET LIQUOR / CONSOLIDATED STOCK\n\nThis clears ALL liquor stock across the Liquor Store and every ' +
+      'floor bar (store ledger + closing counts + transfers) — every location goes to 0.\n\nThe bars themselves, ' +
+      'central grocery stock, materials, recipes and sales are NOT touched.\n\nType  RESET  to confirm:'
+    );
+    if ((ans || '').trim().toUpperCase() !== 'RESET') return;
+    setQuickBusy('liquor'); setQuickMsg(null);
+    try {
+      const r = await api('/api/inventory/reset-liquor', { method: 'POST', body: { confirm: 'RESET' } });
+      const j = await r.json().catch(() => ({}));
+      setQuickMsg(r.ok
+        ? { text: j.summary || 'Liquor stock reset.', type: 'ok' }
+        : { text: j.error || 'Liquor reset failed.', type: 'err' });
+    } catch { setQuickMsg({ text: 'Network error — please try again.', type: 'err' }); }
+    finally { setQuickBusy(''); }
+  };
 
   return (
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
@@ -177,7 +195,7 @@ export default function ResetPage() {
             <p className="text-[11px] text-[#6B5744] mt-0.5">One-click repairs — no scope or date range needed.</p>
           </div>
           <div className="p-4 space-y-3">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
               <div className="border border-[#E8D5C4] rounded-lg p-3 flex flex-col">
                 <div className="text-sm font-semibold flex items-center gap-1.5"><AlertTriangle className="w-4 h-4 text-red-500" /> Fix Negative Stock</div>
                 <p className="text-[11px] text-[#6B5744] mt-1 flex-1">Set any item with <b>negative</b> stock to 0 (negative on-hand is impossible). Leaves everything else alone.</p>
@@ -192,6 +210,14 @@ export default function ResetPage() {
                 <button onClick={startFresh} disabled={quickBusy !== ''}
                   className="mt-2 self-start px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium disabled:opacity-50 inline-flex items-center gap-1.5">
                   {quickBusy === 'fresh' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />} Start Fresh (type RESET)
+                </button>
+              </div>
+              <div className="border border-red-200 bg-red-50/40 rounded-lg p-3 flex flex-col">
+                <div className="text-sm font-semibold flex items-center gap-1.5"><AlertTriangle className="w-4 h-4 text-red-600" /> Reset Liquor Stock</div>
+                <p className="text-[11px] text-[#6B5744] mt-1 flex-1">Clear <b>all liquor stock</b> across the Liquor Store + every floor bar (ledger, counts, transfers) to 0. The bars, grocery, materials &amp; sales are <b>not</b> touched.</p>
+                <button onClick={resetLiquor} disabled={quickBusy !== ''}
+                  className="mt-2 self-start px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium disabled:opacity-50 inline-flex items-center gap-1.5">
+                  {quickBusy === 'liquor' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />} Reset Liquor Stock (type RESET)
                 </button>
               </div>
             </div>
