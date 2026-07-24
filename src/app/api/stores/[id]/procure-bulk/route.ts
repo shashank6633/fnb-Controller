@@ -40,7 +40,7 @@ interface SkippedRow {
   row: number;
   item_name: string; sku: string;
   cases: any; bottles: any; loose: any; unit_price: any; amount: any;
-  batch_no: string; expiry_date: string;
+  batch_no: string; expiry_date: string; date: string;
   kind: SkipKind; reason: string;
 }
 
@@ -72,8 +72,14 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     }
     if (!supplier) return Response.json({ error: 'supplier is required' }, { status: 400 });
 
+    // Bill-level default date (from the modal). A CSV row may override it with
+    // its own `date` column; otherwise every row falls back to this.
     const date = String(b.date || '').trim();
     const backdate = /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
+    const rowDate = (v: any) => {
+      const d = String(v || '').trim();
+      return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : backdate;
+    };
 
     if (!Array.isArray(b.rows) || b.rows.length === 0) {
       return Response.json({ error: 'rows array is required (at least one CSV line)' }, { status: 400 });
@@ -132,6 +138,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const prepared: {
       material_id: string; name: string; unit: string; recipe_qty: number;
       unit_cost: number; line_total: number; batch_no: string; expiry_date: string;
+      date: string | null;
     }[] = [];
 
     const skip = (row: any, i: number, kind: SkipKind, reason: string) => {
@@ -142,6 +149,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         cases: row.cases ?? '', bottles: row.bottles ?? '', loose: row.loose ?? '',
         unit_price: row.unit_price ?? '', amount: row.amount ?? '',
         batch_no: String(row.batch_no || '').trim(), expiry_date: String(row.expiry_date || '').trim(),
+        date: String(row.date || '').trim(),
         kind, reason,
       });
     };
@@ -204,6 +212,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         recipe_qty: recipeQty, unit_cost: unitCost, line_total: lineTotal,
         batch_no: String(row.batch_no || '').trim(),
         expiry_date: String(row.expiry_date || '').trim(),
+        date: rowDate(row.date),
       });
     }
 
@@ -223,7 +232,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
             supplier, vendor_id: vendorId, expiry_date: p.expiry_date,
             ref: invoiceRef, notes: '', created_by: user.email,
           });
-          if (backdate) backdateStmt.run(backdate, id);
+          if (p.date) backdateStmt.run(p.date, id);
           ledgerIds.push(id);
         }
         // Record/refresh bill charges when this upload carries charge amounts OR

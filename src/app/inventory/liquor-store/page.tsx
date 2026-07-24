@@ -109,6 +109,24 @@ const numOr0 = (s?: string) => {
   const n = Number(s);
   return s != null && s !== '' && Number.isFinite(n) ? n : 0;
 };
+/** Normalise a CSV date cell to YYYY-MM-DD. Accepts YYYY-MM-DD as-is, or a
+ *  day-first DD-MM-YYYY / DD/MM/YYYY / DD.MM.YYYY (2- or 4-digit year, the
+ *  Indian convention). Anything else → '' so the server falls back to the
+ *  bill's default date from the modal. */
+const normDate = (raw: string): string => {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  let m = s.match(/^(\d{4})[/.](\d{1,2})[/.](\d{1,2})$/);      // year-first
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  m = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/);       // day-first
+  if (m) {
+    const d = m[1].padStart(2, '0'), mo = m[2].padStart(2, '0');
+    let y = m[3]; if (y.length === 2) y = '20' + y;
+    if (Number(d) >= 1 && Number(d) <= 31 && Number(mo) >= 1 && Number(mo) <= 12) return `${y}-${mo}-${d}`;
+  }
+  return '';
+};
 
 /* One quantity: '2 cs + 9 btl + 450 ml' (bold) with '· 25,200 ml' alongside.
    Plain-unit materials (pack_size ≤ 1) render exactly as before. */
@@ -1555,12 +1573,12 @@ interface UploadRow {
   item_name: string; sku: string;
   cases: string; bottles: string; loose: string;
   unit_price: string; amount: string; per_case: boolean;
-  batch_no: string; expiry_date: string;
+  batch_no: string; expiry_date: string; date: string;
 }
 interface UploadSkipped {
   row: number; item_name: string; sku: string;
   cases: any; bottles: any; loose: any; unit_price: any; amount: any;
-  batch_no: string; expiry_date: string; kind: string; reason: string;
+  batch_no: string; expiry_date: string; date: string; kind: string; reason: string;
 }
 
 /** Parse a CSV (header row required) into normalized UploadRows via papaparse.
@@ -1595,12 +1613,13 @@ function parseBillCsv(text: string): UploadRow[] {
     const pc = get(row, 'per_case', 'per case', 'rate_per_case').toLowerCase();
     const batch_no = get(row, 'batch_no', 'batch', 'batch no', 'lot');
     const expiry_date = get(row, 'expiry_date', 'expiry', 'exp', 'best_before');
+    const date = normDate(get(row, 'date', 'purchase_date', 'purchase date', 'invoice_date', 'invoice date', 'bill_date', 'bill date'));
     // Skip a fully-blank line (all key fields empty).
     if (!item_name && !sku && !cases && !bottles && !loose && !unit_price && !amount) continue;
     out.push({
       item_name, sku, cases, bottles, loose, unit_price, amount,
       per_case: pc === '1' || pc === 'true' || pc === 'yes' || pc === 'y',
-      batch_no, expiry_date,
+      batch_no, expiry_date, date,
     });
   }
   return out;
@@ -1647,12 +1666,13 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
   };
 
   const downloadTemplate = () => {
+    const d = today();
     const sample =
-      'item_name,sku,cases,bottles,unit_price,amount,per_case,batch_no,expiry_date\n' +
-      'HEINEKEN LAGER BEER,6561,5,0,,15010,,,\n' +
-      'KINGFISHER ULTRA LAGER BEER,5029,12,0,,28824,,,\n' +
-      'GREY GOOSE VODKA,9004,1,0,,20101,,,\n' +
-      'ABSOLUT VODKA,8006,1,0,3900,,1,,\n';
+      'item_name,sku,cases,bottles,unit_price,amount,per_case,date,batch_no,expiry_date\n' +
+      `HEINEKEN LAGER BEER,6561,5,0,,15010,,${d},,\n` +
+      `KINGFISHER ULTRA LAGER BEER,5029,12,0,,28824,,${d},,\n` +
+      `GREY GOOSE VODKA,9004,1,0,,20101,,${d},,\n` +
+      `ABSOLUT VODKA,8006,1,0,3900,,1,${d},,\n`;
     const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1671,10 +1691,10 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
       if (/^[=+\-@]/.test(s)) s = "'" + s;               // formula-injection guard
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const header = ['item_name', 'sku', 'cases', 'bottles', 'loose', 'unit_price', 'amount', 'batch_no', 'expiry_date', 'reason'];
+    const header = ['item_name', 'sku', 'cases', 'bottles', 'loose', 'unit_price', 'amount', 'date', 'batch_no', 'expiry_date', 'reason'];
     const lines = [header.join(',')];
     for (const s of balance) {
-      lines.push([s.item_name, s.sku, s.cases, s.bottles, s.loose, s.unit_price, s.amount, s.batch_no, s.expiry_date, s.reason].map(clean).join(','));
+      lines.push([s.item_name, s.sku, s.cases, s.bottles, s.loose, s.unit_price, s.amount, s.date, s.batch_no, s.expiry_date, s.reason].map(clean).join(','));
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -1700,7 +1720,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
             item_name: r.item_name, sku: r.sku || undefined,
             cases: r.cases || undefined, bottles: r.bottles || undefined, loose: r.loose || undefined,
             unit_price: r.unit_price || undefined, amount: r.amount || undefined,
-            per_case: r.per_case || undefined,
+            per_case: r.per_case || undefined, date: r.date || undefined,
             batch_no: r.batch_no || undefined, expiry_date: r.expiry_date || undefined,
           })),
         },
@@ -1769,8 +1789,9 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
           <input value={invoiceRef} onChange={e => setInvoiceRef(e.target.value)} placeholder="INV-…" className={inputCls} />
         </div>
         <div>
-          <L>Date</L>
+          <L>Date (default)</L>
           <input type="date" value={date} onChange={e => setDate(e.target.value)} className={inputCls} />
+          <div className="text-[10px] text-[#8B7355] mt-0.5">Used for rows without a date column</div>
         </div>
         <VendorSelect used={storeVendors} all={vendors} value={vendorId} onChange={setVendorId} />
       </div>
@@ -1799,7 +1820,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
         <div className="text-[11px] text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5 leading-relaxed">
           <b>CSV columns</b> (header row required; extra columns ignored): <code>item_name</code> or <code>sku</code>/<code>brand_code</code> (matched to a Raw Material),
           {' '}<code>cases</code>, <code>bottles</code>, optional <code>loose</code>, and a price — either <code>amount</code> (line total ₹, as printed on the indent)
-          {' '}<i>or</i> <code>unit_price</code> (₹ per bottle; add <code>per_case=1</code> for a per-case rate). Optional <code>batch_no</code>, <code>expiry_date</code>.
+          {' '}<i>or</i> <code>unit_price</code> (₹ per bottle; add <code>per_case=1</code> for a per-case rate). Optional <code>date</code> (YYYY-MM-DD or DD-MM-YYYY; blank rows use the Date field above), <code>batch_no</code>, <code>expiry_date</code>.
           The 4 bill charges are entered below, not in the CSV.
         </div>
       )}
@@ -1813,7 +1834,8 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
               <thead className="bg-[#FBF6EF] text-[#8B7355] sticky top-0">
                 <tr><th className="text-left px-2 py-1">Item</th><th className="text-left px-2 py-1">SKU</th>
                   <th className="text-right px-2 py-1">Cases</th><th className="text-right px-2 py-1">Bottles</th>
-                  <th className="text-right px-2 py-1">Unit ₹</th><th className="text-right px-2 py-1">Amount ₹</th></tr>
+                  <th className="text-right px-2 py-1">Unit ₹</th><th className="text-right px-2 py-1">Amount ₹</th>
+                  <th className="text-left px-2 py-1">Date</th></tr>
               </thead>
               <tbody className="divide-y divide-[#F0E4D6]">
                 {rows.slice(0, 100).map((r, i) => (
@@ -1824,6 +1846,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
                     <td className="px-2 py-1 text-right">{r.bottles || '—'}</td>
                     <td className="px-2 py-1 text-right">{r.unit_price || '—'}{r.per_case ? '/cs' : ''}</td>
                     <td className="px-2 py-1 text-right">{r.amount || '—'}</td>
+                    <td className="px-2 py-1 text-[#6B5744] whitespace-nowrap">{r.date || <span className="text-[#8B7355]">(Date above)</span>}</td>
                   </tr>
                 ))}
               </tbody>
