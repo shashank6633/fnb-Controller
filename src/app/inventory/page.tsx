@@ -208,8 +208,6 @@ export default function InventoryPage() {
   // CSV Import
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
-  const [fixingNeg, setFixingNeg] = useState(false);
-  const [resetting, setResetting] = useState(false);
   // Round-trip CSV (export edits + re-upload)
   const [roundtripImporting, setRoundtripImporting] = useState(false);
   // Bulk rate-correction tool
@@ -271,60 +269,6 @@ export default function InventoryPage() {
   useEffect(() => {
     fetchMaterials();
   }, [fetchMaterials]);
-
-  // Any item with negative stock? (surfaces the admin "Fix Negative Stock" button)
-  const hasNegativeStock = materials.some((m) => m.current_stock < 0);
-  async function fixNegativeStock() {
-    if (typeof window !== 'undefined' && !window.confirm(
-      'Reset every item with NEGATIVE stock to 0?\n\n' +
-      'Negative stock is impossible — this clears it so Total Stock Value is correct again. ' +
-      'Afterwards, do a physical count (Opening / Closing Stock) to enter the real on-hand.'
-    )) return;
-    setFixingNeg(true);
-    try {
-      const res = await api('/api/inventory/fix-negative-stock', { method: 'POST' });
-      const j = await res.json().catch(() => ({}));
-      if (res.ok) {
-        setImportResult({ message: j.summary || `Fixed ${j.items_fixed} item(s) with negative stock.`, type: 'success' });
-        await fetchMaterials();
-      } else {
-        setImportResult({ message: j.error || 'Could not fix negative stock.', type: 'error' });
-      }
-    } catch {
-      setImportResult({ message: 'Network error — please try again.', type: 'error' });
-    } finally {
-      setFixingNeg(false);
-    }
-  }
-
-  // Full clean slate: delete all purchases + opening stock and zero all stock, so
-  // 3 months of purchases can be re-entered fresh. Type-to-confirm (destructive).
-  async function startFresh() {
-    if (typeof window === 'undefined') return;
-    const ans = window.prompt(
-      '⚠ START FRESH\n\n' +
-      'This DELETES all purchases + opening stock and sets ALL stock to 0, so you can ' +
-      're-enter your 3 months of purchases cleanly.\n\n' +
-      'Your materials, recipes, sales and party data are NOT touched.\n\n' +
-      'Type  RESET  to confirm:'
-    );
-    if ((ans || '').trim().toUpperCase() !== 'RESET') return;
-    setResetting(true);
-    try {
-      const res = await api('/api/inventory/reset-fresh', { method: 'POST', body: { confirm: 'RESET' } });
-      const j = await res.json().catch(() => ({}));
-      if (res.ok) {
-        setImportResult({ message: j.summary || 'Fresh start done.', type: 'success' });
-        await fetchMaterials();
-      } else {
-        setImportResult({ message: j.error || 'Reset failed.', type: 'error' });
-      }
-    } catch {
-      setImportResult({ message: 'Network error — please try again.', type: 'error' });
-    } finally {
-      setResetting(false);
-    }
-  }
 
   /* ---- Filtering + Sorting ---- */
 
@@ -715,28 +659,6 @@ export default function InventoryPage() {
               >
                 <Star className="w-4 h-4" />
                 Set Priority
-              </button>
-            )}
-            {me?.role === 'admin' && hasNegativeStock && (
-              <button
-                onClick={fixNegativeStock}
-                disabled={fixingNeg}
-                className="flex items-center gap-2 px-4 py-2.5 border border-red-500 text-red-600 hover:bg-red-50 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                title="Some items have NEGATIVE stock (impossible physical value — usually after a purchases reset). This resets them to 0 so Total Stock Value is correct. Do a physical count afterwards to enter real on-hand."
-              >
-                {fixingNeg ? <Loader2 className="w-4 h-4 animate-spin" /> : <AlertTriangle className="w-4 h-4" />}
-                {fixingNeg ? 'Fixing…' : 'Fix Negative Stock'}
-              </button>
-            )}
-            {me?.role === 'admin' && (
-              <button
-                onClick={startFresh}
-                disabled={resetting}
-                className="flex items-center gap-2 px-4 py-2.5 border border-red-600 bg-red-50 text-red-700 hover:bg-red-100 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
-                title="Delete ALL purchases + opening stock and set ALL stock to 0, to re-enter 3 months of purchases fresh. Materials / recipes / sales are NOT touched. Requires typing RESET."
-              >
-                {resetting ? <Loader2 className="w-4 h-4 animate-spin" /> : <AlertTriangle className="w-4 h-4" />}
-                {resetting ? 'Resetting…' : 'Start Fresh'}
               </button>
             )}
             <button

@@ -40,6 +40,9 @@ export default function ResetPage() {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
+  // Quick one-click inventory repairs (moved here from the Raw Materials page).
+  const [quickBusy, setQuickBusy] = useState<'' | 'neg' | 'fresh'>('');
+  const [quickMsg, setQuickMsg] = useState<{ text: string; type: 'ok' | 'err' } | null>(null);
 
   useEffect(() => {
     Promise.all([
@@ -120,6 +123,40 @@ export default function ResetPage() {
     } finally { setBusy(false); }
   };
 
+  // ── Quick inventory fixes ──
+  const fixNegative = async () => {
+    if (typeof window !== 'undefined' && !window.confirm(
+      'Reset every item with NEGATIVE stock to 0?\n\nNegative on-hand is impossible — this clears it. Do a physical count afterwards for the real stock.'
+    )) return;
+    setQuickBusy('neg'); setQuickMsg(null);
+    try {
+      const r = await api('/api/inventory/fix-negative-stock', { method: 'POST' });
+      const j = await r.json().catch(() => ({}));
+      setQuickMsg(r.ok
+        ? { text: j.summary || `Fixed ${j.items_fixed} item(s).`, type: 'ok' }
+        : { text: j.error || 'Could not fix negative stock.', type: 'err' });
+    } catch { setQuickMsg({ text: 'Network error — please try again.', type: 'err' }); }
+    finally { setQuickBusy(''); }
+  };
+  const startFresh = async () => {
+    if (typeof window === 'undefined') return;
+    const ans = window.prompt(
+      '⚠ START FRESH\n\nThis DELETES all purchases + opening stock and sets ALL stock to 0, so you can ' +
+      're-enter your 3 months of purchases cleanly.\n\nMaterials, recipes, sales and party data are NOT touched.\n\n' +
+      'Type  RESET  to confirm:'
+    );
+    if ((ans || '').trim().toUpperCase() !== 'RESET') return;
+    setQuickBusy('fresh'); setQuickMsg(null);
+    try {
+      const r = await api('/api/inventory/reset-fresh', { method: 'POST', body: { confirm: 'RESET' } });
+      const j = await r.json().catch(() => ({}));
+      setQuickMsg(r.ok
+        ? { text: j.summary || 'Fresh start done.', type: 'ok' }
+        : { text: j.error || 'Reset failed.', type: 'err' });
+    } catch { setQuickMsg({ text: 'Network error — please try again.', type: 'err' }); }
+    finally { setQuickBusy(''); }
+  };
+
   return (
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
       <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 space-y-5">
@@ -131,6 +168,39 @@ export default function ResetPage() {
             Bulk-delete sales, purchases, POs or closing-stock counts for the current outlet so you can re-import a clean dataset.
             Recipes and inventory items can also be cleared with their own options below. Vendors, users and outlets always stay intact.
           </p>
+        </div>
+
+        {/* Quick inventory fixes — one-click repairs (no scope / date needed) */}
+        <div className="bg-white border border-[#E8D5C4] rounded-xl shadow overflow-hidden">
+          <div className="px-4 py-3 border-b border-[#E8D5C4] bg-[#FFF1E3]/50">
+            <h3 className="text-sm font-semibold text-[#2D1B0E]">Quick inventory fixes</h3>
+            <p className="text-[11px] text-[#6B5744] mt-0.5">One-click repairs — no scope or date range needed.</p>
+          </div>
+          <div className="p-4 space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="border border-[#E8D5C4] rounded-lg p-3 flex flex-col">
+                <div className="text-sm font-semibold flex items-center gap-1.5"><AlertTriangle className="w-4 h-4 text-red-500" /> Fix Negative Stock</div>
+                <p className="text-[11px] text-[#6B5744] mt-1 flex-1">Set any item with <b>negative</b> stock to 0 (negative on-hand is impossible). Leaves everything else alone.</p>
+                <button onClick={fixNegative} disabled={quickBusy !== ''}
+                  className="mt-2 self-start px-3 py-1.5 rounded-lg border border-red-500 text-red-600 hover:bg-red-50 text-sm font-medium disabled:opacity-50 inline-flex items-center gap-1.5">
+                  {quickBusy === 'neg' && <Loader2 className="w-4 h-4 animate-spin" />} Fix Negative Stock
+                </button>
+              </div>
+              <div className="border border-red-200 bg-red-50/40 rounded-lg p-3 flex flex-col">
+                <div className="text-sm font-semibold flex items-center gap-1.5"><AlertTriangle className="w-4 h-4 text-red-600" /> Start Fresh</div>
+                <p className="text-[11px] text-[#6B5744] mt-1 flex-1">Delete <b>all purchases + opening stock</b> and set <b>all stock to 0</b>, to re-enter 3 months of purchases cleanly. Materials / recipes / sales are <b>not</b> touched.</p>
+                <button onClick={startFresh} disabled={quickBusy !== ''}
+                  className="mt-2 self-start px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium disabled:opacity-50 inline-flex items-center gap-1.5">
+                  {quickBusy === 'fresh' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />} Start Fresh (type RESET)
+                </button>
+              </div>
+            </div>
+            {quickMsg && (
+              <div className={`text-xs rounded-lg p-2.5 ${quickMsg.type === 'ok' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-700 border border-red-200'}`}>
+                {quickMsg.text}
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Outlet banner */}
