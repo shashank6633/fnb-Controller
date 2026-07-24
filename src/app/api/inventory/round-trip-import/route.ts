@@ -49,6 +49,10 @@ const FIELD_TYPES: Record<string, 'string' | 'number' | 'bool'> = {
 };
 const WRITABLE_FIELDS = Object.keys(FIELD_TYPES);
 
+/** Thrown to roll back the whole import when "remove missing" is on but the file
+ *  matched no existing material (wrong-file guard — see the deactivation block). */
+class ZeroMatchAbort extends Error {}
+
 function coerce(field: string, raw: any): any {
   if (raw == null || raw === '') return undefined;
   const t = FIELD_TYPES[field];
@@ -124,22 +128,27 @@ export async function POST(request: Request) {
         }
 
         const id = String(r.id || '').trim();
-        // Per-row SKU uniqueness vs DB (excluding the same id we're updating)
         const newSku = String(r.sku || '').trim();
-        if (newSku) {
-          const dup = db.prepare(`SELECT id FROM raw_materials WHERE LOWER(sku) = LOWER(?) ${id ? 'AND id != ?' : ''}`)
-            .get(...(id ? [newSku, id] : [newSku])) as any;
-          if (dup) {
-            skipped.push({ row: idx + 1, name, reason: `SKU "${newSku}" already used by another material (id=${dup.id})` });
-            continue;
-          }
-        }
-        if (id) {
-          seenIds.add(id);
-          const existing = db.prepare(`SELECT id, sku, name FROM raw_materials WHERE id = ?`).get(id) as any;
-          if (!existing) {
-            skipped.push({ row: idx + 1, name, reason: `id "${id}" not found — keep blank to create new` });
-            continue;
+
+        // Resolve the target material: match by id FIRST, then fall back to SKU.
+        // This lets a spreadsheet keyed by SKU (blank/stale id column) still
+        // update the correct existing row instead of skipping it. No id and no
+        // SKU match → create a new material (names are NOT used to match, since
+        // they aren't unique). Owner-confirmed 2026-07-24.
+        let existing: any = null;
+        if (id) existing = db.prepare(`SELECT id, sku, name FROM raw_materials WHERE id = ?`).get(id) as any;
+        if (!existing && newSku) existing = db.prepare(`SELECT id, sku, name FROM raw_materials WHERE LOWER(sku) = LOWER(?)`).get(newSku) as any;
+
+        if (existing) {
+          seenIds.add(existing.id);
+          // SKU-rename conflict guard: changing this row's SKU to one already
+          // held by a DIFFERENT material is rejected (SKUs must stay unique).
+          if (newSku && newSku.toLowerCase() !== String(existing.sku || '').toLowerCase()) {
+            const dup = db.prepare(`SELECT id FROM raw_materials WHERE LOWER(sku) = LOWER(?) AND id != ?`).get(newSku, existing.id) as any;
+            if (dup) {
+              skipped.push({ row: idx + 1, name, reason: `SKU "${newSku}" already used by another material (id=${dup.id})` });
+              continue;
+            }
           }
           // Unit Audit owns the unit-of-measure fields: if this material is
           // locked, a round-tripped CSV can NEVER overwrite its units (that was
@@ -159,8 +168,8 @@ export async function POST(request: Request) {
           // Always re-activate if user is round-tripping (they kept the row)
           sets.push(`is_active = 1`);
           sets.push(`updated_at = datetime('now')`);
-          db.prepare(`UPDATE raw_materials SET ${sets.join(', ')} WHERE id = ?`).run(...params, id);
-          updated.push({ id, name });
+          db.prepare(`UPDATE raw_materials SET ${sets.join(', ')} WHERE id = ?`).run(...params, existing.id);
+          updated.push({ id: existing.id, name });
         } else {
           // Insert path
           const newId = generateId();
@@ -213,7 +222,20 @@ export async function POST(request: Request) {
         }
       }
 
-      // Soft-delete materials not in the payload
+      // "Remove old inventory details": treat the file as the AUTHORITATIVE
+      // catalog and deactivate anything not in it. SAFETY: only do this when the
+      // file actually MATCHED existing materials (updated > 0). A file that
+      // matched ZERO existing rows is almost certainly the wrong file (bad
+      // headers / stale ids / mismatched SKUs) — and because the SKU-fallback
+      // path would "else create", such a file would otherwise inject new rows
+      // AND wipe the real catalog. So we ABORT the whole import: throw → the
+      // surrounding transaction rolls back every insert/update too, changing
+      // nothing. This is the guard for the "Deactivated 1067 not in file"
+      // incident. Owner-confirmed 2026-07-24 ("abort only if 0 applied" — where
+      // "applied" means matched an existing material, NOT a brand-new create).
+      if (deactivateMissing && updated.length === 0) {
+        throw new ZeroMatchAbort();
+      }
       if (deactivateMissing) {
         const active = db.prepare(`SELECT id, name FROM raw_materials WHERE is_active = 1`).all() as any[];
         const upd = db.prepare(`UPDATE raw_materials SET is_active = 0, updated_at = datetime('now') WHERE id = ?`);
@@ -222,12 +244,51 @@ export async function POST(request: Request) {
         }
       }
     });
-    txn();
+
+    let abortedZeroMatch = false;
+    try {
+      txn();
+    } catch (e: any) {
+      if (e instanceof ZeroMatchAbort) abortedZeroMatch = true;
+      else throw e;
+    }
+
+    const first_skips = () => skipped.slice(0, 8).map((s: any) =>
+      `row ${s.row}${s.name ? ` (${s.name})` : ''}: ${s.reason}`);
+
+    // "Remove old inventory details" was on but the file matched NO existing
+    // material → the whole import rolled back (nothing created/updated/deactivated).
+    if (abortedZeroMatch) {
+      return Response.json({
+        created: [], updated: [], skipped, deactivated: 0,
+        aborted: true, deactivation_skipped: true, first_skips: first_skips(),
+        summary: `⚠ Aborted — "Remove old inventory details" was on, but the file matched 0 of your `
+          + `existing materials, so NOTHING was changed (no items created, edited, or deactivated). `
+          + `This usually means the wrong file or a mismatched "sku"/"id" column. Fix the file, or `
+          + `untick "Remove old inventory details" to add/update without removing anything.`,
+      });
+    }
+
+    // Nothing matched and nothing created — a harmless no-op, but surface WHY.
+    if (created.length + updated.length === 0) {
+      return Response.json({
+        created, updated, skipped, deactivated: 0, first_skips: first_skips(),
+        summary: `⚠ Nothing changed — 0 rows matched or created. `
+          + `Check that your file's "sku" (or "id") column matches and "name" is filled.`,
+      });
+    }
+
+    // Proceed, but warn when a non-deactivate upload matched no existing rows and
+    // only created — a common sign of a mismatched SKU column making duplicates.
+    const createOnlyWarning = (!deactivateMissing && updated.length === 0 && created.length > 0)
+      ? ` · ⚠ 0 existing matched — ${created.length} NEW item(s) created; if you meant to EDIT existing `
+        + `items, fix your "sku" column and remove the duplicates.`
+      : ``;
 
     return Response.json({
       created, updated, skipped, deactivated,
       summary: `Updated ${updated.length} · Created ${created.length} · Skipped ${skipped.length}` +
-               (deactivateMissing ? ` · Deactivated ${deactivated} not in file` : ''),
+               (deactivateMissing ? ` · Deactivated ${deactivated} not in file` : '') + createOnlyWarning,
     });
   } catch (e: any) {
     console.error('[/api/inventory/round-trip-import]', e);
