@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { getStoreById, userStoreAccess, LEDGER_TXN_TYPES } from '@/lib/store-engine';
+import { getStoreById, userStoreAccess, LEDGER_TXN_TYPES, getBillChargesForStore } from '@/lib/store-engine';
 
 /**
  * GET /api/stores/[id]/ledger — filterable store ledger, newest first.
@@ -131,7 +131,11 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         .slice(0, limit);
     }
 
-    return Response.json({ store: { id: store.id, name: store.name }, ledger });
+    // Bill-level charges (TGBCL invoice overhead) keyed by invoice_ref (lower) —
+    // the client attaches them to each bill-subtotal marker to show Net Indent Value.
+    const bill_charges = getBillChargesForStore(db, storeId);
+
+    return Response.json({ store: { id: store.id, name: store.name }, ledger, bill_charges });
   } catch (e: any) {
     console.error('[/api/stores/[id]/ledger GET]', e);
     return Response.json({ error: e.message }, { status: 500 });

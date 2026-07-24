@@ -1743,3 +1743,106 @@ export function overallReconciliation(db: Database, opts: { from: string; to: st
     unattributed_party,
   };
 }
+
+/* ── Store bill charges (TGBCL govt liquor invoice overhead layer) ───────────
+ * See db.ts `store_bill_charges`. These are BILL-LEVEL charges on a liquor
+ * supplier invoice (MRP Rounding Off, Bar Excise Turnover Tax, Special Excise
+ * Cess, TCS) captured on top of the line amounts. Recorded only — they never
+ * touch per-bottle unit_cost. All amounts are ₹, ≥ 0. */
+
+export interface BillCharges {
+  mrp_rounding: number;
+  excise_turnover_tax: number;
+  special_excise_cess: number;
+  tcs: number;
+}
+
+/** Coerce a raw charges object from a request body into numbers.
+ *  Missing / blank / invalid → 0. Never throws.
+ *  NOTE: MRP Rounding Off is SIGNED — a TGBCL indent frequently rounds the total
+ *  DOWN (negative), so it must be allowed through as-is. The three levies
+ *  (excise turnover tax, special excise cess, TCS) are inherently ≥ 0 and are
+ *  clamped so a stray negative can't silently reduce the recorded bill total. */
+export function normalizeBillCharges(raw: any): BillCharges {
+  const signed = (v: any) => {          // any finite value, sign preserved
+    const x = Number(v);
+    return Number.isFinite(x) ? Math.round(x * 100) / 100 : 0;
+  };
+  const nonNeg = (v: any) => {           // clamp negatives / invalid to 0
+    const x = Number(v);
+    return Number.isFinite(x) && x > 0 ? Math.round(x * 100) / 100 : 0;
+  };
+  const c = raw && typeof raw === 'object' ? raw : {};
+  return {
+    mrp_rounding: signed(c.mrp_rounding),
+    excise_turnover_tax: nonNeg(c.excise_turnover_tax),
+    special_excise_cess: nonNeg(c.special_excise_cess),
+    tcs: nonNeg(c.tcs),
+  };
+}
+
+/** True when this invoice_ref already has purchase rows in the store ledger —
+ *  the idempotency guard so a bill (or its CSV) can never be uploaded twice. */
+export function invoiceRefHasPurchases(db: Database, storeId: string, invoiceRef: string): boolean {
+  const ref = String(invoiceRef || '').trim();
+  if (!ref) return false;
+  const hit = db.prepare(`
+    SELECT 1 FROM store_stock_ledger
+    WHERE store_id = ? AND txn_type = 'purchase' AND TRIM(ref) = ? COLLATE NOCASE
+    LIMIT 1
+  `).get(storeId, ref);
+  return !!hit;
+}
+
+/** Upsert the bill charges for (store, invoice). `invoiceValue` is the Σ of line
+ *  amounts (bottle cost); net_indent_value is derived = invoiceValue + 4 charges.
+ *  Keyed UNIQUE(store_id, invoice_ref) so re-save updates in place. Returns the
+ *  stored figures (incl. net_indent_value). A no-op-safe write: only call when
+ *  the caller actually has charges to record. */
+export function upsertBillCharges(
+  db: Database,
+  args: {
+    store_id: string; invoice_ref: string; supplier?: string; date?: string;
+    invoice_value: number; charges: BillCharges; created_by?: string;
+  },
+): { invoice_value: number; net_indent_value: number } & BillCharges {
+  const invoiceValue = Math.round((Number(args.invoice_value) || 0) * 100) / 100;
+  const c = normalizeBillCharges(args.charges);
+  const netIndent = Math.round(
+    (invoiceValue + c.mrp_rounding + c.excise_turnover_tax + c.special_excise_cess + c.tcs) * 100,
+  ) / 100;
+  db.prepare(`
+    INSERT INTO store_bill_charges
+      (id, store_id, invoice_ref, supplier, date, invoice_value,
+       mrp_rounding, excise_turnover_tax, special_excise_cess, tcs, net_indent_value, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(store_id, invoice_ref) DO UPDATE SET
+      supplier            = excluded.supplier,
+      date                = excluded.date,
+      invoice_value       = excluded.invoice_value,
+      mrp_rounding        = excluded.mrp_rounding,
+      excise_turnover_tax = excluded.excise_turnover_tax,
+      special_excise_cess = excluded.special_excise_cess,
+      tcs                 = excluded.tcs,
+      net_indent_value    = excluded.net_indent_value,
+      updated_at          = datetime('now')
+  `).run(
+    generateId(), args.store_id, String(args.invoice_ref || '').trim(),
+    String(args.supplier || '').trim(), String(args.date || '').trim(), invoiceValue,
+    c.mrp_rounding, c.excise_turnover_tax, c.special_excise_cess, c.tcs, netIndent,
+    String(args.created_by || '').trim(),
+  );
+  return { invoice_value: invoiceValue, net_indent_value: netIndent, ...c };
+}
+
+/** All bill-charge rows for a store, keyed by invoice_ref (for ledger render). */
+export function getBillChargesForStore(db: Database, storeId: string): Record<string, any> {
+  const rows = db.prepare(`
+    SELECT invoice_ref, supplier, date, invoice_value, mrp_rounding, excise_turnover_tax,
+           special_excise_cess, tcs, net_indent_value
+    FROM store_bill_charges WHERE store_id = ?
+  `).all(storeId) as any[];
+  const map: Record<string, any> = {};
+  for (const r of rows) map[String(r.invoice_ref || '').trim().toLowerCase()] = r;
+  return map;
+}

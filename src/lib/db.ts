@@ -3054,6 +3054,44 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('store_transfers schema failed:', e); }
 
+  // ── Store bill charges (TGBCL govt liquor invoice, additive) ──────────────
+  // A liquor supplier invoice (esp. the Telangana TGBCL indent) carries, on TOP
+  // of the line-item amounts, several bill-level charges that are entered by
+  // hand (they vary invoice-to-invoice, no formula): MRP Rounding Off, Bar
+  // Excise Turnover Tax, Special Excise Cess and TCS. This table stores ONE row
+  // per (store, invoice) capturing those charges plus the two totals:
+  //   invoice_value    = Σ line amounts (the bottle cost the ledger already holds)
+  //   net_indent_value = invoice_value + the four charges (the true bill total).
+  // Per the product decision these charges are recorded at the BILL level only —
+  // they do NOT change per-bottle unit_cost in store_stock_ledger (TCS is a
+  // recoverable tax; keeping it out of stock valuation is deliberate). The
+  // ledger stays the source of truth for stock value; this is the invoice
+  // overhead layer surfaced on the bill + in reporting. UNIQUE(store_id,
+  // invoice_ref) → re-saving the same invoice upserts, never duplicates.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS store_bill_charges (
+        id                  TEXT PRIMARY KEY,
+        store_id            TEXT NOT NULL,
+        invoice_ref         TEXT NOT NULL,
+        supplier            TEXT DEFAULT '',
+        date                TEXT DEFAULT '',            -- YYYY-MM-DD bill date
+        invoice_value       REAL NOT NULL DEFAULT 0,    -- Σ line amounts at save
+        mrp_rounding        REAL NOT NULL DEFAULT 0,
+        excise_turnover_tax REAL NOT NULL DEFAULT 0,
+        special_excise_cess REAL NOT NULL DEFAULT 0,
+        tcs                 REAL NOT NULL DEFAULT 0,
+        net_indent_value    REAL NOT NULL DEFAULT 0,    -- invoice_value + 4 charges
+        created_by          TEXT DEFAULT '',
+        created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(store_id, invoice_ref),
+        FOREIGN KEY (store_id) REFERENCES store_locations(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_store_bill_charges_store ON store_bill_charges(store_id, invoice_ref);
+    `);
+  } catch (e) { console.error('store_bill_charges schema failed:', e); }
+
   // ── Multi-floor bar Phase 2/3 (leak-proof automation, additive) ───────────
   // Three purely-additive pieces, all guarded so a redeploy is a no-op:
   //   1. store_locations.floor_label — a TEXT label (or comma-separated list of

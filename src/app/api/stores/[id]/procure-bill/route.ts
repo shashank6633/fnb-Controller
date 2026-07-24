@@ -1,6 +1,7 @@
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { getStoreById, materialStoreId, postLedger, userStoreAccess } from '@/lib/store-engine';
+import { getStoreById, materialStoreId, postLedger, userStoreAccess,
+         invoiceRefHasPurchases, upsertBillCharges, normalizeBillCharges } from '@/lib/store-engine';
 import { caseFactor, packFactor, tripleToRecipe } from '@/lib/pack-units';
 
 /**
@@ -48,6 +49,21 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const b = await request.json();
     const invoiceRef = String(b.invoice_ref || '').trim();
     if (!invoiceRef) return Response.json({ error: 'invoice_ref is required (the bill / invoice number)' }, { status: 400 });
+
+    // Idempotency: a bill with this invoice number is already in the ledger.
+    // Block the whole save so the same invoice can never be posted twice
+    // (double-counting stock). The client shows this as "already uploaded".
+    if (invoiceRefHasPurchases(db, storeId, invoiceRef)) {
+      return Response.json({
+        error: `Invoice "${invoiceRef}" is already recorded for ${store.name} — it was uploaded earlier. Duplicate bills are blocked to avoid double-counting stock. Use a different invoice number, or check the ledger.`,
+        duplicate: true,
+      }, { status: 409 });
+    }
+
+    // Optional bill-level charges (TGBCL: MRP rounding, excise turnover tax,
+    // special excise cess, TCS). Recorded only — they never change unit_cost.
+    const charges = normalizeBillCharges(b.charges);
+    const hasCharges = !!b.charges && typeof b.charges === 'object';
 
     let vendorId = String(b.vendor_id || '').trim();
     let supplier = String(b.supplier || '').trim();
@@ -120,6 +136,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const backdateStmt = db.prepare(`
       UPDATE store_stock_ledger SET created_at = ? || ' ' || strftime('%H:%M:%S', 'now') WHERE id = ?
     `);
+    const totalValue = Math.round(prepared.reduce((s, p) => s + p.line_total, 0) * 100) / 100;
+    let billCharges: any = null;
     const txn = db.transaction(() => {
       for (const p of prepared) {
         const id = postLedger(db, {
@@ -139,10 +157,17 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         if (backdate) backdateStmt.run(backdate, id);
         ledgerIds.push(id);
       }
+      // Record bill-level charges (invoice_value = Σ line amounts). Only when the
+      // client sent a charges object — same transaction as the ledger posts so
+      // a bill's lines and its charges are all-or-nothing together.
+      if (hasCharges) {
+        billCharges = upsertBillCharges(db, {
+          store_id: storeId, invoice_ref: invoiceRef, supplier, date: backdate || '',
+          invoice_value: totalValue, charges, created_by: user.email,
+        });
+      }
     });
     txn();
-
-    const totalValue = Math.round(prepared.reduce((s, p) => s + p.line_total, 0) * 100) / 100;
 
     logAuditEvent(db, {
       event_type: 'store.procure_bill',
@@ -162,14 +187,17 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           batch_no: p.batch_no, expiry_date: p.expiry_date,
         })),
         total_value: totalValue,
+        bill_charges: billCharges || undefined,
       },
-      note: `${store.name}: bill ${invoiceRef} from ${supplier} — ${prepared.length} line(s), ₹${totalValue}`,
+      note: `${store.name}: bill ${invoiceRef} from ${supplier} — ${prepared.length} line(s), ₹${totalValue}`
+        + (billCharges ? ` (Net Indent ₹${billCharges.net_indent_value})` : ''),
     });
 
     return Response.json({
       ok: true,
       posted: prepared.length,
       total_value: totalValue,
+      bill_charges: billCharges || null,
       skipped: [],
       lines: prepared.map((p, i) => ({
         material_id: p.material_id, ledger_id: ledgerIds[i],
