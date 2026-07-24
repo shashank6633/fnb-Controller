@@ -339,17 +339,18 @@ export function buildWhatsOn(
     }
   }
 
-  // Status breakdown (enquiry vs confirmed vs …) + sort cancelled last.
+  // Cancelled bookings are hidden entirely from the board (a cancelled party is
+  // not "on" — the GRE only wants live enquiries/confirmed). Applies to both the
+  // sheet cache and the DB fallback.
+  parties = parties.filter((p) => !isCancelled(p.status));
+
+  // Status breakdown (enquiry vs confirmed vs …), sorted by time then host.
   const partyStatus: PartyStatusCounts = {
     confirmed: 0, enquiry: 0, tentative: 0, completed: 0, cancelled: 0, other: 0,
   };
   for (const p of parties) partyStatus[classifyStatus(p.status)]++;
-  parties.sort((a, b) => {
-    const ca = isCancelled(a.status) ? 1 : 0;
-    const cb = isCancelled(b.status) ? 1 : 0;
-    if (ca !== cb) return ca - cb;
-    return (a.time || '').localeCompare(b.time || '') || (a.guest_name || '').localeCompare(b.guest_name || '');
-  });
+  parties.sort((a, b) =>
+    (a.time || '').localeCompare(b.time || '') || (a.guest_name || '').localeCompare(b.guest_name || ''));
 
   // ── Reservations (ct_bookings LEFT JOIN ct_guests) ───────────────────────
   const reservations: WhatsOnReservation[] = [];
