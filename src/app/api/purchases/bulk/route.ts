@@ -15,6 +15,16 @@ interface BulkPurchaseItem {
   gst_amount?: number;
 }
 
+/** One rejected row, echoed back with enough to re-download + fix + re-upload. */
+type SkipKind = 'missing' | 'date' | 'not_found' | 'liquor' | 'invalid' | 'duplicate';
+interface SkippedRow {
+  row: number;
+  item_name: string; vendor: string; brand: string;
+  quantity: any; unit_price: any; total_amount: any; gst_amount: any;
+  date: string; notes: string;
+  kind: SkipKind; reason: string;
+}
+
 export async function POST(request: Request) {
   try {
     const db = getDb();
@@ -25,22 +35,13 @@ export async function POST(request: Request) {
       return Response.json({ error: 'purchases array is required' }, { status: 400 });
     }
 
-    // Configurable backdate window (per line). Non-admins can't save a date older
-    // than N days or in the future; admins are exempt.
     const me = await getCurrentUser();
     const isAdmin = me?.role === 'admin';
 
-    // Load all materials for name matching (with units so we can convert
-    // purchase-unit quantities → recipe units for the stock increment).
     const allMaterials = db.prepare('SELECT id, name, unit, purchase_unit, pack_size FROM raw_materials').all() as any[];
     const materialMap = new Map<string, any>();
-    for (const m of allMaterials) {
-      materialMap.set(m.name.toLowerCase().trim(), m);
-    }
-    // Stock is kept in RECIPE units everywhere (sales deduction, closing-stock
-    // variance × average_price). The CSV quantity is in PURCHASE units, so
-    // multiply by pack_size when recipe_unit ≠ purchase_unit — mirroring
-    // updateMaterialPrice()'s guard so price (÷pack) and stock (×pack) stay aligned.
+    for (const m of allMaterials) materialMap.set(m.name.toLowerCase().trim(), m);
+
     const toStockQty = (m: any, qty: number) => {
       const packSize = Number(m.pack_size) || 1;
       const ru = String(m.unit || '').toLowerCase().trim();
@@ -49,122 +50,116 @@ export async function POST(request: Request) {
     };
 
     const results: {
-      success: number; skipped: number; errors: string[];
-      // Store guard (liquor) — rows skipped because the material is store-mapped.
-      // Per-line skip + report, mirroring inward-import: never fail the batch.
+      success: number; skipped: number; duplicates: number;
+      errors: string[];
       store_blocked: Array<{ material: string; error: string }>;
-    } = {
-      success: 0,
-      skipped: 0,
-      errors: [],
-      store_blocked: [],
+      skipped_rows: SkippedRow[];
+    } = { success: 0, skipped: 0, duplicates: 0, errors: [], store_blocked: [], skipped_rows: [] };
+
+    // Record a skipped row into every reporting channel (back-compat + the new
+    // detailed list the UI shows + lets the user download).
+    const skip = (item: BulkPurchaseItem, rowNum: number, kind: SkipKind, reason: string) => {
+      results.skipped++;
+      if (kind === 'duplicate') results.duplicates++;
+      results.errors.push(`Row ${rowNum}: ${reason}`);
+      if (kind === 'liquor') results.store_blocked.push({ material: item.item_name || '', error: reason });
+      results.skipped_rows.push({
+        row: rowNum,
+        item_name: item.item_name || '', vendor: item.vendor || '', brand: item.brand || '',
+        quantity: item.quantity ?? '', unit_price: item.unit_price ?? '',
+        total_amount: item.total_amount ?? '', gst_amount: item.gst_amount ?? '',
+        date: item.date || '', notes: item.notes || '',
+        kind, reason,
+      });
     };
-    // Only materials that actually received a purchase row get a price recompute.
-    const touchedMaterials = new Set<string>();
 
     const insertPurchase = db.prepare(`
       INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     `);
-
     const updateStock = db.prepare(`
       UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?
     `);
-
     const insertTransaction = db.prepare(`
       INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
       VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'))
     `);
+    // Duplicate guard: a purchase with the SAME material + vendor + date + qty +
+    // unit_price already in the DB. Rounded so float noise never causes a miss.
+    const dupCheck = db.prepare(`
+      SELECT 1 FROM purchases
+      WHERE material_id = ?
+        AND LOWER(COALESCE(vendor, '')) = LOWER(?)
+        AND date = ?
+        AND ROUND(quantity, 3)   = ROUND(?, 3)
+        AND ROUND(unit_price, 2) = ROUND(?, 2)
+      LIMIT 1
+    `);
+
+    const touchedMaterials = new Set<string>();
+    // Also dedupe WITHIN the uploaded file (same row twice in one upload).
+    const seenInFile = new Set<string>();
+    const dupKey = (mid: string, vendor: string, date: string, q: number, up: number) =>
+      `${mid}|${(vendor || '').toLowerCase().trim()}|${date}|${Math.round(q * 1000)}|${Math.round(up * 100)}`;
 
     const batchInsert = db.transaction(() => {
       for (let i = 0; i < purchases.length; i++) {
         const item = purchases[i];
         const rowNum = i + 1;
 
-        // Validate required fields
         if (!item.item_name || (!item.quantity && !item.total_amount) || (!item.unit_price && !item.total_amount)) {
-          results.errors.push(`Row ${rowNum}: Missing required fields (item_name: "${item.item_name || ''}")`);
-          results.skipped++;
+          skip(item, rowNum, 'missing', `Missing required fields (item_name / quantity / price)`);
           continue;
         }
-
-        // Configurable backdate window (per line): reject a date older than N days
-        // or in the future for non-admins; admins are exempt.
         const dateCheck = checkPurchaseDate(db, item.date, isAdmin);
-        if (!dateCheck.ok) {
-          results.errors.push(`Row ${rowNum}: ${dateCheck.error}`);
-          results.skipped++;
-          continue;
-        }
+        if (!dateCheck.ok) { skip(item, rowNum, 'date', dateCheck.error || 'Invalid date'); continue; }
 
-        // Match material by name (case-insensitive)
         const mat = materialMap.get(item.item_name.toLowerCase().trim());
-        if (!mat) {
-          results.errors.push(`Row ${rowNum}: Material not found: "${item.item_name}"`);
-          results.skipped++;
-          continue;
-        }
+        if (!mat) { skip(item, rowNum, 'not_found', `Material not found: "${item.item_name}" — name must match an existing Raw Material.`); continue; }
         const materialId = mat.id;
 
-        // Store guard: store-mapped materials (liquor) never enter Central
-        // purchases/stock via bulk import — skip the line, report it, keep going.
         const storeMsg = centralFlowBlock(db, materialId);
-        if (storeMsg) {
-          results.store_blocked.push({ material: item.item_name, error: storeMsg });
-          results.skipped++;
-          continue;
-        }
+        if (storeMsg) { skip(item, rowNum, 'liquor', storeMsg); continue; }
 
         let quantity = Number(item.quantity) || 0;
         let unitPrice = Number(item.unit_price) || 0;
         const totalAmount = Number(item.total_amount) || 0;
         const gstAmount = Number(item.gst_amount) || 0;
-
-        // If total_amount provided but no unit_price, calculate it
         if (totalAmount > 0 && unitPrice === 0 && quantity > 0) {
           unitPrice = Math.round(((totalAmount + gstAmount) / quantity) * 100) / 100;
         }
-
-        // If unit_price provided and gst exists, add gst proportionally
         if (unitPrice > 0 && gstAmount > 0 && totalAmount === 0) {
           const lineTotal = unitPrice * quantity;
           unitPrice = Math.round(((lineTotal + gstAmount) / quantity) * 100) / 100;
         }
-
         if (quantity <= 0 || unitPrice <= 0) {
-          results.errors.push(`Row ${rowNum}: Invalid quantity or price for "${item.item_name}"`);
-          results.skipped++;
+          skip(item, rowNum, 'invalid', `Invalid quantity or price for "${item.item_name}"`);
           continue;
         }
 
+        // Duplicate guard — already uploaded (DB) OR repeated earlier in this file.
+        const key = dupKey(materialId, item.vendor || '', item.date, quantity, unitPrice);
+        const already = seenInFile.has(key) || !!dupCheck.get(materialId, item.vendor || '', item.date, quantity, unitPrice);
+        if (already) {
+          skip(item, rowNum, 'duplicate',
+            `Already uploaded — same item + vendor + date + qty + rate already exists. Skipped to avoid double-counting.`);
+          continue;
+        }
+        seenInFile.add(key);
+
         const totalPrice = Math.round(quantity * unitPrice * 100) / 100;
         const id = generateId();
-
-        insertPurchase.run(
-          id, materialId, item.vendor || '', item.brand || '',
-          quantity, unitPrice, totalPrice, item.date, item.notes || ''
-        );
-
-        const stockQty = toStockQty(mat, quantity);   // recipe/stock units
+        insertPurchase.run(id, materialId, item.vendor || '', item.brand || '', quantity, unitPrice, totalPrice, item.date, item.notes || '');
+        const stockQty = toStockQty(mat, quantity);
         updateStock.run(stockQty, materialId);
-
-        insertTransaction.run(
-          generateId(), materialId, stockQty, id,
-          `Bulk import: ${item.vendor || 'unknown'}`
-        );
-
+        insertTransaction.run(generateId(), materialId, stockQty, id, `Bulk import: ${item.vendor || 'unknown'}`);
         touchedMaterials.add(materialId);
         results.success++;
       }
     });
-
     batchInsert();
 
-    // Update prices for all affected materials (batch at end for performance).
-    // Uses the touched set so store-blocked / skipped lines never trigger a recompute.
-    for (const materialId of touchedMaterials) {
-      updateMaterialPrice(db, materialId);
-    }
+    for (const materialId of touchedMaterials) updateMaterialPrice(db, materialId);
 
     return Response.json(results, { status: 200 });
   } catch (error: any) {

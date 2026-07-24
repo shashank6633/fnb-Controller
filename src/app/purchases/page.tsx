@@ -179,7 +179,36 @@ export default function PurchasesPage() {
   const [bulkFileName, setBulkFileName] = useState<string | null>(null);
   const [bulkParsedData, setBulkParsedData] = useState<any[]>([]);
   const [bulkUploading, setBulkUploading] = useState(false);
-  const [bulkResult, setBulkResult] = useState<{ success: number; skipped: number; errors: string[] } | null>(null);
+  const [bulkResult, setBulkResult] = useState<{
+    success: number; skipped: number; errors: string[];
+    duplicates?: number;
+    skipped_rows?: Array<{
+      row: number; item_name: string; vendor: string; brand: string;
+      quantity: any; unit_price: any; total_amount: any; gst_amount: any;
+      date: string; notes: string; kind: string; reason: string;
+    }>;
+  } | null>(null);
+
+  // Build a re-uploadable CSV of the rows that did NOT import (fix + re-upload
+  // just these). Same columns as the Bulk template + a reason column.
+  const downloadSkippedRows = () => {
+    const rows = bulkResult?.skipped_rows || [];
+    if (rows.length === 0) return;
+    const header = ['item_name', 'vendor', 'brand', 'quantity', 'unit_price', 'total_amount', 'gst_amount', 'date', 'notes', 'reason'];
+    const esc = (v: any) => {
+      let s = v == null ? '' : String(v);
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;            // CSV formula-injection guard
+      if (/[",\r\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+      return s;
+    };
+    const lines = [header.join(',')].concat(rows.map(r =>
+      [r.item_name, r.vendor, r.brand, r.quantity, r.unit_price, r.total_amount, r.gst_amount, r.date, r.notes, r.reason].map(esc).join(',')));
+    const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `unuploaded-purchases-${new Date().toISOString().slice(0, 10)}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  };
   const [bulkDragOver, setBulkDragOver] = useState(false);
   const bulkFileInputRef = useRef<HTMLInputElement>(null);
   // Opening-stock import (natural purchase units → base units via pack_size)
@@ -1626,24 +1655,55 @@ export default function PurchasesPage() {
                     ) : (
                       <AlertCircle className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0" />
                     )}
-                    <div className="flex-1 text-sm">
+                    <div className="flex-1 text-sm min-w-0">
                       {bulkResult.success > 0 && (
                         <p className="text-green-700 font-medium">{bulkResult.success} purchase(s) uploaded successfully!</p>
                       )}
                       {bulkResult.skipped > 0 && (
-                        <p className="text-amber-700">{bulkResult.skipped} row(s) skipped.</p>
+                        <p className="text-amber-700">
+                          {bulkResult.skipped} row(s) NOT uploaded
+                          {bulkResult.duplicates ? ` — including ${bulkResult.duplicates} already-uploaded duplicate(s)` : ''}.
+                        </p>
                       )}
-                      {bulkResult.errors.length > 0 && (
+
+                      {bulkResult.skipped_rows && bulkResult.skipped_rows.length > 0 ? (
+                        <div className="mt-2">
+                          <div className="flex items-center justify-between gap-2 mb-1">
+                            <p className="text-[#6B5744] font-medium">Un-uploaded items ({bulkResult.skipped_rows.length}):</p>
+                            <button
+                              onClick={downloadSkippedRows}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#af4408] hover:bg-[#8a3506] text-white text-xs font-semibold whitespace-nowrap"
+                            >
+                              <Download className="w-3.5 h-3.5" /> Download un-uploaded rows
+                            </button>
+                          </div>
+                          <div className="max-h-56 overflow-y-auto border border-[#E8D5C4] rounded-lg bg-white/70 divide-y divide-[#F0E4D6]">
+                            {bulkResult.skipped_rows.map((r, i) => (
+                              <div key={i} className="px-2.5 py-1.5 text-xs flex items-start justify-between gap-3">
+                                <span className="font-medium text-[#2D1B0E] truncate">Row {r.row}: {r.item_name || '(no name)'}</span>
+                                <span className={`shrink-0 text-right ${
+                                  r.kind === 'liquor' ? 'text-blue-600'
+                                  : r.kind === 'duplicate' ? 'text-amber-700'
+                                  : 'text-red-600'
+                                }`}>{r.reason}</span>
+                              </div>
+                            ))}
+                          </div>
+                          <p className="text-[10px] text-[#8B7355] mt-1">
+                            Fix the flagged items (or move liquor to Inventory → Liquor Store), then re-upload the downloaded file — already-uploaded rows are auto-skipped, so nothing doubles.
+                          </p>
+                        </div>
+                      ) : bulkResult.errors.length > 0 ? (
                         <div className="mt-2 max-h-40 overflow-y-auto">
                           <p className="text-red-700 font-medium mb-1">Errors:</p>
                           {bulkResult.errors.slice(0, 20).map((err, i) => (
                             <p key={i} className="text-red-600 text-xs">{err}</p>
                           ))}
                           {bulkResult.errors.length > 20 && (
-                            <p className="text-red-500 text-xs mt-1">... and {bulkResult.errors.length - 20} more errors</p>
+                            <p className="text-red-500 text-xs mt-1">... and {bulkResult.errors.length - 20} more</p>
                           )}
                         </div>
-                      )}
+                      ) : null}
                     </div>
                     <button onClick={() => setBulkResult(null)} className="text-[#8B7355] hover:text-[#2D1B0E] text-xs">
                       Dismiss
