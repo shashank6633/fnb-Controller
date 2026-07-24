@@ -572,6 +572,17 @@ function initializeSchema(db: Database.Database) {
     if (!has('image_url'))    db.exec(`ALTER TABLE recipes ADD COLUMN image_url TEXT DEFAULT ''`);
   } catch (e) { console.error('recipes yield migration failed:', e); }
 
+  // Migration: ct_specials gains a `category` (special|offer|notice|event|vip) so
+  // the GRE "What's On" board's specials tool doubles as a general per-date
+  // heading+details notice board (each category renders its own icon/colour).
+  // Additive & defaulted; harmless if the table doesn't exist yet.
+  try {
+    const cols = db.prepare("PRAGMA table_info(ct_specials)").all() as any[];
+    if (cols.length && !cols.some((c: any) => c.name === 'category')) {
+      db.exec(`ALTER TABLE ct_specials ADD COLUMN category TEXT NOT NULL DEFAULT 'special'`);
+    }
+  } catch (e) { console.error('ct_specials category migration failed:', e); }
+
   // ============================================================
   // MULTI-OUTLET SUPPORT
   // ============================================================
@@ -3641,6 +3652,30 @@ function initializeSchema(db: Database.Database) {
         updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
       );
       CREATE INDEX IF NOT EXISTS idx_ct_ent_date ON ct_entertainment(event_date);
+
+      -- Specials & offers for the GRE "What's On" board. A special is either
+      -- RECURRING on a weekday (scope='weekday', weekday 0=Sun..6=Sat — e.g.
+      -- "every Sunday: Brunch") or a ONE-OFF on a date (scope='date', event_date).
+      -- Shown on the board for any date it matches, alongside the always-on
+      -- talking-points text (ct_settings.whatson_specials).
+      CREATE TABLE IF NOT EXISTS ct_specials (
+        id          TEXT PRIMARY KEY,
+        outlet_id   TEXT NOT NULL DEFAULT '',
+        scope       TEXT NOT NULL DEFAULT 'weekday',   -- weekday | date
+        weekday     INTEGER NOT NULL DEFAULT -1,        -- 0=Sun..6=Sat (scope='weekday')
+        event_date  TEXT NOT NULL DEFAULT '',           -- YYYY-MM-DD (scope='date')
+        category    TEXT NOT NULL DEFAULT 'special',    -- special|offer|workshop|event|notice|vip
+        title       TEXT NOT NULL DEFAULT '',           -- e.g. "Sunday Brunch"
+        details     TEXT NOT NULL DEFAULT '',           -- menu / price / notes
+        start_time  TEXT NOT NULL DEFAULT '',           -- HH:mm-ish, free text ok
+        end_time    TEXT NOT NULL DEFAULT '',
+        active      INTEGER NOT NULL DEFAULT 1,
+        created_by  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_specials_weekday ON ct_specials(weekday);
+      CREATE INDEX IF NOT EXISTS idx_ct_specials_date ON ct_specials(event_date);
 
       CREATE TABLE IF NOT EXISTS ct_follow_ups (
         id          TEXT PRIMARY KEY,

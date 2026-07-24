@@ -30,15 +30,19 @@ import {
   Disc3,
   Gauge,
   Gift,
+  GraduationCap,
+  Megaphone,
   Mic2,
   Music,
   PartyPopper,
   Pencil,
+  Percent,
   Phone,
   PhoneCall,
   Plus,
   Sparkles,
   Star,
+  Ticket,
   Trash2,
   Users,
   X,
@@ -98,6 +102,18 @@ interface ReservationRow {
   status: string;
   table_id: string | null;
 }
+interface SpecialItem {
+  id: string;
+  scope: 'weekday' | 'date';
+  weekday: number;
+  event_date: string;
+  category: string;
+  title: string;
+  details: string;
+  start_time: string;
+  end_time: string;
+  recurring_label: string;
+}
 interface CapacityBlock {
   capacity: number;
   reserved_covers: number;
@@ -119,6 +135,7 @@ interface WhatsOn {
   parties: PartyRow[];
   reservations: ReservationRow[];
   specials: string;
+  specials_items?: SpecialItem[];
   capacity: CapacityBlock | null;
   party_sync?: { source: 'sheet-cache' | 'db-fallback' | 'none'; fetched_at: string };
   party_status?: PartyStatusCounts;
@@ -148,6 +165,14 @@ function syncAgo(iso?: string): string {
   return `${Math.round(mins / 60)} h ago`;
 }
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const WEEKDAYS_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+/** Weekday (0=Sun..6=Sat) for a YYYY-MM-DD string, or -1. */
+function weekdayOfIso(iso: string): number {
+  const [y, m, d] = (iso || '').split('-').map(Number);
+  if (!y || !m || !d) return -1;
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
 
 function addDays(iso: string, n: number): string {
   const [y, m, d] = (iso || '').split('-').map(Number);
@@ -243,6 +268,46 @@ interface EntForm {
 }
 const EMPTY_FORM: EntForm = { type: 'band', name: '', start_time: '', end_time: '', area: '', description: '' };
 
+// ─── Special/offer form state ────────────────────────────────────────────────
+
+interface SpecialForm {
+  scope: 'weekday' | 'date';
+  weekday: number;       // 0=Sun..6=Sat (scope='weekday')
+  category: string;      // special|offer|workshop|event|notice|vip
+  title: string;
+  details: string;
+  start_time: string;
+  end_time: string;
+}
+const EMPTY_SPECIAL: SpecialForm = { scope: 'weekday', weekday: 0, category: 'special', title: '', details: '', start_time: '', end_time: '' };
+
+// Category meta — icon + colours + label. Full class-literals so Tailwind keeps them.
+const SPECIAL_CATEGORIES: { value: string; label: string }[] = [
+  { value: 'special', label: 'Special' },
+  { value: 'offer', label: 'Offer' },
+  { value: 'workshop', label: 'Workshop' },
+  { value: 'event', label: 'Event' },
+  { value: 'notice', label: 'Notice' },
+  { value: 'vip', label: 'VIP' },
+];
+function specialCatMeta(cat: string): { label: string; icon: React.ReactNode; sq: string; chip: string } {
+  const cls = 'w-4 h-4';
+  switch ((cat || '').toLowerCase()) {
+    case 'offer':
+      return { label: 'Offer', icon: <Percent className={cls} />, sq: 'bg-rose-100 text-rose-700', chip: 'bg-rose-50 text-rose-700 border-rose-200' };
+    case 'workshop':
+      return { label: 'Workshop', icon: <GraduationCap className={cls} />, sq: 'bg-violet-100 text-violet-700', chip: 'bg-violet-50 text-violet-700 border-violet-200' };
+    case 'event':
+      return { label: 'Event', icon: <Ticket className={cls} />, sq: 'bg-blue-100 text-blue-700', chip: 'bg-blue-50 text-blue-700 border-blue-200' };
+    case 'notice':
+      return { label: 'Notice', icon: <Megaphone className={cls} />, sq: 'bg-slate-100 text-slate-600', chip: 'bg-slate-100 text-slate-600 border-slate-200' };
+    case 'vip':
+      return { label: 'VIP', icon: <Star className={cls} />, sq: 'bg-purple-100 text-purple-700', chip: 'bg-purple-50 text-purple-700 border-purple-200' };
+    default:
+      return { label: 'Special', icon: <Sparkles className={cls} />, sq: 'bg-amber-100 text-amber-700', chip: 'bg-amber-50 text-amber-700 border-amber-200' };
+  }
+}
+
 // ─── Page ────────────────────────────────────────────────────────────────────
 
 export default function WhatsOnPage() {
@@ -251,6 +316,7 @@ export default function WhatsOnPage() {
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const [isManagement, setIsManagement] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   // Entertainment editor
   const [showAdd, setShowAdd] = useState(false);
@@ -259,6 +325,20 @@ export default function WhatsOnPage() {
   const [editForm, setEditForm] = useState<EntForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState('');
+
+  // Specials & offers editor (management)
+  const [showAddSpecial, setShowAddSpecial] = useState(false);
+  const [specialForm, setSpecialForm] = useState<SpecialForm>(EMPTY_SPECIAL);
+  const [editingSpecialId, setEditingSpecialId] = useState<string | null>(null);
+  const [editSpecialForm, setEditSpecialForm] = useState<SpecialForm>(EMPTY_SPECIAL);
+  const [savingSpecial, setSavingSpecial] = useState(false);
+  const [specialError, setSpecialError] = useState('');
+
+  // Talking-points inline edit (admin only — writes the admin-gated setting)
+  const [editingTalking, setEditingTalking] = useState(false);
+  const [talkingDraft, setTalkingDraft] = useState('');
+  const [savingTalking, setSavingTalking] = useState(false);
+  const [talkingError, setTalkingError] = useState('');
 
   // Live call context
   const [ringing, setRinging] = useState<RingingCall[]>([]);
@@ -311,6 +391,7 @@ export default function WhatsOnPage() {
         const u = j?.user;
         if (alive && u) {
           setIsManagement(u.role === 'admin' || u.role === 'manager' || !!u.is_head_chef);
+          setIsAdmin(u.role === 'admin');
         }
       } catch { /* stay non-management */ }
     })();
@@ -441,6 +522,127 @@ export default function WhatsOnPage() {
       if (res.ok) await load(true);
     } catch { /* ignore */ }
     finally { setSaving(false); }
+  }
+
+  // ── Specials & offers CRUD ──
+  function resetSpecialEditor() {
+    setShowAddSpecial(false);
+    setEditingSpecialId(null);
+    setSpecialForm({ ...EMPTY_SPECIAL, weekday: Math.max(0, weekdayOfIso(date)) });
+    setEditSpecialForm(EMPTY_SPECIAL);
+    setSpecialError('');
+  }
+
+  /** Build the API body for a special form (weekday recurring OR this exact date). */
+  function specialBody(f: SpecialForm) {
+    const common = {
+      category: f.category,
+      title: f.title.trim(),
+      details: f.details.trim(),
+      start_time: f.start_time.trim(),
+      end_time: f.end_time.trim(),
+    };
+    return f.scope === 'date'
+      ? { scope: 'date' as const, event_date: date, ...common }
+      : { scope: 'weekday' as const, weekday: f.weekday, ...common };
+  }
+
+  async function createSpecial() {
+    if (!specialForm.title.trim()) { setSpecialError('Title is required.'); return; }
+    setSavingSpecial(true);
+    setSpecialError('');
+    try {
+      const res = await api('/api/crm-calls/specials', { method: 'POST', body: specialBody(specialForm) });
+      if (!res.ok) {
+        let msg = 'Could not add the special.';
+        try { msg = (await res.json()).error || msg; } catch { /* keep default */ }
+        setSpecialError(msg);
+        return;
+      }
+      setShowAddSpecial(false);
+      setSpecialForm({ ...EMPTY_SPECIAL, weekday: Math.max(0, weekdayOfIso(date)) });
+      await load(true);
+    } catch {
+      setSpecialError('Network error — please try again.');
+    } finally {
+      setSavingSpecial(false);
+    }
+  }
+
+  function startEditSpecial(row: SpecialItem) {
+    setShowAddSpecial(false);
+    setEditingSpecialId(row.id);
+    setSpecialError('');
+    setEditSpecialForm({
+      scope: row.scope,
+      weekday: row.weekday >= 0 && row.weekday <= 6 ? row.weekday : Math.max(0, weekdayOfIso(date)),
+      category: row.category || 'special',
+      title: row.title,
+      details: row.details,
+      start_time: row.start_time,
+      end_time: row.end_time,
+    });
+  }
+
+  async function saveSpecialEdit(id: string) {
+    if (!editSpecialForm.title.trim()) { setSpecialError('Title is required.'); return; }
+    setSavingSpecial(true);
+    setSpecialError('');
+    try {
+      const res = await api(`/api/crm-calls/specials/${id}`, { method: 'PUT', body: specialBody(editSpecialForm) });
+      if (!res.ok) {
+        let msg = 'Could not save changes.';
+        try { msg = (await res.json()).error || msg; } catch { /* keep default */ }
+        setSpecialError(msg);
+        return;
+      }
+      setEditingSpecialId(null);
+      await load(true);
+    } catch {
+      setSpecialError('Network error — please try again.');
+    } finally {
+      setSavingSpecial(false);
+    }
+  }
+
+  async function deleteSpecial(id: string) {
+    if (typeof window !== 'undefined' && !window.confirm('Remove this special?')) return;
+    setSavingSpecial(true);
+    try {
+      const res = await api(`/api/crm-calls/specials/${id}`, { method: 'DELETE' });
+      if (res.ok) await load(true);
+    } catch { /* ignore */ }
+    finally { setSavingSpecial(false); }
+  }
+
+  // ── Talking-points inline edit (admin only) ──
+  function startEditTalking() {
+    setTalkingDraft(data?.specials || '');
+    setTalkingError('');
+    setEditingTalking(true);
+  }
+
+  async function saveTalking() {
+    setSavingTalking(true);
+    setTalkingError('');
+    try {
+      const res = await api('/api/crm-calls/settings', {
+        method: 'PUT',
+        body: { whatson_specials: talkingDraft },
+      });
+      if (!res.ok) {
+        let msg = 'Could not save talking points.';
+        try { msg = (await res.json()).error || msg; } catch { /* keep default */ }
+        setTalkingError(msg);
+        return;
+      }
+      setEditingTalking(false);
+      await load(true);
+    } catch {
+      setTalkingError('Network error — please try again.');
+    } finally {
+      setSavingTalking(false);
+    }
   }
 
   // ── Loading skeleton ──
@@ -599,7 +801,7 @@ export default function WhatsOnPage() {
             subtitle={`${fmtNum(data?.entertainment.length)} on ${labelDate(date, false)}`}
             action={isManagement ? (
               <button
-                onClick={() => { resetEditor(); setShowAdd(v => !v); }}
+                onClick={() => { if (showAdd) { setShowAdd(false); setFormError(''); } else { resetEditor(); setShowAdd(true); } }}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white transition-colors"
               >
                 {showAdd ? <X className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
@@ -809,14 +1011,160 @@ export default function WhatsOnPage() {
           </Card>
         )}
 
-        {/* ── Specials ── */}
+        {/* ── Specials & Offers ── */}
         {panels.specials && (
-          <Card icon={<Sparkles className="w-4 h-4" />} title="Specials & Talking Points">
-            {data?.specials && data.specials.trim() ? (
-              <p className="text-sm text-[#3A2A1B] whitespace-pre-line leading-relaxed">{data.specials}</p>
-            ) : (
-              <p className="py-4 text-sm text-[#B8A48E] italic">No talking points set.</p>
+          <Card
+            icon={<Sparkles className="w-4 h-4" />}
+            title="Specials & Workshops"
+            subtitle={`${fmtNum(data?.specials_items?.length)} on ${labelDate(date, false)}`}
+            action={isManagement ? (
+              <button
+                onClick={() => { if (showAddSpecial) { setShowAddSpecial(false); setSpecialError(''); } else { resetSpecialEditor(); setShowAddSpecial(true); } }}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white transition-colors"
+              >
+                {showAddSpecial ? <X className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
+                {showAddSpecial ? 'Close' : 'Add'}
+              </button>
+            ) : null}
+          >
+            {/* Add form */}
+            {isManagement && showAddSpecial && (
+              <SpecialEditor
+                form={specialForm}
+                setForm={setSpecialForm}
+                boardDate={date}
+                onSave={createSpecial}
+                onCancel={() => { setShowAddSpecial(false); setSpecialError(''); }}
+                saving={savingSpecial}
+                error={specialError}
+                submitLabel="Add to board"
+              />
             )}
+
+            {/* Special cards */}
+            {(data?.specials_items?.length ?? 0) === 0 && !showAddSpecial ? (
+              <Empty text="Nothing listed for this day." />
+            ) : (
+              <div className="space-y-2.5 mt-1">
+                {data?.specials_items?.map(row => {
+                  const cat = specialCatMeta(row.category);
+                  return editingSpecialId === row.id && isManagement ? (
+                    <SpecialEditor
+                      key={row.id}
+                      form={editSpecialForm}
+                      setForm={setEditSpecialForm}
+                      boardDate={date}
+                      onSave={() => saveSpecialEdit(row.id)}
+                      onCancel={() => { setEditingSpecialId(null); setSpecialError(''); }}
+                      saving={savingSpecial}
+                      error={specialError}
+                      submitLabel="Save"
+                    />
+                  ) : (
+                    <div
+                      key={row.id}
+                      className="flex items-start gap-3 p-3 rounded-lg border border-[#F0E4D6] bg-[#FFFDFA]"
+                    >
+                      <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${cat.sq}`}>
+                        {cat.icon}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <p className="font-semibold truncate">{row.title}</p>
+                          <span className={`text-[10px] font-semibold uppercase tracking-wide border rounded px-1.5 py-0.5 ${cat.chip}`}>
+                            {cat.label}
+                          </span>
+                          {row.recurring_label ? (
+                            <span className="text-[10px] font-semibold uppercase tracking-wide text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5">
+                              {row.recurring_label}
+                            </span>
+                          ) : (
+                            <span className="text-[10px] font-semibold uppercase tracking-wide text-blue-700 bg-blue-50 border border-blue-200 rounded px-1.5 py-0.5">
+                              This date
+                            </span>
+                          )}
+                        </div>
+                        {timeRange(row.start_time, row.end_time) && (
+                          <p className="text-xs text-[#8B7355] mt-0.5">{timeRange(row.start_time, row.end_time)}</p>
+                        )}
+                        {row.details && (
+                          <p className="text-xs text-[#6B5744] mt-1 whitespace-pre-line">{row.details}</p>
+                        )}
+                      </div>
+                      {isManagement && (
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            onClick={() => startEditSpecial(row)}
+                            className="p-1.5 rounded-lg text-[#8B7355] hover:text-[#af4408] hover:bg-[#FFF1E3] transition-colors"
+                            title="Edit"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => deleteSpecial(row.id)}
+                            disabled={savingSpecial}
+                            className="p-1.5 rounded-lg text-[#8B7355] hover:text-red-500 hover:bg-red-50 transition-colors disabled:opacity-50"
+                            title="Delete"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Talking points (always-on note, edited by admins) */}
+            <div className="mt-4 pt-4 border-t border-[#F0E4D6]">
+              <div className="flex items-center justify-between gap-2 mb-1.5">
+                <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">Talking points</p>
+                {isAdmin && !editingTalking && (
+                  <button
+                    onClick={startEditTalking}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-[#af4408] hover:underline"
+                  >
+                    <Pencil className="w-3 h-3" /> Edit
+                  </button>
+                )}
+              </div>
+              {editingTalking ? (
+                <div>
+                  <textarea
+                    value={talkingDraft}
+                    onChange={e => setTalkingDraft(e.target.value)}
+                    rows={4}
+                    maxLength={4000}
+                    placeholder="General talking points shown on every date (e.g. current promotions, house rules)…"
+                    className="w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm text-[#2D1B0E] outline-none focus:border-[#af4408] resize-y"
+                  />
+                  {talkingError && <p className="mt-1 text-xs font-medium text-red-500">{talkingError}</p>}
+                  <div className="flex items-center gap-2 mt-2">
+                    <button
+                      onClick={saveTalking}
+                      disabled={savingTalking}
+                      className="px-4 py-2 rounded-lg text-sm font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white transition-colors disabled:opacity-50"
+                    >
+                      {savingTalking ? 'Saving…' : 'Save'}
+                    </button>
+                    <button
+                      onClick={() => setEditingTalking(false)}
+                      disabled={savingTalking}
+                      className="px-4 py-2 rounded-lg text-sm font-medium text-[#6B5744] hover:bg-[#FFF1E3] transition-colors disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : data?.specials && data.specials.trim() ? (
+                <p className="text-sm text-[#3A2A1B] whitespace-pre-line leading-relaxed">{data.specials}</p>
+              ) : (
+                <p className="text-sm text-[#B8A48E] italic">
+                  {isAdmin ? 'No talking points yet — click Edit to add.' : 'No talking points set.'}
+                </p>
+              )}
+            </div>
           </Card>
         )}
 
@@ -970,6 +1318,148 @@ function EntEditor({ form, setForm, onSave, onCancel, saving, error, submitLabel
             maxLength={1000}
             rows={2}
             placeholder="Notes for the team…"
+            className={inputCls + ' mt-1 resize-y'}
+          />
+        </label>
+      </div>
+      {error && <p className="mt-2 text-xs font-medium text-red-500">{error}</p>}
+      <div className="flex items-center gap-2 mt-3">
+        <button
+          onClick={onSave}
+          disabled={saving}
+          className="px-4 py-2 rounded-lg text-sm font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white transition-colors disabled:opacity-50"
+        >
+          {saving ? 'Saving…' : submitLabel}
+        </button>
+        <button
+          onClick={onCancel}
+          disabled={saving}
+          className="px-4 py-2 rounded-lg text-sm font-medium text-[#6B5744] hover:bg-[#FFF1E3] transition-colors disabled:opacity-50"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Add/edit form for a special/offer — recurring weekly OR this exact date. */
+function SpecialEditor({ form, setForm, boardDate, onSave, onCancel, saving, error, submitLabel }: {
+  form: SpecialForm;
+  setForm: (updater: (f: SpecialForm) => SpecialForm) => void;
+  boardDate: string;
+  onSave: () => void;
+  onCancel: () => void;
+  saving: boolean;
+  error: string;
+  submitLabel: string;
+}) {
+  const inputCls = 'w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm text-[#2D1B0E] outline-none focus:border-[#af4408]';
+  return (
+    <div className="mb-3 p-3 sm:p-4 rounded-xl border border-[#E8D5C4] bg-[#FFFBF5]">
+      {/* Category picker */}
+      <div className="mb-3">
+        <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">Type</span>
+        <div className="flex flex-wrap gap-1.5 mt-1">
+          {SPECIAL_CATEGORIES.map(c => (
+            <button
+              key={c.value}
+              type="button"
+              onClick={() => setForm(f => ({ ...f, category: c.value }))}
+              className={`px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors ${
+                form.category === c.value
+                  ? 'bg-[#af4408] text-white border-[#903905]'
+                  : 'bg-white text-[#6B5744] border-[#E8D5C4] hover:bg-[#FFF1E3]'
+              }`}
+            >
+              {c.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Scope toggle: recurring weekly vs this date only */}
+      <div className="flex flex-wrap gap-2 mb-3">
+        <button
+          type="button"
+          onClick={() => setForm(f => ({ ...f, scope: 'weekday' }))}
+          className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
+            form.scope === 'weekday'
+              ? 'bg-[#af4408] text-white border-[#903905]'
+              : 'bg-white text-[#6B5744] border-[#E8D5C4] hover:bg-[#FFF1E3]'
+          }`}
+        >
+          Every week
+        </button>
+        <button
+          type="button"
+          onClick={() => setForm(f => ({ ...f, scope: 'date' }))}
+          className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
+            form.scope === 'date'
+              ? 'bg-[#af4408] text-white border-[#903905]'
+              : 'bg-white text-[#6B5744] border-[#E8D5C4] hover:bg-[#FFF1E3]'
+          }`}
+        >
+          This date only
+        </button>
+      </div>
+
+      <div className="grid sm:grid-cols-2 gap-2.5">
+        {form.scope === 'weekday' ? (
+          <label className="block">
+            <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">Repeats on</span>
+            <select
+              value={form.weekday}
+              onChange={e => setForm(f => ({ ...f, weekday: Number(e.target.value) }))}
+              className={inputCls + ' mt-1'}
+            >
+              {WEEKDAYS_FULL.map((w, i) => <option key={i} value={i}>Every {w}</option>)}
+            </select>
+          </label>
+        ) : (
+          <label className="block">
+            <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">On date</span>
+            <div className={inputCls + ' mt-1 bg-[#F7EEE3] text-[#6B5744]'}>{labelDate(boardDate)}</div>
+          </label>
+        )}
+        <label className="block">
+          <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">Title</span>
+          <input
+            value={form.title}
+            onChange={e => setForm(f => ({ ...f, title: e.target.value }))}
+            maxLength={120}
+            placeholder="e.g. Sunday Brunch, Sushi Workshop"
+            className={inputCls + ' mt-1'}
+          />
+        </label>
+        <label className="block">
+          <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">Start time</span>
+          <input
+            value={form.start_time}
+            onChange={e => setForm(f => ({ ...f, start_time: e.target.value }))}
+            maxLength={20}
+            placeholder="12:00"
+            className={inputCls + ' mt-1'}
+          />
+        </label>
+        <label className="block">
+          <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">End time</span>
+          <input
+            value={form.end_time}
+            onChange={e => setForm(f => ({ ...f, end_time: e.target.value }))}
+            maxLength={20}
+            placeholder="16:00"
+            className={inputCls + ' mt-1'}
+          />
+        </label>
+        <label className="block sm:col-span-2">
+          <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">Details</span>
+          <textarea
+            value={form.details}
+            onChange={e => setForm(f => ({ ...f, details: e.target.value }))}
+            maxLength={2000}
+            rows={3}
+            placeholder="Menu highlights, price, unlimited food/drinks, etc."
             className={inputCls + ' mt-1 resize-y'}
           />
         </label>

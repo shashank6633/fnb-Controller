@@ -62,6 +62,19 @@ export interface PartyStatusCounts {
   other: number;
 }
 
+export interface WhatsOnSpecial {
+  id: string;
+  scope: 'weekday' | 'date';
+  weekday: number;      // 0=Sun..6=Sat (scope='weekday'), else -1
+  event_date: string;   // YYYY-MM-DD (scope='date'), else ''
+  category: string;     // special|offer|workshop|event|notice|vip
+  title: string;
+  details: string;
+  start_time: string;
+  end_time: string;
+  recurring_label: string; // e.g. "Every Sunday" or "" for one-off
+}
+
 export interface WhatsOnReservation {
   id: string;
   slot_time: string;
@@ -89,6 +102,9 @@ export interface WhatsOnResult {
   parties: WhatsOnParty[];
   reservations: WhatsOnReservation[];
   specials: string;
+  // Structured specials/offers matching this date — recurring weekday specials
+  // (e.g. every Sunday = Brunch) plus one-off dated specials.
+  specials_items: WhatsOnSpecial[];
   capacity: WhatsOnCapacity | null;
   // Where the parties came from + when the sheet cache last synced, for the
   // board's "synced X ago / refresh" affordance.
@@ -150,6 +166,21 @@ function readPartyCache(
   } catch {
     return { parties: [], fetched_at: '' };
   }
+}
+
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+/** Weekday (0=Sun..6=Sat) for a YYYY-MM-DD date, timezone-independent, or -1. */
+function weekdayOf(date: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date || '');
+  if (!m) return -1;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return -1;
+  // Date.UTC avoids any local-timezone shift on the weekday.
+  const dow = new Date(Date.UTC(y, mo - 1, d)).getUTCDay();
+  return Number.isInteger(dow) ? dow : -1;
 }
 
 function isCancelled(status: string | undefined): boolean {
@@ -398,6 +429,43 @@ export function buildWhatsOn(
     /* leave reservations empty on failure */
   }
 
+  // ── Specials & offers (ct_specials) — recurring weekday specials whose
+  //    weekday matches, plus one-off specials on this exact date. Active only,
+  //    outlet-scoped (legacy blank-outlet rows always included). ─────────────
+  const specialsItems: WhatsOnSpecial[] = [];
+  try {
+    const oid = (outletId || '').trim();
+    const dow = weekdayOf(date);
+    const rows = db
+      .prepare(
+        `SELECT id, scope, weekday, event_date, category, title, details, start_time, end_time
+         FROM ct_specials
+         WHERE active = 1 AND (outlet_id = ? OR outlet_id = '')
+           AND ((scope = 'date' AND event_date = ?) OR (scope = 'weekday' AND weekday = ?))
+         ORDER BY (scope = 'date') DESC, start_time, title`,
+      )
+      .all(oid, date, dow) as any[];
+    for (const r of rows) {
+      const scope = r.scope === 'date' ? 'date' : 'weekday';
+      const wd = Number(r.weekday);
+      specialsItems.push({
+        id: String(r.id),
+        scope,
+        weekday: Number.isInteger(wd) ? wd : -1,
+        event_date: String(r.event_date || ''),
+        category: String(r.category || 'special'),
+        title: String(r.title || ''),
+        details: String(r.details || ''),
+        start_time: String(r.start_time || ''),
+        end_time: String(r.end_time || ''),
+        recurring_label:
+          scope === 'weekday' && wd >= 0 && wd <= 6 ? `Every ${WEEKDAY_NAMES[wd]}` : '',
+      });
+    }
+  } catch {
+    /* leave specials items empty on failure */
+  }
+
   // ── Capacity gauge ───────────────────────────────────────────────────────
   const reservedCovers = reservations
     .filter((r) => {
@@ -447,6 +515,7 @@ export function buildWhatsOn(
     parties: panels.parties ? parties : [],
     reservations: panels.reservations ? reservations : [],
     specials: panels.specials ? specials : '',
+    specials_items: panels.specials ? specialsItems : [],
     capacity: panels.capacity ? capacity : null,
     party_sync: { source: partySource, fetched_at: partyFetchedAt },
     party_status: partyStatus,

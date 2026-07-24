@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
+import SpecialsManager from './SpecialsManager';
 
 // Mirrors CT_SETTING_DEFAULTS in src/lib/ct/settings.ts (that lib is
 // server-only — it imports node crypto — so we keep a local copy here).
@@ -679,9 +680,12 @@ export default function CtSettingsPage() {
                       className={`${inputCls} mt-0.5 resize-y`} />
             <p className="text-[10px] text-[#6B5744] mt-1">
               Free text shown on the board so GREs can mention the day&apos;s highlights on a call. Line
-              breaks are preserved. Up to 4000 characters.
+              breaks are preserved. Up to 4000 characters. Saved with the <strong>Save</strong> button below.
             </p>
           </div>
+
+          {/* Specials, workshops & notices manager (saves itself — separate from the form) */}
+          <SpecialsManager />
 
           {/* Daily seat capacity */}
           <div className="border-t border-[#E8D5C4]/60 pt-3 max-w-xs">
