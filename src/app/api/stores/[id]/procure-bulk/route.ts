@@ -139,6 +139,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       material_id: string; name: string; unit: string; recipe_qty: number;
       unit_cost: number; line_total: number; batch_no: string; expiry_date: string;
       date: string | null;
+      discount: number; cgst: number; sgst: number; delivery_charges: number;
     }[] = [];
 
     const skip = (row: any, i: number, kind: SkipKind, reason: string) => {
@@ -213,6 +214,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         batch_no: String(row.batch_no || '').trim(),
         expiry_date: String(row.expiry_date || '').trim(),
         date: rowDate(row.date),
+        discount: Math.max(0, num(row.discount)), cgst: Math.max(0, num(row.cgst)),
+        sgst: Math.max(0, num(row.sgst)), delivery_charges: Math.max(0, num(row.delivery_charges)),
       });
     }
 
@@ -231,6 +234,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
             quantity: p.recipe_qty, unit_cost: p.unit_cost, batch_no: p.batch_no,
             supplier, vendor_id: vendorId, expiry_date: p.expiry_date,
             ref: invoiceRef, notes: '', created_by: user.email,
+            discount: p.discount, cgst: p.cgst, sgst: p.sgst, delivery_charges: p.delivery_charges,
           });
           if (p.date) backdateStmt.run(p.date, id);
           ledgerIds.push(id);

@@ -1779,6 +1779,17 @@ function initializeSchema(db: Database.Database) {
     if (!hasG('qc_damage'))        db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN qc_damage INTEGER NOT NULL DEFAULT 0`);
     if (!hasG('qc_weight'))        db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN qc_weight INTEGER NOT NULL DEFAULT 0`);
     if (!hasG('qc_invoice_match')) db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN qc_invoice_match INTEGER NOT NULL DEFAULT 0`);
+
+    // GRN Inward financial columns (TGBCL-style inward register) — per LINE ₹
+    // amounts captured at receive time. SUBTOTAL = inward qty × rate (computed),
+    // TOTAL INWARD AMOUNT = subtotal − discount + cgst + sgst + special excise
+    // cess + tcs + delivery + mrp round off (computed on read). Only these seven
+    // inputs are stored; all default 0 so every existing GRN line is unchanged.
+    const grniCols = db.prepare("PRAGMA table_info(goods_receipt_note_items)").all() as any[];
+    const hasGI = (n: string) => grniCols.some((c: any) => c.name === n);
+    for (const col of ['discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off']) {
+      if (!hasGI(col)) db.exec(`ALTER TABLE goods_receipt_note_items ADD COLUMN ${col} REAL NOT NULL DEFAULT 0`);
+    }
   } catch (e) { console.error('GRN schema failed:', e); }
 
   // POS Phase 1 — front-of-house order backbone: tables → order → settle → sale.
@@ -3090,6 +3101,16 @@ function initializeSchema(db: Database.Database) {
       );
       CREATE INDEX IF NOT EXISTS idx_store_bill_charges_store ON store_bill_charges(store_id, invoice_ref);
     `);
+    // GRN-Inward per-line charges on a liquor purchase line (recorded only —
+    // never change unit_cost / stock valuation). These four are PER LINE on the
+    // ledger; the other four (MRP round-off, excise turnover tax, special excise
+    // cess, TCS) stay BILL-level in store_bill_charges and are allocated per line
+    // in the inward register. All default 0 → every existing ledger row unchanged.
+    const sslCols = db.prepare("PRAGMA table_info(store_stock_ledger)").all() as any[];
+    const hasSSL = (n: string) => sslCols.some((c: any) => c.name === n);
+    for (const col of ['discount', 'cgst', 'sgst', 'delivery_charges']) {
+      if (!hasSSL(col)) db.exec(`ALTER TABLE store_stock_ledger ADD COLUMN ${col} REAL NOT NULL DEFAULT 0`);
+    }
   } catch (e) { console.error('store_bill_charges schema failed:', e); }
 
   // ── Multi-floor bar Phase 2/3 (leak-proof automation, additive) ───────────

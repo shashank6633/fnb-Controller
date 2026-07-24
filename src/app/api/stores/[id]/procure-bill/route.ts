@@ -87,6 +87,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       cases: number; bottles: number; loose: number;
       recipe_qty: number; unit_cost: number; price_per_bottle: number;
       line_total: number; batch_no: string; expiry_date: string;
+      discount: number; cgst: number; sgst: number; delivery_charges: number;
     }[] = [];
     for (let i = 0; i < b.lines.length; i++) {
       const line = b.lines[i] || {};
@@ -128,6 +129,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         line_total: Math.round(recipeQty * unitCost * 100) / 100,
         batch_no: String(line.batch_no || '').trim(),
         expiry_date: String(line.expiry_date || '').trim(),
+        // Per-line inward charges (recorded only, ≥ 0).
+        discount: Math.max(0, num(line.discount)), cgst: Math.max(0, num(line.cgst)),
+        sgst: Math.max(0, num(line.sgst)), delivery_charges: Math.max(0, num(line.delivery_charges)),
       });
     }
 
@@ -153,6 +157,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           ref: invoiceRef,
           notes: '',
           created_by: user.email,
+          discount: p.discount, cgst: p.cgst, sgst: p.sgst, delivery_charges: p.delivery_charges,
         });
         if (backdate) backdateStmt.run(backdate, id);
         ledgerIds.push(id);

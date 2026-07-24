@@ -377,6 +377,40 @@ export default function LiquorStorePage() {
     loadStock(); loadLedger();
   };
 
+  /* Download the liquor inward register (one row per purchase line, TGBCL sheet
+     column order; bill-level charges allocated per line) for the ledger's
+     current date range. */
+  const [regBusy, setRegBusy] = useState(false);
+  const downloadInwardRegister = async () => {
+    if (!storeId) return;
+    setRegBusy(true);
+    try {
+      const p = new URLSearchParams();
+      if (lFrom) p.set('from', lFrom);
+      if (lTo) p.set('to', lTo);
+      const r = await fetch(`/api/stores/${storeId}/inward-register?${p.toString()}`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      const rows: any[] = j.rows || [];
+      if (!rows.length) { setError('No inward lines for this store in the selected range.'); setTimeout(() => setError(null), 4000); return; }
+      const clean = (v: any) => { let s = String(v ?? ''); if (/^[=+\-@]/.test(s) && !Number.isFinite(Number(s))) s = "'" + s; return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+      const header = ['INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
+        'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
+        'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'EXCISE TURNOVER TAX', 'TOTAL INWARD AMOUNT'];
+      const lines = [header.join(',')];
+      for (const r0 of rows) lines.push([
+        r0.invoice_ref, r0.inward_date, r0.supplier, r0.category, r0.item,
+        r0.inward_qty, r0.purchase_unit, r0.rate, r0.subtotal, r0.discount, r0.cgst, r0.sgst,
+        r0.special_excise_cess, r0.tcs, r0.delivery_charges, r0.mrp_round_off, r0.excise_turnover_tax, r0.total_inward_amount,
+      ].map(clean).join(','));
+      const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = url; a.download = `liquor-inward-register-${lFrom || 'all'}_to_${lTo || 'now'}.csv`;
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    } catch (e: any) { setError(e.message); }
+    finally { setRegBusy(false); }
+  };
+
   /* Stock derived */
   const cats = useMemo(
     () => Array.from(new Set(stock.map(r => r.category))).sort((a, b) => a.localeCompare(b)),
@@ -554,6 +588,13 @@ export default function LiquorStorePage() {
           <button onClick={() => setShowBill(true)}
                   className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5">
             <ReceiptText className="w-4 h-4" /> New Bill
+          </button>
+        )}
+        {access.can_view && (
+          <button onClick={downloadInwardRegister} disabled={regBusy}
+                  title="Download the inward register (one row per line, TGBCL sheet column order) as CSV/Excel"
+                  className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5 disabled:opacity-50">
+            {regBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Inward Register
           </button>
         )}
       </div>
@@ -1310,9 +1351,11 @@ function AdjustModal({ storeId, storeName, materials, hasHistory, onClose, onSav
 interface BillLine {
   key: number; material_id: string; cbl: CBLValue;
   price: string; perCase: boolean; batch: string; expiry: string;
+  discount: string; cgst: string; sgst: string; delivery: string;
 }
 const newBillLine = (key: number): BillLine =>
-  ({ key, material_id: '', cbl: CBL_EMPTY, price: '', perCase: false, batch: '', expiry: '' });
+  ({ key, material_id: '', cbl: CBL_EMPTY, price: '', perCase: false, batch: '', expiry: '',
+     discount: '', cgst: '', sgst: '', delivery: '' });
 
 /* ── Bill charges (TGBCL invoice overhead) — shared by New Bill + Upload CSV ── */
 interface ChargesState { mrp: string; excise: string; cess: string; tcs: string; }
@@ -1400,6 +1443,8 @@ function BillModal({ storeId, storeName, materials, suppliers, vendors, storeVen
   const [vendorId, setVendorId] = useState('');
   const [lines, setLines] = useState<BillLine[]>([newBillLine(1)]);
   const [charges, setCharges] = useState<ChargesState>(CHARGES_EMPTY);
+  const [openLineChg, setOpenLineChg] = useState<Set<number>>(new Set());
+  const toggleLineChg = (key: number) => setOpenLineChg(p => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -1447,6 +1492,8 @@ function BillModal({ storeId, storeName, materials, suppliers, vendors, storeVen
             cases: numOr0(l.cbl.cases), bottles: numOr0(l.cbl.bottles), loose: numOr0(l.cbl.loose),
             unit_price: Number(l.price) || 0, per_case: l.perCase || undefined,
             batch_no: l.batch.trim() || undefined, expiry_date: l.expiry || undefined,
+            discount: numOr0(l.discount) || undefined, cgst: numOr0(l.cgst) || undefined,
+            sgst: numOr0(l.sgst) || undefined, delivery_charges: numOr0(l.delivery) || undefined,
           })),
         },
       });
@@ -1552,6 +1599,25 @@ function BillModal({ storeId, storeName, materials, suppliers, vendors, storeVen
                   </div>
                 </div>
               </div>
+              {/* Per-line inward charges (recorded only). Bill-level charges
+                  (MRP round-off / excise turnover / cess / TCS) are entered once
+                  below in Bill charges. */}
+              <button type="button" onClick={() => toggleLineChg(l.key)}
+                      className="text-[10px] text-[#af4408] hover:underline">
+                {openLineChg.has(l.key) ? '− Hide line charges' : '+ Line charges (discount / CGST / SGST / delivery)'}
+              </button>
+              {openLineChg.has(l.key) && (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 border-t border-[#F0E4D6]">
+                  {([['discount', 'Discount'], ['cgst', 'CGST'], ['sgst', 'SGST'], ['delivery', 'Delivery']] as const).map(([k, label]) => (
+                    <div key={k}>
+                      <L>{label} ₹</L>
+                      <input type="number" min={0} step="any" inputMode="decimal" value={(l as any)[k]}
+                             onChange={e => setLine(l.key, { [k]: e.target.value } as Partial<BillLine>)}
+                             placeholder="0" className={inputCls} />
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           );
         })}
@@ -1574,6 +1640,7 @@ interface UploadRow {
   cases: string; bottles: string; loose: string;
   unit_price: string; amount: string; per_case: boolean;
   batch_no: string; expiry_date: string; date: string;
+  discount: string; cgst: string; sgst: string; delivery_charges: string;
 }
 interface UploadSkipped {
   row: number; item_name: string; sku: string;
@@ -1614,12 +1681,16 @@ function parseBillCsv(text: string): UploadRow[] {
     const batch_no = get(row, 'batch_no', 'batch', 'batch no', 'lot');
     const expiry_date = get(row, 'expiry_date', 'expiry', 'exp', 'best_before');
     const date = normDate(get(row, 'date', 'purchase_date', 'purchase date', 'invoice_date', 'invoice date', 'bill_date', 'bill date'));
+    const discount = get(row, 'discount', 'disc');
+    const cgst = get(row, 'cgst');
+    const sgst = get(row, 'sgst');
+    const delivery_charges = get(row, 'delivery_charges', 'delivery', 'delivery charges', 'delivery_charge');
     // Skip a fully-blank line (all key fields empty).
     if (!item_name && !sku && !cases && !bottles && !loose && !unit_price && !amount) continue;
     out.push({
       item_name, sku, cases, bottles, loose, unit_price, amount,
       per_case: pc === '1' || pc === 'true' || pc === 'yes' || pc === 'y',
-      batch_no, expiry_date, date,
+      batch_no, expiry_date, date, discount, cgst, sgst, delivery_charges,
     });
   }
   return out;
@@ -1688,7 +1759,9 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
     if (!balance.length) return;
     const clean = (v: any) => {
       let s = String(v ?? '');
-      if (/^[=+\-@]/.test(s)) s = "'" + s;               // formula-injection guard
+      // Formula-injection guard — skip genuinely-numeric cells so signed numbers
+      // stay summable in Excel (not coerced to text).
+      if (/^[=+\-@]/.test(s) && !Number.isFinite(Number(s))) s = "'" + s;
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const header = ['item_name', 'sku', 'cases', 'bottles', 'loose', 'unit_price', 'amount', 'date', 'batch_no', 'expiry_date', 'reason'];
@@ -1722,6 +1795,8 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
             unit_price: r.unit_price || undefined, amount: r.amount || undefined,
             per_case: r.per_case || undefined, date: r.date || undefined,
             batch_no: r.batch_no || undefined, expiry_date: r.expiry_date || undefined,
+            discount: r.discount || undefined, cgst: r.cgst || undefined,
+            sgst: r.sgst || undefined, delivery_charges: r.delivery_charges || undefined,
           })),
         },
       });
@@ -1821,7 +1896,8 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
           <b>CSV columns</b> (header row required; extra columns ignored): <code>item_name</code> or <code>sku</code>/<code>brand_code</code> (matched to a Raw Material),
           {' '}<code>cases</code>, <code>bottles</code>, optional <code>loose</code>, and a price — either <code>amount</code> (line total ₹, as printed on the indent)
           {' '}<i>or</i> <code>unit_price</code> (₹ per bottle; add <code>per_case=1</code> for a per-case rate). Optional <code>date</code> (YYYY-MM-DD or DD-MM-YYYY; blank rows use the Date field above), <code>batch_no</code>, <code>expiry_date</code>.
-          The 4 bill charges are entered below, not in the CSV.
+          Optional per-line ₹ charges: <code>discount</code>, <code>cgst</code>, <code>sgst</code>, <code>delivery_charges</code>.
+          The 4 bill-level charges (MRP round-off, excise turnover tax, special excise cess, TCS) are entered below, not in the CSV.
         </div>
       )}
 

@@ -38,7 +38,11 @@ export async function GET(request: Request) {
       if (!grn) return Response.json({ error: 'Not found' }, { status: 404 });
       const items = db.prepare(`
         SELECT gi.*, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
-               rm.pack_size, rm.purchase_unit
+               rm.pack_size, rm.purchase_unit, rm.category AS material_category,
+               ROUND(gi.quantity_received * gi.unit_price, 2) AS subtotal,
+               ROUND(gi.quantity_received * gi.unit_price
+                     - gi.discount + gi.cgst + gi.sgst + gi.special_excise_cess
+                     + gi.tcs + gi.delivery_charges + gi.mrp_round_off, 2) AS total_inward_amount
         FROM goods_receipt_note_items gi
         JOIN raw_materials rm ON rm.id = gi.material_id
         WHERE gi.grn_id = ?
@@ -50,8 +54,41 @@ export async function GET(request: Request) {
     const to   = url.searchParams.get('to');
     const vendorId = url.searchParams.get('vendor_id');
     const status   = url.searchParams.get('status');
+    const register = url.searchParams.get('register');   // flat line-level inward register (export)
     const where: string[] = ['1=1']; const params: any[] = [];
     const outletId = await getCurrentOutletId();
+
+    // Flat inward register — one row PER LINE, header fields repeated, in the
+    // sheet's column order + our extras. Used by the "Download Inward Register"
+    // export. Same filters as the list.
+    if (register) {
+      const rw: string[] = ['1=1']; const rp: any[] = [];
+      if (outletId) { rw.push('(g.outlet_id = ? OR g.outlet_id IS NULL)'); rp.push(outletId); }
+      if (from)     { rw.push('g.date >= ?'); rp.push(from); }
+      if (to)       { rw.push('g.date <= ?'); rp.push(to); }
+      if (vendorId) { rw.push('g.vendor_id = ?'); rp.push(vendorId); }
+      if (status)   { rw.push('g.status = ?'); rp.push(status); }
+      const rows = db.prepare(`
+        SELECT g.grn_number, g.invoice_number, g.date AS inward_date, g.vendor AS supplier,
+               rm.category AS category_name, rm.name AS item_name,
+               gi.quantity_ordered AS po_qty, gi.quantity_received AS inward_qty,
+               COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS purchase_unit,
+               gi.unit_price AS rate,
+               ROUND(gi.quantity_received * gi.unit_price, 2) AS subtotal,
+               gi.discount, gi.cgst, gi.sgst, gi.special_excise_cess, gi.tcs,
+               gi.delivery_charges, gi.mrp_round_off,
+               ROUND(gi.quantity_received * gi.unit_price - gi.discount + gi.cgst + gi.sgst
+                     + gi.special_excise_cess + gi.tcs + gi.delivery_charges + gi.mrp_round_off, 2) AS total_inward_amount,
+               gi.quantity_accepted, gi.quantity_rejected, gi.rejection_reason,
+               g.status, g.received_by, g.invoice_date
+        FROM goods_receipt_note_items gi
+        JOIN goods_receipt_notes g  ON g.id  = gi.grn_id
+        JOIN raw_materials       rm ON rm.id = gi.material_id
+        WHERE ${rw.join(' AND ')}
+        ORDER BY g.date DESC, g.grn_number, rm.name
+      `).all(...rp);
+      return Response.json({ rows });
+    }
     if (outletId)  { where.push('(g.outlet_id = ? OR g.outlet_id IS NULL)'); params.push(outletId); }
     if (from)      { where.push('g.date >= ?'); params.push(from); }
     if (to)        { where.push('g.date <= ?'); params.push(to); }
@@ -62,7 +99,10 @@ export async function GET(request: Request) {
              po.po_number AS po_number,
              (SELECT COUNT(*)        FROM goods_receipt_note_items WHERE grn_id = g.id)                    AS line_count,
              (SELECT SUM(quantity_rejected) FROM goods_receipt_note_items WHERE grn_id = g.id)             AS total_rejected,
-             (SELECT SUM(quantity_accepted * unit_price) FROM goods_receipt_note_items WHERE grn_id = g.id) AS accepted_value
+             (SELECT SUM(quantity_accepted * unit_price) FROM goods_receipt_note_items WHERE grn_id = g.id) AS accepted_value,
+             (SELECT SUM(quantity_received * unit_price
+                         - discount + cgst + sgst + special_excise_cess + tcs + delivery_charges + mrp_round_off)
+                FROM goods_receipt_note_items WHERE grn_id = g.id) AS inward_value
       FROM goods_receipt_notes g
       LEFT JOIN purchase_orders po ON po.id = g.po_id
       WHERE ${where.join(' AND ')}
@@ -133,9 +173,13 @@ export async function POST(request: Request) {
       const insGrnItem = db.prepare(`
         INSERT INTO goods_receipt_note_items
           (id, grn_id, po_item_id, material_id, quantity_ordered, quantity_received,
-           quantity_accepted, quantity_rejected, rejection_reason, unit_price, notes)
-        VALUES (?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?)
+           quantity_accepted, quantity_rejected, rejection_reason, unit_price, notes,
+           discount, cgst, sgst, special_excise_cess, tcs, delivery_charges, mrp_round_off)
+        VALUES (?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
+      // Per-line inward charges (₹). mrp_round_off is signed; the rest ≥ 0.
+      const chg = (v: any) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0; };
+      const chgSigned = (v: any) => { const n = Number(v); return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; };
       const insPurchase = db.prepare(`
         INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
                                is_emergency, payment_mode, emergency_reason, outlet_id, created_at)
@@ -169,7 +213,9 @@ export async function POST(request: Request) {
         if (rejected > 0) hasReject = true;
 
         insGrnItem.run(generateId(), grnId, it.material_id, received, accepted, rejected, reason, price,
-                       it.notes || (rejected > 0 ? `Rejected ${rejected} (${reason || 'no reason given'})` : ''));
+                       it.notes || (rejected > 0 ? `Rejected ${rejected} (${reason || 'no reason given'})` : ''),
+                       chg(it.discount), chg(it.cgst), chg(it.sgst), chg(it.special_excise_cess),
+                       chg(it.tcs), chg(it.delivery_charges), chgSigned(it.mrp_round_off));
 
         // Mirror into purchases + inventory_transactions for ANY non-zero
         // accepted qty (including negatives, which represent reversal of a

@@ -1,6 +1,7 @@
 import type { Database } from 'better-sqlite3';
 import type { SessionUser } from './auth';
 import { generateId, convertToMaterialUnit } from './db';
+import { packFactor } from './pack-units';
 
 /**
  * Multi-Store Inventory Engine — Phase A foundation (LIQUOR STORE first).
@@ -85,6 +86,14 @@ export interface LedgerEntry {
   ref?: string;
   notes?: string;
   created_by?: string;
+  /** GRN-Inward per-line charges (₹) — recorded only, never affect unit_cost.
+   *  discount subtracts; cgst/sgst/delivery add. Bill-level charges (mrp round
+   *  off / excise turnover tax / special excise cess / TCS) live in
+   *  store_bill_charges, not here. */
+  discount?: number;
+  cgst?: number;
+  sgst?: number;
+  delivery_charges?: number;
 }
 
 export interface StoreStockRow {
@@ -326,17 +335,22 @@ export function postLedger(db: Database, entry: LedgerEntry): string {
   const mat = db.prepare('SELECT id FROM raw_materials WHERE id = ?').get(materialId);
   if (!mat) throw new Error('Unknown material');
 
+  // Per-line inward charges (recorded only). discount & the three additive
+  // charges are ≥ 0; blank/invalid → 0. They do NOT enter unit_cost/valuation.
+  const chg = (v: any) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? Math.round(x * 100) / 100 : 0; };
   const id = generateId();
   db.prepare(`
     INSERT INTO store_stock_ledger
       (id, store_id, material_id, txn_type, quantity, unit_cost,
-       batch_no, supplier, vendor_id, expiry_date, ref, notes, created_by, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+       batch_no, supplier, vendor_id, expiry_date, ref, notes, created_by,
+       discount, cgst, sgst, delivery_charges, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `).run(
     id, storeId, materialId, txnType, qty, unitCost,
     String(entry.batch_no || ''), String(entry.supplier || ''), String(entry.vendor_id || ''),
     String(entry.expiry_date || ''), String(entry.ref || ''), String(entry.notes || ''),
     String(entry.created_by || ''),
+    chg(entry.discount), chg(entry.cgst), chg(entry.sgst), chg(entry.delivery_charges),
   );
   return id;
 }
@@ -1845,4 +1859,95 @@ export function getBillChargesForStore(db: Database, storeId: string): Record<st
   const map: Record<string, any> = {};
   for (const r of rows) map[String(r.invoice_ref || '').trim().toLowerCase()] = r;
   return map;
+}
+
+/* ── Liquor Store Inward register (GRN-Inward sheet format) ──────────────────
+ * One flat row PER purchase LINE in a store, in the TGBCL sheet's column order.
+ * Per-line charges (discount / cgst / sgst / delivery) ride the ledger row; the
+ * four BILL-level charges (mrp round off / excise turnover tax / special excise
+ * cess / TCS) live in store_bill_charges and are ALLOCATED across the bill's
+ * lines in proportion to each line's subtotal, so Σ(line total_inward) equals
+ * the bill's Net Indent Value. Recorded-only — nothing here changes stock/cost. */
+export interface InwardRegisterRow {
+  invoice_ref: string; inward_date: string; supplier: string;
+  category: string; item: string;
+  inward_qty: number; purchase_unit: string; rate: number; subtotal: number;
+  discount: number; cgst: number; sgst: number;
+  special_excise_cess: number; tcs: number; delivery_charges: number; mrp_round_off: number;
+  excise_turnover_tax: number; total_inward_amount: number;
+}
+export function getStoreInwardRegister(
+  db: Database, storeId: string, from?: string, to?: string,
+): InwardRegisterRow[] {
+  const where: string[] = ["l.store_id = ?", "l.txn_type = 'purchase'"];
+  const args: any[] = [storeId];
+  if (from) { where.push('date(l.created_at) >= date(?)'); args.push(from); }
+  if (to)   { where.push('date(l.created_at) <= date(?)'); args.push(to); }
+  const rows = db.prepare(`
+    SELECT l.id, substr(l.created_at, 1, 10) AS inward_date, TRIM(l.ref) AS invoice_ref,
+           l.supplier, l.quantity, l.unit_cost,
+           l.discount, l.cgst, l.sgst, l.delivery_charges,
+           rm.name AS item, rm.category, rm.unit, rm.purchase_unit, rm.pack_size, rm.case_size
+    FROM store_stock_ledger l
+    JOIN raw_materials rm ON rm.id = l.material_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY l.created_at DESC, l.rowid DESC
+  `).all(...args) as any[];
+
+  const bill = getBillChargesForStore(db, storeId);   // keyed by lower(invoice_ref)
+  const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+  // Per-bill subtotal sums (for proportional allocation of the 4 bill charges).
+  const billSubtotal: Record<string, number> = {};
+  const lines = rows.map(r => {
+    const pf = packFactor(r);
+    const bottles = pf > 1 ? (Number(r.quantity) || 0) / pf : (Number(r.quantity) || 0);
+    const ratePerBottle = pf > 1 ? (Number(r.unit_cost) || 0) * pf : (Number(r.unit_cost) || 0);
+    const subtotal = r2((Number(r.quantity) || 0) * (Number(r.unit_cost) || 0)); // = bottles × ratePerBottle
+    const key = String(r.invoice_ref || '').toLowerCase();
+    billSubtotal[key] = (billSubtotal[key] || 0) + subtotal;
+    return { r, bottles, ratePerBottle, subtotal, key };
+  });
+
+  // Allocation with last-line remainder so each bill charge sums EXACTLY (no
+  // rounding drift). Track per-bill running allocations + which line is last.
+  const lastIdxOfBill: Record<string, number> = {};
+  lines.forEach((ln, i) => { lastIdxOfBill[ln.key] = i; });
+  const alloc: Record<string, { cess: number; tcs: number; round: number; turn: number }> = {};
+
+  const out: InwardRegisterRow[] = lines.map((ln, i) => {
+    const bc = bill[ln.key];
+    const billTot = billSubtotal[ln.key] || 0;
+    const share = billTot > 0 ? ln.subtotal / billTot : 0;
+    if (!alloc[ln.key]) alloc[ln.key] = { cess: 0, tcs: 0, round: 0, turn: 0 };
+    const isLast = lastIdxOfBill[ln.key] === i;
+    const linesInBill = lines.filter(x => x.key === ln.key).length;
+    // Allocate a bill charge to this line: proportional, but the LAST line of
+    // the bill gets the remainder so the parts sum to the exact bill amount.
+    const allocOne = (total: number, acc: keyof typeof alloc[string]) => {
+      const t = Number(total) || 0;
+      let v: number;
+      if (isLast) v = r2(t - alloc[ln.key][acc]);
+      else { v = billTot > 0 ? r2(t * share) : r2(t / linesInBill); alloc[ln.key][acc] += v; }
+      return v;
+    };
+    const cess  = bc ? allocOne(bc.special_excise_cess, 'cess')  : 0;
+    const tcs   = bc ? allocOne(bc.tcs,                 'tcs')   : 0;
+    const round = bc ? allocOne(bc.mrp_rounding,        'round') : 0;
+    const turn  = bc ? allocOne(bc.excise_turnover_tax, 'turn')  : 0;
+
+    const disc = Number(ln.r.discount) || 0, cg = Number(ln.r.cgst) || 0,
+          sg = Number(ln.r.sgst) || 0, deliv = Number(ln.r.delivery_charges) || 0;
+    const total = r2(ln.subtotal - disc + cg + sg + deliv + cess + tcs + round + turn);
+    return {
+      invoice_ref: ln.r.invoice_ref || '', inward_date: ln.r.inward_date || '',
+      supplier: ln.r.supplier || '', category: ln.r.category || '', item: ln.r.item || '',
+      inward_qty: r2(ln.bottles), purchase_unit: ln.r.purchase_unit || ln.r.unit || '',
+      rate: r2(ln.ratePerBottle), subtotal: ln.subtotal,
+      discount: r2(disc), cgst: r2(cg), sgst: r2(sg),
+      special_excise_cess: cess, tcs, delivery_charges: r2(deliv),
+      mrp_round_off: round, excise_turnover_tax: turn, total_inward_amount: total,
+    };
+  });
+  return out;
 }

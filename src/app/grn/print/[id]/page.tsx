@@ -16,11 +16,24 @@ const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 
 interface GrnItem {
   id: string; material_id: string; material_name: string; material_sku?: string; material_unit: string;
-  pack_size?: number; purchase_unit?: string;
+  pack_size?: number; purchase_unit?: string; material_category?: string;
   quantity_ordered: number; quantity_received: number;
   quantity_accepted: number; quantity_rejected: number; rejection_reason?: string;
   unit_price: number; notes?: string;
+  // GRN Inward per-line charges (₹) + computed subtotal / total.
+  discount?: number; cgst?: number; sgst?: number; special_excise_cess?: number;
+  tcs?: number; delivery_charges?: number; mrp_round_off?: number;
+  subtotal?: number; total_inward_amount?: number;
 }
+/** Sum the per-line charges (₹) for a compact print sub-line. */
+const chargeParts = (it: GrnItem): string => {
+  const parts: string[] = [];
+  const add = (label: string, v?: number) => { if (Number(v)) parts.push(`${label} ${Math.round((Number(v) || 0) * 100) / 100}`); };
+  add('Disc', it.discount); add('CGST', it.cgst); add('SGST', it.sgst);
+  add('Cess', it.special_excise_cess); add('TCS', it.tcs);
+  add('Deliv', it.delivery_charges); add('Round', it.mrp_round_off);
+  return parts.join(' · ');
+};
 interface Grn {
   id: string; grn_number: string; date: string; time?: string;
   po_id?: string; po_number?: string;
@@ -66,6 +79,9 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
   const totalAcceptedQty = grn.items.reduce((s, i) => s + (Number(i.quantity_accepted) || 0), 0);
   const totalRejectedQty = grn.items.reduce((s, i) => s + (Number(i.quantity_rejected) || 0), 0);
   const totalAcceptedValue = grn.items.reduce((s, i) => s + ((Number(i.quantity_accepted) || 0) * (Number(i.unit_price) || 0)), 0);
+  // Total INWARD value — received × rate + charges (matches the register + list).
+  const totalInward = grn.items.reduce((s, i) => s + (Number(i.total_inward_amount)
+    || (Number(i.quantity_received) || 0) * (Number(i.unit_price) || 0)), 0);
   // Render negative totals with a "(back-correction)" tag so the print is
   // unambiguous and accounting can spot the adjustment row immediately.
   const hasNegative = grn.items.some(i => (Number(i.quantity_received) || 0) < 0 || (Number(i.quantity_accepted) || 0) < 0);
@@ -132,7 +148,7 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
               <th className="text-right border border-[#999] py-1 px-2">Accepted</th>
               <th className="text-right border border-[#999] py-1 px-2">Rejected</th>
               <th className="text-right border border-[#999] py-1 px-2">Rate</th>
-              <th className="text-right border border-[#999] py-1 px-2">Value</th>
+              <th className="text-right border border-[#999] py-1 px-2">Total Inward</th>
             </tr>
           </thead>
           <tbody>
@@ -146,13 +162,14 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
                     <div className="text-[10px] text-red-700 mt-0.5">Reject reason: <span className="capitalize">{it.rejection_reason.replace(/_/g, ' ')}</span></div>
                   )}
                   {it.notes && <div className="text-[10px] italic text-[#666] mt-0.5">{it.notes}</div>}
+                  {chargeParts(it) && <div className="text-[10px] text-[#666] mt-0.5">Charges: {chargeParts(it)}</div>}
                 </td>
                 <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_ordered} {it.material_unit}</td>
                 <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_received} {it.material_unit}</td>
                 <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_accepted} {it.material_unit}</td>
                 <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_rejected || '—'}</td>
                 <td className="border border-[#999] py-1 px-2 text-right font-mono">{fmt(it.unit_price)}</td>
-                <td className="border border-[#999] py-1 px-2 text-right font-mono">{fmt(it.quantity_accepted * (it.unit_price || 0))}</td>
+                <td className="border border-[#999] py-1 px-2 text-right font-mono">{fmt(Number(it.total_inward_amount) || (it.quantity_received * (it.unit_price || 0)))}</td>
               </tr>
             ))}
           </tbody>
@@ -164,15 +181,15 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
               <td className="border border-[#999] py-1 px-2 text-right font-mono">{totalAcceptedQty.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
               <td className="border border-[#999] py-1 px-2 text-right font-mono">{totalRejectedQty > 0 ? totalRejectedQty.toLocaleString('en-IN', { maximumFractionDigits: 3 }) : '—'}</td>
               <td className="border border-[#999] py-1 px-2"></td>
-              <td className="border border-[#999] py-1 px-2 text-right font-mono">{fmt(totalAcceptedValue)}</td>
+              <td className="border border-[#999] py-1 px-2 text-right font-mono">{fmt(totalInward)}</td>
             </tr>
-            {/* Row 2 — grand total value, full-width emphasis row. */}
+            {/* Row 2 — grand total inward value, full-width emphasis row. */}
             <tr className="bg-[#f4ede2]">
               <td colSpan={7} className="border border-[#999] py-1.5 px-2 text-right text-[11px] uppercase tracking-wider">
-                Grand Total Accepted Value
+                Grand Total Inward Value
                 {hasNegative && <span className="ml-2 text-amber-700 normal-case tracking-normal text-[10px]">(includes back-correction)</span>}
               </td>
-              <td className="border border-[#999] py-1.5 px-2 text-right font-mono text-[13px]">{fmt(totalAcceptedValue)}</td>
+              <td className="border border-[#999] py-1.5 px-2 text-right font-mono text-[13px]">{fmt(totalInward)}</td>
             </tr>
           </tfoot>
         </table>

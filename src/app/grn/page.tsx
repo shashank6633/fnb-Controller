@@ -5,14 +5,18 @@
  * Listing + drill-down detail. GRNs are auto-created on PO receive.
  */
 
-import { useEffect, useMemo, useState } from 'react';
-import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save } from 'lucide-react';
+import { useEffect, useMemo, useState, Fragment } from 'react';
+import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save, Download, Percent } from 'lucide-react';
 import { api } from '@/lib/api';
 import { todayIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import Combobox from '@/components/Combobox';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
+/** ₹ with 2 decimals — for the inward register (taxes/charges carry paise). */
+const m2 = (v: any) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+/** Bare 2-dp number for charge cells (0 shown muted). */
+const q2 = (v: any) => (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 const today = () => new Date().toISOString().slice(0,10);
 const minusDays = (n: number) => { const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().slice(0,10); };
 /** Subtract n days from a YYYY-MM-DD string (UTC math avoids DST/local drift). */
@@ -23,6 +27,34 @@ const isoMinusDays = (iso: string, n: number): string => {
   dt.setUTCDate(dt.getUTCDate() - n);
   return dt.toISOString().slice(0, 10);
 };
+
+/* GRN Inward line (entry form). The seven ₹ charge fields mirror the sheet:
+   Discount, CGST, SGST, Special Excise Cess, TCS, Delivery Charges, MRP Round Off.
+   SUBTOTAL = received × rate; TOTAL INWARD = subtotal − discount + cgst + sgst
+   + cess + tcs + delivery + round-off. */
+interface GrnLine {
+  material_id: string; quantity_received: string; quantity_accepted: string;
+  rejection_reason: string; unit_price: string; notes: string;
+  discount: string; cgst: string; sgst: string; special_excise_cess: string;
+  tcs: string; delivery_charges: string; mrp_round_off: string;
+}
+const blankLine = (): GrnLine => ({
+  material_id: '', quantity_received: '', quantity_accepted: '', rejection_reason: '', unit_price: '', notes: '',
+  discount: '', cgst: '', sgst: '', special_excise_cess: '', tcs: '', delivery_charges: '', mrp_round_off: '',
+});
+const n0 = (s?: string) => { const v = Number(s); return Number.isFinite(v) ? v : 0; };
+/** SUBTOTAL = inward qty × rate. */
+const lineSubtotal = (l: GrnLine) => n0(l.quantity_received) * n0(l.unit_price);
+/** TOTAL INWARD AMOUNT for a line (same formula the server + register use). */
+const lineTotal = (l: GrnLine) =>
+  lineSubtotal(l) - n0(l.discount) + n0(l.cgst) + n0(l.sgst) + n0(l.special_excise_cess)
+  + n0(l.tcs) + n0(l.delivery_charges) + n0(l.mrp_round_off);
+/** Same TOTAL formula for a saved GRN item row (server fields). */
+const itemInwardTotal = (it: any) =>
+  (Number(it.quantity_received) || 0) * (Number(it.unit_price) || 0)
+  - (Number(it.discount) || 0) + (Number(it.cgst) || 0) + (Number(it.sgst) || 0)
+  + (Number(it.special_excise_cess) || 0) + (Number(it.tcs) || 0)
+  + (Number(it.delivery_charges) || 0) + (Number(it.mrp_round_off) || 0);
 
 interface GRN {
   id: string; grn_number: string; date: string; time?: string;
@@ -35,6 +67,7 @@ interface GRN {
   line_count: number;
   total_rejected: number;
   accepted_value: number;
+  inward_value: number;
 }
 
 const STATUS_TONE: Record<string, string> = {
@@ -60,6 +93,38 @@ export default function GrnPage() {
   };
   useEffect(() => { reload(); /* eslint-disable-next-line */ }, [from, to, statusFilter]);
 
+  // Download the flat inward register (one row per LINE) in the sheet's column
+  // order + our extras, for the current date range + status filter.
+  const [exporting, setExporting] = useState(false);
+  const downloadRegister = async () => {
+    setExporting(true);
+    try {
+      const qs = new URLSearchParams({ register: '1', from, to }); if (statusFilter) qs.set('status', statusFilter);
+      const d = await fetch(`/api/grn?${qs}`).then(r => r.json());
+      const rows: any[] = d.rows || [];
+      if (!rows.length) { alert('No inward lines in this date range.'); return; }
+      // Formula-injection guard — but only for genuinely non-numeric cells, so
+      // signed numbers (negative MRP round-off, back-correction qtys/totals)
+      // stay as real numbers Excel can sum (not text). Number('') is 0 → fine.
+      const clean = (v: any) => { let s = String(v ?? ''); if (/^[=+\-@]/.test(s) && !Number.isFinite(Number(s))) s = "'" + s; return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+      const header = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
+        'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
+        'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
+        'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE'];
+      const lines = [header.join(',')];
+      for (const r of rows) lines.push([
+        r.grn_number, r.invoice_number, r.inward_date, r.supplier, r.category_name, r.item_name,
+        r.po_qty, r.inward_qty, r.purchase_unit, r.rate, r.subtotal, r.discount, r.cgst, r.sgst,
+        r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
+        r.quantity_accepted, r.quantity_rejected, r.rejection_reason, r.status, r.received_by, r.invoice_date,
+      ].map(clean).join(','));
+      const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = url; a.download = `GRN-inward-register-${from}_to_${to}.csv`;
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    } finally { setExporting(false); }
+  };
+
   const counts = useMemo(() => {
     const c = { received: 0, partial: 0, rejected: 0, total_rejected_qty: 0, accepted_value: 0 };
     for (const g of list) {
@@ -81,10 +146,17 @@ export default function GrnPage() {
             Every PO receive creates a GRN. Each line records ordered / received / accepted / rejected with a reason. Use <em>Ad-hoc GRN</em> for receipts without a parent PO (cash buy, sample, donation).
           </p>
         </div>
-        <button onClick={() => setCreating(true)}
-                className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm flex items-center gap-2">
-          <Plus className="w-4 h-4" /> New Ad-hoc GRN
-        </button>
+        <div className="flex items-center gap-2">
+          <button onClick={downloadRegister} disabled={exporting}
+                  title="Download the inward register (one row per line, sheet column order) as CSV/Excel"
+                  className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50">
+            {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Inward Register
+          </button>
+          <button onClick={() => setCreating(true)}
+                  className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm flex items-center gap-2">
+            <Plus className="w-4 h-4" /> New Ad-hoc GRN
+          </button>
+        </div>
       </div>
       {creating && <AdHocGrnModal onClose={() => setCreating(false)} onCreated={() => { setCreating(false); reload(); }} />}
 
@@ -129,6 +201,7 @@ export default function GrnPage() {
                 <th className="text-right py-1.5 px-3 font-medium">Lines</th>
                 <th className="text-right py-1.5 px-3 font-medium">Rejected qty</th>
                 <th className="text-right py-1.5 px-3 font-medium">Accepted ₹</th>
+                <th className="text-right py-1.5 px-3 font-medium">Inward ₹</th>
                 <th className="text-left py-1.5 px-3 font-medium">Status</th>
                 <th className="text-left py-1.5 px-3 font-medium">Received by</th>
                 <th className="w-12"></th>
@@ -165,6 +238,7 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
         <td className="py-2 px-3 text-right font-mono">{g.line_count}</td>
         <td className="py-2 px-3 text-right font-mono text-red-700">{g.total_rejected > 0 ? Number(g.total_rejected).toLocaleString('en-IN') : <span className="text-[#8B7355]">—</span>}</td>
         <td className="py-2 px-3 text-right font-mono font-semibold">{fmt(g.accepted_value || 0)}</td>
+        <td className="py-2 px-3 text-right font-mono font-semibold text-[#af4408]">{g.inward_value ? fmt(g.inward_value) : '—'}</td>
         <td className="py-2 px-3">
           <span className={`text-[10px] px-1.5 py-0.5 rounded border ${STATUS_TONE[g.status]}`}>{g.status}</span>
         </td>
@@ -172,13 +246,16 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
         <td className="py-2 px-3"><a href={`/grn/print/${g.id}`} target="_blank" className="text-[10px] text-[#af4408] hover:underline">Print</a></td>
       </tr>
       {expanded && (
-        <tr><td colSpan={11} className="bg-[#FFF8F0] py-3 px-4">
+        <tr><td colSpan={12} className="bg-[#FFF8F0] py-3 px-4">
           {!detail ? (
             <div className="text-xs text-[#8B7355]"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Loading line items…</div>
           ) : (
             <>
-              <div className="text-xs text-[#6B5744] mb-2 space-x-3">
-                {detail.invoice_number && <span><b>Invoice:</b> {detail.invoice_number}</span>}
+              <div className="text-xs text-[#6B5744] mb-2 flex flex-wrap gap-x-3 gap-y-1">
+                <span><b>GRN #:</b> {detail.grn_number}</span>
+                {detail.invoice_number && <span><b>Invoice ID:</b> {detail.invoice_number}</span>}
+                <span><b>Inward date:</b> {detail.date}</span>
+                <span><b>Supplier:</b> {detail.vendor || '—'}</span>
                 {detail.invoice_date && <span><b>Invoice date:</b> {detail.invoice_date}</span>}
                 {detail.qc_by && <span><b>QC by:</b> {detail.qc_by}</span>}
                 {detail.notes && <span><b>Notes:</b> {detail.notes}</span>}
@@ -207,34 +284,69 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
                   </div>
                 );
               })()}
+              {/* Inward register — sheet column order (line-level), then our
+                  extra QC columns (Accepted / Rejected / Reason). Header fields
+                  (GRN #, Invoice, Date, Supplier) show in the summary line above. */}
               <div className="overflow-x-auto">
-              <table className="w-full text-xs min-w-[640px]">
-                <thead className="text-[#8B7355]">
+              <table className="w-full text-xs min-w-[1180px]">
+                <thead className="text-[#8B7355] bg-[#FFF1E3]/50">
                   <tr>
-                    <th className="text-left  py-1 px-2 font-medium">Material</th>
-                    <th className="text-right py-1 px-2 font-medium">Ordered</th>
-                    <th className="text-right py-1 px-2 font-medium">Received</th>
-                    <th className="text-right py-1 px-2 font-medium">Accepted</th>
+                    <th className="text-left  py-1 px-2 font-medium">Category</th>
+                    <th className="text-left  py-1 px-2 font-medium">Item</th>
+                    <th className="text-right py-1 px-2 font-medium">PO Qty</th>
+                    <th className="text-right py-1 px-2 font-medium">Inward Qty</th>
+                    <th className="text-left  py-1 px-2 font-medium">Purchase Unit</th>
+                    <th className="text-right py-1 px-2 font-medium">Rate</th>
+                    <th className="text-right py-1 px-2 font-medium">Subtotal</th>
+                    <th className="text-right py-1 px-2 font-medium">Discount</th>
+                    <th className="text-right py-1 px-2 font-medium">CGST</th>
+                    <th className="text-right py-1 px-2 font-medium">SGST</th>
+                    <th className="text-right py-1 px-2 font-medium">Sp. Excise Cess</th>
+                    <th className="text-right py-1 px-2 font-medium">TCS</th>
+                    <th className="text-right py-1 px-2 font-medium">Delivery</th>
+                    <th className="text-right py-1 px-2 font-medium">MRP Round Off</th>
+                    <th className="text-right py-1 px-2 font-medium text-[#af4408]">Total Inward</th>
+                    <th className="text-right py-1 px-2 font-medium border-l border-[#E8D5C4]">Accepted</th>
                     <th className="text-right py-1 px-2 font-medium">Rejected</th>
                     <th className="text-left  py-1 px-2 font-medium">Reason</th>
-                    <th className="text-right py-1 px-2 font-medium">Unit ₹</th>
-                    <th className="text-right py-1 px-2 font-medium">Line ₹</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {detail.items.map((it: any) => (
+                  {detail.items.map((it: any) => {
+                    const muted = 'text-[#B8A590]';
+                    const chargeCell = (v: any) => <td className={`py-1 px-2 text-right font-mono ${Number(v) ? 'text-[#2D1B0E]' : muted}`}>{q2(v)}</td>;
+                    return (
                     <tr key={it.id} className="border-t border-[#E8D5C4]/50">
-                      <td className="py-1 px-2">{it.material_name}</td>
-                      <td className="py-1 px-2 text-right font-mono">{it.quantity_ordered} {it.material_unit}</td>
+                      <td className="py-1 px-2 text-[#6B5744]">{it.material_category || '—'}</td>
+                      <td className="py-1 px-2 text-[#2D1B0E]">{it.material_name}</td>
+                      <td className="py-1 px-2 text-right font-mono">{Number(it.quantity_ordered) || 0}</td>
                       <td className="py-1 px-2 text-right font-mono">{it.quantity_received}</td>
-                      <td className="py-1 px-2 text-right font-mono text-emerald-700">{it.quantity_accepted}</td>
+                      <td className="py-1 px-2 text-[#6B5744]">{it.purchase_unit || it.material_unit || '—'}</td>
+                      <td className="py-1 px-2 text-right font-mono">{m2(it.unit_price)}</td>
+                      <td className="py-1 px-2 text-right font-mono">{m2(it.subtotal)}</td>
+                      {chargeCell(it.discount)}
+                      {chargeCell(it.cgst)}
+                      {chargeCell(it.sgst)}
+                      {chargeCell(it.special_excise_cess)}
+                      {chargeCell(it.tcs)}
+                      {chargeCell(it.delivery_charges)}
+                      {chargeCell(it.mrp_round_off)}
+                      <td className="py-1 px-2 text-right font-mono font-semibold text-[#af4408]">{m2(it.total_inward_amount)}</td>
+                      <td className="py-1 px-2 text-right font-mono text-emerald-700 border-l border-[#E8D5C4]">{it.quantity_accepted}</td>
                       <td className="py-1 px-2 text-right font-mono text-red-700">{it.quantity_rejected || 0}</td>
                       <td className="py-1 px-2 text-[#6B5744]">{it.rejection_reason || ''}</td>
-                      <td className="py-1 px-2 text-right font-mono">{fmt(it.unit_price)}</td>
-                      <td className="py-1 px-2 text-right font-mono font-semibold">{fmt(it.quantity_accepted * it.unit_price)}</td>
                     </tr>
-                  ))}
+                  ); })}
                 </tbody>
+                <tfoot className="bg-[#FFF1E3]/60 font-semibold text-[#2D1B0E] border-t border-[#E8D5C4]">
+                  <tr>
+                    <td className="py-1.5 px-2" colSpan={6}>{detail.items.length} line(s)</td>
+                    <td className="py-1.5 px-2 text-right font-mono">{m2(detail.items.reduce((s: number, it: any) => s + (Number(it.subtotal) || 0), 0))}</td>
+                    <td className="py-1.5 px-2 text-right font-mono" colSpan={7}></td>
+                    <td className="py-1.5 px-2 text-right font-mono text-[#af4408]">{m2(detail.items.reduce((s: number, it: any) => s + (Number(it.total_inward_amount) || 0), 0))}</td>
+                    <td colSpan={3}></td>
+                  </tr>
+                </tfoot>
               </table>
               </div>
             </>
@@ -263,9 +375,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     qc_damage: false, qc_weight: false, qc_invoice_match: false,
   });
   const toggleQc = (k: keyof typeof qc) => setQc(p => ({ ...p, [k]: !p[k] }));
-  const [items, setItems] = useState<Array<{ material_id: string; quantity_received: string; quantity_accepted: string; rejection_reason: string; unit_price: string; notes: string }>>([
-    { material_id: '', quantity_received: '', quantity_accepted: '', rejection_reason: '', unit_price: '', notes: '' },
-  ]);
+  const [items, setItems] = useState<GrnLine[]>([blankLine()]);
+  // Per-line collapsible charges panel (Discount / CGST / SGST / Cess / TCS /
+  // Delivery / MRP round-off). Default collapsed — most lines carry no charges.
+  const [openCharges, setOpenCharges] = useState<Set<number>>(new Set());
+  const toggleCharges = (i: number) => setOpenCharges(p => { const n = new Set(p); n.has(i) ? n.delete(i) : n.add(i); return n; });
   const [vendors, setVendors] = useState<any[]>([]);
   const [materials, setMaterials] = useState<any[]>([]);
   const [busy, setBusy] = useState(false);
@@ -335,7 +449,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     ? materials.filter(m => vendorMaterialIds.has(m.id))
     : materials;
 
-  const addLine = () => setItems(p => [...p, { material_id: '', quantity_received: '', quantity_accepted: '', rejection_reason: '', unit_price: '', notes: '' }]);
+  const addLine = () => setItems(p => [...p, blankLine()]);
   const removeLine = (i: number) => setItems(p => p.filter((_, j) => j !== i));
   const updateLine = (i: number, patch: any) => setItems(p => p.map((it, j) => j === i ? { ...it, ...patch } : it));
 
@@ -394,6 +508,14 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             rejection_reason:  i.rejection_reason,
             unit_price:        parseFloat(i.unit_price) || 0,
             notes:             i.notes,
+            // GRN Inward per-line charges (₹). Blank → 0 on the server.
+            discount:            n0(i.discount),
+            cgst:                n0(i.cgst),
+            sgst:                n0(i.sgst),
+            special_excise_cess: n0(i.special_excise_cess),
+            tcs:                 n0(i.tcs),
+            delivery_charges:    n0(i.delivery_charges),
+            mrp_round_off:       n0(i.mrp_round_off),
           })),
         },
       });
@@ -551,12 +673,14 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                     <th className="text-right py-1 px-2 font-medium">Accepted</th>
                     <th className="text-left  py-1 px-2 font-medium">Reject reason</th>
                     <th className="text-right py-1 px-2 font-medium">Unit ₹</th>
+                    <th className="text-right py-1 px-2 font-medium">Charges / Total ₹</th>
                     <th className="w-8"></th>
                   </tr>
                 </thead>
                 <tbody className="block md:table-row-group">
                   {items.map((it, i) => (
-                    <tr key={i} className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
+                    <Fragment key={i}>
+                    <tr className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
                         <MaterialTypeahead
@@ -610,8 +734,50 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                         <input type="number" step="any" value={it.unit_price}
                                                        onChange={e => updateLine(i, { unit_price: e.target.value })}
                                                        className="w-full md:w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" /></td>
+                      <td className="py-1 px-2 text-right block md:table-cell">
+                        <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Charges / Total</span>
+                        <div className="flex items-center justify-end gap-1.5">
+                          <button type="button" onClick={() => toggleCharges(i)}
+                                  className={`px-1.5 py-0.5 rounded border text-[10px] flex items-center gap-1 ${
+                                    openCharges.has(i) ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
+                            <Percent className="w-2.5 h-2.5" /> {openCharges.has(i) ? 'hide' : 'charges'}
+                          </button>
+                          <span className="font-mono font-semibold text-[#2D1B0E] min-w-[64px] text-right">
+                            {(n0(it.quantity_received) && n0(it.unit_price)) ? `₹${lineTotal(it).toLocaleString('en-IN', { maximumFractionDigits: 2 })}` : '—'}
+                          </span>
+                        </div>
+                      </td>
                       <td className="py-1 px-2 text-right block md:table-cell"><button onClick={() => removeLine(i)} className="text-red-500"><Trash2 className="w-3 h-3" /></button></td>
                     </tr>
+                    {openCharges.has(i) && (
+                      <tr className="block md:table-row">
+                        <td colSpan={7} className="block md:table-cell px-2 pb-3 md:pb-2">
+                          <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-2.5">
+                            <div className="text-[10px] font-semibold text-[#6B5744] mb-1.5">Line charges (₹) — leave 0 if not applicable</div>
+                            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+                              {([
+                                ['discount', 'Discount'], ['cgst', 'CGST'], ['sgst', 'SGST'],
+                                ['special_excise_cess', 'Special Excise Cess'], ['tcs', 'TCS'],
+                                ['delivery_charges', 'Delivery Charges'], ['mrp_round_off', 'MRP Round Off'],
+                              ] as const).map(([k, label]) => (
+                                <label key={k} className="flex flex-col gap-0.5 text-[9px] uppercase tracking-wide text-[#8B7355]">
+                                  {label}
+                                  <input type="number" step="any" value={(it as any)[k]}
+                                         onChange={e => updateLine(i, { [k]: e.target.value })}
+                                         placeholder="0"
+                                         className="px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs bg-white text-[#2D1B0E] normal-case" />
+                                </label>
+                              ))}
+                            </div>
+                            <div className="flex flex-wrap justify-end gap-4 mt-2 text-[11px] text-[#6B5744]">
+                              <span>Subtotal <b className="text-[#2D1B0E] font-mono">₹{lineSubtotal(it).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</b></span>
+                              <span>Total Inward <b className="text-[#af4408] font-mono">₹{lineTotal(it).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</b></span>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   ))}
                 </tbody>
                 {/* Live totals footer — recomputes on every line edit/remove
@@ -621,10 +787,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                 {(() => {
                   const totRec = items.reduce((s, ln) => s + (parseFloat(ln.quantity_received) || 0), 0);
                   const totAcc = items.reduce((s, ln) => s + (parseFloat(ln.quantity_accepted) || parseFloat(ln.quantity_received) || 0), 0);
-                  const totVal = items.reduce((s, ln) => {
-                    const qa = parseFloat(ln.quantity_accepted) || parseFloat(ln.quantity_received) || 0;
-                    return s + qa * (parseFloat(ln.unit_price) || 0);
-                  }, 0);
+                  const totInward = items.reduce((s, ln) => s + (ln.material_id ? lineTotal(ln) : 0), 0);
                   const lineCount = items.filter(ln => ln.material_id && (parseFloat(ln.quantity_received) || 0) !== 0).length;
                   if (lineCount === 0) return null;
                   return (
@@ -634,10 +797,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                         <td className="py-1.5 px-2 text-right font-mono block md:table-cell">{totRec.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
                         <td className="py-1.5 px-2 text-right font-mono block md:table-cell">{totAcc.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
                         <td className="py-1.5 px-2 block md:table-cell"></td>
-                        <td className="py-1.5 px-2 text-right text-[10px] text-[#6B5744] block md:table-cell">Total ₹</td>
+                        <td className="py-1.5 px-2 text-right text-[10px] text-[#6B5744] block md:table-cell">Total Inward ₹</td>
                         <td className="py-1.5 px-2 text-right font-mono text-emerald-800 block md:table-cell">
-                          ₹{totVal.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                          ₹{totInward.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
                         </td>
+                        <td className="py-1.5 px-2 block md:table-cell"></td>
                       </tr>
                     </tfoot>
                   );
