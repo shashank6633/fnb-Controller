@@ -1738,12 +1738,15 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
 
   const downloadTemplate = () => {
     const d = today();
+    // Per-line charge columns (discount,cgst,sgst,delivery_charges) are optional
+    // — usually blank for TGBCL liquor. The four bill-level charges (MRP round-off,
+    // excise turnover tax, special excise cess, TCS) go in the modal, not here.
     const sample =
-      'item_name,sku,cases,bottles,unit_price,amount,per_case,date,batch_no,expiry_date\n' +
-      `HEINEKEN LAGER BEER,6561,5,0,,15010,,${d},,\n` +
-      `KINGFISHER ULTRA LAGER BEER,5029,12,0,,28824,,${d},,\n` +
-      `GREY GOOSE VODKA,9004,1,0,,20101,,${d},,\n` +
-      `ABSOLUT VODKA,8006,1,0,3900,,1,${d},,\n`;
+      'item_name,sku,cases,bottles,unit_price,amount,per_case,date,discount,cgst,sgst,delivery_charges,batch_no,expiry_date\n' +
+      `HEINEKEN LAGER BEER,6561,5,0,,15010,,${d},,,,,,\n` +
+      `KINGFISHER ULTRA LAGER BEER,5029,12,0,,28824,,${d},,,,,,\n` +
+      `GREY GOOSE VODKA,9004,1,0,,20101,,${d},500,,,,,\n` +
+      `ABSOLUT VODKA,8006,1,0,3900,,1,${d},,,,,,\n`;
     const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
