@@ -1,4 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
+import { poWriteGate } from '@/lib/po-helpers';
 
 /**
  * Vendor Contracts — negotiated unit prices per (vendor, material).
@@ -15,6 +16,15 @@ import { getDb, generateId } from '@/lib/db';
  * DELETE /api/vendor-contracts?id=Z                           → soft-delete (is_active=0)
  *
  * "Active" means is_active=1 AND today is within [valid_from, valid_to NULL=∞].
+ *
+ * WRITES (POST/PUT/DELETE) are gated with poWriteGate() — the same membership as
+ * the PO writes they feed: a contract rate seeds the PO line rate when that
+ * vendor chip is picked (vendors/for-material), drives the off-contract flag's
+ * one-click "match", and is first in Smart Reorder's price ladder
+ * (api/crm/reorder) — so it IS PO money. proxy.ts only proves a session cookie
+ * exists on /api/* paths (page_access is enforced on non-API paths only), so
+ * this route is the only gate. GET stays open to any session: the PO composer's
+ * contract flag needs it for whoever is drafting the PO.
  */
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -25,6 +35,16 @@ const SELECT_BASE = `
          rm.name AS material_name,
          rm.sku  AS material_sku,
          rm.unit AS material_unit,
+         -- Pack basis, carried on the same row as the price: vc.unit_price is
+         -- ₹/PURCHASE unit while rm.average_price is ₹/RECIPE unit, so a consumer
+         -- needs the purchase unit to label the rate and pack_size to convert the
+         -- average before comparing. Without these the page has to re-derive the
+         -- basis from a second catalog fetch, and names the wrong unit when that
+         -- fetch misses. The COALESCE/NULLIF fallbacks mirror packFactor() in
+         -- lib/pack-units (purchase_unit ?? unit, pack_size ?? 1) so a material
+         -- whose purchase_unit was never filled reads the same on both paths.
+         COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
+         COALESCE(rm.pack_size, 1) AS material_pack_size,
          rm.average_price AS material_avg_price,
          rm.last_purchase_price AS material_last_price,
          CASE
@@ -77,6 +97,9 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    const gate = await poWriteGate();
+    if (gate === 'anon')   return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can create a vendor contract' }, { status: 403 });
     const db = getDb();
     const b = await request.json();
     if (!b.vendor_id || !b.material_id) {
@@ -135,6 +158,9 @@ export async function POST(request: Request) {
 
 export async function PUT(request: Request) {
   try {
+    const gate = await poWriteGate();
+    if (gate === 'anon')   return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can edit a vendor contract' }, { status: 403 });
     const db = getDb();
     const b = await request.json();
     if (!b.id) return Response.json({ error: 'id required' }, { status: 400 });
@@ -166,6 +192,9 @@ export async function PUT(request: Request) {
 
 export async function DELETE(request: Request) {
   try {
+    const gate = await poWriteGate();
+    if (gate === 'anon')   return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can end a vendor contract' }, { status: 403 });
     const db = getDb();
     const id = new URL(request.url).searchParams.get('id');
     if (!id) return Response.json({ error: 'id required' }, { status: 400 });

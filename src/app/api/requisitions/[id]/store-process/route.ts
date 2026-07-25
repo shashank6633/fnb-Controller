@@ -31,6 +31,8 @@ import { applyPartyFulfillment } from '@/lib/party-fulfillment';
  *       quantity_issued: number,
  *       quantity_to_purchase: number,
  *       unit_price?: number,
+ *       po_entry_unit?: string,           // unit quantity_to_purchase + unit_price are in
+ *                                         // (recipe or purchase unit); omitted = purchase unit
  *       vendor?: string,
  *       vendor_id?: string
  *     }
@@ -71,7 +73,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     for (const ln of lines) if (ln?.id) lineMap.set(ln.id, ln);
 
     const items = db.prepare(`
-      SELECT ri.*, rm.name AS material_name, rm.current_stock, rm.last_purchase_price, rm.average_price, rm.unit AS material_unit
+      SELECT ri.*, rm.name AS material_name, rm.current_stock, rm.last_purchase_price, rm.average_price,
+             rm.unit AS material_unit,
+             -- purchase-unit basis for the auto-PO lines below (a blank
+             -- purchase_unit means the material is bought in its recipe unit)
+             COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
+             COALESCE(rm.pack_size, 1) AS material_pack_size
       FROM requisition_items ri
       JOIN raw_materials rm ON rm.id = ri.material_id
       WHERE ri.req_id = ?
@@ -127,12 +134,41 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             material: it.material_name,
           }, { status: 400 });
         }
+        // ── Unit-basis boundary (CORE CONVENTION) ──────────────────────
+        // purchase_order_items is PURCHASE-unit basis: quantity in purchase
+        // units, unit_price in ₹/purchase-unit — receive/route.ts writes that
+        // row unchanged and converts ONLY the stock credit (× pack_size).
+        // The shortfall the store user works with is in the RECIPE unit, so the
+        // basis has to be stated on the wire rather than assumed: optional
+        // `po_entry_unit` names the unit this line's quantity_to_purchase +
+        // unit_price are in. Omitted = already purchase basis (what the
+        // requisition modal posts — it converts before submitting).
+        const packSize = Number(it.material_pack_size) || 1;
+        const recipeUnit   = String(it.material_unit || '').toLowerCase().trim();
+        const purchaseUnit = String(it.material_purchase_unit || it.material_unit || '').toLowerCase().trim();
+        // Same guard as receive/route.ts and packFactor(): a real pack
+        // conversion needs pack_size > 1 AND the two units to actually differ.
+        const isPack = packSize > 1 && recipeUnit !== purchaseUnit;
+        const declaredUnit = String(ln.po_entry_unit || '').toLowerCase().trim();
+        if (declaredUnit && declaredUnit !== purchaseUnit && declaredUnit !== recipeUnit) {
+          return Response.json({
+            error: `Cannot raise PO for ${it.material_name} — unrecognised unit "${ln.po_entry_unit}". Send qty/price in ${it.material_purchase_unit || it.material_unit} (purchase unit) or ${it.material_unit} (recipe unit).`,
+            material: it.material_name,
+          }, { status: 400 });
+        }
+        // A caller that declares the recipe unit is converted here, so it can no
+        // longer post a recipe-unit qty against a ₹/purchase-unit rate (750 ml ×
+        // ₹900/BTL = a ₹675,000 line that receive then credits as 562,500 ml).
+        // Exact division, no rounding up: qty × price — and the recipe quantity
+        // recovered at receive (× pack_size) — are both preserved.
+        const poQty   = isPack && declaredUnit === recipeUnit ? purchase / packSize      : purchase;
+        const poPrice = isPack && declaredUnit === recipeUnit ? explicitPrice * packSize : explicitPrice;
         poLines.push({
           req_item_id: it.id,
           material_id: it.material_id,
           material_name: it.material_name,
-          quantity:   purchase,
-          unit_price: explicitPrice,
+          quantity:   poQty,
+          unit_price: poPrice,
           vendor:     vendorName,
           vendor_id:  vendorId,
           notes:      it.notes || '',
@@ -177,7 +213,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           else if (distinctVendors.size > 1) headerVendor = `Mixed (${distinctVendors.size} vendors)`;
         }
         if (!headerVendorId && headerVendor) {
-          const v = db.prepare('SELECT id FROM vendors WHERE LOWER(name) = LOWER(?) LIMIT 1').get(headerVendor) as any;
+          // TRIM both sides: the needle is already trimmed (body value at the top
+          // of this block, or an equally trimmed poLines vendor), so an untrimmed
+          // vendors.name row would miss and leave the PO header with a vendor NAME
+          // but a NULL vendor_id — which every vendor_id-keyed join then drops.
+          const v = db.prepare('SELECT id FROM vendors WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1').get(headerVendor) as any;
           if (v) headerVendorId = v.id;
         }
 

@@ -8,7 +8,13 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 
-const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+// Always 2 dp: at 0 dp the paise were dropped per row, so the item column
+// visibly failed to add up to the footer/list total (₹235.50 + ₹118.50 showed
+// as ₹236 + ₹119 = ₹355 against a ₹354 header). Every ₹ TOTAL on this page goes
+// through this one formatter; the per-line rates spell out .toFixed(2) inline.
+// Either way nothing on this page rounds money to whole rupees, so the same
+// number never reads two different ways in two places.
+const fmt = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const dateLabel = (s?: string | null) =>
   s ? new Date(s).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
 
@@ -260,6 +266,25 @@ export default function PurchaseOrdersPage() {
                                   <PackageCheck className="w-3 h-3" /> Receive
                                 </button>
                               )}
+                              {/* Gated on the status itself, NOT the canCancel
+                                  array or the tab — the Rejected/Cancelled tab
+                                  also holds cancelled POs, which cannot be
+                                  revised. Reads before the destructive Cancel. */}
+                              {p.status === 'rejected' && (
+                                <button onClick={async () => {
+                                  setSavingId(p.id);
+                                  try {
+                                    // DELETE on /reject = withdraw the rejection (back to draft for re-submit).
+                                    // Can't use action(): that helper hardcodes method POST.
+                                    const r = await api(`/api/purchase-orders/${p.id}/reject`, { method: 'DELETE' });
+                                    if (!r.ok) { alert(((await r.json()).error) || 'Failed to revise'); return; }
+                                    await fetchAll();
+                                  } finally { setSavingId(null); }
+                                }} disabled={isSaving}
+                                        className="px-2 py-1 rounded text-[10px] bg-amber-500 hover:bg-amber-600 text-white inline-flex items-center gap-1 disabled:opacity-50">
+                                  <Send className="w-3 h-3" /> Revise
+                                </button>
+                              )}
                               {canCancel && p.status !== 'draft' && (
                                 <button onClick={() => action(p.id, 'cancel')} disabled={isSaving}
                                         className="px-2 py-1 rounded text-[10px] text-[#8B7355] hover:text-red-700 hover:bg-red-50">
@@ -374,12 +399,30 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
         method: 'POST', body: { received_at: receivedAt, item_overrides },
       });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) { alert(j.error || 'Failed'); return; }
+      if (!r.ok) {
+        alert(j.error || 'Failed');
+        // 409 = someone else already received this PO (the route claims the row
+        // with UPDATE … WHERE status = 'approved' inside the txn). The list row
+        // behind this modal still says "approved", so close + refetch rather
+        // than leave a Receive button that can only fail again.
+        if (r.status === 409) onReceived();
+        return;
+      }
+      // Store-mapped (liquor) lines are SKIPPED by the receive route so they
+      // never touch Central stock — but the "Receive total" the receiver just
+      // confirmed counted them, so name the lines that did NOT arrive.
+      if (Array.isArray(j.store_blocked) && j.store_blocked.length > 0) {
+        alert(
+          `${j.store_blocked.length} line(s) were NOT received:\n` +
+          j.store_blocked.map((b: any) => `• ${b.material_name} — ${b.error}`).join('\n') +
+          '\n\nThese must be procured through Inventory → Liquor Store instead.'
+        );
+      }
       // Excess-acceptance acknowledgement — show the receiver that the admin
       // has been notified (audit_event + in-app notification + optional Slack).
       if (j.excess_lines > 0) {
         alert(
-          `Received. ${j.excess_lines} line(s) accepted over the ordered qty (₹${Math.round(j.excess_value || 0)} excess).\n\n` +
+          `Received. ${j.excess_lines} line(s) accepted over the ordered qty (${fmt(j.excess_value || 0)} excess).\n\n` +
           'The admin has been notified for review (visible on /audit as "po.received_excess").'
         );
       }
@@ -476,7 +519,7 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
                             </div>
                           )}
                         </td>
-                        <td className="py-1.5 px-2 text-right font-mono font-semibold">₹{lineTotal.toFixed(0)}</td>
+                        <td className="py-1.5 px-2 text-right font-mono font-semibold">{fmt(lineTotal)}</td>
                       </tr>
                     );
                   })}
@@ -484,14 +527,14 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
                 <tfoot>
                   <tr className="border-t border-[#E8D5C4] font-semibold">
                     <td className="py-2 px-2 text-right" colSpan={3}>Ordered total</td>
-                    <td colSpan={2} className="py-2 px-2 text-right font-mono text-[#8B7355]">₹{orderedTotal.toFixed(0)}</td>
+                    <td colSpan={2} className="py-2 px-2 text-right font-mono text-[#8B7355]">{fmt(orderedTotal)}</td>
                     <td></td>
                   </tr>
                   <tr className="font-semibold">
                     <td className="py-2 px-2 text-right" colSpan={3}>Receive total</td>
-                    <td colSpan={2} className="py-2 px-2 text-right font-mono">₹{total.toFixed(0)}</td>
+                    <td colSpan={2} className="py-2 px-2 text-right font-mono">{fmt(total)}</td>
                     <td className={`py-2 px-2 text-right font-mono text-xs ${total !== orderedTotal ? (total > orderedTotal ? 'text-red-600' : 'text-amber-700') : 'text-[#8B7355]'}`}>
-                      {total !== orderedTotal ? `${total > orderedTotal ? '+' : ''}₹${(total - orderedTotal).toFixed(0)}` : '—'}
+                      {total !== orderedTotal ? `${total > orderedTotal ? '+' : ''}${fmt(total - orderedTotal)}` : '—'}
                     </td>
                   </tr>
                 </tfoot>
@@ -595,6 +638,12 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               const priceDiff = recPrice != null ? Number(recPrice) - Number(it.unit_price) : 0;
               const valDiff   = recTotal != null ? Number(recTotal) - Number(it.total_price) : 0;
               const rejected  = Number((it as any).quantity_rejected) || 0;
+              // A PO line is expressed in the PURCHASE unit (kg/BTL/CASE) at
+              // ₹/purchase-unit — never the recipe unit (g/ml), which differs by
+              // pack_size. GET /api/purchase-orders?id= returns
+              // material_purchase_unit for exactly this label (same derivation as
+              // the receive modal), so "10 kg @ ₹900/kg" can't read as ₹900/g.
+              const u = (it as any).material_purchase_unit || it.material_unit || '';
               return (
                 <tr key={it.id} className="border-t border-[#E8D5C4]/50">
                   <td className="py-1 px-2 font-mono text-[10px] text-[#8B7355]">{it.material_sku || '·'}</td>
@@ -602,14 +651,14 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                     {it.material_name}
                     {isReceived && rejected > 0 && (
                       <div className="text-[10px] text-red-700 mt-0.5">
-                        Rejected: {rejected} {it.material_unit}
+                        Rejected: {rejected} {u}
                         {(it as any).rejection_reason && <span className="capitalize"> ({String((it as any).rejection_reason).replace(/_/g, ' ')})</span>}
                       </div>
                     )}
                   </td>
                   <td className="py-1 px-2 text-[#6B5744]">{(it as any).vendor || <span className="text-[#8B7355] italic">—</span>}</td>
                   <td className="py-1 px-2 text-right font-mono">{it.quantity.toLocaleString('en-IN')}</td>
-                  <td className="py-1 px-2 text-[#6B5744]">{it.material_unit}</td>
+                  <td className="py-1 px-2 text-[#6B5744]">{u}</td>
                   <td className="py-1 px-2 text-right font-mono">{fmt(it.unit_price)}</td>
                   <td className="py-1 px-2 text-right font-mono font-semibold">{fmt(it.total_price)}</td>
                   {isReceived && <>
@@ -624,8 +673,8 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                     </td>
                     <td className={`py-1 px-2 text-right font-mono text-[10px] ${valDiff === 0 ? 'text-[#8B7355]' : valDiff > 0 ? 'text-red-700' : 'text-amber-700'}`}>
                       {qtyDiff !== 0 && (
-                        <div title={`Qty ${qtyDiff > 0 ? '+' : ''}${qtyDiff} ${it.material_unit}`}>
-                          {qtyDiff > 0 ? '+' : ''}{qtyDiff} {it.material_unit}
+                        <div title={`Qty ${qtyDiff > 0 ? '+' : ''}${qtyDiff} ${u}`}>
+                          {qtyDiff > 0 ? '+' : ''}{qtyDiff} {u}
                         </div>
                       )}
                       {valDiff !== 0 && (
@@ -671,12 +720,22 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
 /* Create new PO modal                                            */
 /* ============================================================ */
 interface POLine {
+  uid: string;             // stable row identity — see newLineUid()
   material_id: string;
   quantity: number;
   unit_price: number;
-  vendor: string;          // free-text or matched name
+  vendor: string;          // master vendor name, or a purchase-history name the
+                           // master no longer resolves (the __legacy__ option)
   vendor_id: string;       // optional FK to vendors master
 }
+
+/* Rows were keyed by array index, so deleting a line handed the removed row's
+ * per-line child state (ContractFlag's fetched contract, EligibleVendorChips'
+ * list) to the row that shifted into its slot — and "remove the line to change
+ * the item" makes deletion routine. A monotonic counter, not crypto.randomUUID,
+ * which is undefined on plain-http LAN origins. */
+let poLineSeq = 0;
+const newLineUid = () => `poline-${++poLineSeq}`;
 
 /**
  * Eligible-vendor quick-pick chips for a PO line.
@@ -704,13 +763,19 @@ function ContractFlag({ materialId, vendorId, unitPrice, onMatch }: {
 }) {
   const [contract, setContract] = useState<{ unit_price: number; valid_to: string | null } | null>(null);
   useEffect(() => {
-    if (!materialId || !vendorId) { setContract(null); return; }
+    // Clear FIRST, always: the previous (material, vendor) pair's contract used
+    // to stay on screen — and stay wired to the one-click "match" button — when
+    // the pair changed or the refetch failed (the .catch below is silent).
+    setContract(null);
+    if (!materialId || !vendorId) return;
     const ctrl = new AbortController();
     fetch(`/api/vendor-contracts?material_id=${materialId}&vendor_id=${vendorId}&active=1`, { signal: ctrl.signal })
       .then(r => r.json())
       .then(d => {
         const c = (d.contracts || [])[0];
-        setContract(c ? { unit_price: c.unit_price, valid_to: c.valid_to } : null);
+        // A 0/blank contract rate is "no price agreed", not an authoritative ₹0
+        // — otherwise "match" would wipe the line rate to zero.
+        setContract(c && Number(c.unit_price) > 0 ? { unit_price: Number(c.unit_price), valid_to: c.valid_to } : null);
       })
       .catch(() => {});
     return () => ctrl.abort();
@@ -756,13 +821,16 @@ function EligibleVendorChips({ materialId, currentVendor, onPick }: {
   if (!materialId) return null;
   if (loading)     return <div className="text-[10px] text-[#8B7355] mt-1">Loading vendors…</div>;
   if (list.length === 0) {
-    return <div className="text-[10px] text-[#8B7355] italic mt-1">No prior purchases — type a vendor or pick from master.</div>;
+    return <div className="text-[10px] text-[#8B7355] italic mt-1">No prior purchases — pick a vendor from the dropdown above.</div>;
   }
   return (
     <div className="flex flex-wrap gap-1 mt-1">
       <span className="text-[10px] text-[#8B7355] mr-1 self-center">Past suppliers:</span>
       {list.slice(0, 6).map(v => {
         const active = currentVendor.toLowerCase().trim() === v.vendor.toLowerCase().trim();
+        // > 0, not != null: a ₹0 contract row means no rate was agreed, so it must
+        // not show as a contract chip nor be picked as the line rate.
+        const hasContract = Number(v.contract_price) > 0;
         return (
           <button
             key={v.vendor}
@@ -773,26 +841,29 @@ function EligibleVendorChips({ materialId, currentVendor, onPick }: {
               v.last_date ? `last ${v.last_date}` : null,
               v.last_price != null ? `last ₹${v.last_price.toFixed(2)}` : null,
               v.avg_price  != null ? `avg ₹${v.avg_price.toFixed(2)}`  : null,
-              v.contract_price != null ? `CONTRACT ₹${v.contract_price.toFixed(2)}${v.contract_valid_to ? ` until ${v.contract_valid_to}` : ' (open)'}` : null,
+              hasContract ? `CONTRACT ₹${Number(v.contract_price).toFixed(2)}${v.contract_valid_to ? ` until ${v.contract_valid_to}` : ' (open)'}` : null,
               v.payment_terms || null,
               v.lead_time_days ? `${v.lead_time_days}d lead` : null,
             ].filter(Boolean).join(' · ')}
             className={`text-[10px] px-1.5 py-0.5 rounded border transition ${
               active
                 ? 'bg-[#af4408] text-white border-[#af4408]'
-                : v.contract_price != null
+                : hasContract
                   ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:border-emerald-500'
                   : 'bg-white text-[#2D1B0E] border-[#E8D5C4] hover:border-[#af4408] hover:bg-[#FFF1E3]'
             }`}
           >
             {v.vendor}
-            {v.contract_price != null ? (
+            {hasContract ? (
               <span className={`ml-1 font-mono font-semibold ${active ? 'text-white' : 'text-emerald-700'}`}>
-                📄₹{v.contract_price.toFixed(0)}
+                {/* 2 dp, like every other ₹ here: at 0 dp this chip showed
+                    "₹236" while the ContractFlag directly below it showed the
+                    same contract as ₹235.50. */}
+                📄₹{Number(v.contract_price).toFixed(2)}
               </span>
             ) : v.last_price != null && (
               <span className={`ml-1 font-mono ${active ? 'text-white/80' : 'text-[#8B7355]'}`}>
-                ₹{v.last_price.toFixed(0)}
+                ₹{v.last_price.toFixed(2)}
               </span>
             )}
             <span className={`ml-1 ${active ? 'text-white/70' : 'text-[#8B7355]'}`}>×{v.purchase_count}</span>
@@ -810,8 +881,9 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   const [date, setDate] = useState(today);
   const [vendors, setVendors] = useState<Array<{ id: string; name: string; payment_terms?: string; lead_time_days?: number }>>([]);
   const [notes, setNotes] = useState('');
-  const [items, setItems] = useState<POLine[]>([
-    { material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' },
+  // Lazy initializer — newLineUid() must be called once, not on every render.
+  const [items, setItems] = useState<POLine[]>(() => [
+    { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' },
   ]);
   const [saving, setSaving] = useState(false);
   // Phase 1 §3 — pick vendor FIRST. Materials list filters to "purchased from this
@@ -822,9 +894,20 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   const [showAllMaterials, setShowAllMaterials] = useState(false);
   const [vendorMaterialIds, setVendorMaterialIds] = useState<Set<string>>(new Set());
   const [loadingVendorMats, setLoadingVendorMats] = useState(false);
+  const [vendorLoadError, setVendorLoadError] = useState('');
 
+  // This list feeds BOTH the header dropdown and every line dropdown, and a line
+  // vendor is required to save. A silently failed fetch would therefore leave the
+  // form unsubmittable with no explanation. Surface it instead.
   useEffect(() => {
-    fetch('/api/vendors').then(r => r.json()).then(d => setVendors((d.vendors || []).filter((v: any) => v.is_active)));
+    fetch('/api/vendors')
+      .then(r => r.json())
+      .then(d => {
+        const list = (d.vendors || []).filter((v: any) => v.is_active);
+        setVendors(list);
+        setVendorLoadError(list.length === 0 ? 'No active vendors found — add one under Vendors first.' : '');
+      })
+      .catch(() => setVendorLoadError('Could not load the vendor list — reload the page to try again.'));
   }, []);
 
   // Whenever vendor changes, fetch the explicit vendor↔material MAPPINGS
@@ -851,7 +934,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
     ? materials.filter(m => vendorMaterialIds.has(m.id))
     : materials;
 
-  const addLine = () => setItems(prev => [...prev, { material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' }]);
+  const addLine = () => setItems(prev => [...prev, { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' }]);
   const removeLine = (i: number) => setItems(prev => prev.filter((_, j) => j !== i));
   const updateLine = (i: number, patch: Partial<POLine>) =>
     setItems(prev => prev.map((it, j) => j === i ? { ...it, ...patch } : it));
@@ -867,8 +950,37 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   })();
 
   const submit = async () => {
-    const cleaned = items.filter(i => i.material_id && Number(i.quantity) > 0);
-    if (cleaned.length === 0) { alert('Add at least one valid item'); return; }
+    // Validate PER ROW instead of silently filtering: a blank qty/rate box looks
+    // unfinished, not invalid, so a dropped line used to vanish without a word
+    // even though the footer Total (which sums EVERY row, material chosen or
+    // not) had already counted it. The trash button stays the way to discard a
+    // line.
+    // Empty list first: `items.some(...)` is false on an empty array, so running
+    // the vendor gate ahead of this blamed a missing vendor when the real
+    // blocker was that the user had deleted every line.
+    if (items.length === 0) { alert('Add at least one item'); return; }
+    // The header vendor is OPTIONAL. One PO here legitimately spans several
+    // vendors (it is an internal approval/costing document, not a sheet sent to
+    // a vendor), and such a PO has no single header vendor — deriveHeaderVendor
+    // writes "Mixed (N vendors)" from the lines. What the PO actually needs is a
+    // vendor on every LINE, which is checked below and is what receive files
+    // each purchase against.
+    if (!primaryVendorId && !items.some(i => i.vendor.trim())) {
+      alert('Pick a vendor — on the header, or per line.'); return;
+    }
+    const problems: string[] = [];
+    items.forEach((it, i) => {
+      const qty = Number(it.quantity);
+      const px  = Number(it.unit_price);
+      const u   = poUnitOf(materials.find(m => m.id === it.material_id));
+      if (!it.material_id)      problems.push(`Line ${i + 1}: select an item (or remove the line)`);
+      else if (!(qty > 0))      problems.push(`Line ${i + 1}: enter a quantity greater than 0`);
+      // A ₹0 / negative rate reaches the purchases row at receive and drags
+      // average_price toward (or below) zero — never let it be saved.
+      else if (!(px > 0))       problems.push(`Line ${i + 1}: enter a unit rate greater than 0 (₹ per ${u || 'purchase unit'})`);
+      else if (!it.vendor.trim()) problems.push(`Line ${i + 1}: pick a vendor — receiving files the purchase against it`);
+    });
+    if (problems.length) { alert(problems.join('\n')); return; }
     setSaving(true);
     try {
       const r = await api('/api/purchase-orders', {
@@ -876,8 +988,16 @@ function CreatePOModal({ materials, onClose, onCreated }: {
         body: {
           date,
           notes,
-          // Items now carry their own vendor — backend derives the header vendor.
-          items: cleaned,
+          // Seed only: the route INSERTs the header with these, then
+          // deriveHeaderVendor() rewrites it from the LINE vendors before the
+          // same txn commits (one vendor → that line's vendor_id, several →
+          // "Mixed (N)" with vendor_id NULL). Every line is validated above to
+          // carry a vendor, so that derivation always wins; these are sent so a
+          // PO raised here is never INSERTed vendor-less.
+          vendor_id: primaryVendorId,
+          vendor: primaryVendorName,
+          // Items carry their own vendor. uid is client-only row identity.
+          items: items.map(({ uid, ...line }) => line),
         },
       });
       if (!r.ok) { alert((await r.json()).error || 'Failed'); return; }
@@ -900,15 +1020,20 @@ function CreatePOModal({ materials, onClose, onCreated }: {
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
-          {/* Header — Phase 1 §3: pick VENDOR first, then materials are filtered to that vendor. */}
+          {/* Header vendor is OPTIONAL: it seeds the line vendors and narrows the
+              material list to that vendor's mapped items. A PO that spans several
+              vendors just leaves it blank and sets the vendor per line. */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <label className="text-xs text-[#6B5744] flex flex-col gap-1">
-              Vendor (pick first) <span className="text-red-500">*</span>
+              Vendor <span className="text-[#8B7355] font-normal">(optional — filters the item list)</span>
               <select value={primaryVendorId} onChange={e => setPrimaryVendorId(e.target.value)}
                       className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
                 <option value="">Select vendor…</option>
                 {vendors.map(v => <option key={v.id} value={v.id}>{v.name}{v.payment_terms ? ` · ${v.payment_terms}` : ''}{v.lead_time_days ? ` · ${v.lead_time_days}d` : ''}</option>)}
               </select>
+              {vendorLoadError && (
+                <span className="text-[10px] text-red-600">{vendorLoadError}</span>
+              )}
               {primaryVendorId && (
                 <span className="text-[10px] text-[#8B7355]">
                   {loadingVendorMats ? 'Loading mapped materials…' :
@@ -926,7 +1051,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
             <div className="text-xs text-[#6B5744] flex flex-col gap-1 justify-end">
               <span className="text-[10px] text-[#8B7355]">Vendor(s) on this PO</span>
               <div className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF1E3] text-sm font-medium text-[#2D1B0E] min-h-[34px]">
-                {vendorSummary || <span className="text-[#8B7355] italic">{primaryVendorId ? 'Pick a material below — vendor auto-fills' : 'Select a vendor first ↑'}</span>}
+                {vendorSummary || <span className="text-[#8B7355] italic">{primaryVendorId ? 'Pick a material below — vendor auto-fills' : 'Set a vendor per line below, or pick one above ↑'}</span>}
               </div>
             </div>
           </div>
@@ -964,7 +1089,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                   const mat = materials.find(m => m.id === it.material_id);
                   const lineTotal = Number(it.quantity) * Number(it.unit_price);
                   return (
-                    <tr key={i} className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
+                    <tr key={it.uid} className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
                         {/* Once an item is chosen the line is LOCKED to it — to
@@ -986,11 +1111,13 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                                 if (m && (!it.vendor || it.vendor.trim() === '')) {
                                                   // Phase 1 §3: vendor was picked at header level — default the line vendor to it.
                                                   // Falls back to the material's primary_vendor only if no header vendor was set.
-                                                  const defaultVendor = primaryVendorName || (m as any).primary_vendor || '';
-                                                  patch.vendor = defaultVendor;
-                                                  patch.vendor_id = primaryVendorId
-                                                    || vendors.find(v => v.name.toLowerCase().trim() === defaultVendor.toLowerCase().trim())?.id
-                                                    || '';
+                                                  // Resolve against the master FIRST: the line vendor is a dropdown now, so a
+                                                  // name with no matching id can't be shown — leave it blank and make the
+                                                  // user pick rather than seeding a value the select can't represent.
+                                                  const seed = vendors.find(v => v.id === primaryVendorId)
+                                                    || vendors.find(v => v.name.toLowerCase().trim() === String((m as any).primary_vendor || '').toLowerCase().trim());
+                                                  patch.vendor    = seed ? seed.name : '';
+                                                  patch.vendor_id = seed ? seed.id : '';
                                                 }
                                                 updateLine(i, patch);
                                               }} />
@@ -1004,37 +1131,62 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Vendor</span>
-                        {/* Vendor picker — autocomplete-style: type or pick from master */}
-                        <input
-                          list={`po-vendor-list-${i}`}
-                          value={it.vendor}
-                          placeholder={mat?.primary_vendor || 'Type or pick…'}
-                          onChange={e => {
-                            const typed = e.target.value;
-                            const m = vendors.find(v => v.name.toLowerCase().trim() === typed.toLowerCase().trim());
-                            updateLine(i, { vendor: typed, vendor_id: m ? m.id : '' });
-                          }}
-                          className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-xs"
-                        />
-                        <datalist id={`po-vendor-list-${i}`}>
-                          {vendors.map(v => (
-                            <option key={v.id} value={v.name}>
-                              {v.payment_terms ? `${v.payment_terms}` : ''}{v.lead_time_days ? ` · ${v.lead_time_days}d lead` : ''}
-                            </option>
-                          ))}
-                        </datalist>
+                        {/* Vendor must come FROM the master, not be typed. A typed
+                            name that doesn't match a master row leaves vendor_id
+                            empty, and every downstream join (contracts, vendor
+                            history, payment terms) is keyed on vendor_id — so a
+                            single typo silently cost the line its contract price.
+                            Select by id; the name is cached alongside for display. */}
+                        {(() => {
+                          // A vendor deactivated AFTER this line was saved is no
+                          // longer in `vendors`; keep it selectable so an existing
+                          // draft still round-trips instead of blanking itself.
+                          const knownVendor = vendors.some(v => v.id === it.vendor_id);
+                          const legacy = !!it.vendor.trim() && !knownVendor;
+                          return (
+                            <select
+                              value={legacy ? '__legacy__' : (it.vendor_id || '')}
+                              onChange={e => {
+                                if (e.target.value === '__legacy__') return;   // unchanged
+                                const v = vendors.find(x => x.id === e.target.value);
+                                updateLine(i, { vendor_id: v ? v.id : '', vendor: v ? v.name : '' });
+                              }}
+                              className={`w-full px-1.5 py-1 border rounded text-xs bg-white ${legacy ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`}
+                            >
+                              <option value="">Select vendor…</option>
+                              {legacy && <option value="__legacy__">{it.vendor} — not in vendor master</option>}
+                              {vendors.map(v => (
+                                <option key={v.id} value={v.id}>
+                                  {v.name}
+                                  {v.payment_terms ? ` · ${v.payment_terms}` : ''}
+                                  {v.lead_time_days ? ` · ${v.lead_time_days}d lead` : ''}
+                                </option>
+                              ))}
+                            </select>
+                          );
+                        })()}
                         <EligibleVendorChips
                           materialId={it.material_id}
                           currentVendor={it.vendor}
-                          onPick={v => updateLine(i, {
-                            vendor: v.vendor,
-                            vendor_id: v.vendor_id || '',
-                            // Contract beats last_price beats nothing.
-                            // Always overwrite when a contract exists — that's the point.
-                            ...(v.contract_price != null
-                                ? { unit_price: v.contract_price }
-                                : (!it.unit_price && v.last_price != null ? { unit_price: v.last_price } : {})),
-                          })}
+                          onPick={v => {
+                            // Chips come from purchase HISTORY, which can name a
+                            // vendor the master no longer resolves. Re-resolve by
+                            // name so the dropdown can actually show the pick
+                            // instead of falling back to the legacy option.
+                            const mv = vendors.find(x => x.id === v.vendor_id)
+                                    || vendors.find(x => x.name.toLowerCase().trim() === v.vendor.toLowerCase().trim());
+                            updateLine(i, {
+                              vendor: mv ? mv.name : v.vendor,
+                              vendor_id: mv ? mv.id : '',
+                              // Contract beats last_price beats nothing.
+                              // Always overwrite when a contract exists — that's the point.
+                              // > 0, not != null: a ₹0 contract row means no rate was
+                              // agreed and must not wipe a correctly seeded rate.
+                              ...(Number(v.contract_price) > 0
+                                  ? { unit_price: Number(v.contract_price) }
+                                  : (!it.unit_price && Number(v.last_price) > 0 ? { unit_price: Number(v.last_price) } : {})),
+                            });
+                          }}
                         />
                         {it.vendor && it.vendor_id && (() => {
                           const v = vendors.find(x => x.id === it.vendor_id);
@@ -1047,8 +1199,14 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Qty</span>
-                        <input type="number" step="any" value={it.quantity || ''}
-                               onChange={e => updateLine(i, { quantity: parseFloat(e.target.value) || 0 })}
+                        {/* min=0 + clamp: a negative qty/rate used to flow straight
+                            through save → approve → receive into the purchases row
+                            and average_price. Ordering can never be negative. */}
+                        <input type="number" step="any" min={0} value={it.quantity || ''}
+                               onChange={e => {
+                                 const v = parseFloat(e.target.value);
+                                 updateLine(i, { quantity: Number.isFinite(v) ? Math.max(0, v) : 0 });
+                               }}
                                className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
                         {/* Spell out the ORDER unit so qty can never be read as
                             the recipe/stock unit (g) — a PO is in kg/BTL/CASE. */}
@@ -1056,10 +1214,18 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Unit ₹</span>
-                        <input type="number" step="any" value={it.unit_price || ''}
-                               onChange={e => updateLine(i, { unit_price: parseFloat(e.target.value) || 0 })}
+                        <input type="number" step="any" min={0} value={it.unit_price || ''}
+                               onChange={e => {
+                                 const v = parseFloat(e.target.value);
+                                 updateLine(i, { unit_price: Number.isFinite(v) ? Math.max(0, v) : 0 });
+                               }}
                                className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
                         {mat && <div className="text-[9px] text-[#8B7355] text-right mt-0.5">/ {poUnitOf(mat)}</div>}
+                        {/* The box renders blank at 0 (value={it.unit_price || ''}), which
+                            reads as optional — say it out loud instead. */}
+                        {it.material_id && !(Number(it.unit_price) > 0) && (
+                          <div className="text-[9px] text-red-600 text-right mt-0.5">rate required</div>
+                        )}
                         {it.material_id && it.vendor_id && (
                           <ContractFlag materialId={it.material_id} vendorId={it.vendor_id}
                                         unitPrice={Number(it.unit_price) || 0}
@@ -1193,7 +1359,9 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
   { poId: string; initialDate: string; initialVendor: string; initialNotes: string; initialItems: POItem[]; materials: Material[]; onCancel: () => void; onSaved: () => void }) {
   const [date, setDate] = useState(initialDate);
   const [notes, setNotes] = useState(initialNotes || '');
-  const [items, setItems] = useState(initialItems.map(i => ({
+  // Lazy initializer — newLineUid() must be called once per row, not per render.
+  const [items, setItems] = useState(() => initialItems.map(i => ({
+    uid: newLineUid(),      // stable row identity — index keys leaked child state on remove
     material_id: i.material_id,
     quantity: i.quantity,
     unit_price: i.unit_price,
@@ -1203,20 +1371,59 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
   const [vendors, setVendors] = useState<Array<{ id: string; name: string; payment_terms?: string; lead_time_days?: number }>>([]);
   const [saving, setSaving] = useState(false);
 
+  // is_active filter matches the new-PO composer: a retired vendor must not be
+  // offered for a fresh line. One already saved on this draft stays visible via
+  // the select's legacy option, so editing an old draft never blanks its vendor.
   useEffect(() => {
-    fetch('/api/vendors').then(r => r.json()).then(d => setVendors(d.vendors || [])).catch(() => {});
+    fetch('/api/vendors')
+      .then(r => r.json())
+      .then(d => setVendors((d.vendors || []).filter((v: any) => v.is_active)))
+      .catch(() => {});
   }, []);
 
   const update = (i: number, patch: any) => setItems(prev => prev.map((it, j) => j === i ? { ...it, ...patch } : it));
-  const add = () => setItems(prev => [...prev, { material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' }]);
+  const add = () => setItems(prev => [...prev, { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' }]);
   const remove = (i: number) => setItems(prev => prev.filter((_, j) => j !== i));
 
   const save = async () => {
+    // PUT replaces the whole item list, so an empty list silently WIPED the
+    // draft's items (total_cost 0) and a blank row was silently dropped. Validate
+    // per row, and never send an empty list.
+    if (items.length === 0) {
+      alert('A PO needs at least one item. To scrap this PO, use Delete on the draft instead.');
+      return;
+    }
+    const problems: string[] = [];
+    items.forEach((it, i) => {
+      const qty = Number(it.quantity);
+      const px  = Number(it.unit_price);
+      const u   = poUnitOf(materials.find(m => m.id === it.material_id));
+      if (!it.material_id)      problems.push(`Line ${i + 1}: select an item (or remove the line)`);
+      else if (!(qty > 0))      problems.push(`Line ${i + 1}: enter a quantity greater than 0`);
+      // ₹0 / negative rates reach the purchases row at receive and drag
+      // average_price toward zero.
+      else if (!(px > 0))       problems.push(`Line ${i + 1}: enter a unit rate greater than 0 (₹ per ${u || 'purchase unit'})`);
+      else if (!it.vendor.trim()) problems.push(`Line ${i + 1}: pick a vendor — receiving files the purchase against it`);
+    });
+    if (problems.length) {
+      // State it as POLICY, because it is one: Smart Reorder deliberately files
+      // drafts with a blank line vendor and a 0 rate (lib/crm-reorder-po.ts) for
+      // the buyer to complete here. Editing such a draft therefore means
+      // finishing every line, not just the one you came to change — approve and
+      // receive both reject a zero rate anyway.
+      alert(
+        problems.join('\n') +
+        '\n\nA draft is only saved once every line is complete (item + qty + rate + vendor). ' +
+        'Smart Reorder drafts arrive with the vendor and rate blank on purpose — fill those in here.'
+      );
+      return;
+    }
     setSaving(true);
     try {
       const r = await api('/api/purchase-orders', {
         method: 'PUT',
-        body: { id: poId, date, notes, items: items.filter(i => i.material_id && i.quantity > 0) },
+        // uid is client-only row identity — strip it off the wire.
+        body: { id: poId, date, notes, items: items.map(({ uid, ...line }) => line) },
       });
       if (!r.ok) { alert((await r.json()).error || 'Failed'); return; }
       onSaved();
@@ -1240,7 +1447,7 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
       {items.map((it, i) => {
         const mat = materials.find(m => m.id === it.material_id);
         return (
-          <div key={i} className="grid grid-cols-12 gap-2 text-xs items-start">
+          <div key={it.uid} className="grid grid-cols-12 gap-2 text-xs items-start">
             <div className="col-span-4">
               {/* Locked once chosen — remove the line to order a different item. */}
               {mat ? (
@@ -1254,9 +1461,11 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
                   // ₹ per PURCHASE unit (kg) — never the raw recipe-unit average.
                   if (m && (id !== it.material_id || !it.unit_price)) patch.unit_price = poRateOf(m);
                   if (m && (!it.vendor || it.vendor.trim() === '')) {
+                    // Only seed a vendor the dropdown can actually show — see the
+                    // matching comment in the new-PO composer.
                     const dv = (m as any).primary_vendor || '';
-                    patch.vendor = dv;
                     const mv = vendors.find(v => v.name.toLowerCase().trim() === dv.toLowerCase().trim());
+                    patch.vendor    = mv ? mv.name : '';
                     patch.vendor_id = mv ? mv.id : '';
                   }
                   update(i, patch);
@@ -1264,35 +1473,65 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
               )}
             </div>
             <div className="col-span-3">
-              <input
-                list={`edit-vendor-list-${i}`}
-                value={it.vendor}
-                placeholder={mat?.primary_vendor || 'Type or pick…'}
-                onChange={e => {
-                  const typed = e.target.value;
-                  const m = vendors.find(v => v.name.toLowerCase().trim() === typed.toLowerCase().trim());
-                  update(i, { vendor: typed, vendor_id: m ? m.id : '' });
-                }}
-                className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-xs"
-              />
-              <datalist id={`edit-vendor-list-${i}`}>
-                {vendors.map(v => <option key={v.id} value={v.name} />)}
-              </datalist>
+              {/* Pick from the master — a typed name leaves vendor_id empty and
+                  silently breaks every vendor_id-keyed join. Same rule as the
+                  new-PO composer, including the legacy escape hatch. */}
+              {(() => {
+                const knownVendor = vendors.some(v => v.id === it.vendor_id);
+                const legacy = !!it.vendor.trim() && !knownVendor;
+                return (
+                  <select
+                    value={legacy ? '__legacy__' : (it.vendor_id || '')}
+                    onChange={e => {
+                      if (e.target.value === '__legacy__') return;
+                      const v = vendors.find(x => x.id === e.target.value);
+                      update(i, { vendor_id: v ? v.id : '', vendor: v ? v.name : '' });
+                    }}
+                    className={`w-full px-1.5 py-1 border rounded text-xs bg-white ${legacy ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`}
+                  >
+                    <option value="">Select vendor…</option>
+                    {legacy && <option value="__legacy__">{it.vendor} — not in vendor master</option>}
+                    {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                  </select>
+                );
+              })()}
               <EligibleVendorChips
                 materialId={it.material_id}
                 currentVendor={it.vendor}
-                onPick={v => update(i, {
-                  vendor: v.vendor,
-                  vendor_id: v.vendor_id || '',
-                  ...(v.contract_price != null
-                      ? { unit_price: v.contract_price }
-                      : (!it.unit_price && v.last_price != null ? { unit_price: v.last_price } : {})),
-                })}
+                onPick={v => {
+                  // Re-resolve the history name against the master so the select
+                  // can show it — see the new-PO composer.
+                  const mv = vendors.find(x => x.id === v.vendor_id)
+                          || vendors.find(x => x.name.toLowerCase().trim() === v.vendor.toLowerCase().trim());
+                  update(i, {
+                    vendor: mv ? mv.name : v.vendor,
+                    vendor_id: mv ? mv.id : '',
+                    // > 0, not != null — a ₹0 contract row is "no rate agreed" and
+                    // must not overwrite a correctly seeded rate with 0.
+                    ...(Number(v.contract_price) > 0
+                        ? { unit_price: Number(v.contract_price) }
+                        : (!it.unit_price && Number(v.last_price) > 0 ? { unit_price: Number(v.last_price) } : {})),
+                  });
+                }}
               />
             </div>
-            <input type="number" step="any" value={it.quantity || ''} onChange={e => update(i, { quantity: parseFloat(e.target.value) || 0 })} className="col-span-2 px-2 py-1 border border-[#E8D5C4] rounded text-right" />
+            {/* min=0 + clamp — a negative ordered qty/rate is never re-checked at
+                receive (only overrides are) so it would reach purchases. */}
+            <div className="col-span-2">
+              <input type="number" step="any" min={0} value={it.quantity || ''}
+                     onChange={e => { const v = parseFloat(e.target.value); update(i, { quantity: Number.isFinite(v) ? Math.max(0, v) : 0 }); }}
+                     className="w-full px-2 py-1 border border-[#E8D5C4] rounded text-right" />
+              {/* Same labels as the new-PO composer: a PO is in kg/BTL/CASE at
+                  ₹/purchase-unit, and here the basis was stated only in the
+                  material cell — which wraps out of line on a narrow screen
+                  while this box rewrites a live PO's money. */}
+              {mat && <div className="text-[9px] text-[#8B7355] text-right mt-0.5">{poUnitOf(mat)}</div>}
+            </div>
             <div className="col-span-1">
-              <input type="number" step="any" value={it.unit_price || ''} onChange={e => update(i, { unit_price: parseFloat(e.target.value) || 0 })} className="w-full px-2 py-1 border border-[#E8D5C4] rounded text-right" />
+              <input type="number" step="any" min={0} value={it.unit_price || ''}
+                     onChange={e => { const v = parseFloat(e.target.value); update(i, { unit_price: Number.isFinite(v) ? Math.max(0, v) : 0 }); }}
+                     className="w-full px-2 py-1 border border-[#E8D5C4] rounded text-right" />
+              {mat && <div className="text-[9px] text-[#8B7355] text-right mt-0.5">/ {poUnitOf(mat)}</div>}
               {it.material_id && it.vendor_id && (
                 <ContractFlag materialId={it.material_id} vendorId={it.vendor_id}
                               unitPrice={Number(it.unit_price) || 0}
@@ -1373,8 +1612,17 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
             </thead>
             <tbody>
               {data.items.map((it: any) => {
+                // requested_qty is in PURCHASE units (10 kg) while current_stock and
+                // the usage columns are in RECIPE units (2,000 g) — they differ by
+                // pack_size, so they must not be labelled the same nor divided
+                // directly. Same pack guard as the rest of the app: convert only when
+                // pack>1 AND the two units genuinely differ.
+                const poUnit = it.material_purchase_unit || it.material_unit;
+                const pack   = Number(it.material_pack_size) || 1;
+                const packFactor = (pack > 1 && String(poUnit).toLowerCase().trim() !== String(it.material_unit).toLowerCase().trim()) ? pack : 1;
+                const reqInStockUnits = (Number(it.requested_qty) || 0) * packFactor;
                 const reqVsStock = it.current_stock > 0 && it.requested_qty > 0
-                  ? `+${((it.requested_qty / it.current_stock) * 100).toFixed(0)}%`
+                  ? `+${((reqInStockUnits / it.current_stock) * 100).toFixed(0)}%`
                   : null;
                 return (
                   <tr key={it.po_item_id} className={`border-t border-amber-100 ${it.flags.length > 0 ? 'bg-red-50/20' : ''}`}>
@@ -1383,8 +1631,16 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
                       <div className="text-[10px] font-mono text-[#8B7355]">{it.material_sku}</div>
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
-                      <div className="font-semibold">{it.requested_qty.toLocaleString('en-IN')} {it.material_unit}</div>
-                      <div className="text-[10px] text-[#8B7355]">@ ₹{it.requested_unit_price.toFixed(2)}</div>
+                      <div className="font-semibold">{it.requested_qty.toLocaleString('en-IN')} {poUnit}</div>
+                      {/* Always state the basis: a bare "@ ₹151.50" beside the
+                          recipe-unit columns reads as ₹/g. poUnit is never blank
+                          — the API COALESCEs purchase_unit to the recipe unit. */}
+                      <div className="text-[10px] text-[#8B7355]">@ ₹{it.requested_unit_price.toFixed(2)}/{poUnit}</div>
+                      {/* Spell out the stock-unit equivalent so "10 kg" can be compared
+                          with the recipe-unit stock/usage columns beside it. */}
+                      {packFactor > 1 && (
+                        <div className="text-[10px] text-[#8B7355]">= {reqInStockUnits.toLocaleString('en-IN')} {it.material_unit}</div>
+                      )}
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
                       <div>{it.current_stock.toLocaleString('en-IN')} {it.material_unit}</div>
@@ -1409,7 +1665,10 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
                           {it.last_purchases.map((p: any, i: number) => (
                             <div key={i} className="text-[10px]">
                               <span className="text-[#6B5744]">{dateLabel(p.date)}</span>
-                              <span className="ml-1 font-mono">{p.quantity.toLocaleString('en-IN')} × ₹{p.unit_price.toFixed(2)}</span>
+                              {/* purchases.quantity/unit_price are PURCHASE-unit
+                                  basis (canon) — say so, or "10 × ₹900" beside
+                                  the recipe-unit stock column reads as 10 g. */}
+                              <span className="ml-1 font-mono">{p.quantity.toLocaleString('en-IN')} {poUnit} × ₹{p.unit_price.toFixed(2)}/{poUnit}</span>
                               <span className="ml-1 text-[#8B7355]">· {p.vendor || 'unknown'}</span>
                             </div>
                           ))}
@@ -1495,7 +1754,7 @@ function RejectPOModal({ po, onClose, onRejected }: {
   const buildMailto = (finalReason: string) => {
     const subject = encodeURIComponent(`PO ${po.po_number} rejected — please review`);
     const body = encodeURIComponent(
-      `Hi,\n\nYour purchase order ${po.po_number} dated ${po.date} (vendor: ${po.vendor || 'unspecified'}, total ₹${po.total_cost.toLocaleString('en-IN')}) was rejected.\n\nReason:\n${finalReason}\n\nPlease address the above and re-submit.\n\nThanks.`,
+      `Hi,\n\nYour purchase order ${po.po_number} dated ${po.date} (vendor: ${po.vendor || 'unspecified'}, total ${fmt(po.total_cost)}) was rejected.\n\nReason:\n${finalReason}\n\nPlease address the above and re-submit.\n\nThanks.`,
     );
     return `mailto:${encodeURIComponent(drafterEmail || '')}?subject=${subject}&body=${body}`;
   };
@@ -1620,7 +1879,7 @@ function ApprovePOModal({ po, onClose, onApproved }: {
             <h2 className="font-bold text-[#2D1B0E] inline-flex items-center gap-2">
               <ShieldCheck className="w-5 h-5 text-blue-600" /> Approve {po.po_number}
             </h2>
-            <p className="text-xs text-[#8B7355] mt-0.5">Vendor: {po.vendor || '—'} · Total: ₹{po.total_cost.toLocaleString('en-IN')}</p>
+            <p className="text-xs text-[#8B7355] mt-0.5">Vendor: {po.vendor || '—'} · Total: {fmt(po.total_cost)}</p>
           </div>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>

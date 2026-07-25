@@ -1,7 +1,7 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
-import { effectiveRole, effectiveActor, recalcTotal } from '@/lib/po-helpers';
+import { effectiveRole, effectiveActor, recalcTotal, poWriteGate } from '@/lib/po-helpers';
 
 /** Phase B store guard for PO composition (create/edit are interactive, so we
  *  reject the request with a clear message instead of silently dropping lines).
@@ -46,6 +46,47 @@ function nextPoNumber(db: ReturnType<typeof getDb>, isoDate: string): string {
 }
 
 /**
+ * Per-line sanity gate for PO items.
+ *
+ * The composers clamp their inputs, but a clamp is cosmetic: a stale tab or a
+ * crafted request can still post a negative quantity, and a negative order line
+ * credits NEGATIVE stock the moment the PO is received. Reject at the door.
+ *
+ * NaN-safe on purpose — the old `Number(x) || 0` turned "abc" into a silent
+ * zero-qty line that passed every downstream check.
+ *
+ * Quantities are PURCHASE units and prices are ₹ per PURCHASE unit here; this
+ * gate deliberately does not convert, it only rejects impossible values.
+ */
+function lineSanityError(db: ReturnType<typeof getDb>, items: any[]): string | null {
+  const matExists = db.prepare('SELECT 1 FROM raw_materials WHERE id = ?');
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const n = i + 1;
+    const materialId = String(it?.material_id || '').trim();
+    if (!it || !materialId) return `Line ${n}: pick an item`;
+    // purchase_order_items.material_id carries an enforced FK (foreign_keys = ON),
+    // so an unknown id aborts the whole INSERT transaction and the composer shows
+    // the raw driver text "FOREIGN KEY constraint failed". Same probe the
+    // edit-approved endpoint runs; name the offending line instead.
+    if (!matExists.get(materialId)) return `Line ${n}: unknown item (${materialId})`;
+
+    const qty = Number(it.quantity);
+    if (!Number.isFinite(qty)) return `Line ${n}: quantity is not a number`;
+    if (qty <= 0)              return `Line ${n}: quantity must be greater than 0 (got ${qty})`;
+
+    // A rate of 0 is ALLOWED on purpose: Smart Reorder legitimately drafts lines
+    // whose ₹/purchase-unit is not known yet (crm-reorder-po.ts accepts px ≥ 0),
+    // and a 0 rate can never reach the books — [id]/receive rejects a 0/blank
+    // effective rate on every accepted line. Only a negative rate is impossible.
+    const px = Number(it.unit_price);
+    if (!Number.isFinite(px)) return `Line ${n}: rate is not a number`;
+    if (px < 0)               return `Line ${n}: rate cannot be negative (got ${px})`;
+  }
+  return null;
+}
+
+/**
  * Recompute the PO's header vendor from its line items.
  * - If all lines share one vendor → that's the PO vendor.
  * - If multiple → header reads "Mixed (N)" so reports/printouts make sense.
@@ -72,9 +113,9 @@ function deriveHeaderVendor(db: ReturnType<typeof getDb>, poId: string) {
 // ---------- GET ----------
 export async function GET(request: Request) {
   try {
-    // POST/PUT/DELETE all gate on effectiveRole(); GET did not, so PO pricing +
-    // vendor terms were readable by any request that reached the route. Require
-    // a signed-in user for reads too.
+    // POST/PUT/DELETE all gate on poWriteGate(); GET did not gate at all, so PO
+    // pricing + vendor terms were readable by any request that reached the route.
+    // Reads stay open to any signed-in user, but no further.
     const viewer = await getCurrentUser();
     if (!viewer) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
@@ -82,11 +123,12 @@ export async function GET(request: Request) {
     const id = url.searchParams.get('id');
 
     if (id) {
+      // No settings-based role here: this used to ship settings.current_role
+      // (which seeds to 'admin') as `viewer_role`, the same field name the list
+      // branch uses for the SESSION-derived role — po-helpers.ts removed that
+      // fallback precisely because it treated a forged/expired cookie as admin.
       const po = db.prepare(`
-        SELECT po.*, role.value AS viewer_role
-        FROM purchase_orders po
-        LEFT JOIN settings role ON role.key = 'current_role'
-        WHERE po.id = ?
+        SELECT po.* FROM purchase_orders po WHERE po.id = ?
       `).get(id) as any;
       if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
       const items = db.prepare(`
@@ -128,7 +170,9 @@ export async function GET(request: Request) {
           }
         }
       }
-      return Response.json({ purchase_order: { ...po, items } });
+      // Role travels at the TOP level (session-derived), exactly as the list
+      // branch returns it — never nested on the row, where it looked like PO data.
+      return Response.json({ purchase_order: { ...po, items }, viewer_role: await effectiveRole() });
     }
 
     const status = url.searchParams.get('status');
@@ -167,7 +211,11 @@ export async function GET(request: Request) {
 // ---------- POST (create draft) ----------
 export async function POST(request: Request) {
   try {
-    if (!(await effectiveRole())) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    // effectiveRole() collapses staff → 'manager', so the old truthiness check
+    // only proved a session existed and let any signed-in captain write POs.
+    const gate = await poWriteGate();
+    if (gate === 'anon')   return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can create POs' }, { status: 403 });
     const db = getDb();
     const body = await request.json();
     const { date, vendor_id, vendor, notes, items } = body;
@@ -178,6 +226,8 @@ export async function POST(request: Request) {
     }
     const blocked = storeBlockedError(db, items);
     if (blocked) return Response.json({ error: blocked }, { status: 400 });
+    const badLine = lineSanityError(db, items);
+    if (badLine) return Response.json({ error: badLine }, { status: 400 });
 
     // Resolve vendor — prefer vendor_id, cache name for display
     let resolvedVendorId: string | null = vendor_id || null;
@@ -202,15 +252,24 @@ export async function POST(request: Request) {
         INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
-      const lookupVendorId = db.prepare('SELECT id FROM vendors WHERE LOWER(name) = LOWER(?) LIMIT 1');
+      const lookupVendorId   = db.prepare('SELECT id FROM vendors WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1');
+      const lookupVendorName = db.prepare('SELECT name FROM vendors WHERE id = ?');
       for (const it of items) {
-        const qty = Number(it.quantity) || 0;
-        const px  = Number(it.unit_price) || 0;
+        // Validated by lineSanityError above — no `|| 0` fallback, which would
+        // silently rewrite a bad value instead of surfacing it.
+        const qty = Number(it.quantity);
+        const px  = Number(it.unit_price);
         let lineVendor   = String(it.vendor || '').trim();
         let lineVendorId = it.vendor_id || null;
         if (!lineVendorId && lineVendor) {
           const v = lookupVendorId.get(lineVendor) as any;
           if (v) lineVendorId = v.id;
+        } else if (lineVendorId && !lineVendor) {
+          // The composer now sends an id from the vendor dropdown; backfill the
+          // display name so deriveHeaderVendor (which skips blank names) can
+          // still resolve the header, and the line reads correctly everywhere.
+          const v = lookupVendorName.get(lineVendorId) as any;
+          if (v) lineVendor = String(v.name || '').trim();
         }
         insItem.run(generateId(), id, it.material_id, qty, px,
                     Math.round(qty * px * 100) / 100,
@@ -232,7 +291,11 @@ export async function POST(request: Request) {
 // ---------- PUT (update draft items / metadata) ----------
 export async function PUT(request: Request) {
   try {
-    if (!(await effectiveRole())) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    // Tier-accurate gate — see the POST handler (effectiveRole() reports
+    // 'manager' for the staff tier, so truthiness is only "has a session").
+    const gate = await poWriteGate();
+    if (gate === 'anon')   return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can edit POs' }, { status: 403 });
     const db = getDb();
     const body = await request.json();
     const { id, date, vendor_id, vendor, notes, items } = body;
@@ -241,8 +304,14 @@ export async function PUT(request: Request) {
     if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
     if (po.status !== 'draft') return Response.json({ error: 'Only drafts can be edited' }, { status: 400 });
     if (Array.isArray(items)) {
+      // An items array that is present but empty would delete every line and
+      // leave a submittable draft with nothing on it. The composer already
+      // requires one line; hold the same line here.
+      if (items.length === 0) return Response.json({ error: 'A purchase order needs at least one line' }, { status: 400 });
       const blocked = storeBlockedError(db, items);
       if (blocked) return Response.json({ error: blocked }, { status: 400 });
+      const badLine = lineSanityError(db, items);
+      if (badLine) return Response.json({ error: badLine }, { status: 400 });
     }
 
     let resolvedVendorName = vendor;
@@ -268,15 +337,21 @@ export async function PUT(request: Request) {
           INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
-        const lookupVendorId = db.prepare('SELECT id FROM vendors WHERE LOWER(name) = LOWER(?) LIMIT 1');
+        const lookupVendorId   = db.prepare('SELECT id FROM vendors WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1');
+        const lookupVendorName = db.prepare('SELECT name FROM vendors WHERE id = ?');
         for (const it of items) {
-          const qty = Number(it.quantity) || 0;
-          const px  = Number(it.unit_price) || 0;
+          // Validated by lineSanityError above — see the POST handler.
+          const qty = Number(it.quantity);
+          const px  = Number(it.unit_price);
           let lineVendor   = String(it.vendor || '').trim();
           let lineVendorId = it.vendor_id || null;
           if (!lineVendorId && lineVendor) {
             const v = lookupVendorId.get(lineVendor) as any;
             if (v) lineVendorId = v.id;
+          } else if (lineVendorId && !lineVendor) {
+            // Backfill the name from the id — see the POST handler.
+            const v = lookupVendorName.get(lineVendorId) as any;
+            if (v) lineVendor = String(v.name || '').trim();
           }
           ins.run(generateId(), id, it.material_id, qty, px,
                   Math.round(qty * px * 100) / 100,
@@ -299,7 +374,10 @@ export async function PUT(request: Request) {
 // ---------- DELETE (drafts only) ----------
 export async function DELETE(request: Request) {
   try {
-    if (!(await effectiveRole())) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    // Tier-accurate gate — see the POST handler.
+    const gate = await poWriteGate();
+    if (gate === 'anon')   return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can delete POs' }, { status: 403 });
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');

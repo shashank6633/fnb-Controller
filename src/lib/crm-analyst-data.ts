@@ -12,6 +12,7 @@
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type Database from 'better-sqlite3';
+import { packFactor } from '@/lib/pack-units';
 
 type DB = Database.Database;
 
@@ -143,11 +144,11 @@ export function reorderSuggestions(db: DB) {
     const belowReorder = m.reorder_level > 0 && m.current_stock <= m.reorder_level;
     const daysLeft = avg > 0 ? m.current_stock / avg : null;
     if (!belowReorder && !(daysLeft != null && daysLeft < 7)) continue;
-    const pack = m.pack_size > 0 ? m.pack_size : 1;
+    const packF = packFactor(m);           // recipe units per purchase unit (1 = no conversion)
     const need7 = avg * 7;                                        // recipe units for 7-day cover
-    let packs = Math.ceil(Math.max(0, need7 - m.current_stock) / pack);
+    let packs = Math.ceil(Math.max(0, need7 - m.current_stock) / packF);
     if (packs <= 0 && belowReorder) {
-      packs = Math.max(1, Math.ceil((m.reorder_level - m.current_stock) / pack));
+      packs = Math.max(1, Math.ceil((m.reorder_level - m.current_stock) / packF));
     }
     if (packs <= 0) continue;
     out.push({
@@ -158,7 +159,7 @@ export function reorderSuggestions(db: DB) {
       days_of_stock_left: daysLeft == null ? null : r2(daysLeft),
       suggested_order_qty: packs,
       order_unit: m.purchase_unit || m.unit,
-      est_cost: r2(packs * pack * m.average_price),
+      est_cost: r2(packs * packF * m.average_price),   // packs → recipe units × ₹/recipe-unit
     });
   }
   out.sort((a, b) => {
@@ -170,7 +171,7 @@ export function reorderSuggestions(db: DB) {
   return {
     as_of: today(),
     latest_issue_date: latestIssueDate(db),  // if older than 14d, suggestions fall back to reorder-level top-ups
-    note: 'Suggested order quantity = ceil((7-day need − on-hand) ÷ pack size), in PURCHASE units, for a 7-day cover. est_cost in ₹.',
+    note: 'Suggested order quantity = ceil((7-day need − on-hand) ÷ pack factor), in PURCHASE units, for a 7-day cover. Pack factor = pack_size only when the recipe unit differs from the purchase unit, else 1. est_cost in ₹.',
     rows: out.slice(0, 15),
   };
 }
@@ -522,7 +523,9 @@ export function pendingApprovals(db: DB) {
  *                  vendor; else null.
  *   unit_price   — ₹/PURCHASE-unit: contract price → last_purchase_price (already
  *                  ₹/PU — same derivation the Requisitions page shows as "Last ₹")
- *                  → average_price × pack_size.
+ *                  → average_price (₹/recipe-unit) × packFactor — which is
+ *                  pack_size ONLY when the recipe unit differs from the
+ *                  purchase unit, else 1.
  */
 export function reorderSuggestionsEnriched(db: DB) {
   const use = dailyUseMap(db, 14);
@@ -569,10 +572,16 @@ export function reorderSuggestionsEnriched(db: DB) {
     const daysLeft = avg > 0 ? m.current_stock / avg : null;
     if (!belowReorder && !(daysLeft != null && daysLeft < 7)) continue;
     const pack = m.pack_size > 0 ? m.pack_size : 1;
+    // Recipe units per purchase unit — 1 unless pack_size > 1 AND the recipe
+    // unit differs from the purchase unit. Both halves matter: "PICKLED GINGER
+    // 1.5KG" (unit kg = purchase_unit kg, pack 1.5) has NO conversion. These
+    // rows are drafted straight into a PO by /api/crm/reorder, so a wrong
+    // factor here becomes a wrong purchases.unit_price.
+    const packF = packFactor(m);
     const need7 = avg * 7;
-    let packs = Math.ceil(Math.max(0, need7 - m.current_stock) / pack);
+    let packs = Math.ceil(Math.max(0, need7 - m.current_stock) / packF);
     if (packs <= 0 && belowReorder) {
-      packs = Math.max(1, Math.ceil((m.reorder_level - m.current_stock) / pack));
+      packs = Math.max(1, Math.ceil((m.reorder_level - m.current_stock) / packF));
     }
     if (packs <= 0) continue;
 
@@ -601,9 +610,9 @@ export function reorderSuggestionsEnriched(db: DB) {
     let priceSource: 'contract' | 'last_purchase' | 'average';
     if (matContracts[0]) { unitPrice = r2(matContracts[0].unit_price); priceSource = 'contract'; }
     else if (lastPrice.has(m.id)) { unitPrice = r2(lastPrice.get(m.id)); priceSource = 'last_purchase'; }
-    else { unitPrice = r2(m.average_price * pack); priceSource = 'average'; }
+    // average_price is ₹/RECIPE-unit — ×packF (never ×pack) lifts it to ₹/purchase-unit.
+    else { unitPrice = r2(m.average_price * packF); priceSource = 'average'; }
 
-    const hasPU = !!(m.purchase_unit && m.purchase_unit.toLowerCase() !== (m.unit || '').toLowerCase() && pack > 1);
     out.push({
       material_id: m.id,
       name: m.name, sku: m.sku || '', category: m.category,
@@ -611,7 +620,7 @@ export function reorderSuggestionsEnriched(db: DB) {
       current_stock: r3(m.current_stock), unit: m.unit,
       purchase_unit: m.purchase_unit || m.unit,
       pack_size: pack,
-      current_stock_pu: r2(hasPU ? m.current_stock / pack : m.current_stock),
+      current_stock_pu: r2(m.current_stock / packF),   // packF = 1 when there is no conversion
       avg_daily_use_14d: r3(avg),
       days_of_stock_left: daysLeft == null ? null : r2(daysLeft),
       suggested_order_qty: packs,
@@ -635,7 +644,7 @@ export function reorderSuggestionsEnriched(db: DB) {
   return {
     as_of: today(),
     latest_issue_date: latestIssueDate(db),
-    note: 'Suggested qty = ceil((7-day need − on-hand) ÷ pack size), in PURCHASE units, CRITICAL (3★) materials first. unit_price is ₹/purchase-unit (contract → last purchase → average×pack).',
+    note: 'Suggested qty = ceil((7-day need − on-hand) ÷ pack factor), in PURCHASE units, CRITICAL (3★) materials first. Pack factor = pack_size only when the recipe unit differs from the purchase unit, else 1. unit_price is ₹/purchase-unit (contract → last purchase → average × pack factor).',
     rows: out.slice(0, 60),
   };
 }

@@ -1,4 +1,5 @@
 import { getDb } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
 
 /**
  * Approval Context for a Purchase Order.
@@ -17,18 +18,36 @@ import { getDb } from '@/lib/db';
  *       'price_jump'        — requested unit_price > 1.10 × avg_purchase_price
  *       'overstock'         — current_stock alone covers > 60 days
  *
+ * UNIT BASIS: a PO line is qty in PURCHASE units at ₹/purchase-unit, while
+ * current_stock / usage are RECIPE units and average_price is ₹/recipe-unit.
+ * Every comparison below aligns the two bases with pack_size first — mixing
+ * them makes each flag wrong by a factor of pack (over_order never fires,
+ * price_jump always fires).
+ *
  * The aim is to let the admin spot stockpiling / panic ordering at a glance.
  */
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
+    // Sensitive read: per line this returns our rate, the vendor's last 2 rates,
+    // current stock and 30/60/90-day consumption. proxy.ts only checks that an
+    // fnb_session cookie is PRESENT on a GET (step 2) — validity is asserted only
+    // for state-changing methods (step 2c) — so a forged cookie reaches this
+    // handler. Verify the session here, exactly as the sibling
+    // GET /api/purchase-orders does.
+    const viewer = await getCurrentUser();
+    if (!viewer) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
 
     const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id) as any;
     if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
 
     const items = db.prepare(`
+      -- pack_size / purchase_unit are NOT on purchase_order_items, so poi.* can
+      -- never supply them — they must come off raw_materials for the conversion.
       SELECT poi.*, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
+             COALESCE(rm.pack_size, 1) AS material_pack_size,
              rm.current_stock, rm.last_purchase_price, rm.last_purchase_date, rm.average_price
       FROM purchase_order_items poi
       JOIN raw_materials rm ON rm.id = poi.material_id
@@ -65,14 +84,27 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         daysSinceLast = Math.floor(ms / 86400000);
       }
 
+      // ── Unit-basis boundary (CORE CONVENTION) ────────────────────────────
+      // Convert ONCE here, with the same test every unit-aware surface uses
+      // (pack>1 AND recipe≠purchase unit — see the "Unit-basis boundary" block
+      // in [id]/receive/route.ts, ~line 278):
+      //   qty × pack   → PURCHASE units become RECIPE units (stock/usage basis)
+      //   avg × pack   → ₹/recipe-unit becomes ₹/purchase-unit (PO rate basis)
+      const packSize = Number(it.material_pack_size) || 1;
+      const ru = String(it.material_unit || '').toLowerCase().trim();
+      const pu = String(it.material_purchase_unit || it.material_unit || '').toLowerCase().trim();
+      const isPack = packSize > 1 && ru !== pu;
+
       const flags: string[] = [];
       // 1. Over-ordering: requested qty + current_stock > 90d of consumption
-      const requestedQty = Number(it.quantity) || 0;
-      if (u90 > 0 && (requestedQty + it.current_stock) > u90) flags.push('over_order');
+      const requestedQty = Number(it.quantity) || 0;                  // PURCHASE units
+      const requestedQtyRecipe = isPack ? requestedQty * packSize : requestedQty;
+      if (u90 > 0 && (requestedQtyRecipe + it.current_stock) > u90) flags.push('over_order');
       // 2. Recent purchase (< 7 days)
       if (daysSinceLast != null && daysSinceLast < 7) flags.push('recent_purchase');
-      // 3. Price jump
-      if (it.average_price > 0 && Number(it.unit_price) > it.average_price * 1.10) flags.push('price_jump');
+      // 3. Price jump — both sides must be ₹/purchase-unit (unit_price already is)
+      const avgPricePO = isPack ? (Number(it.average_price) || 0) * packSize : (Number(it.average_price) || 0);
+      if (avgPricePO > 0 && Number(it.unit_price) > avgPricePO * 1.10) flags.push('price_jump');
       // 4. Already overstocked: current_stock alone covers > 60 days
       if (avgDaily > 0 && it.current_stock > avgDaily * 60) flags.push('overstock');
       // 5. Never sold (no usage history at all but stock exists)
@@ -84,11 +116,17 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         material_name: it.material_name,
         material_sku: it.material_sku,
         material_unit: it.material_unit,
+        // Labels: requested_qty/@rate are PURCHASE-unit basis, current_stock and
+        // every usage number are RECIPE-unit basis — the UI must not share a unit.
+        material_purchase_unit: it.material_purchase_unit,
+        material_pack_size: packSize,
         requested_qty: requestedQty,
+        requested_qty_recipe: requestedQtyRecipe,
         requested_unit_price: Number(it.unit_price) || 0,
         requested_total: Number(it.total_price) || 0,
         current_stock: it.current_stock,
         average_price: it.average_price,
+        average_price_purchase_unit: avgPricePO,
         last_purchase_price: it.last_purchase_price,
         last_purchase_date: it.last_purchase_date,
         days_since_last_purchase: daysSinceLast,

@@ -4,7 +4,10 @@ import { useParams } from 'next/navigation';
 import { Printer } from 'lucide-react';
 
 import { fmtIST, fmtISTDate } from '@/lib/format-date';
-const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+// Fixed 2 dp, deliberately the same formatter as the /purchase-orders list page,
+// so the same PO reads identically on screen and on paper (max-only would print
+// ₹354 here and ₹354.00 there).
+const fmt = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 // All timestamps in IST. dt() shows date only (legacy callers); use fmtIST when
 // you need a date+time stamp on the PO print.
 const dt = (s?: string | null) => fmtISTDate(s, { fallback: '—' });
@@ -37,14 +40,34 @@ export default function POPrintPage() {
   // For received POs we display BOTH so the print is honest about any
   // qty/price overrides made during receive.
   const isReceived = po.status === 'received';
+  // A PO may legitimately span several vendors (it is an internal approval and
+  // costing document here, not a sheet sent to one vendor). When it does, the
+  // header shows "Mixed (N vendors)" and the single-vendor identity block below
+  // is suppressed because vendor_id is NULL — so the per-line vendor is the only
+  // way to tell whose line is whose. Show that column only in that case; a
+  // single-vendor PO already names its vendor in the header.
+  const isMixedVendor = new Set(
+    (po.items || []).map((it: any) => String(it.vendor || '').trim()).filter(Boolean)
+  ).size > 1;
   const orderedSubtotal = (po.items || []).reduce((s: number, it: any) => s + (Number(it.total_price) || 0), 0);
   const receivedSubtotal = isReceived
     ? (po.items || []).reduce((s: number, it: any) => s + (Number(it.received_line_total) || 0), 0)
     : 0;
-  // Fall back to po.total_cost (server-recomputed on receive) if per-line GRN
-  // data isn't joined for some reason — keeps the grand total trustworthy.
+  // GRN data is authoritative whenever the receive actually joined GRN lines —
+  // including a legitimate ₹0 receive (every line rejected). Detect "joined" by
+  // the presence of received_line_total (the API sets it only for po_items
+  // matched to a GRN row), NOT by receivedSubtotal > 0, since a truthful zero
+  // sums to 0. Fall back to po.total_cost (server-recomputed on receive) only
+  // when no GRN line joined at all.
+  const hasGrnLines = isReceived && (po.items || []).some((it: any) => it.received_line_total != null);
+  // purchase_orders.total_cost is REAL NOT NULL DEFAULT 0 (db.ts:794) and the GET
+  // returns SELECT po.*, so a real row always lands a finite number here. The
+  // `?? NaN` + isFinite pair only guards a malformed payload (explicit null or a
+  // non-numeric), which `|| 0` would silently print as a bogus ₹0.
+  const storedTotal = Number(po.total_cost ?? NaN);
   const grandTotal = isReceived
-    ? (receivedSubtotal > 0 ? receivedSubtotal : Number(po.total_cost) || orderedSubtotal)
+    ? (hasGrnLines ? receivedSubtotal
+                   : (Number.isFinite(storedTotal) ? storedTotal : orderedSubtotal))
     : orderedSubtotal;
 
   return (
@@ -107,6 +130,7 @@ export default function POPrintPage() {
               <th className="border border-gray-300 px-2 py-1.5 text-left">#</th>
               <th className="border border-gray-300 px-2 py-1.5 text-left">SKU</th>
               <th className="border border-gray-300 px-2 py-1.5 text-left">Material</th>
+              {isMixedVendor && <th className="border border-gray-300 px-2 py-1.5 text-left">Vendor</th>}
               <th className="border border-gray-300 px-2 py-1.5 text-right">Ordered Qty</th>
               <th className="border border-gray-300 px-2 py-1.5 text-left">Unit</th>
               <th className="border border-gray-300 px-2 py-1.5 text-right">Rate (Ord)</th>
@@ -140,6 +164,7 @@ export default function POPrintPage() {
                       </div>
                     )}
                   </td>
+                  {isMixedVendor && <td className="border border-gray-300 px-2 py-1.5">{it.vendor || '—'}</td>}
                   <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{Number(it.quantity).toLocaleString('en-IN')}</td>
                   {/* PO qty/rate are in the PURCHASE unit (kg, BTL, CASE), not
                       the recipe unit (g, ml) — the vendor orders in the former. */}
@@ -163,7 +188,8 @@ export default function POPrintPage() {
           </tbody>
           <tfoot className="font-bold bg-gray-50">
             <tr>
-              <td colSpan={6} className="border border-gray-300 px-2 py-2 text-right">Total Ordered</td>
+              {/* +1 for the Vendor column that only a mixed-vendor PO renders. */}
+              <td colSpan={isMixedVendor ? 7 : 6} className="border border-gray-300 px-2 py-2 text-right">Total Ordered</td>
               <td className="border border-gray-300 px-2 py-2 text-right font-mono">{fmt(orderedSubtotal)}</td>
               {isReceived && <>
                 <td colSpan={2} className="border border-gray-300 px-2 py-2 text-right bg-emerald-50">Total Received</td>
@@ -172,7 +198,7 @@ export default function POPrintPage() {
             </tr>
             {isReceived && Math.abs(receivedSubtotal - orderedSubtotal) > 0.01 && (
               <tr className="bg-amber-50">
-                <td colSpan={isReceived ? 9 : 6} className="border border-gray-300 px-2 py-1.5 text-right text-amber-900 text-[11px]">
+                <td colSpan={(isReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-amber-900 text-[11px]">
                   Variance (Received − Ordered)
                 </td>
                 <td className="border border-gray-300 px-2 py-1.5 text-right font-mono text-amber-900">
@@ -181,7 +207,7 @@ export default function POPrintPage() {
               </tr>
             )}
             <tr className="bg-gray-100">
-              <td colSpan={isReceived ? 9 : 6} className="border border-gray-300 px-2 py-2 text-right uppercase tracking-wider text-[11px]">
+              <td colSpan={(isReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-2 text-right uppercase tracking-wider text-[11px]">
                 Grand Total {isReceived ? '(Final, post-receive)' : '(Ordered)'}
               </td>
               <td className="border border-gray-300 px-2 py-2 text-right font-mono text-[13px]">{fmt(grandTotal)}</td>

@@ -39,12 +39,18 @@ export async function POST(request: Request) {
   try {
     const db = getDb();
     const b = await request.json();
-    if (!b.name) return Response.json({ error: 'name required' }, { status: 400 });
+    // Trim at the write boundary. The name is the join key back to purchases.vendor
+    // (LOWER(TRIM(name)) in vendors/for-material, materials-summary, vendor-contracts
+    // and the PO vendor_id lookups), so a trailing space typed on a phone keyboard
+    // would persist and desync those matches. JS trim() also strips tabs/NBSP, which
+    // SQLite's TRIM() does not. A whitespace-only name is no name — 400 as before.
+    const name = typeof b.name === 'string' ? b.name.trim() : b.name;
+    if (!name) return Response.json({ error: 'name required' }, { status: 400 });
     const id = generateId();
     db.prepare(`
       INSERT INTO vendors (id, name, contact_person, phone, email, gstin, address, payment_terms, lead_time_days, is_active, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, b.name, b.contact_person || '', b.phone || '', b.email || '', b.gstin || '',
+    `).run(id, name, b.contact_person || '', b.phone || '', b.email || '', b.gstin || '',
             b.address || '', b.payment_terms || '', Number(b.lead_time_days) || 0,
             b.is_active === false ? 0 : 1, b.notes || '');
     const v = db.prepare('SELECT * FROM vendors WHERE id = ?').get(id);
@@ -72,7 +78,11 @@ export async function PUT(request: Request) {
         updated_at = datetime('now')
       WHERE id = ?
     `).run(
-      b.name ?? null, b.contact_person ?? null, b.phone ?? null, b.email ?? null,
+      // Same write-boundary trim as POST. A whitespace-only edit binds NULL so
+      // COALESCE keeps the stored name — blanking it would orphan every
+      // LOWER(TRIM(name)) join back to purchases.vendor.
+      b.name != null ? (String(b.name).trim() || null) : null,
+      b.contact_person ?? null, b.phone ?? null, b.email ?? null,
       b.gstin ?? null, b.address ?? null, b.payment_terms ?? null,
       b.lead_time_days != null ? Number(b.lead_time_days) : null,
       b.is_active != null ? (b.is_active ? 1 : 0) : null,

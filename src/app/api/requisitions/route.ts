@@ -151,9 +151,17 @@ export async function GET(request: Request) {
       SELECT r.*, d.name AS department_name, d.code AS department_code,
              po.po_number AS linked_po_number, po.status AS linked_po_status,
              (SELECT COUNT(*) FROM requisition_items WHERE req_id = r.id) AS item_count,
+             -- average_price is ₹ per RECIPE unit, so a line requested in the
+             -- PURCHASE unit is scaled by pack_size — and ONLY when that purchase
+             -- unit really differs from the recipe unit (house pack-factor CASE,
+             -- same rule as packFactor() and the page's reqPackFactor; without the
+             -- ri.unit <> rm.unit half, a kg-priced kg-requested 1.5 kg pack
+             -- (PICKLED GINGER 1.5KG) would value 1.5x the per-row costing shown).
              (SELECT COALESCE(SUM(
                   ri.quantity_requested
-                  * (CASE WHEN ri.unit = rm.purchase_unit AND COALESCE(rm.pack_size, 1) > 1 THEN rm.pack_size ELSE 1 END)
+                  * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                               AND ri.unit <> rm.unit AND COALESCE(rm.pack_size, 1) > 1
+                          THEN rm.pack_size ELSE 1 END)
                   * rm.average_price), 0)
                 FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
                 WHERE ri.req_id = r.id) AS estimated_value
@@ -291,7 +299,7 @@ export async function POST(request: Request) {
           `SELECT id, COALESCE(NULLIF(category, ''), 'other') AS category FROM raw_materials WHERE id IN (${ids.map(() => '?').join(',')})`,
         ).all(...ids) as { id: string; category: string }[];
         const catById = new Map(rows.map((r) => [r.id, r.category]));
-        const offender = validItems.find((it: any) => !allow.has(catById.get(it.material_id) || ' '));
+        const offender = validItems.find((it: any) => !allow.has(catById.get(it.material_id) || ''));
         if (offender) {
           return Response.json({ error: "One or more items are outside your department's allowed categories." }, { status: 403 });
         }

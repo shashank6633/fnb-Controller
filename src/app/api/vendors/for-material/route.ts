@@ -1,4 +1,5 @@
 import { getDb } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
 
 /**
  * Eligible vendors for a given raw material — vendors we've actually purchased
@@ -11,9 +12,14 @@ import { getDb } from '@/lib/db';
  * Source of truth: the `purchases` table (committed receipts). We dedupe by
  * normalised lowercase vendor name and try to resolve to a vendors-master row
  * for richer display (payment_terms, lead time).
+ *
+ * Any signed-in user (read-only) — the response carries negotiated contract rates
+ * and purchase history, so it must not be readable without a session.
  */
 export async function GET(request: Request) {
   try {
+    const viewer = await getCurrentUser();
+    if (!viewer) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const materialId = new URL(request.url).searchParams.get('material_id');
     if (!materialId) return Response.json({ error: 'material_id required' }, { status: 400 });
@@ -41,7 +47,22 @@ export async function GET(request: Request) {
 
     // Resolve each vendor name to a vendors-master row when possible.
     // Also attach the currently-active contract price for this (vendor, material), if any.
-    const lookup = db.prepare('SELECT id, name, payment_terms, lead_time_days FROM vendors WHERE LOWER(name) = LOWER(?) LIMIT 1');
+    // TRIM both sides: the bind value is the TRIM(p.vendor) the SELECT above produced,
+    // but a vendors-master name can carry stray whitespace, so an untrimmed compare
+    // silently fails to resolve vendor_id and the active contract price never surfaces.
+    // Same convention as vendor-contracts / vendors/materials-summary. Note SQLite's
+    // TRIM() strips spaces only — a tab/NBSP-padded master name still misses here; the
+    // durable fix is trimming the name at the vendors write boundary.
+    // ORDER BY: with both sides trimmed, a clean row and a whitespace-padded duplicate
+    // of the same name both match, so pick deterministically — the live row first, then
+    // the exact (shortest, i.e. unpadded) name — instead of whatever the scan hits first.
+    const lookup = db.prepare(`
+      SELECT id, name, payment_terms, lead_time_days
+      FROM vendors
+      WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))
+      ORDER BY is_active DESC, LENGTH(name) ASC
+      LIMIT 1
+    `);
     const contractLookup = db.prepare(`
       SELECT id, unit_price, valid_from, valid_to
       FROM vendor_contracts
@@ -54,6 +75,10 @@ export async function GET(request: Request) {
     const enriched = rows.map(r => {
       const v = lookup.get(r.vendor) as any;
       const contract = v?.id ? contractLookup.get(v.id, materialId) as any : null;
+      // A ₹0 contract row is "this vendor sells this item, price TBD" — vendor-contracts
+      // POST explicitly allows unit_price = 0 — not an agreed rate. Report the whole
+      // contract as absent so no consumer auto-fills a PO line at ₹0.
+      const hasRate = Number(contract?.unit_price) > 0;
       return {
         vendor: r.vendor,
         vendor_id: v?.id || null,
@@ -64,9 +89,9 @@ export async function GET(request: Request) {
         last_price: r.last_price,
         avg_price: r.avg_price,
         total_qty: r.total_qty,
-        contract_id: contract?.id || null,
-        contract_price: contract?.unit_price ?? null,
-        contract_valid_to: contract?.valid_to || null,
+        contract_id: hasRate ? contract.id : null,
+        contract_price: hasRate ? contract.unit_price : null,
+        contract_valid_to: hasRate ? (contract.valid_to || null) : null,
       };
     });
 

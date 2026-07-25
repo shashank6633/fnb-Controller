@@ -153,10 +153,14 @@ export default function CrmReorderPage() {
 
   const onVendorChange = (row: EditableRow, vendorId: string) => {
     // Adopt the chosen vendor's contract price when it has one.
+    // > 0, not != null: contract_price is vendor_contracts.unit_price rounded
+    // (crm-analyst-data.ts), so a contract row with no agreed rate arrives as 0,
+    // not null — adopting it would wipe the seeded ₹/purchase-unit with ₹0.
     const opt = row.vendors.find(v => v.vendor_id === vendorId);
+    const contract = Number(opt?.contract_price);
     update(row.material_id, {
       vendor_id: vendorId,
-      ...(opt && opt.contract_price != null ? { price: opt.contract_price } : {}),
+      ...(contract > 0 ? { price: contract } : {}),
     });
   };
 
@@ -380,7 +384,7 @@ export default function CrmReorderPage() {
                     <option value="">Unassigned — pick on the PO</option>
                     {r.vendors.map(v => (
                       <option key={v.vendor_id} value={v.vendor_id}>
-                        {v.vendor_name}{v.contract_price != null ? ` · ₹${v.contract_price}/​${r.purchase_unit}` : ''}
+                        {v.vendor_name}{Number(v.contract_price) > 0 ? ` · ₹${v.contract_price}/​${r.purchase_unit}` : ''}
                       </option>
                     ))}
                   </select>
@@ -461,7 +465,7 @@ export default function CrmReorderPage() {
                         <option value="">Unassigned</option>
                         {r.vendors.map(v => (
                           <option key={v.vendor_id} value={v.vendor_id}>
-                            {v.vendor_name}{v.contract_price != null ? ` · ₹${v.contract_price}` : ''}
+                            {v.vendor_name}{Number(v.contract_price) > 0 ? ` · ₹${v.contract_price}` : ''}
                           </option>
                         ))}
                       </select>

@@ -1,6 +1,6 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
-import { getCurrentUser } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 
 export async function GET(request: Request) {
@@ -72,6 +72,12 @@ export async function POST(request: Request) {
     const dateCheck = checkPurchaseDate(db, date, me?.role === 'admin');
     if (!dateCheck.ok) return Response.json({ error: dateCheck.error }, { status: 400 });
 
+    // Book the purchase against the outlet the user is currently viewing, the
+    // way /api/grn does. An unstamped (NULL) row is rewritten to the DEFAULT
+    // outlet by the startup migration in db.ts, so a purchase entered at a
+    // non-default outlet would silently land in the default outlet's reports.
+    const outletId = await getCurrentOutletId();
+
     const material = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(material_id) as any;
     if (!material) {
       return Response.json({ error: 'Material not found' }, { status: 404 });
@@ -115,10 +121,10 @@ export async function POST(request: Request) {
       }
       db.prepare(`
         INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
-                               is_emergency, payment_mode, emergency_reason, invoice_id, bill_no, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                               is_emergency, payment_mode, emergency_reason, invoice_id, bill_no, outlet_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       `).run(id, material_id, vendor || '', brand || '', quantity, unit_price, total_price, date, notes || '',
-              is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '', invoiceId, billNo);
+              is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '', invoiceId, billNo, outletId);
 
       // Stock is kept in RECIPE units (sales deduction, closing-stock variance
       // × average_price). quantity is entered in PURCHASE units, so multiply by
@@ -135,9 +141,9 @@ export async function POST(request: Request) {
 
       // Create inventory transaction
       db.prepare(`
-        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-        VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'))
-      `).run(generateId(), material_id, stockQty, id, `Purchase from ${vendor || 'unknown'}`);
+        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
+        VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
+      `).run(generateId(), material_id, stockQty, id, `Purchase from ${vendor || 'unknown'}`, outletId);
 
       // Update material price and cascade
       updateMaterialPrice(db, material_id);

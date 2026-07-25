@@ -17,6 +17,7 @@ import {
   AlertTriangle, ChevronDown, ChevronRight, Loader2, Upload, Search, X, Eye, Pencil,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { packFactor } from '@/lib/pack-units';
 import { fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import TabScroller from '@/components/TabScroller';
@@ -1543,26 +1544,35 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // is recipe-units per purchase-unit (e.g. 750 ml in 1 BTL).
       const purchaseUnit = (it as any).material_purchase_unit || it.material_unit || '';
       const packSize     = Number((it as any).material_pack_size) || 1;
+      // Recipe-units per purchase-unit under the canon guard: a real conversion
+      // needs BOTH pack_size > 1 AND a recipe unit that differs from the purchase
+      // unit. packFactor() is that guard; PO-receive applies the identical test to
+      // the stock credit (api/purchase-orders/[id]/receive line `isPack`), so what
+      // we order here and what receive credits can never disagree. pack_size > 1
+      // alone would under-order by pack for a material bought AND cooked in kg.
+      const packConv = packFactor({ unit: it.material_unit, purchase_unit: purchaseUnit, pack_size: packSize });
       // Vendors quote per purchase-unit. Default the PO line to that unit when
-      // pack_size > 1; otherwise the recipe-unit IS the purchase-unit and the
-      // distinction doesn't matter.
-      const buyInPurchaseUnit = packSize > 1;
+      // there is a real pack conversion; otherwise the recipe-unit IS the
+      // purchase-unit and the distinction doesn't matter.
+      const buyInPurchaseUnit = packConv > 1;
       // Convert shortfall to purchase-unit qty for the PO line. If the request
       // was ALREADY in the purchase unit (reqFactor>1) the shortfall is in
       // purchase units — use it as-is; else it's recipe units → divide by pack.
       // Ceil so the order covers the demand — vendors don't sell fractional bottles.
       const buyQty = buyInPurchaseUnit
-        ? (reqFactor > 1 ? Math.ceil(shortfall) : Math.ceil(shortfall / packSize))
+        ? (reqFactor > 1 ? Math.ceil(shortfall) : Math.ceil(shortfall / packConv))
         : shortfall;
       // PRICE BASES (canon): last_purchase_price is ₹ per PURCHASE unit
       // (PO-receive + db backfill write it that way); average_price is ₹ per
       // RECIPE unit. The old code asserted the opposite and multiplied lpp by
       // pack_size again — a 500 g line estimated at ₹89,825 instead of ₹89.82.
       const lpp = Number((it as any).last_purchase_price) || 0;
-      const unitsDiffer = purchaseUnit !== '' && purchaseUnit !== (it.material_unit || '') && packSize > 1;
+      // Driven by the SAME canon guard as the qty above — the two bases only
+      // diverge when the pack conversion is real, so one test must decide both
+      // or a line's price and qty end up on opposite bases.
       const buyUnitPrice = buyInPurchaseUnit
-        ? (lpp || (it.average_price || 0) * (unitsDiffer ? packSize : 1))
-        : (lpp && unitsDiffer ? lpp / packSize : (lpp || it.average_price || 0));
+        ? (lpp || (it.average_price || 0) * packConv)     // entry is ₹/purchase-unit
+        : (lpp || it.average_price || 0);                 // recipe unit IS the purchase unit → same basis
       return {
         id: it.id,
         material_id: it.material_id,         // needed to look up mapped vendors
@@ -1570,7 +1580,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         material_unit: it.material_unit,     // recipe unit (canonical)
         req_unit: reqUnit(it),               // unit the dept requested in — requested/issued qtys are in THIS unit
         purchase_unit: purchaseUnit,         // vendor-facing unit
-        pack_size: packSize,                 // recipe-units per purchase-unit
+        pack_size: packConv,                 // recipe-units per purchase-unit, canon-guarded (1 = no real conversion, so every `pack_size > 1` test below is the full guard)
         current_stock: it.current_stock,     // keep raw value for the warning render
         requested: effective,                // chef-approved demand, not raw request
         quantity_issued: issuable,
@@ -1578,7 +1588,8 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         quantity_to_purchase: buyQty,
         unit_price: buyUnitPrice,
         /** Unit the user is entering qty + price in. Drives both the column
-         *  labels and the on-submit conversion back to recipe units. */
+         *  labels and the on-submit conversion, which normalises a recipe-unit
+         *  entry UP to the PO's purchase-unit basis (never the other way). */
         po_entry_unit: buyInPurchaseUnit ? purchaseUnit : (it.material_unit || ''),
         vendor: '',
         vendor_id: '',
@@ -1813,11 +1824,17 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                  ? 'System stock is negative — cannot issue. Raise a vendor PO immediately.'
                                  : 'Quantity to hand over now.'}
                                className={`w-20 px-1.5 py-1 border rounded text-right text-xs ${negStock ? 'border-red-200 bg-red-50/40 cursor-not-allowed' : 'border-[#E8D5C4]'}`} />
-                        <span className="ml-1 text-[10px] text-[#8B7355]">{ln.material_unit}</span>
+                        {/* Issued qty is seeded and edited in the REQUESTED unit
+                            (issuable = min(demand, stock÷pack) above; store-process
+                            persists the number verbatim, and ReqItem documents
+                            quantity_issued as being in ri.unit) — so label it with
+                            req_unit, not the recipe unit. */}
+                        <span className="ml-1 text-[10px] text-[#8B7355]">{ln.req_unit}</span>
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono">
+                        {/* requested − issued: both in the requested unit. */}
                         {short > 0
-                          ? <span className="text-amber-700">{short} {ln.material_unit}</span>
+                          ? <span className="text-amber-700">{short} {ln.req_unit}</span>
                           : <span className="text-emerald-700">0</span>}
                       </td>
                       {raisePo && <>
@@ -1827,10 +1844,12 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                    value={ln.quantity_to_purchase || ''}
                                    onChange={e => update(i, { quantity_to_purchase: Number(e.target.value) || 0 })}
                                    className="w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
-                            {/* Unit selector when the material has both a purchase
-                                unit and a recipe unit (pack_size > 1). User picks
-                                which one they're entering qty / price in; the
-                                math + submit conversion both follow. */}
+                            {/* Unit selector only when the two units really differ
+                                (ln.pack_size is the canon-guarded factor, so > 1
+                                means recipe unit ≠ purchase unit — never two
+                                identical options). User picks which one they're
+                                entering qty / price in; the math + submit
+                                conversion both follow. */}
                             {ln.pack_size > 1 ? (
                               <select value={ln.po_entry_unit}
                                       onChange={e => {

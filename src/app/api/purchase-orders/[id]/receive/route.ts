@@ -1,5 +1,5 @@
 import { getDb, generateId, updateMaterialPrice, logAuditEvent } from '@/lib/db';
-import { currentRole } from '@/lib/po-helpers';
+import { poWriteGate } from '@/lib/po-helpers';
 import { getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
@@ -21,10 +21,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   try {
     const { id } = await params;
     const db = getDb();
-    // Either role can mark received (warehouse op) — but a VALID session is required
-    // (no fail-open to admin). Receiving bumps stock + rewrites average_price.
-    const role = await currentRole();
-    if (!role) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    // Receiving is a PO WRITE action and the irreversible one: it bumps stock,
+    // writes purchases rows and rewrites average_price across every recipe.
+    // currentRole() could NOT gate it — it collapses 'staff' → 'manager', so a
+    // truthiness check on it only meant "has a session" and any signed-in
+    // captain could fire this. poWriteGate() tests the real membership; there is
+    // still no fail-open to admin when the session is missing.
+    const gate = await poWriteGate();
+    if (gate === 'anon') return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can receive POs' }, { status: 403 });
     const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id) as any;
     if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
     if (po.status !== 'approved') {
@@ -41,7 +46,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // Backdate guard — a PO-receive writes received_at into both the GRN date
     // and every purchases row it creates, so a user-supplied received_at must
     // pass the same configurable window as /api/grn and /api/purchases. Admins
-    // (role === 'admin') are fully exempt.
+    // (me.role === 'admin' — the REAL tier off the session) are fully exempt.
     const dateCheck = checkPurchaseDate(db, receivedAt, me?.role === 'admin');
     if (!dateCheck.ok) return Response.json({ error: dateCheck.error }, { status: 400 });
     // Per-line overrides now support accept/reject for QC at the receiving bay.
@@ -97,28 +102,62 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }, { status: 400 });
     }
 
-    // Reject negative qty / price in the receive payload BEFORE the txn starts.
+    // Unit LABEL for a PO line = the PURCHASE unit, because a PO line's qty and
+    // rate are both in purchase units (canon, see the boundary note below).
+    // rm.purchase_unit is selected un-COALESCEd (line 74) so fall back to the
+    // recipe unit when it is NULL/blank.
+    const puLabel = (it: any) =>
+      String(it.material_purchase_unit || '').trim() || String(it.material_unit || '').trim();
+
+    // Reject negative qty / price BEFORE the txn starts.
     // Receiving is an additive workflow — stock corrections (negative qtys) live
     // on the dedicated GRN back-correction flow. A negative here would silently
     // reduce stock without the audit-trail tagging that back-corrections get.
+    // Every check below runs on the EFFECTIVE per-line value (override if sent,
+    // else the stored PO line) — the same resolution the txn loop uses. Checking
+    // only the override payload left the stored line unvalidated, and PO lines
+    // saved before lineSanityError() existed can themselves carry a bad qty/rate.
     for (const it of receivable) {
       const ov = overrides.get(it.id);
-      if (!ov) continue;
-      const checks: Array<[string, unknown]> = [
-        ['quantity',   ov.quantity],
-        ['accepted',   ov.accepted],
-        ['unit_price', ov.unit_price],
+      const effRcv   = ov?.quantity   != null ? Number(ov.quantity) : Number(it.quantity);
+      const effAcc   = ov?.accepted   != null ? Number(ov.accepted) : effRcv;
+      const effPrice = ov?.unit_price != null ? Number(ov.unit_price) : Number(it.unit_price);
+      const checks: Array<[string, number]> = [
+        ['quantity',   effRcv],
+        ['accepted',   effAcc],
+        ['unit_price', effPrice],
       ];
-      for (const [field, raw] of checks) {
-        if (raw == null) continue;
-        const n = Number(raw);
+      for (const [field, n] of checks) {
         if (!Number.isFinite(n) || n < 0) {
           return Response.json({
-            error: `Negative or invalid ${field.replace('_', ' ')} on "${it.material_name}" (${raw}). Receiving cannot go below 0 — use the GRN page's back-correction workflow for stock reversals.`,
+            error: `Negative or invalid ${field.replace('_', ' ')} on "${it.material_name}" (${n}). Receiving cannot go below 0 — use the GRN page's back-correction workflow for stock reversals.`,
             material: it.material_name,
             field,
           }, { status: 400 });
         }
+      }
+      // accepted ≤ received is an invariant of the GRN row: `rejected` is derived
+      // as max(0, received - accepted), so an over-accept clamps rejected to 0 and
+      // credits stock + purchases for goods the same GRN says never arrived.
+      if (effAcc > effRcv) {
+        return Response.json({
+          error: `Accepted (${effAcc}) exceeds received (${effRcv}) on "${it.material_name}". Accepted qty can never be more than the qty received — record the extra as received first.`,
+          material: it.material_name,
+          field: 'accepted',
+        }, { status: 400 });
+      }
+      // Rate guard — a 0/blank rate is accepted by the PO composer and by
+      // create/approve, but receiving it writes purchases(unit_price 0) and then
+      // updateMaterialPrice wipes average_price to 0, cascading a "free"
+      // ingredient through every recipe. Mirrors /api/purchases' `!unit_price`
+      // reject. A 0 rate is only fatal on lines that actually enter stock/books
+      // (accepted > 0) — a fully-rejected line never reaches updateMaterialPrice.
+      if (effAcc > 0 && effPrice <= 0) {
+        return Response.json({
+          error: `Missing or zero rate on "${it.material_name}". A receive rewrites this material's average price, so the line needs a real ₹/${puLabel(it) || 'unit'} — edit the PO line rate (or send a unit_price override) before receiving.`,
+          material: it.material_name,
+          field: 'unit_price',
+        }, { status: 400 });
       }
     }
 
@@ -126,9 +165,27 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const touchedMaterials = new Set<string>();
 
     const txn = db.transaction(() => {
+      // ── Atomic claim (MUST stay the first statement in this txn) ──────────
+      // The status === 'approved' check above is separated from every write by
+      // two awaits (req.json + getCurrentUser), so two concurrent receives can
+      // both pass it and each credit stock, write a purchases row and mint a
+      // GRN. better-sqlite3 txns are synchronous: whoever flips approved→received
+      // here wins, the loser's UPDATE matches 0 rows and throws, rolling back
+      // its whole txn before anything else is written.
+      const claim = db.prepare(`
+        UPDATE purchase_orders
+        SET status = 'received', received_at = ?, updated_at = datetime('now')
+        WHERE id = ? AND status = 'approved'
+      `).run(receivedAt, id);
+      if (claim.changes === 0) {
+        const err: any = new Error('This PO has already been received (or is no longer approved). Reload the page.');
+        err.httpStatus = 409;
+        throw err;
+      }
+
       const insPurchase = db.prepare(`
-        INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, created_at)
-        VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, datetime('now'))
+        INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, outlet_id, created_at)
+        VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, datetime('now'))
       `);
       const bumpStock = db.prepare(`
         UPDATE raw_materials
@@ -139,8 +196,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         WHERE id = ?
       `);
       const insTx = db.prepare(`
-        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-        VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'))
+        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id, created_at)
+        VALUES (?, ?, 'purchase', ?, ?, ?, ?, datetime('now'))
       `);
 
       // Phase 1 §5 — auto-create a GRN for this PO receive. Stock only bumps by the
@@ -192,7 +249,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             received:   received,
             accepted:   accepted,
             excess:     excess,
-            unit:       (it as any).material_unit || '',
+            // Purchase unit — ordered/accepted/excess are all PO qtys and the
+            // ₹ in the same sentence is ₹/purchase-unit. Labelling with the
+            // recipe unit made a 3 L (₹2,400) surplus read as "3 ml".
+            unit:       puLabel(it),
             unit_price: price,
             excess_value: Math.round(excess * price * 100) / 100,
           });
@@ -221,10 +281,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           const pu = String(it.material_purchase_unit || it.material_unit || '').toLowerCase().trim();
           const isPack = packSize > 1 && ru !== pu;
           const stockQty = isPack ? accepted * packSize : accepted;
+          // Stamp the receipt with the PO's outlet (the GRN header above already
+          // does). A NULL here gets backfilled to the DEFAULT outlet by the
+          // startup migration, silently moving another outlet's purchase.
           insPurchase.run(purchaseId, it.material_id, lineVendor, accepted, price, acceptedTotal, receivedAt,
-            `Received against ${po.po_number} (GRN ${grnNumber})`);
+            `Received against ${po.po_number} (GRN ${grnNumber})`, po.outlet_id);
           bumpStock.run(stockQty, price, receivedAt, it.material_id);
-          insTx.run(generateId(), it.material_id, stockQty, purchaseId, `PO ${po.po_number} received via GRN ${grnNumber}`);
+          insTx.run(generateId(), it.material_id, stockQty, purchaseId, `PO ${po.po_number} received via GRN ${grnNumber}`, po.outlet_id);
           touchedMaterials.add(it.material_id);
         }
       }
@@ -235,11 +298,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         db.prepare(`UPDATE goods_receipt_notes SET status = 'partial' WHERE id = ?`).run(grnId);
       }
 
+      // Only the figures that could not be known until every line was priced.
+      // status + received_at are deliberately NOT re-written here: the atomic
+      // claim at the top of this txn is their sole writer, so it stays the one
+      // statement that guards the approved→received transition.
       db.prepare(`
         UPDATE purchase_orders
-        SET status = 'received', received_at = ?, total_cost = ?, grn_id = ?, updated_at = datetime('now')
+        SET total_cost = ?, grn_id = ?, updated_at = datetime('now')
         WHERE id = ?
-      `).run(receivedAt, total, grnId, id);
+      `).run(total, grnId, id);
       (result as any).grn_id = grnId;
       (result as any).grn_number = grnNumber;
 
@@ -285,9 +352,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               WHERE id = ?
             `);
             const insPartyTx = db.prepare(`
-              INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-              VALUES (?, ?, 'party_consumption', ?, ?, ?, datetime('now'))
+              INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id, created_at)
+              VALUES (?, ?, 'party_consumption', ?, ?, ?, ?, datetime('now'))
             `);
+            // The consumption belongs to the requisition's outlet (PO's as a
+            // fallback); an unstamped row is backfilled to the DEFAULT outlet.
+            const partyOutletId = reqRow.outlet_id || po.outlet_id || null;
             const partyNote = `Party: ${reqRow.event_name || '(unnamed)'} @ ${reqRow.event_date || ''}`.trim();
             const auditItems: any[] = [];
             let totalCost = 0;
@@ -295,9 +365,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               const issued = Number(it.quantity_issued) || Number(it.quantity_requested) || 0;
               if (issued <= 0) continue;
               decStock.run(issued, it.material_id);
-              insPartyTx.run(generateId(), it.material_id, -issued, po.requisition_id, partyNote);
+              insPartyTx.run(generateId(), it.material_id, -issued, po.requisition_id, partyNote, partyOutletId);
               // `issued` is RECIPE units; last_purchase_price is ₹/PURCHASE-unit
-              // (canon, see line ~215) — convert before mixing bases.
+              // (canon, see the unit-basis boundary note above) — convert first.
               const rPack = Number(it.rm_pack_size) || 1;
               const rUnitsDiffer = String(it.rm_unit || '').toLowerCase().trim()
                 !== String(it.rm_purchase_unit || it.rm_unit || '').toLowerCase().trim();
@@ -426,6 +496,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     });
   } catch (e: any) {
     console.error('[receive PO]', e);
-    return Response.json({ error: e.message }, { status: 500 });
+    // A lost double-receive race is a conflict, not a server fault — the atomic
+    // claim inside the txn tags it with 409 so the UI can say "already received".
+    const status = Number(e?.httpStatus) || 500;
+    return Response.json({ error: e.message }, { status });
   }
 }

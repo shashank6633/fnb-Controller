@@ -14,6 +14,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { FileText, Plus, Edit, Save, X, Loader2, Search, AlertTriangle } from 'lucide-react';
 import { api } from '@/lib/api';
 import { usePurchaseUnitOptions } from '@/lib/use-units';
+import { packFactor, type PackMeta } from '@/lib/pack-units';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 
 const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -23,6 +24,9 @@ interface Contract {
   id: string;
   vendor_id: string; vendor_name: string;
   material_id: string; material_name: string; material_sku?: string; material_unit?: string;
+  // Pack basis of the material — optional: the list API may not select them yet,
+  // in which case they resolve off the locally loaded catalog (packMetaOf).
+  material_purchase_unit?: string; material_pack_size?: number;
   material_avg_price?: number; material_last_price?: number;
   unit_price: number; currency: string;
   valid_from: string; valid_to: string | null;
@@ -32,7 +36,37 @@ interface Contract {
   created_at: string; updated_at: string;
 }
 interface Vendor   { id: string; name: string; }
-interface Material { id: string; name: string; sku?: string; unit: string; average_price: number; last_purchase_price?: number; }
+interface Material { id: string; name: string; sku?: string; unit: string; purchase_unit?: string; pack_size?: number; average_price: number; last_purchase_price?: number; }
+
+/* ── CONTRACT PRICE BASIS ─────────────────────────────────────────────────────
+ * vendor_contracts.unit_price is ₹ per PURCHASE unit (kg, L, BTL): the PO
+ * composer seeds a PO line straight from it and ContractFlag compares it with
+ * purchases.unit_price, which is also ₹/purchase-unit. raw_materials.average_price
+ * is ₹ per RECIPE unit (₹0.90/g), so it must be multiplied by the pack factor
+ * before it can be seeded into, compared with, or shown beside a contract rate.
+ * packFactor() is the one shared rule (pack_size > 1 AND recipe unit ≠ purchase
+ * unit) so this can never drift from the stock-credit conversion.
+ * Same basis rule as poUnitOf/poRateOf in purchase-orders/page.tsx, but NOT
+ * identical code: rateOf() below rounds to paise even when there is no pack
+ * conversion, where poRateOf returns the raw average. Consolidate the two only
+ * with that difference in hand. */
+const packMetaOf = (c: Partial<Contract>, m?: Material): PackMeta => ({
+  unit:          c.material_unit          || m?.unit,
+  purchase_unit: c.material_purchase_unit || m?.purchase_unit,
+  pack_size:     c.material_pack_size     || m?.pack_size,
+});
+/** The unit a contract rate is quoted in — purchase unit, recipe unit as fallback. */
+const puOf = (m?: PackMeta | null): string =>
+  String(m?.purchase_unit || '').trim() || String(m?.unit || '').trim();
+/** Seed rate for a contract: ₹ per PURCHASE unit. Prefers the last actual
+ *  purchase price (already ₹/purchase-unit); otherwise converts the recipe-unit
+ *  average by pack size. 0 when we genuinely have no price. */
+const rateOf = (m?: Partial<Material> | null): number => {
+  const last = Number(m?.last_purchase_price) || 0;
+  if (last > 0) return last;
+  const avg = Number(m?.average_price) || 0;
+  return Math.round(avg * packFactor(m || {}) * 100) / 100;
+};
 
 export default function ContractsPage() {
   const [contracts, setContracts] = useState<Contract[]>([]);
@@ -71,6 +105,18 @@ export default function ContractsPage() {
           || (c.material_sku || '').toLowerCase().includes(q);
     });
   }, [contracts, search, filter]);
+
+  // Catalog lookup — supplies the pack basis (purchase_unit / pack_size) the
+  // contracts API doesn't select, for both the table rows and the form.
+  const materialById = useMemo(() => new Map(materials.map(m => [m.id, m])), [materials]);
+
+  const editMaterial = editing ? materialById.get(editing.material_id || '') : undefined;
+  const editMeta     = editing ? packMetaOf(editing, editMaterial) : null;
+  // Only name a basis unit when we actually know it — labelling the rate
+  // "₹ / g" because the catalog didn't load would assert the wrong basis.
+  const editKnown    = !!(editing?.material_purchase_unit || editMaterial);
+  const editUnit     = editKnown && editMeta ? puOf(editMeta) : '';
+  const editPack     = editMeta ? packFactor(editMeta) : 1;
 
   const startNew = () => setEditing({ valid_from: today(), valid_to: null, currency: 'INR', unit_price: 0, notes: '' });
   const startEdit = (c: Contract) => setEditing({ ...c });
@@ -111,7 +157,7 @@ export default function ContractsPage() {
           <FileText className="w-7 h-7 text-[#af4408]" />
           <div>
             <h1 className="text-2xl font-bold text-[#2D1B0E]">Vendor Contracts</h1>
-            <p className="text-xs text-[#6B5744]">Negotiated unit prices auto-fill on PO. Deviations are flagged.</p>
+            <p className="text-xs text-[#6B5744]">Negotiated unit prices auto-fill on PO. Deviations are flagged. Rates are ₹ per <strong>purchase unit</strong> (kg, L, BTL) — the basis POs are raised in.</p>
           </div>
         </div>
         <button onClick={startNew} className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm flex items-center gap-2">
@@ -152,8 +198,8 @@ export default function ContractsPage() {
               <tr>
                 <th className="text-left  py-2 px-3 font-medium">Vendor</th>
                 <th className="text-left  py-2 px-3 font-medium">Material</th>
-                <th className="text-right py-2 px-3 font-medium">Contract ₹</th>
-                <th className="text-right py-2 px-3 font-medium">Avg ₹ / Last ₹</th>
+                <th className="text-right py-2 px-3 font-medium" title="₹ per PURCHASE unit — same basis as PO rates">Contract ₹</th>
+                <th className="text-right py-2 px-3 font-medium" title="Both ₹ per PURCHASE unit (avg is converted from ₹/recipe-unit by pack size)">Avg ₹ / Last ₹</th>
                 <th className="text-right py-2 px-3 font-medium">Δ vs avg</th>
                 <th className="text-left  py-2 px-3 font-medium">Validity</th>
                 <th className="text-left  py-2 px-3 font-medium">Status</th>
@@ -162,19 +208,31 @@ export default function ContractsPage() {
             </thead>
             <tbody>
               {filtered.map(c => {
-                const avg = c.material_avg_price || 0;
+                const meta = packMetaOf(c, materialById.get(c.material_id));
+                // average_price is ₹/recipe-unit and unit_price is ₹/purchase-unit —
+                // convert before comparing, else a pack-1000 material reads +99,900%
+                // and a genuinely bad contract is indistinguishable from a correct one.
+                const knownBasis = !!(c.material_purchase_unit || materialById.has(c.material_id));
+                const avg = knownBasis ? (c.material_avg_price || 0) * packFactor(meta) : 0;
                 const delta = avg ? ((c.unit_price - avg) / avg) * 100 : 0;
+                // Same guard as the form (editKnown): without the pack basis, puOf()
+                // falls back to the RECIPE unit, which would label a ₹/kg rate "per g".
+                // '' = basis unknown → say nothing rather than say the wrong thing.
+                const basisUnit = knownBasis ? (puOf(meta) || c.material_unit || '') : '';
                 const isActive = !!c.currently_active;
                 return (
                   <tr key={c.id} className={`border-t border-[#E8D5C4]/50 ${isActive ? '' : 'opacity-60'}`}>
                     <td className="py-2 px-3 font-medium text-[#2D1B0E]">{c.vendor_name}</td>
                     <td className="py-2 px-3">
                       <div className="text-[#2D1B0E]">{c.material_name}</div>
-                      <div className="text-[10px] font-mono text-[#8B7355]">{c.material_sku} · per {c.material_unit}</div>
+                      {/* Basis label = PURCHASE unit: the rate in the next column is
+                          ₹/purchase-unit. Dropped entirely when the basis is unknown. */}
+                      <div className="text-[10px] font-mono text-[#8B7355]">{c.material_sku}{basisUnit ? ` · per ${basisUnit}` : ''}</div>
                     </td>
                     <td className="py-2 px-3 text-right font-mono font-semibold">{fmt(c.unit_price)}</td>
-                    <td className="py-2 px-3 text-right font-mono text-xs text-[#6B5744]">
-                      {fmt(c.material_avg_price || 0)} / {fmt(c.material_last_price || 0)}
+                    <td className="py-2 px-3 text-right font-mono text-xs text-[#6B5744]"
+                        title={basisUnit ? `₹ per ${basisUnit} — same basis as the contract rate` : undefined}>
+                      {knownBasis ? fmt(avg) : '—'} / {fmt(c.material_last_price || 0)}
                     </td>
                     <td className={`py-2 px-3 text-right font-mono text-xs ${
                       Math.abs(delta) < 1 ? 'text-[#6B5744]' : delta < 0 ? 'text-emerald-700' : 'text-red-700'
@@ -243,8 +301,9 @@ export default function ContractsPage() {
                   // Edit mode — show locked label (material can't change on existing contract)
                   <div className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF1E3] text-sm text-[#6B5744]">
                     {(() => {
-                      const m = materials.find(x => x.id === editing.material_id);
-                      return m ? `${m.sku ? m.sku + ' — ' : ''}${m.name} (${m.unit})` : editing.material_id;
+                      const m = editMaterial;
+                      // Show the PURCHASE unit — the rate below is quoted per that unit.
+                      return m ? `${m.sku ? m.sku + ' — ' : ''}${m.name} (per ${editUnit || m.unit})` : editing.material_id;
                     })()}
                   </div>
                 ) : (
@@ -252,11 +311,15 @@ export default function ContractsPage() {
                     materials={materials as any}
                     value={editing.material_id || ''}
                     onPick={(id) => {
-                      const m = materials.find(x => x.id === id);
+                      const m = materialById.get(id);
                       setEditing(p => ({
                         ...p,
                         material_id: id,
-                        unit_price: p?.unit_price || m?.last_purchase_price || m?.average_price || 0,
+                        // rateOf = ₹/purchase-unit (see CONTRACT PRICE BASIS): a raw
+                        // average_price here would seed ₹/g into a ₹/kg field.
+                        // Re-seed when the material CHANGES (same guard as the PO
+                        // composer) — the old material's rate is a different basis.
+                        unit_price: (id !== p?.material_id || !p?.unit_price) ? rateOf(m) : p?.unit_price,
                       }));
                     }}
                     placeholder="Search SKU or name…"
@@ -265,18 +328,20 @@ export default function ContractsPage() {
                 )}
               </div>
               {editing.material_id && (() => {
-                const m = materials.find(x => x.id === editing.material_id);
+                const m = editMaterial;
                 if (!m) return null;
-                const ref = m.last_purchase_price || m.average_price || 0;
+                // Both references in ₹/purchase-unit — the basis of unit_price.
+                const avgPu = (Number(m.average_price) || 0) * packFactor(m);
+                const ref = rateOf(m);
                 const delta = ref ? (((Number(editing.unit_price) || 0) - ref) / ref) * 100 : 0;
                 return (
                   <div className="text-[10px] text-[#6B5744] bg-[#FFF1E3] px-2 py-1 rounded">
-                    Reference: avg {fmt(m.average_price)} · last {fmt(m.last_purchase_price || 0)}
+                    Reference (per {editUnit || m.unit}): avg {fmt(avgPu)} · last {fmt(m.last_purchase_price || 0)}
                     {ref > 0 && Number(editing.unit_price) > 0 && (
                       <span className={`ml-2 font-medium ${
                         Math.abs(delta) < 5 ? 'text-emerald-700' : delta < 0 ? 'text-emerald-700' : 'text-red-700'
                       }`}>
-                        contract is {delta > 0 ? '+' : ''}{delta.toFixed(1)}% vs last
+                        contract is {delta > 0 ? '+' : ''}{delta.toFixed(1)}% vs {m.last_purchase_price ? 'last' : 'avg'}
                       </span>
                     )}
                   </div>
@@ -284,10 +349,17 @@ export default function ContractsPage() {
               })()}
               <div className="grid grid-cols-3 gap-2">
                 <label className="text-xs text-[#6B5744] flex flex-col gap-1">
-                  Unit Price (₹)
+                  Unit Price (₹{editUnit ? ` / ${editUnit}` : ''})
                   <input type="number" step="any" value={editing.unit_price || ''}
                          onChange={e => setEditing(p => ({ ...p, unit_price: parseFloat(e.target.value) || 0 }))}
                          className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+                  {/* Pack materials: spell out the basis — typing ₹/g here would be
+                      read by every PO as ₹/kg (1000× off). */}
+                  {editPack > 1 && (
+                    <span className="text-[10px] text-[#8B7355]">
+                      Vendor rate per <strong>{editUnit}</strong> (1 {editUnit} = {editPack} {editMeta?.unit}) — not per {editMeta?.unit}.
+                    </span>
+                  )}
                 </label>
                 <label className="text-xs text-[#6B5744] flex flex-col gap-1">
                   Valid From
@@ -338,7 +410,8 @@ export default function ContractsPage() {
             setEditing(p => ({
               ...p,
               material_id: newMaterial.id,
-              unit_price: p?.unit_price || newMaterial.average_price || 0,
+              // ₹/purchase-unit basis (see CONTRACT PRICE BASIS) — same seed as the picker.
+              unit_price: p?.unit_price || rateOf(newMaterial),
             }));
             setShowQuickCreate(false);
           }}
@@ -347,7 +420,8 @@ export default function ContractsPage() {
             setEditing(p => ({
               ...p,
               material_id: m.id,
-              unit_price: p?.unit_price || m.last_purchase_price || m.average_price || 0,
+              // ₹/purchase-unit basis (see CONTRACT PRICE BASIS), not raw average_price.
+              unit_price: p?.unit_price || rateOf(m),
             }));
             setShowQuickCreate(false);
           }}
