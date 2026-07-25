@@ -967,12 +967,22 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                     <tr key={i} className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
-                        <SimpleMaterialPicker value={it.material_id} materials={eligibleMaterials}
+                        {/* Once an item is chosen the line is LOCKED to it — to
+                            order a different item, remove the line and add a new
+                            one. Swapping in place used to leave the previous
+                            item's rate/vendor/contract behind on the line. */}
+                        {mat ? (
+                          <div className="px-2 py-1 rounded border border-[#E8D5C4] bg-[#FFF8F0] text-xs text-[#2D1B0E]">
+                            <span className="font-mono text-[10px] text-[#8B7355] mr-1">{mat.sku}</span>{mat.name}
+                          </div>
+                        ) : (
+                          <SimpleMaterialPicker value={it.material_id} materials={eligibleMaterials}
                                               onChange={(id, m) => {
                                                 const patch: Partial<POLine> = { material_id: id };
-                                                // Auto-fill price + vendor from the material's history
                                                 // Seed ₹ per PURCHASE unit (kg), never the recipe unit (g).
-                                if (m && !it.unit_price) patch.unit_price = poRateOf(m);
+                                                // Re-seeds on any material change too (belt-and-braces:
+                                                // the line is locked above, so this can't go stale).
+                                                if (m && (id !== it.material_id || !it.unit_price)) patch.unit_price = poRateOf(m);
                                                 if (m && (!it.vendor || it.vendor.trim() === '')) {
                                                   // Phase 1 §3: vendor was picked at header level — default the line vendor to it.
                                                   // Falls back to the material's primary_vendor only if no header vendor was set.
@@ -984,9 +994,11 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                                 }
                                                 updateLine(i, patch);
                                               }} />
+                        )}
                         {mat && (
                           <div className="text-[10px] text-[#8B7355] mt-0.5">
-                            {mat.sku} · order unit {poUnitOf(mat)} · ₹{poRateOf(mat).toFixed(2)}/{poUnitOf(mat)}
+                            order unit {poUnitOf(mat)} · ₹{poRateOf(mat).toFixed(2)}/{poUnitOf(mat)}
+                            <span className="ml-1 text-[#B8A590]">· 🗑 remove the line to change the item</span>
                           </div>
                         )}
                       </td>
@@ -1038,12 +1050,16 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                         <input type="number" step="any" value={it.quantity || ''}
                                onChange={e => updateLine(i, { quantity: parseFloat(e.target.value) || 0 })}
                                className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
+                        {/* Spell out the ORDER unit so qty can never be read as
+                            the recipe/stock unit (g) — a PO is in kg/BTL/CASE. */}
+                        {mat && <div className="text-[9px] text-[#8B7355] text-right mt-0.5">{poUnitOf(mat)}</div>}
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Unit ₹</span>
                         <input type="number" step="any" value={it.unit_price || ''}
                                onChange={e => updateLine(i, { unit_price: parseFloat(e.target.value) || 0 })}
                                className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
+                        {mat && <div className="text-[9px] text-[#8B7355] text-right mt-0.5">/ {poUnitOf(mat)}</div>}
                         {it.material_id && it.vendor_id && (
                           <ContractFlag materialId={it.material_id} vendorId={it.vendor_id}
                                         unitPrice={Number(it.unit_price) || 0}
@@ -1226,17 +1242,26 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
         return (
           <div key={i} className="grid grid-cols-12 gap-2 text-xs items-start">
             <div className="col-span-4">
-              <SimpleMaterialPicker value={it.material_id} materials={materials} onChange={(id, m) => {
-                const patch: any = { material_id: id };
-                if (m && !it.unit_price) patch.unit_price = m.last_purchase_price || m.average_price || 0;
-                if (m && (!it.vendor || it.vendor.trim() === '')) {
-                  const dv = (m as any).primary_vendor || '';
-                  patch.vendor = dv;
-                  const mv = vendors.find(v => v.name.toLowerCase().trim() === dv.toLowerCase().trim());
-                  patch.vendor_id = mv ? mv.id : '';
-                }
-                update(i, patch);
-              }} />
+              {/* Locked once chosen — remove the line to order a different item. */}
+              {mat ? (
+                <div className="px-2 py-1 rounded border border-[#E8D5C4] bg-[#FFF8F0] text-xs text-[#2D1B0E]">
+                  <span className="font-mono text-[10px] text-[#8B7355] mr-1">{mat.sku}</span>{mat.name}
+                  <div className="text-[9px] text-[#8B7355]">order unit {poUnitOf(mat)} · ₹{poRateOf(mat).toFixed(2)}/{poUnitOf(mat)}</div>
+                </div>
+              ) : (
+                <SimpleMaterialPicker value={it.material_id} materials={materials} onChange={(id, m) => {
+                  const patch: any = { material_id: id };
+                  // ₹ per PURCHASE unit (kg) — never the raw recipe-unit average.
+                  if (m && (id !== it.material_id || !it.unit_price)) patch.unit_price = poRateOf(m);
+                  if (m && (!it.vendor || it.vendor.trim() === '')) {
+                    const dv = (m as any).primary_vendor || '';
+                    patch.vendor = dv;
+                    const mv = vendors.find(v => v.name.toLowerCase().trim() === dv.toLowerCase().trim());
+                    patch.vendor_id = mv ? mv.id : '';
+                  }
+                  update(i, patch);
+                }} />
+              )}
             </div>
             <div className="col-span-3">
               <input

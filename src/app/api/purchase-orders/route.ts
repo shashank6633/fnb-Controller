@@ -1,5 +1,5 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
-import { getCurrentOutletId } from '@/lib/auth';
+import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { effectiveRole, effectiveActor, recalcTotal } from '@/lib/po-helpers';
 
@@ -72,6 +72,11 @@ function deriveHeaderVendor(db: ReturnType<typeof getDb>, poId: string) {
 // ---------- GET ----------
 export async function GET(request: Request) {
   try {
+    // POST/PUT/DELETE all gate on effectiveRole(); GET did not, so PO pricing +
+    // vendor terms were readable by any request that reached the route. Require
+    // a signed-in user for reads too.
+    const viewer = await getCurrentUser();
+    if (!viewer) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');

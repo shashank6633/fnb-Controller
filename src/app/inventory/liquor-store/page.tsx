@@ -1641,6 +1641,10 @@ interface UploadRow {
   unit_price: string; amount: string; per_case: boolean;
   batch_no: string; expiry_date: string; date: string;
   discount: string; cgst: string; sgst: string; delivery_charges: string;
+  /** BILL-level charges (one set per invoice) may also be supplied in the sheet.
+   *  They are read off the first row that carries them and pre-fill the modal's
+   *  Bill charges inputs, so the user always sees what was picked up. */
+  mrp_round_off: string; excise_turnover_tax: string; special_excise_cess: string; tcs: string;
 }
 interface UploadSkipped {
   row: number; item_name: string; sku: string;
@@ -1685,12 +1689,18 @@ function parseBillCsv(text: string): UploadRow[] {
     const cgst = get(row, 'cgst');
     const sgst = get(row, 'sgst');
     const delivery_charges = get(row, 'delivery_charges', 'delivery', 'delivery charges', 'delivery_charge');
+    // BILL-level charges, optionally supplied in the sheet (TGBCL indent names too).
+    const mrp_round_off = get(row, 'mrp_round_off', 'mrp round off', 'mrp_rounding', 'mrp rounding off');
+    const excise_turnover_tax = get(row, 'excise_turnover_tax', 'bar excise turnover tax', 'excise turnover tax', 'turnover_tax');
+    const special_excise_cess = get(row, 'special_excise_cess', 'special excise cess', 'cess');
+    const tcs = get(row, 'tcs');
     // Skip a fully-blank line (all key fields empty).
     if (!item_name && !sku && !cases && !bottles && !loose && !unit_price && !amount) continue;
     out.push({
       item_name, sku, cases, bottles, loose, unit_price, amount,
       per_case: pc === '1' || pc === 'true' || pc === 'yes' || pc === 'y',
       batch_no, expiry_date, date, discount, cgst, sgst, delivery_charges,
+      mrp_round_off, excise_turnover_tax, special_excise_cess, tcs,
     });
   }
   return out;
@@ -1733,20 +1743,40 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
       const parsed = parseBillCsv(text);
       if (parsed.length === 0) { setErr('No data rows found — check the CSV has a header row and at least one line.'); return; }
       setRows(parsed); setFileName(f.name);
+      // Bill-level charges are ONE set per invoice. If the sheet carries them,
+      // take the first row that has a value for each and pre-fill the Bill
+      // charges inputs below, so what was picked up is visible + editable.
+      const firstOf = (k: 'mrp_round_off' | 'excise_turnover_tax' | 'special_excise_cess' | 'tcs') => {
+        const hit = parsed.find(r => String(r[k] || '').trim() !== '' && numOr0(r[k]) !== 0);
+        return hit ? String(hit[k]).trim() : '';
+      };
+      const fromSheet = {
+        mrp: firstOf('mrp_round_off'), excise: firstOf('excise_turnover_tax'),
+        cess: firstOf('special_excise_cess'), tcs: firstOf('tcs'),
+      };
+      if (fromSheet.mrp || fromSheet.excise || fromSheet.cess || fromSheet.tcs) {
+        setCharges(prev => ({
+          mrp: fromSheet.mrp || prev.mrp, excise: fromSheet.excise || prev.excise,
+          cess: fromSheet.cess || prev.cess, tcs: fromSheet.tcs || prev.tcs,
+        }));
+      }
     } catch (e: any) { setErr(`Could not read file: ${e.message}`); }
   };
 
   const downloadTemplate = () => {
     const d = today();
-    // Per-line charge columns (discount,cgst,sgst,delivery_charges) are optional
-    // — usually blank for TGBCL liquor. The four bill-level charges (MRP round-off,
-    // excise turnover tax, special excise cess, TCS) go in the modal, not here.
+    // Columns 9-12 are PER-LINE charges (usually blank for TGBCL liquor).
+    // Columns 13-16 are the BILL-level charges — ONE set per invoice, so put
+    // them on the FIRST row only; they pre-fill the Bill charges box in the
+    // modal (which stays editable). Sample below mirrors a TGBCL indent.
     const sample =
-      'item_name,sku,cases,bottles,unit_price,amount,per_case,date,discount,cgst,sgst,delivery_charges,batch_no,expiry_date\n' +
-      `HEINEKEN LAGER BEER,6561,5,0,,15010,,${d},,,,,,\n` +
-      `KINGFISHER ULTRA LAGER BEER,5029,12,0,,28824,,${d},,,,,,\n` +
-      `GREY GOOSE VODKA,9004,1,0,,20101,,${d},500,,,,,\n` +
-      `ABSOLUT VODKA,8006,1,0,3900,,1,${d},,,,,,\n`;
+      'item_name,sku,cases,bottles,unit_price,amount,per_case,date,'
+      + 'discount,cgst,sgst,delivery_charges,'
+      + 'mrp_round_off,excise_turnover_tax,special_excise_cess,tcs,batch_no,expiry_date\n'
+      + `HEINEKEN LAGER BEER,6561,5,0,,15010,,${d},,,,,7214.40,0,22617,5491,,\n`
+      + `KINGFISHER ULTRA LAGER BEER,5029,12,0,,28824,,${d},,,,,,,,,,\n`
+      + `GREY GOOSE VODKA,9004,1,0,,20101,,${d},500,,,,,,,,,\n`
+      + `ABSOLUT VODKA,8006,1,0,3900,,1,${d},,,,,,,,,,\n`;
     const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1900,7 +1930,8 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
           {' '}<code>cases</code>, <code>bottles</code>, optional <code>loose</code>, and a price — either <code>amount</code> (line total ₹, as printed on the indent)
           {' '}<i>or</i> <code>unit_price</code> (₹ per bottle; add <code>per_case=1</code> for a per-case rate). Optional <code>date</code> (YYYY-MM-DD or DD-MM-YYYY; blank rows use the Date field above), <code>batch_no</code>, <code>expiry_date</code>.
           Optional per-line ₹ charges: <code>discount</code>, <code>cgst</code>, <code>sgst</code>, <code>delivery_charges</code>.
-          The 4 bill-level charges (MRP round-off, excise turnover tax, special excise cess, TCS) are entered below, not in the CSV.
+          The 4 bill-level charges — <code>mrp_round_off</code>, <code>excise_turnover_tax</code>, <code>special_excise_cess</code>, <code>tcs</code> —
+          can go in the CSV too: put them on the <b>first row only</b> (one set per invoice) and they pre-fill the Bill charges box below, which stays editable.
         </div>
       )}
 

@@ -1663,17 +1663,21 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     const body: any = {
       note,
       lines: lines.map(ln => {
-        // Convert qty + price back to RECIPE units before sending — the PO
-        // items table + stock-on-receive both work in recipe units (the
-        // canonical store). The line total (qty × price) stays identical
-        // regardless of which unit basis we use, so vendor totals on the
-        // PO print match exactly what the store user entered.
-        const goingInPurchaseUnit = raisePo && ln.po_entry_unit === ln.purchase_unit && ln.pack_size > 1;
-        const recipeQty   = goingInPurchaseUnit
-          ? (Number(ln.quantity_to_purchase) || 0) * ln.pack_size
+        // Send qty + price in PURCHASE units — purchase_order_items is
+        // purchase-unit basis (a PO is raised to a VENDOR; the receive route
+        // then ×pack_size for the recipe-unit stock credit, exactly like
+        // /api/grn and /api/purchases). So a value the store user typed IN the
+        // purchase unit goes through unchanged; only a recipe-unit entry is
+        // converted UP to the purchase unit. The line total is identical either
+        // way, so vendor totals on the PO print still match what was entered.
+        const enteredInPurchaseUnit = raisePo && ln.po_entry_unit === ln.purchase_unit && ln.pack_size > 1;
+        const enteredInRecipeUnit = raisePo && !enteredInPurchaseUnit
+          && ln.pack_size > 1 && ln.po_entry_unit === ln.material_unit;
+        const poQty = enteredInRecipeUnit
+          ? (Number(ln.quantity_to_purchase) || 0) / ln.pack_size
           : Number(ln.quantity_to_purchase) || 0;
-        const recipePrice = goingInPurchaseUnit
-          ? (Number(ln.unit_price) || 0) / ln.pack_size
+        const poPrice = enteredInRecipeUnit
+          ? (Number(ln.unit_price) || 0) * ln.pack_size
           : Number(ln.unit_price) || 0;
         return {
           id: ln.id,
@@ -1681,8 +1685,8 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
           // Only send the purchase qty when raisePo is ticked. Backend's default
           // (auto_create_po=false) makes it ignore this field anyway, but keep
           // the payload honest.
-          quantity_to_purchase: raisePo ? recipeQty : 0,
-          unit_price:           raisePo ? recipePrice : undefined,
+          quantity_to_purchase: raisePo ? poQty : 0,
+          unit_price:           raisePo ? poPrice : undefined,
           // Send BOTH the vendor display name and vendor_id when we have it —
           // server prefers vendor_id (proper FK), falls back to name lookup.
           vendor:    raisePo ? ln.vendor    : undefined,

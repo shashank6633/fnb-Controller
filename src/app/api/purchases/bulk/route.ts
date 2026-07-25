@@ -5,6 +5,8 @@ import { checkPurchaseDate } from '@/lib/purchase-guard';
 
 interface BulkPurchaseItem {
   item_name: string;
+  /** Preferred match key — unique across the whole catalogue. */
+  sku?: string;
   vendor?: string;
   brand?: string;
   quantity: number;
@@ -31,7 +33,7 @@ interface BulkPurchaseItem {
 type SkipKind = 'missing' | 'date' | 'not_found' | 'liquor' | 'invalid' | 'duplicate' | 'unit_mismatch';
 interface SkippedRow {
   row: number;
-  item_name: string; vendor: string; brand: string;
+  item_name: string; sku: string; vendor: string; brand: string;
   quantity: any; unit_price: any; total_amount: any; gst_amount: any;
   date: string; notes: string; bill_no: string;
   category_name: string; po_qty: any; purchase_unit: string;
@@ -55,9 +57,17 @@ export async function POST(request: Request) {
     const me = await getCurrentUser();
     const isAdmin = me?.role === 'admin';
 
-    const allMaterials = db.prepare('SELECT id, name, unit, purchase_unit, pack_size, category FROM raw_materials').all() as any[];
+    const allMaterials = db.prepare('SELECT id, name, sku, unit, purchase_unit, pack_size, category FROM raw_materials').all() as any[];
+    // Match by SKU FIRST, then name. SKUs are unique across the whole catalogue
+    // (grocery + liquor) and are stable, whereas a name can be renamed or carry
+    // a typo — so a sheet that supplies `sku` always resolves to the right item.
     const materialMap = new Map<string, any>();
-    for (const m of allMaterials) materialMap.set(m.name.toLowerCase().trim(), m);
+    const skuMap = new Map<string, any>();
+    for (const m of allMaterials) {
+      materialMap.set(m.name.toLowerCase().trim(), m);
+      const s = String(m.sku || '').toLowerCase().trim();
+      if (s) skuMap.set(s, m);
+    }
 
     const toStockQty = (m: any, qty: number) => {
       const packSize = Number(m.pack_size) || 1;
@@ -82,7 +92,7 @@ export async function POST(request: Request) {
       if (kind === 'liquor') results.store_blocked.push({ material: item.item_name || '', error: reason });
       results.skipped_rows.push({
         row: rowNum,
-        item_name: item.item_name || '', vendor: item.vendor || '', brand: item.brand || '',
+        item_name: item.item_name || '', sku: item.sku || '', vendor: item.vendor || '', brand: item.brand || '',
         quantity: item.quantity ?? '', unit_price: item.unit_price ?? '',
         total_amount: item.total_amount ?? '', gst_amount: item.gst_amount ?? '',
         date: item.date || '', notes: item.notes || '', bill_no: item.bill_no || '',
@@ -184,15 +194,22 @@ export async function POST(request: Request) {
         const item = purchases[i];
         const rowNum = i + 1;
 
-        if (!item.item_name || (!item.quantity && !item.total_amount) || (!item.unit_price && !item.total_amount)) {
-          skip(item, rowNum, 'missing', `Missing required fields (item_name / quantity / price)`);
+        const rowSku = String(item.sku || '').toLowerCase().trim();
+        if ((!item.item_name && !rowSku) || (!item.quantity && !item.total_amount) || (!item.unit_price && !item.total_amount)) {
+          skip(item, rowNum, 'missing', `Missing required fields (sku or item_name / quantity / price)`);
           continue;
         }
         const dateCheck = checkPurchaseDate(db, item.date, isAdmin);
         if (!dateCheck.ok) { skip(item, rowNum, 'date', dateCheck.error || 'Invalid date'); continue; }
 
-        const mat = materialMap.get(item.item_name.toLowerCase().trim());
-        if (!mat) { skip(item, rowNum, 'not_found', `Material not found: "${item.item_name}" — name must match an existing Raw Material.`); continue; }
+        // SKU wins over name — it's unique and immune to renames/typos.
+        const mat = (rowSku && skuMap.get(rowSku))
+          || (item.item_name ? materialMap.get(item.item_name.toLowerCase().trim()) : undefined);
+        if (!mat) {
+          skip(item, rowNum, 'not_found',
+            `Material not found: "${item.sku || item.item_name}" — the sku (preferred) or name must match an existing Raw Material.`);
+          continue;
+        }
         const materialId = mat.id;
 
         const storeMsg = centralFlowBlock(db, materialId);
