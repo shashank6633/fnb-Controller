@@ -63,6 +63,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/party-consumption',   // post-party liquor consumption recording
   '/api/department-materials', // dept on-hand transfer view + post-party reconcile
   '/api/party-bookings',      // sheet refresh (POST forces live fetch)
+  '/api/party-menus',         // party (limited) menu presets — create/enable/assign tables
   '/api/dine-in/tables',      // POS table management (create/edit/delete)
   '/api/kitchen-production',   // prepared-item batches + FIFO consumption + label print
   '/api/settings/label-printer', // TSC label-printer config (admin) — matched by /api/settings too, kept explicit

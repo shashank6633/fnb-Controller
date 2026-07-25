@@ -2,6 +2,7 @@ import { getDb, generateId } from '@/lib/db';
 import { autoSaveCrmGuest } from '@/lib/ct/guest-autosave';
 import { addOrderGuest, listOrderGuests } from '@/lib/ct/seating';
 import { resolveTableByToken, priceLookup, getCustomerMenuDesign, otpAppliesToTable } from '@/lib/customer';
+import { activePartyMenuForTable } from '@/lib/party-menu';
 import { normMobile, otpChannelReady, hasVerifiedMobile, recentSendFailed, otpSendExhausted } from '@/lib/customer-otp';
 import { fireStagingOrder } from '@/lib/kot-fire';
 import { raiseKotAlert } from '@/lib/kot-alerts';
@@ -62,6 +63,21 @@ export async function POST(req: Request) {
     if (!lines.length) return Response.json({ ok: false, error: 'These items are no longer available.' }, { status: 409 });
 
     const db = getDb();
+
+    // Party Menu enforcement (defence-in-depth — the menu API already hides
+    // these items). If this table is under an ENABLED limited menu, reject any
+    // line not on it, so a stale/crafted cart can't order a restricted item.
+    const party = activePartyMenuForTable(db, table.id);
+    if (party) {
+      const blocked = lines.filter(l => !party.itemIds.has(l.id));
+      if (blocked.length) {
+        return Response.json({
+          ok: false,
+          error: 'Some items aren’t on this table’s menu right now. Please refresh the menu and try again.',
+        }, { status: 409 });
+      }
+    }
+
     const note = String(body?.note || '').slice(0, 300);
     const orderId = generateId();
 

@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { resolveTableByToken, buildCustomerMenu, getCustomerMenuDesign, otpAppliesToTable } from '@/lib/customer';
 import { otpChannelReady } from '@/lib/customer-otp';
+import { activePartyMenuForTable } from '@/lib/party-menu';
 
 /**
  * GET /api/customer/menu?t=<qr_token>
@@ -40,7 +41,11 @@ export async function GET(req: Request) {
       otpApplies: otpAppliesToTable(fullDesign, { id: table.id, zone: table.zone, section: table.section }),
     };
 
-    const menu = buildCustomerMenu(table.outlet_id);
+    // Party Menu: if this table has an enabled limited menu, restrict the menu
+    // to the picked items. party_menu (name/note) is surfaced for staff-facing
+    // clients (e.g. Captain); the guest simply sees the curated list.
+    const party = activePartyMenuForTable(db, table.id);
+    const menu = buildCustomerMenu(table.outlet_id, party?.itemIds);
 
     return Response.json({
       ok: true,
@@ -48,6 +53,7 @@ export async function GET(req: Request) {
       brand,
       design,
       menu,
+      party_menu: party ? { name: party.name, note: party.note } : null,
     }, {
       // Menu can be cached briefly at the edge/browser; it changes rarely.
       headers: { 'Cache-Control': 'public, max-age=30, stale-while-revalidate=120' },

@@ -237,8 +237,14 @@ interface MenuSection {
  * Every item carries ALL fields the UI reads, with safe synthesized defaults
  * for the curated fields the backend doesn't store (taste/pairs/spice/tags).
  */
-export function buildCustomerMenu(outletId: string | null): { food: MenuSection; bev: MenuSection; liquor: MenuSection } {
+export function buildCustomerMenu(
+  outletId: string | null,
+  allowedIds?: Set<string> | null,
+): { food: MenuSection; bev: MenuSection; liquor: MenuSection } {
   const db = getDb();
+  // Party Menu: when a table has an enabled limited menu, only these item ids
+  // are shown (see lib/party-menu.ts). null/undefined → full menu (normal case).
+  const limit = allowedIds && allowedIds.size > 0 ? allowedIds : null;
   // Show this outlet's items; items with NULL outlet are shared/global.
   const rows = db.prepare(`
     SELECT id, name, category, station, item_type, dietary_tag,
@@ -261,6 +267,7 @@ export function buildCustomerMenu(outletId: string | null): { food: MenuSection;
   };
 
   for (const r of rows) {
+    if (limit && !limit.has(String(r.id))) continue;   // Party Menu: only picked items
     const sec = sectionOf(r.item_type);
     const cat = String(r.category || 'others');
     if (!buckets[sec].has(cat)) buckets[sec].set(cat, []);

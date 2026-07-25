@@ -45,6 +45,10 @@ interface Booking {
   guest_name?: string | null;
   guest_phone?: string | null;
   guest_tags?: string | null;
+  party_menu_id?: string | null;
+  party_menu_name?: string | null;
+  party_menu_note?: string | null;
+  party_menu_enabled?: number | null;
 }
 
 interface TableItem {
@@ -88,6 +92,20 @@ function isVip(tagsJson?: string | null): boolean {
 
 function guestLabel(b: Booking): string {
   return (b.guest_name || '').trim() || (b.guest_phone ? formatPhone(b.guest_phone) : 'Walk-in guest');
+}
+
+/** Heads-up badge when this reservation has a linked Party (limited) Menu, so
+ *  the host knows to contact the manager to enable it once the guest is seated. */
+function PartyMenuBadge({ b }: { b: Booking }) {
+  if (!b.party_menu_id) return null;
+  const live = !!b.party_menu_enabled;
+  return (
+    <span title={b.party_menu_note || b.party_menu_name || 'Limited menu'}
+          className={`inline-flex items-center gap-1 text-[10px] font-semibold rounded-full px-2 py-0.5 border ${
+            live ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-amber-50 text-amber-800 border-amber-300'}`}>
+      <PartyPopper size={11} /> {live ? 'Limited menu LIVE' : 'Limited menu — contact manager'}
+    </span>
+  );
 }
 
 /** slot_time ascending, blanks last — the natural order a host works the stand. */
@@ -316,6 +334,7 @@ export default function ReservationsPage() {
                           {guestLabel(b)}
                         </p>
                         {b.guest_phone && <p className="text-[11px] text-[#8B7355] font-mono">{formatPhone(b.guest_phone)}</p>}
+                        {b.party_menu_id && <div className="mt-1"><PartyMenuBadge b={b} /></div>}
                       </div>
                       <span className={`shrink-0 text-[10px] font-semibold uppercase tracking-wide rounded-full px-2 py-0.5 ${
                         b.status === 'confirmed' ? 'bg-blue-500/10 text-blue-700' : 'bg-[#8B7355]/15 text-[#6B5744]'}`}>
@@ -377,6 +396,7 @@ export default function ReservationsPage() {
                             {guestLabel(b)}
                           </p>
                           {b.guest_phone && <p className="text-[11px] text-[#8B7355] font-mono">{formatPhone(b.guest_phone)}</p>}
+                        {b.party_menu_id && <div className="mt-1"><PartyMenuBadge b={b} /></div>}
                         </div>
                         {tableLabel ? (
                           <span className="shrink-0 inline-flex items-center gap-1 text-[11px] font-bold rounded-full px-2.5 py-1 bg-green-600 text-white">

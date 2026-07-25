@@ -3113,6 +3113,46 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('store_bill_charges schema failed:', e); }
 
+  // ── Party Menu (manager-enabled LIMITED menu for selected tables, additive) ─
+  // A curated subset of à-la-carte items shown ONLY on specific tables' QR menu
+  // while ENABLED (e.g. a 10–20 pax party the host wants without costly liquor).
+  // A preset = hand-picked menu items (party_menu_items) + assigned tables
+  // (party_menu_tables, switchable) + an `enabled` flag a MANAGER flips on. When
+  // enabled, the customer menu + order APIs for those tables are restricted to
+  // the picked items (see lib/party-menu.ts). `booking_id` optionally links a
+  // reservation so the Reservations board can badge "limited menu — contact
+  // manager". Purely additive; a table with no enabled party menu is unaffected.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS party_menus (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        note        TEXT DEFAULT '',              -- staff note (guest, "contact manager", …)
+        enabled     INTEGER NOT NULL DEFAULT 0,   -- manager toggles this ON
+        booking_id  TEXT,                         -- optional ct_bookings link
+        outlet_id   TEXT,
+        created_by  TEXT DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS party_menu_items (
+        party_menu_id TEXT NOT NULL,
+        menu_item_id  TEXT NOT NULL,
+        PRIMARY KEY (party_menu_id, menu_item_id),
+        FOREIGN KEY (party_menu_id) REFERENCES party_menus(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS party_menu_tables (
+        party_menu_id TEXT NOT NULL,
+        table_id      TEXT NOT NULL,
+        PRIMARY KEY (party_menu_id, table_id),
+        FOREIGN KEY (party_menu_id) REFERENCES party_menus(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_party_menu_tables_table ON party_menu_tables(table_id);
+      CREATE INDEX IF NOT EXISTS idx_party_menu_items_pm     ON party_menu_items(party_menu_id);
+      CREATE INDEX IF NOT EXISTS idx_party_menus_booking     ON party_menus(booking_id);
+    `);
+  } catch (e) { console.error('party_menus schema failed:', e); }
+
   // ── Multi-floor bar Phase 2/3 (leak-proof automation, additive) ───────────
   // Three purely-additive pieces, all guarded so a redeploy is a no-op:
   //   1. store_locations.floor_label — a TEXT label (or comma-separated list of

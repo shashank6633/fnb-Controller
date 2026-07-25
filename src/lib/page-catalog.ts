@@ -64,6 +64,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/dine-in/offline-print', label: 'KOT & Bill Printers' },
       { path: '/dine-in/tables',      label: 'Tables' },
       { path: '/dine-in/reservations', label: 'Reservations' },
+      { path: '/dine-in/party-menus', label: 'Party Menu' },
       { path: '/customers',           label: 'Customers' },
       { path: '/dine-in/order',       label: 'Order Terminal' },
       { path: '/captain',             label: 'Captain (Tablet POS)' },

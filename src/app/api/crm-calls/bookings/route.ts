@@ -30,7 +30,11 @@ function isRealDate(d: string): boolean {
 }
 
 const GUEST_JOIN_SELECT = `
-  SELECT b.*, g.name AS guest_name, g.phone_e164 AS guest_phone, g.tags AS guest_tags
+  SELECT b.*, g.name AS guest_name, g.phone_e164 AS guest_phone, g.tags AS guest_tags,
+    (SELECT pm.id      FROM party_menus pm WHERE pm.booking_id = b.id ORDER BY pm.updated_at DESC LIMIT 1) AS party_menu_id,
+    (SELECT pm.name    FROM party_menus pm WHERE pm.booking_id = b.id ORDER BY pm.updated_at DESC LIMIT 1) AS party_menu_name,
+    (SELECT pm.note    FROM party_menus pm WHERE pm.booking_id = b.id ORDER BY pm.updated_at DESC LIMIT 1) AS party_menu_note,
+    (SELECT pm.enabled FROM party_menus pm WHERE pm.booking_id = b.id ORDER BY pm.updated_at DESC LIMIT 1) AS party_menu_enabled
   FROM ct_bookings b
   LEFT JOIN ct_guests g ON g.id = b.guest_id
 `;
