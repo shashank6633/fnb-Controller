@@ -185,7 +185,9 @@ export default function PurchasesPage() {
     skipped_rows?: Array<{
       row: number; item_name: string; vendor: string; brand: string;
       quantity: any; unit_price: any; total_amount: any; gst_amount: any;
-      date: string; notes: string; kind: string; reason: string;
+      date: string; notes: string; bill_no: string;
+      discount: any; cgst: any; sgst: any; special_excise_cess: any; tcs: any; delivery_charges: any; mrp_round_off: any;
+      kind: string; reason: string;
     }>;
   } | null>(null);
 
@@ -194,7 +196,11 @@ export default function PurchasesPage() {
   const downloadSkippedRows = () => {
     const rows = bulkResult?.skipped_rows || [];
     if (rows.length === 0) return;
-    const header = ['item_name', 'vendor', 'brand', 'quantity', 'unit_price', 'total_amount', 'gst_amount', 'date', 'notes', 'reason'];
+    // Must mirror the Bulk template's columns (incl. the 7 charges the server
+    // echoes back) so fix-and-re-upload never silently zeroes a charge.
+    const header = ['item_name', 'vendor', 'bill_no', 'brand', 'quantity', 'unit_price',
+      'discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off',
+      'total_amount', 'gst_amount', 'date', 'notes', 'reason'];
     const esc = (v: any) => {
       let s = v == null ? '' : String(v);
       if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;            // CSV formula-injection guard
@@ -202,7 +208,9 @@ export default function PurchasesPage() {
       return s;
     };
     const lines = [header.join(',')].concat(rows.map(r =>
-      [r.item_name, r.vendor, r.brand, r.quantity, r.unit_price, r.total_amount, r.gst_amount, r.date, r.notes, r.reason].map(esc).join(',')));
+      [r.item_name, r.vendor, r.bill_no, r.brand, r.quantity, r.unit_price,
+       r.discount, r.cgst, r.sgst, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off,
+       r.total_amount, r.gst_amount, r.date, r.notes, r.reason].map(esc).join(',')));
     const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -550,6 +558,9 @@ export default function PurchasesPage() {
           quantity: qtyForApi,
           unit_price: unitPriceForApi,
           date: billData.date,
+          // The VENDOR's bill number as a real field (it also stays in notes for
+          // back-compat). The server mints our Invoice ID from it.
+          bill_no: billData.bill_number || '',
           notes: [`Bill #${billData.bill_number || 'N/A'}`,
                   `GST: ₹${item.gst_share} included`,
                   billData.notes, ...noteExtras].filter(Boolean).join(' | '),
@@ -615,11 +626,31 @@ export default function PurchasesPage() {
       const itemName = r.item_name || r.ITEM_NAME || r['Item Name'] || r['ITEM NAME'] || r.material || r.Material || r.name || r.Name || '';
       const quantity = Number(r.quantity || r.QUANTITY || r.Quantity || r.qty || r.QTY || r.Qty || r['INWARD QTY'] || r.inward_qty || 0);
       const unitPrice = Number(r.unit_price || r.UNIT_PRICE || r['Unit Price'] || r.RATE || r.Rate || r.rate || r.price || r.Price || 0);
-      const totalAmount = Number(r.total_amount || r.TOTAL_AMOUNT || r['Total Amount'] || r['TOTAL INWARD AMOUNT'] || r.total || r.Total || 0);
+      // CHARGE-FREE line amount (qty × rate). SUBTOTAL is the register's
+      // charge-free column; TOTAL INWARD AMOUNT is deliberately NOT in this
+      // chain — it is charge-INCLUSIVE and is handled separately below.
+      const totalAmount = Number(r.total_amount || r.TOTAL_AMOUNT || r['Total Amount']
+        || r.subtotal || r.SUBTOTAL || r['Sub Total'] || r.total || r.Total || 0);
+      // CHARGE-INCLUSIVE register total (see api/grn: subtotal − discount + cgst
+      // + sgst + cess + tcs + delivery + round-off).
+      const totalInward = Number(r['TOTAL INWARD AMOUNT'] || r.total_inward_amount || r['Total Inward Amount'] || 0);
       const vendor = r.vendor || r.VENDOR || r.Vendor || r['SUPPLIER NAME'] || r.supplier || r.Supplier || '';
       const brand = r.brand || r.BRAND || r.Brand || '';
       const gstAmount = Number(r.gst_amount || r.GST || r.gst || r['GST Amount'] || 0);
       const notes = r.notes || r.NOTES || r.Notes || '';
+      // The VENDOR's bill number (printed on the bill they give us). Our own
+      // Invoice ID is generated server-side and is never read from the file.
+      const billNo = r.bill_no || r.bill_number || r['Bill No'] || r['BILL NO'] || r['Bill Number']
+        || r.invoice_no || r.invoice_number || r.invoice || r.Invoice || r['INVOICE ID'] || r['Invoice No'] || '';
+      // GRN-Inward per-line charges (₹) — optional. Accept snake_case + the sheet's UPPER names.
+      const num = (v: any) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+      const discount = num(r.discount ?? r.DISCOUNT ?? r.Discount);
+      const cgst = num(r.cgst ?? r.CGST);
+      const sgst = num(r.sgst ?? r.SGST);
+      const specialExciseCess = num(r.special_excise_cess ?? r['SPECIAL EXCISE CESS'] ?? r.cess ?? r.CESS);
+      const tcs = num(r.tcs ?? r.TCS);
+      const deliveryCharges = num(r.delivery_charges ?? r['DELIVERY CHARGES'] ?? r.delivery ?? r.Delivery);
+      const mrpRoundOff = num(r.mrp_round_off ?? r['MRP ROUND OFF'] ?? r.mrp_rounding ?? r['MRP Round Off']);
 
       // Parse date - handle various formats
       let date = r.date || r.DATE || r.Date || r['INWARD DATE'] || r.inward_date || '';
@@ -637,22 +668,36 @@ export default function PurchasesPage() {
       }
       if (!date) date = todayString();
 
-      // Calculate unit price from total if needed
+      // Calculate unit price from the line amount when no rate was given.
+      // MUST use a CHARGE-FREE base: the 7 charges are stored separately, so
+      // folding them into unit_price would bake them into the weighted-average
+      // cost AND count them a second time in Total Inward. When only the
+      // charge-inclusive TOTAL INWARD AMOUNT is available, back the charges out.
+      const chargeBlock = -discount + cgst + sgst + specialExciseCess + tcs + deliveryCharges + mrpRoundOff;
       let finalUnitPrice = unitPrice;
-      if (finalUnitPrice === 0 && totalAmount > 0 && quantity > 0) {
-        finalUnitPrice = Math.round(((totalAmount + gstAmount) / quantity) * 100) / 100;
+      if (finalUnitPrice === 0 && quantity > 0) {
+        const base = totalAmount > 0 ? totalAmount
+          : (totalInward !== 0 ? totalInward - chargeBlock : 0);
+        if (base > 0) finalUnitPrice = Math.round(((base + gstAmount) / quantity) * 100) / 100;
       }
+      // Report the charge-free base so the preview total and the list's
+      // Total Inward reconcile back to the source sheet.
+      const baseAmount = totalAmount > 0 ? totalAmount
+        : (totalInward !== 0 ? Math.round((totalInward - chargeBlock) * 100) / 100 : 0);
 
       return {
         item_name: String(itemName).trim(),
         quantity,
         unit_price: finalUnitPrice,
-        total_amount: totalAmount,
+        total_amount: baseAmount,
         vendor: String(vendor).trim(),
         brand: String(brand).trim(),
         date,
         gst_amount: gstAmount,
         notes: String(notes).trim(),
+        bill_no: String(billNo).trim(),
+        discount, cgst, sgst, special_excise_cess: specialExciseCess,
+        tcs, delivery_charges: deliveryCharges, mrp_round_off: mrpRoundOff,
       };
     }).filter((r: any) => r.item_name); // Filter out empty rows
   };
@@ -723,19 +768,25 @@ export default function PurchasesPage() {
     const sample = [...materials].sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
     const ex1: any = sample[0];
     const ex2: any = sample.find((m: any) => (Number(m.pack_size) || 1) > 1) || sample[1];
-    const header = ['item_name', 'vendor', 'brand', 'quantity', 'unit_price', 'total_amount', 'gst_amount', 'date', 'notes'];
+    const header = ['item_name', 'vendor', 'bill_no', 'brand', 'quantity', 'unit_price',
+      'discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off',
+      'total_amount', 'gst_amount', 'date', 'notes'];
     const rows = [
       {
         item_name: ex1?.name || 'Tomato',
-        vendor: 'ABC Traders', brand: '',
-        quantity: 10, unit_price: 25, total_amount: '', gst_amount: '',
+        vendor: 'ABC Traders', bill_no: 'ABC/2026/117', brand: '',
+        quantity: 10, unit_price: 25,
+        discount: '', cgst: '', sgst: '', special_excise_cess: '', tcs: '', delivery_charges: '', mrp_round_off: '',
+        total_amount: '', gst_amount: '',
         date: todayString(), notes: 'SAMPLE — delete before uploading',
       },
       {
         item_name: ex2?.name || 'Refined Oil',
-        vendor: 'XYZ Supplies', brand: '',
-        quantity: 5, unit_price: '', total_amount: 900, gst_amount: 45,
-        date: todayString(), notes: 'SAMPLE — unit price auto-derived from total + gst',
+        vendor: 'XYZ Supplies', bill_no: 'XYZ-8842', brand: '',
+        quantity: 5, unit_price: 180,
+        discount: 50, cgst: 45, sgst: 45, special_excise_cess: '', tcs: '', delivery_charges: 30, mrp_round_off: '',
+        total_amount: '', gst_amount: '',
+        date: todayString(), notes: 'SAMPLE — charges recorded on top; rate is still unit_price',
       },
     ];
     const ws = XLSX.utils.json_to_sheet(rows, { header });
@@ -749,6 +800,9 @@ export default function PurchasesPage() {
       ['total_amount', 'optional', '₹ line/invoice amount. If given without unit_price: unit_price = (total_amount + gst_amount) ÷ quantity.'],
       ['gst_amount', 'optional', '₹ GST for the line. Folded into the effective unit price.'],
       ['vendor', 'optional', 'Supplier name.'],
+      ['bill_no', 'optional', "The VENDOR's own bill number, as printed on the bill they give you (aliases: bill_number, invoice_no, INVOICE ID). Part of the duplicate check — the same bill re-uploaded is skipped, but two different bills are both kept. Do NOT put our Invoice ID here."],
+      ['(Invoice ID)', 'AUTO', 'NOT a column — our own system number (PINV-2026-0001) is generated automatically on upload. Lines sharing the same vendor + bill_no + date get ONE Invoice ID.'],
+      ['discount / cgst / sgst / special_excise_cess / tcs / delivery_charges / mrp_round_off', 'optional', '₹ per-line charges (GRN-Inward format). RECORDED ONLY — they do NOT change the unit cost/weighted-average. Total Inward = (qty × rate) − discount + cgst + sgst + cess + tcs + delivery + mrp_round_off. Leave blank/0 if not applicable. mrp_round_off may be negative.'],
       ['brand', 'optional', 'Brand, if you track it.'],
       ['date', 'optional', 'DD-MM-YYYY, DD/MM/YYYY or YYYY-MM-DD. Defaults to today. Non-admins cannot backdate beyond the allowed window or use future dates.'],
       ['notes', 'optional', 'Any remark.'],
@@ -773,6 +827,8 @@ export default function PurchasesPage() {
       date: p.date || '',
       item_name: p.material_name || p.material_id || '',
       vendor: p.vendor || '',
+      invoice_id: p.invoice_id || '',
+      bill_no: p.bill_no || '',
       brand: p.brand || '',
       quantity: Number(p.purchase_qty ?? p.quantity ?? 0),
       purchase_unit: p.material_purchase_unit || p.material_unit || '',
@@ -780,7 +836,7 @@ export default function PurchasesPage() {
       total_amount: Number(p.total_price ?? 0),
       notes: p.notes || '',
     }));
-    const header = ['date', 'item_name', 'vendor', 'brand', 'quantity', 'purchase_unit', 'unit_price', 'total_amount', 'notes'];
+    const header = ['date', 'item_name', 'vendor', 'invoice_id', 'bill_no', 'brand', 'quantity', 'purchase_unit', 'unit_price', 'total_amount', 'notes'];
     const ws = XLSX.utils.json_to_sheet(rows, { header });
     ws['!cols'] = header.map((h) => ({ wch: h === 'item_name' ? 28 : h === 'notes' ? 30 : 14 }));
     const wb = XLSX.utils.book_new();
@@ -1096,10 +1152,13 @@ export default function PurchasesPage() {
                   </th>
                   <th className="text-left py-3 px-4 font-medium">Material</th>
                   <th className="text-left py-3 px-4 font-medium">Vendor</th>
+                  <th className="text-left py-3 px-4 font-medium" title="Our system-generated invoice number">Invoice ID</th>
+                  <th className="text-left py-3 px-4 font-medium" title="The vendor's own bill number">Bill No</th>
                   <th className="text-left py-3 px-4 font-medium">Brand</th>
                   <th className="text-right py-3 px-4 font-medium">Qty</th>
                   <th className="text-right py-3 px-4 font-medium">Unit Price</th>
                   <th className="text-right py-3 px-4 font-medium">Total</th>
+                  <th className="text-right py-3 px-4 font-medium">Total Inward</th>
                   <th className="text-left py-3 px-4 font-medium">Notes</th>
                 </tr>
               </thead>
@@ -1126,6 +1185,8 @@ export default function PurchasesPage() {
                       </div>
                     </td>
                     <td className="py-3 px-4 text-[#6B5744]">{p.vendor || '-'}</td>
+                      <td className="py-3 px-4 text-[#6B5744] font-mono text-xs">{(p as any).invoice_id || '-'}</td>
+                    <td className="py-3 px-4 text-[#6B5744] font-mono text-xs">{(p as any).bill_no || '-'}</td>
                     <td className="py-3 px-4 text-[#6B5744]">{p.brand || '-'}</td>
                     <td className="py-3 px-4 text-right text-[#3D2614] font-mono">
                       {(() => {
@@ -1170,6 +1231,14 @@ export default function PurchasesPage() {
                     <td className="py-3 px-4 text-right text-green-400 font-mono font-medium">
                       {formatCurrency(p.total_price)}
                     </td>
+                    <td className="py-3 px-4 text-right font-mono">
+                      {(() => {
+                        const c = (k: string) => Number((p as any)[k]) || 0;
+                        const charges = -c('discount') + c('cgst') + c('sgst') + c('special_excise_cess') + c('tcs') + c('delivery_charges') + c('mrp_round_off');
+                        if (charges === 0) return <span className="text-[#8B7355]">—</span>;
+                        return <span className="text-[#af4408] font-medium">{formatCurrency((Number(p.total_price) || 0) + charges)}</span>;
+                      })()}
+                    </td>
                     <td className="py-3 px-4 text-[#8B7355] max-w-[200px] truncate">
                       {p.notes || '-'}
                     </td>
@@ -1177,7 +1246,7 @@ export default function PurchasesPage() {
                 ))}
                 {paginatedPurchases.length === 0 && (
                   <tr>
-                    <td colSpan={8} className="py-12 text-center text-[#8B7355]">
+                    <td colSpan={11} className="py-12 text-center text-[#8B7355]">
                       <ShoppingCart className="w-10 h-10 mx-auto mb-3 opacity-40" />
                       <p>No purchases found.</p>
                       <p className="text-xs mt-1">Add your first purchase to get started.</p>

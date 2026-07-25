@@ -1718,6 +1718,21 @@ function initializeSchema(db: Database.Database) {
     if (!has('is_emergency'))      db.exec(`ALTER TABLE purchases ADD COLUMN is_emergency INTEGER NOT NULL DEFAULT 0`);
     if (!has('payment_mode'))      db.exec(`ALTER TABLE purchases ADD COLUMN payment_mode TEXT DEFAULT ''`);
     if (!has('emergency_reason'))  db.exec(`ALTER TABLE purchases ADD COLUMN emergency_reason TEXT DEFAULT ''`);
+    // TWO DIFFERENT identifiers per purchase line — do not conflate:
+    //   invoice_id — OUR system-generated number (PINV-<year>-####). Auto-assigned
+    //                on entry; lines of the SAME vendor bill share one invoice_id.
+    //   bill_no    — the VENDOR's own bill/invoice number, as printed on the
+    //                physical bill the vendor gives us. Entered by the user.
+    // Additive, default '' → every existing row unchanged.
+    if (!has('invoice_id'))        db.exec(`ALTER TABLE purchases ADD COLUMN invoice_id TEXT DEFAULT ''`);
+    if (!has('bill_no'))           db.exec(`ALTER TABLE purchases ADD COLUMN bill_no TEXT DEFAULT ''`);
+    // GRN-Inward-style per-line charges (₹) on a purchase — RECORDED ONLY, they
+    // do NOT change unit_price/total_price (the weighted-avg cost basis). Total
+    // Inward Amount = total_price − discount + cgst + sgst + special_excise_cess
+    // + tcs + delivery_charges + mrp_round_off (computed on read). All default 0.
+    for (const col of ['discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off']) {
+      if (!has(col)) db.exec(`ALTER TABLE purchases ADD COLUMN ${col} REAL NOT NULL DEFAULT 0`);
+    }
   } catch (e) { console.error('purchases.is_emergency migration failed:', e); }
 
   // Phase 1 §5: Goods Receipt Note (GRN) — formal record at the receiving bay.

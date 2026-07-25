@@ -60,7 +60,7 @@ export async function POST(request: Request) {
     const db = getDb();
     const body = await request.json();
     const { material_id, vendor, brand, quantity, unit_price, date, notes,
-            is_emergency, payment_mode, emergency_reason } = body;
+            is_emergency, payment_mode, emergency_reason, bill_no } = body;
 
     if (!material_id || !quantity || !unit_price || !date) {
       return Response.json({ error: 'material_id, quantity, unit_price, and date are required' }, { status: 400 });
@@ -88,12 +88,37 @@ export async function POST(request: Request) {
 
     const insertPurchase = db.transaction(() => {
       // Create purchase record (with optional emergency / cash flags)
+      // bill_no = the VENDOR's own bill number (from the "Enter Full Bill"
+      // modal). invoice_id (OUR number) is minted per vendor bill: reuse the id
+      // already assigned to this (vendor, bill_no, date) so every line of one
+      // bill shares it; otherwise take the next free PINV-<year>-#### number.
+      const billNo = String(bill_no || '').trim();
+      let invoiceId = '';
+      if (billNo) {
+        const prior = db.prepare(`
+          SELECT invoice_id FROM purchases
+          WHERE COALESCE(invoice_id, '') <> ''
+            AND LOWER(TRIM(COALESCE(vendor, ''))) = ?
+            AND LOWER(TRIM(COALESCE(bill_no, ''))) = ?
+            AND date = ?
+          LIMIT 1
+        `).get(String(vendor || '').toLowerCase().trim(), billNo.toLowerCase(), date) as any;
+        if (prior?.invoice_id) invoiceId = prior.invoice_id;
+      }
+      if (!invoiceId) {
+        const yr = new Date().getFullYear();
+        const last = db.prepare(
+          `SELECT MAX(CAST(substr(invoice_id, length('PINV-' || ? || '-') + 1) AS INTEGER)) AS n
+           FROM purchases WHERE invoice_id LIKE 'PINV-' || ? || '-%'`
+        ).get(String(yr), String(yr)) as any;
+        invoiceId = `PINV-${yr}-${String((Number(last?.n) || 0) + 1).padStart(4, '0')}`;
+      }
       db.prepare(`
         INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
-                               is_emergency, payment_mode, emergency_reason, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                               is_emergency, payment_mode, emergency_reason, invoice_id, bill_no, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       `).run(id, material_id, vendor || '', brand || '', quantity, unit_price, total_price, date, notes || '',
-              is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '');
+              is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '', invoiceId, billNo);
 
       // Stock is kept in RECIPE units (sales deduction, closing-stock variance
       // × average_price). quantity is entered in PURCHASE units, so multiply by
