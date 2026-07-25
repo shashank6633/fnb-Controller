@@ -85,7 +85,12 @@ export async function GET(request: Request) {
       `).get(id) as any;
       if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
       const items = db.prepare(`
+        -- A PO is raised in PURCHASE units at ₹/purchase-unit, so the UI must
+        -- label qty/rate with material_purchase_unit (kg), NOT the recipe unit
+        -- (g) — those differ by pack_size and mislabelling them misreads the PO.
         SELECT poi.*, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
+               COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
+               rm.pack_size AS material_pack_size,
                rm.average_price AS current_avg_price, rm.last_purchase_price,
                rm.primary_vendor AS material_default_vendor
         FROM purchase_order_items poi

@@ -141,7 +141,9 @@ export default function POPrintPage() {
                     )}
                   </td>
                   <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{Number(it.quantity).toLocaleString('en-IN')}</td>
-                  <td className="border border-gray-300 px-2 py-1.5">{it.material_unit}</td>
+                  {/* PO qty/rate are in the PURCHASE unit (kg, BTL, CASE), not
+                      the recipe unit (g, ml) — the vendor orders in the former. */}
+                  <td className="border border-gray-300 px-2 py-1.5">{it.material_purchase_unit || it.material_unit}</td>
                   <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{fmt(it.unit_price)}</td>
                   <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{fmt(it.total_price)}</td>
                   {isReceived && <>

@@ -12,7 +12,33 @@ const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFra
 const dateLabel = (s?: string | null) =>
   s ? new Date(s).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
 
-interface Material { id: string; name: string; unit: string; sku?: string; average_price: number; primary_vendor?: string; last_purchase_price?: number; }
+interface Material { id: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; sku?: string; average_price: number; primary_vendor?: string; last_purchase_price?: number; }
+
+/* ── PO UNIT BASIS ────────────────────────────────────────────────────────────
+ * A Purchase Order is raised to a VENDOR, so it must be expressed in the
+ * material's PURCHASE unit (kg, L, BTL, CASE…) at ₹ per PURCHASE unit — never
+ * the recipe/stock unit (g, ml) the kitchen consumes in.
+ *   raw_materials.unit           = RECIPE unit  (e.g. g)
+ *   raw_materials.purchase_unit  = PURCHASE unit (e.g. kg)
+ *   raw_materials.average_price  = ₹ per RECIPE unit  (e.g. ₹0.90/g)
+ *   purchases.unit_price / last_purchase_price = ₹ per PURCHASE unit (₹900/kg)
+ * So average_price must be multiplied by pack_size to become a PO rate.
+ * (See lib/pack-units + the unit convention: stock is recipe units = purchase
+ * qty × pack_size, hence ₹/purchase-unit = ₹/recipe-unit × pack_size.) */
+const poUnitOf = (m?: Partial<Material> | null): string =>
+  String(m?.purchase_unit || '').trim() || String(m?.unit || '').trim();
+/** Seed rate for a PO line: ₹ per PURCHASE unit. Prefers the last actual
+ *  purchase price (already ₹/purchase-unit); otherwise converts the recipe-unit
+ *  average by pack size. Returns 0 when we genuinely have no price. */
+const poRateOf = (m?: Partial<Material> | null): number => {
+  const last = Number(m?.last_purchase_price) || 0;
+  if (last > 0) return last;
+  const pack = Number(m?.pack_size) || 1;
+  const ru = String(m?.unit || '').toLowerCase().trim();
+  const pu = String(m?.purchase_unit || m?.unit || '').toLowerCase().trim();
+  const avg = Number(m?.average_price) || 0;
+  return (pack > 1 && ru !== pu) ? Math.round(avg * pack * 100) / 100 : avg;
+};
 interface POItem { id: string; material_id: string; material_name?: string; material_sku?: string; material_unit?: string; quantity: number; unit_price: number; total_price: number; current_avg_price?: number; last_purchase_price?: number; notes?: string; }
 interface PO { id: string; po_number: string; date: string; vendor: string; status: string; total_cost: number; notes: string; drafted_by: string; submitted_at?: string; approved_by?: string; approved_at?: string; rejected_reason?: string; received_at?: string; item_count?: number; items?: POItem[]; }
 
@@ -397,10 +423,11 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
                     const lineTotal = Number(ov.quantity) * Number(ov.unit_price);
                     const qtyDiff = Number(ov.quantity) - it.quantity;
                     const priceDiff = Number(ov.unit_price) - it.unit_price;
-                    // material_unit is the canonical recipe / stock unit that
-                    // the PO stores qty in. Show it next to every qty cell so
-                    // the receiver knows exactly what they're confirming.
-                    const u = (it as any).material_unit || '';
+                    // A PO's qty + rate are in the PURCHASE unit (kg, BTL, CASE)
+                    // — NOT the recipe/stock unit (g, ml), which differs by
+                    // pack_size. Label every qty/rate cell with it so the
+                    // receiver knows exactly what they're confirming.
+                    const u = (it as any).material_purchase_unit || (it as any).material_unit || '';
                     return (
                       <tr key={it.id} className="border-t border-[#E8D5C4]/50">
                         <td className="py-1.5 px-2">
@@ -944,7 +971,8 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                               onChange={(id, m) => {
                                                 const patch: Partial<POLine> = { material_id: id };
                                                 // Auto-fill price + vendor from the material's history
-                                                if (m && !it.unit_price) patch.unit_price = m.last_purchase_price || m.average_price || 0;
+                                                // Seed ₹ per PURCHASE unit (kg), never the recipe unit (g).
+                                if (m && !it.unit_price) patch.unit_price = poRateOf(m);
                                                 if (m && (!it.vendor || it.vendor.trim() === '')) {
                                                   // Phase 1 §3: vendor was picked at header level — default the line vendor to it.
                                                   // Falls back to the material's primary_vendor only if no header vendor was set.
@@ -958,7 +986,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                               }} />
                         {mat && (
                           <div className="text-[10px] text-[#8B7355] mt-0.5">
-                            {mat.sku} · stock unit {mat.unit} · last ₹{(mat.last_purchase_price ?? mat.average_price).toFixed(2)}
+                            {mat.sku} · order unit {poUnitOf(mat)} · ₹{poRateOf(mat).toFixed(2)}/{poUnitOf(mat)}
                           </div>
                         )}
                       </td>
@@ -1132,8 +1160,8 @@ function SimpleMaterialPicker({ value, materials, onChange }: {
                       className="w-full text-left px-2 py-1 hover:bg-[#FFF1E3] rounded text-xs flex items-center gap-2">
                 <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0">{m.sku || '·'}</span>
                 <span className="flex-1 truncate">{m.name}</span>
-                <span className="text-[10px] text-[#6B5744]">{m.unit}</span>
-                <span className="text-[10px] font-mono text-[#6B5744]">₹{(m.last_purchase_price ?? m.average_price).toFixed(2)}</span>
+                <span className="text-[10px] text-[#6B5744]">{poUnitOf(m)}</span>
+                <span className="text-[10px] font-mono text-[#6B5744]">₹{poRateOf(m).toFixed(2)}</span>
               </button>
             ))}
           </div>

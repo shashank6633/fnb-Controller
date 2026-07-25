@@ -1733,6 +1733,10 @@ function initializeSchema(db: Database.Database) {
     for (const col of ['discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off']) {
       if (!has(col)) db.exec(`ALTER TABLE purchases ADD COLUMN ${col} REAL NOT NULL DEFAULT 0`);
     }
+    // PO QTY from the inward sheet — what the PO asked for, vs `quantity` which
+    // is what actually came IN. Record-only (no stock/costing effect); lets the
+    // inward register show ordered-vs-received without a linked PO.
+    if (!has('po_qty')) db.exec(`ALTER TABLE purchases ADD COLUMN po_qty REAL NOT NULL DEFAULT 0`);
   } catch (e) { console.error('purchases.is_emergency migration failed:', e); }
 
   // Phase 1 §5: Goods Receipt Note (GRN) — formal record at the receiving bay.
