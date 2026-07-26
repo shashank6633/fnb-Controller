@@ -1645,6 +1645,13 @@ interface UploadRow {
    *  They are read off the first row that carries them and pre-fill the modal's
    *  Bill charges inputs, so the user always sees what was picked up. */
   mrp_round_off: string; excise_turnover_tax: string; special_excise_cess: string; tcs: string;
+  /** Bill-level like the four charges above — read off the first row that carries
+   *  it and pre-fills the modal's Invoice number (one invoice per upload). */
+  inward_no: string;
+  /** Carried so the sheet mirrors the Inward Register export. REFERENCE ONLY —
+   *  the item is resolved by sku then item_name, and raw_materials.category is
+   *  authoritative, so this never decides which material a row lands on. */
+  category_name: string;
 }
 interface UploadSkipped {
   row: number; item_name: string; sku: string;
@@ -1694,6 +1701,17 @@ function parseBillCsv(text: string): UploadRow[] {
     const excise_turnover_tax = get(row, 'excise_turnover_tax', 'bar excise turnover tax', 'excise turnover tax', 'turnover_tax');
     const special_excise_cess = get(row, 'special_excise_cess', 'special excise cess', 'cess');
     const tcs = get(row, 'tcs');
+    // Inward/invoice number and category, so the upload sheet mirrors the Inward
+    // Register export (INVOICE ID · INWARD DATE · SUPPLIER NAME · CATEGORY NAME · …)
+    // and a downloaded register can be filled in and sent straight back.
+    // inward_no is a BILL-level value: one invoice per upload, so it pre-fills the
+    // modal's Invoice number (same treatment as the bill-level charges below).
+    const inward_no = get(row, 'inward_no', 'inward no', 'invoice_id', 'invoice id', 'invoice_ref',
+                          'invoice_no', 'invoice no', 'indent_no', 'indent no');
+    // Reference only — the item is resolved by SKU then name on the server, and
+    // raw_materials.category is authoritative. Carried so the sheet reads like the
+    // register; it never decides which material a row lands on.
+    const category_name = get(row, 'category_name', 'category name', 'category');
     // Skip a fully-blank line (all key fields empty).
     if (!item_name && !sku && !cases && !bottles && !loose && !unit_price && !amount) continue;
     out.push({
@@ -1701,6 +1719,7 @@ function parseBillCsv(text: string): UploadRow[] {
       per_case: pc === '1' || pc === 'true' || pc === 'yes' || pc === 'y',
       batch_no, expiry_date, date, discount, cgst, sgst, delivery_charges,
       mrp_round_off, excise_turnover_tax, special_excise_cess, tcs,
+      inward_no, category_name,
     });
   }
   return out;
@@ -1760,6 +1779,15 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
           cess: fromSheet.cess || prev.cess, tcs: fromSheet.tcs || prev.tcs,
         }));
       }
+      // Same treatment for the inward/invoice number — one per bill. Only fill a
+      // BLANK field: whatever the user already typed is a deliberate choice and
+      // must win over the sheet.
+      const sheetInward = parsed.find(r => String(r.inward_no || '').trim() !== '');
+      if (sheetInward) setInvoiceRef(prev => prev.trim() || String(sheetInward.inward_no).trim());
+      // A per-row date is already supported; if the sheet carries one, adopt it for
+      // the bill header too so the register round-trips without re-typing.
+      const sheetDate = parsed.find(r => String(r.date || '').trim() !== '');
+      if (sheetDate) setDate(prev => (prev === today() ? String(sheetDate.date).trim() : prev));
     } catch (e: any) { setErr(`Could not read file: ${e.message}`); }
   };
 
@@ -1769,14 +1797,18 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
     // Columns 13-16 are the BILL-level charges — ONE set per invoice, so put
     // them on the FIRST row only; they pre-fill the Bill charges box in the
     // modal (which stays editable). Sample below mirrors a TGBCL indent.
+    // inward_no is BILL-level like columns 13-16: one invoice per upload, so put
+    // it on the FIRST row only — it pre-fills the modal's Invoice number field.
+    // category_name is reference only (the item is matched by sku, then name), and
+    // leads the item columns so the sheet reads in Inward Register order.
     const sample =
-      'item_name,sku,cases,bottles,unit_price,amount,per_case,date,'
+      'inward_no,date,category_name,item_name,sku,cases,bottles,unit_price,amount,per_case,'
       + 'discount,cgst,sgst,delivery_charges,'
       + 'mrp_round_off,excise_turnover_tax,special_excise_cess,tcs,batch_no,expiry_date\n'
-      + `HEINEKEN LAGER BEER,6561,5,0,,15010,,${d},,,,,7214.40,0,22617,5491,,\n`
-      + `KINGFISHER ULTRA LAGER BEER,5029,12,0,,28824,,${d},,,,,,,,,,\n`
-      + `GREY GOOSE VODKA,9004,1,0,,20101,,${d},500,,,,,,,,,\n`
-      + `ABSOLUT VODKA,8006,1,0,3900,,1,${d},,,,,,,,,,\n`;
+      + `INV-001,${d},beer,HEINEKEN LAGER BEER,6561,5,0,,15010,,,,,,7214.40,0,22617,5491,,\n`
+      + `,${d},beer,KINGFISHER ULTRA LAGER BEER,5029,12,0,,28824,,,,,,,,,,,\n`
+      + `,${d},vodka,GREY GOOSE VODKA,9004,1,0,,20101,,500,,,,,,,,,\n`
+      + `,${d},vodka,ABSOLUT VODKA,8006,1,0,3900,,1,,,,,,,,,,\n`;
     const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1932,6 +1964,8 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
           Optional per-line ₹ charges: <code>discount</code>, <code>cgst</code>, <code>sgst</code>, <code>delivery_charges</code>.
           The 4 bill-level charges — <code>mrp_round_off</code>, <code>excise_turnover_tax</code>, <code>special_excise_cess</code>, <code>tcs</code> —
           can go in the CSV too: put them on the <b>first row only</b> (one set per invoice) and they pre-fill the Bill charges box below, which stays editable.
+          {' '}<code>inward_no</code> (the invoice / indent number) is bill-level the same way — first row only, and it pre-fills Invoice number above.
+          {' '}<code>category_name</code> is accepted so the sheet matches the Inward Register export, but it is <b>reference only</b> — the item is always resolved by <code>sku</code> first, then <code>item_name</code>.
         </div>
       )}
 
