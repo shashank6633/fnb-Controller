@@ -15,11 +15,20 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Warehouse, Loader2, Plus, X, Save, AlertCircle, CheckCircle2, Edit2,
-  Users as UsersIcon, Tags, Power, MapPin,
+  Users as UsersIcon, Tags, Power, MapPin, AlertTriangle,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 
 interface CatMap { id: string; category: string; }
+
+/** JS mirror of catNorm in src/lib/store-engine.ts — category matching is case-,
+ *  space-, hyphen- and underscore-insensitive. Kept identical on purpose: this
+ *  page decides what to offer and what to flag, and disagreeing with the server
+ *  means suggesting an option the API will 409. */
+const catNormJs = (s: string) => String(s || '').toLowerCase().trim().replace(/[ _-]/g, '');
+/** A table zone that actually has tables — the only labels a floor bar can
+ *  usefully be mapped to (floorStoreForZone matches floor_label to these). */
+interface ZoneOpt { zone: string; tables: number; }
 interface AccessRow {
   id: string; user_id: string; user_name: string; user_email: string;
   can_view: number; can_procure: number; can_adjust: number; can_close_stock: number;
@@ -43,6 +52,7 @@ const PERM_COLS: { key: 'can_view' | 'can_procure' | 'can_adjust' | 'can_close_s
 export default function StoreLocationsPage() {
   const [stores, setStores] = useState<StoreRow[]>([]);
   const [materialCats, setMaterialCats] = useState<string[]>([]);
+  const [tableZones, setTableZones] = useState<ZoneOpt[]>([]);
   const [users, setUsers] = useState<UserOpt[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -69,6 +79,7 @@ export default function StoreLocationsPage() {
         if (j.error) { setError(j.error); return; }
         setStores(j.stores || []);
         setMaterialCats(j.material_categories || []);
+        setTableZones(j.table_zones || []);
         setUsers(j.users || []);
       })
       .catch(e => !cancelled && setError(e.message))
@@ -163,7 +174,7 @@ export default function StoreLocationsPage() {
         </div>
       ) : (
         stores.map(s => (
-          <StoreCard key={s.id} store={s} materialCats={materialCats} users={users}
+          <StoreCard key={s.id} store={s} materialCats={materialCats} tableZones={tableZones} users={users}
                      busy={busy} run={run} />
         ))
       )}
@@ -179,9 +190,10 @@ export default function StoreLocationsPage() {
 
 // ─── One store card: header + category mapping + user access ───────────────
 
-function StoreCard({ store, materialCats, users, busy, run }: {
+function StoreCard({ store, materialCats, tableZones, users, busy, run }: {
   store: StoreRow;
   materialCats: string[];
+  tableZones: ZoneOpt[];
   users: UserOpt[];
   busy: boolean;
   run: (fn: () => Promise<Response>, okMsg: string) => Promise<boolean>;
@@ -198,14 +210,30 @@ function StoreCard({ store, materialCats, users, busy, run }: {
     setName(store.name); setCode(store.code); setFloorLabel(store.floor_label || ''); setRenames({});
   }, [store]);
 
-  const mapped = useMemo(
-    () => new Set(store.categories.map(c => c.category.trim().toLowerCase())),
+  // The dropdown must hide anything already owned under catNorm, not just an exact
+  // NOCASE match — otherwise it keeps offering 'RED WINE' while 'red-wine' is
+  // mapped, and the server (now) 409s on the very option it suggested.
+  const mappedNorm = useMemo(
+    () => new Set(store.categories.map(c => catNormJs(c.category))),
     [store.categories],
   );
   const unmappedCats = useMemo(
-    () => materialCats.filter(c => !mapped.has(c.trim().toLowerCase())),
-    [materialCats, mapped],
+    () => materialCats.filter(c => !mappedNorm.has(catNormJs(c))),
+    [materialCats, mappedNorm],
   );
+  // Chips that are the SAME category as an earlier chip once separators and case
+  // are ignored ('RED WINE' vs 'red-wine'). Matching is catNorm everywhere, so the
+  // later spelling adds nothing — flag it so it can be removed with the ✕.
+  const redundant = useMemo(() => {
+    const seen = new Map<string, string>();
+    const dupes = new Map<string, string>();          // chip id -> the spelling it duplicates
+    for (const c of store.categories) {
+      const k = catNormJs(c.category);
+      if (seen.has(k)) dupes.set(c.id, seen.get(k)!);
+      else seen.set(k, c.category.trim());
+    }
+    return dupes;
+  }, [store.categories]);
   const grantedIds = useMemo(() => new Set((store.access || []).map(a => a.user_id)), [store.access]);
   const pickableUsers = useMemo(
     () => users.filter(u => !grantedIds.has(u.id) && u.role !== 'admin'),
@@ -325,11 +353,46 @@ function StoreCard({ store, materialCats, users, busy, run }: {
               </button>
             )}
           </div>
+          {/* Click-to-add the REAL zones. A hand-typed label that matches no table
+              zone is an "orphan label" — nothing can be sold there, so the bar
+              silently never reconciles. Appends, because a bar may serve several. */}
+          {tableZones.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1 mt-1.5">
+              <span className="text-[10px] text-[#8B7355] mr-0.5">Zones with tables:</span>
+              {tableZones.map(z => {
+                const already = floorLabel.split(',').some(p => p.trim().toLowerCase() === z.zone.toLowerCase());
+                return (
+                  <button key={z.zone} type="button" disabled={busy || already}
+                          onClick={() => setFloorLabel(prev => (prev.trim() ? `${prev.trim()}, ${z.zone}` : z.zone))}
+                          title={already ? `${z.zone} is already mapped here` : `Add ${z.zone}`}
+                          className={`px-1.5 py-0.5 rounded-full border text-[10px] ${already
+                            ? 'border-[#E8D5C4] bg-[#F3E9DC] text-[#B8A590] cursor-default'
+                            : 'border-[#E8D5C4] bg-white text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408]'}`}>
+                    {z.zone} <span className="text-[#B8A590]">({z.tables})</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
           <p className="text-[10px] text-[#8B7355] mt-1">
             Match this floor bar to the table <strong>zone</strong> its sales come from (comma-separated for
             several zones). Sales in a mapped zone are attributed to this store for leak reconciliation. Leave
             blank for a non-floor store like the central Liquor Store.
           </p>
+          {/* A store that owns NO categories is a receiving location (a floor bar) —
+              it can only be judged against what was sold in its zone. With no zone
+              it is invisible to reconciliation, which reads as "no leak" rather
+              than "not checked". The category-owning central store is exempt: it
+              is procurement, not a floor, and is correctly blank. */}
+          {store.is_active && store.categories.length === 0 && !floorLabel.trim() && (
+            <p className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 mt-1 flex items-start gap-1">
+              <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+              <span>
+                No zone mapped, and this store owns no categories — so nothing attributes sales to it and its
+                sales-vs-consumption check never runs. Pick the zone{tableZones.length > 0 ? ' above' : ''} that this bar serves.
+              </span>
+            </p>
+          )}
         </div>
 
         {/* ── Category mapping ── */}
@@ -346,9 +409,11 @@ function StoreCard({ store, materialCats, users, busy, run }: {
             {store.categories.map(c => {
               const staged = renames[c.category];
               const dirty = staged !== undefined && staged.trim() !== '' && staged.trim() !== c.category;
+              const dupOf = redundant.get(c.id);
               return (
                 <span key={c.id}
-                      className={`inline-flex items-center gap-1 border rounded-full pl-2 pr-1 py-0.5 text-xs ${dirty ? 'bg-amber-50 border-amber-300' : 'bg-[#FFF8F0] border-[#E8D5C4]'}`}>
+                      title={dupOf ? `Same category as "${dupOf}" (case and - _ spaces are ignored when matching) — this row adds nothing, safe to remove` : undefined}
+                      className={`inline-flex items-center gap-1 border rounded-full pl-2 pr-1 py-0.5 text-xs ${dirty ? 'bg-amber-50 border-amber-300' : dupOf ? 'bg-[#F3E9DC] border-dashed border-[#C4A98A] text-[#8B7355]' : 'bg-[#FFF8F0] border-[#E8D5C4]'}`}>
                   <input
                     value={staged ?? c.category}
                     onChange={e => setRenames(prev => ({ ...prev, [c.category]: e.target.value }))}
@@ -362,6 +427,7 @@ function StoreCard({ store, materialCats, users, busy, run }: {
                       <Edit2 className="w-3 h-3" />
                     </button>
                   )}
+                  {dupOf && <span className="text-[9px] uppercase tracking-wide text-[#A8907A]">dup</span>}
                   <button onClick={() => removeCategory(c.category)} disabled={busy}
                           title={`Remove "${c.category}"`} className="text-[#8B7355] hover:text-red-600">
                     <X className="w-3.5 h-3.5" />

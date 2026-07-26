@@ -74,21 +74,44 @@ export async function POST(request: Request) {
     if (!wanted.length) return Response.json({ error: 'table_number is required' }, { status: 400 });
     if (wanted.length > 500) return Response.json({ error: 'Too many tables at once (max 500).' }, { status: 400 });
 
-    // Skip numbers that already exist for this outlet (active or inactive) so a
-    // bulk add never creates duplicates or clashes with a deactivated table.
+    // A number already taken by an ACTIVE table is a real clash → skip it.
+    // A number held by a DEACTIVATED table is different: Delete here is a SOFT
+    // delete (is_active = 0, see DELETE below) because orders.table_id points at
+    // these rows and hard-deleting would orphan order history. The table then
+    // vanishes from the list — which filters on is_active — while still owning its
+    // number, so re-creating it reported "already exists" with no way out of the
+    // UI. Revive that row instead: same id, so past orders stay linked, and the
+    // numbering can be redone freely.
     const existsStmt = db.prepare(
-      "SELECT 1 FROM restaurant_tables WHERE table_number = ? AND (outlet_id = ? OR (outlet_id IS NULL AND ? IS NULL)) LIMIT 1",
+      "SELECT id, is_active FROM restaurant_tables WHERE table_number = ? AND (outlet_id = ? OR (outlet_id IS NULL AND ? IS NULL)) LIMIT 1",
     );
+    // Re-apply the zone/section/seats being asked for — the point of re-creating a
+    // number is usually to place it differently. qr_token is deliberately NOT
+    // regenerated: the table comes back as itself, so QR standees already printed
+    // for it keep working.
+    const revive = db.prepare(`
+      UPDATE restaurant_tables
+         SET is_active = 1, zone = ?, section = ?, seats = ?, updated_at = datetime('now')
+       WHERE id = ?
+    `);
     const ins = db.prepare(`
       INSERT INTO restaurant_tables (id, outlet_id, table_number, zone, section, seats, qr_token, is_active, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
     `);
     const skippedNumbers: string[] = [];
+    const restoredNumbers: string[] = [];
     let created = 0;
     let firstId = '';
     const tx = db.transaction(() => {
       for (const n of wanted) {
-        if (existsStmt.get(n, outletId, outletId)) { skippedNumbers.push(n); continue; }
+        const hit = existsStmt.get(n, outletId, outletId) as { id: string; is_active: number } | undefined;
+        if (hit) {
+          if (hit.is_active) { skippedNumbers.push(n); continue; }   // live table — real clash
+          revive.run(zone, section, seats, hit.id);                  // deactivated — bring it back
+          restoredNumbers.push(n);
+          if (!firstId) firstId = hit.id;
+          continue;
+        }
         const id = generateId();
         ins.run(id, outletId, n, zone, section, seats, generateId());
         if (!firstId) firstId = id;
@@ -98,7 +121,11 @@ export async function POST(request: Request) {
     tx();
 
     return Response.json(
-      { success: true, id: firstId || undefined, created, skipped: skippedNumbers.length, skippedNumbers },
+      {
+        success: true, id: firstId || undefined, created,
+        restored: restoredNumbers.length, restoredNumbers,
+        skipped: skippedNumbers.length, skippedNumbers,
+      },
       { status: 201 },
     );
   } catch (e: any) {

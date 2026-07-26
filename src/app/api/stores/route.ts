@@ -54,7 +54,20 @@ export async function GET() {
       ORDER BY 1 COLLATE NOCASE
     `).all() as { category: string }[]).map(r => r.category);
 
-    const payload: any = { stores, material_categories };
+    // Dropdown assist for the Floor / zone field. A floor bar is tied to sales by
+    // matching its floor_label against restaurant_tables.zone (see
+    // floorStoreForZone), so an unmapped bar can never be reconciled against what
+    // was sold on it. Ship the real zones — free-typing a label that matches no
+    // zone is exactly the "orphan label" the floor-readiness check reports.
+    const table_zones = db.prepare(`
+      SELECT TRIM(zone) AS zone, COUNT(*) AS tables
+      FROM restaurant_tables
+      WHERE zone IS NOT NULL AND TRIM(zone) != ''
+      GROUP BY LOWER(TRIM(zone))
+      ORDER BY 1 COLLATE NOCASE
+    `).all() as { zone: string; tables: number }[];
+
+    const payload: any = { stores, material_categories, table_zones };
     if (isAdmin) {
       payload.users = db.prepare(`
         SELECT id, name, email, role FROM users

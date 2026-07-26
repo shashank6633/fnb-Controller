@@ -107,8 +107,13 @@ export default function TablesPage() {
       const r = await api('/api/dine-in/tables', { method: 'POST', body: { table_numbers: bulkComposed, zone: bulk.zone, section: bulk.section, seats: bulk.seats } });
       const j = await r.json();
       if (j.error) { alert(j.error); return; }
-      const msg = `Created ${j.created} table${j.created === 1 ? '' : 's'}.` +
-        (j.skipped ? ` Skipped ${j.skipped} that already exist${j.skipped === 1 ? 's' : ''}${j.skippedNumbers?.length ? `: ${j.skippedNumbers.slice(0, 12).join(', ')}${j.skippedNumbers.length > 12 ? '…' : ''}` : ''}.` : '');
+      // A number held by a table you DELETED is restored, not skipped — deleting is
+      // a soft delete (order history points at the row), so say "restored" rather
+      // than reporting 0 created and leaving it looking like nothing happened.
+      const list = (a?: string[]) => (a?.length ? `: ${a.slice(0, 12).join(', ')}${a.length > 12 ? '…' : ''}` : '');
+      const msg = `Created ${j.created} table${j.created === 1 ? '' : 's'}.`
+        + (j.restored ? ` Restored ${j.restored} previously deleted${list(j.restoredNumbers)}.` : '')
+        + (j.skipped ? ` Skipped ${j.skipped} already in use${list(j.skippedNumbers)}.` : '');
       setBulkOpen(false); setBulk({ text: '', zone: '', section: '', seats: 2 });
       await load();
       alert(msg);

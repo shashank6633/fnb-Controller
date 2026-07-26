@@ -1652,6 +1652,19 @@ interface UploadRow {
    *  the item is resolved by sku then item_name, and raw_materials.category is
    *  authoritative, so this never decides which material a row lands on. */
   category_name: string;
+  /** Bill-level: pre-fills the modal's Supplier when it is still blank. The
+   *  vendor dropdown there stays authoritative. */
+  supplier_name: string;
+  /** Register parity only — the liquor store has no PO stage, so this is never read. */
+  po_qty: string;
+  /** Routes inward_qty onto cases / bottles / loose (see the parser). */
+  purchase_unit: string;
+  /** Line total INCLUDING this line's charges. Cross-check only — NOT the price
+   *  basis, or the charges would be counted into unit cost twice. */
+  total_inward_amount: string;
+  /** Set when inward_qty had a blank/unrecognised purchase_unit and was read as
+   *  bottles, so the preview can say so instead of silently assuming. */
+  unit_note: string;
 }
 interface UploadSkipped {
   row: number; item_name: string; sku: string;
@@ -1687,11 +1700,12 @@ function parseBillCsv(text: string): UploadRow[] {
     const bottles = get(row, 'bottles', 'quantity bottles', 'quantity_bottles', 'qty bottles', 'bottle', 'btl');
     const loose = get(row, 'loose', 'pegs', 'units');
     const unit_price = get(row, 'unit_price', 'unit price', 'price', 'rate', 'price_per_bottle');
-    const amount = get(row, 'amount', 'total', 'line_total', 'line total', 'value');
+    // 'subtotal' is the register's name for this: qty x rate, BEFORE charges.
+    const amount = get(row, 'amount', 'subtotal', 'sub total', 'total', 'line_total', 'line total', 'value');
     const pc = get(row, 'per_case', 'per case', 'rate_per_case').toLowerCase();
     const batch_no = get(row, 'batch_no', 'batch', 'batch no', 'lot');
     const expiry_date = get(row, 'expiry_date', 'expiry', 'exp', 'best_before');
-    const date = normDate(get(row, 'date', 'purchase_date', 'purchase date', 'invoice_date', 'invoice date', 'bill_date', 'bill date'));
+    const date = normDate(get(row, 'date', 'inward_date', 'inward date', 'purchase_date', 'purchase date', 'invoice_date', 'invoice date', 'bill_date', 'bill date'));
     const discount = get(row, 'discount', 'disc');
     const cgst = get(row, 'cgst');
     const sgst = get(row, 'sgst');
@@ -1712,14 +1726,49 @@ function parseBillCsv(text: string): UploadRow[] {
     // raw_materials.category is authoritative. Carried so the sheet reads like the
     // register; it never decides which material a row lands on.
     const category_name = get(row, 'category_name', 'category name', 'category');
+    const supplier_name = get(row, 'supplier_name', 'supplier name', 'supplier', 'vendor', 'vendor_name', 'vendor name');
+    // Accepted for register parity and IGNORED on purpose: the liquor store has no
+    // PO stage (bills are booked straight onto the store ledger), so there is no
+    // ordered quantity to compare against. Carried so a register round-trips.
+    const po_qty = get(row, 'po_qty', 'po qty', 'ordered_qty', 'ordered qty');
+    // Generic qty + unit, the shape the Inward Register exports. Mapped onto
+    // cases/bottles/loose below — /procure-bill speaks CBL, not qty+unit.
+    const inward_qty = get(row, 'inward_qty', 'inward qty', 'qty', 'quantity');
+    const purchase_unit = get(row, 'purchase_unit', 'purchase unit', 'unit', 'uom');
+    // The line TOTAL INCLUDING this line's charges. Parsed for a cross-check only —
+    // never used as the price basis. Feeding it in as the subtotal is exactly how
+    // the Central purchases template once double-counted CGST/SGST into unit cost.
+    const total_inward_amount = get(row, 'total_inward_amount', 'total inward amount', 'net_amount', 'net amount');
     // Skip a fully-blank line (all key fields empty).
-    if (!item_name && !sku && !cases && !bottles && !loose && !unit_price && !amount) continue;
+    if (!item_name && !sku && !cases && !bottles && !loose && !inward_qty && !unit_price && !amount) continue;
+
+    // ── inward_qty + purchase_unit -> cases / bottles / loose ────────────────
+    // Explicit cases/bottles/loose ALWAYS win: they are the native liquor shape and
+    // an existing sheet must keep behaving exactly as before. Only fill from the
+    // generic pair when none of the three was given.
+    let qCases = cases, qBottles = bottles, qLoose = loose;
+    let unitNote = '';
+    if (!cases && !bottles && !loose && inward_qty) {
+      const u = purchase_unit.toLowerCase().replace(/[^a-z]/g, '');
+      if (['case', 'cases', 'cs', 'box', 'boxes', 'carton', 'cartons'].includes(u)) qCases = inward_qty;
+      else if (['bottle', 'bottles', 'btl', 'btls', 'pc', 'pcs', 'piece', 'pieces', 'nos', 'no', 'each', 'ea', 'unit', 'units'].includes(u)) qBottles = inward_qty;
+      else if (['ml', 'l', 'ltr', 'litre', 'litres', 'liter', 'liters', 'peg', 'pegs', 'loose', 'g', 'kg'].includes(u)) qLoose = inward_qty;
+      else {
+        // Blank or unrecognised unit. Default to BOTTLES, never cases: a case is
+        // ~12 bottles, so guessing "case" would inflate the receipt an order of
+        // magnitude, and unit_price is per bottle unless per_case says otherwise.
+        // Flagged so the preview shows what was assumed rather than hiding it.
+        qBottles = inward_qty;
+        unitNote = purchase_unit ? `read "${purchase_unit}" as bottles` : 'no purchase_unit — read as bottles';
+      }
+    }
     out.push({
-      item_name, sku, cases, bottles, loose, unit_price, amount,
+      item_name, sku, cases: qCases, bottles: qBottles, loose: qLoose, unit_price, amount,
       per_case: pc === '1' || pc === 'true' || pc === 'yes' || pc === 'y',
       batch_no, expiry_date, date, discount, cgst, sgst, delivery_charges,
       mrp_round_off, excise_turnover_tax, special_excise_cess, tcs,
-      inward_no, category_name,
+      inward_no, category_name, supplier_name, po_qty, purchase_unit,
+      total_inward_amount, unit_note: unitNote,
     });
   }
   return out;
@@ -1746,6 +1795,19 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
   // computed on the server with each material's pack/case factors). When a row
   // carries `amount` (the line total, as on the govt indent) it's exact; a
   // unit_price-only row is a rough estimate since case size isn't known here.
+  // total_inward_amount is NEVER used as a price. It is only checked against
+  // subtotal + this line's own charges, because a sheet where those disagree means
+  // the operator's arithmetic and ours differ — worth saying before posting, and
+  // far safer than adopting their figure (which would fold charges into unit cost).
+  const inwardMismatches = useMemo(() => rows.filter(r => {
+    const stated = numOr0(r.total_inward_amount);
+    if (!(stated > 0)) return false;
+    const sub = numOr0(r.amount);
+    if (!(sub > 0)) return false;                       // no subtotal to compare against
+    const calc = sub - numOr0(r.discount) + numOr0(r.cgst) + numOr0(r.sgst) + numOr0(r.delivery_charges);
+    return Math.abs(calc - stated) > 1;                 // ₹1 tolerance for rounding
+  }).length, [rows]);
+
   const previewInvoice = useMemo(() => rows.reduce((s, r) => {
     const amt = numOr0(r.amount);
     if (amt > 0) return s + amt;
@@ -1784,6 +1846,11 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
       // must win over the sheet.
       const sheetInward = parsed.find(r => String(r.inward_no || '').trim() !== '');
       if (sheetInward) setInvoiceRef(prev => prev.trim() || String(sheetInward.inward_no).trim());
+      // Supplier likewise. The vendor dropdown below stays authoritative — this only
+      // saves re-typing a name the sheet already carries, and never overwrites a
+      // supplier the user picked.
+      const sheetSupplier = parsed.find(r => String(r.supplier_name || '').trim() !== '');
+      if (sheetSupplier) setSupplier(prev => prev.trim() || String(sheetSupplier.supplier_name).trim());
       // A per-row date is already supported; if the sheet carries one, adopt it for
       // the bill header too so the register round-trips without re-typing.
       const sheetDate = parsed.find(r => String(r.date || '').trim() !== '');
@@ -1801,14 +1868,26 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
     // it on the FIRST row only — it pre-fills the modal's Invoice number field.
     // category_name is reference only (the item is matched by sku, then name), and
     // leads the item columns so the sheet reads in Inward Register order.
+    // Full Inward Register column set, in register order, so a downloaded register
+    // can be filled in and sent straight back. inward_no / supplier_name and the 4
+    // bill-level charges are ONE-PER-INVOICE: first row only.
+    // inward_qty + purchase_unit is the register's way of stating quantity; cases /
+    // bottles / loose still work and WIN when present (the native liquor shape).
     const sample =
-      'inward_no,date,category_name,item_name,sku,cases,bottles,unit_price,amount,per_case,'
-      + 'discount,cgst,sgst,delivery_charges,'
-      + 'mrp_round_off,excise_turnover_tax,special_excise_cess,tcs,batch_no,expiry_date\n'
-      + `INV-001,${d},beer,HEINEKEN LAGER BEER,6561,5,0,,15010,,,,,,7214.40,0,22617,5491,,\n`
-      + `,${d},beer,KINGFISHER ULTRA LAGER BEER,5029,12,0,,28824,,,,,,,,,,,\n`
-      + `,${d},vodka,GREY GOOSE VODKA,9004,1,0,,20101,,500,,,,,,,,,\n`
-      + `,${d},vodka,ABSOLUT VODKA,8006,1,0,3900,,1,,,,,,,,,,\n`;
+      'inward_no,inward_date,supplier_name,category_name,item_name,sku,'
+      + 'po_qty,inward_qty,purchase_unit,rate,subtotal,'
+      + 'discount,cgst,sgst,special_excise_cess,tcs,delivery_charges,mrp_round_off,total_inward_amount,'
+      + 'cases,bottles,loose,per_case,batch_no,expiry_date\n'
+      // case-quantity line, priced by line total, carrying the bill-level charges
+      + `TGBCL-001,${d},GOVERNMENT OF TELANGANA,beer,HEINEKEN LAGER BEER,6561,,5,case,,15010,,,,22617,5491,,7214.40,50332.40,,,,,,\n`
+      // same, no charges of its own
+      + `,${d},,beer,KINGFISHER ULTRA LAGER BEER,5029,,12,case,,28824,,,,,,,,28824,,,,,,\n`
+      // per-line discount, and a bottle quantity
+      + `,${d},,vodka,GREY GOOSE VODKA,9004,,6,bottle,,20101,500,,,,,,,19601,,,,,,\n`
+      // priced per CASE instead of per bottle -> per_case=1
+      + `,${d},,vodka,ABSOLUT VODKA,8006,,1,case,3900,,,,,,,,,3900,,,,1,,\n`
+      // the older cases/bottles style still works and takes precedence
+      + `,${d},,rum,CAMIKARA RUM 750ML,7001,,,,2425.08,2425.08,,,,,,,,2425.08,0,1,,,,\n`;
     const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1965,7 +2044,11 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
           The 4 bill-level charges — <code>mrp_round_off</code>, <code>excise_turnover_tax</code>, <code>special_excise_cess</code>, <code>tcs</code> —
           can go in the CSV too: put them on the <b>first row only</b> (one set per invoice) and they pre-fill the Bill charges box below, which stays editable.
           {' '}<code>inward_no</code> (the invoice / indent number) is bill-level the same way — first row only, and it pre-fills Invoice number above.
+          {' '}<code>supplier_name</code> is bill-level too and pre-fills Supplier.
           {' '}<code>category_name</code> is accepted so the sheet matches the Inward Register export, but it is <b>reference only</b> — the item is always resolved by <code>sku</code> first, then <code>item_name</code>.
+          {' '}Quantity may be given the register&apos;s way as <code>inward_qty</code> + <code>purchase_unit</code> (<code>case</code> / <code>bottle</code> / <code>ml</code>); <code>cases</code>/<code>bottles</code>/<code>loose</code> still work and take precedence.
+          {' '}<code>subtotal</code> is the same as <code>amount</code>. <code>total_inward_amount</code> is only cross-checked — the bill posts from subtotal + charges, never from that column.
+          {' '}<code>po_qty</code> is accepted for register parity and ignored: liquor bills have no PO stage.
         </div>
       )}
 
@@ -1973,6 +2056,19 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
       {!result && rows.length > 0 && (
         <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
           <div className="px-3 py-1.5 bg-[#FFF1E3] text-[11px] font-semibold text-[#6B5744]">{rows.length} rows parsed from {fileName}</div>
+          {/* Say what was assumed / what disagrees BEFORE the bill is posted. */}
+          {rows.some(r => r.unit_note) && (
+            <div className="px-3 py-1.5 bg-amber-50 border-t border-amber-200 text-[11px] text-amber-800">
+              {rows.filter(r => r.unit_note).length} row(s) gave a quantity without a usable <code>purchase_unit</code> — read as <b>bottles</b>.
+              {' '}Add <code>purchase_unit</code> (<code>case</code> or <code>bottle</code>), or use the <code>cases</code>/<code>bottles</code> columns, if that is wrong.
+            </div>
+          )}
+          {inwardMismatches > 0 && (
+            <div className="px-3 py-1.5 bg-amber-50 border-t border-amber-200 text-[11px] text-amber-800">
+              {inwardMismatches} row(s) where <code>total_inward_amount</code> ≠ subtotal − discount + CGST + SGST + delivery.
+              {' '}The bill is posted from <b>subtotal + charges</b>, not from that column — worth re-checking the sheet.
+            </div>
+          )}
           <div className="max-h-52 overflow-auto">
             <table className="w-full text-xs">
               <thead className="bg-[#FBF6EF] text-[#8B7355] sticky top-0">

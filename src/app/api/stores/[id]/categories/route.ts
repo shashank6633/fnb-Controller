@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
-import { getStoreById } from '@/lib/store-engine';
+import { getStoreById, catNorm } from '@/lib/store-engine';
 
 /**
  * Category mappings for one store — which raw_materials.category values the
@@ -32,13 +32,32 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const category = String(b.category || '').trim();
     if (!category) return Response.json({ error: 'category is required' }, { status: 400 });
 
-    // One owner per category across ALL stores — otherwise materialStoreId
-    // would be ambiguous. NOCASE + TRIM comparison.
+    // One owner per category across ALL stores — otherwise materialStoreId is
+    // ambiguous. Compare with catNorm, the SAME normalisation every match uses
+    // (case-, space-, hyphen- and underscore-insensitive). A TRIM/NOCASE compare
+    // let 'RED WINE' onto a second store while 'red-wine' sat on the first: the
+    // guard saw two different strings, but every lookup sees one category.
     const owner = g.db.prepare(`
-      SELECT s.name FROM store_category_map m JOIN store_locations s ON s.id = m.store_id
-      WHERE TRIM(m.category) = TRIM(?) COLLATE NOCASE AND m.store_id != ?
+      SELECT s.name, m.category FROM store_category_map m JOIN store_locations s ON s.id = m.store_id
+      WHERE ${catNorm('m.category')} = ${catNorm('?')} AND m.store_id != ?
     `).get(category, g.store.id) as any;
-    if (owner) return Response.json({ error: `"${category}" is already mapped to ${owner.name}` }, { status: 409 });
+    if (owner) {
+      const spelt = String(owner.category || '').trim();
+      const note = spelt && spelt.toLowerCase() !== category.toLowerCase() ? ` (spelt "${spelt}" there — same category)` : '';
+      return Response.json({ error: `"${category}" is already mapped to ${owner.name}${note}` }, { status: 409 });
+    }
+    // Same normalisation WITHIN this store, so a separator variant of a category
+    // the store already owns is rejected instead of silently adding a duplicate
+    // row that only clutters the chip list.
+    const mine = g.db.prepare(`
+      SELECT category FROM store_category_map
+      WHERE store_id = ? AND ${catNorm('category')} = ${catNorm('?')}
+    `).get(g.store.id, category) as any;
+    if (mine) {
+      const spelt = String(mine.category || '').trim();
+      const note = spelt && spelt.toLowerCase() !== category.toLowerCase() ? ` as "${spelt}"` : '';
+      return Response.json({ error: `"${category}" is already mapped to ${g.store.name}${note}` }, { status: 409 });
+    }
 
     const r = g.db.prepare(`
       INSERT OR IGNORE INTO store_category_map (id, store_id, category)
@@ -61,12 +80,19 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     const to = String(b.to || '').trim();
     if (!from || !to) return Response.json({ error: 'from + to are required' }, { status: 400 });
 
+    // catNorm, matching the POST guard and every lookup — a TRIM/NOCASE clash
+    // check let a rename land on a separator variant of a category another store
+    // (or this one) already owns. The NOT (…) clause exempts the row being renamed.
     const clash = g.db.prepare(`
-      SELECT s.name FROM store_category_map m JOIN store_locations s ON s.id = m.store_id
-      WHERE TRIM(m.category) = TRIM(?) COLLATE NOCASE
-        AND NOT (m.store_id = ? AND TRIM(m.category) = TRIM(?) COLLATE NOCASE)
+      SELECT s.name, m.category FROM store_category_map m JOIN store_locations s ON s.id = m.store_id
+      WHERE ${catNorm('m.category')} = ${catNorm('?')}
+        AND NOT (m.store_id = ? AND ${catNorm('m.category')} = ${catNorm('?')})
     `).get(to, g.store.id, from) as any;
-    if (clash) return Response.json({ error: `"${to}" is already mapped to ${clash.name}` }, { status: 409 });
+    if (clash) {
+      const spelt = String(clash.category || '').trim();
+      const note = spelt && spelt.toLowerCase() !== to.toLowerCase() ? ` (spelt "${spelt}" — same category)` : '';
+      return Response.json({ error: `"${to}" is already mapped to ${clash.name}${note}` }, { status: 409 });
+    }
 
     const r = g.db.prepare(`
       UPDATE store_category_map SET category = ?

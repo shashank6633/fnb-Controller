@@ -157,11 +157,20 @@ export function materialStoreId(
 ): string | null {
   const cat = String(material?.category || '').trim();
   if (!cat) return null;
+  // ORDER BY is REQUIRED, not cosmetic. Matching is catNorm (separator- and
+  // case-insensitive), but UNIQUE(store_id, category) is only NOCASE — so
+  // 'RED WINE' and 'red-wine' are two rows that both match here. A bare LIMIT 1
+  // then returned whichever row SQLite happened to visit, which can change with
+  // the query plan: the same material could be reported as owned by a different
+  // store between two calls, and centralFlowBlock would name the wrong store.
+  // Oldest mapping wins — the original owner — and id breaks any remaining tie,
+  // so the answer is stable for a given set of rows.
   const row = db.prepare(`
     SELECT m.store_id
     FROM store_category_map m
     JOIN store_locations s ON s.id = m.store_id
     WHERE s.is_active = 1 AND ${catNorm('m.category')} = ${catNorm('?')}
+    ORDER BY m.created_at ASC, m.id ASC
     LIMIT 1
   `).get(cat) as { store_id: string } | undefined;
   return row?.store_id || null;
