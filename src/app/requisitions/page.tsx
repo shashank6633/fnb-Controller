@@ -202,23 +202,31 @@ export default function RequisitionsPage() {
   };
   useEffect(() => { reload(); }, []);
 
-  // Free-text search across the fields printed on the row, mirroring the Party
-  // Requisitions page. Applied AFTER the status tab so the two narrow together
-  // and the "N of M" counter reads against the tab you are looking at.
+  // Free-text search over every column printed on the row — req #, department
+  // (name + code), the party host/company, the linked PO number and who drafted
+  // it — plus the status BOTH as displayed ("With HOD") and as the raw code
+  // ("submitted"), so typing what you can see on the badge works. `notes` is
+  // also searched even though it only shows in the expanded detail, not the row.
   const searchMatch = (r: Requisition, q: string) => {
     if (!q) return true;
     const hay = [r.req_number, r.department_name, r.department_code, r.notes,
-                 r.event_name, r.customer, r.status]
+                 r.event_name, r.customer, r.status, STATUS_LABEL[r.status],
+                 r.linked_po_number, r.drafted_by]
       .filter(Boolean).join(' ').toLowerCase();
     return hay.includes(q);
   };
 
-  const filtered = useMemo(() => {
-    const byStatus = statusFiltered(reqs, statusFilter);
+  // The search narrows the WHOLE list first; the status tab then slices it
+  // (both are plain filters, so the order doesn't change the result). The tab
+  // badges below are counted off this same searched set, so a badge can never
+  // promise more rows than the table will actually render for that tab.
+  const searched = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return q ? byStatus.filter(r => searchMatch(r, q)) : byStatus;
+    return q ? reqs.filter(r => searchMatch(r, q)) : reqs;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reqs, statusFilter, search]);
+  }, [reqs, search]);
+
+  const filtered = useMemo(() => statusFiltered(searched, statusFilter), [searched, statusFilter]);
 
   function statusFiltered(reqs: Requisition[], statusFilter: string) {
     if (statusFilter === 'all') return reqs;
@@ -235,14 +243,23 @@ export default function RequisitionsPage() {
     return reqs.filter(r => r.status === statusFilter);
   }
 
-  const counts = useMemo(() => ({
-    inbox_chef:  reqs.filter(r => r.status === 'submitted').length,
-    inbox_mgmt:  reqs.filter(r => r.status === 'chef_approved').length,
-    inbox_store: reqs.filter(r => ['mgmt_approved', 'chef_approved', 'store_processed'].includes(r.status)).length,
+  const tally = (list: Requisition[]) => ({
+    inbox_chef:  list.filter(r => r.status === 'submitted').length,
+    inbox_mgmt:  list.filter(r => r.status === 'chef_approved').length,
+    inbox_store: list.filter(r => ['mgmt_approved', 'chef_approved', 'store_processed'].includes(r.status)).length,
     // partially-issued is its own bucket — keep it out of `open`.
-    partially_issued: reqs.filter(r => r.status === 'store_processed').length,
-    open:        reqs.filter(r => !['fulfilled', 'cancelled', 'chef_rejected', 'store_processed'].includes(r.status)).length,
-  }), [reqs]);
+    partially_issued: list.filter(r => r.status === 'store_processed').length,
+    open:        list.filter(r => !['fulfilled', 'cancelled', 'chef_rejected', 'store_processed'].includes(r.status)).length,
+  });
+
+  // Tab badges count the SEARCH-narrowed set, so "(4)" on a tab always equals
+  // the rows you get when you click it.
+  const counts = useMemo(() => tally(searched), [searched]);
+  // The inbox call-outs are a workload alert about the REAL queue, so they
+  // count the unsearched list — and their buttons clear the search before
+  // switching tabs, so the queue you land on holds exactly that many rows.
+  const inboxCounts = useMemo(() => tally(reqs), [reqs]);
+  const openQueue = (tab: string) => { setSearch(''); setStatusFilter(tab); };
 
   const toggleExpand = (id: string) => setExpanded(prev => {
     const n = new Set(prev);
@@ -259,8 +276,12 @@ export default function RequisitionsPage() {
         <ClipboardList className="w-6 h-6 text-[#af4408] shrink-0" />
         {/* min-w is the wrap trigger: this page has TWO action buttons (Party has
             one), so a small floor let them squeeze the heading onto two lines.
-            Keep enough width for the title and let the buttons wrap instead. */}
-        <div className="flex-1 min-w-[330px]">
+            Keep enough width for the title and let the buttons wrap instead.
+            The floor MUST stay under the phone content column (viewport minus
+            the AppShell + page padding) — main is overflow-x:hidden below
+            1024px, so anything wider is clipped, not scrollable. Hence the
+            repo-standard 220px on phones, full 330px from `sm` up. */}
+        <div className="flex-1 min-w-[220px] sm:min-w-[330px]">
           <h1 className="text-xl font-semibold text-[#2D1B0E]">Department Requisitions</h1>
           <p className="text-xs text-[#8B7355]">Internal stock requests → HOD (Head of Department) → Store Manager → Vendor PO (admin approves) → Fulfilled.</p>
         </div>
@@ -283,7 +304,7 @@ export default function RequisitionsPage() {
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 flex items-center gap-2 mb-4">
         <Search size={14} className="text-[#8B7355]" />
         <input value={search} onChange={e => setSearch(e.target.value)}
-               placeholder="Search by req #, department, party or notes…"
+               placeholder="Search by req #, department, party, status, PO # or notes…"
                className="flex-1 px-2 py-1 text-sm bg-transparent focus:outline-none" />
         {search && (
           <button onClick={() => setSearch('')} title="Clear search" className="text-[#8B7355] hover:text-[#af4408]">
@@ -293,26 +314,28 @@ export default function RequisitionsPage() {
         <span className="text-xs text-[#8B7355]">{filtered.length} of {statusFiltered(reqs, statusFilter).length}</span>
       </div>
 
-      {/* Inbox call-outs */}
-      {(viewer.can_chef && counts.inbox_chef > 0) && (
+      {/* Inbox call-outs. These count the FULL queue (inboxCounts), not the
+          search-narrowed one, so an old query in the box can never hide work
+          from an approver — and openQueue() clears the search on the way in. */}
+      {(viewer.can_chef && inboxCounts.inbox_chef > 0) && (
         <div className="mb-3 px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800 flex items-center gap-2">
-          <AlertTriangle className="w-4 h-4" /> {counts.inbox_chef} requisition(s) waiting for your chef approval.
-          <button onClick={() => setStatusFilter('inbox-chef')} className="ml-auto underline">Review</button>
+          <AlertTriangle className="w-4 h-4" /> {inboxCounts.inbox_chef} requisition(s) waiting for your chef approval.
+          <button onClick={() => openQueue('inbox-chef')} className="ml-auto underline">Review</button>
         </div>
       )}
       {/* Mgmt callout only when the gate is ON. When OFF, chef approval is the
           final gate and there's no Mgmt action to take here. */}
-      {(requireMgmt && viewer.can_mgmt && counts.inbox_mgmt > 0) && (
+      {(requireMgmt && viewer.can_mgmt && inboxCounts.inbox_mgmt > 0) && (
         <div className="mb-3 px-4 py-2 bg-indigo-50 border border-indigo-200 rounded-lg text-xs text-indigo-800 flex items-center gap-2">
-          <CheckCircle2 className="w-4 h-4" /> {counts.inbox_mgmt} HOD-approved requisition(s) waiting for Management approval.
-          <button onClick={() => setStatusFilter('inbox-mgmt')} className="ml-auto underline">Approve</button>
+          <CheckCircle2 className="w-4 h-4" /> {inboxCounts.inbox_mgmt} HOD-approved requisition(s) waiting for Management approval.
+          <button onClick={() => openQueue('inbox-mgmt')} className="ml-auto underline">Approve</button>
         </div>
       )}
-      {(viewer.can_store && counts.inbox_store > 0) && (
+      {(viewer.can_store && inboxCounts.inbox_store > 0) && (
         <div className="mb-3 px-4 py-2 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-800 flex items-center gap-2">
           <Package className="w-4 h-4" />
-          {counts.inbox_store} {requireMgmt ? 'mgmt-approved' : 'HOD-approved'} requisition(s) for store to process.
-          <button onClick={() => setStatusFilter('inbox-store')} className="ml-auto underline">Process</button>
+          {inboxCounts.inbox_store} {requireMgmt ? 'mgmt-approved' : 'HOD-approved'} requisition(s) for store to process.
+          <button onClick={() => openQueue('inbox-store')} className="ml-auto underline">Process</button>
         </div>
       )}
 
@@ -341,7 +364,9 @@ export default function RequisitionsPage() {
           { k: 'inbox-store', l: `Store Inbox (${counts.inbox_store})` },
           // "Partially issued" only appears when there's at least one — saves
           // tab-row noise when everything is either pending or fully issued.
-          ...(counts.partially_issued > 0
+          // Kept visible while it's the ACTIVE tab, so a search that matches
+          // nothing here can't pull the highlighted tab out from under you.
+          ...(counts.partially_issued > 0 || statusFilter === 'partially-issued'
             ? [{ k: 'partially-issued', l: `Partially Issued (${counts.partially_issued})` }]
             : []),
           { k: 'draft', l: 'Drafts' }, { k: 'fulfilled', l: 'Fulfilled' },
@@ -362,7 +387,11 @@ export default function RequisitionsPage() {
         ) : filtered.length === 0 ? (
           <div className="p-8 text-center text-[#8B7355]">
             <ClipboardList className="w-8 h-8 mx-auto mb-2 opacity-50" />
-            No requisitions{statusFilter !== 'all' ? ' matching that filter' : ''}.
+            {/* Name the search first (like /party-requisitions) — otherwise a
+                query that matches nothing reads exactly like an empty list. */}
+            {search.trim()
+              ? <>No requisitions match &ldquo;{search.trim()}&rdquo;{statusFilter !== 'all' ? ' on this tab' : ''}.</>
+              : <>No requisitions{statusFilter !== 'all' ? ' matching that filter' : ''}.</>}
           </div>
         ) : (
           <table className="w-full text-sm">

@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, isManagement } from '@/lib/auth';
+import { centralFlowBlock } from '@/lib/store-engine';
 
 /**
  * Shared Purchase Order helpers.
@@ -67,8 +68,16 @@ export function recalcTotal(db: ReturnType<typeof getDb>, poId: string) {
 
 /** Is the admin approval step switched ON? Reads `po_require_admin_approval`
  *  from the settings KV (same table as the `po_send_to_vendor` toggle).
- *  "1" — or a MISSING row — means approval is required; only the exact stored
- *  string "0" turns it off, so a blank/garbage value still requires approval.
+ *  THE RULE, one sentence, shared with the client: TRIM the stored value and
+ *  compare to "0" — only "0" (padding allowed) turns approval off, so a MISSING
+ *  row, a blank or any garbage value still requires approval.
+ *  The Purchasing settings page applies that exact expression
+ *  (`String(value ?? '').trim() !== '0'`, settings/purchasing/page.tsx) so its
+ *  "Admin approval is OFF" banner can never contradict what this enforces. The
+ *  `??` fallbacks are spelled differently ('1' here, '' there) only because each
+ *  side's "nothing was read" sentinel differs; neither equals "0", so both read a
+ *  missing row as required. The `.trim()` is what keeps them in step: without it
+ *  a hand-edited/migrated " 0 " read OFF in the UI while this still enforced ON.
  *  FAIL-SAFE: any throw (table missing on an un-migrated DB, locked file) also
  *  returns true. Approval is a spend control — a failed read must never be the
  *  thing that silently lets a PO skip it. */
@@ -77,7 +86,7 @@ export function requiresAdminApproval(db: ReturnType<typeof getDb>): boolean {
     const r = db.prepare('SELECT value FROM settings WHERE key = ?').get('po_require_admin_approval') as
       | { value?: string }
       | undefined;
-    return String(r?.value ?? '1') !== '0';
+    return String(r?.value ?? '1').trim() !== '0';
   } catch {
     return true;
   }
@@ -96,23 +105,47 @@ export function requiresAdminApproval(db: ReturnType<typeof getDb>): boolean {
  *  `po_require_admin_approval` is off the submit path auto-approves and never
  *  reaches that route — both paths must run this or turning the switch off would
  *  remove the only thing standing between a ₹0 draft and the books.
- *  Same JOIN receive uses, so this blocks exactly the lines receive would
- *  process. Number.isFinite first — a bare `<= 0` is false for NaN. */
+ *  DIAGNOSIS ONLY, NO REMEDY: the message is shared by [id]/approve (where the
+ *  fix is reject → revise → re-submit) and [id]/submit's auto-approve (where the
+ *  txn rolled back and the PO never left draft, so there is nothing to reject).
+ *  Each caller appends its own remedy sentence; naming one here made the other
+ *  path hand out two contradictory instructions in a single alert.
+ *  SCOPE = the lines receive can actually book: same JOIN, and store-mapped lines
+ *  are skipped exactly as receive skips them (centralFlowBlock → `receivable`).
+ *  Still a deliberate SUPERSET in the one direction that cannot be mirrored:
+ *  receive only enforces the rate where accepted > 0, and whether a line will be
+ *  fully rejected at QC is unknowable here, so a line that ends up rejected in
+ *  full must still carry a real rate to get past this.
+ *  Number.isFinite first — a bare `<= 0` is false for NaN. */
 export function zeroRateBlocker(db: ReturnType<typeof getDb>, poId: string): string | null {
   const rateLines = db.prepare(`
-    SELECT poi.unit_price, rm.name AS material_name,
+    SELECT poi.material_id, poi.unit_price, rm.name AS material_name,
            COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit
     FROM purchase_order_items poi
     JOIN raw_materials rm ON rm.id = poi.material_id
     WHERE poi.po_id = ?
   `).all(poId) as any[];
   for (const line of rateLines) {
+    // Store-mapped (liquor) lines never enter Central purchases: receive filters
+    // them out before pricing anything, so their rate cannot reach
+    // updateMaterialPrice and blocking on one only strands the PO — PUT
+    // /api/purchase-orders 400s on any payload naming a store-mapped material,
+    // so the draft could be neither approved nor edited, only deleted.
+    // FAIL-CLOSED: if the store lookup throws, treat the line as receivable and
+    // hold it to the rate rule.
+    let storeMapped = false;
+    try {
+      storeMapped = centralFlowBlock(db, String(line.material_id || '')) !== null;
+    } catch {
+      storeMapped = false;
+    }
+    if (storeMapped) continue;
     const px = Number(line.unit_price);
     if (!Number.isFinite(px) || px <= 0) {
       // Unit label = the PURCHASE unit: a PO line's rate is ₹ per purchase
       // unit (canon), so "₹/kg" here, never the recipe unit.
       const unit = String(line.material_purchase_unit || '').trim() || 'unit';
-      return `Missing or zero rate on "${line.material_name}" (${px}). Approving commits this PO and receiving it would rewrite the material's average price, so the line needs a real ₹/${unit} — reject this PO, revise it with the rate and re-submit.`;
+      return `Missing or zero rate on "${line.material_name}" (${px}). Receiving this PO would rewrite the material's average price, so the line needs a real ₹/${unit}.`;
     }
   }
   return null;

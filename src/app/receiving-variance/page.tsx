@@ -5,9 +5,15 @@
  * Shows GRN lines where physical receipt did not match the PO ordered qty,
  * or where some quantity was rejected at QC. Helps spot vendor short-supply,
  * over-supply, and chronic quality issues.
+ *
+ * SCOPE: quantity and QC variance ONLY. The API filter is
+ * `quantity_received != quantity_ordered OR quantity_rejected > 0`, so a line
+ * received in full at a rate that differs from the PO does NOT appear here —
+ * that deviation is captured by the receive route's admin alert / audit event
+ * ('po.received_deviation') and is reviewed on /audit.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, TrendingDown, TrendingUp, XCircle, Loader2 } from 'lucide-react';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
@@ -29,9 +35,34 @@ interface Resp {
   summary: {
     lines: number; net_value_short: number; net_value_excess: number; total_rejected_value: number;
     reason_stats: Record<string, { count: number; qty: number; value: number }>;
+    /**
+     * How many PO-linked GRN lines exist in the range at all (variance or not).
+     * OPTIONAL: older/other builds of /api/receiving-variance do not send it. It
+     * is only used to tell "nothing was received" apart from "received, nothing
+     * deviated" in the empty state — when it is absent we fall back to wording
+     * that is true either way rather than guessing.
+     */
+    receipts_in_range?: number;
   };
   rows: Row[];
 }
+
+/**
+ * The rate this report values a line at. The API computes Δ ₹ as
+ * `delta * COALESCE(NULLIF(gi.unit_price,0), rm.average_price * packGuard)` —
+ * quantities are PURCHASE units while average_price is ₹ per RECIPE unit, so the
+ * average has to be lifted by pack_size, and only when BOTH halves of the guard
+ * hold (pack_size > 1 AND recipe unit <> purchase unit). Mirrored here so the
+ * Rejected ₹ roll-up cannot disagree with the Δ ₹ column on a line whose stored
+ * unit_price is 0 (legacy / imported GRNs).
+ */
+const effectiveRate = (r: Row) => {
+  if (r.unit_price) return r.unit_price;
+  const recipeUnit   = (r.material_unit || '').toLowerCase().trim();
+  const purchaseUnit = (r.purchase_unit || r.material_unit || '').toLowerCase().trim();
+  const pack = Number(r.pack_size || 1);
+  return (r.average_price || 0) * (pack > 1 && recipeUnit !== purchaseUnit ? pack : 1);
+};
 
 const REASON_TONE: Record<string, string> = {
   damage:        'bg-orange-100 text-orange-700',
@@ -48,17 +79,36 @@ export default function ReceivingVariancePage() {
   const [vendors, setVendors] = useState<{ id: string; name: string }[]>([]);
   const [data, setData]   = useState<Resp | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  // Only the newest in-flight request may write state — rapid filter changes
+  // fire overlapping fetches and they do not necessarily resolve in order.
+  const reqSeq = useRef(0);
 
   useEffect(() => {
     fetch('/api/vendors').then(r => r.json()).then(d => setVendors(d.vendors || d || [])).catch(() => {});
   }, []);
 
   const reload = async () => {
+    const seq = ++reqSeq.current;
     setLoading(true);
     const qs = new URLSearchParams({ from, to });
     if (vendor) qs.set('vendor_id', vendor);
-    const d = await fetch(`/api/receiving-variance?${qs}`).then(r => r.json());
-    setData(d); setLoading(false);
+    try {
+      const res = await fetch(`/api/receiving-variance?${qs}`);
+      const d = await res.json().catch(() => null);
+      if (seq !== reqSeq.current) return;          // superseded by a newer filter change
+      // An error body (401 'Sign in required' from the proxy, 500 from the route)
+      // has no `rows` key — storing it would make every `data.rows` / `data.summary`
+      // read below throw. Keep the payload only when it is actually a report.
+      if (d && Array.isArray(d.rows)) { setData(d); setError(''); }
+      else { setData(null); setError((d && d.error) || `Could not load the report (HTTP ${res.status}).`); }
+    } catch (e) {
+      if (seq !== reqSeq.current) return;
+      setData(null);
+      setError((e instanceof Error && e.message) || 'Could not reach the server.');
+    } finally {
+      if (seq === reqSeq.current) setLoading(false);
+    }
   };
   useEffect(() => { reload(); /* eslint-disable-next-line */ }, [from, to, vendor]);
 
@@ -71,7 +121,7 @@ export default function ReceivingVariancePage() {
       slot.lines += 1;
       if (r.accept_delta < 0) slot.short += -(r.accept_delta_value || 0);
       else if (r.accept_delta > 0) slot.excess += (r.accept_delta_value || 0);
-      if (r.quantity_rejected > 0) slot.rejected += (r.quantity_rejected * (r.unit_price || 0));
+      if (r.quantity_rejected > 0) slot.rejected += (r.quantity_rejected * effectiveRate(r));
     }
     return Object.values(m).sort((a, b) => (b.short + b.rejected) - (a.short + a.rejected));
   }, [data]);
@@ -82,7 +132,11 @@ export default function ReceivingVariancePage() {
         <AlertTriangle className="text-[#af4408]" size={24} />
         <div>
           <h1 className="text-xl font-semibold text-[#2D1B0E]">Receiving Variance</h1>
-          <p className="text-xs text-[#8B7355]">PO ordered vs GRN received vs QC accepted — spot vendor short-supply, over-supply &amp; quality issues.</p>
+          <p className="text-xs text-[#8B7355]">
+            PO ordered vs GRN received vs QC accepted — spot vendor short-supply, over-supply &amp; quality issues.
+            {' '}Quantity &amp; QC variance only; a line received in full at an off-PO <em>rate</em> is not listed here — those are logged on{' '}
+            <a href="/audit" className="text-[#af4408] hover:underline">/audit</a>.
+          </p>
         </div>
       </div>
 
@@ -104,36 +158,43 @@ export default function ReceivingVariancePage() {
           </select>
         </label>
         <div className="ml-auto text-xs text-[#6B5744]">
-          {loading ? <Loader2 className="animate-spin" size={16} /> : `${data?.rows.length || 0} variance lines`}
+          {loading ? <Loader2 className="animate-spin" size={16} /> : error ? '—' : `${data?.rows?.length || 0} variance lines`}
         </div>
       </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-sm text-red-700 flex flex-wrap items-center justify-between gap-3">
+          <span>{error}</span>
+          <button onClick={reload} className="px-3 py-1 rounded border border-red-300 text-red-700 hover:bg-red-100 text-xs">Retry</button>
+        </div>
+      )}
 
       {/* Summary cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
           <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Lines flagged</div>
-          <div className="text-2xl font-semibold text-[#2D1B0E] mt-1">{data?.summary.lines || 0}</div>
+          <div className="text-2xl font-semibold text-[#2D1B0E] mt-1">{data?.summary?.lines || 0}</div>
         </div>
         <div className="bg-white border border-amber-200 rounded-xl p-4">
           <div className="text-[10px] uppercase tracking-wide text-amber-700 flex items-center gap-1"><TrendingDown size={11} /> Net short-supply value</div>
-          <div className="text-2xl font-semibold text-amber-800 mt-1">{fmt(data?.summary.net_value_short || 0)}</div>
+          <div className="text-2xl font-semibold text-amber-800 mt-1">{fmt(data?.summary?.net_value_short || 0)}</div>
         </div>
         <div className="bg-white border border-blue-200 rounded-xl p-4">
           <div className="text-[10px] uppercase tracking-wide text-blue-700 flex items-center gap-1"><TrendingUp size={11} /> Net excess-supply value</div>
-          <div className="text-2xl font-semibold text-blue-800 mt-1">{fmt(data?.summary.net_value_excess || 0)}</div>
+          <div className="text-2xl font-semibold text-blue-800 mt-1">{fmt(data?.summary?.net_value_excess || 0)}</div>
         </div>
         <div className="bg-white border border-red-200 rounded-xl p-4">
           <div className="text-[10px] uppercase tracking-wide text-red-700 flex items-center gap-1"><XCircle size={11} /> Rejected at QC</div>
-          <div className="text-2xl font-semibold text-red-800 mt-1">{fmt(data?.summary.total_rejected_value || 0)}</div>
+          <div className="text-2xl font-semibold text-red-800 mt-1">{fmt(data?.summary?.total_rejected_value || 0)}</div>
         </div>
       </div>
 
       {/* Rejection reasons */}
-      {data && Object.keys(data.summary.reason_stats).length > 0 && (
+      {data && Object.keys(data.summary?.reason_stats || {}).length > 0 && (
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
           <h2 className="text-sm font-semibold text-[#2D1B0E] mb-3">Rejection reasons</h2>
           <div className="flex flex-wrap gap-2">
-            {Object.entries(data.summary.reason_stats).map(([reason, s]) => (
+            {Object.entries(data.summary?.reason_stats || {}).map(([reason, s]) => (
               <div key={reason} className={`px-3 py-2 rounded-lg ${REASON_TONE[reason] || 'bg-[#F5EDE2] text-[#6B5744]'}`}>
                 <div className="text-xs font-semibold capitalize">{reason.replace(/_/g, ' ')}</div>
                 <div className="text-[10px] mt-0.5">{s.count} {s.count === 1 ? 'line' : 'lines'} · {fmt(s.value)}</div>
@@ -181,9 +242,18 @@ export default function ReceivingVariancePage() {
         </div>
         {loading ? (
           <div className="p-6 text-center text-sm text-[#8B7355]"><Loader2 className="animate-spin inline mr-1" size={14} /> Loading…</div>
-        ) : (data?.rows.length || 0) === 0 ? (
-          <div className="p-6 text-center text-sm text-emerald-700">
-            ✓ No variance — every PO line in this range was received and accepted in full.
+        ) : (data?.rows?.length || 0) === 0 ? (
+          <div className="p-6 text-center text-sm">
+            {/* Zero rows means "nothing deviated" — it does NOT mean anything was
+                received. Only claim the receipts were clean when the API tells us
+                there were receipts; otherwise say only what an empty result proves. */}
+            {error ? (
+              <span className="text-[#8B7355]">Report not loaded — see the message above.</span>
+            ) : data?.summary?.receipts_in_range === 0 ? (
+              <span className="text-[#8B7355]">No PO-linked receipts in this range — nothing to compare.</span>
+            ) : (
+              <span className="text-emerald-700">✓ No variance flagged — no PO-linked receipt in this range differed from its ordered qty or had a QC rejection.</span>
+            )}
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -208,6 +278,10 @@ export default function ReceivingVariancePage() {
                   // in kg / BTL / CASE and the GRN keeps those numbers — so label them
                   // with the purchase unit. Showing the recipe unit (g, ml) read as a
                   // pack_size-sized error to anyone checking the sheet.
+                  // CAVEAT: this is the material's CURRENT purchase_unit (the API joins
+                  // live raw_materials); the quantities were frozen at receive time. If
+                  // the unit is later changed on Unit Audit, historical rows here are
+                  // relabelled. Fixing that needs a unit snapshot on the GRN line.
                   const u = r.purchase_unit || r.material_unit;
                   const dShort = r.accept_delta < 0;
                   const dExcess = r.accept_delta > 0;
@@ -230,7 +304,8 @@ export default function ReceivingVariancePage() {
                         {r.accept_delta > 0 ? '+' : ''}{r.accept_delta} {u}
                       </td>
                       <td className={`py-1.5 px-3 text-right font-mono ${dShort ? 'text-amber-800' : dExcess ? 'text-blue-800' : 'text-[#6B5744]'}`}>
-                        {r.accept_delta_value ? (r.accept_delta_value > 0 ? '+' : '') + fmt(Math.abs(r.accept_delta_value)).replace('₹', dShort ? '-₹' : '+₹') : '—'}
+                        {/* .replace already supplies the sign — prefixing '+' too rendered '++₹1,200'. */}
+                        {r.accept_delta_value ? fmt(Math.abs(r.accept_delta_value)).replace('₹', dShort ? '-₹' : '+₹') : '—'}
                       </td>
                       <td className="py-1.5 px-3">
                         {r.rejection_reason ? (

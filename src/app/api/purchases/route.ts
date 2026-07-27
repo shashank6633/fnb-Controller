@@ -71,8 +71,28 @@ export async function POST(request: Request) {
             is_emergency, payment_mode, emergency_reason, bill_no,
             discount, delivery_charges } = body;
 
-    if (!material_id || !quantity || !unit_price || !date) {
-      return Response.json({ error: 'material_id, quantity, unit_price, and date are required' }, { status: 400 });
+    if (!material_id || !date) {
+      return Response.json({ error: 'material_id and date are required' }, { status: 400 });
+    }
+
+    // Line sanity, NaN-safe — the same shape as /api/purchase-orders'
+    // lineSanityError, minus its deliberate "a 0 rate is fine on a draft PO"
+    // exception: a purchase writes STRAIGHT to stock and to updateMaterialPrice,
+    // so the rate has to be real here, exactly as /api/purchase-orders/[id]/receive
+    // demands on an accepted line.
+    // The old `!quantity || !unit_price` test caught 0/blank/NaN but PASSED a
+    // NEGATIVE number (`!(-900)` is false) and passed a non-numeric string
+    // (`!'abc'` is false), which then stored total_price = NaN. A negative rate
+    // reached updateMaterialPrice and gave the material a negative average_price.
+    const qty = Number(quantity);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      return Response.json({ error: 'quantity must be a number greater than 0 (in purchase units)' }, { status: 400 });
+    }
+    const px = Number(unit_price);
+    if (!Number.isFinite(px) || px <= 0) {
+      return Response.json({
+        error: 'unit_price must be a number greater than 0 (₹ per purchase unit) — a zero or negative rate would rewrite this material\'s average price and every recipe cost built on it',
+      }, { status: 400 });
     }
 
     // Configurable backdate window: non-admins can't save a date older than N days
@@ -98,7 +118,9 @@ export async function POST(request: Request) {
     const storeBlock = centralFlowBlock(db, material_id);
     if (storeBlock) return Response.json({ error: storeBlock }, { status: 400 });
 
-    const total_price = Math.round(quantity * unit_price * 100) / 100;
+    // qty/px (the validated numbers) from here down, so a numeric STRING from the
+    // wire is stored as a number and can never reach the arithmetic un-coerced.
+    const total_price = Math.round(qty * px * 100) / 100;
     const id = generateId();
 
     const insertPurchase = db.transaction(() => {
@@ -133,7 +155,7 @@ export async function POST(request: Request) {
                                is_emergency, payment_mode, emergency_reason, invoice_id, bill_no, outlet_id,
                                discount, delivery_charges, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      `).run(id, material_id, vendor || '', brand || '', quantity, unit_price, total_price, date, notes || '',
+      `).run(id, material_id, vendor || '', brand || '', qty, px, total_price, date, notes || '',
               is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '', invoiceId, billNo, outletId,
               // RECORDED-ONLY columns, matching db.ts's contract: they never change
               // unit_price/total_price, and readers compute
@@ -142,7 +164,12 @@ export async function POST(request: Request) {
               // The bill form deliberately sends none: it nets the discount into
               // unit_price (the user's rule — a discount lowers what the goods cost),
               // so passing it here as well would subtract it twice.
-              Math.max(0, Number(discount) || 0),
+              // Clamped to [0, total_price] because of that same subtraction: an
+              // oversized discount (fat-fingered, or a hand-rolled API POST) would
+              // drag Total Inward below zero. The bill form puts the same ceiling on
+              // its bill-level discount (min(discount, subtotal)) before netting it
+              // into the rate, so this is the server half of that rule.
+              Math.min(Math.max(0, Number(discount) || 0), total_price),
               Math.max(0, Number(delivery_charges) || 0));
 
       // Stock is kept in RECIPE units (sales deduction, closing-stock variance
@@ -151,7 +178,7 @@ export async function POST(request: Request) {
       const packSize = Number(material.pack_size) || 1;
       const ru = String(material.unit || '').toLowerCase().trim();
       const pu = String(material.purchase_unit || material.unit || '').toLowerCase().trim();
-      const stockQty = (packSize > 1 && ru !== pu) ? quantity * packSize : quantity;
+      const stockQty = (packSize > 1 && ru !== pu) ? qty * packSize : qty;
 
       // Update stock
       db.prepare(`

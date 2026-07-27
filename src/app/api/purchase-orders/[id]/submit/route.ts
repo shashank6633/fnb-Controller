@@ -10,6 +10,11 @@ import { poWriteGate, effectiveActor, requiresAdminApproval, zeroRateBlocker } f
  *  must stay a DRAFT, the only status in which the rate can still be edited. */
 class ZeroRateBlocked extends Error {}
 
+/** One sentence for BOTH the stored approval_note and the audit note, so the row
+ *  and the audit trail can never disagree about why this PO is approved. */
+const AUTO_APPROVAL_NOTE = (actor: string) =>
+  `Auto-approved on submit by ${actor}: admin approval is OFF (po_require_admin_approval=0).`;
+
 export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
@@ -65,21 +70,28 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
       // THROW, so the submit rolls back and the PO stays a DRAFT. Committing the
       // submit and leaving it 'pending' stranded it: approve/route.ts re-runs this
       // same blocker and 400s, PUT /api/purchase-orders is draft-only, and Revise
-      // needs status 'rejected' — so the PO could be neither fixed nor approved
-      // nor withdrawn. Draft is the one state where the rate is editable, which is
-      // exactly what the fix requires.
+      // needs status 'rejected' — so the PO could be neither fixed nor approved.
+      // The one remaining exit is cancel/route.ts (it accepts 'pending' behind the
+      // same poWriteGate the submitter just passed), which throws the PO away
+      // rather than fixing it. Draft is the one state where the rate is editable,
+      // which is exactly what the fix requires.
       const blocker = zeroRateBlocker(db, id);
       if (blocker) throw new ZeroRateBlocked(blocker);
 
       // approved_by names the automation AND the person whose submit triggered
       // it — never a real admin's address, or the audit trail would show a human
       // approval that never happened.
+      // approval_note is OVERWRITTEN for the same reason: approve/route.ts writes
+      // it on every human approval and edit-approved writes "Re-approval requested
+      // by …", so a PO that went approved → edit → reject → revise → draft still
+      // carries that note. Leaving it would park a stale human justification next
+      // to approved_by = 'auto (…)'. Same sentence as the audit note below.
       db.prepare(`
         UPDATE purchase_orders
            SET status = 'approved', approved_by = ?, approved_at = datetime('now'),
-               updated_at = datetime('now')
+               approval_note = ?, updated_at = datetime('now')
          WHERE id = ?
-      `).run(`auto (${actor})`, id);
+      `).run(`auto (${actor})`, AUTO_APPROVAL_NOTE(actor), id);
       return { status: 'approved' };
     })();
 
@@ -93,7 +105,7 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
         actor_email: actor,
         before: { status: 'draft' },
         after: { status: 'approved', approved_by: `auto (${actor})` },
-        note: `Auto-approved on submit by ${actor}: admin approval is OFF (po_require_admin_approval=0).`,
+        note: AUTO_APPROVAL_NOTE(actor),
       });
       return Response.json({ success: true, status: 'approved', auto_approved: true });
     }
@@ -101,10 +113,17 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
   } catch (e: any) {
     if (e instanceof ZeroRateBlocked) {
       // Rolled back — the PO is still a draft, which is the only state where the
-      // rate can be fixed. Say that plainly rather than implying an admin can
-      // clear it, because approve re-runs the same check and would 400 too.
+      // rate can be fixed, and that is the ONLY remedy this response may name.
+      // zeroRateBlocker() is written for [id]/approve and ends its message with
+      // approve's remedy ("reject this PO, revise it…"), which is impossible from
+      // here: reject is admin-only and 400s on anything but pending, and Revise
+      // needs 'rejected'. So keep the helper's diagnosis and drop its remedy
+      // clause. The replace is a no-op if the helper is ever changed to hand back
+      // the diagnosis alone (see the handoff on po-helpers.ts).
+      const stripped = e.message.replace(/\s*—\s*reject this PO[\s\S]*$/i, '').trim();
+      const diagnosis = /[.!?]$/.test(stripped) ? stripped : `${stripped}.`;
       return Response.json({
-        error: `${e.message}\n\nThe PO is still a draft — fix the rate on the line above and submit it again.`,
+        error: `${diagnosis}\n\nThe PO was NOT submitted — it is still a draft. Fix the rate on the line above and submit it again.`,
         status: 'draft',
       }, { status: 400 });
     }

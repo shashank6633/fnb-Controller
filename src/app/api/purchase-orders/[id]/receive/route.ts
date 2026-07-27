@@ -19,8 +19,11 @@ import { todayIST } from '@/lib/format-date';
  *   — lets the receiver record short/over-shipments before commit.
  *   `rejection_reason` stays QC-only (why some units were REJECTED).
  *   `deviation_reason` is the separate "why does this line differ from the PO":
- *   REQUIRED whenever received qty ≠ ordered qty or the rate ≠ the ordered rate.
+ *   REQUIRED whenever ANY of the three axes moves off the approved PO line —
+ *   received qty ≠ ordered qty, accepted qty ≠ ordered qty (a full delivery
+ *   part-rejected at QC counts), or the rate ≠ the ordered rate.
  *   It is stored on the GRN line + the purchases row and alerted to the admin.
+ *   Changing the rate at receive time is ADMIN-ONLY (403 otherwise).
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -188,8 +191,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // reject. A 0 rate is only fatal on lines that actually enter stock/books
       // (accepted > 0) — a fully-rejected line never reaches updateMaterialPrice.
       if (effAcc > 0 && effPrice <= 0) {
+        // The remedy differs by role, and saying the wrong one wastes a delivery
+        // standing at the gate: only an admin may supply a rate at receive time
+        // (the rate lock below is a hard 403), so a non-admin's ONLY route out of
+        // a ₹0 line is to have the PO line rate corrected and re-approved.
+        const remedy = me?.role === 'admin'
+          ? 'edit the PO line rate (or send a unit_price override) before receiving'
+          : 'only an admin can set a rate while receiving, so ask an admin to correct the PO line rate and re-approve the PO (or to receive this line)';
         return Response.json({
-          error: `Missing or zero rate on "${it.material_name}". A receive rewrites this material's average price, so the line needs a real ₹/${puLabel(it) || 'unit'} — edit the PO line rate (or send a unit_price override) before receiving.`,
+          error: `Missing or zero rate on "${it.material_name}". A receive rewrites this material's average price, so the line needs a real ₹/${puLabel(it) || 'unit'} — ${remedy}.`,
           material: it.material_name,
           field: 'unit_price',
         }, { status: 400 });
@@ -205,17 +215,26 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // me.role is the REAL tier off the session (already trusted above for the
       // backdate exemption); effectiveRole() must NOT be used here because it
       // collapses 'staff' into 'manager'.
+      // Consequence, deliberate: a PO line approved at ₹0 cannot be repaired from
+      // the receive screen by a non-admin (the zero-rate gate above refuses the
+      // line and this gate refuses the override). The documented remedy is the PO
+      // edit + re-approve path — say so instead of pointing at the PO rate.
       if (ov?.unit_price != null && Math.abs(effPrice - Number(it.unit_price)) > RATE_EPS && me?.role !== 'admin') {
+        const ordRatePO = Number(it.unit_price);
         return Response.json({
-          error: `Only an admin can change the rate while receiving. "${it.material_name}" was ordered at ₹${Number(it.unit_price)}/${puLabel(it) || 'unit'} — receive at the PO rate, or ask an admin to receive this line.`,
+          error: ordRatePO > 0
+            ? `Only an admin can change the rate while receiving. "${it.material_name}" was ordered at ₹${ordRatePO}/${puLabel(it) || 'unit'} — receive at the PO rate, or ask an admin to receive this line.`
+            : `Only an admin can set the rate while receiving, and "${it.material_name}" was ordered with no rate (₹0) — which cannot be received either. Ask an admin to correct the PO line rate and re-approve the PO (or to receive this line); it cannot be fixed from this screen.`,
           material: it.material_name,
           field: 'unit_price',
         }, { status: 403 });
       }
       // Deviation gate — receiving OFF-PO must say why.
-      // The two ways a receive silently rewrites what was approved: a qty that
-      // isn't the ordered qty (short OR over) moves stock and money, and a rate
-      // that isn't the ordered rate feeds updateMaterialPrice → average_price →
+      // The three ways a receive silently rewrites what was approved: a RECEIVED
+      // qty that isn't the ordered qty (short OR over) moves stock and money, an
+      // ACCEPTED qty short of the ordered qty does the same even when the truck
+      // arrived in full (QC turned units away), and a RATE that isn't the ordered
+      // rate feeds updateMaterialPrice → average_price →
       // every recipe cost. The receive modal asks for the reason, but THIS is
       // the gate — a crafted request must not commit an unexplained deviation.
       // The reason is persisted on the GRN line + the purchases row and goes
@@ -365,9 +384,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           });
         }
 
-        // Off-PO line → admin alert. Qty is judged on RECEIVED (that is what the
-        // PO promised and what the gate above asked a reason for); the money
-        // impact is judged on ACCEPTED, since rejected units are never paid for.
+        // Off-PO line → admin alert. A line deviates on any of the three axes the
+        // gate above asked a reason for: RECEIVED vs ordered (short/over),
+        // ACCEPTED vs ordered (accShort — arrived in full, part-rejected at QC),
+        // and RATE vs the ordered rate. The money impact is always computed on
+        // ACCEPTED, since rejected units are never paid for.
         if (deviated) {
           deviationLines.push({
             material_name: it.material_name,
@@ -431,9 +452,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         }
       }
 
-      // Mark the GRN as 'partial' if any rejections happened, 'received' otherwise
-      const rejCount = db.prepare(`SELECT COUNT(*) AS n FROM goods_receipt_note_items WHERE grn_id = ? AND quantity_rejected > 0`).get(grnId) as any;
-      if (rejCount.n > 0) {
+      // Mark the GRN 'partial' when this is NOT a clean full receipt — a line
+      // with units rejected at QC, OR a line the vendor short-supplied. Keying
+      // only off quantity_rejected left a short delivery (rejected = max(0,
+      // received - accepted) = 0) reading 'received', i.e. complete, on /grn and
+      // on the printed GRN, even though goods are still owed. Same QTY_EPS as the
+      // deviation gate so float noise alone never downgrades a full receipt.
+      const partialCount = db.prepare(`
+        SELECT COUNT(*) AS n FROM goods_receipt_note_items
+        WHERE grn_id = ? AND (quantity_rejected > 0 OR quantity_received < quantity_ordered - ?)
+      `).get(grnId, QTY_EPS) as any;
+      if (partialCount.n > 0) {
         db.prepare(`UPDATE goods_receipt_notes SET status = 'partial' WHERE id = ?`).run(grnId);
       }
 
@@ -544,11 +573,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // ────────────────────────────────────────────────────────────────────
     // Off-PO (deviation) notification.
     // Every line that came in differently from the approved PO — SHORT qty,
-    // OVER qty, or a CHANGED RATE — is sent to the admin via an audit_event
+    // OVER qty, SHORT-ACCEPTED (arrived in full, part-rejected at QC) or a
+    // CHANGED RATE — is sent to the admin via an audit_event
     // (always) + a notifications row (always) + an optional Slack ping (when
     // configured on Settings → Integrations). A short is a vendor service
-    // issue, a surplus is stock we never ordered, and a rate change rewrites
-    // average_price through every recipe — all three are the admin's call, so
+    // issue, a surplus is stock we never ordered, a short-accept is money the
+    // PO expected to spend and didn't, and a rate change rewrites
+    // average_price through every recipe — all four are the admin's call, so
     // the alert carries the reason the receiver was forced to give.
     // ────────────────────────────────────────────────────────────────────
     const shortLines       = deviationLines.filter(l => l.qty_short);
@@ -556,6 +587,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const rateChangedLines = deviationLines.filter(l => l.rate_changed);
     // Arrived in full but wasn't all accepted — distinct from a vendor short.
     const accShortLines    = deviationLines.filter(l => l.acc_short && !l.qty_short);
+    // The event_type actually written below, echoed back in the response so the
+    // caller quotes the string a receiver can really find on /audit instead of
+    // guessing from its own line counters. Stays null when nothing was logged
+    // (no deviation, or the whole alert block threw and was swallowed).
+    let loggedEventType: string | null = null;
     if (deviationLines.length > 0) {
       try {
         const totalExcessValue = excessLines.reduce((s, l) => s + l.excess_value, 0);
@@ -579,8 +615,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
         // A receive whose ONLY deviation is over-quantity keeps the event_type
         // and notification kind it already has — 'po.received_excess' is what
-        // /audit and the receive modal's copy call that case today. Short qty
-        // and rate changes are new, so they get the general type.
+        // /audit and the receive modal's copy call that case today. Short qty,
+        // short-accepts and rate changes are new, so they get the general type.
+        // This is a per-RECEIVE decision (a mixed receive is one event, logged as
+        // 'po.received_deviation'), which is why the resolved type is echoed back
+        // in the response — a caller that guessed it from its own per-LINE excess
+        // counter sent receivers hunting /audit for a row that was never written.
         const excessOnly = shortLines.length === 0 && rateChangedLines.length === 0 && accShortLines.length === 0;
         const eventType  = excessOnly ? 'po.received_excess'  : 'po.received_deviation';
         const notifKind  = excessOnly ? 'po_received_excess'  : 'po_received_deviation';
@@ -604,6 +644,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           },
           note: title,
         });
+        loggedEventType = eventType;
 
         // 2. In-app notification row for admin review (kind keyed for dedup)
         db.exec(`
@@ -665,12 +706,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       total_cost: total,
       excess_lines: excessLines.length,           // expose to caller so the UI
       excess_value: excessLines.reduce((s, l) => s + l.excess_value, 0),  // can show a "notified admin" confirmation
-      // Off-PO counts — the receive modal shows "admin notified" for short qty
-      // and rate changes too, not just the accepted-over case above.
+      // Off-PO counts — the receive modal shows "admin notified" for short qty,
+      // short-accepts and rate changes too, not just the accepted-over case
+      // above. All FOUR axis counters are published, and they are the same four
+      // written into the audit payload: a caller that reasons about "what kind of
+      // deviation" from these must not read "none" for a short-accept that moved
+      // real stock and money.
       deviation_lines: deviationLines.length,
       short_lines: shortLines.length,
       over_lines: overLines.length,
+      acc_short_lines: accShortLines.length,
       rate_changed_lines: rateChangedLines.length,
+      // The event_type actually logged for this receive ('po.received_excess' or
+      // 'po.received_deviation'), or null if nothing was logged — quote THIS on
+      // screen rather than deriving it from the counters above.
+      deviation_event_type: loggedEventType,
     });
   } catch (e: any) {
     console.error('[receive PO]', e);

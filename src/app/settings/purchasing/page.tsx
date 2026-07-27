@@ -14,6 +14,8 @@ import { ShoppingCart, Send, Loader2, AlertTriangle, ShieldCheck } from 'lucide-
  * average_price rewrite — with no second pair of eyes. That is a spend control,
  * so the state is read FAIL-SAFE: only an explicit "0" reads as off, and a
  * missing row, a null value or a failed fetch leaves the switch showing ON.
+ * A failed read ALSO raises a "could not read this setting" row, so a default
+ * ON is never mistaken for an ON the server actually confirmed.
  * The zero-rate gate is deliberately NOT part of this switch (see below).
  *
  * The other toggle is `po_send_to_vendor`. AKAN raises ONE combined internal
@@ -31,6 +33,11 @@ export default function PurchasingSettingsPage() {
   // Starts ON, and every failure path below leaves it ON: this switch reports a
   // spend control, so a read that goes wrong must never render as "approval off".
   const [requireApproval, setRequireApproval] = useState(true);
+  // Whether the value above came from the server at all. Defaulting ON keeps the
+  // control safe, but ON-because-we-could-not-read looks identical to
+  // ON-because-the-server-says-so — and the second one suppresses the amber
+  // "approval is OFF" banner. This flag tells the two apart on screen.
+  const [approvalRead, setApprovalRead] = useState<'ok' | 'failed'>('ok');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [me, setMe] = useState<{ role?: string } | null>(null);
@@ -56,11 +63,22 @@ export default function PurchasingSettingsPage() {
       fetch('/api/settings?key=po_require_admin_approval').then(r => r.json())
         // FAIL-SAFE, and the mirror of requiresAdminApproval() on the server:
         // ONLY an explicit "0" is off. A missing row, a null, an unreadable value
-        // or a 401 body (no `value` field) all leave this true = approval required.
+        // or a 401 body (no `value` field) all leave this true = approval required
+        // — and the last of those also marks the read failed, so the default is
+        // labelled as a default rather than passed off as the server's answer.
         // Trimmed on purpose: if the server ever reads a padded " 0" as off, an
         // untrimmed compare here would show "on" over a switch that is actually
         // off — hiding a disabled spend control. Trimming can only over-warn.
-        .then(d => setRequireApproval(String(d?.value ?? '').trim() !== '0')).catch(() => {}),
+        .then(d => {
+          // A 200 is not proof of a read. GET /api/settings answers a real read
+          // with a `value` field (null included — that is a genuine "no row yet",
+          // which IS approval-required); a 401/500 body carries `error` instead.
+          // Without this split, an unreadable key renders as a confident ON and
+          // silently suppresses the amber banner below while the server may be
+          // enforcing OFF — the one inversion this card exists to prevent.
+          if (!d || typeof d !== 'object' || !('value' in d)) { setApprovalRead('failed'); return; }
+          setRequireApproval(String(d.value ?? '').trim() !== '0');
+        }).catch(() => setApprovalRead('failed')),
     ]).finally(() => setLoading(false));
     fetch('/api/vendors').then(r => r.json())
       .then(d => {
@@ -77,8 +95,9 @@ export default function PurchasingSettingsPage() {
   // Stricter than canEdit for this ONE key, following the same reasoning as
   // purchase_backdate_limit_days in /api/settings: approving a PO is admin-only,
   // so a Manager who could switch this off would be handing themselves approval
-  // of their own POs. Client-side only — the API still accepts a manager PUT on
-  // this key, so treat this as intent, not enforcement, until that gate lands.
+  // of their own POs. Mirrors the real server gate in /api/settings PUT (and its
+  // POST alias), which 403s a non-admin write of this key — this is the UI half
+  // of an enforced rule, not intent. Keep the two in sync.
   const canEditApproval = !!me && me.role === 'admin';
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 2500); };
 
@@ -103,7 +122,10 @@ export default function PurchasingSettingsPage() {
     try {
       const r = await api('/api/settings', { method: 'PUT', body: { key: 'po_require_admin_approval', value: on ? '1' : '0' } });
       if (!r.ok) { setRequireApproval(prev); flash(false, (await r.json().catch(() => ({}))).error || 'Failed to save'); }
-      else flash(true, on ? 'Admin approval required' : 'Admin approval turned OFF');
+      // A save that lands tells us the server's value for certain, so it clears a
+      // failed initial read — otherwise the "could not read" row would keep
+      // warning about a value the admin just set from this page.
+      else { setApprovalRead('ok'); flash(true, on ? 'Admin approval required' : 'Admin approval turned OFF'); }
     } catch { setRequireApproval(prev); flash(false, 'Failed to save'); }
     setSaving(false);
   };
@@ -140,7 +162,10 @@ export default function PurchasingSettingsPage() {
                 <p className="text-sm text-[#8B7355] mt-1.5">
                   Two things do not change. The <b>zero-rate check still runs either way</b>: a line with
                   a missing or ₹0 rate is refused, because a ₹0 purchase would wipe that material&apos;s
-                  average price and cascade a free ingredient through every recipe. What you do lose is
+                  average price and cascade a free ingredient through every recipe. And <b>editing an
+                  already-approved PO still sends it back for Admin re-approval</b>, switch or no switch —
+                  only the first submit is auto-approved, and an edited PO cannot be received again until
+                  an Admin clears it. What you do lose is
                   the <b>Approval Review</b> panel — past purchases, current stock, consumption and its
                   flags (over-order, bought recently, price jump, already overstocked) are only shown
                   while a PO sits waiting for approval, so nothing surfaces them when this is off.
@@ -153,6 +178,17 @@ export default function PurchasingSettingsPage() {
               </div>
               <Toggle checked={requireApproval} onChange={(v) => saveApproval(v)} disabled={!canEditApproval || saving} label="Require admin approval for POs" className="mt-1 shrink-0" />
             </div>
+
+            {approvalRead === 'failed' && (
+              <div className="flex items-start gap-2 p-5 bg-amber-50">
+                <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+                <p className="text-sm text-amber-800">
+                  <b>Could not read this setting.</b> The switch above is showing its safe default
+                  (approval required), not a value confirmed by the server — approval may in fact be
+                  OFF right now. Reload before trusting it, or set it explicitly here.
+                </p>
+              </div>
+            )}
 
             {!requireApproval && (
               <div className="flex items-start gap-2 p-5 bg-amber-50">

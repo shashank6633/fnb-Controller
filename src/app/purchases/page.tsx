@@ -528,7 +528,9 @@ export default function PurchasesPage() {
     }));
   };
 
-  // Calculate bill totals with GST distribution
+  // Calculate bill totals and split the two bill-level charges across the lines.
+  // No GST anywhere on this path: Discount is netted OFF each line rate, Delivery
+  // is carried per line for reporting only, and unit_price stays the goods rate.
   const billCalc = (() => {
     const items = billData.items.map((item) => {
       const qty = parseFloat(item.quantity) || 0;
@@ -586,6 +588,41 @@ export default function PurchasesPage() {
       return;
     }
 
+    // A discount that swallows the whole subtotal zeroes EVERY line rate, which the
+    // filter below would then read as "no items entered" — the wrong field, named
+    // wrongly. Say what actually blocked it.
+    if (billCalc.subtotal > 0 && billCalc.discountAmount >= billCalc.subtotal) {
+      setBillError(
+        `Discount (${formatCurrency(billCalc.discountAmount)}) equals or exceeds the items subtotal ` +
+        `(${formatCurrency(billCalc.subtotal)}), so every line would be booked at ₹0. ` +
+        `Reduce the discount, or record a free-of-charge receipt separately.`
+      );
+      return;
+    }
+
+    // Same trap one line at a time: a line whose net rate rounds to ₹0 (rate below
+    // ₹0.005, or its discount share eating the whole line) used to be dropped in
+    // silence, and the success toast then reported fewer items than were typed.
+    // Name the lines instead of swallowing them.
+    const zeroCostLines = billCalc.items
+      .map((i, idx) => ({ i, idx }))
+      .filter(({ i }) => i.material_id && parseFloat(i.quantity) > 0 && i.final_unit_price <= 0);
+
+    if (zeroCostLines.length > 0) {
+      const names = zeroCostLines
+        .map(({ i, idx }) => {
+          const mat = materials.find((m) => String(m.id) === String(i.material_id));
+          return mat ? `line ${idx + 1} (${mat.name})` : `line ${idx + 1}`;
+        })
+        .join(', ');
+      const many = zeroCostLines.length > 1;
+      setBillError(
+        `Net rate is ₹0 on ${names} — ${many ? 'those lines' : 'that line'} would be stocked at no cost. ` +
+        `Enter a unit price, lower the discount, or remove the line${many ? 's' : ''}.`
+      );
+      return;
+    }
+
     const validItems = billCalc.items.filter(
       (i) => i.material_id && parseFloat(i.quantity) > 0 && i.final_unit_price > 0
     );
@@ -597,7 +634,9 @@ export default function PurchasesPage() {
 
     setBillSubmitting(true);
     try {
-      // Submit each line item as a separate purchase with GST-included unit price.
+      // Submit each line item as a separate purchase. unit_price here is the
+      // DISCOUNT-NET, GST-FREE goods rate (final_unit_price above) — nothing is
+      // folded into it, so average_price stays a true cost basis.
       // When entry_mode='case', expand cases → bottles using the material's case_size
       // BEFORE submitting, so the API still sees a bottle-count quantity (its native unit).
       for (const item of validItems) {
@@ -1920,7 +1959,7 @@ export default function PurchasesPage() {
                 </div>
                 <div>
                   <h2 className="text-lg font-semibold text-[#2D1B0E]">Enter Full Bill</h2>
-                  <p className="text-xs text-[#8B7355]">Enter combined vendor bill with GST - auto-split across items</p>
+                  <p className="text-xs text-[#8B7355]">One vendor bill, many items — Delivery &amp; Discount auto-split across the lines. Enter each rate as the plain goods rate (no tax added in).</p>
                 </div>
               </div>
               <button onClick={() => setBillModalOpen(false)} className="p-1 text-[#8B7355] hover:text-[#2D1B0E]">
@@ -2190,7 +2229,8 @@ export default function PurchasesPage() {
                 </div>
                 <p className="text-[10px] text-[#8B7355] text-center mt-2">
                   Discount and Delivery are split across items in proportion to line value.
-                  Final Unit Price = (Line Total − Discount Share) ÷ Qty, and that is what is stored as the purchase price —
+                  Final Unit Price = (Line Total − Discount Share) ÷ Qty, and that is what is stored as the purchase price
+                  (case-mode lines are stored per bottle, expanded by case size: rate ÷ case size against qty × case size) —
                   so a discount lowers item cost while delivery is recorded on the bill without changing it.
                 </p>
               </div>

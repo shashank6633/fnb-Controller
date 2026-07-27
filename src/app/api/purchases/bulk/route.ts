@@ -46,6 +46,19 @@ const chgSigned = (v: any) => { const x = Number(v); return Number.isFinite(x) ?
 
 export async function POST(request: Request) {
   try {
+    // AUTH GATE — same one POST /api/grn and POST /api/purchases already have.
+    // This handler read the session ONLY to decide the admin backdate exemption
+    // (`isAdmin` below) and never rejected an anonymous caller. proxy.ts step 2c
+    // does validate the session token for mutating API calls, but that check is
+    // wrapped in try/catch and falls OPEN on a DB/infra error — so it must not be
+    // the only thing standing between an unauthenticated caller and a bulk import
+    // that bumps stock, writes purchases rows and lets updateMaterialPrice rewrite
+    // average_price through every recipe built on those materials. Resolve the
+    // session once here and reuse it for the backdate rule.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    const isAdmin = me.role === 'admin';
+
     const db = getDb();
     const body = await request.json();
     const { purchases } = body as { purchases: BulkPurchaseItem[] };
@@ -53,9 +66,6 @@ export async function POST(request: Request) {
     if (!purchases || !Array.isArray(purchases) || purchases.length === 0) {
       return Response.json({ error: 'purchases array is required' }, { status: 400 });
     }
-
-    const me = await getCurrentUser();
-    const isAdmin = me?.role === 'admin';
 
     const allMaterials = db.prepare('SELECT id, name, sku, unit, purchase_unit, pack_size, category FROM raw_materials').all() as any[];
     // Match by SKU FIRST, then name. SKUs are unique across the whole catalogue

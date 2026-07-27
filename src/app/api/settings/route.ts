@@ -1,6 +1,94 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 
+/**
+ * ONE table for every key this generic endpoint treats specially. BOTH halves
+ * read it — the GET redaction filter and the PUT write gate — so a privileged
+ * setting can no longer be listed on one side and forgotten on the other. That
+ * drift is exactly what left po_require_admin_approval UI-restricted with no
+ * server counterpart for a whole release.
+ *
+ *   read:  'admin'  → non-admins read back null. This is ON TOP of
+ *                     SECRET_KEY_RE below, which already redacts anything that
+ *                     merely LOOKS like a secret; list a key here only when the
+ *                     name does not give it away (e.g. a phone number).
+ *   write: 'admin'  → a manager PUT/POST of this key 403s with `writeError`.
+ *   owner: '<path>' → the key belongs to a dedicated route that validates and
+ *                     masks it; this generic door is shut for EVERYONE, admins
+ *                     included, so that route stays the single way in.
+ */
+type KeyPolicy = { read?: 'admin'; write?: 'admin'; writeError?: string; owner?: string };
+
+const KEY_POLICY = new Map<string, KeyPolicy>([
+  // The crash-alert WhatsApp number decides WHO gets production error alerts.
+  // Admin-only to read (don't hand a personal number to every signed-in staff
+  // session) and to write — the /api/error-report console is admin-only, so a
+  // manager must not be able to redirect or silence the alerts either.
+  ['error_alert_phone', {
+    read: 'admin', write: 'admin',
+    writeError: 'Admin role required to change the error alert number',
+  }],
+  // The backdate limit governs a hard block that managers (non-admins) are
+  // themselves subject to on Purchase/Bulk/GRN dates. Managers keep write
+  // access to every OTHER non-privileged setting, but must NOT be able to raise
+  // this key to self-lift the block.
+  ['purchase_backdate_limit_days', {
+    write: 'admin',
+    writeError: 'Admin role required to change the backdate limit',
+  }],
+  // Same self-lift reasoning as the backdate limit, and the sharpest case of it.
+  // Approving a PO is admin-only (purchase-orders/[id]/approve returns 403 on
+  // role !== 'admin'). Switching this key off makes submit auto-approve, and a
+  // manager also passes poWriteGate on receive — so a manager who could write it
+  // would go PUT '0' → submit own PO → auto-approved → receive, booking stock and
+  // rewriting average_price across every recipe with no admin anywhere in the
+  // chain. That is the approve gate defeated by exactly the role it denies.
+  // READ stays open (the settings page shows managers the switch, read-only).
+  ['po_require_admin_approval', {
+    write: 'admin',
+    writeError: 'Admin role required to change the PO approval requirement',
+  }],
+  // Owned keys. Each has a dedicated admin-only route that VALIDATES the value
+  // (Slack host check, service-account JSON parse, printer normalisation) and
+  // masks it on read — writing it through here would bypass both gate and
+  // validation, so this endpoint refuses the key outright.
+  ['slack_webhook_url', { owner: '/api/admin/slack-webhook' }],
+  ['google_sa_json', { owner: '/api/admin/google-sheets' }],
+  ['label_printer', { owner: '/api/settings/label-printer' }],
+]);
+
+/**
+ * wa_* (Meta/Interakt credentials, the master switch, template names and the
+ * wa_notify_* prefs) all belong to /api/whatsapp/config, which is admin-gated
+ * and never echoes a raw secret. Prefix-matched so a wa_ key added later is
+ * owned by DEFAULT instead of falling through to this generic writer.
+ */
+const OWNED_PREFIXES: Array<{ re: RegExp; route: string }> = [
+  { re: /^wa_/i, route: '/api/whatsapp/config' },
+];
+
+/** The dedicated route that owns this key, or null when this endpoint owns it. */
+function ownerRoute(key: string): string | null {
+  const owned = KEY_POLICY.get(key)?.owner;
+  if (owned) return owned;
+  return OWNED_PREFIXES.find((p) => p.re.test(key))?.route ?? null;
+}
+
+// Pattern-matched, not a fixed list, so a secret added later is redacted by
+// DEFAULT rather than leaking until someone remembers to list it.
+const SECRET_KEY_RE = /(token|api[_-]?key|_keys|secret|password|passwd|webhook|credential|sa_json|private)/i;
+
+/** Admin-only to READ: looks like a secret, or is listed read:'admin' above. */
+const isSecret = (k: string) => SECRET_KEY_RE.test(k) || KEY_POLICY.get(k)?.read === 'admin';
+
+/**
+ * Admin-only to WRITE through this endpoint. Secret-looking keys are included
+ * so the write side has the same default-deny posture as the read side: a new
+ * credential dropped into settings is admin-write from the moment it exists,
+ * not from the moment someone remembers to list it.
+ */
+const isAdminOnlyWrite = (k: string) => KEY_POLICY.get(k)?.write === 'admin' || SECRET_KEY_RE.test(k);
+
 export async function GET(req: Request) {
   // SECURITY: settings expose tax %, service charge, branding AND the OTP table
   // scope (which tables run captain-less). The proxy only checks that a session
@@ -11,10 +99,7 @@ export async function GET(req: Request) {
   const db = getDb();
   const url = new URL(req.url);
   const key = url.searchParams.get('key');
-  // error_alert_phone (crash-alert WhatsApp number) is admin-only — don't leak
-  // it to non-admin staff via the generic settings read.
   const isAdmin = me.role === 'admin';
-  const ADMIN_ONLY_KEYS = new Set(['error_alert_phone']);
   // PRE-EXISTING LEAK, closed here: this table is also where the app keeps its
   // live credentials, and the unfiltered read below handed every one of them to
   // any signed-in session — a captain or storekeeper could GET /api/settings and
@@ -22,10 +107,7 @@ export async function GET(req: Request) {
   // webhook and the Google service-account JSON. Those same values are masked by
   // whatsapp.ts's SECRET_KEYS, and /api/admin/slack-webhook refuses to show a
   // non-admin even a MASKED copy — this route was the back door around all of it.
-  // Pattern-matched, not a fixed list, so a secret added later is redacted by
-  // DEFAULT rather than leaking until someone remembers to list it.
-  const SECRET_KEY_RE = /(token|api[_-]?key|_keys|secret|password|passwd|webhook|credential|sa_json|private)/i;
-  const isSecret = (k: string) => SECRET_KEY_RE.test(k) || ADMIN_ONLY_KEYS.has(k);
+  // isSecret() (module scope) is the read half of KEY_POLICY + SECRET_KEY_RE.
   if (key) {
     if (isSecret(key) && !isAdmin) return Response.json({ key, value: null });
     const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as any;
@@ -39,7 +121,8 @@ export async function GET(req: Request) {
 export async function PUT(req: Request) {
   // SECURITY: settings hold the tax percentages (bill_design), service charge,
   // require_mgmt_approval and current_role — a plain staff user must not change
-  // them. Admin/manager only. (Was completely unauthenticated.)
+  // them. Admin/manager is the FLOOR (it was completely unauthenticated); the
+  // per-key rules in KEY_POLICY / ownerRoute() then narrow it further.
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
   if (me.role !== 'admin' && me.role !== 'manager') {
@@ -48,31 +131,28 @@ export async function PUT(req: Request) {
   const db = getDb();
   const { key, value } = await req.json();
   if (!key) return Response.json({ error: 'key required' }, { status: 400 });
-  // The backdate limit governs a hard block that managers (non-admins) are
-  // themselves subject to on Purchase/Bulk/GRN dates. Managers keep write
-  // access to every OTHER setting, but must NOT be able to raise this key to
-  // self-lift the block — restrict this one key to admins.
-  if (key === 'purchase_backdate_limit_days' && me.role !== 'admin') {
-    return Response.json({ error: 'Admin role required to change the backdate limit' }, { status: 403 });
+  const k = String(key);
+  // Keys owned by a dedicated route are refused here for EVERYONE (admins too).
+  // The generic writer takes any string: it would store an arbitrary URL as the
+  // Slack webhook, unparseable text as the service-account JSON or a raw token
+  // where /api/whatsapp/config would have validated and masked it — and, until
+  // now, would do it for a manager whom every one of those routes 403s.
+  const owner = ownerRoute(k);
+  if (owner) {
+    return Response.json(
+      { error: `'${k}' is managed by ${owner} — the generic settings endpoint does not write it` },
+      { status: 403 },
+    );
   }
-  // The crash-alert WhatsApp number decides WHO gets production error alerts —
-  // a manager must not redirect or silence it (the /api/error-report console is
-  // admin-only, so this second door must be too).
-  if (key === 'error_alert_phone' && me.role !== 'admin') {
-    return Response.json({ error: 'Admin role required to change the error alert number' }, { status: 403 });
+  // Admin-only writes (KEY_POLICY write:'admin' + anything secret-looking).
+  // Each listed key carries its own reason in the table above.
+  if (isAdminOnlyWrite(k) && me.role !== 'admin') {
+    return Response.json(
+      { error: KEY_POLICY.get(k)?.writeError ?? 'Admin role required to change this setting' },
+      { status: 403 },
+    );
   }
-  // Same self-lift reasoning as the backdate limit, and the sharpest case of it.
-  // Approving a PO is admin-only (purchase-orders/[id]/approve returns 403 on
-  // role !== 'admin'). Switching this key off makes submit auto-approve, and a
-  // manager also passes poWriteGate on receive — so a manager who could write it
-  // would go PUT '0' → submit own PO → auto-approved → receive, booking stock and
-  // rewriting average_price across every recipe with no admin anywhere in the
-  // chain. That is the approve gate defeated by exactly the role it denies.
-  // READ stays open (the settings page shows managers the switch, read-only).
-  if (key === 'po_require_admin_approval' && me.role !== 'admin') {
-    return Response.json({ error: 'Admin role required to change the PO approval requirement' }, { status: 403 });
-  }
-  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, String(value ?? ''));
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(k, String(value ?? ''));
   return Response.json({ key, value });
 }
 

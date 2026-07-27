@@ -26,7 +26,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // "free" ingredient through every recipe).
     const rateBlocker = zeroRateBlocker(db, id);
     if (rateBlocker) {
-      return Response.json({ error: rateBlocker, field: 'unit_price' }, { status: 400 });
+      // Error-shape parity with [id]/receive, whose sibling 400s all carry
+      // `material` next to { error, field }. zeroRateBlocker hands back only the
+      // message, and that message is the single source of truth for WHICH line
+      // failed — so lift the material name out of it instead of re-scanning the
+      // lines here, where a second query could name a different line than the
+      // text the user is reading. Best-effort: if the message ever stops quoting
+      // the name, `material` is omitted and `error` (the only field the PO page
+      // reads today) is unchanged.
+      const material = rateBlocker.match(/"([^"]+)"/)?.[1];
+      return Response.json(
+        { error: rateBlocker, field: 'unit_price', ...(material ? { material } : {}) },
+        { status: 400 },
+      );
     }
 
     const body = await req.json().catch(() => ({}));

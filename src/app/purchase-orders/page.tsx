@@ -17,6 +17,16 @@ import { api } from '@/lib/api';
 const fmt = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const dateLabel = (s?: string | null) =>
   s ? new Date(s).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
+/** QTY for humans. Binary floats make 2.4 − 2.5 = −0.09999999999999964, and that
+ *  string was being read out to the receiver in the deviation hint, the blocking
+ *  banner, the button tooltip and the submit alert. 6 dp is far finer than any
+ *  qty a receiving bay types, so this only ever trims the noise. */
+const qfmt = (n: number) => (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 6 });
+/** "Differs from the PO" tolerances — the receive route's own values
+ *  (receive/route.ts QTY_EPS / RATE_EPS). Kept identical so this screen never
+ *  demands a reason for a difference the server would ignore, or vice versa. */
+const QTY_EPS = 1e-6;
+const RATE_EPS = 0.005;   // ₹ — half a paisa
 
 interface Material { id: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; sku?: string; average_price: number; primary_vendor?: string; last_purchase_price?: number; }
 
@@ -83,7 +93,10 @@ const TAB_STATUSES: Record<string, string[]> = {
 export default function PurchaseOrdersPage() {
   const [pos, setPos] = useState<PO[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
-  const [role, setRole] = useState<'admin' | 'manager'>('admin');
+  // Starts at the LOWER tier, same rule as the setter below: until the server
+  // has actually said "admin", the answer to "is this viewer an admin" is no.
+  // (It also stops a manager's first paint claiming "signed in as ADMIN".)
+  const [role, setRole] = useState<'admin' | 'manager'>('manager');
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<'all' | 'draft' | 'pending' | 'approved' | 'received' | 'rejected'>('pending');
   const [search, setSearch] = useState('');
@@ -114,6 +127,13 @@ export default function PurchaseOrdersPage() {
       // never resolve to the MORE privileged answer. Only an explicit 'admin' is admin.
       setRole(posRes.viewer_role === 'admin' ? 'admin' : 'manager');
       setMaterials(invRes.materials || []);
+    } catch {
+      // Promise.all rejecting (network blip, a non-JSON 500 so r.json() throws)
+      // used to skip BOTH setters and leave `role` at whatever it was — which,
+      // on the first load, was 'admin'. Fail closed explicitly: no rows, lower
+      // tier. Refresh re-runs this.
+      setPos([]);
+      setRole('manager');
     } finally { setLoading(false); }
   }, []);
   useEffect(() => { fetchAll(); }, [fetchAll]);
@@ -149,7 +169,16 @@ export default function PurchaseOrdersPage() {
     setSavingId(id);
     try {
       const r = await api(`/api/purchase-orders/${id}/${kind}`, { method: 'POST', body });
-      if (!r.ok) { alert(((await r.json()).error) || `Failed to ${kind}`); return; }
+      const j = await r.json().catch(() => ({} as any));
+      if (!r.ok) { alert(j.error || `Failed to ${kind}`); return; }
+      // With `po_require_admin_approval` OFF, submit ALSO approves in the same
+      // txn (submit/route.ts returns auto_approved). The default tab is Pending
+      // Approval, so without this the PO just vanishes from the list and the
+      // user is never told it is now receivable. Say it, then show it.
+      if (kind === 'submit' && j.auto_approved) {
+        alert('Submitted and auto-approved — admin approval is currently OFF (Settings → Purchasing).\n\nThis PO is in Approved and can be received now.');
+        setTab('approved');
+      }
       await fetchAll();
     } finally { setSavingId(null); }
   };
@@ -252,8 +281,12 @@ export default function PurchaseOrdersPage() {
                     const canReceive = p.status === 'approved';
                     const canDelete = p.status === 'draft';
                     return (
-                      <>
-                        <tr key={p.id} className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30">
+                      // Key belongs on the FRAGMENT, not the inner <tr>: a row can
+                      // render up to three siblings (row + detail + review), so a
+                      // keyless <> makes React reconcile this list by index and
+                      // remount everything below an approve/reject reorder.
+                      <Fragment key={p.id}>
+                        <tr className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30">
                           <td className="py-2 px-3 text-xs font-mono">
                             <button onClick={() => setOpenDetailId(isOpen ? null : p.id)}
                                     className="inline-flex items-center gap-1 hover:text-[#af4408]">
@@ -357,7 +390,7 @@ export default function PurchaseOrdersPage() {
                         {reviewId === p.id && (
                           <ApprovalContextPanel key={p.id + '-r'} poId={p.id} />
                         )}
-                      </>
+                      </Fragment>
                     );
                   })}
                 </tbody>
@@ -453,23 +486,29 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
    * about which lines are deviating (the payload filter used to be a separate
    * copy of the same predicate).
    * Qty and rate here are PURCHASE units / ₹ per purchase unit — never the
-   * recipe unit — so every number is labelled with material_purchase_unit. */
+   * recipe unit — so every number is labelled with material_purchase_unit.
+   * The tolerances are the receive route's own (QTY_EPS 1e-6, RATE_EPS 0.005 —
+   * receive/route.ts), so a line this screen demands a reason for is exactly a
+   * line the server would refuse without one: an exact `!== 0` here blocked
+   * Confirm on ₹900.002 vs ₹900, which the route treats as no change at all. */
   const deviations = useMemo(() => items.map(it => {
     const ov = overrides[it.id] || { quantity: it.quantity, unit_price: it.unit_price };
     const qty       = Number(ov.quantity);
     const price     = Number(ov.unit_price);
     const qtyDiff   = qty - it.quantity;
     const priceDiff = price - it.unit_price;
+    const qtyOff    = Math.abs(qtyDiff) > QTY_EPS;
+    const rateOff   = Math.abs(priceDiff) > RATE_EPS;
     const u = (it as any).material_purchase_unit || (it as any).material_unit || '';
     const bits: string[] = [];
-    if (qtyDiff !== 0) {
-      bits.push(`${qtyDiff > 0 ? 'excess' : 'short'} ${Math.abs(qtyDiff)}${u ? ' ' + u : ''} ` +
-                `(received ${qty}${u ? ' ' + u : ''} vs ordered ${it.quantity}${u ? ' ' + u : ''})`);
+    if (qtyOff) {
+      bits.push(`${qtyDiff > 0 ? 'excess' : 'short'} ${qfmt(Math.abs(qtyDiff))}${u ? ' ' + u : ''} ` +
+                `(received ${qfmt(qty)}${u ? ' ' + u : ''} vs ordered ${qfmt(it.quantity)}${u ? ' ' + u : ''})`);
     }
-    if (priceDiff !== 0) {
+    if (rateOff) {
       bits.push(`rate ₹${price.toFixed(2)}${u ? '/' + u : ''} vs ordered ₹${it.unit_price.toFixed(2)}${u ? '/' + u : ''}`);
     }
-    return { it, ov, qtyDiff, priceDiff, u, deviates: bits.length > 0, label: bits.join(' · ') };
+    return { it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, deviates: bits.length > 0, label: bits.join(' · ') };
   }), [items, overrides]);
 
   // Free text, trimmed, ≥ 3 chars — same floor the receive route enforces, so a
@@ -528,22 +567,29 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           '\n\nThese must be procured through Inventory → Liquor Store instead.'
         );
       }
-      // Excess-acceptance acknowledgement — show the receiver that the admin
-      // has been notified (audit_event + in-app notification + optional Slack).
-      if (j.excess_lines > 0) {
-        alert(
-          `Received. ${j.excess_lines} line(s) accepted over the ordered qty (${fmt(j.excess_value || 0)} excess).\n\n` +
-          'The admin has been notified for review (visible on /audit as "po.received_excess").'
-        );
-      } else if (deviating.length > 0) {
-        // Short qty and rate changes are alerted the same way. Counted from what
-        // we SENT rather than a response field, so this stays true whatever the
-        // route names its counters.
-        alert(
-          `Received. ${deviating.length} line(s) differed from the PO (qty and/or rate).\n\n` +
+      // Off-PO acknowledgement — show the receiver that the admin has been
+      // notified (audit_event + in-app notification + optional Slack).
+      // Excess and short/rate are NOT alternatives: a mixed receive is 1 line
+      // over AND 2 short. These used to be if/else-if, so the excess line
+      // swallowed the confirmation for exactly the short lines the receiver had
+      // just been forced to justify. One alert, both facts.
+      const notes: string[] = [];
+      if (deviating.length > 0) {
+        // Counted from what we SENT rather than a response field, so this stays
+        // true whatever the route names its counters. Short qty and rate changes
+        // raise the same admin alert as excess.
+        notes.push(
+          `${deviating.length} line(s) differed from the PO (qty and/or rate). ` +
           'The reason you gave has been recorded and the admin has been notified for review.'
         );
       }
+      if (j.excess_lines > 0) {
+        notes.push(
+          `${j.excess_lines} line(s) were accepted OVER the ordered qty (${fmt(j.excess_value || 0)} excess) — ` +
+          'visible on /audit as "po.received_excess".'
+        );
+      }
+      if (notes.length > 0) alert('Received.\n\n' + notes.join('\n\n'));
       onReceived();
     } finally { setSaving(false); }
   };
@@ -589,7 +635,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                       — NOT the recipe/stock unit (g, ml), which differs by
                       pack_size. `u` is that purchase unit and labels every
                       qty/rate cell so the receiver knows what they're confirming. */}
-                  {deviations.map(({ it, ov, qtyDiff, priceDiff, u, deviates, label }) => {
+                  {deviations.map(({ it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, deviates, label }) => {
                     const lineTotal = Number(ov.quantity) * Number(ov.unit_price);
                     const unlocked = !!rateUnlocked[it.id];
                     const reason = reasons[it.id] || '';
@@ -615,12 +661,12 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                                      const v = parseFloat(e.target.value);
                                      setQty(it.id, Number.isFinite(v) ? Math.max(0, v) : 0);
                                    }}
-                                   className={`w-full px-1.5 py-1 border rounded text-right ${qtyDiff !== 0 ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
+                                   className={`w-full px-1.5 py-1 border rounded text-right ${qtyOff ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
                             {u && <span className="text-[10px] text-[#8B7355]">{u}</span>}
                           </div>
-                          {qtyDiff !== 0 && (
+                          {qtyOff && (
                             <div className={`text-[9px] mt-0.5 text-right ${qtyDiff > 0 ? 'text-blue-600' : 'text-amber-700'}`}>
-                              {qtyDiff > 0 ? '+' : ''}{qtyDiff}{u ? ' ' + u : ''} vs ordered
+                              {qtyDiff > 0 ? '+' : ''}{qfmt(qtyDiff)}{u ? ' ' + u : ''} vs ordered
                             </div>
                           )}
                         </td>
@@ -640,10 +686,10 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                                          const v = parseFloat(e.target.value);
                                          setPrice(it.id, Number.isFinite(v) ? Math.max(0, v) : 0);
                                        }}
-                                       className={`w-full px-1.5 py-1 border rounded text-right ${priceDiff !== 0 ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
+                                       className={`w-full px-1.5 py-1 border rounded text-right ${rateOff ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
                                 {u && <span className="text-[10px] text-[#8B7355]">/{u}</span>}
                               </div>
-                              {priceDiff !== 0 && (
+                              {rateOff && (
                                 <div className={`text-[9px] mt-0.5 text-right ${priceDiff > 0 ? 'text-red-600' : 'text-green-700'}`}>
                                   {priceDiff > 0 ? '+' : ''}₹{priceDiff.toFixed(2)}{u && `/${u}`} vs ordered
                                 </div>
@@ -677,8 +723,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                               {/* A ₹0 PO rate is rejected by the receive route
                                   (it would wipe average_price to 0), and the
                                   lock means only an admin can fix it — say so
-                                  here instead of failing on submit. */}
-                              {Number(ov.unit_price) <= 0 && (
+                                  here instead of failing on submit.
+                                  Gated on qty > 0 the same way the route is
+                                  (`effAcc > 0 && effPrice <= 0`): a line
+                                  received at 0 never reaches updateMaterialPrice,
+                                  so the server accepts it and this must not
+                                  claim otherwise. */}
+                              {Number(ov.quantity) > 0 && Number(ov.unit_price) <= 0 && (
                                 <div className="mt-0.5 text-[9px] text-red-600">
                                   PO rate is ₹0 — {canChangeRate ? 'set a real rate to receive this line.' : 'an admin must set a real rate before this can be received.'}
                                 </div>
