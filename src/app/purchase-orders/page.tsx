@@ -1,10 +1,10 @@
 'use client';
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ClipboardList, Plus, Trash2, Search, Loader2, CheckCircle2, XCircle, Send,
-  ShieldCheck, PackageCheck, RefreshCw, AlertTriangle, ChevronDown, Printer,
+  ShieldCheck, PackageCheck, RefreshCw, AlertTriangle, ChevronDown, Printer, Lock,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 
@@ -51,10 +51,33 @@ interface PO { id: string; po_number: string; date: string; vendor: string; stat
 const STATUS_COLOR: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-700',
   pending: 'bg-amber-100 text-amber-800',
+  pending_reapproval: 'bg-amber-100 text-amber-800',
   approved: 'bg-blue-100 text-blue-800',
   received: 'bg-green-100 text-green-800',
   rejected: 'bg-red-100 text-red-700',
   cancelled: 'bg-slate-100 text-slate-500 line-through',
+};
+
+/**
+ * THE tab → statuses map. The row filter and the tab badge both read this, so a
+ * PO counted in a tab is always listed in it.
+ *
+ * They used to be written separately and had drifted apart in two places:
+ *   • the badge counted 'cancelled' under Rejected/Cancelled while the filter
+ *     tested `status === 'rejected'`, so a cancelled PO showed as "(1)" over an
+ *     empty "No POs in this view";
+ *   • 'pending_reapproval' — written by [id]/edit-approved and accepted by
+ *     approve/reject — appeared in NO map at all, so a PO sent back for
+ *     re-approval was invisible everywhere except the All tab, silently missing
+ *     from the approval queue.
+ * Add a new status here and both surfaces pick it up together.
+ */
+const TAB_STATUSES: Record<string, string[]> = {
+  draft:    ['draft'],
+  pending:  ['pending', 'pending_reapproval'],
+  approved: ['approved'],
+  received: ['received'],
+  rejected: ['rejected', 'cancelled'],
 };
 
 export default function PurchaseOrdersPage() {
@@ -84,7 +107,12 @@ export default function PurchaseOrdersPage() {
         fetch('/api/inventory?scope=all').then(r => r.json()),
       ]);
       setPos(posRes.purchase_orders || []);
-      setRole((posRes.viewer_role === 'manager' ? 'manager' : 'admin'));
+      // Fail CLOSED to the lower tier. This was `=== 'manager' ? 'manager' : 'admin'`,
+      // which handed out 'admin' for anything that wasn't literally "manager" — an
+      // absent field, an error body, a future role string. `role` gates the
+      // admin-only rate unlock in the receive modal, so an unexpected value must
+      // never resolve to the MORE privileged answer. Only an explicit 'admin' is admin.
+      setRole(posRes.viewer_role === 'admin' ? 'admin' : 'manager');
       setMaterials(invRes.materials || []);
     } finally { setLoading(false); }
   }, []);
@@ -94,7 +122,12 @@ export default function PurchaseOrdersPage() {
 
   const filtered = useMemo(() => {
     let list = pos;
-    if (tab !== 'all') list = list.filter(p => p.status === tab);
+    // Same map the badges use — never `status === tab`, which silently drops any
+    // status whose name isn't identical to the tab key (cancelled, pending_reapproval).
+    if (tab !== 'all') {
+      const allowed = TAB_STATUSES[tab] || [tab];
+      list = list.filter(p => allowed.includes(p.status));
+    }
     if (search) {
       const q = search.toLowerCase();
       list = list.filter(p => p.po_number.toLowerCase().includes(q) || (p.vendor || '').toLowerCase().includes(q));
@@ -102,13 +135,15 @@ export default function PurchaseOrdersPage() {
     return list;
   }, [pos, tab, search]);
 
-  const counts = useMemo(() => ({
-    draft: pos.filter(p => p.status === 'draft').length,
-    pending: pos.filter(p => p.status === 'pending').length,
-    approved: pos.filter(p => p.status === 'approved').length,
-    received: pos.filter(p => p.status === 'received').length,
-    rejected: pos.filter(p => p.status === 'rejected' || p.status === 'cancelled').length,
-  }), [pos]);
+  // Derived from TAB_STATUSES so a badge can never count something the tab
+  // won't show (or miss something it will).
+  const counts = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const [key, statuses] of Object.entries(TAB_STATUSES)) {
+      out[key] = pos.filter(p => statuses.includes(p.status)).length;
+    }
+    return out as { draft: number; pending: number; approved: number; received: number; rejected: number };
+  }, [pos]);
 
   const action = async (id: string, kind: 'submit' | 'approve' | 'reject' | 'cancel' | 'receive', body: any = {}) => {
     setSavingId(id);
@@ -202,8 +237,17 @@ export default function PurchaseOrdersPage() {
                     const isOpen = openDetailId === p.id;
                     const canEdit = p.status === 'draft';
                     const canSubmit = p.status === 'draft';
-                    const canApprove = p.status === 'pending' && role === 'admin';
-                    const canReject = p.status === 'pending' && role === 'admin';
+                    // Derive from the SAME map the tab uses. Testing the literal
+                    // 'pending' left a pending_reapproval PO counted in the Pending
+                    // Approval tab with no Approve/Reject button — visible but
+                    // un-actionable, a worse dead end than being hidden. Both
+                    // approve/route.ts:18 and reject/route.ts:22 already accept it.
+                    const inApproval = TAB_STATUSES.pending.includes(p.status);
+                    const canApprove = inApproval && role === 'admin';
+                    const canReject = inApproval && role === 'admin';
+                    // Deliberately NOT inApproval: cancel/route.ts:22 accepts only
+                    // draft/pending/rejected, so offering it on pending_reapproval
+                    // would render a button that 400s. Widen BOTH or neither.
                     const canCancel = ['draft', 'pending', 'rejected'].includes(p.status);
                     const canReceive = p.status === 'approved';
                     const canDelete = p.status === 'draft';
@@ -242,7 +286,7 @@ export default function PurchaseOrdersPage() {
                                   <Send className="w-3 h-3" /> Submit
                                 </button>
                               )}
-                              {p.status === 'pending' && (
+                              {inApproval && (
                                 <button onClick={() => setReviewId(reviewId === p.id ? null : p.id)}
                                         className="px-2 py-1 rounded text-[10px] bg-amber-100 hover:bg-amber-200 text-amber-800 inline-flex items-center gap-1">
                                   <AlertTriangle className="w-3 h-3" /> {reviewId === p.id ? 'Hide' : 'Review'}
@@ -328,6 +372,7 @@ export default function PurchaseOrdersPage() {
 
         {receivingId && (
           <ReceiveModal poId={receivingId}
+                        role={role}
                         onClose={() => setReceivingId(null)}
                         onReceived={() => { setReceivingId(null); fetchAll(); }} />
         )}
@@ -357,13 +402,32 @@ export default function PurchaseOrdersPage() {
 /* ============================================================ */
 /* Receive Modal — adjust per-line qty/price for partial deliveries */
 /* ============================================================ */
-function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: () => void; onReceived: () => void }) {
+function ReceiveModal({ poId, role, onClose, onReceived }: {
+  poId: string; role: 'admin' | 'manager'; onClose: () => void; onReceived: () => void;
+}) {
   const [po, setPo] = useState<PO | null>(null);
   const [items, setItems] = useState<POItem[]>([]);
   const [overrides, setOverrides] = useState<Record<string, { quantity: number; unit_price: number }>>({});
   const [receivedAt, setReceivedAt] = useState<string>(new Date().toISOString().slice(0, 10));
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Per-line rate unlock + per-line "why does this differ from the PO" reason.
+  const [rateUnlocked, setRateUnlocked] = useState<Record<string, boolean>>({});
+  const [reasons, setReasons] = useState<Record<string, string>>({});
+
+  /* WHO MAY UNLOCK A LINE'S RATE.
+   * The rate typed here is written to purchases.unit_price and then through
+   * updateMaterialPrice into raw_materials.average_price — i.e. into the cost of
+   * every recipe that uses the material. A silent re-type at the receiving bay is
+   * exactly what must not happen, so the rate is plain text by default.
+   * Only 'admin' unlocks it. `role` comes from /api/purchase-orders' viewer_role,
+   * which is effectiveRole() — and that collapses staff → 'manager'. So on this
+   * page 'manager' means "everyone who got past poWriteGate and is doing the
+   * receiving" (manager, HOD, storekeeper): precisely the people the lock exists
+   * for. Admin is the only tier this response can actually distinguish, so admin
+   * is the unlock. A manager who genuinely got a re-rated bill asks an admin —
+   * the same person who already approves the PO. */
+  const canChangeRate = role === 'admin';
 
   useEffect(() => {
     fetch(`/api/purchase-orders?id=${poId}`).then(r => r.json()).then(d => {
@@ -380,6 +444,41 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
   const setQty   = (id: string, v: number) => setOverrides(o => ({ ...o, [id]: { ...o[id], quantity: v } }));
   const setPrice = (id: string, v: number) => setOverrides(o => ({ ...o, [id]: { ...o[id], unit_price: v } }));
 
+  /* ── THE ONE DEFINITION OF "THIS LINE DEVIATES" ───────────────────────────
+   * A line deviates when the received qty differs from the ordered qty (short OR
+   * excess) or the effective rate differs from the ordered rate. Every deviating
+   * line needs a typed reason and raises an admin alert server-side.
+   * The row hint, the blocking banner, the disabled Confirm button and the
+   * submitted item_overrides all read THIS memo, so they can never disagree
+   * about which lines are deviating (the payload filter used to be a separate
+   * copy of the same predicate).
+   * Qty and rate here are PURCHASE units / ₹ per purchase unit — never the
+   * recipe unit — so every number is labelled with material_purchase_unit. */
+  const deviations = useMemo(() => items.map(it => {
+    const ov = overrides[it.id] || { quantity: it.quantity, unit_price: it.unit_price };
+    const qty       = Number(ov.quantity);
+    const price     = Number(ov.unit_price);
+    const qtyDiff   = qty - it.quantity;
+    const priceDiff = price - it.unit_price;
+    const u = (it as any).material_purchase_unit || (it as any).material_unit || '';
+    const bits: string[] = [];
+    if (qtyDiff !== 0) {
+      bits.push(`${qtyDiff > 0 ? 'excess' : 'short'} ${Math.abs(qtyDiff)}${u ? ' ' + u : ''} ` +
+                `(received ${qty}${u ? ' ' + u : ''} vs ordered ${it.quantity}${u ? ' ' + u : ''})`);
+    }
+    if (priceDiff !== 0) {
+      bits.push(`rate ₹${price.toFixed(2)}${u ? '/' + u : ''} vs ordered ₹${it.unit_price.toFixed(2)}${u ? '/' + u : ''}`);
+    }
+    return { it, ov, qtyDiff, priceDiff, u, deviates: bits.length > 0, label: bits.join(' · ') };
+  }), [items, overrides]);
+
+  // Free text, trimmed, ≥ 3 chars — same floor the receive route enforces, so a
+  // reason the server would reject can never look accepted here.
+  const MIN_REASON = 3;
+  const missingReason = deviations.filter(d => d.deviates && (reasons[d.it.id] || '').trim().length < MIN_REASON);
+  const missingList = (prefix: string) =>
+    prefix + missingReason.map(d => `• ${d.it.material_name} — ${d.label}`).join('\n');
+
   const total = items.reduce((s, it) => {
     const ov = overrides[it.id] || it;
     return s + (Number(ov.quantity) || 0) * (Number(ov.unit_price) || 0);
@@ -387,14 +486,25 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
   const orderedTotal = items.reduce((s, it) => s + it.quantity * it.unit_price, 0);
 
   const submit = async () => {
+    // Belt-and-braces with the disabled button: the reason gate must not be
+    // skippable by a stale click. (The receive route re-checks it anyway — that
+    // is the real gate; this is only so the receiver gets a readable message.)
+    if (missingReason.length > 0) {
+      alert(missingList('Add a reason for these lines before receiving:\n'));
+      return;
+    }
     setSaving(true);
     try {
-      const item_overrides = items
-        .filter(it => {
-          const ov = overrides[it.id];
-          return ov && (ov.quantity !== it.quantity || ov.unit_price !== it.unit_price);
-        })
-        .map(it => ({ po_item_id: it.id, quantity: overrides[it.id].quantity, unit_price: overrides[it.id].unit_price }));
+      // Only deviating lines are sent — and every one of them carries the reason
+      // the receiver typed, as deviation_reason (why it differs from the PO).
+      // rejection_reason stays what it always was: QC, why units were rejected.
+      const deviating = deviations.filter(d => d.deviates);
+      const item_overrides = deviating.map(d => ({
+        po_item_id: d.it.id,
+        quantity: d.ov.quantity,
+        unit_price: d.ov.unit_price,
+        deviation_reason: (reasons[d.it.id] || '').trim(),
+      }));
       const r = await api(`/api/purchase-orders/${poId}/receive`, {
         method: 'POST', body: { received_at: receivedAt, item_overrides },
       });
@@ -425,6 +535,14 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
           `Received. ${j.excess_lines} line(s) accepted over the ordered qty (${fmt(j.excess_value || 0)} excess).\n\n` +
           'The admin has been notified for review (visible on /audit as "po.received_excess").'
         );
+      } else if (deviating.length > 0) {
+        // Short qty and rate changes are alerted the same way. Counted from what
+        // we SENT rather than a response field, so this stays true whatever the
+        // route names its counters.
+        alert(
+          `Received. ${deviating.length} line(s) differed from the PO (qty and/or rate).\n\n` +
+          'The reason you gave has been recorded and the admin has been notified for review.'
+        );
       }
       onReceived();
     } finally { setSaving(false); }
@@ -436,7 +554,11 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
           <div>
             <h2 className="font-bold text-[#2D1B0E]">Receive PO {po?.po_number}</h2>
-            <p className="text-xs text-[#8B7355] mt-0.5">Adjust each line if you got more / less or at a different price. Stock + recipe costs update on submit.</p>
+            <p className="text-xs text-[#8B7355] mt-0.5">
+              Adjust the qty if you got more / less. The rate is locked to the PO
+              {canChangeRate ? ' — unlock a line only if the vendor genuinely billed differently.' : ' and only an admin can change it.'}
+              {' '}Any line that differs from the PO needs a reason and alerts the admin. Stock + recipe costs update on submit.
+            </p>
           </div>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>
@@ -461,18 +583,20 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
                   </tr>
                 </thead>
                 <tbody>
-                  {items.map(it => {
-                    const ov = overrides[it.id] || { quantity: it.quantity, unit_price: it.unit_price };
+                  {/* Rows are driven by `deviations`, not `items`, so the hints,
+                      the reason gate and the payload all read one computation.
+                      A PO's qty + rate are in the PURCHASE unit (kg, BTL, CASE)
+                      — NOT the recipe/stock unit (g, ml), which differs by
+                      pack_size. `u` is that purchase unit and labels every
+                      qty/rate cell so the receiver knows what they're confirming. */}
+                  {deviations.map(({ it, ov, qtyDiff, priceDiff, u, deviates, label }) => {
                     const lineTotal = Number(ov.quantity) * Number(ov.unit_price);
-                    const qtyDiff = Number(ov.quantity) - it.quantity;
-                    const priceDiff = Number(ov.unit_price) - it.unit_price;
-                    // A PO's qty + rate are in the PURCHASE unit (kg, BTL, CASE)
-                    // — NOT the recipe/stock unit (g, ml), which differs by
-                    // pack_size. Label every qty/rate cell with it so the
-                    // receiver knows exactly what they're confirming.
-                    const u = (it as any).material_purchase_unit || (it as any).material_unit || '';
+                    const unlocked = !!rateUnlocked[it.id];
+                    const reason = reasons[it.id] || '';
+                    const needsReason = deviates && reason.trim().length < MIN_REASON;
                     return (
-                      <tr key={it.id} className="border-t border-[#E8D5C4]/50">
+                      <Fragment key={it.id}>
+                      <tr className={`border-t border-[#E8D5C4]/50 ${deviates ? 'bg-amber-50/40' : ''}`}>
                         <td className="py-1.5 px-2">
                           <div className="text-[#2D1B0E]">{it.material_name}</div>
                           <div className="text-[10px] text-[#8B7355]">{it.material_sku} · {u}</div>
@@ -503,24 +627,88 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
                         <td className="py-1.5 px-2 text-right font-mono text-[10px] text-[#8B7355]">
                           ₹{it.unit_price.toFixed(2)}{u && <span>/{u}</span>}
                         </td>
+                        {/* RATE — read-only unless this line was explicitly
+                            unlocked by an admin (see canChangeRate). It is the
+                            number that rewrites average_price, so it is never
+                            a stray keystroke away. */}
                         <td className="py-1.5 px-2">
-                          <div className="flex items-center gap-1 justify-end">
-                            <input type="number" step="any" min={0} value={ov.unit_price}
-                                   onChange={e => {
-                                     const v = parseFloat(e.target.value);
-                                     setPrice(it.id, Number.isFinite(v) ? Math.max(0, v) : 0);
-                                   }}
-                                   className={`w-full px-1.5 py-1 border rounded text-right ${priceDiff !== 0 ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
-                            {u && <span className="text-[10px] text-[#8B7355]">/{u}</span>}
-                          </div>
-                          {priceDiff !== 0 && (
-                            <div className={`text-[9px] mt-0.5 text-right ${priceDiff > 0 ? 'text-red-600' : 'text-green-700'}`}>
-                              {priceDiff > 0 ? '+' : ''}₹{priceDiff.toFixed(2)}{u && `/${u}`} vs ordered
+                          {unlocked ? (
+                            <>
+                              <div className="flex items-center gap-1 justify-end">
+                                <input type="number" step="any" min={0} value={ov.unit_price} autoFocus
+                                       onChange={e => {
+                                         const v = parseFloat(e.target.value);
+                                         setPrice(it.id, Number.isFinite(v) ? Math.max(0, v) : 0);
+                                       }}
+                                       className={`w-full px-1.5 py-1 border rounded text-right ${priceDiff !== 0 ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
+                                {u && <span className="text-[10px] text-[#8B7355]">/{u}</span>}
+                              </div>
+                              {priceDiff !== 0 && (
+                                <div className={`text-[9px] mt-0.5 text-right ${priceDiff > 0 ? 'text-red-600' : 'text-green-700'}`}>
+                                  {priceDiff > 0 ? '+' : ''}₹{priceDiff.toFixed(2)}{u && `/${u}`} vs ordered
+                                </div>
+                              )}
+                              <button type="button"
+                                      onClick={() => {
+                                        // Re-locking restores the PO rate, so a
+                                        // half-typed change can't survive as a
+                                        // deviation nobody meant to make.
+                                        setPrice(it.id, it.unit_price);
+                                        setRateUnlocked(m => ({ ...m, [it.id]: false }));
+                                      }}
+                                      className="mt-0.5 block ml-auto text-[9px] text-[#8B7355] hover:text-[#af4408] underline">
+                                Reset to PO rate
+                              </button>
+                            </>
+                          ) : (
+                            <div className="text-right">
+                              <div className="font-mono text-[#2D1B0E] flex items-center gap-1 justify-end">
+                                <Lock className="w-3 h-3 text-[#8B7355]" />
+                                ₹{Number(ov.unit_price).toFixed(2)}{u && <span className="text-[10px] text-[#8B7355]">/{u}</span>}
+                              </div>
+                              {canChangeRate ? (
+                                <button type="button" onClick={() => setRateUnlocked(m => ({ ...m, [it.id]: true }))}
+                                        className="mt-0.5 text-[9px] text-[#af4408] hover:text-[#8a3506] underline">
+                                  Change rate
+                                </button>
+                              ) : (
+                                <div className="mt-0.5 text-[9px] text-[#8B7355]">PO rate — admin only</div>
+                              )}
+                              {/* A ₹0 PO rate is rejected by the receive route
+                                  (it would wipe average_price to 0), and the
+                                  lock means only an admin can fix it — say so
+                                  here instead of failing on submit. */}
+                              {Number(ov.unit_price) <= 0 && (
+                                <div className="mt-0.5 text-[9px] text-red-600">
+                                  PO rate is ₹0 — {canChangeRate ? 'set a real rate to receive this line.' : 'an admin must set a real rate before this can be received.'}
+                                </div>
+                              )}
                             </div>
                           )}
                         </td>
                         <td className="py-1.5 px-2 text-right font-mono font-semibold">{fmt(lineTotal)}</td>
                       </tr>
+                      {/* REASON — appears the moment a line stops matching the
+                          PO (short, excess, or a changed rate). Required: the
+                          receive route rejects a deviating line without one, and
+                          the admin alert quotes it. */}
+                      {deviates && (
+                        <tr className="bg-amber-50/40">
+                          <td colSpan={6} className="px-2 pb-2">
+                            <div className="flex flex-col sm:flex-row sm:items-center gap-1.5">
+                              <span className={`text-[10px] shrink-0 ${needsReason ? 'text-amber-800 font-semibold' : 'text-[#6B5744]'}`}>
+                                <AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5" />
+                                {label}{needsReason ? ' — reason required' : ''}
+                              </span>
+                              <input value={reason}
+                                     onChange={e => setReasons(r => ({ ...r, [it.id]: e.target.value }))}
+                                     placeholder="Why does this differ from the PO? e.g. vendor short-supplied; rate revised on bill #1234"
+                                     className={`flex-1 min-w-0 px-2 py-1 border rounded text-[11px] bg-white ${needsReason ? 'border-amber-400' : 'border-[#E8D5C4]'}`} />
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </Fragment>
                     );
                   })}
                 </tbody>
@@ -541,10 +729,30 @@ function ReceiveModal({ poId, onClose, onReceived }: { poId: string; onClose: ()
               </table>
             </div>
           )}
+
+          {/* Names every line still blocking the receive, so the receiver never
+              has to hunt for which row the disabled button is waiting on. */}
+          {missingReason.length > 0 && (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <div>
+                <div className="font-semibold">
+                  {missingReason.length} line(s) differ from the PO and still need a reason (min {MIN_REASON} characters):
+                </div>
+                <ul className="mt-0.5 space-y-0.5">
+                  {missingReason.map(d => (
+                    <li key={d.it.id}>• <span className="font-medium">{d.it.material_name}</span> — {d.label}</li>
+                  ))}
+                </ul>
+                <div className="mt-1 text-[10px]">The admin is alerted with the reason you give.</div>
+              </div>
+            </div>
+          )}
         </div>
         <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
           <button onClick={onClose} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
-          <button onClick={submit} disabled={saving || loading}
+          <button onClick={submit} disabled={saving || loading || missingReason.length > 0}
+                  title={missingReason.length > 0 ? missingList('Reason still needed on:\n') : undefined}
                   className="px-3 py-2 text-sm bg-green-600 hover:bg-green-700 text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <PackageCheck className="w-4 h-4" />}
             Confirm Receive

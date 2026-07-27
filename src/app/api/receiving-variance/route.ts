@@ -40,7 +40,12 @@ export async function GET(request: Request) {
         rm.name         AS material_name,
         rm.sku          AS material_sku,
         rm.unit         AS material_unit,
-        rm.pack_size, rm.purchase_unit,
+        rm.pack_size,
+        -- Resolve the PURCHASE unit here, the same expression the PO and GRN
+        -- queries use, so the client never has to guess: a material with a blank
+        -- or whitespace-only purchase_unit falls back to its recipe unit rather
+        -- than rendering an empty label.
+        COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS purchase_unit,
         gi.quantity_ordered,
         gi.quantity_received,
         gi.quantity_accepted,
@@ -50,7 +55,21 @@ export async function GET(request: Request) {
         rm.average_price,
         (gi.quantity_received - gi.quantity_ordered)  AS receive_delta,
         (gi.quantity_accepted - gi.quantity_ordered)  AS accept_delta,
-        ((gi.quantity_accepted - gi.quantity_ordered) * rm.average_price) AS accept_delta_value
+        -- Value the over/under-supply on the SAME basis as the quantity.
+        -- gi.quantity_* are PURCHASE units (kg, BTL, CASE) — the GRN stores the PO's
+        -- numbers unchanged — but rm.average_price is Rs per RECIPE unit (Rs/g).
+        -- Multiplying the two understated every variance by pack_size, which is why a
+        -- real 1 kg excess rendered as Rs 0. Prefer the line's own rate (gi.unit_price
+        -- is already Rs per purchase unit, and is what the rejected-value rollup below
+        -- has always used); fall back to the average lifted into purchase units, with
+        -- BOTH halves of the pack guard — pack_size > 1 AND recipe unit <> purchase unit.
+        ((gi.quantity_accepted - gi.quantity_ordered) * COALESCE(
+           NULLIF(gi.unit_price, 0),
+           rm.average_price * CASE
+             WHEN COALESCE(rm.pack_size, 1) > 1
+              AND LOWER(TRIM(rm.unit)) <> LOWER(TRIM(COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit)))
+             THEN rm.pack_size ELSE 1 END
+         )) AS accept_delta_value
       FROM goods_receipt_note_items gi
       JOIN goods_receipt_notes g ON g.id = gi.grn_id
       LEFT JOIN purchase_orders po ON po.id = g.po_id

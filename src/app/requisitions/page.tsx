@@ -130,6 +130,7 @@ export default function RequisitionsPage() {
   const [materials, setMaterials] = useState<Material[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [search, setSearch] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [creating, setCreating] = useState(false);
   // Draft being edited — when set, the create modal opens in edit mode (PUT).
@@ -201,7 +202,25 @@ export default function RequisitionsPage() {
   };
   useEffect(() => { reload(); }, []);
 
+  // Free-text search across the fields printed on the row, mirroring the Party
+  // Requisitions page. Applied AFTER the status tab so the two narrow together
+  // and the "N of M" counter reads against the tab you are looking at.
+  const searchMatch = (r: Requisition, q: string) => {
+    if (!q) return true;
+    const hay = [r.req_number, r.department_name, r.department_code, r.notes,
+                 r.event_name, r.customer, r.status]
+      .filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(q);
+  };
+
   const filtered = useMemo(() => {
+    const byStatus = statusFiltered(reqs, statusFilter);
+    const q = search.trim().toLowerCase();
+    return q ? byStatus.filter(r => searchMatch(r, q)) : byStatus;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reqs, statusFilter, search]);
+
+  function statusFiltered(reqs: Requisition[], statusFilter: string) {
     if (statusFilter === 'all') return reqs;
     // "Open" = awaiting an approval / decision. store_processed (partially
     // issued) is NOT open — the store has already acted on it; it's mid-flight.
@@ -214,7 +233,7 @@ export default function RequisitionsPage() {
     if (statusFilter === 'inbox-store') return reqs.filter(r => ['mgmt_approved', 'chef_approved', 'store_processed'].includes(r.status));
     if (statusFilter === 'partially-issued') return reqs.filter(r => r.status === 'store_processed');
     return reqs.filter(r => r.status === statusFilter);
-  }, [reqs, statusFilter]);
+  }
 
   const counts = useMemo(() => ({
     inbox_chef:  reqs.filter(r => r.status === 'submitted').length,
@@ -233,26 +252,45 @@ export default function RequisitionsPage() {
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
-      <div className="flex items-center justify-between mb-6">
-        <div className="flex items-center gap-3">
-          <ClipboardList className="w-7 h-7 text-[#af4408]" />
-          <div>
-            <h1 className="text-2xl font-bold text-[#2D1B0E]">Department Requisitions</h1>
-            <p className="text-xs text-[#6B5744]">Internal stock requests → HOD (Head of Department) → Store Manager → Vendor PO (admin approves) → Fulfilled.</p>
-          </div>
+      {/* Header matches /party-requisitions: icon inline, flex-1 title block,
+          flex-wrap so the actions drop to their own row on a narrow screen
+          instead of being squeezed until the button text wraps. */}
+      <div className="flex items-center gap-3 flex-wrap mb-5">
+        <ClipboardList className="w-6 h-6 text-[#af4408] shrink-0" />
+        {/* min-w is the wrap trigger: this page has TWO action buttons (Party has
+            one), so a small floor let them squeeze the heading onto two lines.
+            Keep enough width for the title and let the buttons wrap instead. */}
+        <div className="flex-1 min-w-[330px]">
+          <h1 className="text-xl font-semibold text-[#2D1B0E]">Department Requisitions</h1>
+          <p className="text-xs text-[#8B7355]">Internal stock requests → HOD (Head of Department) → Store Manager → Vendor PO (admin approves) → Fulfilled.</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 shrink-0">
           {viewer.role === 'admin' && (
             <button onClick={() => setImporting(true)}
-                    className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+                    className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2 whitespace-nowrap">
               <Upload className="w-4 h-4" /> Import Recaho Transfers
             </button>
           )}
           <button onClick={() => setCreating(true)}
-                  className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm flex items-center gap-2">
+                  className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm flex items-center gap-2 whitespace-nowrap">
             <Plus className="w-4 h-4" /> Raise Requisition
           </button>
         </div>
+      </div>
+
+      {/* Search — same control as /party-requisitions. Counter reads against the
+          ACTIVE tab, so "3 of 12" means 3 matches within the tab you are on. */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 flex items-center gap-2 mb-4">
+        <Search size={14} className="text-[#8B7355]" />
+        <input value={search} onChange={e => setSearch(e.target.value)}
+               placeholder="Search by req #, department, party or notes…"
+               className="flex-1 px-2 py-1 text-sm bg-transparent focus:outline-none" />
+        {search && (
+          <button onClick={() => setSearch('')} title="Clear search" className="text-[#8B7355] hover:text-[#af4408]">
+            <X size={12} />
+          </button>
+        )}
+        <span className="text-xs text-[#8B7355]">{filtered.length} of {statusFiltered(reqs, statusFilter).length}</span>
       </div>
 
       {/* Inbox call-outs */}

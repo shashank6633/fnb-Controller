@@ -15,13 +15,24 @@ export async function GET(req: Request) {
   // it to non-admin staff via the generic settings read.
   const isAdmin = me.role === 'admin';
   const ADMIN_ONLY_KEYS = new Set(['error_alert_phone']);
+  // PRE-EXISTING LEAK, closed here: this table is also where the app keeps its
+  // live credentials, and the unfiltered read below handed every one of them to
+  // any signed-in session — a captain or storekeeper could GET /api/settings and
+  // read the Gemini keys, the WhatsApp access token and verify token, the Slack
+  // webhook and the Google service-account JSON. Those same values are masked by
+  // whatsapp.ts's SECRET_KEYS, and /api/admin/slack-webhook refuses to show a
+  // non-admin even a MASKED copy — this route was the back door around all of it.
+  // Pattern-matched, not a fixed list, so a secret added later is redacted by
+  // DEFAULT rather than leaking until someone remembers to list it.
+  const SECRET_KEY_RE = /(token|api[_-]?key|_keys|secret|password|passwd|webhook|credential|sa_json|private)/i;
+  const isSecret = (k: string) => SECRET_KEY_RE.test(k) || ADMIN_ONLY_KEYS.has(k);
   if (key) {
-    if (ADMIN_ONLY_KEYS.has(key) && !isAdmin) return Response.json({ key, value: null });
+    if (isSecret(key) && !isAdmin) return Response.json({ key, value: null });
     const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as any;
     return Response.json({ key, value: r?.value ?? null });
   }
   const all = (db.prepare('SELECT key, value FROM settings').all() as any[])
-    .filter((row) => isAdmin || !ADMIN_ONLY_KEYS.has(row.key));
+    .filter((row) => isAdmin || !isSecret(row.key));
   return Response.json({ settings: all });
 }
 
@@ -49,6 +60,17 @@ export async function PUT(req: Request) {
   // admin-only, so this second door must be too).
   if (key === 'error_alert_phone' && me.role !== 'admin') {
     return Response.json({ error: 'Admin role required to change the error alert number' }, { status: 403 });
+  }
+  // Same self-lift reasoning as the backdate limit, and the sharpest case of it.
+  // Approving a PO is admin-only (purchase-orders/[id]/approve returns 403 on
+  // role !== 'admin'). Switching this key off makes submit auto-approve, and a
+  // manager also passes poWriteGate on receive — so a manager who could write it
+  // would go PUT '0' → submit own PO → auto-approved → receive, booking stock and
+  // rewriting average_price across every recipe with no admin anywhere in the
+  // chain. That is the approve gate defeated by exactly the role it denies.
+  // READ stays open (the settings page shows managers the switch, read-only).
+  if (key === 'po_require_admin_approval' && me.role !== 'admin') {
+    return Response.json({ error: 'Admin role required to change the PO approval requirement' }, { status: 403 });
   }
   db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, String(value ?? ''));
   return Response.json({ key, value });

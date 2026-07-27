@@ -57,19 +57,28 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    // PRE-EXISTING GAP, closed here: this handler read the session ONLY to decide
+    // the backdate exemption (`me?.role === 'admin'` below) and never rejected an
+    // anonymous caller — while proxy.ts merely checks that a session cookie is
+    // PRESENT, not that it is valid. So a forged cookie could POST a purchase:
+    // stock bump, a purchases row, and updateMaterialPrice rewriting average_price
+    // through every recipe. Mirrors the gate /api/grn already has.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const body = await request.json();
     const { material_id, vendor, brand, quantity, unit_price, date, notes,
-            is_emergency, payment_mode, emergency_reason, bill_no } = body;
+            is_emergency, payment_mode, emergency_reason, bill_no,
+            discount, delivery_charges } = body;
 
     if (!material_id || !quantity || !unit_price || !date) {
       return Response.json({ error: 'material_id, quantity, unit_price, and date are required' }, { status: 400 });
     }
 
     // Configurable backdate window: non-admins can't save a date older than N days
-    // or in the future; admins are exempt.
-    const me = await getCurrentUser();
-    const dateCheck = checkPurchaseDate(db, date, me?.role === 'admin');
+    // or in the future; admins are exempt. (`me` is resolved and null-checked at
+    // the top of the handler.)
+    const dateCheck = checkPurchaseDate(db, date, me.role === 'admin');
     if (!dateCheck.ok) return Response.json({ error: dateCheck.error }, { status: 400 });
 
     // Book the purchase against the outlet the user is currently viewing, the
@@ -121,10 +130,20 @@ export async function POST(request: Request) {
       }
       db.prepare(`
         INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
-                               is_emergency, payment_mode, emergency_reason, invoice_id, bill_no, outlet_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                               is_emergency, payment_mode, emergency_reason, invoice_id, bill_no, outlet_id,
+                               discount, delivery_charges, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       `).run(id, material_id, vendor || '', brand || '', quantity, unit_price, total_price, date, notes || '',
-              is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '', invoiceId, billNo, outletId);
+              is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '', invoiceId, billNo, outletId,
+              // RECORDED-ONLY columns, matching db.ts's contract: they never change
+              // unit_price/total_price, and readers compute
+              //   Total Inward = total_price − discount + cgst + sgst + delivery …
+              // So a caller must send `discount` ONLY when unit_price is still GROSS.
+              // The bill form deliberately sends none: it nets the discount into
+              // unit_price (the user's rule — a discount lowers what the goods cost),
+              // so passing it here as well would subtract it twice.
+              Math.max(0, Number(discount) || 0),
+              Math.max(0, Number(delivery_charges) || 0));
 
       // Stock is kept in RECIPE units (sales deduction, closing-stock variance
       // × average_price). quantity is entered in PURCHASE units, so multiply by

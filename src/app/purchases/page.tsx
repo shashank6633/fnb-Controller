@@ -83,7 +83,8 @@ interface BillLineItem {
   quantity: string;
   unit_price: string;
   line_total: number;
-  gst_share: number;
+  discount_share: number;
+  delivery_share: number;
   final_unit_price: number;
   /** 'btl' = qty is bottles (default; price per bottle).
    *  'case' = qty is cases; submit-time we expand to qty × case_size bottles. */
@@ -94,14 +95,62 @@ interface BillFormData {
   vendor: string;
   bill_number: string;
   date: string;
-  gst_percent: string;
-  gst_amount: string;
-  gst_mode: 'percent' | 'amount';
+  /** Recorded against the bill for vendor/spend reporting. Never enters unit cost. */
+  delivery_mode: 'percent' | 'amount';
+  delivery_value: string;
+  /** REDUCES unit cost — a discount genuinely lowers what the goods cost. */
+  discount_mode: 'percent' | 'amount';
+  discount_value: string;
   notes: string;
   items: BillLineItem[];
 }
 
 let billLineIdCounter = 1;
+
+/**
+ * One bill-level charge row: By % / By Amount + the resolved ₹ figure.
+ * Shared by Delivery Charges and Discount so the two always look and behave the
+ * same — the only difference is what each does to cost, which `hint` states.
+ */
+function ChargeRow({ label, hint, mode, value, onMode, onValue, placeholder, total, tone, negative }: {
+  label: string; hint: string;
+  mode: 'percent' | 'amount'; value: string;
+  onMode: (m: 'percent' | 'amount') => void;
+  onValue: (v: string) => void;
+  placeholder: string; total: number; tone: string; negative?: boolean;
+}) {
+  const name = label.replace(/\s+/g, '-').toLowerCase();
+  return (
+    <div className="flex items-center gap-4 flex-wrap">
+      <span className="text-sm font-medium text-[#6B5744] min-w-[130px]">
+        {label}
+        <span className="block text-[10px] font-normal text-[#8B7355]">{hint}</span>
+      </span>
+      <div className="flex items-center gap-2">
+        {(['percent', 'amount'] as const).map(m => (
+          <label key={m} className="flex items-center gap-1.5 cursor-pointer">
+            {/* name= groups the pair, so the two rows don't share a selection */}
+            <input type="radio" name={name} checked={mode === m} onChange={() => onMode(m)} className="accent-[#af4408]" />
+            <span className="text-sm text-[#6B5744]">{m === 'percent' ? 'By %' : 'By Amount'}</span>
+          </label>
+        ))}
+      </div>
+      <div className="flex items-center gap-1">
+        {mode === 'amount' && <span className="text-sm text-[#8B7355]">₹</span>}
+        <input
+          type="number" step="0.01" min="0" value={value}
+          onChange={e => onValue(e.target.value)}
+          placeholder={placeholder}
+          className="w-28 px-3 py-1.5 bg-white border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+        />
+        <span className="text-sm text-[#8B7355]">{mode === 'percent' ? '%' : ''}</span>
+      </div>
+      <span className={`text-sm font-medium ml-auto ${tone}`}>
+        {negative && total > 0 ? '- ' : ''}{formatCurrency(total)}
+      </span>
+    </div>
+  );
+}
 
 function emptyBillLine(): BillLineItem {
   return {
@@ -111,7 +160,8 @@ function emptyBillLine(): BillLineItem {
     quantity: '',
     unit_price: '',
     line_total: 0,
-    gst_share: 0,
+    discount_share: 0,
+    delivery_share: 0,
     final_unit_price: 0,
     entry_mode: 'btl',
   };
@@ -121,9 +171,10 @@ const emptyBill: BillFormData = {
   vendor: '',
   bill_number: '',
   date: todayString(),
-  gst_percent: '',
-  gst_amount: '',
-  gst_mode: 'percent',
+  delivery_mode: 'amount',
+  delivery_value: '',
+  discount_mode: 'percent',
+  discount_value: '',
   notes: '',
   items: [emptyBillLine(), emptyBillLine()],
 };
@@ -487,27 +538,39 @@ export default function PurchasesPage() {
 
     const subtotal = items.reduce((s, i) => s + i.line_total, 0);
 
-    let gstAmount = 0;
-    if (billData.gst_mode === 'percent') {
-      const pct = parseFloat(billData.gst_percent) || 0;
-      gstAmount = Math.round(subtotal * pct / 100 * 100) / 100;
-    } else {
-      gstAmount = parseFloat(billData.gst_amount) || 0;
-    }
+    const pctOrFlat = (mode: 'percent' | 'amount', raw: string) => {
+      const v = parseFloat(raw) || 0;
+      if (v <= 0) return 0;
+      return mode === 'percent' ? Math.round(subtotal * v / 100 * 100) / 100 : v;
+    };
 
-    const grandTotal = Math.round((subtotal + gstAmount) * 100) / 100;
+    // A discount can never exceed the goods value — that would produce a negative
+    // unit cost and poison average_price. Clamp and flag it instead.
+    const rawDiscount = pctOrFlat(billData.discount_mode, billData.discount_value);
+    const discountAmount = Math.min(rawDiscount, subtotal);
+    const discountClamped = rawDiscount > subtotal;
+    const deliveryAmount = pctOrFlat(billData.delivery_mode, billData.delivery_value);
 
-    // Distribute GST proportionally to each line item
-    const itemsWithGst = items.map((item) => {
+    // What you actually pay the vendor. Delivery is part of the bill total but NOT
+    // of the goods cost — see the per-line split below.
+    const grandTotal = Math.round((subtotal - discountAmount + deliveryAmount) * 100) / 100;
+
+    const pricedItems = items.map((item) => {
       const proportion = subtotal > 0 ? item.line_total / subtotal : 0;
-      const gstShare = Math.round(gstAmount * proportion * 100) / 100;
-      const totalWithGst = item.line_total + gstShare;
+      const discountShare = Math.round(discountAmount * proportion * 100) / 100;
+      const deliveryShare = Math.round(deliveryAmount * proportion * 100) / 100;
+      // DISCOUNT lowers the cost basis; DELIVERY does not touch it. Delivery is
+      // carried per line for vendor/spend reporting only — the same rule the GRN
+      // and bulk-upload charge columns follow, so a bill costs the same whichever
+      // screen books it. (The old GST control folded tax INTO this number, which
+      // inflated average_price and every recipe cost built on it.)
+      const netTotal = item.line_total - discountShare;
       const qty = parseFloat(item.quantity) || 0;
-      const finalUnitPrice = qty > 0 ? Math.round(totalWithGst / qty * 100) / 100 : 0;
-      return { ...item, gst_share: gstShare, final_unit_price: finalUnitPrice };
+      const finalUnitPrice = qty > 0 ? Math.round(netTotal / qty * 100) / 100 : 0;
+      return { ...item, discount_share: discountShare, delivery_share: deliveryShare, final_unit_price: finalUnitPrice };
     });
 
-    return { items: itemsWithGst, subtotal, gstAmount, grandTotal };
+    return { items: pricedItems, subtotal, discountAmount, deliveryAmount, grandTotal, discountClamped };
   })();
 
   const handleBillSubmit = async (e: React.FormEvent) => {
@@ -564,8 +627,17 @@ export default function PurchasesPage() {
           // The VENDOR's bill number as a real field (it also stays in notes for
           // back-compat). The server mints our Invoice ID from it.
           bill_no: billData.bill_number || '',
+          // DELIVERY only. Do NOT send `discount` here: unit_price above is
+          // already net of it, and purchases.discount is a RECORDED-ONLY column
+          // that every reader subtracts a second time (db.ts's "Total Inward =
+          // total_price − discount + cgst + …", this page's own Total Inward
+          // column, the bulk preview, /api/grn). Writing both netted it twice —
+          // a ₹1,000 discount on a ₹10,000 bill rendered ₹8,500 instead of
+          // ₹9,500. The rupees stay visible in the note below.
+          delivery_charges: item.delivery_share,
           notes: [`Bill #${billData.bill_number || 'N/A'}`,
-                  `GST: ₹${item.gst_share} included`,
+                  item.discount_share > 0 ? `Discount ₹${item.discount_share} (netted off rate)` : '',
+                  item.delivery_share > 0 ? `Delivery ₹${item.delivery_share} (not in rate)` : '',
                   billData.notes, ...noteExtras].filter(Boolean).join(' | '),
         };
 
@@ -1914,61 +1986,42 @@ export default function PurchasesPage() {
                 </div>
               </div>
 
-              {/* GST Section */}
-              <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4">
-                <div className="flex items-center gap-4 flex-wrap">
-                  <span className="text-sm font-medium text-[#6B5744]">GST:</span>
-                  <div className="flex items-center gap-2">
-                    <label className="flex items-center gap-1.5 cursor-pointer">
-                      <input
-                        type="radio"
-                        checked={billData.gst_mode === 'percent'}
-                        onChange={() => updateBillField('gst_mode', 'percent')}
-                        className="accent-[#af4408]"
-                      />
-                      <span className="text-sm text-[#6B5744]">By %</span>
-                    </label>
-                    <label className="flex items-center gap-1.5 cursor-pointer">
-                      <input
-                        type="radio"
-                        checked={billData.gst_mode === 'amount'}
-                        onChange={() => updateBillField('gst_mode', 'amount')}
-                        className="accent-[#af4408]"
-                      />
-                      <span className="text-sm text-[#6B5744]">By Amount</span>
-                    </label>
-                  </div>
-                  {billData.gst_mode === 'percent' ? (
-                    <div className="flex items-center gap-1">
-                      <input
-                        type="number"
-                        step="0.01"
-                        min="0"
-                        value={billData.gst_percent}
-                        onChange={(e) => updateBillField('gst_percent', e.target.value)}
-                        placeholder="e.g. 18"
-                        className="w-24 px-3 py-1.5 bg-white border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-                      />
-                      <span className="text-sm text-[#8B7355]">%</span>
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-1">
-                      <span className="text-sm text-[#8B7355]">₹</span>
-                      <input
-                        type="number"
-                        step="0.01"
-                        min="0"
-                        value={billData.gst_amount}
-                        onChange={(e) => updateBillField('gst_amount', e.target.value)}
-                        placeholder="GST amount"
-                        className="w-32 px-3 py-1.5 bg-white border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-                      />
-                    </div>
-                  )}
-                  <span className="text-sm text-[#af4408] font-medium ml-auto">
-                    GST: {formatCurrency(billCalc.gstAmount)}
-                  </span>
-                </div>
+              {/* Bill-level charges. Delivery is RECORDED ONLY; Discount REDUCES the
+                  recorded cost of the goods. Both are split across the lines in
+                  proportion to line value. (This replaced a GST control that folded
+                  tax into every unit price — inflating average_price and every recipe
+                  cost derived from it, with the tax stored nowhere it could be
+                  reclaimed.) */}
+              <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4 space-y-3">
+                <ChargeRow
+                  label="Delivery Charges"
+                  hint="recorded on the bill — does not change item cost"
+                  mode={billData.delivery_mode}
+                  value={billData.delivery_value}
+                  onMode={(m) => updateBillField('delivery_mode', m)}
+                  onValue={(v) => updateBillField('delivery_value', v)}
+                  placeholder="e.g. 100"
+                  total={billCalc.deliveryAmount}
+                  tone="text-[#6B5744]"
+                />
+                <ChargeRow
+                  label="Discount"
+                  hint="reduces item cost"
+                  mode={billData.discount_mode}
+                  value={billData.discount_value}
+                  onMode={(m) => updateBillField('discount_mode', m)}
+                  onValue={(v) => updateBillField('discount_value', v)}
+                  placeholder="e.g. 10"
+                  total={billCalc.discountAmount}
+                  tone="text-emerald-700"
+                  negative
+                />
+                {billCalc.discountClamped && (
+                  <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                    Discount is larger than the bill&apos;s item value — capped at {formatCurrency(billCalc.subtotal)}{' '}
+                    so the cost can&apos;t go negative.
+                  </p>
+                )}
               </div>
 
               {/* Line Items */}
@@ -2000,7 +2053,7 @@ export default function PurchasesPage() {
                         <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="Number of bottles / cans / packs (not cases)">Qty * <span className="text-[10px] font-normal text-[#8B7355]">(bottles)</span></th>
                         <th className="text-right py-2.5 px-3 font-medium w-[12%]" title="Per-bottle vendor rate">Unit Price (₹) * <span className="text-[10px] font-normal text-[#8B7355]">/btl</span></th>
                         <th className="text-right py-2.5 px-3 font-medium w-[10%]">Line Total</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[10%]">GST Share</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[10%]">Discount</th>
                         <th className="text-right py-2.5 px-3 font-medium w-[12%]">Final Unit ₹</th>
                         <th className="py-2.5 px-2 w-8"></th>
                       </tr>
@@ -2083,9 +2136,9 @@ export default function PurchasesPage() {
                             <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Line Total</span>
                             {formatCurrency(item.line_total)}
                           </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono text-amber-600 block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">GST Share</span>
-                            {formatCurrency(item.gst_share)}
+                          <td className="py-2 px-3 text-right text-xs font-mono text-emerald-700 block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Discount</span>
+                            {item.discount_share > 0 ? `- ${formatCurrency(item.discount_share)}` : formatCurrency(0)}
                           </td>
                           <td className="py-2 px-3 text-right text-xs font-mono font-semibold text-[#af4408] block md:table-cell">
                             <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Final Unit ₹</span>
@@ -2117,22 +2170,28 @@ export default function PurchasesPage() {
 
               {/* Bill Summary */}
               <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4">
-                <div className="grid grid-cols-3 gap-4 text-center">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-center">
                   <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">Subtotal (Before GST)</p>
+                    <p className="text-xs text-[#8B7355] mb-0.5">Items Subtotal</p>
                     <p className="text-lg font-bold text-[#2D1B0E]">{formatCurrency(billCalc.subtotal)}</p>
                   </div>
                   <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">GST Amount</p>
-                    <p className="text-lg font-bold text-amber-600">{formatCurrency(billCalc.gstAmount)}</p>
+                    <p className="text-xs text-[#8B7355] mb-0.5">Discount</p>
+                    <p className="text-lg font-bold text-emerald-700">- {formatCurrency(billCalc.discountAmount)}</p>
                   </div>
                   <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">Grand Total (Incl. GST)</p>
+                    <p className="text-xs text-[#8B7355] mb-0.5">Delivery</p>
+                    <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.deliveryAmount)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-[#8B7355] mb-0.5">Bill Total</p>
                     <p className="text-lg font-bold text-[#af4408]">{formatCurrency(billCalc.grandTotal)}</p>
                   </div>
                 </div>
                 <p className="text-[10px] text-[#8B7355] text-center mt-2">
-                  GST is proportionally distributed across items. Final Unit Price = (Line Total + GST Share) / Qty. This price is stored as purchase price.
+                  Discount and Delivery are split across items in proportion to line value.
+                  Final Unit Price = (Line Total − Discount Share) ÷ Qty, and that is what is stored as the purchase price —
+                  so a discount lowers item cost while delivery is recorded on the bill without changing it.
                 </p>
               </div>
 

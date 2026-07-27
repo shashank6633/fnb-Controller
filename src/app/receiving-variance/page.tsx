@@ -204,7 +204,11 @@ export default function ReceivingVariancePage() {
               </thead>
               <tbody>
                 {data!.rows.map((r, idx) => {
-                  const u = r.material_unit;
+                  // Ordered / received / accepted are PURCHASE units — a PO is raised
+                  // in kg / BTL / CASE and the GRN keeps those numbers — so label them
+                  // with the purchase unit. Showing the recipe unit (g, ml) read as a
+                  // pack_size-sized error to anyone checking the sheet.
+                  const u = r.purchase_unit || r.material_unit;
                   const dShort = r.accept_delta < 0;
                   const dExcess = r.accept_delta > 0;
                   return (

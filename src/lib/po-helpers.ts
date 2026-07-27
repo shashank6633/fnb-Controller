@@ -64,3 +64,56 @@ export function recalcTotal(db: ReturnType<typeof getDb>, poId: string) {
   `).get(poId) as any;
   db.prepare(`UPDATE purchase_orders SET total_cost = ?, updated_at = datetime('now') WHERE id = ?`).run(r.t, poId);
 }
+
+/** Is the admin approval step switched ON? Reads `po_require_admin_approval`
+ *  from the settings KV (same table as the `po_send_to_vendor` toggle).
+ *  "1" — or a MISSING row — means approval is required; only the exact stored
+ *  string "0" turns it off, so a blank/garbage value still requires approval.
+ *  FAIL-SAFE: any throw (table missing on an un-migrated DB, locked file) also
+ *  returns true. Approval is a spend control — a failed read must never be the
+ *  thing that silently lets a PO skip it. */
+export function requiresAdminApproval(db: ReturnType<typeof getDb>): boolean {
+  try {
+    const r = db.prepare('SELECT value FROM settings WHERE key = ?').get('po_require_admin_approval') as
+      | { value?: string }
+      | undefined;
+    return String(r?.value ?? '1') !== '0';
+  } catch {
+    return true;
+  }
+}
+
+/** Zero-rate gate. Returns null when every line has a usable rate, else the
+ *  ready-to-return error message naming the offending material.
+ *  A 0/blank rate is legal on a DRAFT on purpose (Smart Reorder drafts a line
+ *  whose ₹/purchase-unit is not known yet — see lineSanityError in
+ *  /api/purchase-orders/route.ts), but the last decision gate before the vendor
+ *  ships must refuse it: [id]/receive rejects a 0 rate on every line it books (a
+ *  ₹0 purchases row makes updateMaterialPrice wipe the material's average_price
+ *  to 0 and cascade a "free" ingredient through every recipe), so leaving it to
+ *  receive strands goods the warehouse is already holding.
+ *  SHARED ON PURPOSE: this lives here, not inline in [id]/approve, because when
+ *  `po_require_admin_approval` is off the submit path auto-approves and never
+ *  reaches that route — both paths must run this or turning the switch off would
+ *  remove the only thing standing between a ₹0 draft and the books.
+ *  Same JOIN receive uses, so this blocks exactly the lines receive would
+ *  process. Number.isFinite first — a bare `<= 0` is false for NaN. */
+export function zeroRateBlocker(db: ReturnType<typeof getDb>, poId: string): string | null {
+  const rateLines = db.prepare(`
+    SELECT poi.unit_price, rm.name AS material_name,
+           COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit
+    FROM purchase_order_items poi
+    JOIN raw_materials rm ON rm.id = poi.material_id
+    WHERE poi.po_id = ?
+  `).all(poId) as any[];
+  for (const line of rateLines) {
+    const px = Number(line.unit_price);
+    if (!Number.isFinite(px) || px <= 0) {
+      // Unit label = the PURCHASE unit: a PO line's rate is ₹ per purchase
+      // unit (canon), so "₹/kg" here, never the recipe unit.
+      const unit = String(line.material_purchase_unit || '').trim() || 'unit';
+      return `Missing or zero rate on "${line.material_name}" (${px}). Approving commits this PO and receiving it would rewrite the material's average price, so the line needs a real ₹/${unit} — reject this PO, revise it with the rate and re-submit.`;
+    }
+  }
+  return null;
+}
