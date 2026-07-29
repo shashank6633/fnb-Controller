@@ -187,7 +187,10 @@ export default function ClosingOverviewPage() {
           dates: json?.dates,
         });
       } catch (e: unknown) {
-        if (alive) { setError((e as Error)?.message || 'Failed to load'); setData(null); }
+        // Keep whatever board is already on screen. Blanking it on a flaky-wifi
+        // refresh threw away a good read and made the degraded-refresh banner
+        // (which needs `error && data`) unreachable.
+        if (alive) setError((e as Error)?.message || 'Failed to load');
       } finally {
         if (alive) setLoading(false);
       }

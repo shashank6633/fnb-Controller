@@ -352,7 +352,7 @@ export default function PartyRequisitionsPage() {
           customer:    editingReq.customer || '',
           // event_notes is the field the composer writes; `notes` is the legacy
           // fallback (it is now the cart's justification field).
-          event_notes: editingReq.event_notes || editingReq.notes || '',
+          event_notes: editingReq.event_notes || '',
         },
       };
     }

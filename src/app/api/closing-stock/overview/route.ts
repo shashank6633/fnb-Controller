@@ -91,7 +91,10 @@ export async function GET(request: Request) {
         COALESCE(NULLIF(TRIM(rm.storage_location), ''), '${UNASSIGNED}') AS location,
         CASE WHEN d.id IS NULL THEN '${STORE_KEY}'
              ELSE COALESCE(NULLIF(TRIM(d.parent_id), ''), d.id) END      AS dept_key,
-        COUNT(*)                                         AS counted,
+        -- DISTINCT materials, not rows: the denominator (total_items) counts
+        -- materials, and a material counted twice on one date (two departments,
+        -- or a re-count) made the cell read "2 of 1".
+        COUNT(DISTINCT cs.material_id)                   AS counted,
         SUM(cs.physical_stock * rm.average_price)        AS physical_value,
         SUM(cs.system_stock   * rm.average_price)        AS system_value,
         SUM(cs.variance_value)                           AS variance_value,

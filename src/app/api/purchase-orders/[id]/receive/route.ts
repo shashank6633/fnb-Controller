@@ -741,6 +741,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               FROM requisition_items ri
               JOIN raw_materials rm ON rm.id = ri.material_id
               WHERE ri.req_id = ?
+                -- A line the chef or the store REFUSED never leaves the store, so
+                -- it can never be consumed. Without this filter a rejected line
+                -- still carried its quantity_requested into the fallback below.
+                AND COALESCE(ri.is_rejected, 0) = 0
+                AND COALESCE(ri.store_rejected, 0) = 0
             `).all(po.requisition_id) as any[];
             const decStock = db.prepare(`
               UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now')
@@ -757,7 +762,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             const auditItems: any[] = [];
             let totalCost = 0;
             for (const it of reqItems) {
-              const issuedReq = Number(it.quantity_issued) || Number(it.quantity_requested) || 0;
+              /* EFFECTIVE QTY — the house rule (store-issue/route.ts, dept-stock,
+                 party-approvals): what the chef APPROVED, falling back to what was
+                 requested only when no approval was recorded. The old fallback was
+                 raw quantity_requested, so a line the chef trimmed 10 → 4, or
+                 rejected outright, still deducted 10 — and once the pack factor
+                 below was applied that became 7,500 ml of a material nobody
+                 released. Cap at the approved figure and this cannot recur. */
+              const effApproved = (it.chef_approved_qty != null
+                ? Number(it.chef_approved_qty)
+                : Number(it.quantity_requested)) || 0;
+              const issuedReq = Math.min(Number(it.quantity_issued) || effApproved, effApproved);
               if (issuedReq <= 0) continue;
               // ri.unit → RECIPE units. Requisition quantities are stored in the
               // LINE's OWN unit (option B), so a "2 BTL" line is TWO BOTTLES —

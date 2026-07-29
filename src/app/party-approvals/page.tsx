@@ -1031,8 +1031,13 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
                 </div>
                 {/* A negative approved qty is never valid — see the matching
                     clamp on the requisitions approve grid. */}
+                {/* Keep the RAW string: round-tripping through Number() ate the
+                    decimal point mid-typing ("2." -> "2"), so a fractional party
+                    qty like 2.5 kg became untypeable. min= stops the spinner;
+                    a typed/pasted minus is stripped, and the value is clamped
+                    where it is actually used, not while the chef is typing. */}
                 <input type="number" step="any" min={0} value={it.qty}
-                       onChange={e => update(i, { qty: String(Math.max(0, Number(e.target.value) || 0)) })}
+                       onChange={e => update(i, { qty: e.target.value.replace(/^-+/, '') })}
                        className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
                 <span className="col-span-1 text-xs text-[#8B7355] py-2" title="Unit this line was requested in">{it.unit || m?.unit || ''}</span>
                 <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}

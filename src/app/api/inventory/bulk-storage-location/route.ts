@@ -107,7 +107,17 @@ export async function POST(request: Request) {
 
     let updated = 0;
     let remainingBlank = 0;
+    // Snapshot BEFORE the write, inside the same transaction, so the audit row
+    // records exactly what each material held. Capped so a whole-category apply
+    // can't bloat the event; the count tells you if it was truncated.
+    let beforeImage: Array<{ id: string; storage_location: string }> = [];
     db.transaction(() => {
+      beforeImage = (category
+        ? db.prepare(`SELECT id, COALESCE(storage_location,'') AS storage_location
+                      FROM raw_materials WHERE category COLLATE NOCASE = ? LIMIT 500`).all(category)
+        : db.prepare(`SELECT id, COALESCE(storage_location,'') AS storage_location
+                      FROM raw_materials WHERE id IN (${ids.map(() => '?').join(',') || "''"}) LIMIT 500`).all(...ids)
+      ) as Array<{ id: string; storage_location: string }>;
       if (category) {
         updated = updByCategory.run(storageLocation, category).changes;
       } else {
@@ -119,6 +129,10 @@ export async function POST(request: Request) {
         entity_type: 'raw_material',
         entity_id: 'bulk',
         actor_email: me.email,
+        // BEFORE image — a bulk apply can rewrite hundreds of rows in one click
+        // and there is no undo button. Recording each material's prior value
+        // makes the change reversible from the audit log alone.
+        before: { previous: beforeImage },
         after: {
           storage_location: storageLocation,
           category: category || null,

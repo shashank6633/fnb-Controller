@@ -271,9 +271,28 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }
 
       // --- 3. Mark the requisition as processed ---
-      // If there was no shortfall (all issued from stock), jump straight to 'fulfilled'.
-      const finalStatus = linkedPoId ? 'store_processed' : 'fulfilled';
-      const fulfilledAt = linkedPoId ? null : new Date().toISOString();
+      // 'fulfilled' means NOTHING is still owed to the department. The old rule
+      // asked only "was a PO raised?", so issuing 3,000 against an approved
+      // 4,500 and raising no PO closed the requisition outright: it dropped out
+      // of the store queue after a day and the 1,500 balance was never handed
+      // over. Re-read the lines this transaction just wrote and apply the SAME
+      // test store-issue uses — effective qty = chef_approved_qty ??
+      // quantity_requested, either rejection counts as done, and a deferred line
+      // is never done even at full quantity.
+      const fresh = db.prepare(`
+        SELECT is_rejected, store_rejected, quantity_requested, chef_approved_qty,
+               quantity_issued, deferred_until
+        FROM requisition_items WHERE req_id = ?
+      `).all(id) as any[];
+      const allDone = fresh.every(it => {
+        if (it.is_rejected) return true;
+        if (it.store_rejected) return true;
+        const eff = (it.chef_approved_qty != null ? Number(it.chef_approved_qty) : Number(it.quantity_requested)) || 0;
+        const got = Number(it.quantity_issued) || 0;
+        return got >= eff && !it.deferred_until;
+      });
+      const finalStatus = (linkedPoId || !allDone) ? 'store_processed' : 'fulfilled';
+      const fulfilledAt = finalStatus === 'fulfilled' ? new Date().toISOString() : null;
 
       // --- 3a. PARTY requisition TRANSFER (store → department) ---
       // Business rule: party requisitions consume directly (no recipe). On the
@@ -283,7 +302,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // (via the existing party_consumption ledger row), the store deduction, and
       // the department credit — so it is safe to call from both fulfilment paths
       // without any double-transfer. Only fire when no PO is being raised.
-      if (finalStatus === 'fulfilled' && r.purpose === 'party') {
+      //
+      // The trigger stays "no PO raised" and deliberately does NOT follow
+      // finalStatus any more. A short issue is now 'store_processed', and gating
+      // the transfer on fulfilment would stop party stock leaving the store on
+      // the day it physically leaves — and because the party_consumption ledger
+      // row makes the transfer one-shot, a later top-up could never move the
+      // balance either. Status honesty and transfer timing are separate calls.
+      if (!linkedPoId && r.purpose === 'party') {
         applyPartyFulfillment(db, id, me.email);
       }
       db.prepare(`

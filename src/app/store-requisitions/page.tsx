@@ -16,6 +16,12 @@
  *   store_processed → fulfilled (when every non-rejected, non-deferred line
  *                                has quantity_issued >= chef_approved_qty).
  *
+ * The tabs are ROLL-UPS of the line columns, not a second status field, so one
+ * requisition can legitimately sit in more than one: a half-issued req is in
+ * "Issued Today" (goods did move) AND "Balance Pending" (goods are still owed).
+ * "Deferred" is NOT a synonym for either — it means a line carries a promised
+ * date/time (deferred_until), which only a human sets.
+ *
  * Each line carries an `issue_history` JSON array of {qty, at, by, note},
  * so split-issues are fully traceable. The /audit page shows the per-line
  * + req-level audit_events written by the store-issue endpoint.
@@ -25,9 +31,10 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Package, Loader2, RefreshCw, Search, Clock, CheckCircle2, AlertCircle,
   Send, RotateCcw, ChevronRight, ChevronDown, History, User as UserIcon, XCircle,
+  Hourglass,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { fmtIST } from '@/lib/format-date';
+import { fmtIST, fmtISTIsoDate, todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import { packFactor } from '@/lib/pack-units';
 
@@ -67,8 +74,17 @@ interface Requisition {
   mgmt_approved_at: string | null; store_processed_at: string | null;
   store_processed_by: string | null;
   event_name?: string; event_date?: string;
+  fulfilled_at?: string | null;
   items: ReqLine[];
   total_lines: number; lines_issued: number; lines_deferred: number; lines_open: number;
+  /** Lines with 0 < issued < effective — handed over, but not in full. */
+  lines_partial: number;
+  /** Σ max(0, effective − issued) over non-rejected lines. MIXED UNITS by
+   *  design (each line carries its own unit), so this is only ever asked
+   *  `> 0` — "is anything still owed?". Never render it as a number. */
+  qty_outstanding: number;
+  /** Did any line move goods today (IST)? Independent of `status`. */
+  issued_today: boolean;
 }
 
 // All timestamps render in IST (Asia/Kolkata) via the shared formatter.
@@ -117,9 +133,11 @@ export default function StoreRequisitionsPage() {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState<'open' | 'deferred' | 'today_fulfilled' | 'issued_log'>('open');
+  const [filter, setFilter] = useState<StoreTab>('open');
   // Issued-log state (date range, fetched separately from the queue).
-  const todayStr = new Date().toISOString().slice(0, 10);
+  // IST, not UTC: before 05:30 IST a UTC "today" is still yesterday's date, and
+  // the store opens its log expecting the day it is standing in.
+  const todayStr = todayIST();
   const [logFrom, setLogFrom] = useState(todayStr);
   const [logTo, setLogTo] = useState(todayStr);
   const [log, setLog] = useState<{ events: any[]; totals: any } | null>(null);
@@ -190,9 +208,16 @@ export default function StoreRequisitionsPage() {
     if (lines.length === 0) { alert('No selected items to issue.'); return; }
     setIssuingSelected(req.id);
     try {
+      const resolvedLines = lines.map(l => ({ l, r: resolveIssueQty(l, l.remaining) }));
+      const needReason = resolvedLines.filter(x => x.r.over && x.r.note.length < 3);
+      if (needReason.length > 0) {
+        alert('These lines are being issued OVER what was approved — say why first:\n'
+          + needReason.map(x => `• ${x.l.material_name}`).join('\n'));
+        return;
+      }
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
         method: 'POST',
-        body: { lines: lines.map(l => ({ id: l.id, action: 'issue', quantity: l.remaining })) },
+        body: { lines: resolvedLines.map(x => ({ id: x.l.id, action: 'issue', quantity: x.r.qty, note: x.r.note })) },
       });
       const j = await r.json();
       if (!r.ok) { alert(j.error || 'Issue selected failed'); return; }
@@ -222,16 +247,19 @@ export default function StoreRequisitionsPage() {
       // because those filter on r.date (when the req was raised), not on
       // fulfilled_at (when items were issued). Filter client-side instead.
       // Limit to recent fulfilled reqs so the list doesn't balloon.
-      const todayPrefix = new Date().toISOString().slice(0, 10);
+      const todayPrefix = todayIST();
       // Pull every fulfilled req (both purposes). Party reqs live on
       // /party-approvals for the approval workflow, but once Mgmt-approved
       // they're issued from the store here too, so they belong in this log.
       const fulfilled = await fetchJson(`/api/requisitions?status=fulfilled${deptId ? `&department_id=${deptId}` : ''}`);
       const fulfilledRaw: any[] = (fulfilled.requisitions || fulfilled.list || fulfilled.items || fulfilled) as any[];
       const fulfilledToday = (fulfilledRaw || []).filter((rq: any) => {
-        const ts = String(rq.fulfilled_at || rq.store_processed_at || '');
-        // fulfilled_at may be ISO ("2026-05-26T13:45:00") or SQLite ("2026-05-26 13:45:00")
-        return ts.startsWith(todayPrefix);
+        // fulfilled_at may be ISO ("2026-05-26T13:45:00") or SQLite ("2026-05-26 13:45:00");
+        // both are UTC, so compare on the IST CALENDAR DAY rather than the raw
+        // prefix — a 23:10 IST hand-over is stamped 17:40 UTC of the same date,
+        // but a 01:00 IST one is stamped on the previous UTC date and a raw
+        // prefix match would drop it off the store's own day.
+        return fmtISTIsoDate(rq.fulfilled_at || rq.store_processed_at) === todayPrefix;
       });
       const fulfilledDetailed = await Promise.all(
         fulfilledToday.map(async (rq: any) => {
@@ -275,27 +303,45 @@ export default function StoreRequisitionsPage() {
     }).catch(() => {});
   }, []);
 
-  const filtered = useMemo(() => {
-    let rows = list;
-    if (search) {
-      const q = search.toLowerCase();
-      rows = rows.filter(r => r.req_number?.toLowerCase().includes(q)
-        || r.department_name?.toLowerCase().includes(q)
-        || r.event_name?.toLowerCase().includes(q));
-    }
-    if (filter === 'open') {
-      // pending issue: status != fulfilled AND at least one open line
-      rows = rows.filter(r => r.status !== 'fulfilled' && r.lines_open > 0);
-    } else if (filter === 'deferred') {
-      rows = rows.filter(r => r.lines_deferred > 0);
-    } else if (filter === 'today_fulfilled') {
-      rows = rows.filter(r => r.status === 'fulfilled');
-    }
-    return rows;
-  }, [list, filter, search]);
+  // The search narrows the whole list first; matchesTab then slices it. Both the
+  // body below and the tab badges read this same searched set through the same
+  // predicate, so a badge can never promise rows the tab won't render.
+  const searched = useMemo(() => {
+    if (!search) return list;
+    const q = search.toLowerCase();
+    return list.filter(r => r.req_number?.toLowerCase().includes(q)
+      || r.department_name?.toLowerCase().includes(q)
+      || r.event_name?.toLowerCase().includes(q));
+  }, [list, search]);
+
+  const filtered = useMemo(
+    () => searched.filter(r => matchesTab(r, filter)),
+    [searched, filter],
+  );
 
   const toggleRow = (id: string) => {
     setExpanded(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  };
+
+  /* THE one place an issue quantity is decided — used by "Issue Now" AND by
+     "Issue All Items" / "Issue Selected". The bulk buttons used to post the
+     approved remainder and ignore whatever the store had typed, so a store that
+     handed over 10 against an approved 3 still recorded 3 whenever it used the
+     big green button. Anything typed for a line now wins on every path.
+     Returns the qty in the LINE's stored unit, plus whether it is an over-issue. */
+  const resolveIssueQty = (line: ReqLine, outstanding: number) => {
+    const U = lineUnits(line);
+    const typed = editQty[line.id];
+    const typedPU = Number(typed);
+    const hasTyped = typed !== undefined && String(typed).trim() !== '' && Number.isFinite(typedPU);
+    // Typing exactly what the row displays means "all of it" — post the exact
+    // outstanding rather than a 3-dp round trip that leaves a residue.
+    const saysOutstanding = hasTyped && Math.abs(typedPU - U.toPU(outstanding)) < 1e-9;
+    const qty = !hasTyped || saysOutstanding ? outstanding : U.fromPU(typedPU);
+    const over = qty - outstanding > 1e-9;
+    // The reason belongs to an OVER-issue. Left unguarded, a reason typed for an
+    // abandoned over-issue attached itself to the next within-approval issue.
+    return { qty, over, note: over ? (issueNotes[line.id] || '').trim() : '' };
   };
 
   const issueLine = async (req: Requisition, line: ReqLine, qtyOverride?: number) => {
@@ -316,16 +362,8 @@ export default function StoreRequisitionsPage() {
     // Anything else is a deliberate different number and converts normally (and
     // is NOT clamped — issuing more than outstanding is a real thing a store
     // does, and silently truncating it would hide stock that physically left).
-    const U = lineUnits(line);
-    const typed = editQty[line.id];
-    const typedPU = Number(typed);
-    const saysOutstanding = typed !== undefined && Number.isFinite(typedPU)
-      && Math.abs(typedPU - U.toPU(outstanding)) < 1e-9;
-    const qty = qtyOverride != null
-      ? qtyOverride
-      : (typed === undefined || saysOutstanding)
-        ? outstanding
-        : U.fromPU(typedPU);
+    const resolved = resolveIssueQty(line, outstanding);
+    const qty = qtyOverride != null ? qtyOverride : resolved.qty;
     if (!qty || qty <= 0) { alert('Enter a quantity > 0'); return; }
     setBusyLine(line.id);
     try {
@@ -417,9 +455,16 @@ export default function StoreRequisitionsPage() {
     if (lines.length === 0) { alert('No open items to issue.'); return; }
     setIssuingAll(true);
     try {
+      const resolvedLines = lines.map(l => ({ l, r: resolveIssueQty(l, l.remaining) }));
+      const needReason = resolvedLines.filter(x => x.r.over && x.r.note.length < 3);
+      if (needReason.length > 0) {
+        alert('These lines are being issued OVER what was approved — say why first:\n'
+          + needReason.map(x => `• ${x.l.material_name}`).join('\n'));
+        return;
+      }
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
         method: 'POST',
-        body: { lines: lines.map(l => ({ id: l.id, action: 'issue', quantity: l.remaining })) },
+        body: { lines: resolvedLines.map(x => ({ id: x.l.id, action: 'issue', quantity: x.r.qty, note: x.r.note })) },
       });
       const j = await r.json();
       if (!r.ok) { alert(j.error || 'Issue all failed'); return; }
@@ -450,22 +495,26 @@ export default function StoreRequisitionsPage() {
       {/* Status tabs */}
       <TabScroller className="gap-2 text-xs">
         {([
-          { k: 'open',             label: 'Pending Issue',   icon: AlertCircle, tone: 'amber' },
-          { k: 'deferred',         label: 'Deferred',        icon: Clock,       tone: 'blue' },
-          { k: 'today_fulfilled',  label: 'Fulfilled Today', icon: CheckCircle2,tone: 'emerald' },
-          { k: 'issued_log',       label: 'Issued Items Log',icon: History,     tone: 'amber' },
+          { k: 'open',             label: 'Pending Issue',    icon: AlertCircle, tone: 'amber' },
+          { k: 'deferred',         label: 'Deferred',         icon: Clock,       tone: 'blue' },
+          { k: 'balance_pending',  label: 'Balance Pending',  icon: Hourglass,   tone: 'rose' },
+          { k: 'issued_today',     label: 'Issued Today',     icon: CheckCircle2,tone: 'emerald' },
+          { k: 'issued_log',       label: 'Issued Items Log', icon: History,     tone: 'amber' },
         ] as const).map(t => {
-          const n = filter === t.k ? (t.k === 'issued_log' ? (log?.totals?.events || 0) : filtered.length) :
-            t.k === 'open'            ? list.filter(r => r.status !== 'fulfilled' && r.lines_open > 0).length :
-            t.k === 'deferred'        ? list.filter(r => r.lines_deferred > 0).length :
-            t.k === 'today_fulfilled' ? list.filter(r => r.status === 'fulfilled').length :
-                                        (log?.totals?.events || 0);
+          // ONE source for the badge — the same predicate the body filters with.
+          // These used to be re-written inline here, so changing a tab's meaning
+          // in one place left the badge promising rows the tab wouldn't render.
+          // (The Issued Items Log isn't a requisition view; it counts its own events.)
+          const n = t.k === 'issued_log'
+            ? (log?.totals?.events || 0)
+            : searched.filter(r => matchesTab(r, t.k)).length;
           const active = filter === t.k;
           const Icon = t.icon;
           const onStyle: Record<string, string> = {
             amber: active ? 'bg-amber-600 text-white border-amber-600' : 'bg-amber-50 text-amber-800 border-amber-200',
             blue:  active ? 'bg-blue-600  text-white border-blue-600'  : 'bg-blue-50  text-blue-800  border-blue-200',
             emerald: active ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-emerald-50 text-emerald-800 border-emerald-200',
+            rose: active ? 'bg-rose-600 text-white border-rose-600' : 'bg-rose-50 text-rose-800 border-rose-200',
           };
           return (
             <button key={t.k} onClick={() => setFilter(t.k)}
@@ -493,7 +542,7 @@ export default function StoreRequisitionsPage() {
 
       {error && <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">{error}</div>}
 
-      {/* Tab body — Issued Log gets its own panel, the other three share the requisition list. */}
+      {/* Tab body — Issued Log gets its own panel, the other four share the requisition list. */}
       {filter === 'issued_log' ? (
         <IssuedLogPanel
           loading={logLoading} log={log}
@@ -508,8 +557,9 @@ export default function StoreRequisitionsPage() {
         <div className="p-10 bg-white border border-[#E8D5C4] rounded-xl text-center text-sm text-[#8B7355]">
           <CheckCircle2 className="w-7 h-7 mx-auto mb-2 text-emerald-500" />
           Nothing here. {filter === 'open' && 'Caught up — no pending requisitions.'}
-          {filter === 'deferred' && 'No deferred items.'}
-          {filter === 'today_fulfilled' && 'No fulfilments recorded today yet.'}
+          {filter === 'deferred' && 'No items promised for a later time.'}
+          {filter === 'balance_pending' && 'No balances owed — every issued requisition went out in full.'}
+          {filter === 'issued_today' && 'Nothing has been handed over today yet.'}
         </div>
       ) : (
         <div className="space-y-3">
@@ -553,6 +603,7 @@ export default function StoreRequisitionsPage() {
       {confirmIssueAll && (
         <IssueAllModal
           req={confirmIssueAll}
+          resolveQty={(line, remaining) => resolveIssueQty(line, remaining)}
           busy={issuingAll}
           onCancel={() => { if (!issuingAll) setConfirmIssueAll(null); }}
           onConfirm={() => issueAllOpen(confirmIssueAll)}
@@ -567,8 +618,12 @@ export default function StoreRequisitionsPage() {
  * issued (material × remaining qty) to the requisition's department, with
  * Confirm / Cancel. Nothing is POSTed until the user confirms.
  */
-function IssueAllModal({ req, busy, onCancel, onConfirm }: {
-  req: Requisition; busy: boolean; onCancel: () => void; onConfirm: () => void;
+function IssueAllModal({ req, resolveQty, busy, onCancel, onConfirm }: {
+  req: Requisition;
+  /** The SAME resolver the POST uses — the list must show what will be issued,
+      not the approved remainder, or the confirmation lies about an over-issue. */
+  resolveQty: (line: ReqLine, remaining: number) => { qty: number; over: boolean; note: string };
+  busy: boolean; onCancel: () => void; onConfirm: () => void;
 }) {
   const lines = openIssuableLines(req);
   return (
@@ -590,12 +645,18 @@ function IssueAllModal({ req, busy, onCancel, onConfirm }: {
               {lines.map(l => {
                 const U = lineUnits(l);
                 const u = U.pu;
+                const rq = resolveQty(l, l.remaining);
                 return (
                   <li key={l.id} className="flex items-center justify-between text-sm border-b border-[#E8D5C4]/50 py-1.5">
                     <span className="text-[#2D1B0E]">{l.material_name}</span>
                     <span className="font-mono font-semibold text-emerald-700">
-                      × {fmtNum(U.toPU(l.remaining))}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
-                      {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-1">= {fmtNum(U.toRecipe(l.remaining))} {U.recipeUnit}</span>}
+                      × {fmtNum(U.toPU(rq.qty))}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
+                      {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-1">= {fmtNum(U.toRecipe(rq.qty))} {U.recipeUnit}</span>}
+                      {rq.over && (
+                        <span className="ml-1 text-[9px] px-1 rounded bg-amber-100 text-amber-800 border border-amber-300">
+                          over approved ({fmtNum(U.toPU(l.remaining))} {u})
+                        </span>
+                      )}
                     </span>
                   </li>
                 );
@@ -642,9 +703,29 @@ function openIssuableLines(req: Requisition): Array<ReqLine & { remaining: numbe
   return out;
 }
 
+/**
+ * Did this line hand goods over on `dayIST`?
+ *
+ * issue_history is the per-hand-over log written by /store-issue. The one-shot
+ * /store-process path writes quantity_issued with NO history entry and no
+ * issued_at, so the requisition's own store_processed_at stamp is the only date
+ * that hand-over has — used last, and only for a line that did move something.
+ */
+function issuedOnDay(line: ReqLine, reqStamp: unknown, dayIST: string): boolean {
+  if ((Number(line.quantity_issued) || 0) <= 0) return false;
+  let history: unknown[] = [];
+  try { const p: unknown = JSON.parse(line.issue_history || '[]'); if (Array.isArray(p)) history = p; } catch { /* corrupt JSON reads as no history */ }
+  if (history.length > 0) return history.some(h => fmtISTIsoDate((h as { at?: unknown } | null)?.at) === dayIST);
+  if (line.issued_at) return fmtISTIsoDate(line.issued_at) === dayIST;
+  return fmtISTIsoDate(reqStamp) === dayIST;
+}
+
 function mergeStats(req: any): Requisition {
   const items: ReqLine[] = req.items || [];
-  let issued = 0, deferred = 0, open = 0;
+  const today = todayIST();
+  const reqStamp = req.fulfilled_at || req.store_processed_at || null;
+  let issued = 0, deferred = 0, open = 0, partial = 0, outstanding = 0;
+  let issuedToday = false;
   for (const it of items) {
     if (it.is_rejected) continue;
     if (it.store_rejected) continue;      // store rejected — not counted as open/issued/deferred
@@ -653,6 +734,11 @@ function mergeStats(req: any): Requisition {
     if (got >= eff && !it.deferred_until) issued++;
     else if (it.deferred_until) deferred++;
     else open++;
+    // A part-issued line is NOT the same as an untouched one — it used to be
+    // filed as `open` above, which is why "some of it went out" was invisible.
+    if (got > 0 && got < eff) partial++;
+    outstanding += Math.max(0, eff - got);
+    if (!issuedToday && issuedOnDay(it, reqStamp, today)) issuedToday = true;
   }
   return {
     ...req,
@@ -661,7 +747,88 @@ function mergeStats(req: any): Requisition {
     lines_issued: issued,
     lines_deferred: deferred,
     lines_open: open,
+    lines_partial: partial,
+    qty_outstanding: outstanding,
+    issued_today: issuedToday,
   } as Requisition;
+}
+
+/** The queue tabs. 'issued_log' is a separate panel, not a slice of the list. */
+type StoreTab = 'open' | 'deferred' | 'balance_pending' | 'issued_today' | 'issued_log';
+
+/**
+ * THE definition of every tab — called by the tab body AND by the tab badges.
+ *
+ * These are roll-ups of the LINE columns, not readings of requisitions.status
+ * (which is a single scalar and cannot say "issued some, owes the rest"), so a
+ * requisition can match more than one tab. That is the point: a half-issued req
+ * belongs in Issued Today *and* Balance Pending.
+ *
+ * 'deferred' stays strictly "a human promised a time on this line"
+ * (deferred_until) — it is NOT the generic "something is still owed" bucket,
+ * because a deferred line also suppresses Issue All and the selection checkbox.
+ */
+function matchesTab(r: Requisition, tab: StoreTab): boolean {
+  switch (tab) {
+    case 'open':            return r.status !== 'fulfilled' && r.lines_open > 0;
+    case 'deferred':        return r.lines_deferred > 0;
+    // Goods went out, goods are still owed, and the req is not closed — the
+    // half-transfer bucket. The "something was actually handed over" clause is
+    // what makes this tab DISTINCT: without it every untouched requisition
+    // (nothing issued, therefore everything outstanding) matches too and the
+    // tab becomes a copy of Pending Issue.
+    case 'balance_pending':
+      return r.status !== 'fulfilled'
+        && r.qty_outstanding > 0
+        && (r.lines_issued > 0 || r.lines_partial > 0);
+    // "Goods moved today", NOT "requisition closed" — the two are different
+    // events and this tab used to conflate them under the name "Fulfilled Today".
+    case 'issued_today':    return r.status === 'fulfilled' || r.issued_today;
+    default:                return false;
+  }
+}
+
+/**
+ * Requisition status in the department's words. Same vocabulary as the sister
+ * page /requisitions (its STATUS_LABEL) — kept as a local map rather than an
+ * import so this page doesn't pull a 2,000-line page module into its bundle for
+ * a handful of strings. Keep the wording in step with that page.
+ *
+ * ONE deliberate difference: chef_approved reads 'With Store' here, not 'With
+ * Mgmt'. Anything chef_approved that reaches THIS page reached it through the
+ * inbox=store query — it is, by definition, sitting on the store's counter.
+ */
+const STATUS_LABEL: Record<string, string> = {
+  draft:           'Draft',
+  submitted:       'With HOD',
+  chef_approved:   'With Store',
+  mgmt_approved:   'With Store',
+  chef_rejected:   'Rejected',
+  store_processed: 'Issued (partial)',
+  fulfilled:       'Fulfilled',
+  cancelled:       'Cancelled',
+};
+
+/**
+ * Header summary for a part-issued requisition, in PURCHASE units (the store
+ * hands over bottles and packets, not millilitres).
+ *
+ * One part-issued line reads as real numbers — "4 of 6 BTL issued". Two or more
+ * can't be added up: each line carries its own unit, so a sum would be a
+ * meaningless number presented as a fact. Those report the count and leave the
+ * quantities to the expanded rows.
+ */
+function partialSummary(req: Requisition): string | null {
+  const partials = (req.items || []).filter(l => {
+    if (l.is_rejected || l.store_rejected) return false;
+    const got = Number(l.quantity_issued) || 0;
+    return got > 0 && got < effectiveQty(l);
+  });
+  if (partials.length === 0) return null;
+  if (partials.length > 1) return `${partials.length} items part-issued`;
+  const l = partials[0];
+  const U = lineUnits(l);
+  return `${fmtNum(U.toPU(l.quantity_issued))} of ${fmtNum(U.toPU(effectiveQty(l)))}${U.pu ? ` ${U.pu}` : ''} issued`;
 }
 
 function ReqCard(props: {
@@ -694,6 +861,7 @@ function ReqCard(props: {
   const selectedCount = openIds.filter(id => props.selectedIds.has(id)).length;
   const allOpenSelected = openIds.length > 0 && selectedCount === openIds.length;
   const someOpenSelected = selectedCount > 0 && !allOpenSelected;
+  const partialText = partialSummary(req);
   const statusTone: Record<string, string> = {
     mgmt_approved:   'bg-amber-100 text-amber-800 border-amber-200',
     chef_approved:   'bg-amber-100 text-amber-800 border-amber-200',
@@ -731,7 +899,15 @@ function ReqCard(props: {
           {req.lines_issued > 0 && <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">{req.lines_issued} issued</span>}
           {req.lines_deferred > 0 && <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">{req.lines_deferred} deferred</span>}
           {req.lines_open > 0 && <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200">{req.lines_open} open</span>}
-          <span className={`px-2 py-0.5 rounded border ${statusTone[req.status] || 'bg-gray-50 text-gray-700 border-gray-200'}`}>{req.status}</span>
+          {/* What actually went out, in the store's own units. The card used to
+              print the raw column value ("store_processed") at the person
+              holding the goods and say nothing about the shortfall. */}
+          {partialText && (
+            <span className="px-1.5 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200">{partialText}</span>
+          )}
+          <span className={`px-2 py-0.5 rounded border ${statusTone[req.status] || 'bg-gray-50 text-gray-700 border-gray-200'}`}>
+            {STATUS_LABEL[req.status] || req.status}
+          </span>
         </div>
       </button>
 
@@ -867,7 +1043,9 @@ function LineRow(props: {
      to the approval; it just has to be deliberate and explained. Compared in the
      PURCHASE basis the box is typed in. */
   const typedPU = Number(props.editQty[line.id]);
-  const overIssue = Number.isFinite(typedPU) && typedPU - outstandingPU > 1e-9;
+  // Only meaningful while the line is still open — on a completed line
+  // outstanding is 0, so any leftover text in the box read as an "over-issue".
+  const overIssue = outstanding > 0 && Number.isFinite(typedPU) && typedPU - outstandingPU > 1e-9;
   const overBy = overIssue ? Math.round((typedPU - outstandingPU) * 1000) / 1000 : 0;
   const rowTone = line.is_rejected ? 'bg-red-50/40 text-[#999] line-through'
                 : line.store_rejected ? 'bg-red-50/40 text-[#999]'

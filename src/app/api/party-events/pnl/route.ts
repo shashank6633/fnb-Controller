@@ -141,7 +141,10 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
       WHERE r.purpose = 'party'
         AND r.event_name IN (${ph})
         AND r.event_date = ?
-        AND r.status = 'fulfilled'
+        -- A part-issued party req now correctly stays 'store_processed' rather
+        -- than being mis-stamped 'fulfilled'; its goods still left the store, so
+        -- excluding it here would silently drop real cost from the party P&L.
+        AND r.status IN ('fulfilled', 'store_processed')
         AND LOWER(TRIM(COALESCE(rm.category, ''))) ${inOrNotIn} (${lph})
     `).get(...names, key.event_date, ...LIQUOR_CATEGORIES) as { cost: number; item_count: number };
     const food = runSplit('NOT IN');

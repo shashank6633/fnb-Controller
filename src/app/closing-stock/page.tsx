@@ -208,6 +208,22 @@ export default function ClosingStockByLocationPage() {
   const [materials, setMaterials] = useState<any[]>([]);
   const [closingStockOpen, setClosingStockOpen] = useState(false);
   const [closingDate, setClosingDate] = useState(new Date().toISOString().split('T')[0]);
+  /* DEEP LINK from the Closing Overview board: /closing-stock?date=&location=&department_id=
+     Seeded once on mount — without this every "Record" link on that board landed
+     on today's page with no area or department selected, which reads as a dead
+     link. Applied only when the param is present, so a plain visit is unchanged. */
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const q = new URLSearchParams(window.location.search);
+    const d = q.get('date');
+    if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) { setDate(d); setClosingDate(d); }
+    const dept = q.get('department_id');
+    if (dept && dept !== '__store__') setSelectedDept(dept);
+    const loc = q.get('location');
+    if (loc) setPendingLocation(loc === '__unassigned__' ? '— Unassigned —' : loc);
+  }, []);
+  // Applied once the location list has loaded (the drill-in needs the list).
+  const [pendingLocation, setPendingLocation] = useState<string | null>(null);
   const [closingItems, setClosingItems] = useState<Record<string, { physical_stock: string; notes: string }>>({});
   const [closingSearch, setClosingSearch] = useState('');
   const [closingCategory, setClosingCategory] = useState('');
@@ -592,6 +608,14 @@ export default function ClosingStockByLocationPage() {
   // Changing the active department re-scopes the open location's counts too, so
   // today_count reflects the newly-selected department (not a stale one).
   useEffect(() => { if (active) openLocation(active); /* eslint-disable-next-line */ }, [activeDeptId]);
+  // Deep link: drill into the requested area as soon as the list exists.
+  useEffect(() => {
+    if (!pendingLocation || locations.length === 0) return;
+    const hit = locations.find(l => l.location === pendingLocation);
+    if (hit) openLocation(hit.location);
+    setPendingLocation(null);
+    /* eslint-disable-next-line */
+  }, [pendingLocation, locations]);
 
   // List of distinct categories present in the current location, with item counts.
   // Powers the chip strip above the count table. Counts respect the search box
