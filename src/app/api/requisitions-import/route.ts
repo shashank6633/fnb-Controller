@@ -247,9 +247,18 @@ export async function POST(request: Request) {
               datetime('now'), 'recaho-import', 'Imported from Recaho transfer report',
               datetime('now'), 'recaho-import', ?, datetime('now'), datetime('now'))
     `);
+    // `unit` MUST be stamped. This INSERT used to omit it, which made every
+    // imported line's quantity ambiguous: reqPackFactor treats a blank unit as
+    // recipe units, but Recaho's TO QTY column is PURCHASE units (a "1" here is
+    // one kg/bottle/pack, not one gram) — so 16k+ imported lines displayed and
+    // valued pack_size× too small ("issued 1 g of ghee"). Resolve the purchase
+    // unit server-side from the matched material; the requester never typed one.
+    const unitOfMaterial = db.prepare(`
+      SELECT COALESCE(NULLIF(TRIM(purchase_unit), ''), unit) AS u FROM raw_materials WHERE id = ?
+    `);
     const insReqItem = db.prepare(`
-      INSERT INTO requisition_items (id, req_id, material_id, quantity_requested, quantity_issued, quantity_to_purchase, notes)
-      VALUES (?, ?, ?, ?, ?, 0, ?)
+      INSERT INTO requisition_items (id, req_id, material_id, quantity_requested, quantity_issued, quantity_to_purchase, notes, unit)
+      VALUES (?, ?, ?, ?, ?, 0, ?, ?)
     `);
     // Note: we deliberately do NOT touch raw_materials.current_stock or write
     // inventory_transactions here. Internal transfers and recipe-driven
@@ -292,6 +301,7 @@ export async function POST(request: Request) {
             generateId(), reqId, matId,
             ln.qty_requested, ln.qty_issued,
             ln.category ? `cat: ${ln.category}` : '',
+            String((unitOfMaterial.get(matId) as any)?.u || ''),
           );
           summary.created_lines += 1;
         }

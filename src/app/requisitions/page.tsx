@@ -87,8 +87,13 @@ function reqUnit(it: ReqItem): string {
  *  qty by this to compare it against current_stock (always in recipe units). */
 function reqPackFactor(it: ReqItem): number {
   const pack = Number(it.material_pack_size) || 1;
-  return (it.unit && it.material_purchase_unit && it.unit === it.material_purchase_unit && it.unit !== it.material_unit && pack > 1)
-    ? pack : 1;
+  // Normalised compare: purchase_unit tokens are stored in mixed case (BTL, kg,
+  // Kg) and an exact === silently returned 1 for a case-only mismatch, flipping
+  // the whole line's basis. Same lowercase+trim rule as pack-units' packFactor.
+  const lu = String(it.unit || '').toLowerCase().trim();
+  const pu = String(it.material_purchase_unit || '').toLowerCase().trim();
+  const ru = String(it.material_unit || '').toLowerCase().trim();
+  return (lu && pu && lu === pu && lu !== ru && pack > 1) ? pack : 1;
 }
 
 const STATUS_BADGE: Record<string, string> = {
@@ -912,21 +917,23 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                       {rejected
                         ? <span className="text-red-700 no-underline">—</span>
                         : it.chef_approved_qty != null
-                          ? <span className="text-amber-700">{Number(it.chef_approved_qty).toLocaleString('en-IN')}</span>
+                          ? <span className="text-amber-700">{Number(it.chef_approved_qty).toLocaleString('en-IN')} {reqUnit(it)}</span>
                           : <span className="text-[#C0A98F]">—</span>}
                     </td>
                     <td className={`py-1 px-2 text-right font-mono ${short ? 'text-red-700 font-semibold' : 'text-[#6B5744]'}`}>
-                      {it.current_stock.toLocaleString('en-IN')} {it.material_unit}{short && ' ⚠'}
-                      {hasPU && (
-                        <div className="text-[9px] text-[#8B7355] font-normal no-underline">
-                          = {(it.current_stock / packN).toLocaleString('en-IN', { maximumFractionDigits: 1 })} {puLbl}
-                        </div>
-                      )}
+                      {/* Owner rule: purchase basis leads; the exact recipe figure
+                          stays underneath — it is the stored truth. */}
+                      {hasPU
+                        ? <>{(it.current_stock / packN).toLocaleString('en-IN', { maximumFractionDigits: 2 })} {puLbl}{short && ' ⚠'}
+                            <div className="text-[9px] text-[#8B7355] font-normal no-underline">
+                              = {it.current_stock.toLocaleString('en-IN')} {it.material_unit}
+                            </div></>
+                        : <>{it.current_stock.toLocaleString('en-IN')} {it.material_unit}{short && ' ⚠'}</>}
                     </td>
                     {(detail.status === 'store_processed' || detail.status === 'fulfilled') && (
                       <>
-                        <td className="py-1 px-2 text-right font-mono text-emerald-700">{rejected ? '—' : (it.quantity_issued || 0)}</td>
-                        <td className="py-1 px-2 text-right font-mono text-blue-700">{rejected ? '—' : (it.quantity_to_purchase || 0)}</td>
+                        <td className="py-1 px-2 text-right font-mono text-emerald-700">{rejected ? '—' : <>{it.quantity_issued || 0} {reqUnit(it)}</>}</td>
+                        <td className="py-1 px-2 text-right font-mono text-blue-700">{rejected ? '—' : <>{it.quantity_to_purchase || 0} {reqUnit(it)}</>}</td>
                       </>
                     )}
                     <td className="py-1 px-2 text-right font-mono text-[#6B5744]"
@@ -1237,8 +1244,16 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                         <Lbl>On hand · Buf</Lbl>
                         {mat ? (
                           <>
-                            <div className={`font-mono ${short ? 'text-red-700 font-semibold' : 'text-[#2D1B0E]'}`}>
-                              {mat.current_stock.toLocaleString('en-IN')} {mat.unit}
+                            <div className={`font-mono ${short ? 'text-red-700 font-semibold' : 'text-[#2D1B0E]'}`}
+                                 title={`= ${mat.current_stock.toLocaleString('en-IN')} ${mat.unit} (exact)`}>
+                              {(() => {
+                                const pk = Number((mat as any).pack_size) || 1;
+                                const pu = String((mat as any).purchase_unit || '').toLowerCase().trim();
+                                const conv = pk > 1 && pu && pu !== String(mat.unit||'').toLowerCase().trim();
+                                return conv
+                                  ? `${(mat.current_stock / pk).toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${(mat as any).purchase_unit}`
+                                  : `${mat.current_stock.toLocaleString('en-IN')} ${mat.unit}`;
+                              })()}
                             </div>
                             <div className={`font-mono ${belowBuffer ? 'text-red-700 font-semibold' : 'text-[#8B7355]'}`}
                                  title={belowBuffer ? `Will drop to ${postReq.toFixed(2)} ${mat.unit}, below buffer ${buffer}` : `Buffer / reorder level`}>
@@ -1444,6 +1459,9 @@ function ChefApproveModal({ req, onClose, onDone }: { req: Requisition; onClose:
                              disabled={isRej}
                              onChange={e => setOverrides(p => ({ ...p, [it.id]: parseFloat(e.target.value) || 0 }))}
                              className="w-24 px-1.5 py-1 border border-[#E8D5C4] rounded text-right disabled:opacity-50" />
+                      {/* The override is interpreted in the SAME unit the line was
+                          requested in (store-process persists it verbatim). */}
+                      <span className="ml-1 text-[10px] text-[#8B7355]">{reqUnit(it)}</span>
                     </td>
                     <td className="py-1 px-2 text-center no-underline">
                       <input type="checkbox" checked={isRej}
@@ -1710,6 +1728,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
 
   const update = (i: number, patch: any) => setLines(p => p.map((ln, j) => j === i ? { ...ln, ...patch } : ln));
 
+  // A cross-line SUM of shortfalls mixes units (kg + BTL + pcs) and is
+  // meaningless as a number — count the lines that are short instead.
+  const shortLineCount = lines.filter(ln => (ln.requested - ln.quantity_issued) > 0).length;
   const totalShortfall = lines.reduce((s, ln) => s + Math.max(0, ln.requested - ln.quantity_issued), 0);
   const poTotal = lines.reduce((s, ln) => s + (ln.quantity_to_purchase * ln.unit_price), 0);
 
@@ -1825,7 +1846,14 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               <ul className="ml-5 list-disc">
                 {negativeStockLines.map(ln => (
                   <li key={ln.id}>
-                    <b>{ln.material_name}</b> — system shows {Number(ln.current_stock).toLocaleString('en-IN')} {ln.material_unit}.
+                    <b>{ln.material_name}</b> — system shows {(() => {
+                      const pk = Number(ln.pack_size) || 1;
+                      const conv = pk > 1 && String(ln.purchase_unit||'').toLowerCase().trim()
+                        && String(ln.purchase_unit||'').toLowerCase().trim() !== String(ln.material_unit||'').toLowerCase().trim();
+                      return conv
+                        ? `${(Number(ln.current_stock) / pk).toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${ln.purchase_unit} (= ${Number(ln.current_stock).toLocaleString('en-IN')} ${ln.material_unit})`
+                        : `${Number(ln.current_stock).toLocaleString('en-IN')} ${ln.material_unit}`;
+                    })()}.
                     Issuing 0 here; raise a PO on <a href="/purchase-orders" className="underline">Purchase Orders</a> immediately.
                   </li>
                 ))}
@@ -1879,8 +1907,16 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                         )}
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono">{ln.requested} {ln.req_unit}</td>
-                      <td className={`py-1.5 px-2 text-right font-mono ${negStock ? 'text-red-700 font-bold' : 'text-[#6B5744]'}`}>
-                        {ln.current_stock}{negStock && ' ⚠'}
+                      <td className={`py-1.5 px-2 text-right font-mono ${negStock ? 'text-red-700 font-bold' : 'text-[#6B5744]'}`}
+                          title={`= ${Number(ln.current_stock).toLocaleString('en-IN')} ${ln.material_unit} (exact)`}>
+                        {(() => {
+                          const pk = Number(ln.pack_size) || 1;
+                          const conv = pk > 1 && String(ln.purchase_unit||'').toLowerCase().trim()
+                            && String(ln.purchase_unit||'').toLowerCase().trim() !== String(ln.material_unit||'').toLowerCase().trim();
+                          return conv
+                            ? `${(Number(ln.current_stock) / pk).toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${ln.purchase_unit}`
+                            : `${Number(ln.current_stock).toLocaleString('en-IN')} ${ln.material_unit}`;
+                        })()}{negStock && ' ⚠'}
                       </td>
                       <td className="py-1.5 px-2">
                         <input type="number" step="any" min={0}
@@ -1902,7 +1938,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                         {/* requested − issued: both in the requested unit. */}
                         {short > 0
                           ? <span className="text-amber-700">{short} {ln.req_unit}</span>
-                          : <span className="text-emerald-700">0</span>}
+                          : <span className="text-emerald-700">0 {ln.req_unit}</span>}
                       </td>
                       {raisePo && <>
                         <td className="py-1.5 px-2">
@@ -2041,7 +2077,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             </div>
           ) : totalShortfall > 0 ? (
             <div className="text-[11px] px-3 py-2 bg-amber-50 border border-amber-200 rounded">
-              ⚠ Total shortfall: <b>{totalShortfall}</b> across the lines above. To buy the rest, either tick "Also raise vendor PO" above, or raise POs separately on the <a href="/purchase-orders" className="underline">Purchase Orders</a> page.
+              ⚠ <b>{shortLineCount}</b> line{shortLineCount === 1 ? ' is' : 's are'} short of the requested qty above. To buy the rest, either tick "Also raise vendor PO" above, or raise POs separately on the <a href="/purchase-orders" className="underline">Purchase Orders</a> page.
             </div>
           ) : (
             <div className="text-[11px] px-3 py-2 bg-emerald-50 border border-emerald-200 rounded">

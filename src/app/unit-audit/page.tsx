@@ -18,6 +18,7 @@ import {
   Download, Upload,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { purchasePrice } from '@/lib/pack-units';
 import { usePurchaseUnitOptions } from '@/lib/use-units';
 import TabScroller from '@/components/TabScroller';
 
@@ -504,7 +505,7 @@ export default function UnitAuditPage() {
                   <th className="text-right py-1.5 px-2 font-medium" title="How many recipe-units are in one purchase-unit. e.g. 750 ml in 1 BTL of 100 Pipers.">Pack Size</th>
                   <th className="text-right py-1.5 px-2 font-medium" title="Bottles per outer case. 12 for a case of 12, 24 for a beer case. 1 = no outer pack.">Case Size</th>
                   <th className="text-right py-1.5 px-2 font-medium">Stock</th>
-                  <th className="text-right py-1.5 px-2 font-medium">Last ₹</th>
+                  <th className="text-right py-1.5 px-2 font-medium" title="₹ per purchase unit — last purchase rate, else the average lifted to the purchase basis">Last ₹/unit</th>
                   <th className="text-right py-1.5 px-2 font-medium">Used in</th>
                   <th className="text-left  py-1.5 px-2 font-medium">Flags</th>
                 </tr>
@@ -637,7 +638,14 @@ export default function UnitAuditPage() {
                           return <>{m.current_stock.toLocaleString('en-IN', { maximumFractionDigits: 2 })} <span className="text-[9px] text-[#8B7355]">{ru}</span></>;
                         })()}
                       </td>
-                      <td className="py-1.5 px-2 text-right font-mono">{fmt(m.last_purchase_price || m.average_price)}</td>
+                      {/* ONE basis: ₹/purchase-unit. last_purchase_price already is;
+                          the average_price fallback is ₹/recipe-unit and used to be
+                          shown raw, so a never-purchased pack material silently read
+                          ~pack× smaller than its neighbours in the same column. */}
+                      <td className="py-1.5 px-2 text-right font-mono">
+                        {fmt(m.last_purchase_price || purchasePrice(m.average_price, m))}
+                        <span className="text-[9px] text-[#8B7355]">/{(m.purchase_unit || m.unit) as string}</span>
+                      </td>
                       <td className="py-1.5 px-2 text-right font-mono text-[#6B5744]">
                         {m.purchase_count} buy · {m.recipe_use_count} rec
                       </td>

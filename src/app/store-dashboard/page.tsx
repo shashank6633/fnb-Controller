@@ -1,4 +1,5 @@
 'use client';
+import { toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 
 /**
  * Store-Manager Dashboard — "what do I need to buy right now?"
@@ -265,12 +266,12 @@ export default function StoreDashboardPage() {
                 <tr>
                   <th className="text-left  py-2 px-2 font-medium">Material</th>
                   <th className="text-left  py-2 px-2 font-medium">Category</th>
-                  <th className="text-right py-2 px-2 font-medium" title="What's on hand right now">Current</th>
+                  <th className="text-right py-2 px-2 font-medium" title="What's on hand right now, in purchase units (exact recipe figure shown beneath when they differ)">Current</th>
                   <th className="text-right py-2 px-2 font-medium" title="Buffer / reorder level — alert if stock drops below this">Buffer</th>
-                  <th className="text-right py-2 px-2 font-medium" title="How much to buy to restore buffer (in recipe units)">To Buy (recipe)</th>
+                  <th className="text-right py-2 px-2 font-medium" title="How much to buy to restore the buffer, in the unit you purchase in">To Buy</th>
                   <th className="text-right py-2 px-2 font-medium" title="How many purchase-unit packs that equates to">Packs</th>
                   <th className="text-left  py-2 px-2 font-medium">Last Vendor</th>
-                  <th className="text-right py-2 px-2 font-medium">Last ₹</th>
+                  <th className="text-right py-2 px-2 font-medium" title="Last purchase rate, ₹ per purchase unit">Last ₹/unit</th>
                   <th className="text-right py-2 px-2 font-medium">Est. Cost</th>
                   <th className="text-right py-2 px-2 font-medium" title="Days since last purchase">Last Buy</th>
                   <th className="text-left  py-2 px-2 font-medium">Status</th>
@@ -286,6 +287,12 @@ export default function StoreDashboardPage() {
                   </td>
                 </tr>
                 {g.rows.map(r => {
+                  // Owner rule: this is a BUY list — read it in PURCHASE units.
+                  // Display-only; recipe figures stay underneath as the exact trail.
+                  const meta = { unit: r.recipe_unit, purchase_unit: r.purchase_unit, pack_size: r.pack_size };
+                  const pu = r.purchase_unit || r.recipe_unit;
+                  const conv = (v: number) => toPurchaseQty(Number(v) || 0, meta);
+                  const packed = conv(1) !== 1 || String(r.purchase_unit||'').toLowerCase().trim() !== String(r.recipe_unit||'').toLowerCase().trim();
                   const sevColor = r.severity === 'critical' ? 'bg-red-50/50'
                                   : r.severity === 'low' ? 'bg-amber-50/30' : '';
                   return (
@@ -297,14 +304,20 @@ export default function StoreDashboardPage() {
                       <td className="py-1.5 px-2 text-[#6B5744]">{r.category || '—'}</td>
                       <td className="py-1.5 px-2 text-right font-mono">
                         <span className={r.current_stock <= 0 ? 'text-red-700 font-semibold' : 'text-[#6B5744]'}>
-                          {fmtNum(r.current_stock)} {r.recipe_unit}
+                          {fmtQtyNum(conv(r.current_stock))} {pu}
                         </span>
+                        {packed && conv(r.current_stock) !== Number(r.current_stock) && (
+                          <div className="text-[9px] text-[#B8A590]">= {fmtNum(r.current_stock)} {r.recipe_unit}</div>
+                        )}
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono text-[#6B5744]">
-                        {fmtNum(r.reorder_level)} {r.recipe_unit}
+                        {fmtQtyNum(conv(r.reorder_level))} {pu}
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono font-semibold text-[#af4408]">
-                        {fmtNum(r.suggest_recipe_qty)} {r.recipe_unit}
+                        {fmtQtyNum(conv(r.suggest_recipe_qty))} {pu}
+                        {packed && conv(r.suggest_recipe_qty) !== Number(r.suggest_recipe_qty) && (
+                          <div className="text-[9px] font-normal text-[#B8A590]">= {fmtNum(r.suggest_recipe_qty)} {r.recipe_unit}</div>
+                        )}
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono text-[#6B5744]">
                         {r.pack_size > 1
@@ -312,7 +325,7 @@ export default function StoreDashboardPage() {
                           : <span className="text-[#C0A98F]">—</span>}
                       </td>
                       <td className="py-1.5 px-2 text-[#6B5744]">{r.last_vendor || <span className="text-[#C0A98F]">—</span>}</td>
-                      <td className="py-1.5 px-2 text-right font-mono">{r.last_unit_price > 0 ? fmt(r.last_unit_price) : '—'}</td>
+                      <td className="py-1.5 px-2 text-right font-mono">{r.last_unit_price > 0 ? <>{fmt(r.last_unit_price)}<span className="text-[9px] text-[#8B7355]">/{pu}</span></> : '—'}</td>
                       <td className="py-1.5 px-2 text-right font-mono font-semibold text-emerald-700">
                         {r.est_cost > 0 ? fmt(r.est_cost) : '—'}
                       </td>

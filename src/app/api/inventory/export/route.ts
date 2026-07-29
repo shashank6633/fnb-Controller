@@ -67,13 +67,30 @@ export async function GET() {
     // matches what the UI shows. The round-trip import ignores unknown columns,
     // so it can never be written back — average_price stays the canonical
     // ₹/recipe-unit value.
-    lines.push([...COLUMNS, 'avg_price_per_purchase_unit'].join(','));
+    // INPUT HAZARD, deliberately handled with INFORMATIONAL columns only: the
+    // writable columns (reorder_level, average_price) stay in RECIPE basis
+    // because /api/inventory/round-trip-import writes them back verbatim —
+    // converting them here would multiply every buffer and rate by pack_size on
+    // the next round trip. The *_purchase_unit columns below are display-only
+    // twins the importer ignores (not in WRITABLE_FIELDS), so a manager reading
+    // the sheet sees the same numbers the screen shows without being able to
+    // corrupt the stored basis by editing the wrong cell.
+    lines.push([...COLUMNS, 'avg_price_per_purchase_unit', 'current_stock_purchase_unit', 'reorder_level_purchase_unit'].join(','));
     for (const r of rows) {
       const pack = Number(r.pack_size) || 1;
-      const perPU = (r.purchase_unit && r.purchase_unit !== r.unit && pack > 1)
+      const packed = !!(r.purchase_unit
+        && String(r.purchase_unit).toLowerCase().trim() !== String(r.unit || '').toLowerCase().trim()
+        && pack > 1);
+      const perPU = packed
         ? Math.round((r.average_price || 0) * pack * 100) / 100
         : (r.average_price ?? 0);
-      lines.push([...COLUMNS.map(c => csvEscape(r[c])), csvEscape(perPU)].join(','));
+      const stockPU = packed
+        ? Math.round(((r.current_stock || 0) / pack) * 1000) / 1000
+        : (r.current_stock ?? 0);
+      const reorderPU = packed
+        ? Math.round(((r.reorder_level || 0) / pack) * 1000) / 1000
+        : (r.reorder_level ?? 0);
+      lines.push([...COLUMNS.map(c => csvEscape(r[c])), csvEscape(perPU), csvEscape(stockPU), csvEscape(reorderPU)].join(','));
     }
     const csv = lines.join('\n') + '\n';
 

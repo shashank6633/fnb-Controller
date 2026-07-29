@@ -84,10 +84,21 @@ export async function GET(request: Request) {
       // "Buy this much" in recipe units (kg/L/etc); also expressed in purchase units
       // when pack_size > 1 (so the store manager sees both "120 ml" and "1 BTL").
       const suggestRecipeQty = deficit;
-      const suggestPurchaseQty = r.pack_size > 1 ? Math.ceil(suggestRecipeQty / r.pack_size) : suggestRecipeQty;
-      const unitCost = Number(r.last_unit_price) || Number(r.average_price) || 0;
-      // unit_price is per RECIPE unit (matches `quantity` stored in recipe units),
-      // so estimated cost = suggestRecipeQty × unitCost.
+      // BOTH halves of the pack guard: pack_size > 1 alone divides a kg/kg/1.5
+      // material's quantity for no reason (the same missing-half that shipped a
+      // 1000× price elsewhere).
+      const isPack = Number(r.pack_size) > 1
+        && String(r.recipe_unit || '').toLowerCase().trim()
+           !== String(r.purchase_unit || r.recipe_unit || '').toLowerCase().trim();
+      const suggestPurchaseQty = isPack ? Math.ceil(suggestRecipeQty / r.pack_size) : suggestRecipeQty;
+      // ONE basis for the money. last_unit_price comes off `purchases` and is
+      // ₹/PURCHASE unit (canon) — the old comment claimed recipe basis and
+      // multiplied it by a RECIPE qty, overstating packed materials pack×.
+      // Normalise to ₹/recipe-unit before multiplying; average_price already is.
+      const lppRecipe = isPack
+        ? (Number(r.last_unit_price) || 0) / Number(r.pack_size)
+        : Number(r.last_unit_price) || 0;
+      const unitCost = lppRecipe || Number(r.average_price) || 0;
       const estCost = suggestRecipeQty * unitCost;
       const lastDate = r.last_purchase_date ? new Date(r.last_purchase_date) : null;
       const daysSince = lastDate ? Math.floor((today.getTime() - lastDate.getTime()) / 86400000) : null;

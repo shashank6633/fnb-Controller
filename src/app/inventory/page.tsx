@@ -789,7 +789,7 @@ export default function InventoryPage() {
                       <ArrowUpDown className="w-3 h-3" />
                     </button>
                   </th>
-                  <th className="px-4 py-3 font-medium text-right" title="Most recent purchase price (per recipe unit); hover a value for the purchase date. — = never purchased.">Latest ₹</th>
+                  <th className="px-4 py-3 font-medium text-right" title="Most recent purchase price, ₹ per PURCHASE unit (total ÷ qty of the last purchase); hover a value for the purchase date. — = never purchased.">Latest ₹</th>
                   <th className="px-4 py-3 font-medium text-right">Avg Price</th>
                   <th className="px-4 py-3 font-medium text-right">
                     <button
@@ -917,7 +917,10 @@ export default function InventoryPage() {
                                 </>
                               );
                             }
-                            return <>{m.current_stock.toLocaleString('en-IN')} <span className="text-[10px] text-[#8B7355]">{m.unit}</span></>;
+                            // No quantity conversion (factor 1), but the LABEL still
+                            // follows the purchase unit — pcs/BTL pack-1 materials flip
+                            // label only.
+                            return <>{m.current_stock.toLocaleString('en-IN')} <span className="text-[10px] text-[#8B7355]">{(m as any).purchase_unit || m.unit}</span></>;
                           })()}
                         </td>
                         {/* Latest ₹ — most recent purchase price PER PURCHASE UNIT, right
@@ -953,7 +956,7 @@ export default function InventoryPage() {
                                 </>
                               );
                             }
-                            return m.reorder_level;
+                            return <>{m.reorder_level} <span className="ml-1 text-[10px] text-[#8B7355]">{pu}</span></>;
                           })()}
                         </td>
                         <td className="px-4 py-3 text-center">
@@ -1427,7 +1430,7 @@ export default function InventoryPage() {
                            className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
                   </label>
                   <label className="text-xs text-[#6B5744] flex flex-col gap-1">
-                    Standard Purchase Rate (₹)
+                    Standard Purchase Rate (₹ per {formData.purchase_unit || formData.unit || 'purchase unit'})
                     <input type="number" min={0} step="any"
                            value={formData.standard_purchase_rate ?? 0}
                            onChange={e => setFormData(f => ({ ...f, standard_purchase_rate: Number(e.target.value) }))}

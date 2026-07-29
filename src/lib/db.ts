@@ -1452,6 +1452,31 @@ function initializeSchema(db: Database.Database) {
     const cols = db.prepare("PRAGMA table_info(requisition_items)").all() as any[];
     const has = (n: string) => cols.some((c: any) => c.name === n);
     if (!has('unit')) db.exec(`ALTER TABLE requisition_items ADD COLUMN unit TEXT DEFAULT ''`);
+
+    // BACKFILL (2026-07-27, idempotent): Recaho-imported lines were inserted
+    // without a unit — the importer's INSERT simply omitted the column — and a
+    // blank unit is read as RECIPE units by reqPackFactor, while Recaho's
+    // "TO QTY" figures are PURCHASE units (a "1" is one kg/BTL/pack, not one
+    // gram). So 16k+ imported lines displayed and valued pack_size× too small
+    // ("issued 1 g of ghee"). Provenance is clean — every affected row belongs
+    // to a req_number LIKE 'REQ-IMP-%' written by that one importer — so stamp
+    // each line with its material's purchase unit, the same resolution the
+    // importer itself now uses. Scoped to REQ-IMP only: the handful of blank
+    // APP-created lines are left alone (their entry basis is not provable, and
+    // blank = recipe-units is at least a consistent reading for them).
+    // Idempotent by construction: once stamped, no row matches the WHERE again.
+    const backfilled = db.prepare(`
+      UPDATE requisition_items SET unit = (
+        SELECT COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit)
+        FROM raw_materials rm WHERE rm.id = requisition_items.material_id
+      )
+      WHERE TRIM(COALESCE(unit, '')) = ''
+        AND EXISTS (SELECT 1 FROM raw_materials rm WHERE rm.id = requisition_items.material_id)
+        AND req_id IN (SELECT id FROM requisitions WHERE req_number LIKE 'REQ-IMP-%')
+    `).run();
+    if (backfilled.changes > 0) {
+      console.log(`[migration] stamped purchase unit on ${backfilled.changes} Recaho-imported requisition lines`);
+    }
   } catch (e) { console.error('requisition_items unit-column migration failed:', e); }
 
   // Migration: store-issue per-item tracking. The store manager doesn't always

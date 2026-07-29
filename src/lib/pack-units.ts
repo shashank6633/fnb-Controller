@@ -128,3 +128,143 @@ export function fmtBreakdown(qty: number, m: PackMeta): string | null {
   if (parts.length === 0) parts.push(`0 ${bu}`);
   return (b.sign < 0 ? '−' : '') + parts.join(' + ');
 }
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * DUAL-BASIS DISPLAY LAYER (owner rule, 2026-07-27): every quantity shown on
+ * an Inventory / Store / Purchase / Requisition / Issuing / Dept-Stock surface
+ * reads in PURCHASE units; recipes, food-consumption and exact-balance reports
+ * stay in recipe units.
+ *
+ * Storage is UNCHANGED: current_stock stays recipe units, average_price stays
+ * ₹/recipe-unit. Only the display converts, through here — one helper, so no
+ * two surfaces can drift (drift is the root of every unit bug this app has had).
+ *
+ * Wire/prop contract is FROZEN to match /api/store-issued-log, the first
+ * shipped implementation: { qty, unit, qty_purchase, purchase_unit, pack_factor }.
+ *
+ * TRAPS the callers must respect:
+ *  • qty_purchase is a ROUNDED DERIVATIVE. Never store it, never post it back,
+ *    never sum it across rows — sum the recipe numbers, convert the total once.
+ *  • Money never round-trips through the purchase basis:
+ *    (146/1000)×(1000×0.05) ≠ 146×0.05 in floats. value = recipeQty × ₹/recipe.
+ *  • Never sum qty_purchase across MATERIALS (2 BTL + 3 kg is meaningless).
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** Frozen wire + prop shape (matches /api/store-issued-log exactly). */
+export interface DualQty {
+  /** RECIPE basis — the stored truth; what money + stock deductions use. */
+  qty: number;
+  /** Recipe unit, raw stored string (not lowercased). */
+  unit: string;
+  /** PURCHASE basis — derived, display-only, rounded to 3 dp. */
+  qty_purchase: number;
+  /** Purchase unit, raw stored string; falls back to the recipe unit. */
+  purchase_unit: string;
+  /** packFactor(m) — 1 when there is no real pack conversion. */
+  pack_factor: number;
+}
+
+/** recipeQty → purchase units. Display-only: rounded to 3 dp, −0 normalised. */
+export function toPurchaseQty(recipeQty: number, m: PackMeta): number {
+  const v = Math.round(((Number(recipeQty) || 0) / packFactor(m)) * 1000) / 1000;
+  return v === 0 ? 0 : v; // normalises -0 → 0 ((-0).toLocaleString prints "-0")
+}
+
+/** Build the frozen wire shape from a recipe qty + the material's pack meta. */
+export function dualQty(recipeQty: number, m: PackMeta): DualQty {
+  const q = Number(recipeQty) || 0;
+  return {
+    qty: q,
+    unit: String(m?.unit || '').trim(),
+    qty_purchase: toPurchaseQty(q, m),
+    purchase_unit: String(m?.purchase_unit || m?.unit || '').trim(),
+    pack_factor: packFactor(m),
+  };
+}
+
+/**
+ * DISPLAY-ONLY unit price: ₹/recipe-unit → ₹/purchase-unit (× packFactor).
+ * Never use the output to compute a line value — value = recipeQty × ₹/recipe,
+ * always, or rounding drift creates paise-level disagreements between surfaces.
+ */
+export function purchasePrice(pricePerRecipeUnit: number, m: PackMeta): number {
+  return Math.round((Number(pricePerRecipeUnit) || 0) * packFactor(m) * 100) / 100;
+}
+
+/**
+ * Adaptive-precision en-IN number: whole numbers plain, fractions to 3 dp with
+ * trailing zeros trimmed. Exported so pages stop re-inventing fmtNum (there
+ * were nine divergent local copies with 2-vs-3 dp disagreements).
+ */
+export function fmtQtyNum(v: number): string {
+  const n = Number(v) || 0;
+  return n.toLocaleString('en-IN', { maximumFractionDigits: 3 });
+}
+
+/** CSV-safe number: fixed 3 dp, NO locale grouping (never toLocaleString in an export). */
+export function csvQty(v: number): number {
+  return Math.round((Number(v) || 0) * 1000) / 1000;
+}
+
+export type HintStyle = 'recipe' | 'breakdown' | 'none';
+export interface QtyDisplay {
+  /** e.g. "2 l" — formatted, ready to print. */
+  primary: string;
+  primaryUnit: string;
+  primaryValue: number;
+  /** "= 2,000 ml" | "9 btl + 450 ml" | null. */
+  hint: string | null;
+  /** Which basis `primary` is in — 'recipe' is the honest fallback when pack
+   *  meta is missing (an older cached payload, a route that forgot the JOIN). */
+  basis: 'purchase' | 'recipe';
+}
+
+/**
+ * THE display entry point. Accepts a server DualQty payload, or a recipe qty +
+ * PackMeta for client-side conversion. The recipe hint appears only when the
+ * two bases actually differ; bar surfaces pass hint:'breakdown' to keep the
+ * cases+bottles+loose string they already use.
+ */
+export function displayQty(d: DualQty, opts?: { hint?: HintStyle; meta?: PackMeta }): QtyDisplay;
+export function displayQty(recipeQty: number, m: PackMeta, opts?: { hint?: HintStyle }): QtyDisplay;
+export function displayQty(a: DualQty | number, b?: PackMeta | { hint?: HintStyle; meta?: PackMeta }, c?: { hint?: HintStyle }): QtyDisplay {
+  let d: DualQty; let hint: HintStyle; let meta: PackMeta | undefined;
+  if (typeof a === 'number') {
+    meta = (b as PackMeta) || {};
+    d = dualQty(a, meta);
+    hint = c?.hint ?? 'recipe';
+  } else {
+    // Tolerate an older cached payload that predates the dual fields (PWA +
+    // IndexedDB outbox can replay pre-conversion responses).
+    d = {
+      qty: Number(a?.qty) || 0,
+      unit: String(a?.unit || '').trim(),
+      qty_purchase: a?.qty_purchase ?? (Number(a?.qty) || 0),
+      purchase_unit: String(a?.purchase_unit || a?.unit || '').trim(),
+      pack_factor: Number(a?.pack_factor) || 1,
+    };
+    const o = b as { hint?: HintStyle; meta?: PackMeta } | undefined;
+    hint = o?.hint ?? 'recipe';
+    meta = o?.meta;
+  }
+  const converts = d.pack_factor > 1;
+  const primaryValue = converts ? d.qty_purchase : Number(d.qty) || 0;
+  const primaryUnit = d.purchase_unit || d.unit;
+  const out: QtyDisplay = {
+    primary: `${fmtQtyNum(primaryValue)} ${primaryUnit}`.trim(),
+    primaryUnit,
+    primaryValue,
+    hint: null,
+    basis: converts || d.purchase_unit === d.unit || !d.unit ? 'purchase' : 'purchase',
+  };
+  // Honest fallback: no pack meta AND no conversion means we cannot know the
+  // purchase basis — say recipe rather than lie.
+  if (!converts && d.purchase_unit === d.unit && d.pack_factor === 1 && !d.purchase_unit) out.basis = 'recipe';
+  if (hint === 'none' || !converts) return out;
+  if (hint === 'breakdown' && meta) {
+    const br = fmtBreakdown(d.qty, meta);
+    if (br) { out.hint = br; return out; }
+  }
+  out.hint = `= ${fmtQtyNum(d.qty)} ${d.unit}`.trim();
+  return out;
+}

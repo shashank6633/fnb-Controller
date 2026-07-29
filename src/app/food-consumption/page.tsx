@@ -241,8 +241,10 @@ function FoodItemsModal({ target, onClose }: { target: PnLRow; onClose: () => vo
                   {items.map(it => (
                     <tr key={it.id} className="border-t border-[#E8D5C4]/50">
                       <td className="py-1.5 px-2 text-[#2D1B0E]">{it.material_name}</td>
-                      <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{it.qty} {it.material_unit}</td>
-                      <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{it.qty_issued || 0} {it.material_unit}</td>
+                      {/* qty is stored in the LINE's unit (usually the purchase unit) — labelling it
+                          with the recipe unit read a 2-BTL request as 2 ml. */}
+                      <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{it.qty} {(it as any).qty_unit || it.material_unit}</td>
+                      <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{it.qty_issued || 0} {(it as any).qty_unit || it.material_unit}</td>
                       <td className="py-1.5 px-2 text-right font-mono">{fmt(it.cost)}</td>
                       <td className="py-1.5 px-2 text-[10px] text-[#8B7355] whitespace-nowrap">{(it.req_status || '').replace(/_/g, ' ')}</td>
                     </tr>

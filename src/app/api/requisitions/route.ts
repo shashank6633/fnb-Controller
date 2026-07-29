@@ -332,9 +332,20 @@ export async function POST(request: Request) {
         INSERT INTO requisition_items (id, req_id, material_id, quantity_requested, unit, notes, department_id)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
+      // A blank unit is AMBIGUOUS downstream: reqPackFactor reads it as recipe
+      // units while the composer's picker shows purchase units, so a "1" typed
+      // against "1 kg" would deduct one gram. The client normally sends the
+      // purchase unit (StaffCatalogPicker/onPick), but the SERVER must not
+      // depend on that — default it from the material, the same resolution the
+      // Recaho importer now uses. This is what quantities on a requisition ARE.
+      const unitOfMaterial = db.prepare(`
+        SELECT COALESCE(NULLIF(TRIM(purchase_unit), ''), unit) AS u FROM raw_materials WHERE id = ?
+      `);
       for (const it of validItems) {
+        const unit = String(it.unit || '').trim()
+          || String((unitOfMaterial.get(it.material_id) as any)?.u || '');
         insItem.run(generateId(), id, it.material_id, Number(it.quantity_requested),
-                    (it.unit || '').toString(), it.notes || '', it.department_id);
+                    unit, it.notes || '', it.department_id);
       }
     });
     txn();
@@ -439,9 +450,13 @@ export async function PUT(request: Request) {
           const qty = Number(it.quantity_requested) || 0;
           if (!it.material_id || qty <= 0) continue;
           const prev = prevByMat.get(it.material_id);
+          // Same no-blank rule as POST: client value → prior line's unit → the
+          // material's purchase unit. A blank would flip the quantity's meaning
+          // to recipe units (reqPackFactor) against a picker that showed packs.
           const unit = (it.unit != null && String(it.unit).trim() !== '')
             ? String(it.unit)
-            : (prev?.unit || '');
+            : (prev?.unit
+               || String((db.prepare(`SELECT COALESCE(NULLIF(TRIM(purchase_unit), ''), unit) AS u FROM raw_materials WHERE id = ?`).get(it.material_id) as any)?.u || ''));
           // Line dept: explicit from client → prior line dept → req-level dept.
           const deptId = it.department_id || prev?.department_id || r.department_id;
           ins.run(generateId(), id, it.material_id, qty, unit, it.notes || '', deptId);

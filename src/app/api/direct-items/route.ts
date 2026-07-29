@@ -21,6 +21,8 @@ import { getDb } from '@/lib/db';
  */
 
 type Mat = {
+  purchase_unit?: string | null;
+  pack_size?: number | null;
   id: string;
   name: string;
   unit: string;
@@ -167,6 +169,7 @@ export async function GET(request: Request) {
     // Pre-aggregate material data
     const materials = db.prepare(`
       SELECT rm.id, rm.name, rm.unit, rm.current_stock, rm.average_price,
+             rm.purchase_unit, COALESCE(rm.pack_size, 1) AS pack_size,
              COALESCE(SUM(p.quantity), 0)  AS purchased_qty,
              COUNT(p.id)                   AS purchase_count
       FROM raw_materials rm
@@ -281,7 +284,16 @@ export async function GET(request: Request) {
                 : `assumed 30 ml/peg`);
       }
 
-      const purchasedQty = best?.mat.purchased_qty ?? 0;
+      // purchases.quantity is PURCHASE units (canon); everything below —
+      // soldInMatUnit, current_stock, avgCost (₹/recipe-unit) — is RECIPE basis.
+      // Subtracting bottles from ml understated purchases pack_size× and turned
+      // the leakage/purchase-error verdicts into noise for packed materials.
+      const _pm = best?.mat;
+      const _pf = _pm && Number(_pm.pack_size) > 1
+        && String(_pm.unit || '').toLowerCase().trim()
+           !== String(_pm.purchase_unit || _pm.unit || '').toLowerCase().trim()
+        ? Number(_pm.pack_size) : 1;
+      const purchasedQty = (_pm?.purchased_qty ?? 0) * _pf;
       const currentStock = best?.mat.current_stock ?? 0;
       const avgCost = best?.mat.average_price ?? 0;
 
@@ -383,7 +395,12 @@ export async function GET(request: Request) {
           matched: {
             material_id: m.id, material_name: m.name, unit: m.unit, per_unit_ml: null,
             avg_price: m.average_price || 0, current_stock: m.current_stock || 0,
-            purchased_qty: m.purchased_qty || 0, purchase_count: m.purchase_count || 0, score: 1,
+            // Same recipe-basis normalisation as the sales-matched path above.
+            purchased_qty: (m.purchased_qty || 0) * (Number(m.pack_size) > 1
+              && String(m.unit || '').toLowerCase().trim()
+                 !== String(m.purchase_unit || m.unit || '').toLowerCase().trim()
+              ? Number(m.pack_size) : 1),
+            purchase_count: m.purchase_count || 0, score: 1,
           },
           sold_in_mat_unit: 0, conversion_note: 'manual — no sales yet',
           diff_qty: 0, diff_value: 0, status: 'reconciled',

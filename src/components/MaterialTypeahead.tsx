@@ -20,6 +20,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Search, X } from 'lucide-react';
+import { toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 
 export interface MaterialLite {
   id: string;
@@ -29,6 +30,10 @@ export interface MaterialLite {
   category?: string;
   current_stock?: number;
   reorder_level?: number;
+  /** Optional pack meta — only read when `purchaseBasis` is on. Optional so the
+   *  many existing callers (incl. /recipes) compile and behave unchanged. */
+  purchase_unit?: string | null;
+  pack_size?: number | null;
 }
 
 export default function MaterialTypeahead({
@@ -39,6 +44,7 @@ export default function MaterialTypeahead({
   placeholder = 'Type material name, SKU or category…',
   compact = true,
   showStock = true,
+  purchaseBasis = false,
 }: {
   materials: MaterialLite[];
   value: string;
@@ -47,7 +53,31 @@ export default function MaterialTypeahead({
   placeholder?: string;
   compact?: boolean;
   showStock?: boolean;
+  /** OPT-IN: render the on-hand figure and the picked chip's unit in PURCHASE
+   *  units (owner rule for Inventory/Store/Purchase surfaces). Strictly opt-in
+   *  because this component is ALSO mounted by /recipes, which must stay in
+   *  recipe units — the default render path must never convert. Callers that
+   *  turn it on must supply purchase_unit + pack_size on their MaterialLite
+   *  rows (the /api/inventory payload already carries both). */
+  purchaseBasis?: boolean;
 }) {
+  // Display-only conversion for the opt-in purchase basis. Falls back to the
+  // recipe figure when the caller did not supply pack meta — an honest recipe
+  // number beats a silently under-converted one.
+  const displayStock = (m: MaterialLite): { qty: number; unit: string } => {
+    if (!purchaseBasis || m.purchase_unit == null) {
+      return { qty: Number(m.current_stock) || 0, unit: String(m.unit || '') };
+    }
+    return {
+      qty: toPurchaseQty(Number(m.current_stock) || 0, m),
+      unit: String(m.purchase_unit || m.unit || ''),
+    };
+  };
+  const displayUnit = (m: MaterialLite): string =>
+    purchaseBasis && m.purchase_unit != null
+      ? String(m.purchase_unit || m.unit || '')
+      : String(m.unit || '');
+
   const [open, setOpen]   = useState(false);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
@@ -186,7 +216,7 @@ export default function MaterialTypeahead({
           <span className="break-words leading-snug min-w-0 flex-1">
             {picked.sku && <span className="text-[#8B7355] font-mono">{picked.sku} — </span>}
             <span className="text-[#2D1B0E]">{picked.name}</span>
-            {picked.unit && <span className="text-[#8B7355]"> ({picked.unit})</span>}
+            {displayUnit(picked) && <span className="text-[#8B7355]"> ({displayUnit(picked)})</span>}
           </span>
           <X size={11} className="text-[#8B7355] hover:text-red-700 mt-0.5 shrink-0"
              onClick={(e) => { e.stopPropagation(); clear(); }} />
@@ -235,11 +265,14 @@ export default function MaterialTypeahead({
                       </div>
                       <div className="text-[9px] text-[#8B7355] flex gap-2 flex-wrap mt-0.5">
                         {m.category && <span>{m.category}</span>}
-                        {showStock && m.current_stock != null && (
-                          <span className={lowStock ? 'text-red-700 font-semibold' : ''}>
-                            on hand: {m.current_stock} {m.unit}{lowStock ? ' ⚠' : ''}
-                          </span>
-                        )}
+                        {showStock && m.current_stock != null && (() => {
+                          const d = displayStock(m);
+                          return (
+                            <span className={lowStock ? 'text-red-700 font-semibold' : ''}>
+                              on hand: {fmtQtyNum(d.qty)} {d.unit}{lowStock ? ' ⚠' : ''}
+                            </span>
+                          );
+                        })()}
                       </div>
                     </div>
                   </li>

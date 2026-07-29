@@ -21,7 +21,7 @@ import {
   IndianRupee, Store as StoreIcon, AlertTriangle, PackageX, Warehouse,
 } from 'lucide-react';
 import Papa from 'papaparse';
-import { fmtBreakdown, PackMeta } from '@/lib/pack-units';
+import { fmtBreakdown, PackMeta, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -55,14 +55,23 @@ const packMeta = (r: Row): PackMeta => ({
 });
 const PAGE_SIZE = 50;
 
-/* One qty cell: raw recipe qty, with the CBL breakdown beneath when packed. */
+/* One qty cell — owner rule: the PURCHASE figure leads ("2 l", "3 BTL"); the
+ * cases+bottles+loose breakdown stays as the hint for bar materials; the exact
+ * recipe number lives in the tooltip (it is the stored truth the ₹ column and
+ * the deductions use). qty stays recipe-basis in state — display converts here
+ * and ONLY here on this page. */
 function QtyCell({ qty, r, strong }: { qty: number; r: Row; strong?: boolean }) {
   const neg = qty < 0;
-  const dual = (r.pack_size > 1 || (r.case_size ?? 1) > 1) ? fmtBreakdown(qty, packMeta(r)) : null;
+  const meta = packMeta(r);
+  const dual = (r.pack_size > 1 || (r.case_size ?? 1) > 1) ? fmtBreakdown(qty, meta) : null;
   const zero = qty === 0;
+  const puQty = toPurchaseQty(qty, meta);
+  const puLbl = r.purchase_unit || r.unit || '';
+  const converts = puQty !== qty || String(r.purchase_unit || '').toLowerCase().trim() !== String(r.unit || '').toLowerCase().trim();
   return (
-    <div className={`text-right tabular-nums ${neg ? 'text-red-700' : zero ? 'text-[#B9A896]' : 'text-[#2D1B0E]'}`}>
-      <span className={strong ? 'font-semibold' : ''}>{fq(qty)}</span>
+    <div className={`text-right tabular-nums ${neg ? 'text-red-700' : zero ? 'text-[#B9A896]' : 'text-[#2D1B0E]'}`}
+         title={converts ? `= ${fq(qty)} ${r.unit || ''} (exact)` : undefined}>
+      <span className={strong ? 'font-semibold' : ''}>{fmtQtyNum(puQty)}{puLbl ? ' ' + puLbl : ''}</span>
       {dual && <div className="text-[10px] text-[#8B7355] font-normal leading-tight">{dual}</div>}
     </div>
   );
@@ -140,13 +149,21 @@ export default function StockOverviewPage() {
   }, [filtered]);
 
   const exportCsv = () => {
-    const header = ['Material', 'SKU', 'Category', 'Unit', 'Grocery (central)', ...stores.map(s => s.name), 'Total Qty', 'Total Value'];
-    const body = filtered.map(r => [
-      r.name, r.sku || '', r.category || '', r.unit || '',
-      Number(r.grocery_qty),
-      ...stores.map(s => Number(r.by_store[s.id] ?? 0)),
-      Number(r.total_qty), Number(r.total_value),
-    ]);
+    // Both bases, named columns: purchase leads (what the store reads), the
+    // recipe figures follow (the exact stored truth the ₹ column uses).
+    const header = ['Material', 'SKU', 'Category', 'Purchase Unit', 'Grocery (central)',
+                    ...stores.map(s => s.name), 'Total Qty',
+                    'Recipe Unit', 'Grocery (recipe)', 'Total Qty (recipe)', 'Total Value'];
+    const body = filtered.map(r => {
+      const meta = packMeta(r);
+      return [
+        r.name, r.sku || '', r.category || '', r.purchase_unit || r.unit || '',
+        toPurchaseQty(Number(r.grocery_qty), meta),
+        ...stores.map(s => toPurchaseQty(Number(r.by_store[s.id] ?? 0), meta)),
+        toPurchaseQty(Number(r.total_qty), meta),
+        r.unit || '', Number(r.grocery_qty), Number(r.total_qty), Number(r.total_value),
+      ];
+    });
     const csv = Papa.unparse([header, ...body]);
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -287,17 +304,14 @@ export default function StockOverviewPage() {
                 <tr className="border-t-2 border-[#E8D5C4] bg-[#FFF1E3] font-semibold text-[#2D1B0E]">
                   <td className="px-3 py-2 sticky left-0 bg-[#FFF1E3] z-10">Page total</td>
                   <td className="px-3 py-2" />
-                  <td className="px-3 py-2 text-right tabular-nums text-xs text-[#6B5744] bg-[#FBF0E6] border-l border-[#F0E4D6]">
-                    {fq(paged.reduce((a, r) => a + r.grocery_qty, 0))}
-                  </td>
+                  {/* Quantity totals removed: summing ml + g + pcs across
+                      materials was meaningless in ANY unit basis. The ₹ total
+                      (right) is the valid aggregate. */}
+                  <td className="px-3 py-2 text-right text-xs text-[#B9A896] bg-[#FBF0E6] border-l border-[#F0E4D6]">—</td>
                   {stores.map(s => (
-                    <td key={s.id} className="px-3 py-2 text-right tabular-nums text-xs text-[#6B5744]">
-                      {fq(paged.reduce((a, r) => a + Number(r.by_store[s.id] ?? 0), 0))}
-                    </td>
+                    <td key={s.id} className="px-3 py-2 text-right text-xs text-[#B9A896]">—</td>
                   ))}
-                  <td className="px-3 py-2 text-right tabular-nums text-xs bg-[#FBE7D3]">
-                    {fq(paged.reduce((a, r) => a + r.total_qty, 0))}
-                  </td>
+                  <td className="px-3 py-2 text-right text-xs text-[#B9A896] bg-[#FBE7D3]">—</td>
                   <td className="px-3 py-2 text-right tabular-nums bg-[#FBE7D3]">
                     {inr(paged.reduce((a, r) => a + r.total_value, 0))}
                   </td>

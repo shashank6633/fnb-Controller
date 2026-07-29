@@ -27,6 +27,9 @@ export async function GET(request: Request) {
       SELECT ri.id,
              rm.name               AS material_name,
              rm.unit               AS material_unit,
+             -- The unit the qty numbers are ACTUALLY stored in (reqPackFactor
+             -- convention) — the client must label with this, not the recipe unit.
+             COALESCE(NULLIF(TRIM(ri.unit), ''), rm.unit) AS qty_unit,
              ri.quantity_requested AS qty,
              ri.quantity_issued    AS qty_issued,
              rm.average_price      AS avg_price,

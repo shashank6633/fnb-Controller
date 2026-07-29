@@ -1047,14 +1047,18 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
 
   const downloadCsv = () => {
     if (events.length === 0) return;
-    const headers = ['When', 'Material', 'Qty', 'Unit', 'Department', 'Req #', 'Issuer', 'Unit Cost', 'Value', 'Purpose', 'Event', 'Note'];
+    // Both bases: the purchase figure is what was handed over, the recipe
+    // figure is what Value and the stock deduction were computed from.
+    const headers = ['When', 'Material', 'Qty', 'Unit', 'Qty (recipe)', 'Recipe Unit',
+                     'Department', 'Req #', 'Issuer', 'Unit Cost', 'Value', 'Purpose', 'Event', 'Note'];
     const escape = (v: any) => {
       const s = v == null ? '' : String(v);
       return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     const lines = [headers.join(',')];
     for (const e of events) {
-      lines.push([e.at, e.material_name, e.qty, e.unit, e.department_name, e.req_number,
+      lines.push([e.at, e.material_name, e.qty_purchase ?? e.qty, e.purchase_unit || e.unit,
+                  e.qty, e.unit, e.department_name, e.req_number,
                   e.issuer, e.unit_cost?.toFixed?.(2), e.value?.toFixed?.(2),
                   e.purpose, e.event_name, e.note].map(escape).join(','));
     }
@@ -1131,8 +1135,18 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
                         <div className="text-[9px] text-[#8B7355]">party: {e.event_name}</div>
                       )}
                     </td>
+                    {/* Lead with the PURCHASE figure — that is what the store
+                        physically handed over. `qty` is RECIPE units (g, ml), which
+                        reads as nonsense on a hand-over row ("issued 4 g of butter"),
+                        so it is shown underneath only when the two differ, because it
+                        is the number the Value column and the stock deduction use.
+                        ?? / || fallbacks keep an older payload rendering. */}
                     <td className="py-1.5 px-2 text-right font-mono font-semibold text-emerald-700">
-                      {fmtNum(e.qty)} <span className="text-[9px] text-[#8B7355]">{e.unit}</span>
+                      {fmtNum(e.qty_purchase ?? e.qty)}{' '}
+                      <span className="text-[9px] text-[#8B7355]">{e.purchase_unit || e.unit}</span>
+                      {Number(e.pack_factor) > 1 && (
+                        <div className="text-[9px] font-normal text-[#B8A590]">= {fmtNum(e.qty)} {e.unit}</div>
+                      )}
                     </td>
                     <td className="py-1.5 px-2 text-[#6B5744]">{e.department_name || '—'}</td>
                     <td className="py-1.5 px-2 font-mono text-[10px] text-[#8B7355]">{e.req_number}</td>
