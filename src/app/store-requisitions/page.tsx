@@ -363,6 +363,15 @@ export default function StoreRequisitionsPage() {
     // is NOT clamped — issuing more than outstanding is a real thing a store
     // does, and silently truncating it would hide stock that physically left).
     const resolved = resolveIssueQty(line, outstanding);
+    // Enforced HERE rather than by grey-ing the button: a disabled button with
+    // no message reads as "the app ignored me", which is exactly how an
+    // over-issue looked before this.
+    if (qtyOverride == null && resolved.over && resolved.note.length < 3) {
+      alert(`You are issuing more than was approved for ${line.material_name}.\n\n`
+        + `Type a short reason in the amber box next to the quantity (at least 3 characters) — `
+        + `it is recorded on the issue history so the extra stock is accounted for.`);
+      return;
+    }
     const qty = qtyOverride != null ? qtyOverride : resolved.qty;
     if (!qty || qty <= 0) { alert('Enter a quantity > 0'); return; }
     setBusyLine(line.id);
@@ -1183,10 +1192,8 @@ function LineRow(props: {
                          overIssue ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`} />
                 {u && <span className="text-[10px] text-[#6B5744] font-medium">{u}</span>}
                 <button onClick={() => props.onIssue(line)}
-                        disabled={busy || (overIssue && (props.issueNotes[line.id] || '').trim().length < 3)}
-                        title={overIssue && (props.issueNotes[line.id] || '').trim().length < 3
-                          ? 'Say why you are issuing more than was approved (min 3 characters)'
-                          : undefined}
+                        disabled={busy}
+                        title={overIssue ? 'Issuing more than approved — a short reason is required' : undefined}
                         className="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[10px] flex items-center gap-1 disabled:opacity-50">
                   {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
                   Issue Now

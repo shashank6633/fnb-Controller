@@ -1899,6 +1899,12 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               <tbody>
                 {lines.map((ln, i) => {
                   const short = Math.max(0, ln.requested - ln.quantity_issued);
+                  /* OVER-ISSUE. The field is seeded with the APPROVED qty
+                     (min(approved, stock)), so a store that physically handed
+                     over more had no way to know it could type the real figure —
+                     it just submitted the seeded number. The value is allowed
+                     and recorded as-is; this only makes it visible. */
+                  const overIssued = ln.quantity_issued - ln.requested > 1e-9;
                   // Negative-stock guard — disable the input and force qty to 0.
                   // The accompanying red banner above tells the user to raise a PO.
                   const negStock = Number(ln.current_stock) < 0;
@@ -1929,8 +1935,17 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                onChange={e => update(i, { quantity_issued: Math.max(0, Number(e.target.value) || 0) })}
                                title={negStock
                                  ? 'System stock is negative — cannot issue. Raise a vendor PO immediately.'
-                                 : 'Quantity to hand over now.'}
-                               className={`w-20 px-1.5 py-1 border rounded text-right text-xs ${negStock ? 'border-red-200 bg-red-50/40 cursor-not-allowed' : 'border-[#E8D5C4]'}`} />
+                                 : 'Quantity actually handed over. Seeded with the approved qty — type the real figure if more or less left the store.'}
+                               className={`w-20 px-1.5 py-1 border rounded text-right text-xs ${
+                                 negStock ? 'border-red-200 bg-red-50/40 cursor-not-allowed'
+                                 : overIssued ? 'border-amber-400 bg-amber-50'
+                                 : 'border-[#E8D5C4]'}`} />
+                        {overIssued && (
+                          <div className="text-[9px] text-amber-800 mt-0.5 text-right">
+                            {(ln.quantity_issued - ln.requested).toLocaleString('en-IN', { maximumFractionDigits: 3 })} {ln.req_unit} over
+                            the approved {ln.requested.toLocaleString('en-IN')} {ln.req_unit} — recorded as issued
+                          </div>
+                        )}
                         {/* Issued qty is seeded and edited in the REQUESTED unit
                             (issuable = min(demand, stock÷pack) above; store-process
                             persists the number verbatim, and ReqItem documents
