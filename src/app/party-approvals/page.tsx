@@ -34,9 +34,10 @@ const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
  *  purchase-unit lines by the pack size. */
 function reqPackFactor(it: any): number {
   const pack = Number(it.material_pack_size) || 1;
-  const u = String(it.unit || '').trim();
-  return (u !== '' && it.material_purchase_unit && u === it.material_purchase_unit &&
-          u !== it.material_unit && pack > 1) ? pack : 1;
+  const u = String(it.unit || '').toLowerCase().trim();
+  const pu = String(it.material_purchase_unit || '').toLowerCase().trim();
+  const ru = String(it.material_unit || '').toLowerCase().trim();
+  return (u !== '' && pu !== '' && u === pu && u !== ru && pack > 1) ? pack : 1;
 }
 
 /** Heuristic sanity check for a requisition line — returns a human-readable
@@ -688,6 +689,7 @@ export default function PartyApprovalsPage() {
                                               </td>
                                               <td className="py-0.5 text-right">
                                                 {editable && !rejected ? (
+                                                  <>
                                                   <input type="number" step="any" min={0}
                                                          // CONTROLLED input — value tracks the draft map.
                                                          // Up/down spin buttons fire onChange too, so cost
@@ -705,6 +707,8 @@ export default function PartyApprovalsPage() {
                                                          onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
                                                          className={`w-20 px-1 py-0.5 border rounded text-right text-[11px] font-mono ${effQty !== reqQty ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4] bg-white'}`}
                                                          title={effQty !== reqQty ? `Chef adjusted from ${reqQty} → ${effQty}` : 'Click / spin / type to edit; tab/enter/blur to save'} />
+                                                    <span className="ml-1 text-[9px] text-[#8B7355]">{String(it.unit || '').trim() || it.material_unit || ''}</span>
+                                                  </>
                                                 ) : (
                                                   <span className={`font-mono ${effQty !== reqQty ? 'text-amber-700 font-semibold' : 'text-[#2D1B0E]'}`}>
                                                     {effQty} <span className="text-[9px] text-[#8B7355]">{String(it.unit || '').trim() || it.material_unit || ''}</span>

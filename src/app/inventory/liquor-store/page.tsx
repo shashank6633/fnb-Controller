@@ -765,8 +765,10 @@ export default function LiquorStorePage() {
                               )}
                             </td>
                             <td className="px-3 py-2 text-right whitespace-nowrap text-[#6B5744]">
-                              {inr(r.avg_cost, 4)}/{r.unit}
-                              {pc > 1 && <div className="text-[10px] text-[#8B7355]">{inr(r.avg_cost * pc)}/{r.purchase_unit}</div>}
+                              {/* ₹/purchase-unit leads (owner rule) — the row's quantities are
+                                  bottles, so the rate beside them must be per bottle too. */}
+                              {pc > 1 ? <>{inr(r.avg_cost * pc)}/{r.purchase_unit}</> : <>{inr(r.avg_cost, 4)}/{r.unit}</>}
+                              {pc > 1 && <div className="text-[10px] text-[#8B7355]">{inr(r.avg_cost, 4)}/{r.unit}</div>}
                             </td>
                             <td className="px-3 py-2 text-right font-medium text-[#2D1B0E] whitespace-nowrap">{inr(r.value)}</td>
                           </tr>
@@ -805,7 +807,10 @@ export default function LiquorStorePage() {
                         <span>
                           <DualQty qty={r.qty} m={r} boldCls={`font-bold ${low ? 'text-red-700' : 'text-[#2D1B0E]'}`} />
                         </span>
-                        <span>{inr(r.avg_cost, 4)}/{r.unit}</span>
+                        <span>{(() => {
+                          const mpc = packFactor(r);
+                          return mpc > 1 ? `${inr(r.avg_cost * mpc)}/${r.purchase_unit}` : `${inr(r.avg_cost, 4)}/${r.unit}`;
+                        })()}</span>
                         <span className="ml-auto font-semibold text-[#2D1B0E]">{inr(r.value)}</span>
                       </div>
                       {central > 0 && (
@@ -923,7 +928,7 @@ export default function LiquorStorePage() {
                                 <span className="font-medium text-[#2D1B0E]">Counted <DualQty qty={l.quantity} m={l} boldCls="font-medium text-[#2D1B0E]" /></span>
                                 {isAdmin && (
                                   <div className="text-[10px] text-[#8B7355]">
-                                    system {fq(l.system_qty ?? 0)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fq(l.variance ?? 0)}
+                                    system {fmtBreakdown(l.system_qty ?? 0, l) || `${fq(l.system_qty ?? 0)} ${l.unit}`} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fmtBreakdown(Math.abs(l.variance ?? 0), l) ? `${(l.variance ?? 0) < 0 ? '−' : ''}${fmtBreakdown(Math.abs(l.variance ?? 0), l)}` : `${fq(l.variance ?? 0)} ${l.unit}`}
                                   </div>
                                 )}
                                 <div className="text-[10px] italic text-[#8B7355]">count only — stock unchanged</div>
@@ -935,7 +940,12 @@ export default function LiquorStorePage() {
                               </td>
                             )}
                             <td className="px-3 py-2 text-right whitespace-nowrap text-[#6B5744]">
-                              {!l.is_count && l.unit_cost > 0 ? <>{inr(l.unit_cost, 4)}/{l.unit}</> : '—'}
+                              {!l.is_count && l.unit_cost > 0 ? (() => {
+                                const lpc = packConv(l);
+                                return lpc > 1
+                                  ? <>{inr(l.unit_cost * lpc)}/{l.purchase_unit}<div className="text-[10px] text-[#8B7355]">{inr(l.unit_cost, 4)}/{l.unit}</div></>
+                                  : <>{inr(l.unit_cost, 4)}/{l.unit}</>;
+                              })() : '—'}
                             </td>
                             <td className="px-3 py-2 text-[#6B5744]">
                               {l.batch_no || '—'}
@@ -987,7 +997,7 @@ export default function LiquorStorePage() {
                           <span className="font-semibold text-[#2D1B0E]">Counted <DualQty qty={l.quantity} m={l} boldCls="font-semibold text-[#2D1B0E]" /></span>
                           {isAdmin && (
                             <div className="text-[10px] text-[#8B7355]">
-                              system {fq(l.system_qty ?? 0)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fq(l.variance ?? 0)}
+                              system {fmtBreakdown(l.system_qty ?? 0, l) || `${fq(l.system_qty ?? 0)} ${l.unit}`} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fmtBreakdown(Math.abs(l.variance ?? 0), l) ? `${(l.variance ?? 0) < 0 ? '−' : ''}${fmtBreakdown(Math.abs(l.variance ?? 0), l)}` : `${fq(l.variance ?? 0)} ${l.unit}`}
                             </div>
                           )}
                           <div className="text-[10px] italic text-[#8B7355]">count only — stock unchanged</div>
@@ -998,7 +1008,10 @@ export default function LiquorStorePage() {
                             <DualQty qty={l.quantity} m={l} sign
                                      boldCls={`font-semibold ${l.quantity < 0 ? 'text-red-700' : 'text-emerald-700'}`} />
                           </span>
-                          {l.unit_cost > 0 && <span>{inr(l.unit_cost, 4)}/{l.unit}</span>}
+                          {l.unit_cost > 0 && <span>{(() => {
+                            const lpc = packConv(l);
+                            return lpc > 1 ? `${inr(l.unit_cost * lpc)}/${l.purchase_unit}` : `${inr(l.unit_cost, 4)}/${l.unit}`;
+                          })()}</span>}
                         </div>
                       )}
                       <div className="mt-1 text-[10px] text-[#8B7355] space-x-2">
@@ -1752,7 +1765,15 @@ function parseBillCsv(text: string): UploadRow[] {
       const u = purchase_unit.toLowerCase().replace(/[^a-z]/g, '');
       if (['case', 'cases', 'cs', 'box', 'boxes', 'carton', 'cartons'].includes(u)) qCases = inward_qty;
       else if (['bottle', 'bottles', 'btl', 'btls', 'pc', 'pcs', 'piece', 'pieces', 'nos', 'no', 'each', 'ea', 'unit', 'units'].includes(u)) qBottles = inward_qty;
-      else if (['ml', 'l', 'ltr', 'litre', 'litres', 'liter', 'liters', 'peg', 'pegs', 'loose', 'g', 'kg'].includes(u)) qLoose = inward_qty;
+      else if (['ml', 'l', 'ltr', 'litre', 'litres', 'liter', 'liters', 'peg', 'pegs', 'loose', 'g', 'kg'].includes(u)) {
+        qLoose = inward_qty;
+        // Loose is the RECIPE-unit slot (usually ml/g). 'L'/'kg' are 1000× the
+        // usual recipe unit and CANNOT be scaled here (material resolves
+        // server-side) — flag so the operator fixes the sheet before posting.
+        if (['l', 'ltr', 'litre', 'litres', 'liter', 'liters', 'kg'].includes(u)) {
+          unitNote = `"${purchase_unit}" routed to LOOSE, which is read in the recipe unit (ml/g) — a ${inward_qty} ${purchase_unit} line would post ~1000× small. Use ml/g or the cases/bottles columns.`;
+        }
+      }
       else {
         // Blank or unrecognised unit. Default to BOTTLES, never cases: a case is
         // ~12 bottles, so guessing "case" would inflate the receipt an order of
@@ -1808,13 +1829,21 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
     return Math.abs(calc - stated) > 1;                 // ₹1 tolerance for rounding
   }).length, [rows]);
 
-  const previewInvoice = useMemo(() => rows.reduce((s, r) => {
-    const amt = numOr0(r.amount);
-    if (amt > 0) return s + amt;
-    const up = numOr0(r.unit_price);
-    const cs = numOr0(r.cases), bt = numOr0(r.bottles);
-    return s + up * (r.per_case ? cs : cs + bt);   // rough estimate; exact on server
-  }, 0), [rows]);
+  const [previewInvoice, previewExcluded] = useMemo(() => {
+    let sum = 0, excluded = 0;
+    for (const r of rows) {
+      const amt = numOr0(r.amount);
+      if (amt > 0) { sum += amt; continue; }
+      const up = numOr0(r.unit_price);
+      const cs = numOr0(r.cases), bt = numOr0(r.bottles);
+      if (r.per_case) { sum += up * cs; continue; }
+      // Per-bottle price with cases present: the case's bottle count is only
+      // known server-side, so estimating cs×1 bottle would undershoot ~12×.
+      if (cs > 0) { excluded++; sum += up * bt; continue; }
+      sum += up * bt;
+    }
+    return [sum, excluded];
+  }, [rows]);
 
   const onFile = async (f: File | null) => {
     if (!f) return;
@@ -1974,7 +2003,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
     <ModalShell wide title="Upload CSV Bill (govt invoice)" icon={<Upload className="w-5 h-5 text-[#af4408]" />} onClose={onClose}
       footer={<>
         <span className="mr-auto text-sm text-[#6B5744]">
-          {rows.length > 0 ? <>{rows.length} row{rows.length === 1 ? '' : 's'} · Invoice ≈ <b className="text-[#2D1B0E]">{inr(previewInvoice)}</b></> : 'No file yet'}
+          {rows.length > 0 ? <>{rows.length} row{rows.length === 1 ? '' : 's'} · Invoice ≈ <b className="text-[#2D1B0E]">{inr(previewInvoice)}</b>{previewExcluded > 0 && <span className="text-amber-700"> ({previewExcluded} row{previewExcluded === 1 ? '' : 's'} with cases at a per-bottle price counted bottles only — case contents added on the server)</span>}</> : 'No file yet'}
         </span>
         <button onClick={onClose} disabled={busy}
                 className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
@@ -2057,10 +2086,16 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
         <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
           <div className="px-3 py-1.5 bg-[#FFF1E3] text-[11px] font-semibold text-[#6B5744]">{rows.length} rows parsed from {fileName}</div>
           {/* Say what was assumed / what disagrees BEFORE the bill is posted. */}
-          {rows.some(r => r.unit_note) && (
+          {rows.some(r => r.unit_note && !/LOOSE/.test(r.unit_note)) && (
             <div className="px-3 py-1.5 bg-amber-50 border-t border-amber-200 text-[11px] text-amber-800">
-              {rows.filter(r => r.unit_note).length} row(s) gave a quantity without a usable <code>purchase_unit</code> — read as <b>bottles</b>.
+              {rows.filter(r => r.unit_note && !/LOOSE/.test(r.unit_note)).length} row(s) gave a quantity without a usable <code>purchase_unit</code> — read as <b>bottles</b>.
               {' '}Add <code>purchase_unit</code> (<code>case</code> or <code>bottle</code>), or use the <code>cases</code>/<code>bottles</code> columns, if that is wrong.
+            </div>
+          )}
+          {rows.some(r => r.unit_note && /LOOSE/.test(r.unit_note)) && (
+            <div className="px-3 py-1.5 bg-red-50 border-t border-red-200 text-[11px] text-red-800 font-medium">
+              ⚠ {rows.filter(r => r.unit_note && /LOOSE/.test(r.unit_note)).length} row(s) would post ~1000× small:
+              {' '}{rows.filter(r => r.unit_note && /LOOSE/.test(r.unit_note)).slice(0, 3).map(r => `${r.item_name || r.sku}: ${r.unit_note}`).join(' · ')}
             </div>
           )}
           {inwardMismatches > 0 && (
@@ -2074,6 +2109,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
               <thead className="bg-[#FBF6EF] text-[#8B7355] sticky top-0">
                 <tr><th className="text-left px-2 py-1">Item</th><th className="text-left px-2 py-1">SKU</th>
                   <th className="text-right px-2 py-1">Cases</th><th className="text-right px-2 py-1">Bottles</th>
+                  <th className="text-right px-2 py-1">Loose</th>
                   <th className="text-right px-2 py-1">Unit ₹</th><th className="text-right px-2 py-1">Amount ₹</th>
                   <th className="text-left px-2 py-1">Date</th></tr>
               </thead>
@@ -2084,6 +2120,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
                     <td className="px-2 py-1 text-[#6B5744]">{r.sku || '—'}</td>
                     <td className="px-2 py-1 text-right">{r.cases || '—'}</td>
                     <td className="px-2 py-1 text-right">{r.bottles || '—'}</td>
+                    <td className={`px-2 py-1 text-right ${r.unit_note ? 'text-amber-700 font-semibold' : ''}`}>{r.loose || '—'}</td>
                     <td className="px-2 py-1 text-right">{r.unit_price || '—'}{r.per_case ? '/cs' : ''}</td>
                     <td className="px-2 py-1 text-right">{r.amount || '—'}</td>
                     <td className="px-2 py-1 text-[#6B5744] whitespace-nowrap">{r.date || <span className="text-[#8B7355]">(Date above)</span>}</td>
@@ -2249,7 +2286,8 @@ function BulkAdjustModal({ storeId, storeName, stock, materials, onClose, onSave
     for (const r of rows) {
       out.push([
         r.material_id, r.sku || '', r.material_name || '', r.category || '', r.unit || '',
-        r.qty, '', '', '', '',   // Cases / Bottles / Loose / Cost — blank to fill
+        r.qty, fmtBreakdown(r.qty, r) || '',
+        '', '', '', '',   // Cases / Bottles / Loose / Cost — blank to fill
       ].map(csvEscape).join(','));
     }
     const blob = new Blob([out.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
@@ -2326,8 +2364,9 @@ function BulkAdjustModal({ storeId, storeName, stock, materials, onClose, onSave
   };
 
   const badge = (c: ReturnType<typeof calc>) => {
-    if (c.action === 'opening') return <span className="inline-flex items-center gap-1 text-[10px] font-semibold bg-sky-50 border border-sky-200 text-sky-800 rounded-full px-2 py-0.5">Opening +{fq(c.target)} {c.mat?.unit}</span>;
-    if (c.action === 'adjust') return <span className={`inline-flex items-center gap-1 text-[10px] font-semibold rounded-full px-2 py-0.5 border ${c.delta < 0 ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'}`}>{c.delta > 0 ? '+' : ''}{fq(c.delta)} {c.mat?.unit}</span>;
+    const bd = (v: number) => (c.mat && fmtBreakdown(Math.abs(v), c.mat)) || `${fq(Math.abs(v))} ${c.mat?.unit || ''}`;
+    if (c.action === 'opening') return <span className="inline-flex items-center gap-1 text-[10px] font-semibold bg-sky-50 border border-sky-200 text-sky-800 rounded-full px-2 py-0.5">Opening +{bd(c.target)}</span>;
+    if (c.action === 'adjust') return <span className={`inline-flex items-center gap-1 text-[10px] font-semibold rounded-full px-2 py-0.5 border ${c.delta < 0 ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'}`}>{c.delta > 0 ? '+' : '−'}{bd(c.delta)}</span>;
     if (c.action === 'nochange') return <span className="text-[10px] text-[#8B7355]">No change</span>;
     return <span className="text-[10px] text-[#8B7355]">—</span>;
   };
@@ -2560,12 +2599,12 @@ interface ClosingDay {
 
 /* Closing-stock CSV template columns — keeps the liquor Cases+Bottles+loose
    entry convention (blank for the counter to fill). */
-const CSV_COLS_CLOSE = ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Cases', 'Bottles', 'Loose'];
+const CSV_COLS_CLOSE = ['material_id', 'SKU', 'Name', 'Category', 'Recipe unit', 'System stock', 'System (cs+btl+loose)', 'Cases', 'Bottles', 'Loose'];
 
 /* Bulk-adjust CSV template columns — Cases/Bottles/Loose is the TARGET stock
    to set (blank row = untouched); Cost/unit is optional, used only when the
    material is getting its first (opening) entry. */
-const CSV_COLS_BULKADJ = ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'Current stock', 'Cases', 'Bottles', 'Loose', 'Cost/unit (opening only)'];
+const CSV_COLS_BULKADJ = ['material_id', 'SKU', 'Name', 'Category', 'Recipe unit', 'Current stock', 'Current (cs+btl+loose)', 'Cases', 'Bottles', 'Loose', 'Cost/unit (opening only)'];
 
 /* ── Closing Stock section — category-wise "Record Closing Stock" ──────────
    Mirrors the central /closing-stock modal (header + Template / Upload CSV /
@@ -2749,12 +2788,14 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
      adjust_to_physical forced OFF (a bulk file must never reconcile stock). */
   const downloadTemplate = () => {
     // Blind count: non-admins get the template WITHOUT the System stock column.
-    const cols = isAdmin ? CSV_COLS_CLOSE : CSV_COLS_CLOSE.filter(c => c !== 'System stock');
+    const cols = isAdmin ? CSV_COLS_CLOSE : CSV_COLS_CLOSE.filter(c => c !== 'System stock' && c !== 'System (cs+btl+loose)');
     const lines = [cols.join(',')];
     for (const r of rows) {
       const base = [r.material_id, r.sku || '', r.material_name || '', r.category || '', r.unit || ''];
       // System stock only for admins; Cases / Bottles / Loose blank for the counter.
-      lines.push((isAdmin ? [...base, systemFor(r), '', '', ''] : [...base, '', '', '']).map(csvEscape).join(','));
+      lines.push((isAdmin
+        ? [...base, systemFor(r), fmtBreakdown(systemFor(r), r) || '', '', '', '']
+        : [...base, '', '', '']).map(csvEscape).join(','));
     }
     const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -2985,7 +3026,10 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                                 {pc > 1 && <div className="text-[10px]">{fq(sys)} {r.unit}</div>}
                               </td>
                             )}
-                            <td className="px-3 py-2 text-right text-xs text-[#8B7355] whitespace-nowrap">{r.unit}</td>
+                            <td className="px-3 py-2 text-right text-xs text-[#8B7355] whitespace-nowrap"
+                                title={packConv(r) > 1 ? `recipe unit: ${r.unit} · 1 ${r.purchase_unit} = ${fq(packConv(r))} ${r.unit}` : undefined}>
+                              {r.purchase_unit || r.unit}
+                            </td>
                             <td className="px-3 py-2">
                               <div className="flex items-center gap-1 flex-wrap">
                                 {showCasesBox && (<>
@@ -3259,13 +3303,15 @@ const REPORT_DEFS: ReportDef[] = [
     { k: 'material', l: 'Material' }, { k: 'sku', l: 'SKU' }, { k: 'category', l: 'Category' },
     { k: 'qty_cbl', l: 'On hand (cs/btl)' },
     { k: 'qty', l: 'Recipe qty', fmt: 'qty' }, { k: 'unit', l: 'R.unit' },
-    { k: 'avg_cost', l: 'Avg cost', fmt: 'inr4' }, { k: 'value', l: 'Value', fmt: 'inr' },
+    { k: 'avg_cost_purchase', l: '₹/purchase unit', fmt: 'inr' },
+    { k: 'avg_cost', l: '₹/recipe unit', fmt: 'inr4' }, { k: 'value', l: 'Value', fmt: 'inr' },
   ] },
   { key: 'ledger', label: 'Stock Ledger', dated: true, cols: [
     { k: 'date', l: 'Date' }, { k: 'txn_type', l: 'Type' }, { k: 'material', l: 'Material' },
     { k: 'qty_cbl', l: 'Cs/Btl' },
     { k: 'qty', l: 'Qty', fmt: 'qty' }, { k: 'unit', l: 'Unit' },
-    { k: 'unit_cost', l: 'Unit cost', fmt: 'inr4' }, { k: 'running_balance', l: 'Balance', fmt: 'qty' },
+    { k: 'unit_cost', l: '₹/recipe unit', fmt: 'inr4' },
+    { k: 'balance_cbl', l: 'Balance (cs/btl)' }, { k: 'running_balance', l: 'Balance (recipe)', fmt: 'qty' },
     { k: 'supplier', l: 'Supplier' }, { k: 'ref', l: 'Ref' }, { k: 'by', l: 'By' },
   ] },
   { key: 'purchases', label: 'Purchase Register', dated: true, cols: [
@@ -3277,10 +3323,10 @@ const REPORT_DEFS: ReportDef[] = [
     { k: 'invoice', l: 'Invoice' }, { k: 'by', l: 'By' },
   ] },
   { key: 'movement', label: 'Movement', dated: true, cols: [
-    { k: 'material', l: 'Material' }, { k: 'unit', l: 'Unit' },
+    { k: 'material', l: 'Material' }, { k: 'unit', l: 'Unit (recipe)' },
     { k: 'opening', l: 'Opening', fmt: 'qty' }, { k: 'in_qty', l: 'In', fmt: 'qty' },
     { k: 'out_qty', l: 'Out', fmt: 'qty' }, { k: 'adjust_qty', l: 'Adjust', fmt: 'qty' },
-    { k: 'closing', l: 'Closing', fmt: 'qty' },
+    { k: 'closing', l: 'Closing', fmt: 'qty' }, { k: 'closing_cbl', l: 'Closing (cs/btl)' },
   ] },
   { key: 'daily_closing', label: 'Daily Closing', dated: true, cols: [
     { k: 'date', l: 'Date' }, { k: 'items', l: 'Items' },
@@ -3289,28 +3335,33 @@ const REPORT_DEFS: ReportDef[] = [
     { k: 'abs_variance_value', l: 'Abs ₹', fmt: 'inr' },
   ] },
   { key: 'valuation', label: 'Valuation', cols: [
+    // qty column dropped: Σ of ml+g+pcs across a category is meaningless in
+    // any unit basis — Value is what a valuation report answers.
     { k: 'category', l: 'Category' }, { k: 'items', l: 'Items' },
-    { k: 'qty', l: 'Qty (recipe)', fmt: 'qty' }, { k: 'value', l: 'Value', fmt: 'inr' },
+    { k: 'value', l: 'Value', fmt: 'inr' },
   ] },
   { key: 'low_stock', label: 'Low Stock', cols: [
     { k: 'material', l: 'Material' }, { k: 'category', l: 'Category' },
-    { k: 'qty', l: 'On hand', fmt: 'qty' }, { k: 'unit', l: 'Unit' },
-    { k: 'reorder_level', l: 'Reorder at', fmt: 'qty' }, { k: 'deficit', l: 'Deficit', fmt: 'qty' },
+    { k: 'qty_cbl', l: 'On hand (cs/btl)' },
+    { k: 'qty_purchase', l: 'On hand', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
+    { k: 'reorder_purchase', l: 'Reorder at', fmt: 'qty' }, { k: 'deficit_purchase', l: 'To buy', fmt: 'qty' },
     { k: 'value', l: 'Value', fmt: 'inr' },
   ] },
   { key: 'dead_stock', label: 'Dead Stock', days: true, cols: [
     { k: 'material', l: 'Material' }, { k: 'category', l: 'Category' },
-    { k: 'qty', l: 'On hand', fmt: 'qty' }, { k: 'unit', l: 'Unit' },
+    { k: 'qty_cbl', l: 'On hand (cs/btl)' },
+    { k: 'qty_purchase', l: 'On hand', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
     { k: 'value', l: 'Value', fmt: 'inr' }, { k: 'last_outward', l: 'Last outward' },
   ] },
   { key: 'supplier', label: 'Supplier-wise', dated: true, cols: [
+    // qty dropped for the same cross-material reason as Valuation.
     { k: 'supplier', l: 'Supplier' }, { k: 'purchases', l: 'Purchases' },
-    { k: 'qty', l: 'Qty (recipe)', fmt: 'qty' }, { k: 'total_value', l: 'Value', fmt: 'inr' },
+    { k: 'total_value', l: 'Value', fmt: 'inr' },
   ] },
   { key: 'category', label: 'Category-wise', cols: [
     { k: 'category', l: 'Category' }, { k: 'material', l: 'Material' }, { k: 'sku', l: 'SKU' },
     { k: 'qty_purchase', l: 'On hand', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
-    { k: 'avg_cost', l: 'Avg cost', fmt: 'inr4' }, { k: 'value', l: 'Value', fmt: 'inr' },
+    { k: 'avg_cost_purchase', l: '₹/purchase unit', fmt: 'inr' }, { k: 'value', l: 'Value', fmt: 'inr' },
   ] },
   { key: 'audit', label: 'Audit Trail', dated: true, cols: [
     { k: 'date', l: 'Date' }, { k: 'event', l: 'Event' },
@@ -3435,7 +3486,12 @@ function ReportsSection({ storeId, storeCode }: { storeId: string; storeCode: st
       {/* Totals strip */}
       {!loading && !err && (
         <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl px-3 sm:px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-[#6B5744]">
-          {Object.entries(totals).map(([k, v]) => (
+          {Object.entries(totals)
+            // in_qty/out_qty are Σ of recipe quantities ACROSS materials (ml+g+pcs
+            // added together) — no unit exists for them, so they are dropped
+            // rather than shown as bare misleading numbers.
+            .filter(([k]) => k !== 'in_qty' && k !== 'out_qty')
+            .map(([k, v]) => (
             <span key={k} className="capitalize">{totalLabel(k)} <b className="text-[#2D1B0E]">{totalFmt(k, v)}</b></span>
           ))}
           {truncated && <span className="text-amber-700">showing first 1000 rows</span>}

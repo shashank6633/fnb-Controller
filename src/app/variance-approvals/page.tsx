@@ -19,6 +19,7 @@ import {
   ScrollText, ShieldCheck, Loader2, RefreshCw, CheckCircle2, XCircle,
   AlertTriangle, Lock, PackageX, PackagePlus, Store, Boxes,
 } from 'lucide-react';
+import { packFactor, toPurchaseQty } from '@/lib/pack-units';
 
 interface Approval {
   id: string; source: 'central' | 'liquor'; material_id: string; material_name: string; material_sku: string;
@@ -69,11 +70,12 @@ export default function VarianceApprovalsPage() {
     if (reason.length < 2) { flash('Enter a reason first — ask the staff what caused it.'); return; }
     setBusy(row.id);
     try {
+      const vm = { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size };
       const res = await api(`/api/variance-approvals/${row.id}/${action}`, { method: 'POST', body: { reason } });
       const j = await res.json();
       if (!res.ok) throw new Error(j?.error || 'Failed');
       flash(action === 'approve'
-        ? `Approved — ${row.material_name} stock set to ${qty(row.physical_stock)} ${row.unit}`
+        ? `Approved — ${row.material_name} stock set to ${qty(toPurchaseQty(row.physical_stock, vm))} ${(row as any).material_purchase_unit || row.unit}`
         : `Rejected — ${row.material_name} stock unchanged; logged as an open loss`);
       setReasons(p => { const n = { ...p }; delete n[row.id]; return n; });
       await load();
@@ -178,7 +180,7 @@ export default function VarianceApprovalsPage() {
                         {shortage ? <PackageX className="w-4 h-4" /> : <PackagePlus className="w-4 h-4" />}
                         {shortage ? 'Shortage' : 'Surplus'} {inr(row.variance_value)}
                       </div>
-                      <div className="text-[12px]">{row.variance > 0 ? '+' : '−'}{qty(Math.abs(row.variance))} {row.unit}</div>
+                      <div className="text-[12px]">{row.variance > 0 ? '+' : '−'}{qty(toPurchaseQty(Math.abs(row.variance), { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }))} {(row as any).material_purchase_unit || row.unit}</div>
                     </div>
                   </div>
 
@@ -186,15 +188,15 @@ export default function VarianceApprovalsPage() {
                   <div className="grid grid-cols-3 gap-2 mt-3 text-center">
                     <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg py-2">
                       <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">System</div>
-                      <div className="font-semibold">{qty(row.system_stock)} <span className="text-[11px] font-normal text-[#8B7355]">{row.unit}</span></div>
+                      <div className="font-semibold" title={packFactor({ unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }) > 1 ? `= ${qty(row.system_stock)} ${row.unit}` : undefined}>{qty(toPurchaseQty(row.system_stock, { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }))} <span className="text-[11px] font-normal text-[#8B7355]">{(row as any).material_purchase_unit || row.unit}</span></div>
                     </div>
                     <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg py-2">
                       <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Counted</div>
-                      <div className="font-semibold">{qty(row.physical_stock)} <span className="text-[11px] font-normal text-[#8B7355]">{row.unit}</span></div>
+                      <div className="font-semibold">{qty(toPurchaseQty(row.physical_stock, { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }))} <span className="text-[11px] font-normal text-[#8B7355]">{(row as any).material_purchase_unit || row.unit}</span></div>
                     </div>
                     <div className={`rounded-lg py-2 border ${shortage ? 'bg-red-50 border-red-200' : 'bg-emerald-50 border-emerald-200'}`}>
                       <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">If approved</div>
-                      <div className="font-semibold">→ {qty(row.physical_stock)} <span className="text-[11px] font-normal text-[#8B7355]">{row.unit}</span></div>
+                      <div className="font-semibold">→ {qty(toPurchaseQty(row.physical_stock, { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }))} <span className="text-[11px] font-normal text-[#8B7355]">{(row as any).material_purchase_unit || row.unit}</span></div>
                     </div>
                   </div>
 

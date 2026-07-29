@@ -884,7 +884,10 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
   }, [from, fromCentral]);
 
   const matLite: MaterialLite[] = useMemo(
-    () => items.map(m => ({ id: m.material_id, name: m.name, category: m.category, unit: m.unit })),
+    // Carries pack meta for the typeahead's opt-in purchase basis: on a STORE
+    // surface the picked chip must read "(BTL)", not "(ml)".
+    () => items.map(m => ({ id: m.material_id, name: m.name, category: m.category, unit: m.unit,
+                            purchase_unit: m.purchase_unit, pack_size: m.pack_size })),
     [items],
   );
   const metaById = useMemo(() => new Map(items.map(m => [m.material_id, m])), [items]);
@@ -1001,7 +1004,7 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
                         materials={matLite} value={l.material_id}
                         excludeIds={chosenIds.filter(id => id !== l.material_id)}
                         onPick={id => setLine(l.key, { material_id: id, cbl: { ...CBL_EMPTY } })}
-                        showStock={false} compact={false}
+                        showStock={false} compact={false} purchaseBasis
                         placeholder="Type a material name or category…" />
                     </div>
                     {lines.length > 1 && (
@@ -1315,7 +1318,10 @@ function EmptiesModal({ stores, onClose, onSaved }: {
   }, [storeId]);
 
   const matLite: MaterialLite[] = useMemo(
-    () => items.map(m => ({ id: m.material_id, name: m.name, category: m.category, unit: m.unit })),
+    // Carries pack meta for the typeahead's opt-in purchase basis: on a STORE
+    // surface the picked chip must read "(BTL)", not "(ml)".
+    () => items.map(m => ({ id: m.material_id, name: m.name, category: m.category, unit: m.unit,
+                            purchase_unit: m.purchase_unit, pack_size: m.pack_size })),
     [items],
   );
   const metaById = useMemo(() => new Map(items.map(m => [m.material_id, m])), [items]);
@@ -1393,6 +1399,7 @@ function EmptiesModal({ stores, onClose, onSaved }: {
           <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3">Pick a store first.</div>
         ) : (
           <MaterialTypeahead
+            purchaseBasis
             materials={matLite} value={materialId}
             onPick={id => { setMaterialId(id); setCbl({ ...CBL_EMPTY }); }}
             showStock={false} compact={false}

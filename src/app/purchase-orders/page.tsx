@@ -1902,12 +1902,15 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
                       )}
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
-                      <div>{it.current_stock.toLocaleString('en-IN')} {it.material_unit}</div>
+                      {/* Purchase basis (owner rule): current_stock is recipe units;
+                          ÷packFactor so "2 BTL on hand" reads as 2, not 1500. */}
+                      <div>{(Math.round((it.current_stock / packFactor) * 1000) / 1000).toLocaleString('en-IN')} {packFactor > 1 ? poUnit : it.material_unit}</div>
+                      {packFactor > 1 && <div className="text-[10px] text-[#8B7355]">= {it.current_stock.toLocaleString('en-IN')} {it.material_unit}</div>}
                       {reqVsStock && <div className="text-[10px] text-[#8B7355]">order is {reqVsStock} of stock</div>}
                     </td>
                     <td className="py-2 px-2 text-right font-mono text-[#6B5744]">
-                      {Math.round(it.usage_30d).toLocaleString('en-IN')} / {Math.round(it.usage_60d).toLocaleString('en-IN')} / {Math.round(it.usage_90d).toLocaleString('en-IN')}
-                      {it.avg_daily_usage_30d > 0 && <div className="text-[10px] text-[#8B7355]">avg {it.avg_daily_usage_30d.toFixed(1)}/day</div>}
+                      {(it.usage_30d / packFactor).toLocaleString('en-IN', { maximumFractionDigits: 1 })} / {(it.usage_60d / packFactor).toLocaleString('en-IN', { maximumFractionDigits: 1 })} / {(it.usage_90d / packFactor).toLocaleString('en-IN', { maximumFractionDigits: 1 })}
+                      <div className="text-[10px] text-[#8B7355]">{packFactor > 1 ? poUnit : it.material_unit}{it.avg_daily_usage_30d > 0 ? ` · avg ${(it.avg_daily_usage_30d / packFactor).toFixed(2)}/day` : ''}</div>
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
                       {it.days_of_stock != null

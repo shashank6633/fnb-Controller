@@ -12,14 +12,30 @@
  *   5. Department × Material matrix table — drillable
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import {
   Building2, Package, ArrowUpRight, Loader2, Download, Filter, ChevronDown, ChevronRight, Warehouse,
 } from 'lucide-react';
 import TabScroller from '@/components/TabScroller';
+import { toPurchaseQty, purchasePrice, packFactor, type PackMeta } from '@/lib/pack-units';
 
 const fmt  = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const fmt2 = (v: number) => (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+const fmt3 = (v: number) => (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+// Purchase-lead qty cell: API rows carry recipe-basis qty + material pack meta;
+// convert for display only (owner rule) — recipe stays in the small hint.
+const metaOf = (unit?: string, pu?: string, pack?: number): PackMeta =>
+  ({ unit: unit || '', purchase_unit: pu || unit || '', pack_size: Number(pack) || 1 });
+const QtyPU = ({ qty, unit, pu, pack }: { qty: number; unit?: string; pu?: string; pack?: number }) => {
+  const m = metaOf(unit, pu, pack);
+  const pf = packFactor(m);
+  return (
+    <>
+      {fmt3(toPurchaseQty(qty, m))} <span className="text-[#8B7355]">{m.purchase_unit}</span>
+      {pf > 1 && <span className="block text-[9px] text-[#B09A82]">= {fmt2(qty)} {unit}</span>}
+    </>
+  );
+};
 const todayIso = () => new Date().toISOString().slice(0, 10);
 const isoMinusDays = (n: number) => { const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().slice(0, 10); };
 
@@ -80,19 +96,23 @@ export default function DepartmentConsumptionPage() {
   const exportCsv = () => {
     if (view === 'register') {
       if (!register?.rows?.length) return;
-      const lines = [['date','department','material','category','unit','qty','value','requisitions'].join(',')];
+      const lines = [['date','department','material','category','qty_purchase','purchase_unit','qty_recipe','recipe_unit','value','requisitions'].join(',')];
       for (const r of register.rows) {
-        lines.push([r.date, r.department_name, r.material_name, r.category || '', r.unit, r.qty, r.value, r.req_count].map(csvCell).join(','));
+        lines.push([r.date, r.department_name, r.material_name, r.category || '',
+                    (r as any).qty_purchase ?? r.qty, (r as any).purchase_unit || r.unit,
+                    r.qty, r.unit, r.value, r.req_count].map(csvCell).join(','));
       }
       downloadCsv(`materials-register-${from}_to_${to}.csv`, lines);
       return;
     }
     if (!data?.by_department_material?.length) return;
-    const lines = [['department','material','sku','category','unit','qty','avg_price','value'].join(',')];
+    const lines = [['department','material','sku','category','qty_purchase','purchase_unit','qty_recipe','recipe_unit','avg_price_per_recipe_unit','value'].join(',')];
     for (const r of data.by_department_material) {
       const avg = r.qty > 0 ? r.value / r.qty : 0;
-      lines.push([r.department_name, r.material_name, r.material_sku || '', r.category || '', r.material_unit,
-                  r.qty, avg.toFixed(2), r.value].map(csvCell).join(','));
+      const m = metaOf(r.material_unit, r.material_purchase_unit, r.material_pack_size);
+      lines.push([r.department_name, r.material_name, r.material_sku || '', r.category || '',
+                  toPurchaseQty(r.qty, m), m.purchase_unit, r.qty, r.material_unit,
+                  avg.toFixed(2), r.value].map(csvCell).join(','));
     }
     downloadCsv(`dept-consumption-${from}_to_${to}.csv`, lines);
   };
@@ -218,7 +238,7 @@ export default function DepartmentConsumptionPage() {
                 const maxValue = data.by_department[0].total_value || 1;
                 const pct = (d.total_value / maxValue) * 100;
                 return (
-                  <>
+                  <Fragment key={d.department_id}>
                     <tr key={d.department_id} className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30 cursor-pointer"
                         onClick={() => setExpandedDept(isExp ? null : d.department_id)}>
                       <td className="py-2 px-2">{isExp ? <ChevronDown className="w-4 h-4 text-[#6B5744]" /> : <ChevronRight className="w-4 h-4 text-[#6B5744]" />}</td>
@@ -229,7 +249,10 @@ export default function DepartmentConsumptionPage() {
                       <td className="py-2 px-3 text-right font-mono">{d.material_count}</td>
                       <td className="py-2 px-3 text-right font-mono">{d.line_count}</td>
                       <td className="py-2 px-3 text-right font-mono">{d.requisition_count}</td>
-                      <td className="py-2 px-3 text-right font-mono">{fmt2(d.total_qty)}</td>
+                      {/* Σ across materials (g+ml+pcs) — meaningless in any unit;
+                          same ruling as the stock-overview footer. Value is the
+                          comparable per-department number. */}
+                      <td className="py-2 px-3 text-right font-mono text-[#B09A82]" title="Quantities of different units can't be summed — compare departments by Value ₹">—</td>
                       <td className="py-2 px-3 text-right font-mono font-semibold text-[#af4408]">{fmt(d.total_value)}</td>
                       <td className="py-2 px-3">
                         <div className="h-2 bg-[#FFF1E3] rounded">
@@ -242,7 +265,7 @@ export default function DepartmentConsumptionPage() {
                         <DepartmentDrillDown rows={matrixForDept(d.department_id)} />
                       </td></tr>
                     )}
-                  </>
+                  </Fragment>
                 );
               })}
             </tbody>
@@ -277,8 +300,8 @@ export default function DepartmentConsumptionPage() {
                   <td className="py-1.5 px-3 font-mono text-[10px] text-[#8B7355]">{m.material_sku || '·'}</td>
                   <td className="py-1.5 px-3">{m.material_name}</td>
                   <td className="py-1.5 px-3 text-[#6B5744]">{m.category}</td>
-                  <td className="py-1.5 px-3 text-right font-mono">{fmt2(m.total_qty)} <span className="text-[#8B7355]">{m.material_unit}</span></td>
-                  <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{fmt(m.average_price)}</td>
+                  <td className="py-1.5 px-3 text-right font-mono"><QtyPU qty={m.total_qty} unit={m.material_unit} pu={m.material_purchase_unit} pack={m.material_pack_size} /></td>
+                  <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{fmt(purchasePrice(m.average_price, metaOf(m.material_unit, m.material_purchase_unit, m.material_pack_size)))}<span className="text-[10px] text-[#8B7355]">/{m.material_purchase_unit || m.material_unit}</span></td>
                   <td className="py-1.5 px-3 text-right font-mono font-semibold">{fmt(m.total_value)}</td>
                   <td className="py-1.5 px-3 text-right font-mono">{m.distinct_depts}</td>
                 </tr>
@@ -334,7 +357,10 @@ export default function DepartmentConsumptionPage() {
                         <td className="py-1.5 px-3 font-medium text-[#2D1B0E]">{r.department_name}</td>
                         <td className="py-1.5 px-3">{r.material_name}</td>
                         <td className="py-1.5 px-3 text-[#6B5744]">{r.category}</td>
-                        <td className="py-1.5 px-3 text-right font-mono">{fmt2(r.qty)} <span className="text-[#8B7355]">{r.unit}</span></td>
+                        <td className="py-1.5 px-3 text-right font-mono">
+                          {fmt3((r as any).qty_purchase ?? r.qty)} <span className="text-[#8B7355]">{(r as any).purchase_unit || r.unit}</span>
+                          {((r as any).pack_factor || 1) > 1 && <span className="block text-[9px] text-[#B09A82]">= {fmt2(r.qty)} {r.unit}</span>}
+                        </td>
                         <td className="py-1.5 px-3 text-right font-mono font-semibold text-[#af4408]">{fmt(r.value)}</td>
                         <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{r.req_count}</td>
                       </tr>
@@ -386,7 +412,7 @@ function DepartmentDrillDown({ rows }: { rows: any[] }) {
             <td className="py-1 px-2 font-mono text-[10px] text-[#8B7355]">{r.material_sku || '·'}</td>
             <td className="py-1 px-2">{r.material_name}</td>
             <td className="py-1 px-2 text-[#6B5744]">{r.category}</td>
-            <td className="py-1 px-2 text-right font-mono">{fmt2(r.qty)} {r.material_unit}</td>
+            <td className="py-1 px-2 text-right font-mono"><QtyPU qty={r.qty} unit={r.material_unit} pu={r.material_purchase_unit} pack={r.material_pack_size} /></td>
             <td className="py-1 px-2 text-right font-mono">{fmt(r.value)}</td>
             <td className="py-1 px-2 text-right font-mono text-[#6B5744]">
               {total > 0 ? ((r.value / total) * 100).toFixed(1) : '0.0'}%

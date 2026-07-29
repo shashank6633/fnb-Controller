@@ -1501,7 +1501,7 @@ export default function PurchasesPage() {
                   </div>
                 ) : (
                   <MaterialTypeahead
-                    materials={materials as any}
+                    materials={materials as any} purchaseBasis
                     value={formData.material_id}
                     onPick={(id) => handleFormChange('material_id', id)}
                     placeholder="Type material name, SKU or category…"
@@ -2103,7 +2103,7 @@ export default function PurchasesPage() {
                           <td className="py-2 px-2 block md:table-cell">
                             <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
                             <MaterialTypeahead
-                              materials={materials as any}
+                              materials={materials as any} purchaseBasis
                               value={item.material_id}
                               onPick={(id) => updateBillLine(item.id, 'material_id', id)}
                             />

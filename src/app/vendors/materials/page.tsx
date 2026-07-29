@@ -270,7 +270,7 @@ export default function VendorMaterialsPage() {
                     <span className="text-[11px] text-[#6B5744] font-medium">+ Map a material to {v.vendor_name}:</span>
                     <div className="flex-1 min-w-[240px] max-w-md">
                       <MaterialTypeahead
-                        materials={allMaterials as any}
+                        materials={allMaterials as any} purchaseBasis
                         value={addPick[v.vendor_id] || ''}
                         onPick={(id: string) => setAddPick(p => ({ ...p, [v.vendor_id]: id }))}
                         excludeIds={v.materials.filter(m => m.is_mapped).map(m => m.material_id)}

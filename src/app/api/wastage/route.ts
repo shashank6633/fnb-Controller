@@ -30,6 +30,8 @@ export async function GET(request: Request) {
     if (outletId) { where.push('(w.outlet_id = ? OR w.outlet_id IS NULL)'); params.push(outletId); }
     const rows = db.prepare(`
       SELECT w.*, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS material_purchase_unit,
+             COALESCE(rm.pack_size, 1) AS material_pack_size,
              rm.average_price, r.name AS recipe_name,
              (w.quantity * rm.average_price) AS value
       FROM wastages w

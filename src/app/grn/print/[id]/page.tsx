@@ -164,10 +164,13 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
                   {it.notes && <div className="text-[10px] italic text-[#666] mt-0.5">{it.notes}</div>}
                   {chargeParts(it) && <div className="text-[10px] text-[#666] mt-0.5">Charges: {chargeParts(it)}</div>}
                 </td>
-                <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_ordered} {it.material_unit}</td>
-                <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_received} {it.material_unit}</td>
-                <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_accepted} {it.material_unit}</td>
-                <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_rejected || '—'}</td>
+                {/* GRN qty columns hold the PO's numbers = PURCHASE units (kg, BTL,
+                    CASE). Labelling them with the recipe unit (g, ml) read every
+                    packed line pack_size× smaller than what physically arrived. */}
+                <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_ordered} {it.purchase_unit || it.material_unit}</td>
+                <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_received} {it.purchase_unit || it.material_unit}</td>
+                <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_accepted} {it.purchase_unit || it.material_unit}</td>
+                <td className="border border-[#999] py-1 px-2 text-right font-mono">{it.quantity_rejected ? <>{it.quantity_rejected} {it.purchase_unit || it.material_unit}</> : '—'}</td>
                 <td className="border border-[#999] py-1 px-2 text-right font-mono">{fmt(it.unit_price)}</td>
                 <td className="border border-[#999] py-1 px-2 text-right font-mono">{fmt(Number(it.total_inward_amount) || (it.quantity_received * (it.unit_price || 0)))}</td>
               </tr>

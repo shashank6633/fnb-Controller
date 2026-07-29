@@ -110,6 +110,14 @@ export async function GET(request: Request) {
            (Number(row.pack_size) || 1) > 1)
             ? Number(row.pack_size) : 1;
         const unitCost = (Number(row.average_price) || 0) * packFactor;
+        // Display divisor to the purchase basis — INDEPENDENT of the line's own
+        // basis (both-halves guard). qty is normalised to recipe first, so a
+        // group mixing a legacy recipe-unit line with a purchase-unit line
+        // still sums one basis.
+        const packDiv = ((Number(row.pack_size) || 1) > 1
+          && String(row.unit || '').toLowerCase().trim()
+             !== String(row.purchase_unit || row.unit || '').toLowerCase().trim())
+          ? Number(row.pack_size) : 1;
         for (const h of hist) {
           const day = String(h && h.at || '').slice(0, 10);
           if (!day || day < from || day > to) continue;
@@ -119,18 +127,25 @@ export async function GET(request: Request) {
           if (!g) {
             g = { date: day, department_id: row.department_id || '', department_name: row.department_name || '—',
                   material_id: row.material_id, material_name: row.material_name, unit: row.unit, category: row.category || '',
+                  purchase_unit: row.purchase_unit || row.unit, pack_div: packDiv,
                   qty: 0, value: 0, reqs: new Set<string>() };
             map.set(key, g);
           }
-          g.qty += qty; g.value += qty * unitCost; g.reqs.add(row.req_number);
+          // g.qty is RECIPE units (qty × packFactor) — before this fix it summed
+          // the raw line-unit numbers, so "5 BTL" landed in a column labelled ml.
+          const recipeQty = qty * packFactor;
+          g.qty += recipeQty; g.value += qty * unitCost; g.reqs.add(row.req_number);
           days.add(day); depts.add(row.department_id || ''); mats.add(row.material_id);
-          totQty += qty; totVal += qty * unitCost;
+          totQty += recipeQty; totVal += qty * unitCost;
         }
       }
       const regRows = [...map.values()]
         .map(g => ({ date: g.date, department_id: g.department_id, department_name: g.department_name,
           material_id: g.material_id, material_name: g.material_name, unit: g.unit, category: g.category,
-          qty: Math.round(g.qty * 1000) / 1000, value: Math.round(g.value * 100) / 100, req_count: g.reqs.size }))
+          qty: Math.round(g.qty * 1000) / 1000, value: Math.round(g.value * 100) / 100, req_count: g.reqs.size,
+          // PURCHASE basis for display (rounded derivative — never summed)
+          qty_purchase: Math.round((g.qty / g.pack_div) * 1000) / 1000,
+          purchase_unit: g.purchase_unit, pack_factor: g.pack_div }))
         .sort((a, b) => b.date.localeCompare(a.date) || a.department_name.localeCompare(b.department_name) || b.value - a.value);
       return Response.json({
         view: 'register', range: { from, to }, rows: regRows,
@@ -150,7 +165,10 @@ export async function GET(request: Request) {
         COUNT(DISTINCT r.id)             AS requisition_count,
         COUNT(DISTINCT r.department_id)  AS departments,
         COUNT(DISTINCT ri.material_id)   AS materials,
-        COALESCE(SUM(ri.quantity_issued), 0)                                   AS total_qty,
+        COALESCE(SUM(ri.quantity_issued * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+                       AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
+                       AND COALESCE(rm.pack_size,1) > 1
+                  THEN rm.pack_size ELSE 1 END)), 0)                          AS total_qty,
         COALESCE(SUM(ri.quantity_issued
           * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                        AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
@@ -168,7 +186,10 @@ export async function GET(request: Request) {
              COUNT(DISTINCT r.id)              AS requisition_count,
              COUNT(DISTINCT ri.material_id)    AS material_count,
              COUNT(*)                          AS line_count,
-             COALESCE(SUM(ri.quantity_issued), 0)                              AS total_qty,
+             COALESCE(SUM(ri.quantity_issued * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+                       AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
+                       AND COALESCE(rm.pack_size,1) > 1
+                  THEN rm.pack_size ELSE 1 END)), 0)                     AS total_qty,
              COALESCE(SUM(ri.quantity_issued
                * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                             AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
@@ -187,7 +208,11 @@ export async function GET(request: Request) {
     const byDepartmentMaterial = db.prepare(`
       SELECT d.id AS department_id, d.name AS department_name,
              rm.id AS material_id, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit, rm.category,
-             SUM(ri.quantity_issued)                                  AS qty,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS material_purchase_unit, COALESCE(rm.pack_size, 1) AS material_pack_size,
+             SUM(ri.quantity_issued * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+                       AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
+                       AND COALESCE(rm.pack_size,1) > 1
+                  THEN rm.pack_size ELSE 1 END))                         AS qty,
              SUM(ri.quantity_issued
                * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                             AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
@@ -207,7 +232,11 @@ export async function GET(request: Request) {
     const topMaterials = db.prepare(`
       SELECT rm.id AS material_id, rm.name AS material_name, rm.sku AS material_sku,
              rm.unit AS material_unit, rm.category, rm.average_price,
-             SUM(ri.quantity_issued)                            AS total_qty,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS material_purchase_unit, COALESCE(rm.pack_size, 1) AS material_pack_size,
+             SUM(ri.quantity_issued * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+                       AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
+                       AND COALESCE(rm.pack_size,1) > 1
+                  THEN rm.pack_size ELSE 1 END))                   AS total_qty,
              SUM(ri.quantity_issued
                * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                             AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit

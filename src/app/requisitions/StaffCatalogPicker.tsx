@@ -24,6 +24,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Loader2, Minus, Plus, Search, Send, ShoppingCart, X } from 'lucide-react';
 import { api } from '@/lib/api';
+import { packFactor } from '@/lib/pack-units';
 
 interface Material {
   id: string; name: string; sku?: string; unit: string;
@@ -53,18 +54,14 @@ interface EditDraft {
   items?: DraftItem[];
 }
 
-/** Recipe-units per 1 purchase-unit (pack factor). ×pack only when the
- *  purchase unit differs from the recipe unit and pack_size > 1 — the same
- *  convention as reqPackFactor / createTotal in page.tsx. */
-function packFactor(m: Material): number {
-  const pack = Number(m.pack_size) || 1;
-  return (m.purchase_unit && m.purchase_unit !== m.unit && pack > 1) ? pack : 1;
-}
 /** Recipe-units per 1 of the unit a LINE was requested in — ×pack only when
- *  that unit is the material's purchase unit (createTotal / reqPackFactor). */
+ *  that unit is the material's purchase unit (createTotal / reqPackFactor).
+ *  Compares are normalised (lowercase/trim) like the shared packFactor. */
 function lineFactor(m: Material, unit: string): number {
-  const pack = Number(m.pack_size) || 1;
-  return (unit && m.purchase_unit && unit === m.purchase_unit && unit !== m.unit && pack > 1) ? pack : 1;
+  const lu = String(unit || '').toLowerCase().trim();
+  const pu = String(m.purchase_unit || '').toLowerCase().trim();
+  const ru = String(m.unit || '').toLowerCase().trim();
+  return (lu !== '' && pu !== '' && lu === pu && lu !== ru) ? packFactor(m) : 1;
 }
 /** ₹ per PURCHASE unit: prefer last_purchase_price (already ₹/PU), else
  *  average_price (₹/recipe-unit) × pack factor. Mirrors the classic form. */

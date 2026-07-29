@@ -14,12 +14,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Warehouse, Loader2, ClipboardCheck, X, RotateCcw, Package } from 'lucide-react';
 import { api } from '@/lib/api';
+import { packFactor, toPurchaseQty } from '@/lib/pack-units';
 
 const fmt  = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const fmt2 = (v: number) => (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 const todayIso = () => new Date().toISOString().slice(0, 10);
 
-interface Item { material_id: string; name: string; unit: string; on_hand: number; avg_price: number; value: number; }
+interface Item { material_id: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; on_hand: number; avg_price: number; value: number; }
 interface Dept { department_id: string; name: string; code: string; items: Item[]; }
 
 export default function DepartmentMaterialsPage() {
@@ -108,7 +109,8 @@ export default function DepartmentMaterialsPage() {
                       <tr key={it.material_id} className="border-t border-[#E8D5C4]/50">
                         <td className="py-1.5 px-3 text-[#2D1B0E]">{it.name}</td>
                         <td className="py-1.5 px-3 text-right font-mono">
-                          {fmt2(it.on_hand)} <span className="text-[#8B7355]">{it.unit}</span>
+                          {fmt2(toPurchaseQty(it.on_hand, it))} <span className="text-[#8B7355]">{it.purchase_unit || it.unit}</span>
+                          {packFactor(it) > 1 && <span className="block text-[9px] text-[#B09A82]">= {fmt2(it.on_hand)} {it.unit}</span>}
                         </td>
                         <td className="py-1.5 px-3 text-right font-mono font-semibold">{fmt(it.value)}</td>
                       </tr>
@@ -135,21 +137,33 @@ export default function DepartmentMaterialsPage() {
 function ReconcileModal({ dept, onClose, onDone }: { dept: Dept; onClose: () => void; onDone: () => void }) {
   const [eventName, setEventName] = useState('');
   const [eventDate, setEventDate] = useState(todayIso());
+  // The whole modal works in PURCHASE units (owner rule) — on_hand_pu is the
+  // display/entry number; pf converts back to recipe once, at POST time.
   const [rows, setRows] = useState(() =>
-    dept.items.map(it => ({ ...it, leftover: it.on_hand, return_to_store: false })));
+    dept.items.map(it => {
+      const pf = packFactor(it);
+      const on_hand_pu = toPurchaseQty(it.on_hand, it);
+      // touched: rows the user never edited POST the EXACT recipe on-hand as
+      // leftover — round-tripping the 3-dp on_hand_pu would book a phantom
+      // sub-unit consumption (e.g. 0.4 g) on every untouched line.
+      return { ...it, pf, on_hand_pu, leftover: on_hand_pu, touched: false, return_to_store: false };
+    }));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
   const setLeftover = (id: string, v: string) => {
     const n = Math.max(0, Number(v) || 0);
-    setRows(rs => rs.map(r => r.material_id === id ? { ...r, leftover: Math.min(n, r.on_hand) } : r));
+    setRows(rs => rs.map(r => r.material_id === id ? { ...r, leftover: Math.min(n, r.on_hand_pu), touched: true } : r));
   };
   const toggleReturn = (id: string) => {
     setRows(rs => rs.map(r => r.material_id === id ? { ...r, return_to_store: !r.return_to_store } : r));
   };
 
   const totalConsumed = useMemo(
-    () => rows.reduce((s, r) => s + Math.max(0, r.on_hand - r.leftover) * r.avg_price, 0),
+    () => rows.reduce((s, r) => {
+      const leftoverRecipe = r.touched ? r.leftover * r.pf : r.on_hand;
+      return s + Math.max(0, r.on_hand - leftoverRecipe) * r.avg_price;
+    }, 0),
     [rows]);
 
   const submit = async () => {
@@ -163,7 +177,9 @@ function ReconcileModal({ dept, onClose, onDone }: { dept: Dept; onClose: () => 
           event_date: eventDate,
           items: rows.map(r => ({
             material_id: r.material_id,
-            leftover_qty: r.leftover,
+            // entered in purchase units → recipe units for storage (canon);
+            // untouched rows send the exact stored on-hand (no rounding drift)
+            leftover_qty: r.touched ? Math.round(r.leftover * r.pf * 1e6) / 1e6 : r.on_hand,
             return_to_store: r.return_to_store,
           })),
         },
@@ -222,15 +238,15 @@ function ReconcileModal({ dept, onClose, onDone }: { dept: Dept; onClose: () => 
                 </thead>
                 <tbody>
                   {rows.map(r => {
-                    const consumed = Math.max(0, r.on_hand - r.leftover);
+                    const consumed = Math.max(0, r.on_hand_pu - r.leftover);
                     return (
                       <tr key={r.material_id} className="border-t border-[#E8D5C4]/50">
                         <td className="py-1.5 px-3 text-[#2D1B0E]">
-                          {r.name} <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
+                          {r.name} <span className="text-[10px] text-[#8B7355]" title={r.pf > 1 ? `1 ${r.purchase_unit} = ${r.pf} ${r.unit}` : undefined}>{r.purchase_unit || r.unit}</span>
                         </td>
-                        <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{fmt2(r.on_hand)}</td>
+                        <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]" title={r.pf > 1 ? `= ${fmt2(r.on_hand)} ${r.unit}` : undefined}>{fmt2(r.on_hand_pu)}</td>
                         <td className="py-1.5 px-3 text-right">
-                          <input type="number" min={0} max={r.on_hand} step="any" value={r.leftover}
+                          <input type="number" min={0} max={r.on_hand_pu} step="any" value={r.leftover}
                                  onChange={e => setLeftover(r.material_id, e.target.value)}
                                  className="w-24 px-2 py-1 border border-[#E8D5C4] rounded bg-white text-right font-mono" />
                         </td>

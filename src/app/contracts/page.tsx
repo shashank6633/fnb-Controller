@@ -308,7 +308,7 @@ export default function ContractsPage() {
                   </div>
                 ) : (
                   <MaterialTypeahead
-                    materials={materials as any}
+                    materials={materials as any} purchaseBasis
                     value={editing.material_id || ''}
                     onPick={(id) => {
                       const m = materialById.get(id);
@@ -506,7 +506,7 @@ function QuickCreateMaterial({ existingMaterials, onClose, onCreated, onPickedEx
             1. Already in the catalog? Search & select it
           </label>
           <MaterialTypeahead
-            materials={existingMaterials as any}
+            materials={existingMaterials as any} purchaseBasis
             value=""
             onPick={(id: string) => {
               const m = existingMaterials.find(x => x.id === id);

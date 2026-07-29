@@ -31,7 +31,7 @@ import {
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
-import { packFactor } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty } from '@/lib/pack-units';
 import TabScroller from '@/components/TabScroller';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
@@ -381,13 +381,20 @@ export default function ClosingStockByLocationPage() {
       // who filled counts then switched department must not save the hidden
       // rows under the newly-selected department.
       const allowedIds = new Set(deptScopedMaterials.map((m: any) => String(m.id)));
+      const byIdSubmit = new Map(deptScopedMaterials.map((m: any) => [String(m.id), m]));
       const itemsToSubmit = Object.entries(closingItems)
         .filter(([id, v]) => v.physical_stock !== '' && allowedIds.has(String(id)))
-        .map(([materialId, v]) => ({
-          material_id: materialId,
-          physical_stock: parseFloat(v.physical_stock),
-          notes: v.notes,
-        }));
+        .map(([materialId, v]) => {
+          // The modal takes counts in PURCHASE units; storage stays RECIPE
+          // (canon). ×packFactor here, once, at the storage boundary.
+          const mat: any = byIdSubmit.get(String(materialId));
+          const pf = mat ? packFactor(mat) : 1;
+          return {
+            material_id: materialId,
+            physical_stock: Math.round(parseFloat(v.physical_stock) * pf * 1e6) / 1e6,
+            notes: v.notes,
+          };
+        });
 
       if (itemsToSubmit.length === 0) {
         setClosingResult({ success: 0, errors: ['Enter physical stock for at least one material'] });
@@ -416,10 +423,12 @@ export default function ClosingStockByLocationPage() {
   };
 
   // --- CSV template download + bulk upload -----------------------------
-  // Mirror the modal's manual save exactly: physical_stock is a plain number
-  // in the material's RECIPE unit (m.unit), matched to a material by id, and
-  // POSTed to the same /api/closing-stock endpoint. adjust_stock is FORCED
-  // off for the CSV path — a bulk file must never overwrite system stock.
+  // Mirror the modal's manual save exactly: the template's Unit column now
+  // carries the PURCHASE unit and counts are entered on that basis; the
+  // parser converts to recipe units before POSTing (storage never changes
+  // basis). Old files whose Unit column says the recipe unit still parse
+  // correctly — the row's own Unit cell decides the basis. adjust_stock is
+  // FORCED off for the CSV path — a bulk file must never overwrite system stock.
   const csvEscape = (v: any) => {
     if (v == null) return '';
     const s = String(v);
@@ -446,9 +455,12 @@ export default function ClosingStockByLocationPage() {
     }
     const lines = [CSV_COLS.join(',')];
     for (const m of mats) {
-      const base = [m.id, m.sku || '', m.name || '', (m.super_category || m.category || ''), m.unit || ''];
-      // Physical count column left blank for the counter; system stock only for admins.
-      lines.push((isAdmin ? [...base, m.current_stock ?? 0, ''] : [...base, '']).map(csvEscape).join(','));
+      const pf = packFactor(m);
+      const base = [m.id, m.sku || '', m.name || '', (m.super_category || m.category || ''), (m.purchase_unit || m.unit || '')];
+      // Physical count column left blank for the counter; system stock only for
+      // admins — in the SAME purchase unit the Unit column declares.
+      const sysPU = m.current_stock == null ? 0 : Math.round((m.current_stock / pf) * 1000) / 1000;
+      lines.push((isAdmin ? [...base, sysPU, ''] : [...base, '']).map(csvEscape).join(','));
     }
     const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -491,7 +503,23 @@ export default function ClosingStockByLocationPage() {
         const nameKey = get(row, 'Name', 'name').toLowerCase();
         const m = (idKey && byId.get(idKey)) || (skuKey && bySku.get(skuKey)) || (nameKey && byName.get(nameKey));
         if (!m) { errors.push(`${label}: material not found (check material_id / SKU / Name)`); continue; }
-        items.push({ material_id: m.id, physical_stock: qty });
+        // Basis comes from the row's own Unit cell: new templates declare the
+        // purchase unit (count ×pack → recipe), old files declare the recipe
+        // unit (raw). Anything else is ambiguous — reject the row rather than
+        // guess a basis that could scale stock pack×.
+        const pf = packFactor(m);
+        const unitCell = get(row, 'Unit', 'unit').toLowerCase();
+        const ru = String(m.unit || '').trim().toLowerCase();
+        const pu = String(m.purchase_unit || m.unit || '').trim().toLowerCase();
+        let recipeQty: number;
+        if (unitCell === '' && pf > 1) {
+          errors.push(`${label}: the Unit column is blank — write ${m.purchase_unit} (count in purchase units) or ${m.unit} (recipe units) so the basis is unambiguous`);
+          continue;
+        }
+        if (unitCell === '' || unitCell === ru) recipeQty = qty;
+        else if (unitCell === pu) recipeQty = Math.round(qty * pf * 1e6) / 1e6;
+        else { errors.push(`${label}: unit "${unitCell}" matches neither ${m.unit} nor ${m.purchase_unit || m.unit}`); continue; }
+        items.push({ material_id: m.id, physical_stock: recipeQty });
       }
       if (items.length === 0) {
         setClosingResult({ success: 0, errors: errors.length ? errors : ['No physical counts found in the file'] });
@@ -838,9 +866,9 @@ export default function ClosingStockByLocationPage() {
                             {(() => {
                               const phys = physicalFor(it, cases[it.id], entries[it.id], loose[it.id]) ?? it.today_count;
                               if (phys == null || it.current_stock == null) return <span className="text-[#8B7355]">—</span>;
-                              const v = Math.round((phys - it.current_stock) * 1000) / 1000;
+                              const v = Math.round(toPurchaseQty(phys - it.current_stock, it) * 1000) / 1000;
                               const tone = v < 0 ? 'text-amber-800' : v > 0 ? 'text-blue-800' : 'text-emerald-700';
-                              return <span className={tone}>{v > 0 ? '+' : ''}{v} {it.unit}</span>;
+                              return <span className={tone}>{v > 0 ? '+' : ''}{v} {it.purchase_unit || it.unit}</span>;
                             })()}
                           </td>
                         )}
@@ -1117,15 +1145,21 @@ export default function ClosingStockByLocationPage() {
                           {historyItems.map((item: any) => {
                             const isShortage = item.variance < 0;
                             const isExcess = item.variance > 0;
+                            // API rows now carry purchase_unit/pack_size; render the
+                            // stored recipe numbers on the purchase basis (display only).
+                            const hm = { unit: item.unit, purchase_unit: item.purchase_unit, pack_size: item.pack_size };
+                            const hpf = packFactor(hm);
+                            const hq = (v: number) => Math.round(toPurchaseQty(Number(v) || 0, hm) * 1000) / 1000;
+                            const hu = item.purchase_unit || item.unit;
                             return (
                               <tr key={item.id} className={`border-t border-[#E8D5C4]/50 ${isAdmin && isShortage ? 'bg-red-50/50' : isAdmin && isExcess ? 'bg-blue-50/50' : ''}`}>
                                 <td className="py-2 px-3 text-[#2D1B0E] font-medium text-xs">{item.material_name}</td>
                                 <td className="py-2 px-3 text-xs text-[#6B5744]">{categoryLabel(item.category)}</td>
-                                {isAdmin && <td className="py-2 px-3 text-right text-xs font-mono">{item.system_stock} {item.unit}</td>}
-                                <td className="py-2 px-3 text-right text-xs font-mono font-semibold">{item.physical_stock} {item.unit}</td>
+                                {isAdmin && <td className="py-2 px-3 text-right text-xs font-mono" title={hpf > 1 ? `= ${item.system_stock} ${item.unit}` : undefined}>{hq(item.system_stock)} {hu}</td>}
+                                <td className="py-2 px-3 text-right text-xs font-mono font-semibold" title={hpf > 1 ? `= ${item.physical_stock} ${item.unit}` : undefined}>{hq(item.physical_stock)} {hu}</td>
                                 {isAdmin && (
                                   <td className={`py-2 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
-                                    {item.variance > 0 ? '+' : ''}{item.variance} {item.unit}
+                                    {item.variance > 0 ? '+' : ''}{hq(item.variance)} {hu}
                                   </td>
                                 )}
                                 {isAdmin && (
@@ -1248,18 +1282,26 @@ export default function ClosingStockByLocationPage() {
                       <tr className="text-[#8B7355]">
                         <th className="text-left py-2.5 px-3 font-medium">Material</th>
                         <th className="text-left py-2.5 px-3 font-medium">Category</th>
-                        <th className="text-right py-2.5 px-3 font-medium">System Stock</th>
+                        {/* Blind count: only admins see the expected figure + variance —
+                            a counter who can read the system number can copy it back. */}
+                        {isAdmin && <th className="text-right py-2.5 px-3 font-medium">System Stock</th>}
                         <th className="text-right py-2.5 px-3 font-medium">Unit</th>
                         <th className="text-right py-2.5 px-3 font-medium w-32">Physical Count *</th>
-                        <th className="text-right py-2.5 px-3 font-medium">Variance</th>
+                        {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance</th>}
                         <th className="text-left py-2.5 px-3 font-medium w-40">Notes</th>
                       </tr>
                     </thead>
                     <tbody>
                       {closingFiltered.map((m) => {
                         const ci = closingItems[m.id];
+                        // Counts are ENTERED in the purchase unit (owner rule: the
+                        // person counting sees bottles/kg, not ml/g). System stock
+                        // and variance render on the same basis; the recipe number
+                        // only leaves this component ×packFactor at submit.
+                        const pf = packFactor(m);
+                        const sysPU = m.current_stock == null ? null : Math.round((m.current_stock / pf) * 1000) / 1000;
                         const physicalVal = ci ? parseFloat(ci.physical_stock) : NaN;
-                        const variance = !isNaN(physicalVal) ? Math.round((physicalVal - m.current_stock) * 1000) / 1000 : null;
+                        const variance = !isNaN(physicalVal) && sysPU != null ? Math.round((physicalVal - sysPU) * 1000) / 1000 : null;
                         const isShortage = variance !== null && variance < 0;
                         const isExcess = variance !== null && variance > 0;
                         return (
@@ -1270,8 +1312,8 @@ export default function ClosingStockByLocationPage() {
                                 {categoryLabel(m.category)}
                               </span>
                             </td>
-                            <td className="py-1.5 px-3 text-right text-xs font-mono text-[#2D1B0E]">{m.current_stock}</td>
-                            <td className="py-1.5 px-3 text-right text-xs text-[#8B7355]">{m.unit}</td>
+                            {isAdmin && <td className="py-1.5 px-3 text-right text-xs font-mono text-[#2D1B0E]" title={pf > 1 ? `= ${m.current_stock} ${m.unit}` : undefined}>{sysPU ?? ''}</td>}
+                            <td className="py-1.5 px-3 text-right text-xs text-[#8B7355]" title={pf > 1 ? `1 ${m.purchase_unit} = ${pf} ${m.unit}` : undefined}>{m.purchase_unit || m.unit}</td>
                             <td className="py-1.5 px-2">
                               <input
                                 type="number"
@@ -1279,20 +1321,20 @@ export default function ClosingStockByLocationPage() {
                                 min="0"
                                 value={ci?.physical_stock || ''}
                                 onChange={e => updateClosingItem(m.id, 'physical_stock', e.target.value)}
-                                placeholder={m.current_stock.toString()}
+                                placeholder={isAdmin && sysPU != null ? sysPU.toString() : ''}
                                 className="w-full px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-right font-mono text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408] placeholder-[#C4B09A]"
                               />
                             </td>
-                            <td className={`py-1.5 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : variance === 0 ? 'text-green-600' : 'text-[#8B7355]'}`}>
+                            {isAdmin && <td className={`py-1.5 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : variance === 0 ? 'text-green-600' : 'text-[#8B7355]'}`}>
                               {variance !== null ? (
                                 <span className="flex items-center justify-end gap-1">
                                   {isShortage && <TrendingDown className="w-3 h-3" />}
                                   {isExcess && <TrendingUp className="w-3 h-3" />}
                                   {variance === 0 && <Minus className="w-3 h-3" />}
-                                  {variance > 0 ? '+' : ''}{variance} {m.unit}
+                                  {variance > 0 ? '+' : ''}{variance} {m.purchase_unit || m.unit}
                                 </span>
                               ) : '-'}
-                            </td>
+                            </td>}
                             <td className="py-1.5 px-2">
                               <input
                                 type="text"

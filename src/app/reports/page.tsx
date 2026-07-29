@@ -29,6 +29,7 @@ import {
 } from 'recharts';
 import type { ItemPnL, PeriodReport } from '@/types';
 import TabScroller from '@/components/TabScroller';
+import { packFactor as puPackFactor, toPurchaseQty as puToPurchaseQty } from '@/lib/pack-units';
 
 const COLORS = {
   revenue: '#10B981',
@@ -1048,8 +1049,11 @@ function DepartmentConsumptionSection({ deptData, from, to }: { deptData: any | 
                         <td className="py-1.5 px-3">{m.material_name}</td>
                         <td className="py-1.5 px-3 text-[#6B5744]">{m.category}</td>
                         <td className="py-1.5 px-3 text-right font-mono">
-                          {(m.total_qty || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
-                          <span className="text-[#8B7355] ml-1">{m.material_unit}</span>
+                          {puToPurchaseQty(m.total_qty || 0, { unit: m.material_unit, purchase_unit: m.material_purchase_unit, pack_size: m.material_pack_size }).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                          <span className="text-[#8B7355] ml-1">{m.material_purchase_unit || m.material_unit}</span>
+                          {puPackFactor({ unit: m.material_unit, purchase_unit: m.material_purchase_unit, pack_size: m.material_pack_size }) > 1 && (
+                            <span className="block text-[9px] text-[#B09A82]">= {(m.total_qty || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })} {m.material_unit}</span>
+                          )}
                         </td>
                         <td className="py-1.5 px-3 text-right font-mono font-semibold">{formatCurrency(m.total_value)}</td>
                         <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{m.distinct_depts}</td>

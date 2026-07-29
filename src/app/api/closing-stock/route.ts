@@ -47,6 +47,8 @@ export async function GET(request: Request) {
     // return, and we can expose the owning department's name + area per item.
     let query = `
       SELECT cs.*, rm.name as material_name, rm.unit, rm.category, rm.average_price,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS purchase_unit,
+             COALESCE(rm.pack_size, 1) AS pack_size,
              d.name as department_name, d.area as department_area
       FROM closing_stock cs
       JOIN raw_materials rm ON cs.material_id = rm.id

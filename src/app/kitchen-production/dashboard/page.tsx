@@ -34,7 +34,12 @@ interface Widgets {
   active_batches: number;
   total_batches: number;
   today_consumption_qty: number;
+  /** Per-unit split (kg + pcs + L are never summed); optional for older cached payloads. */
+  today_consumption_by_unit?: { unit: string; qty: number }[];
   waste_pct: number;
+  /** Unit the headline waste % is measured in (largest 30-day production). */
+  waste_pct_unit?: string;
+  waste_pct_by_unit?: { unit: string; pct: number | null }[];
   fifo_compliance_pct: number;
   low_stock_alerts: number;
 }
@@ -47,6 +52,30 @@ interface ExpiringSoon {
 
 const fmtNum = (v: number) =>
   (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+
+// "12.5 kg · 40 pcs" (or plain "12.5 kg" / "0") — never a cross-unit sum;
+// falls back to the legacy scalar when a cached payload lacks the split.
+const consumptionLabel = (w: Widgets) => {
+  const rows = w.today_consumption_by_unit;
+  if (!Array.isArray(rows)) return fmtNum(w.today_consumption_qty);
+  const parts = rows
+    .filter(r => (Number(r.qty) || 0) > 0)
+    .map(r => `${fmtNum(r.qty)}${r.unit ? ` ${r.unit}` : ''}`);
+  return parts.length ? parts.join(' · ') : '0';
+};
+
+// "8.2% (kg)" — the ratio of the highest-production unit, truthfully labelled.
+const wasteLabel = (w: Widgets) =>
+  `${fmtNum(w.waste_pct)}%${w.waste_pct_unit ? ` (${w.waste_pct_unit})` : ''}`;
+
+// Sub-note lists the remaining units' own ratios when more than one exists.
+const wasteSub = (w: Widgets) => {
+  const others = (w.waste_pct_by_unit || []).slice(1);
+  if (!others.length) return 'trailing 30 days';
+  // pct=null: waste recorded in a unit with no production this window — a
+  // ratio would be a lie, but the waste itself must not vanish from the KPI.
+  return `trailing 30 days · ${others.map(r => r.pct == null ? `${r.unit || 'unit'} waste w/o production` : `${r.unit || 'unit'} ${fmtNum(r.pct)}%`).join(', ')}`;
+};
 
 // ─── Page ───────────────────────────────────────────────────────────────
 export default function KitchenProductionDashboardPage() {
@@ -134,8 +163,8 @@ export default function KitchenProductionDashboardPage() {
             <StatCard icon={Printer}   label="Labels Printed Today" value={fmtNum(widgets.labels_printed_today)}   sub="print + reprint jobs" />
             <StatCard icon={Layers}    label="Active Batches"       value={fmtNum(widgets.active_batches)}         sub="currently on hand" />
             <StatCard icon={Boxes}     label="Total Production"     value={fmtNum(widgets.total_batches)}          sub="all-time batches" />
-            <StatCard icon={Utensils}  label="Today's Consumption"  value={fmtNum(widgets.today_consumption_qty)}  sub="qty consumed today" />
-            <StatCard icon={Trash2}    label="Waste %"              value={`${fmtNum(widgets.waste_pct)}%`}        sub="trailing 30 days"
+            <StatCard icon={Utensils}  label="Today's Consumption"  value={consumptionLabel(widgets)}              sub="qty consumed today" />
+            <StatCard icon={Trash2}    label="Waste %"              value={wasteLabel(widgets)}                    sub={wasteSub(widgets)}
                       accent={widgets.waste_pct >= 10 ? 'red' : widgets.waste_pct >= 5 ? 'amber' : 'emerald'} />
             <StatCard icon={GitCompare} label="FIFO Compliance"     value={`${fmtNum(widgets.fifo_compliance_pct)}%`} sub="oldest-first discipline"
                       accent={widgets.fifo_compliance_pct >= 90 ? 'emerald' : widgets.fifo_compliance_pct >= 70 ? 'amber' : 'red'} />

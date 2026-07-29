@@ -684,7 +684,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
                         <MaterialTypeahead
-                          materials={filteredMaterials as any}
+                          materials={filteredMaterials as any} purchaseBasis
                           value={it.material_id}
                           onPick={(id) => updateLine(i, { material_id: id })}
                           excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}

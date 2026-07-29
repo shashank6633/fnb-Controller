@@ -10,6 +10,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Trash2, Plus, Calendar, Save, Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
+import { packFactor, toPurchaseQty } from '@/lib/pack-units';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const today = () => new Date().toISOString().slice(0, 10);
@@ -18,6 +19,7 @@ interface Material { id: string; name: string; sku?: string; unit: string; avera
 interface Wastage {
   id: string; date: string; material_id: string;
   material_name: string; material_unit: string; material_sku?: string;
+  material_purchase_unit?: string; material_pack_size?: number;
   quantity: number; reason: string; notes?: string;
   recipe_id?: string; recipe_name?: string;
   recorded_by?: string; value: number;
@@ -88,7 +90,11 @@ export default function WastagePage() {
     try {
       const r = await api('/api/wastage', {
         method: 'POST',
-        body: { date, material_id: matId, quantity: parseFloat(qty), reason, notes },
+        // Qty is ENTERED in the purchase unit (owner rule); storage stays
+        // recipe units — ×packFactor once, here.
+        body: { date, material_id: matId,
+                quantity: Math.round(parseFloat(qty) * (selectedMat ? packFactor(selectedMat as any) : 1) * 1e6) / 1e6,
+                reason, notes },
       });
       if (!r.ok) { alert((await r.json()).error || 'Failed'); return; }
       setMatId(''); setQty(''); setNotes('');
@@ -97,7 +103,8 @@ export default function WastagePage() {
   };
 
   const remove = async (w: Wastage) => {
-    if (!confirm(`Delete wastage entry? Stock will be credited back (+${w.quantity} ${w.material_unit}).`)) return;
+    const wm = { unit: w.material_unit, purchase_unit: w.material_purchase_unit, pack_size: w.material_pack_size };
+    if (!confirm(`Delete wastage entry? Stock will be credited back (+${toPurchaseQty(w.quantity, wm)} ${w.material_purchase_unit || w.material_unit}).`)) return;
     const r = await api(`/api/wastage?id=${w.id}`, { method: 'DELETE', body: {} });
     if (!r.ok) { alert((await r.json()).error || 'Failed'); return; }
     reload();
@@ -134,16 +141,17 @@ export default function WastagePage() {
               value={matId}
               onPick={setMatId}
               compact={false}
+              purchaseBasis
             />
           </div>
           <label className="flex flex-col gap-1 text-[#6B5744] md:col-span-2">
             <span>Quantity</span>
             <input type="number" step="any" min="0" value={qty} onChange={e => setQty(e.target.value)}
-                   placeholder={selectedMat ? `in ${selectedMat.unit}` : '0'}
+                   placeholder={selectedMat ? `in ${(selectedMat as any).purchase_unit || selectedMat.unit}` : '0'}
                    className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0] font-mono" />
             {selectedMat && (
               <span className="text-[10px] text-[#8B7355]">
-                @ {fmt(selectedMat.average_price * (parseFloat(qty) || 0))} loss
+                @ {fmt(selectedMat.average_price * packFactor(selectedMat as any) * (parseFloat(qty) || 0))} loss
               </span>
             )}
           </label>
@@ -213,7 +221,10 @@ export default function WastagePage() {
                     <div className="font-medium">{w.material_name}</div>
                     {w.material_sku && <div className="text-[10px] font-mono text-[#8B7355]">{w.material_sku}</div>}
                   </td>
-                  <td className="py-1.5 px-3 text-right font-mono">{w.quantity.toLocaleString('en-IN')} {w.material_unit}</td>
+                  <td className="py-1.5 px-3 text-right font-mono"
+                      title={(w.material_pack_size || 1) > 1 && w.material_purchase_unit !== w.material_unit ? `= ${w.quantity.toLocaleString('en-IN')} ${w.material_unit}` : undefined}>
+                    {toPurchaseQty(w.quantity, { unit: w.material_unit, purchase_unit: w.material_purchase_unit, pack_size: w.material_pack_size }).toLocaleString('en-IN')} {w.material_purchase_unit || w.material_unit}
+                  </td>
                   <td className="py-1.5 px-3 text-right font-mono text-red-700 font-semibold">{fmt(w.value)}</td>
                   <td className="py-1.5 px-3">
                     <span className={`text-[10px] px-1.5 py-0.5 rounded ${REASON_TONE[w.reason] || ''}`}>

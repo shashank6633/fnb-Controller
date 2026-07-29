@@ -17,6 +17,26 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
+import { packFactor, toPurchaseQty } from '@/lib/pack-units';
+
+/** Detail-table qty cell: resolve the stored number through the LINE's unit
+ *  (party saves stamp the recipe unit; legacy lines may carry the purchase
+ *  unit), then lead with the purchase basis per the owner rule. */
+function PartyQty({ qty, it }: { qty: number | null | undefined; it: any }) {
+  if (qty == null) return <>—</>;
+  const meta = { unit: it.material_unit || it.unit, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size };
+  const pf = packFactor(meta);
+  const lu = String(it.unit || '').toLowerCase().trim();
+  const lineIsPU = pf > 1 && lu !== '' && lu === String(meta.purchase_unit || '').toLowerCase().trim();
+  const recipeQty = lineIsPU ? Number(qty) * pf : Number(qty);
+  const pu = toPurchaseQty(recipeQty, meta);
+  return (
+    <>
+      {pu.toLocaleString('en-IN')} <span className="text-[#8B7355]">{meta.purchase_unit || meta.unit}</span>
+      {pf > 1 && <span className="block text-[9px] text-[#B09A82]">= {recipeQty.toLocaleString('en-IN')} {meta.unit}</span>}
+    </>
+  );
+}
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const today = () => new Date().toISOString().slice(0, 10);
@@ -492,16 +512,16 @@ export default function PartyRequisitionsPage() {
                                       {it.material_name}
                                       {it.chef_note && <div className="text-[9px] text-amber-700 no-underline">Chef: {it.chef_note}</div>}
                                     </td>
-                                    <td className="py-1 px-2 text-right font-mono">{Number(it.quantity_requested).toLocaleString('en-IN')} {it.material_unit || it.unit}</td>
+                                    <td className="py-1 px-2 text-right font-mono"><PartyQty qty={it.quantity_requested} it={it} /></td>
                                     <td className="py-1 px-2 text-right font-mono">
                                       {rejected
                                         ? <span className="text-red-700 no-underline">—</span>
                                         : it.chef_approved_qty != null
-                                          ? <span className="text-amber-700">{Number(it.chef_approved_qty).toLocaleString('en-IN')}</span>
+                                          ? <span className="text-amber-700"><PartyQty qty={it.chef_approved_qty} it={it} /></span>
                                           : <span className="text-[#C0A98F]">—</span>}
                                     </td>
                                     <td className="py-1 px-2 text-right font-mono text-emerald-700">
-                                      {rejected ? '—' : (Number(it.quantity_issued) || 0).toLocaleString('en-IN')}
+                                      {rejected ? '—' : <PartyQty qty={Number(it.quantity_issued) || 0} it={it} />}
                                     </td>
                                     <td className="py-1 px-2 no-underline">
                                       {rejected
@@ -1193,7 +1213,7 @@ function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose
                       </div>
                       <div className="md:col-span-1">
                         <Lbl>Unit</Lbl>
-                        <div className="text-xs text-[#8B7355] py-2 truncate" title="Ordering unit (purchase unit)">{allowedUnits[0] || m?.unit || ''}</div>
+                        <div className="text-xs text-[#8B7355] py-2 truncate" title="Unit this line is entered in (save reads the same)">{it.unit || allowedUnits[0] || m?.unit || ''}</div>
                       </div>
                     </div>
                     {/* Dept (mixed mode) or Notes — full width mobile, col-3 desktop */}

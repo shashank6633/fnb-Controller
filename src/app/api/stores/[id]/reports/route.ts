@@ -101,6 +101,9 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
           purchase_unit: pu,
           qty_cbl: fmtBreakdown(r.qty, pm) || '',
           avg_cost: r4(r.avg_cost),
+          // ₹ per PURCHASE unit (display companion; avg_cost stays ₹/recipe-unit)
+          avg_cost_purchase: r2(n(r.avg_cost) * pc),
+          pack_factor: pc,
           value: r2(r.value),
           reorder_level: n(m.reorder_level),
         };
@@ -150,6 +153,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
             qty_cbl: fmtBreakdown(n(l.quantity), l) || '',
             unit_cost: r4(l.unit_cost),
             running_balance: bal,
+            balance_cbl: fmtBreakdown(bal, l) || '',
             supplier: l.supplier || '',
             ref: l.ref || '',
             notes: l.notes || '',
@@ -243,6 +247,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         }
         const raw = db.prepare(`
           SELECT l.material_id, rm.name AS material, rm.unit,
+                 rm.purchase_unit, rm.pack_size, rm.case_size,
                  SUM(CASE WHEN l.quantity > 0 THEN l.quantity ELSE 0 END)  AS in_qty,
                  SUM(CASE WHEN l.quantity < 0 THEN -l.quantity ELSE 0 END) AS out_qty,
                  SUM(CASE WHEN l.txn_type = 'adjustment' THEN l.quantity ELSE 0 END) AS adjust_qty,
@@ -264,6 +269,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
             out_qty: r3(m.out_qty),
             adjust_qty: r3(m.adjust_qty),
             closing: r3(open + n(m.net_qty)),
+            closing_cbl: fmtBreakdown(open + n(m.net_qty), m) || '',
           };
         });
         totals = {
@@ -334,8 +340,13 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
           .map(r => ({
             material: r.material, category: r.category,
             qty: r.qty, unit: r.unit,
+            qty_purchase: r.qty_purchase, purchase_unit: r.purchase_unit, qty_cbl: r.qty_cbl,
             reorder_level: r3(r.reorder_level),
+            // qty/reorder/deficit convert in LOCKSTEP (same pack_factor) — mixing
+            // bases here would show a deficit that disagrees with its own columns.
+            reorder_purchase: r3(r.reorder_level / (r.pack_factor || 1)),
             deficit: r3(r.reorder_level - r.qty),
+            deficit_purchase: r3((r.reorder_level - r.qty) / (r.pack_factor || 1)),
             value: r.value,
           }));
         totals = { items: rows.length, total_value: r2(rows.reduce((s, r) => s + n(r.value), 0)) };
@@ -373,7 +384,9 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
           })
           .map(r => ({
             material: r.material, category: r.category,
-            qty: r.qty, unit: r.unit, value: r.value,
+            qty: r.qty, unit: r.unit,
+            qty_purchase: r.qty_purchase, purchase_unit: r.purchase_unit, qty_cbl: r.qty_cbl,
+            value: r.value,
             last_outward: (lastOut.get(r.material_id) || '').slice(0, 10) || 'never',
           }));
         totals = {
@@ -416,7 +429,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
             category: r.category, material: r.material, sku: r.sku,
             qty: r.qty, unit: r.unit,
             qty_purchase: r.qty_purchase, purchase_unit: r.purchase_unit,
-            avg_cost: r.avg_cost, value: r.value,
+            avg_cost: r.avg_cost, avg_cost_purchase: r.avg_cost_purchase, value: r.value,
           }));
         totals = { items: rows.length, total_value: r2(rows.reduce((s, r) => s + n(r.value), 0)) };
         break;

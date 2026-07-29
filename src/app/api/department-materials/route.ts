@@ -38,6 +38,8 @@ export async function GET(request: Request) {
              dm.material_id,
              rm.name AS material_name,
              rm.unit AS material_unit,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS material_purchase_unit,
+             COALESCE(rm.pack_size, 1) AS material_pack_size,
              dm.on_hand,
              rm.average_price AS avg_price
       FROM department_materials dm
@@ -70,6 +72,8 @@ export async function GET(request: Request) {
         material_id: r.material_id,
         name: r.material_name,
         unit: r.material_unit,
+        purchase_unit: r.material_purchase_unit,
+        pack_size: Number(r.material_pack_size) || 1,
         on_hand: onHand,
         avg_price: avg,
         value,

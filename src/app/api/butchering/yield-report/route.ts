@@ -63,7 +63,7 @@ export async function GET(request: Request) {
     const batches = db.prepare(`
       SELECT bb.id, bb.batch_id, bb.source_material_id, bb.gross_weight, bb.total_cost,
              bb.butcher, bb.closed_at,
-             rm.name AS source_material_name
+             rm.name AS source_material_name, rm.unit AS source_material_unit
       FROM butchering_batches bb
       JOIN raw_materials rm ON rm.id = bb.source_material_id
       WHERE ${where.join(' AND ')}
@@ -74,10 +74,11 @@ export async function GET(request: Request) {
     const bySource = new Map<string, {
       source_material_id: string;
       source_material_name: string;
+      source_material_unit: string;
       batch_count: number;
       total_gross_weight: number;
       total_cost: number;
-      cuts: Map<string, { material_id: string; material_name: string; total_weight: number; weighted_yield_sum: number }>;
+      cuts: Map<string, { material_id: string; material_name: string; material_unit: string; total_weight: number; weighted_yield_sum: number }>;
       total_waste_weight: number;
     }>();
 
@@ -86,6 +87,7 @@ export async function GET(request: Request) {
         bySource.set(b.source_material_id, {
           source_material_id: b.source_material_id,
           source_material_name: b.source_material_name,
+          source_material_unit: b.source_material_unit,
           batch_count: 0, total_gross_weight: 0, total_cost: 0,
           cuts: new Map(), total_waste_weight: 0,
         });
@@ -96,7 +98,7 @@ export async function GET(request: Request) {
       agg.total_cost += b.total_cost || 0;
 
       const outs = db.prepare(`
-        SELECT bo.*, rm.name AS material_name
+        SELECT bo.*, rm.name AS material_name, rm.unit AS material_unit
         FROM butchering_outputs bo
         LEFT JOIN raw_materials rm ON rm.id = bo.material_id
         WHERE bo.batch_id = ?
@@ -105,7 +107,7 @@ export async function GET(request: Request) {
         if (o.output_type === 'cut' && o.material_id) {
           if (!agg.cuts.has(o.material_id)) {
             agg.cuts.set(o.material_id, {
-              material_id: o.material_id, material_name: o.material_name,
+              material_id: o.material_id, material_name: o.material_name, material_unit: o.material_unit,
               total_weight: 0, weighted_yield_sum: 0,
             });
           }
@@ -130,6 +132,7 @@ export async function GET(request: Request) {
         return {
           material_id: c.material_id,
           material_name: c.material_name,
+          material_unit: c.material_unit,
           total_weight: c.total_weight,
           avg_yield_pct: avgYield,
           std_yield_min: std?.min ?? null,
@@ -142,6 +145,7 @@ export async function GET(request: Request) {
       return {
         source_material_id: agg.source_material_id,
         source_material_name: agg.source_material_name,
+        source_material_unit: agg.source_material_unit,
         batch_count: agg.batch_count,
         total_gross_weight: agg.total_gross_weight,
         total_cost: agg.total_cost,

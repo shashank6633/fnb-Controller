@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canManageKitchenProduction } from '@/lib/auth';
 import { parseDateTime, expiryStatus, ProductionBatch } from '@/lib/production-batch';
 import { todayIST, fmtISTIsoDate } from '@/lib/format-date';
+import { packFactor } from '@/lib/pack-units';
 
 /**
  * GET /api/kitchen-production/dashboard
@@ -23,13 +24,22 @@ import { todayIST, fmtISTIsoDate } from '@/lib/format-date';
  *   today_production                     — batches whose production_date is today.
  *   labels_printed_today                 — printed+reprinted tx logged today.
  *   active_batches / total_batches       — status counts.
- *   today_consumption_qty                — Σ 'consumed' tx quantity today.
- *   waste_pct                            — (wasted+disposed qty) ÷ produced qty,
- *                                          over the trailing 30 days.
+ *   today_consumption_qty                — Σ 'consumed' tx quantity today
+ *                                          (legacy cross-unit scalar, kept for
+ *                                          wire compat — prefer the split below).
+ *   today_consumption_by_unit            — same figure split per batch unit:
+ *                                          [{ unit, qty }] (kg + pcs + L must
+ *                                          never be added together).
+ *   waste_pct / waste_pct_unit           — (wasted+disposed qty) ÷ produced qty
+ *                                          over the trailing 30 days, computed
+ *                                          PER UNIT; headline is the unit with
+ *                                          the largest produced quantity.
+ *   waste_pct_by_unit                    — every unit's ratio: [{ unit, pct }].
  *   fifo_compliance_pct                  — heuristic (see note below).
  *   low_stock_alerts                     — # of material-linked items whose total
  *                                          remaining across ACTIVE batches is at
- *                                          or below the raw_materials reorder level.
+ *                                          or below the raw_materials reorder level
+ *                                          (unit-aware — see exclusion rule inline).
  *
  * "today" for tx rows is the IST calendar day: created_at is stored UTC
  * (datetime('now')), so we shift it +5:30 before comparing dates.
@@ -77,22 +87,47 @@ export async function GET() {
     }
 
     // ---- low stock: material-linked items vs reorder level ----
-    const remainingByMaterial: Record<string, number> = {};
+    // Batch remainders are in production_batches.unit while reorder_level is
+    // in the material's RECIPE unit, so track remainders per batch unit and
+    // only compare the commensurable ones (exclusion rule below).
+    const remainingByMaterial: Record<string, Record<string, number>> = {};
     for (const b of activeBatches) {
       if (!b.material_id) continue;
       const rem = Math.max(0, (b.quantity_produced || 0) - (b.quantity_consumed || 0));
-      remainingByMaterial[b.material_id] = (remainingByMaterial[b.material_id] || 0) + rem;
+      const bu = String(b.unit || '').toLowerCase().trim();
+      const byUnit = (remainingByMaterial[b.material_id] ||= {});
+      byUnit[bu] = (byUnit[bu] || 0) + rem;
     }
     let low_stock_alerts = 0;
     const matIds = Object.keys(remainingByMaterial);
     if (matIds.length) {
       const placeholders = matIds.map(() => '?').join(',');
       const mats = db.prepare(
-        `SELECT id, reorder_level FROM raw_materials WHERE id IN (${placeholders})`
-      ).all(...matIds) as { id: string; reorder_level: number }[];
+        `SELECT id, unit, purchase_unit, pack_size, reorder_level
+           FROM raw_materials WHERE id IN (${placeholders})`
+      ).all(...matIds) as {
+        id: string; unit: string; purchase_unit: string; pack_size: number; reorder_level: number;
+      }[];
       for (const m of mats) {
         const reorder = Number(m.reorder_level) || 0;
-        if (reorder > 0 && (remainingByMaterial[m.id] || 0) <= reorder) low_stock_alerts += 1;
+        if (reorder <= 0) continue;
+        const ru = String(m.unit || '').toLowerCase().trim();
+        const pu = String(m.purchase_unit || '').toLowerCase().trim();
+        const pf = packFactor(m); // pack_size when it really converts, else 1
+        let remaining = 0;
+        let commensurable = true;
+        for (const [bu, rem] of Object.entries(remainingByMaterial[m.id])) {
+          if (!(Number(rem) > 0)) continue;                    // empty bucket can't block the compare
+          if (bu === ru) remaining += rem;                     // already recipe units
+          else if (bu === pu && pf > 1) remaining += rem * pf; // purchase → recipe
+          else { commensurable = false; break; }
+        }
+        // Exclusion rule: a batch unit that is neither the material's recipe
+        // unit nor a pack-convertible purchase unit cannot be compared against
+        // reorder_level (recipe units) — skip the material entirely, because a
+        // wrong alert is worse than no alert.
+        if (!commensurable) continue;
+        if (remaining <= reorder) low_stock_alerts += 1;
       }
     }
 
@@ -120,20 +155,54 @@ export async function GET() {
         WHERE type = 'consumed' AND ${istDay} = ? ${outletSql}`
     ).get(today, ...outletParams) as any)?.s || 0);
 
+    // Same figure split per batch unit — kg + pcs + L must never be added
+    // together, so the UI renders this and the scalar above stays only for
+    // wire compat. Qualified fragments: the join makes bare column names
+    // ambiguous (both tables carry outlet_id / created_at).
+    const txIstDay = `date(t.created_at, '+5 hours', '+30 minutes')`;
+    const txOutletSql = outletId ? 'AND (t.outlet_id = ? OR t.outlet_id IS NULL)' : '';
+    const today_consumption_by_unit = (db.prepare(
+      `SELECT LOWER(TRIM(COALESCE(pb.unit, ''))) AS unit, COALESCE(SUM(t.quantity),0) AS qty
+         FROM batch_transactions t
+         JOIN production_batches pb ON pb.id = t.batch_id
+        WHERE t.type = 'consumed' AND ${txIstDay} = ? ${txOutletSql}
+        GROUP BY LOWER(TRIM(COALESCE(pb.unit, '')))
+        ORDER BY qty DESC`
+    ).all(today, ...outletParams) as { unit: string; qty: number }[])
+      .map(r => ({ unit: String(r.unit || ''), qty: Number(r.qty) || 0 }));
+
     // ---- waste % over trailing 30 days ----
-    const wasteRow = db.prepare(
-      `SELECT COALESCE(SUM(quantity),0) AS s FROM batch_transactions
-        WHERE type IN ('wasted','disposed')
-          AND ${istDay} >= date(?, '-30 days') ${outletSql}`
-    ).get(today, ...outletParams) as any;
-    const producedRow = db.prepare(
-      `SELECT COALESCE(SUM(quantity),0) AS s FROM batch_transactions
-        WHERE type = 'created'
-          AND ${istDay} >= date(?, '-30 days') ${outletSql}`
-    ).get(today, ...outletParams) as any;
-    const wasteQty = Number(wasteRow?.s || 0);
-    const producedQty = Number(producedRow?.s || 0);
-    const waste_pct = producedQty > 0 ? Math.round((wasteQty / producedQty) * 1000) / 10 : 0;
+    // Computed PER UNIT: a ratio only means something when numerator and
+    // denominator share a unit. Headline = the unit with the most production;
+    // the rest ride along in waste_pct_by_unit for the page's sub-note.
+    const wasteAgg = db.prepare(
+      `SELECT LOWER(TRIM(COALESCE(pb.unit, ''))) AS unit,
+              COALESCE(SUM(CASE WHEN t.type IN ('wasted','disposed') THEN t.quantity ELSE 0 END),0) AS wasted,
+              COALESCE(SUM(CASE WHEN t.type = 'created' THEN t.quantity ELSE 0 END),0) AS created
+         FROM batch_transactions t
+         JOIN production_batches pb ON pb.id = t.batch_id
+        WHERE t.type IN ('wasted','disposed','created')
+          AND ${txIstDay} >= date(?, '-30 days') ${txOutletSql}
+        GROUP BY LOWER(TRIM(COALESCE(pb.unit, '')))`
+    ).all(today, ...outletParams) as { unit: string; wasted: number; created: number }[];
+    const wasteRows = wasteAgg
+      .filter(r => Number(r.created) > 0) // headline needs a denominator
+      .map(r => ({
+        unit: String(r.unit || ''),
+        pct: Math.round((Number(r.wasted) / Number(r.created)) * 1000) / 10,
+        created: Number(r.created),
+      }))
+      .sort((a, b) => b.created - a.created);
+    const waste_pct = wasteRows[0]?.pct ?? 0;
+    const waste_pct_unit = wasteRows[0]?.unit ?? '';
+    const waste_pct_by_unit: { unit: string; pct: number | null }[] = wasteRows.map(({ unit, pct }) => ({ unit, pct }));
+    // Waste in a unit with zero production this window: no ratio exists, but
+    // hiding it entirely would make the KPI read cleaner than reality.
+    for (const r of wasteAgg) {
+      if (!(Number(r.created) > 0) && Number(r.wasted) > 0) {
+        waste_pct_by_unit.push({ unit: String(r.unit || ''), pct: null });
+      }
+    }
 
     // ---- FIFO compliance (heuristic) ----
     // We cannot replay historical stock levels, so we approximate at the batch
@@ -197,7 +266,10 @@ export async function GET() {
       active_batches,
       total_batches,
       today_consumption_qty,
+      today_consumption_by_unit,
       waste_pct,
+      waste_pct_unit,
+      waste_pct_by_unit,
       fifo_compliance_pct,
       low_stock_alerts,
     };

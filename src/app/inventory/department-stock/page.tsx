@@ -16,6 +16,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Boxes, Loader2, Search, Warehouse } from 'lucide-react';
 import TabScroller from '@/components/TabScroller';
+import { packFactor as sharedPackFactor } from '@/lib/pack-units';
 
 interface Row {
   material_id: string; name: string; category: string; unit: string;
@@ -28,9 +29,8 @@ interface Summary { items: number; est_value: number; never_counted_count: numbe
 interface Department { id: string; name: string; code?: string; parent_id?: string | null; area?: string; is_active?: number; }
 
 const inr = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
-/** Recipe-units per purchase unit — same convention as StaffCatalogPicker. */
-const packFactor = (r: Row) =>
-  (r.purchase_unit && r.purchase_unit !== r.unit && (Number(r.pack_size) || 1) > 1) ? Number(r.pack_size) : 1;
+/** Recipe-units per purchase unit — the ONE shared guard (pack-units). */
+const packFactor = (r: Row) => sharedPackFactor(r);
 const inPU = (r: Row, recipeQty: number) => {
   const v = recipeQty / packFactor(r);
   return v.toLocaleString('en-IN', { maximumFractionDigits: 2 });

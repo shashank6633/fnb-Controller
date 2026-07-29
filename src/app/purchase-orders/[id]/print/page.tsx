@@ -159,7 +159,7 @@ export default function POPrintPage() {
                     {it.material_name}
                     {isReceived && (it.quantity_rejected || 0) > 0 && (
                       <div className="text-[10px] text-red-700 mt-0.5">
-                        Rejected: {it.quantity_rejected}
+                        Rejected: {it.quantity_rejected} {it.material_purchase_unit || it.material_unit}
                         {it.rejection_reason && <span className="capitalize"> ({it.rejection_reason.replace(/_/g, ' ')})</span>}
                       </div>
                     )}

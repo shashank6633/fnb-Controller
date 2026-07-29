@@ -97,7 +97,9 @@ export async function GET() {
 
     // 3. Largest inventory variances (yesterday)
     const variances = db.prepare(`
-      SELECT cs.material_id, rm.name, cs.variance, cs.variance_value, rm.unit
+      SELECT cs.material_id, rm.name, cs.variance, cs.variance_value, rm.unit,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS purchase_unit,
+             COALESCE(rm.pack_size, 1) AS pack_size
       FROM closing_stock cs
       JOIN raw_materials rm ON rm.id = cs.material_id
       WHERE cs.date = ? AND ABS(cs.variance_value) >= 500
@@ -112,7 +114,13 @@ export async function GET() {
         severity: Math.abs(v.variance_value) > 5000 ? 'high' : 'medium',
         category: 'Variance',
         headline: `${v.name} ${tone} by ₹${Math.round(Math.abs(v.variance_value)).toLocaleString('en-IN')}`,
-        detail: `Physical count off by ${v.variance} ${v.unit} vs system stock.`,
+        // Purchase-basis wording (owner rule) — the stored variance is recipe units.
+        detail: (() => {
+          const pk = Number(v.pack_size) || 1;
+          const isPack = pk > 1 && String(v.unit || '').toLowerCase().trim() !== String(v.purchase_unit || v.unit || '').toLowerCase().trim();
+          const q = isPack ? Math.round((v.variance / pk) * 1000) / 1000 : v.variance;
+          return `Physical count off by ${q} ${isPack ? v.purchase_unit : v.unit} vs system stock.`;
+        })(),
         fix_url: `/variance-report`,
         metric_value: v.variance_value,
       });

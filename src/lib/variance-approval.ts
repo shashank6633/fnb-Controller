@@ -123,6 +123,8 @@ export function listVarianceApprovals(
   const limit = Math.min(Math.max(Number(opts.limit) || 200, 1), 1000);
   const rows = db.prepare(`
     SELECT va.*, rm.name AS material_name, rm.sku AS material_sku,
+           COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS material_purchase_unit,
+           COALESCE(rm.pack_size, 1) AS material_pack_size,
            COALESCE(sl.name, '')  AS store_name,
            COALESCE(d.name, '')   AS department_name
     FROM variance_approvals va

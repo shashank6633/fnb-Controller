@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { listStores, consolidatedStock } from '@/lib/store-engine';
+import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 
 /**
  * GET /api/stores/overview — the ADMIN CONSOLIDATED STOCK board (multi-floor
@@ -21,7 +22,12 @@ import { listStores, consolidatedStock } from '@/lib/store-engine';
  *             Each row also carries grocery_qty / grocery_value (central grocery
  *             backstock = raw_materials.current_stock @ average_price) straight
  *             from consolidatedStock(); already folded into total_qty/total_value,
- *             surfaced by the page as a leftmost "Grocery" location column,
+ *             surfaced by the page as a leftmost "Grocery" location column.
+ *             DualQty companions (pack-units wire canon): every per-material
+ *             recipe qty ships its purchase-basis derivative — by_store_purchase
+ *             (store_id → qty_purchase), grocery_qty_purchase,
+ *             total_qty_purchase — plus pack_factor. All ADDITIVE; the recipe
+ *             fields stay the canonical truth and are unchanged,
  *     generated_at,
  *   }
  *
@@ -72,13 +78,30 @@ export async function GET() {
 
     const enriched = rows.map(r => {
       const m = meta.get(r.material_id);
+      // fall back to the recipe unit when no distinct purchase unit is set,
+      // matching pack-units' packFactor (which treats unit === purchase_unit
+      // as "no pack conversion").
+      const purchase_unit = m?.purchase_unit || r.unit;
+      const pm: PackMeta = { unit: r.unit, purchase_unit, pack_size: r.pack_size, case_size: r.case_size };
+      // DualQty companions — every per-material qty gains its purchase-basis
+      // derivative (toPurchaseQty: ÷ packFactor only when the both-halves guard
+      // passes, 3dp, −0 → 0). Each is converted ONCE from its recipe figure,
+      // never summed from other qty_purchase values: grocery_qty and total_qty
+      // are SAME-material sums, so the conversion is unit-sound. (The only
+      // cross-material sums in this feature are the page's ₹ totals — no
+      // purchase-basis aggregate is emitted for those.)
+      const by_store_purchase: Record<string, number> = {};
+      for (const sid of Object.keys(r.by_store)) {
+        by_store_purchase[sid] = toPurchaseQty(r.by_store[sid], pm);
+      }
       return {
         ...r,
         sku: m?.sku || '',
-        // fall back to the recipe unit when no distinct purchase unit is set,
-        // matching pack-units' packFactor (which treats unit === purchase_unit
-        // as "no pack conversion").
-        purchase_unit: m?.purchase_unit || r.unit,
+        purchase_unit,
+        pack_factor: packFactor(pm),
+        by_store_purchase,
+        grocery_qty_purchase: toPurchaseQty(r.grocery_qty, pm),
+        total_qty_purchase: toPurchaseQty(r.total_qty, pm),
       };
     });
 

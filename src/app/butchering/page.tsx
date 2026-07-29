@@ -21,15 +21,36 @@ import MaterialTypeahead from '@/components/MaterialTypeahead';
 import { api } from '@/lib/api';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
-const fmtKg = (v: number) => (v || 0).toFixed(3) + ' kg';
+// Butchering weights are stored + shown in each material's RECIPE unit (source
+// debit = source unit, cut credit = cut unit) — so labels come from data,
+// never a hardcoded 'kg'. 'kg' is only the fallback when no unit is known yet.
+const fmtWt = (v: number, unit?: string | null) => (v || 0).toFixed(3) + ' ' + (unit || 'kg');
+const uNorm = (u?: string | null) => String(u || 'kg').toLowerCase().trim();
+// Cheap metric map (g↔kg, ml↔l only). Yield % and the reconciliation strip
+// divide/sum weights across DIFFERENT materials — meaningful only when units
+// agree. This factor makes them agree where physically possible; anything else
+// (pcs, btl…) is non-convertible and must be dashed/excluded, never guessed.
+const METRIC: Record<string, { base: string; f: number }> = {
+  g: { base: 'g', f: 1 }, kg: { base: 'g', f: 1000 },
+  ml: { base: 'ml', f: 1 }, l: { base: 'ml', f: 1000 }, ltr: { base: 'ml', f: 1000 }, litre: { base: 'ml', f: 1000 },
+};
+// Factor converting 1 `from` unit into `to` units; null = not convertible.
+const wtFactor = (from?: string | null, to?: string | null): number | null => {
+  const f = uNorm(from), t = uNorm(to);
+  if (f === t) return 1;
+  const F = METRIC[f], T = METRIC[t];
+  return F && T && F.base === T.base ? F.f / T.f : null;
+};
 const today = () => new Date().toISOString().slice(0, 10);
 
 interface Material { id: string; name: string; sku?: string; unit?: string; average_price?: number; category?: string }
 interface Batch {
   id: string; batch_id: string; source_material_id: string; source_material_name: string;
+  source_material_unit?: string;
   gross_weight: number; invoice_weight?: number; cost_per_unit: number; total_cost: number;
   butcher: string; head_chef: string; status: 'open' | 'closed' | 'cancelled';
   cut_count: number; total_cut_weight: number; total_waste_weight: number;
+  cut_units?: string | null;   // DISTINCT cut units, comma-joined (from list API)
   notes?: string; created_at: string; closed_at?: string;
 }
 type OutputLine = {
@@ -155,8 +176,13 @@ export default function ButcheringPage() {
                         onClick={() => setOpenBatchId(b.id)}>
                       <td className="py-1.5 px-3 font-mono text-[#af4408]">{b.batch_id}</td>
                       <td className="py-1.5 px-3 text-[#2D1B0E]">{b.source_material_name}</td>
-                      <td className="py-1.5 px-3 text-right font-mono">{fmtKg(b.gross_weight)}</td>
-                      <td className="py-1.5 px-3 text-right font-mono">{b.cut_count} ({fmtKg(b.total_cut_weight)})</td>
+                      <td className="py-1.5 px-3 text-right font-mono">{fmtWt(b.gross_weight, b.source_material_unit)}</td>
+                      {/* total_cut_weight is a raw SUM across cut materials — only
+                          truthful when they all share ONE unit (cut_units has no
+                          comma); mixed/unknown units show the count alone. */}
+                      <td className="py-1.5 px-3 text-right font-mono">
+                        {b.cut_count}{b.cut_units && !b.cut_units.includes(',') ? ` (${fmtWt(b.total_cut_weight, b.cut_units)})` : ''}
+                      </td>
                       <td className={`py-1.5 px-3 text-right font-mono ${wasteTone}`}>{wastePct.toFixed(1)}%</td>
                       <td className="py-1.5 px-3 text-right font-mono">{fmt(b.total_cost)}</td>
                       <td className="py-1.5 px-3 text-[#6B5744]">{b.butcher || '—'}</td>
@@ -231,6 +257,9 @@ function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
     return /carcass|mutton|chicken|lamb|goat|poultry|seafood|prawn|\bmeat\b|\bfish\b/.test(hay);
   };
   const sourceMaterials = showAllSources ? materials : materials.filter(isCarcassSource);
+  // Weight fields debit the SOURCE material's stock verbatim → label with ITS
+  // recipe unit ('kg' only until a source is picked).
+  const srcUnit = materials.find(m => m.id === sourceId)?.unit || 'kg';
 
   // Detect if the standard mutton cuts are missing — if so, surface a 1-click seed button
   const hasMuttonCarcass = materials.some(m =>
@@ -329,12 +358,12 @@ function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
           <input value={butcher} onChange={e => setButcher(e.target.value)}
                  className="w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3]" />
         </Field>
-        <Field label="Gross dressed weight (kg) *">
+        <Field label={`Gross dressed weight (${srcUnit}) *`}>
           <input type="number" step="any" min="0" value={grossWeight} onChange={e => setGrossWeight(e.target.value)}
                  placeholder="14.250"
                  className="w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-right font-mono" />
         </Field>
-        <Field label="Invoice weight (kg)" hint="for variance check vs vendor">
+        <Field label={`Invoice weight (${srcUnit})`} hint="for variance check vs vendor">
           <input type="number" step="any" min="0" value={invoiceWeight} onChange={e => setInvoiceWeight(e.target.value)}
                  className="w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-right font-mono" />
         </Field>
@@ -418,16 +447,39 @@ function BatchDetailModal({ batchId, materials, onClose }: {
   const update = (i: number, patch: Partial<OutputLine>) =>
     setOutputs(p => p.map((o, idx) => idx === i ? { ...o, ...patch } : o));
 
-  const totalCut = useMemo(() => outputs.filter(o => o.output_type === 'cut').reduce((a, o) => a + (Number(o.weight) || 0), 0), [outputs]);
-  const totalWaste = useMemo(() => outputs.filter(o => o.output_type === 'waste').reduce((a, o) => a + (Number(o.weight) || 0), 0), [outputs]);
-  const totalOut = totalCut + totalWaste;
+  const srcUnit = batch?.source_material_unit || 'kg';
+  // Cost-proration basis — MIRRORS the server: each cut normalized into the
+  // source unit, non-convertible units falling back to the raw weight (??1).
+  // Positive raw stays positive, so the "has cuts" gate is unaffected.
+  const totalCut = useMemo(() => outputs.filter(o => o.output_type === 'cut').reduce((a, o) => {
+    const u = materials.find(m => m.id === o.material_id)?.unit || srcUnit;
+    return a + (Number(o.weight) || 0) * (wtFactor(u, srcUnit) ?? 1);
+  }, 0), [outputs, materials, srcUnit]);
+  // Normalized reconciliation: each line's weight converted into the SOURCE
+  // unit (g↔kg, ml↔l) before summing — a 500 g cut of a kg carcass counts as
+  // 0.5, not 500. Waste is recorded against the SOURCE material → source unit.
+  // Non-convertible lines (e.g. pcs vs kg) are EXCLUDED from the strip + gap
+  // math (adding pcs to kg is meaningless) and surfaced as an excluded count.
+  const { totalCutN, totalWasteN, excluded } = useMemo(() => {
+    let cut = 0, waste = 0, excluded = 0;
+    for (const o of outputs) {
+      const w = Number(o.weight) || 0;
+      if (!(w > 0)) continue;
+      const unit = o.output_type === 'waste' ? srcUnit
+        : (materials.find(m => m.id === o.material_id)?.unit || srcUnit); // unpicked cut: assume source unit
+      const k = wtFactor(unit, srcUnit);
+      if (k == null) { excluded++; continue; }
+      if (o.output_type === 'cut') cut += w * k; else waste += w * k;
+    }
+    return { totalCutN: cut, totalWasteN: waste, excluded };
+  }, [outputs, materials, srcUnit]);
   // Live basis: the recon strip, per-line yields and costs all follow the
   // EDITED gross weight so what you see is exactly what saving produces.
   const gross = Number(grossW) > 0 ? Number(grossW) : 0;
   const liveTotalCost = (batch?.cost_per_unit || 0) * gross;
-  const gap = gross - totalOut;
+  const gap = gross - (totalCutN + totalWasteN);
   const gapPct = gross > 0 ? Math.abs(gap) / gross : 0;
-  const wastePct = gross > 0 ? (totalWaste / gross) * 100 : 0;
+  const wastePct = gross > 0 ? (totalWasteN / gross) * 100 : 0;
   const withinTolerance = gapPct <= 0.015;
 
   // Foolproofing: never silently drop a line. Weight without material (or a
@@ -504,7 +556,7 @@ function BatchDetailModal({ batchId, materials, onClose }: {
   const readOnly = batch.status !== 'open';
 
   return (
-    <ModalShell title={`Batch ${batch.batch_id}`} subtitle={`${batch.source_material_name} · ${fmtKg(batch.gross_weight)} gross · ${fmt(batch.total_cost)}`}
+    <ModalShell title={`Batch ${batch.batch_id}`} subtitle={`${batch.source_material_name} · ${fmtWt(batch.gross_weight, batch.source_material_unit)} gross · ${fmt(batch.total_cost)}`}
                 onClose={onClose}>
       {readOnly && (
         <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded p-2 text-xs mb-3">
@@ -515,12 +567,12 @@ function BatchDetailModal({ batchId, materials, onClose }: {
       {/* Batch details — editable while open; every Save Draft persists them
           and re-bases yields/costs on the corrected gross weight. */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
-        <Field label="Gross weight (kg) *">
+        <Field label={`Gross weight (${srcUnit}) *`}>
           <input type="number" step="any" min="0" value={grossW} readOnly={readOnly}
                  onChange={e => setGrossW(e.target.value)}
                  className={`w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono ${readOnly ? 'bg-[#F7F0E8] text-[#8B7355]' : 'bg-[#FFF1E3]'}`} />
         </Field>
-        <Field label="Invoice weight (kg)">
+        <Field label={`Invoice weight (${srcUnit})`}>
           <input type="number" step="any" min="0" value={invoiceW} readOnly={readOnly}
                  onChange={e => setInvoiceW(e.target.value)}
                  className={`w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono ${readOnly ? 'bg-[#F7F0E8] text-[#8B7355]' : 'bg-[#FFF1E3]'}`} />
@@ -539,12 +591,17 @@ function BatchDetailModal({ batchId, materials, onClose }: {
         </Field>
       </div>
 
-      {/* Reconciliation strip */}
+      {/* Reconciliation strip — all figures normalized into the SOURCE unit */}
       <div className={`rounded-lg p-3 grid grid-cols-4 gap-3 text-xs border ${withinTolerance ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
-        <div><div className="text-[10px] uppercase text-[#8B7355]">Gross</div><div className="font-mono font-semibold">{fmtKg(gross)}</div></div>
-        <div><div className="text-[10px] uppercase text-[#8B7355]">Total Cut</div><div className="font-mono font-semibold">{fmtKg(totalCut)}</div></div>
-        <div><div className="text-[10px] uppercase text-[#8B7355]">Total Waste</div><div className={`font-mono font-semibold ${wastePct > 12 ? 'text-red-700' : ''}`}>{fmtKg(totalWaste)} ({wastePct.toFixed(1)}%)</div></div>
-        <div><div className="text-[10px] uppercase text-[#8B7355]">Gap</div><div className={`font-mono font-semibold ${withinTolerance ? 'text-emerald-700' : 'text-amber-700'}`}>{fmtKg(gap)} ({(gapPct*100).toFixed(2)}%)</div></div>
+        <div><div className="text-[10px] uppercase text-[#8B7355]">Gross</div><div className="font-mono font-semibold">{fmtWt(gross, srcUnit)}</div></div>
+        <div><div className="text-[10px] uppercase text-[#8B7355]">Total Cut</div><div className="font-mono font-semibold">{fmtWt(totalCutN, srcUnit)}</div></div>
+        <div><div className="text-[10px] uppercase text-[#8B7355]">Total Waste</div><div className={`font-mono font-semibold ${wastePct > 12 ? 'text-red-700' : ''}`}>{fmtWt(totalWasteN, srcUnit)} ({wastePct.toFixed(1)}%)</div></div>
+        <div><div className="text-[10px] uppercase text-[#8B7355]">Gap</div><div className={`font-mono font-semibold ${withinTolerance ? 'text-emerald-700' : 'text-amber-700'}`}>{fmtWt(gap, srcUnit)} ({(gapPct*100).toFixed(2)}%)</div></div>
+        {excluded > 0 && (
+          <div className="col-span-4 text-[10px] text-amber-800">
+            {excluded} line{excluded > 1 ? 's' : ''} excluded (unit mismatch — cannot be converted to {srcUnit})
+          </div>
+        )}
       </div>
 
       {/* CUTS section */}
@@ -557,13 +614,13 @@ function BatchDetailModal({ batchId, materials, onClose }: {
         </div>
         <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wide text-[#8B7355] px-1">
           <div className="col-span-6">Material</div>
-          <div className="col-span-2 text-right">Weight (kg)</div>
+          <div className="col-span-2 text-right">Weight</div>
           <div className="col-span-1 text-right">Yield %</div>
           <div className="col-span-2 text-right">Cost</div>
         </div>
         <div className="space-y-1 mt-1">
           {outputs.map((o, i) => o.output_type !== 'cut' ? null : (
-            <CutLine key={i} idx={i} line={o} grossWeight={gross} totalCost={liveTotalCost} materials={materials}
+            <CutLine key={i} idx={i} line={o} grossWeight={gross} sourceUnit={srcUnit} totalCost={liveTotalCost} materials={materials}
                      totalCutWeight={totalCut} readOnly={readOnly} excludeIds={outputs.filter(x => x.output_type === 'cut' && x.material_id).map(x => x.material_id)}
                      onUpdate={(patch) => update(i, patch)} onRemove={() => removeLine(i)} />
           ))}
@@ -580,12 +637,12 @@ function BatchDetailModal({ batchId, materials, onClose }: {
         </div>
         <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wide text-[#8B7355] px-1">
           <div className="col-span-6">Category</div>
-          <div className="col-span-2 text-right">Weight (kg)</div>
+          <div className="col-span-2 text-right">Weight</div>
           <div className="col-span-3">Notes</div>
         </div>
         <div className="space-y-1 mt-1">
           {outputs.map((o, i) => o.output_type !== 'waste' ? null : (
-            <WasteLine key={i} idx={i} line={o} readOnly={readOnly}
+            <WasteLine key={i} idx={i} line={o} sourceUnit={srcUnit} readOnly={readOnly}
                        onUpdate={(patch) => update(i, patch)} onRemove={() => removeLine(i)} />
           ))}
         </div>
@@ -617,29 +674,44 @@ function BatchDetailModal({ batchId, materials, onClose }: {
   );
 }
 
-function CutLine({ idx, line, grossWeight, totalCost, materials, totalCutWeight, readOnly, excludeIds, onUpdate, onRemove }: {
-  idx: number; line: OutputLine; grossWeight: number; totalCost: number; materials: Material[]; totalCutWeight: number;
+function CutLine({ idx, line, grossWeight, sourceUnit, totalCost, materials, totalCutWeight, readOnly, excludeIds, onUpdate, onRemove }: {
+  idx: number; line: OutputLine; grossWeight: number; sourceUnit: string; totalCost: number; materials: Material[]; totalCutWeight: number;
   readOnly: boolean; excludeIds: string[];
   onUpdate: (patch: Partial<OutputLine>) => void; onRemove: () => void;
 }) {
   const weight = Number(line.weight) || 0;
-  const yieldPct = grossWeight > 0 ? (weight / grossWeight) * 100 : 0;
-  const cost = totalCutWeight > 0 ? totalCost * (weight / totalCutWeight) : 0;
+  const mat = materials.find(m => m.id === line.material_id);
+  const unit = mat?.unit || sourceUnit;   // unpicked line: assume source unit until chosen
+  // Yield = cut ÷ gross — only meaningful once the cut weight is expressed in
+  // the source's unit; non-convertible pairs (pcs vs kg) get a dash, not a lie.
+  const k = wtFactor(unit, sourceUnit);
+  const yieldPct = k != null && grossWeight > 0 ? (weight * k / grossWeight) * 100 : null;
+  // Cost proration mirrors the server: NORMALIZED weights (non-convertible
+  // units fall back to raw — same ??1 the server applies).
+  const cost = totalCutWeight > 0 ? totalCost * ((weight * (k ?? 1)) / totalCutWeight) : 0;
   return (
     <div className="grid grid-cols-12 gap-2 items-start">
       <div className="col-span-6">
         {readOnly ? (
-          <div className="px-2 py-1.5 text-xs font-medium">{materials.find(m => m.id === line.material_id)?.name || '—'}</div>
+          <div className="px-2 py-1.5 text-xs font-medium">{mat?.name || '—'}</div>
         ) : (
           <MaterialTypeahead materials={materials as any} value={line.material_id}
                              onPick={(id: string) => onUpdate({ material_id: id })}
+                             purchaseBasis
                              excludeIds={excludeIds.filter(x => x !== line.material_id) as string[]} />
         )}
       </div>
-      <input type="number" step="any" min="0" value={line.weight} readOnly={readOnly}
-             onChange={e => onUpdate({ weight: e.target.value })}
-             className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
-      <div className="col-span-1 text-right text-xs font-mono py-2 text-[#6B5744]">{yieldPct.toFixed(1)}%</div>
+      <div className="col-span-2 flex items-center gap-1">
+        <input type="number" step="any" min="0" value={line.weight} readOnly={readOnly}
+               onChange={e => onUpdate({ weight: e.target.value })}
+               className="w-full min-w-0 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
+        <span className="text-[10px] text-[#8B7355] shrink-0">{unit}</span>
+      </div>
+      <div className="col-span-1 text-right text-xs font-mono py-2 text-[#6B5744]">
+        {yieldPct == null
+          ? <span title={`Yield not comparable: cut is in ${unit}, source in ${sourceUnit}`}>—</span>
+          : `${yieldPct.toFixed(1)}%`}
+      </div>
       <div className="col-span-2 text-right text-xs font-mono py-2 text-[#6B5744]">{fmt(cost)}</div>
       <div className="col-span-1 text-right">
         {!readOnly && (
@@ -650,8 +722,8 @@ function CutLine({ idx, line, grossWeight, totalCost, materials, totalCutWeight,
   );
 }
 
-function WasteLine({ idx, line, readOnly, onUpdate, onRemove }: {
-  idx: number; line: OutputLine; readOnly: boolean;
+function WasteLine({ idx, line, sourceUnit, readOnly, onUpdate, onRemove }: {
+  idx: number; line: OutputLine; sourceUnit: string; readOnly: boolean;
   onUpdate: (patch: Partial<OutputLine>) => void; onRemove: () => void;
 }) {
   return (
@@ -661,9 +733,13 @@ function WasteLine({ idx, line, readOnly, onUpdate, onRemove }: {
               className="col-span-6 px-2 py-1.5 border border-[#D4B896] rounded text-xs">
         {WASTE_CATEGORIES.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
       </select>
-      <input type="number" step="any" min="0" value={line.weight} readOnly={readOnly}
-             onChange={e => onUpdate({ weight: e.target.value })}
-             className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
+      {/* waste is written to wastages against the SOURCE material → source unit */}
+      <div className="col-span-2 flex items-center gap-1">
+        <input type="number" step="any" min="0" value={line.weight} readOnly={readOnly}
+               onChange={e => onUpdate({ weight: e.target.value })}
+               className="w-full min-w-0 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
+        <span className="text-[10px] text-[#8B7355] shrink-0">{sourceUnit}</span>
+      </div>
       <input value={line.notes} readOnly={readOnly}
              onChange={e => onUpdate({ notes: e.target.value })}
              className="col-span-3 px-2 py-1.5 border border-[#D4B896] rounded text-xs" />
@@ -730,7 +806,7 @@ function YieldReportPanel() {
               <div className="flex items-baseline gap-3 flex-wrap">
                 <h3 className="text-sm font-semibold text-[#2D1B0E]">{src.source_material_name}</h3>
                 <span className="text-xs text-[#8B7355]">
-                  {src.batch_count} batches · {fmtKg(src.total_gross_weight)} gross · {fmt(src.total_cost)}
+                  {src.batch_count} batches · {fmtWt(src.total_gross_weight, src.source_material_unit)} gross · {fmt(src.total_cost)}
                 </span>
                 <span className={`text-xs ml-auto px-2 py-0.5 rounded ${src.waste.status === 'high' ? 'bg-red-100 text-red-700 font-semibold' : 'bg-emerald-100 text-emerald-700'}`}>
                   Waste: {src.waste.total_pct.toFixed(1)}% (target ≤ {src.waste.target_max_pct}%)
@@ -748,11 +824,20 @@ function YieldReportPanel() {
                   </tr>
                 </thead>
                 <tbody>
-                  {src.cuts.map((c: any) => (
+                  {src.cuts.map((c: any) => {
+                    // yield_pct is stored NORMALIZED (source-unit basis) by the
+                    // save route — display verbatim. The dash stays for
+                    // non-convertible pairs, where no ratio is meaningful.
+                    const yf = wtFactor(c.material_unit, src.source_material_unit);
+                    return (
                     <tr key={c.material_id} className="border-t border-[#E8D5C4]/50">
                       <td className="py-1 text-[#2D1B0E]">{c.material_name}</td>
-                      <td className="py-1 text-right font-mono">{fmtKg(c.total_weight)}</td>
-                      <td className="py-1 text-right font-mono">{c.avg_yield_pct.toFixed(1)}%</td>
+                      <td className="py-1 text-right font-mono">{fmtWt(c.total_weight, c.material_unit)}</td>
+                      <td className="py-1 text-right font-mono">
+                        {yf == null
+                          ? <span title={`Yield not comparable: cut is in ${c.material_unit || '?'}, source in ${src.source_material_unit || 'kg'}`}>—</span>
+                          : `${Number(c.avg_yield_pct || 0).toFixed(1)}%`}
+                      </td>
                       <td className="py-1 text-right font-mono text-[#8B7355]">
                         {c.std_yield_min != null ? `${c.std_yield_min}–${c.std_yield_max}%` : '—'}
                       </td>
@@ -765,7 +850,8 @@ function YieldReportPanel() {
                         }`}>{c.status === 'unknown' ? 'no std' : c.status}</span>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
               </div>

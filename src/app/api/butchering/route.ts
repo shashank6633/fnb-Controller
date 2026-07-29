@@ -27,6 +27,24 @@ export const dynamic = 'force-dynamic';
 
 const RECONCILE_TOLERANCE = 0.015; // 1.5%
 
+// Metric normalization — MIRRORS page.tsx (uNorm/METRIC/wtFactor). Weights are
+// stored in each material's OWN recipe unit; any math that sums or divides
+// weights across materials (reconciliation gap, cost proration, yield %) must
+// first express them in the SOURCE material's unit. g↔kg and ml↔l only;
+// anything else (pcs, btl…) is non-convertible: excluded from the gap sum
+// (same as the page strip) and left raw in the proration (documented fallback).
+const uNorm = (u?: string | null) => String(u || 'kg').toLowerCase().trim();
+const METRIC: Record<string, { base: string; f: number }> = {
+  g: { base: 'g', f: 1 }, kg: { base: 'g', f: 1000 },
+  ml: { base: 'ml', f: 1 }, l: { base: 'ml', f: 1000 }, ltr: { base: 'ml', f: 1000 }, litre: { base: 'ml', f: 1000 },
+};
+const wtFactor = (from?: string | null, to?: string | null): number | null => {
+  const f = uNorm(from), t = uNorm(to);
+  if (f === t) return 1;
+  const F = METRIC[f], T = METRIC[t];
+  return F && T && F.base === T.base ? F.f / T.f : null;
+};
+
 export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
@@ -52,8 +70,13 @@ export async function GET(request: Request) {
         WHERE bo.batch_id = ?
         ORDER BY bo.output_type DESC, rm.name
       `).all(id);
-      // Reconciliation summary
-      const totalOutput = (outputs as any[]).reduce((a, o) => a + (o.weight || 0), 0);
+      // Reconciliation summary — normalized into the source unit; waste rows
+      // are recorded against the source material so they use the source unit.
+      const srcU = batch.source_material_unit;
+      const totalOutput = (outputs as any[]).reduce((a, o) => {
+        const k = wtFactor(o.output_type === 'waste' ? srcU : (o.material_unit || srcU), srcU);
+        return k == null ? a : a + (Number(o.weight) || 0) * k;
+      }, 0);
       const gap = batch.gross_weight - totalOutput;
       const gapPct = batch.gross_weight > 0 ? Math.abs(gap) / batch.gross_weight : 0;
       return Response.json({
@@ -81,10 +104,15 @@ export async function GET(request: Request) {
     if (to)     { where.push("date(bb.created_at) <= ?"); params.push(to); }
 
     const rows = db.prepare(`
-      SELECT bb.*, rm.name AS source_material_name,
+      SELECT bb.*, rm.name AS source_material_name, rm.unit AS source_material_unit,
              (SELECT COUNT(*) FROM butchering_outputs WHERE batch_id = bb.id AND output_type = 'cut')   AS cut_count,
              (SELECT COALESCE(SUM(weight), 0) FROM butchering_outputs WHERE batch_id = bb.id AND output_type = 'cut')   AS total_cut_weight,
-             (SELECT COALESCE(SUM(weight), 0) FROM butchering_outputs WHERE batch_id = bb.id AND output_type = 'waste') AS total_waste_weight
+             (SELECT COALESCE(SUM(weight), 0) FROM butchering_outputs WHERE batch_id = bb.id AND output_type = 'waste') AS total_waste_weight,
+             -- DISTINCT recipe units across this batch's cut materials: the UI only
+             -- labels the cut-weight SUM when there is exactly one unit (no comma).
+             (SELECT GROUP_CONCAT(DISTINCT lower(trim(COALESCE(rm2.unit, ''))))
+                FROM butchering_outputs bo2 JOIN raw_materials rm2 ON rm2.id = bo2.material_id
+               WHERE bo2.batch_id = bb.id AND bo2.output_type = 'cut') AS cut_units
       FROM butchering_batches bb
       JOIN raw_materials rm ON rm.id = bb.source_material_id
       WHERE ${where.join(' AND ')}
@@ -222,7 +250,12 @@ export async function PUT(request: Request) {
     // Replace outputs if provided — always against the CURRENT (possibly
     // just-updated) gross weight and total cost.
     if (Array.isArray(outputs)) {
-      const basis = db.prepare('SELECT gross_weight, total_cost FROM butchering_batches WHERE id = ?').get(id) as any;
+      const basis = db.prepare(`
+        SELECT bb.gross_weight, bb.total_cost, rm.unit AS source_unit
+        FROM butchering_batches bb JOIN raw_materials rm ON rm.id = bb.source_material_id
+        WHERE bb.id = ?
+      `).get(id) as any;
+      const unitOf = db.prepare('SELECT unit FROM raw_materials WHERE id = ?');
       const txn = db.transaction(() => {
         db.prepare('DELETE FROM butchering_outputs WHERE batch_id = ?').run(id);
         const ins = db.prepare(`
@@ -242,11 +275,20 @@ export async function PUT(request: Request) {
             wastes.push({ ...o, weight: w });
           }
         }
-        const totalCutWeight = cuts.reduce((a, c) => a + c.weight, 0);
-        // Cost allocation: pro-rata by weight across CUTS only (waste absorbs no cost)
+        // Cost allocation: pro-rata by NORMALIZED weight across CUTS only (waste
+        // absorbs no cost). Each cut's weight is in ITS material's recipe unit —
+        // raw proration handed a 3500 g line 350× the cost of a 10 kg line.
+        // Non-convertible units (pcs vs kg) fall back to the raw weight; that is
+        // the best available basis and matches the page's Cost column.
         for (const c of cuts) {
-          const yieldPct = basis.gross_weight > 0 ? (c.weight / basis.gross_weight) * 100 : 0;
-          const cost = totalCutWeight > 0 ? basis.total_cost * (c.weight / totalCutWeight) : 0;
+          c._n = c.weight * (wtFactor((unitOf.get(c.material_id) as any)?.unit, basis.source_unit) ?? 1);
+        }
+        const totalCutWeight = cuts.reduce((a, c) => a + c._n, 0);
+        for (const c of cuts) {
+          // yield_pct is stored NORMALIZED (source-unit basis) — the page and
+          // yield report display it verbatim, no client-side rescale.
+          const yieldPct = basis.gross_weight > 0 ? (c._n / basis.gross_weight) * 100 : 0;
+          const cost = totalCutWeight > 0 ? basis.total_cost * (c._n / totalCutWeight) : 0;
           ins.run(generateId(), id, 'cut', c.material_id, null, c.weight, cost, yieldPct, c.notes || '');
         }
         for (const w of wastes) {
@@ -259,10 +301,25 @@ export async function PUT(request: Request) {
 
     // Close action: post inventory transactions and lock the batch
     if (action === 'close') {
-      const fresh = db.prepare('SELECT * FROM butchering_batches WHERE id = ?').get(id) as any;
-      const outs = db.prepare('SELECT * FROM butchering_outputs WHERE batch_id = ?').all(id) as any[];
+      const fresh = db.prepare(`
+        SELECT bb.*, rm.unit AS source_unit
+        FROM butchering_batches bb JOIN raw_materials rm ON rm.id = bb.source_material_id
+        WHERE bb.id = ?
+      `).get(id) as any;
+      const outs = db.prepare(`
+        SELECT bo.*, rm.unit AS material_unit
+        FROM butchering_outputs bo LEFT JOIN raw_materials rm ON rm.id = bo.material_id
+        WHERE bo.batch_id = ?
+      `).all(id) as any[];
       if (outs.length === 0) return Response.json({ error: 'Cannot close empty batch — add outputs first' }, { status: 400 });
-      const totalOut = outs.reduce((a, o) => a + (o.weight || 0), 0);
+      // Gap check MIRRORS the page's reconciliation strip: weights normalized
+      // into the source unit; non-convertible lines excluded from the sum. A raw
+      // sum here made any mixed-unit batch fail closing (3500 g read as 3500 kg)
+      // while the on-screen strip said it reconciled.
+      const totalOut = outs.reduce((a, o) => {
+        const k = wtFactor(o.output_type === 'waste' ? fresh.source_unit : (o.material_unit || fresh.source_unit), fresh.source_unit);
+        return k == null ? a : a + (Number(o.weight) || 0) * k;
+      }, 0);
       const gapPct = fresh.gross_weight > 0 ? Math.abs(fresh.gross_weight - totalOut) / fresh.gross_weight : 1;
       if (gapPct > RECONCILE_TOLERANCE) {
         return Response.json({
