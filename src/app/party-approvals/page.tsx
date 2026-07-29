@@ -1029,8 +1029,10 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
                     excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                   />
                 </div>
-                <input type="number" step="any" value={it.qty}
-                       onChange={e => update(i, { qty: e.target.value })}
+                {/* A negative approved qty is never valid — see the matching
+                    clamp on the requisitions approve grid. */}
+                <input type="number" step="any" min={0} value={it.qty}
+                       onChange={e => update(i, { qty: String(Math.max(0, Number(e.target.value) || 0)) })}
                        className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
                 <span className="col-span-1 text-xs text-[#8B7355] py-2" title="Unit this line was requested in">{it.unit || m?.unit || ''}</span>
                 <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}

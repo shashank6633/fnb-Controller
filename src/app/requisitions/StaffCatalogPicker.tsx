@@ -19,12 +19,25 @@
  *     Edit mode PUTs {id, date, department_id, notes, items} (mirrors the
  *     modal's isEditing branch). "Submit to HOD" then POSTs
  *     /api/requisitions/<id>/submit.
+ *
+ * PARTY MODE (optional `party` prop; absent ⇒ everything below is inert and the
+ * internal flow is unchanged). /party-requisitions renders this same picker so
+ * there is ONE cart, one pack-factor guard and one save path. It additionally
+ * shows the event header and merges {purpose:'party', event_*, customer,
+ * guest_count} + the sheet-sync keys into the very same POST/PUT.
+ *   - Party lines are stamped with the PURCHASE unit, exactly like internal
+ *     ones. The old party composer stamped the RECIPE unit and pre-multiplied
+ *     qty by pack_size; every reader resolves a line's own `unit` column, so
+ *     legacy rows keep working while new rows are uniform across both flows.
+ *   - Mixed mode (a department per LINE) is party-only: the header selector
+ *     picks the dept the NEXT item is added under, the cart groups by dept, and
+ *     department_id is omitted from the body so the server derives it.
  */
 
-import { useEffect, useMemo, useState } from 'react';
-import { Loader2, Minus, Plus, Search, Send, ShoppingCart, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Loader2, Lock, Minus, Plus, Search, Send, ShoppingCart, X } from 'lucide-react';
 import { api } from '@/lib/api';
-import { packFactor } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty } from '@/lib/pack-units';
 
 interface Material {
   id: string; name: string; sku?: string; unit: string;
@@ -47,11 +60,38 @@ interface DraftItem {
   material_name: string; material_unit: string;
   material_purchase_unit?: string; material_pack_size?: number;
   current_stock: number; average_price: number; last_purchase_price?: number;
+  /** Per-line department — only read in party mixed mode. */
+  department_id?: string | null;
 }
 interface EditDraft {
   id: string; req_number: string; date: string;
   department_id: string; notes: string;
   items?: DraftItem[];
+}
+
+/** Event-header fields a party requisition carries beside the catalog. Kept as
+ *  strings because they are text inputs; save() coerces guest_count. */
+export interface PartyEvent {
+  event_name: string; event_date: string; guest_count: string;
+  customer: string; event_notes: string;
+}
+/** Presence of this prop switches the picker into party mode. */
+export interface PartyMode {
+  /** Seed values for the event header — the page decides whether they come
+   *  from the draft being resumed or from the FP / sheet prefill. */
+  initial?: Partial<PartyEvent>;
+  /** Header fields are read-only: the AKAN sheet is the source of truth.
+   *  Admins get the documented override, applied here from `me`. */
+  sheetLocked?: boolean;
+  /** Merged verbatim into the POST/PUT body — the server re-asserts sheet truth
+   *  for non-admins from these keys. */
+  sheet?: { from_sheet?: boolean; party_unique_id?: string; fp_id?: string };
+  /** Rendered above the event header (FP banner / menu checklist). */
+  banner?: ReactNode;
+  /** Cart pre-seed. quantity is in the material's RECIPE unit (what
+   *  fp-estimator emits); the picker converts it to the purchase basis it
+   *  carts in via the shared toPurchaseQty. */
+  seed?: { material_id: string; quantity: number }[];
 }
 
 /** Recipe-units per 1 of the unit a LINE was requested in — ×pack only when
@@ -76,7 +116,7 @@ function pu(m: Material): string { return m.purchase_unit || m.unit || ''; }
 const inr = (v: number, dp = 0) =>
   '₹' + (v || 0).toLocaleString('en-IN', { minimumFractionDigits: dp, maximumFractionDigits: dp });
 
-export default function StaffCatalogPicker({ materials, me, departments, editDraft, deptStock, onClose, onCreated }: {
+export default function StaffCatalogPicker({ materials, me, departments, editDraft, deptStock, party, onClose, onCreated }: {
   materials: Material[];
   me: {
     role?: string; email?: string; department_id?: string | null;
@@ -89,10 +129,14 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
    *  department. The picker refetches itself if its dept differs (privileged
    *  users can switch departments in the header). */
   deptStock?: DeptStockProp | null;
+  /** Present ⇒ party mode (see the party-mode note in the file header).
+   *  Absent ⇒ the internal flow, entirely unchanged. */
+  party?: PartyMode | null;
   onClose: () => void;
   onCreated: () => void;
 }) {
   const isEditing = !!editDraft;
+  const isParty = !!party;
   const today = new Date().toISOString().slice(0, 10);
   const date = editDraft?.date || today;
   // Same privilege condition as CreateRequisitionModal.canChangeDept —
@@ -154,6 +198,65 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /* ── Party mode ───────────────────────────────────────────────────────────
+   * All of the following is inert when `party` is absent. */
+  const [evName,     setEvName]     = useState(party?.initial?.event_name  || '');
+  const [evDate,     setEvDate]     = useState(party?.initial?.event_date  || today);
+  const [evGuests,   setEvGuests]   = useState(party?.initial?.guest_count || '');
+  const [evCustomer, setEvCustomer] = useState(party?.initial?.customer    || '');
+  const [evNotes,    setEvNotes]    = useState(party?.initial?.event_notes || '');
+  // Sheet-locked fields are read-only; admin keeps the documented override.
+  const evLocked = !!party?.sheetLocked && me?.role !== 'admin';
+  // Collapsed once the event is fully identified — the sheet already filled it
+  // in and the catalog needs the vertical space on a phone. Stays open when a
+  // banner is present: the FP menu checklist is what you shop the catalog from.
+  const [evOpen, setEvOpen] = useState(() =>
+    !!party?.banner || !(party?.initial?.event_name && party?.initial?.event_date));
+
+  /** Per-LINE department, stamped when the item is added. Only consulted in
+   *  party mixed mode; seeded from the draft so resuming never flattens the
+   *  per-line depts back onto one department. */
+  const [deptById, setDeptById] = useState<Record<string, string>>(() =>
+    Object.fromEntries((editDraft?.items || [])
+      .filter(it => it.material_id && it.department_id)
+      .map(it => [it.material_id, String(it.department_id)])));
+  // A resumed draft whose lines span >1 department must reopen in mixed mode,
+  // otherwise saving would re-stamp every line onto the header department.
+  const [mixedMode, setMixedMode] = useState(() =>
+    new Set((editDraft?.items || []).map(it => it.department_id).filter(Boolean)).size > 1);
+
+  /** In-progress text for the party qty field, so clearing it mid-edit doesn't
+   *  drop the line (setQty(0) removes it). Dropped on blur. */
+  const [qtyText, setQtyText] = useState<Record<string, string>>({});
+
+  // FP seed. Applied via an effect rather than in the cart initialiser because
+  // the page may mount the picker before /api/inventory resolves, and the seed
+  // needs each material's pack meta to convert recipe → purchase units.
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (seeded.current || isEditing) return;
+    const seed = party?.seed;
+    if (!seed?.length || materials.length === 0) return;
+    seeded.current = true;
+    const byId = new Map(materials.map(m => [m.id, m]));
+    const qtys: Record<string, number> = {};
+    const units: Record<string, string> = {};
+    for (const s of seed) {
+      const m = byId.get(s.material_id);
+      const q = m ? toPurchaseQty(Number(s.quantity) || 0, m) : 0;
+      if (!m || q <= 0) continue;
+      qtys[m.id] = q;
+      units[m.id] = pu(m);
+    }
+    if (Object.keys(qtys).length === 0) return;
+    setCart(prev => ({ ...qtys, ...prev }));
+    setUnitById(prev => ({ ...units, ...prev }));
+    // Stamp the header dept so seeded lines aren't orphaned if mixed mode is
+    // switched on later; the per-line selector can still re-point them.
+    const depts = Object.fromEntries(Object.keys(qtys).map(id => [id, deptId]));
+    setDeptById(prev => ({ ...depts, ...prev }));
+  }, [materials, party?.seed, isEditing, deptId]);
+
   // Phantom materials for draft lines whose material is no longer in the
   // staff's catalog (deleted / re-scoped) — keeps the line visible in the cart
   // labeled from the draft's own data.
@@ -204,6 +307,23 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
   const lineValue = (m: Material, qty: number) => qty * lineFactor(m, unitOf(m)) * (m.average_price || 0);
   const cartTotal = cartLines.reduce((s, l) => s + lineValue(l.m, l.qty), 0);
 
+  /** Mixed mode renders the cart grouped by department with each group labelled;
+   *  every other mode is a single unlabelled group. */
+  const cartGroups = useMemo(() => {
+    if (!(isParty && mixedMode)) return [{ id: '', name: '', lines: cartLines }];
+    const byDept = new Map<string, typeof cartLines>();
+    for (const l of cartLines) {
+      const id = deptById[l.m.id] || '';
+      if (!byDept.has(id)) byDept.set(id, []);
+      byDept.get(id)!.push(l);
+    }
+    return Array.from(byDept, ([id, lines]) => ({
+      id,
+      name: departments.find(d => d.id === id)?.name || 'No department',
+      lines,
+    }));
+  }, [cartLines, isParty, mixedMode, deptById, departments]);
+
   const setQty = (m: Material, qty: number) => {
     setCart(prev => {
       const n = { ...prev };
@@ -214,17 +334,46 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
       if (qty <= 0) { const n = { ...prev }; delete n[m.id]; return n; }
       return prev[m.id] ? prev : { ...prev, [m.id]: pu(m) };
     });
+    // Party only: the header selector decides which dept a NEW line belongs to.
+    if (!isParty) return;
+    setDeptById(prev => {
+      if (qty <= 0) { const n = { ...prev }; delete n[m.id]; return n; }
+      return prev[m.id] ? prev : { ...prev, [m.id]: deptId };
+    });
   };
 
   // Same POST/PUT + submit flow as CreateRequisitionModal.save().
   const save = async (submitAfter: boolean) => {
-    if (!deptId) {
+    // Party header first — same order and wording as the modal this replaces.
+    if (isParty) {
+      if (!evName.trim()) { setError('Event Host Name required'); return; }
+      if (!evDate)        { setError('Event date required'); return; }
+    }
+    // Mixed mode has no header department: every line carries its own.
+    if (!deptId && !(isParty && mixedMode)) {
       setError(canChangeDept
         ? 'Pick a department.'
         : 'Your user has no home department set. Ask an admin to assign one on /users.');
       return;
     }
     if (cartLines.length === 0) { setError('Add at least one item.'); return; }
+    if (isParty) {
+      // A line whose unit is no longer one of the material's registered units
+      // (legacy row, or the material was re-configured since) would be costed
+      // on the wrong basis. Same guard the party modal ran per line.
+      for (const l of cartLines) {
+        const u = unitOf(l.m).trim();
+        const allowed = [pu(l.m), l.m.unit].map(s => String(s || '').trim()).filter(Boolean);
+        if (allowed.length > 0 && u && !allowed.includes(u)) {
+          setError(`${l.m.name}: unit "${u}" is not registered for this material. Allowed: ${allowed.join(', ')}.`);
+          return;
+        }
+      }
+      if (mixedMode) {
+        const orphan = cartLines.find(l => !deptById[l.m.id]);
+        if (orphan) { setError(`Pick a department for ${orphan.m.name}.`); return; }
+      }
+    }
     setSaving(true); setError(null);
     try {
       const items = cartLines.map(l => ({
@@ -232,16 +381,32 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
         quantity_requested: l.qty,
         unit: unitOf(l.m),
         notes: '',
+        // Party sends an explicit per-line dept so changing the header dept on a
+        // draft edit re-stamps the lines — PUT otherwise falls back to the PRIOR
+        // line's dept. Internal omits the key exactly as before.
+        ...(isParty ? { department_id: mixedMode ? deptById[l.m.id] : deptId } : null),
       }));
-      const r = isEditing
-        ? await api('/api/requisitions', {
-            method: 'PUT',
-            body: { id: editDraft!.id, date, department_id: deptId, notes, items },
-          })
-        : await api('/api/requisitions', {
-            method: 'POST',
-            body: { date, department_id: deptId, notes, items },
-          });
+      const base = isEditing
+        ? { id: editDraft!.id, date, department_id: deptId, notes, items }
+        : { date, department_id: deptId, notes, items };
+      const body = isParty
+        ? {
+            ...base,
+            purpose: 'party',
+            event_name:  evName.trim(),
+            event_date:  evDate,
+            guest_count: Number(evGuests) || null,
+            customer:    evCustomer.trim(),
+            event_notes: evNotes.trim(),
+            // undefined is dropped by JSON.stringify, so in mixed mode the
+            // server derives the req-level dept from the first line.
+            department_id: mixedMode ? undefined : deptId,
+            from_sheet:      !!party!.sheet?.from_sheet,
+            party_unique_id: party!.sheet?.party_unique_id,
+            fp_id:           party!.sheet?.fp_id,
+          }
+        : base;
+      const r = await api('/api/requisitions', { method: isEditing ? 'PUT' : 'POST', body });
       if (!r.ok) { setError((await r.json().catch(() => ({}))).error || 'Failed to save requisition'); return; }
       if (submitAfter) {
         const j = await r.json().catch(() => ({}));
@@ -267,7 +432,9 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
       <div className="shrink-0 px-3 pt-3 pb-2 border-b border-[#E8D5C4] bg-[#FFF8F0]">
         <div className="flex items-center justify-between gap-2 mb-2">
           <div className="min-w-0 flex-1">
-            {isEditing ? (
+            {/* Party keeps the dept selector while editing — the old party modal
+                allowed re-pointing a draft at another department. */}
+            {isEditing && !isParty ? (
               <div className="text-sm font-bold text-[#2D1B0E] truncate">
                 {`Edit Draft ${editDraft!.req_number}`}
               </div>
@@ -288,8 +455,20 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
               </div>
             )}
             <div className="text-[11px] text-[#8B7355] mt-0.5">
-              {isEditing && dept ? `${dept.name} · ` : ''}{date}
+              {isEditing && isParty ? `${editDraft!.req_number} · ` : ''}
+              {isEditing && dept && !isParty ? `${dept.name} · ` : ''}{date}
             </div>
+            {isParty && canChangeDept && (
+              <label className="mt-1 flex items-center gap-1.5 text-[11px] text-[#6B5744] cursor-pointer">
+                <input type="checkbox" checked={mixedMode} onChange={e => setMixedMode(e.target.checked)} />
+                Multiple departments
+                {mixedMode && (
+                  <span className="text-[10px] text-[#8B7355] italic truncate">
+                    — adding to {dept?.name || 'select above'}
+                  </span>
+                )}
+              </label>
+            )}
           </div>
           <button onClick={onClose} aria-label="Close" className="shrink-0 p-2 text-[#8B7355]">
             <X className="w-5 h-5" />
@@ -305,6 +484,74 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
           />
         </div>
       </div>
+
+      {/* ── Party: event header (collapsible so the catalog keeps the phone
+             screen once the event is identified) ─────────────── */}
+      {isParty && (
+        <div className="shrink-0 border-b border-[#E8D5C4] bg-white">
+          <button onClick={() => setEvOpen(o => !o)} aria-expanded={evOpen}
+                  className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left">
+            <div className="min-w-0">
+              <div className="text-[10px] font-bold uppercase tracking-wide text-[#af4408] flex items-center gap-1">
+                Event {evLocked && <Lock className="w-3 h-3" />}
+              </div>
+              <div className="text-xs text-[#2D1B0E] truncate">
+                {evName || <span className="text-red-500">Event host name required</span>}
+                {evDate ? ` · ${evDate}` : ''}
+                {Number(evGuests) > 0 ? ` · ${evGuests} pax` : ''}
+              </div>
+            </div>
+            <span className="shrink-0 text-[11px] font-semibold text-[#af4408]">{evOpen ? 'HIDE' : 'SHOW'}</span>
+          </button>
+
+          {evOpen && (
+            <div className="px-3 pb-3 space-y-2 max-h-[45vh] overflow-y-auto">
+              {party!.banner}
+              {evLocked && (
+                <div className="bg-blue-50/60 border border-blue-200 rounded-lg p-2 text-[11px] text-blue-900 flex items-start gap-2">
+                  <Lock className="w-3 h-3 mt-0.5 shrink-0" />
+                  <div>
+                    <strong>Host name, date, guest count and company are locked</strong> — they come from the
+                    AKAN Party Manager sheet. Edit the sheet row and click Refresh on Party Events.
+                    (Admin can override.)
+                  </div>
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2">
+                <label className="block text-[11px] text-[#6B5744]">
+                  Event Host Name *
+                  <input value={evName} onChange={e => setEvName(e.target.value)} readOnly={evLocked}
+                         placeholder="e.g. Mr. Sharma"
+                         className={`mt-0.5 w-full px-2 py-1.5 border rounded-lg text-sm ${evLocked ? 'border-blue-200 bg-blue-50/40 cursor-not-allowed' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`} />
+                </label>
+                <label className="block text-[11px] text-[#6B5744]">
+                  Event Date *
+                  <input type="date" value={evDate} onChange={e => setEvDate(e.target.value)} readOnly={evLocked}
+                         className={`mt-0.5 w-full px-2 py-1.5 border rounded-lg text-sm ${evLocked ? 'border-blue-200 bg-blue-50/40 cursor-not-allowed' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`} />
+                </label>
+                <label className="block text-[11px] text-[#6B5744]">
+                  Guest Count
+                  <input type="number" min={0} value={evGuests} onChange={e => setEvGuests(e.target.value)}
+                         readOnly={evLocked} placeholder="e.g. 80"
+                         className={`mt-0.5 w-full px-2 py-1.5 border rounded-lg text-sm font-mono ${evLocked ? 'border-blue-200 bg-blue-50/40 cursor-not-allowed' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`} />
+                </label>
+                <label className="block text-[11px] text-[#6B5744]">
+                  Company Name
+                  <input value={evCustomer} onChange={e => setEvCustomer(e.target.value)} readOnly={evLocked}
+                         placeholder="e.g. IBM India Pvt Ltd"
+                         className={`mt-0.5 w-full px-2 py-1.5 border rounded-lg text-sm ${evLocked ? 'border-blue-200 bg-blue-50/40 cursor-not-allowed' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`} />
+                </label>
+              </div>
+              <label className="block text-[11px] text-[#6B5744]">
+                Event Notes
+                <input value={evNotes} onChange={e => setEvNotes(e.target.value)}
+                       placeholder="Menu, special requests…"
+                       className="mt-0.5 w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+              </label>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── Body: category rail + item list ─────────────────── */}
       <div className="flex-1 min-h-0 flex overflow-hidden">
@@ -411,21 +658,62 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
             <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-2">
               {cartLines.length === 0 ? (
                 <div className="py-6 text-center text-sm text-[#8B7355]">Cart is empty.</div>
-              ) : cartLines.map(({ m, qty }) => (
-                <div key={m.id} className="flex items-center gap-2 border border-[#E8D5C4] rounded-lg p-2">
-                  <div className="flex-1 min-w-0">
-                    <div className="text-xs font-semibold text-[#2D1B0E] break-words">{m.name}</div>
-                    <div className="text-[10px] text-[#8B7355]">
-                      {qty} {unitOf(m)} · {inr(lineValue(m, qty))}
+              ) : cartGroups.map(g => (
+                <div key={g.id || 'all'} className="space-y-2">
+                  {isParty && mixedMode && (
+                    <div className={`text-[10px] font-bold uppercase tracking-wide pt-1 ${g.id ? 'text-[#af4408]' : 'text-red-600'}`}>
+                      {g.name}
                     </div>
-                  </div>
-                  <div className="shrink-0 flex items-center gap-1 bg-blue-50 border border-blue-200 rounded-lg">
-                    <button onClick={() => setQty(m, qty - 1)} disabled={saving} aria-label={`Decrease ${m.name}`}
-                            className="px-2 py-1.5 text-blue-700"><Minus className="w-3.5 h-3.5" /></button>
-                    <span className="min-w-[2ch] text-center text-xs font-bold tabular-nums">{qty}</span>
-                    <button onClick={() => setQty(m, qty + 1)} disabled={saving} aria-label={`Increase ${m.name}`}
-                            className="px-2 py-1.5 text-blue-700"><Plus className="w-3.5 h-3.5" /></button>
-                  </div>
+                  )}
+                  {g.lines.map(({ m, qty }) => (
+                    <div key={m.id} className="flex items-center gap-2 border border-[#E8D5C4] rounded-lg p-2">
+                      <div className="flex-1 min-w-0">
+                        <div className="text-xs font-semibold text-[#2D1B0E] break-words">{m.name}</div>
+                        <div className="text-[10px] text-[#8B7355]">
+                          {qty} {unitOf(m)} · {inr(lineValue(m, qty))}
+                        </div>
+                        {isParty && mixedMode && (
+                          // Mixed mode: the line's dept is editable here, so a
+                          // line added under the wrong header dept (or seeded
+                          // from an FP) can be re-pointed without re-adding it.
+                          <select value={deptById[m.id] || ''} disabled={saving}
+                                  aria-label={`Department for ${m.name}`}
+                                  onChange={e => setDeptById(p => ({ ...p, [m.id]: e.target.value }))}
+                                  className={`mt-1 w-full px-1.5 py-1 border rounded text-[10px] ${
+                                    deptById[m.id] ? 'border-[#E8D5C4] bg-white' : 'border-amber-400 bg-amber-50 text-amber-800'
+                                  }`}>
+                            <option value="">— pick dept —</option>
+                            {departments.map(d => (
+                              <option key={d.id} value={d.id}>{d.code ? `[${d.code}] ` : ''}{d.name}</option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+                      <div className="shrink-0 flex items-center gap-1 bg-blue-50 border border-blue-200 rounded-lg">
+                        <button onClick={() => setQty(m, qty - 1)} disabled={saving} aria-label={`Decrease ${m.name}`}
+                                className="px-2 py-1.5 text-blue-700"><Minus className="w-3.5 h-3.5" /></button>
+                        {isParty ? (
+                          // Parties order fractional quantities (2.5 kg paneer) that
+                          // whole-step buttons can't express.
+                          <input type="number" step="any" min={0} disabled={saving}
+                                 aria-label={`Quantity for ${m.name}`}
+                                 value={qtyText[m.id] ?? String(qty)}
+                                 onChange={e => {
+                                   const v = e.target.value;
+                                   setQtyText(p => ({ ...p, [m.id]: v }));
+                                   const n = Number(v);
+                                   if (v.trim() !== '' && Number.isFinite(n) && n > 0) setQty(m, n);
+                                 }}
+                                 onBlur={() => setQtyText(p => { const n = { ...p }; delete n[m.id]; return n; })}
+                                 className="w-14 text-center text-xs font-bold tabular-nums bg-transparent border-0 focus:outline-none" />
+                        ) : (
+                          <span className="min-w-[2ch] text-center text-xs font-bold tabular-nums">{qty}</span>
+                        )}
+                        <button onClick={() => setQty(m, qty + 1)} disabled={saving} aria-label={`Increase ${m.name}`}
+                                className="px-2 py-1.5 text-blue-700"><Plus className="w-3.5 h-3.5" /></button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               ))}
 

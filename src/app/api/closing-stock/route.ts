@@ -1,4 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
+import { canSeeAllDeptStock } from '@/lib/dept-stock';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
 import { upsertVarianceApproval } from '@/lib/variance-approval';
 
@@ -137,10 +138,17 @@ export async function GET(request: Request) {
       const safeItems = (items as any[]).map(i => ({
         ...i, system_stock: null, variance: null, variance_value: null,
       }));
+      // by_area is a physical-value rollup, not a system figure — managers / HODs /
+      // store managers render the same panel, so emit it for the whole
+      // canSeeAllDeptStock set (it was admin-only, leaving them a silently empty
+      // panel) with only the system/variance columns blinded.
+      const safeByArea = me && canSeeAllDeptStock(me)
+        ? by_area.map(a => ({ ...a, system_value: null, variance_value: null }))
+        : [];
       const safeSummary = {
         total_items: summary.total_items,
         total_system_value: null, total_physical_value: null, total_variance_value: null,
-        shortage_count: null, excess_count: null, match_count: null, by_area: [],
+        shortage_count: null, excess_count: null, match_count: null, by_area: safeByArea,
       };
       return Response.json({ items: safeItems, summary: safeSummary });
     }

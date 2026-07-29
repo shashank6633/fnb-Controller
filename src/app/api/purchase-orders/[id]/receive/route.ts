@@ -757,15 +757,28 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             const auditItems: any[] = [];
             let totalCost = 0;
             for (const it of reqItems) {
-              const issued = Number(it.quantity_issued) || Number(it.quantity_requested) || 0;
-              if (issued <= 0) continue;
-              decStock.run(issued, it.material_id);
-              insPartyTx.run(generateId(), it.material_id, -issued, po.requisition_id, partyNote, partyOutletId);
-              // `issued` is RECIPE units; last_purchase_price is ₹/PURCHASE-unit
-              // (canon, see the unit-basis boundary note above) — convert first.
+              const issuedReq = Number(it.quantity_issued) || Number(it.quantity_requested) || 0;
+              if (issuedReq <= 0) continue;
+              // ri.unit → RECIPE units. Requisition quantities are stored in the
+              // LINE's OWN unit (option B), so a "2 BTL" line is TWO BOTTLES —
+              // deducting it verbatim took 2 ml off stock instead of 1,500 ml
+              // and wrote a −2 party_consumption row. Same pack-factor CASE as
+              // src/lib/party-fulfillment.ts and the department-consumption SQL;
+              // keep the three byte-equivalent.
               const rPack = Number(it.rm_pack_size) || 1;
               const rUnitsDiffer = String(it.rm_unit || '').toLowerCase().trim()
                 !== String(it.rm_purchase_unit || it.rm_unit || '').toLowerCase().trim();
+              const reqPackFactor =
+                (String(it.unit ?? '').trim() !== '' &&
+                 it.unit === it.rm_purchase_unit &&
+                 it.unit !== it.rm_unit &&
+                 rPack > 1)
+                  ? rPack : 1;
+              const issued = issuedReq * reqPackFactor;   // RECIPE units
+              decStock.run(issued, it.material_id);
+              insPartyTx.run(generateId(), it.material_id, -issued, po.requisition_id, partyNote, partyOutletId);
+              // last_purchase_price is ₹/PURCHASE-unit (canon) — normalise to
+              // ₹/recipe-unit before multiplying by the recipe-unit `issued`.
               const lppRecipe = (rPack > 1 && rUnitsDiffer)
                 ? (Number(it.last_purchase_price) || 0) / rPack
                 : Number(it.last_purchase_price) || 0;

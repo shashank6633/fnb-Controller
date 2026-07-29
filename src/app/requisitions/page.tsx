@@ -1455,9 +1455,13 @@ function ChefApproveModal({ req, onClose, onDone }: { req: Requisition; onClose:
                     <td className="py-1 px-2">{it.material_name}</td>
                     <td className="py-1 px-2 text-right font-mono text-[#6B5744]">{it.quantity_requested} {reqUnit(it)}</td>
                     <td className="py-1 px-2">
-                      <input type="number" step="any" value={overrides[it.id] ?? ''}
+                      {/* min + clamp: approving a NEGATIVE quantity is never valid
+                          (it would issue stock backwards), and the spinner walked
+                          straight past zero. min= stops the arrows, Math.max stops
+                          a typed/pasted minus. */}
+                      <input type="number" step="any" min={0} value={overrides[it.id] ?? ''}
                              disabled={isRej}
-                             onChange={e => setOverrides(p => ({ ...p, [it.id]: parseFloat(e.target.value) || 0 }))}
+                             onChange={e => setOverrides(p => ({ ...p, [it.id]: Math.max(0, parseFloat(e.target.value) || 0) }))}
                              className="w-24 px-1.5 py-1 border border-[#E8D5C4] rounded text-right disabled:opacity-50" />
                       {/* The override is interpreted in the SAME unit the line was
                           requested in (store-process persists it verbatim). */}
@@ -1987,9 +1991,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                           )}
                         </td>
                         <td className="py-1.5 px-2">
-                          <input type="number" step="any" value={ln.unit_price || ''}
+                          <input type="number" step="any" min={0} value={ln.unit_price || ''}
                                  disabled={ln.quantity_to_purchase <= 0}
-                                 onChange={e => update(i, { unit_price: Number(e.target.value) || 0 })}
+                                 onChange={e => update(i, { unit_price: Math.max(0, Number(e.target.value) || 0) })}
                                  title={`Price per ${ln.po_entry_unit}`}
                                  className="w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs disabled:opacity-50" />
                           <span className="ml-1 text-[10px] text-[#8B7355]">/{ln.po_entry_unit}</span>

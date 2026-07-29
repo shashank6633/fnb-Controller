@@ -11,13 +11,14 @@
 
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import {
-  PartyPopper, Plus, Loader2, Calendar, Users as UsersIcon, Trash2, Save, X,
-  ChevronDown, ChevronRight,
-  Search, Upload, Lock, ChefHat,
+  PartyPopper, Loader2, X, ChevronDown, ChevronRight, Search,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import MaterialTypeahead from '@/components/MaterialTypeahead';
 import { packFactor, toPurchaseQty } from '@/lib/pack-units';
+// ONE composer for both flows: /requisitions renders this picker with no `party`
+// prop, we render it with one. Nothing about the cart, the pack-factor guard or
+// the save path is duplicated here — that duplication is what used to drift.
+import StaffCatalogPicker, { type PartyMode } from '../requisitions/StaffCatalogPicker';
 
 /** Detail-table qty cell: resolve the stored number through the LINE's unit
  *  (party saves stamp the recipe unit; legacy lines may carry the purchase
@@ -195,7 +196,13 @@ export default function PartyRequisitionsPage() {
     }
     return cur;
   };
-  const [me, setMe] = useState<{ role?: string; email?: string } | null>(null);
+  // Widened from {role,email}: the picker resolves canChangeDept / the sheet-lock
+  // admin override from these. /api/auth/me already returns the whole user, so
+  // this replaces the composer's own duplicate /me fetch.
+  const [me, setMe] = useState<{
+    role?: string; email?: string; department_id?: string | null;
+    is_head_chef?: boolean; is_store_manager?: boolean;
+  } | null>(null);
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user || null)).catch(() => {});
   }, []);
@@ -320,6 +327,69 @@ export default function PartyRequisitionsPage() {
       (r.req_number || '').toLowerCase().includes(q)
     );
   }, [list, search]);
+
+  /* ── Composer wiring ──────────────────────────────────────────────────────
+   * Everything party-specific the shared picker needs. The event-field
+   * resolution is the old modal's `initial` memo, moved out intact. */
+  const isPrefilled = !!(fpPrefill && (fpPrefill.parsed || (fpPrefill.materials?.length || 0) > 0));
+
+  // /api/inventory feeds both pages; fill in the fields the picker requires.
+  const catalog = useMemo(() => materials.map(m => ({
+    ...m,
+    unit: m.unit || '',
+    current_stock: Number(m.current_stock) || 0,
+    average_price: Number(m.average_price) || 0,
+  })), [materials]);
+
+  const partyProps = useMemo<PartyMode>(() => {
+    // EDIT wins over FP prefill — we're resuming an existing draft.
+    if (editingReq) {
+      return {
+        initial: {
+          event_name:  editingReq.event_name || '',
+          event_date:  editingReq.event_date || today(),
+          guest_count: editingReq.guest_count ? String(editingReq.guest_count) : '',
+          customer:    editingReq.customer || '',
+          // event_notes is the field the composer writes; `notes` is the legacy
+          // fallback (it is now the cart's justification field).
+          event_notes: editingReq.event_notes || editingReq.notes || '',
+        },
+      };
+    }
+
+    const p = fpPrefill?.parsed;
+    const mats = fpPrefill?.materials || [];
+    const warnings = [...(fpPrefill?.warnings || [])];
+
+    // Defensive: drop FP materials that are not in the catalog.
+    const catalogIds = new Set(materials.map(m => m.id));
+    const known = mats.filter(m => catalogIds.has(m.material_id));
+    const unknown = mats.length - known.length;
+    if (unknown > 0) warnings.push(`${unknown} material${unknown === 1 ? '' : 's'} from FP not found in catalog (skipped)`);
+
+    // "Event Host Name" is strictly the host. We deliberately do NOT fall back
+    // to event_name — on some FPs that field actually holds the company string.
+    const notesParts: string[] = [];
+    if (p?.package_name)  notesParts.push(p.package_name);
+    if (p?.rate_per_head) notesParts.push(`@ ₹${p.rate_per_head}/head`);
+    if (p?.event_time)    notesParts.push(p.event_time);
+    if (p?.reference)     notesParts.push(`Ref: ${p.reference}`);
+
+    return {
+      initial: {
+        event_name:  (p?.guest_name || (p?.fp_number ? `FP ${p.fp_number}` : '')) ?? '',
+        event_date:  p?.event_date || today(),
+        guest_count: p?.guest_count ? String(p.guest_count) : '',
+        customer:    (p?.guest_company || '').trim(),
+        event_notes: notesParts.join(' · '),
+      },
+      sheetLocked: isPrefilled,
+      sheet: { from_sheet: isPrefilled, party_unique_id: p?.party_unique_id, fp_id: p?.fp_number },
+      // fp-estimator emits RECIPE units; the picker converts to its purchase basis.
+      seed: known.map(m => ({ material_id: m.material_id, quantity: m.quantity })),
+      banner: isPrefilled ? <FpBanner prefill={fpPrefill!} warnings={warnings} /> : null,
+    };
+  }, [editingReq, fpPrefill, materials, isPrefilled]);
 
   return (
     <div className="p-6 space-y-5">
@@ -551,766 +621,71 @@ export default function PartyRequisitionsPage() {
       </div>
 
       {showNew && (
-        <NewPartyReqModal
-          editingReq={editingReq}
-          materials={materials}
+        <StaffCatalogPicker
+          materials={catalog}
+          me={me}
           departments={departments}
-          prefill={fpPrefill}
+          editDraft={editingReq}
+          party={partyProps}
           onClose={() => { setShowNew(false); setFpPrefill(null); setEditingReq(null); }}
-          onSaved={() => { setShowNew(false); setFpPrefill(null); setEditingReq(null); reload(); }}
+          onCreated={() => { setShowNew(false); setFpPrefill(null); setEditingReq(null); reload(); }}
         />
       )}
     </div>
   );
 }
 
-type LineItem = {
-  material_id: string;
-  qty: string;
-  /** Unit the staff entered the qty in. Must be one of the material's registered
-   *  units (recipe_unit or purchase_unit). Defaults to recipe_unit on pick. */
-  unit?: string;
-  notes: string;
-  department_id: string;
-  confidence?: 'high' | 'medium' | 'low';
-};
-
-/** The set of units a material allows for requisition entry — purchase_unit
- *  and recipe_unit (deduped). e.g. for "Mutton" with recipe_unit=kg, purchase_unit=kg
- *  → ['kg']. For "100 Pipers (750ml)" with recipe_unit=ml, purchase_unit=BTL → ['ml','BTL'].
- *  Anything outside this list is intentionally rejected so staff can't request in
- *  units the material isn't configured for (no "5 PKT of mutton" mistakes). */
-function allowedUnitsForMaterial(m: Material | undefined): string[] {
-  if (!m) return [];
-  const u = (m.unit || '').trim();
-  const pu = (m.purchase_unit || '').trim();
-  const out: string[] = [];
-  if (pu) out.push(pu);
-  if (u && u !== pu) out.push(u);
-  return out;
-}
-
-function NewPartyReqModal({ materials, departments, prefill, editingReq, onClose, onSaved }: {
-  materials: Material[];
-  departments: Department[];
-  prefill?: FpPrefill | null;
-  /** When set, the modal opens in EDIT mode — fields are pre-loaded from this
-   *  existing draft requisition and the save uses PUT instead of POST. */
-  editingReq?: {
-    id: string; req_number: string;
-    event_name?: string; event_date?: string; guest_count?: number;
-    customer?: string; notes?: string; department_id?: string;
-    items: Array<{ id?: string; material_id: string; quantity_requested: number;
-                   unit?: string; notes?: string; department_id?: string }>;
-  } | null;
-  onClose: () => void;
-  onSaved: () => void;
-}) {
-  const isEditMode = !!editingReq;
-  // Compute prefill-driven initial state once at mount.
-  const initial = useMemo(() => {
-    // EDIT mode wins over FP prefill — we're resuming an existing draft.
-    if (editingReq) {
-      const items: LineItem[] = (editingReq.items || []).map(it => {
-        const mat = materials.find(x => x.id === it.material_id);
-        return {
-          material_id: it.material_id,
-          qty: String(it.quantity_requested ?? ''),
-          unit: (it.unit || mat?.unit || '').trim() || undefined,
-          notes: it.notes || '',
-          department_id: it.department_id || '',
-        };
-      });
-      // Always append one empty line so the user can add more without clicking.
-      const lastDept = [...items].reverse().find(it => it.department_id)?.department_id || '';
-      items.push({ material_id: '', qty: '', unit: '', notes: '', department_id: lastDept });
-      return {
-        eventName:   editingReq.event_name || '',
-        eventDate:   editingReq.event_date || today(),
-        guestCount:  editingReq.guest_count ? String(editingReq.guest_count) : '',
-        customer:    editingReq.customer || '',
-        eventNotes:  editingReq.notes || '',
-        items,
-        warnings: [] as string[],
-      };
-    }
-
-    const p = prefill?.parsed;
-    const mats = prefill?.materials || [];
-    const warnings: string[] = [...(prefill?.warnings || [])];
-
-    if (!p && mats.length === 0) {
-      return {
-        eventName: '', eventDate: today(), guestCount: '', customer: '',
-        eventNotes: '', items: [{ material_id: '', qty: '', unit: '', notes: '', department_id: '' }] as LineItem[],
-        warnings,
-      };
-    }
-
-    // "Event Host Name" — strictly the host (guest_name on the FP). We
-    // intentionally do NOT fall back to event_name here, because for some FPs
-    // the sheet-level event_name field is actually the company string, which
-    // would land in the wrong field. FP-number is the only acceptable fallback
-    // when the host name is genuinely missing.
-    const eventName = (p?.guest_name || (p?.fp_number ? `FP ${p.fp_number}` : '')) ?? '';
-    const eventDate = p?.event_date || today();
-    const guestCount = p?.guest_count ? String(p.guest_count) : '';
-    // "Company Name" — just the company; phone moves to the event notes if present.
-    const customer = (p?.guest_company || '').trim();
-    // Host mobile number is intentionally NOT pushed into notes — we don't
-    // carry phone numbers into requisitions at all.
-    const notesParts: string[] = [];
-    if (p?.package_name) notesParts.push(p.package_name);
-    if (p?.rate_per_head) notesParts.push(`@ ₹${p.rate_per_head}/head`);
-    if (p?.event_time) notesParts.push(p.event_time);
-    if (p?.reference) notesParts.push(`Ref: ${p.reference}`);
-    const eventNotes = notesParts.join(' · ');
-
-    // Defensive: filter materials not in the catalog.
-    const catalogIds = new Set(materials.map(m => m.id));
-    const known = mats.filter(m => catalogIds.has(m.material_id));
-    const unknown = mats.length - known.length;
-    if (unknown > 0) warnings.push(`${unknown} material${unknown === 1 ? '' : 's'} from FP not found in catalog (skipped)`);
-
-    const items: LineItem[] = known.length > 0
-      ? known.map(m => {
-          // Default each line's unit to the material's recipe_unit (canonical).
-          const mat = materials.find(x => x.id === m.material_id);
-          return {
-            material_id: m.material_id,
-            qty: String(m.quantity),
-            unit: (mat?.unit || '').trim() || undefined,
-            notes: m.reasoning || '',
-            department_id: '',
-            confidence: m.confidence,
-          };
-        })
-      : [{ material_id: '', qty: '', unit: '', notes: '', department_id: '' }];
-
-    return { eventName, eventDate, guestCount, customer, eventNotes, items, warnings };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const [eventName, setEventName] = useState(initial.eventName);
-  const [eventDate, setEventDate] = useState(initial.eventDate);
-  const [guestCount, setGuestCount] = useState<string>(initial.guestCount);
-  const [customer, setCustomer] = useState(initial.customer);
-  const [eventNotes, setEventNotes] = useState(initial.eventNotes);
-  const [items, setItems] = useState<LineItem[]>(initial.items);
-  const [saving, setSaving] = useState(false);
-  const [error, setError]   = useState<string | null>(null);
-  const isPrefilled = !!(prefill && (prefill.parsed || (prefill.materials && prefill.materials.length > 0)));
-  const effectiveWarnings = initial.warnings;
-
-  // Role check — captures the fields needed for two gates:
-  //   1. Sheet-locked name/date/phone (admin can edit; others can't)
-  //   2. Dept-change ability (only manager / admin / head_chef can switch
-  //      depts on a party req; staff are locked to their own dept)
-  const [isAdmin, setIsAdmin] = useState(false);
-  const [myRole, setMyRole] = useState<string>('');
-  const [isHeadChef, setIsHeadChef] = useState(false);
-  const [isStoreManager, setIsStoreManager] = useState(false);
-  const [myDeptId, setMyDeptId] = useState<string>('');
-  const [myUserLoaded, setMyUserLoaded] = useState(false);
-  useEffect(() => {
-    fetch('/api/auth/me').then(r => r.json()).then(d => {
-      setIsAdmin(d?.user?.role === 'admin');
-      setMyRole(d?.user?.role || '');
-      setIsHeadChef(!!d?.user?.is_head_chef);
-      setIsStoreManager(!!d?.user?.is_store_manager);
-      setMyDeptId(d?.user?.department_id || '');
-      setMyUserLoaded(true);
-    }).catch(() => setMyUserLoaded(true));
-  }, []);
-  const sheetLocked = isPrefilled && !isAdmin;
-
-  // Who can switch departments / use mixed mode?
-  //   - admin                        : yes (cross-cutting)
-  //   - manager (any flavour)        : yes (department head decides their own)
-  //   - is_head_chef (any role)      : yes (oversees multiple kitchens)
-  //   - is_store_manager (any role)  : yes (cross-cutting)
-  //   - staff                        : NO — locked to their own dept, no mixed mode
-  const canChangeDept = isAdmin || isHeadChef || isStoreManager || myRole === 'manager';
-
-  // Single-dept (default) vs Mixed-dept mode. New primary workflow is
-  // "one req per dept" — each dept manager raises their own. The mixed mode
-  // is kept as an escape hatch for admin / head chef who occasionally need
-  // to fire off a cross-dept req from one screen.
-  //
-  // IMPORTANT: declared BEFORE the belt-and-suspenders useEffect below so
-  // the dependency array doesn't hit a Temporal Dead Zone (TDZ) on render.
-  // Putting the useEffect first triggered "Cannot access 'mixedMode' before
-  // initialization" because the dep array is evaluated synchronously during
-  // render — before the useState call.
-  const [reqDeptId, setReqDeptId] = useState<string>('');
-  const [mixedMode, setMixedMode] = useState(false);
-  const [autoSelectedDept, setAutoSelectedDept] = useState(false);   // for the UI hint
-
-  // Belt-and-suspenders: if a staff user previously had mixed mode enabled
-  // (e.g. before a role demotion), force it off so the locked-dept flow takes over.
-  useEffect(() => {
-    if (myUserLoaded && !canChangeDept && mixedMode) setMixedMode(false);
-  }, [myUserLoaded, canChangeDept, mixedMode]);
-
-  // Auto-select the requesting dept once /me AND /departments have both loaded.
-  // Skip for admins (they're cross-cutting and may pick any dept). Validate
-  // the user's dept exists in the active list — if not, leave blank + show hint.
-  useEffect(() => {
-    if (reqDeptId) return;                                  // already picked (manual or auto)
-    if (!myUserLoaded || departments.length === 0) return;  // wait for both
-    if (isAdmin) return;                                    // admin picks per req
-    if (!myDeptId) return;                                  // user has no dept configured
-    const exists = departments.some(d => d.id === myDeptId);
-    if (!exists) {
-      // User's dept was deactivated/deleted — don't auto-pick a stale id
-      console.warn('[party-req] user dept not in active list; manual pick required', myDeptId);
-      return;
-    }
-    setReqDeptId(myDeptId);
-    setAutoSelectedDept(true);
-  }, [myUserLoaded, myDeptId, departments, isAdmin, reqDeptId]);
-
-  // When user manually changes the dept, clear the "auto-selected" badge
-  const setReqDept = (id: string) => { setReqDeptId(id); setAutoSelectedDept(false); };
-
-  // Hint for users with no dept configured
-  const noDeptHint = myUserLoaded && !isAdmin && !myDeptId
-    ? 'Your user has no department configured. Ask admin to set it on /users.'
-    : null;
-
-  // When adding a new line, default its dept to the most recently picked dept
-  // so the user doesn't repeat the dept selection if all lines go to the same one.
-  const addLine = () => setItems(p => {
-    const lastDept = [...p].reverse().find(it => it.department_id)?.department_id || '';
-    return [...p, { material_id: '', qty: '', unit: '', notes: '', department_id: lastDept }];
-  });
-  /** Auto-add a fresh empty line when staff fills in qty on the LAST line. Saves
-   *  the "click Add Line" tap on every item — a big deal for parties with 30+ lines. */
-  const ensureTrailingEmpty = (changedIndex: number, patch: Partial<LineItem>) => {
-    setItems(prev => {
-      // Apply the patch in-place first
-      const next = prev.map((it, idx) => idx === changedIndex ? { ...it, ...patch } : it);
-      const isLast = changedIndex === next.length - 1;
-      if (!isLast) return next;
-      const last = next[changedIndex];
-      const hasContent = !!last.material_id || (Number(last.qty) > 0);
-      if (!hasContent) return next;
-      // Don't add if there's already a trailing empty (defensive)
-      const lastDept = [...next].reverse().find(it => it.department_id)?.department_id || '';
-      next.push({ material_id: '', qty: '', unit: '', notes: '', department_id: lastDept });
-      return next;
-    });
-  };
-  const removeLine = (i: number) => setItems(p => p.filter((_, idx) => idx !== i));
-  const update = (i: number, patch: Partial<typeof items[0]>) =>
-    setItems(p => p.map((it, idx) => idx === i ? { ...it, ...patch } : it));
-
-  // Live cost estimate so the user sees per-head before saving
-  const totalCost = useMemo(() => {
-    let t = 0;
-    for (const it of items) {
-      const m = materials.find(x => x.id === it.material_id);
-      if (!m) continue;
-      const q = Number(it.qty) || 0;
-      if (q === 0) continue;
-      // Same conversion as the per-line cost: a qty entered in the purchase
-      // unit (BTL/BAG) is pack_size recipe-units each. Without this the footer
-      // total disagrees with the line costs whenever a purchase unit is used.
-      const recipeU = (m.unit || '').trim();
-      const lineU = (it.unit || allowedUnitsForMaterial(m)[0] || recipeU).trim();
-      const effQty = (lineU && lineU !== recipeU) ? q * (Number(m.pack_size) || 1) : q;
-      t += effQty * (m.average_price || 0);
-    }
-    return t;
-  }, [items, materials]);
-  const guests = Number(guestCount) || 0;
-  const perHead = guests > 0 ? totalCost / guests : 0;
-
-  // submitToChef=true → after creating the draft, immediately submit it so
-  // the head chef sees it in /party-approvals (no extra click).
-  const submit = async (submitToChef: boolean = true) => {
-    if (!eventName.trim()) { setError('Event Host Name required'); return; }
-    if (!eventDate)        { setError('Event date required'); return; }
-    if (!mixedMode && !reqDeptId) { setError('Pick a Requesting Department'); return; }
-    // Validate units before sending: every line's unit MUST be one of the
-    // material's registered units. Catches typo/import edge cases.
-    for (let idx = 0; idx < items.length; idx++) {
-      const it = items[idx];
-      if (!it.material_id || !(Number(it.qty) > 0)) continue;
-      const m = materials.find(x => x.id === it.material_id);
-      const allowed = allowedUnitsForMaterial(m);
-      // Fallback matches what the dropdown DISPLAYS when unit is unset
-      // (allowedUnits[0] = ordering unit) — never silently reinterpret as recipe unit.
-      const u = (it.unit || allowed[0] || m?.unit || '').trim();
-      if (allowed.length > 0 && u && !allowed.includes(u)) {
-        setError(`Line ${idx + 1}: unit "${u}" is not registered for ${m?.name}. Allowed: ${allowed.join(', ')}.`);
-        return;
-      }
-    }
-    const cleaned = items
-      .filter(i => i.material_id && Number(i.qty) > 0)
-      .map(i => {
-        const m = materials.find(x => x.id === i.material_id);
-        const recipeU = (m?.unit || '').trim();
-        // Same fallback as the dropdown display (ordering unit first) — an unset
-        // unit must be interpreted as what the user SAW, not the recipe unit.
-        const lineU = (i.unit || allowedUnitsForMaterial(m)[0] || recipeU).trim();
-        const q = Number(i.qty) || 0;
-        // Persist quantity in RECIPE units so downstream code (recipe cost,
-        // chef approval, store issue) keeps working uniformly. When the staff
-        // entered in the purchase unit, multiply by pack_size to convert.
-        const recipeQty = (lineU && lineU !== recipeU)
-          ? q * (Number(m?.pack_size) || 1)
-          : q;
-        return {
-          material_id: i.material_id,
-          quantity_requested: recipeQty,
-          unit: recipeU,                    // canonical unit on the record
-          entered_qty: q,                   // what staff typed
-          entered_unit: lineU,              // what unit staff picked
-          notes: i.notes,
-          // Single-mode: every line inherits the top-level dept.
-          // Mixed-mode: each line keeps its own.
-          department_id: mixedMode ? i.department_id : reqDeptId,
-        };
-      });
-    if (cleaned.length === 0) { setError('Add at least one material with a non-zero qty'); return; }
-    if (mixedMode) {
-      const lineWithoutDept = cleaned.findIndex(i => !i.department_id);
-      if (lineWithoutDept >= 0) {
-        setError(`Pick a department for line ${lineWithoutDept + 1}`);
-        return;
-      }
-    }
-
-    setSaving(true); setError(null);
-    try {
-      // EDIT mode → PUT to update the existing draft. NEW mode → POST to create.
-      const body: any = {
-        purpose: 'party',
-        event_name: eventName.trim(),
-        event_date: eventDate,
-        guest_count: guests || null,
-        customer: customer.trim(),
-        event_notes: eventNotes.trim(),
-        // Single-mode: department_id sent explicitly. Mixed-mode: server
-        // derives it from the first item's dept.
-        department_id: mixedMode ? undefined : reqDeptId,
-        date: today(),
-        items: cleaned,
-        // Sheet-sync signal: when this req came from the AKAN Party Manager
-        // sheet, the server re-asserts name/date/customer/pax from the cached
-        // sheet row (for non-admins) so those fields stay in sync.
-        from_sheet: isPrefilled,
-        party_unique_id: prefill?.parsed?.party_unique_id,
-        fp_id: prefill?.parsed?.fp_number,
-      };
-      if (isEditMode && editingReq?.id) body.id = editingReq.id;
-      const r = await api('/api/requisitions', {
-        method: isEditMode ? 'PUT' : 'POST',
-        body,
-      });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
-
-      // If user clicked "Save & Submit", immediately flip the draft to
-      // 'submitted' so it lands in the head chef's approval inbox.
-      const savedId = j.requisition?.id || editingReq?.id;
-      if (submitToChef && savedId) {
-        const sub = await api(`/api/requisitions/${savedId}/submit`, {
-          method: 'POST', body: {},
-        });
-        if (!sub.ok) {
-          const sj = await sub.json().catch(() => ({}));
-          // Don't fail the whole save — the draft was created. Just warn.
-          setError(`Saved as draft, but auto-submit failed: ${sj.error || `HTTP ${sub.status}`}. Submit it manually from /requisitions.`);
-          return;
-        }
-      }
-      onSaved();
-    } finally { setSaving(false); }
-  };
+/** FP / sheet prefill notice + the read-only menu checklist. Rendered inside the
+ *  picker's event header through its `banner` slot, so the picker never needs to
+ *  know anything about FP parsing. */
+function FpBanner({ prefill, warnings }: { prefill: FpPrefill; warnings: string[] }) {
+  const menu: any = prefill.parsed?.menu;
+  const cats: { label: string; items?: string[] }[] = [
+    { label: '🥗 Veg Starters',     items: menu?.veg_starters },
+    { label: '🍗 Non-Veg Starters', items: menu?.nonveg_starters },
+    { label: '🥘 Veg Mains',        items: menu?.veg_mains },
+    { label: '🍖 Non-Veg Mains',    items: menu?.nonveg_mains },
+    { label: '🍚 Rice',             items: menu?.rice },
+    { label: '🥣 Dal',              items: menu?.dal },
+    { label: '🥬 Salad',            items: menu?.salad },
+    { label: '🍮 Desserts',         items: menu?.desserts },
+    { label: '🫓 Accompaniments',   items: menu?.accompaniments },
+  ].filter(c => Array.isArray(c.items) && c.items!.length > 0);
+  const barNotes = menu?.bar_notes_raw && String(menu.bar_notes_raw).trim();
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 backdrop-blur-sm p-4 overflow-y-auto"
-         onClick={onClose}>
-      <div className="bg-white border border-[#E8D5C4] rounded-xl w-full max-w-3xl my-4 flex flex-col max-h-[calc(100vh-2rem)]"
-           onClick={e => e.stopPropagation()}>
-        <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4] shrink-0">
-          <h2 className="text-lg font-semibold text-[#2D1B0E] flex items-center gap-2">
-            <PartyPopper size={20} className="text-[#af4408]" />
-            {isEditMode ? `Edit Draft — ${editingReq?.req_number || ''}` : 'New Party Requisition'}
-          </h2>
-          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]"><X size={20} /></button>
-        </div>
-
-        <div className="px-6 py-4 space-y-4 overflow-y-auto flex-1">
-          {isPrefilled && (
-            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-800">
-              📄 Pre-filled from FP {prefill?.parsed?.fp_number || '(unknown)'} · {(prefill?.materials?.length || 0)} materials estimated.
-              Review and adjust before saving.
-              {effectiveWarnings.length > 0 && (
-                <ul className="mt-2 list-disc pl-4">
-                  {effectiveWarnings.map((w, i) => <li key={i}>⚠ {w}</li>)}
-                </ul>
-              )}
-            </div>
-          )}
-
-          {/* Menu checklist — surfaces food items from FP / sheet so the team
-              knows what they need to request materials for. Read-only. */}
-          {isPrefilled && prefill?.parsed?.menu && (() => {
-            const menu: any = prefill.parsed.menu;
-            const cats: { label: string; items?: string[] }[] = [
-              { label: '🥗 Veg Starters',     items: menu.veg_starters },
-              { label: '🍗 Non-Veg Starters', items: menu.nonveg_starters },
-              { label: '🥘 Veg Mains',        items: menu.veg_mains },
-              { label: '🍖 Non-Veg Mains',    items: menu.nonveg_mains },
-              { label: '🍚 Rice',             items: menu.rice },
-              { label: '🥣 Dal',              items: menu.dal },
-              { label: '🥬 Salad',            items: menu.salad },
-              { label: '🍮 Desserts',         items: menu.desserts },
-              { label: '🫓 Accompaniments',   items: menu.accompaniments },
-            ].filter(c => Array.isArray(c.items) && c.items!.length > 0);
-            if (cats.length === 0) return null;
-            return (
-              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs">
-                <div className="font-semibold text-amber-900 mb-2">
-                  🍽️ Menu from FP — use as checklist for material lines below
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1.5">
-                  {cats.map((c, i) => (
-                    <div key={i} className="text-amber-900">
-                      <span className="font-medium">{c.label}:</span>{' '}
-                      <span className="text-amber-800">{c.items!.join(', ')}</span>
-                    </div>
-                  ))}
-                </div>
-                {menu.bar_notes_raw && String(menu.bar_notes_raw).trim() && (
-                  <div className="mt-2 pt-2 border-t border-amber-200 bg-amber-100/50 rounded px-2 py-1.5">
-                    <div className="font-semibold text-amber-900 mb-0.5">🍸 Cocktails / Mocktails / Bar Notes</div>
-                    <div className="text-amber-900 whitespace-pre-wrap">{menu.bar_notes_raw}</div>
-                  </div>
-                )}
-              </div>
-            );
-          })()}
-          {/* Event metadata. When sheetLocked = true, name/date/customer/pax
-              are read-only (source of truth is the AKAN Party Manager sheet).
-              Admins can still edit as an escape hatch. */}
-          {sheetLocked && (
-            <div className="bg-blue-50/60 border border-blue-200 rounded-lg p-2 text-[11px] text-blue-900 flex items-start gap-2">
-              <Lock size={12} className="mt-0.5 shrink-0" />
-              <div>
-                <strong>Host name, date, guest count and company are locked</strong> — these come from the AKAN
-                Party Manager sheet. To change them, edit the sheet row and click Refresh on Party Events.
-                (Admin can override.)
-              </div>
-            </div>
-          )}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-[#6B5744] mb-1 flex items-center gap-1">
-                Event Host Name * {sheetLocked && <Lock size={10} className="text-blue-700" />}
-              </label>
-              <input value={eventName} onChange={e => setEventName(e.target.value)} autoFocus={!sheetLocked}
-                     readOnly={sheetLocked}
-                     placeholder="e.g. Mr. Sharma"
-                     title="The person hosting this party (from the AKAN Party Manager sheet's Host Name column)."
-                     className={`w-full px-3 py-2 border rounded-lg text-sm ${sheetLocked ? 'border-blue-200 bg-blue-50/40 text-[#6B5744] cursor-not-allowed' : 'border-[#D4B896] bg-[#FFF1E3]'}`} />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-[#6B5744] mb-1 flex items-center gap-1">
-                <Calendar size={12} /> Event Date * {sheetLocked && <Lock size={10} className="text-blue-700" />}
-              </label>
-              <input type="date" value={eventDate} onChange={e => setEventDate(e.target.value)}
-                     readOnly={sheetLocked}
-                     className={`w-full px-3 py-2 border rounded-lg text-sm ${sheetLocked ? 'border-blue-200 bg-blue-50/40 text-[#6B5744] cursor-not-allowed' : 'border-[#D4B896] bg-[#FFF1E3]'}`} />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-[#6B5744] mb-1 flex items-center gap-1">
-                <UsersIcon size={12} /> Guest Count {sheetLocked && <Lock size={10} className="text-blue-700" />}
-              </label>
-              <input type="number" min={0} value={guestCount} onChange={e => setGuestCount(e.target.value)}
-                     readOnly={sheetLocked}
-                     placeholder="e.g. 80"
-                     className={`w-full px-3 py-2 border rounded-lg text-sm font-mono ${sheetLocked ? 'border-blue-200 bg-blue-50/40 text-[#6B5744] cursor-not-allowed' : 'border-[#D4B896] bg-[#FFF1E3]'}`} />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-[#6B5744] mb-1 flex items-center gap-1">
-                Company Name {sheetLocked && <Lock size={10} className="text-blue-700" />}
-              </label>
-              <input value={customer} onChange={e => setCustomer(e.target.value)}
-                     readOnly={sheetLocked}
-                     placeholder="e.g. IBM India Pvt Ltd"
-                     title="Company sponsoring this party (from the AKAN Party Manager sheet's Company column). Phone is preserved in Event Notes."
-                     className={`w-full px-3 py-2 border rounded-lg text-sm ${sheetLocked ? 'border-blue-200 bg-blue-50/40 text-[#6B5744] cursor-not-allowed' : 'border-[#D4B896] bg-[#FFF1E3]'}`} />
-            </div>
-            <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-[#6B5744] mb-1">Event Notes</label>
-              <input value={eventNotes} onChange={e => setEventNotes(e.target.value)}
-                     placeholder="Menu, special requests…"
-                     className="w-full px-3 py-2 border border-[#D4B896] rounded-lg bg-[#FFF1E3] text-sm" />
-            </div>
-          </div>
-
-          {/* Department selector. STAFF role is locked to their own dept (no
-              dropdown, no mixed-mode toggle). Manager / Admin / Head Chef /
-              Store Manager can switch depts and use mixed mode. */}
-          <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 space-y-2">
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <div className="flex-1 min-w-0">
-                <label className="text-xs font-medium text-[#6B5744] mb-1 block flex items-center gap-1">
-                  Requesting Department *
-                  {!canChangeDept && (
-                    <Lock size={10} className="text-blue-700" />
-                  )}
-                  {autoSelectedDept && canChangeDept && (
-                    <span className="ml-1 text-[10px] font-normal text-emerald-700 italic">
-                      ✓ auto-selected from your profile
-                    </span>
-                  )}
-                </label>
-
-                {/* STAFF: locked label, no dropdown */}
-                {!canChangeDept ? (
-                  (() => {
-                    const myDept = departments.find(d => d.id === myDeptId);
-                    if (myDept) {
-                      return (
-                        <div className="w-full max-w-md px-3 py-2 border border-blue-200 bg-blue-50/40 rounded-lg text-sm text-[#2D1B0E] flex items-center gap-2"
-                             title="Your role can only raise requisitions for your own department. Ask admin if you need to raise for another dept.">
-                          <Lock size={11} className="text-blue-700 shrink-0" />
-                          <span>{myDept.code ? `[${myDept.code}] ` : ''}{myDept.name}</span>
-                        </div>
-                      );
-                    }
-                    // Staff with NO dept configured — block + hint
-                    return (
-                      <div className="w-full max-w-md px-3 py-2 border border-amber-400 bg-amber-50 rounded-lg text-sm text-amber-900">
-                        ⚠ Your user has no department assigned. Ask admin to set one on{' '}
-                        <a href="/users" className="underline">/users</a> before raising requisitions.
-                      </div>
-                    );
-                  })()
-                ) : !mixedMode ? (
-                  <>
-                    <select value={reqDeptId} onChange={e => setReqDept(e.target.value)}
-                            className={`w-full max-w-md px-3 py-2 border rounded-lg text-sm ${reqDeptId ? 'border-[#D4B896] bg-white' : 'border-amber-400 bg-amber-50 text-amber-800'}`}>
-                      <option value="">— pick department (Continental / Bakery / Bar…) —</option>
-                      {departments.map(d => (
-                        <option key={d.id} value={d.id}>{d.code ? `[${d.code}] ` : ''}{d.name}</option>
-                      ))}
-                    </select>
-                    {noDeptHint && (
-                      <div className="text-[10px] text-amber-700 mt-1">⚠ {noDeptHint}</div>
-                    )}
-                  </>
-                ) : (
-                  <div className="text-xs text-[#8B7355] italic">Multiple departments — each line below picks its own.</div>
-                )}
-              </div>
-
-              {/* Mixed-mode toggle ONLY visible to manager / admin / head chef / store mgr.
-                  Staff don't see it (they can't even use it since dept is locked). */}
-              {canChangeDept && (
-                <label className="text-[11px] text-[#6B5744] flex items-center gap-1.5 cursor-pointer">
-                  <input type="checkbox" checked={mixedMode} onChange={e => setMixedMode(e.target.checked)} />
-                  Multiple departments
-                </label>
-              )}
-            </div>
-            {!mixedMode && (
-              <div className="text-[10px] text-[#8B7355]">
-                Each dept raises its own party req. HOD sees them all together on the <strong>Party Approvals</strong> screen.
-              </div>
-            )}
-          </div>
-
-          {/* Items table — per-line dept only shows in mixed mode */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-xs font-semibold text-[#2D1B0E]">Items needed</label>
-              {/* Desktop keeps a quick top button; the primary Add-line is full-width
-                  at the BOTTOM so on mobile it sits right below the last material. */}
-              <button type="button" onClick={addLine}
-                      className="hidden md:inline-flex text-xs text-[#af4408] hover:underline items-center gap-1">
-                <Plus size={12} /> Add line
-              </button>
-            </div>
-            {/* Column headers — desktop only; mobile rows carry inline labels */}
-            <div className="hidden md:grid grid-cols-12 gap-2 mb-1 text-[10px] font-medium text-[#8B7355] uppercase tracking-wide px-1">
-              <div className="col-span-3">Material</div>
-              <div className="col-span-3 text-right">Qty</div>
-              <div className="col-span-1">Unit</div>
-              {mixedMode
-                ? <div className="col-span-3">Department</div>
-                : <div className="col-span-3">Notes</div>}
-              <div className="col-span-2 text-right">Cost</div>
-            </div>
-            <div className="space-y-2">
-              {items.map((it, i) => {
-                const m = materials.find(x => x.id === it.material_id);
-                const allowedUnits = allowedUnitsForMaterial(m);
-                // Live cost — convert qty to recipe-units first when the line's
-                // unit is the purchase_unit (so we don't double-count pack size).
-                const effectiveQty = (() => {
-                  const q = Number(it.qty) || 0;
-                  if (!m || q === 0) return 0;
-                  const recipeU = (m.unit || '').trim();
-                  // Match the dropdown's display fallback (ordering unit first).
-                  const lineU = (it.unit || allowedUnits[0] || recipeU).trim();
-                  if (lineU === recipeU) return q;
-                  // line unit == purchase_unit → convert to recipe units via pack_size
-                  const pack = Number(m.pack_size) || 1;
-                  return q * pack;
-                })();
-                const lineCost = m && effectiveQty > 0 ? effectiveQty * (m.average_price || 0) : 0;
-                // Rate shown PER PURCHASE UNIT so the cost is human-verifiable and
-                // unit-mismatched prices are obvious. average_price is ₹/recipe-unit,
-                // so ×pack_size gives ₹/purchase-unit (e.g. 0.1785/ml ×1000 = ₹178.50/BTL).
-                const puUnit = (allowedUnits[0] || (m?.unit || '')).trim();
-                const pricePerPU = (m?.average_price || 0) * ((m && puUnit && puUnit !== (m.unit || '').trim()) ? (Number(m.pack_size) || 1) : 1);
-                const Lbl = ({ children }: { children: React.ReactNode }) => (
-                  <div className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] mb-0.5">{children}</div>
-                );
-                return (
-                  // Mobile: a stacked card (material on its own line, then Qty·Unit,
-                  // then Dept/Notes, then Cost). Desktop (md+): the original 12-col grid.
-                  <div key={i} className="rounded-lg border border-[#E8D5C4] bg-white p-3 space-y-2.5 text-xs
-                                          md:rounded-none md:border-0 md:bg-transparent md:p-0 md:space-y-0
-                                          md:grid md:grid-cols-12 md:gap-2 md:items-start">
-                    {/* Material — full width mobile, col-3 desktop */}
-                    <div className="md:col-span-3">
-                      <div className="flex items-start gap-2">
-                        <div className="flex-1 min-w-0">
-                          <Lbl>Material</Lbl>
-                          <MaterialTypeahead
-                            materials={materials as any}
-                            value={it.material_id}
-                            onPick={(id) => {
-                              // Line unit is FIXED to the material's purchase / ordering
-                              // unit (allowedUnits[0]) — staff always requisition in the
-                              // bulk unit so "12" can't be misread as 12 ml.
-                              const mat = materials.find(x => x.id === id);
-                              ensureTrailingEmpty(i, { material_id: id, unit: allowedUnitsForMaterial(mat)[0] || '' });
-                            }}
-                            excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
-                          />
-                        </div>
-                        {/* delete — inline top-right on mobile */}
-                        <button type="button" onClick={() => removeLine(i)} className="md:hidden text-red-600 shrink-0 pt-5" aria-label="Remove line"><Trash2 size={16} /></button>
-                      </div>
-                    </div>
-                    {/* Qty + Unit: 2-up on mobile; flow straight into the grid on desktop */}
-                    <div className="grid grid-cols-2 gap-2 md:contents">
-                      <div className="md:col-span-3">
-                        <Lbl>Qty</Lbl>
-                        <input type="number" step="any" value={it.qty}
-                               onChange={e => ensureTrailingEmpty(i, { qty: e.target.value })}
-                               placeholder="Qty"
-                               className="w-full min-w-0 px-3 py-2 border border-[#D4B896] rounded text-sm text-right font-mono tabular-nums" />
-                      </div>
-                      <div className="md:col-span-1">
-                        <Lbl>Unit</Lbl>
-                        <div className="text-xs text-[#8B7355] py-2 truncate" title="Unit this line is entered in (save reads the same)">{it.unit || allowedUnits[0] || m?.unit || ''}</div>
-                      </div>
-                    </div>
-                    {/* Dept (mixed mode) or Notes — full width mobile, col-3 desktop */}
-                    <div className="md:col-span-3">
-                      <Lbl>{mixedMode ? 'Department' : 'Notes'}</Lbl>
-                      {mixedMode ? (
-                        <select value={it.department_id}
-                                onChange={e => update(i, { department_id: e.target.value })}
-                                className={`w-full px-2 py-1.5 border rounded text-xs ${it.department_id ? 'border-[#D4B896] bg-white' : 'border-amber-400 bg-amber-50 text-amber-800'}`}>
-                          <option value="">— pick dept —</option>
-                          {departments.map(d => (
-                            <option key={d.id} value={d.id}>{d.code ? `[${d.code}] ` : ''}{d.name}</option>
-                          ))}
-                        </select>
-                      ) : (
-                        <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
-                               placeholder="Notes (optional)"
-                               className="w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs" />
-                      )}
-                    </div>
-                    {/* Cost — with mobile label; delete lives here on desktop */}
-                    <div className="md:col-span-2 flex items-center justify-between md:justify-end gap-1">
-                      <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355]">Cost</span>
-                      <div className="flex items-center gap-1">
-                        {it.confidence && (
-                          <span title={`Confidence: ${it.confidence}`}
-                                className={`text-[9px] px-1 py-0.5 rounded uppercase font-semibold ${
-                                  it.confidence === 'high'   ? 'bg-emerald-100 text-emerald-800' :
-                                  it.confidence === 'medium' ? 'bg-amber-100 text-amber-800' :
-                                                               'bg-gray-100 text-gray-600'
-                                }`}>
-                            {it.confidence[0]}
-                          </span>
-                        )}
-                        <span className="text-right leading-tight" title={m ? `₹${pricePerPU.toFixed(2)} per ${puUnit}` : ''}>
-                          <span className="block text-xs font-mono text-[#6B5744]">{fmt(lineCost)}</span>
-                          {m && pricePerPU > 0 && <span className="block text-[9px] font-mono text-[#8B7355]">₹{pricePerPU.toFixed(2)}/{puUnit}</span>}
-                        </span>
-                        <button type="button" onClick={() => removeLine(i)}
-                                className="hidden md:inline-flex text-red-600 hover:text-red-700"><Trash2 size={12} /></button>
-                      </div>
-                    </div>
-                    {/* Mixed mode: notes get their own full-width row below */}
-                    {mixedMode && (
-                      <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
-                             placeholder="Line notes (optional)"
-                             className="md:col-span-12 w-full px-2 py-1 border border-[#E8D5C4] rounded text-[11px] text-[#6B5744] md:-mt-1" />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-            {/* Primary Add-line — full width at the BOTTOM so on mobile it sits
-                right below the material you just added. */}
-            <button type="button" onClick={addLine}
-                    className="mt-2 w-full flex items-center justify-center gap-1.5 py-2.5 border-2 border-dashed border-[#E8D5C4] rounded-lg text-sm font-medium text-[#af4408] hover:border-[#af4408] hover:bg-[#FFF1E3] active:bg-[#FFE8D5]">
-              <Plus size={16} /> Add line
-            </button>
-          </div>
-
-          {/* Live cost estimate */}
-          <div className="bg-[#FFF1E3] border border-[#D4B896] rounded-lg p-3 flex items-center justify-between">
-            <div>
-              <div className="text-xs text-[#8B7355]">Estimated cost</div>
-              <div className="text-xl font-bold text-[#2D1B0E]">{fmt(totalCost)}</div>
-            </div>
-            {guests > 0 && (
-              <div className="text-right">
-                <div className="text-xs text-[#8B7355]">Per head ({guests} guests)</div>
-                <div className="text-lg font-semibold text-[#af4408]">{fmt(perHead)}</div>
-              </div>
-            )}
-          </div>
-
-          {error && (
-            <div className="bg-red-50 border border-red-200 text-red-700 rounded p-2 text-xs">{error}</div>
-          )}
-        </div>
-
-        <div className="flex justify-end gap-2 px-6 py-3 border-t border-[#E8D5C4] shrink-0">
-          <button onClick={onClose} className="px-4 py-2 text-sm text-[#6B5744] hover:bg-[#FFF1E3] rounded">Cancel</button>
-          {/* Save Draft → stays in 'draft' status, dept can edit later */}
-          <button onClick={() => submit(false)} disabled={saving}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 border border-[#D4B896] text-[#6B5744] hover:bg-[#FFF1E3] rounded text-sm disabled:opacity-50"
-                  title="Keep as draft; you can edit later before submitting.">
-            <Save size={14} />
-            Save as Draft
-          </button>
-          {/* Save & Submit → primary action, lands on Head Chef's approval inbox */}
-          <button onClick={() => submit(true)} disabled={saving}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#af4408] hover:bg-[#933807] text-white rounded text-sm disabled:opacity-50"
-                  title="Save and immediately send to HOD for approval.">
-            {saving ? <Loader2 className="animate-spin" size={14} /> : <ChefHat size={14} />}
-            {saving ? 'Saving…' : 'Save & Submit to HOD'}
-          </button>
-        </div>
+    <>
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-2.5 text-[11px] text-blue-800">
+        📄 Pre-filled from FP {prefill.parsed?.fp_number || '(unknown)'} ·{' '}
+        {(prefill.materials?.length || 0)} materials estimated. Review and adjust before saving.
+        {warnings.length > 0 && (
+          <ul className="mt-1.5 list-disc pl-4">
+            {warnings.map((w, i) => <li key={i}>⚠ {w}</li>)}
+          </ul>
+        )}
       </div>
-    </div>
+
+      {(cats.length > 0 || barNotes) && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-[11px]">
+          <div className="font-semibold text-amber-900 mb-1.5">
+            🍽️ Menu from FP — use as a checklist for the items below
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1">
+            {cats.map(c => (
+              <div key={c.label} className="text-amber-900">
+                <span className="font-medium">{c.label}:</span>{' '}
+                <span className="text-amber-800">{c.items!.join(', ')}</span>
+              </div>
+            ))}
+          </div>
+          {barNotes && (
+            <div className="mt-1.5 pt-1.5 border-t border-amber-200 bg-amber-100/50 rounded px-2 py-1.5">
+              <div className="font-semibold text-amber-900 mb-0.5">🍸 Cocktails / Mocktails / Bar Notes</div>
+              <div className="text-amber-900 whitespace-pre-wrap">{String(menu.bar_notes_raw)}</div>
+            </div>
+          )}
+        </div>
+      )}
+    </>
   );
 }

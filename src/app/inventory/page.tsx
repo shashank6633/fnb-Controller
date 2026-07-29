@@ -19,6 +19,7 @@ import {
   ClipboardCheck,
   Star,
   Sparkles,
+  MapPin,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
@@ -49,6 +50,9 @@ interface RawMaterial {
   discovered_source?: string;
   /** Priority stars: 3 = critical, 2 = standard, 1 = low (default 2). */
   priority?: number;
+  sku?: string;
+  /** Physical area the item lives in — free text, blank until filled. */
+  storage_location?: string;
 }
 
 interface FormData {
@@ -148,6 +152,40 @@ const PRIORITY_OPTIONS = [
   { v: 1, stars: '⭐',   label: 'Low',      hint: 'lowest tier — dashboards only' },
 ] as const;
 
+/** The physical areas closing stock is grouped by. Seeded into every
+ *  storage-location picker so the vocabulary can't drift into eight spellings of
+ *  the same room while the column is still mostly blank. */
+const CANONICAL_STORAGE_LOCATIONS = ['Grocery Store', 'Chiller', 'Beverage Store'] as const;
+
+/** Proposed category → physical area map, pre-filled in the bulk tool so the
+ *  owner reviews ~20 lines instead of typing 928 rows. Nothing here is applied
+ *  without a click. Categories NOT listed (bar + the liquor leaves) are shown
+ *  unproposed in the same table — liquor's shelf is a call only the owner can make. */
+const STORAGE_LOCATION_PROPOSAL: { location: string; categories: string[] }[] = [
+  { location: 'Grocery Store', categories: ['grocery', 'other', 'packaging', 'housekeeping', 'stationery', 'bakery'] },
+  { location: 'Chiller',       categories: ['veg', 'vegetables', 'english-vegetables', 'dairy', 'non-veg', 'meat', 'poultry', 'seafood', 'frozen-cheese', 'fruits', 'puree'] },
+  { location: 'Beverage Store', categories: ['beverages', 'syrups', 'crush'] },
+];
+
+/** Proposed categories whose bucket is a GUESS — flagged in the UI for the owner
+ *  to confirm rather than rubber-stamp ('other' is a ~140-material grab bag). */
+const STORAGE_PROPOSAL_GUESSES = new Set(['other']);
+
+/** Canonical values first, then every other spelling actually stored on a
+ *  material. Deduped case-insensitively — a list that offers both "Chiller" and
+ *  "chiller" is the drift it exists to prevent. */
+function mergeStorageLocations(values: (string | undefined)[]): string[] {
+  const seen = new Map<string, string>();
+  for (const v of values) {
+    const s = (v || '').trim();
+    if (!s) continue;
+    const k = s.toLowerCase();
+    if (!seen.has(k)) seen.set(k, s);
+  }
+  for (const c of CANONICAL_STORAGE_LOCATIONS) seen.delete(c.toLowerCase());
+  return [...CANONICAL_STORAGE_LOCATIONS, ...Array.from(seen.values()).sort((a, b) => a.localeCompare(b))];
+}
+
 const SUPER_CATEGORIES = ['', 'Meat', 'Seafood', 'Dairy', 'Vegetables', 'Fruits', 'Liquor', 'Beverages', 'Grocery', 'Housekeeping', 'Stationery', 'Fuel', 'Other'] as const;
 const CLOSING_CADENCES = [
   { v: 'none',    label: 'None (only on demand)' },
@@ -214,6 +252,8 @@ export default function InventoryPage() {
   const [showRates, setShowRates] = useState(false);
   // Bulk priority-star tool (admin / store manager only)
   const [showPriority, setShowPriority] = useState(false);
+  // Bulk storage-location tool (same gate as the priority tool)
+  const [showStorage, setShowStorage] = useState(false);
   // Inline per-row priority save in flight (material id)
   const [savingPriorityId, setSavingPriorityId] = useState<string | null>(null);
   const [me, setMe] = useState<any>(null);
@@ -322,6 +362,14 @@ export default function InventoryPage() {
     const all = new Set<string>([...CATEGORIES, ...live]);
     return Array.from(all).sort((a, b) => a.localeCompare(b));
   }, [materials]);
+
+  /** Storage-location vocabulary: canonical areas + whatever is actually stored
+   *  on a material today. Feeds both the edit-modal datalist and the bulk tool,
+   *  so both offer the same spellings. */
+  const storageLocationOptions = useMemo(
+    () => mergeStorageLocations(materials.map(m => m.storage_location)),
+    [materials],
+  );
 
   /** Same options but grouped by super_category so the dropdowns render with
    *  <optgroup> headers like "Bar > Beers / Whisky / Vodka …". Leaves not yet
@@ -659,6 +707,16 @@ export default function InventoryPage() {
               >
                 <Star className="w-4 h-4" />
                 Set Priority
+              </button>
+            )}
+            {canBulkPriority && (
+              <button
+                onClick={() => setShowStorage(true)}
+                className="flex items-center gap-2 px-4 py-2.5 border border-sky-600 text-sky-700 hover:bg-sky-50 rounded-lg text-sm font-medium transition-colors"
+                title="Bulk-fill the storage location (Grocery Store / Chiller / Beverage Store) by category, so closing stock can be grouped by physical area."
+              >
+                <MapPin className="w-4 h-4" />
+                Storage Locations
               </button>
             )}
             <button
@@ -1462,17 +1520,14 @@ export default function InventoryPage() {
                     Storage Location
                     <input value={formData.storage_location || ''}
                            onChange={e => setFormData(f => ({ ...f, storage_location: e.target.value }))}
-                           placeholder="e.g. Cold Room A · Dry Store · Bar Fridge"
+                           placeholder={`e.g. ${CANONICAL_STORAGE_LOCATIONS.join(' · ')}`}
                            list="storage-locations"
                            className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+                    {/* Built from the locations actually in use (+ the canonical
+                        areas) — a hard-coded list drifts away from the data the
+                        moment someone types a new room. */}
                     <datalist id="storage-locations">
-                      <option value="Cold Room A" />
-                      <option value="Cold Room B" />
-                      <option value="Freezer" />
-                      <option value="Dry Store" />
-                      <option value="Bar Fridge" />
-                      <option value="Wine Cellar" />
-                      <option value="Spice Rack" />
+                      {storageLocationOptions.map(loc => <option key={loc} value={loc} />)}
                     </datalist>
                   </label>
                   <label className="text-xs text-[#6B5744] flex flex-col gap-1">
@@ -1539,6 +1594,15 @@ export default function InventoryPage() {
           categories={availableCategories}
           onClose={() => setShowPriority(false)}
           onApplied={fetchMaterials}
+        />
+      )}
+
+      {showStorage && (
+        <SetStorageLocationModal
+          materials={materials}
+          locationOptions={storageLocationOptions}
+          onClose={() => setShowStorage(false)}
+          onApplied={() => fetchMaterials(true)}
         />
       )}
     </div>
@@ -2251,6 +2315,309 @@ function SetPriorityModal({ categories, onClose, onApplied }: {
                 Apply selected ({tickedCount})
               </button>
             )
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Bulk storage locations ──────────────────────────────────────────────
+// POST /api/inventory/bulk-storage-location (admin / store manager):
+//   { category, storage_location }      — a whole category (a row's Apply)
+//   { material_ids, storage_location }  — the ticked rows of a preview
+// storage_location is what closing stock gets grouped by, and it starts blank on
+// every material — so the table ships PRE-FILLED with a proposal and the owner
+// reviews ~20 lines instead of typing 928. Nothing applies without a click.
+interface StorageRow { id: string; sku: string; name: string; current: string; ticked: boolean }
+
+function SetStorageLocationModal({ materials, locationOptions, onClose, onApplied }: {
+  materials: RawMaterial[]; locationOptions: string[]; onClose: () => void; onApplied: () => void;
+}) {
+  // Which action is in flight — `cat:<category>` for a row, 'selected' for the
+  // preview apply. Per-key so one row's spinner doesn't freeze the whole table.
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+  /** Blanks left AFTER the last apply — the server's count, which is the number
+   *  this whole tool exists to drive to zero. Null until something is applied. */
+  const [remaining, setRemaining] = useState<number | null>(null);
+
+  // Editable proposal, seeded once so the owner's edits survive a refresh of
+  // `materials` after an apply.
+  const [draft, setDraft] = useState<Record<string, string>>(() => {
+    const d: Record<string, string> = {};
+    for (const g of STORAGE_LOCATION_PROPOSAL) for (const c of g.categories) d[c] = g.location;
+    return d;
+  });
+
+  // Preview state (also the manual picker)
+  const [pickCat, setPickCat] = useState('');
+  const [pickLoc, setPickLoc] = useState('');
+  const [rows, setRows] = useState<StorageRow[] | null>(null);
+
+  const proposedByCat = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const g of STORAGE_LOCATION_PROPOSAL) for (const c of g.categories) m.set(c, g.location);
+    return m;
+  }, []);
+
+  const stats = useMemo(() => {
+    const m = new Map<string, { n: number; blank: number }>();
+    for (const mat of materials) {
+      const c = (mat.category || '').trim();
+      if (!c) continue;
+      const e = m.get(c) || { n: 0, blank: 0 };
+      e.n++;
+      if (!(mat.storage_location || '').trim()) e.blank++;
+      m.set(c, e);
+    }
+    return m;
+  }, [materials]);
+
+  const proposedCats = useMemo(
+    () => Array.from(proposedByCat.keys()).filter(c => stats.has(c)),
+    [proposedByCat, stats],
+  );
+  // Live categories the proposal does NOT cover (bar + the liquor leaves). Shown
+  // in the same table, unproposed: leaving them out would hide the fact that
+  // they'd still be blank after applying every proposed line.
+  const otherCats = useMemo(
+    () => Array.from(stats.keys())
+      .filter(c => !proposedByCat.has(c))
+      .sort((a, b) => (stats.get(b)!.n - stats.get(a)!.n) || a.localeCompare(b)),
+    [stats, proposedByCat],
+  );
+  const otherCount = otherCats.reduce((s, c) => s + stats.get(c)!.n, 0);
+  const blankNow = useMemo(
+    () => materials.filter(m => !(m.storage_location || '').trim()).length,
+    [materials],
+  );
+
+  const post = async (body: any) => {
+    const r = await api('/api/inventory/bulk-storage-location', { method: 'POST', body });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    return j;
+  };
+
+  const mappedNote = (n: number) =>
+    n > 0 ? ` ${n} of them sit in a store-mapped (liquor) category — a shelf is separate from the store ledger, so they were written too.` : '';
+
+  const applyCategory = async (cat: string) => {
+    const loc = (draft[cat] ?? '').trim();
+    setBusy(`cat:${cat}`); setError(null); setDone(null);
+    try {
+      const j = await post({ category: cat, storage_location: loc });
+      setDone(`${j.updated} material${j.updated === 1 ? '' : 's'} in ${categoryLabel(cat)} → ${loc ? `“${loc}”` : 'cleared'}.${mappedNote(Number(j.store_mapped) || 0)}`);
+      setRemaining(Number(j.remaining_blank));
+      if (pickCat.toLowerCase() === cat.toLowerCase()) setRows(null);
+      onApplied();
+    } catch (e: any) { setError(e?.message || 'Apply failed'); }
+    finally { setBusy(null); }
+  };
+
+  const openPreview = (cat: string) => {
+    setError(null); setDone(null);
+    setPickCat(cat);
+    setPickLoc(draft[cat] ?? '');
+    setRows(materials
+      .filter(m => (m.category || '').trim().toLowerCase() === cat.trim().toLowerCase())
+      .map(m => ({ id: m.id, sku: m.sku || '', name: m.name, current: (m.storage_location || '').trim(), ticked: true })));
+  };
+
+  const applySelected = async () => {
+    const picked = (rows || []).filter(r => r.ticked);
+    if (picked.length === 0) { setError('No rows ticked'); return; }
+    const loc = pickLoc.trim();
+    setBusy('selected'); setError(null); setDone(null);
+    try {
+      const j = await post({ material_ids: picked.map(r => r.id), storage_location: loc });
+      setDone(`${j.updated} material${j.updated === 1 ? '' : 's'} → ${loc ? `“${loc}”` : 'cleared'}.${j.skipped ? ` ${j.skipped} skipped (no longer exist).` : ''}${mappedNote(Number(j.store_mapped) || 0)}`);
+      setRemaining(Number(j.remaining_blank));
+      setRows(null);
+      onApplied();
+    } catch (e: any) { setError(e?.message || 'Apply failed'); }
+    finally { setBusy(null); }
+  };
+
+  const tickedCount = (rows || []).filter(r => r.ticked).length;
+  const allCats = useMemo(
+    () => Array.from(stats.keys()).sort((a, b) => a.localeCompare(b)),
+    [stats],
+  );
+
+  const catRow = (cat: string, proposed: boolean) => {
+    const s = stats.get(cat)!;
+    const val = draft[cat] ?? '';
+    const guess = proposed && STORAGE_PROPOSAL_GUESSES.has(cat);
+    const rowBusy = busy === `cat:${cat}`;
+    return (
+      <tr key={cat} className={guess ? 'bg-amber-50/60' : ''}>
+        <td className="px-2 py-1.5">
+          <div className="text-[#2D1B0E] font-medium flex items-center gap-1.5">
+            {categoryLabel(cat)}
+            {guess && (
+              <span title="Grab-bag category — spot-check a few items before applying."
+                    className="px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-800 text-[9px] font-semibold uppercase tracking-wide">
+                guess — confirm
+              </span>
+            )}
+          </div>
+          <div className="text-[10px] text-[#8B7355]">
+            {s.n} material{s.n === 1 ? '' : 's'} · {s.blank === 0 ? 'all set' : `${s.blank} blank`}
+          </div>
+        </td>
+        <td className="px-2 py-1.5">
+          <input value={val}
+                 onChange={e => setDraft(d => ({ ...d, [cat]: e.target.value }))}
+                 list="bulk-storage-locations"
+                 maxLength={60}
+                 placeholder={proposed ? '' : 'type or pick a location'}
+                 className="w-full px-2 py-1 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-xs" />
+        </td>
+        <td className="px-2 py-1.5 whitespace-nowrap text-right">
+          <button onClick={() => openPreview(cat)} disabled={!!busy}
+                  className="px-2 py-1 mr-1.5 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-xs disabled:opacity-50">
+            Preview
+          </button>
+          {/* An empty box means "not decided yet", not "clear the category" — so
+              a row Apply needs a value. Clearing is done deliberately, through
+              Preview → untick → Apply selected with a blank location. */}
+          <button onClick={() => applyCategory(cat)} disabled={!!busy || !val.trim()}
+                  title={!val.trim() ? 'Enter a storage location first' : `Set all ${s.n} ${categoryLabel(cat)} materials`}
+                  className="px-2 py-1 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-xs font-medium inline-flex items-center gap-1 disabled:opacity-50">
+            {rowBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : null} Apply
+          </button>
+        </td>
+      </tr>
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl shadow-xl flex flex-col overflow-hidden"
+           style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+            <MapPin className="w-5 h-5 text-sky-600" /> Storage Locations
+          </div>
+          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
+          <p className="text-xs text-[#8B7355]">
+            Closing stock can only be grouped by physical area once every material carries a
+            <b> storage location</b>. Set it a category at a time — the rows below come pre-filled with a
+            proposal you can edit. <b>Preview</b> lists the materials so you can untick the odd one out;
+            <b> Apply</b> writes the whole category.
+          </p>
+
+          <div className={`rounded-lg p-2.5 text-sm border ${(remaining ?? blankNow) === 0 ? 'bg-green-50 border-green-200 text-green-800' : 'bg-sky-50 border-sky-200 text-sky-900'}`}>
+            <b>{remaining ?? blankNow}</b> of {materials.length} material{materials.length === 1 ? '' : 's'} still have no storage location.
+          </div>
+
+          {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
+          {done && <div className="bg-green-50 border border-green-200 rounded-lg p-2.5 text-sm text-green-800 flex items-start gap-2"><CheckCircle className="w-4 h-4 mt-0.5 shrink-0" /> <span>{done}</span></div>}
+
+          <datalist id="bulk-storage-locations">
+            {locationOptions.map(loc => <option key={loc} value={loc} />)}
+          </datalist>
+
+          <div className="overflow-x-auto rounded-lg border border-[#E8D5C4]">
+            <table className="w-full text-xs">
+              <thead className="bg-[#FFF1E3] text-[#8B7355]"><tr>
+                <th className="text-left px-2 py-1.5">Category</th>
+                <th className="text-left px-2 py-1.5 w-52">Storage location</th>
+                <th className="px-2 py-1.5 w-40"></th>
+              </tr></thead>
+              <tbody className="divide-y divide-[#F0E4D6]">
+                <tr className="bg-[#FFF8F0]"><td colSpan={3} className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">
+                  Proposed ({proposedCats.length} categories)
+                </td></tr>
+                {proposedCats.map(c => catRow(c, true))}
+                {otherCats.length > 0 && (
+                  <tr className="bg-[#FFF8F0]"><td colSpan={3} className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">
+                    Not proposed — {otherCount} material{otherCount === 1 ? '' : 's'} (mostly bar / liquor: pick their shelf yourself)
+                  </td></tr>
+                )}
+                {otherCats.map(c => catRow(c, false))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Manual picker — any category, any location, same preview + apply. */}
+          <div className="border-t border-[#E8D5C4] pt-3 space-y-2">
+            <div className="text-xs font-medium text-[#6B5744]">Or pick any category</div>
+            <div className="flex flex-wrap gap-2 items-center">
+              <select value={pickCat}
+                      onChange={e => { setPickCat(e.target.value); setRows(null); }}
+                      className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-xs min-w-48">
+                <option value="">Select a category…</option>
+                {allCats.map(c => (
+                  <option key={c} value={c}>{categoryLabel(c)} ({stats.get(c)!.n})</option>
+                ))}
+              </select>
+              <input value={pickLoc} onChange={e => setPickLoc(e.target.value)}
+                     list="bulk-storage-locations" maxLength={60}
+                     placeholder="Storage location"
+                     className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-xs min-w-48" />
+              <button onClick={() => openPreview(pickCat)} disabled={!!busy || !pickCat}
+                      className="px-3 py-1.5 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-xs font-medium disabled:opacity-50">
+                Preview
+              </button>
+            </div>
+          </div>
+
+          {rows !== null && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-xs text-[#6B5744]">
+                <span>
+                  <b>{rows.length}</b> material{rows.length === 1 ? '' : 's'} in {categoryLabel(pickCat)} · {tickedCount} ticked
+                  {pickLoc.trim() ? <> → <b>{pickLoc.trim()}</b></> : <> → <span className="text-amber-700">(blank clears the location)</span></>}
+                </span>
+                <span className="flex gap-2">
+                  <button onClick={() => setRows(rs => (rs || []).map(r => ({ ...r, ticked: true })))} className="text-[#af4408] hover:underline">tick all</button>
+                  <button onClick={() => setRows(rs => (rs || []).map(r => ({ ...r, ticked: false })))} className="text-[#af4408] hover:underline">untick all</button>
+                </span>
+              </div>
+              <div className="overflow-x-auto rounded-lg border border-[#E8D5C4] max-h-72 overflow-y-auto">
+                <table className="w-full text-xs">
+                  <thead className="bg-[#FFF1E3] text-[#8B7355] sticky top-0"><tr>
+                    <th className="px-2 py-1.5 w-8"></th>
+                    <th className="text-left px-2 py-1.5">Material</th>
+                    <th className="text-left px-2 py-1.5 w-40">Current location</th>
+                  </tr></thead>
+                  <tbody className="divide-y divide-[#F0E4D6]">
+                    {rows.map(r => (
+                      <tr key={r.id} className={r.ticked ? '' : 'opacity-50'}>
+                        <td className="px-2 py-1.5">
+                          <input type="checkbox" checked={r.ticked}
+                                 onChange={e => setRows(rs => (rs || []).map(x => x.id === r.id ? { ...x, ticked: e.target.checked } : x))}
+                                 className="w-3.5 h-3.5 accent-[#af4408]" />
+                        </td>
+                        <td className="px-2 py-1.5">
+                          <div className="text-[#2D1B0E] font-medium">{r.name}</div>
+                          <div className="text-[9px] font-mono text-[#8B7355]">{r.sku}</div>
+                        </td>
+                        <td className="px-2 py-1.5 text-[#6B5744]">{r.current || <span className="text-[#B9A491]">— blank —</span>}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
+          <button onClick={onClose} disabled={!!busy} className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Close</button>
+          {rows !== null && rows.length > 0 && (
+            <button onClick={applySelected} disabled={!!busy || tickedCount === 0}
+                    className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+              {busy === 'selected' ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+              Apply selected ({tickedCount})
+            </button>
           )}
         </div>
       </div>

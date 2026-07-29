@@ -1187,6 +1187,35 @@ function DetailModal({ transferId, accessByStore, elevated, onClose, onChanged }
           </div>
           {t.note && <div className="text-xs text-[#6B5744] bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg px-2.5 py-1.5">{t.note}</div>}
 
+          {/* WHERE THE STOCK IS RIGHT NOW. A transfer only moves stock when it is
+              ISSUED — a request on its own changes nothing — and a store→store
+              move lives on the store ledgers, never on the central Raw Materials
+              figure. Both were silent, which reads as "the transfer didn't
+              deduct anything". */}
+          {t.status === 'requested' && (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-900">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <span>
+                <b>No stock has moved yet.</b> This is still a request — {t.from_central ? 'the central grocery' : t.from_store_name} is
+                debited only when someone presses <b>Issue</b>{canIssue ? ' (you can do that here).' : ', which needs someone with issue rights on the source.'}
+              </span>
+            </div>
+          )}
+          {t.status === 'issued' && (
+            <div className="flex items-start gap-2 rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-2 text-[11px] text-blue-900">
+              <PackageCheck className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <span>
+                Stock has left {t.from_central ? 'the central grocery' : t.from_store_name}. It reaches {t.to_store_name} only
+                on <b>Receive</b>{canReceive ? ' — you can acknowledge it here.' : '.'}
+              </span>
+            </div>
+          )}
+          {!t.from_central && (
+            <div className="text-[10px] text-[#8B7355]">
+              Store-to-store movement is recorded on each store&apos;s own ledger — the central Raw Materials quantity is not part of it.
+            </div>
+          )}
+
           {mode !== 'view' && (
             <div className="text-xs text-[#6B5744] bg-blue-50 border border-blue-200 rounded-lg px-2.5 py-1.5">
               {mode === 'issue'

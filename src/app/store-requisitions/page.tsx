@@ -145,6 +145,8 @@ export default function StoreRequisitionsPage() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [busyLine, setBusyLine] = useState<string | null>(null);
   const [editQty, setEditQty] = useState<Record<string, string>>({});
+  // Why more than approved was handed over — recorded on the issue-history entry.
+  const [issueNotes, setIssueNotes] = useState<Record<string, string>>({});
   const [editDefer, setEditDefer] = useState<Record<string, { until: string; reason: string }>>({});
   const [showHistoryFor, setShowHistoryFor] = useState<string | null>(null);
   // "Issue All Items" confirmation — holds the requisition whose bulk-issue is
@@ -329,11 +331,17 @@ export default function StoreRequisitionsPage() {
     try {
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
         method: 'POST',
-        body: { lines: [{ id: line.id, action: 'issue', quantity: qty }] },
+        body: { lines: [{
+          id: line.id, action: 'issue', quantity: qty,
+          // Over-issue reason rides on the issue-history entry, so "why did 10
+          // leave against an approved 3" is answerable from the log alone.
+          note: (issueNotes[line.id] || '').trim(),
+        }] },
       });
       const j = await r.json();
       if (!r.ok) { alert(j.error || 'Issue failed'); return; }
       setEditQty(s => ({ ...s, [line.id]: '' }));
+      setIssueNotes(s => { const n = { ...s }; delete n[line.id]; return n; });
       setRefreshKey(k => k + 1);
     } finally { setBusyLine(null); }
   };
@@ -520,6 +528,7 @@ export default function StoreRequisitionsPage() {
                      issuingSelected={issuingSelected === req.id}
                      busyLine={busyLine}
                      editQty={editQty}
+                     issueNotes={issueNotes} setIssueNotes={setIssueNotes}
                      setEditQty={setEditQty}
                      editDefer={editDefer}
                      setEditDefer={setEditDefer}
@@ -667,6 +676,7 @@ function ReqCard(props: {
   issuingSelected: boolean;
   busyLine: string | null;
   editQty: Record<string, string>; setEditQty: (f: any) => void;
+  issueNotes: Record<string, string>; setIssueNotes: (f: any) => void;
   editDefer: Record<string, { until: string; reason: string }>;
   setEditDefer: (f: any) => void;
   onIssue: (line: ReqLine, qty?: number) => void;
@@ -797,6 +807,7 @@ function ReqCard(props: {
                          onToggleSelect={() => props.onToggleLineSelect(line.id)}
                          busy={props.busyLine === line.id}
                          editQty={props.editQty} setEditQty={props.setEditQty}
+                         issueNotes={props.issueNotes} setIssueNotes={props.setIssueNotes}
                          editDefer={props.editDefer} setEditDefer={props.setEditDefer}
                          onIssue={props.onIssue} onDefer={props.onDefer}
                          onUndo={props.onUndo} onReject={props.onReject} onUnreject={props.onUnreject}
@@ -822,6 +833,7 @@ function LineRow(props: {
   selected?: boolean;
   onToggleSelect?: () => void;
   editQty: Record<string, string>; setEditQty: (f: any) => void;
+  issueNotes: Record<string, string>; setIssueNotes: (f: any) => void;
   editDefer: Record<string, { until: string; reason: string }>;
   setEditDefer: (f: any) => void;
   onIssue: (line: ReqLine, qty?: number) => void;
@@ -850,6 +862,13 @@ function LineRow(props: {
   // instead, so the row never claims to be finished when it isn't.
   const puNum = (v: number, raw: number) =>
     v === 0 && raw > 0 ? '<0.001' : fmtNum(v);
+  /* OVER-ISSUE — the store handed over more than the HOD approved. It is a real
+     thing (a bag is a bag), so it is recorded as what actually left, not capped
+     to the approval; it just has to be deliberate and explained. Compared in the
+     PURCHASE basis the box is typed in. */
+  const typedPU = Number(props.editQty[line.id]);
+  const overIssue = Number.isFinite(typedPU) && typedPU - outstandingPU > 1e-9;
+  const overBy = overIssue ? Math.round((typedPU - outstandingPU) * 1000) / 1000 : 0;
   const rowTone = line.is_rejected ? 'bg-red-50/40 text-[#999] line-through'
                 : line.store_rejected ? 'bg-red-50/40 text-[#999]'
                 : outstanding === 0 && !line.deferred_until ? 'bg-emerald-50/30'
@@ -969,15 +988,27 @@ function LineRow(props: {
           <div className="flex flex-wrap items-center gap-1">
             {outstanding > 0 && !deferOpen && (
               <>
-                <input type="number" step="any" min={0} max={U.pf > 1 ? outstanding / U.pf : outstanding}
+                {/* NO max — the store can physically hand over more than was
+                    approved, and the number here must be what actually left the
+                    store. A max= capped the spinner at the approved qty and made
+                    a genuine over-issue look impossible, so 10 given against 3
+                    approved got recorded as 3. Over-issues are allowed, flagged
+                    and reasoned (below) rather than quietly trimmed. */}
+                <input type="number" step="any" min={0}
                        value={props.editQty[line.id] ?? ''}
                        onChange={e => props.setEditQty((s: any) => ({ ...s, [line.id]: e.target.value }))}
                        placeholder={String(puNum(outstandingPU, outstanding))}
                        title={`Issue in ${u || 'units'} — outstanding ${outstandingPU}${u ? ' ' + u : ''}`
-                              + (U.pf > 1 ? ` (= ${fmtNum(U.toRecipe(outstanding))} ${U.recipeUnit})` : '')}
-                       className="w-16 px-1 py-0.5 border border-[#E8D5C4] rounded text-right text-xs bg-[#FFF8F0]" />
+                              + (U.pf > 1 ? ` (= ${fmtNum(U.toRecipe(outstanding))} ${U.recipeUnit})` : '')
+                              + '. You may issue more than approved — say why when you do.'}
+                       className={`w-16 px-1 py-0.5 border rounded text-right text-xs ${
+                         overIssue ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`} />
                 {u && <span className="text-[10px] text-[#6B5744] font-medium">{u}</span>}
-                <button onClick={() => props.onIssue(line)} disabled={busy}
+                <button onClick={() => props.onIssue(line)}
+                        disabled={busy || (overIssue && (props.issueNotes[line.id] || '').trim().length < 3)}
+                        title={overIssue && (props.issueNotes[line.id] || '').trim().length < 3
+                          ? 'Say why you are issuing more than was approved (min 3 characters)'
+                          : undefined}
                         className="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[10px] flex items-center gap-1 disabled:opacity-50">
                   {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
                   Issue Now
@@ -993,6 +1024,18 @@ function LineRow(props: {
                   <XCircle className="w-3 h-3" /> Reject
                 </button>
               </>
+            )}
+            {overIssue && !deferOpen && (
+              <div className="w-full flex flex-col sm:flex-row sm:items-center gap-1 bg-amber-50 border border-amber-300 rounded px-1.5 py-1">
+                <span className="text-[10px] text-amber-900 shrink-0">
+                  <AlertCircle className="w-3 h-3 inline mr-0.5 -mt-0.5" />
+                  {fmtNum(overBy)} {u} MORE than approved ({fmtNum(outstandingPU)} {u}) — this is what will be recorded as issued.
+                </span>
+                <input value={props.issueNotes[line.id] || ''}
+                       onChange={e => props.setIssueNotes((s: any) => ({ ...s, [line.id]: e.target.value }))}
+                       placeholder="Why more than approved? e.g. full 10 kg bag, cannot split"
+                       className="flex-1 min-w-0 px-1.5 py-0.5 border border-amber-400 rounded text-[10px] bg-white" />
+              </div>
             )}
             {deferOpen && (
               <div className="flex items-center gap-1 bg-blue-50 border border-blue-200 rounded px-1.5 py-1">

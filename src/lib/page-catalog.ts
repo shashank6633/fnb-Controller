@@ -112,6 +112,9 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/settings/categories', label: 'Categories' },
       { path: '/inventory/liquor-store', label: 'Liquor Store' },
       { path: '/inventory/stock-overview', label: 'Stock Overview' },
+      // Read-only board: counted stock by storage area x department. Counts are
+      // still recorded on /closing-stock — this only makes them comparable.
+      { path: '/inventory/closing-overview', label: 'Closing Overview', mgmtOnly: true },
       { path: '/inventory/transfers', label: 'Store Transfers' },
       { path: '/inventory/department-stock', label: 'Department Stock' },
       { path: '/inventory/reconciliation', label: 'Sales vs Consumption' },
