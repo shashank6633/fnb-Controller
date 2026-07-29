@@ -21,6 +21,7 @@
  */
 import type Database from 'better-sqlite3';
 import { generateId } from '@/lib/db';
+import { mergeDuplicateLines } from '@/lib/po-helpers';
 
 type DB = Database.Database;
 
@@ -145,7 +146,15 @@ export function createDraftPosFromReorder(
         INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
-      for (const it of groupItems) {
+      // ONE MATERIAL = ONE PO LINE. This list is MACHINE-assembled (the reorder
+      // suggestions the client ticks), so the same material arriving twice is an
+      // artefact of the suggestion rows, not a buyer's decision — sum it onto one
+      // line rather than 400 the whole basket. The human composer paths do the
+      // opposite (POST/PUT/edit-approved return duplicateLineError) because there
+      // a person authored the specific numbers and a silent merge would order
+      // something they never approved. Merged PER GROUP, after grouping, so the
+      // one-PO-per-vendor semantics above are unchanged.
+      for (const it of mergeDuplicateLines(groupItems)) {
         const qty = Number(it.qty) || 0;
         const px = Number(it.unit_price) || 0;
         insItem.run(generateId(), id, it.material_id, qty, px,

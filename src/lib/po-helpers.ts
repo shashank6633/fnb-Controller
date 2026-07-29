@@ -150,3 +150,113 @@ export function zeroRateBlocker(db: ReturnType<typeof getDb>, poId: string): str
   }
   return null;
 }
+
+/** A PO line, as far as the two duplicate helpers below care. Every field is
+ *  optional and `unknown` because both run BEFORE the payload has been shape-
+ *  validated, and the four call sites hand over four different row shapes: the
+ *  composer posts {material_id, quantity, unit_price, vendor, …} with no material
+ *  name at all, Smart Reorder's rows name the quantity `qty`
+ *  (ReorderPoItemInput), and the requisition auto-PO carries material_name +
+ *  notes. */
+type PoLineLike = {
+  material_id?: unknown;
+  material_name?: unknown;
+  name?: unknown;
+  quantity?: unknown;
+  qty?: unknown;
+  unit_price?: unknown;
+  total_price?: unknown;
+  notes?: unknown;
+};
+
+/** The dedupe key is material_id ALONE — deliberately NOT (material, vendor).
+ *  A PO is one document; the same item from two vendors is two POs, not two
+ *  lines on one. Trimmed to match lineSanityError, which validates and stores
+ *  the trimmed id. */
+function lineKey(it: PoLineLike | null | undefined): string {
+  return String(it?.material_id ?? '').trim();
+}
+
+/** Smart Reorder's row shape names the quantity `qty`; every other caller says
+ *  `quantity`. Non-numeric reads as 0 — every caller of mergeDuplicateLines has
+ *  already rejected a non-finite quantity by the time it merges. */
+function lineQty(it: PoLineLike | null | undefined): number {
+  const n = Number(it?.quantity ?? it?.qty);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function lineLabel(it: PoLineLike | null | undefined): string {
+  return String(it?.material_name ?? it?.name ?? '').trim();
+}
+
+/** ONE MATERIAL = ONE LINE PER PO. Returns null when no material_id repeats,
+ *  else the ready-to-return 400 message naming both 1-based line numbers.
+ *  WHY THIS IS AN ERROR, NOT A SILENT SUM: two lines for one item double-order
+ *  it, and [id]/receive books each line separately — two `purchases` rows, two
+ *  stock credits and two passes through updateMaterialPrice's weighted average
+ *  for a single delivered item.
+ *  BLANK LINES ARE LEGAL AND SKIPPED: the composer opens with an empty row, so a
+ *  missing/blank material_id is left to lineSanityError ("pick an item") — this
+ *  helper must never turn two untouched draft rows into a duplicate error.
+ *  PURE, NO DB — so it works on the raw payload before any lookup. The composer
+ *  does not post a material name, so the label falls back to the id
+ *  (MAT-01055): the same identifier lineSanityError already names in its own
+ *  messages, and the one the user sees on the line. */
+export function duplicateLineError(
+  items: readonly (PoLineLike | null | undefined)[] | null | undefined,
+): string | null {
+  const list = Array.isArray(items) ? items : [];
+  const firstLine = new Map<string, number>();
+  for (let i = 0; i < list.length; i++) {
+    const key = lineKey(list[i]);
+    if (!key) continue;
+    const seen = firstLine.get(key);
+    if (seen === undefined) { firstLine.set(key, i + 1); continue; }
+    const label = lineLabel(list[i]) || lineLabel(list[seen - 1]) || key;
+    return `Line ${i + 1} repeats an item already on line ${seen} (${label}) — put the full quantity on one line.`;
+  }
+  return null;
+}
+
+/** The GENERATED-path counterpart to duplicateLineError: folds a repeat line
+ *  into its first occurrence instead of refusing the whole list. Only for lists
+ *  a MACHINE assembled (Smart Reorder, the requisition auto-PO), where a repeat
+ *  is an artefact of how the source rows were raised. A human authored specific
+ *  numbers, so those paths must 400 — merging would order something nobody
+ *  approved.
+ *  SEMANTICS: quantity is summed onto the FIRST occurrence, which KEEPS its own
+ *  unit_price / vendor / vendor_id (the merged line has to be bought at one
+ *  rate from one vendor); notes are joined with ' | ', empties skipped;
+ *  total_price is re-rounded to paise from qty × rate ONLY if the row shape
+ *  carries one (the composer/auto-PO shapes compute it at insert instead).
+ *  Input order is preserved, the caller's rows are never mutated, and a list
+ *  with nothing repeated comes back as the SAME array — the clean path is
+ *  bit-for-bit untouched. PURE, NO DB. */
+export function mergeDuplicateLines<T extends PoLineLike>(items: T[]): T[] {
+  if (!Array.isArray(items) || items.length < 2) return items;
+  if (!duplicateLineError(items)) return items;
+
+  const out: T[] = [];
+  const firstIdx = new Map<string, number>();
+  for (const it of items) {
+    const key = lineKey(it);
+    const idx = key ? firstIdx.get(key) : undefined;
+    if (idx === undefined) {
+      if (key) firstIdx.set(key, out.length);
+      out.push({ ...it });                       // clone: the caller keeps its rows
+      continue;
+    }
+    const first = out[idx] as unknown as Record<string, unknown>;
+    // Write the sum back under the key the FIRST row already uses, so a
+    // `qty`-shaped list stays `qty`-shaped for its caller's insert loop.
+    const qtyKey = 'quantity' in first ? 'quantity' : ('qty' in first ? 'qty' : 'quantity');
+    first[qtyKey] = lineQty(first) + lineQty(it);
+    const notes = [first.notes, it.notes].map(n => String(n ?? '').trim()).filter(Boolean);
+    if (notes.length) first.notes = notes.join(' | ');
+    if ('total_price' in first) {
+      const px = Number(first.unit_price);
+      first.total_price = Math.round(lineQty(first) * (Number.isFinite(px) ? px : 0) * 100) / 100;
+    }
+  }
+  return out;
+}

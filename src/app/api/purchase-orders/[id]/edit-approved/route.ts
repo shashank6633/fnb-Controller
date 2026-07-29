@@ -1,6 +1,7 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
+import { duplicateLineError } from '@/lib/po-helpers';
 
 /**
  * Phase 1 §3 — Edit an APPROVED PO. Drops status back to `pending_reapproval`
@@ -86,6 +87,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         return Response.json({ error: 'Line rate must be a number (₹ per purchase unit) and cannot be negative' }, { status: 400 });
       }
     }
+    // …and the same one-material-one-line rule POST/PUT enforce: this endpoint
+    // replaces the WHOLE item set, so a repeat here would reach receive as two
+    // purchases rows + two stock credits for one item.
+    const dupLine = duplicateLineError(items);
+    if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
 
     // Snapshot the lines BEFORE the DELETE below — plus the approval this edit
     // erases (approved_by/approved_at are cleared by the atomic claim below).

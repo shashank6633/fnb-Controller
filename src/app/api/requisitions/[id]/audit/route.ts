@@ -29,21 +29,33 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       LIMIT 200
     `).all(id, id) as any[];
 
-    // Decorate item events with material name for readability
+    // Decorate item events with material name + UNIT META. The logged before/after
+    // quantities are in the LINE's own unit (option B), so a reader can only make
+    // sense of them alongside the line unit and the material's pack meta — the
+    // drawer renders them in purchase units like every other screen.
     const itemRows = db.prepare(`
-      SELECT ri.id, rm.name AS material_name
+      SELECT ri.id, ri.unit AS line_unit, rm.name AS material_name, rm.unit AS material_unit,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
+             COALESCE(rm.pack_size, 1) AS material_pack_size
       FROM requisition_items ri
       JOIN raw_materials rm ON rm.id = ri.material_id
       WHERE ri.req_id = ?
     `).all(id) as any[];
-    const matByItem = new Map(itemRows.map((r: any) => [r.id, r.material_name]));
+    const matByItem = new Map(itemRows.map((r: any) => [r.id, r]));
 
-    const decorated = events.map(e => ({
+    const decorated = events.map(e => {
+      const m: any = e.entity_type === 'requisition_item' ? matByItem.get(e.entity_id) : null;
+      return {
       ...e,
-      material_name: e.entity_type === 'requisition_item' ? matByItem.get(e.entity_id) || null : null,
+      material_name: m?.material_name || null,
+      unit: m?.line_unit ?? null,
+      material_unit: m?.material_unit ?? null,
+      material_purchase_unit: m?.material_purchase_unit ?? null,
+      material_pack_size: m?.material_pack_size ?? null,
       before: safeParse(e.before_json),
       after:  safeParse(e.after_json),
-    }));
+    };
+    });
 
     return Response.json({ events: decorated });
   } catch (e: any) {

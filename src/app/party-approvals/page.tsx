@@ -21,9 +21,12 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
+import { packFactor } from '@/lib/pack-units';
 
 import { fmtIST } from '@/lib/format-date';
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
+// Same adaptive 3-dp quantity format as /store-requisitions (fmtNum there).
+const fmtNum = (v: number) => (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
 
 /** Recipe-units per 1 requested-unit — same semantics as reqPackFactor on the
  *  requisitions screen and the SQL CASE in party-events/pnl: × pack_size only
@@ -38,6 +41,43 @@ function reqPackFactor(it: any): number {
   const pu = String(it.material_purchase_unit || '').toLowerCase().trim();
   const ru = String(it.material_unit || '').toLowerCase().trim();
   return (u !== '' && pu !== '' && u === pu && u !== ru && pack > 1) ? pack : 1;
+}
+
+/**
+ * Resolve one line's UNIT BASIS and expose the purchase-unit view — mirrors
+ * lineUnits() on /store-requisitions exactly, so the two screens can never
+ * disagree about what "3 kg" means.
+ *
+ * Requisition quantities are stored in the LINE's own `unit` (option B) and the
+ * two composers disagree: the internal picker stamps the PURCHASE unit, the
+ * party composer stamps the RECIPE unit (and converts qty ×pack). Blank/legacy
+ * reads as recipe. Owner rule: this screen READS and is ENTERED in purchase
+ * units; `fromPU` converts back once at the POST boundary, because the item PUT
+ * writes chef_approved_qty in the line's own unit verbatim.
+ *
+ * Identity that keeps money safe: toRecipe(q) === q × reqPackFactor(it), so the
+ * existing ₹ math (qty × packF × ₹/recipe-unit) is untouched by this layer.
+ */
+function lineUnits(it: any) {
+  const recipeUnit = it.material_unit || it.unit || '';
+  const pf = packFactor({
+    unit: recipeUnit,
+    purchase_unit: it.material_purchase_unit,
+    pack_size: it.material_pack_size,
+  });
+  const pu = it.material_purchase_unit || recipeUnit;
+  const lu = String(it.unit || '').toLowerCase().trim();
+  // Already stored in the purchase unit → no conversion in either direction.
+  const isPU = pf > 1 && lu !== '' && lu === String(pu).toLowerCase().trim();
+  return {
+    pf, pu, recipeUnit, isPU,
+    /** stored line qty → purchase-unit display figure (3 dp, display only) */
+    toPU: (q: any) => isPU ? (Number(q) || 0) : Math.round(((Number(q) || 0) / pf) * 1000) / 1000,
+    /** purchase-unit entry → the line's stored unit (what the API writes verbatim) */
+    fromPU: (q: any) => isPU ? (Number(q) || 0) : Math.round((Number(q) || 0) * pf * 1e6) / 1e6,
+    /** stored line qty → recipe units (the small "= N g" hint) */
+    toRecipe: (q: any) => isPU ? (Number(q) || 0) * pf : (Number(q) || 0),
+  };
 }
 
 /** Heuristic sanity check for a requisition line — returns a human-readable
@@ -58,6 +98,12 @@ function plausibilityFlag(it: any, guests: number | null | undefined, effQty: nu
   // (average_price is ₹/recipe-unit).
   const packF = reqPackFactor(it);
   const cost = qty * packF * price;
+  // DETECTION stays on the recipe basis (it is a unit-mistake detector and the
+  // thresholds are recipe-unit thresholds). Only the WARNING TEXT is restated in
+  // the purchase basis the screen now shows, so the chef can match the message
+  // to the row. `shown` is display-only — never fed back into the math.
+  const U = lineUnits(it);
+  const shown = `${fmtNum(U.toPU(qty))} ${U.pu || unit}`.trim();
 
   // A) Less than ONE purchase pack of a pack-based material (oil sold in 1L
   //    bottles, rice in 30kg bags): "12 ml" < 1,000 ml/BTL almost certainly
@@ -65,14 +111,16 @@ function plausibilityFlag(it: any, guests: number | null | undefined, effQty: nu
   //    Skipped for purchase-unit lines (packF > 1): "2 BTL" is exactly what the
   //    chef meant — flagging it as "2 ml" would be a false alarm.
   if (packF === 1 && pack >= 100 && qty < pack) {
-    return `Only ${qty.toLocaleString('en-IN')} ${unit} — less than one ${pu || 'pack'} (${pack.toLocaleString('en-IN')} ${unit}). Did the chef mean ${qty.toLocaleString('en-IN')} ${pu || 'packs'}?`;
+    const alsoRecipe = U.pf > 1 ? ` (= ${qty.toLocaleString('en-IN')} ${unit})` : '';
+    return `Only ${shown}${alsoRecipe} — less than one ${pu || 'pack'} (${pack.toLocaleString('en-IN')} ${unit}). Did the chef mean ${qty.toLocaleString('en-IN')} ${pu || 'packs'}?`;
   }
   // B) Absurdly small for the crowd AND nearly free: under 0.5 g/ml per guest
   //    with line cost < ₹50. The cost floor keeps genuinely tiny-but-expensive
   //    items (saffron) from being flagged. Compare in RECIPE units (qty × packF).
   const recipeQty = qty * packF;
   if (guests && guests > 0 && (unit === 'g' || unit === 'ml') && recipeQty / guests < 0.5 && cost < 50) {
-    return `${recipeQty.toLocaleString('en-IN')} ${unit} ≈ ${(recipeQty / guests).toFixed(2)} ${unit}/guest for ${guests} guests (≈${fmt(cost)}) — check the unit.`;
+    const alsoRecipe = U.pf > 1 ? ` (= ${recipeQty.toLocaleString('en-IN')} ${unit})` : '';
+    return `${shown}${alsoRecipe} ≈ ${(recipeQty / guests).toFixed(2)} ${unit}/guest for ${guests} guests (≈${fmt(cost)}) — check the unit.`;
   }
   return null;
 }
@@ -651,16 +699,33 @@ export default function PartyApprovalsPage() {
                                           // (ri.unit, possibly the purchase unit) while average_price
                                           // is ₹/recipe-unit. See reqPackFactor above.
                                           const packF = reqPackFactor(it);
+                                          // Owner rule: every quantity on this screen READS and is ENTERED in
+                                          // PURCHASE units. Storage basis is untouched — reqQty / serverQty /
+                                          // effQty below all stay in the line's own stored unit.
+                                          const U = lineUnits(it);
+                                          const unitTag = U.pu ? <span className="text-[9px] text-[#8B7355] ml-0.5">{U.pu}</span> : null;
+                                          const hint = (q: number) => U.pf > 1
+                                            ? <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
+                                            : null;
                                           // Effective qty: chef's approved value if set, else what was requested
                                           const reqQty = Number(it.quantity_requested) || 0;
                                           const serverQty = it.chef_approved_qty != null ? Number(it.chef_approved_qty) : reqQty;
+                                          const reqQtyPU = U.toPU(reqQty);
+                                          const serverQtyPU = U.toPU(serverQty);
                                           // Live qty for display + cost: prefer the local draft (chef is
                                           // currently editing this line — spin buttons / typing both update it),
                                           // otherwise fall back to what's on the server. lineCost is computed
                                           // from this so the cost column tracks the input value in real time.
+                                          // The draft is a PURCHASE-unit string → back to the stored unit here
+                                          // so cost / plausibility keep running on the stored basis.
                                           const draftRaw = qtyDraft[it.id];
+                                          // Compare in the PURCHASE basis the box shows — the SAME equality the
+                                          // blur guard uses. Re-typing the displayed figure is not an edit, and
+                                          // converting it back (fromPU(toPU(q)) !== q) would flip the row to
+                                          // "adjusted", move the line cost, and re-run the plausibility check
+                                          // for a change the save path then correctly discards.
                                           const liveQty = draftRaw != null && draftRaw !== ''
-                                            ? (Number(draftRaw) || 0)
+                                            ? (Number(draftRaw) === serverQtyPU ? serverQty : U.fromPU(draftRaw))
                                             : serverQty;
                                           const effQty = liveQty;
                                           const rejected = !!it.is_rejected;
@@ -684,8 +749,10 @@ export default function PartyApprovalsPage() {
                                                 )}
                                               </td>
                                               <td className="py-0.5 text-right font-mono text-[#8B7355]">
-                                                {/* Label with the unit the line was REQUESTED in (ri.unit), falling back to the recipe unit — matches reqUnit() on /requisitions */}
-                                                {reqQty} <span className="text-[9px]">{String(it.unit || '').trim() || it.material_unit || ''}</span>
+                                                {/* PURCHASE basis — same lineUnits() resolver as /store-requisitions,
+                                                    so a party line stored as 2,550 g reads "2.55 kg" on both screens. */}
+                                                {fmtNum(reqQtyPU)}{unitTag}
+                                                {hint(reqQty)}
                                               </td>
                                               <td className="py-0.5 text-right">
                                                 {editable && !rejected ? (
@@ -694,25 +761,39 @@ export default function PartyApprovalsPage() {
                                                          // CONTROLLED input — value tracks the draft map.
                                                          // Up/down spin buttons fire onChange too, so cost
                                                          // updates immediately instead of waiting for blur.
-                                                         value={draftRaw != null ? draftRaw : String(serverQty)}
+                                                         // Entered in PURCHASE units — see onBlur for the single
+                                                         // conversion back to the line's stored unit.
+                                                         value={draftRaw != null ? draftRaw : String(serverQtyPU)}
                                                          disabled={isSaving}
                                                          onChange={e => setQtyDraft(prev => ({ ...prev, [it.id]: e.target.value }))}
                                                          onBlur={e => {
-                                                           const v = e.target.value === '' ? null : Number(e.target.value);
+                                                           const vPU = e.target.value === '' ? null : Number(e.target.value);
                                                            // Clear the draft regardless — server detail re-fetch
                                                            // will reflect the canonical value.
                                                            setQtyDraft(prev => { const n = { ...prev }; delete n[it.id]; return n; });
-                                                           if (v !== serverQty) updateItem(r.id, it.id, { chef_approved_qty: v });
+                                                           // Compare in the PURCHASE basis the box is showing: an
+                                                           // untouched value must never be re-posted through the
+                                                           // 3-dp display figure (fromPU(toPU(q)) ≠ q in general).
+                                                           // Blank still means "reset to requested" → null.
+                                                           if (vPU !== serverQtyPU) {
+                                                             updateItem(r.id, it.id, { chef_approved_qty: vPU == null ? null : U.fromPU(vPU) });
+                                                           }
                                                          }}
                                                          onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
                                                          className={`w-20 px-1 py-0.5 border rounded text-right text-[11px] font-mono ${effQty !== reqQty ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4] bg-white'}`}
-                                                         title={effQty !== reqQty ? `Chef adjusted from ${reqQty} → ${effQty}` : 'Click / spin / type to edit; tab/enter/blur to save'} />
-                                                    <span className="ml-1 text-[9px] text-[#8B7355]">{String(it.unit || '').trim() || it.material_unit || ''}</span>
+                                                         title={effQty !== reqQty
+                                                           ? `Chef adjusted from ${fmtNum(reqQtyPU)} → ${fmtNum(U.toPU(effQty))} ${U.pu}`.trim()
+                                                           : `Enter in ${U.pu || 'units'} — click / spin / type to edit; tab/enter/blur to save`} />
+                                                    {unitTag}
+                                                    {hint(effQty)}
                                                   </>
                                                 ) : (
-                                                  <span className={`font-mono ${effQty !== reqQty ? 'text-amber-700 font-semibold' : 'text-[#2D1B0E]'}`}>
-                                                    {effQty} <span className="text-[9px] text-[#8B7355]">{String(it.unit || '').trim() || it.material_unit || ''}</span>
-                                                  </span>
+                                                  <>
+                                                    <span className={`font-mono ${effQty !== reqQty ? 'text-amber-700 font-semibold' : 'text-[#2D1B0E]'}`}>
+                                                      {fmtNum(U.toPU(effQty))}{unitTag}
+                                                    </span>
+                                                    {hint(effQty)}
+                                                  </>
                                                 )}
                                               </td>
                                               <td className="py-0.5 text-[10px] pl-3">
@@ -729,8 +810,14 @@ export default function PartyApprovalsPage() {
                                                   <span className="text-[#6B5744] italic">{it.chef_note || it.notes || ''}</span>
                                                 )}
                                               </td>
-                                              {/* ₹ per REQUESTED unit (price × pack factor) so qty × ₹/unit = line cost */}
-                                              <td className="py-0.5 text-right font-mono text-[#6B5744]">{fmt(price * packF)}</td>
+                                              {/* ₹ per PURCHASE unit (₹/recipe-unit × pf) — the basis the qty
+                                                  columns are shown in, so displayed qty × this ≈ line cost.
+                                                  DISPLAY ONLY: lineCost below stays on the recipe basis
+                                                  (recipeQty × ₹/recipe-unit); money never routes through here. */}
+                                              <td className="py-0.5 text-right font-mono text-[#6B5744]">
+                                                {fmt(price * U.pf)}
+                                                {U.pu && <span className="text-[9px] text-[#8B7355]">/{U.pu}</span>}
+                                              </td>
                                               <td className="py-0.5 text-right font-mono font-medium">{rejected ? '—' : fmt(lineCost)}</td>
                                               {editable && (
                                                 <td className="py-0.5 text-center">
@@ -1003,7 +1090,11 @@ function AuditTimelineDrawer({ reqId, reqNum, onClose }: { reqId: string; reqNum
       // Edit
       const parts: string[] = [];
       if (e.before && e.after && e.before.chef_approved_qty !== e.after.chef_approved_qty) {
-        parts.push(`qty ${e.before.chef_approved_qty ?? 'req\'d'} → ${e.after.chef_approved_qty ?? 'req\'d'}`);
+        // Logged values are in the LINE's own unit; the audit API now sends the
+        // unit meta so the drawer can speak the same purchase basis as the table.
+        const U = lineUnits(e);
+        const q = (v: any) => v == null ? "req'd" : `${fmtNum(U.toPU(v))} ${U.pu}`.trim();
+        parts.push(`qty ${q(e.before.chef_approved_qty)} → ${q(e.after.chef_approved_qty)}`);
       }
       if (e.before && e.after && e.before.chef_note !== e.after.chef_note) {
         parts.push(`note: "${e.after.chef_note}"`);

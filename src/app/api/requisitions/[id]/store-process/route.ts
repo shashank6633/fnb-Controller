@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth';
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
+import { mergeDuplicateLines } from '@/lib/po-helpers';
 
 /**
  * Store Manager processes a chef-approved requisition.
@@ -102,7 +103,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
 
     // Build the shortfall list — these are PO line candidates
-    const poLines: any[] = [];
+    let poLines: any[] = [];
     const issueLines: { item: any; qty: number }[] = [];
 
     for (const it of items) {
@@ -175,6 +176,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         });
       }
     }
+
+    // ONE MATERIAL = ONE PO LINE. This list is MACHINE-assembled from the
+    // requisition's rows, so one material reaching it twice (the same item
+    // requested on two lines) is an artefact of how the req was raised, not a
+    // buyer's decision — sum it onto one line instead of refusing to process the
+    // requisition. The human PO composer does the opposite (POST/PUT/
+    // edit-approved return duplicateLineError) because a person authored those
+    // numbers. Merged BEFORE the header-vendor derivation below so the header
+    // describes the lines actually written; a shortfall list with no repeat comes
+    // back as the same array, unchanged.
+    poLines = mergeDuplicateLines(poLines);
 
     const outletId = await getCurrentOutletId();
     const result: any = {};

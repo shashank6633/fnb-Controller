@@ -7,6 +7,7 @@ import {
   ShieldCheck, PackageCheck, RefreshCw, AlertTriangle, ChevronDown, Printer, Lock,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { allocateBillCharges, resolveCharge, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT } from '@/lib/po-charges';
 
 // Always 2 dp: at 0 dp the paise were dropped per row, so the item column
 // visibly failed to add up to the footer/list total (₹235.50 + ₹118.50 showed
@@ -435,6 +436,49 @@ export default function PurchaseOrdersPage() {
 /* ============================================================ */
 /* Receive Modal — adjust per-line qty/price for partial deliveries */
 /* ============================================================ */
+/**
+ * One bill-level charge row: By % / By Amount + the resolved ₹ figure.
+ * Same shape and behaviour as the Enter Full Bill modal on /purchases, so the
+ * two places a bill is entered look identical; only the effect on cost differs,
+ * and `hint` is where that is stated.
+ */
+function ChargeRow({ label, hint, mode, value, onMode, onValue, placeholder, resolved, tone, negative }: {
+  label: string; hint: string;
+  mode: 'pct' | 'amt'; value: string;
+  onMode: (m: 'pct' | 'amt') => void;
+  onValue: (v: string) => void;
+  placeholder: string; resolved: number; tone: string; negative?: boolean;
+}) {
+  const name = label.replace(/\s+/g, '-').toLowerCase();
+  return (
+    <div className="flex items-center gap-3 flex-wrap">
+      <span className="text-xs font-medium text-[#6B5744] min-w-[120px]">
+        {label}
+        <span className="block text-[10px] font-normal text-[#8B7355]">{hint}</span>
+      </span>
+      <div className="flex items-center gap-2">
+        {(['pct', 'amt'] as const).map(m => (
+          <label key={m} className="flex items-center gap-1 cursor-pointer">
+            {/* name= groups each pair, so the two rows keep separate selections */}
+            <input type="radio" name={name} checked={mode === m} onChange={() => onMode(m)} className="accent-[#af4408]" />
+            <span className="text-xs text-[#6B5744]">{m === 'pct' ? 'By %' : 'By Amount'}</span>
+          </label>
+        ))}
+      </div>
+      <div className="flex items-center gap-1">
+        {mode === 'amt' && <span className="text-xs text-[#8B7355]">₹</span>}
+        <input type="number" step="0.01" min="0" value={value}
+               onChange={e => onValue(e.target.value)} placeholder={placeholder}
+               className="w-24 px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-right" />
+        <span className="text-xs text-[#8B7355]">{mode === 'pct' ? '%' : ''}</span>
+      </div>
+      <span className={`text-xs font-semibold ml-auto ${tone}`}>
+        {negative && resolved > 0 ? '− ' : ''}{fmt(resolved)}
+      </span>
+    </div>
+  );
+}
+
 function ReceiveModal({ poId, role, onClose, onReceived }: {
   poId: string; role: 'admin' | 'manager'; onClose: () => void; onReceived: () => void;
 }) {
@@ -447,6 +491,17 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   // Per-line rate unlock + per-line "why does this differ from the PO" reason.
   const [rateUnlocked, setRateUnlocked] = useState<Record<string, boolean>>({});
   const [reasons, setReasons] = useState<Record<string, string>>({});
+  /* BILL CHARGES — entered once for the whole delivery, allocated per line by
+     the server. Discount REDUCES cost (it is netted into the rate written to
+     purchases.unit_price, which is what average_price averages); Delivery is
+     RECORDED ONLY. The %/₹ mode is transient UI state and is never persisted —
+     the client resolves it to rupees before posting, same as /purchases. */
+  const [deliveryMode, setDeliveryMode] = useState<'pct' | 'amt'>('amt');
+  const [deliveryValue, setDeliveryValue] = useState('');
+  const [discountMode, setDiscountMode] = useState<'pct' | 'amt'>('amt');
+  const [discountValue, setDiscountValue] = useState('');
+  const [chargesNote, setChargesNote] = useState('');
+  const [billNo, setBillNo] = useState('');
 
   /* WHO MAY UNLOCK A LINE'S RATE.
    * The rate typed here is written to purchases.unit_price and then through
@@ -524,12 +579,49 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   }, 0);
   const orderedTotal = items.reduce((s, it) => s + it.quantity * it.unit_price, 0);
 
+  /* The bill preview runs the SAME allocator the route runs, on the SAME
+     effective numbers the deviations memo uses — so the figure the receiver
+     confirms is the figure that gets booked. */
+  const billCalc = useMemo(() => {
+    const chargeLines = deviations.map(d => ({
+      id: d.it.id, name: d.it.material_name,
+      qty: Number(d.ov.quantity) || 0, rate: Number(d.ov.unit_price) || 0,
+    }));
+    const subtotal = chargeLines.reduce((s, l) => s + (l.qty > 0 && l.rate > 0 ? l.qty * l.rate : 0), 0);
+    const discount = resolveCharge(discountMode, discountValue, subtotal);
+    const delivery = resolveCharge(deliveryMode, deliveryValue, subtotal);
+    return { alloc: allocateBillCharges(chargeLines, { discount, delivery }), discount, delivery };
+  }, [deviations, discountMode, discountValue, deliveryMode, deliveryValue]);
+
+  const alloc = billCalc.alloc;
+  const hasCharges = alloc.discount_applied > 0 || alloc.delivery > 0;
+  // A discount changes what stock cost — it needs the same "say why" discipline
+  // as an off-PO line, and the server enforces the identical floor.
+  const needsChargeNote = alloc.discount_applied > 0 && chargesNote.trim().length < MIN_REASON;
+  // > cap + half a paisa — the same headroom the route uses, so an exactly-25%
+  // discount is not refused here while the server would accept it.
+  const overDiscountCap = !canChangeRate && alloc.subtotal > 0
+    && alloc.discount_applied - (alloc.subtotal * NON_ADMIN_DISCOUNT_CAP_PCT) / 100 > 0.005;
+  const zeroCost = alloc.zero_cost_lines;
+  const chargeBlockers: string[] = [
+    ...(needsChargeNote ? ['Say why the vendor gave the discount (min 3 characters).'] : []),
+    ...(overDiscountCap ? [`A discount above ${NON_ADMIN_DISCOUNT_CAP_PCT}% of the bill needs an admin to receive.`] : []),
+    ...(zeroCost.length > 0 ? [`The discount is bigger than these lines are worth: ${zeroCost.map(l => l.name).join(', ')}.`] : []),
+    ...(alloc.subtotal <= 0 && hasCharges ? ['Nothing is being accepted, so there is nothing to apply the bill charges to.'] : []),
+  ];
+
   const submit = async () => {
     // Belt-and-braces with the disabled button: the reason gate must not be
     // skippable by a stale click. (The receive route re-checks it anyway — that
     // is the real gate; this is only so the receiver gets a readable message.)
     if (missingReason.length > 0) {
       alert(missingList('Add a reason for these lines before receiving:\n'));
+      return;
+    }
+    // Same belt-and-braces as the reason gate — the route re-checks every one of
+    // these; this is only so the receiver gets a readable message.
+    if (chargeBlockers.length > 0) {
+      alert('Fix the bill charges before receiving:\n' + chargeBlockers.map(b => `• ${b}`).join('\n'));
       return;
     }
     setSaving(true);
@@ -545,7 +637,25 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
         deviation_reason: (reasons[d.it.id] || '').trim(),
       }));
       const r = await api(`/api/purchase-orders/${poId}/receive`, {
-        method: 'POST', body: { received_at: receivedAt, item_overrides },
+        method: 'POST',
+        body: {
+          received_at: receivedAt, item_overrides,
+          // Rupees, resolved from the %/₹ toggle here. The server re-allocates
+          // from its own effective line values — it never trusts these shares.
+          bill_charges: hasCharges || billNo.trim() ? {
+            // Mode + raw value travel WITH the resolved rupees: this preview
+            // sums every PO line, but the route allocates only over the lines it
+            // actually receives (store-mapped ones are dropped), so a "5%" here
+            // could land as 10% there. The route re-resolves a percentage
+            // against its own base; the ₹ figure covers By-Amount + old clients.
+            discount_mode: discountMode, discount_value: Number(discountValue) || 0,
+            delivery_mode: deliveryMode, delivery_value: Number(deliveryValue) || 0,
+            discount_amount: alloc.discount_applied,
+            delivery_amount: alloc.delivery,
+            charges_note: chargesNote.trim(),
+            bill_no: billNo.trim(),
+          } : undefined,
+        },
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
@@ -586,7 +696,15 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       if (j.excess_lines > 0) {
         notes.push(
           `${j.excess_lines} line(s) were accepted OVER the ordered qty (${fmt(j.excess_value || 0)} excess) — ` +
-          'visible on /audit as "po.received_excess".'
+          'recorded on /audit with the rest of this receive.'
+        );
+      }
+      if (j.charges_applied && (j.charges_applied.discount_applied > 0 || j.charges_applied.delivery > 0)) {
+        const c = j.charges_applied;
+        notes.push(
+          `Bill charges booked: discount ${fmt(c.discount_applied)} (reduced the cost of stock)` +
+          `${c.discount_clamped ? ' — capped at the bill value' : ''}` +
+          ` · delivery ${fmt(c.delivery)} (recorded against the bill, not added to item cost).`
         );
       }
       if (notes.length > 0) alert('Received.\n\n' + notes.join('\n\n'));
@@ -595,9 +713,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
-      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-8 shadow-xl">
-        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-3 overflow-y-auto">
+      {/* Capped shell (header + footer pinned, body scrolls): the charges card
+          made this modal tall enough to push Confirm below the fold on phones —
+          the same bug the create-PO modal already fixed once. */}
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-4 shadow-xl flex flex-col overflow-hidden"
+           style={{ maxHeight: 'calc(100vh - 1.5rem)' }}>
+        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
           <div>
             <h2 className="font-bold text-[#2D1B0E]">Receive PO {po?.po_number}</h2>
             <p className="text-xs text-[#8B7355] mt-0.5">
@@ -608,7 +730,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           </div>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>
-        <div className="p-5 space-y-3">
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-3">
           <label className="text-xs text-[#6B5744] flex flex-col gap-1 max-w-xs">
             Received on
             <input type="date" value={receivedAt} onChange={e => setReceivedAt(e.target.value)}
@@ -781,6 +903,70 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
             </div>
           )}
 
+          {/* BILL CHARGES — what the vendor's bill carries beyond the goods.
+              Discount REDUCES the cost of the stock (it is netted into the rate
+              booked to purchases.unit_price, which is what average_price — and
+              therefore every recipe cost — averages). Delivery is RECORDED only:
+              it is stored against the bill and never enters item cost. */}
+          {!loading && (
+            <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2.5 space-y-2">
+              <div className="text-xs font-semibold text-[#2D1B0E]">Bill charges (optional)</div>
+              <ChargeRow label="Delivery Charges" hint="recorded on the bill — does not change item cost"
+                         mode={deliveryMode} value={deliveryValue}
+                         onMode={setDeliveryMode} onValue={setDeliveryValue}
+                         placeholder={deliveryMode === 'pct' ? 'e.g. 2' : 'e.g. 500'}
+                         resolved={alloc.delivery} tone="text-[#6B5744]" />
+              <ChargeRow label="Discount" hint="reduces what the goods cost — updates stock value + recipe costs"
+                         mode={discountMode} value={discountValue}
+                         onMode={setDiscountMode} onValue={setDiscountValue}
+                         placeholder={discountMode === 'pct' ? 'e.g. 5' : 'e.g. 250'}
+                         resolved={alloc.discount_applied} tone="text-emerald-700" negative />
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input value={billNo} onChange={e => setBillNo(e.target.value)}
+                       placeholder="Vendor bill no. (optional)"
+                       className="sm:w-48 px-2 py-1 border border-[#E8D5C4] rounded text-[11px] bg-white" />
+                {alloc.discount_applied > 0 && (
+                  <input value={chargesNote} onChange={e => setChargesNote(e.target.value)}
+                         placeholder="Why the discount? e.g. 5% scheme on bill #4471"
+                         className={`flex-1 min-w-0 px-2 py-1 border rounded text-[11px] bg-white ${needsChargeNote ? 'border-amber-400' : 'border-[#E8D5C4]'}`} />
+                )}
+              </div>
+              {hasCharges && alloc.subtotal > 0 && (
+                <div className="border-t border-[#E8D5C4] pt-1.5 text-[11px] font-mono space-y-0.5">
+                  <div className="flex justify-between text-[#6B5744]"><span>Accepted subtotal</span><span>{fmt(alloc.subtotal)}</span></div>
+                  {alloc.discount_applied > 0 && (
+                    <div className="flex justify-between text-emerald-700"><span>− Discount</span><span>− {fmt(alloc.discount_applied)}</span></div>
+                  )}
+                  <div className="flex justify-between font-semibold text-[#2D1B0E]">
+                    <span>= Cost basis booked to stock</span><span>{fmt(alloc.net_subtotal)}</span>
+                  </div>
+                  {alloc.delivery > 0 && (
+                    <div className="flex justify-between text-[#8B7355]"><span>+ Delivery (recorded only)</span><span>{fmt(alloc.delivery)}</span></div>
+                  )}
+                  <div className="flex justify-between text-[#6B5744] border-t border-[#E8D5C4]/60 pt-0.5">
+                    <span>Bill total</span><span>{fmt(alloc.net_subtotal + alloc.delivery)}</span>
+                  </div>
+                </div>
+              )}
+              {alloc.discount_clamped && (
+                <div className="text-[10px] text-amber-800">
+                  The discount is larger than the bill — capped at {fmt(alloc.subtotal)}.
+                </div>
+              )}
+              {chargeBlockers.length > 0 && (
+                <ul className="text-[10px] text-red-700 space-y-0.5">
+                  {chargeBlockers.map((b, i) => <li key={i}>• {b}</li>)}
+                </ul>
+              )}
+              {zeroCost.length > 0 && (
+                <div className="text-[10px] text-red-700">
+                  A line booked at ₹0 would wipe that material&apos;s average price and every recipe that uses it
+                  (floor {fmt(MIN_NET_RATE)}). Reduce the discount, or record it as a credit note instead.
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Names every line still blocking the receive, so the receiver never
               has to hunt for which row the disabled button is waiting on. */}
           {missingReason.length > 0 && (
@@ -800,10 +986,11 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
             </div>
           )}
         </div>
-        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
           <button onClick={onClose} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
-          <button onClick={submit} disabled={saving || loading || missingReason.length > 0}
-                  title={missingReason.length > 0 ? missingList('Reason still needed on:\n') : undefined}
+          <button onClick={submit} disabled={saving || loading || missingReason.length > 0 || chargeBlockers.length > 0}
+                  title={missingReason.length > 0 ? missingList('Reason still needed on:\n')
+                       : chargeBlockers.length > 0 ? chargeBlockers.join('\n') : undefined}
                   className="px-3 py-2 text-sm bg-green-600 hover:bg-green-700 text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <PackageCheck className="w-4 h-4" />}
             Confirm Receive
@@ -1194,6 +1381,34 @@ function CreatePOModal({ materials, onClose, onCreated }: {
     : materials;
 
   const addLine = () => setItems(prev => [...prev, { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' }]);
+  /* material_id → the 1-based line it already sits on. Feeds the picker so a
+     material that is already on this PO can't be added twice (one material =
+     one line: a duplicate double-orders and, on receive, bumps stock twice). */
+  const takenIds = useMemo(() => {
+    const m = new Map<string, number>();
+    items.forEach((l, idx) => { if (l.material_id && !m.has(l.material_id)) m.set(l.material_id, idx + 1); });
+    return m;
+  }, [items]);
+  const [flashLine, setFlashLine] = useState<number | null>(null);
+  const [dupNote, setDupNote] = useState<string | null>(null);
+  // Scoped to THIS composer's item list: a document-wide [data-po-qty=N] lookup
+  // focused the inline PO editor's row when both were mounted.
+  const linesRef = useRef<HTMLDivElement | null>(null);
+  /* Send the user to the line that already holds the item instead of silently
+     doing nothing: focus its qty box, flash the row, and say where it went. */
+  const goToTakenLine = (lineNo: number) => {
+    const existing = items[lineNo - 1];
+    const mat = materials.find(mm => mm.id === existing?.material_id);
+    setDupNote(`${mat?.name || 'That item'} is already on line ${lineNo} — add the extra quantity there.`);
+    setFlashLine(lineNo);
+    setTimeout(() => setFlashLine(null), 1400);
+    setTimeout(() => {
+      const el = (linesRef.current || document).querySelector<HTMLInputElement>(`[data-po-qty="${lineNo}"]`);
+      el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      el?.focus(); el?.select();
+    }, 0);
+  };
+
   const removeLine = (i: number) => setItems(prev => prev.filter((_, j) => j !== i));
   const updateLine = (i: number, patch: Partial<POLine>) =>
     setItems(prev => prev.map((it, j) => j === i ? { ...it, ...patch } : it));
@@ -1331,7 +1546,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                 <Plus className="w-3 h-3" /> Add line
               </button>
             </div>
-            <div className="overflow-x-auto">
+            <div ref={linesRef} className="overflow-x-auto">
             <table className="w-full text-xs block md:table md:min-w-[600px]">
               <thead className="text-[#8B7355] hidden md:table-header-group">
                 <tr>
@@ -1348,7 +1563,8 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                   const mat = materials.find(m => m.id === it.material_id);
                   const lineTotal = Number(it.quantity) * Number(it.unit_price);
                   return (
-                    <tr key={it.uid} className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
+                    <tr key={it.uid} className={`border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0 ${
+                      flashLine === i + 1 ? 'ring-2 ring-[#af4408] bg-[#FFF1E3]' : ''}`}>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
                         {/* Once an item is chosen the line is LOCKED to it — to
@@ -1361,7 +1577,12 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                           </div>
                         ) : (
                           <SimpleMaterialPicker value={it.material_id} materials={eligibleMaterials}
+                                              takenIds={takenIds} onPickTaken={goToTakenLine}
                                               onChange={(id, m) => {
+                                                // Belt-and-braces: keyboard selection or stale state could
+                                                // reach here even though the row renders as un-pickable.
+                                                const taken = takenIds.get(id);
+                                                if (taken && taken !== i + 1) { goToTakenLine(taken); return; }
                                                 const patch: Partial<POLine> = { material_id: id };
                                                 // Seed ₹ per PURCHASE unit (kg), never the recipe unit (g).
                                                 // Re-seeds on any material change too (belt-and-braces:
@@ -1461,7 +1682,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                         {/* min=0 + clamp: a negative qty/rate used to flow straight
                             through save → approve → receive into the purchases row
                             and average_price. Ordering can never be negative. */}
-                        <input type="number" step="any" min={0} value={it.quantity || ''}
+                        <input type="number" step="any" min={0} value={it.quantity || ''} data-po-qty={i + 1}
                                onChange={e => {
                                  const v = parseFloat(e.target.value);
                                  updateLine(i, { quantity: Number.isFinite(v) ? Math.max(0, v) : 0 });
@@ -1513,6 +1734,13 @@ function CreatePOModal({ materials, onClose, onCreated }: {
               </tfoot>
             </table>
             </div>
+            {dupNote && (
+              <div className="mt-2 flex items-start gap-2 rounded-lg border border-[#D4B896] bg-[#FFF1E3] px-3 py-2 text-[11px] text-[#6B5744]">
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0 text-[#af4408]" />
+                <span className="flex-1">{dupNote}</span>
+                <button type="button" onClick={() => setDupNote(null)} className="text-[#8B7355] hover:text-[#2D1B0E]">✕</button>
+              </div>
+            )}
             {/* Primary Add-line — full width at the BOTTOM so after entering a
                 material the button sits right below it (mobile-friendly). */}
             <button type="button" onClick={addLine}
@@ -1540,9 +1768,17 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   );
 }
 
-/* Simple inline picker for the PO modal/edit (separate from the recipe picker so the file stays self-contained) */
-function SimpleMaterialPicker({ value, materials, onChange }: {
+/* Simple inline picker for the PO modal/edit (separate from the recipe picker so the file stays self-contained)
+ *
+ * ONE MATERIAL = ONE LINE. A PO carrying the same material twice double-orders,
+ * and on receive it writes two purchases rows and bumps stock twice for one
+ * item — which then skews that material's weighted-average cost. `takenIds`
+ * maps material_id → the 1-based line it is already on; those rows stay VISIBLE
+ * (hiding them reads as "we don't stock that") but cannot be picked, and
+ * clicking one sends the user to the line that already has it. */
+function SimpleMaterialPicker({ value, materials, onChange, takenIds, onPickTaken }: {
   value: string; materials: Material[]; onChange: (id: string, mat?: Material) => void;
+  takenIds?: Map<string, number>; onPickTaken?: (lineNo: number) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
@@ -1596,15 +1832,31 @@ function SimpleMaterialPicker({ value, materials, onChange }: {
                 {q.trim() ? <>No materials match &quot;{q}&quot;.</> : <>No materials loaded yet — refresh if this stays empty.</>}
               </div>
             )}
-            {list.map(m => (
-              <button type="button" key={m.id} onClick={() => { onChange(m.id, m); setOpen(false); setQ(''); }}
-                      className="w-full text-left px-2 py-1 hover:bg-[#FFF1E3] rounded text-xs flex items-center gap-2">
+            {list.map(m => {
+              const takenLine = takenIds?.get(m.id);
+              return (
+              <button type="button" key={m.id}
+                      onClick={() => {
+                        setOpen(false); setQ('');
+                        if (takenLine) { onPickTaken?.(takenLine); return; }
+                        onChange(m.id, m);
+                      }}
+                      title={takenLine ? `Already on line ${takenLine} — add the extra quantity there` : undefined}
+                      className={`w-full text-left px-2 py-1 rounded text-xs flex items-center gap-2 ${
+                        takenLine ? 'bg-[#FFF8F0] text-[#A08B76] cursor-default' : 'hover:bg-[#FFF1E3]'}`}>
                 <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0">{m.sku || '·'}</span>
                 <span className="flex-1 truncate">{m.name}</span>
-                <span className="text-[10px] text-[#6B5744]">{poUnitOf(m)}</span>
-                <span className="text-[10px] font-mono text-[#6B5744]">₹{poRateOf(m).toFixed(2)}</span>
+                {takenLine ? (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#F0E4D6] text-[#8B7355] shrink-0">
+                    already on line {takenLine}
+                  </span>
+                ) : (<>
+                  <span className="text-[10px] text-[#6B5744]">{poUnitOf(m)}</span>
+                  <span className="text-[10px] font-mono text-[#6B5744]">₹{poRateOf(m).toFixed(2)}</span>
+                </>)}
               </button>
-            ))}
+              );
+            })}
           </div>
         </div>,
         document.body,
@@ -1641,6 +1893,33 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
   }, []);
 
   const update = (i: number, patch: any) => setItems(prev => prev.map((it, j) => j === i ? { ...it, ...patch } : it));
+  /* material_id → the 1-based line it already sits on. Feeds the picker so a
+     material that is already on this PO can't be added twice (one material =
+     one line: a duplicate double-orders and, on receive, bumps stock twice). */
+  const takenIds = useMemo(() => {
+    const m = new Map<string, number>();
+    items.forEach((l, idx) => { if (l.material_id && !m.has(l.material_id)) m.set(l.material_id, idx + 1); });
+    return m;
+  }, [items]);
+  const [flashLine, setFlashLine] = useState<number | null>(null);
+  const [dupNote, setDupNote] = useState<string | null>(null);
+  // Scoped to THIS composer's rows — see the matching ref in the new-PO modal.
+  const linesRef = useRef<HTMLDivElement | null>(null);
+  /* Send the user to the line that already holds the item instead of silently
+     doing nothing: focus its qty box, flash the row, and say where it went. */
+  const goToTakenLine = (lineNo: number) => {
+    const existing = items[lineNo - 1];
+    const mat = materials.find(mm => mm.id === existing?.material_id);
+    setDupNote(`${mat?.name || 'That item'} is already on line ${lineNo} — add the extra quantity there.`);
+    setFlashLine(lineNo);
+    setTimeout(() => setFlashLine(null), 1400);
+    setTimeout(() => {
+      const el = (linesRef.current || document).querySelector<HTMLInputElement>(`[data-po-qty="${lineNo}"]`);
+      el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      el?.focus(); el?.select();
+    }, 0);
+  };
+
   const add = () => setItems(prev => [...prev, { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' }]);
   const remove = (i: number) => setItems(prev => prev.filter((_, j) => j !== i));
 
@@ -1690,7 +1969,7 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
   };
 
   return (
-    <div className="space-y-3">
+    <div ref={linesRef} className="space-y-3">
       <div className="grid grid-cols-3 gap-2 text-xs">
         <input type="date" value={date} onChange={e => setDate(e.target.value)} className="px-2 py-1 border border-[#E8D5C4] rounded" />
         <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Notes" className="px-2 py-1 border border-[#E8D5C4] rounded col-span-2" />
@@ -1706,7 +1985,8 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
       {items.map((it, i) => {
         const mat = materials.find(m => m.id === it.material_id);
         return (
-          <div key={it.uid} className="grid grid-cols-12 gap-2 text-xs items-start">
+          <div key={it.uid} className={`grid grid-cols-12 gap-2 text-xs items-start rounded ${
+            flashLine === i + 1 ? 'ring-2 ring-[#af4408] bg-[#FFF1E3]' : ''}`}>
             <div className="col-span-4">
               {/* Locked once chosen — remove the line to order a different item. */}
               {mat ? (
@@ -1715,7 +1995,12 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
                   <div className="text-[9px] text-[#8B7355]">order unit {poUnitOf(mat)} · ₹{poRateOf(mat).toFixed(2)}/{poUnitOf(mat)}</div>
                 </div>
               ) : (
-                <SimpleMaterialPicker value={it.material_id} materials={materials} onChange={(id, m) => {
+                <SimpleMaterialPicker value={it.material_id} materials={materials}
+                                      takenIds={takenIds} onPickTaken={goToTakenLine}
+                                      onChange={(id, m) => {
+                  // Belt-and-braces — see the matching guard in the new-PO composer.
+                  const taken = takenIds.get(id);
+                  if (taken && taken !== i + 1) { goToTakenLine(taken); return; }
                   const patch: any = { material_id: id };
                   // ₹ per PURCHASE unit (kg) — never the raw recipe-unit average.
                   if (m && (id !== it.material_id || !it.unit_price)) patch.unit_price = poRateOf(m);
@@ -1777,7 +2062,7 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
             {/* min=0 + clamp — a negative ordered qty/rate is never re-checked at
                 receive (only overrides are) so it would reach purchases. */}
             <div className="col-span-2">
-              <input type="number" step="any" min={0} value={it.quantity || ''}
+              <input type="number" step="any" min={0} value={it.quantity || ''} data-po-qty={i + 1}
                      onChange={e => { const v = parseFloat(e.target.value); update(i, { quantity: Number.isFinite(v) ? Math.max(0, v) : 0 }); }}
                      className="w-full px-2 py-1 border border-[#E8D5C4] rounded text-right" />
               {/* Same labels as the new-PO composer: a PO is in kg/BTL/CASE at

@@ -29,6 +29,7 @@ import {
 import { api } from '@/lib/api';
 import { fmtIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
+import { packFactor } from '@/lib/pack-units';
 
 interface Department { id: string; name: string; }
 interface ReqLine {
@@ -39,6 +40,9 @@ interface ReqLine {
   unit: string;
   /** Canonical recipe unit on raw_materials (from rm.unit AS material_unit). Fallback for `unit`. */
   material_unit?: string;
+  /** Pack meta (rm.purchase_unit / rm.pack_size) — the store works in purchase units. */
+  material_purchase_unit?: string;
+  material_pack_size?: number;
   quantity_requested: number;
   chef_approved_qty: number | null;
   is_rejected: number;
@@ -74,6 +78,39 @@ const fmtNum = (v: number) => (v || 0).toLocaleString('en-IN', { maximumFraction
 // Stable empty set — passed as the default `selectedIds` so ReqCard doesn't get
 // a fresh Set identity every render when a requisition has no selection yet.
 const EMPTY_SET: Set<string> = new Set();
+
+/**
+ * Resolve one requisition line's UNIT BASIS and expose the purchase-unit view.
+ *
+ * Requisition quantities are stored in the LINE's own `unit` (option B), and the
+ * two composers disagree: the internal picker stamps the PURCHASE unit, the
+ * party composer stamps the RECIPE unit (and converts qty ×pack). Legacy lines
+ * can be blank — read as recipe, matching what this page has always displayed.
+ * The store hands over bottles/kg, so everything here READS and is ENTERED in
+ * purchase units; `fromPU` converts back to the line's unit at the POST
+ * boundary, because /store-issue adds the number to quantity_issued verbatim.
+ */
+function lineUnits(line: ReqLine) {
+  const recipeUnit = line.material_unit || line.unit || '';
+  const pf = packFactor({
+    unit: recipeUnit,
+    purchase_unit: line.material_purchase_unit,
+    pack_size: line.material_pack_size,
+  });
+  const pu = line.material_purchase_unit || recipeUnit;
+  const lu = String(line.unit || '').toLowerCase().trim();
+  // Already stored in the purchase unit → no conversion in either direction.
+  const isPU = pf > 1 && lu !== '' && lu === String(pu).toLowerCase().trim();
+  return {
+    pf, pu, recipeUnit, isPU,
+    /** stored line qty → purchase-unit display figure (3 dp, display only) */
+    toPU: (q: any) => isPU ? (Number(q) || 0) : Math.round(((Number(q) || 0) / pf) * 1000) / 1000,
+    /** purchase-unit entry → the line's stored unit (what the API adds verbatim) */
+    fromPU: (q: any) => isPU ? (Number(q) || 0) : Math.round((Number(q) || 0) * pf * 1e6) / 1e6,
+    /** stored line qty → recipe units (the small "= N g" hint) */
+    toRecipe: (q: any) => isPU ? (Number(q) || 0) * pf : (Number(q) || 0),
+  };
+}
 
 export default function StoreRequisitionsPage() {
   const [list, setList] = useState<Requisition[]>([]);
@@ -262,7 +299,31 @@ export default function StoreRequisitionsPage() {
   const issueLine = async (req: Requisition, line: ReqLine, qtyOverride?: number) => {
     const requested = effectiveQty(line);
     const outstanding = Math.max(0, requested - (line.quantity_issued || 0));
-    const qty = qtyOverride ?? Number(editQty[line.id] ?? outstanding);
+    // The box is in PURCHASE units; /store-issue adds the number to
+    // quantity_issued verbatim, which lives in the LINE's own unit → convert
+    // once, here. qtyOverride (programmatic) is already in the line's unit.
+    //
+    // TWO EXACT PATHS, because the displayed purchase figure is rounded to 3 dp
+    // and fromPU(toPU(q)) !== q in general (1000 ml of a 750 ml/BTL material
+    // shows as 1.333 BTL and converts back to 999.75 ml). Left uncorrected, the
+    // 0.25 ml residue keeps quantity_issued under the approved qty forever: the
+    // line never reaches "fully issued", the requisition never advances to
+    // fulfilled, and for a party req the store→department transfer never fires.
+    //   - untouched box            → issue the EXACT outstanding
+    //   - typed what the row shows → issue the EXACT outstanding
+    // Anything else is a deliberate different number and converts normally (and
+    // is NOT clamped — issuing more than outstanding is a real thing a store
+    // does, and silently truncating it would hide stock that physically left).
+    const U = lineUnits(line);
+    const typed = editQty[line.id];
+    const typedPU = Number(typed);
+    const saysOutstanding = typed !== undefined && Number.isFinite(typedPU)
+      && Math.abs(typedPU - U.toPU(outstanding)) < 1e-9;
+    const qty = qtyOverride != null
+      ? qtyOverride
+      : (typed === undefined || saysOutstanding)
+        ? outstanding
+        : U.fromPU(typedPU);
     if (!qty || qty <= 0) { alert('Enter a quantity > 0'); return; }
     setBusyLine(line.id);
     try {
@@ -518,12 +579,14 @@ function IssueAllModal({ req, busy, onCancel, onConfirm }: {
           ) : (
             <ul className="space-y-1">
               {lines.map(l => {
-                const u = l.unit || l.material_unit || '';
+                const U = lineUnits(l);
+                const u = U.pu;
                 return (
                   <li key={l.id} className="flex items-center justify-between text-sm border-b border-[#E8D5C4]/50 py-1.5">
                     <span className="text-[#2D1B0E]">{l.material_name}</span>
                     <span className="font-mono font-semibold text-emerald-700">
-                      × {fmtNum(l.remaining)}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
+                      × {fmtNum(U.toPU(l.remaining))}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
+                      {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-1">= {fmtNum(U.toRecipe(l.remaining))} {U.recipeUnit}</span>}
                     </span>
                   </li>
                 );
@@ -772,11 +835,21 @@ function LineRow(props: {
   const eff = effectiveQty(line);
   const issued = Number(line.quantity_issued) || 0;
   const outstanding = Math.max(0, eff - issued);
-  // Display unit — prefer the line's own unit, else fall back to the canonical
-  // material_unit returned by the API. We render it next to every quantity so
-  // the store user always knows what they're handing over (kg / L / pcs / BTL).
-  const u = line.unit || line.material_unit || '';
+  // Everything reads in PURCHASE units (owner rule) — the store hands over
+  // bottles/kg, not ml/g — regardless of which unit the composer stored the
+  // line in. `hint` carries the recipe equivalent for packed materials.
+  const U = lineUnits(line);
+  const u = U.pu;
   const unitTag = u ? <span className="text-[9px] text-[#8B7355] ml-0.5">{u}</span> : null;
+  const hint = (q: number) => U.pf > 1
+    ? <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
+    : null;
+  const outstandingPU = U.toPU(outstanding);
+  // A remainder smaller than the 3-dp display (e.g. 0.25 ml of a 750 ml bottle)
+  // would print a flat "0" on a line the card still counts as OPEN. Say "<0.001"
+  // instead, so the row never claims to be finished when it isn't.
+  const puNum = (v: number, raw: number) =>
+    v === 0 && raw > 0 ? '<0.001' : fmtNum(v);
   const rowTone = line.is_rejected ? 'bg-red-50/40 text-[#999] line-through'
                 : line.store_rejected ? 'bg-red-50/40 text-[#999]'
                 : outstanding === 0 && !line.deferred_until ? 'bg-emerald-50/30'
@@ -853,17 +926,21 @@ function LineRow(props: {
           );
         })()}
       </td>
-      <td className="py-1.5 px-2 text-right font-mono">{fmtNum(line.quantity_requested)}{unitTag}</td>
+      <td className="py-1.5 px-2 text-right font-mono">
+        {fmtNum(U.toPU(line.quantity_requested))}{unitTag}
+        {hint(line.quantity_requested)}
+      </td>
       <td className="py-1.5 px-2 text-right font-mono">
         {line.is_rejected
           ? <span className="text-red-600">rejected</span>
           : line.chef_approved_qty != null
-            ? <span className="text-amber-700">{fmtNum(line.chef_approved_qty)}{unitTag}</span>
+            ? <span className="text-amber-700">{fmtNum(U.toPU(line.chef_approved_qty))}{unitTag}</span>
             : '—'}
       </td>
-      <td className="py-1.5 px-2 text-right font-mono">{fmtNum(issued)}{unitTag}</td>
+      <td className="py-1.5 px-2 text-right font-mono">{puNum(U.toPU(issued), issued)}{unitTag}</td>
       <td className="py-1.5 px-2 text-right font-mono font-semibold">
-        <span className={outstanding === 0 ? 'text-emerald-700' : 'text-[#af4408]'}>{fmtNum(outstanding)}{unitTag}</span>
+        <span className={outstanding === 0 ? 'text-emerald-700' : 'text-[#af4408]'}>{puNum(outstandingPU, outstanding)}{unitTag}</span>
+        {hint(outstanding)}
       </td>
       <td className="py-1.5 px-2 align-top text-[10px] text-[#6B5744]">
         {line.issued_at ? (
@@ -892,11 +969,12 @@ function LineRow(props: {
           <div className="flex flex-wrap items-center gap-1">
             {outstanding > 0 && !deferOpen && (
               <>
-                <input type="number" step="any" min={0} max={outstanding}
+                <input type="number" step="any" min={0} max={U.pf > 1 ? outstanding / U.pf : outstanding}
                        value={props.editQty[line.id] ?? ''}
                        onChange={e => props.setEditQty((s: any) => ({ ...s, [line.id]: e.target.value }))}
-                       placeholder={String(outstanding)}
-                       title={`Outstanding: ${outstanding}${u ? ' ' + u : ''}`}
+                       placeholder={String(puNum(outstandingPU, outstanding))}
+                       title={`Issue in ${u || 'units'} — outstanding ${outstandingPU}${u ? ' ' + u : ''}`
+                              + (U.pf > 1 ? ` (= ${fmtNum(U.toRecipe(outstanding))} ${U.recipeUnit})` : '')}
                        className="w-16 px-1 py-0.5 border border-[#E8D5C4] rounded text-right text-xs bg-[#FFF8F0]" />
                 {u && <span className="text-[10px] text-[#6B5744] font-medium">{u}</span>}
                 <button onClick={() => props.onIssue(line)} disabled={busy}
@@ -1009,10 +1087,8 @@ function HistoryDrawer({ line, onClose }: { line: ReqLine; onClose: () => void }
                   <tr key={i} className="border-t border-[#E8D5C4]/50">
                     <td className="py-1.5 px-2">{fmtDateTime(h.at)}</td>
                     <td className="py-1.5 px-2 text-right font-mono font-semibold text-emerald-700">
-                      {fmtNum(h.qty)}
-                      {(line.unit || line.material_unit) && (
-                        <span className="text-[9px] text-[#8B7355] ml-0.5">{line.unit || line.material_unit}</span>
-                      )}
+                      {fmtNum(lineUnits(line).toPU(h.qty))}
+                      <span className="text-[9px] text-[#8B7355] ml-0.5">{lineUnits(line).pu}</span>
                     </td>
                     <td className="py-1.5 px-2 text-[#6B5744] flex items-center gap-1"><UserIcon className="w-3 h-3" /> {h.by}</td>
                     <td className="py-1.5 px-2 text-[#8B7355]">{h.note || '—'}</td>

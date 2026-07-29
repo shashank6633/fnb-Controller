@@ -60,13 +60,20 @@ export default function POPrintPage() {
   // sums to 0. Fall back to po.total_cost (server-recomputed on receive) only
   // when no GRN line joined at all.
   const hasGrnLines = isReceived && (po.items || []).some((it: any) => it.received_line_total != null);
+  // Bill charges recorded at receive. The GRN carries the GROSS rate + these
+  // figures, while purchase_orders.total_cost is NET of the discount — without
+  // showing them the printed subtotal and the stored total silently disagree.
+  const billDiscount = isReceived
+    ? (po.items || []).reduce((s: number, it: any) => s + (Number(it.received_discount) || 0), 0) : 0;
+  const billDelivery = isReceived
+    ? (po.items || []).reduce((s: number, it: any) => s + (Number(it.received_delivery) || 0), 0) : 0;
   // purchase_orders.total_cost is REAL NOT NULL DEFAULT 0 (db.ts:794) and the GET
   // returns SELECT po.*, so a real row always lands a finite number here. The
   // `?? NaN` + isFinite pair only guards a malformed payload (explicit null or a
   // non-numeric), which `|| 0` would silently print as a bogus ₹0.
   const storedTotal = Number(po.total_cost ?? NaN);
   const grandTotal = isReceived
-    ? (hasGrnLines ? receivedSubtotal
+    ? (hasGrnLines ? Math.round((receivedSubtotal - billDiscount) * 100) / 100
                    : (Number.isFinite(storedTotal) ? storedTotal : orderedSubtotal))
     : orderedSubtotal;
 
@@ -206,9 +213,29 @@ export default function POPrintPage() {
                 </td>
               </tr>
             )}
+            {/* Bill charges recorded at receive. The discount REDUCES the cost the
+                goods were booked at (it is netted into the rate on the purchases
+                row); delivery is recorded against the bill and never enters item
+                cost — so it is shown, but not added into the Grand Total. */}
+            {isReceived && billDiscount > 0.005 && (
+              <tr>
+                <td colSpan={(isReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-[11px]">
+                  Less: bill discount
+                </td>
+                <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">− {fmt(billDiscount)}</td>
+              </tr>
+            )}
+            {isReceived && billDelivery > 0.005 && (
+              <tr>
+                <td colSpan={(isReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-[11px] text-gray-600">
+                  Delivery charges (recorded — not in item cost)
+                </td>
+                <td className="border border-gray-300 px-2 py-1.5 text-right font-mono text-gray-600">{fmt(billDelivery)}</td>
+              </tr>
+            )}
             <tr className="bg-gray-100">
               <td colSpan={(isReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-2 text-right uppercase tracking-wider text-[11px]">
-                Grand Total {isReceived ? '(Final, post-receive)' : '(Ordered)'}
+                Grand Total {isReceived ? (billDiscount > 0.005 ? '(Final, net of discount)' : '(Final, post-receive)') : '(Ordered)'}
               </td>
               <td className="border border-gray-300 px-2 py-2 text-right font-mono text-[13px]">{fmt(grandTotal)}</td>
             </tr>

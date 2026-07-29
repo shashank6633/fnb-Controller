@@ -1,7 +1,7 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
-import { effectiveRole, effectiveActor, recalcTotal, poWriteGate } from '@/lib/po-helpers';
+import { effectiveRole, effectiveActor, recalcTotal, poWriteGate, duplicateLineError } from '@/lib/po-helpers';
 
 /** Phase B store guard for PO composition (create/edit are interactive, so we
  *  reject the request with a clear message instead of silently dropping lines).
@@ -152,7 +152,8 @@ export async function GET(request: Request) {
       if (po.grn_id) {
         const grnItems = db.prepare(`
           SELECT po_item_id, quantity_received, quantity_accepted, quantity_rejected,
-                 unit_price AS received_unit_price, rejection_reason
+                 unit_price AS received_unit_price, rejection_reason,
+                 discount AS received_discount, delivery_charges AS received_delivery
           FROM goods_receipt_note_items
           WHERE grn_id = ?
         `).all(po.grn_id) as any[];
@@ -166,6 +167,11 @@ export async function GET(request: Request) {
             it.quantity_rejected     = g.quantity_rejected;
             it.received_unit_price   = g.received_unit_price;
             it.rejection_reason      = g.rejection_reason;
+            // GRN rates are GROSS (the bill document). The bill-level discount +
+            // delivery ride along per line so the print can reconcile the gross
+            // received subtotal with purchase_orders.total_cost, which is NET.
+            it.received_discount     = Number(g.received_discount) || 0;
+            it.received_delivery     = Number(g.received_delivery) || 0;
             it.received_line_total   = Math.round(g.quantity_accepted * g.received_unit_price * 100) / 100;
           }
         }
@@ -228,6 +234,8 @@ export async function POST(request: Request) {
     if (blocked) return Response.json({ error: blocked }, { status: 400 });
     const badLine = lineSanityError(db, items);
     if (badLine) return Response.json({ error: badLine }, { status: 400 });
+    const dupLine = duplicateLineError(items);
+    if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
 
     // Resolve vendor — prefer vendor_id, cache name for display
     let resolvedVendorId: string | null = vendor_id || null;
@@ -312,6 +320,8 @@ export async function PUT(request: Request) {
       if (blocked) return Response.json({ error: blocked }, { status: 400 });
       const badLine = lineSanityError(db, items);
       if (badLine) return Response.json({ error: badLine }, { status: 400 });
+      const dupLine = duplicateLineError(items);
+      if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
     }
 
     let resolvedVendorName = vendor;
