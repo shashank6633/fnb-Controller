@@ -892,7 +892,8 @@ export default function LiquorStorePage() {
                         <th className="text-right px-3 py-2 font-medium">Unit cost</th>
                         <th className="text-left px-3 py-2 font-medium">Batch</th>
                         <th className="text-left px-3 py-2 font-medium">Supplier</th>
-                        <th className="text-left px-3 py-2 font-medium">Ref / notes</th>
+                        <th className="text-left px-3 py-2 font-medium">Invoice No.</th>
+                        <th className="text-left px-3 py-2 font-medium">Notes</th>
                         <th className="text-left px-3 py-2 font-medium">By</th>
                       </tr>
                     </thead>
@@ -901,7 +902,7 @@ export default function LiquorStorePage() {
                         if (item.kind === 'bill') {
                           return (
                             <tr key={`bill-${item.ref}-${idx}`} className="bg-[#FFF1E3]/70">
-                              <td colSpan={9} className="px-3 py-1.5 text-[11px] text-[#6B5744]">
+                              <td colSpan={10} className="px-3 py-1.5 text-[11px] text-[#6B5744]">
                                 <ReceiptText className="w-3.5 h-3.5 inline mr-1 text-[#af4408]" />
                                 Bill <span className="font-mono">{item.ref}</span>
                                 {item.supplier ? ` · ${item.supplier}` : ''} — {item.count} lines,
@@ -952,11 +953,8 @@ export default function LiquorStorePage() {
                               {l.expiry_date && <div className="text-[10px] text-[#8B7355]">exp {l.expiry_date}</div>}
                             </td>
                             <td className="px-3 py-2 text-[#6B5744]">{l.supplier || '—'}</td>
-                            <td className="px-3 py-2 text-[#6B5744] max-w-[220px]">
-                              {l.ref && <div className="font-mono text-[10px]">{l.ref}</div>}
-                              {l.notes && <div className="break-words">{l.notes}</div>}
-                              {!l.ref && !l.notes && '—'}
-                            </td>
+                            <td className="px-3 py-2 text-[#2D1B0E] font-mono text-[11px] whitespace-nowrap">{l.ref || '—'}</td>
+                            <td className="px-3 py-2 text-[#6B5744] max-w-[180px] break-words">{l.notes || '—'}</td>
                             <td className="px-3 py-2 text-[#8B7355] whitespace-nowrap">{(l.created_by || '').split('@')[0] || '—'}</td>
                           </tr>
                         );
@@ -1018,7 +1016,7 @@ export default function LiquorStorePage() {
                         {l.supplier && <span>{l.supplier}</span>}
                         {l.batch_no && <span>batch {l.batch_no}</span>}
                         {l.expiry_date && <span>exp {l.expiry_date}</span>}
-                        {l.ref && <span className="font-mono">{l.ref}</span>}
+                        {l.ref && <span className="font-mono">inv {l.ref}</span>}
                         {l.created_by && <span>by {(l.created_by || '').split('@')[0]}</span>}
                       </div>
                       {l.notes && <div className="mt-1 text-[10px] text-[#6B5744] break-words">{l.notes}</div>}
@@ -1658,8 +1656,10 @@ interface UploadRow {
    *  They are read off the first row that carries them and pre-fill the modal's
    *  Bill charges inputs, so the user always sees what was picked up. */
   mrp_round_off: string; excise_turnover_tax: string; special_excise_cess: string; tcs: string;
-  /** Bill-level like the four charges above — read off the first row that carries
-   *  it and pre-fills the modal's Invoice number (one invoice per upload). */
+  /** PER-ROW inward/invoice number. A register CSV holds MANY inward bills —
+   *  each line posts to the ledger under ITS OWN number (dup-guard included).
+   *  The first row's value still pre-fills the modal's Invoice No., which
+   *  covers rows without one and carries the bill-level charges. */
   inward_no: string;
   /** Carried so the sheet mirrors the Inward Register export. REFERENCE ONLY —
    *  the item is resolved by sku then item_name, and raw_materials.category is
@@ -1970,6 +1970,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
             batch_no: r.batch_no || undefined, expiry_date: r.expiry_date || undefined,
             discount: r.discount || undefined, cgst: r.cgst || undefined,
             sgst: r.sgst || undefined, delivery_charges: r.delivery_charges || undefined,
+            inward_no: r.inward_no || undefined,
           })),
         },
       });
@@ -2018,9 +2019,9 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
         )}
       </>}>
       <p className="text-[11px] text-[#8B7355] -mt-1">
-        Upload one supplier invoice (e.g. the TGBCL indent) as a CSV — every matched line posts to the
-        {' '}{storeName} ledger under this invoice number, plus the bill charges. Re-uploading the same
-        invoice number is blocked so nothing doubles. Central Store stays untouched.
+        Upload one supplier invoice or a multi-bill inward register as a CSV — each matched line posts to the
+        {' '}{storeName} ledger under its row&apos;s own <b>inward_no</b> (this invoice number covers rows
+        without one, and the bill charges). Already-posted lines are skipped so nothing doubles. Central Store stays untouched.
       </p>
       {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{err}</div>}
 
@@ -2085,6 +2086,15 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
       {!result && rows.length > 0 && (
         <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
           <div className="px-3 py-1.5 bg-[#FFF1E3] text-[11px] font-semibold text-[#6B5744]">{rows.length} rows parsed from {fileName}</div>
+          {(() => {
+            const inwards = new Set(rows.map(r => String(r.inward_no || '').trim()).filter(Boolean));
+            return inwards.size > 1 ? (
+              <div className="px-3 py-1.5 bg-sky-50 border-t border-sky-200 text-[11px] text-sky-800">
+                {inwards.size} distinct inward numbers in this file — each line posts under <b>its own</b> number.
+                The Invoice No. above is used only for rows without one, and for the bill-level charges.
+              </div>
+            ) : null;
+          })()}
           {/* Say what was assumed / what disagrees BEFORE the bill is posted. */}
           {rows.some(r => r.unit_note && !/LOOSE/.test(r.unit_note)) && (
             <div className="px-3 py-1.5 bg-amber-50 border-t border-amber-200 text-[11px] text-amber-800">

@@ -8,13 +8,16 @@ import { caseFactor, packFactor, tripleToRecipe } from '@/lib/pack-units';
 
 /**
  * POST /api/stores/[id]/procure-bulk — FORGIVING CSV bulk upload for a store
- * (liquor). One supplier invoice, many rows parsed from a CSV. Unlike
- * /procure-bill (manual, all-or-nothing), this SKIPS rows it can't handle and
- * reports them back so the user can fix + re-upload just those — mirroring the
- * central Generic CSV upload (/api/purchases/bulk).
+ * (liquor). One supplier invoice OR a multi-bill inward register, many rows
+ * parsed from a CSV. Unlike /procure-bill (manual, all-or-nothing), this SKIPS
+ * rows it can't handle and reports them back so the user can fix + re-upload
+ * just those — mirroring the central Generic CSV upload (/api/purchases/bulk).
  *
  * body: {
- *   invoice_ref  — REQUIRED bill/invoice number (the whole CSV = ONE invoice),
+ *   invoice_ref  — REQUIRED header bill/invoice number. A row that carries its
+ *                  own inward_no posts under THAT number instead (a register
+ *                  CSV holds many inward bills); invoice_ref covers rows
+ *                  without one and keys the bill-level charges,
  *   supplier / vendor_id, date? (YYYY-MM-DD backdate),
  *   charges?     — bill-level { mrp_rounding, excise_turnover_tax,
  *                  special_excise_cess, tcs } (recorded, never touches cost),
@@ -23,7 +26,7 @@ import { caseFactor, packFactor, tripleToRecipe } from '@/lib/pack-units';
  *     cases?, bottles?, loose?,      — bar counting convention (blank = 0)
  *     unit_price?, per_case?,        — ₹ per BOTTLE (or per CASE if per_case)
  *     amount?,                       — …OR the line total ₹ (unit_price wins)
- *     batch_no?, expiry_date?,
+ *     batch_no?, expiry_date?, inward_no?,
  *   }]
  * }
  *
@@ -85,20 +88,29 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       return Response.json({ error: 'rows array is required (at least one CSV line)' }, { status: 400 });
     }
 
-    // ── Idempotency at the LINE level (not the whole invoice). Re-uploading
-    //    the SAME file → every row already posted → all skipped as 'duplicate'
-    //    (nothing doubles). Re-uploading the balance CSV (previously-skipped
-    //    rows, now fixed) under the SAME invoice_ref → those rows aren't in the
-    //    ledger yet → they post, completing the invoice. A row is a duplicate
-    //    when the same material at the same qty already exists under this
-    //    (store, invoice_ref). Also dedupe within the uploaded file itself. ──
-    const postedKeys = new Set(
-      (db.prepare(`
+    // ── Idempotency at the LINE level, keyed by the row's OWN ref. A register
+    //    CSV holds MANY inward bills: the same material at the same qty on TWO
+    //    different inwards is two real purchases, so the dup key must include
+    //    the ref. The HEADER ref's rows are ALSO checked for every row — before
+    //    per-row refs existed, whole registers posted under one header number,
+    //    and re-uploading such a file must not double those legacy lines. ──
+    const rowRefOf = (row: any) => String(row?.inward_no || '').trim() || invoiceRef;
+    const involvedRefs = Array.from(new Set(
+      [invoiceRef, ...b.rows.map((r: any) => rowRefOf(r))].map(r => r.toLowerCase()),
+    ));
+    const postedByRef = new Map<string, Set<string>>();
+    {
+      const q = db.prepare(`
         SELECT material_id, quantity FROM store_stock_ledger
-        WHERE store_id = ? AND txn_type = 'purchase' AND TRIM(ref) = ? COLLATE NOCASE
-      `).all(storeId, invoiceRef) as any[])
-        .map(r => `${r.material_id}|${Math.round(Number(r.quantity) * 1000)}`),
-    );
+        WHERE store_id = ? AND txn_type = 'purchase' AND LOWER(TRIM(ref)) = ?
+      `);
+      for (const ref of involvedRefs) {
+        postedByRef.set(ref, new Set(
+          (q.all(storeId, ref) as any[])
+            .map(r => `${r.material_id}|${Math.round(Number(r.quantity) * 1000)}`),
+        ));
+      }
+    }
     const seenInFile = new Set<string>();
     const dupKey = (matId: string, recipeQty: number) => `${matId}|${Math.round(recipeQty * 1000)}`;
 
@@ -138,7 +150,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const prepared: {
       material_id: string; name: string; unit: string; recipe_qty: number;
       unit_cost: number; line_total: number; batch_no: string; expiry_date: string;
-      date: string | null;
+      date: string | null; ref: string;
       discount: number; cgst: number; sgst: number; delivery_charges: number;
     }[] = [];
 
@@ -180,14 +192,19 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       if (!(recipeQty > 0)) { skip(row, i, 'invalid', `${mat.name}: enter a quantity (cases / bottles / loose).`); continue; }
 
       // Line-level idempotency: this material at this qty already posted under
-      // this invoice (earlier upload) or repeated within this file → skip.
+      // this row's ref (earlier upload), under the header ref (legacy uploads
+      // stamped everything with it), or repeated within this file → skip.
+      const rowRef = rowRefOf(row);
       const key = dupKey(mat.id, recipeQty);
-      if (postedKeys.has(key) || seenInFile.has(key)) {
+      const fileKey = `${rowRef.toLowerCase()}|${key}`;
+      if (postedByRef.get(rowRef.toLowerCase())?.has(key)
+          || postedByRef.get(invoiceRef.toLowerCase())?.has(key)
+          || seenInFile.has(fileKey)) {
         skip(row, i, 'duplicate',
-          `${mat.name}: already uploaded under invoice ${invoiceRef} — skipped to avoid double-counting.`);
+          `${mat.name}: already uploaded under invoice ${rowRef} — skipped to avoid double-counting.`);
         continue;
       }
-      seenInFile.add(key);
+      seenInFile.add(fileKey);
 
       // Price: explicit unit_price (per bottle, or per case) wins; else derive
       // ₹/recipe-unit straight from the line amount (amount ÷ recipe qty).
@@ -213,7 +230,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         recipe_qty: recipeQty, unit_cost: unitCost, line_total: lineTotal,
         batch_no: String(row.batch_no || '').trim(),
         expiry_date: String(row.expiry_date || '').trim(),
-        date: rowDate(row.date),
+        date: rowDate(row.date), ref: rowRef,
         discount: Math.max(0, num(row.discount)), cgst: Math.max(0, num(row.cgst)),
         sgst: Math.max(0, num(row.sgst)), delivery_charges: Math.max(0, num(row.delivery_charges)),
       });
@@ -233,7 +250,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
             store_id: storeId, material_id: p.material_id, txn_type: 'purchase',
             quantity: p.recipe_qty, unit_cost: p.unit_cost, batch_no: p.batch_no,
             supplier, vendor_id: vendorId, expiry_date: p.expiry_date,
-            ref: invoiceRef, notes: '', created_by: user.email,
+            ref: p.ref, notes: '', created_by: user.email,
             discount: p.discount, cgst: p.cgst, sgst: p.sgst, delivery_charges: p.delivery_charges,
           });
           if (p.date) backdateStmt.run(p.date, id);
@@ -244,10 +261,14 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         // recomputed from the FULL ledger for this (store, invoice_ref) so it
         // stays correct across a first upload + later balance re-uploads.
         if (incomingHasValue || existingCharges) {
+          // Invoice Value spans the header ref AND every per-row inward ref this
+          // upload touched — a register's charges cover all its inwards.
+          const refList = Array.from(new Set([invoiceRef.toLowerCase(), ...prepared.map(p => p.ref.toLowerCase())]));
           const inv = db.prepare(`
             SELECT COALESCE(SUM(quantity * unit_cost), 0) AS v FROM store_stock_ledger
-            WHERE store_id = ? AND txn_type = 'purchase' AND TRIM(ref) = ? COLLATE NOCASE
-          `).get(storeId, invoiceRef) as any;
+            WHERE store_id = ? AND txn_type = 'purchase'
+              AND LOWER(TRIM(ref)) IN (${refList.map(() => '?').join(',')})
+          `).get(storeId, ...refList) as any;
           billCharges = upsertBillCharges(db, {
             store_id: storeId, invoice_ref: invoiceRef, supplier, date: backdate || '',
             invoice_value: Math.round((Number(inv?.v) || 0) * 100) / 100,
@@ -270,6 +291,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         },
         note: `${store.name}: CSV bill ${invoiceRef} from ${supplier} — ${prepared.length} posted, `
           + `${skipped_rows.length} skipped, ₹${totalValue}`
+          + (() => { const n = new Set(prepared.map(p => p.ref)).size; return n > 1 ? ` across ${n} inward numbers` : ''; })()
           + (billCharges ? ` (Net Indent ₹${billCharges.net_indent_value})` : ''),
       });
     }
