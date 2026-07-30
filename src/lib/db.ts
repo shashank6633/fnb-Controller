@@ -508,8 +508,15 @@ function initializeSchema(db: Database.Database) {
       ['options', "TEXT DEFAULT ''"],                   // JSON: [{label, choices:[…]}] — e.g. Temperature: Normal/Chilled
     ];
     for (const [c, t] of miAdds) if (!miNames.has(c)) db.exec(`ALTER TABLE menu_items ADD COLUMN ${c} ${t}`);
-    // Backfill — any menu item already with a material_id is implicitly reviewed
-    db.exec(`UPDATE menu_items SET direct_reviewed = 1 WHERE material_id IS NOT NULL AND direct_reviewed = 0`);
+    // Backfill — any menu item already with a material_id is implicitly reviewed.
+    // ONE-SHOT: direct_reviewed is a human's judgement, so re-running this on
+    // every boot silently re-reviewed anything an admin had un-reviewed, on the
+    // next deploy. Same class of bug as the nav-continuity grants below.
+    const reviewedBackfilled = db.prepare("SELECT value FROM settings WHERE key='direct_reviewed_backfill_v1'").get() as any;
+    if (!reviewedBackfilled) {
+      db.exec(`UPDATE menu_items SET direct_reviewed = 1 WHERE material_id IS NOT NULL AND direct_reviewed = 0`);
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('direct_reviewed_backfill_v1', '1')").run();
+    }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_menu_items_direct_reviewed ON menu_items(direct_reviewed)`);
   } catch (e) { console.error('direct_reviewed migration failed:', e); }
 
@@ -1736,41 +1743,57 @@ function initializeSchema(db: Database.Database) {
     for (const s of seeds) seedRole.run(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
   } catch (e) { console.error('roles schema/seed migration failed:', e); }
 
-  // Unified Guests continuity: the CRM › Guests page (/crm-calls/guests) now
-  // supersedes the legacy "Guests & Loyalty" (/crm/guests) in the sidebar. So
-  // anyone previously granted only /crm/guests keeps a working guest nav link —
-  // add /crm-calls/guests to any role/user whose page_access lists /crm/guests
-  // but not the new path yet. Idempotent + additive: NULL page_access (= all
-  // access) is untouched, malformed JSON is skipped, and '/crm/guests' is NOT a
-  // substring of '/crm-calls/guests' so the quoted-element LIKE is exact.
+  // ── NAV-CONTINUITY GRANTS — ONE-SHOT, NEVER ON EVERY BOOT ────────────────
+  //
+  // These two hand a newly-added page to roles that already hold its sibling,
+  // so a rename or a split does not silently strand people. That is a
+  // one-time courtesy at the moment the page ships.
+  //
+  // They used to run on EVERY boot, and because a deploy restarts the process,
+  // that made them run on every deploy. Their WHERE clause cannot tell "this
+  // role has never seen the new page" from "an admin deliberately revoked it",
+  // so a revoke survived exactly until the next deploy and then silently
+  // undid itself. Reproduced on the live Floor Manager role: revoke
+  // /dine-in/reservations, restart once, and it is back.
+  //
+  // Access is admin-owned state, not derived state. Once it has been granted
+  // once, the admin's word is final — so both are gated behind a settings flag
+  // and can never run a second time. Same one-shot pattern as
+  // phase1_master_backfill_v1 and the other *_v1 flags in this file.
+  //
+  // ANY future migration that writes roles.page_access, users.page_access, a
+  // role tier, or any other admin-set permission MUST be one-shot for the same
+  // reason. scripts/check-boot-migrations.js enforces this.
   try {
-    for (const tbl of ['roles', 'users']) {
-      db.prepare(
-        `UPDATE ${tbl}
-           SET page_access = json_insert(page_access, '$[#]', '/crm-calls/guests')
-         WHERE page_access IS NOT NULL
-           AND json_valid(page_access)
-           AND page_access LIKE '%"/crm/guests"%'
-           AND page_access NOT LIKE '%"/crm-calls/guests"%'`,
-      ).run();
+    const navGranted = db.prepare("SELECT value FROM settings WHERE key='nav_continuity_grants_v1'").get() as any;
+    if (!navGranted) {
+      // /crm-calls/guests supersedes the legacy "Guests & Loyalty" (/crm/guests).
+      // '/crm/guests' is NOT a substring of '/crm-calls/guests', so the
+      // quoted-element LIKE is exact. NULL page_access (= full access) untouched.
+      for (const tbl of ['roles', 'users']) {
+        db.prepare(
+          `UPDATE ${tbl}
+             SET page_access = json_insert(page_access, '$[#]', '/crm-calls/guests')
+           WHERE page_access IS NOT NULL
+             AND json_valid(page_access)
+             AND page_access LIKE '%"/crm/guests"%'
+             AND page_access NOT LIKE '%"/crm-calls/guests"%'`,
+        ).run();
+      }
+      // The host Seat board sits beside Tables, so whoever runs Tables gets it.
+      for (const tbl of ['roles', 'users']) {
+        db.prepare(
+          `UPDATE ${tbl}
+             SET page_access = json_insert(page_access, '$[#]', '/dine-in/reservations')
+           WHERE page_access IS NOT NULL
+             AND json_valid(page_access)
+             AND page_access LIKE '%"/dine-in/tables"%'
+             AND page_access NOT LIKE '%"/dine-in/reservations"%'`,
+        ).run();
+      }
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('nav_continuity_grants_v1', '1')").run();
     }
-  } catch (e) { console.error('unified-guests page_access migration failed:', e); }
-
-  // Nav continuity: the new host Seat board (/dine-in/reservations) — grant it to
-  // any role/user who can already see Tables, so existing scoped Floor/Cashier
-  // roles get Reservations without a manual regrant. Same idempotent pattern.
-  try {
-    for (const tbl of ['roles', 'users']) {
-      db.prepare(
-        `UPDATE ${tbl}
-           SET page_access = json_insert(page_access, '$[#]', '/dine-in/reservations')
-         WHERE page_access IS NOT NULL
-           AND json_valid(page_access)
-           AND page_access LIKE '%"/dine-in/tables"%'
-           AND page_access NOT LIKE '%"/dine-in/reservations"%'`,
-      ).run();
-    }
-  } catch (e) { console.error('reservations page_access migration failed:', e); }
+  } catch (e) { console.error('nav-continuity page_access migration failed:', e); }
 
   // Mark the linked_po_id column on purchase_orders so we can navigate from PO → Requisition
   try {
