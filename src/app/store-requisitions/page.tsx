@@ -31,7 +31,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Package, Loader2, RefreshCw, Search, Clock, CheckCircle2, AlertCircle,
   Send, RotateCcw, ChevronRight, ChevronDown, History, User as UserIcon, XCircle,
-  Hourglass,
+  Hourglass, Split,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { fmtIST, fmtISTIsoDate, todayIST } from '@/lib/format-date';
@@ -79,6 +79,16 @@ interface Requisition {
   total_lines: number; lines_issued: number; lines_deferred: number; lines_open: number;
   /** Lines with 0 < issued < effective — handed over, but not in full. */
   lines_partial: number;
+  /**
+   * Lines that have moved ANY goods (quantity_issued > 0), whatever else is true
+   * of them. The three counters above are a PARTITION — each line lands in
+   * exactly one of issued / deferred / open — so a line that gave out 2 of 4 and
+   * carries a promised time for the balance is filed under `deferred` and the 2
+   * that physically left the store disappear from the roll-up. This is the count
+   * that still sees them. It is additive: nothing reads it in place of the five
+   * fields above, which badges and tab predicates depend on.
+   */
+  lines_issued_any: number;
   /** Σ max(0, effective − issued) over non-rejected lines. MIXED UNITS by
    *  design (each line carries its own unit), so this is only ever asked
    *  `> 0` — "is anything still owed?". Never render it as a number. */
@@ -166,6 +176,20 @@ export default function StoreRequisitionsPage() {
   // Why more than approved was handed over — recorded on the issue-history entry.
   const [issueNotes, setIssueNotes] = useState<Record<string, string>>({});
   const [editDefer, setEditDefer] = useState<Record<string, { until: string; reason: string }>>({});
+  // "Issue N, defer the rest" — the gesture, captured the moment the store asks
+  // for the split:
+  //   qty   the hand-over quantity in the LINE's own stored unit. Held apart
+  //         from editQty (a purchase-unit STRING the user keeps typing in) so
+  //         the number cannot drift while the promised time is being picked.
+  //   token the per-gesture idempotency token /store-issue accepts as
+  //         body.client_token (route.ts:121-127). Minted HERE, not at POST time,
+  //         so a re-submit of the SAME gesture carries the SAME token and the
+  //         ledger's (client_token, req_item_id) index can recognise the replay.
+  //         Optional by contract, and inert while requisition_deduct_at_issue is
+  //         '0' — no ledger row exists to collide with, so today it changes
+  //         nothing whatsoever.
+  // A key here is also what turns the defer panel into the combined action.
+  const [splitIssueQty, setSplitIssueQty] = useState<Record<string, { qty: number; token: string }>>({});
   const [showHistoryFor, setShowHistoryFor] = useState<string | null>(null);
   // "Issue All Items" confirmation — holds the requisition whose bulk-issue is
   // awaiting confirmation (null = no modal). We compute the lines to issue at
@@ -409,6 +433,89 @@ export default function StoreRequisitionsPage() {
     } finally { setBusyLine(null); }
   };
 
+  /* ── "Issue N, defer the rest" ───────────────────────────────────────────
+     Step 1 of 2 (this function): capture WHAT is going out now and open the
+     defer editor pre-filled. The store types the quantity in the same box it
+     always has, in PURCHASE units; it is converted once, here, to the line's
+     stored unit and parked in splitIssueQty. Nothing is POSTed yet — a defer is
+     a promise about a TIME, and only a human may set it.
+
+     It refuses the whole outstanding on purpose: with nothing left over there is
+     no "rest" to defer, and silently degrading to a plain issue would leave a
+     promised time hanging on a finished line. */
+  const beginIssueAndDeferRest = (line: ReqLine) => {
+    const U = lineUnits(line);
+    const s = lineSplit(line);
+    const typed = editQty[line.id];
+    const typedPU = Number(typed);
+    const hasTyped = typed !== undefined && String(typed).trim() !== '' && Number.isFinite(typedPU) && typedPU > 0;
+    if (!hasTyped) {
+      alert(`Type how much ${line.material_name} is going out NOW in the quantity box`
+        + `${U.pu ? ` (in ${U.pu})` : ''}, then press this again.\n\n`
+        + `The balance is what gets the promised time — so it has to be less than the `
+        + `${fmtNum(U.toPU(s.outstanding))}${U.pu ? ` ${U.pu}` : ''} still outstanding.`);
+      return;
+    }
+    const qty = U.fromPU(typedPU);
+    if (qty >= s.outstanding - 1e-9) {
+      alert(`${fmtNum(typedPU)}${U.pu ? ` ${U.pu}` : ''} is the whole outstanding quantity — `
+        + `there is no balance left to defer.\n\nUse "Issue Now" for that.`);
+      return;
+    }
+    setSplitIssueQty(p => ({ ...p, [line.id]: { qty, token: gestureToken() } }));
+    setEditDefer(p => ({ ...p, [line.id]: { until: defaultDefer(), reason: '' } }));
+  };
+
+  /* Step 2 of 2: ONE POST, ONE transaction — hand part of the line over and put
+     the promised time on the balance. Before this the store had to issue, watch
+     the row drop out of the open list, hunt it down and defer it separately.
+
+     ORDER IS LOAD-BEARING. /store-issue walks `lines` in array order, and its
+     'issue' branch clears the deferred fields — historically always (its
+     `updIssue` statement), and now only when the line ends up fully satisfied
+     (`updIssuePartial`, see "THE DEFER RULE (half-transfer)" in that route's
+     header). A defer written FIRST would be wiped by the issue that follows it.
+     Issue-then-defer lands in the same final state under BOTH readings, which is
+     why this ordering is not conditional on that change. Nothing here duplicates
+     it: the client never decides whether a defer survives, it just orders the
+     two actions so it never has to ask. The route re-reads each line inside its
+     own transaction, so the second entry for this same line id sees the first. */
+  const issueAndDeferRest = async (req: Requisition, line: ReqLine) => {
+    const gesture = splitIssueQty[line.id];
+    const qty = gesture?.qty as number;
+    const cfg = editDefer[line.id];
+    const U = lineUnits(line);
+    const s = lineSplit(line);
+    if (!Number.isFinite(qty) || !(qty > 0)) { alert('Nothing captured to issue — start again.'); return; }
+    if (qty >= s.outstanding - 1e-9) {
+      alert('The outstanding quantity changed — there is no balance left to defer. Refresh and try again.');
+      return;
+    }
+    if (!cfg?.until) { alert('Pick the date/time you can issue the balance'); return; }
+    const restPU = fmtNum(U.toPU(s.outstanding - qty));
+    setBusyLine(line.id);
+    try {
+      const r = await api(`/api/requisitions/${req.id}/store-issue`, {
+        method: 'POST',
+        body: { client_token: gesture.token, lines: [
+          { id: line.id, action: 'issue', quantity: qty, note: (issueNotes[line.id] || '').trim() },
+          { id: line.id, action: 'defer', defer_until: cfg.until,
+            // A defer with no words on it reads as "forgotten" three hours later.
+            // Say what the promise is FOR when the store didn't.
+            reason: (cfg.reason || '').trim()
+              || `Balance ${restPU}${U.pu ? ` ${U.pu}` : ''} to follow` },
+        ] },
+      });
+      const j = await r.json();
+      if (!r.ok) { alert(j.error || 'Issue + defer failed'); return; }
+      setEditQty(sm => ({ ...sm, [line.id]: '' }));
+      setIssueNotes(sm => { const n = { ...sm }; delete n[line.id]; return n; });
+      setEditDefer(sm => { const n = { ...sm }; delete n[line.id]; return n; });
+      setSplitIssueQty(sm => { const n = { ...sm }; delete n[line.id]; return n; });
+      setRefreshKey(k => k + 1);
+    } finally { setBusyLine(null); }
+  };
+
   const undoLine = async (req: Requisition, line: ReqLine) => {
     if (!confirm(`Undo all actions on ${line.material_name}?`)) return;
     setBusyLine(line.id);
@@ -506,6 +613,10 @@ export default function StoreRequisitionsPage() {
         {([
           { k: 'open',             label: 'Pending Issue',    icon: AlertCircle, tone: 'amber' },
           { k: 'deferred',         label: 'Deferred',         icon: Clock,       tone: 'blue' },
+          // The half-transferred line. Sits next to Deferred because that is the
+          // tab it used to hide inside: a line issued 2 of 4 and promised for
+          // 7pm counted as 1 deferred, 0 issued.
+          { k: 'part_issued',      label: 'Part-Issued',      icon: Split,       tone: 'violet' },
           { k: 'balance_pending',  label: 'Balance Pending',  icon: Hourglass,   tone: 'rose' },
           { k: 'issued_today',     label: 'Issued Today',     icon: CheckCircle2,tone: 'emerald' },
           { k: 'issued_log',       label: 'Issued Items Log', icon: History,     tone: 'amber' },
@@ -524,6 +635,7 @@ export default function StoreRequisitionsPage() {
             blue:  active ? 'bg-blue-600  text-white border-blue-600'  : 'bg-blue-50  text-blue-800  border-blue-200',
             emerald: active ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-emerald-50 text-emerald-800 border-emerald-200',
             rose: active ? 'bg-rose-600 text-white border-rose-600' : 'bg-rose-50 text-rose-800 border-rose-200',
+            violet: active ? 'bg-violet-600 text-white border-violet-600' : 'bg-violet-50 text-violet-800 border-violet-200',
           };
           return (
             <button key={t.k} onClick={() => setFilter(t.k)}
@@ -567,6 +679,7 @@ export default function StoreRequisitionsPage() {
           <CheckCircle2 className="w-7 h-7 mx-auto mb-2 text-emerald-500" />
           Nothing here. {filter === 'open' && 'Caught up — no pending requisitions.'}
           {filter === 'deferred' && 'No items promised for a later time.'}
+          {filter === 'part_issued' && 'No line has been split — nothing went out in part with a balance still owed.'}
           {filter === 'balance_pending' && 'No balances owed — every issued requisition went out in full.'}
           {filter === 'issued_today' && 'Nothing has been handed over today yet.'}
         </div>
@@ -591,6 +704,10 @@ export default function StoreRequisitionsPage() {
                      setEditQty={setEditQty}
                      editDefer={editDefer}
                      setEditDefer={setEditDefer}
+                     splitIssueQty={splitIssueQty}
+                     setSplitIssueQty={setSplitIssueQty}
+                     onBeginIssueDeferRest={(line) => beginIssueAndDeferRest(line)}
+                     onIssueDeferRest={(line) => issueAndDeferRest(req, line)}
                      onIssue={(line, qty) => issueLine(req, line, qty)}
                      onDefer={(line) => deferLine(req, line)}
                      onUndo={(line) => undoLine(req, line)}
@@ -696,6 +813,47 @@ function effectiveQty(line: ReqLine): number {
 }
 
 /**
+ * ONE line's quantity, split three ways. THE unit basis is the LINE's own stored
+ * `unit` (option B) for every figure here — nothing is converted. Push each part
+ * through lineUnits() at the point it is displayed, exactly as the row's other
+ * quantities already are.
+ *
+ *   issued    — what physically left the store (quantity_issued). NOT capped at
+ *               `effective`: an over-issue is a real event the store records as
+ *               what actually went, and clamping it here would quietly hide it.
+ *   deferred  — the part of the remainder a human has promised a time for.
+ *   open      — the part of the remainder nobody has promised anything about.
+ *
+ * WHY THIS IS THE WHOLE FIX: the store's real answer to "issue 4 kg?" is often
+ * "2 now, 2 at 7pm", and the line has only ever been able to land WHOLLY in one
+ * bucket — deferring it filed it as 1 deferred / 0 issued and the 2 kg that left
+ * the counter became invisible. Split into three parts they are all sayable.
+ *
+ * `deferred` and `open` are mutually exclusive TODAY, because deferred_until is
+ * a flag on the whole line: set, and the entire remainder is the promise; unset,
+ * and the entire remainder is open. That is a property of the schema, not an
+ * assumption baked in here — the shape stays correct if a per-quantity defer
+ * ever lands, and every caller renders whichever parts are non-zero.
+ */
+function lineSplit(line: ReqLine): {
+  effective: number; issued: number; outstanding: number;
+  deferred: number; open: number; isSplit: boolean;
+} {
+  const effective = effectiveQty(line);
+  const issued = Math.max(0, Number(line.quantity_issued) || 0);
+  const outstanding = Math.max(0, effective - issued);
+  const promised = !!line.deferred_until;
+  return {
+    effective, issued, outstanding,
+    deferred: promised ? outstanding : 0,
+    open:     promised ? 0 : outstanding,
+    // The owner's case in one boolean: goods went out AND goods are still owed,
+    // on the SAME line.
+    isSplit: issued > 0 && outstanding > 0,
+  };
+}
+
+/**
  * Lines that "Issue All Items" will issue: not rejected, not deferred, and with
  * a positive remaining qty. Returns each with its `remaining` (effective − issued)
  * so both the confirmation list and the POST body use the same numbers.
@@ -734,6 +892,9 @@ function mergeStats(req: any): Requisition {
   const today = todayIST();
   const reqStamp = req.fulfilled_at || req.store_processed_at || null;
   let issued = 0, deferred = 0, open = 0, partial = 0, outstanding = 0;
+  // Counted ALONGSIDE the partition above, never instead of it — the five
+  // existing fields are what the header badges and every tab predicate read.
+  let issuedAny = 0;
   let issuedToday = false;
   for (const it of items) {
     if (it.is_rejected) continue;
@@ -746,6 +907,11 @@ function mergeStats(req: any): Requisition {
     // A part-issued line is NOT the same as an untouched one — it used to be
     // filed as `open` above, which is why "some of it went out" was invisible.
     if (got > 0 && got < eff) partial++;
+    // "Did goods leave the store on this line?" — the question the partition
+    // cannot answer, because a part-issued DEFERRED line answers `deferred` to
+    // it and `lines_issued` stays 0. Deliberately not gated on `got < eff` or on
+    // deferred_until: it counts hand-overs, not completeness.
+    if (got > 0) issuedAny++;
     outstanding += Math.max(0, eff - got);
     if (!issuedToday && issuedOnDay(it, reqStamp, today)) issuedToday = true;
   }
@@ -757,13 +923,14 @@ function mergeStats(req: any): Requisition {
     lines_deferred: deferred,
     lines_open: open,
     lines_partial: partial,
+    lines_issued_any: issuedAny,
     qty_outstanding: outstanding,
     issued_today: issuedToday,
   } as Requisition;
 }
 
 /** The queue tabs. 'issued_log' is a separate panel, not a slice of the list. */
-type StoreTab = 'open' | 'deferred' | 'balance_pending' | 'issued_today' | 'issued_log';
+type StoreTab = 'open' | 'deferred' | 'part_issued' | 'balance_pending' | 'issued_today' | 'issued_log';
 
 /**
  * THE definition of every tab — called by the tab body AND by the tab badges.
@@ -781,6 +948,19 @@ function matchesTab(r: Requisition, tab: StoreTab): boolean {
   switch (tab) {
     case 'open':            return r.status !== 'fulfilled' && r.lines_open > 0;
     case 'deferred':        return r.lines_deferred > 0;
+    // A LINE was SPLIT: part of its quantity physically went out and the rest is
+    // still owed — "2 issued, 2 to follow". lines_partial is exactly that count
+    // (0 < issued < effective), and it is deliberately blind to deferred_until,
+    // so the split shows here whether the balance was promised for 7pm or left
+    // open.
+    //
+    // NOT a second name for Balance Pending. That tab also fires when WHOLE
+    // lines went out and OTHER lines are untouched, where the store never
+    // divided anything; this one is only ever about a single line handed over in
+    // pieces. And it takes nothing away: matchesTab is asked once per tab and
+    // never exclusively, so a requisition landing here keeps every bucket it
+    // already matched — Deferred, Balance Pending and Issued Today included.
+    case 'part_issued':     return r.status !== 'fulfilled' && r.lines_partial > 0;
     // Goods went out, goods are still owed, and the req is not closed — the
     // half-transfer bucket. The "something was actually handed over" clause is
     // what makes this tab DISTINCT: without it every untouched requisition
@@ -826,6 +1006,12 @@ const STATUS_LABEL: Record<string, string> = {
  * can't be added up: each line carries its own unit, so a sum would be a
  * meaningless number presented as a fact. Those report the count and leave the
  * quantities to the expanded rows.
+ *
+ * BOTH shapes now name WHERE THE BALANCE SAT when the store walked away, because
+ * "4 of 6 BTL issued" is only half the sentence: it never said whether someone
+ * promised the other 2 for 7pm or whether they are simply unhandled. The
+ * single-line form says the balance in the same purchase unit as the lead; the
+ * many-line form counts them, since the units still cannot be added.
  */
 function partialSummary(req: Requisition): string | null {
   const partials = (req.items || []).filter(l => {
@@ -834,10 +1020,22 @@ function partialSummary(req: Requisition): string | null {
     return got > 0 && got < effectiveQty(l);
   });
   if (partials.length === 0) return null;
-  if (partials.length > 1) return `${partials.length} items part-issued`;
+  if (partials.length > 1) {
+    const promised = partials.filter(l => !!l.deferred_until).length;
+    const tail = promised === 0            ? 'balances still open'
+               : promised === partials.length ? 'balances deferred'
+               : `${promised} deferred, ${partials.length - promised} still open`;
+    return `${partials.length} items part-issued — ${tail}`;
+  }
   const l = partials[0];
   const U = lineUnits(l);
-  return `${fmtNum(U.toPU(l.quantity_issued))} of ${fmtNum(U.toPU(effectiveQty(l)))}${U.pu ? ` ${U.pu}` : ''} issued`;
+  const s = lineSplit(l);
+  // s.deferred / s.open are mutually exclusive per line (deferred_until is a
+  // line flag), so exactly one of these two sentences is the true one.
+  const balance = s.deferred > 0
+    ? `${fmtNum(U.toPU(s.deferred))}${U.pu ? ` ${U.pu}` : ''} deferred`
+    : `${fmtNum(U.toPU(s.open))}${U.pu ? ` ${U.pu}` : ''} still open`;
+  return `${fmtNum(U.toPU(s.issued))} of ${fmtNum(U.toPU(s.effective))}${U.pu ? ` ${U.pu}` : ''} issued — ${balance}`;
 }
 
 function ReqCard(props: {
@@ -855,6 +1053,11 @@ function ReqCard(props: {
   issueNotes: Record<string, string>; setIssueNotes: (f: any) => void;
   editDefer: Record<string, { until: string; reason: string }>;
   setEditDefer: (f: any) => void;
+  // "Issue N, defer the rest" — the captured gesture per line + its two steps.
+  splitIssueQty: Record<string, { qty: number; token: string }>;
+  setSplitIssueQty: (f: any) => void;
+  onBeginIssueDeferRest: (line: ReqLine) => void;
+  onIssueDeferRest: (line: ReqLine) => void;
   onIssue: (line: ReqLine, qty?: number) => void;
   onDefer: (line: ReqLine) => void;
   onUndo: (line: ReqLine) => void;
@@ -904,10 +1107,25 @@ function ReqCard(props: {
             <span>Approved: {fmtDateTime(req.mgmt_approved_at || req.chef_approved_at)}</span>
           </div>
         </div>
-        <div className="flex items-center gap-2 text-[11px]">
+        {/* flex-wrap because this row now carries up to six chips — the store's
+            tablet was squeezing the requisition number to make them all fit on
+            one line. */}
+        <div className="flex flex-wrap justify-end items-center gap-2 text-[11px]">
           {req.lines_issued > 0 && <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">{req.lines_issued} issued</span>}
           {req.lines_deferred > 0 && <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">{req.lines_deferred} deferred</span>}
           {req.lines_open > 0 && <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200">{req.lines_open} open</span>}
+          {/* Lines that DID hand goods over but are not counted in "N issued" —
+              part-issued, or fully issued with a promise still parked on them.
+              The three counters above partition each line into one bucket, so
+              without this the 2 kg that left the counter on a deferred line is
+              nowhere on the card. Purely additive: it reads lines_issued_any and
+              changes none of them. */}
+          {req.lines_issued_any > req.lines_issued && (
+            <span title="Goods went out on these lines, but they are still owed (part-issued, or deferred with a promised time)"
+                  className="px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200">
+              {req.lines_issued_any - req.lines_issued} sent, not closed
+            </span>
+          )}
           {/* What actually went out, in the store's own units. The card used to
               print the raw column value ("store_processed") at the person
               holding the goods and say nothing about the shortfall. */}
@@ -998,6 +1216,9 @@ function ReqCard(props: {
                          editQty={props.editQty} setEditQty={props.setEditQty}
                          issueNotes={props.issueNotes} setIssueNotes={props.setIssueNotes}
                          editDefer={props.editDefer} setEditDefer={props.setEditDefer}
+                         splitIssueQty={props.splitIssueQty} setSplitIssueQty={props.setSplitIssueQty}
+                         onBeginIssueDeferRest={props.onBeginIssueDeferRest}
+                         onIssueDeferRest={props.onIssueDeferRest}
                          onIssue={props.onIssue} onDefer={props.onDefer}
                          onUndo={props.onUndo} onReject={props.onReject} onUnreject={props.onUnreject}
                          onShowHistory={props.onShowHistory} />
@@ -1025,6 +1246,12 @@ function LineRow(props: {
   issueNotes: Record<string, string>; setIssueNotes: (f: any) => void;
   editDefer: Record<string, { until: string; reason: string }>;
   setEditDefer: (f: any) => void;
+  // "Issue N, defer the rest". A key in splitIssueQty for this line means the
+  // defer panel below is showing the COMBINED action, not a plain defer.
+  splitIssueQty: Record<string, { qty: number; token: string }>;
+  setSplitIssueQty: (f: any) => void;
+  onBeginIssueDeferRest: (line: ReqLine) => void;
+  onIssueDeferRest: (line: ReqLine) => void;
   onIssue: (line: ReqLine, qty?: number) => void;
   onDefer: (line: ReqLine) => void;
   onUndo: (line: ReqLine) => void;
@@ -1036,6 +1263,11 @@ function LineRow(props: {
   const eff = effectiveQty(line);
   const issued = Number(line.quantity_issued) || 0;
   const outstanding = Math.max(0, eff - issued);
+  // The same three numbers as above, named — split.effective / .issued /
+  // .outstanding are identical to eff / issued / outstanding by construction;
+  // what it adds is WHICH BUCKET the remainder sits in. eff, issued and
+  // outstanding stay in place because the over-issue maths below reads them.
+  const split = lineSplit(line);
   // Everything reads in PURCHASE units (owner rule) — the store hands over
   // bottles/kg, not ml/g — regardless of which unit the composer stored the
   // line in. `hint` carries the recipe equivalent for packed materials.
@@ -1069,6 +1301,16 @@ function LineRow(props: {
                 : outstanding === 0 && !line.deferred_until ? 'bg-emerald-50/30'
                 : line.deferred_until ? 'bg-blue-50/30' : '';
   const deferOpen = !!props.editDefer[line.id];
+  /* "Issue N, defer the rest" — two derived states.
+     `splitQty` is the hand-over quantity already captured (in the LINE's stored
+     unit), which is what turns the defer panel below into the combined action.
+     `typedIsPartial` drives the button's live label BEFORE that: it is true only
+     while the box holds a genuine PART of what is still owed, so the button can
+     say the actual numbers instead of a generic promise. */
+  const splitQty = props.splitIssueQty[line.id]?.qty;
+  const splitMode = deferOpen && Number.isFinite(splitQty) && splitQty > 0;
+  const splitRest = splitMode ? Math.max(0, outstanding - splitQty) : 0;
+  const typedIsPartial = Number.isFinite(typedPU) && typedPU > 0 && outstandingPU - typedPU > 1e-9;
   // A line is selectable only when it's an open issuable line: not rejected by
   // chef or store, not deferred, and with a positive outstanding qty. Matches
   // openIssuableLines() so header select-all and per-line boxes stay in sync.
@@ -1160,9 +1402,35 @@ function LineRow(props: {
         {puNum(U.toPU(issued), issued)}{unitTag}
         {hint(issued)}
       </td>
+      {/* OUTSTANDING, split by who owes what.
+          The total stays the lead — the column header and its tooltip promise
+          "still owed", and that number is still the answer. Under it, when the
+          line has actually been divided, the remainder is named: DEFERRED (a
+          human put a time on it) or OPEN (nobody has). Before this the two were
+          the same figure, so "2 kg issued, 2 kg promised for 7pm" and "2 kg
+          issued, 2 kg nobody has touched" printed identically.
+          A line that has moved nothing and carries no promise renders exactly as
+          it always did — no extra markup, no second figure. Both parts lead with
+          the PURCHASE unit (unitTag = U.pu) and carry the recipe hint. */}
       <td className="py-1.5 px-2 text-right font-mono font-semibold">
         <span className={outstanding === 0 ? 'text-emerald-700' : 'text-[#af4408]'}>{puNum(outstandingPU, outstanding)}{unitTag}</span>
         {hint(outstanding)}
+        {(split.isSplit || split.deferred > 0) && (
+          <>
+            {split.deferred > 0 && (
+              <div className="mt-0.5 font-normal text-[10px] text-blue-700">
+                Deferred {puNum(U.toPU(split.deferred), split.deferred)}{unitTag}
+                {hint(split.deferred)}
+              </div>
+            )}
+            {split.open > 0 && (
+              <div className="mt-0.5 font-normal text-[10px] text-[#af4408]">
+                Open {puNum(U.toPU(split.open), split.open)}{unitTag}
+                {hint(split.open)}
+              </div>
+            )}
+          </>
+        )}
       </td>
       <td className="py-1.5 px-2 align-top text-[10px] text-[#6B5744]">
         {line.issued_at ? (
@@ -1218,6 +1486,21 @@ function LineRow(props: {
                         className="px-2 py-0.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded text-[10px] flex items-center gap-1">
                   <Clock className="w-3 h-3" /> Defer
                 </button>
+                {/* THE SPLIT. Issue what is physically on the shelf and promise
+                    the balance in the same gesture — one POST, one transaction,
+                    one row in the history. Doing it as Issue-then-Defer left the
+                    line out of the open list between the two clicks, and the
+                    store had to go and find it again. The label carries the real
+                    numbers as soon as the box holds a partial quantity, so the
+                    button says exactly what it is about to do. */}
+                <button onClick={() => props.onBeginIssueDeferRest(line)} disabled={busy}
+                        title="Hand over part of this line now and put a promised time on the balance — one action, recorded as both"
+                        className="px-2 py-0.5 bg-violet-50 hover:bg-violet-100 text-violet-700 border border-violet-200 rounded text-[10px] flex items-center gap-1 disabled:opacity-50">
+                  <Split className="w-3 h-3" />
+                  {typedIsPartial
+                    ? <>Issue {fmtNum(typedPU)} {u}, defer {fmtNum(Math.round((outstandingPU - typedPU) * 1000) / 1000)} {u}</>
+                    : <>Issue part, defer rest</>}
+                </button>
                 {/* Store rejection — distinct from the chef's. Prompts for a reason. */}
                 <button onClick={() => props.onReject(line)} disabled={busy}
                         title="Store cannot fulfil this line (discontinued / wrong item)"
@@ -1245,20 +1528,49 @@ function LineRow(props: {
               </div>
             )}
             {deferOpen && (
-              <div className="flex items-center gap-1 bg-blue-50 border border-blue-200 rounded px-1.5 py-1">
+              // The SAME editor serves both actions. In split mode it is tinted
+              // violet, states the two quantities it is about to record, and its
+              // save button performs the combined issue+defer; otherwise it is
+              // the plain defer it has always been, unchanged.
+              <div className={`flex flex-wrap items-center gap-1 border rounded px-1.5 py-1 ${
+                splitMode ? 'bg-violet-50 border-violet-200' : 'bg-blue-50 border-blue-200'}`}>
+                {splitMode && (
+                  <span className="w-full sm:w-auto text-[10px] text-[#6B5744] shrink-0">
+                    Handing over <b className="text-emerald-700">{fmtNum(U.toPU(splitQty))} {u}</b> now
+                    {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-0.5">= {fmtNum(U.toRecipe(splitQty))} {U.recipeUnit}</span>}
+                    , the balance <b className="text-violet-700">{fmtNum(U.toPU(splitRest))} {u}</b>
+                    {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-0.5">= {fmtNum(U.toRecipe(splitRest))} {U.recipeUnit}</span>}
+                    {' '}is promised for
+                  </span>
+                )}
                 <input type="datetime-local" value={props.editDefer[line.id]?.until || ''}
                        onChange={e => props.setEditDefer((s: any) => ({ ...s, [line.id]: { ...s[line.id], until: e.target.value } }))}
-                       className="px-1 py-0.5 border border-blue-200 rounded text-[10px] bg-white" />
+                       className={`px-1 py-0.5 border rounded text-[10px] bg-white ${splitMode ? 'border-violet-200' : 'border-blue-200'}`} />
                 <input type="text" placeholder="reason (optional)"
                        value={props.editDefer[line.id]?.reason || ''}
                        onChange={e => props.setEditDefer((s: any) => ({ ...s, [line.id]: { ...s[line.id], reason: e.target.value } }))}
-                       className="w-32 px-1 py-0.5 border border-blue-200 rounded text-[10px] bg-white" />
-                <button onClick={() => props.onDefer(line)} disabled={busy}
-                        className="px-2 py-0.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-[10px] disabled:opacity-50">
-                  {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Save defer'}
-                </button>
-                <button onClick={() => props.setEditDefer((s: any) => { const n = { ...s }; delete n[line.id]; return n; })}
-                        className="text-[10px] text-blue-700 px-1">cancel</button>
+                       className={`w-32 px-1 py-0.5 border rounded text-[10px] bg-white ${splitMode ? 'border-violet-200' : 'border-blue-200'}`} />
+                {splitMode ? (
+                  <button onClick={() => props.onIssueDeferRest(line)} disabled={busy}
+                          title="Records the hand-over AND the promised time in one transaction"
+                          className="px-2 py-0.5 bg-violet-600 hover:bg-violet-700 text-white rounded text-[10px] disabled:opacity-50 flex items-center gap-1">
+                    {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Split className="w-3 h-3" />}
+                    Issue &amp; defer balance
+                  </button>
+                ) : (
+                  <button onClick={() => props.onDefer(line)} disabled={busy}
+                          className="px-2 py-0.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-[10px] disabled:opacity-50">
+                    {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Save defer'}
+                  </button>
+                )}
+                {/* Cancel drops the captured quantity too — leaving it behind
+                    would re-arm the split the next time the plain Defer button
+                    opened this panel. */}
+                <button onClick={() => {
+                          props.setEditDefer((s: any) => { const n = { ...s }; delete n[line.id]; return n; });
+                          props.setSplitIssueQty((s: any) => { const n = { ...s }; delete n[line.id]; return n; });
+                        }}
+                        className={`text-[10px] px-1 ${splitMode ? 'text-violet-700' : 'text-blue-700'}`}>cancel</button>
               </div>
             )}
             {(issued > 0 || line.deferred_until) && (
@@ -1295,6 +1607,17 @@ function deferDueStatus(deferredUntil: string | null): { soon: boolean; overdue:
   const soon = delta <= 4 * 3600 * 1000;   // within 4h (or already past)
   const hours = Math.max(0, Math.round(delta / 3600000));
   return { soon, overdue, hours };
+}
+
+/**
+ * One id per GESTURE, for /store-issue's optional body.client_token. randomUUID
+ * needs a secure context; the fallback is only ever used where it isn't (plain
+ * http on a LAN IP), and uniqueness per gesture is all the token has to promise.
+ */
+function gestureToken(): string {
+  const c: any = (globalThis as any).crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return `split-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 /** Default defer to +2h from now, formatted for <input type="datetime-local">. */

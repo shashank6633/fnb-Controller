@@ -223,6 +223,14 @@ export async function POST(request: Request) {
 
         delOne.run(date, item.material_id, deptId);
 
+        // KNOWN LIMITATION — the system figure is the CENTRAL pool
+        // (raw_materials.current_stock) even for a row tagged to a department.
+        // A department's count is therefore NOT comparable to it. Left as-is
+        // (changing it would change what every existing count means); instead
+        // approveVariance() refuses to move central stock for a central count
+        // with a department_id — see varianceApprovalBlock() in
+        // src/lib/variance-approval.ts. Counting a department against its own
+        // computed balance is a separate build.
         const systemStock = material.current_stock;
         const physicalStock = Number(item.physical_stock);
 

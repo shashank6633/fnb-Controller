@@ -1,5 +1,6 @@
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
+import { lineHasMovedStock } from '@/lib/issue-stock';
 
 /**
  * Per-item chef edit on a submitted requisition.
@@ -69,6 +70,21 @@ export async function PUT(
     if (body.is_rejected !== undefined) {
       const v = body.is_rejected ? 1 : 0;
       if (v !== item.is_rejected) {
+        // STOCK SAFETY: dept-stock.ts:193 excludes `COALESCE(ri.is_rejected,0) = 0`
+        // lines from the department balance. Flagging a line that has already moved
+        // stock therefore hides it from the department while central stays deducted
+        // — the goods are stranded. Reversal belongs to the Issue desk (undo /
+        // store-reject), which runs applyIssueDelta with the negative delta; only
+        // then may the line be chef-rejected. Un-rejecting (v === 0) is always
+        // allowed: it restores the line to the department balance, which is the
+        // side that matches an already-deducted central stock.
+        // Returns false for every line while `requisition_deduct_at_issue` is '0'
+        // (no ledger row can exist), so this refuses nothing today.
+        if (v === 1 && lineHasMovedStock(db, itemId)) {
+          return Response.json({
+            error: 'Cannot reject this item — stock has already been issued against it. Undo or store-reject the issued quantity on the Store Issue desk first.',
+          }, { status: 400 });
+        }
         changes.is_rejected = v;
         before.is_rejected = !!item.is_rejected;
         after.is_rejected = !!v;

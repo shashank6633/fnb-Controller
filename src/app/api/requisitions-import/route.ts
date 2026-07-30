@@ -38,6 +38,31 @@ import * as XLSX from 'xlsx';
  * write inventory_transactions. Internal transfers are an audit/analytics record of
  * who got what; consumption is computed exclusively from recipe-deduction on sales,
  * parties, staff-meals, and closing-stock variance. Mixing the two would double-count.
+ *
+ * ── DELIBERATELY NOT A STOCK WRITER (deduct-at-issue) ──────────────────────────
+ * This route writes requisition_items.quantity_issued directly (insReqItem below)
+ * and does NOT call applyIssueDelta() from '@/lib/issue-stock'. That is the one
+ * intentional exception to "every writer of quantity_issued goes through the
+ * helper", and it must stay that way:
+ *
+ *   - This importer is the origin of 1,619 of the 1,620 fulfilled requisitions in
+ *     the live DB (14,140 of the 14,147 lines that carry quantity_issued > 0).
+ *     Those rows are Recaho history that was already handed over months ago and is
+ *     already reflected in today's on-hand count.
+ *   - Hooking it up would retro-deduct all of that history the next time anyone
+ *     re-imports, wiping out stock a second time for goods that left the store once.
+ *   - The design is FORWARD-ONLY, and structurally so: applyIssueDelta stamps
+ *     baseline_line_qty from whatever quantity_issued already holds the first time
+ *     it touches a line, so these imported quantities ARE the baseline. A genuine
+ *     future issue against one of these lines moves only the increment above it.
+ *     Writing them here, outside the ledger, is exactly what makes that true.
+ *   - Nothing downstream is lost: because no ledger row is ever written for an
+ *     imported line, lineHasMovedStock()/requisitionHasMovedStock() stay false for
+ *     it, so the cancel / chef-reject / requisition-PUT guards keep treating
+ *     imported history as freely editable, as they do today.
+ *
+ * If a future change ever needs imported lines to move stock, it must be a separate,
+ * explicitly-scoped, one-shot migration — never a call from this loop.
  */
 
 /**
@@ -263,6 +288,10 @@ export async function POST(request: Request) {
     // Note: we deliberately do NOT touch raw_materials.current_stock or write
     // inventory_transactions here. Internal transfers and recipe-driven
     // consumption are kept strictly separate.
+    //
+    // The quantity_issued written by insReqItem is likewise NOT routed through
+    // applyIssueDelta() — see "DELIBERATELY NOT A STOCK WRITER" in the file header.
+    // These rows are the forward-only baseline, not a stock movement.
 
     const txn = db.transaction((groups: ParsedTransferGroup[]) => {
       // 1) Create missing departments

@@ -1,10 +1,20 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { requisitionHasMovedStock } from '@/lib/issue-stock';
 
 /**
  * Cancel a requisition (any non-terminal state). Drafter or admin only.
  * If a vendor PO was already linked & is still a draft, leave the PO alone — admin
  * can cancel it separately. We don't want to silently destroy that paper trail.
+ *
+ * STOCK SAFETY: TERMINAL below deliberately does NOT list 'store_processed', so a
+ * partially-issued requisition is cancellable — and cancelling it performs no
+ * reversal of anything the store already handed over, while dept-stock.ts:190 drops
+ * `r.status IN ('cancelled','chef_rejected')` out of the department balance. Once
+ * deduct-at-issue is on, that combination strands the goods: gone from central
+ * stock, gone from the department. We do not widen TERMINAL (that would refuse
+ * cancels that are legal today); we refuse only the requisitions that have actually
+ * moved stock, which the requisition_issue_ledger records. See src/lib/issue-stock.ts.
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -27,6 +37,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       return Response.json({
         error: 'Only HOD or admin can cancel a requisition once it has been submitted. The drafter can cancel it only while it is still a draft.',
       }, { status: 403 });
+    }
+    // Stock guard — see the header. A requisition that has already moved stock
+    // cannot be cancelled, because cancelling reverses nothing and simultaneously
+    // hides the line from the department balance. The store must undo (or
+    // store-reject) the issued lines on the Issue desk first: that path runs
+    // applyIssueDelta with the negative delta and puts the goods back in central
+    // stock, after which this returns false and the cancel goes through.
+    // Returns false for every requisition while `requisition_deduct_at_issue` is
+    // '0' (no ledger row can exist), so this refuses nothing today.
+    if (requisitionHasMovedStock(db, id)) {
+      return Response.json({
+        error: 'Cannot cancel — stock has already been issued against this requisition. Undo or store-reject the issued lines on the Store Issue desk first, then cancel.',
+      }, { status: 400 });
     }
     db.prepare(`
       UPDATE requisitions SET status = 'cancelled', cancelled_at = datetime('now'),

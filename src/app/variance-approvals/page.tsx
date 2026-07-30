@@ -27,6 +27,8 @@ interface Approval {
   date: string; system_stock: number; physical_stock: number; variance: number; variance_value: number;
   unit: string; counted_by: string; count_note: string;
   status: string; reviewed_by: string; reviewed_at: string; review_reason: string; created_at: string;
+  /** Server-side refusal reason for Approve (department count vs central stock). */
+  approve_blocked?: string | null;
 }
 
 const inr = (v: number) => '₹' + Math.abs(Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -66,6 +68,10 @@ export default function VarianceApprovalsPage() {
   useEffect(() => { load(); }, [load]);
 
   const decide = async (row: Approval, action: 'approve' | 'reject') => {
+    // Approving a department count would overwrite CENTRAL stock — the server
+    // refuses it; mirror that here so the click never leaves the page. Reject is
+    // always allowed: it moves no stock.
+    if (action === 'approve' && row.approve_blocked) { flash(row.approve_blocked); return; }
     const reason = (reasons[row.id] || '').trim();
     if (reason.length < 2) { flash('Enter a reason first — ask the staff what caused it.'); return; }
     setBusy(row.id);
@@ -211,6 +217,12 @@ export default function VarianceApprovalsPage() {
                     </div>
                   ) : (
                     <div className="mt-3 border-t border-[#F0E4D6] pt-3 space-y-2">
+                      {row.approve_blocked && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-[12px] text-amber-900 flex gap-2">
+                          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                          <span>{row.approve_blocked}</span>
+                        </div>
+                      )}
                       <input
                         value={reasons[row.id] || ''}
                         onChange={e => setReasons(p => ({ ...p, [row.id]: e.target.value }))}
@@ -222,9 +234,11 @@ export default function VarianceApprovalsPage() {
                                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium border border-red-300 text-red-700 hover:bg-red-50 disabled:opacity-50">
                           {busy === row.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <XCircle className="w-4 h-4" />} Reject (keep stock)
                         </button>
-                        <button onClick={() => decide(row, 'approve')} disabled={busy === row.id}
-                                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white disabled:opacity-50">
-                          {busy === row.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Approve → set stock to counted
+                        <button onClick={() => decide(row, 'approve')} disabled={busy === row.id || !!row.approve_blocked}
+                                title={row.approve_blocked || undefined}
+                                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                          {busy === row.id ? <Loader2 className="w-4 h-4 animate-spin" /> : row.approve_blocked ? <Lock className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
+                          {row.approve_blocked ? 'Approve blocked (department count)' : 'Approve → set stock to counted'}
                         </button>
                       </div>
                     </div>

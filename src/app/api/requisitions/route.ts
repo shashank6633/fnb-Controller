@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
+import { requisitionHasMovedStock } from '@/lib/issue-stock';
 
 // Statuses at which a requisition can be edited, by whom:
 //   draft                                            → drafter or admin
@@ -168,7 +169,59 @@ export async function GET(request: Request) {
                           THEN rm.pack_size ELSE 1 END)
                   * rm.average_price), 0)
                 FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
-                WHERE ri.req_id = r.id) AS estimated_value
+                WHERE ri.req_id = r.id) AS estimated_value,
+             -- ── Half-transfer split (ADDITIVE — nothing above changes) ──────────
+             -- "4 requested, 2 given, 2 deferred" must read as 2 fulfilled AND
+             -- 2 deferred, because only the issued half ever left the store. One
+             -- all-or-nothing flag cannot say that, so the list carries three
+             -- independent line counters instead.
+             --
+             -- All three use the SAME two exclusions as every other reader of
+             -- these lines (store-issue/route.ts:183-184, store-process/route.ts:
+             -- 306-307, the page's mergeStats at store-requisitions/page.tsx:
+             -- 739-740): a chef-rejected (is_rejected) or store-rejected
+             -- (store_rejected) line is settled, never open and never owing.
+             --
+             -- And the SAME effective quantity as effectiveQty() on the client
+             -- (store-requisitions/page.tsx:692) — chef_approved_qty when the chef
+             -- set one, else quantity_requested — so the badge the store reads and
+             -- the number the server counted cannot disagree. The comparison is a
+             -- bare "<", mirroring the client's "got >= eff", rather than an
+             -- epsilon that would make the two drift apart on the same row.
+             --
+             -- Quantities here are compared LIKE-FOR-LIKE inside one line
+             -- (quantity_issued vs chef_approved_qty/quantity_requested are all in
+             -- that line's own unit column, Option B), so no pack conversion
+             -- applies — these are counts of lines, never sums of quantities.
+
+             -- Lines that have handed over SOMETHING. Deliberately NOT "fully
+             -- issued": the half of a split transfer that did go out is exactly
+             -- what this has to make visible.
+             (SELECT COUNT(*) FROM requisition_items ri
+               WHERE ri.req_id = r.id
+                 AND COALESCE(ri.is_rejected, 0) = 0
+                 AND COALESCE(ri.store_rejected, 0) = 0
+                 AND COALESCE(ri.quantity_issued, 0) > 0) AS lines_issued_any,
+
+             -- Lines parked for later. TRIM/'' as well as NULL, because the
+             -- client tests "if (line.deferred_until)" and an empty string is
+             -- falsy there — a blank must not count as deferred on one side only.
+             (SELECT COUNT(*) FROM requisition_items ri
+               WHERE ri.req_id = r.id
+                 AND COALESCE(ri.is_rejected, 0) = 0
+                 AND COALESCE(ri.store_rejected, 0) = 0
+                 AND COALESCE(TRIM(ri.deferred_until), '') <> '') AS lines_deferred,
+
+             -- Lines the store still owes the department. Independent of the two
+             -- above by design: a half-issued line is counted in lines_issued_any
+             -- AND in lines_owing, which is what "2 fulfilled, 2 still to come"
+             -- means on one line.
+             (SELECT COUNT(*) FROM requisition_items ri
+               WHERE ri.req_id = r.id
+                 AND COALESCE(ri.is_rejected, 0) = 0
+                 AND COALESCE(ri.store_rejected, 0) = 0
+                 AND COALESCE(ri.quantity_issued, 0)
+                     < COALESCE(ri.chef_approved_qty, ri.quantity_requested, 0)) AS lines_owing
       FROM requisitions r
       JOIN departments d ON d.id = r.department_id
       LEFT JOIN purchase_orders po ON po.id = r.linked_po_id
@@ -400,6 +453,22 @@ export async function PUT(request: Request) {
             ? 'Only admin can edit an already-chef-approved requisition.'
             : 'Only the drafter or admin can edit this requisition.',
       }, { status: 403 });
+    }
+
+    // STOCK SAFETY: the items branch below is a wholesale DELETE + reinsert. Every
+    // replacement row gets a NEW requisition_items.id and no quantity_issued, so a
+    // requisition that has already moved stock would be left with ledger rows
+    // pointing at req_item_ids that no longer exist — the deduction is unreversible
+    // (undo needs the line), and the department balance, derived from
+    // requisition_items.quantity_issued, silently drops the issued quantity.
+    // Refuse the edit instead. Metadata-only edits (no `items` array) touch no line
+    // and stay allowed.
+    // Returns false for every requisition while `requisition_deduct_at_issue` is
+    // '0' (no ledger row can exist), so this refuses nothing today.
+    if (Array.isArray(items) && requisitionHasMovedStock(db, id)) {
+      return Response.json({
+        error: 'Cannot change the items on this requisition — stock has already been issued against it. Undo or store-reject the issued lines on the Store Issue desk first.',
+      }, { status: 400 });
     }
 
     // Pull all editable metadata off the body — for party reqs, the UI may

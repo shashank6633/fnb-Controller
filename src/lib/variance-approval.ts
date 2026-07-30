@@ -108,6 +108,8 @@ export interface VarianceRow {
   date: string; system_stock: number; physical_stock: number; variance: number; variance_value: number;
   unit: string; counted_by: string; count_note: string;
   status: string; reviewed_by: string; reviewed_at: string; review_reason: string; created_at: string;
+  /** Set only when approval is refused — the reason. See varianceApprovalBlock(). */
+  approve_blocked?: string | null;
 }
 
 /** List approvals (default: pending first, newest first). */
@@ -135,10 +137,50 @@ export function listVarianceApprovals(
     ORDER BY (va.status = 'pending') DESC, va.date DESC, va.created_at DESC
     LIMIT ${limit}
   `).all(...params) as VarianceRow[];
-  return rows;
+  // Additive: tell the queue up front which rows approveVariance() will refuse,
+  // so the admin sees the reason instead of discovering it on click.
+  return rows.map(r => ({ ...r, approve_blocked: varianceApprovalBlock(r, r.department_name) }));
 }
 
 export interface DecisionResult { ok: boolean; error?: string; applied?: boolean }
+
+/**
+ * Can this variance safely be APPROVED? Returns null when yes, otherwise the
+ * reason to refuse (shown verbatim to the admin).
+ *
+ * THE DEPARTMENT CLOBBER. A central count is stored against the CENTRAL number:
+ * /api/closing-stock POST reads `material.current_stock` as `systemStock` for
+ * every row (src/app/api/closing-stock/route.ts:226) no matter which department
+ * the row is tagged to. Approving then does an ABSOLUTE
+ * `SET current_stock = physical_stock` (below). So approving a count that the
+ * KITCHEN took would write the kitchen's shelf quantity straight over the
+ * central store's stock — a real loss of the store's number, not a rounding
+ * nuance. Refuse it here rather than at count time, so the discrepancy is still
+ * recorded and the admin can Reject it (Reject moves no stock).
+ *
+ * Only central+department is blocked. Central Store/Overall (department_id '')
+ * is exactly the number being SET, and liquor rows post a signed store-ledger
+ * adjustment scoped to their own store — both unchanged.
+ *
+ * Comparing a department count against that department's own computed balance
+ * (computeDeptStock) is the real fix and a separate build; it is deliberately
+ * NOT attempted here.
+ */
+export function varianceApprovalBlock(
+  row: { source: string; department_id?: string | null },
+  deptName?: string | null,
+): string | null {
+  if (String(row.source) !== 'central') return null;
+  if (!norm(row.department_id)) return null;
+  const who = norm(deptName) || 'a department';
+  return (
+    `Department count — cannot be approved against central stock. This count belongs to ${who}, ` +
+    `but it was compared against the CENTRAL store's stock, and approving sets central stock to the ` +
+    `counted number — so ${who}'s shelf quantity would overwrite the store's. ` +
+    `Reject it (stock stays untouched) and re-count at the central store, or fix it as a department-stock ` +
+    `correction. Approving a department count against its own department balance is not built yet.`
+  );
+}
 
 /**
  * Approve a pending variance → move stock to the physical count and log it.
@@ -150,6 +192,18 @@ export function approveVariance(
   const row = db.prepare(`SELECT * FROM variance_approvals WHERE id = ?`).get(id) as (VarianceRow & Record<string, unknown>) | undefined;
   if (!row) return { ok: false, error: 'Variance approval not found' };
   if (row.status !== 'pending') return { ok: false, error: `Already ${row.status}` };
+
+  // Refuse the department-clobber case BEFORE anything is written. See
+  // varianceApprovalBlock().
+  let deptName = '';
+  if (norm(row.department_id)) {
+    try {
+      deptName = (db.prepare(`SELECT name FROM departments WHERE id = ?`).get(row.department_id) as
+        { name?: string } | undefined)?.name || '';
+    } catch { /* name is cosmetic */ }
+  }
+  const blocked = varianceApprovalBlock(row, deptName);
+  if (blocked) return { ok: false, error: blocked };
 
   const apply = db.transaction(() => {
     if (row.source === 'liquor') {

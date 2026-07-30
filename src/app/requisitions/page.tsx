@@ -77,6 +77,23 @@ interface Requisition {
   linked_po_id?: string | null; linked_po_number?: string | null; linked_po_status?: string | null;
   fulfilled_at?: string;
   item_count?: number; estimated_value?: number;
+  /* ── Half-transfer roll-ups (additive columns on /api/requisitions) ────────
+   * `status` is ONE scalar and cannot say "handed two lines over, still owes
+   * two more", which is why 'fulfilled' and 'partially-issued' used to be
+   * mutually exclusive here. These are LINE counts, so a requisition may
+   * legitimately answer yes to several of them at once.
+   *
+   *   lines_issued_any — lines where quantity_issued > 0 (goods actually went out)
+   *   lines_deferred   — lines a human promised a later time on (deferred_until)
+   *   lines_owing      — lines still short of their effective qty
+   *
+   * OPTIONAL on purpose: an older payload (or the API deployed a beat behind
+   * this page) omits them, every reader below coerces the absent value to 0,
+   * and each new predicate collapses back to exactly today's status-only
+   * behaviour. Never read these directly — go through the predicates. */
+  lines_issued_any?: number;
+  lines_deferred?: number;
+  lines_owing?: number;
   items?: ReqItem[];
 }
 
@@ -157,6 +174,76 @@ const STATUS_LABEL: Record<string, string> = {
   chef_approved: 'With Mgmt', mgmt_approved: 'With Store',
   chef_rejected: 'Rejected', store_processed: 'Issued (partial)', fulfilled: 'Fulfilled', cancelled: 'Cancelled',
 };
+
+/* ============================================================================
+ * HALF-TRANSFER PREDICATES — the single definition of each roll-up tab.
+ *
+ * Every one of these is called by BOTH statusFiltered() (which rows the table
+ * renders) and tally() (the number printed on the tab). That is the whole
+ * reason they are functions and not two copies of an expression: the previous
+ * pair of hand-copied predicates is how a badge starts promising four rows and
+ * the list hands you three.
+ *
+ * They read the LINE roll-ups, not `status`, so they overlap by design — a
+ * requisition with two lines handed over and two still owing is genuinely
+ * BOTH fulfilled (for the part that arrived) and partially issued (for the
+ * part that has not). That overlap is the owner's ask, not a bug.
+ *
+ * num() is the compatibility floor: a missing column reads 0, so on a payload
+ * without these fields matchesFulfilled() degenerates to `status ===
+ * 'fulfilled'` and the other two match nothing — i.e. today's behaviour.
+ * ========================================================================== */
+const num = (v: number | undefined | null) => Number(v) || 0;
+
+/** Did goods physically leave the store on at least one line? */
+function hasIssuedAnyLine(r: Requisition): boolean { return num(r.lines_issued_any) > 0; }
+
+/**
+ * Statuses a requisition holds BEFORE the store can hand anything over. Goods
+ * cannot legitimately have left the store in any of them, so a stray
+ * quantity_issued on such a row is bad data, not a half-transfer.
+ */
+const PRE_STORE_STATUSES = ['draft', 'submitted', 'cancelled', 'chef_rejected'];
+
+/**
+ * The 'fulfilled' tab. A SUPERSET of the old `status === 'fulfilled'` test —
+ * it can only ever add rows, never drop one a staff member sees there today.
+ * The extra rows are the half-transfers: the part that WAS handed over is
+ * fulfilled, whatever the requisition-level status still says.
+ *
+ * The pre-store exclusion keeps that honest. REQ-TEST-PACKFIX is `submitted`
+ * with all three lines carrying a full quantity_issued — seeded harness data
+ * that never passed the store. Without the guard it renders under Fulfilled
+ * wearing a "With HOD" chip, which reads as a bug to anyone looking at it.
+ * One live row today, but the shape recurs with every import and fixture.
+ */
+function matchesFulfilled(r: Requisition): boolean {
+  return r.status === 'fulfilled'
+    || (hasIssuedAnyLine(r) && !PRE_STORE_STATUSES.includes(r.status));
+}
+
+/** The 'deferred' tab — strictly "a human promised a time on this line". */
+function matchesDeferred(r: Requisition): boolean { return num(r.lines_deferred) > 0; }
+
+/**
+ * Part-issued: goods went out, more is still owed, and the requisition is still
+ * LIVE. Drives the "Part" chip, so a requisition now appearing under both
+ * Fulfilled and Partially Issued reads as one half-transfer, not a duplicate.
+ *
+ * The terminal exclusion is not cosmetic tidying — it is what keeps the chip
+ * true. On this database 737 of the 1,620 `fulfilled` requisitions (45%) still
+ * have a short line: REQ-IMP-5380 was closed having issued 0 of 2 BTL FRESH
+ * CREAM 1 LTR, and 736 more like it. Those were closed SHORT months ago;
+ * nothing is owed on them any more, so a chip reading "the rest is still owed"
+ * would be false on 737 rows and would rose-wash half the Fulfilled tab.
+ * Short-closed history is a real thing to look at, but it is a report, not a
+ * per-row alarm on a closed requisition. Same terminal vocabulary as canCancel.
+ */
+const TERMINAL_STATUSES = ['fulfilled', 'cancelled', 'chef_rejected'];
+function isPartIssued(r: Requisition): boolean {
+  return !TERMINAL_STATUSES.includes(r.status)
+    && hasIssuedAnyLine(r) && num(r.lines_owing) > 0;
+}
 
 /**
  * Render children at the end of document.body via a React portal.
@@ -291,9 +378,19 @@ export default function RequisitionsPage() {
     // started but didn't finish — otherwise it would vanish after first issue.
     if (statusFilter === 'inbox-store') return reqs.filter(r => ['mgmt_approved', 'chef_approved', 'store_processed'].includes(r.status));
     if (statusFilter === 'partially-issued') return reqs.filter(r => r.status === 'store_processed');
+    // ── Half-transfer tabs. Both sit BEFORE the status fallthrough because
+    // they are line roll-ups, not statuses. 'fulfilled' would otherwise mean
+    // `status === 'fulfilled'` and a half-transferred requisition could only
+    // ever appear in ONE of Fulfilled / Partially Issued; now the part that
+    // was handed over counts as fulfilled while the rest stays owing.
+    // 'deferred' is not a status at all — the fallthrough matched nothing.
+    if (statusFilter === 'fulfilled') return reqs.filter(matchesFulfilled);
+    if (statusFilter === 'deferred')  return reqs.filter(matchesDeferred);
     return reqs.filter(r => r.status === statusFilter);
   }
 
+  // Same predicates, same order, no second copy of any expression — the tab
+  // badge and the tab body are computed from ONE definition each.
   const tally = (list: Requisition[]) => ({
     inbox_chef:  list.filter(r => r.status === 'submitted').length,
     inbox_mgmt:  list.filter(r => r.status === 'chef_approved').length,
@@ -301,6 +398,8 @@ export default function RequisitionsPage() {
     // partially-issued is its own bucket — keep it out of `open`.
     partially_issued: list.filter(r => r.status === 'store_processed').length,
     open:        list.filter(r => !['fulfilled', 'cancelled', 'chef_rejected', 'store_processed'].includes(r.status)).length,
+    fulfilled:   list.filter(matchesFulfilled).length,
+    deferred:    list.filter(matchesDeferred).length,
   });
 
   // Tab badges count the SEARCH-narrowed set, so "(4)" on a tab always equals
@@ -420,7 +519,13 @@ export default function RequisitionsPage() {
           ...(counts.partially_issued > 0 || statusFilter === 'partially-issued'
             ? [{ k: 'partially-issued', l: `Partially Issued (${counts.partially_issued})` }]
             : []),
-          { k: 'draft', l: 'Drafts' }, { k: 'fulfilled', l: 'Fulfilled' },
+          // "Deferred" = the store promised a later time on at least one line.
+          // Same appear-only-when-non-empty rule as Partially Issued, so a
+          // venue that never defers sees the exact tab row it sees today.
+          ...(counts.deferred > 0 || statusFilter === 'deferred'
+            ? [{ k: 'deferred', l: `Deferred (${counts.deferred})` }]
+            : []),
+          { k: 'draft', l: 'Drafts' }, { k: 'fulfilled', l: `Fulfilled (${counts.fulfilled})` },
           { k: 'chef_rejected', l: 'Rejected' },
         ].map(o => (
           <button key={o.k} onClick={() => setStatusFilter(o.k)}
@@ -764,6 +869,16 @@ function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt,
           <span className={`text-[10px] px-2 py-0.5 rounded font-medium ${STATUS_BADGE[r.status]}`}>
             {STATUS_LABEL[r.status] || r.status}
           </span>
+          {/* Part — goods went out on some lines and the rest is still owed on a
+              LIVE requisition. Without it, the same req appearing under both
+              Fulfilled and Partially Issued reads as a duplicate rather than a
+              state. Hidden when the roll-ups are absent (they read 0). */}
+          {isPartIssued(r) && (
+            <span title={`Part-issued — ${num(r.lines_issued_any)} line(s) handed over, ${num(r.lines_owing)} still owed`}
+                  className="ml-1 text-[10px] px-1.5 py-0.5 rounded font-medium whitespace-nowrap bg-rose-100 text-rose-700">
+              Part
+            </span>
+          )}
         </td>
         <td className="py-2 px-3 font-mono text-xs">
           {r.linked_po_number ? (

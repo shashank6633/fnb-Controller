@@ -2,17 +2,26 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth';
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import { mergeDuplicateLines } from '@/lib/po-helpers';
+import { applyIssueDelta } from '@/lib/issue-stock';
 
 /**
  * Store Manager processes a chef-approved requisition.
  *
  * For each line the store decides:
- *   - quantity_issued      → recorded on the requisition_item for audit / dept analytics.
- *                            **Does NOT touch raw_materials.current_stock and does NOT write
- *                            inventory_transactions.** Internal transfers and recipe-driven
- *                            consumption are kept strictly separate — the only things that
- *                            affect current_stock are vendor purchases (+) and recipe-deduction
- *                            on sales / parties / staff meals (−).
+ *   - quantity_issued      → recorded on the requisition_item for audit / dept analytics, and
+ *                            routed through applyIssueDelta() (src/lib/issue-stock.ts), the
+ *                            single writer of stock for a requisition issue.
+ *                            While settings key `requisition_deduct_at_issue` is '0' (the
+ *                            shipped default) that helper is a no-op, so this route behaves
+ *                            exactly as it always has: it does NOT touch
+ *                            raw_materials.current_stock and does NOT write
+ *                            inventory_transactions. Internal transfers and recipe-driven
+ *                            consumption stay strictly separate — the only things that affect
+ *                            current_stock are vendor purchases (+) and recipe-deduction on
+ *                            sales / parties / staff meals (−).
+ *                            With the flag on, the helper owns the whole movement (unit
+ *                            conversion, stock UPDATE, inventory_transactions row, ledger row,
+ *                            department credit). This route adds none of it by hand.
  *   - quantity_to_purchase → goes onto an auto-created vendor PO (status=pending) which then
  *                            flows through the existing admin-approval pipeline. When that PO
  *                            is received, current_stock increases via the normal purchase path.
@@ -70,6 +79,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // the old "issue + auto-PO for shortfall" behaviour must pass
     // `auto_create_po: true` explicitly.
     const autoCreatePo: boolean = body?.auto_create_po === true;
+    // Optional per-gesture replay token (Layer 2 idempotency). When present it is
+    // stamped on every issue-ledger row this request writes, and the partial
+    // unique index uq_req_issue_token_item makes a replayed POST collide and roll
+    // the whole transaction back rather than deduct twice. No current client
+    // sends it, and with the deduct flag off no ledger row exists to collide
+    // with, so it is inert until both are true.
+    const clientToken: string | null =
+      typeof body?.client_token === 'string' && body.client_token.trim()
+        ? body.client_token.trim()
+        : null;
     const lineMap = new Map<string, any>();
     for (const ln of lines) if (ln?.id) lineMap.set(ln.id, ln);
 
@@ -192,11 +211,38 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const result: any = {};
 
     const txn = db.transaction(() => {
-      // --- 1. Record what was issued — for audit / department analytics only.
-      // We deliberately do NOT touch raw_materials.current_stock or write to
-      // inventory_transactions. Recipe consumption (driven by sales) is the
-      // ONLY thing that subtracts from stock; purchases (vendor inwards) are
-      // the only thing that adds to it. Internal transfers stay out of that loop.
+      // ── Atomic claim (MUST stay the first statement in this txn) ──────────
+      // The status check at the top of this handler is separated from every
+      // write by two awaits (params + req.json), so two concurrent processes can
+      // both pass it. This route is ABSOLUTE (SET quantity_issued = ?), so a lost
+      // race is not a harmless repeat: both requests write their own absolute
+      // quantities, both raise an auto-PO, and — once the deduct flag is on —
+      // both compute a delta from the same stale pre-image and deduct it twice.
+      // better-sqlite3 transactions are synchronous, so whoever flips the status
+      // out of the approved set here wins; the loser's UPDATE matches 0 rows and
+      // throws, rolling its whole txn back before anything else is written.
+      // 'store_processed' is provisional — the real finalStatus ('fulfilled' or
+      // 'store_processed') is written by the UPDATE at the end of this txn, so
+      // the committed row is unchanged from today's behaviour.
+      const claim = db.prepare(`
+        UPDATE requisitions
+        SET status = 'store_processed'
+        WHERE id = ? AND status IN ('mgmt_approved', 'chef_approved')
+      `).run(id);
+      if (claim.changes === 0) {
+        const err: any = new Error('This requisition has already been processed (or is no longer approved). Reload the page.');
+        err.httpStatus = 409;
+        throw err;
+      }
+
+      // --- 1. Record what was issued.
+      // This route itself still writes NOTHING to raw_materials.current_stock or
+      // inventory_transactions by hand. Any stock movement is delegated to
+      // applyIssueDelta() below, and that helper is a no-op until settings key
+      // `requisition_deduct_at_issue` is '1' — the shipped default is '0'. Until
+      // it is flipped, recipe consumption (driven by sales) remains the ONLY
+      // thing that subtracts from stock and purchases (vendor inwards) the only
+      // thing that adds to it, exactly as before.
       const updReqItem = db.prepare(`
         UPDATE requisition_items
         SET quantity_issued = ?, quantity_to_purchase = ?
@@ -221,15 +267,46 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         return postedIsPurchase ? posted * packSize : posted / packSize;
       };
 
+      // The pre-image for the issue ledger. It MUST be read here — inside this
+      // transaction, immediately before the absolute UPDATE — for two reasons:
+      //   1. This route SETs quantity_issued rather than adding to it, so the
+      //      instant updReqItem runs the old value is gone and no later read can
+      //      recover it.
+      //   2. The `items` array above was SELECTed before `await req.json()` and
+      //      before this transaction opened, so it is a stale snapshot, not a
+      //      pre-image.
+      const selBefore = db.prepare(`SELECT quantity_issued FROM requisition_items WHERE id = ?`);
+      const unitReview: string[] = [];
+
       for (const it of items) {
         const ln = lineMap.get(it.id) || {};
         const issued   = Number(ln.quantity_issued)      || 0;
         const purchase = Number(ln.quantity_to_purchase) || 0;
-        if (issued > 0) {
-          // No stock mutation. Just keep the audit number on the requisition_item.
-        }
+        const beforeIssued = Number((selBefore.get(it.id) as any)?.quantity_issued) || 0;
         updReqItem.run(issued, toLineBasis(it, ln, purchase), it.id);
+        // EVERY row in this loop, not only the ones with issued > 0. This loop is
+        // both absolute and unfiltered: it rewrites lines the client omitted
+        // (issued = 0) and chef-rejected lines too — the is_rejected guard exists
+        // in the validate loop and the PO-building loop above, but deliberately
+        // NOT here. So a line that held 5 and is now absent must CREDIT 5 back to
+        // the store, which is exactly what a before/after pair says. Passing
+        // `issued` as if it were a deduction would double-deduct every re-process,
+        // and computing new−old for submitted rows only would silently swallow
+        // every credit.
+        const res = applyIssueDelta(db, {
+          reqItemId: it.id,
+          beforeLineQty: beforeIssued,
+          afterLineQty: issued,
+          reason: 'store_process',
+          actor: me.email,
+          clientToken,
+        });
+        if (res.needsUnitReview) unitReview.push(it.material_name);
       }
+      // Only surfaced when the helper actually refused a line for an ambiguous
+      // unit — impossible while the deduct flag is off, so the response body is
+      // byte-identical to today's.
+      if (unitReview.length > 0) result.issue_unit_review = unitReview;
 
       // --- 2. Create vendor PO for the shortfall (if any) ---
       let linkedPoId: string | null = null;
@@ -347,6 +424,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return Response.json({ success: true, ...result });
   } catch (e: any) {
     console.error('[req store-process]', e);
-    return Response.json({ error: e.message }, { status: 500 });
+    // A lost double-process race is a conflict, not a server fault — the atomic
+    // claim at the top of the txn tags it with 409 so the UI can say "already
+    // processed". Everything else keeps the existing 500.
+    const status = Number(e?.httpStatus) || 500;
+    return Response.json({ error: e.message }, { status });
   }
 }

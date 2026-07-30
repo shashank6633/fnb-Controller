@@ -1205,7 +1205,7 @@ function initializeSchema(db: Database.Database) {
         outlet_id     TEXT,
         department_id TEXT NOT NULL,
         material_id   TEXT NOT NULL,
-        type          TEXT NOT NULL,               -- received | consumed | returned | adjusted
+        type          TEXT NOT NULL,               -- received | consumed | returned | adjusted | issued
         quantity      REAL DEFAULT 0,              -- positive = in, negative = out
         balance_after REAL DEFAULT 0,
         reference_id  TEXT,
@@ -1218,6 +1218,62 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_dept_mat_tx_dept_mat ON department_material_transactions(department_id, material_id);
     `);
   } catch (e) { console.error('department_materials schema failed:', e); }
+
+  // Requisition issue ledger — the audit spine for "stock is deducted once, at
+  // issue" (settings key `requisition_deduct_at_issue`, default OFF).
+  //
+  // Every writer of requisition_items.quantity_issued calls applyIssueDelta()
+  // (src/lib/issue-stock.ts) inside its own transaction with the before/after
+  // line quantities, and exactly one row lands here per non-zero delta. The
+  // invariant that makes this safe against retries, absolute overwrites and
+  // zeroings alike:
+  //
+  //   SUM(delta_recipe_qty) == (quantity_issued - baseline_line_qty) x pack_factor
+  //
+  // baseline_line_qty is stamped ONLY on the first row for a req_item_id, from
+  // whatever quantity_issued already held. That is what makes forward-only
+  // structural rather than a promise: the 14,147 lines of imported history are
+  // the baseline, so a new issue against an old requisition moves only the
+  // increment and can never retro-deduct the past.
+  //
+  // pack_factor is stored per row because a later Unit Audit rebase changes a
+  // material's factor; the audit must reconcile with the factor actually used.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS requisition_issue_ledger (
+        id                TEXT PRIMARY KEY,
+        req_id            TEXT NOT NULL,
+        req_item_id       TEXT NOT NULL,
+        material_id       TEXT NOT NULL,
+        department_id     TEXT,
+        outlet_id         TEXT,
+        reason            TEXT NOT NULL,            -- issue | store_process | undo | store_reject | admin_adjust
+        baseline_line_qty REAL,                     -- NON-NULL only on the first row for a req_item_id
+        before_line_qty   REAL NOT NULL,
+        after_line_qty    REAL NOT NULL,
+        delta_line_qty    REAL NOT NULL,            -- in the LINE's own unit (Option B)
+        line_unit         TEXT,
+        pack_factor       REAL NOT NULL,
+        delta_recipe_qty  REAL NOT NULL,            -- RECIPE units; positive = left the store
+        store_mapped      INTEGER NOT NULL DEFAULT 0,
+        needs_unit_review INTEGER NOT NULL DEFAULT 0,
+        inv_txn_id        TEXT,
+        client_token      TEXT,
+        actor             TEXT,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_req_issue_ledger_item ON requisition_issue_ledger(req_item_id);
+      CREATE INDEX IF NOT EXISTS idx_req_issue_ledger_req  ON requisition_issue_ledger(req_id);
+      CREATE INDEX IF NOT EXISTS idx_req_issue_ledger_mat  ON requisition_issue_ledger(material_id);
+      -- Layer 2 idempotency: a replayed POST carrying the same gesture token
+      -- collides here, better-sqlite3 rolls the whole txn back, and the route
+      -- answers 200 {replayed:true} instead of deducting a second time.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_req_issue_token_item
+        ON requisition_issue_ledger(client_token, req_item_id)
+        WHERE client_token IS NOT NULL;
+    `);
+    db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('requisition_deduct_at_issue', '0')`);
+  } catch (e) { console.error('requisition_issue_ledger schema failed:', e); }
 
   // Butchering — track whole-carcass breakdown into named cuts.
   // Buys carcass at vendor rate (per kg of dressed weight); cuts inherit

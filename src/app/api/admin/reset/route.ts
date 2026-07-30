@@ -79,6 +79,12 @@ export async function POST(req: Request) {
     // will still fail loudly — this only relaxes mid-transaction checks.
     db.prepare('PRAGMA defer_foreign_keys = 1').run();
 
+    // Set by the two branches that re-baseline current_stock wholesale (the full
+    // purchases/PO wipe below, and `stock_only`). Once stock has been zeroed on
+    // purpose, crediting a requisition's issued quantity back on top of that zero
+    // would invent stock, so the requisition credit-back in PHASE 1 skips itself.
+    let stockRebaselined = false;
+
     // ---- SALES ----
     if (includes('sales')) {
       // Date-range scoping: only delete sales (and their recipe-deduction txs)
@@ -223,6 +229,7 @@ export async function POST(req: Request) {
       db.prepare(`UPDATE recipes SET total_cost = 0, profit = selling_price, food_cost_percent = 0, updated_at = datetime('now')`).run();
       db.prepare(`UPDATE sub_recipes SET total_cost = 0, cost_per_unit = 0, updated_at = datetime('now')`).run();
       deleted.materials_reset = (db.prepare('SELECT COUNT(*) AS n FROM raw_materials').get() as any).n;
+      stockRebaselined = true;
     } else if (includes('sales')) {
       // Sales-only reset: stock has already been credited back inside the SALES
       // block above, so current_stock now matches "purchases minus zero deductions".
@@ -283,6 +290,14 @@ export async function POST(req: Request) {
         { table: 'vendor_materials',         col: 'material_id',        nullable: false },
         { table: 'purchase_order_items',     col: 'material_id',        nullable: false },
         { table: 'requisition_items',        col: 'material_id',        nullable: false },
+        // Records the RECIPE-unit stock each requisition line moved. It keys on
+        // material_id (no declared FK, so the commit-time check won't catch it):
+        // without this entry, `inventory_all` would delete every material and every
+        // requisition_items row and leave the ledger pointing at both. No credit-back
+        // here — the materials themselves are being deleted. Empty while
+        // `requisition_deduct_at_issue` is '0'; tableExists() skips it on an
+        // un-migrated DB.
+        { table: 'requisition_issue_ledger', col: 'material_id',        nullable: false },
         { table: 'butchering_batches',       col: 'source_material_id', nullable: false },
         { table: 'butchering_outputs',       col: 'material_id',        nullable: false },
         { table: 'party_consumption',        col: 'material_id',        nullable: false },
@@ -337,6 +352,7 @@ export async function POST(req: Request) {
       deleted.stock_zeroed = db.prepare(
         `UPDATE raw_materials SET current_stock = 0, updated_at = datetime('now')`
       ).run().changes;
+      stockRebaselined = true;
     }
 
     // ---- PHASE 1 DEPENDENT CLEANUP ----
@@ -365,6 +381,52 @@ export async function POST(req: Request) {
       // Receiving / requisition / wastage trail
       safeDel('goods_receipt_note_items');
       safeDel('goods_receipt_notes');
+      // ---- REQUISITION ISSUE CREDIT-BACK ----
+      // Deleting requisitions used to be the one deletion here with no stock
+      // reversal, unlike sales (credited back above) and purchases (debited back
+      // above). Once `requisition_deduct_at_issue` is on, every issue debits
+      // raw_materials.current_stock and records the RECIPE-unit amount in
+      // requisition_issue_ledger.delta_recipe_qty (positive = goods left the
+      // store); the matching inventory_transactions rows are wiped wholesale a few
+      // lines below. Dropping all of that without crediting would permanently lose
+      // that stock. So: sum the ledger per material and add it back BEFORE the
+      // requisitions go, mirroring the sales branch exactly.
+      //
+      // Scope note: this cleanup deletes requisitions unscoped (DELETE FROM
+      // requisitions), so the credit-back is unscoped to match the rows that
+      // actually disappear.
+      //
+      // While the flag is '0' the ledger table is empty (and on an un-migrated DB
+      // does not exist at all — hence the try/catch, which must not abort the txn),
+      // so this credits nothing and behaves exactly as production does today.
+      if (!stockRebaselined) {
+        try {
+          const reqCreditRows = db.prepare(`
+            SELECT material_id, COALESCE(SUM(delta_recipe_qty), 0) AS net_qty
+            FROM requisition_issue_ledger
+            GROUP BY material_id
+          `).all() as any[];
+          const reqCreditStmt = db.prepare(`
+            UPDATE raw_materials
+            SET current_stock = current_stock + ?, updated_at = datetime('now')
+            WHERE id = ?
+          `);
+          let reqCredited = 0;
+          for (const row of reqCreditRows) {
+            if (!row.material_id || !Number(row.net_qty)) continue;
+            reqCreditStmt.run(Number(row.net_qty), row.material_id);
+            reqCredited += 1;
+          }
+          deleted.materials_credited_back_requisitions = reqCredited;
+        } catch { deleted.materials_credited_back_requisitions_skipped = 0; }
+      } else {
+        // current_stock was deliberately zeroed above — nothing to credit onto.
+        deleted.materials_credited_back_requisitions_skipped = 0;
+      }
+      // The ledger itself goes with the requisitions it describes; leaving it would
+      // orphan every row against a req_item_id that no longer exists AND let a
+      // later cancel/reject guard refuse on a requisition that is gone.
+      safeDel('requisition_issue_ledger');
       safeDel('requisition_items');
       safeDel('requisitions');
       safeDel('wastages');
