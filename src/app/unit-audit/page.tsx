@@ -18,7 +18,7 @@ import {
   Download, Upload,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { purchasePrice } from '@/lib/pack-units';
+import { purchasePrice, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 import { usePurchaseUnitOptions } from '@/lib/use-units';
 import TabScroller from '@/components/TabScroller';
 
@@ -621,21 +621,35 @@ export default function UnitAuditPage() {
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono text-[#6B5744]">
                         {(() => {
-                          const ps = m.pack_size || 1;
-                          const pu = m.purchase_unit || m.recipe_unit || m.unit;
+                          // Stock is stored in RECIPE units; this is a Purchase/Inventory
+                          // page, so the lead is always the PURCHASE basis. The pack rule
+                          // has TWO halves (pack_size > 1 AND recipe unit !== purchase
+                          // unit) — a local `pack_size > 1` divided PICKLED GINGER 1.5KG
+                          // (kg/kg, pack 1.5) from 6 kg into "4 kg" while the hint right
+                          // underneath still read "= 6 kg". Never re-derive it here.
                           const ru = m.recipe_unit || m.unit;
-                          if (ps > 1) {
-                            return (
-                              <>
-                                <span>{(m.current_stock / ps).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
-                                <span className="ml-1 text-[9px] text-[#8B7355]">{pu}</span>
+                          const meta = {
+                            unit: ru,
+                            purchase_unit: m.purchase_unit || ru,
+                            pack_size: m.pack_size,
+                            case_size: m.case_size,
+                          };
+                          const pu = meta.purchase_unit;
+                          // Hint only where the recipe basis is genuinely a different
+                          // label. When it equals the purchase unit the hint would just
+                          // restate the lead (the PICKLED GINGER contradiction above).
+                          const showHint = String(ru).toLowerCase().trim() !== String(pu).toLowerCase().trim();
+                          return (
+                            <>
+                              <span>{fmtQtyNum(toPurchaseQty(m.current_stock, meta))}</span>
+                              <span className="ml-1 text-[9px] text-[#8B7355]">{pu}</span>
+                              {showHint && (
                                 <div className="text-[9px] text-[#8B7355]">
-                                  = {m.current_stock.toLocaleString('en-IN')} {ru}
+                                  = {fmtQtyNum(m.current_stock)} {ru}
                                 </div>
-                              </>
-                            );
-                          }
-                          return <>{m.current_stock.toLocaleString('en-IN', { maximumFractionDigits: 2 })} <span className="text-[9px] text-[#8B7355]">{ru}</span></>;
+                              )}
+                            </>
+                          );
                         })()}
                       </td>
                       {/* ONE basis: ₹/purchase-unit. last_purchase_price already is;

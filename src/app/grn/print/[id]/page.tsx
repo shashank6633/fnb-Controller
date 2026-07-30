@@ -85,6 +85,21 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
   // Render negative totals with a "(back-correction)" tag so the print is
   // unambiguous and accounting can spot the adjustment row immediately.
   const hasNegative = grn.items.some(i => (Number(i.quantity_received) || 0) < 0 || (Number(i.quantity_accepted) || 0) < 0);
+  // The three qty totals above add ACROSS MATERIALS, and every GRN qty is a
+  // PURCHASE unit — so "15" on a GRN of 12 BTL + 3 kg is 15 of nothing. Print a
+  // qty total only when the whole note is in one purchase unit; otherwise the
+  // cell is an em-dash. The ₹ totals are unaffected (rupees always add).
+  const noteUnits = new Set(
+    grn.items.map(i => String(i.purchase_unit || i.material_unit || '').toLowerCase().trim()).filter(Boolean)
+  );
+  const noteUnit = noteUnits.size === 1
+    ? String(grn.items[0]?.purchase_unit || grn.items[0]?.material_unit || '')
+    : null;
+  const qtyTotal = (v: number, dashWhenZero = false) => {
+    if (dashWhenZero && !(v > 0)) return '—';
+    if (!noteUnit) return '—';
+    return `${v.toLocaleString('en-IN', { maximumFractionDigits: 3 })} ${noteUnit}`;
+  };
 
   return (
     <div className="bg-white text-[#1a1a1a] mx-auto max-w-[820px] p-8 print:p-6 text-[12px] leading-relaxed">
@@ -179,10 +194,13 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
           <tfoot className="bg-[#fafafa] font-semibold">
             {/* Row 1 — total quantities, aligned under each qty column. */}
             <tr>
-              <td colSpan={3} className="border border-[#999] py-1 px-2 text-right">Totals</td>
-              <td className="border border-[#999] py-1 px-2 text-right font-mono">{totalReceived.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
-              <td className="border border-[#999] py-1 px-2 text-right font-mono">{totalAcceptedQty.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
-              <td className="border border-[#999] py-1 px-2 text-right font-mono">{totalRejectedQty > 0 ? totalRejectedQty.toLocaleString('en-IN', { maximumFractionDigits: 3 }) : '—'}</td>
+              <td colSpan={3} className="border border-[#999] py-1 px-2 text-right">
+                Totals
+                {!noteUnit && <div className="text-[9px] font-normal text-[#666] normal-case">mixed purchase units — see each line</div>}
+              </td>
+              <td className="border border-[#999] py-1 px-2 text-right font-mono">{qtyTotal(totalReceived)}</td>
+              <td className="border border-[#999] py-1 px-2 text-right font-mono">{qtyTotal(totalAcceptedQty)}</td>
+              <td className="border border-[#999] py-1 px-2 text-right font-mono">{qtyTotal(totalRejectedQty, true)}</td>
               <td className="border border-[#999] py-1 px-2"></td>
               <td className="border border-[#999] py-1 px-2 text-right font-mono">{fmt(totalInward)}</td>
             </tr>

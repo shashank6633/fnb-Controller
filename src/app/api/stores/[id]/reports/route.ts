@@ -1,7 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { getStoreById, storeStock, userStoreAccess } from '@/lib/store-engine';
-import { fmtBreakdown } from '@/lib/pack-units';
+import { fmtBreakdown, packFactor } from '@/lib/pack-units';
 
 /**
  * GET /api/stores/[id]/reports?type=…&from=&to=&days= — store-scoped reports
@@ -144,15 +144,27 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         rows = raw.map(l => {
           const bal = r3((run.get(l.material_id) || 0) + n(l.quantity));
           run.set(l.material_id, bal);
+          // Purchase-basis companions (ADDITIVE — the recipe fields stay the
+          // exact running-balance truth). packFactor's both-halves guard means
+          // pc is 1 for a material with no real pack conversion, so those rows
+          // carry the SAME number with the right (purchase) unit label.
+          // rate_purchase is DISPLAY ONLY: ₹ never derives from it (cost stays
+          // recipeQty × ₹/recipe-unit wherever it is computed).
+          const pc = packFactor(l);
           return {
             date: String(l.created_at).slice(0, 16),
             txn_type: l.txn_type,
             material: l.material,
             qty: r3(l.quantity),
             unit: l.unit,
+            qty_purchase: r3(n(l.quantity) / pc),
+            purchase_unit: l.purchase_unit || l.unit,
+            pack_factor: pc,
             qty_cbl: fmtBreakdown(n(l.quantity), l) || '',
             unit_cost: r4(l.unit_cost),
+            rate_purchase: r2(n(l.unit_cost) * pc),
             running_balance: bal,
+            balance_purchase: r3(bal / pc),
             balance_cbl: fmtBreakdown(bal, l) || '',
             supplier: l.supplier || '',
             ref: l.ref || '',

@@ -8,11 +8,49 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { CalendarClock, Download, Filter, Loader2 } from 'lucide-react';
+import { packFactor, toPurchaseQty, fmtQtyNum, csvQty, type PackMeta } from '@/lib/pack-units';
 
 const fmt  = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
-const fmt2 = (v: number | null) => v == null ? '—' : v.toLocaleString('en-IN', { maximumFractionDigits: 2 });
 const today = () => new Date().toISOString().slice(0,10);
 const minusDays = (n: number) => { const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().slice(0,10); };
+
+/**
+ * ONE quantity cell for this report — every one of the seven columns goes
+ * through it, so no cell can revert to grams while its siblings read bottles.
+ *
+ * /api/daily-rollup ships every quantity in RECIPE units and says so in its own
+ * comments ("Opening in RECIPE units: scale purchases-before by the factor").
+ * The owner rule for Inventory surfaces is that the PURCHASE unit LEADS, with
+ * the recipe figure kept only as the small declared hint — otherwise KAHLUA
+ * LIQUEUR (750 ML) prints a closing of "6,630", which reads as 6,630 bottles
+ * against a real 8.84 BTL.
+ *
+ * Conversion is the shared pack layer only (packFactor's two-half guard), never
+ * re-derived here: PICKLED GINGER 1.5KG is kg/kg with pack_size 1.5, so it must
+ * keep printing 6 kg, not "4 kg".
+ */
+function Qty({ v, m, signed }: { v: number | null | undefined; m: PackMeta; signed?: boolean }) {
+  if (v == null) return <>—</>;
+  const pf = packFactor(m);
+  const pq = toPurchaseQty(v, m);
+  const pu = String(m.purchase_unit || m.unit || '').trim();
+  // The sign must come from the STORED value, never from the rounded purchase
+  // figure. A -0.3 ml variance divides to -0.0004 BTL, which rounds to NEGATIVE
+  // ZERO — and (-0 >= 0) is true in JS, so keying the sign off pq printed
+  // "+0 BTL" directly above a hint reading "= -0.3 ml", on a row the page had
+  // already tinted as a loss.
+  const sign = v > 0 ? '+' : v < 0 ? '-' : '';
+  const show = (n: number) => (signed ? `${sign}${fmtQtyNum(Math.abs(n))}` : fmtQtyNum(n === 0 ? 0 : n));
+  return (
+    <>
+      <span className="whitespace-nowrap">{show(pq)} <span className="text-[10px] font-normal text-[#8B7355]">{pu}</span></span>
+      {pf > 1 && (
+        // Declared recipe HINT (house style) — the purchase lead is on the line above.
+        <div className="text-[9px] text-[#B8A590] font-normal whitespace-nowrap">= {show(v)} {m.unit}</div>
+      )}
+    </>
+  );
+}
 
 interface RollupRow {
   date: string; material_id: string; material_name: string; material_sku?: string;
@@ -55,16 +93,33 @@ export default function DailyRollupPage() {
 
   const exportCsv = () => {
     if (rows.length === 0) return;
+    // The original 13 columns are UNCHANGED (still recipe-basis, still labelled by
+    // the `unit` column) so any existing sheet keeps working. The purchase-basis
+    // mirror of the seven quantity columns is APPENDED, matching what the screen
+    // now leads with — a sheet that read "6,630" for KAHLUA is otherwise as
+    // misleading on paper as it was on screen.
     const head = ['date','sku','material','unit','opening','received','consumed_recipe','consumed_wastage','consumed','closing','counted','variance','loss_value'];
-    const lines = [head.join(',')];
+    const QCOLS = ['opening','received','consumed_recipe','consumed_wastage','consumed','closing','counted','variance'] as const;
+    const puHead = ['purchase_unit','pack_factor', ...QCOLS.map(k => `${k}_purchase`)];
+    const lines = [[...head, ...puHead].join(',')];
     for (const r of rows) {
-      lines.push(head.map(k => {
+      const cells = head.map(k => {
         const map: any = { sku: 'material_sku', material: 'material_name' };
         const v = (r as any)[map[k] ?? k];
         if (v == null) return '';
         const s = String(v).replace(/"/g, '""');
         return s.includes(',') ? `"${s}"` : s;
-      }).join(','));
+      });
+      const pu = String(r.purchase_unit || r.unit || '').replace(/"/g, '""');
+      cells.push(pu.includes(',') ? `"${pu}"` : pu);
+      cells.push(String(packFactor(r)));
+      // Convert each stored recipe figure once, through the shared helper; never
+      // sum these across materials (BTL + kg has no meaning).
+      for (const k of QCOLS) {
+        const v = (r as any)[k];
+        cells.push(v == null ? '' : String(csvQty(toPurchaseQty(v, r))));
+      }
+      lines.push(cells.join(','));
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -81,6 +136,7 @@ export default function DailyRollupPage() {
           </h1>
           <p className="text-xs text-[#6B5744] mt-1">
             <code>Opening + Received − Recipe − Wastage = Closing</code>. When you record a physical count for the day, variance = Closing − Counted (positive = leakage).
+            {' '}Every quantity below reads in the material&apos;s <strong>purchase unit</strong> (kg · L · BTL · CASE); the small grey line under each figure is the same quantity in recipe units.
           </p>
         </div>
         <button onClick={exportCsv} disabled={rows.length === 0}
@@ -149,14 +205,19 @@ export default function DailyRollupPage() {
                   <tr>
                     <th className="text-left  py-1.5 px-3 font-medium">SKU</th>
                     <th className="text-left  py-1.5 px-3 font-medium">Material</th>
-                    <th className="text-right py-1.5 px-3 font-medium">Opening</th>
-                    <th className="text-right py-1.5 px-3 font-medium">Received</th>
-                    <th className="text-right py-1.5 px-3 font-medium" title="Sales · Parties · Staff meals">Recipe</th>
-                    <th className="text-right py-1.5 px-3 font-medium" title="Spoilage / Expiry / Damage / etc.">Wastage</th>
-                    <th className="text-right py-1.5 px-3 font-medium">Closing</th>
-                    <th className="text-right py-1.5 px-3 font-medium">Counted</th>
-                    <th className="text-right py-1.5 px-3 font-medium">Variance</th>
-                    <th className="text-right py-1.5 px-3 font-medium">Loss ₹</th>
+                    <th className="text-left  py-1.5 px-3 font-medium" title="The unit every quantity column below is printed in (the material's purchase unit), and the recipe unit it converts from">Unit</th>
+                    {/* All seven quantity columns lead in the material's PURCHASE unit
+                        (kg / L / BTL / CASE); the small grey "= …" line under each is
+                        the recipe figure the API actually ships. State the basis here
+                        so nobody has to infer it from the numbers. */}
+                    <th className="text-right py-1.5 px-3 font-medium" title="Stock at start of day — in the material's purchase unit (kg, L, BTL, CASE)">Opening <span className="block font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Purchases received on the day — in the material's purchase unit (kg, L, BTL, CASE)">Received <span className="block font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Sales · Parties · Staff meals — in the material's purchase unit (kg, L, BTL, CASE)">Recipe <span className="block font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Spoilage / Expiry / Damage / etc. — in the material's purchase unit (kg, L, BTL, CASE)">Wastage <span className="block font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Opening + Received − Recipe − Wastage — in the material's purchase unit (kg, L, BTL, CASE)">Closing <span className="block font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Physical count recorded for the day — in the material's purchase unit (kg, L, BTL, CASE)">Counted <span className="block font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Closing − Counted, positive = leakage — in the material's purchase unit (kg, L, BTL, CASE)">Variance <span className="block font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Variance valued at the material's average cost">Loss ₹</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -168,14 +229,20 @@ export default function DailyRollupPage() {
                       <tr key={i} className={`border-t border-[#E8D5C4]/50 ${isLeak ? 'bg-red-50/20' : isOver ? 'bg-indigo-50/20' : ''}`}>
                         <td className="py-1.5 px-3 font-mono text-[10px] text-[#8B7355]">{r.material_sku || '·'}</td>
                         <td className="py-1.5 px-3">{r.material_name}</td>
-                        <td className="py-1.5 px-3 text-right font-mono">{fmt2(r.opening)}</td>
-                        <td className="py-1.5 px-3 text-right font-mono text-emerald-700">{fmt2(r.received)}</td>
-                        <td className="py-1.5 px-3 text-right font-mono text-blue-700">{fmt2(r.consumed_recipe)}</td>
-                        <td className="py-1.5 px-3 text-right font-mono text-amber-700">{fmt2(r.consumed_wastage)}</td>
-                        <td className="py-1.5 px-3 text-right font-mono font-semibold text-[#2D1B0E]">{fmt2(r.closing)}</td>
-                        <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{r.counted != null ? fmt2(r.counted) : '—'}</td>
+                        <td className="py-1.5 px-3 text-[10px] text-[#6B5744] whitespace-nowrap">
+                          {r.purchase_unit || r.unit}
+                          {/* State the pack rule outright when the two bases differ, so the
+                              "= …" hint under every figure is self-explanatory. */}
+                          {packFactor(r) > 1 && <div className="text-[9px] text-[#B8A590]">1 {r.purchase_unit} = {fmtQtyNum(packFactor(r))} {r.unit}</div>}
+                        </td>
+                        <td className="py-1.5 px-3 text-right font-mono"><Qty v={r.opening} m={r} /></td>
+                        <td className="py-1.5 px-3 text-right font-mono text-emerald-700"><Qty v={r.received} m={r} /></td>
+                        <td className="py-1.5 px-3 text-right font-mono text-blue-700"><Qty v={r.consumed_recipe} m={r} /></td>
+                        <td className="py-1.5 px-3 text-right font-mono text-amber-700"><Qty v={r.consumed_wastage} m={r} /></td>
+                        <td className="py-1.5 px-3 text-right font-mono font-semibold text-[#2D1B0E]"><Qty v={r.closing} m={r} /></td>
+                        <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]"><Qty v={r.counted} m={r} /></td>
                         <td className={`py-1.5 px-3 text-right font-mono font-semibold ${isLeak ? 'text-red-700' : isOver ? 'text-indigo-700' : 'text-[#8B7355]'}`}>
-                          {r.variance == null ? '—' : (r.variance >= 0 ? '+' : '') + fmt2(r.variance)}
+                          <Qty v={r.variance} m={r} signed />
                         </td>
                         <td className={`py-1.5 px-3 text-right font-mono font-semibold ${isLeak ? 'text-red-700' : isOver ? 'text-indigo-700' : 'text-[#8B7355]'}`}>
                           {r.loss_value == null ? '—' : (r.loss_value >= 0 ? '+' : '') + fmt(r.loss_value)}

@@ -112,6 +112,9 @@ function plausibilityFlag(it: any, guests: number | null | undefined, effQty: nu
   //    chef meant — flagging it as "2 ml" would be a false alarm.
   if (packF === 1 && pack >= 100 && qty < pack) {
     const alsoRecipe = U.pf > 1 ? ` (= ${qty.toLocaleString('en-IN')} ${unit})` : '';
+    // unit-lock: `shown` already leads in the purchase unit. The recipe figures here
+    // are the DETECTOR's own terms — "less than one BTL (750 ml)" only makes sense
+    // in ml, because the whole warning is that the chef typed ml where BTL was meant.
     return `Only ${shown}${alsoRecipe} — less than one ${pu || 'pack'} (${pack.toLocaleString('en-IN')} ${unit}). Did the chef mean ${qty.toLocaleString('en-IN')} ${pu || 'packs'}?`;
   }
   // B) Absurdly small for the crowd AND nearly free: under 0.5 g/ml per guest
@@ -120,6 +123,9 @@ function plausibilityFlag(it: any, guests: number | null | undefined, effQty: nu
   const recipeQty = qty * packF;
   if (guests && guests > 0 && (unit === 'g' || unit === 'ml') && recipeQty / guests < 0.5 && cost < 50) {
     const alsoRecipe = U.pf > 1 ? ` (= ${recipeQty.toLocaleString('en-IN')} ${unit})` : '';
+    // unit-lock: per-guest portion is a RECIPE-unit threshold (0.5 g/ml per guest) —
+    // restating it in kg/BTL would print "0.00 BTL/guest" and destroy the signal.
+    // The quantity itself still leads in the purchase unit via `shown`.
     return `${shown}${alsoRecipe} ≈ ${(recipeQty / guests).toFixed(2)} ${unit}/guest for ${guests} guests (≈${fmt(cost)}) — check the unit.`;
   }
   return null;
@@ -904,29 +910,60 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
   // through the edit UNCHANGED — the PUT replaces ALL items, so omitting either
   // field silently blanked ri.unit (flipping purchase-unit lines like "2 BTL"
   // into ×1 recipe-unit costing) and flattened per-line departments.
-  const [items, setItems] = useState<{ id?: string; material_id: string; qty: string; unit: string; notes: string; department_id?: string }[]>([]);
+  //
+  // `qty` stays in the LINE's OWN stored unit (what persist() posts verbatim);
+  // `meta` is the material's pack meta, captured at load so the purchase-basis
+  // display never has to wait on the separate /api/inventory fetch; `qty0` is
+  // the pristine loaded value, restored on blur when the chef didn't actually
+  // change anything (fromPU(toPU(q)) ≠ q, so an untouched line must never be
+  // round-tripped through the 3-dp display figure).
+  type EditLine = {
+    id?: string; material_id: string; qty: string; unit: string; notes: string;
+    department_id?: string; qty0?: string;
+    meta: { unit: string; purchase_unit: string; pack_size: number };
+  };
+  const [items, setItems] = useState<EditLine[]>([]);
   const [materials, setMaterials] = useState<any[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Raw purchase-unit strings while typing — kept as typed so "2." stays "2."
+  // and a decimal qty is actually typeable. Cleared on blur.
+  const [puDraft, setPuDraft] = useState<Record<number, string>>({});
 
   useEffect(() => {
     fetch(`/api/requisitions?id=${reqId}`).then(r => r.json()).then(d => {
       const r = d.requisition;
       setReq(r);
-      setItems((r.items || []).map((it: any) => ({
+      setItems((r.items || []).map((it: any): EditLine => ({
         id: it.id,
         material_id: it.material_id,
         qty: String(it.quantity_requested),
+        qty0: String(it.quantity_requested),
         unit: it.unit || '',
         notes: it.notes || '',
         department_id: it.department_id || undefined,
+        meta: {
+          unit: it.material_unit || '',
+          purchase_unit: it.material_purchase_unit || '',
+          pack_size: Number(it.material_pack_size) || 1,
+        },
       })));
     });
     fetch('/api/inventory').then(r => r.json()).then(d => setMaterials(d.materials || d || []));
   }, [reqId]);
 
-  const addLine = () => setItems(p => [...p, { material_id: '', qty: '', unit: '', notes: '' }]);
-  const removeLine = (i: number) => setItems(p => p.filter((_, idx) => idx !== i));
+  /** The canon resolver, fed this line's own unit + the material's pack meta. */
+  const unitsOf = (it: EditLine) => lineUnits({
+    unit: it.unit,
+    material_unit: it.meta?.unit,
+    material_purchase_unit: it.meta?.purchase_unit,
+    material_pack_size: it.meta?.pack_size,
+  });
+
+  const addLine = () => setItems(p => [...p, { material_id: '', qty: '', unit: '', notes: '', meta: { unit: '', purchase_unit: '', pack_size: 1 } }]);
+  // Removing a line shifts every later index, so any in-flight display draft
+  // (keyed by index) would attach to the wrong row — drop them all.
+  const removeLine = (i: number) => { setPuDraft({}); setItems(p => p.filter((_, idx) => idx !== i)); };
   const update = (i: number, patch: any) => setItems(p => p.map((it, idx) => idx === i ? { ...it, ...patch } : it));
 
   /** Recipe-units per 1 of the unit the LINE was requested in — ×pack only when
@@ -1013,18 +1050,41 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
           {items.map((it, i) => {
             const m = materials.find(x => x.id === it.material_id);
             const lineCost = m && Number(it.qty) > 0 ? Number(it.qty) * lineFactor(m, it.unit) * (m.average_price || 0) : 0;
+            // Owner rule: this box READS and is ENTERED in PURCHASE units. `it.qty`
+            // stays in the line's own stored unit, so persist() posts it verbatim
+            // and the ₹ math above is untouched.
+            const U = unitsOf(it);
+            const shownPU = puDraft[i] ?? (it.qty === '' ? '' : String(U.toPU(it.qty)));
             return (
               <div key={i} className="grid grid-cols-12 gap-2 items-start">
                 <div className="col-span-5">
                   <MaterialTypeahead
                     materials={materials as any}
+                    // Same defect as the /requisitions composer: the qty box beside
+                    // this picker READS and is ENTERED in purchase units (U.toPU /
+                    // U.fromPU above), and onPick stamps the line with purchase_unit
+                    // — but the dropdown was printing "on hand" in RECIPE units.
+                    // /api/inventory feeds this list, so purchase_unit + pack_size
+                    // are both present.
+                    purchaseBasis
                     value={it.material_id}
                     onPick={(id: string) => {
                       // New / swapped material → house convention: request in the
                       // PURCHASE unit (1 BTL = pack recipe units). Existing lines
                       // keep their saved unit until the material itself changes.
+                      // Carry the new material's pack meta so the qty box converts,
+                      // and drop qty0 — a swapped line has no pristine value left.
                       const nm = materials.find(x => x.id === id);
-                      update(i, { material_id: id, unit: nm?.purchase_unit || nm?.unit || '' });
+                      update(i, {
+                        material_id: id,
+                        unit: nm?.purchase_unit || nm?.unit || '',
+                        qty0: undefined,
+                        meta: {
+                          unit: nm?.unit || '',
+                          purchase_unit: nm?.purchase_unit || '',
+                          pack_size: Number(nm?.pack_size) || 1,
+                        },
+                      });
                     }}
                     excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                   />
@@ -1036,10 +1096,38 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
                     qty like 2.5 kg became untypeable. min= stops the spinner;
                     a typed/pasted minus is stripped, and the value is clamped
                     where it is actually used, not while the chef is typing. */}
-                <input type="number" step="any" min={0} value={it.qty}
-                       onChange={e => update(i, { qty: e.target.value.replace(/^-+/, '') })}
-                       className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
-                <span className="col-span-1 text-xs text-[#8B7355] py-2" title="Unit this line was requested in">{it.unit || m?.unit || ''}</span>
+                <div className="col-span-2">
+                  <input type="number" step="any" min={0} value={shownPU}
+                         title={`Enter in ${U.pu || 'units'}`}
+                         onChange={e => {
+                           const raw = e.target.value.replace(/^-+/, '');
+                           setPuDraft(d => ({ ...d, [i]: raw }));
+                           // ONE conversion back to the line's stored unit, so the
+                           // live line cost keeps running on the stored basis.
+                           update(i, { qty: raw === '' ? '' : String(U.fromPU(raw)) });
+                         }}
+                         onBlur={() => {
+                           // Re-typing the displayed figure is not an edit: restore
+                           // the pristine stored value rather than keep fromPU(toPU(q)).
+                           const raw = puDraft[i];
+                           if (raw != null && it.qty0 != null && Number(raw) === U.toPU(it.qty0)) {
+                             update(i, { qty: it.qty0 });
+                           }
+                           setPuDraft(d => { const n = { ...d }; delete n[i]; return n; });
+                         }}
+                         className="w-full px-2 py-1.5 border border-[#D4B896] rounded text-xs text-right font-mono" />
+                  {U.pf > 1 && (
+                    <div className="text-[9px] text-[#B8A590] text-right mt-0.5">
+                      = {fmtNum(U.toRecipe(it.qty))} {U.recipeUnit}
+                    </div>
+                  )}
+                </div>
+                <span className="col-span-1 text-xs text-[#8B7355] py-2"
+                      title={U.pf > 1
+                        ? `Purchase unit. Stored on the line as ${it.unit || U.recipeUnit || '—'} (1 ${U.pu} = ${U.pf} ${U.recipeUnit}).`
+                        : 'Unit this line is requested in'}>
+                  {U.pu || it.unit || m?.unit || ''}
+                </span>
                 <input value={it.notes} onChange={e => update(i, { notes: e.target.value })}
                        placeholder="Notes"
                        className="col-span-2 px-2 py-1.5 border border-[#D4B896] rounded text-xs" />

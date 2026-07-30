@@ -1,6 +1,7 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { getStoreById, materialStoreId, postLedger } from '@/lib/store-engine';
+import { dualQty } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
 
 /**
@@ -17,7 +18,9 @@ import { todayIST } from '@/lib/format-date';
  * adjust store stock — everything else is register-only.
  *
  * GET  /api/stores/empties?store_id=&from=&to=&kind=
- *   → { empties: [{ …row, material_name, unit, pack_size, store_name }],
+ *   → { empties: [{ …row, material_name, store_name, category,
+ *                   unit, purchase_unit, pack_size, case_size,
+ *                   qty (recipe), qty_purchase, pack_factor }],
  *       kinds: [...] }
  *
  * POST /api/stores/empties
@@ -68,12 +71,14 @@ export async function GET(request: Request) {
     if (to) { where.push('e.date <= ?'); args.push(to); }
     if (kind && (KINDS as readonly string[]).includes(kind)) { where.push('e.kind = ?'); args.push(kind); }
 
-    const empties = db.prepare(`
+    const rows = db.prepare(`
       SELECT e.id, e.store_id, e.material_id, e.qty, e.kind, e.note,
              e.recorded_by, e.date, e.created_at,
              COALESCE(rm.name, '(deleted material)') AS material_name,
              COALESCE(rm.unit, '')                   AS unit,
+             COALESCE(rm.purchase_unit, rm.unit, '') AS purchase_unit,
              COALESCE(rm.pack_size, 1)               AS pack_size,
+             COALESCE(rm.case_size, 1)               AS case_size,
              COALESCE(rm.category, '')               AS category,
              COALESCE(sl.name, '(deleted store)')    AS store_name
       FROM bar_empties e
@@ -82,7 +87,13 @@ export async function GET(request: Request) {
       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
       ORDER BY e.date DESC, e.created_at DESC
       LIMIT 1000
-    `).all(...args);
+    `).all(...args) as any[];
+
+    // e.qty is stored in RECIPE units. Ship the purchase-basis companion (the
+    // frozen DualQty wire shape) alongside it so a consumer renders bottles, not
+    // millilitres — purchase_unit + case_size are carried for the same reason
+    // (packFactor needs BOTH halves, and fmtBreakdown needs the case size).
+    const empties = rows.map(r => ({ ...r, ...dualQty(Number(r.qty) || 0, r) }));
 
     return Response.json({ empties, kinds: KINDS });
   } catch (e: any) {

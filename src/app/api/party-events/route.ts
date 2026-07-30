@@ -119,9 +119,26 @@ export async function GET(request: Request) {
           req_number: i.req_number,
           material:   i.material_name,
           sku:        i.sku,
+          // `unit` stays the RECIPE unit and `quantity` stays in the LINE's own
+          // unit — both are frozen wire fields. The three fields below are
+          // ADDITIVE so the client can resolve the line's basis and lead with
+          // PURCHASE units (a 2-BTL line was rendering as "2 ml" because the
+          // qty came from ri.unit while the label came from rm.unit).
           unit:       i.unit,
           quantity:   i.quantity_requested,
+          req_unit:      String(i.req_unit || '').trim(),
+          purchase_unit: String(i.purchase_unit || i.unit || '').trim(),
+          pack_size:     Number(i.pack_size) || 1,
+          // ₹/RECIPE-unit — unchanged. FROZEN wire field: other readers depend
+          // on the 2-dp figure. line_cost never routes through it.
           unit_price: Math.round((i.average_price || 0) * 100) / 100,
+          // ADDITIVE (2026-07-30) — the UNROUNDED ₹/recipe-unit. The screen's
+          // ₹/purchase-unit LABEL must derive from THIS, never from unit_price:
+          // round2(price) × pack_size amplifies the 2-dp rounding by up to
+          // pack_size/200 rupees (₹3.75 on a 750 ml bottle), so the printed rate
+          // stopped reconciling with line_cost in the SAME row. The rule is
+          // price × packFactor THEN format — never round2(price) × packFactor.
+          unit_price_exact: Number(i.average_price) || 0,
           line_cost:  Math.round(i.quantity_requested * packFactor(i) * (i.average_price || 0) * 100) / 100,
         })),
         sales: canSeeFinancials ? sales.map(s => ({

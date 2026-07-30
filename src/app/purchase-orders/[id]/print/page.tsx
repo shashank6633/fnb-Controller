@@ -8,6 +8,11 @@ import { fmtIST, fmtISTDate } from '@/lib/format-date';
 // so the same PO reads identically on screen and on paper (max-only would print
 // ₹354 here and ₹354.00 there).
 const fmt = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+/* QTY for paper. Every quantity on this document is in the material's PURCHASE
+ * unit (kg, BTL, CASE) — a PO is what we send a VENDOR, so the recipe unit (g,
+ * ml) has no place on it and no recipe hint is printed. 3 dp trims binary-float
+ * noise (a rejected 0.30000000000000004) without touching any real figure. */
+const qty = (v: number) => (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
 // All timestamps in IST. dt() shows date only (legacy callers); use fmtIST when
 // you need a date+time stamp on the PO print.
 const dt = (s?: string | null) => fmtISTDate(s, { fallback: '—' });
@@ -139,7 +144,9 @@ export default function POPrintPage() {
               <th className="border border-gray-300 px-2 py-1.5 text-left">Material</th>
               {isMixedVendor && <th className="border border-gray-300 px-2 py-1.5 text-left">Vendor</th>}
               <th className="border border-gray-300 px-2 py-1.5 text-right">Ordered Qty</th>
-              <th className="border border-gray-300 px-2 py-1.5 text-left">Unit</th>
+              {/* Named outright: every qty + rate on this sheet is in the
+                  PURCHASE unit, so nobody reads a "10" as ten grams. */}
+              <th className="border border-gray-300 px-2 py-1.5 text-left">Unit (purchase)</th>
               <th className="border border-gray-300 px-2 py-1.5 text-right">Rate (Ord)</th>
               <th className="border border-gray-300 px-2 py-1.5 text-right">Ordered ₹</th>
               {isReceived && <>
@@ -166,13 +173,13 @@ export default function POPrintPage() {
                     {it.material_name}
                     {isReceived && (it.quantity_rejected || 0) > 0 && (
                       <div className="text-[10px] text-red-700 mt-0.5">
-                        Rejected: {it.quantity_rejected} {it.material_purchase_unit || it.material_unit}
+                        Rejected: {qty(it.quantity_rejected)} {it.material_purchase_unit || it.material_unit}
                         {it.rejection_reason && <span className="capitalize"> ({it.rejection_reason.replace(/_/g, ' ')})</span>}
                       </div>
                     )}
                   </td>
                   {isMixedVendor && <td className="border border-gray-300 px-2 py-1.5">{it.vendor || '—'}</td>}
-                  <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{Number(it.quantity).toLocaleString('en-IN')}</td>
+                  <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{qty(it.quantity)}</td>
                   {/* PO qty/rate are in the PURCHASE unit (kg, BTL, CASE), not
                       the recipe unit (g, ml) — the vendor orders in the former. */}
                   <td className="border border-gray-300 px-2 py-1.5">{it.material_purchase_unit || it.material_unit}</td>
@@ -180,7 +187,7 @@ export default function POPrintPage() {
                   <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{fmt(it.total_price)}</td>
                   {isReceived && <>
                     <td className={`border border-gray-300 px-2 py-1.5 text-right font-mono ${qtyDiffers ? 'bg-amber-50 font-semibold' : 'bg-emerald-50/30'}`}>
-                      {recQty != null ? Number(recQty).toLocaleString('en-IN') : '—'}
+                      {recQty != null ? qty(recQty) : '—'}
                     </td>
                     <td className={`border border-gray-300 px-2 py-1.5 text-right font-mono ${priceDiffers ? 'bg-amber-50 font-semibold' : 'bg-emerald-50/30'}`}>
                       {recPrice != null ? fmt(Number(recPrice)) : '—'}

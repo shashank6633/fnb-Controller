@@ -14,7 +14,7 @@ import {
   PartyPopper, Loader2, X, ChevronDown, ChevronRight, Search,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { packFactor, toPurchaseQty } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 // ONE composer for both flows: /requisitions renders this picker with no `party`
 // prop, we render it with one. Nothing about the cart, the pack-factor guard or
 // the save path is duplicated here — that duplication is what used to drift.
@@ -33,8 +33,8 @@ function PartyQty({ qty, it }: { qty: number | null | undefined; it: any }) {
   const pu = toPurchaseQty(recipeQty, meta);
   return (
     <>
-      {pu.toLocaleString('en-IN')} <span className="text-[#8B7355]">{meta.purchase_unit || meta.unit}</span>
-      {pf > 1 && <span className="block text-[9px] text-[#B09A82]">= {recipeQty.toLocaleString('en-IN')} {meta.unit}</span>}
+      {fmtQtyNum(pu)} <span className="text-[#8B7355]">{meta.purchase_unit || meta.unit}</span>
+      {pf > 1 && <span className="block text-[9px] text-[#B8A590]">= {fmtQtyNum(recipeQty)} {meta.unit}</span>}
     </>
   );
 }

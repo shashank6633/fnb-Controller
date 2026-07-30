@@ -976,10 +976,14 @@ function ReqCard(props: {
                   </th>
                 )}
                 <th className="text-left  py-1.5 px-2 font-medium">Material</th>
-                <th className="text-right py-1.5 px-2 font-medium" title="Quantity requested in the recipe unit (kg / L / pcs / etc.)">Requested (qty + unit)</th>
-                <th className="text-right py-1.5 px-2 font-medium" title="HOD-approved quantity (overrides requested if set)">HOD OK</th>
-                <th className="text-right py-1.5 px-2 font-medium">Issued so far</th>
-                <th className="text-right py-1.5 px-2 font-medium">Outstanding</th>
+                {/* All four quantity columns read in the PURCHASE unit (BTL / kg /
+                    PKT), with the recipe equivalent as the small grey hint under
+                    packed materials. This tooltip used to say "recipe unit", which
+                    is exactly how the store was reading the numbers. */}
+                <th className="text-right py-1.5 px-2 font-medium" title="Quantity requested, in the PURCHASE unit (BTL / kg / PKT / pcs). The small grey line is the recipe equivalent.">Requested</th>
+                <th className="text-right py-1.5 px-2 font-medium" title="HOD-approved quantity, in the PURCHASE unit (overrides requested if set)">HOD OK</th>
+                <th className="text-right py-1.5 px-2 font-medium" title="Handed over so far, in the PURCHASE unit">Issued so far</th>
+                <th className="text-right py-1.5 px-2 font-medium" title="Still owed, in the PURCHASE unit">Outstanding</th>
                 <th className="text-left  py-1.5 px-2 font-medium">Last issue</th>
                 <th className="text-left  py-1.5 px-2 font-medium">Action</th>
               </tr>
@@ -1038,7 +1042,11 @@ function LineRow(props: {
   const U = lineUnits(line);
   const u = U.pu;
   const unitTag = u ? <span className="text-[9px] text-[#8B7355] ml-0.5">{u}</span> : null;
-  const hint = (q: number) => U.pf > 1
+  // Suppressed at q = 0: "= 0 ml" under a "0 BTL" says nothing, and it used to
+  // appear on every fully-issued row's Outstanding cell. Gate on the STORED qty,
+  // not the 3-dp purchase figure — a 0.25 ml residue shows "<0.001 BTL" up top
+  // and its hint is the only place the real remainder is legible.
+  const hint = (q: number) => U.pf > 1 && (Number(q) || 0) > 0
     ? <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
     : null;
   const outstandingPU = U.toPU(outstanding);
@@ -1140,10 +1148,18 @@ function LineRow(props: {
         {line.is_rejected
           ? <span className="text-red-600">rejected</span>
           : line.chef_approved_qty != null
-            ? <span className="text-amber-700">{fmtNum(U.toPU(line.chef_approved_qty))}{unitTag}</span>
+            ? <>
+                <span className="text-amber-700">{fmtNum(U.toPU(line.chef_approved_qty))}{unitTag}</span>
+                {hint(line.chef_approved_qty)}
+              </>
             : '—'}
       </td>
-      <td className="py-1.5 px-2 text-right font-mono">{puNum(U.toPU(issued), issued)}{unitTag}</td>
+      {/* Issued so far carries the recipe hint too — without it this cell was the
+          odd one out on a row whose other three quantities all showed one. */}
+      <td className="py-1.5 px-2 text-right font-mono">
+        {puNum(U.toPU(issued), issued)}{unitTag}
+        {hint(issued)}
+      </td>
       <td className="py-1.5 px-2 text-right font-mono font-semibold">
         <span className={outstanding === 0 ? 'text-emerald-700' : 'text-[#af4408]'}>{puNum(outstandingPU, outstanding)}{unitTag}</span>
         {hint(outstanding)}
@@ -1185,7 +1201,7 @@ function LineRow(props: {
                        value={props.editQty[line.id] ?? ''}
                        onChange={e => props.setEditQty((s: any) => ({ ...s, [line.id]: e.target.value }))}
                        placeholder={String(puNum(outstandingPU, outstanding))}
-                       title={`Issue in ${u || 'units'} — outstanding ${outstandingPU}${u ? ' ' + u : ''}`
+                       title={`Issue in ${u || 'units'} (purchase unit) — outstanding ${puNum(outstandingPU, outstanding)}${u ? ' ' + u : ''}`
                               + (U.pf > 1 ? ` (= ${fmtNum(U.toRecipe(outstanding))} ${U.recipeUnit})` : '')
                               + '. You may issue more than approved — say why when you do.'}
                        className={`w-16 px-1 py-0.5 border rounded text-right text-xs ${
@@ -1214,7 +1230,13 @@ function LineRow(props: {
               <div className="w-full flex flex-col sm:flex-row sm:items-center gap-1 bg-amber-50 border border-amber-300 rounded px-1.5 py-1">
                 <span className="text-[10px] text-amber-900 shrink-0">
                   <AlertCircle className="w-3 h-3 inline mr-0.5 -mt-0.5" />
-                  {fmtNum(overBy)} {u} MORE than approved ({fmtNum(outstandingPU)} {u}) — this is what will be recorded as issued.
+                  {/* Say ALL the numbers. The first version called `outstanding`
+                      "approved", so a line approved for 4 kg with 3 kg already
+                      issued read "2 kg more than approved (1 kg)" — which looks
+                      like the approval was 1 kg. It never was. */}
+                  Only {fmtNum(outstandingPU)} {u} is still open — {fmtNum(U.toPU(issued))} of {fmtNum(U.toPU(eff))} {u} already issued.
+                  {' '}Handing over {fmtNum(typedPU)} {u} takes the total to <b>{fmtNum(U.toPU(issued) + typedPU)} {u}</b>,
+                  {' '}which is {fmtNum(overBy)} {u} over the {fmtNum(U.toPU(eff))} {u} approved.
                 </span>
                 <input value={props.issueNotes[line.id] || ''}
                        onChange={e => props.setIssueNotes((s: any) => ({ ...s, [line.id]: e.target.value }))}
@@ -1286,6 +1308,10 @@ function defaultDefer(): string {
 function HistoryDrawer({ line, onClose }: { line: ReqLine; onClose: () => void }) {
   let history: Array<{ qty: number; at: string; by: string; note?: string }> = [];
   try { history = JSON.parse(line.issue_history || '[]'); } catch {}
+  // h.qty is stored in the LINE's own unit (store-issue adds it verbatim), so it
+  // reads through the same resolver as the row it came from. Hoisted out of the
+  // map — it was rebuilt twice per history row.
+  const U = lineUnits(line);
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
       <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-lg shadow-xl" onClick={e => e.stopPropagation()}>
@@ -1305,7 +1331,7 @@ function HistoryDrawer({ line, onClose }: { line: ReqLine; onClose: () => void }
               <thead className="bg-[#FFF1E3] text-[#6B5744]">
                 <tr>
                   <th className="text-left  py-1.5 px-2">When</th>
-                  <th className="text-right py-1.5 px-2">Qty</th>
+                  <th className="text-right py-1.5 px-2" title="Handed over, in the PURCHASE unit">Qty</th>
                   <th className="text-left  py-1.5 px-2">By</th>
                   <th className="text-left  py-1.5 px-2">Note</th>
                 </tr>
@@ -1315,8 +1341,11 @@ function HistoryDrawer({ line, onClose }: { line: ReqLine; onClose: () => void }
                   <tr key={i} className="border-t border-[#E8D5C4]/50">
                     <td className="py-1.5 px-2">{fmtDateTime(h.at)}</td>
                     <td className="py-1.5 px-2 text-right font-mono font-semibold text-emerald-700">
-                      {fmtNum(lineUnits(line).toPU(h.qty))}
-                      <span className="text-[9px] text-[#8B7355] ml-0.5">{lineUnits(line).pu}</span>
+                      {fmtNum(U.toPU(h.qty))}
+                      <span className="text-[9px] text-[#8B7355] ml-0.5">{U.pu}</span>
+                      {U.pf > 1 && (Number(h.qty) || 0) > 0 && (
+                        <div className="text-[9px] font-normal text-[#B8A590]">= {fmtNum(U.toRecipe(h.qty))} {U.recipeUnit}</div>
+                      )}
                     </td>
                     <td className="py-1.5 px-2 text-[#6B5744] flex items-center gap-1"><UserIcon className="w-3 h-3" /> {h.by}</td>
                     <td className="py-1.5 px-2 text-[#8B7355]">{h.note || '—'}</td>
@@ -1353,7 +1382,10 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
     if (events.length === 0) return;
     // Both bases: the purchase figure is what was handed over, the recipe
     // figure is what Value and the stock deduction were computed from.
-    const headers = ['When', 'Material', 'Qty', 'Unit', 'Qty (recipe)', 'Recipe Unit',
+    // Column names say WHICH basis each figure is in — an unqualified "Qty"/"Unit"
+    // next to a "Qty (recipe)" invites the reader to assume the first pair is the
+    // recipe one too. Header text only; the values are unchanged.
+    const headers = ['When', 'Material', 'Qty (purchase)', 'Purchase Unit', 'Qty (recipe)', 'Recipe Unit',
                      'Department', 'Req #', 'Issuer', 'Unit Cost', 'Value', 'Purpose', 'Event', 'Note'];
     const escape = (v: any) => {
       const s = v == null ? '' : String(v);
@@ -1421,7 +1453,7 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
                 <tr>
                   <th className="text-left  py-2 px-2 font-medium">When</th>
                   <th className="text-left  py-2 px-2 font-medium">Material</th>
-                  <th className="text-right py-2 px-2 font-medium">Qty</th>
+                  <th className="text-right py-2 px-2 font-medium" title="Handed over, in the PURCHASE unit. The small grey line is the recipe equivalent that Value was computed from.">Qty</th>
                   <th className="text-left  py-2 px-2 font-medium">To Dept</th>
                   <th className="text-left  py-2 px-2 font-medium">Req #</th>
                   <th className="text-left  py-2 px-2 font-medium">Issued By</th>

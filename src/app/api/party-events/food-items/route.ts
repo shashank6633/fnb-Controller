@@ -29,7 +29,13 @@ export async function GET(request: Request) {
              rm.unit               AS material_unit,
              -- The unit the qty numbers are ACTUALLY stored in (reqPackFactor
              -- convention) — the client must label with this, not the recipe unit.
+             -- A BLANK ri.unit falls back to the recipe unit, which is exactly
+             -- what a blank line means; the client then divides by the pack.
              COALESCE(NULLIF(TRIM(ri.unit), ''), rm.unit) AS qty_unit,
+             -- Pack meta so the modal can LEAD in purchase units (owner rule).
+             -- Additive: qty / qty_unit / cost are unchanged.
+             COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
+             COALESCE(rm.pack_size, 1) AS material_pack_size,
              ri.quantity_requested AS qty,
              ri.quantity_issued    AS qty_issued,
              rm.average_price      AS avg_price,

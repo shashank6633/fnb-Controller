@@ -80,7 +80,11 @@ export async function GET(request: Request) {
       // inventory route — for the detail view we just want the latest purchase).
       const items = db.prepare(`
         SELECT ri.*, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
-               COALESCE(rm.purchase_unit, rm.unit) AS material_purchase_unit,
+               -- NULLIF(TRIM(...)) — not a bare COALESCE: an EMPTY-STRING
+               -- purchase_unit would ship '' to the client, where every reader
+               -- falls back to the recipe unit and the row silently prints
+               -- grams. Same expression as the audit + store-process routes.
+               COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
                COALESCE(rm.pack_size, 1)          AS material_pack_size,
                rm.current_stock, rm.average_price,
                (SELECT unit_price FROM purchases WHERE material_id = rm.id ORDER BY date DESC, created_at DESC LIMIT 1) AS last_purchase_price,

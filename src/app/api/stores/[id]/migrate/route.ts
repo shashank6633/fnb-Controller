@@ -1,6 +1,7 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { getStoreById, postLedger } from '@/lib/store-engine';
+import { packFactor } from '@/lib/pack-units';
 
 /**
  * POST /api/stores/[id]/migrate — ADMIN-ONLY one-time migration of CENTRAL
@@ -101,7 +102,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
     const migrated: {
       material_id: string; material: string; qty: number; unit: string;
-      unit_cost: number; value: number; ledger_id: string;
+      /** Purchase-basis companions (display only — qty stays the recipe truth
+       *  the ledger holds and the ONLY basis ₹ is ever computed from). */
+      qty_purchase: number; purchase_unit: string; pack_factor: number;
+      unit_cost: number; unit_cost_purchase: number; value: number; ledger_id: string;
     }[] = [];
 
     const zeroCentral = db.prepare(`
@@ -116,6 +120,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       for (const m of migratable) {
         const qty = Number(m.current_stock) || 0;                    // recipe units
         const unitCost = Number(m.average_price) || 0;               // ₹/recipe unit
+        // Purchase-basis view for the notes/audit strings a human reads. Storage
+        // and ₹ are untouched: value stays qty × unitCost (recipe × ₹/recipe).
+        const pf = packFactor(m);
+        const qtyPU = Math.round((qty / pf) * 1000) / 1000;
+        const costPU = Math.round(unitCost * pf * 100) / 100;
+        const puLabel = m.purchase_unit || m.unit;
+        const qtyLabel = `${qtyPU} ${puLabel}${pf > 1 ? ` (${qty} ${m.unit})` : ''}`;
         const ledgerId = postLedger(db, {
           store_id: storeId,
           material_id: m.id,
@@ -123,17 +134,18 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           quantity: qty,
           unit_cost: unitCost,
           ref: 'central-migration',
-          notes: `Migrated from Central Store (central stock ${qty} ${m.unit} @ ₹${unitCost}/${m.unit})`,
+          notes: `Migrated from Central Store (central stock ${qtyLabel} @ ₹${costPU}/${puLabel})`,
           created_by: user.email,
         });
         zeroCentral.run(m.id);
         centralTxn.run(
           generateId(), m.id, -qty, ledgerId,
-          `Migrated to ${store.name}: ${qty} ${m.unit} moved to store ledger (opening ${ledgerId})`,
+          `Migrated to ${store.name}: ${qtyLabel} moved to store ledger (opening ${ledgerId})`,
         );
         migrated.push({
           material_id: m.id, material: m.name, qty, unit: m.unit,
-          unit_cost: unitCost,
+          qty_purchase: qtyPU, purchase_unit: puLabel, pack_factor: pf,
+          unit_cost: unitCost, unit_cost_purchase: costPU,
           value: Math.round(qty * unitCost * 100) / 100,
           ledger_id: ledgerId,
         });
@@ -151,9 +163,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           store_id: storeId, store: store.name,
           material_id: m.material_id, material: m.material,
           qty: m.qty, unit: m.unit, unit_cost: m.unit_cost, value: m.value,
+          qty_purchase: m.qty_purchase, purchase_unit: m.purchase_unit,
+          pack_factor: m.pack_factor, unit_cost_purchase: m.unit_cost_purchase,
           central_stock_before: m.qty, central_stock_after: 0,
         },
-        note: `${store.name}: migrated ${m.qty} ${m.unit} ${m.material} from Central Store (₹${m.value})`,
+        note: `${store.name}: migrated ${m.qty_purchase} ${m.purchase_unit}`
+          + `${m.pack_factor > 1 ? ` (${m.qty} ${m.unit})` : ''}`
+          + ` ${m.material} from Central Store (₹${m.value})`,
       });
     }
 

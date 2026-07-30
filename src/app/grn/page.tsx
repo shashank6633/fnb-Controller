@@ -11,6 +11,7 @@ import { api } from '@/lib/api';
 import { todayIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import Combobox from '@/components/Combobox';
+import { packFactor, fmtQtyNum } from '@/lib/pack-units';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 /** ₹ with 2 decimals — for the inward register (taxes/charges carry paise). */
@@ -66,6 +67,11 @@ interface GRN {
   notes?: string;
   line_count: number;
   total_rejected: number;
+  /** How many DISTINCT purchase units the rejected lines span (0 = none rejected).
+   *  total_rejected is only a printable quantity when this is exactly 1. */
+  rejected_unit_count?: number;
+  rejected_unit?: string | null;
+  rejected_lines?: number;
   accepted_value: number;
   inward_value: number;
 }
@@ -126,10 +132,14 @@ export default function GrnPage() {
   };
 
   const counts = useMemo(() => {
-    const c = { received: 0, partial: 0, rejected: 0, total_rejected_qty: 0, accepted_value: 0 };
+    // No cross-GRN quantity total here on purpose: rejected qtys are PURCHASE
+    // units of different materials (kg + BTL + pcs) and summing them produces a
+    // number that means nothing. Only the ₹ roll-up is addable. (An unrendered
+    // total_rejected_qty accumulator used to sit here — removed so nobody
+    // "helpfully" prints it later.)
+    const c = { received: 0, partial: 0, rejected: 0, accepted_value: 0 };
     for (const g of list) {
       c[g.status] = (c[g.status] || 0) + 1;
-      c.total_rejected_qty += g.total_rejected || 0;
       c.accepted_value += g.accepted_value || 0;
     }
     return c;
@@ -236,7 +246,32 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
         <td className="py-2 px-3 text-[#6B5744]">{g.vendor || '—'}</td>
         <td className="py-2 px-3 font-mono">{g.po_number ? <a href="/purchase-orders" className="text-[#af4408] hover:underline">{g.po_number}</a> : <span className="text-[#8B7355]">—</span>}</td>
         <td className="py-2 px-3 text-right font-mono">{g.line_count}</td>
-        <td className="py-2 px-3 text-right font-mono text-red-700">{g.total_rejected > 0 ? Number(g.total_rejected).toLocaleString('en-IN') : <span className="text-[#8B7355]">—</span>}</td>
+        {/* Rejected qty is a SUM ACROSS MATERIALS and GRN qtys are PURCHASE units,
+            so it can only be printed as a quantity when every rejected line shares
+            one purchase unit (kg + kg). A mixed GRN (2 kg + 3 BTL) has no honest
+            total — show the rejected LINE COUNT and send the reader to the rows.
+            Same precedent as the stock-overview tfoot. */}
+        <td className="py-2 px-3 text-right font-mono text-red-700">
+          {(() => {
+            const rej = Number(g.total_rejected) || 0;
+            if (rej <= 0) return <span className="text-[#8B7355]">—</span>;
+            // undefined (a payload from before these fields existed) ≠ "mixed" —
+            // say we don't know the unit rather than invent either answer.
+            if (g.rejected_unit_count == null) {
+              return <span title="Expand the row for the per-line quantities and their purchase units.">{rej.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</span>;
+            }
+            const uc = Number(g.rejected_unit_count) || 0;
+            if (uc === 1 && g.rejected_unit) {
+              return <>{rej.toLocaleString('en-IN', { maximumFractionDigits: 3 })} <span className="text-[9px] text-[#B8A590]">{g.rejected_unit}</span></>;
+            }
+            const n = Number(g.rejected_lines ?? 0) || 0;
+            return (
+              <span title="Rejected across materials with different purchase units — a single total would mix units. Expand the row for the per-line quantities.">
+                {n > 0 ? `${n} line${n === 1 ? '' : 's'}` : '—'} <span className="text-[9px] text-[#B8A590]">mixed units</span>
+              </span>
+            );
+          })()}
+        </td>
         <td className="py-2 px-3 text-right font-mono font-semibold">{fmt(g.accepted_value || 0)}</td>
         <td className="py-2 px-3 text-right font-mono font-semibold text-[#af4408]">{g.inward_value ? fmt(g.inward_value) : '—'}</td>
         <td className="py-2 px-3">
@@ -315,6 +350,11 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
                   {detail.items.map((it: any) => {
                     const muted = 'text-[#B8A590]';
                     const chargeCell = (v: any) => <td className={`py-1 px-2 text-right font-mono ${Number(v) ? 'text-[#2D1B0E]' : muted}`}>{q2(v)}</td>;
+                    // Accepted / Rejected sit twelve ₹ columns to the RIGHT of the
+                    // Purchase Unit column, far enough that the unit no longer reads
+                    // as theirs. They are the same PURCHASE units as Inward Qty —
+                    // repeat the label so nobody reads them as recipe grams.
+                    const pu = it.purchase_unit || it.material_unit || '';
                     return (
                     <tr key={it.id} className="border-t border-[#E8D5C4]/50">
                       <td className="py-1 px-2 text-[#6B5744]">{it.material_category || '—'}</td>
@@ -332,8 +372,8 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
                       {chargeCell(it.delivery_charges)}
                       {chargeCell(it.mrp_round_off)}
                       <td className="py-1 px-2 text-right font-mono font-semibold text-[#af4408]">{m2(it.total_inward_amount)}</td>
-                      <td className="py-1 px-2 text-right font-mono text-emerald-700 border-l border-[#E8D5C4]">{it.quantity_accepted}</td>
-                      <td className="py-1 px-2 text-right font-mono text-red-700">{it.quantity_rejected || 0}</td>
+                      <td className="py-1 px-2 text-right font-mono text-emerald-700 border-l border-[#E8D5C4]">{it.quantity_accepted} <span className="text-[9px] text-[#B8A590]">{pu}</span></td>
+                      <td className="py-1 px-2 text-right font-mono text-red-700">{it.quantity_rejected || 0} <span className="text-[9px] text-[#B8A590]">{pu}</span></td>
                       <td className="py-1 px-2 text-[#6B5744]">{it.rejection_reason || ''}</td>
                     </tr>
                   ); })}
@@ -448,6 +488,23 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const filteredMaterials = (vendorMaterialIds && !showAllMaterials)
     ? materials.filter(m => vendorMaterialIds.has(m.id))
     : materials;
+
+  /**
+   * PURCHASE-unit basis for every quantity on this form. /api/grn POST reads
+   * quantity_received / quantity_accepted as PURCHASE units and applies the
+   * ×pack_size step itself (see its "Unit-basis boundary" comment), and
+   * unit_price is ₹ per purchase unit — so this is a LABEL resolver only:
+   * nothing here converts, and nothing is converted on the way to the API.
+   * Resolved off the FULL catalog, not filteredMaterials, so a line picked
+   * before the vendor filter narrowed the list still shows its unit.
+   */
+  const lineUnits = (materialId: string) => {
+    const m = materials.find(x => x.id === materialId) as any;
+    if (!m) return { pu: '', ru: '', pf: 1 };
+    const ru = String(m.unit || '');
+    const pu = String(m.purchase_unit || ru || '');
+    return { pu, ru, pf: packFactor({ unit: ru, purchase_unit: m.purchase_unit, pack_size: m.pack_size }) };
+  };
 
   const addLine = () => setItems(p => [...p, blankLine()]);
   const removeLine = (i: number) => setItems(p => p.filter((_, j) => j !== i));
@@ -669,16 +726,27 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                 <thead className="text-[#8B7355] hidden md:table-header-group">
                   <tr>
                     <th className="text-left  py-1 px-2 font-medium">Material</th>
-                    <th className="text-right py-1 px-2 font-medium">Received</th>
-                    <th className="text-right py-1 px-2 font-medium">Accepted</th>
+                    <th className="text-right py-1 px-2 font-medium" title="In the material's PURCHASE unit (kg, L, BTL, CASE) — the unit shows under each box">Received <span className="font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-1 px-2 font-medium" title="In the material's PURCHASE unit — blank means the same as Received">Accepted <span className="font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
                     <th className="text-left  py-1 px-2 font-medium">Reject reason</th>
-                    <th className="text-right py-1 px-2 font-medium">Unit ₹</th>
+                    <th className="text-right py-1 px-2 font-medium" title="₹ per PURCHASE unit (per kg / per BTL) — never per gram">Unit ₹ <span className="font-normal text-[9px] text-[#B8A590]">/ purchase unit</span></th>
                     <th className="text-right py-1 px-2 font-medium">Charges / Total ₹</th>
                     <th className="w-8"></th>
                   </tr>
                 </thead>
                 <tbody className="block md:table-row-group">
-                  {items.map((it, i) => (
+                  {items.map((it, i) => {
+                    const lu = lineUnits(it.material_id);
+                    // Display-only hint: the raw input string is never touched here
+                    // (running it through Number() on every keystroke is what made
+                    // "2." untypeable), we only read it to render "= N g".
+                    const hint = (raw: string) => {
+                      if (lu.pf <= 1) return null;
+                      const q = parseFloat(raw);
+                      if (!Number.isFinite(q) || q === 0) return null;
+                      return `= ${fmtQtyNum(q * lu.pf)} ${lu.ru}`;
+                    };
+                    return (
                     <Fragment key={i}>
                     <tr className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
                       <td className="py-1 px-2 block md:table-cell">
@@ -702,6 +770,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                    ? 'border-amber-400 bg-amber-50 text-amber-900 font-semibold'
                                    : 'border-[#E8D5C4]'
                                }`} />
+                        {lu.pu && (
+                          <div className="text-[9px] text-[#B8A590] text-right mt-0.5 md:w-20">
+                            {lu.pu}{hint(it.quantity_received) ? <> · {hint(it.quantity_received)}</> : null}
+                          </div>
+                        )}
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Accepted</span>
@@ -715,6 +788,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                    ? 'border-amber-400 bg-amber-50 text-amber-900 font-semibold'
                                    : 'border-[#E8D5C4]'
                                }`} />
+                        {lu.pu && (
+                          <div className="text-[9px] text-[#B8A590] text-right mt-0.5 md:w-20">
+                            {lu.pu}{hint(it.quantity_accepted) ? <> · {hint(it.quantity_accepted)}</> : null}
+                          </div>
+                        )}
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Reject reason</span>
@@ -733,7 +811,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Unit ₹</span>
                         <input type="number" step="any" value={it.unit_price}
                                                        onChange={e => updateLine(i, { unit_price: e.target.value })}
-                                                       className="w-full md:w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" /></td>
+                                                       className="w-full md:w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
+                        {/* ₹ per PURCHASE unit — the rate the vendor bills. The
+                            weighted average is stored per RECIPE unit, but that
+                            division happens server-side; never type ₹/g here. */}
+                        {lu.pu && <div className="text-[9px] text-[#B8A590] text-right mt-0.5 md:w-20">₹ / {lu.pu}</div>}</td>
                       <td className="py-1 px-2 text-right block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Charges / Total</span>
                         <div className="flex items-center justify-end gap-1.5">
@@ -778,24 +860,33 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                       </tr>
                     )}
                     </Fragment>
-                  ))}
+                  ); })}
                 </tbody>
                 {/* Live totals footer — recomputes on every line edit/remove
                     so the staff always sees the up-to-date GRN value. Counts
                     negative back-correction lines in the totals the same way
                     the server + print do, so the three numbers match end-to-end. */}
                 {(() => {
+                  const filled = items.filter(ln => ln.material_id && (parseFloat(ln.quantity_received) || 0) !== 0);
                   const totRec = items.reduce((s, ln) => s + (parseFloat(ln.quantity_received) || 0), 0);
                   const totAcc = items.reduce((s, ln) => s + (parseFloat(ln.quantity_accepted) || parseFloat(ln.quantity_received) || 0), 0);
                   const totInward = items.reduce((s, ln) => s + (ln.material_id ? lineTotal(ln) : 0), 0);
-                  const lineCount = items.filter(ln => ln.material_id && (parseFloat(ln.quantity_received) || 0) !== 0).length;
+                  const lineCount = filled.length;
                   if (lineCount === 0) return null;
+                  // A qty total only exists when every filled line is in the SAME
+                  // purchase unit. 12 BTL + 3 kg is not 15 of anything — print an
+                  // em-dash and keep the ₹ total, which is always addable.
+                  const units = new Set(filled.map(ln => lineUnits(ln.material_id).pu.toLowerCase().trim()).filter(Boolean));
+                  const oneUnit = units.size === 1 ? lineUnits(filled[0].material_id).pu : null;
+                  const qtyCell = (v: number) => oneUnit
+                    ? <>{v.toLocaleString('en-IN', { maximumFractionDigits: 3 })} <span className="text-[9px] font-normal text-[#B8A590]">{oneUnit}</span></>
+                    : <span className="text-[#B8A590]" title="Lines are in different purchase units (e.g. kg and BTL) — a single quantity total would mix units. The ₹ total is unaffected.">—</span>;
                   return (
                     <tfoot className="bg-[#FFF1E3]/60 font-semibold text-[#2D1B0E] block md:table-footer-group">
                       <tr className="block md:table-row">
                         <td className="py-1.5 px-2 text-right text-[10px] text-[#6B5744] block md:table-cell">{lineCount} line{lineCount === 1 ? '' : 's'}</td>
-                        <td className="py-1.5 px-2 text-right font-mono block md:table-cell">{totRec.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
-                        <td className="py-1.5 px-2 text-right font-mono block md:table-cell">{totAcc.toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
+                        <td className="py-1.5 px-2 text-right font-mono block md:table-cell">{qtyCell(totRec)}</td>
+                        <td className="py-1.5 px-2 text-right font-mono block md:table-cell">{qtyCell(totAcc)}</td>
                         <td className="py-1.5 px-2 block md:table-cell"></td>
                         <td className="py-1.5 px-2 text-right text-[10px] text-[#6B5744] block md:table-cell">Total Inward ₹</td>
                         <td className="py-1.5 px-2 text-right font-mono text-emerald-800 block md:table-cell">

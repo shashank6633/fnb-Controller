@@ -31,7 +31,8 @@ import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead';
 import {
-  packFactor, caseFactor, entryMode, tripleToRecipe, breakdownQty, fmtBreakdown, PackMeta,
+  packFactor, caseFactor, entryMode, tripleToRecipe, breakdownQty, fmtBreakdown,
+  toPurchaseQty, csvQty, PackMeta,
 } from '@/lib/pack-units';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
@@ -83,6 +84,24 @@ const fq = (v: number, dp = 2) =>
 const inr = (v: number, dp = 2) =>
   '₹' + (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: dp });
 
+/** The unit every quantity on this page READS in — the PURCHASE unit, falling
+ *  back to the recipe unit only when the material has none. */
+const puOf = (m: PackMeta) => String(m?.purchase_unit || m?.unit || '').trim() || 'units';
+
+/**
+ * One quantity as text, ALWAYS purchase-first.
+ *   packs (pack_size > 1 or a case size) → '2 cs + 9 btl + 450 ml'
+ *   no pack conversion                   → '2,279 BTL'
+ *
+ * The second branch is why this helper exists. fmtBreakdown returns null when
+ * packFactor's both-halves guard fails, and every call site used to fall back to
+ * `${qty} ${m.unit}` — the RECIPE unit. On the beer catalog (unit 'pcs',
+ * purchase_unit 'BTL', pack_size 1) that printed "2,279 pcs" on a floor that
+ * counts bottles. The factor is 1 there, so the number is identical in both
+ * bases and labelling it with the purchase unit is exact, not a conversion.
+ */
+const qtyText = (qty: number, m: PackMeta) => fmtBreakdown(qty, m) || `${fq(qty)} ${puOf(m)}`;
+
 /** Compact breakdown of the TGBCL bill-level charges, shown under a bill
  *  subtotal. Only non-zero charges are listed; Net Indent Value is always shown. */
 function BillChargesLine({ c }: { c: BillChargeRow }) {
@@ -129,14 +148,15 @@ const normDate = (raw: string): string => {
 };
 
 /* One quantity: '2 cs + 9 btl + 450 ml' (bold) with '· 25,200 ml' alongside.
-   Plain-unit materials (pack_size ≤ 1) render exactly as before. */
+   Materials with no pack conversion read in the PURCHASE unit ('2,279 BTL') —
+   same number, right label (see qtyText). */
 function DualQty({ qty, m, boldCls, sign }: {
   qty: number; m: PackMeta; boldCls: string; sign?: boolean;
 }) {
   const dual = fmtBreakdown(qty, m);
   const ru = String(m.unit || '');
   if (!dual) {
-    return <span className={boldCls}>{sign && qty > 0 ? '+' : ''}{fq(qty)} {ru}</span>;
+    return <span className={boldCls}>{sign && qty > 0 ? '+' : ''}{fq(qty)} {puOf(m)}</span>;
   }
   return (
     <>
@@ -167,9 +187,11 @@ function CBLEntry({ mat, value, onChange }: {
   const touched = value.cases !== '' || value.bottles !== '' || value.loose !== '';
   const box = 'w-full px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]';
   if (mode === 'plain') {
+    // No pack conversion (factor 1), so the single box is the purchase unit —
+    // label it that way rather than with the recipe unit ('BTL', not 'pcs').
     return (
       <div>
-        <L>Qty ({ru})</L>
+        <L>Qty ({bu})</L>
         <input type="number" min={0} step="any" inputMode="decimal" value={value.bottles}
                onChange={e => onChange({ ...value, bottles: e.target.value })}
                placeholder="e.g. 2" className={box} />
@@ -209,6 +231,16 @@ function CBLEntry({ mat, value, onChange }: {
       </div>
       {mat && touched && (
         <div className="mt-1 text-[11px] text-[#6B5744] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-2 py-1">
+          {/* Live preview of the bar's cases + bottles + loose entry, e.g.
+              "2 cs + 9 btl + 450 ml = 25,200 ml". The LEAD is the purchase
+              basis (cs / bu, resolved from purchase_unit). The trailing
+              "= 25,200 ml" is the EXACT figure this entry will post, and the
+              "+ 450 ml" is the Loose box's own value, whose input is labelled
+              "Loose (ml)" right above. Same reason as the DualQty companion
+              higher up this file: the cs/btl breakdown rounds to whole units,
+              so the ledger must carry the unrounded recipe total or
+              opening + in − out = closing stops reconciling exactly.
+              unit-lock: exact-balance-ledger — bar entry preview, purchase-lead */}
           {showCases ? `${numOr0(value.cases)} cs + ` : ''}
           {`${numOr0(value.bottles)} ${bu.toLowerCase()}`}
           {showLoose ? ` + ${numOr0(value.loose)} ${ru}` : ''}
@@ -754,7 +786,7 @@ export default function LiquorStorePage() {
                               )}
                               {central > 0 && (
                                 <div className="text-[10px] text-[#8B7355] mt-0.5">
-                                  In central: {fmtBreakdown(central, r) || `${fq(central)} ${r.unit}`}
+                                  In central: {qtyText(central, r)}
                                   {isAdmin && !r.has_ledger && (
                                     <button onClick={() => setMigrateTarget([r.material_id])}
                                             className="ml-1.5 px-1.5 py-px border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded text-[10px] font-medium align-middle">
@@ -766,8 +798,9 @@ export default function LiquorStorePage() {
                             </td>
                             <td className="px-3 py-2 text-right whitespace-nowrap text-[#6B5744]">
                               {/* ₹/purchase-unit leads (owner rule) — the row's quantities are
-                                  bottles, so the rate beside them must be per bottle too. */}
-                              {pc > 1 ? <>{inr(r.avg_cost * pc)}/{r.purchase_unit}</> : <>{inr(r.avg_cost, 4)}/{r.unit}</>}
+                                  bottles, so the rate beside them must be per bottle too.
+                                  pc === 1 → ₹/recipe IS ₹/purchase, so only the label changes. */}
+                              {pc > 1 ? <>{inr(r.avg_cost * pc)}/{r.purchase_unit}</> : <>{inr(r.avg_cost, 4)}/{puOf(r)}</>}
                               {pc > 1 && <div className="text-[10px] text-[#8B7355]">{inr(r.avg_cost, 4)}/{r.unit}</div>}
                             </td>
                             <td className="px-3 py-2 text-right font-medium text-[#2D1B0E] whitespace-nowrap">{inr(r.value)}</td>
@@ -809,13 +842,13 @@ export default function LiquorStorePage() {
                         </span>
                         <span>{(() => {
                           const mpc = packFactor(r);
-                          return mpc > 1 ? `${inr(r.avg_cost * mpc)}/${r.purchase_unit}` : `${inr(r.avg_cost, 4)}/${r.unit}`;
+                          return mpc > 1 ? `${inr(r.avg_cost * mpc)}/${r.purchase_unit}` : `${inr(r.avg_cost, 4)}/${puOf(r)}`;
                         })()}</span>
                         <span className="ml-auto font-semibold text-[#2D1B0E]">{inr(r.value)}</span>
                       </div>
                       {central > 0 && (
                         <div className="mt-1.5 flex items-center gap-2 text-[10px] text-[#8B7355]">
-                          <span>In central: {fmtBreakdown(central, r) || `${fq(central)} ${r.unit}`}</span>
+                          <span>In central: {qtyText(central, r)}</span>
                           {isAdmin && !r.has_ledger && (
                             <button onClick={() => setMigrateTarget([r.material_id])}
                                     className="px-1.5 py-px border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded text-[10px] font-medium">
@@ -929,7 +962,7 @@ export default function LiquorStorePage() {
                                 <span className="font-medium text-[#2D1B0E]">Counted <DualQty qty={l.quantity} m={l} boldCls="font-medium text-[#2D1B0E]" /></span>
                                 {isAdmin && (
                                   <div className="text-[10px] text-[#8B7355]">
-                                    system {fmtBreakdown(l.system_qty ?? 0, l) || `${fq(l.system_qty ?? 0)} ${l.unit}`} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fmtBreakdown(Math.abs(l.variance ?? 0), l) ? `${(l.variance ?? 0) < 0 ? '−' : ''}${fmtBreakdown(Math.abs(l.variance ?? 0), l)}` : `${fq(l.variance ?? 0)} ${l.unit}`}
+                                    system {qtyText(l.system_qty ?? 0, l)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{(l.variance ?? 0) < 0 ? '−' : ''}{qtyText(Math.abs(l.variance ?? 0), l)}
                                   </div>
                                 )}
                                 <div className="text-[10px] italic text-[#8B7355]">count only — stock unchanged</div>
@@ -945,7 +978,7 @@ export default function LiquorStorePage() {
                                 const lpc = packConv(l);
                                 return lpc > 1
                                   ? <>{inr(l.unit_cost * lpc)}/{l.purchase_unit}<div className="text-[10px] text-[#8B7355]">{inr(l.unit_cost, 4)}/{l.unit}</div></>
-                                  : <>{inr(l.unit_cost, 4)}/{l.unit}</>;
+                                  : <>{inr(l.unit_cost, 4)}/{puOf(l)}</>;
                               })() : '—'}
                             </td>
                             <td className="px-3 py-2 text-[#6B5744]">
@@ -995,7 +1028,7 @@ export default function LiquorStorePage() {
                           <span className="font-semibold text-[#2D1B0E]">Counted <DualQty qty={l.quantity} m={l} boldCls="font-semibold text-[#2D1B0E]" /></span>
                           {isAdmin && (
                             <div className="text-[10px] text-[#8B7355]">
-                              system {fmtBreakdown(l.system_qty ?? 0, l) || `${fq(l.system_qty ?? 0)} ${l.unit}`} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{fmtBreakdown(Math.abs(l.variance ?? 0), l) ? `${(l.variance ?? 0) < 0 ? '−' : ''}${fmtBreakdown(Math.abs(l.variance ?? 0), l)}` : `${fq(l.variance ?? 0)} ${l.unit}`}
+                              system {qtyText(l.system_qty ?? 0, l)} · variance {(l.variance ?? 0) > 0 ? '+' : ''}{(l.variance ?? 0) < 0 ? '−' : ''}{qtyText(Math.abs(l.variance ?? 0), l)}
                             </div>
                           )}
                           <div className="text-[10px] italic text-[#8B7355]">count only — stock unchanged</div>
@@ -1008,7 +1041,7 @@ export default function LiquorStorePage() {
                           </span>
                           {l.unit_cost > 0 && <span>{(() => {
                             const lpc = packConv(l);
-                            return lpc > 1 ? `${inr(l.unit_cost * lpc)}/${l.purchase_unit}` : `${inr(l.unit_cost, 4)}/${l.unit}`;
+                            return lpc > 1 ? `${inr(l.unit_cost * lpc)}/${l.purchase_unit}` : `${inr(l.unit_cost, 4)}/${puOf(l)}`;
                           })()}</span>}
                         </div>
                       )}
@@ -1159,7 +1192,7 @@ function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, stor
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      onSaved(`Recorded ${mat ? fmtBreakdown(recipeQty, mat) || `${fq(recipeQty)} ${mat.unit}` : ''} of ${mat?.name} into ${storeName} (${inr(j.total ?? totalCost)})`);
+      onSaved(`Recorded ${mat ? qtyText(recipeQty, mat) : ''} of ${mat?.name} into ${storeName} (${inr(j.total ?? totalCost)})`);
     } catch (e: any) { setErr(e.message); }
     finally { setBusy(false); }
   };
@@ -2119,7 +2152,9 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
               <thead className="bg-[#FBF6EF] text-[#8B7355] sticky top-0">
                 <tr><th className="text-left px-2 py-1">Item</th><th className="text-left px-2 py-1">SKU</th>
                   <th className="text-right px-2 py-1">Cases</th><th className="text-right px-2 py-1">Bottles</th>
-                  <th className="text-right px-2 py-1">Loose</th>
+                  {/* Cases + Bottles are PURCHASE units; Loose is the recipe-unit
+                      remainder (ml/g) — say so, it is the column that misreads. */}
+                  <th className="text-right px-2 py-1">Loose (recipe)</th>
                   <th className="text-right px-2 py-1">Unit ₹</th><th className="text-right px-2 py-1">Amount ₹</th>
                   <th className="text-left px-2 py-1">Date</th></tr>
               </thead>
@@ -2294,9 +2329,11 @@ function BulkAdjustModal({ storeId, storeName, stock, materials, onClose, onSave
       .sort((a, b) => a.material_name.localeCompare(b.material_name));
     const out = [CSV_COLS_BULKADJ.join(',')];
     for (const r of rows) {
+      // Purchase figure leads; the recipe figure follows, explicitly labelled.
+      // csvQty (not toLocaleString) — a grouped "1,250" breaks every spreadsheet.
       out.push([
-        r.material_id, r.sku || '', r.material_name || '', r.category || '', r.unit || '',
-        r.qty, fmtBreakdown(r.qty, r) || '',
+        r.material_id, r.sku || '', r.material_name || '', r.category || '', puOf(r), r.unit || '',
+        csvQty(toPurchaseQty(r.qty, r)), csvQty(r.qty), qtyText(r.qty, r),
         '', '', '', '',   // Cases / Bottles / Loose / Cost — blank to fill
       ].map(csvEscape).join(','));
     }
@@ -2374,7 +2411,7 @@ function BulkAdjustModal({ storeId, storeName, stock, materials, onClose, onSave
   };
 
   const badge = (c: ReturnType<typeof calc>) => {
-    const bd = (v: number) => (c.mat && fmtBreakdown(Math.abs(v), c.mat)) || `${fq(Math.abs(v))} ${c.mat?.unit || ''}`;
+    const bd = (v: number) => c.mat ? qtyText(Math.abs(v), c.mat) : fq(Math.abs(v));
     if (c.action === 'opening') return <span className="inline-flex items-center gap-1 text-[10px] font-semibold bg-sky-50 border border-sky-200 text-sky-800 rounded-full px-2 py-0.5">Opening +{bd(c.target)}</span>;
     if (c.action === 'adjust') return <span className={`inline-flex items-center gap-1 text-[10px] font-semibold rounded-full px-2 py-0.5 border ${c.delta < 0 ? 'bg-red-50 border-red-200 text-red-700' : 'bg-emerald-50 border-emerald-200 text-emerald-800'}`}>{c.delta > 0 ? '+' : '−'}{bd(c.delta)}</span>;
     if (c.action === 'nochange') return <span className="text-[10px] text-[#8B7355]">No change</span>;
@@ -2467,7 +2504,7 @@ function BulkAdjustModal({ storeId, storeName, stock, materials, onClose, onSave
               <CBLEntry mat={c.mat} value={l.cbl} onChange={v => setLine(l.key, { cbl: v })} />
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-[#6B5744]">
                 {l.material_id && (
-                  <span>Current: <b className="text-[#2D1B0E]">{c.srow ? (fmtBreakdown(c.current, c.srow) || `${fq(c.current)} ${c.mat?.unit || ''}`) : '—'}</b></span>
+                  <span>Current: <b className="text-[#2D1B0E]">{c.srow ? qtyText(c.current, c.srow) : '—'}</b></span>
                 )}
                 {c.touched && <span>Change: {badge(c)}</span>}
                 {c.action === 'opening' && (
@@ -2560,8 +2597,8 @@ function MigrateModal({ storeId, storeName, candidates, blockedCount, onClose, o
                   <tr key={r.material_id}>
                     <td className="px-3 py-1.5 text-[#2D1B0E]">{r.material_name}</td>
                     <td className="px-3 py-1.5 text-right whitespace-nowrap font-mono text-[#6B5744]">
-                      {fmtBreakdown(r.central_stock, r) || `${fq(r.central_stock)} ${r.unit}`}
-                      <span className="text-[10px]"> · {fq(r.central_stock)} {r.unit}</span>
+                      {qtyText(r.central_stock, r)}
+                      {packConv(r) > 1 && <span className="text-[10px]"> · {fq(r.central_stock)} {r.unit}</span>}
                     </td>
                     <td className="px-3 py-1.5 text-right whitespace-nowrap font-medium text-[#2D1B0E]">
                       {inr((Number(r.central_stock) || 0) * (Number(r.average_price) || 0))}
@@ -2608,13 +2645,22 @@ interface ClosingDay {
 }
 
 /* Closing-stock CSV template columns — keeps the liquor Cases+Bottles+loose
-   entry convention (blank for the counter to fill). */
-const CSV_COLS_CLOSE = ['material_id', 'SKU', 'Name', 'Category', 'Recipe unit', 'System stock', 'System (cs+btl+loose)', 'Cases', 'Bottles', 'Loose'];
+   entry convention (blank for the counter to fill). The stock columns say WHICH
+   basis they are in: the purchase figure leads, the recipe figure is labelled.
+   COL_SYS_* are the admin-only pair the blind-count filter strips — keep those
+   names in sync with the filter below (they are matched by string). */
+const COL_SYS_PU = 'System stock (purchase)';
+const COL_SYS_RECIPE = 'System stock (recipe)';
+const COL_SYS_CBL = 'System (cs+btl+loose)';
+const CSV_COLS_CLOSE = ['material_id', 'SKU', 'Name', 'Category', 'Purchase unit', 'Recipe unit',
+  COL_SYS_PU, COL_SYS_RECIPE, COL_SYS_CBL, 'Cases', 'Bottles', 'Loose'];
 
 /* Bulk-adjust CSV template columns — Cases/Bottles/Loose is the TARGET stock
    to set (blank row = untouched); Cost/unit is optional, used only when the
    material is getting its first (opening) entry. */
-const CSV_COLS_BULKADJ = ['material_id', 'SKU', 'Name', 'Category', 'Recipe unit', 'Current stock', 'Current (cs+btl+loose)', 'Cases', 'Bottles', 'Loose', 'Cost/unit (opening only)'];
+const CSV_COLS_BULKADJ = ['material_id', 'SKU', 'Name', 'Category', 'Purchase unit', 'Recipe unit',
+  'Current stock (purchase)', 'Current stock (recipe)', 'Current (cs+btl+loose)',
+  'Cases', 'Bottles', 'Loose', 'Cost/unit (opening only)'];
 
 /* ── Closing Stock section — category-wise "Record Closing Stock" ──────────
    Mirrors the central /closing-stock modal (header + Template / Upload CSV /
@@ -2797,14 +2843,17 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
      converts the triple to recipe units and posts to the SAME endpoint with
      adjust_to_physical forced OFF (a bulk file must never reconcile stock). */
   const downloadTemplate = () => {
-    // Blind count: non-admins get the template WITHOUT the System stock column.
-    const cols = isAdmin ? CSV_COLS_CLOSE : CSV_COLS_CLOSE.filter(c => c !== 'System stock' && c !== 'System (cs+btl+loose)');
+    // Blind count: non-admins get the template WITHOUT any System stock column.
+    const cols = isAdmin
+      ? CSV_COLS_CLOSE
+      : CSV_COLS_CLOSE.filter(c => c !== COL_SYS_PU && c !== COL_SYS_RECIPE && c !== COL_SYS_CBL);
     const lines = [cols.join(',')];
     for (const r of rows) {
-      const base = [r.material_id, r.sku || '', r.material_name || '', r.category || '', r.unit || ''];
-      // System stock only for admins; Cases / Bottles / Loose blank for the counter.
+      const base = [r.material_id, r.sku || '', r.material_name || '', r.category || '', puOf(r), r.unit || ''];
+      // System stock only for admins — purchase basis first, recipe labelled.
+      // Cases / Bottles / Loose stay blank for the counter to fill.
       lines.push((isAdmin
-        ? [...base, systemFor(r), fmtBreakdown(systemFor(r), r) || '', '', '', '']
+        ? [...base, csvQty(toPurchaseQty(systemFor(r), r)), csvQty(systemFor(r)), qtyText(systemFor(r), r), '', '', '']
         : [...base, '', '', '']).map(csvEscape).join(','));
     }
     const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
@@ -3032,8 +3081,11 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                             <td className="px-3 py-2 text-[#6B5744] text-xs">{r.category}</td>
                             {isAdmin && (
                               <td className="px-3 py-2 text-right whitespace-nowrap font-mono text-[#6B5744]">
-                                {fmtBreakdown(sys, r) || <>{fq(sys)} {r.unit}</>}
-                                {pc > 1 && <div className="text-[10px]">{fq(sys)} {r.unit}</div>}
+                                {qtyText(sys, r)}
+                                {/* House style: a recipe figure under a purchase lead is a
+                                    HINT and reads "= N ml". Without the "=" it looks like a
+                                    second, contradictory quantity. */}
+                                {pc > 1 && <div className="text-[10px]">= {fq(sys)} {r.unit}</div>}
                               </td>
                             )}
                             <td className="px-3 py-2 text-right text-xs text-[#8B7355] whitespace-nowrap"
@@ -3060,13 +3112,16 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                                   <span className="text-[10px] text-[#8B7355]">{r.purchase_unit}</span>
                                   {showLooseBox && <span className="text-[10px] text-[#8B7355]">+</span>}
                                 </>)}
+                                {/* pc > 1 → this really is the LOOSE remainder, counted in the
+                                    recipe unit. pc === 1 → it is the ONLY box and the count is a
+                                    whole-unit count, so it reads in the PURCHASE unit. */}
                                 {showLooseBox && (<>
                                   <input type="number" step="any" min={0} value={loose[r.material_id] ?? ''}
                                          onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
-                                         placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : r.unit}`}
-                                         title={pc > 1 ? `Loose / open ${r.unit}` : `Count in ${r.unit}`}
+                                         placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : puOf(r)}`}
+                                         title={pc > 1 ? `Loose / open ${r.unit}` : `Count in ${puOf(r)}`}
                                          className={box} />
-                                  <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
+                                  <span className="text-[10px] text-[#8B7355]">{pc > 1 ? r.unit : puOf(r)}</span>
                                 </>)}
                                 {phys != null && (pc > 1 || cf > 1) && (
                                   <span className="text-[10px] font-mono text-[#af4408] whitespace-nowrap">= {fq(phys)} {r.unit}</span>
@@ -3077,7 +3132,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                               <td className={`px-3 py-2 text-right whitespace-nowrap font-mono ${vTone}`}>
                                 {v == null ? <span className="text-[#8B7355]">—</span> : (
                                   <>
-                                    {fmtBreakdown(v, r) || <>{v > 0 ? '+' : ''}{fq(v)} {r.unit}</>}
+                                    {v > 0 ? '+' : ''}{qtyText(v, r)}
                                     <div className="text-[10px]">{vv != null && vv !== 0 ? (vv > 0 ? '+' : '−') + inr(Math.abs(vv)) : inr(0)}</div>
                                   </>
                                 )}
@@ -3120,7 +3175,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                           </div>
                           {isAdmin && (
                             <div className="text-[10px] text-[#8B7355] mt-0.5">
-                              System: {fmtBreakdown(sys, r) || `${fq(sys)} ${r.unit}`}{pc > 1 ? ` (${fq(sys)} ${r.unit})` : ''}
+                              System: {qtyText(sys, r)}{pc > 1 ? ` (${fq(sys)} ${r.unit})` : ''}
                             </div>
                           )}
                         </div>
@@ -3146,12 +3201,12 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                         {showLooseBox && (<>
                           <input type="number" step="any" min={0} inputMode="decimal" value={loose[r.material_id] ?? ''}
                                  onChange={e => setLoose(p => ({ ...p, [r.material_id]: e.target.value }))}
-                                 placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : r.unit}`} className={boxM} />
-                          <span className="text-[10px] text-[#8B7355]">{r.unit}</span>
+                                 placeholder="0" aria-label={`${r.material_name} — ${pc > 1 ? `loose ${r.unit}` : puOf(r)}`} className={boxM} />
+                          <span className="text-[10px] text-[#8B7355]">{pc > 1 ? r.unit : puOf(r)}</span>
                         </>)}
                         {v != null && (
                           <span className={`ml-auto font-mono ${v < 0 ? 'text-red-700' : v > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
-                            {fmtBreakdown(v, r) || `${v > 0 ? '+' : ''}${fq(v)} ${r.unit}`}{vv != null && vv !== 0 ? ` · ${vv > 0 ? '+' : '−'}${inr(Math.abs(vv))}` : ''}
+                            {v > 0 ? '+' : ''}{qtyText(v, r)}{vv != null && vv !== 0 ? ` · ${vv > 0 ? '+' : '−'}${inr(Math.abs(vv))}` : ''}
                           </span>
                         )}
                       </div>
@@ -3267,15 +3322,15 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                             <td className="px-3 py-2 text-[#6B5744]">{c.category || '—'}</td>
                             {isAdmin && (
                               <td className="px-3 py-2 text-right font-mono text-[#6B5744]">
-                                {fmtBreakdown(c.system_qty, c) || <>{fq(c.system_qty)} {c.unit}</>}
+                                {qtyText(c.system_qty, c)}
                               </td>
                             )}
                             <td className="px-3 py-2 text-right font-mono text-[#2D1B0E]">
-                              {fmtBreakdown(c.physical_qty, c) || <>{fq(c.physical_qty)} {c.unit}</>}
+                              {qtyText(c.physical_qty, c)}
                             </td>
                             {isAdmin && (
                               <td className={`px-3 py-2 text-right font-mono ${c.variance < 0 ? 'text-red-700' : c.variance > 0 ? 'text-blue-700' : 'text-emerald-700'}`}>
-                                {fmtBreakdown(c.variance, c) || <>{c.variance > 0 ? '+' : ''}{fq(c.variance)} {c.unit}</>}
+                                {c.variance > 0 ? '+' : ''}{qtyText(c.variance, c)}
                               </td>
                             )}
                             {isAdmin && (
@@ -3309,18 +3364,29 @@ interface ReportCol { k: string; l: string; fmt?: ColFmt; }
 interface ReportDef { key: string; label: string; dated?: boolean; days?: boolean; cols: ReportCol[]; }
 
 const REPORT_DEFS: ReportDef[] = [
+  // qty_cbl is BLANK for a material with no pack conversion (fmtBreakdown
+  // returns null), so every report that leads with it must ALSO carry the plain
+  // qty_purchase + purchase_unit pair — otherwise the beer catalog (pcs ↔ BTL,
+  // pack_size 1) shows nothing but its recipe figure.
   { key: 'current_stock', label: 'Current Stock', cols: [
     { k: 'material', l: 'Material' }, { k: 'sku', l: 'SKU' }, { k: 'category', l: 'Category' },
+    { k: 'qty_purchase', l: 'On hand', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
     { k: 'qty_cbl', l: 'On hand (cs/btl)' },
     { k: 'qty', l: 'Recipe qty', fmt: 'qty' }, { k: 'unit', l: 'R.unit' },
     { k: 'avg_cost_purchase', l: '₹/purchase unit', fmt: 'inr' },
     { k: 'avg_cost', l: '₹/recipe unit', fmt: 'inr4' }, { k: 'value', l: 'Value', fmt: 'inr' },
   ] },
+  // Ledger is an EXACT-BALANCE report: the recipe columns stay (a running
+  // balance must not round through a 3-dp derivative) but they are LABELLED as
+  // recipe, and the purchase pair leads.
   { key: 'ledger', label: 'Stock Ledger', dated: true, cols: [
     { k: 'date', l: 'Date' }, { k: 'txn_type', l: 'Type' }, { k: 'material', l: 'Material' },
+    { k: 'qty_purchase', l: 'Qty', fmt: 'qty' }, { k: 'purchase_unit', l: 'Unit' },
     { k: 'qty_cbl', l: 'Cs/Btl' },
-    { k: 'qty', l: 'Qty', fmt: 'qty' }, { k: 'unit', l: 'Unit' },
+    { k: 'qty', l: 'Qty (recipe)', fmt: 'qty' }, { k: 'unit', l: 'Unit (recipe)' },
+    { k: 'rate_purchase', l: '₹/purchase unit', fmt: 'inr' },
     { k: 'unit_cost', l: '₹/recipe unit', fmt: 'inr4' },
+    { k: 'balance_purchase', l: 'Balance', fmt: 'qty' },
     { k: 'balance_cbl', l: 'Balance (cs/btl)' }, { k: 'running_balance', l: 'Balance (recipe)', fmt: 'qty' },
     { k: 'supplier', l: 'Supplier' }, { k: 'ref', l: 'Ref' }, { k: 'by', l: 'By' },
   ] },

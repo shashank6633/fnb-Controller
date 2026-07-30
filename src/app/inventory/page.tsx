@@ -24,7 +24,7 @@ import {
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
 import { usePurchaseUnitOptions } from '@/lib/use-units';
-import { packFactor } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 import Toggle from '@/components/Toggle';
 
 /* ------------------------------------------------------------------ */
@@ -73,7 +73,10 @@ interface FormData {
   yield_percent?: number;           // default 100; meat/seafood get 98
   tax_percent?: number;             // GST %
   cess_percent?: number;            // additional cess (esp. liquor)
-  standard_purchase_rate?: number;  // expected rate; PO above this needs mgmt approval
+  /** ₹ per PURCHASE unit (same basis as purchases.unit_price / PO rates), so it
+   *  compares like-for-like with a vendor quote. Held as the RAW input string —
+   *  see the entry-field note on avg_price_per_purchase_unit. */
+  standard_purchase_rate?: string;  // expected rate; PO above this needs mgmt approval
   closing_cadence?: 'daily' | 'weekly' | 'monthly' | 'none';
   is_recipe_item?: number;
   is_direct_sell?: number;
@@ -82,12 +85,29 @@ interface FormData {
   shelf_life_days?: number;    // days from receipt; 0 = none / undefined
   priority?: number;           // 3★ critical / 2★ standard / 1★ low
   /** Editable in purchase-unit terms (e.g. ₹/kg). On save we divide by
-   *  pack_size and store the per-recipe-unit value in raw_materials.average_price. */
-  avg_price_per_purchase_unit?: number;
+   *  pack_size and store the per-recipe-unit value in raw_materials.average_price.
+   *  RAW INPUT STRING, never a number: `Number(e.target.value)` on every keystroke
+   *  makes decimals untypeable — a <input type=number> reports '' while the text
+   *  reads "355.", so a numeric round-trip rewrites the box as 0/blank and eats
+   *  the point. Keep the string, parse ONCE at the POST boundary. */
+  avg_price_per_purchase_unit?: string;
   /** Editable in purchase-unit terms (e.g. 5 kg or 2 BTL). On save we multiply
-   *  by pack_size and store in recipe units (current_stock < reorder_level → low stock). */
-  reorder_level_purchase_unit?: number;
+   *  by pack_size and store in recipe units (current_stock < reorder_level → low
+   *  stock). Raw input string for the same reason as avg_price_per_purchase_unit. */
+  reorder_level_purchase_unit?: string;
 }
+
+/** Entry-field sanitiser: keep the user's raw text (so "355." stays typable),
+ *  only refuse a leading minus — no stock buffer or rate is ever negative.
+ *  Clamping happens where the value is USED, never on the keystroke. */
+function rawNum(v: string): string {
+  return v.replace(/^-/, '');
+}
+
+/** en-IN quantity with the same 3-dp precision as every other converted surface
+ *  (fmtQtyNum) — local 2-dp formatters were how "3,000 g" and "3 kg" drifted
+ *  apart on the same row. */
+const fmtPU = (recipeQty: number, m: any) => fmtQtyNum(toPurchaseQty(recipeQty, m));
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -135,7 +155,7 @@ const EMPTY_FORM: FormData = {
   yield_percent: 100,
   tax_percent: 0,
   cess_percent: 0,
-  standard_purchase_rate: 0,
+  standard_purchase_rate: '0',
   closing_cadence: 'none',
   is_recipe_item: 0,
   is_direct_sell: 0,
@@ -240,6 +260,17 @@ export default function InventoryPage() {
   // Modal
   const [modalOpen, setModalOpen] = useState(false);
   const [formData, setFormData] = useState<FormData>({ ...EMPTY_FORM });
+  /** The purchase-basis strings we SEEDED the form with. A value the user never
+   *  touched must be written back exactly as stored — re-deriving it from the
+   *  rounded display figure (×pack of a 3-dp ÷pack) shifts average_price in the
+   *  4th decimal and moves money on a save that changed nothing. Compared in the
+   *  purchase basis, string-to-string, so "no edit" is unambiguous. */
+  const [seededEntry, setSeededEntry] = useState<{ avg: string; reorder: string; spr: string; avgStored: number; reorderStored: number }>(
+    { avg: '', reorder: '', spr: '', avgStored: 0, reorderStored: 0 },
+  );
+  /** Raw text of the Reorder-Level "cases" box while it is being typed; null =
+   *  show the figure derived from the packs box. */
+  const [reorderCasesRaw, setReorderCasesRaw] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -419,11 +450,33 @@ export default function InventoryPage() {
 
   function openAddModal() {
     setFormData({ ...EMPTY_FORM });
+    setSeededEntry({
+      avg: '', reorder: '', spr: String(EMPTY_FORM.standard_purchase_rate ?? ''),
+      avgStored: 0, reorderStored: EMPTY_FORM.reorder_level,
+    });
+    setReorderCasesRaw(null);
     setFormError(null);
     setModalOpen(true);
   }
 
   function openEditModal(m: RawMaterial) {
+    // Purchase-basis seeds. packFactor guards the conversion: it is 1 unless
+    // pack_size > 1 AND the recipe unit differs from the purchase unit (kg/kg
+    // rows convert by 1). String(Number(...)) trims the padding zeros so the
+    // box reads "82.8", not "82.8000".
+    const pf = packFactor(m as any);
+    const avgSeed = String(Number((((m as any).average_price || 0) * pf).toFixed(4)));
+    const reorderSeed = String(Number(((m.reorder_level || 0) / pf).toFixed(3)));
+    // Standard purchase rate needs no conversion (it is already ₹ per PURCHASE
+    // unit) but it still needs a seed string, so handleSubmit can tell an
+    // UNTOUCHED box apart from a DELIBERATELY EMPTIED one.
+    const sprSeed = String((m as any).standard_purchase_rate ?? 0);
+    setSeededEntry({
+      avg: avgSeed, reorder: reorderSeed, spr: sprSeed,
+      avgStored: Number((m as any).average_price) || 0,
+      reorderStored: Number(m.reorder_level) || 0,
+    });
+    setReorderCasesRaw(null);
     setFormData({
       id: m.id,
       name: m.name,
@@ -441,7 +494,7 @@ export default function InventoryPage() {
       yield_percent:          (m as any).yield_percent          ?? 100,
       tax_percent:            (m as any).tax_percent            ?? 0,
       cess_percent:           (m as any).cess_percent           ?? 0,
-      standard_purchase_rate: (m as any).standard_purchase_rate ?? 0,
+      standard_purchase_rate: sprSeed,
       closing_cadence:        (m as any).closing_cadence        || 'none',
       is_recipe_item:         (m as any).is_recipe_item         ?? 0,
       is_direct_sell:         (m as any).is_direct_sell         ?? 0,
@@ -449,16 +502,10 @@ export default function InventoryPage() {
       storage_location:       (m as any).storage_location       || '',
       shelf_life_days:        (m as any).shelf_life_days        ?? 0,
       priority:               (m as any).priority               ?? 2,
-      // Show price in purchase-unit terms (₹/kg) for editing — easier to read off invoices.
-      // packFactor guards the conversion: it is 1 unless pack_size > 1 AND the
-      // recipe unit differs from the purchase unit (kg/kg rows convert by 1).
-      avg_price_per_purchase_unit: Number(
-        (((m as any).average_price || 0) * packFactor(m as any)).toFixed(4)
-      ),
-      // Show reorder level in purchase-unit terms (kg / BTL) — easier to think about
-      reorder_level_purchase_unit: Number(
-        ((m.reorder_level || 0) / packFactor(m as any)).toFixed(3)
-      ),
+      // Price in purchase-unit terms (₹/kg) — how it reads off an invoice.
+      avg_price_per_purchase_unit: avgSeed,
+      // Reorder level in purchase-unit terms (kg / BTL) — how the store thinks.
+      reorder_level_purchase_unit: reorderSeed,
     });
     setFormError(null);
     setModalOpen(true);
@@ -481,16 +528,40 @@ export default function InventoryPage() {
       // always per recipe-unit so recipe-cost math (qty × average_price)
       // stays correct.
       const ps = packFactor(formData as any);
-      const avgPerPurchase = formData.avg_price_per_purchase_unit;
-      const reorderPerPurchase = formData.reorder_level_purchase_unit;
+      const avgPerPurchase = (formData.avg_price_per_purchase_unit ?? '').trim();
+      const reorderPerPurchase = (formData.reorder_level_purchase_unit ?? '').trim();
       const bodyToSend: any = { ...formData };
-      if (avgPerPurchase != null && Number.isFinite(Number(avgPerPurchase))) {
+      // THE conversion boundary — the ONLY place a purchase-unit entry becomes a
+      // stored recipe-unit value. An untouched box (string identical to the seed)
+      // is never converted back: ₹/recipe → ₹/purchase (4 dp) → ₹/recipe does not
+      // round-trip, and a save that changed nothing must move zero rupees.
+      if (avgPerPurchase !== '' && avgPerPurchase !== seededEntry.avg && Number.isFinite(Number(avgPerPurchase))) {
         bodyToSend.average_price = Number(avgPerPurchase) / ps;
+      } else {
+        delete bodyToSend.average_price;   // PUT leaves the stored ₹/recipe-unit alone
       }
       // Reorder level: user enters in purchase units; store as recipe units
       // (since current_stock is in recipe units and we compare them directly).
-      if (reorderPerPurchase != null && Number.isFinite(Number(reorderPerPurchase))) {
+      // Untouched → send the stored recipe figure verbatim (seeded above).
+      if (reorderPerPurchase !== '' && reorderPerPurchase !== seededEntry.reorder && Number.isFinite(Number(reorderPerPurchase))) {
         bodyToSend.reorder_level = Number(reorderPerPurchase) * ps;
+      }
+      // Standard purchase rate is already ₹ per PURCHASE unit (it is compared
+      // against PO / invoice rates to decide whether management approval is
+      // required) — parse only, never divide. Three distinct cases, and blank is
+      // NOT the same as untouched: the box is always seeded non-blank, so an
+      // emptied box is the user deliberately REMOVING the approval ceiling and
+      // must write 0. Only a string identical to the seed is "untouched", and
+      // that omits the field so the PUT leaves the stored rate exactly as it is.
+      const sprRaw = String(formData.standard_purchase_rate ?? '').trim();
+      if (sprRaw === seededEntry.spr) {
+        delete bodyToSend.standard_purchase_rate;          // untouched → stored ceiling preserved
+      } else if (sprRaw === '') {
+        bodyToSend.standard_purchase_rate = 0;             // cleared on purpose → ceiling removed
+      } else if (Number.isFinite(Number(sprRaw))) {
+        bodyToSend.standard_purchase_rate = Number(sprRaw);
+      } else {
+        delete bodyToSend.standard_purchase_rate;          // mid-typing junk → don't touch
       }
       delete bodyToSend.avg_price_per_purchase_unit;
       delete bodyToSend.reorder_level_purchase_unit;
@@ -838,7 +909,8 @@ export default function InventoryPage() {
                   <th className="px-4 py-3 font-medium" title="Recipe / stock unit — what recipes consume in. Drives recipe-deduction.">Recipe Unit</th>
                   <th className="px-4 py-3 font-medium" title="How the vendor invoices — set this on Unit Audit page or via the edit form.">Purchase Unit</th>
                   <th className="px-4 py-3 font-medium text-right" title="Always in the material's recipe unit. e.g. for MAKHANA (recipe unit = g, purchase unit = kg) pack_size = 1000 g per 1 kg.">Pack Size <span className="text-[9px] font-normal text-[#8B7355]">(in recipe unit)</span></th>
-                  <th className="px-4 py-3 font-medium">
+                  <th className="px-4 py-3 font-medium"
+                      title="Shown in PURCHASE units (kg / BTL / CASE). Stored in recipe units — the small grey line is the exact stored figure.">
                     <button
                       onClick={() => toggleSort('current_stock')}
                       className="flex items-center gap-1 hover:text-[#3D2614] transition-colors"
@@ -846,9 +918,14 @@ export default function InventoryPage() {
                       Current Stock
                       <ArrowUpDown className="w-3 h-3" />
                     </button>
+                    <div className="text-[9px] font-normal text-[#8B7355] leading-none">(purchase units)</div>
                   </th>
                   <th className="px-4 py-3 font-medium text-right" title="Most recent purchase price, ₹ per PURCHASE unit (total ÷ qty of the last purchase); hover a value for the purchase date. — = never purchased.">Latest ₹</th>
-                  <th className="px-4 py-3 font-medium text-right">Avg Price</th>
+                  <th className="px-4 py-3 font-medium text-right"
+                      title="Weighted average cost, ₹ per PURCHASE unit (stored per recipe unit and multiplied by pack size for display). Click a value to edit it in ₹ per purchase unit.">
+                    Avg Price
+                    <div className="text-[9px] font-normal text-[#8B7355] leading-none">(₹ / purchase unit)</div>
+                  </th>
                   <th className="px-4 py-3 font-medium text-right">
                     <button
                       onClick={() => toggleSort('stock_value')}
@@ -858,7 +935,10 @@ export default function InventoryPage() {
                       <ArrowUpDown className="w-3 h-3" />
                     </button>
                   </th>
-                  <th className="px-4 py-3 font-medium text-right" title="Triggers low-stock badge when current stock falls below this. Shown in purchase units; stored in recipe units.">Reorder Level</th>
+                  <th className="px-4 py-3 font-medium text-right" title="Triggers low-stock badge when current stock falls below this. Shown in purchase units; stored in recipe units.">
+                    Reorder Level
+                    <div className="text-[9px] font-normal text-[#8B7355] leading-none">(purchase units)</div>
+                  </th>
                   <th className="px-4 py-3 font-medium text-center">Status</th>
                   <th className="px-4 py-3 font-medium text-center">Actions</th>
                 </tr>
@@ -967,10 +1047,10 @@ export default function InventoryPage() {
                             if (ps > 1) {
                               return (
                                 <>
-                                  <span>{(m.current_stock / ps).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
+                                  <span>{fmtPU(m.current_stock, m)}</span>
                                   <span className="ml-1 text-[10px] text-[#8B7355]">{pu}</span>
-                                  <div className="text-[10px] text-[#8B7355]">
-                                    = {m.current_stock.toLocaleString('en-IN')} {m.unit}
+                                  <div className="text-[9px] text-[#B8A590]">
+                                    = {fmtQtyNum(m.current_stock)} {m.unit}
                                   </div>
                                 </>
                               );
@@ -978,7 +1058,7 @@ export default function InventoryPage() {
                             // No quantity conversion (factor 1), but the LABEL still
                             // follows the purchase unit — pcs/BTL pack-1 materials flip
                             // label only.
-                            return <>{m.current_stock.toLocaleString('en-IN')} <span className="text-[10px] text-[#8B7355]">{(m as any).purchase_unit || m.unit}</span></>;
+                            return <>{fmtQtyNum(m.current_stock)} <span className="text-[10px] text-[#8B7355]">{pu}</span></>;
                           })()}
                         </td>
                         {/* Latest ₹ — most recent purchase price PER PURCHASE UNIT, right
@@ -1009,12 +1089,18 @@ export default function InventoryPage() {
                             if (ps > 1) {
                               return (
                                 <>
-                                  {(m.reorder_level / ps).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                                  {fmtPU(m.reorder_level, m)}
                                   <span className="ml-1 text-[10px] text-[#8B7355]">{pu}</span>
+                                  {/* the stored basis, so the low-stock compare
+                                      (current_stock < reorder_level, both recipe)
+                                      is auditable from the screen */}
+                                  <div className="text-[9px] text-[#B8A590]">
+                                    = {fmtQtyNum(m.reorder_level)} {m.unit}
+                                  </div>
                                 </>
                               );
                             }
-                            return <>{m.reorder_level} <span className="ml-1 text-[10px] text-[#8B7355]">{pu}</span></>;
+                            return <>{fmtQtyNum(m.reorder_level)} <span className="ml-1 text-[10px] text-[#8B7355]">{pu}</span></>;
                           })()}
                         </td>
                         <td className="px-4 py-3 text-center">
@@ -1062,9 +1148,9 @@ export default function InventoryPage() {
                   <tr className="text-[#8B7355] border-b border-[#E8D5C4]">
                     <th className="text-left py-2 px-3 font-medium">Material</th>
                     <th className="text-left py-2 px-3 font-medium">Category</th>
-                    <th className="text-right py-2 px-3 font-medium">Current Stock</th>
-                    <th className="text-right py-2 px-3 font-medium">Reorder Level</th>
-                    <th className="text-right py-2 px-3 font-medium">Deficit</th>
+                    <th className="text-right py-2 px-3 font-medium">Current Stock <span className="text-[9px] font-normal text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-2 px-3 font-medium">Reorder Level <span className="text-[9px] font-normal text-[#B8A590]">(purchase units)</span></th>
+                    <th className="text-right py-2 px-3 font-medium">Deficit <span className="text-[9px] font-normal text-[#B8A590]">(purchase units)</span></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1088,11 +1174,16 @@ export default function InventoryPage() {
                         {(() => {
                           const ps = packFactor(m as any);
                           const pu = (m as any).purchase_unit || m.unit;
-                          const showAsPurchase = ps > 1;
-                          const fmtQ = (q: number) =>
-                            showAsPurchase
-                              ? <>{(q / ps).toLocaleString('en-IN', { maximumFractionDigits: 2 })} <span className="text-[10px] text-[#8B7355]">{pu}</span></>
-                              : <>{q} <span className="text-[10px] text-[#8B7355]">{m.unit}</span></>;
+                          // Same basis as the main table above, cell for cell: the
+                          // purchase figure leads, the recipe figure is the hint.
+                          // (A row that read "3,000 g" here while the list read
+                          // "3 kg" is exactly the drift this rollout removes.)
+                          const fmtQ = (q: number) => (
+                            <>
+                              {fmtPU(q, m)} <span className="text-[10px] text-[#8B7355]">{pu}</span>
+                              {ps > 1 && <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(q)} {m.unit}</div>}
+                            </>
+                          );
                           return (
                             <>
                               <td className="py-2.5 px-3 text-right text-red-400 font-mono">{fmtQ(m.current_stock)}</td>
@@ -1278,7 +1369,7 @@ export default function InventoryPage() {
                 <input
                   type="number" step="any" min={0}
                   value={formData.avg_price_per_purchase_unit ?? ''}
-                  onChange={(e) => setFormData((f) => ({ ...f, avg_price_per_purchase_unit: e.target.value === '' ? undefined : Number(e.target.value) }))}
+                  onChange={(e) => setFormData((f) => ({ ...f, avg_price_per_purchase_unit: rawNum(e.target.value) }))}
                   placeholder={`e.g. 355.51 for ₹355.51 / ${formData.purchase_unit || formData.unit || 'unit'}`}
                   className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] font-mono focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
                 />
@@ -1286,11 +1377,19 @@ export default function InventoryPage() {
                   const ps = packFactor(formData as any);
                   const apu = Number(formData.avg_price_per_purchase_unit);
                   if (!Number.isFinite(apu) || apu <= 0 || ps <= 0) return null;
-                  const perRecipe = apu / ps;
+                  // An untouched box shows what IS stored, not what a re-conversion
+                  // would produce — those differ in the 4th decimal and we do not
+                  // write the re-conversion back (see handleSubmit).
+                  const untouched = (formData.avg_price_per_purchase_unit ?? '') === seededEntry.avg;
+                  const perRecipe = untouched ? seededEntry.avgStored : apu / ps;
                   return (
                     <p className="text-[10px] text-[#8B7355] mt-1">
+                      {/* unit-lock: this line IS the ₹-basis explainer. The box above takes
+                          ₹/purchase-unit; this shows the ₹/recipe-unit that will actually be
+                          stored in average_price. Showing it in the purchase basis would make
+                          the explainer restate its own input and explain nothing. */}
                       ≡ <span className="font-mono">₹{perRecipe.toFixed(4)}</span> per {formData.unit || 'recipe-unit'}{' '}
-                      <span className="opacity-60">(stored value — auto-converted from your entry)</span>
+                      <span className="opacity-60">({untouched ? 'stored value — unchanged unless you edit this box' : 'stored value — auto-converted from your entry'})</span>
                     </p>
                   );
                 })()}
@@ -1335,10 +1434,10 @@ export default function InventoryPage() {
                     <input
                       type="number" step="any" min={0}
                       value={formData.reorder_level_purchase_unit ?? ''}
-                      onChange={(e) => setFormData((f) => ({
-                        ...f,
-                        reorder_level_purchase_unit: e.target.value === '' ? undefined : Number(e.target.value),
-                      }))}
+                      onChange={(e) => {
+                        setReorderCasesRaw(null);   // cases box goes back to deriving from this
+                        setFormData((f) => ({ ...f, reorder_level_purchase_unit: rawNum(e.target.value) }));
+                      }}
                       placeholder={`Packs of ${formData.purchase_unit || formData.unit || 'unit'}`}
                       className="w-full px-3 py-2 pr-16 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] font-mono focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
                     />
@@ -1353,17 +1452,25 @@ export default function InventoryPage() {
                       <input
                         type="number" step="any" min={0}
                         value={
-                          formData.reorder_level_purchase_unit != null && formData.case_size
-                            ? Number((Number(formData.reorder_level_purchase_unit) / formData.case_size).toFixed(2))
-                            : ''
+                          // While this box is being typed its own raw text wins;
+                          // otherwise it mirrors the packs box ÷ case size.
+                          reorderCasesRaw !== null
+                            ? reorderCasesRaw
+                            : (formData.reorder_level_purchase_unit && formData.case_size
+                                ? String(Number((Number(formData.reorder_level_purchase_unit) / formData.case_size).toFixed(2)))
+                                : '')
                         }
                         onChange={(e) => {
                           const cs = formData.case_size || 1;
-                          const cases = e.target.value === '' ? undefined : Number(e.target.value);
-                          setFormData((f) => ({
-                            ...f,
-                            reorder_level_purchase_unit: cases == null ? undefined : cases * cs,
-                          }));
+                          const raw = rawNum(e.target.value);
+                          setReorderCasesRaw(raw);
+                          const cases = Number(raw);
+                          // Blank/incomplete text ("2.") leaves the packs value as
+                          // it stands — never rewrite it to NaN mid-keystroke.
+                          if (raw === '') setFormData((f) => ({ ...f, reorder_level_purchase_unit: '' }));
+                          else if (Number.isFinite(cases)) {
+                            setFormData((f) => ({ ...f, reorder_level_purchase_unit: String(Math.round(cases * cs * 1e6) / 1e6) }));
+                          }
                         }}
                         placeholder={`Cases of ${formData.case_size}`}
                         className="w-full px-3 py-2 pr-16 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] font-mono focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
@@ -1380,7 +1487,11 @@ export default function InventoryPage() {
                   const cs = Number(formData.case_size) || 1;
                   const rpu = Number(formData.reorder_level_purchase_unit);
                   if (!Number.isFinite(rpu) || rpu <= 0) return null;
-                  const inRecipeUnits = rpu * ps;
+                  // Untouched → the stored recipe figure verbatim. Re-deriving it
+                  // (rpu × pack) inflates small buffers: 2 ml shows as 0.003 BTL
+                  // and would read back as 2.25 ml.
+                  const untouched = (formData.reorder_level_purchase_unit ?? '') === seededEntry.reorder;
+                  const inRecipeUnits = untouched ? seededEntry.reorderStored : rpu * ps;
                   const inCases = cs > 1 ? rpu / cs : null;
                   return (
                     <p className="text-[10px] text-[#8B7355] mt-1">
@@ -1388,6 +1499,9 @@ export default function InventoryPage() {
                       {inCases !== null && (
                         <> · <span className="font-mono">{inCases.toFixed(2)}</span> case{inCases === 1 ? '' : 's'} of {cs}</>
                       )}
+                      {/* unit-lock: the purchase figure already LEADS this line (rpu + the
+                          case breakdown). This trailing term is the storage preview — what
+                          reorder_level will actually hold — and is labelled as such. */}
                       {' · '}<span className="font-mono">{inRecipeUnits.toLocaleString('en-IN')}</span> {formData.unit || 'recipe-unit'}
                       <span className="opacity-60"> (stored as recipe-units)</span>
                     </p>
@@ -1490,8 +1604,9 @@ export default function InventoryPage() {
                   <label className="text-xs text-[#6B5744] flex flex-col gap-1">
                     Standard Purchase Rate (₹ per {formData.purchase_unit || formData.unit || 'purchase unit'})
                     <input type="number" min={0} step="any"
-                           value={formData.standard_purchase_rate ?? 0}
-                           onChange={e => setFormData(f => ({ ...f, standard_purchase_rate: Number(e.target.value) }))}
+                           value={formData.standard_purchase_rate ?? ''}
+                           onChange={e => setFormData(f => ({ ...f, standard_purchase_rate: rawNum(e.target.value) }))}
+                           title="Already in ₹ per PURCHASE unit — it is compared against PO / invoice rates, which are per purchase unit too. Stored as entered; no pack conversion."
                            className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
                   </label>
                   <label className="text-xs text-[#6B5744] flex flex-col gap-1">
@@ -1678,18 +1793,24 @@ interface AuditRow {
 const fmtRate = (n: number) =>
   '₹' + (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: Math.abs(n) < 100 ? 4 : 2 });
 
-/** Dual-basis rendering: "₹3.44/ml = ₹2,580/BTL" (real pack conversion) or
- *  "₹458/pcs". Guarded via packFactor so a kg/kg row with a stray pack_size
- *  never shows a bogus "= ₹2,655/kg" second basis. */
+/** Dual-basis rendering: "₹2,580/BTL = ₹3.44/ml stored" (real pack conversion)
+ *  or "₹458/pcs". The PURCHASE rate leads — that is the number on the invoice
+ *  and the basis every Inventory/Purchase screen reads in — with the stored
+ *  ₹/recipe-unit named beside it, since this tool exists to make a wrong basis
+ *  visible. Guarded via packFactor so a kg/kg row with a stray pack_size never
+ *  shows a bogus second basis. */
 function DualAvg({ perRecipe, unit, pack, pu, className }: {
   perRecipe: number; unit: string; pack: number; pu: string; className?: string;
 }) {
   const v = Number(perRecipe) || 0;
   const pf = packFactor({ unit, purchase_unit: pu, pack_size: pack });
+  if (pf <= 1) {
+    return <span className={`whitespace-nowrap ${className || ''}`}>{fmtRate(v)}/{pu || unit}</span>;
+  }
   return (
     <span className={`whitespace-nowrap ${className || ''}`}>
-      {fmtRate(v)}/{unit}
-      {pf > 1 && <span> = {fmtRate(v * pf)}/{pu || unit}</span>}
+      {fmtRate(v * pf)}/{pu || unit}
+      <span className="text-[9px] text-[#B8A590]"> = {fmtRate(v)}/{unit} stored</span>
     </span>
   );
 }
@@ -2030,8 +2151,13 @@ function EditableRate({ m, onSaved }: { m: RawMaterial; onSaved: () => void }) {
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const start = () => { setVal(current ? String(Math.round(current * 10000) / 10000) : ''); setErr(null); setEditing(true); };
+  // The exact string we put in the box, so an "edit" that changed nothing can be
+  // detected in the PURCHASE basis and skipped — re-posting the displayed ₹/pu
+  // would re-derive average_price as rate ÷ pack and shift it in the 4th decimal.
+  const seed = current ? String(Math.round(current * 10000) / 10000) : '';
+  const start = () => { setVal(seed); setErr(null); setEditing(true); };
   const save = async () => {
+    if (val.trim() === seed) { setEditing(false); return; }   // untouched → don't move money
     const rate = Number(val);
     if (!Number.isFinite(rate) || rate < 0) { setErr('bad'); return; }
     setSaving(true); setErr(null);
@@ -2068,7 +2194,9 @@ function EditableRate({ m, onSaved }: { m: RawMaterial; onSaved: () => void }) {
     <button onClick={start} title="Click to edit the rate (₹ per purchase unit)"
       className="group inline-flex items-center gap-1 justify-end hover:text-[#af4408]">
       {current ? formatCurrency(current) : <span className="text-[#C0A98F]">—</span>}
-      {ps > 1 && <span className="ml-0.5 text-[10px] text-[#8B7355]">/ {pu}</span>}
+      {/* The basis is named on EVERY row, not just packed ones — a bare "₹125"
+          beside a purchase quantity is the ambiguity this rollout removes. */}
+      {!!current && <span className="ml-0.5 text-[10px] text-[#8B7355]">/ {pu}</span>}
       <Edit className="w-3 h-3 opacity-0 group-hover:opacity-100 text-[#af4408]" />
     </button>
   );

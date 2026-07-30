@@ -203,6 +203,24 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         WHERE id = ?
       `);
 
+      // quantity_to_purchase obeys Option B exactly like every other quantity on
+      // the row: it is stored in the LINE'S OWN `unit` (blank = recipe). But the
+      // modal posts it in `po_entry_unit`, which DEFAULTS to the purchase unit —
+      // so without this a 6-BTL shortfall landed verbatim in a blank-unit
+      // (recipe) line and the requisition read it back as 6 ml, 750× too small.
+      // The PO line is unaffected: it keeps using poQty, already purchase units.
+      const toLineBasis = (it: any, ln: any, posted: number) => {
+        const recipeUnit   = String(it.material_unit || '').toLowerCase().trim();
+        const purchaseUnit = String(it.material_purchase_unit || '').toLowerCase().trim();
+        const packSize     = Number(it.material_pack_size) || 1;
+        if (!(packSize > 1 && recipeUnit !== purchaseUnit)) return posted;
+        const lineUnit         = String(it.unit || '').toLowerCase().trim();
+        const lineIsPurchase   = lineUnit !== '' && lineUnit === purchaseUnit;
+        const postedIsPurchase = (String(ln.po_entry_unit || '').toLowerCase().trim() || purchaseUnit) === purchaseUnit;
+        if (postedIsPurchase === lineIsPurchase) return posted;
+        return postedIsPurchase ? posted * packSize : posted / packSize;
+      };
+
       for (const it of items) {
         const ln = lineMap.get(it.id) || {};
         const issued   = Number(ln.quantity_issued)      || 0;
@@ -210,7 +228,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         if (issued > 0) {
           // No stock mutation. Just keep the audit number on the requisition_item.
         }
-        updReqItem.run(issued, purchase, it.id);
+        updReqItem.run(issued, toLineBasis(it, ln, purchase), it.id);
       }
 
       // --- 2. Create vendor PO for the shortfall (if any) ---

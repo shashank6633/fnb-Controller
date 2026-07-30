@@ -14,8 +14,52 @@ import {
   AlertTriangle, ChevronDown, ChevronRight,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { packFactor, purchasePrice, fmtQtyNum } from '@/lib/pack-units';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
+/**
+ * A per-unit RATE prints paise. Whole rupees cannot reconcile against the line
+ * cost: ₹2,479.73 × 6 BTL = ₹14,878.35, but ₹2,480 × 6 = ₹14,880. Totals and
+ * line costs keep the whole-rupee `fmt` — only the rate cell uses this.
+ */
+const fmtRate = (v: number) =>
+  '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/**
+ * Resolve one cost line's UNIT BASIS — the same resolver as lineUnits() on
+ * /store-requisitions and /party-approvals, so a party line stored as 2 BTL
+ * reads "2 BTL" here too (it used to render "2 ml": the quantity comes from
+ * requisition_items.unit while the label came from raw_materials.unit).
+ *
+ * Requisition quantities are stored in the LINE's own unit (option B); a BLANK
+ * line unit is the RECIPE basis and must be divided by the pack factor, never
+ * shown raw against the recipe unit. Money is untouched — line_cost arrives
+ * pre-computed on the recipe basis from the server.
+ */
+function costLineUnits(it: { unit?: string; req_unit?: string; purchase_unit?: string; pack_size?: number }) {
+  const recipeUnit = it.unit || '';
+  const meta = { unit: recipeUnit, purchase_unit: it.purchase_unit, pack_size: it.pack_size };
+  const pf = packFactor(meta);
+  const pu = it.purchase_unit || recipeUnit;
+  const lu = String(it.req_unit || '').toLowerCase().trim();
+  // Already stored in the purchase unit → no conversion.
+  const isPU = pf > 1 && lu !== '' && lu === String(pu).toLowerCase().trim();
+  return {
+    pf, pu, recipeUnit,
+    /** stored line qty → purchase-unit display figure (3 dp, display only) */
+    toPU: (q: any) => isPU ? (Number(q) || 0) : Math.round(((Number(q) || 0) / pf) * 1000) / 1000,
+    /** stored line qty → recipe units (the small "= N ml" hint) */
+    toRecipe: (q: any) => isPU ? (Number(q) || 0) * pf : (Number(q) || 0),
+    /**
+     * ₹/recipe-unit → ₹/purchase-unit, for the rate LABEL only.
+     * MUST be handed the UNROUNDED price (items[].unit_price_exact). Feeding it
+     * the 2-dp `unit_price` multiplies a rounding error by the pack size — on
+     * KAHLUA (750 ml/BTL) that was ₹2,483 printed against a true ₹2,479.73, so
+     * the rate no longer reconciled with the row's own Line Cost.
+     */
+    rate: (pricePerRecipeUnit: any) => purchasePrice(Number(pricePerRecipeUnit) || 0, meta),
+  };
+}
 
 interface Event {
   event_name: string; event_date: string;
@@ -28,7 +72,14 @@ interface EventDetail {
   customer: string; notes: string;
   requisitions: { id: string; req_number: string; status: string; department: string }[];
   items: { req_number: string; material: string; sku?: string; unit?: string;
-           quantity: number; unit_price: number; line_cost: number }[];
+           /** The line's own stored unit (blank = recipe basis) + the material's
+            *  pack meta — additive fields the purchase-basis display needs. */
+           req_unit?: string; purchase_unit?: string; pack_size?: number;
+           quantity: number; unit_price: number;
+           /** UNROUNDED ₹/recipe-unit (additive). Optional so a cached payload
+            *  that predates it still renders — it falls back to unit_price. */
+           unit_price_exact?: number;
+           line_cost: number }[];
   sales: { id?: string; item_name: string; qty: number; revenue: number; category: string; link_type?: 'auto' | 'manual' }[];
   summary: {
     cost: number; revenue: number; profit: number; food_cost_percent: number;
@@ -227,18 +278,34 @@ export default function PartyEventsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {detail.items.map((it, i) => (
+                  {detail.items.map((it, i) => {
+                    // PURCHASE basis (owner rule) — recipe figure kept as a hint.
+                    const U = costLineUnits(it);
+                    return (
                     <tr key={i} className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF8F0]">
                       <td className="py-1.5 px-3 font-mono text-[#af4408] text-[10px]">{it.req_number}</td>
                       <td className="py-1.5 px-3">
                         <div className="font-medium text-[#2D1B0E]">{it.material}</div>
                         {it.sku && <div className="text-[9px] font-mono text-[#8B7355]">{it.sku}</div>}
                       </td>
-                      <td className="py-1.5 px-3 text-right font-mono">{it.quantity} {it.unit}</td>
-                      <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{fmt(it.unit_price)}/{it.unit}</td>
+                      <td className="py-1.5 px-3 text-right font-mono">
+                        {fmtQtyNum(U.toPU(it.quantity))} <span className="text-[#8B7355]">{U.pu}</span>
+                        {U.pf > 1 && (
+                          <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(U.toRecipe(it.quantity))} {U.recipeUnit}</div>
+                        )}
+                      </td>
+                      {/* ₹ per PURCHASE unit (UNROUNDED ₹/recipe-unit × pack factor) —
+                          the basis the Qty column reads in. It reads unit_price_exact,
+                          NOT the 2-dp unit_price: multiplying an already-rounded rupee
+                          figure by the pack size inflated the error (KAHLUA 750 ml/BTL
+                          printed ₹2,483 against a true ₹2,479.73 — ₹20 adrift over the
+                          6-BTL line). DISPLAY ONLY: line_cost is the server's
+                          recipe-basis figure and never routes through here. */}
+                      <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{fmtRate(U.rate(it.unit_price_exact ?? it.unit_price))}/{U.pu}</td>
                       <td className="py-1.5 px-3 text-right font-mono font-semibold">{fmt(it.line_cost)}</td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
                 <tfoot>
                   <tr className="bg-[#FFF1E3] font-semibold">

@@ -54,9 +54,17 @@ export interface InventoryItem extends RawMaterial {
 export interface StockAlert {
   material_id: string;
   material_name: string;
+  /** RECIPE units — the stored basis. Display converts via packFactor(). */
   current_stock: number;
+  /** RECIPE units. */
   reorder_level: number;
+  /** RECIPE unit (g / ml). */
   unit: UnitType;
+  /** PURCHASE unit (kg / L / BTL) — what the widget must LEAD with. Optional so
+   *  a cached pre-conversion payload still type-checks; falls back to `unit`. */
+  purchase_unit?: string;
+  /** Recipe units per purchase unit. packFactor() applies the both-halves guard. */
+  pack_size?: number;
   deficit: number;
 }
 

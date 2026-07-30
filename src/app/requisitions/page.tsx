@@ -17,13 +17,16 @@ import {
   AlertTriangle, ChevronDown, ChevronRight, Loader2, Upload, Search, X, Eye, Pencil,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { packFactor } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty } from '@/lib/pack-units';
 import { fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import TabScroller from '@/components/TabScroller';
 import StaffCatalogPicker, { type DeptStockLite, type DeptStockProp } from './StaffCatalogPicker';
 
 const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+/** Quantity formatter — 3 dp, trailing zeros trimmed. Same as the sibling
+ *  requisition screens, so a converted figure prints identically on all four. */
+const fmtNum = (v: number) => (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
 
 interface Material {
   id: string; name: string; sku?: string; unit: string;
@@ -94,6 +97,49 @@ function reqPackFactor(it: ReqItem): number {
   const pu = String(it.material_purchase_unit || '').toLowerCase().trim();
   const ru = String(it.material_unit || '').toLowerCase().trim();
   return (lu && pu && lu === pu && lu !== ru && pack > 1) ? pack : 1;
+}
+
+/**
+ * Resolve one line's UNIT BASIS and expose the purchase-unit view — mirrors
+ * lineUnits() on /store-requisitions and /party-approvals VERBATIM, so the four
+ * requisition screens can never disagree about what "3 kg" means. (Before this,
+ * this page alone labelled every qty with the line's STORED unit, so a legacy
+ * blank-unit line read "4,500 ml" here and "6 BTL" everywhere else.)
+ *
+ * Quantities are stored in the LINE's own `unit` (option B) and the composers
+ * disagree: the internal picker stamps the PURCHASE unit, older/imported rows
+ * are blank. Blank/legacy reads as RECIPE, which is what it has always meant.
+ *
+ * Identity that keeps money safe: toRecipe(q) === q × reqPackFactor(it) — isPU
+ * is true on exactly the lines reqPackFactor returns pack for. So every ₹ figure
+ * (qty × reqPackFactor × ₹/recipe-unit) is untouched by this display layer.
+ */
+type Q = number | null | undefined;
+function lineUnits(it: ReqItem) {
+  const recipeUnit = it.material_unit || it.unit || '';
+  const pf = packFactor({
+    unit: recipeUnit,
+    purchase_unit: it.material_purchase_unit,
+    pack_size: it.material_pack_size,
+  });
+  const pu = it.material_purchase_unit || recipeUnit;
+  const lu = String(it.unit || '').toLowerCase().trim();
+  // Already stored in the purchase unit → no conversion in either direction.
+  const isPU = pf > 1 && lu !== '' && lu === String(pu).toLowerCase().trim();
+  return {
+    pf, pu, recipeUnit, isPU,
+    /* Qty params are `number | null | undefined` rather than the siblings' `any`
+       — same tolerance (Number(null) || 0 === 0), without a fresh lint error. */
+    /** stored line qty → purchase-unit display figure (3 dp, display only) */
+    toPU: (q: Q) => isPU ? (Number(q) || 0) : Math.round(((Number(q) || 0) / pf) * 1000) / 1000,
+    /** purchase-unit entry → the line's stored unit (what the API writes verbatim) */
+    fromPU: (q: Q) => isPU ? (Number(q) || 0) : Math.round((Number(q) || 0) * pf * 1e6) / 1e6,
+    /** stored line qty → recipe units (the small "= N g" hint) */
+    toRecipe: (q: Q) => isPU ? (Number(q) || 0) * pf : (Number(q) || 0),
+    /** material-level recipe figure (current_stock) → purchase units. Stock is
+     *  ALWAYS recipe units — never route it through toPU, which reads the line. */
+    stockPU: (q: Q) => Math.round(((Number(q) || 0) / pf) * 1000) / 1000,
+  };
 }
 
 const STATUS_BADGE: Record<string, string> = {
@@ -853,11 +899,20 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                 <tbody>
                   {(detail.items || []).map(it => {
                     const rejected = !!it.is_rejected;
+                    // Owner rule: purchase basis leads, recipe figure as the hint.
+                    const U = lineUnits(it);
                     return (
                       <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`}>
                         <td className="py-1 px-2">{it.material_name}</td>
-                        <td className="py-1 px-2 text-right font-mono">{it.quantity_requested.toLocaleString('en-IN')}</td>
-                        <td className="py-1 px-2 font-bold text-[#2D1B0E]">{reqUnit(it)}</td>
+                        <td className="py-1 px-2 text-right font-mono">
+                          {fmtNum(U.toPU(it.quantity_requested))}
+                          {U.pf > 1 && (
+                            <div className="text-[9px] text-[#B8A590] font-normal no-underline">
+                              = {fmtNum(U.toRecipe(it.quantity_requested))} {U.recipeUnit}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-1 px-2 font-bold text-[#2D1B0E]">{U.pu}</td>
                       </tr>
                     );
                   })}
@@ -897,10 +952,17 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                 // Purchase-unit context for display: stock is stored in recipe
                 // units (g/ml) and average_price is ₹/recipe-unit — both are
                 // unreadable raw (18,000 / ₹0). Convert to the ordering unit.
-                const packN = Number(it.material_pack_size) || 1;
-                const hasPU = !!(it.material_purchase_unit && it.material_purchase_unit !== it.material_unit && packN > 1);
-                const puLbl = it.material_purchase_unit || it.material_unit || '';
-                const avgPerPU = (it.average_price || 0) * (hasPU ? packN : 1);
+                // Every basis question on this row goes through the ONE resolver
+                // (was a local packN/hasPU pair whose case-sensitive purchase_unit
+                // compare could disagree with packFactor's normalised one).
+                const U = lineUnits(it);
+                const puLbl = U.pu;
+                const avgPerPU = (it.average_price || 0) * U.pf;
+                // Small "= N g" recipe hint under a purchase-unit figure. no-underline
+                // keeps it legible on the struck-through rejected rows.
+                const hint = (q: number) => U.pf > 1
+                  ? <div className="text-[9px] text-[#B8A590] font-normal no-underline">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
+                  : null;
                 // Rejected lines get strikethrough + faded; rest render normal.
                 const rowCls = `border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`;
                 return (
@@ -910,32 +972,43 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                       {it.material_name}
                       {it.chef_note && <div className="text-[9px] text-amber-700 no-underline">Chef: {it.chef_note}</div>}
                     </td>
-                    <td className="py-1 px-2 text-right font-mono" title={reqPackFactor(it) > 1 ? `= ${(it.quantity_requested * reqPackFactor(it)).toLocaleString('en-IN')} ${it.material_unit}` : undefined}>
-                      {it.quantity_requested.toLocaleString('en-IN')} {reqUnit(it)}
+                    <td className="py-1 px-2 text-right font-mono">
+                      {fmtNum(U.toPU(it.quantity_requested))} {puLbl}
+                      {hint(it.quantity_requested)}
                     </td>
                     <td className="py-1 px-2 text-right font-mono">
                       {rejected
                         ? <span className="text-red-700 no-underline">—</span>
                         : it.chef_approved_qty != null
-                          ? <span className="text-amber-700">{Number(it.chef_approved_qty).toLocaleString('en-IN')} {reqUnit(it)}</span>
+                          ? <><span className="text-amber-700">{fmtNum(U.toPU(it.chef_approved_qty))} {puLbl}</span>{hint(Number(it.chef_approved_qty))}</>
                           : <span className="text-[#C0A98F]">—</span>}
                     </td>
                     <td className={`py-1 px-2 text-right font-mono ${short ? 'text-red-700 font-semibold' : 'text-[#6B5744]'}`}>
                       {/* Owner rule: purchase basis leads; the exact recipe figure
-                          stays underneath — it is the stored truth. */}
-                      {hasPU
-                        ? <>{(it.current_stock / packN).toLocaleString('en-IN', { maximumFractionDigits: 2 })} {puLbl}{short && ' ⚠'}
-                            <div className="text-[9px] text-[#8B7355] font-normal no-underline">
-                              = {it.current_stock.toLocaleString('en-IN')} {it.material_unit}
+                          stays underneath — it is the stored truth. current_stock
+                          is ALWAYS recipe units (material-level), so it converts
+                          with stockPU, never with the line-basis toPU. */}
+                      {U.pf > 1
+                        ? <>{fmtNum(U.stockPU(it.current_stock))} {puLbl}{short && ' ⚠'}
+                            <div className="text-[9px] text-[#B8A590] font-normal no-underline">
+                              = {fmtNum(it.current_stock)} {U.recipeUnit}
                             </div></>
-                        : <>{it.current_stock.toLocaleString('en-IN')} {it.material_unit}{short && ' ⚠'}</>}
+                        : <>{fmtNum(it.current_stock)} {puLbl}{short && ' ⚠'}</>}
                     </td>
                     {(detail.status === 'store_processed' || detail.status === 'fulfilled') && (
                       <>
-                        <td className="py-1 px-2 text-right font-mono text-emerald-700">{rejected ? '—' : <>{it.quantity_issued || 0} {reqUnit(it)}</>}</td>
-                        <td className="py-1 px-2 text-right font-mono text-blue-700">{rejected ? '—' : <>{it.quantity_to_purchase || 0} {reqUnit(it)}</>}</td>
+                        <td className="py-1 px-2 text-right font-mono text-emerald-700">
+                          {rejected ? '—' : <>{fmtNum(U.toPU(it.quantity_issued))} {puLbl}{hint(it.quantity_issued || 0)}</>}
+                        </td>
+                        <td className="py-1 px-2 text-right font-mono text-blue-700">
+                          {rejected ? '—' : <>{fmtNum(U.toPU(it.quantity_to_purchase))} {puLbl}{hint(it.quantity_to_purchase || 0)}</>}
+                        </td>
                       </>
                     )}
+                    {/* unit-lock: the CELL shows ₹/purchase-unit (avgPerPU); the tooltip
+                        deliberately shows the STORED basis, ₹/recipe-unit, because that is
+                        the number every money formula uses. Converting it would hide the
+                        only auditable figure on the row. */}
                     <td className="py-1 px-2 text-right font-mono text-[#6B5744]"
                         title={`avg ₹${(it.average_price || 0).toFixed(4)}/${it.material_unit}`}>
                       {avgPerPU >= 1 ? fmt(avgPerPU) : `₹${avgPerPU.toFixed(2)}`}
@@ -1220,12 +1293,27 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                                  className="w-full text-left px-2 py-1 text-xs border border-[#E8D5C4] rounded bg-[#F5EDE3] text-[#2D1B0E] break-words leading-snug cursor-not-allowed">
                               {mat?.sku && <span className="text-[#8B7355] font-mono">{mat.sku} — </span>}
                               <span>{mat?.name || '(material removed)'}</span>
-                              {mat?.unit && <span className="text-[#8B7355]"> ({mat.unit})</span>}
+                              {/* Locked chip = the SAME slot the typeahead occupies when not
+                                  editing, so it must carry the SAME basis. `pu` is
+                                  purchase_unit ?? unit — identical to the component's
+                                  displayUnit(). It used to print mat.unit, so an edited draft
+                                  read "(g)" while the freshly-picked chip read "(PKT)". */}
+                              {pu && <span className="text-[#8B7355]"> ({pu})</span>}
                             </div>
                           ) : (
                             <MaterialTypeahead
                               materials={materials}
                               value={it.material_id}
+                              // Owner rule: this composer counts in PURCHASE units — the
+                              // On-hand cell two columns right already reads via
+                              // toPurchaseQty, and onPick seeds the line unit with
+                              // purchase_unit. Without this prop the dropdown's "on hand"
+                              // printed the RECIPE figure (SALTED BUTTER 500 GM: "1,01,500 g"
+                              // in the list, "203 PKT" on the row it fills) — the
+                              // fix-one-cell-leave-the-sibling failure, on one screen.
+                              // Every sibling mount (purchases, grn, wastage, transfers)
+                              // passes it; /api/inventory carries purchase_unit + pack_size.
+                              purchaseBasis
                               excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                               onPick={(id) => { const m = materials.find(x => x.id === id); update(i, { material_id: id, unit: (m?.purchase_unit || m?.unit || '') }); }}
                             />
@@ -1244,20 +1332,25 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                         <Lbl>On hand · Buf</Lbl>
                         {mat ? (
                           <>
+                            {/* On hand — purchase basis, via the SHARED resolver. This cell
+                                used to re-derive the pack rule inline with a 2-dp formatter,
+                                which (a) drifted from toPurchaseQty's 3 dp and (b) fell back
+                                to the RECIPE unit whenever pack_size was 1 — so a pack-1
+                                material bought by the bottle (unit 'pcs', purchase_unit 'BTL')
+                                read "2,279 pcs" on a buy list that counts bottles. The number
+                                is identical in both bases there; only the label was wrong. */}
                             <div className={`font-mono ${short ? 'text-red-700 font-semibold' : 'text-[#2D1B0E]'}`}
                                  title={`= ${mat.current_stock.toLocaleString('en-IN')} ${mat.unit} (exact)`}>
-                              {(() => {
-                                const pk = Number((mat as any).pack_size) || 1;
-                                const pu = String((mat as any).purchase_unit || '').toLowerCase().trim();
-                                const conv = pk > 1 && pu && pu !== String(mat.unit||'').toLowerCase().trim();
-                                return conv
-                                  ? `${(mat.current_stock / pk).toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${(mat as any).purchase_unit}`
-                                  : `${mat.current_stock.toLocaleString('en-IN')} ${mat.unit}`;
-                              })()}
+                              {`${fmtNum(toPurchaseQty(mat.current_stock, mat as any))} ${pu}`}
                             </div>
                             <div className={`font-mono ${belowBuffer ? 'text-red-700 font-semibold' : 'text-[#8B7355]'}`}
-                                 title={belowBuffer ? `Will drop to ${postReq.toFixed(2)} ${mat.unit}, below buffer ${buffer}` : `Buffer / reorder level`}>
-                              buf: {buffer || '—'}{belowBuffer && <span className="ml-1">⚠</span>}
+                                 title={belowBuffer
+                                   ? `Will drop to ${fmtNum(toPurchaseQty(postReq, mat as any))} ${pu} (= ${postReq.toFixed(2)} ${mat.unit}), below buffer ${fmtNum(toPurchaseQty(buffer, mat as any))} ${pu}`
+                                   : `Buffer / reorder level`}>
+                              {/* reorder_level is stored in RECIPE units — read it in the
+                                  same basis as the On-hand figure directly above it, or the
+                                  two numbers on this row are not comparable. */}
+                              buf: {buffer ? `${fmtNum(toPurchaseQty(buffer, mat as any))} ${pu}` : '—'}{belowBuffer && <span className="ml-1">⚠</span>}
                             </div>
                           </>
                         ) : <span className="text-[#8B7355]">—</span>}
@@ -1303,6 +1396,10 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                         {mat ? (
                           <>
                             <div className="text-[#6B5744]">{pu}</div>
+                            {/* unit-lock: the ₹ figure below is ₹/purchase-unit; this tooltip
+                                deliberately exposes the STORED basis, ₹/recipe-unit, which is
+                                what every money formula multiplies. Converting it would remove
+                                the only auditable price on the row. */}
                             <div className="font-mono text-[#6B5744]"
                                  title={`avg ₹${(mat.average_price || 0).toFixed(4)}/${mat.unit}${mat.last_purchase_date ? ' · last bought ' + mat.last_purchase_date : ''}`}>
                               ₹{(Number(mat.last_purchase_price) > 0
@@ -1377,8 +1474,15 @@ function ChefApproveModal({ req, onClose, onDone }: { req: Requisition; onClose:
   const [note, setNote] = useState('');
   // Per-line qty + reject toggle. Initial values reflect any pre-existing
   // chef edits (chef_approved_qty / is_rejected) from earlier approval passes.
-  const [overrides, setOverrides] = useState<Record<string, number>>(
-    Object.fromEntries((req.items || []).map(it => [it.id, (it.chef_approved_qty ?? it.quantity_requested)]))
+  //
+  // The box is ENTERED and READ in PURCHASE units (owner rule) but the API writes
+  // the number into the line's own stored unit verbatim — so the draft is kept as
+  // a RAW STRING in the purchase basis and converted back exactly ONCE, in submit().
+  // Raw string, not a number: running every keystroke through Number() turns "2."
+  // into "2" and makes decimals untypeable. Clamping happens where it is USED.
+  const [overrides, setOverrides] = useState<Record<string, string>>(
+    Object.fromEntries((req.items || []).map(it =>
+      [it.id, String(lineUnits(it).toPU(it.chef_approved_qty ?? it.quantity_requested))]))
   );
   const [rejected, setRejected] = useState<Record<string, boolean>>(
     Object.fromEntries((req.items || []).map(it => [it.id, !!it.is_rejected]))
@@ -1415,13 +1519,27 @@ function ChefApproveModal({ req, onClose, onDone }: { req: Requisition; onClose:
       return;
     }
 
-    const item_overrides = (req.items || []).map(it => ({
-      id: it.id,
-      // For rejected lines: send qty 1 placeholder (chef-approve interprets
-      // qty=0 as delete, which we don't want — we want the line preserved
-      // with is_rejected=1 so the audit trail stays intact).
-      quantity_requested: rejected[it.id] ? 1 : (overrides[it.id] || 0),
-    }));
+    const item_overrides = (req.items || []).map(it => {
+      const U = lineUnits(it);
+      // The ONE conversion boundary: the box holds purchase units, the API stores
+      // the line's own unit. Compare in the PURCHASE basis the chef was looking at —
+      // an untouched value must never be re-posted through the 3-dp display figure
+      // (fromPU(toPU(q)) !== q in general, e.g. 4,500 ml → 6 BTL → 4,500 ml is fine
+      // but 146 g → 0.146 kg → 146 g only survives because of the 1e6 rounding).
+      const serverQty = Number(it.chef_approved_qty ?? it.quantity_requested) || 0;
+      const raw = overrides[it.id];
+      // Clamp HERE, not in onChange: approving a NEGATIVE quantity would issue
+      // stock backwards. Blank still means 0 → chef-approve deletes the line.
+      const vPU = Math.max(0, Number(raw) || 0);
+      const qty = vPU === U.toPU(serverQty) ? serverQty : U.fromPU(vPU);
+      return {
+        id: it.id,
+        // For rejected lines: send qty 1 placeholder (chef-approve interprets
+        // qty=0 as delete, which we don't want — we want the line preserved
+        // with is_rejected=1 so the audit trail stays intact).
+        quantity_requested: rejected[it.id] ? 1 : qty,
+      };
+    });
     const r = await api(`/api/requisitions/${req.id}/chef-approve`, { method: 'POST', body: { note, item_overrides } });
     if (!r.ok) { alert((await r.json()).error || 'Failed'); setBusy(false); return; }
     onDone();
@@ -1450,22 +1568,35 @@ function ChefApproveModal({ req, onClose, onDone }: { req: Requisition; onClose:
             <tbody>
               {(req.items || []).map(it => {
                 const isRej = !!rejected[it.id];
+                // Owner rule: this grid READS and is ENTERED in purchase units.
+                const U = lineUnits(it);
+                // Takes a qty in the line's STORED unit — same signature as the
+                // detail table's hint, so the two can't drift.
+                const hint = (q: number) => U.pf > 1
+                  ? <div className="text-[9px] text-[#B8A590] font-normal no-underline">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
+                  : null;
+                // What is in the box right now, back on the stored basis, so the
+                // hint tracks typing. Display-only — submit() does its own convert.
+                const liveStored = U.fromPU(Math.max(0, Number(overrides[it.id]) || 0));
                 return (
                   <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${isRej ? 'opacity-50 line-through bg-red-50/30' : ''}`}>
                     <td className="py-1 px-2">{it.material_name}</td>
-                    <td className="py-1 px-2 text-right font-mono text-[#6B5744]">{it.quantity_requested} {reqUnit(it)}</td>
+                    <td className="py-1 px-2 text-right font-mono text-[#6B5744]">
+                      {fmtNum(U.toPU(it.quantity_requested))} {U.pu}
+                      {hint(it.quantity_requested)}
+                    </td>
                     <td className="py-1 px-2">
-                      {/* min + clamp: approving a NEGATIVE quantity is never valid
-                          (it would issue stock backwards), and the spinner walked
-                          straight past zero. min= stops the arrows, Math.max stops
-                          a typed/pasted minus. */}
+                      {/* Entered in PURCHASE units — submit() converts back to the
+                          line's stored unit once. min= stops the spinner walking
+                          past zero; the typed/pasted minus is stripped here and the
+                          value is clamped at USE, so "2." stays typeable. */}
                       <input type="number" step="any" min={0} value={overrides[it.id] ?? ''}
                              disabled={isRej}
-                             onChange={e => setOverrides(p => ({ ...p, [it.id]: Math.max(0, parseFloat(e.target.value) || 0) }))}
+                             onChange={e => setOverrides(p => ({ ...p, [it.id]: e.target.value.replace(/^-/, '') }))}
+                             title={`Enter in ${U.pu || 'units'}`}
                              className="w-24 px-1.5 py-1 border border-[#E8D5C4] rounded text-right disabled:opacity-50" />
-                      {/* The override is interpreted in the SAME unit the line was
-                          requested in (store-process persists it verbatim). */}
-                      <span className="ml-1 text-[10px] text-[#8B7355]">{reqUnit(it)}</span>
+                      <span className="ml-1 text-[10px] text-[#8B7355]">{U.pu}</span>
+                      {hint(liveStored)}
                     </td>
                     <td className="py-1 px-2 text-center no-underline">
                       <input type="checkbox" checked={isRej}
@@ -1662,20 +1793,35 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       const buyUnitPrice = buyInPurchaseUnit
         ? (lpp || (it.average_price || 0) * packConv)     // entry is ₹/purchase-unit
         : (lpp || it.average_price || 0);                 // recipe unit IS the purchase unit → same basis
+      // ONE unit resolver per line, built HERE because the seed is the only
+      // place the ReqItem is in scope. Every cell below and the submit boundary
+      // read this same object, so the issue grid can never disagree with the
+      // approve grid / detail table about what "1 PKT" means.
+      const U = lineUnits(it);
       return {
         id: it.id,
         material_id: it.material_id,         // needed to look up mapped vendors
         material_name: it.material_name,
         material_unit: it.material_unit,     // recipe unit (canonical)
-        req_unit: reqUnit(it),               // unit the dept requested in — requested/issued qtys are in THIS unit
+        req_unit: reqUnit(it),               // unit the dept requested in — requested/issued qtys are STORED in THIS unit
+        U,                                   // purchase-unit view of req_unit (display only — see lineUnits)
         purchase_unit: purchaseUnit,         // vendor-facing unit
         pack_size: packConv,                 // recipe-units per purchase-unit, canon-guarded (1 = no real conversion, so every `pack_size > 1` test below is the full guard)
         current_stock: it.current_stock,     // keep raw value for the warning render
         requested: effective,                // chef-approved demand, not raw request
-        quantity_issued: issuable,
-        // PO-only fields, hidden until raisePo is ticked.
-        quantity_to_purchase: buyQty,
-        unit_price: buyUnitPrice,
+        /** STORED-basis seed. Posted VERBATIM while the box still reads its own
+         *  seeded purchase figure — fromPU(toPU(q)) is not the identity, so a
+         *  quantity nobody touched must never round-trip through the display. */
+        issued_seed: issuable,
+        /** What the store user types: PURCHASE units (owner rule), held as a RAW
+         *  STRING. Number() on every keystroke turns "2." into "2" and makes
+         *  decimals untypeable — clamp where the value is USED, not on change. */
+        issued_pu: U.toPU(issuable) > 0 ? String(U.toPU(issuable)) : '',
+        // PO-only fields, hidden until raisePo is ticked. These are ALREADY on
+        // the purchase basis (po_entry_unit names it) — raw strings for the same
+        // typing reason, but no basis change: the PO side is not re-converted.
+        quantity_to_purchase: buyQty > 0 ? String(buyQty) : '',
+        unit_price: buyUnitPrice > 0 ? String(buyUnitPrice) : '',
         /** Unit the user is entering qty + price in. Drives both the column
          *  labels and the on-submit conversion, which normalises a recipe-unit
          *  entry UP to the PO's purchase-unit basis (never the other way). */
@@ -1711,7 +1857,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     // Per-material mappings — fetched in parallel for each line that has a
     // purchase qty > 0 and isn't yet cached.
     const toFetch = lines
-      .filter(ln => ln.quantity_to_purchase > 0 && ln.material_id && !vendorsByMaterial[ln.material_id])
+      .filter(ln => (Number(ln.quantity_to_purchase) || 0) > 0 && ln.material_id && !vendorsByMaterial[ln.material_id])
       .map(ln => ln.material_id);
     if (toFetch.length === 0) return;
     const unique = Array.from(new Set(toFetch));
@@ -1732,11 +1878,32 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
 
   const update = (i: number, patch: any) => setLines(p => p.map((ln, j) => j === i ? { ...ln, ...patch } : ln));
 
+  type Line = (typeof lines)[number];
+  /**
+   * Live issued qty back in the LINE's STORED unit. The box holds purchase
+   * units, but everything downstream — shortfall, the over-issue test and the
+   * POST body — is stored-basis, and store-process persists the number verbatim.
+   *
+   * THE conversion boundary, crossed exactly once. An UNTOUCHED box must post
+   * the server's own number: compare in the purchase basis the store user is
+   * looking at, and convert only a figure they actually changed (4,500 ml →
+   * 6 BTL → 4,500 ml survives, but a 3-dp display figure in general does not).
+   */
+  const issuedOf = (ln: Line) => {
+    // Clamp HERE, not in onChange: a negative issue would hand stock backwards.
+    const vPU = Math.max(0, Number(ln.issued_pu) || 0);
+    return vPU === ln.U.toPU(ln.issued_seed) ? ln.issued_seed : ln.U.fromPU(vPU);
+  };
+  /** Buy qty / unit price as numbers — the boxes hold raw strings (see seed).
+   *  NO basis change: both stay in ln.po_entry_unit, exactly as before. */
+  const buyOf   = (ln: Line) => Math.max(0, Number(ln.quantity_to_purchase) || 0);
+  const priceOf = (ln: Line) => Math.max(0, Number(ln.unit_price) || 0);
+
   // A cross-line SUM of shortfalls mixes units (kg + BTL + pcs) and is
   // meaningless as a number — count the lines that are short instead.
-  const shortLineCount = lines.filter(ln => (ln.requested - ln.quantity_issued) > 0).length;
-  const totalShortfall = lines.reduce((s, ln) => s + Math.max(0, ln.requested - ln.quantity_issued), 0);
-  const poTotal = lines.reduce((s, ln) => s + (ln.quantity_to_purchase * ln.unit_price), 0);
+  const shortLineCount = lines.filter(ln => (ln.requested - issuedOf(ln)) > 0).length;
+  const totalShortfall = lines.reduce((s, ln) => s + Math.max(0, ln.requested - issuedOf(ln)), 0);
+  const poTotal = lines.reduce((s, ln) => s + (buyOf(ln) * priceOf(ln)), 0);
 
   const submit = async () => {
     if (raisePo) {
@@ -1744,13 +1911,13 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // a clear, line-specific error instead of a half-created PO.
       //
       // 1. At least one line must actually contribute to the PO (qty > 0).
-      const buyLines = lines.filter(ln => Number(ln.quantity_to_purchase) > 0);
+      const buyLines = lines.filter(ln => buyOf(ln) > 0);
       if (buyLines.length === 0) {
         alert('You ticked "Also raise vendor PO" but no line has a Buy quantity. Enter a positive Buy qty on at least one line, or untick the box to issue without a PO.');
         return;
       }
       // 2. Every Buy-qty line must have a positive unit price.
-      const noPrice = buyLines.find(ln => !(Number(ln.unit_price) > 0));
+      const noPrice = buyLines.find(ln => !(priceOf(ln) > 0));
       if (noPrice) {
         alert(`Enter a unit price (> 0) for "${noPrice.material_name}" before raising the PO. POs cannot be raised at ₹0.`);
         return;
@@ -1777,14 +1944,16 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         const enteredInRecipeUnit = raisePo && !enteredInPurchaseUnit
           && ln.pack_size > 1 && ln.po_entry_unit === ln.material_unit;
         const poQty = enteredInRecipeUnit
-          ? (Number(ln.quantity_to_purchase) || 0) / ln.pack_size
-          : Number(ln.quantity_to_purchase) || 0;
+          ? buyOf(ln) / ln.pack_size
+          : buyOf(ln);
         const poPrice = enteredInRecipeUnit
-          ? (Number(ln.unit_price) || 0) * ln.pack_size
-          : Number(ln.unit_price) || 0;
+          ? priceOf(ln) * ln.pack_size
+          : priceOf(ln);
         return {
           id: ln.id,
-          quantity_issued: ln.quantity_issued,
+          // Purchase-unit box → the line's own stored unit, converted ONCE here
+          // (and not at all when the store user never touched the figure).
+          quantity_issued: issuedOf(ln),
           // Only send the purchase qty when raisePo is ticked. Backend's default
           // (auto_create_po=false) makes it ignore this field anyway, but keep
           // the payload honest.
@@ -1823,6 +1992,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
           <p className="text-[10px] text-[#8B7355] italic">
             Issuing is recorded for department audit only — it does NOT deduct stock. Recipe-deduction on sales is the only thing that subtracts from inventory; vendor purchases are the only thing that adds to it.
           </p>
+          <p className="text-[10px] text-[#8B7355] italic">
+            Every quantity below is shown and entered in the material&apos;s <b>purchase unit</b> (PKT / BTL / CASE) — the same unit the HOD approved in. The small grey figure underneath is the exact recipe-unit equivalent that gets stored.
+          </p>
 
           {rejectedCount > 0 && (
             <div className="text-[11px] px-3 py-2 bg-red-50 border border-red-200 rounded text-red-800">
@@ -1850,14 +2022,12 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               <ul className="ml-5 list-disc">
                 {negativeStockLines.map(ln => (
                   <li key={ln.id}>
-                    <b>{ln.material_name}</b> — system shows {(() => {
-                      const pk = Number(ln.pack_size) || 1;
-                      const conv = pk > 1 && String(ln.purchase_unit||'').toLowerCase().trim()
-                        && String(ln.purchase_unit||'').toLowerCase().trim() !== String(ln.material_unit||'').toLowerCase().trim();
-                      return conv
-                        ? `${(Number(ln.current_stock) / pk).toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${ln.purchase_unit} (= ${Number(ln.current_stock).toLocaleString('en-IN')} ${ln.material_unit})`
-                        : `${Number(ln.current_stock).toLocaleString('en-IN')} ${ln.material_unit}`;
-                    })()}.
+                    {/* current_stock is a MATERIAL-level recipe figure — stockPU,
+                        never the line-basis toPU. (Was a local re-derivation of
+                        the pack guard; one resolver now answers it.) */}
+                    <b>{ln.material_name}</b> — system shows {ln.U.pf > 1
+                      ? `${fmtNum(ln.U.stockPU(ln.current_stock))} ${ln.U.pu} (= ${fmtNum(ln.current_stock)} ${ln.U.recipeUnit})`
+                      : `${fmtNum(ln.current_stock)} ${ln.U.pu}`}.
                     Issuing 0 here; raise a PO on <a href="/purchase-orders" className="underline">Purchase Orders</a> immediately.
                   </li>
                 ))}
@@ -1898,16 +2068,27 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               </thead>
               <tbody>
                 {lines.map((ln, i) => {
-                  const short = Math.max(0, ln.requested - ln.quantity_issued);
+                  const U = ln.U;
+                  // Live issued qty in the STORED unit — every comparison below
+                  // stays on the stored basis (exact, and it is what gets saved);
+                  // only the PRINTING is converted to purchase units.
+                  const issued = issuedOf(ln);
+                  const short = Math.max(0, ln.requested - issued);
                   /* OVER-ISSUE. The field is seeded with the APPROVED qty
                      (min(approved, stock)), so a store that physically handed
                      over more had no way to know it could type the real figure —
                      it just submitted the seeded number. The value is allowed
                      and recorded as-is; this only makes it visible. */
-                  const overIssued = ln.quantity_issued - ln.requested > 1e-9;
+                  const overIssued = issued - ln.requested > 1e-9;
                   // Negative-stock guard — disable the input and force qty to 0.
                   // The accompanying red banner above tells the user to raise a PO.
                   const negStock = Number(ln.current_stock) < 0;
+                  /** Recipe-unit hint under a purchase-lead figure. Takes a qty in
+                   *  the LINE's stored unit — same signature as the approve grid's
+                   *  hint(), so the two screens print identical equivalents. */
+                  const hint = (q: number) => U.pf > 1
+                    ? <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
+                    : null;
                   return (
                     <tr key={ln.id} className={`border-t border-[#E8D5C4]/50 ${negStock ? 'bg-red-50/50' : ''}`}>
                       <td className="py-1.5 px-2 font-medium">
@@ -1916,55 +2097,75 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                           <div className="text-[9px] text-red-700 font-semibold">⚠ Negative stock — raise PO ASAP</div>
                         )}
                       </td>
-                      <td className="py-1.5 px-2 text-right font-mono">{ln.requested} {ln.req_unit}</td>
+                      {/* Approved demand — printed in the unit the HOD approved
+                          in, not the unit it happens to be stored in. */}
+                      <td className="py-1.5 px-2 text-right font-mono">
+                        {fmtNum(U.toPU(ln.requested))} {U.pu}
+                        {hint(ln.requested)}
+                      </td>
                       <td className={`py-1.5 px-2 text-right font-mono ${negStock ? 'text-red-700 font-bold' : 'text-[#6B5744]'}`}
-                          title={`= ${Number(ln.current_stock).toLocaleString('en-IN')} ${ln.material_unit} (exact)`}>
-                        {(() => {
-                          const pk = Number(ln.pack_size) || 1;
-                          const conv = pk > 1 && String(ln.purchase_unit||'').toLowerCase().trim()
-                            && String(ln.purchase_unit||'').toLowerCase().trim() !== String(ln.material_unit||'').toLowerCase().trim();
-                          return conv
-                            ? `${(Number(ln.current_stock) / pk).toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${ln.purchase_unit}`
-                            : `${Number(ln.current_stock).toLocaleString('en-IN')} ${ln.material_unit}`;
-                        })()}{negStock && ' ⚠'}
+                          title={`= ${fmtNum(ln.current_stock)} ${U.recipeUnit} (exact)`}>
+                        {/* On hand is a MATERIAL-level recipe figure — stockPU,
+                            never toPU (which reads the LINE's basis). */}
+                        {U.pf > 1
+                          ? <>{fmtNum(U.stockPU(ln.current_stock))} {U.pu}{negStock && ' ⚠'}
+                              <div className="text-[9px] text-[#B8A590] font-normal">
+                                = {fmtNum(ln.current_stock)} {U.recipeUnit}
+                              </div></>
+                          : <>{fmtNum(ln.current_stock)} {U.pu}{negStock && ' ⚠'}</>}
                       </td>
                       <td className="py-1.5 px-2">
+                        {/* Entered in PURCHASE units — the same unit the HOD
+                            approved in. min= stops the spinner walking past zero;
+                            a typed/pasted minus is stripped here and the value is
+                            clamped at USE (issuedOf), so "2." stays typeable. */}
                         <input type="number" step="any" min={0}
-                               value={negStock ? '' : (ln.quantity_issued || '')}
+                               value={negStock ? '' : ln.issued_pu}
                                disabled={negStock}
-                               onChange={e => update(i, { quantity_issued: Math.max(0, Number(e.target.value) || 0) })}
+                               onChange={e => update(i, { issued_pu: e.target.value.replace(/^-/, '') })}
                                title={negStock
                                  ? 'System stock is negative — cannot issue. Raise a vendor PO immediately.'
-                                 : 'Quantity actually handed over. Seeded with the approved qty — type the real figure if more or less left the store.'}
+                                 : `Quantity actually handed over, in ${U.pu || 'units'}. Seeded with the approved qty — type the real figure if more or less left the store.`}
                                className={`w-20 px-1.5 py-1 border rounded text-right text-xs ${
                                  negStock ? 'border-red-200 bg-red-50/40 cursor-not-allowed'
                                  : overIssued ? 'border-amber-400 bg-amber-50'
                                  : 'border-[#E8D5C4]'}`} />
+                        {/* Same warning as before, said in purchase units: the
+                            over-issue is measured on the exact stored basis, only
+                            the two printed figures are converted. */}
                         {overIssued && (
                           <div className="text-[9px] text-amber-800 mt-0.5 text-right">
-                            {(ln.quantity_issued - ln.requested).toLocaleString('en-IN', { maximumFractionDigits: 3 })} {ln.req_unit} over
-                            the approved {ln.requested.toLocaleString('en-IN')} {ln.req_unit} — recorded as issued
+                            {fmtNum(U.toPU(issued - ln.requested))} {U.pu} over
+                            the approved {fmtNum(U.toPU(ln.requested))} {U.pu} — recorded as issued
                           </div>
                         )}
-                        {/* Issued qty is seeded and edited in the REQUESTED unit
-                            (issuable = min(demand, stock÷pack) above; store-process
-                            persists the number verbatim, and ReqItem documents
-                            quantity_issued as being in ri.unit) — so label it with
-                            req_unit, not the recipe unit. */}
-                        <span className="ml-1 text-[10px] text-[#8B7355]">{ln.req_unit}</span>
+                        {/* The box reads in the PURCHASE unit; store-process still
+                            persists the number in the line's own stored unit
+                            (ReqItem documents quantity_issued as ri.unit) — the
+                            hint below is that stored figure, so the store user can
+                            see both sides of the one conversion. */}
+                        <span className="ml-1 text-[10px] text-[#8B7355]">{U.pu}</span>
+                        {hint(issued)}
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono">
-                        {/* requested − issued: both in the requested unit. */}
+                        {/* requested − issued: both stored-basis, printed in PU. */}
                         {short > 0
-                          ? <span className="text-amber-700">{short} {ln.req_unit}</span>
-                          : <span className="text-emerald-700">0 {ln.req_unit}</span>}
+                          ? <span className="text-amber-700">{fmtNum(U.toPU(short))} {U.pu}</span>
+                          : <span className="text-emerald-700">0 {U.pu}</span>}
+                        {short > 0 && hint(short)}
                       </td>
                       {raisePo && <>
                         <td className="py-1.5 px-2">
                           <div className="flex items-center gap-1">
+                            {/* Buy qty is ALREADY on the PO's own basis (whatever
+                                po_entry_unit says, defaulted to the purchase unit)
+                                — it is NOT put through the issue-side conversion,
+                                or the rate would end up on the other basis from
+                                the qty. Raw string only so decimals stay typeable. */}
                             <input type="number" step="any" min={0}
-                                   value={ln.quantity_to_purchase || ''}
-                                   onChange={e => update(i, { quantity_to_purchase: Number(e.target.value) || 0 })}
+                                   value={ln.quantity_to_purchase}
+                                   onChange={e => update(i, { quantity_to_purchase: e.target.value.replace(/^-/, '') })}
+                                   title={`Quantity to order, in ${ln.po_entry_unit || 'units'} (the unit the rate beside it is per).`}
                                    className="w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
                             {/* Unit selector only when the two units really differ
                                 (ln.pack_size is the canon-guarded factor, so > 1
@@ -1983,12 +2184,17 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                         // total stays the same after the switch.
                                         const goingToPurchase = newUnit === ln.purchase_unit;
                                         const newQty   = goingToPurchase
-                                          ? Math.ceil((Number(ln.quantity_to_purchase) || 0) / ln.pack_size)
-                                          : (Number(ln.quantity_to_purchase) || 0) * ln.pack_size;
+                                          ? Math.ceil(buyOf(ln) / ln.pack_size)
+                                          : buyOf(ln) * ln.pack_size;
                                         const newPrice = goingToPurchase
-                                          ? (Number(ln.unit_price) || 0) * ln.pack_size
-                                          : (Number(ln.unit_price) || 0) / ln.pack_size;
-                                        update(i, { po_entry_unit: newUnit, quantity_to_purchase: newQty, unit_price: Math.round(newPrice * 100) / 100 });
+                                          ? priceOf(ln) * ln.pack_size
+                                          : priceOf(ln) / ln.pack_size;
+                                        // Back to strings — the boxes hold raw text (blank stays blank).
+                                        update(i, {
+                                          po_entry_unit: newUnit,
+                                          quantity_to_purchase: newQty > 0 ? String(newQty) : '',
+                                          unit_price: newPrice > 0 ? String(Math.round(newPrice * 100) / 100) : '',
+                                        });
                                       }}
                                       title="Switch between vendor's purchase unit and recipe unit. Math stays consistent."
                                       className="px-1 py-1 border border-[#E8D5C4] rounded text-xs bg-white">
@@ -2004,11 +2210,22 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                               1 {ln.purchase_unit} = {ln.pack_size} {ln.material_unit}
                             </div>
                           )}
+                          {/* Recipe-unit equivalent of what is being ordered —
+                              only meaningful while the box is on the purchase
+                              basis (the recipe option already IS recipe units). */}
+                          {ln.pack_size > 1 && ln.po_entry_unit === ln.purchase_unit && buyOf(ln) > 0 && (
+                            <div className="text-[9px] text-[#B8A590]">
+                              = {fmtNum(buyOf(ln) * ln.pack_size)} {ln.material_unit}
+                            </div>
+                          )}
                         </td>
                         <td className="py-1.5 px-2">
-                          <input type="number" step="any" min={0} value={ln.unit_price || ''}
-                                 disabled={ln.quantity_to_purchase <= 0}
-                                 onChange={e => update(i, { unit_price: Math.max(0, Number(e.target.value) || 0) })}
+                          {/* ₹ per po_entry_unit — same basis as the qty beside it,
+                              so rate × qty is one basis end to end. Raw string for
+                              the same reason as the qty: "450." must stay typeable. */}
+                          <input type="number" step="any" min={0} value={ln.unit_price}
+                                 disabled={buyOf(ln) <= 0}
+                                 onChange={e => update(i, { unit_price: e.target.value.replace(/^-/, '') })}
                                  title={`Price per ${ln.po_entry_unit}`}
                                  className="w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs disabled:opacity-50" />
                           <span className="ml-1 text-[10px] text-[#8B7355]">/{ln.po_entry_unit}</span>
@@ -2023,7 +2240,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                             const mapped  = vendorsByMaterial[ln.material_id] || [];
                             const mappedIds = new Set(mapped.map(v => v.id));
                             const others  = allVendors.filter(v => !mappedIds.has(v.id));
-                            const disabled = ln.quantity_to_purchase <= 0;
+                            const disabled = buyOf(ln) <= 0;
                             return (
                               <select value={ln.vendor_id}
                                       disabled={disabled}
@@ -2053,9 +2270,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                             );
                           })()}
                         </td>
-                        <td className="py-1.5 px-2 text-right font-mono">
-                          {ln.quantity_to_purchase > 0
-                            ? '₹' + (ln.quantity_to_purchase * ln.unit_price).toFixed(0)
+                        <td className="py-1.5 px-2 text-right font-mono"
+                            title={buyOf(ln) > 0 ? `${fmtNum(buyOf(ln))} × ₹${priceOf(ln)} per ${ln.po_entry_unit}` : ''}>
+                          {buyOf(ln) > 0
+                            ? '₹' + (buyOf(ln) * priceOf(ln)).toFixed(0)
                             : <span className="text-[#8B7355]">—</span>}
                         </td>
                       </>}
@@ -2107,16 +2325,16 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         {/* Submit gate — when PO mode is on, the button is also disabled if no
             Buy line has qty + price + vendor yet (visual feedback before click). */}
         {(() => {
-          const buyLines = lines.filter(ln => Number(ln.quantity_to_purchase) > 0);
+          const buyLines = lines.filter(ln => buyOf(ln) > 0);
           const poReady  = !raisePo || (
             buyLines.length > 0
             && buyLines.every(ln =>
-              Number(ln.unit_price) > 0 && (ln.vendor_id || (ln.vendor || '').trim()))
+              priceOf(ln) > 0 && (ln.vendor_id || (ln.vendor || '').trim()))
           );
           const blockedReason = !raisePo ? ''
             : buyLines.length === 0
               ? 'Enter a Buy qty on at least one line, or untick "Also raise vendor PO".'
-              : buyLines.some(ln => !(Number(ln.unit_price) > 0))
+              : buyLines.some(ln => !(priceOf(ln) > 0))
                 ? 'Every Buy line needs a unit price > 0 before raising the PO.'
                 : 'Every Buy line needs a vendor picked before raising the PO.';
           return (

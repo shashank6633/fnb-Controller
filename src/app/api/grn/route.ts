@@ -99,6 +99,20 @@ export async function GET(request: Request) {
              po.po_number AS po_number,
              (SELECT COUNT(*)        FROM goods_receipt_note_items WHERE grn_id = g.id)                    AS line_count,
              (SELECT SUM(quantity_rejected) FROM goods_receipt_note_items WHERE grn_id = g.id)             AS total_rejected,
+             -- total_rejected sums the rejected qty of EVERY line, and GRN qtys are
+             -- PURCHASE units — so a mixed GRN adds 2 kg to 3 BTL and the number is
+             -- meaningless. These two say whether it can honestly be labelled: one
+             -- distinct purchase unit across the rejected lines → print "N <unit>";
+             -- more than one → the list prints the rejected LINE COUNT instead.
+             (SELECT COUNT(DISTINCT LOWER(TRIM(COALESCE(NULLIF(TRIM(rm2.purchase_unit), ''), rm2.unit))))
+                FROM goods_receipt_note_items gi2
+                JOIN raw_materials rm2 ON rm2.id = gi2.material_id
+               WHERE gi2.grn_id = g.id AND gi2.quantity_rejected > 0)                                     AS rejected_unit_count,
+             (SELECT MIN(COALESCE(NULLIF(TRIM(rm2.purchase_unit), ''), rm2.unit))
+                FROM goods_receipt_note_items gi2
+                JOIN raw_materials rm2 ON rm2.id = gi2.material_id
+               WHERE gi2.grn_id = g.id AND gi2.quantity_rejected > 0)                                     AS rejected_unit,
+             (SELECT COUNT(*) FROM goods_receipt_note_items WHERE grn_id = g.id AND quantity_rejected > 0) AS rejected_lines,
              (SELECT SUM(quantity_accepted * unit_price) FROM goods_receipt_note_items WHERE grn_id = g.id) AS accepted_value,
              (SELECT SUM(quantity_received * unit_price
                          - discount + cgst + sgst + special_excise_cess + tcs + delivery_charges + mrp_round_off)

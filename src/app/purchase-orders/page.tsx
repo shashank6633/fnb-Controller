@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { allocateBillCharges, resolveCharge, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT } from '@/lib/po-charges';
+import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
 
 // Always 2 dp: at 0 dp the paise were dropped per row, so the item column
 // visibly failed to add up to the footer/list total (₹235.50 + ₹118.50 showed
@@ -56,7 +57,58 @@ const poRateOf = (m?: Partial<Material> | null): number => {
   const avg = Number(m?.average_price) || 0;
   return (pack > 1 && ru !== pu) ? Math.round(avg * pack * 100) / 100 : avg;
 };
-interface POItem { id: string; material_id: string; material_name?: string; material_sku?: string; material_unit?: string; quantity: number; unit_price: number; total_price: number; current_avg_price?: number; last_purchase_price?: number; notes?: string; }
+
+/* ── PURCHASE-LEAD DISPLAY (owner rule) ───────────────────────────────────────
+ * Every quantity on this page LEADS in the purchase unit; the recipe figure
+ * rides along as a small hint whenever the pack factor is real. A PO quantity is
+ * ALREADY stored in purchase units, so nothing here ever DIVIDES an ordered /
+ * received qty — the hint MULTIPLIES up to the recipe basis. Only the approval
+ * drawer's stock + usage columns (recipe-basis columns off raw_materials) get
+ * divided, and they go through toPurchaseQty.
+ *
+ * The both-halves guard (pack > 1 AND recipe unit ≠ purchase unit) lives in
+ * packFactor() and is never re-derived here — two copies is how the bases drift.
+ */
+const HINT_CLS = 'text-[9px] text-[#B8A590]';
+/** Pack meta off any API row that carries the material_* trio (PO items,
+ *  approval-context items). purchase_unit falls back to the recipe unit exactly
+ *  as the SQL COALESCE does, so packFactor's guard sees the same pair server and
+ *  client. */
+const packMetaOf = (r: any): PackMeta => ({
+  unit: r?.material_unit,
+  purchase_unit: r?.material_purchase_unit || r?.material_unit,
+  pack_size: r?.material_pack_size,
+});
+/** Pack meta from an inventory Material (the composer's picker list). */
+const packMetaOfMat = (m?: Partial<Material> | null): PackMeta => ({
+  unit: m?.unit, purchase_unit: m?.purchase_unit || m?.unit, pack_size: m?.pack_size,
+});
+/** "= 10,000 g" — the recipe-unit equivalent of a PURCHASE quantity. Null when
+ *  there is no real pack conversion: the two bases are then the same number and
+ *  a hint would only add noise. DISPLAY ONLY — never post this back. */
+const recipeHint = (purchaseQty: number, m: PackMeta): string | null => {
+  const pf = packFactor(m);
+  if (pf <= 1) return null;
+  return `= ${fmtQtyNum((Number(purchaseQty) || 0) * pf)} ${String(m.unit || '').trim()}`.trim();
+};
+/** "1 kg = 1,000 g" — states the pack itself, for the composer's item note. */
+const packNote = (m: PackMeta): string | null => {
+  const pf = packFactor(m);
+  if (pf <= 1) return null;
+  return `1 ${String(m.purchase_unit || '').trim()} = ${fmtQtyNum(pf)} ${String(m.unit || '').trim()}`;
+};
+
+interface POItem {
+  id: string; material_id: string; material_name?: string; material_sku?: string;
+  /** RECIPE unit (g/ml) — for the hint only; a PO line is never expressed in it. */
+  material_unit?: string;
+  /** PURCHASE unit (kg/BTL/CASE) — the basis of quantity AND unit_price. */
+  material_purchase_unit?: string;
+  /** raw_materials.pack_size — recipe units per purchase unit. */
+  material_pack_size?: number;
+  quantity: number; unit_price: number; total_price: number;
+  current_avg_price?: number; last_purchase_price?: number; notes?: string;
+}
 interface PO { id: string; po_number: string; date: string; vendor: string; status: string; total_cost: number; notes: string; drafted_by: string; submitted_at?: string; approved_by?: string; approved_at?: string; rejected_reason?: string; received_at?: string; item_count?: number; items?: POItem[]; }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -555,6 +607,10 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     const qtyOff    = Math.abs(qtyDiff) > QTY_EPS;
     const rateOff   = Math.abs(priceDiff) > RATE_EPS;
     const u = (it as any).material_purchase_unit || (it as any).material_unit || '';
+    // Pack meta rides along so every qty cell on the row can print its recipe
+    // hint from ONE resolution — a per-cell re-derivation is how "Ordered 10 kg"
+    // ended up beside a sibling reading grams.
+    const meta = packMetaOf(it);
     const bits: string[] = [];
     if (qtyOff) {
       bits.push(`${qtyDiff > 0 ? 'excess' : 'short'} ${qfmt(Math.abs(qtyDiff))}${u ? ' ' + u : ''} ` +
@@ -563,7 +619,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     if (rateOff) {
       bits.push(`rate ₹${price.toFixed(2)}${u ? '/' + u : ''} vs ordered ₹${it.unit_price.toFixed(2)}${u ? '/' + u : ''}`);
     }
-    return { it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, deviates: bits.length > 0, label: bits.join(' · ') };
+    return { it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, meta, deviates: bits.length > 0, label: bits.join(' · ') };
   }), [items, overrides]);
 
   // Free text, trimmed, ≥ 3 chars — same floor the receive route enforces, so a
@@ -757,8 +813,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                       — NOT the recipe/stock unit (g, ml), which differs by
                       pack_size. `u` is that purchase unit and labels every
                       qty/rate cell so the receiver knows what they're confirming. */}
-                  {deviations.map(({ it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, deviates, label }) => {
+                  {deviations.map(({ it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, meta, deviates, label }) => {
                     const lineTotal = Number(ov.quantity) * Number(ov.unit_price);
+                    // Recipe hints — display only. Both bases are printed on the
+                    // SAME row so an ordered "10 kg" and a received "10 kg" can
+                    // never be read against a sibling cell in grams.
+                    const ordHint = recipeHint(it.quantity, meta);
+                    const rcvHint = recipeHint(Number(ov.quantity) || 0, meta);
                     const unlocked = !!rateUnlocked[it.id];
                     const reason = reasons[it.id] || '';
                     const needsReason = deviates && reason.trim().length < MIN_REASON;
@@ -772,6 +833,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                         <td className="py-1.5 px-2 text-right font-mono">
                           {it.quantity.toLocaleString('en-IN')}
                           {u && <span className="ml-1 text-[10px] text-[#8B7355]">{u}</span>}
+                          {ordHint && <div className={HINT_CLS}>{ordHint}</div>}
                         </td>
                         <td className="py-1.5 px-2">
                           <div className="flex items-center gap-1 justify-end">
@@ -786,6 +848,11 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                                    className={`w-full px-1.5 py-1 border rounded text-right ${qtyOff ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
                             {u && <span className="text-[10px] text-[#8B7355]">{u}</span>}
                           </div>
+                          {/* The box is a PURCHASE-unit box (same basis the PO
+                              and the receive route store), so this hint only
+                              reads the typed number out in recipe units — the
+                              value posted is never round-tripped through it. */}
+                          {rcvHint && <div className={`${HINT_CLS} mt-0.5 text-right`}>{rcvHint}</div>}
                           {qtyOff && (
                             <div className={`text-[9px] mt-0.5 text-right ${qtyDiff > 0 ? 'text-blue-600' : 'text-amber-700'}`}>
                               {qtyDiff > 0 ? '+' : ''}{qfmt(qtyDiff)}{u ? ' ' + u : ''} vs ordered
@@ -1061,7 +1128,9 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               <th className="text-left  py-1 px-2 font-medium">Material</th>
               <th className="text-left  py-1 px-2 font-medium">Vendor</th>
               <th className="text-right py-1 px-2 font-medium">{isReceived ? 'Ordered Qty' : 'Qty'}</th>
-              <th className="text-left  py-1 px-2 font-medium">Unit</th>
+              {/* Spelled out, same as the liquor Movement report's "Unit
+                  (recipe)": every qty in this table is in the PURCHASE unit. */}
+              <th className="text-left  py-1 px-2 font-medium">Unit (purchase)</th>
               <th className="text-right py-1 px-2 font-medium">{isReceived ? 'Rate (Ord)' : 'Unit ₹'}</th>
               <th className="text-right py-1 px-2 font-medium">{isReceived ? 'Ordered ₹' : 'Total ₹'}</th>
               {isReceived && <>
@@ -1090,6 +1159,12 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               // material_purchase_unit for exactly this label (same derivation as
               // the receive modal), so "10 kg @ ₹900/kg" can't read as ₹900/g.
               const u = (it as any).material_purchase_unit || it.material_unit || '';
+              // ONE pack resolution for the whole row — ordered, received and
+              // rejected are all purchase-basis GRN/PO numbers, so they share it.
+              const meta = packMetaOf(it);
+              const ordHint = recipeHint(it.quantity, meta);
+              const rcvHint = recQty != null ? recipeHint(Number(recQty), meta) : null;
+              const rejHint = recipeHint(rejected, meta);
               return (
                 <tr key={it.id} className="border-t border-[#E8D5C4]/50">
                   <td className="py-1 px-2 font-mono text-[10px] text-[#8B7355]">{it.material_sku || '·'}</td>
@@ -1097,19 +1172,26 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                     {it.material_name}
                     {isReceived && rejected > 0 && (
                       <div className="text-[10px] text-red-700 mt-0.5">
-                        Rejected: {rejected} {u}
+                        {/* quantity_rejected is a GRN qty = PURCHASE units, and
+                            it was printing raw (0.30000000000000004). */}
+                        Rejected: {qfmt(rejected)} {u}
                         {(it as any).rejection_reason && <span className="capitalize"> ({String((it as any).rejection_reason).replace(/_/g, ' ')})</span>}
+                        {rejHint && <span className={`${HINT_CLS} ml-1`}>{rejHint}</span>}
                       </div>
                     )}
                   </td>
                   <td className="py-1 px-2 text-[#6B5744]">{(it as any).vendor || <span className="text-[#8B7355] italic">—</span>}</td>
-                  <td className="py-1 px-2 text-right font-mono">{it.quantity.toLocaleString('en-IN')}</td>
+                  <td className="py-1 px-2 text-right font-mono">
+                    {it.quantity.toLocaleString('en-IN')}
+                    {ordHint && <div className={HINT_CLS}>{ordHint}</div>}
+                  </td>
                   <td className="py-1 px-2 text-[#6B5744]">{u}</td>
                   <td className="py-1 px-2 text-right font-mono">{fmt(it.unit_price)}</td>
                   <td className="py-1 px-2 text-right font-mono font-semibold">{fmt(it.total_price)}</td>
                   {isReceived && <>
                     <td className={`py-1 px-2 text-right font-mono ${qtyDiff !== 0 ? (qtyDiff > 0 ? 'bg-amber-50 text-amber-900 font-semibold' : 'bg-red-50 text-red-700 font-semibold') : 'bg-emerald-50/30'}`}>
                       {recQty != null ? Number(recQty).toLocaleString('en-IN') : '—'}
+                      {rcvHint && <div className={HINT_CLS}>{rcvHint}</div>}
                     </td>
                     <td className={`py-1 px-2 text-right font-mono ${priceDiff !== 0 ? (priceDiff > 0 ? 'bg-red-50 text-red-700 font-semibold' : 'bg-emerald-50 text-emerald-800 font-semibold') : 'bg-emerald-50/30'}`}>
                       {recPrice != null ? fmt(Number(recPrice)) : '—'}
@@ -1118,9 +1200,12 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                       {recTotal != null ? fmt(Number(recTotal)) : '—'}
                     </td>
                     <td className={`py-1 px-2 text-right font-mono text-[10px] ${valDiff === 0 ? 'text-[#8B7355]' : valDiff > 0 ? 'text-red-700' : 'text-amber-700'}`}>
+                      {/* qfmt, not the raw float: 2.4 − 2.5 prints as
+                          −0.09999999999999964 straight out of the subtraction.
+                          Purchase basis on both sides, so the delta is too. */}
                       {qtyDiff !== 0 && (
-                        <div title={`Qty ${qtyDiff > 0 ? '+' : ''}${qtyDiff} ${u}`}>
-                          {qtyDiff > 0 ? '+' : ''}{qtyDiff} {u}
+                        <div title={`Qty ${qtyDiff > 0 ? '+' : ''}${qfmt(qtyDiff)} ${u}`}>
+                          {qtyDiff > 0 ? '+' : ''}{qfmt(qtyDiff)} {u}
                         </div>
                       )}
                       {valDiff !== 0 && (
@@ -1605,6 +1690,12 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                         {mat && (
                           <div className="text-[10px] text-[#8B7355] mt-0.5">
                             order unit {poUnitOf(mat)} · ₹{poRateOf(mat).toFixed(2)}/{poUnitOf(mat)}
+                            {/* State the pack itself so the buyer knows what one
+                                order unit contains — the kitchen's recipes are
+                                written in the other unit. */}
+                            {packNote(packMetaOfMat(mat)) && (
+                              <span className="ml-1 text-[#B8A590]">· {packNote(packMetaOfMat(mat))}</span>
+                            )}
                             <span className="ml-1 text-[#B8A590]">· 🗑 remove the line to change the item</span>
                           </div>
                         )}
@@ -1689,8 +1780,17 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                }}
                                className="w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
                         {/* Spell out the ORDER unit so qty can never be read as
-                            the recipe/stock unit (g) — a PO is in kg/BTL/CASE. */}
+                            the recipe/stock unit (g) — a PO is in kg/BTL/CASE.
+                            The hint below reads the SAME typed number out in
+                            recipe units; the box itself stays purchase-basis, so
+                            what is posted is exactly what was typed. */}
                         {mat && <div className="text-[9px] text-[#8B7355] text-right mt-0.5">{poUnitOf(mat)}</div>}
+                        {/* qty > 0 gate: the box renders blank at 0, so an
+                            unconditional hint would read "= 0 g" under an empty
+                            field the buyer has not filled in yet. */}
+                        {mat && Number(it.quantity) > 0 && (
+                          <div className={`${HINT_CLS} text-right`}>{recipeHint(Number(it.quantity), packMetaOfMat(mat))}</div>
+                        )}
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Unit ₹</span>
@@ -1852,7 +1952,10 @@ function SimpleMaterialPicker({ value, materials, onChange, takenIds, onPickTake
                   </span>
                 ) : (<>
                   <span className="text-[10px] text-[#6B5744]">{poUnitOf(m)}</span>
-                  <span className="text-[10px] font-mono text-[#6B5744]">₹{poRateOf(m).toFixed(2)}</span>
+                  {/* Rate carries its own basis: a bare "₹86.00" next to a list
+                      of kitchen materials reads as ₹/g. poRateOf is already
+                      ₹/purchase-unit — say which unit that is. */}
+                  <span className="text-[10px] font-mono text-[#6B5744]">₹{poRateOf(m).toFixed(2)}/{poUnitOf(m)}</span>
                 </>)}
               </button>
               );
@@ -1992,7 +2095,10 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
               {mat ? (
                 <div className="px-2 py-1 rounded border border-[#E8D5C4] bg-[#FFF8F0] text-xs text-[#2D1B0E]">
                   <span className="font-mono text-[10px] text-[#8B7355] mr-1">{mat.sku}</span>{mat.name}
-                  <div className="text-[9px] text-[#8B7355]">order unit {poUnitOf(mat)} · ₹{poRateOf(mat).toFixed(2)}/{poUnitOf(mat)}</div>
+                  <div className="text-[9px] text-[#8B7355]">
+                    order unit {poUnitOf(mat)} · ₹{poRateOf(mat).toFixed(2)}/{poUnitOf(mat)}
+                    {packNote(packMetaOfMat(mat)) && <span className="ml-1 text-[#B8A590]">· {packNote(packMetaOfMat(mat))}</span>}
+                  </div>
                 </div>
               ) : (
                 <SimpleMaterialPicker value={it.material_id} materials={materials}
@@ -2070,6 +2176,10 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
                   material cell — which wraps out of line on a narrow screen
                   while this box rewrites a live PO's money. */}
               {mat && <div className="text-[9px] text-[#8B7355] text-right mt-0.5">{poUnitOf(mat)}</div>}
+              {/* qty > 0 gate — see the matching note in the new-PO composer. */}
+              {mat && Number(it.quantity) > 0 && (
+                <div className={`${HINT_CLS} text-right`}>{recipeHint(Number(it.quantity), packMetaOfMat(mat))}</div>
+              )}
             </div>
             <div className="col-span-1">
               <input type="number" step="any" min={0} value={it.unit_price || ''}
@@ -2159,12 +2269,23 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
                 // requested_qty is in PURCHASE units (10 kg) while current_stock and
                 // the usage columns are in RECIPE units (2,000 g) — they differ by
                 // pack_size, so they must not be labelled the same nor divided
-                // directly. Same pack guard as the rest of the app: convert only when
-                // pack>1 AND the two units genuinely differ.
-                const poUnit = it.material_purchase_unit || it.material_unit;
-                const pack   = Number(it.material_pack_size) || 1;
-                const packFactor = (pack > 1 && String(poUnit).toLowerCase().trim() !== String(it.material_unit).toLowerCase().trim()) ? pack : 1;
-                const reqInStockUnits = (Number(it.requested_qty) || 0) * packFactor;
+                // directly. ONE resolution per row through the shared guard: the
+                // "pack > 1 AND the units differ" test lives in packFactor() and is
+                // never re-derived here, because a local copy is exactly how one
+                // cell in a row ends up on the other basis.
+                const meta   = packMetaOf(it);
+                // Never blank — the API COALESCEs purchase_unit to the recipe unit.
+                // Used for EVERY column, including pack-1 materials (pcs vs BTL):
+                // labelling stock "pcs" beside a request in "BTL" is the same
+                // sibling mismatch, even when the two numbers happen to be equal.
+                const poUnit = String(meta.purchase_unit || '').trim() || it.material_unit;
+                const pf     = packFactor(meta);
+                const reqInStockUnits = (Number(it.requested_qty) || 0) * pf;
+                // Recipe-basis columns → purchase basis for the lead figure.
+                const stockPU = toPurchaseQty(it.current_stock, meta);
+                const usePU   = (v: number) => fmtQtyNum(toPurchaseQty(v, meta));
+                // % of stock — recipe ÷ recipe, so it is basis-independent and
+                // must NOT be recomputed from the rounded purchase figures.
                 const reqVsStock = it.current_stock > 0 && it.requested_qty > 0
                   ? `+${((reqInStockUnits / it.current_stock) * 100).toFixed(0)}%`
                   : null;
@@ -2175,27 +2296,36 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
                       <div className="text-[10px] font-mono text-[#8B7355]">{it.material_sku}</div>
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
-                      <div className="font-semibold">{it.requested_qty.toLocaleString('en-IN')} {poUnit}</div>
+                      {/* Already PURCHASE units (canon) — printed, never divided. */}
+                      <div className="font-semibold">{fmtQtyNum(it.requested_qty)} {poUnit}</div>
                       {/* Always state the basis: a bare "@ ₹151.50" beside the
                           recipe-unit columns reads as ₹/g. poUnit is never blank
                           — the API COALESCEs purchase_unit to the recipe unit. */}
                       <div className="text-[10px] text-[#8B7355]">@ ₹{it.requested_unit_price.toFixed(2)}/{poUnit}</div>
                       {/* Spell out the stock-unit equivalent so "10 kg" can be compared
-                          with the recipe-unit stock/usage columns beside it. */}
-                      {packFactor > 1 && (
-                        <div className="text-[10px] text-[#8B7355]">= {reqInStockUnits.toLocaleString('en-IN')} {it.material_unit}</div>
+                          with the recipe-unit figures the kitchen works in. */}
+                      {pf > 1 && (
+                        <div className={HINT_CLS}>= {fmtQtyNum(reqInStockUnits)} {it.material_unit}</div>
                       )}
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
                       {/* Purchase basis (owner rule): current_stock is recipe units;
-                          ÷packFactor so "2 BTL on hand" reads as 2, not 1500. */}
-                      <div>{(Math.round((it.current_stock / packFactor) * 1000) / 1000).toLocaleString('en-IN')} {packFactor > 1 ? poUnit : it.material_unit}</div>
-                      {packFactor > 1 && <div className="text-[10px] text-[#8B7355]">= {it.current_stock.toLocaleString('en-IN')} {it.material_unit}</div>}
+                          toPurchaseQty so "2 BTL on hand" reads as 2, not 1500. */}
+                      <div>{fmtQtyNum(stockPU)} {poUnit}</div>
+                      {pf > 1 && <div className={HINT_CLS}>= {fmtQtyNum(it.current_stock)} {it.material_unit}</div>}
                       {reqVsStock && <div className="text-[10px] text-[#8B7355]">order is {reqVsStock} of stock</div>}
                     </td>
                     <td className="py-2 px-2 text-right font-mono text-[#6B5744]">
-                      {(it.usage_30d / packFactor).toLocaleString('en-IN', { maximumFractionDigits: 1 })} / {(it.usage_60d / packFactor).toLocaleString('en-IN', { maximumFractionDigits: 1 })} / {(it.usage_90d / packFactor).toLocaleString('en-IN', { maximumFractionDigits: 1 })}
-                      <div className="text-[10px] text-[#8B7355]">{packFactor > 1 ? poUnit : it.material_unit}{it.avg_daily_usage_30d > 0 ? ` · avg ${(it.avg_daily_usage_30d / packFactor).toFixed(2)}/day` : ''}</div>
+                      {/* Consumption is stored in recipe units; converted so it
+                          reads against the Requested and Current Stock columns
+                          without the reader dividing by the pack in their head. */}
+                      {usePU(it.usage_30d)} / {usePU(it.usage_60d)} / {usePU(it.usage_90d)}
+                      <div className="text-[10px] text-[#8B7355]">{poUnit}{it.avg_daily_usage_30d > 0 ? ` · avg ${toPurchaseQty(it.avg_daily_usage_30d, meta).toFixed(2)}/day` : ''}</div>
+                      {pf > 1 && (
+                        <div className={HINT_CLS}>
+                          = {fmtQtyNum(it.usage_30d)} / {fmtQtyNum(it.usage_60d)} / {fmtQtyNum(it.usage_90d)} {it.material_unit}
+                        </div>
+                      )}
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
                       {it.days_of_stock != null

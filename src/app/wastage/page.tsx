@@ -10,7 +10,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Trash2, Plus, Calendar, Save, Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
-import { packFactor, toPurchaseQty } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const today = () => new Date().toISOString().slice(0, 10);
@@ -104,7 +104,10 @@ export default function WastagePage() {
 
   const remove = async (w: Wastage) => {
     const wm = { unit: w.material_unit, purchase_unit: w.material_purchase_unit, pack_size: w.material_pack_size };
-    if (!confirm(`Delete wastage entry? Stock will be credited back (+${toPurchaseQty(w.quantity, wm)} ${w.material_purchase_unit || w.material_unit}).`)) return;
+    // Purchase basis leads here too; the recipe figure follows only when the two differ.
+    const back = `+${fmtQtyNum(toPurchaseQty(w.quantity, wm))} ${w.material_purchase_unit || w.material_unit}`
+      + (packFactor(wm) > 1 ? ` (= ${fmtQtyNum(w.quantity)} ${w.material_unit})` : '');
+    if (!confirm(`Delete wastage entry? Stock will be credited back (${back}).`)) return;
     const r = await api(`/api/wastage?id=${w.id}`, { method: 'DELETE', body: {} });
     if (!r.ok) { alert((await r.json()).error || 'Failed'); return; }
     reload();
@@ -146,12 +149,21 @@ export default function WastagePage() {
           </div>
           <label className="flex flex-col gap-1 text-[#6B5744] md:col-span-2">
             <span>Quantity</span>
-            <input type="number" step="any" min="0" value={qty} onChange={e => setQty(e.target.value)}
+            {/* Keep the RAW string — running it through Number() on every keystroke
+                eats the decimal point ("2." → "2"). A typed minus is stripped; the
+                value is clamped where it is USED (the POST, and the server's > 0). */}
+            <input type="number" step="any" min="0" value={qty} onChange={e => setQty(e.target.value.replace(/^-+/, ''))}
                    placeholder={selectedMat ? `in ${(selectedMat as any).purchase_unit || selectedMat.unit}` : '0'}
                    className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0] font-mono" />
             {selectedMat && (
               <span className="text-[10px] text-[#8B7355]">
                 @ {fmt(selectedMat.average_price * packFactor(selectedMat as any) * (parseFloat(qty) || 0))} loss
+              </span>
+            )}
+            {/* Entry is in PURCHASE units — show what will actually be deducted. */}
+            {selectedMat && packFactor(selectedMat as any) > 1 && (
+              <span className="text-[9px] text-[#B8A590]">
+                = {fmtQtyNum((parseFloat(qty) || 0) * packFactor(selectedMat as any))} {selectedMat.unit} off stock
               </span>
             )}
           </label>
@@ -221,9 +233,23 @@ export default function WastagePage() {
                     <div className="font-medium">{w.material_name}</div>
                     {w.material_sku && <div className="text-[10px] font-mono text-[#8B7355]">{w.material_sku}</div>}
                   </td>
-                  <td className="py-1.5 px-3 text-right font-mono"
-                      title={(w.material_pack_size || 1) > 1 && w.material_purchase_unit !== w.material_unit ? `= ${w.quantity.toLocaleString('en-IN')} ${w.material_unit}` : undefined}>
-                    {toPurchaseQty(w.quantity, { unit: w.material_unit, purchase_unit: w.material_purchase_unit, pack_size: w.material_pack_size }).toLocaleString('en-IN')} {w.material_purchase_unit || w.material_unit}
+                  {/* PURCHASE basis leads; the recipe figure is a visible hint, not a
+                      tooltip. The pack rule is NEVER re-derived here — packFactor()
+                      owns the both-halves guard (pack > 1 AND recipe unit ≠ purchase
+                      unit, compared lowercased/trimmed). */}
+                  <td className="py-1.5 px-3 text-right font-mono">
+                    {(() => {
+                      const wm = { unit: w.material_unit, purchase_unit: w.material_purchase_unit, pack_size: w.material_pack_size };
+                      const pf = packFactor(wm);
+                      return (
+                        <>
+                          {fmtQtyNum(toPurchaseQty(w.quantity, wm))} <span className="text-[#8B7355]">{w.material_purchase_unit || w.material_unit}</span>
+                          {pf > 1 && (
+                            <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(w.quantity)} {w.material_unit}</div>
+                          )}
+                        </>
+                      );
+                    })()}
                   </td>
                   <td className="py-1.5 px-3 text-right font-mono text-red-700 font-semibold">{fmt(w.value)}</td>
                   <td className="py-1.5 px-3">

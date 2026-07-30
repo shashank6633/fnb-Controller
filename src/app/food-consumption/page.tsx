@@ -13,8 +13,43 @@
 import { useEffect, useState } from 'react';
 import { Utensils, Loader2, RefreshCw, AlertTriangle, Eye, X } from 'lucide-react';
 import { api } from '@/lib/api';
+import { packFactor, fmtQtyNum } from '@/lib/pack-units';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
+
+/**
+ * Resolve a requisition line's UNIT BASIS — same resolver as lineUnits() on
+ * /store-requisitions and /party-approvals. These are party REQUISITION lines
+ * (not a recipe explosion), so the owner rule applies: lead in PURCHASE units
+ * with the recipe figure as a hint. `qty_unit` is the line's own stored unit
+ * (the API already resolves a blank one to the recipe unit, which is what a
+ * blank line means — it then divides by the pack instead of printing grams).
+ */
+function lineUnits(it: FoodItem) {
+  const recipeUnit = it.material_unit || '';
+  const pf = packFactor({ unit: recipeUnit, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size });
+  const pu = it.material_purchase_unit || recipeUnit;
+  const lu = String(it.qty_unit || '').toLowerCase().trim();
+  const isPU = pf > 1 && lu !== '' && lu === String(pu).toLowerCase().trim();
+  return {
+    pf, pu, recipeUnit,
+    toPU:     (q: any) => isPU ? (Number(q) || 0) : Math.round(((Number(q) || 0) / pf) * 1000) / 1000,
+    toRecipe: (q: any) => isPU ? (Number(q) || 0) * pf : (Number(q) || 0),
+  };
+}
+
+/** Purchase-lead quantity cell with the recipe figure as a small hint. */
+function Qty({ qty, it }: { qty: number | null | undefined; it: FoodItem }) {
+  const U = lineUnits(it);
+  return (
+    <>
+      {fmtQtyNum(U.toPU(qty))} <span className="text-[#8B7355]">{U.pu}</span>
+      {U.pf > 1 && (
+        <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(U.toRecipe(qty))} {U.recipeUnit}</div>
+      )}
+    </>
+  );
+}
 
 interface PnLRow {
   party_unique_id?: string;
@@ -179,7 +214,13 @@ export default function FoodConsumptionPage() {
 interface FoodItem {
   id: string;
   material_name: string;
+  /** RECIPE unit (g / ml / kg / pcs). */
   material_unit: string;
+  /** The unit qty / qty_issued are STORED in (blank line → recipe unit). */
+  qty_unit?: string;
+  /** PURCHASE unit + recipe-units-per-purchase-unit — display conversion only. */
+  material_purchase_unit?: string;
+  material_pack_size?: number;
   qty: number;
   qty_issued: number;
   avg_price: number;
@@ -241,10 +282,11 @@ function FoodItemsModal({ target, onClose }: { target: PnLRow; onClose: () => vo
                   {items.map(it => (
                     <tr key={it.id} className="border-t border-[#E8D5C4]/50">
                       <td className="py-1.5 px-2 text-[#2D1B0E]">{it.material_name}</td>
-                      {/* qty is stored in the LINE's unit (usually the purchase unit) — labelling it
-                          with the recipe unit read a 2-BTL request as 2 ml. */}
-                      <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{it.qty} {(it as any).qty_unit || it.material_unit}</td>
-                      <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{it.qty_issued || 0} {(it as any).qty_unit || it.material_unit}</td>
+                      {/* qty is stored in the LINE's unit (option B) — labelling it with the
+                          recipe unit read a 2-BTL request as "2 ml". Both cells now LEAD in
+                          purchase units with the recipe figure as a hint. */}
+                      <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap"><Qty qty={it.qty} it={it} /></td>
+                      <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap"><Qty qty={it.qty_issued || 0} it={it} /></td>
                       <td className="py-1.5 px-2 text-right font-mono">{fmt(it.cost)}</td>
                       <td className="py-1.5 px-2 text-[10px] text-[#8B7355] whitespace-nowrap">{(it.req_status || '').replace(/_/g, ' ')}</td>
                     </tr>

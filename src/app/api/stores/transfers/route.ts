@@ -87,8 +87,42 @@ export async function GET(request: Request) {
       list = list.filter(t => (!t.from_central && access(t.from_store_id).can_view) || access(t.to_store_id).can_view);
     }
 
+    // Per-transfer LINE counts (ADDITIVE — total_requested/issued/received stay
+    // on the wire untouched).
+    //
+    // Those totals are Σ over the transfer's items in RECIPE units, i.e. across
+    // MATERIALS: 750 ml + 2 kg + 24 pcs added together. No unit exists for that
+    // number, in either basis, so the list cannot print it as a quantity. Line
+    // counts answer the same question ("how far along is this transfer?")
+    // honestly and unit-free; the per-item purchase quantities live on the
+    // detail payload. Aggregated over the whole (small) ops table in one pass —
+    // no IN-list, so no 999-variable chunking.
+    const lineStats = new Map<string, { issued: number; received: number; in_transit: number }>();
+    for (const s of db.prepare(`
+      SELECT transfer_id,
+             SUM(CASE WHEN qty_issued   > 0 THEN 1 ELSE 0 END) AS lines_issued,
+             SUM(CASE WHEN qty_received > 0 THEN 1 ELSE 0 END) AS lines_received,
+             SUM(CASE WHEN qty_issued - qty_received > 0.000001 THEN 1 ELSE 0 END) AS lines_in_transit
+      FROM store_transfer_items GROUP BY transfer_id
+    `).all() as any[]) {
+      lineStats.set(String(s.transfer_id), {
+        issued: Number(s.lines_issued) || 0,
+        received: Number(s.lines_received) || 0,
+        in_transit: Number(s.lines_in_transit) || 0,
+      });
+    }
+
     // Source label: 'Grocery' for a central-grocery source, else the store name.
-    const transfers = list.map(t => ({ ...t, source_label: t.from_central ? 'Grocery' : t.from_store_name }));
+    const transfers = list.map(t => {
+      const s = lineStats.get(t.id) || { issued: 0, received: 0, in_transit: 0 };
+      return {
+        ...t,
+        source_label: t.from_central ? 'Grocery' : t.from_store_name,
+        lines_issued: s.issued,
+        lines_received: s.received,
+        lines_in_transit: s.in_transit,
+      };
+    });
 
     return Response.json({ transfers });
   } catch (e: any) {

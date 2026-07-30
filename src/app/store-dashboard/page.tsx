@@ -320,8 +320,12 @@ export default function StoreDashboardPage() {
                         )}
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono text-[#6B5744]">
-                        {r.pack_size > 1
-                          ? <>{r.suggest_purchase_qty} <span className="text-[9px]">{r.purchase_unit}</span></>
+                        {/* Gate on "is there a suggestion", not on the pack rule: the API
+                            already applied the both-halves guard to build this number, and
+                            a pack-1 material bought by the bottle (pcs / BTL) has a perfectly
+                            real buy quantity that the old `pack_size > 1` test hid. */}
+                        {Number(r.suggest_purchase_qty) > 0
+                          ? <>{fmtQtyNum(Number(r.suggest_purchase_qty))} <span className="text-[9px]">{r.purchase_unit || r.recipe_unit}</span></>
                           : <span className="text-[#C0A98F]">—</span>}
                       </td>
                       <td className="py-1.5 px-2 text-[#6B5744]">{r.last_vendor || <span className="text-[#C0A98F]">—</span>}</td>

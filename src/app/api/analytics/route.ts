@@ -198,6 +198,11 @@ export async function GET(request: Request) {
         current_stock,
         reorder_level,
         unit,
+        -- Pack meta so the dashboard can lead with the PURCHASE unit. Additive:
+        -- the recipe "unit" column above stays on the wire for existing readers.
+        -- Both halves are required — packFactor() needs unit AND purchase_unit.
+        COALESCE(NULLIF(TRIM(purchase_unit), ''), unit) AS purchase_unit,
+        COALESCE(pack_size, 1) AS pack_size,
         ROUND(reorder_level - current_stock, 2) as deficit
       FROM raw_materials
       WHERE reorder_level > 0 AND current_stock < reorder_level

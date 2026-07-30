@@ -82,9 +82,19 @@ interface TransferBase {
   issued_by: string; issued_at: string | null;
   received_by: string; received_at: string | null;
   created_at: string; updated_at: string;
+  /** Σ of the transfer's item quantities in RECIPE units — ACROSS MATERIALS
+   *  (750 ml + 2 kg + 24 pcs). No unit exists for that number in any basis, so
+   *  it is never rendered as a quantity: it is only ever asked `> 0`
+   *  ("has anything moved / is anything still out?"). Per-item purchase-unit
+   *  quantities live on the detail payload. */
   total_requested: number; total_issued: number; total_received: number; total_in_transit: number;
 }
-interface TransferSummary extends TransferBase { item_count: number; }
+interface TransferSummary extends TransferBase {
+  item_count: number;
+  /** Unit-free progress, from /api/stores/transfers — the honest list-level
+   *  substitute for the mixed-unit totals above. */
+  lines_issued?: number; lines_received?: number; lines_in_transit?: number;
+}
 interface TransferFull extends TransferBase { items: TransferItem[]; }
 
 /* ── Small helpers ───────────────────────────────────────────────────────── */
@@ -105,10 +115,42 @@ const CENTRAL_SRC = '__central__';
 const sourceLabel = (t: { from_central: boolean; from_store_name: string }) =>
   t.from_central ? 'Grocery' : t.from_store_name;
 
-/** A quantity rendered in the bar convention when the material packs, else plain. */
+/** The unit a quantity READS in here — the PURCHASE unit (a floor asks for and
+ *  receives bottles/kg), falling back to the recipe unit only when none is set. */
+const puOf = (m: PackMeta) => String(m?.purchase_unit || m?.unit || '').trim() || 'units';
+
+/**
+ * A quantity in the bar convention ('2 cs + 9 btl + 450 ml') when the material
+ * packs, else the plain figure in its PURCHASE unit.
+ *
+ * The plain branch is the fix: fmtBreakdown returns null when packFactor's
+ * both-halves guard fails, and this used to label that case with m.unit — the
+ * RECIPE unit. On the beer catalog (unit 'pcs', purchase_unit 'BTL', pack_size 1)
+ * a 24-bottle line read "24 pcs". packFactor is 1 there, so the number is
+ * identical in both bases; only the label was wrong.
+ */
 function qtyText(qty: number, m: PackMeta): string {
   const dual = fmtBreakdown(qty, m);
-  return dual ? dual : `${fq(qty)} ${String(m.unit || '').trim() || 'units'}`;
+  return dual ? dual : `${fq(qty)} ${puOf(m)}`;
+}
+
+/** One labelled quantity: purchase basis leads, the recipe figure is the small
+ *  hint underneath (only when the material actually packs — at factor 1 the two
+ *  numbers are the same and a hint would just be noise). */
+function QtyCell({ label, qty, m, dashIfZero }: {
+  label: string; qty: number; m: PackMeta; dashIfZero?: boolean;
+}) {
+  const q = Number(qty) || 0;
+  const packs = packFactor(m) > 1;
+  return (
+    <div>
+      <div className="text-[9px] uppercase text-[#8B7355]">{label}</div>
+      <div className="text-[#2D1B0E]">{dashIfZero && !q ? '—' : qtyText(q, m)}</div>
+      {packs && (!dashIfZero || !!q) && (
+        <div className="text-[9px] text-[#B8A590]">= {fq(q, 3)} {String(m.unit || '').trim()}</div>
+      )}
+    </div>
+  );
 }
 
 const STATUS_BADGE: Record<TransferStatus, string> = {
@@ -153,10 +195,12 @@ function CBLEntry({ mat, value, onChange, compact }: {
   const touched = value.cases !== '' || value.bottles !== '' || value.loose !== '';
   const box = `w-full px-2 ${compact ? 'py-1 text-xs' : 'py-1.5 text-sm'} border border-[#E8D5C4] rounded bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]`;
   if (mode === 'plain') {
+    // No pack conversion (factor 1) → the single box IS the purchase unit, so
+    // label it 'BTL', not the recipe 'pcs'. Same number either way.
     return (
       <input type="number" min={0} step="any" inputMode="decimal" value={value.bottles}
              onChange={e => onChange({ ...value, bottles: e.target.value })}
-             placeholder={`Qty (${ru})`} className={box} aria-label={`Quantity in ${ru}`} />
+             placeholder={`Qty (${bu})`} className={box} aria-label={`Quantity in ${bu}`} />
     );
   }
   const showCases = mode === 'cbl' || mode === 'cb';
@@ -182,7 +226,10 @@ function CBLEntry({ mat, value, onChange, compact }: {
         )}
       </div>
       {mat && touched && (
-        <div className="mt-1 text-[10px] text-[#6B5744]">= <b>{qtyText(recipe, mat)}</b></div>
+        <div className="mt-1 text-[10px] text-[#6B5744]">
+          = <b>{qtyText(recipe, mat)}</b>
+          {packFactor(mat) > 1 && <span className="text-[9px] text-[#B8A590]"> = {fq(recipe, 3)} {ru}</span>}
+        </div>
       )}
     </div>
   );
@@ -488,16 +535,20 @@ export default function TransfersPage() {
   const canCreate = viewable.length > 0;
 
   const exportCsv = () => {
+    // Header-level export ⇒ LINE counts only. The transfer's Σ quantities add
+    // ml + g + pcs across materials, so there is no unit to export them in —
+    // a per-item quantity export belongs on the transfer detail, in purchase
+    // units. (Columns renamed from requested/issued/received deliberately: the
+    // old ones carried a number no basis could label.)
     const rows = filtered.map(t => ({
       id: t.id,
       from: sourceLabel(t),
       to: t.to_store_name,
       status: t.status,
       items: t.item_count,
-      requested: t.total_requested,
-      issued: t.total_issued,
-      received: t.total_received,
-      in_transit_or_discrepancy: t.total_in_transit,
+      lines_issued: t.lines_issued ?? 0,
+      lines_received: t.lines_received ?? 0,
+      lines_in_transit_or_short: t.lines_in_transit ?? 0,
       requested_by: t.requested_by,
       requested_at: t.requested_at || '',
       issued_by: t.issued_by,
@@ -674,7 +725,7 @@ export default function TransfersPage() {
                     <th className="text-left px-3 py-2 font-medium">Route</th>
                     <th className="text-left px-3 py-2 font-medium">Status</th>
                     <th className="text-right px-3 py-2 font-medium">Items</th>
-                    <th className="text-right px-3 py-2 font-medium">Req / Iss / Rec</th>
+                    <th className="text-right px-3 py-2 font-medium">Lines iss / rec</th>
                     <th className="text-right px-3 py-2 font-medium">In transit</th>
                     <th className="text-left px-3 py-2 font-medium">Raised</th>
                     <th className="px-3 py-2" />
@@ -697,12 +748,15 @@ export default function TransfersPage() {
                         </td>
                         <td className="px-3 py-2"><StatusPill s={t.status} /></td>
                         <td className="px-3 py-2 text-right text-[#6B5744]">{t.item_count}</td>
-                        <td className="px-3 py-2 text-right whitespace-nowrap text-[#6B5744]">
-                          {fq(t.total_requested)} / {fq(t.total_issued)} / {fq(t.total_received)}
+                        {/* LINE counts, not Σ quantities — see TransferBase.total_*.
+                            Open the transfer for the per-item purchase-unit figures. */}
+                        <td className="px-3 py-2 text-right whitespace-nowrap text-[#6B5744]"
+                            title="Lines issued / received. Quantities are per material — open the transfer to see them in purchase units.">
+                          {t.lines_issued ?? 0} / {t.lines_received ?? 0}
                         </td>
                         <td className={`px-3 py-2 text-right whitespace-nowrap font-medium ${disc ? 'text-red-700' : t.total_in_transit > 0 ? 'text-blue-800' : 'text-[#8B7355]'}`}>
                           {t.total_in_transit > 0
-                            ? <span className="inline-flex items-center gap-1">{disc && <AlertTriangle className="w-3.5 h-3.5" />}{fq(t.total_in_transit)}</span>
+                            ? <span className="inline-flex items-center gap-1">{disc && <AlertTriangle className="w-3.5 h-3.5" />}{t.lines_in_transit ?? 0} line{(t.lines_in_transit ?? 0) === 1 ? '' : 's'}</span>
                             : '—'}
                         </td>
                         <td className="px-3 py-2 text-[#8B7355] whitespace-nowrap text-xs">
@@ -740,11 +794,12 @@ export default function TransfersPage() {
                   </div>
                   <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-[#6B5744]">
                     <span>{t.item_count} item{t.item_count === 1 ? '' : 's'}</span>
-                    <span>req {fq(t.total_requested)} · iss {fq(t.total_issued)} · rec {fq(t.total_received)}</span>
+                    {/* Line counts, not Σ quantities — see TransferBase.total_*. */}
+                    <span>{t.lines_issued ?? 0} issued · {t.lines_received ?? 0} received</span>
                     {t.total_in_transit > 0 && (
                       <span className={`ml-auto font-medium flex items-center gap-1 ${disc ? 'text-red-700' : 'text-blue-800'}`}>
                         {disc && <AlertTriangle className="w-3.5 h-3.5" />}
-                        {disc ? 'discrepancy' : 'in transit'} {fq(t.total_in_transit)}
+                        {disc ? 'discrepancy on' : 'in transit'} {t.lines_in_transit ?? 0} line{(t.lines_in_transit ?? 0) === 1 ? '' : 's'}
                       </span>
                     )}
                   </div>
@@ -1246,9 +1301,9 @@ function DetailModal({ transferId, accessByStore, elevated, onClose, onChanged }
                   </div>
 
                   <div className="mt-1.5 grid grid-cols-3 gap-2 text-[11px]">
-                    <div><div className="text-[9px] uppercase text-[#8B7355]">Requested</div><div className="text-[#2D1B0E]">{qtyText(it.qty_requested, it)}</div></div>
-                    <div><div className="text-[9px] uppercase text-[#8B7355]">Issued</div><div className="text-[#2D1B0E]">{it.qty_issued ? qtyText(it.qty_issued, it) : '—'}</div></div>
-                    <div><div className="text-[9px] uppercase text-[#8B7355]">Received</div><div className="text-[#2D1B0E]">{it.qty_received ? qtyText(it.qty_received, it) : '—'}</div></div>
+                    <QtyCell label="Requested" qty={it.qty_requested} m={it} />
+                    <QtyCell label="Issued" qty={it.qty_issued} m={it} dashIfZero />
+                    <QtyCell label="Received" qty={it.qty_received} m={it} dashIfZero />
                   </div>
 
                   {/* In-transit line while issued but not fully received */}
@@ -1272,17 +1327,29 @@ function DetailModal({ transferId, accessByStore, elevated, onClose, onChanged }
             })}
           </div>
 
-          {/* Rollup */}
-          <div className="text-xs text-[#6B5744] flex flex-wrap gap-x-4 gap-y-1 pt-1 border-t border-[#F0E4D6]">
-            <span>Requested <b className="text-[#2D1B0E]">{fq(t.total_requested)}</b></span>
-            <span>Issued <b className="text-[#2D1B0E]">{fq(t.total_issued)}</b></span>
-            <span>Received <b className="text-[#2D1B0E]">{fq(t.total_received)}</b></span>
-            {t.total_in_transit > 0 && (
-              <span className={t.status === 'received' ? 'text-red-700 font-medium' : 'text-blue-800 font-medium'}>
-                {t.status === 'received' ? 'Discrepancy' : 'In transit'} {fq(t.total_in_transit)}
-              </span>
-            )}
-          </div>
+          {/* Rollup — LINE counts. A Σ across materials (ml + g + pcs) has no
+              unit in either basis, so the quantities stay per item above, each
+              already reading in its purchase unit. */}
+          {(() => {
+            const linesIssued = t.items.filter(it => it.qty_issued > 0).length;
+            const linesReceived = t.items.filter(it => it.qty_received > 0).length;
+            const linesOut = t.items.filter(it => it.in_transit > 0).length;
+            return (
+              <div className="text-xs text-[#6B5744] flex flex-wrap gap-x-4 gap-y-1 pt-1 border-t border-[#F0E4D6]">
+                <span>{t.items.length} line{t.items.length === 1 ? '' : 's'}</span>
+                <span>Issued <b className="text-[#2D1B0E]">{linesIssued}</b></span>
+                <span>Received <b className="text-[#2D1B0E]">{linesReceived}</b></span>
+                {linesOut > 0 && (
+                  <span className={t.status === 'received' ? 'text-red-700 font-medium' : 'text-blue-800 font-medium'}>
+                    {t.status === 'received' ? 'Discrepancy on' : 'In transit'} {linesOut} line{linesOut === 1 ? '' : 's'}
+                  </span>
+                )}
+                <span className="basis-full text-[10px] text-[#8B7355]">
+                  Quantities are per line above, in purchase units — they are not added up across materials.
+                </span>
+              </div>
+            );
+          })()}
         </>
       )}
     </ModalShell>

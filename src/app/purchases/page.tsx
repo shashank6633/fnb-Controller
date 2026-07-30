@@ -28,6 +28,7 @@ import Papa from 'papaparse';
 import type { Purchase, RawMaterial } from '@/types';
 import { api } from '@/lib/api';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
+import { packFactor, fmtQtyNum } from '@/lib/pack-units';
 
 function formatCurrency(value: number): string {
   return '₹' + value.toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -182,6 +183,48 @@ const emptyBill: BillFormData = {
 export default function PurchasesPage() {
   const [purchases, setPurchases] = useState<Purchase[]>([]);
   const [materials, setMaterials] = useState<RawMaterial[]>([]);
+  /**
+   * PURCHASE-unit label resolver for every quantity/rate box on this page.
+   * /api/purchases, /api/purchases/bulk and /api/purchases/opening-stock all
+   * read `quantity` as PURCHASE units and `unit_price` as ₹ per purchase unit;
+   * each applies the ×pack_size step to stock itself. So nothing here converts —
+   * this only supplies the LABEL and the "= N g" reading hint, and posting is
+   * untouched. `pf` is 1 unless BOTH halves of the guard hold (pack_size > 1 AND
+   * recipe unit ≠ purchase unit) — packFactor owns that rule.
+   */
+  const matUnits = (materialId: string) => {
+    const m = materials.find(x => x.id === materialId) as any;
+    if (!m) return { pu: '', ru: '', pf: 1 };
+    const ru = String(m.unit || '');
+    return {
+      pu: String(m.purchase_unit || ru || ''),
+      ru,
+      pf: packFactor({ unit: ru, purchase_unit: m.purchase_unit, pack_size: m.pack_size }),
+    };
+  };
+  /** "= 20,000 g" for a purchase-unit entry box. Reads the RAW string — never
+   *  writes it back (Number()-ing on each keystroke makes "2." untypeable). */
+  const recipeHint = (raw: string, u: { ru: string; pf: number }) => {
+    if (u.pf <= 1) return null;
+    const q = parseFloat(raw);
+    if (!Number.isFinite(q) || q === 0) return null;
+    return `= ${fmtQtyNum(q * u.pf)} ${u.ru}`;
+  };
+  /**
+   * Is this quantity/price box actually on the CASE basis? This is the LABEL
+   * mirror of the guard inside handleSubmit() and billSubmit(): both multiply
+   * the typed quantity (and divide the typed rate) by case_size ONLY when the
+   * mode is 'case' AND case_size > 1. A mode left on 'case' after switching to
+   * a non-case material silently falls back to purchase-unit behaviour, so a
+   * label keyed on entry_mode ALONE would announce a basis the arithmetic is
+   * not using. Every annotation on both forms keys on this one helper — the
+   * bug being fixed here was exactly one annotation guarding and its sibling
+   * not (buyer read "in BTL", typed 60 cases-worth, booked 720 bottles).
+   */
+  const caseBasis = (materialId: string, mode?: 'btl' | 'case') => {
+    const cs = Number((materials.find(x => x.id === materialId) as any)?.case_size) || 1;
+    return { cs, on: mode === 'case' && cs > 1 };
+  };
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -893,6 +936,9 @@ export default function PurchasesPage() {
     const XLSX = await import('xlsx');
     const sample = [...materials].sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
     const ex1: any = sample[0];
+    // pack-rule-lock: picks a packed material to make the spreadsheet EXAMPLE row
+    // illustrative. No quantity is converted here, so the both-halves guard has
+    // nothing to protect — a kg/kg material chosen as the sample is still a valid sample.
     const ex2: any = sample.find((m: any) => (Number(m.pack_size) || 1) > 1) || sample[1];
     // Full GRN-Inward column set, in the inward sheet's order, + our extras
     // (bill_no, brand, gst_amount, notes). Invoice ID is NOT a column — it is
@@ -1350,18 +1396,20 @@ export default function PurchasesPage() {
                     </td>
                     <td className="py-3 px-4 text-right text-[#3D2614] font-mono">
                       {(() => {
+                        // p.unit_price is ALREADY ₹ per purchase unit (purchase_unit_price
+                        // is its alias), so there is no division here — only the label.
+                        // It used to be printed bare for pack-1 materials, which left a
+                        // ₹ figure next to a purchase quantity with no unit at all; the
+                        // "/ kg" reads the same for pack 1 and pack 1000.
                         const pup = (p as any).purchase_unit_price;
-                        const pu = (p as any).material_purchase_unit;
-                        const ps = (p as any).material_pack_size;
-                        if (pup != null && ps && ps > 1) {
-                          return (
-                            <>
-                              {formatCurrency(pup)}
-                              <span className="ml-1 text-[10px] text-[#8B7355]">/ {pu}</span>
-                            </>
-                          );
-                        }
-                        return formatCurrency(p.unit_price);
+                        const pu = (p as any).material_purchase_unit || (p as any).material_unit;
+                        const rate = pup != null ? pup : p.unit_price;
+                        return (
+                          <>
+                            {formatCurrency(rate)}
+                            {pu ? <span className="ml-1 text-[10px] text-[#8B7355]">/ {pu}</span> : null}
+                          </>
+                        );
                       })()}
                     </td>
                     <td className="py-3 px-4 text-right text-green-400 font-mono font-medium">
@@ -1539,13 +1587,35 @@ export default function PurchasesPage() {
                 <div>
                   <label className="block text-sm font-medium text-[#6B5744] mb-1">
                     Quantity <span className="text-red-400">*</span>
+                    {/* State the basis on the label, not just under the box: this
+                        field is PURCHASE units (kg / L / BTL / CASE). The API
+                        rejects a recipe-unit figure silently — it just books 20 g
+                        as 20 kg — so the unit has to be visible while typing. */}
                     {(() => {
-                      const mat = materials.find(m => m.id === formData.material_id) as any;
-                      const cs = Number(mat?.case_size) || 1;
-                      if (cs <= 1) return null;
+                      const u = matUnits(formData.material_id);
+                      const cb = caseBasis(formData.material_id, formData.entry_mode);
+                      // The CASE option on the selector below switches this box to
+                      // the CASE basis and handleSubmit() multiplies by case_size,
+                      // so the label MUST switch with it. A fixed "(purchase unit)"
+                      // here told a buyer receiving 5 cases of 100 PIPERS to type
+                      // 60 — and booked 60 × 12 = 720 bottles of stock.
+                      if (cb.on) return (
+                        <span className="ml-2 text-[10px] font-normal text-[#8B7355]">
+                          in <b className="text-[#6B5744]">CASE</b>{u.pu ? ` (${cb.cs} ${u.pu} per case)` : ''}
+                        </span>
+                      );
+                      if (!u.pu) return <span className="ml-2 text-[10px] font-normal text-[#B8A590]">in purchase units</span>;
+                      return <span className="ml-2 text-[10px] font-normal text-[#8B7355]">in <b className="text-[#6B5744]">{u.pu}</b> (purchase unit)</span>;
+                    })()}
+                    {(() => {
+                      const cb = caseBasis(formData.material_id, formData.entry_mode);
+                      // Only in BTL mode: in CASE mode the label above already
+                      // carries the same factor, so printing it twice just adds
+                      // noise to the row.
+                      if (cb.cs <= 1 || cb.on) return null;
                       return (
                         <span className="ml-2 text-[10px] font-normal text-[#8B7355]">
-                          case_size = {cs} btl/case
+                          case_size = {cb.cs} btl/case
                         </span>
                       );
                     })()}
@@ -1574,16 +1644,39 @@ export default function PurchasesPage() {
                     })()}
                   </div>
                   {(() => {
-                    const mat = materials.find(m => m.id === formData.material_id) as any;
-                    const cs = Number(mat?.case_size) || 1;
+                    const cb = caseBasis(formData.material_id, formData.entry_mode);
                     const q = parseFloat(formData.quantity) || 0;
-                    if (cs <= 1 || formData.entry_mode !== 'case' || q <= 0) return null;
-                    return <div className="text-[11px] text-emerald-700 font-mono mt-0.5">= {q * cs} bottles ({q} × {cs})</div>;
+                    if (!cb.on || q <= 0) return null;
+                    return <div className="text-[11px] text-emerald-700 font-mono mt-0.5">= {q * cb.cs} bottles ({q} × {cb.cs})</div>;
+                  })()}
+                  {/* Recipe-unit reading of what was typed. Display only — the POST
+                      still sends the purchase-unit number verbatim. Suppressed in
+                      CASE mode, where the line above already does the expansion. */}
+                  {(() => {
+                    if (caseBasis(formData.material_id, formData.entry_mode).on) return null;
+                    const u = matUnits(formData.material_id);
+                    const h = recipeHint(formData.quantity, u);
+                    return h ? <div className="text-[9px] text-[#B8A590] font-mono mt-0.5">{h}</div> : null;
                   })()}
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-[#6B5744] mb-1">
                     Unit Price (₹) <span className="text-red-400">*</span>
+                    {/* ₹ per PURCHASE unit — the vendor's rate. The ₹/recipe-unit
+                        weighted average is derived server-side (÷ pack_size). */}
+                    {(() => {
+                      const u = matUnits(formData.material_id);
+                      const cb = caseBasis(formData.material_id, formData.entry_mode);
+                      // In CASE mode handleSubmit() does rawPrice / case_size, so
+                      // the box means ₹ per CASE. Same wording the bill grid
+                      // already uses for its per-line case rate.
+                      if (cb.on) return (
+                        <span className="ml-2 text-[10px] font-normal text-[#8B7355]">
+                          per case{u.pu ? ` (${cb.cs} ${u.pu})` : ''}
+                        </span>
+                      );
+                      return <span className="ml-2 text-[10px] font-normal text-[#8B7355]">per {u.pu || 'purchase unit'}</span>;
+                    })()}
                   </label>
                   <input
                     type="number"
@@ -1807,8 +1900,9 @@ export default function PurchasesPage() {
                           <th className="text-left py-2 px-3 font-medium">#</th>
                           <th className="text-left py-2 px-3 font-medium">Item Name</th>
                           <th className="text-left py-2 px-3 font-medium">Vendor</th>
-                          <th className="text-right py-2 px-3 font-medium">Qty</th>
-                          <th className="text-right py-2 px-3 font-medium">Unit Price</th>
+                          <th className="text-right py-2 px-3 font-medium" title="Inward qty in the material's PURCHASE unit — the importer multiplies by pack_size to get stock">Qty</th>
+                          <th className="text-left py-2 px-3 font-medium" title="Purchase unit: from the sheet's purchase_unit column when present, otherwise the material's configured unit (matched by name). Blank = no matching material — the server will skip or auto-create the row.">Unit</th>
+                          <th className="text-right py-2 px-3 font-medium" title="₹ per purchase unit">Unit Price</th>
                           <th className="text-right py-2 px-3 font-medium">Total</th>
                           <th className="text-right py-2 px-3 font-medium">GST</th>
                           <th className="text-left py-2 px-3 font-medium">Date</th>
@@ -1821,6 +1915,21 @@ export default function PurchasesPage() {
                             <td className="py-1.5 px-3 text-[#2D1B0E] text-xs font-medium">{row.item_name}</td>
                             <td className="py-1.5 px-3 text-[#6B5744] text-xs">{row.vendor || '-'}</td>
                             <td className="py-1.5 px-3 text-right text-[#2D1B0E] font-mono text-xs">{row.quantity}</td>
+                            {/* The importer reads `quantity` as PURCHASE units (it
+                                applies ×pack_size itself). Printing it bare left a
+                                sheet of naked numbers with no way to tell 20 kg from
+                                20 g — resolve the unit the same way the server will:
+                                sheet column first, else the material matched by name. */}
+                            <td className="py-1.5 px-3 text-left text-[#8B7355] font-mono text-xs">
+                              {(() => {
+                                const sheetUnit = String(row.purchase_unit || '').trim();
+                                if (sheetUnit) return sheetUnit;
+                                const nm = String(row.item_name || '').toLowerCase().trim();
+                                const m = nm ? (materials.find(x => String(x.name || '').toLowerCase().trim() === nm) as any) : null;
+                                const u = m ? String(m.purchase_unit || m.unit || '').trim() : '';
+                                return u || <span className="text-[#B8A590]">—</span>;
+                              })()}
+                            </td>
                             <td className="py-1.5 px-3 text-right text-[#2D1B0E] font-mono text-xs">{formatCurrency(row.unit_price)}</td>
                             <td className="py-1.5 px-3 text-right text-green-600 font-mono text-xs">
                               {formatCurrency(row.total_amount || row.unit_price * row.quantity)}
@@ -1833,7 +1942,7 @@ export default function PurchasesPage() {
                         ))}
                         {bulkParsedData.length > 100 && (
                           <tr>
-                            <td colSpan={8} className="py-2 px-3 text-center text-xs text-[#8B7355]">
+                            <td colSpan={9} className="py-2 px-3 text-center text-xs text-[#8B7355]">
                               ... and {bulkParsedData.length - 100} more rows (showing first 100)
                             </td>
                           </tr>
@@ -2089,8 +2198,13 @@ export default function PurchasesPage() {
                       <tr className="text-[#6B5744]">
                         <th className="text-left py-2.5 px-3 font-medium w-[30%]">Material *</th>
                         <th className="text-left py-2.5 px-3 font-medium w-[12%]">Brand</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="Number of bottles / cans / packs (not cases)">Qty * <span className="text-[10px] font-normal text-[#8B7355]">(bottles)</span></th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[12%]" title="Per-bottle vendor rate">Unit Price (₹) * <span className="text-[10px] font-normal text-[#8B7355]">/btl</span></th>
+                        {/* These two headers used to be hard-coded "(bottles)" and
+                            "/btl" — true for a liquor bill, plain wrong for the kg /
+                            L / PKT lines that make up most of a grocery bill. Both
+                            columns are the material's own PURCHASE unit, printed
+                            per line under each box. */}
+                        <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="In the material's purchase unit — bottles / kg / L / PKT (not cases, unless you switch the line to CASE)">Qty * <span className="text-[10px] font-normal text-[#8B7355]">(purchase units)</span></th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[12%]" title="Vendor rate per purchase unit (per bottle / per kg / per L)">Unit Price (₹) * <span className="text-[10px] font-normal text-[#8B7355]">/ purchase unit</span></th>
                         <th className="text-right py-2.5 px-3 font-medium w-[10%]">Line Total</th>
                         <th className="text-right py-2.5 px-3 font-medium w-[10%]">Discount</th>
                         <th className="text-right py-2.5 px-3 font-medium w-[12%]">Final Unit ₹</th>
@@ -2153,6 +2267,31 @@ export default function PurchasesPage() {
                                       = {expandedBtl} btl × {caseSize}
                                     </div>
                                   )}
+                                  {/* Purchase unit + the recipe reading of what was
+                                      typed. Display only — the line still posts the
+                                      purchase-unit number (expanded by case_size in
+                                      CASE mode, exactly as before). */}
+                                  {(() => {
+                                    const u = matUnits(item.material_id);
+                                    // A CASE line holds CASES, not BTL — billSubmit
+                                    // posts qty × case_size. Printing the purchase
+                                    // unit unconditionally declared "5 BTL" under a
+                                    // box that meant 5 cases = 60 BTL. The recipe
+                                    // hint below was already suppressed here; the
+                                    // unit itself was not.
+                                    if (mode === 'case' && hasCase) return (
+                                      <div className="text-[9px] text-[#B8A590] text-right">
+                                        case{u.pu ? ` (${caseSize} ${u.pu})` : ''}
+                                      </div>
+                                    );
+                                    if (!u.pu) return null;
+                                    const h = recipeHint(item.quantity, u);
+                                    return (
+                                      <div className="text-[9px] text-[#B8A590] text-right">
+                                        {u.pu}{h ? ` · ${h}` : ''}
+                                      </div>
+                                    );
+                                  })()}
                                 </div>
                               );
                             })()}
@@ -2165,11 +2304,21 @@ export default function PurchasesPage() {
                               onChange={(e) => updateBillLine(item.id, 'unit_price', e.target.value)}
                               placeholder="0"
                               className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
-                              title={item.entry_mode === 'case' ? 'Per-case rate' : 'Per-bottle rate'}
+                              title={caseBasis(item.material_id, item.entry_mode).on ? 'Per-case rate' : 'Per-bottle rate'}
                             />
-                            {item.entry_mode === 'case' && (
+                            {/* Sibling of the Qty cell above — keyed on the SAME
+                                effective guard, so a line left on 'case' after
+                                switching to a material with no case_size (where
+                                billSubmit falls back to the per-unit rate) stops
+                                claiming "per case". */}
+                            {caseBasis(item.material_id, item.entry_mode).on ? (
                               <div className="text-[9px] text-[#8B7355] text-right">per case</div>
-                            )}
+                            ) : (() => {
+                              // ₹ per PURCHASE unit. Stored as ₹/purchase-unit too;
+                              // the ₹/recipe-unit average is derived server-side.
+                              const u = matUnits(item.material_id);
+                              return u.pu ? <div className="text-[9px] text-[#B8A590] text-right">₹ / {u.pu}</div> : null;
+                            })()}
                           </td>
                           <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744] block md:table-cell">
                             <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Line Total</span>

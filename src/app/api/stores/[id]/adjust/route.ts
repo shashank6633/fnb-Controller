@@ -109,8 +109,18 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         store_id: storeId, store: store.name,
         material_id: materialId, material: mat.name,
         quantity, recipe_unit: mat.unit, unit_cost: unitCost, reason,
+        // Purchase-basis companions (ADDITIVE — `quantity` stays the recipe
+        // truth the ledger actually holds).
+        purchase_qty: Math.round((quantity / packConv) * 1000) / 1000,
+        purchase_unit: mat.purchase_unit || mat.unit,
+        pack_factor: packConv,
       },
-      note: `${store.name}: ${txnType} ${quantity > 0 ? '+' : ''}${quantity} ${mat.unit} ${mat.name} — ${reason}`,
+      // Purchase unit leads (what the store counted); the exact recipe figure
+      // follows in brackets, and only when the two differ.
+      note: `${store.name}: ${txnType} ${quantity > 0 ? '+' : ''}`
+        + `${Math.round((quantity / packConv) * 1000) / 1000} ${mat.purchase_unit || mat.unit}`
+        + `${packConv > 1 ? ` (${quantity} ${mat.unit})` : ''}`
+        + ` ${mat.name} — ${reason}`,
     });
 
     return Response.json({ ok: true, ledger_id: ledgerId }, { status: 201 });

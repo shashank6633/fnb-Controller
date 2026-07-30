@@ -1,4 +1,38 @@
 /**
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║ THE PURCHASE-UNIT LOCK — read this before rendering any quantity.        ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ *
+ * OWNER RULE (2026-07-29): every quantity on a Purchase / Inventory page,
+ * sub-page or tab LEADS with the PURCHASE unit (kg / L / BTL / CASE). The
+ * recipe figure (g / ml) may appear only as a small declared hint, house style:
+ *
+ *     <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(q)} {m.unit}</div>
+ *
+ * Only four things stay in recipe units, and each must be LABELLED as recipe on
+ * screen — never silently converted, never silently assumed:
+ *   1. recipes / sub-recipes / cookbook / menu-item costing (authored in grams)
+ *   2. food consumption computed FROM a recipe
+ *   3. exact-balance ledger reports (liquor Movement, variance reconciliation)
+ *   4. cross-material sums — never add ml + g + pcs. Print an em-dash, keep ₹.
+ *
+ * ALWAYS import packFactor / toPurchaseQty / dualQty / fmtBreakdown from here.
+ * NEVER re-derive the pack rule. The guard has TWO halves and local copies keep
+ * dropping the second one:
+ *
+ *     pack_size > 1  AND  lower(trim(unit)) !== lower(trim(purchase_unit))
+ *
+ * A local `pack_size > 1` alone mis-converts every material whose recipe unit
+ * already equals its purchase unit (live example: PICKLED GINGER 1.5KG, kg/kg,
+ * pack_size 1.5 — the short guard divides a 6 kg stock into "4.00 kg").
+ *
+ * ENFORCEMENT: scripts/check-purchase-units.js fails the build on any bare
+ * recipe-unit render in these modules, and carries the declared allow-list.
+ *
+ *     npm run check:units
+ *
+ * ── original notes ────────────────────────────────────────────────────────
+ *
  * Cases / Bottles / loose ↔ recipe-unit conversion helpers (bar counting
  * convention) — shared by the store APIs AND the Liquor Store page, so the
  * math can never drift between client preview and server posting.

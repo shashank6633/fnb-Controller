@@ -46,8 +46,8 @@ interface Row {
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
-const fq = (v: number, dp = 2) =>
-  Number((Number(v) || 0).toFixed(dp)).toLocaleString('en-IN');
+// (quantities all format through fmtQtyNum — one 3-dp rule, shared with every
+//  other converted surface; the local 2-dp helper it replaced is gone)
 const inr = (v: number, dp = 0) =>
   '₹' + (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: dp });
 const packMeta = (r: Row): PackMeta => ({
@@ -70,7 +70,7 @@ function QtyCell({ qty, r, strong }: { qty: number; r: Row; strong?: boolean }) 
   const converts = puQty !== qty || String(r.purchase_unit || '').toLowerCase().trim() !== String(r.unit || '').toLowerCase().trim();
   return (
     <div className={`text-right tabular-nums ${neg ? 'text-red-700' : zero ? 'text-[#B9A896]' : 'text-[#2D1B0E]'}`}
-         title={converts ? `= ${fq(qty)} ${r.unit || ''} (exact)` : undefined}>
+         title={converts ? `= ${fmtQtyNum(qty)} ${r.unit || ''} (exact stored balance)` : undefined}>
       <span className={strong ? 'font-semibold' : ''}>{fmtQtyNum(puQty)}{puLbl ? ' ' + puLbl : ''}</span>
       {dual && <div className="text-[10px] text-[#8B7355] font-normal leading-tight">{dual}</div>}
     </div>
@@ -208,6 +208,8 @@ export default function StockOverviewPage() {
           </h1>
           <p className="text-xs text-[#6B5744] mt-0.5">
             Central grocery backstock plus every material across the Liquor Store and each floor bar, with total qty and value.
+            {' '}Every quantity reads in <b>purchase units</b> (kg / BTL / CASE); the small line beneath is the cases + bottles + loose
+            breakdown, and hovering a figure shows the exact recipe-unit balance the ₹ column is computed from.
             {generatedAt && <span className="text-[#B9A896]"> · as of {new Date(generatedAt).toLocaleString('en-IN')}</span>}
           </p>
         </div>

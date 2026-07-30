@@ -85,8 +85,13 @@ export async function GET(request: Request) {
     // per purchase unit.
     const candidates = db.prepare(`
       SELECT rm.id, rm.sku, rm.name, rm.unit, rm.purchase_unit, rm.pack_size, rm.average_price,
+        -- pack-rule-lock: both halves ARE enforced, just in the outer WHERE below
+        -- (pack_size > 1 AND LOWER(unit) <> LOWER(purchase_unit)), so a kg/kg
+        -- material like PICKLED GINGER 1.5KG never reaches this CASE at all.
+        -- Restating the second half here would be redundant, not safer.
         (SELECT CASE
              WHEN rm.pack_size > 1 AND p.quantity >= rm.pack_size AND (p.quantity % rm.pack_size) = 0
+               -- pack-rule-lock: guarded by the outer WHERE, see the note above
                THEN (p.total_price / p.quantity) * rm.pack_size
              ELSE (p.total_price / p.quantity)
            END

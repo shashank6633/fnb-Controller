@@ -9,14 +9,16 @@
  * show only "received in the last 30 days" with a "not counted yet" chip —
  * never presented as a true balance.
  *
- * DISPLAY convention (app-wide): quantities in PURCHASE units = recipe ÷ pack
- * (same as StaffCatalogPicker stockInPU).
+ * DISPLAY convention (app-wide): every quantity LEADS in PURCHASE units
+ * (recipe ÷ pack) with the recipe figure as a small hint underneath. Storage is
+ * untouched — last_count / issued_since / on_hand_est stay RECIPE units on the
+ * wire, and est_value is computed server-side as recipe × ₹/recipe-unit.
  */
 
 import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Boxes, Loader2, Search, Warehouse } from 'lucide-react';
 import TabScroller from '@/components/TabScroller';
-import { packFactor as sharedPackFactor } from '@/lib/pack-units';
+import { fmtQtyNum, packFactor as sharedPackFactor, toPurchaseQty } from '@/lib/pack-units';
 
 interface Row {
   material_id: string; name: string; category: string; unit: string;
@@ -31,11 +33,13 @@ interface Department { id: string; name: string; code?: string; parent_id?: stri
 const inr = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 /** Recipe-units per purchase unit — the ONE shared guard (pack-units). */
 const packFactor = (r: Row) => sharedPackFactor(r);
-const inPU = (r: Row, recipeQty: number) => {
-  const v = recipeQty / packFactor(r);
-  return v.toLocaleString('en-IN', { maximumFractionDigits: 2 });
-};
+/** Stored RECIPE qty → the purchase-unit figure printed on screen (3 dp). */
+const inPU = (r: Row, recipeQty: number) => fmtQtyNum(toPurchaseQty(recipeQty, r));
 const puLabel = (r: Row) => r.purchase_unit || r.unit || '';
+/** The small "= 30,000 g" recipe hint. Null when the material never converts,
+ *  so a pack-1 item doesn't get a second line repeating the same number. */
+const recipeHint = (r: Row, recipeQty: number) =>
+  packFactor(r) > 1 ? `= ${fmtQtyNum(recipeQty)} ${r.unit}` : null;
 
 export default function DepartmentStockPage() {
   const [me, setMe] = useState<any>(null);
@@ -232,12 +236,20 @@ export default function DepartmentStockPage() {
                         <div className="text-sm font-bold text-amber-800">
                           Recd 30d: {inPU(r, r.on_hand_est)} {puLabel(r)}
                         </div>
+                        {recipeHint(r, r.on_hand_est) && (
+                          <div className="text-[9px] text-[#B8A590]">{recipeHint(r, r.on_hand_est)}</div>
+                        )}
                         {neverChip}
                       </>
                     ) : (
-                      <div className="text-sm font-bold text-[#2D1B0E]">
-                        {inPU(r, r.on_hand_est)} {puLabel(r)}
-                      </div>
+                      <>
+                        <div className="text-sm font-bold text-[#2D1B0E]">
+                          {inPU(r, r.on_hand_est)} {puLabel(r)}
+                        </div>
+                        {recipeHint(r, r.on_hand_est) && (
+                          <div className="text-[9px] text-[#B8A590]">{recipeHint(r, r.on_hand_est)}</div>
+                        )}
+                      </>
                     )}
                     <div className="text-[10px] text-[#6B5744]">{inr(r.est_value)}</div>
                   </div>
@@ -246,10 +258,21 @@ export default function DepartmentStockPage() {
                   <span>
                     Last counted: {r.never_counted
                       ? <span className="text-amber-700 font-semibold">Never</span>
-                      : `${inPU(r, r.last_count || 0)} ${puLabel(r)} on ${r.last_count_date}`}
+                      : <>
+                          {inPU(r, r.last_count || 0)} {puLabel(r)}
+                          {recipeHint(r, r.last_count || 0) && (
+                            <span className="text-[9px] text-[#B8A590]"> ({recipeHint(r, r.last_count || 0)})</span>
+                          )}
+                          {' '}on {r.last_count_date}
+                        </>}
                   </span>
                   {!r.never_counted && (
-                    <span>Received since: {inPU(r, r.issued_since)} {puLabel(r)}</span>
+                    <span>
+                      Received since: {inPU(r, r.issued_since)} {puLabel(r)}
+                      {recipeHint(r, r.issued_since) && (
+                        <span className="text-[9px] text-[#B8A590]"> ({recipeHint(r, r.issued_since)})</span>
+                      )}
+                    </span>
                   )}
                 </div>
               </div>
@@ -281,6 +304,9 @@ export default function DepartmentStockPage() {
                         <>
                           {inPU(r, r.last_count || 0)} {puLabel(r)}
                           <span className="text-[#8B7355]"> · {r.last_count_date}</span>
+                          {recipeHint(r, r.last_count || 0) && (
+                            <span className="block text-[9px] text-[#B8A590]">{recipeHint(r, r.last_count || 0)}</span>
+                          )}
                         </>
                       )}
                     </td>
@@ -288,16 +314,29 @@ export default function DepartmentStockPage() {
                       {r.never_counted ? (
                         <span className="text-[#B8A088]">—</span>
                       ) : (
-                        <>{inPU(r, r.issued_since)} {puLabel(r)}</>
+                        <>
+                          {inPU(r, r.issued_since)} {puLabel(r)}
+                          {recipeHint(r, r.issued_since) && (
+                            <span className="block text-[9px] text-[#B8A590]">{recipeHint(r, r.issued_since)}</span>
+                          )}
+                        </>
                       )}
                     </td>
                     <td className="py-1.5 px-3 text-right font-mono">
                       {r.never_counted ? (
                         <span className="text-amber-800">
                           Recd 30d: {inPU(r, r.on_hand_est)} {puLabel(r)} {neverChip}
+                          {recipeHint(r, r.on_hand_est) && (
+                            <span className="block text-[9px] font-normal text-[#B8A590]">{recipeHint(r, r.on_hand_est)}</span>
+                          )}
                         </span>
                       ) : (
-                        <span className="font-bold text-[#2D1B0E]">{inPU(r, r.on_hand_est)} {puLabel(r)}</span>
+                        <span className="font-bold text-[#2D1B0E]">
+                          {inPU(r, r.on_hand_est)} {puLabel(r)}
+                          {recipeHint(r, r.on_hand_est) && (
+                            <span className="block text-[9px] font-normal text-[#B8A590]">{recipeHint(r, r.on_hand_est)}</span>
+                          )}
+                        </span>
                       )}
                     </td>
                     <td className="py-1.5 px-3 text-right font-mono text-xs">{inr(r.est_value)}</td>
@@ -316,8 +355,10 @@ export default function DepartmentStockPage() {
       )}
 
       <p className="text-[10px] text-[#8B7355] leading-relaxed">
-        Estimate = last closing count + store issues since. Kitchen/bar usage between counts
-        reflects only after the next closing count. Party-event stock is tracked separately.
+        Quantities are shown in <strong>purchase units</strong> (kg / L / BTL); the small grey
+        line underneath is the same figure in recipe units. Estimate = last closing count + store
+        issues since. Kitchen/bar usage between counts reflects only after the next closing count.
+        Party-event stock is tracked separately.
       </p>
     </div>
   );

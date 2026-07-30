@@ -17,6 +17,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ChevronLeft, Check, Loader2, SkipForward, MapPin } from 'lucide-react';
 import { api } from '@/lib/api';
+// Purchase-unit lock: the count box is labelled in the PURCHASE unit, so the
+// pack rule must come from the shared resolver — a local `pack_size > 1` drops
+// the second half of the guard and writes a count nobody typed.
+// See src/lib/pack-units.ts and scripts/check-purchase-units.js.
+import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 
 interface LocSummary { location: string; items: number; counted_today: number; }
 interface Item {
@@ -81,8 +86,9 @@ export default function EODPage() {
     if (!active || !keypad || isNaN(Number(keypad))) { setError('Enter a number first'); return; }
     setSaving(true);
     try {
-      const inPurchase = !!(active.pack_size && active.pack_size > 1);
-      const physical = Number(keypad) * (inPurchase ? active.pack_size! : 1);
+      // Purchase-unit entry → the stored recipe basis, converted exactly once,
+      // here, at the POST boundary, through the same resolver the label uses.
+      const physical = Number(keypad) * packFactor(active);
       const r = await api('/api/closing-stock', {
         method: 'POST',
         body: { date: today(), items: [{ material_id: active.id, physical_stock: physical }] },
@@ -173,10 +179,11 @@ export default function EODPage() {
   if (loading || !active) {
     return <div className="min-h-screen bg-[#FFF8F0] flex items-center justify-center"><Loader2 className="animate-spin" size={28} /></div>;
   }
-  const inPurchase = !!(active.pack_size && active.pack_size > 1);
-  const sysDisplay = inPurchase
-    ? `${(active.current_stock / active.pack_size!).toFixed(2)} ${active.purchase_unit}`
-    : `${active.current_stock} ${active.unit}`;
+  const activePf = packFactor(active);
+  const activePu = active.purchase_unit || active.unit;
+  // Purchase basis leads; the stored recipe figure follows as the hint.
+  const sysDisplay = `${fmtQtyNum(toPurchaseQty(active.current_stock, active))} ${activePu}`
+    + (activePf > 1 ? ` (= ${fmtQtyNum(active.current_stock)} ${active.unit})` : '');
   const isLow = (active.current_stock || 0) < (active.reorder_level || 0);
   const pct = items.length > 0 ? Math.round((counted / items.length) * 100) : 0;
 
@@ -222,7 +229,16 @@ export default function EODPage() {
           <div className="text-4xl font-bold text-[#2D1B0E] mt-1 font-mono min-h-[3rem]">
             {keypad || <span className="text-[#D4B896]">0</span>}
           </div>
-          <div className="text-xs text-[#6B5744] mt-1">{inPurchase ? active.purchase_unit : active.unit}</div>
+          {/* The box is always in the purchase unit; saveCount converts back
+              with the same packFactor(), so label and storage cannot disagree. */}
+          <div className="text-xs text-[#6B5744] mt-1">
+            {activePu}
+            {activePf > 1 && (
+              <span className="block text-[9px] text-[#B8A590]">
+                1 {activePu} = {fmtQtyNum(activePf)} {active.unit}
+              </span>
+            )}
+          </div>
           {error && <div className="text-[10px] text-red-700 mt-1">{error}</div>}
         </div>
       </div>

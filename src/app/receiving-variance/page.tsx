@@ -264,10 +264,13 @@ export default function ReceivingVariancePage() {
                   <th className="text-left  py-2 px-3 font-medium">GRN · PO</th>
                   <th className="text-left  py-2 px-3 font-medium">Vendor</th>
                   <th className="text-left  py-2 px-3 font-medium">Material</th>
-                  <th className="text-right py-2 px-3 font-medium">Ordered</th>
-                  <th className="text-right py-2 px-3 font-medium">Received</th>
-                  <th className="text-right py-2 px-3 font-medium">Accepted</th>
-                  <th className="text-right py-2 px-3 font-medium">Δ</th>
+                  {/* Every quantity column below is in the material's PURCHASE unit
+                      (kg / L / BTL / CASE) and each cell carries that unit — say so
+                      in the header too, so the basis is stated before the numbers. */}
+                  <th className="text-right py-2 px-3 font-medium" title="In the material's purchase unit — kg, L, BTL, CASE">Ordered <span className="font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                  <th className="text-right py-2 px-3 font-medium" title="In the material's purchase unit — kg, L, BTL, CASE">Received <span className="font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                  <th className="text-right py-2 px-3 font-medium" title="In the material's purchase unit — kg, L, BTL, CASE">Accepted <span className="font-normal text-[9px] text-[#B8A590]">(purchase units)</span></th>
+                  <th className="text-right py-2 px-3 font-medium" title="Accepted − Ordered, in the material's purchase unit">Δ</th>
                   <th className="text-right py-2 px-3 font-medium">Δ ₹</th>
                   <th className="text-left  py-2 px-3 font-medium">Reject reason</th>
                 </tr>

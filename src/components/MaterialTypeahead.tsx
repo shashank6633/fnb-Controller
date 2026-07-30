@@ -73,6 +73,10 @@ export default function MaterialTypeahead({
       unit: String(m.purchase_unit || m.unit || ''),
     };
   };
+  // Every unit label on this component must come from here, including the picked
+  // chip's title tooltip. Reading m.unit directly anywhere makes that label
+  // contradict its own chip the moment purchaseBasis is on — "SALTED BUTTER
+  // 500 GM (PKT)" on screen, "(g)" on hover.
   const displayUnit = (m: MaterialLite): string =>
     purchaseBasis && m.purchase_unit != null
       ? String(m.purchase_unit || m.unit || '')
@@ -208,7 +212,7 @@ export default function MaterialTypeahead({
       {picked && !open ? (
         <button type="button"
                 onClick={() => { setOpen(true); setQuery(''); }}
-                title={`${picked.sku ? picked.sku + ' — ' : ''}${picked.name}${picked.unit ? ' (' + picked.unit + ')' : ''}`}
+                title={`${picked.sku ? picked.sku + ' — ' : ''}${picked.name}${displayUnit(picked) ? ' (' + displayUnit(picked) + ')' : ''}`}
                 className={`w-full text-left px-2 ${buttonSize} border border-[#E8D5C4] rounded bg-[#FFF8F0] flex items-start justify-between gap-1 hover:border-[#af4408]`}>
           {/* Wrap the full name across lines instead of truncating with an
               ellipsis. Long names like "EXTRA VIRGIN OLIVE OIL POMACE 1 LTR"

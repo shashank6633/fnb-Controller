@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { lockedUnitFields } from '@/lib/unit-audit-lock';
+import { packFactor } from '@/lib/pack-units';
 
 /** raw_materials unit-of-measure fields that Unit Audit owns. */
 const LOCKED_UNIT_FIELDS = new Set(['unit', 'purchase_unit', 'pack_size', 'case_size']);
@@ -53,6 +54,40 @@ const WRITABLE_FIELDS = Object.keys(FIELD_TYPES);
  *  matched no existing material (wrong-file guard — see the deactivation block). */
 class ZeroMatchAbort extends Error {}
 
+/**
+ * The export ships display-only PURCHASE-unit twins (avg_price_per_purchase_unit,
+ * reorder_level_purchase_unit) beside the writable RECIPE-basis columns. They are
+ * not in WRITABLE_FIELDS on purpose — writing them back would multiply every rate
+ * and buffer by pack_size on each round trip. But a manager who edits the column
+ * that matches the screen gets silence, so count those rows and say so.
+ *
+ * Read-only: runs on the payload BEFORE the transaction and never writes.
+ */
+function displayOnlyColumnEdits(rows: any[]): number {
+  let n = 0;
+  for (const r of rows) {
+    const pf = packFactor({ unit: r?.unit, purchase_unit: r?.purchase_unit, pack_size: Number(r?.pack_size) });
+    if (pf <= 1) continue;   // twins equal the recipe columns — nothing to disagree about
+    const pairs: [any, any, number, number][] = [
+      // [twin, recipe column, twin→recipe factor, rounding slack in recipe terms]
+      // The export rounds the qty twin to 3 dp and the ₹ twin to 2 dp, so an
+      // UNTOUCHED sheet is already off by up to half a place — 2 ml of a 750 ml
+      // bottle exports as 0.003 BTL and reads back as 2.25 ml. Without the
+      // absolute slack every tiny buffer would be flagged as an edit.
+      [r.reorder_level_purchase_unit, r.reorder_level, pf, 0.0006 * pf],
+      [r.avg_price_per_purchase_unit, r.average_price, 1 / pf, 0.006 / pf],
+    ];
+    for (const [twinRaw, recipeRaw, factor, slack] of pairs) {
+      if (twinRaw == null || twinRaw === '' || recipeRaw == null || recipeRaw === '') continue;
+      const twin = Number(twinRaw), recipe = Number(recipeRaw);
+      if (!Number.isFinite(twin) || !Number.isFinite(recipe) || recipe === 0) continue;
+      const implied = twin * factor;
+      if (Math.abs(implied - recipe) > Math.max(Math.abs(recipe) * 0.02, slack)) { n++; break; }
+    }
+  }
+  return n;
+}
+
 function coerce(field: string, raw: any): any {
   if (raw == null || raw === '') return undefined;
   const t = FIELD_TYPES[field];
@@ -83,6 +118,10 @@ export async function POST(request: Request) {
     if (rows.length === 0) {
       return Response.json({ error: 'rows array required' }, { status: 400 });
     }
+
+    // Read-only pre-scan (no DB, no writes): did anyone edit the display-only
+    // purchase-unit twins instead of the writable recipe-basis columns?
+    const displayOnlyEdits = displayOnlyColumnEdits(rows);
 
     const created: any[] = [];
     const updated: any[] = [];
@@ -285,10 +324,17 @@ export async function POST(request: Request) {
         + `items, fix your "sku" column and remove the duplicates.`
       : ``;
 
+    const displayOnlyWarning = displayOnlyEdits > 0
+      ? ` · ⚠ ${displayOnlyEdits} row(s) had edits in the display-only purchase-unit columns `
+        + `(avg_price_per_purchase_unit / reorder_level_purchase_unit) — those columns are IGNORED on `
+        + `import. Edit "average_price" (₹ per recipe unit) and "reorder_level" (recipe units) instead.`
+      : ``;
+
     return Response.json({
       created, updated, skipped, deactivated,
+      display_only_edits: displayOnlyEdits,
       summary: `Updated ${updated.length} · Created ${created.length} · Skipped ${skipped.length}` +
-               (deactivateMissing ? ` · Deactivated ${deactivated} not in file` : '') + createOnlyWarning,
+               (deactivateMissing ? ` · Deactivated ${deactivated} not in file` : '') + createOnlyWarning + displayOnlyWarning,
     });
   } catch (e: any) {
     console.error('[/api/inventory/round-trip-import]', e);

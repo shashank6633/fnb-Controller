@@ -268,11 +268,20 @@ export default function VarianceReportPage() {
                     <th className="text-left  py-1.5 px-3 font-medium">Date</th>
                     <th className="text-left  py-1.5 px-3 font-medium">SKU</th>
                     <th className="text-left  py-1.5 px-3 font-medium">Material</th>
-                    <th className="text-right py-1.5 px-3 font-medium" title="Σ purchase quantities up to count date">Purchases</th>
-                    <th className="text-right py-1.5 px-3 font-medium" title="Σ recipe-driven consumption up to count date (sales + parties + staff meals)">Recipe</th>
-                    <th className="text-right py-1.5 px-3 font-medium" title="Purchases − Recipe">Theoretical</th>
-                    <th className="text-right py-1.5 px-3 font-medium" title="Physical closing-stock count">Closing</th>
-                    <th className="text-right py-1.5 px-3 font-medium" title="Theoretical − Closing (positive = loss)">Loss</th>
+                    {/* unit-lock: EXCEPTION 3 (exact-balance ledger). This table is a
+                        reconciliation — Purchases − Recipe − Wastage = Theoretical, and
+                        Loss = Theoretical − Closing. Every term is carried in RECIPE units
+                        (the API converts purchases ×pack_size into the recipe basis before
+                        subtracting) so the identity closes with no rounding. Converting the
+                        columns to purchase units would round five terms independently and
+                        the balance would stop reconciling. The basis is therefore stated in
+                        every header instead — same precedent as the liquor Movement report's
+                        "Unit (recipe)" column. */}
+                    <th className="text-right py-1.5 px-3 font-medium" title="Σ purchase quantities up to count date, converted into the recipe unit">Purchases <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Σ recipe-driven consumption up to count date (sales + parties + staff meals)">Recipe <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Purchases − Recipe">Theoretical <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Physical closing-stock count">Closing <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Theoretical − Closing (positive = loss)">Loss <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
                     <th className="text-right py-1.5 px-3 font-medium" title="Loss × material avg price">Loss ₹</th>
                     <th className="text-left  py-1.5 px-3 font-medium">By</th>
                     <th className="text-left  py-1.5 px-3 font-medium">Notes</th>

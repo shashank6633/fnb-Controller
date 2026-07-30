@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { packFactor } from '@/lib/pack-units';
 
 /**
  * Export every raw_material as a round-trip CSV — every editable field
@@ -77,10 +78,11 @@ export async function GET() {
     // corrupt the stored basis by editing the wrong cell.
     lines.push([...COLUMNS, 'avg_price_per_purchase_unit', 'current_stock_purchase_unit', 'reorder_level_purchase_unit'].join(','));
     for (const r of rows) {
-      const pack = Number(r.pack_size) || 1;
-      const packed = !!(r.purchase_unit
-        && String(r.purchase_unit).toLowerCase().trim() !== String(r.unit || '').toLowerCase().trim()
-        && pack > 1);
+      // packFactor IS the both-halves guard (pack_size > 1 AND recipe unit ≠
+      // purchase unit) — imported, never re-derived, so this sheet can't drift
+      // from what the screens show.
+      const pack = packFactor(r);
+      const packed = pack > 1;
       const perPU = packed
         ? Math.round((r.average_price || 0) * pack * 100) / 100
         : (r.average_price ?? 0);

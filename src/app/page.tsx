@@ -28,6 +28,9 @@ import {
   ResponsiveContainer,
   Legend,
 } from 'recharts';
+// Purchase-unit lock: never re-derive the pack rule locally (see the header of
+// src/lib/pack-units.ts and scripts/check-purchase-units.js).
+import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 import Link from 'next/link';
 import type { DashboardData } from '@/types';
 import { api } from '@/lib/api';
@@ -683,11 +686,20 @@ export default function DashboardPage() {
                     className="border-b border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30 transition-colors"
                   >
                     <td className="py-2.5 text-[#3D2614]">{alert.material_name}</td>
+                    {/* Purchase basis leads (owner rule); the stored recipe
+                        figure stays underneath as the hint, because the
+                        low-stock compare itself is recipe-vs-recipe. */}
                     <td className="py-2.5 text-right text-red-400 font-mono">
-                      {alert.current_stock} {alert.unit}
+                      {fmtQtyNum(toPurchaseQty(alert.current_stock, alert))} {alert.purchase_unit || alert.unit}
+                      {packFactor(alert) > 1 && (
+                        <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(alert.current_stock)} {alert.unit}</div>
+                      )}
                     </td>
                     <td className="py-2.5 text-right text-[#8B7355] font-mono">
-                      {alert.reorder_level} {alert.unit}
+                      {fmtQtyNum(toPurchaseQty(alert.reorder_level, alert))} {alert.purchase_unit || alert.unit}
+                      {packFactor(alert) > 1 && (
+                        <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(alert.reorder_level)} {alert.unit}</div>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -824,9 +836,12 @@ function DailyTrackedWidget() {
     setSavingId(mat.id);
     setErrorByRow(p => { const n = { ...p }; delete n[mat.id]; return n; });
     try {
-      // The /api/closing-stock POST stores in recipe-units. If user typed in
-      // purchase units (visible in the widget when pack_size > 1), convert.
-      const physical = Number(raw) * (mat.pack_size > 1 ? mat.pack_size : 1);
+      // The /api/closing-stock POST stores in recipe-units. The box is labelled
+      // in the PURCHASE unit, so convert back exactly once, here, at the POST
+      // boundary — and through packFactor(), the same resolver the label used.
+      // A bare `pack_size > 1` would multiply a kg/kg material (pack_size 1.5)
+      // by 1.5 and write a count that was never entered.
+      const physical = Number(raw) * packFactor(mat);
       const r = await api('/api/closing-stock', {
         method: 'POST',
         body: { date: data.date, items: [{ material_id: mat.id, physical_stock: physical }] },
@@ -937,6 +952,24 @@ function DailyTrackedWidget() {
               {items.map((it: any) => {
                 const isLow = it.current_stock < (it.reorder_level || 0);
                 const isUrgent = it.days_of_stock != null && it.days_of_stock < 2;
+                // Pack rule comes from the shared helper, never from a local
+                // `pack_size > 1` — that short guard mis-converts a material
+                // whose recipe unit already IS its purchase unit. The entry box
+                // below and saveCount() must resolve pf identically or a typed
+                // count is stored against a different basis than it was labelled.
+                const pf = packFactor(it);
+                const pu = it.purchase_unit || it.unit;
+                // Daily rate arrives from /api/daily-tracked as consumed_90d/90 —
+                // RECIPE units per day, the same basis as current_stock. It has to
+                // lead in the purchase unit like the Current cell two columns left
+                // and the counted chip on the right, or the row prints two numbers
+                // side by side in different bases ("874.2 BTL" vs "783.33").
+                const rate   = Number(it.daily_consumption_rate) || 0;
+                const ratePU = toPurchaseQty(rate, it);   // 3-dp display derivative
+                // A slow mover can be real yet round to 0 in the purchase basis
+                // (SPINACH: 0.04 g/day = 0.00004 kg/day). Printing "0 kg/day" next
+                // to a non-null Days-left would be a lie — say below-threshold.
+                const rateLead = ratePU > 0 ? fmtQtyNum(ratePU) : '<0.001';
                 return (
                   <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${isLow ? 'bg-red-50/30' : ''}`}>
                     <td className="py-1.5 px-3">
@@ -947,12 +980,20 @@ function DailyTrackedWidget() {
                       {it.storage_location || <span className="text-[#8B7355]">—</span>}
                     </td>
                     <td className="py-1.5 px-3 text-right font-mono">
-                      {(it.pack_size > 1
-                        ? `${(it.current_stock / it.pack_size).toFixed(2)} ${it.purchase_unit}`
-                        : `${it.current_stock} ${it.unit}`)}
+                      {fmtQtyNum(toPurchaseQty(it.current_stock, it))} {pu}
+                      {pf > 1 && (
+                        <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(it.current_stock)} {it.unit}</div>
+                      )}
                     </td>
                     <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">
-                      {it.daily_consumption_rate || '—'}
+                      {rate > 0 ? (
+                        <>
+                          {rateLead} {pu}/day
+                          {pf > 1 && (
+                            <div className="text-[9px] text-[#B8A590] font-normal">= {fmtQtyNum(rate)} {it.unit}/day</div>
+                          )}
+                        </>
+                      ) : '—'}
                     </td>
                     <td className={`py-1.5 px-3 text-right font-mono ${isUrgent ? 'text-red-700 font-bold' : 'text-[#6B5744]'}`}>
                       {it.days_of_stock != null ? `${it.days_of_stock}d` : '—'}
@@ -960,10 +1001,8 @@ function DailyTrackedWidget() {
                     <td className="py-1.5 px-3">
                       {it._satisfied && it.counted_today ? (
                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
-                              title={`Counted ${it.today_count} ${it.unit} today`}>
-                          ✓ {it.pack_size > 1
-                                ? `${(it.today_count / it.pack_size).toFixed(2)} ${it.purchase_unit}`
-                                : `${it.today_count} ${it.unit}`}
+                              title={pf > 1 ? `Counted ${fmtQtyNum(toPurchaseQty(it.today_count, it))} ${pu} (= ${fmtQtyNum(it.today_count)} ${it.unit}) today` : `Counted ${fmtQtyNum(it.today_count)} ${pu} today`}>
+                          ✓ {fmtQtyNum(toPurchaseQty(it.today_count, it))} {pu}
                         </span>
                       ) : it._satisfied && it.last_count_date ? (
                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
@@ -977,7 +1016,8 @@ function DailyTrackedWidget() {
                                  onChange={e => setEntries(p => ({ ...p, [it.id]: e.target.value }))}
                                  onKeyDown={e => { if (e.key === 'Enter') saveCount(it); }}
                                  disabled={savingId === it.id}
-                                 placeholder={it.pack_size > 1 ? `count in ${it.purchase_unit}` : `count in ${it.unit}`}
+                                 placeholder={`count in ${pu}`}
+                                 title={pf > 1 ? `Typed in ${pu}; stored as ${it.unit} (1 ${pu} = ${fmtQtyNum(pf)} ${it.unit})` : undefined}
                                  className="w-24 px-1.5 py-0.5 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408] disabled:opacity-50" />
                           <button type="button"
                                   onClick={() => saveCount(it)}

@@ -161,7 +161,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       received: number;
       accepted: number;
       excess: number;
-      unit: string;
+      unit_pu: string;         // PURCHASE unit label (never the recipe unit)
       unit_price: number;
       excess_value: number;
     }> = [];
@@ -175,7 +175,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       ordered: number;        // PO line qty — PURCHASE units
       received: number;       // PURCHASE units
       accepted: number;       // PURCHASE units
-      unit: string;           // PURCHASE unit label
+      unit_pu: string;        // PURCHASE unit label (never the recipe unit)
       ordered_rate: number;   // ₹/purchase-unit on the PO line
       actual_rate: number;    // ₹/purchase-unit actually received at
       qty_short: boolean;
@@ -597,7 +597,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             // Purchase unit — ordered/accepted/excess are all PO qtys and the
             // ₹ in the same sentence is ₹/purchase-unit. Labelling with the
             // recipe unit made a 3 L (₹2,400) surplus read as "3 ml".
-            unit:       puLabel(it),
+            unit_pu:    puLabel(it),
             unit_price: price,
             excess_value: Math.round(excess * price * 100) / 100,
           });
@@ -615,7 +615,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             ordered:       ordQty,
             received:      received,
             accepted:      accepted,
-            unit:          puLabel(it),
+            unit_pu:       puLabel(it),
             ordered_rate:  ordRate,
             actual_rate:   Number(price),
             qty_short:     qtyShort,
@@ -861,11 +861,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const money = (n: number) => `${n < 0 ? '-' : '+'}₹${Math.abs(n).toFixed(0)}`;
         const lineSummary = deviationLines.map(l => {
           const what: string[] = [];
-          if (l.qty_short)    what.push(`SHORT ${Math.round((l.ordered - l.received) * 1000) / 1000} ${l.unit}`);
-          if (l.qty_excess)   what.push(`OVER ${Math.round((l.received - l.ordered) * 1000) / 1000} ${l.unit}`);
-          if (l.acc_short && !l.qty_short) what.push(`SHORT-ACCEPTED ${Math.round((l.ordered - l.accepted) * 1000) / 1000} ${l.unit} (arrived, not accepted)`);
-          if (l.rate_changed) what.push(`RATE ₹${l.ordered_rate} → ₹${l.actual_rate} per ${l.unit}`);
-          return `• ${l.material_name}: ordered ${l.ordered} ${l.unit} @ ₹${l.ordered_rate}, received ${l.received} ${l.unit} (accepted ${l.accepted}) @ ₹${l.actual_rate}\n    ${what.join(', ')} — value impact ${money(l.value_impact)}\n    reason: ${l.reason || '(none recorded)'}`;
+          if (l.qty_short)    what.push(`SHORT ${Math.round((l.ordered - l.received) * 1000) / 1000} ${l.unit_pu}`);
+          if (l.qty_excess)   what.push(`OVER ${Math.round((l.received - l.ordered) * 1000) / 1000} ${l.unit_pu}`);
+          if (l.acc_short && !l.qty_short) what.push(`SHORT-ACCEPTED ${Math.round((l.ordered - l.accepted) * 1000) / 1000} ${l.unit_pu} (arrived, not accepted)`);
+          if (l.rate_changed) what.push(`RATE ₹${l.ordered_rate} → ₹${l.actual_rate} per ${l.unit_pu}`);
+          return `• ${l.material_name}: ordered ${l.ordered} ${l.unit_pu} @ ₹${l.ordered_rate}, received ${l.received} ${l.unit_pu} (accepted ${l.accepted}) @ ₹${l.actual_rate}\n    ${what.join(', ')} — value impact ${money(l.value_impact)}\n    reason: ${l.reason || '(none recorded)'}`;
         }).join('\n');
         const counts: string[] = [];
         if (shortLines.length)       counts.push(`${shortLines.length} short`);

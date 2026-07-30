@@ -12,9 +12,18 @@
  *
  * Source: GET /api/stores/reconciliation → floorReconciliation(). Gate is
  * server-side (admin / manager / store-manager / HOD); a 403 renders the 🔒
- * notice here. Quantities are RECIPE units; packed materials (bottles) show the
- * Cases/Bottles/pegs (CBL) breakdown beneath via pack-units fmtBreakdown, so the
- * peg math never drifts from the Liquor Store / closing pages.
+ * notice here.
+ *
+ * UNITS (owner rule, 2026-07-29): every quantity on this page LEADS in the
+ * PURCHASE basis — the Cases/Bottles/loose breakdown for packed materials
+ * ('2 cs + 9 btl + 450 ml'), or '<n> <purchase unit>' when there is no pack
+ * conversion — and the stored RECIPE figure follows as the small declared hint
+ * ('= 5,250 ml'). Storage and every rupee figure are untouched: the wire still
+ * carries recipe units and value is still recipeQty × ₹/recipe-unit. This cell
+ * used to do the reverse (a bare, unlabelled '5,250' leading, '7 btl' demoted to
+ * a footnote), which read as the headline number to a manager counting bottles.
+ * All of it goes through pack-units, so the peg math never drifts from the
+ * Liquor Store / closing pages.
  *
  * party_consumption has no floor attribution → shown separately, never folded
  * into per-floor variance.
@@ -27,7 +36,7 @@ import {
   TrendingDown, PartyPopper, Info, ChevronDown, ChevronRight, CheckCircle2, Stethoscope,
 } from 'lucide-react';
 import Papa from 'papaparse';
-import { fmtBreakdown, PackMeta } from '@/lib/pack-units';
+import { fmtBreakdown, fmtQtyNum, packFactor, toPurchaseQty, PackMeta } from '@/lib/pack-units';
 
 /* ── Types (mirror FloorReconRow + route enrichment) ───────────────────────── */
 
@@ -107,19 +116,56 @@ const inr = (v: number, dp = 0) =>
 const packMetaOf = (r: { unit: string; purchase_unit: string; pack_size?: number; case_size: number }): PackMeta => ({
   unit: r.unit, purchase_unit: r.purchase_unit, pack_size: r.pack_size ?? 1, case_size: r.case_size,
 });
+
+/** The unit every quantity on this page READS in — the PURCHASE unit, falling
+ *  back to the recipe unit only when the material has none (same helper shape
+ *  as the Liquor Store page, so the two surfaces label bottles identically). */
+const puOf = (m: PackMeta) => String(m?.purchase_unit || m?.unit || '').trim() || 'units';
+
+/**
+ * One quantity as text, ALWAYS purchase-first.
+ *   packed material            → '2 cs + 9 btl + 450 ml'  (fmtBreakdown)
+ *   no pack conversion         → '2,279 BTL'
+ * fmtBreakdown returns null when packFactor's BOTH-HALVES guard fails
+ * (pack_size > 1 AND unit ≠ purchase_unit); in that case the number is identical
+ * in the two bases, so labelling it with the purchase unit is exact, not a
+ * conversion. Never re-derive the pack rule here.
+ */
+const qtyPU = (qty: number, m: PackMeta) => fmtBreakdown(qty, m) || `${fq(qty)} ${puOf(m)}`;
+
+/** The small DECLARED recipe hint, house style. Null when there is no real pack
+ *  conversion — then the lead already prints the one true number. */
+const recipeHint = (qty: number, m: PackMeta) =>
+  packFactor(m) > 1 ? `= ${fmtQtyNum(qty)} ${String(m.unit || '').trim()}` : null;
+
+/** The physical-count working behind Actual, in PURCHASE units and labelled:
+ *  'btl: open 8* + in 1 − close 1 − loss 0.2'. Display only — the arithmetic
+ *  it describes still happens server-side in recipe units. */
+function flowLinePU(r: ReconRow): string {
+  const m = packMetaOf(r);
+  const n = (v: number) => fmtQtyNum(toPurchaseQty(v, m));
+  let s = `${puOf(m)}: open ${n(r.opening_qty)}${r.opening_counted ? '' : '*'}`
+        + ` + in ${n(r.inflow_qty)}`
+        + ` − close ${n(r.closing_qty)}${r.closing_counted ? '' : '*'}`;
+  if (r.known_non_sale_qty > 0) s += ` − loss ${n(r.known_non_sale_qty)}`;
+  return s;
+}
 const localDate = (d: Date) => {
   const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0'), day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
 };
 const PAGE_SIZE = 50;
 
-/* One qty cell: raw recipe qty + CBL breakdown beneath when packed. */
+/* One qty cell — PURCHASE unit LEADS ('7 btl' / '2 cs + 9 btl + 450 ml'), the
+   stored recipe figure follows as the small declared hint ('= 5,250 ml').
+   Inverted 2026-07-29: the lead used to be a bare, unlabelled recipe number. */
 function QtyCell({ qty, r, strong, tone }: {
   qty: number; r: { unit: string; purchase_unit: string; pack_size?: number; case_size: number };
   strong?: boolean; tone?: 'expected' | 'actual' | 'variance';
 }) {
-  const packed = (r.pack_size ?? 1) > 1 || (r.case_size ?? 1) > 1;   // incl. piece-counted cases (cb)
-  const dual = packed ? fmtBreakdown(qty, packMetaOf(r)) : null;
+  const m = packMetaOf(r);
+  const lead = qtyPU(qty, m);
+  const hint = recipeHint(qty, m);
   const zero = qty === 0;
   let color = 'text-[#2D1B0E]';
   if (tone === 'variance') color = qty > 0 ? 'text-red-700' : qty < 0 ? 'text-blue-700' : 'text-[#B9A896]';
@@ -127,8 +173,8 @@ function QtyCell({ qty, r, strong, tone }: {
   else if (qty < 0) color = 'text-red-700';
   return (
     <div className={`text-right tabular-nums ${color}`}>
-      <span className={strong ? 'font-semibold' : ''}>{(tone === 'variance' && qty > 0 ? '+' : '') + fq(qty)}</span>
-      {dual && <div className="text-[10px] text-[#8B7355] font-normal leading-tight">{dual}</div>}
+      <span className={strong ? 'font-semibold' : ''}>{(tone === 'variance' && qty > 0 ? '+' : '') + lead}</span>
+      {hint && <div className="text-[9px] text-[#B8A590] font-normal leading-tight">{hint}</div>}
     </div>
   );
 }
@@ -561,9 +607,15 @@ export default function ReconciliationPage() {
                     <tr className="bg-[#FFF1E3] text-[#6B5744] text-xs">
                       <th className="text-left font-semibold px-3 py-2 sticky left-0 bg-[#FFF1E3] z-10 min-w-[190px]">Material</th>
                       <th className="text-left font-semibold px-3 py-2 min-w-[120px]">Floor</th>
-                      <th className="text-right font-semibold px-3 py-2 min-w-[100px] whitespace-nowrap">Expected</th>
-                      <th className="text-right font-semibold px-3 py-2 min-w-[100px] whitespace-nowrap">Actual</th>
-                      <th className="text-right font-semibold px-3 py-2 min-w-[100px] whitespace-nowrap bg-[#FBE7D3]">Variance</th>
+                      <th className="text-right font-semibold px-3 py-2 min-w-[110px] whitespace-nowrap">
+                        Expected <span className="text-[9px] font-normal text-[#B8A590]">(purchase units)</span>
+                      </th>
+                      <th className="text-right font-semibold px-3 py-2 min-w-[110px] whitespace-nowrap">
+                        Actual <span className="text-[9px] font-normal text-[#B8A590]">(purchase units)</span>
+                      </th>
+                      <th className="text-right font-semibold px-3 py-2 min-w-[110px] whitespace-nowrap bg-[#FBE7D3]">
+                        Variance <span className="text-[9px] font-normal text-[#B8A590]">(purchase units)</span>
+                      </th>
                       <th className="text-right font-semibold px-3 py-2 min-w-[100px] whitespace-nowrap bg-[#FBE7D3]">Variance ₹</th>
                     </tr>
                   </thead>
@@ -582,9 +634,7 @@ export default function ReconciliationPage() {
                           <td className="px-3 py-2 text-[#6B5744] text-xs">
                             {r.store_name}
                             {mode === 'physical' && (
-                              <div className="text-[10px] text-[#B9A896] leading-tight">
-                                open {fq(r.opening_qty)}{!r.opening_counted && '*'} + in {fq(r.inflow_qty)} − close {fq(r.closing_qty)}{!r.closing_counted && '*'}{r.known_non_sale_qty > 0 && ` − loss ${fq(r.known_non_sale_qty)}`}
-                              </div>
+                              <div className="text-[10px] text-[#B9A896] leading-tight">{flowLinePU(r)}</div>
                             )}
                           </td>
                           <td className="px-3 py-2"><QtyCell qty={r.expected_qty} r={r} tone="expected" /></td>
@@ -599,7 +649,9 @@ export default function ReconciliationPage() {
                   </tbody>
                   <tfoot>
                     <tr className="border-t-2 border-[#E8D5C4] bg-[#FFF1E3] font-semibold text-[#2D1B0E]">
-                      <td className="px-3 py-2 sticky left-0 bg-[#FFF1E3] z-10">Page total</td>
+                      {/* Quantities are never summed across materials (ml + g + pcs has no
+                          unit in any basis) — the footer totals the ₹ columns only. */}
+                      <td className="px-3 py-2 sticky left-0 bg-[#FFF1E3] z-10">Page total <span className="text-[10px] font-normal text-[#8B7355]">(₹)</span></td>
                       <td className="px-3 py-2" />
                       <td className="px-3 py-2 text-right tabular-nums text-xs text-[#6B5744]">{inr(paged.reduce((a, r) => a + r.expected_value, 0))}</td>
                       <td className="px-3 py-2 text-right tabular-nums text-xs text-[#6B5744]">{inr(paged.reduce((a, r) => a + r.actual_value, 0))}</td>
@@ -630,20 +682,21 @@ export default function ReconciliationPage() {
                           </div>
                         </div>
                       </div>
-                      <div className="mt-2 pt-2 border-t border-[#F0E4D6] grid grid-cols-2 gap-x-3 gap-y-1">
-                        <div className="flex items-center justify-between gap-2 text-xs min-w-0">
-                          <span className="text-[#8B7355] font-medium">Expected</span>
-                          <QtyCell qty={r.expected_qty} r={r} />
-                        </div>
-                        <div className="flex items-center justify-between gap-2 text-xs min-w-0">
-                          <span className="text-[#8B7355] font-medium">Actual</span>
-                          <QtyCell qty={r.actual_qty} r={r} />
+                      <div className="mt-2 pt-2 border-t border-[#F0E4D6]">
+                        <div className="text-[9px] text-[#B8A590] mb-1">Quantities in purchase units</div>
+                        <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+                          <div className="flex items-center justify-between gap-2 text-xs min-w-0">
+                            <span className="text-[#8B7355] font-medium">Expected</span>
+                            <QtyCell qty={r.expected_qty} r={r} />
+                          </div>
+                          <div className="flex items-center justify-between gap-2 text-xs min-w-0">
+                            <span className="text-[#8B7355] font-medium">Actual</span>
+                            <QtyCell qty={r.actual_qty} r={r} />
+                          </div>
                         </div>
                       </div>
                       {mode === 'physical' && (
-                        <div className="mt-1 text-[10px] text-[#B9A896]">
-                          open {fq(r.opening_qty)}{!r.opening_counted && '*'} + in {fq(r.inflow_qty)} − close {fq(r.closing_qty)}{!r.closing_counted && '*'}{r.known_non_sale_qty > 0 && ` − loss ${fq(r.known_non_sale_qty)}`}
-                        </div>
+                        <div className="mt-1 text-[10px] text-[#B9A896]">{flowLinePU(r)}</div>
                       )}
                     </div>
                   );
@@ -696,7 +749,9 @@ export default function ReconciliationPage() {
                         <tr className="text-[#6B5744] text-xs">
                           <th className="text-left font-semibold px-2 py-1.5">Material</th>
                           <th className="text-left font-semibold px-2 py-1.5">Category</th>
-                          <th className="text-right font-semibold px-2 py-1.5">Qty</th>
+                          <th className="text-right font-semibold px-2 py-1.5">
+                            Qty <span className="text-[9px] font-normal text-[#B8A590]">(purchase units)</span>
+                          </th>
                           <th className="text-right font-semibold px-2 py-1.5">Value</th>
                         </tr>
                       </thead>
