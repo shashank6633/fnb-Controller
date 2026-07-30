@@ -1275,6 +1275,51 @@ function initializeSchema(db: Database.Database) {
     db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('requisition_deduct_at_issue', '0')`);
   } catch (e) { console.error('requisition_issue_ledger schema failed:', e); }
 
+  // Closing counts for SEMI-FINISHED items (sub_recipes) — Mint Chutney, GG
+  // Paste, Aioli and 65 more. The kitchen holds real quantities of these at
+  // close, but they live in sub_recipes, not raw_materials, so the ordinary
+  // closing sheet could never show them.
+  //
+  // A separate table rather than a column on closing_stock: that table's
+  // material_id is NOT NULL with a FOREIGN KEY to raw_materials and
+  // `PRAGMA foreign_keys = ON` is set (db.ts:12), so a sub-recipe id cannot be
+  // stored there at all. Relaxing it would mean a full table rebuild of live
+  // count history to gain nothing — the two sides share no columns beyond
+  // qty/date and value a semi-finished item by its own cost_per_unit, with no
+  // pack factor. Readers UNION the two.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS closing_stock_semi (
+        id             TEXT PRIMARY KEY,
+        sub_recipe_id  TEXT NOT NULL,
+        date           TEXT NOT NULL,
+        department_id  TEXT,
+        outlet_id      TEXT,
+        physical_stock REAL NOT NULL DEFAULT 0,   -- in the sub-recipe's yield_unit
+        unit           TEXT DEFAULT '',           -- yield_unit snapshot at count time
+        rate           REAL NOT NULL DEFAULT 0,   -- Rs per yield_unit at count time
+        total_value    REAL NOT NULL DEFAULT 0,   -- physical_stock x rate
+        notes          TEXT DEFAULT '',
+        recorded_by    TEXT DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (sub_recipe_id) REFERENCES sub_recipes(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_closing_semi_date ON closing_stock_semi(date);
+      CREATE INDEX IF NOT EXISTS idx_closing_semi_sub  ON closing_stock_semi(sub_recipe_id);
+      CREATE INDEX IF NOT EXISTS idx_closing_semi_dept ON closing_stock_semi(department_id);
+    `);
+  } catch (e) { console.error('closing_stock_semi schema failed:', e); }
+
+  // Valuation snapshot on the raw-material closing row. Stored, not recomputed:
+  // a count is a dated record, so the rate it was valued at must survive later
+  // price movement. Nullable so every existing row stays untouched.
+  try {
+    const cols = new Set((db.prepare(`PRAGMA table_info(closing_stock)`).all() as any[]).map(c => c.name));
+    if (!cols.has('rate_per_purchase_unit')) db.exec(`ALTER TABLE closing_stock ADD COLUMN rate_per_purchase_unit REAL`);
+    if (!cols.has('rate_source'))            db.exec(`ALTER TABLE closing_stock ADD COLUMN rate_source TEXT`);
+    if (!cols.has('total_value'))            db.exec(`ALTER TABLE closing_stock ADD COLUMN total_value REAL`);
+  } catch (e) { console.error('closing_stock valuation columns failed:', e); }
+
   // Butchering — track whole-carcass breakdown into named cuts.
   // Buys carcass at vendor rate (per kg of dressed weight); cuts inherit
   // pro-rata cost (default by weight). Waste is tracked separately so the

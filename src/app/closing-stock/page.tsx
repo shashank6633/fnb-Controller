@@ -28,6 +28,7 @@ import {
   AlertCircle,
   Download,
   Upload,
+  Layers,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
@@ -41,6 +42,134 @@ const today = () => new Date().toISOString().slice(0, 10);
  *  item never gets a second line repeating the same number. */
 const hintLine = (recipeQty: number, m: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null }) =>
   packFactor(m) > 1 ? `= ${fmtQtyNum(recipeQty)} ${m.unit || ''}`.trim() : null;
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * VALUATION DISPLAY (req 2/3/4) — rates and values are RESOLVED AND STORED BY
+ * THE SERVER (src/lib/closing-valuation.ts, persisted on closing_stock.
+ * rate_per_purchase_unit / rate_source / total_value and closing_stock_semi.
+ * rate / total_value). This file only PRINTS them.
+ *
+ * Nothing here derives a rate. raw_materials.last_purchase_price is stored in
+ * mixed bases on live data (MALA STRAWBERRY CRUSH 5 LTR holds 0.13 against a
+ * true ₹674.10/BTL — a 5,000x error), so the browser must never read it and
+ * must never re-multiply a historical row by today's price: a count is a dated
+ * record and shows the rate it was valued at.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** ₹ with paise. Rates are per PURCHASE unit and are often small (₹0.20/BTL). */
+const fmtRate = (v: number) =>
+  '₹' + Number(v || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/**
+ * ₹ for the valuation columns, always to paise. Deliberately NOT formatCurrency:
+ * that one drops a trailing zero (₹2,022.3), which reads wrong sitting next to a
+ * ₹674.10 rate in the same row. formatCurrency is left exactly as it is so the
+ * existing variance columns are untouched.
+ */
+const fmtMoney = (v: number) =>
+  '₹' + Number(v || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/**
+ * True when the server resolved NO valuation basis (rate_source 'none'), or the
+ * row predates the valuation columns. 194 live materials have neither a priced
+ * purchase nor an average cost — they get an em-dash, never a confident ₹0.
+ */
+const noBasis = (source?: string | null, rate?: number | null) =>
+  source === 'none' || source == null || rate == null || !(Number(rate) > 0);
+
+/** "last purchase 12 Jul" / "avg cost" — where the stored rate came from. */
+function rateSourceLabel(source?: string | null, asOf?: string | null): string | null {
+  if (source === 'last_purchase') {
+    const d = asOf ? new Date(asOf) : null;
+    return d && !isNaN(d.getTime())
+      ? `last purchase ${d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}`
+      : 'last purchase';
+  }
+  if (source === 'average_cost') return 'avg cost';
+  return null;
+}
+
+/** The em-dash a missing basis prints — same everywhere, with the reason. */
+const NoBasisDash = ({ what = 'valuation' }: { what?: string }) => (
+  <span className="text-[#B8A590]" title={`No ${what} basis — no priced purchase and no average cost on record. Shown as an em-dash rather than a false ₹0.`}>
+    —
+  </span>
+);
+
+/**
+ * The em-dash a CROSS-MATERIAL total prints. Rupees add up across materials;
+ * quantities do not — 2 BTL + 3 kg + 400 g is not a number. Money totals stay,
+ * quantity and rate totals become this.
+ */
+const CrossDash = ({ what }: { what: string }) => (
+  <span className="text-[#B8A590]" title={`A ${what} cannot be summed across materials — they are in different units. Only the rupee total adds up.`}>
+    —
+  </span>
+);
+
+/**
+ * Rate cell. `purchaseUnit` is deliberately NOT called `unit`: this rate is ₹
+ * per PURCHASE unit, so it pairs with the purchase quantity beside it and must
+ * never be printed against a recipe figure.
+ */
+function RateCell({ rate, source, asOf, purchaseUnit, stored }: {
+  rate?: number | null; source?: string | null; asOf?: string | null;
+  purchaseUnit?: string | null;
+  /** API `rate_is_stored`. false = the row predates the valuation columns and
+   *  the server derived this rate on READ, so it is today's price, not the
+   *  count-day price. Marked, because an estimate must not pass as history. */
+  stored?: boolean;
+}) {
+  if (noBasis(source, rate)) return <NoBasisDash what="price" />;
+  const label = rateSourceLabel(source, asOf);
+  return (
+    <span className="font-mono">
+      {fmtRate(Number(rate))}<span className="text-[10px] text-[#8B7355]">/{purchaseUnit || ''}</span>
+      {label && (
+        <span className="block text-[9px] font-sans text-[#B8A590]">
+          {label}
+          {stored === false && (
+            <span title="This count was saved before closing stock was valued, so no rate was stored with it. Shown here at today's price — an estimate, not the count-day rate.">
+              {' '}· est.
+            </span>
+          )}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** Quantity × Rate, as stored by the server. Em-dash when there was no basis. */
+function ValueCell({ value, source, rate }: { value?: number | null; source?: string | null; rate?: number | null }) {
+  if (noBasis(source, rate) || value == null) return <NoBasisDash />;
+  return <span className="font-mono">{fmtMoney(Number(value))}</span>;
+}
+
+/** The row's rate whichever sheet it came from: raw materials are priced per
+ *  PURCHASE unit, sub-recipes per YIELD unit. */
+const rowRate = (r: any) => r?.rate_per_purchase_unit ?? r?.rate_per_unit;
+
+/** Sum of the server's per-item rupee values. Money adds up across materials;
+ *  quantities do not — every cross-material QUANTITY total prints an em-dash. */
+const sumValue = (rows: any[]) =>
+  rows.reduce((s, r) => s + (noBasis(r?.rate_source, rowRate(r)) ? 0 : Number(r?.total_value) || 0), 0);
+
+/** How many rows on a sheet could not be valued — printed so a total is never
+ *  mistaken for the whole sheet. */
+const unvaluedCount = (rows: any[]) =>
+  rows.filter(r => noBasis(r?.rate_source, rowRate(r))).length;
+
+/** A sub-recipe as the count sheet needs it (id, name, and its yield basis). */
+interface SubRecipeRow {
+  id: string; name: string; category?: string;
+  yield_unit: string; cost_per_unit?: number;
+}
+
+/** CSV item TYPE — the column that makes a re-upload unambiguous. A sub-recipe
+ *  and a raw material may share a name ("Green Chutney"); the parser must never
+ *  have to guess which table a row belongs to. */
+const CSV_TYPE_RAW = 'RAW';
+const CSV_TYPE_SEMI = 'SEMI';
 
 /* ------------------------------------------------------------------ */
 /* Closing-stock UPDATE modal helpers (moved from Raw Materials page)  */
@@ -230,16 +359,29 @@ export default function ClosingStockByLocationPage() {
   // Applied once the location list has loaded (the drill-in needs the list).
   const [pendingLocation, setPendingLocation] = useState<string | null>(null);
   const [closingItems, setClosingItems] = useState<Record<string, { physical_stock: string; notes: string }>>({});
+  /* SEMI-FINISHED (req 1) — the 68 sub_recipes the kitchen physically holds at
+     close (Mint Chutney, GG Paste, Aioli…). They are NOT raw materials, so they
+     never appeared on this sheet or in the CSV template and simply could not be
+     counted. Counted in their OWN yield_unit; no pack factor applies. */
+  const [subRecipes, setSubRecipes] = useState<SubRecipeRow[]>([]);
+  const [closingSemi, setClosingSemi] = useState<Record<string, { physical_stock: string; notes: string }>>({});
   const [closingSearch, setClosingSearch] = useState('');
   const [closingCategory, setClosingCategory] = useState('');
   const [adjustStockModal, setAdjustStockModal] = useState(false);
   const [closingSubmitting, setClosingSubmitting] = useState(false);
-  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[] } | null>(null);
+  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[]; semi?: number } | null>(null);
+  /* The saved sheet, re-read from the server after a save/upload so the rate and
+     Quantity × Rate shown are exactly the ones the server RESOLVED AND STORED
+     (req 2/3) — never a browser-side recomputation. */
+  const [valued, setValued] = useState<{
+    date: string; items: any[]; semi: any[]; total: number; priced: boolean;
+  } | null>(null);
   const [closingHistory, setClosingHistory] = useState<any[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyDate, setHistoryDate] = useState<string | null>(null);
   const [historyItems, setHistoryItems] = useState<any[]>([]);
+  const [historySemi, setHistorySemi] = useState<any[]>([]);
   const [historySummary, setHistorySummary] = useState<any>(null);
   // Per-area rollup (admin/HOD only) — each area's overall physical closing value
   // for the selected date. Sourced from summary.by_area on /api/closing-stock.
@@ -316,10 +458,20 @@ export default function ClosingStockByLocationPage() {
         map.get('(Other)')!.add(c);
       }
     }
+    // Sub-recipe categories get their own group, so picking one narrows the
+    // sheet to the semi-finished section instead of emptying it.
+    // Merge, never overwrite: a raw material could legitimately sit under a
+    // super_category spelled 'Semi-finished', and clobbering its set would drop
+    // those categories out of the picker entirely.
+    const semiCats = subRecipes.map(s => (s.category || 'sub-recipe').trim()).filter(Boolean);
+    if (semiCats.length) {
+      if (!map.has('Semi-finished')) map.set('Semi-finished', new Set());
+      for (const c of semiCats) map.get('Semi-finished')!.add(c);
+    }
     return Array.from(map.entries())
       .sort(([a], [b]) => (a === '(Other)' ? 1 : b === '(Other)' ? -1 : a.localeCompare(b)))
       .map(([sup, set]) => ({ sup, cats: Array.from(set).sort((a, b) => a.localeCompare(b)) }));
-  }, [deptScopedMaterials, availableCategories]);
+  }, [deptScopedMaterials, availableCategories, subRecipes]);
 
   const fetchMaterials = async () => {
     try {
@@ -345,30 +497,157 @@ export default function ClosingStockByLocationPage() {
     return [];
   };
 
+  /* The semi-finished count sheet (req 1) — GET /api/closing-stock/semi returns
+     EVERY active sub-recipe with this date+department's count attached when one
+     exists. Sub-recipes carry no department and no storage location, so they are
+     offered to every counter rather than filtered out; a section that holds none
+     simply leaves them blank. Costing is the SERVER's job (cost_per_unit, ₹ per
+     yield_unit) — this fetch only needs the id / name / yield basis. */
+  const fetchSubRecipes = async (forDate?: string) => {
+    try {
+      const qs = new URLSearchParams({ date: forDate || closingDate, department_id: activeDeptId });
+      const res = await fetch(`/api/closing-stock/semi?${qs}`);
+      if (!res.ok) return [] as SubRecipeRow[];
+      const json = await res.json();
+      const list: SubRecipeRow[] = (json.items || []).map((s: any) => ({
+        id: String(s.sub_recipe_id),
+        name: String(s.name || ''),
+        category: s.category || 'sub-recipe',
+        yield_unit: String(s.yield_unit || '').trim(),
+        cost_per_unit: Number(s.cost_per_unit) || 0,
+      }));
+      setSubRecipes(list);
+      return list;
+    } catch { return [] as SubRecipeRow[]; }
+  };
+
+  /**
+   * Save the semi-finished half of a submit. Sub-recipe counts go to their OWN
+   * route (they land in closing_stock_semi — closing_stock.material_id is NOT
+   * NULL with an FK to raw_materials, so a sub-recipe id cannot live there).
+   *
+   * Two POSTs means two ways to fail, so the outcome is reported honestly
+   * rather than folded into the raw-material count: silently dropping a
+   * counter's numbers is the exact failure this feature exists to end.
+   */
+  const postSemiCounts = async (
+    forDate: string,
+    rows: { sub_recipe_id: string; physical_stock: number; notes: string }[],
+    errors: string[],
+  ): Promise<number> => {
+    if (rows.length === 0) return 0;
+    try {
+      const res = await api('/api/closing-stock/semi', {
+        method: 'POST',
+        body: { date: forDate, department_id: activeDeptId, items: rows },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        errors.push(`Semi-finished counts were NOT saved: ${json.error || `HTTP ${res.status}`}`);
+        return 0;
+      }
+      for (const e of json.errors || []) errors.push(e);
+      const saved = Number(json.success) || 0;
+      if (saved < rows.length) {
+        const missed = rows.length - saved;
+        errors.push(`${missed} semi-finished count${missed === 1 ? ' was' : 's were'} not saved.`);
+      }
+      return saved;
+    } catch (e: any) {
+      errors.push(`Semi-finished counts were NOT saved: ${e.message}`);
+      return 0;
+    }
+  };
+
   const openClosingStock = async () => {
+    const openDate = new Date().toISOString().split('T')[0];
     setClosingStockOpen(true);
-    setClosingDate(new Date().toISOString().split('T')[0]);
+    setClosingDate(openDate);
     setClosingResult(null);
+    setValued(null);
     setClosingSearch('');
     setClosingCategory('');
     setShowHistory(false);
     // Pull the full material list, then pre-seed an empty entry per material.
-    const list = await fetchMaterials();
+    // openDate is passed explicitly — setClosingDate above has not applied yet.
+    const [list, subs] = await Promise.all([fetchMaterials(), fetchSubRecipes(openDate)]);
     const seed: Record<string, { physical_stock: string; notes: string }> = {};
     for (const m of list) {
       seed[m.id] = { physical_stock: '', notes: '' };
     }
     setClosingItems(seed);
+    const semiSeed: Record<string, { physical_stock: string; notes: string }> = {};
+    for (const s of subs) semiSeed[s.id] = { physical_stock: '', notes: '' };
+    setClosingSemi(semiSeed);
     fetchClosingHistory();
   };
 
+  /**
+   * Re-read the sheet the server just SAVED, so the rate and Quantity × Rate on
+   * screen are the stored ones (req 2/3). Deliberately a fresh GET rather than a
+   * client-side calculation: the browser has no business resolving a rate, and a
+   * count is a dated record — the server's stored figure is the only truth.
+   */
+  const loadValuedSheet = async (d: string) => {
+    try {
+      const qs = new URLSearchParams({ date: d, department_id: activeDeptId || '__store__' });
+      // Two sheets, two tables, two routes: raw materials from closing_stock,
+      // sub-recipes from closing_stock_semi (counted_only=1 → just the rows
+      // actually saved, not the whole 68-item catalogue).
+      const semiQs = new URLSearchParams({ date: d, department_id: activeDeptId, counted_only: '1' });
+      const [res, semiRes] = await Promise.all([
+        fetch(`/api/closing-stock?${qs}`),
+        fetch(`/api/closing-stock/semi?${semiQs}`),
+      ]);
+      if (!res.ok) { setValued(null); return; }
+      const json = await res.json();
+      const semiJson = semiRes.ok ? await semiRes.json().catch(() => ({})) : {};
+      const items: any[] = json.items || [];
+      const semi: any[] = semiJson.items || [];
+      // The sheet total is the SUM OF THE LINES SHOWN — every addend is a
+      // server-stored total_value, and a footer that disagreed with its own
+      // column would be a bug. (A summary total from the API could legitimately
+      // cover a wider scope than this department-filtered list.) Money adds up
+      // across materials; quantities never do.
+      const total = sumValue(items) + sumValue(semi);
+      // Did this build actually value anything? If the API predates the
+      // valuation columns, say so instead of printing a column of em-dashes.
+      const priced = items.some(i => i.total_value != null || i.rate_source != null)
+        || semi.some(s => s.total_value != null || s.rate_per_unit != null);
+      setValued({ date: d, items, semi, total, priced });
+    } catch { setValued(null); }
+  };
+
+  /**
+   * The history index. Raw-material days and semi-finished days are separate
+   * indexes (separate tables), so they are UNIONED here: a day on which only
+   * sub-recipes were counted must still appear, and a day with both must show
+   * one combined closing value rather than the raw half only.
+   */
   const fetchClosingHistory = async () => {
     try {
-      const res = await fetch('/api/closing-stock');
-      if (res.ok) {
-        const json = await res.json();
-        setClosingHistory(json.dates || []);
+      const [res, semiRes] = await Promise.all([
+        fetch('/api/closing-stock'),
+        fetch('/api/closing-stock/semi'),
+      ]);
+      const json = res.ok ? await res.json() : { dates: [] };
+      const semiJson = semiRes.ok ? await semiRes.json().catch(() => ({ dates: [] })) : { dates: [] };
+      const byDate = new Map<string, any>();
+      for (const d of json.dates || []) byDate.set(d.date, { ...d });
+      for (const s of semiJson.dates || []) {
+        const hit = byDate.get(s.date);
+        if (hit) {
+          hit.semi_count = s.item_count || 0;
+          hit.total_value = (Number(hit.total_value) || 0) + (Number(s.total_value) || 0);
+        } else {
+          byDate.set(s.date, {
+            date: s.date, item_count: 0, semi_count: s.item_count || 0,
+            total_value: Number(s.total_value) || 0,
+            total_variance_value: 0, shortage_count: 0, excess_count: 0,
+          });
+        }
       }
+      setClosingHistory([...byDate.values()].sort((a, b) => String(b.date).localeCompare(String(a.date))));
     } catch (_) {}
   };
 
@@ -376,7 +655,14 @@ export default function ClosingStockByLocationPage() {
     setHistoryDate(d);
     setHistoryLoading(true);
     try {
-      const res = await fetch(`/api/closing-stock?date=${d}`);
+      // Raw-material counts, plus the same date's semi-finished counts across
+      // every department (counted_only=1 → saved rows, not the full catalogue).
+      const [res, semiRes] = await Promise.all([
+        fetch(`/api/closing-stock?date=${d}`),
+        fetch(`/api/closing-stock/semi?date=${d}&counted_only=1`),
+      ]);
+      const semiJson = semiRes.ok ? await semiRes.json().catch(() => ({})) : {};
+      setHistorySemi(semiJson.items || []);
       if (res.ok) {
         const json = await res.json();
         setHistoryItems(json.items || []);
@@ -392,6 +678,33 @@ export default function ClosingStockByLocationPage() {
       ...prev,
       [materialId]: { ...prev[materialId], [field]: value },
     }));
+  };
+
+  const updateClosingSemi = (subId: string, field: 'physical_stock' | 'notes', value: string) => {
+    setClosingSemi(prev => {
+      // Default the row in case the seed missed it (a sub-recipe added while the
+      // modal was open) — without this the other field would come back
+      // undefined and React would flip the input to uncontrolled.
+      const row = prev[subId] || { physical_stock: '', notes: '' };
+      return { ...prev, [subId]: { ...row, [field]: value } };
+    });
+  };
+
+  /**
+   * The semi-finished rows a submit should carry. No pack factor is applied —
+   * a sub-recipe is counted and costed in its OWN yield_unit, so ×packFactor
+   * here would be a category error (see valueSemiCount in closing-valuation.ts).
+   */
+  const collectSemiEntries = (errors: string[]) => {
+    const out: { sub_recipe_id: string; physical_stock: number; notes: string }[] = [];
+    for (const s of subRecipes) {
+      const v = closingSemi[s.id];
+      if (!v || v.physical_stock === '') continue;
+      const q = parseFloat(v.physical_stock);
+      if (isNaN(q) || q < 0) { errors.push(`${s.name}: invalid count "${v.physical_stock}"`); continue; }
+      out.push({ sub_recipe_id: s.id, physical_stock: q, notes: v.notes || '' });
+    }
+    return out;
   };
 
   const submitClosingStock = async () => {
@@ -417,24 +730,36 @@ export default function ClosingStockByLocationPage() {
           };
         });
 
-      if (itemsToSubmit.length === 0) {
-        setClosingResult({ success: 0, errors: ['Enter physical stock for at least one material'] });
+      // Semi-finished counts go to their own route (closing_stock_semi).
+      const errors: string[] = [];
+      const semiToSubmit = collectSemiEntries(errors);
+
+      if (itemsToSubmit.length === 0 && semiToSubmit.length === 0) {
+        setClosingResult({ success: 0, errors: [...errors, 'Enter a physical count for at least one material or sub-recipe'] });
         setClosingSubmitting(false);
         return;
       }
 
-      const res = await api('/api/closing-stock', {
-        method: 'POST',
-        // department_id scopes this batch of counts to the active department
-        // ('' = store/overall). Plain users are pinned to their own department.
-        body: { date: closingDate, items: itemsToSubmit, adjust_stock: adjustStockModal, department_id: activeDeptId },
-      });
-      const json = await res.json();
-      setClosingResult(json);
-      if (json.success > 0) {
+      let rawSaved = 0;
+      if (itemsToSubmit.length > 0) {
+        const res = await api('/api/closing-stock', {
+          method: 'POST',
+          // department_id scopes this batch of counts to the active department
+          // ('' = store/overall). Plain users are pinned to their own department.
+          body: { date: closingDate, items: itemsToSubmit, adjust_stock: adjustStockModal, department_id: activeDeptId },
+        });
+        const json = await res.json();
+        for (const e of json.errors || []) errors.push(e);
+        rawSaved = json.success || 0;
+      }
+      const semiSaved = await postSemiCounts(closingDate, semiToSubmit, errors);
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved });
+      if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
         await reloadLocations();
+        // Show the sheet the server actually stored: rate + Quantity × Rate.
+        await loadValuedSheet(closingDate);
       }
     } catch (err: any) {
       setClosingResult({ success: 0, errors: [err.message] });
@@ -456,9 +781,16 @@ export default function ClosingStockByLocationPage() {
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   // Blind count: non-admins get a template WITHOUT the system-stock column.
+  //
+  // ADDITIVE header change (req 1): `Type` and `sub_recipe_id` are NEW columns;
+  // every previously-emitted column keeps its exact name, and the parser matches
+  // by header name, so a file downloaded before this change still uploads. Type
+  // is what stops a re-upload confusing "Green Chutney" the sub-recipe with a
+  // raw material of the same name — the two live in different tables and are
+  // valued by completely different rules.
   const CSV_COLS = isAdmin
-    ? ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Physical count']
-    : ['material_id', 'SKU', 'Name', 'Category', 'Unit', 'Physical count'];
+    ? ['Type', 'material_id', 'sub_recipe_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Physical count']
+    : ['Type', 'material_id', 'sub_recipe_id', 'SKU', 'Name', 'Category', 'Unit', 'Physical count'];
   const downloadClosingTemplate = async () => {
     // Export the FILTERED set — the rows this user/department is being asked
     // to count — not the full catalogue. (Upload stays global: it matches by
@@ -474,14 +806,23 @@ export default function ClosingStockByLocationPage() {
         mats = mats.filter((m: any) => deptItemIds.has(String(m.id)));
       }
     }
+    const subs = subRecipes.length ? subRecipes : await fetchSubRecipes();
     const lines = [CSV_COLS.join(',')];
     for (const m of mats) {
-      const base = [m.id, m.sku || '', m.name || '', (m.super_category || m.category || ''), (m.purchase_unit || m.unit || '')];
+      const base = [CSV_TYPE_RAW, m.id, '', m.sku || '', m.name || '', (m.super_category || m.category || ''), (m.purchase_unit || m.unit || '')];
       // Physical count column left blank for the counter; system stock only for
       // admins — in the SAME purchase unit the Unit column declares. Shared
       // toPurchaseQty, so the template can never drift from the on-screen figure.
       const sysPU = m.current_stock == null ? 0 : toPurchaseQty(m.current_stock, m);
       lines.push((isAdmin ? [...base, sysPU, ''] : [...base, '']).map(csvEscape).join(','));
+    }
+    // Semi-finished section (req 1). Unit is the sub-recipe's OWN yield_unit —
+    // there is no purchase unit and no pack conversion, so the count goes in
+    // exactly as written. The System stock cell stays blank even for admins:
+    // sub-recipes carry no system figure, and a 0 there would read as one.
+    for (const s of subs) {
+      const base = [CSV_TYPE_SEMI, '', s.id, '', s.name, s.category || 'sub-recipe', s.yield_unit];
+      lines.push((isAdmin ? [...base, '', ''] : [...base, '']).map(csvEscape).join(','));
     }
     const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -497,9 +838,12 @@ export default function ClosingStockByLocationPage() {
     try {
       let mats = materials;
       if (!mats.length) mats = await fetchMaterials();
+      const subs = subRecipes.length ? subRecipes : await fetchSubRecipes();
       const byId = new Map(mats.map(m => [String(m.id), m]));
       const bySku = new Map(mats.filter(m => m.sku).map(m => [String(m.sku).trim().toLowerCase(), m]));
       const byName = new Map(mats.map(m => [String(m.name).trim().toLowerCase(), m]));
+      const subById = new Map(subs.map(s => [String(s.id), s]));
+      const subByName = new Map(subs.map(s => [s.name.trim().toLowerCase(), s]));
       const text = await file.text();
       const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
       if (parsed.errors?.length) {
@@ -508,6 +852,7 @@ export default function ClosingStockByLocationPage() {
       }
       const rows = parsed.data as any[];
       const items: { material_id: string; physical_stock: number }[] = [];
+      const semiItems: { sub_recipe_id: string; physical_stock: number; notes: string }[] = [];
       const errors: string[] = [];
       const get = (row: any, ...keys: string[]) => {
         for (const k of keys) if (row[k] != null && String(row[k]).trim() !== '') return String(row[k]).trim();
@@ -516,9 +861,46 @@ export default function ClosingStockByLocationPage() {
       for (const row of rows) {
         const pc = get(row, 'Physical count', 'Physical Count', 'physical_count', 'physical count');
         if (pc === '') continue;                               // blank = not counted → skip
-        const label = get(row, 'Name', 'name') || get(row, 'material_id') || get(row, 'SKU', 'sku') || 'row';
+        const label = get(row, 'Name', 'name') || get(row, 'material_id') || get(row, 'sub_recipe_id') || get(row, 'SKU', 'sku') || 'row';
         const qty = parseFloat(pc);
         if (isNaN(qty) || qty < 0) { errors.push(`${label}: invalid physical count "${pc}"`); continue; }
+
+        /* ── ITEM TYPE (req 1) ────────────────────────────────────────────
+           A file downloaded from this page declares its type per row. A file
+           without the column is an OLD template — every row in it was a raw
+           material, so blank means RAW and the old round-trip is unchanged.
+           Anything else is rejected rather than guessed: a sub-recipe counted
+           as a raw material (or the reverse) would be valued by the wrong rule
+           entirely — pack factor and ₹/purchase-unit versus ₹/yield-unit. */
+        const typeCell = get(row, 'Type', 'type', 'Item type', 'item_type').toUpperCase();
+        const subIdKey = get(row, 'sub_recipe_id', 'Sub recipe id', 'sub recipe id');
+        const nameLower = get(row, 'Name', 'name').toLowerCase();
+        const isSemi = typeCell === CSV_TYPE_SEMI || (typeCell === '' && !!subIdKey);
+        if (typeCell !== '' && typeCell !== CSV_TYPE_RAW && typeCell !== CSV_TYPE_SEMI) {
+          errors.push(`${label}: unknown Type "${typeCell}" — use ${CSV_TYPE_RAW} for a raw material or ${CSV_TYPE_SEMI} for a sub-recipe`);
+          continue;
+        }
+        // A blank Type on a name that exists ONLY as a sub-recipe is a row from
+        // a hand-built file. Ask for the Type rather than silently missing it.
+        if (typeCell === '' && !subIdKey && nameLower && !byName.has(nameLower) && subByName.has(nameLower)) {
+          errors.push(`${label}: this is a sub-recipe — set Type to ${CSV_TYPE_SEMI} (or fill sub_recipe_id) so it is not read as a raw material`);
+          continue;
+        }
+        if (isSemi) {
+          const s = (subIdKey && subById.get(subIdKey)) || (nameLower && subByName.get(nameLower));
+          if (!s) { errors.push(`${label}: sub-recipe not found (check sub_recipe_id / Name)`); continue; }
+          // Counted in the sub-recipe's OWN yield_unit — no pack conversion
+          // exists, so the Unit cell may only confirm that unit.
+          const unitCell = get(row, 'Unit', 'unit').toLowerCase();
+          const yu = s.yield_unit.toLowerCase();
+          if (unitCell !== '' && unitCell !== yu) {
+            errors.push(`${label}: unit "${unitCell}" is not this sub-recipe's yield unit (${s.yield_unit})`);
+            continue;
+          }
+          semiItems.push({ sub_recipe_id: s.id, physical_stock: qty, notes: get(row, 'Notes', 'notes') });
+          continue;
+        }
+
         const idKey = get(row, 'material_id');
         const skuKey = get(row, 'SKU', 'sku').toLowerCase();
         const nameKey = get(row, 'Name', 'name').toLowerCase();
@@ -542,20 +924,30 @@ export default function ClosingStockByLocationPage() {
         else { errors.push(`${label}: unit "${unitCell}" matches neither ${m.unit} nor ${m.purchase_unit || m.unit}`); continue; }
         items.push({ material_id: m.id, physical_stock: recipeQty });
       }
-      if (items.length === 0) {
+      if (items.length === 0 && semiItems.length === 0) {
         setClosingResult({ success: 0, errors: errors.length ? errors : ['No physical counts found in the file'] });
         return;
       }
-      const res = await api('/api/closing-stock', {
-        method: 'POST',
-        body: { date: closingDate, items, adjust_stock: false, department_id: activeDeptId },
-      });
-      const json = await res.json();
-      setClosingResult({ success: json.success || 0, errors: [...errors, ...(json.errors || [])] });
-      if (json.success > 0) {
+      let rawSaved = 0;
+      if (items.length > 0) {
+        const res = await api('/api/closing-stock', {
+          method: 'POST',
+          body: { date: closingDate, items, adjust_stock: false, department_id: activeDeptId },
+        });
+        const json = await res.json();
+        for (const e of json.errors || []) errors.push(e);
+        rawSaved = json.success || 0;
+      }
+      // Sub-recipe rows from the same file go to the semi route.
+      const semiSaved = await postSemiCounts(closingDate, semiItems, errors);
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved });
+      if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
         await reloadLocations();
+        // req 2/3 — read back the sheet the server valued and stored, so the
+        // counter immediately sees the rate applied and Quantity × Rate.
+        await loadValuedSheet(closingDate);
       }
     } catch (err: any) {
       setClosingResult({ success: 0, errors: [err.message] });
@@ -571,6 +963,30 @@ export default function ClosingStockByLocationPage() {
     if (closingCategory && m.category !== closingCategory) return false;
     return true;
   });
+
+  /* Semi-finished rows obey the same search / category filters. Sub-recipes have
+     no department and no storage location, so they are NOT dept-scoped: the
+     kitchen that holds Mint Chutney must be able to count it whatever tier the
+     counter is. Categories come from sub_recipes.category. */
+  const semiFiltered = subRecipes.filter(s => {
+    if (closingSearch && !s.name.toLowerCase().includes(closingSearch.toLowerCase())) return false;
+    if (closingCategory && (s.category || 'sub-recipe') !== closingCategory) return false;
+    return true;
+  });
+  const semiFilledCount = subRecipes.filter(s => (closingSemi[s.id]?.physical_stock ?? '') !== '').length;
+
+  /* HISTORY VALUATION (req 4) — every figure below comes from the stored row:
+     closing_stock.rate_per_purchase_unit / rate_source / total_value, written
+     at count time. A historical sheet is never re-priced from today's rates. */
+  // Sum of the stored line values actually listed below, so the footer always
+  // equals its own column (a summary figure from the API could cover a wider
+  // scope than the rows on screen).
+  const historyValueTotal = sumValue(historyItems) + sumValue(historySemi);
+  /** Does this date have any stored valuation at all? Counts saved before the
+   *  valuation columns existed have none — say so instead of showing ₹0. */
+  const historyPriced = historyItems.some((i: any) => i.total_value != null || i.rate_source != null)
+    || historySemi.some((s: any) => s.total_value != null || s.rate_per_unit != null);
+  const historyUnvalued = unvaluedCount([...historyItems, ...historySemi]);
 
   const reloadLocations = async () => {
     setLoading(true);
@@ -1154,9 +1570,23 @@ export default function ClosingStockByLocationPage() {
                         <div className="flex items-center justify-between">
                           <div>
                             <p className="font-semibold text-[#2D1B0E]">{new Date(h.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' })}</p>
-                            <p className="text-xs text-[#8B7355]">{h.item_count} items recorded</p>
+                            <p className="text-xs text-[#8B7355]">
+                              {h.item_count} items recorded
+                              {h.semi_count > 0 && <> · {h.semi_count} semi-finished</>}
+                              {h.unvalued_count > 0 && (
+                                <span title="Counts saved before closing stock was valued — they carry no stored rate, so the day's value below is partial.">
+                                  {' '}· {h.unvalued_count} unvalued
+                                </span>
+                              )}
+                            </p>
                           </div>
                           <div className="flex items-center gap-4 text-xs">
+                            {/* Closing VALUE is cost data, not variance data, so
+                                every tier sees it (req 4). Shown only when the
+                                server sends it. */}
+                            {h.total_value != null && (
+                              <span className="text-[#2D1B0E]">Value: <span className="font-semibold font-mono">{fmtMoney(h.total_value)}</span></span>
+                            )}
                             {isAdmin && h.shortage_count > 0 && (
                               <span className="flex items-center gap-1 text-red-500"><TrendingDown className="w-3 h-3" />{h.shortage_count} shortage</span>
                             )}
@@ -1183,6 +1613,12 @@ export default function ClosingStockByLocationPage() {
                       {historySummary && (
                         <div className="flex gap-4 text-xs">
                           <span className="text-[#6B5744]">Items: <span className="font-bold">{historySummary.total_items}</span></span>
+                          {historySemi.length > 0 && (
+                            <span className="text-[#6B5744]">Semi-finished: <span className="font-bold">{historySemi.length}</span></span>
+                          )}
+                          {historyPriced && (
+                            <span className="text-[#2D1B0E]">Closing value: <span className="font-bold font-mono">{fmtMoney(historyValueTotal)}</span></span>
+                          )}
                           {isAdmin && <span className="text-red-500">Shortage: <span className="font-bold">{historySummary.shortage_count}</span></span>}
                           {isAdmin && <span className="text-blue-500">Excess: <span className="font-bold">{historySummary.excess_count}</span></span>}
                           {isAdmin && <span className="text-[#af4408]">Variance Value: <span className="font-bold">{formatCurrency(Math.abs(historySummary.total_variance_value))}</span></span>}
@@ -1198,6 +1634,15 @@ export default function ClosingStockByLocationPage() {
                             {/* Blind count: System / Variance columns are admin-only. */}
                             {isAdmin && <th className="text-right py-2.5 px-3 font-medium">System Stock</th>}
                             <th className="text-right py-2.5 px-3 font-medium">Physical Stock</th>
+                            {/* Valued history (req 4). Rate + value are COST data,
+                                not variance data, so they are NOT admin-gated —
+                                and neither of them can be used to back out the
+                                system figure. Both are the STORED ones. */}
+                            <th className="text-right py-2.5 px-3 font-medium">
+                              Last Purchase Price
+                              <span className="block font-normal text-[9px] text-[#8B7355]">at count time, per purchase unit</span>
+                            </th>
+                            <th className="text-right py-2.5 px-3 font-medium">Total Value</th>
                             {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance</th>}
                             {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance (₹)</th>}
                             <th className="text-left py-2.5 px-3 font-medium">Notes</th>
@@ -1233,6 +1678,15 @@ export default function ClosingStockByLocationPage() {
                                   {hq(item.physical_stock)} {hu}
                                   {hh(item.physical_stock)}
                                 </td>
+                                {/* The rate STORED with this count, in ₹ per
+                                    purchase unit — so it pairs with the purchase
+                                    quantity in the cell to its left. */}
+                                <td className="py-2 px-3 text-right text-xs">
+                                  <RateCell rate={item.rate_per_purchase_unit} source={item.rate_source} asOf={item.rate_as_of} purchaseUnit={hu} stored={item.rate_is_stored} />
+                                </td>
+                                <td className="py-2 px-3 text-right text-xs">
+                                  <ValueCell value={item.total_value} source={item.rate_source} rate={item.rate_per_purchase_unit} />
+                                </td>
                                 {isAdmin && (
                                   <td className={`py-2 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
                                     {item.variance > 0 ? '+' : ''}{hq(item.variance)} {hu}
@@ -1248,9 +1702,77 @@ export default function ClosingStockByLocationPage() {
                               </tr>
                             );
                           })}
+
+                          {/* Semi-finished counts for this date (req 1 + 4).
+                              Valued by cost_per_unit in the sub-recipe's own
+                              yield unit — no purchase unit, no pack factor. */}
+                          {historySemi.length > 0 && (
+                            <tr className="border-t-2 border-[#D4B896] bg-[#F5EDE2]">
+                              <td colSpan={isAdmin ? 9 : 6} className="py-2 px-3">
+                                <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-[#6B5744]">
+                                  <Layers className="w-3.5 h-3.5" /> Semi-finished / sub-recipes
+                                  <span className="font-normal normal-case text-[10px] text-[#8B7355]">— counted and costed per yield unit</span>
+                                </span>
+                              </td>
+                            </tr>
+                          )}
+                          {historySemi.map((s: any) => (
+                            <tr key={`hs-${s.id}`} className="border-t border-[#E8D5C4]/50 bg-[#FFFDF9]">
+                              <td className="py-2 px-3 text-[#2D1B0E] font-medium text-xs">{s.name}</td>
+                              <td className="py-2 px-3 text-xs text-[#6B5744]">{categoryLabel(s.category || 'sub-recipe')}</td>
+                              {isAdmin && <td className="py-2 px-3 text-right text-xs"><NoBasisDash what="system-stock" /></td>}
+                              {/* unit-lock: a sub-recipe has no purchase unit — its yield
+                                  unit IS the counting basis, so there is nothing to convert
+                                  and no recipe hint to print. */}
+                              <td className="py-2 px-3 text-right text-xs font-mono font-semibold">
+                                {fmtQtyNum(Number(s.physical_stock) || 0)} {s.unit || s.yield_unit}
+                              </td>
+                              <td className="py-2 px-3 text-right text-xs">
+                                <RateCell rate={s.rate_per_unit} source={s.rate_source} purchaseUnit={s.unit || s.yield_unit} stored={s.rate_is_stored} />
+                              </td>
+                              <td className="py-2 px-3 text-right text-xs">
+                                <ValueCell value={s.total_value} source={s.rate_source} rate={s.rate_per_unit} />
+                              </td>
+                              {isAdmin && <td className="py-2 px-3 text-right text-xs"><NoBasisDash what="variance" /></td>}
+                              {isAdmin && <td className="py-2 px-3 text-right text-xs"><NoBasisDash what="variance" /></td>}
+                              <td className="py-2 px-3 text-xs text-[#8B7355]">{s.notes || '-'}</td>
+                            </tr>
+                          ))}
                         </tbody>
+                        {/* SHEET TOTAL (req 4). Rupees add across materials;
+                            quantities and per-unit rates do not — those print an
+                            em-dash rather than a meaningless sum. */}
+                        <tfoot className="sticky bottom-0 bg-[#FFF1E3] text-xs font-semibold text-[#2D1B0E]">
+                          <tr className="border-t-2 border-[#D4B896]">
+                            <td colSpan={isAdmin ? 3 : 2} className="py-2 px-3">
+                              Sheet total
+                              {historyUnvalued > 0 && (
+                                <span className="ml-2 font-normal text-[10px] text-[#8B7355]">
+                                  {historyUnvalued} item(s) had no price basis and are excluded
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 text-right"><CrossDash what="quantity total" /></td>
+                            <td className="py-2 px-3 text-right"><CrossDash what="rate total" /></td>
+                            <td className="py-2 px-3 text-right font-mono">
+                              {historyPriced ? fmtMoney(historyValueTotal) : <NoBasisDash />}
+                            </td>
+                            {isAdmin && <td className="py-2 px-3 text-right"><CrossDash what="quantity total" /></td>}
+                            {isAdmin && (
+                              <td className="py-2 px-3 text-right font-mono">
+                                {formatCurrency(historyItems.reduce((s: number, i: any) => s + (Number(i.variance_value) || 0), 0))}
+                              </td>
+                            )}
+                            <td className="py-2 px-3" />
+                          </tr>
+                        </tfoot>
                       </table>
                     </div>
+                    {!historyPriced && (
+                      <p className="text-[11px] italic text-[#8B7355]">
+                        No stored valuation for this date — these counts were recorded before closing stock was valued. Historical rows are never re-priced from today&apos;s rates.
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
@@ -1443,6 +1965,74 @@ export default function ClosingStockByLocationPage() {
                           </tr>
                         );
                       })}
+
+                      {/* ═══ SEMI-FINISHED SECTION (req 1) ═══════════════════
+                          The 68 sub-recipes the kitchen actually holds at close.
+                          Counted in their OWN yield unit — a sub-recipe has no
+                          purchase unit and no pack factor, so nothing here is
+                          converted. There is no system figure for them either,
+                          so System / Variance read as an em-dash for admins
+                          rather than a misleading zero. */}
+                      {semiFiltered.length > 0 && (
+                        <tr className="border-t-2 border-[#D4B896] bg-[#F5EDE2]">
+                          <td colSpan={isAdmin ? 7 : 5} className="py-2 px-3">
+                            <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-[#6B5744] uppercase tracking-wide">
+                              <Layers className="w-3.5 h-3.5" />
+                              Semi-finished / sub-recipes
+                              <span className="font-normal normal-case text-[10px] text-[#8B7355]">
+                                — {semiFiltered.length} item{semiFiltered.length === 1 ? '' : 's'}, counted in each recipe&apos;s own yield unit (no pack conversion). Not department-mapped: count only what your section holds.
+                              </span>
+                            </span>
+                          </td>
+                        </tr>
+                      )}
+                      {semiFiltered.map((s) => {
+                        const sv = closingSemi[s.id];
+                        return (
+                          <tr key={`semi-${s.id}`} className="border-t border-[#E8D5C4]/50 bg-[#FFFDF9]">
+                            <td className="py-1.5 px-3 text-[#2D1B0E] font-medium text-xs">
+                              {s.name}
+                              <span className="ml-1.5 text-[9px] px-1 py-0.5 rounded bg-[#EDE3D5] text-[#6B5744] uppercase align-middle">semi</span>
+                            </td>
+                            <td className="py-1.5 px-3">
+                              <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-[#EDE3D5] text-[#6B5744]">
+                                {categoryLabel(s.category || 'sub-recipe')}
+                              </span>
+                            </td>
+                            {isAdmin && (
+                              <td className="py-1.5 px-3 text-right text-xs font-mono">
+                                <NoBasisDash what="system-stock" />
+                              </td>
+                            )}
+                            <td className="py-1.5 px-3 text-right text-xs text-[#8B7355]" title="Sub-recipes are counted and costed in their yield unit — there is no purchase unit">
+                              {s.yield_unit}
+                            </td>
+                            <td className="py-1.5 px-2">
+                              <input
+                                type="number" step="0.01" min="0"
+                                value={sv?.physical_stock || ''}
+                                onChange={e => updateClosingSemi(s.id, 'physical_stock', e.target.value)}
+                                placeholder=""
+                                className="w-full px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-right font-mono text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408] placeholder-[#C4B09A]"
+                              />
+                            </td>
+                            {isAdmin && (
+                              <td className="py-1.5 px-3 text-right text-xs font-mono">
+                                <NoBasisDash what="variance" />
+                              </td>
+                            )}
+                            <td className="py-1.5 px-2">
+                              <input
+                                type="text"
+                                value={sv?.notes || ''}
+                                onChange={e => updateClosingSemi(s.id, 'notes', e.target.value)}
+                                placeholder="Optional"
+                                className="w-full px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-[#2D1B0E] placeholder-[#C4B09A] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
+                              />
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -1451,6 +2041,9 @@ export default function ClosingStockByLocationPage() {
                 <div className="flex items-center justify-between">
                   <p className="text-xs text-[#8B7355]">
                     {deptScopedMaterials.filter((m: any) => (closingItems[m.id]?.physical_stock ?? '') !== '').length} of {deptScopedMaterials.length} items filled
+                    {subRecipes.length > 0 && (
+                      <> · {semiFilledCount} of {subRecipes.length} sub-recipes</>
+                    )}
                   </p>
                   <div className="flex gap-3">
                     <button
@@ -1472,14 +2065,127 @@ export default function ClosingStockByLocationPage() {
 
                 {/* Result */}
                 {closingResult && (
-                  <div className={`p-3 rounded-lg border ${closingResult.errors.length > 0 && closingResult.success === 0 ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
+                  <div className={`p-3 rounded-lg border ${closingResult.errors.length > 0 && closingResult.success === 0 && !closingResult.semi ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
                     <div className="flex items-start gap-2 text-sm">
-                      {closingResult.success > 0 ? <CheckCircle className="w-4 h-4 text-green-600 mt-0.5" /> : <AlertCircle className="w-4 h-4 text-red-500 mt-0.5" />}
+                      {(closingResult.success > 0 || (closingResult.semi ?? 0) > 0) ? <CheckCircle className="w-4 h-4 text-green-600 mt-0.5" /> : <AlertCircle className="w-4 h-4 text-red-500 mt-0.5" />}
                       <div>
                         {closingResult.success > 0 && <p className="text-green-700">Closing stock recorded for {closingResult.success} items!</p>}
+                        {(closingResult.semi ?? 0) > 0 && (
+                          <p className="text-green-700">
+                            {closingResult.semi} semi-finished item{closingResult.semi === 1 ? '' : 's'} recorded.
+                          </p>
+                        )}
                         {closingResult.errors.map((e, i) => <p key={i} className="text-red-600 text-xs">{e}</p>)}
                       </div>
                     </div>
+                  </div>
+                )}
+
+                {/* ═══ VALUED SHEET (req 2 + 3) ═══════════════════════════════
+                    What the server RESOLVED AND STORED for the counts just
+                    saved: the rate that applied, Quantity × Rate per line, and
+                    the sheet total. Read back from /api/closing-stock, never
+                    recomputed here — the browser must not derive a rate, and
+                    raw_materials.last_purchase_price is unusable anyway (mixed
+                    bases on live data). */}
+                {valued && (valued.items.length > 0 || valued.semi.length > 0) && (
+                  <div className="rounded-lg border border-[#E8D5C4] overflow-hidden">
+                    <div className="px-3 py-2 bg-[#FFF1E3] flex items-center justify-between gap-3 flex-wrap">
+                      <div className="text-xs font-semibold text-[#2D1B0E]">
+                        Valued sheet — {valued.date}
+                        <span className="ml-2 font-normal text-[10px] text-[#8B7355]">
+                          rates resolved and stored by the server at count time
+                        </span>
+                      </div>
+                      <div className="text-xs text-[#6B5744]">
+                        Sheet total <span className="font-mono font-semibold text-[#2D1B0E]">{fmtMoney(valued.total)}</span>
+                      </div>
+                    </div>
+                    {!valued.priced ? (
+                      <p className="px-3 py-3 text-xs text-amber-800 bg-amber-50">
+                        The counts saved, but this server build did not return per-item valuation, so no rate or value can be shown.
+                      </p>
+                    ) : (
+                      <div className="overflow-x-auto max-h-[40vh] overflow-y-auto">
+                        <table className="w-full text-xs">
+                          <thead className="sticky top-0 bg-[#FFF8F0] text-[#8B7355]">
+                            <tr>
+                              <th className="text-left py-2 px-3 font-medium">Item</th>
+                              <th className="text-right py-2 px-3 font-medium">Quantity</th>
+                              <th className="text-right py-2 px-3 font-medium">Last purchase price</th>
+                              <th className="text-right py-2 px-3 font-medium">Total value</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {valued.items.map((it: any) => {
+                              // Rates are ₹ per PURCHASE unit, so the quantity
+                              // beside them must be the PURCHASE quantity.
+                              const vm = { unit: it.unit, purchase_unit: it.purchase_unit, pack_size: it.pack_size };
+                              const vpu = it.purchase_unit || it.unit;
+                              return (
+                                <tr key={`v-${it.id}`} className="border-t border-[#E8D5C4]/50">
+                                  <td className="py-1.5 px-3 text-[#2D1B0E]">{it.material_name}</td>
+                                  <td className="py-1.5 px-3 text-right font-mono">
+                                    {fmtQtyNum(toPurchaseQty(Number(it.physical_stock) || 0, vm))} {vpu}
+                                    {packFactor(vm) > 1 && (
+                                      <span className="block text-[9px] text-[#B8A590]">
+                                        = {fmtQtyNum(Number(it.physical_stock) || 0)} {it.unit}
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="py-1.5 px-3 text-right">
+                                    <RateCell rate={it.rate_per_purchase_unit} source={it.rate_source} asOf={it.rate_as_of} purchaseUnit={vpu} stored={it.rate_is_stored} />
+                                  </td>
+                                  <td className="py-1.5 px-3 text-right">
+                                    <ValueCell value={it.total_value} source={it.rate_source} rate={it.rate_per_purchase_unit} />
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                            {valued.semi.length > 0 && (
+                              <tr className="border-t-2 border-[#D4B896] bg-[#F5EDE2]">
+                                <td colSpan={4} className="py-1.5 px-3 text-[10px] font-semibold uppercase tracking-wide text-[#6B5744]">
+                                  Semi-finished — costed per yield unit
+                                </td>
+                              </tr>
+                            )}
+                            {valued.semi.map((s: any) => (
+                              <tr key={`vs-${s.id}`} className="border-t border-[#E8D5C4]/50 bg-[#FFFDF9]">
+                                <td className="py-1.5 px-3 text-[#2D1B0E]">{s.name}</td>
+                                {/* unit-lock: a sub-recipe is counted and costed in its OWN
+                                    yield unit. It has no purchase unit and no pack factor, so
+                                    there is nothing to convert and nothing to hint at. */}
+                                <td className="py-1.5 px-3 text-right font-mono">
+                                  {fmtQtyNum(Number(s.physical_stock) || 0)} {s.yield_unit || s.unit}
+                                </td>
+                                <td className="py-1.5 px-3 text-right">
+                                  <RateCell rate={s.rate_per_unit} source={s.rate_source} purchaseUnit={s.yield_unit || s.unit} stored={s.rate_is_stored} />
+                                </td>
+                                <td className="py-1.5 px-3 text-right">
+                                  <ValueCell value={s.total_value} source={s.rate_source} rate={s.rate_per_unit} />
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                          <tfoot className="sticky bottom-0 bg-[#FFF1E3] font-semibold text-[#2D1B0E]">
+                            <tr className="border-t-2 border-[#D4B896]">
+                              <td className="py-2 px-3">
+                                Sheet total
+                                {unvaluedCount([...valued.items, ...valued.semi]) > 0 && (
+                                  <span className="ml-2 font-normal text-[10px] text-[#8B7355]">
+                                    {unvaluedCount([...valued.items, ...valued.semi])} item(s) had no price basis and are excluded
+                                  </span>
+                                )}
+                              </td>
+                              {/* Cross-material quantities never add up (ml + g + BTL) — em-dash. */}
+                              <td className="py-2 px-3 text-right"><CrossDash what="quantity total" /></td>
+                              <td className="py-2 px-3 text-right"><CrossDash what="rate total" /></td>
+                              <td className="py-2 px-3 text-right font-mono">{fmtMoney(valued.total)}</td>
+                            </tr>
+                          </tfoot>
+                        </table>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

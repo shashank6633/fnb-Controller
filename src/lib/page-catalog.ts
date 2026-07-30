@@ -115,6 +115,12 @@ export const PAGE_CATALOG: PageSection[] = [
       // Read-only board: counted stock by storage area x department. Counts are
       // still recorded on /closing-stock — this only makes them comparable.
       { path: '/inventory/closing-overview', label: 'Closing Overview', mgmtOnly: true },
+      // Entry-AND-reporting sheet spanning every active department (owner req 5).
+      // Deliberately NOT mgmtOnly: it is a counting surface, and a department's
+      // own staff must be able to record their counts. The API scopes a
+      // non-privileged user to their own + granted departments, and blind-count
+      // (system stock / variance) stays admin-only server-side.
+      { path: '/inventory/closing-sheet', label: 'Department Closing Sheet' },
       { path: '/inventory/transfers', label: 'Store Transfers' },
       { path: '/inventory/department-stock', label: 'Department Stock' },
       { path: '/inventory/reconciliation', label: 'Sales vs Consumption' },

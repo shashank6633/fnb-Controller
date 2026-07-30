@@ -153,6 +153,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Liquor Store",       href: "/inventory/liquor-store", icon: Wine },
       { kind: "link", label: "Stock Overview",     href: "/inventory/stock-overview", icon: Layers },
       { kind: "link", label: "Closing Overview",   href: "/inventory/closing-overview", icon: ClipboardCheck },
+      { kind: "link", label: "Dept Closing Sheet", href: "/inventory/closing-sheet", icon: ClipboardList },
       { kind: "link", label: "Store Transfers",    href: "/inventory/transfers", icon: ArrowLeftRight },
       { kind: "link", label: "Department Stock",   href: "/inventory/department-stock", icon: Warehouse },
       { kind: "link", label: "Sales vs Consumption", href: "/inventory/reconciliation", icon: Scale },
