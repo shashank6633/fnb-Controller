@@ -383,8 +383,19 @@ export async function GET(request: Request) {
     {
       const seen = new Set(results.map(r => String(r.item_name).toLowerCase().trim()));
       const matById = new Map(materials.map(m => [m.id, m]));
+      // qty_per_unit MUST be selected here. It was not, and the push below then
+      // hardcoded 1 — so every saved mapping that reached this block reported
+      // "1 sold = 1 unit" to the screen no matter what was stored. "Budweiser
+      // 330ML Bucket of 4" is saved as 4 and was displayed as 1.
+      //
+      // That was not merely cosmetic: the row editor seeds its input from this
+      // value (direct-items/page.tsx, setEditQpu), so the next Save posted the
+      // 1 it had been shown and OVERWROTE the real 4. The bucket silently
+      // became a single bottle, and one beer was deducted from stock per bucket
+      // sold instead of four.
       const links = db.prepare(`
-        SELECT item_name, material_id, COALESCE(dismissed, 0) AS dismissed
+        SELECT item_name, material_id, COALESCE(qty_per_unit, 1) AS qty_per_unit,
+               COALESCE(dismissed, 0) AS dismissed
         FROM direct_item_links WHERE material_id IS NOT NULL
       `).all() as any[];
       for (const dl of links) {
@@ -413,7 +424,9 @@ export async function GET(request: Request) {
           purchased_in_sold_unit: 0, stock_in_sold_unit: m.current_stock || 0,
           diff_in_sold_unit: 0, leakage_in_sold_unit: 0, sold_unit_label: m.unit || 'units',
           finalized: !dl.dismissed, linked_material_id: dl.material_id, department: 'Manual',
-          reviewed: true, dismissed: !!dl.dismissed, qty_per_unit: 1, manual: true,
+          reviewed: true, dismissed: !!dl.dismissed,
+          qty_per_unit: Number(dl.qty_per_unit) > 0 ? Number(dl.qty_per_unit) : 1,
+          manual: true,
         });
       }
     }
@@ -611,16 +624,41 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     const db = getDb();
-    const { item_name, material_id, qty_per_unit, dismissed } = await request.json();
+    const body = await request.json();
+    const { item_name, material_id, qty_per_unit, dismissed } = body;
     if (!item_name || typeof item_name !== 'string') {
       return Response.json({ error: 'item_name is required' }, { status: 400 });
     }
     if (material_id && typeof material_id !== 'string') {
       return Response.json({ error: 'material_id must be a string or null' }, { status: 400 });
     }
-    const qpu = Number.isFinite(Number(qty_per_unit)) && Number(qty_per_unit) > 0
-                ? Number(qty_per_unit) : 1;
-    const dismissedFlag = dismissed ? 1 : 0;
+
+    // AN ABSENT FIELD MEANS "LEAVE IT ALONE" — it does NOT mean "reset it".
+    //
+    // This write is a full overwrite of the row, so a caller that mentioned only
+    // the field it cared about silently destroyed the others. The dismiss toggle
+    // did exactly that: it posted `material_id: null, qty_per_unit: 1` because
+    // those were the only values it had to hand, and one click turned
+    // "Budweiser Bucket of 4 → BUDWEISER (330ML), 4 per sale" into
+    // "unlinked, 1 per sale". No warning, no way to tell it had happened, and
+    // four bottles a bucket stopped leaving stock.
+    //
+    // `in` rather than a truthiness/undefined test, so an EXPLICIT null still
+    // unlinks — that is what the Unlink button means and it must keep working.
+    // Only a field the caller never mentioned is preserved.
+    const current = db.prepare(
+      'SELECT material_id, qty_per_unit, dismissed FROM direct_item_links WHERE item_name = ?',
+    ).get(item_name) as any;
+
+    const materialGiven = Object.prototype.hasOwnProperty.call(body, 'material_id');
+    const qtyGiven      = Object.prototype.hasOwnProperty.call(body, 'qty_per_unit');
+    const dismissGiven  = Object.prototype.hasOwnProperty.call(body, 'dismissed');
+
+    const effMaterialId = materialGiven ? (material_id || null) : (current?.material_id ?? null);
+    const qpu = qtyGiven
+      ? (Number.isFinite(Number(qty_per_unit)) && Number(qty_per_unit) > 0 ? Number(qty_per_unit) : 1)
+      : (Number(current?.qty_per_unit) > 0 ? Number(current.qty_per_unit) : 1);
+    const dismissedFlag = dismissGiven ? (dismissed ? 1 : 0) : (current?.dismissed ? 1 : 0);
     if (material_id) {
       const exists = db.prepare('SELECT id FROM raw_materials WHERE id = ?').get(material_id);
       if (!exists) return Response.json({ error: 'material_id not found' }, { status: 404 });
@@ -631,7 +669,7 @@ export async function POST(request: Request) {
     // can never mean two different things.
     const txn = db.transaction(() => writeDirectItemLink(db, {
       item_name,
-      material_id: material_id || null,
+      material_id: effMaterialId,
       qty_per_unit: qpu,
       dismissed: !!dismissedFlag,
     }));
@@ -641,7 +679,7 @@ export async function POST(request: Request) {
     return Response.json({
       success: true,
       item_name,
-      material_id: material_id || null,
+      material_id: effMaterialId,
       qty_per_unit: qpu,
       updated_menu_items: updatedMenuItems,
     });

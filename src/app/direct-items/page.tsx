@@ -208,12 +208,19 @@ export default function DirectItemsPage() {
 
   // Toggle dismissed flag for one item. Doesn't touch sales — just marks the
   // direct_item_links row so the report stops surfacing this name.
+  //
+  // SENDS ONLY `dismissed`. It used to also send `material_id: null` and
+  // `qty_per_unit: 1` — values it had no business asserting — and because the
+  // write is a full overwrite of the row, one click on Dismiss unlinked the
+  // material AND reset the quantity. "Budweiser Bucket of 4" silently became an
+  // unlinked item worth 1 bottle a sale. The server now preserves any field a
+  // caller omits, and this caller omits everything it does not mean to change.
   const setDismissed = async (itemName: string, value: boolean) => {
     setDismissingRow(itemName);
     try {
       const r = await api('/api/direct-items', {
         method: 'POST',
-        body: { item_name: itemName, material_id: null, qty_per_unit: 1, dismissed: value },
+        body: { item_name: itemName, dismissed: value },
       });
       if (!r.ok) { alert((await r.json().catch(() => ({}))).error || 'Action failed'); return; }
       load();
