@@ -63,6 +63,7 @@ const WA_EVENT_PARAM_ORDER: Record<string, string[]> = {
   discount_decided:     ['order', 'pct', 'decision', 'decided_by'],
   low_stock_daily:      ['date', 'count', 'summary'],
   digest_daily:         ['date', 'content'],
+  calls_daily:          ['date', 'calls', 'answered', 'answered_pct', 'missed', 'bookings', 'pending', 'peak', 'agents'],
 };
 
 /** Client-side mirror of lib/whatsapp renderTemplate() for the live preview. */
@@ -81,6 +82,7 @@ const NOTIFY_EVENTS: { key: string; label: string; hint: string }[] = [
   { key: 'discount_decided',     label: 'Discount request decided', hint: 'Ping the requesting cashier when a remote discount request is approved / rejected.' },
   { key: 'low_stock_daily',      label: 'Low-stock daily summary', hint: 'One morning message listing materials at/below reorder level.' },
   { key: 'digest_daily',         label: 'Daily digest', hint: 'Send the AKAN daily owner briefing to configured numbers.' },
+  { key: 'calls_daily',          label: 'Daily calls analytics', hint: "Yesterday's reservations line to the owner: calls, answered %, missed, bookings, busiest hour and the top agents." },
 ];
 
 export default function WhatsAppIntegrationPage() {

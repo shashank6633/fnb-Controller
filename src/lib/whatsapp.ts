@@ -323,6 +323,7 @@ export async function sendWhatsAppTemplate(
  */
 export const WA_NOTIFY_EVENTS = [
   'requisition_approved', 'discount_decided', 'low_stock_daily', 'digest_daily',
+  'calls_daily',
 ] as const;
 export type WaNotifyEvent = typeof WA_NOTIFY_EVENTS[number];
 
@@ -338,6 +339,9 @@ export const WA_DEFAULT_EVENT_BODIES: Record<WaNotifyEvent, string> = {
   discount_decided: 'Discount request for order #{{order}} — {{pct}}% {{decision}} by {{decided_by}}.',
   low_stock_daily: '📦 Low-stock summary ({{date}}) — {{count}} material(s) to reorder:\n{{summary}}',
   digest_daily: '📋 AKAN Daily Digest — {{date}}\n\n{{content}}',
+  // Yesterday's reservations line, in one glance. Utility, not marketing —
+  // it goes to our own staff about our own operation.
+  calls_daily: '📞 AKAN Calls — {{date}}\n\nCalls {{calls}} · Answered {{answered}} ({{answered_pct}}%) · Missed {{missed}}\nBookings from calls: {{bookings}}\nMissed still open: {{pending}}\nBusiest hour: {{peak}}\n\n{{agents}}',
 };
 
 /**
@@ -351,6 +355,7 @@ export const WA_EVENT_PARAM_ORDER: Record<WaNotifyEvent, string[]> = {
   discount_decided: ['order', 'pct', 'decision', 'decided_by'],
   low_stock_daily: ['date', 'count', 'summary'],
   digest_daily: ['date', 'content'],
+  calls_daily: ['date', 'calls', 'answered', 'answered_pct', 'missed', 'bookings', 'pending', 'peak', 'agents'],
 };
 
 /** Master switch AND the per-event toggle must both be on. */
@@ -538,7 +543,7 @@ function waSentToday(event: WaNotifyEvent): boolean {
  * Returns a per-job status string for the cron response.
  */
 export async function runWaDailyNotifications(): Promise<Record<string, string>> {
-  const out: Record<string, string> = { low_stock_daily: 'skipped', digest_daily: 'skipped' };
+  const out: Record<string, string> = { low_stock_daily: 'skipped', digest_daily: 'skipped', calls_daily: 'skipped' };
   const date = new Date().toISOString().slice(0, 10);
 
   // 1. Low-stock daily summary — top 10 reorder suggestions (same math as CRM
@@ -580,6 +585,61 @@ export async function runWaDailyNotifications(): Promise<Record<string, string>>
   } catch (e: any) {
     out.digest_daily = 'error';
     try { console.error('[whatsapp digest_daily]', e?.message || e); } catch { /* never */ }
+  }
+
+  // 3. Calls analytics — yesterday's reservations line in one message to the
+  //    owner/admin. Reads dashboardStats(), the SAME source the CRM dashboard
+  //    renders, so the WhatsApp figure and the screen can never disagree.
+  //
+  //    Reports YESTERDAY, not today: the cron runs in the morning, and a
+  //    part-finished day would send a "missed 40%" panic at 9am that fixes
+  //    itself by lunch.
+  try {
+    if (!isWaNotifyEnabled('calls_daily')) out.calls_daily = 'disabled';
+    else if (waSentToday('calls_daily')) out.calls_daily = 'already_sent_today';
+    else {
+      const { dashboardStats } = await import('@/lib/ct/metrics');
+      // 2 days covers yesterday whichever side of midnight the job fires.
+      const st = dashboardStats(getDb(), { days: 2 });
+      const y = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+      const day = (st.byDay || []).find((d: any) => d.date === y);
+
+      if (!day || day.total === 0) out.calls_daily = 'no_calls';
+      else {
+        const answeredPct = day.total > 0 ? Math.round((day.answered / day.total) * 100) : 0;
+        // Busiest hour across the window — byHour is hour-of-day, so this is
+        // "the hour that is usually busy", which is what a rota decision needs.
+        let peak = '—';
+        let best = 0;
+        for (const h of st.byHour || []) {
+          if (h.total > best) { best = h.total; peak = `${String(h.hour).padStart(2, '0')}:00 (${h.total} calls)`; }
+        }
+        // Top 3 agents by calls handled, each with its denominator so a small
+        // sample cannot masquerade as a trend.
+        const agents = (st.agents || [])
+          .slice()
+          .sort((a: any, b: any) => b.handled - a.handled)
+          .slice(0, 3)
+          .map((a: any) => `• ${a.agent}: ${a.handled} handled, ${a.bookings} booking(s)`)
+          .join('\n') || '• no agent activity recorded';
+
+        await notifyEvent('calls_daily', {
+          date: y,
+          calls: day.total,
+          answered: day.answered,
+          answered_pct: answeredPct,
+          missed: day.missed,
+          bookings: st.today?.bookings_from_calls ?? 0,
+          pending: st.today?.pending_recoveries ?? 0,
+          peak,
+          agents,
+        });
+        out.calls_daily = 'fired';
+      }
+    }
+  } catch (e: any) {
+    out.calls_daily = 'error';
+    try { console.error('[whatsapp calls_daily]', e?.message || e); } catch { /* never */ }
   }
 
   return out;

@@ -264,7 +264,11 @@ main > div > div.grid > *:nth-child(6) { animation-delay: 0.20s; }
    *    whose parent shrink-wraps (an icon-only <button>) resolves circularly
    *    to width 0 — the icon vanishes and the button becomes untappable
    *    (this killed the requisitions expand chevron on phones). Icons always
-   *    carry explicit w-*/h-* classes, so they never break out anyway. */
+   *    carry explicit width and height utilities, so they never break out
+   *    anyway. (Do not write those class names with a star-slash here — the
+   *    sequence closes this comment early, which is exactly what happened:
+   *    the rest of the sentence parsed as CSS and every build reported
+   *    "1 warning while optimizing generated CSS".) */
   main iframe, main canvas { max-width: 100%; height: auto; }
   main svg:not(button svg):not(a svg) { max-width: 100%; height: auto; }
 

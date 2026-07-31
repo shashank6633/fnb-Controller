@@ -1282,6 +1282,96 @@ function initializeSchema(db: Database.Database) {
     db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('requisition_deduct_at_issue', '0')`);
   } catch (e) { console.error('requisition_issue_ledger schema failed:', e); }
 
+  // ── WhatsApp templates for the guest-engagement features ─────────────────
+  //
+  // Seeded as DRAFTS: send_as_template = 0 and provider_template_name = ''.
+  // Nothing here can go out as an approved template until a human pastes the
+  // Meta/Interakt-approved name into the Templates tab and flips the switch —
+  // which is correct, because Meta must approve the wording first and we cannot
+  // do that from here. The body text is the exact copy to submit.
+  //
+  // INSERT OR IGNORE, never REPLACE: this is admin-editable content. Once
+  // someone edits the wording or wires the provider name, a redeploy must not
+  // undo them (see scripts/check-boot-migrations.js for why that rule exists).
+  //
+  // CATEGORY MATTERS AT META, and getting it wrong gets the template rejected
+  // or reclassified:
+  //   UTILITY   — follows up on something the guest did (they rang us; they
+  //               sent an enquiry). No offers, no discounts, no marketing words.
+  //   MARKETING — anything promotional. Requires prior opt-in under DPDPA and
+  //               costs the marketing rate (Rs 0.8631/msg in India from
+  //               Jan 2026), versus ~Rs 0.115 for utility.
+  //
+  // Variables are POSITIONAL at the provider ({{1}}, {{2}}); the local `body`
+  // uses names and `param_order` maps one to the other.
+  try {
+    const seedTpl = db.prepare(`
+      INSERT OR IGNORE INTO whatsapp_templates
+        (id, name, category, language, body, is_active, provider_template_name,
+         provider_language, param_order, send_as_template)
+      VALUES (lower(hex(randomblob(16))), ?, ?, 'en', ?, 1, '', 'en', ?, 0)
+    `);
+    const T: Array<[string, string, string, string[]]> = [
+      // [internal name, local category, body, positional param order]
+
+      // 1. UTILITY — the missed-call acknowledgement. Deliberately has NO offer
+      //    in it; one promotional word here turns it into a MARKETING template
+      //    that cannot be used as a service reply.
+      ['ct_missed_call_ack', 'notification',
+       'Sorry we missed your call to {{venue}}. Reply to this message and our team will help you book a table.',
+       ['venue']],
+
+      // 2. UTILITY — same, for a call that came in after closing. Says when we
+      //    open, which is the useful thing to tell someone at 2am.
+      ['ct_missed_call_ack_after_hours', 'notification',
+       'Sorry we missed your call to {{venue}}. We open at {{open_time}}. Reply to this message and we will help you book a table.',
+       ['venue', 'open_time']],
+
+      // 3. UTILITY — follow-up to an enquiry the GUEST started, so it stays
+      //    transactional as long as it offers help rather than a deal.
+      ['ct_enquiry_followup', 'notification',
+       'Hi {{name}}, thank you for your enquiry about an event at {{venue}}. Reply to this message and our events team will share dates and options.',
+       ['name', 'venue']],
+
+      // 4. MARKETING — the win-back. Needs opt-in.
+      ['ct_winback', 'marketing',
+       'Hi {{name}}, it has been a while since your last visit to {{venue}}. We would love to welcome you back — reply to this message to book a table.',
+       ['name', 'venue']],
+
+      // 5. MARKETING — filling a quiet night.
+      ['ct_slow_night', 'marketing',
+       'Hi {{name}}, we have tables free at {{venue}} on {{day}}. Reply to this message to reserve yours.',
+       ['name', 'venue', 'day']],
+
+      // 6. MARKETING — birthday. The highest-converting message a venue sends,
+      //    and the one most worth getting approved.
+      ['ct_birthday', 'marketing',
+       'Happy birthday {{name}}! Everyone at {{venue}} wishes you a wonderful year. Reply to this message to plan your celebration with us.',
+       ['name', 'venue']],
+
+      // 7. UTILITY — DAILY CALLS ANALYTICS TO THE ADMIN. Internal, not a guest
+      //    message: it goes to our own owner/managers about our own operation.
+      //
+      //    The name MUST stay 'calls_daily'. Template lookup for notifyEvent is
+      //    by convention name === event, so renaming this silently drops the
+      //    admin back to the built-in fallback body.
+      //
+      //    Nine variables is a lot for one template and Meta will scrutinise it.
+      //    If it gets rejected, collapse the body to two ({{date}} and one
+      //    pre-formatted {{summary}}) and build the block in runWaDailyNotifications
+      //    instead — the param_order is the only thing that has to change.
+      ['calls_daily', 'notification',
+       '📞 AKAN Calls — {{date}}\n\n'
+       + 'Calls {{calls}} · Answered {{answered}} ({{answered_pct}}%) · Missed {{missed}}\n'
+       + 'Bookings from calls: {{bookings}}\n'
+       + 'Missed still open: {{pending}}\n'
+       + 'Busiest hour: {{peak}}\n\n'
+       + '{{agents}}',
+       ['date', 'calls', 'answered', 'answered_pct', 'missed', 'bookings', 'pending', 'peak', 'agents']],
+    ];
+    for (const [name, cat, body, order] of T) seedTpl.run(name, cat, body, JSON.stringify(order));
+  } catch (e) { console.error('whatsapp guest-engagement template seed failed:', e); }
+
   // ── CRM: topic tracking + win-back campaigns ─────────────────────────────
   // Ideas worth taking from CallHippo, built on the stack we already own
   // rather than bought (their Terms disclaim Indian PSTN termination, they
