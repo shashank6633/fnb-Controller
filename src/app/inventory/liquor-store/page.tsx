@@ -311,7 +311,6 @@ export default function LiquorStorePage() {
   const [lTo, setLTo] = useState('');
 
   // Modals
-  const [showPurchase, setShowPurchase] = useState(false);
   const [showAdjust, setShowAdjust] = useState(false);
   const [showBulkAdjust, setShowBulkAdjust] = useState(false);
   const [showBill, setShowBill] = useState(false);
@@ -603,12 +602,11 @@ export default function LiquorStorePage() {
             <Upload className="w-4 h-4" /> Bulk Adjust
           </button>
         )}
-        {access.can_procure && (
-          <button onClick={() => setShowPurchase(true)}
-                  className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5">
-            <Plus className="w-4 h-4" /> New Purchase
-          </button>
-        )}
+        {/* The single-line "New Purchase" button was removed on the owner's
+            call — it recorded the same inward by a second route, so a one-item
+            purchase is now simply a bill with one line and the TGBCL invoice
+            number, vendor and bill charges are never optional. New Bill and
+            Upload CSV (Bill) are the two remaining ways in. */}
         {access.can_procure && (
           <button onClick={() => setShowUpload(true)}
                   title="Upload a full liquor invoice (govt / TGBCL) from a CSV — many lines + bill charges in one go"
@@ -741,7 +739,7 @@ export default function LiquorStorePage() {
           ) : filtered.length === 0 ? (
             <div className="p-8 text-center text-sm text-[#8B7355] bg-white border border-[#E8D5C4] rounded-xl">
               {stock.length === 0
-                ? `No stock yet. ${access.can_procure ? 'Record your first purchase with “New Purchase”' : 'Purchases will appear here'} — or set opening stock via Adjustment.`
+                ? `No stock yet. ${access.can_procure ? 'Record your first invoice with “New Bill”' : 'Purchases will appear here'} — or set opening stock via Adjustment.`
                 : 'Nothing matches the current filters.'}
             </div>
           ) : (
@@ -1062,14 +1060,6 @@ export default function LiquorStorePage() {
         </>
       )}
 
-      {showPurchase && store && (
-        <PurchaseModal
-          storeId={store.id} storeName={store.name}
-          materials={materials} suppliers={suppliers} vendors={vendors} storeVendors={storeVendors}
-          onClose={() => setShowPurchase(false)}
-          onSaved={msg => { setShowPurchase(false); afterWrite(msg); }}
-        />
-      )}
       {showAdjust && store && (
         <AdjustModal
           storeId={store.id} storeName={store.name}
@@ -1143,137 +1133,6 @@ const L = ({ children }: { children: React.ReactNode }) => (
   <label className="block text-[10px] uppercase tracking-wide text-[#8B7355] mb-0.5">{children}</label>
 );
 const inputCls = 'w-full px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]';
-
-/* ── New Purchase modal ────────────────────────────────────────────────── */
-
-function PurchaseModal({ storeId, storeName, materials, suppliers, vendors, storeVendors, onClose, onSaved }: {
-  storeId: string; storeName: string;
-  materials: MatRow[]; suppliers: string[]; vendors: VendorLite[]; storeVendors: VendorLite[];
-  onClose: () => void; onSaved: (msg: string) => void;
-}) {
-  const [materialId, setMaterialId] = useState('');
-  const [cbl, setCbl] = useState<CBLValue>(CBL_EMPTY);
-  const [price, setPrice] = useState('');
-  const [date, setDate] = useState(today());
-  const [supplier, setSupplier] = useState('');
-  const [vendorId, setVendorId] = useState('');
-  const [batch, setBatch] = useState('');
-  const [expiry, setExpiry] = useState('');
-  const [invoiceRef, setInvoiceRef] = useState('');
-  const [notes, setNotes] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const mat = materials.find(m => m.id === materialId) || null;
-  const pc = mat ? packConv(mat) : 1;
-  const pu = mat ? (mat.purchase_unit || mat.unit) : '';
-  const nPrice = Number(price) || 0;
-  const recipeQty = cblRecipe(mat, cbl);                       // recipe units
-  const bottleQty = pc > 1 ? recipeQty / pc : recipeQty;       // purchase units (₹ total)
-  const totalCost = bottleQty * nPrice;
-
-  const save = async () => {
-    setErr(null);
-    if (!materialId) { setErr('Pick a material'); return; }
-    if (!(recipeQty > 0)) { setErr('Enter a quantity — cases, bottles and/or loose'); return; }
-    if (!(nPrice >= 0) || price === '') { setErr(`Enter the price per ${pu || 'purchase unit'}`); return; }
-    setBusy(true);
-    try {
-      const r = await api(`/api/stores/${storeId}/procure`, {
-        method: 'POST',
-        body: {
-          material_id: materialId,
-          cases: numOr0(cbl.cases), bottles: numOr0(cbl.bottles), loose: numOr0(cbl.loose),
-          unit_price: nPrice,
-          supplier: supplier.trim(), vendor_id: vendorId || undefined,
-          batch_no: batch.trim(), expiry_date: expiry, invoice_ref: invoiceRef.trim(),
-          notes: notes.trim(), date,
-        },
-      });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      onSaved(`Recorded ${mat ? qtyText(recipeQty, mat) : ''} of ${mat?.name} into ${storeName} (${inr(j.total ?? totalCost)})`);
-    } catch (e: any) { setErr(e.message); }
-    finally { setBusy(false); }
-  };
-
-  return (
-    <ModalShell title="New Store Purchase" icon={<Wine className="w-5 h-5 text-[#af4408]" />} onClose={onClose}
-      footer={<>
-        <button onClick={onClose} disabled={busy}
-                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Cancel</button>
-        <button onClick={save} disabled={busy || !materialId}
-                className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
-          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-          Save purchase{recipeQty > 0 && nPrice > 0 ? ` — ${inr(totalCost)}` : ''}
-        </button>
-      </>}>
-      <p className="text-[11px] text-[#8B7355] -mt-1">
-        {`Goes straight to the ${storeName} ledger — Central Store purchases & costing are untouched.`}
-      </p>
-      {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{err}</div>}
-
-      <div>
-        <L>Material ({materials.length} mapped to this store)</L>
-        <MaterialTypeahead materials={materials as MaterialLite[]} value={materialId}
-                           onPick={id => { setMaterialId(id); setCbl(CBL_EMPTY); }} showStock={false} compact={false}
-                           placeholder="Type a liquor name, SKU or category…" />
-        {mat && pc > 1 && (
-          <div className="mt-1 text-[11px] text-[#6B5744] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-2 py-1">
-            {caseFactor(mat) > 1 && `1 case = ${fq(caseFactor(mat))} ${pu} · `}
-            {`1 ${pu} = ${fq(mat.pack_size)} ${mat.unit}`}
-          </div>
-        )}
-      </div>
-
-      <CBLEntry mat={mat} value={cbl} onChange={setCbl} />
-      <div>
-        <L>Price / {mat ? pu : 'purchase unit'} (₹)</L>
-        <input type="number" min={0} step="any" value={price} onChange={e => setPrice(e.target.value)}
-               placeholder="e.g. 500" className={inputCls} />
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <L>Date</L>
-          <input type="date" value={date} onChange={e => setDate(e.target.value)} className={inputCls} />
-        </div>
-        <div>
-          <L>Invoice ref</L>
-          <input value={invoiceRef} onChange={e => setInvoiceRef(e.target.value)} placeholder="INV-…" className={inputCls} />
-        </div>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <L>Supplier</L>
-          <input value={supplier} onChange={e => setSupplier(e.target.value)} list="liq-recent-suppliers"
-                 placeholder="Type a supplier…" className={inputCls} />
-          <datalist id="liq-recent-suppliers">
-            {suppliers.map(s => <option key={s} value={s} />)}
-          </datalist>
-        </div>
-        <VendorSelect used={storeVendors} all={vendors} value={vendorId} onChange={setVendorId} />
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <L>Batch no.</L>
-          <input value={batch} onChange={e => setBatch(e.target.value)} placeholder="optional" className={inputCls} />
-        </div>
-        <div>
-          <L>Expiry</L>
-          <input type="date" value={expiry} onChange={e => setExpiry(e.target.value)} className={inputCls} />
-        </div>
-      </div>
-
-      <div>
-        <L>Notes</L>
-        <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="optional" className={inputCls} />
-      </div>
-    </ModalShell>
-  );
-}
 
 /* ── Adjustment / Opening modal ────────────────────────────────────────── */
 

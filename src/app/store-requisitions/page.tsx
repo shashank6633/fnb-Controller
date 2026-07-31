@@ -640,10 +640,17 @@ export default function StoreRequisitionsPage() {
         {([
           { k: 'open',             label: 'Pending Issue',    icon: AlertCircle, tone: 'amber' },
           { k: 'deferred',         label: 'Deferred',         icon: Clock,       tone: 'blue' },
-          // The half-transferred line. Sits next to Deferred because that is the
-          // tab it used to hide inside: a line issued 2 of 4 and promised for
-          // 7pm counted as 1 deferred, 0 issued.
-          { k: 'part_issued',      label: 'Part-Issued',      icon: Split,       tone: 'violet' },
+          // Balance Pending covers BOTH shapes of "we still owe them something":
+          // a single line handed over in pieces (asked 4, gave 2), and whole
+          // lines issued complete while others were never touched.
+          //
+          // There used to be a separate Part-Issued tab for the first shape.
+          // It was removed on the owner's call: it was a strict SUBSET of this
+          // one — a split line always leaves an outstanding quantity — so the
+          // two counts moved together and nobody could tell them apart. The
+          // split itself is not lost; it is named on the row by partialSummary
+          // ("1 of 2 kg issued — 1 kg deferred"), which is where a storekeeper
+          // actually reads it.
           { k: 'balance_pending',  label: 'Balance Pending',  icon: Hourglass,   tone: 'rose' },
           { k: 'issued_today',     label: 'Issued Today',     icon: CheckCircle2,tone: 'emerald' },
           { k: 'issued_log',       label: 'Issued Items Log', icon: History,     tone: 'amber' },
@@ -706,7 +713,6 @@ export default function StoreRequisitionsPage() {
           <CheckCircle2 className="w-7 h-7 mx-auto mb-2 text-emerald-500" />
           Nothing here. {filter === 'open' && 'Caught up — no pending requisitions.'}
           {filter === 'deferred' && 'No items promised for a later time.'}
-          {filter === 'part_issued' && 'No line has been split — nothing went out in part with a balance still owed.'}
           {filter === 'balance_pending' && 'No balances owed — every issued requisition went out in full.'}
           {filter === 'issued_today' && 'Nothing has been handed over today yet.'}
         </div>
@@ -999,7 +1005,7 @@ function mergeStats(req: any): Requisition {
 }
 
 /** The queue tabs. 'issued_log' is a separate panel, not a slice of the list. */
-type StoreTab = 'open' | 'deferred' | 'part_issued' | 'balance_pending' | 'issued_today' | 'issued_log';
+type StoreTab = 'open' | 'deferred' | 'balance_pending' | 'issued_today' | 'issued_log';
 
 /**
  * THE definition of every tab — called by the tab body AND by the tab badges.
@@ -1017,19 +1023,11 @@ function matchesTab(r: Requisition, tab: StoreTab): boolean {
   switch (tab) {
     case 'open':            return r.status !== 'fulfilled' && r.lines_open > 0;
     case 'deferred':        return r.lines_deferred > 0;
-    // A LINE was SPLIT: part of its quantity physically went out and the rest is
-    // still owed — "2 issued, 2 to follow". lines_partial is exactly that count
-    // (0 < issued < effective), and it is deliberately blind to deferred_until,
-    // so the split shows here whether the balance was promised for 7pm or left
-    // open.
-    //
-    // NOT a second name for Balance Pending. That tab also fires when WHOLE
-    // lines went out and OTHER lines are untouched, where the store never
-    // divided anything; this one is only ever about a single line handed over in
-    // pieces. And it takes nothing away: matchesTab is asked once per tab and
-    // never exclusively, so a requisition landing here keeps every bucket it
-    // already matched — Deferred, Balance Pending and Issued Today included.
-    case 'part_issued':     return r.status !== 'fulfilled' && r.lines_partial > 0;
+    // NOTE: there is no 'part_issued' case any more. A split line
+    // (0 < issued < effective) always leaves an outstanding quantity, so it
+    // already matches 'balance_pending' below — the two tabs were never
+    // independent, and their counts moved together. lines_partial is still
+    // computed and still drives the row chip; it just no longer earns a tab.
     // Goods went out, goods are still owed, and the req is not closed — the
     // half-transfer bucket. The "something was actually handed over" clause is
     // what makes this tab DISTINCT: without it every untouched requisition

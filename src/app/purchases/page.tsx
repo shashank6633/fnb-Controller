@@ -48,33 +48,6 @@ function isoMinusDays(iso: string, n: number): string {
   return dt.toISOString().slice(0, 10);
 }
 
-interface PurchaseFormData {
-  material_id: string;
-  vendor: string;
-  brand: string;
-  quantity: string;
-  unit_price: string;
-  date: string;
-  notes: string;
-  entry_mode: 'btl' | 'case';
-  is_emergency: boolean;
-  payment_mode: '' | 'cash' | 'upi' | 'card' | 'credit';
-  emergency_reason: string;
-}
-
-const emptyForm: PurchaseFormData = {
-  material_id: '',
-  vendor: '',
-  brand: '',
-  quantity: '',
-  unit_price: '',
-  date: todayString(),
-  notes: '',
-  entry_mode: 'btl',
-  is_emergency: false,
-  payment_mode: '',
-  emergency_reason: '',
-};
 
 // ---- Bill Entry Types ----
 interface BillLineItem {
@@ -212,7 +185,7 @@ export default function PurchasesPage() {
   };
   /**
    * Is this quantity/price box actually on the CASE basis? This is the LABEL
-   * mirror of the guard inside handleSubmit() and billSubmit(): both multiply
+   * mirror of the guard inside billSubmit(): it multiplies
    * the typed quantity (and divide the typed rate) by case_size ONLY when the
    * mode is 'case' AND case_size > 1. A mode left on 'case' after switching to
    * a non-case material silently falls back to purchase-unit behaviour, so a
@@ -238,10 +211,6 @@ export default function PurchasesPage() {
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
 
   // Modal
-  const [modalOpen, setModalOpen] = useState(false);
-  const [formData, setFormData] = useState<PurchaseFormData>(emptyForm);
-  const [submitting, setSubmitting] = useState(false);
-  const [formError, setFormError] = useState<string | null>(null);
 
   // Toast
   const [toast, setToast] = useState<string | null>(null);
@@ -447,95 +416,9 @@ export default function PurchasesPage() {
 
   const vendorCount = new Set(purchases.map((p) => p.vendor).filter(Boolean)).size;
 
-  // Form handlers
-  const handleFormChange = (field: keyof PurchaseFormData, value: string) => {
-    setFormData((prev) => ({ ...prev, [field]: value }));
-    setFormError(null);
-  };
-
-  const computedTotal = (() => {
-    const qty = parseFloat(formData.quantity);
-    const price = parseFloat(formData.unit_price);
-    if (!isNaN(qty) && !isNaN(price)) return Math.round(qty * price * 100) / 100;
-    return 0;
-  })();
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setFormError(null);
-
-    if (!formData.material_id) {
-      setFormError('Please select a material.');
-      return;
-    }
-    if (!formData.quantity || parseFloat(formData.quantity) <= 0) {
-      setFormError('Quantity must be greater than 0.');
-      return;
-    }
-    if (!formData.unit_price || parseFloat(formData.unit_price) <= 0) {
-      setFormError('Unit price must be greater than 0.');
-      return;
-    }
-    if (!formData.date) {
-      setFormError('Please select a date.');
-      return;
-    }
-
-    setSubmitting(true);
-    try {
-      // If entry_mode = 'case', expand: qty cases × case_size → bottle count.
-      // Same maths as the bill form. Keeps the API contract (bottle qty + per-btl rate).
-      const rawQty = parseFloat(formData.quantity);
-      const rawPrice = parseFloat(formData.unit_price);
-      let qtyForApi = rawQty;
-      let priceForApi = rawPrice;
-      let caseNote = '';
-      if (formData.entry_mode === 'case') {
-        const mat = materials.find(m => m.id === formData.material_id) as any;
-        const cs = Number(mat?.case_size) || 1;
-        if (cs > 1) {
-          qtyForApi   = rawQty * cs;
-          priceForApi = rawPrice / cs;
-          caseNote    = `Case entry: ${rawQty} × ${cs} = ${qtyForApi} btl`;
-        }
-      }
-      const body = {
-        material_id: formData.material_id,
-        vendor: formData.vendor,
-        brand: formData.brand,
-        quantity: qtyForApi,
-        unit_price: priceForApi,
-        date: formData.date,
-        notes: caseNote ? `${formData.notes} | ${caseNote}`.trim() : formData.notes,
-        is_emergency: formData.is_emergency,
-        payment_mode: formData.payment_mode,
-        emergency_reason: formData.emergency_reason,
-      };
-      const res = await api('/api/purchases', {
-        method: 'POST',
-        body: body,
-      });
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => null);
-        throw new Error(errJson?.error || 'Failed to add purchase');
-      }
-      setModalOpen(false);
-      setFormData(emptyForm);
-      await fetchPurchases(appliedFilters);
-      setToast('Purchase added successfully!');
-      setTimeout(() => setToast(null), 3000);
-    } catch (err: any) {
-      setFormError(err.message);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const openModal = () => {
-    setFormData({ ...emptyForm, date: todayString() });
-    setFormError(null);
-    setModalOpen(true);
-  };
+  // NOTE: the single-line "Add Purchase" form and its handlers were removed
+  // with the button. Every purchase now goes through the bill entry below, so
+  // there is one write path instead of two that could drift apart.
 
   // ---- Bill Entry Handlers ----
 
@@ -1174,19 +1057,19 @@ export default function PurchasesPage() {
             </button>
             <input ref={openingFileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden"
                    onChange={(e) => { const f = e.target.files?.[0]; if (f) handleOpeningFile(f); }} />
+            {/* "Enter Full Bill" is now the ONLY way to record a purchase here.
+                The old single-line "Add Purchase" button was removed on the
+                owner's call: it wrote the same purchases row by a second route,
+                so the two drifted (the CASE/BTL entry-mode bug was fixed twice,
+                once per form). A one-item purchase is simply a bill with one
+                line, and this way the invoice number, vendor and bill charges
+                are never optional. */}
             <button
               onClick={openBillModal}
-              className="flex items-center gap-2 px-4 py-2.5 border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium transition-colors"
+              className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium transition-colors"
             >
               <Receipt className="w-4 h-4" />
               Enter Full Bill
-            </button>
-            <button
-              onClick={openModal}
-              className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium transition-colors"
-            >
-              <Plus className="w-4 h-4" />
-              Add Purchase
             </button>
           </div>
         </div>
@@ -1497,306 +1380,6 @@ export default function PurchasesPage() {
           <button onClick={() => setToast(null)} className="hover:opacity-70 transition-opacity">
             <X className="w-4 h-4" />
           </button>
-        </div>
-      )}
-
-      {/* Add Purchase Modal */}
-      {modalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          {/* Backdrop */}
-          <div
-            className="absolute inset-0 bg-black/40 backdrop-blur-sm"
-            onClick={() => setModalOpen(false)}
-          />
-
-          {/* Modal content */}
-          <div className="relative w-full max-w-lg bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl max-h-[90vh] overflow-y-auto">
-            {/* Modal header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4]">
-              <h2 className="text-lg font-semibold text-[#2D1B0E] flex items-center gap-2">
-                <Plus className="w-5 h-5 text-[#af4408]" />
-                Add Purchase
-              </h2>
-              <button
-                onClick={() => setModalOpen(false)}
-                className="p-1.5 rounded-lg hover:bg-[#FFF1E3] text-[#8B7355] hover:text-[#3D2614] transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* Form */}
-            <form onSubmit={handleSubmit} className="px-6 py-5 space-y-4">
-              {formError && (
-                <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm">
-                  <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-                  {formError}
-                </div>
-              )}
-
-              {/* Material */}
-              <div>
-                <label className="block text-sm font-medium text-[#6B5744] mb-1">
-                  Material <span className="text-red-400">*</span>
-                </label>
-                {materials.length === 0 ? (
-                  <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg text-amber-400 text-sm">
-                    No materials found.{' '}
-                    <Link href="/inventory" className="underline hover:text-amber-300">
-                      Add materials in Raw Materials
-                    </Link>{' '}
-                    first.
-                  </div>
-                ) : (
-                  <MaterialTypeahead
-                    materials={materials as any} purchaseBasis
-                    value={formData.material_id}
-                    onPick={(id) => handleFormChange('material_id', id)}
-                    placeholder="Type material name, SKU or category…"
-                    compact={false}
-                  />
-                )}
-              </div>
-
-              {/* Vendor & Brand row */}
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-sm font-medium text-[#6B5744] mb-1">Vendor</label>
-                  <input
-                    type="text"
-                    value={formData.vendor}
-                    onChange={(e) => handleFormChange('vendor', e.target.value)}
-                    placeholder="Vendor name"
-                    className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-[#6B5744] mb-1">Brand</label>
-                  <input
-                    type="text"
-                    value={formData.brand}
-                    onChange={(e) => handleFormChange('brand', e.target.value)}
-                    placeholder="Brand name"
-                    className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
-                  />
-                </div>
-              </div>
-
-              {/* Quantity & Unit Price row */}
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-sm font-medium text-[#6B5744] mb-1">
-                    Quantity <span className="text-red-400">*</span>
-                    {/* State the basis on the label, not just under the box: this
-                        field is PURCHASE units (kg / L / BTL / CASE). The API
-                        rejects a recipe-unit figure silently — it just books 20 g
-                        as 20 kg — so the unit has to be visible while typing. */}
-                    {(() => {
-                      const u = matUnits(formData.material_id);
-                      const cb = caseBasis(formData.material_id, formData.entry_mode);
-                      // The CASE option on the selector below switches this box to
-                      // the CASE basis and handleSubmit() multiplies by case_size,
-                      // so the label MUST switch with it. A fixed "(purchase unit)"
-                      // here told a buyer receiving 5 cases of 100 PIPERS to type
-                      // 60 — and booked 60 × 12 = 720 bottles of stock.
-                      if (cb.on) return (
-                        <span className="ml-2 text-[10px] font-normal text-[#8B7355]">
-                          in <b className="text-[#6B5744]">CASE</b>{u.pu ? ` (${cb.cs} ${u.pu} per case)` : ''}
-                        </span>
-                      );
-                      if (!u.pu) return <span className="ml-2 text-[10px] font-normal text-[#B8A590]">in purchase units</span>;
-                      return <span className="ml-2 text-[10px] font-normal text-[#8B7355]">in <b className="text-[#6B5744]">{u.pu}</b> (purchase unit)</span>;
-                    })()}
-                    {(() => {
-                      const cb = caseBasis(formData.material_id, formData.entry_mode);
-                      // Only in BTL mode: in CASE mode the label above already
-                      // carries the same factor, so printing it twice just adds
-                      // noise to the row.
-                      if (cb.cs <= 1 || cb.on) return null;
-                      return (
-                        <span className="ml-2 text-[10px] font-normal text-[#8B7355]">
-                          case_size = {cb.cs} btl/case
-                        </span>
-                      );
-                    })()}
-                  </label>
-                  <div className="flex gap-2">
-                    <input
-                      type="number" step="any" min="0.01"
-                      value={formData.quantity}
-                      onChange={(e) => handleFormChange('quantity', e.target.value)}
-                      placeholder="0"
-                      className="flex-1 px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-                      required
-                    />
-                    {(() => {
-                      const mat = materials.find(m => m.id === formData.material_id) as any;
-                      const cs = Number(mat?.case_size) || 1;
-                      if (cs <= 1) return null;
-                      return (
-                        <select value={formData.entry_mode}
-                                onChange={e => handleFormChange('entry_mode', e.target.value)}
-                                className="px-2 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E]">
-                          <option value="btl">BTL</option>
-                          <option value="case">CASE</option>
-                        </select>
-                      );
-                    })()}
-                  </div>
-                  {(() => {
-                    const cb = caseBasis(formData.material_id, formData.entry_mode);
-                    const q = parseFloat(formData.quantity) || 0;
-                    if (!cb.on || q <= 0) return null;
-                    return <div className="text-[11px] text-emerald-700 font-mono mt-0.5">= {q * cb.cs} bottles ({q} × {cb.cs})</div>;
-                  })()}
-                  {/* Recipe-unit reading of what was typed. Display only — the POST
-                      still sends the purchase-unit number verbatim. Suppressed in
-                      CASE mode, where the line above already does the expansion. */}
-                  {(() => {
-                    if (caseBasis(formData.material_id, formData.entry_mode).on) return null;
-                    const u = matUnits(formData.material_id);
-                    const h = recipeHint(formData.quantity, u);
-                    return h ? <div className="text-[9px] text-[#B8A590] font-mono mt-0.5">{h}</div> : null;
-                  })()}
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-[#6B5744] mb-1">
-                    Unit Price (₹) <span className="text-red-400">*</span>
-                    {/* ₹ per PURCHASE unit — the vendor's rate. The ₹/recipe-unit
-                        weighted average is derived server-side (÷ pack_size). */}
-                    {(() => {
-                      const u = matUnits(formData.material_id);
-                      const cb = caseBasis(formData.material_id, formData.entry_mode);
-                      // In CASE mode handleSubmit() does rawPrice / case_size, so
-                      // the box means ₹ per CASE. Same wording the bill grid
-                      // already uses for its per-line case rate.
-                      if (cb.on) return (
-                        <span className="ml-2 text-[10px] font-normal text-[#8B7355]">
-                          per case{u.pu ? ` (${cb.cs} ${u.pu})` : ''}
-                        </span>
-                      );
-                      return <span className="ml-2 text-[10px] font-normal text-[#8B7355]">per {u.pu || 'purchase unit'}</span>;
-                    })()}
-                  </label>
-                  <input
-                    type="number"
-                    step="any"
-                    min="0.01"
-                    value={formData.unit_price}
-                    onChange={(e) => handleFormChange('unit_price', e.target.value)}
-                    placeholder="0.00"
-                    className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
-                    required
-                  />
-                </div>
-              </div>
-
-              {/* Total Price (readonly) */}
-              <div>
-                <label className="block text-sm font-medium text-[#6B5744] mb-1">Total Price (₹)</label>
-                <input
-                  type="text"
-                  value={computedTotal > 0 ? formatCurrency(computedTotal) : '₹0.00'}
-                  readOnly
-                  className="w-full px-3 py-2 bg-[#FFF1E3]/50 border border-[#D4B896] rounded-lg text-sm text-green-400 font-mono font-medium cursor-not-allowed"
-                />
-              </div>
-
-              {/* Date */}
-              <div>
-                <label className="block text-sm font-medium text-[#6B5744] mb-1">
-                  Date <span className="text-red-400">*</span>
-                </label>
-                <input
-                  type="date"
-                  value={formData.date}
-                  onChange={(e) => handleFormChange('date', e.target.value)}
-                  min={dateMin}
-                  max={dateMax}
-                  className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent [color-scheme:light]"
-                  required
-                />
-                {!isAdmin && (
-                  <p className="mt-1 text-[11px] text-[#8B7355]">{backdateHint}</p>
-                )}
-              </div>
-
-              {/* Notes */}
-              <div>
-                <label className="block text-sm font-medium text-[#6B5744] mb-1">Notes</label>
-                <textarea
-                  value={formData.notes}
-                  onChange={(e) => handleFormChange('notes', e.target.value)}
-                  placeholder="Optional notes..."
-                  rows={3}
-                  className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent resize-none"
-                />
-              </div>
-
-              {/* Phase 1 §3 — Emergency / Cash purchase channel */}
-              <div className="border border-amber-200 bg-amber-50/40 rounded-lg p-3 space-y-2">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="checkbox" checked={formData.is_emergency}
-                         onChange={e => setFormData(f => ({ ...f, is_emergency: e.target.checked }))}
-                         className="accent-amber-600" />
-                  <span className="text-sm font-medium text-amber-900">🚨 Emergency / Cash Purchase</span>
-                  <span className="text-[10px] text-amber-800 ml-auto">Bypasses PO workflow — flagged for audit</span>
-                </label>
-                {formData.is_emergency && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
-                    <label className="text-xs text-[#6B5744]">Payment mode
-                      <select value={formData.payment_mode}
-                              onChange={e => setFormData(f => ({ ...f, payment_mode: e.target.value as any }))}
-                              className="w-full mt-1 px-2 py-1.5 border border-amber-300 rounded bg-white text-sm">
-                        <option value="">— select —</option>
-                        <option value="cash">Cash</option>
-                        <option value="upi">UPI</option>
-                        <option value="card">Card</option>
-                        <option value="credit">Credit (vendor)</option>
-                      </select>
-                    </label>
-                    <label className="text-xs text-[#6B5744]">Reason
-                      <input value={formData.emergency_reason}
-                             onChange={e => setFormData(f => ({ ...f, emergency_reason: e.target.value }))}
-                             list="emergency-reasons"
-                             placeholder="e.g. Sunday store-out, ran out mid-service"
-                             className="w-full mt-1 px-2 py-1.5 border border-amber-300 rounded bg-white text-sm" />
-                      <datalist id="emergency-reasons">
-                        <option value="Stockout — vendor closed" />
-                        <option value="Stockout — ran out mid-service" />
-                        <option value="Vendor delivery delayed" />
-                        <option value="Last-minute event / party" />
-                        <option value="Sample / trial purchase" />
-                      </datalist>
-                    </label>
-                  </div>
-                )}
-              </div>
-
-              {/* Actions */}
-              <div className="flex items-center justify-end gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setModalOpen(false)}
-                  className="px-4 py-2 text-sm text-[#6B5744] hover:text-[#2D1B0E] bg-[#FFF1E3] hover:bg-[#FFF1E3] rounded-lg transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={submitting || materials.length === 0}
-                  className="flex items-center gap-2 px-5 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:bg-[#af4408]/50 disabled:opacity-60 text-white rounded-lg text-sm font-medium transition-colors"
-                >
-                  {submitting ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Plus className="w-4 h-4" />
-                  )}
-                  {submitting ? 'Adding...' : 'Add Purchase'}
-                </button>
-              </div>
-            </form>
-          </div>
         </div>
       )}
 
