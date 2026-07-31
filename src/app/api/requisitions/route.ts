@@ -88,7 +88,35 @@ export async function GET(request: Request) {
                COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
                COALESCE(rm.pack_size, 1)          AS material_pack_size,
                rm.current_stock, rm.average_price,
+               rm.reorder_level, rm.sku AS material_sku_code, rm.brand AS material_brand,
                (SELECT unit_price FROM purchases WHERE material_id = rm.id ORDER BY date DESC, created_at DESC LIMIT 1) AS last_purchase_price,
+               -- LAST ISSUE OF THIS MATERIAL, anywhere — not of this line.
+               -- The store's real question at the counter is "when did this go
+               -- out last and how much", so they can spot a department asking
+               -- again three days early. The row's own issued_at answers a
+               -- different question and stays exactly as it was.
+               -- Excludes this requisition so a part-issue does not report
+               -- itself back as the previous hand-over.
+               (SELECT pri.issued_at FROM requisition_items pri
+                 WHERE pri.material_id = rm.id AND pri.req_id <> ri.req_id
+                   AND pri.issued_at IS NOT NULL AND COALESCE(pri.quantity_issued,0) > 0
+                 ORDER BY pri.issued_at DESC LIMIT 1)              AS mat_last_issue_at,
+               (SELECT pri.quantity_issued FROM requisition_items pri
+                 WHERE pri.material_id = rm.id AND pri.req_id <> ri.req_id
+                   AND pri.issued_at IS NOT NULL AND COALESCE(pri.quantity_issued,0) > 0
+                 ORDER BY pri.issued_at DESC LIMIT 1)              AS mat_last_issue_qty,
+               -- Stored in the PREVIOUS line's own unit (Option B), so it must
+               -- travel with that line's unit or the number is meaningless.
+               (SELECT pri.unit FROM requisition_items pri
+                 WHERE pri.material_id = rm.id AND pri.req_id <> ri.req_id
+                   AND pri.issued_at IS NOT NULL AND COALESCE(pri.quantity_issued,0) > 0
+                 ORDER BY pri.issued_at DESC LIMIT 1)              AS mat_last_issue_unit,
+               (SELECT pd.name FROM requisition_items pri
+                  LEFT JOIN requisitions pr ON pr.id = pri.req_id
+                  LEFT JOIN departments pd ON pd.id = COALESCE(pri.department_id, pr.department_id)
+                 WHERE pri.material_id = rm.id AND pri.req_id <> ri.req_id
+                   AND pri.issued_at IS NOT NULL AND COALESCE(pri.quantity_issued,0) > 0
+                 ORDER BY pri.issued_at DESC LIMIT 1)              AS mat_last_issue_dept,
                d.name AS item_department_name, d.code AS item_department_code
         FROM requisition_items ri
         JOIN raw_materials rm ON rm.id = ri.material_id

@@ -147,7 +147,7 @@ export default function MaterialTypeahead({
       const tokens = raw.split(/\s+/).filter(Boolean);
       list = list.filter(m => {
         const hay = [
-          m.name, m.sku, m.category, m.unit,
+          m.name, m.sku, m.category, m.unit, (m as any).brand,
         ].filter(Boolean).join(' ').toLowerCase();
         return tokens.every(t => hay.includes(t));
       });

@@ -65,6 +65,18 @@ interface ReqLine {
   issue_history: string;          // JSON of [{qty, at, by, note}]
   notes?: string;
   department_id?: string;
+  /** Identity, for the item-level search. SKU doubles as the item code. */
+  material_sku?: string;
+  material_sku_code?: string;
+  material_brand?: string | null;
+  /** Central store on-hand + its reorder point, both RECIPE units. */
+  reorder_level?: number;
+  /** Last hand-over of THIS MATERIAL on any OTHER requisition — quantity is in
+   *  that line's own unit (Option B), which is why the unit travels with it. */
+  mat_last_issue_at?: string | null;
+  mat_last_issue_qty?: number | null;
+  mat_last_issue_unit?: string | null;
+  mat_last_issue_dept?: string | null;
 }
 interface Requisition {
   id: string; req_number: string; purpose: string;
@@ -135,6 +147,11 @@ function lineUnits(line: ReqLine) {
     fromPU: (q: any) => isPU ? (Number(q) || 0) : Math.round((Number(q) || 0) * pf * 1e6) / 1e6,
     /** stored line qty → recipe units (the small "= N g" hint) */
     toRecipe: (q: any) => isPU ? (Number(q) || 0) * pf : (Number(q) || 0),
+    /** MATERIAL-level qty → purchase-unit display. current_stock is ALWAYS
+     *  recipe units regardless of what basis this LINE is stored in, so it must
+     *  never go through toPU — that would leave a purchase-basis line's stock
+     *  undivided and print grams as kilos. */
+    stockPU: (q: any) => Math.round(((Number(q) || 0) / pf) * 1000) / 1000,
   };
 }
 
@@ -335,7 +352,17 @@ export default function StoreRequisitionsPage() {
     const q = search.toLowerCase();
     return list.filter(r => r.req_number?.toLowerCase().includes(q)
       || r.department_name?.toLowerCase().includes(q)
-      || r.event_name?.toLowerCase().includes(q));
+      || r.event_name?.toLowerCase().includes(q)
+      // ...and by what is actually IN the requisition. The store person is
+      // asked "who wanted the paneer?", and until now the only way to answer
+      // was to expand every open card in turn. Item code = SKU (MAT-00885);
+      // brand is matched too, though it is unpopulated on all 928 materials
+      // today, so it contributes nothing until someone fills it in.
+      || (r.items || []).some(it =>
+           it.material_name?.toLowerCase().includes(q)
+        || it.material_sku?.toLowerCase().includes(q)
+        || (it as any).material_sku_code?.toLowerCase?.().includes(q)
+        || (it as any).material_brand?.toLowerCase?.().includes(q)));
   }, [list, search]);
 
   const filtered = useMemo(
@@ -651,7 +678,7 @@ export default function StoreRequisitionsPage() {
         <div className="relative flex-1 min-w-[200px]">
           <Search className="w-4 h-4 absolute left-2 top-2 text-[#8B7355]" />
           <input value={search} onChange={e => setSearch(e.target.value)}
-                 placeholder="Search req# / department / event…"
+                 placeholder="Search req# / department / event / item name / SKU…"
                  className="w-full pl-8 pr-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0]" />
         </div>
         <select value={deptId} onChange={e => setDeptId(e.target.value)}
@@ -835,6 +862,48 @@ function effectiveQty(line: ReqLine): number {
  * assumption baked in here — the shape stays correct if a per-quantity defer
  * ever lands, and every caller renders whichever parts are non-zero.
  */
+/**
+ * Red / Amber / Green on the store's in-hand quantity.
+ *
+ * The bands are about THIS hand-over, not a generic reorder alert — the
+ * question at the counter is "can I give what is being asked for", so the
+ * outstanding quantity is the yardstick:
+ *
+ *   RED    nothing on the shelf, or less than this line still needs
+ *   AMBER  enough for this line, but the shelf drops to or below the reorder
+ *          point once it goes out
+ *   GREEN  enough, and still above the reorder point afterwards
+ *
+ * A material with no reorder_level set can never be amber — there is no
+ * threshold to cross — so it reads green whenever it covers the line. Saying
+ * amber there would be inventing a judgement nobody configured.
+ *
+ * All quantities are RECIPE units, the basis current_stock is stored in.
+ */
+function stockLevel(line: ReqLine): {
+  qty: number | null; dot: string; text: string; title: string;
+} {
+  const raw = (line as any).current_stock;
+  if (raw == null) return { qty: null, dot: '', text: '', title: '' };
+  const qty = Number(raw) || 0;
+  const need = Math.max(0, effectiveQty(line) - (Number(line.quantity_issued) || 0));
+  const reorder = Number(line.reorder_level) || 0;
+
+  if (qty <= 0 || qty < need) {
+    return {
+      qty, dot: 'bg-red-500', text: 'text-red-700 font-semibold',
+      title: qty <= 0 ? 'Out of stock in the store' : 'Short — less on the shelf than this line still needs',
+    };
+  }
+  if (reorder > 0 && qty - need <= reorder) {
+    return {
+      qty, dot: 'bg-amber-500', text: 'text-amber-700',
+      title: 'Enough for this line, but the store drops to its reorder point once it goes out',
+    };
+  }
+  return { qty, dot: 'bg-emerald-500', text: 'text-[#6B5744]', title: 'In stock' };
+}
+
 function lineSplit(line: ReqLine): {
   effective: number; issued: number; outstanding: number;
   deferred: number; open: number; isSplit: boolean;
@@ -1199,6 +1268,7 @@ function ReqCard(props: {
                     packed materials. This tooltip used to say "recipe unit", which
                     is exactly how the store was reading the numbers. */}
                 <th className="text-right py-1.5 px-2 font-medium" title="Quantity requested, in the PURCHASE unit (BTL / kg / PKT / pcs). The small grey line is the recipe equivalent.">Requested</th>
+                <th className="text-right py-1.5 px-2 font-medium" title="What the STORE holds right now, in the PURCHASE unit. Red = nothing, or less than this line still needs. Amber = enough, but the store hits its reorder point once it goes out. Green = enough to spare.">In hand</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="HOD-approved quantity, in the PURCHASE unit (overrides requested if set)">HOD OK</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="Handed over so far, in the PURCHASE unit">Issued so far</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="Still owed, in the PURCHASE unit">Outstanding</th>
@@ -1386,6 +1456,25 @@ function LineRow(props: {
         {fmtNum(U.toPU(line.quantity_requested))}{unitTag}
         {hint(line.quantity_requested)}
       </td>
+      {/* IN-HAND — what the store can actually give, read at the moment of
+          deciding. Without it the storekeeper approved a hand-over blind and
+          found out at the shelf. current_stock is RECIPE units (material-level),
+          so it converts with stockPU, never the line-basis toPU. */}
+      <td className="py-1.5 px-2 text-right font-mono">
+        {(() => {
+          const st = stockLevel(line);
+          if (st.qty == null) return <span className="text-[#C0A98F]">—</span>;
+          return (
+            <span title={st.title}>
+              <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1 align-middle ${st.dot}`} />
+              <span className={st.text}>{fmtNum(U.stockPU(st.qty))}{unitTag}</span>
+              {U.pf > 1 && (
+                <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(st.qty)} {U.recipeUnit}</div>
+              )}
+            </span>
+          );
+        })()}
+      </td>
       <td className="py-1.5 px-2 text-right font-mono">
         {line.is_rejected
           ? <span className="text-red-600">rejected</span>
@@ -1439,6 +1528,24 @@ function LineRow(props: {
             <div className="text-[#8B7355]">by {line.issued_by}</div>
           </>
         ) : '—'}
+        {/* PREVIOUS hand-over of this MATERIAL, on some other requisition.
+            The line above answers "what happened on this line"; this answers
+            "when did this item last leave the store, and how much" — which is
+            what tells the storekeeper a department is asking again three days
+            early. Quantity is in that PREVIOUS line's own unit (Option B), so
+            it is printed with the unit that came with it rather than being
+            converted through this row's resolver, which would be a different
+            basis. Absent for a material that has never gone out. */}
+        {line.mat_last_issue_at && (
+          <div className="mt-1 pt-1 border-t border-[#E8D5C4]/60 text-[9px] text-[#8B7355]"
+               title="The last time this item was issued on another requisition">
+            prev: {fmtDateTime(line.mat_last_issue_at)}
+            {Number(line.mat_last_issue_qty) > 0 && (
+              <> · {fmtNum(Number(line.mat_last_issue_qty))} {String(line.mat_last_issue_unit || U.recipeUnit)}</>
+            )}
+            {line.mat_last_issue_dept && <> → {line.mat_last_issue_dept}</>}
+          </div>
+        )}
         <button onClick={() => props.onShowHistory(line)}
                 className="mt-0.5 text-[10px] text-[#af4408] hover:underline inline-flex items-center gap-0.5">
           <History className="w-3 h-3" /> history

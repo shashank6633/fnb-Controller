@@ -289,7 +289,14 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
     return materials.filter(m => {
       if (category !== 'All' && (m.category || '') !== category) return false;
       if (!q) return true;
-      return m.name.toLowerCase().includes(q) || (m.sku || '').toLowerCase().includes(q);
+      // Brand + category alongside name and SKU: "Search Bar should support
+      // Brand Name, SKU, and Material Code". SKU is the material code here
+      // (MAT-00885). brand is unpopulated on all 928 materials today, so it
+      // matches nothing until it is filled in — wired, not yet useful.
+      return m.name.toLowerCase().includes(q)
+        || (m.sku || '').toLowerCase().includes(q)
+        || ((m as any).brand || '').toLowerCase().includes(q)
+        || ((m as any).category || '').toLowerCase().includes(q);
     });
   }, [materials, category, search]);
 
