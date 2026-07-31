@@ -59,6 +59,7 @@ import {
   Settings2,
   Scale,
   Wallet,
+  Banknote,
   Phone,
   PhoneMissed,
   PhoneCall,
@@ -143,6 +144,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Vendors",            href: "/vendors",            icon: Building2 },
       { kind: "link", label: "Vendor → Items",     href: "/vendors/materials",  icon: Building2 },
       { kind: "link", label: "Contracts",          href: "/contracts",          icon: FileText },
+      { kind: "link", label: "Petty Cash",         href: "/petty-cash",         icon: Banknote },
     ],
   },
   {

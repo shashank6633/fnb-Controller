@@ -29,6 +29,8 @@ import {
   Download,
   Upload,
   Layers,
+  Plus,
+  ListChecks,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
@@ -222,6 +224,123 @@ interface Item {
   today_count: number | null; today_variance: number | null; today_by?: string;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * REQUIREMENT 3 — THE ESCAPE HATCH
+ * A department's sheet lists what it has ever requisitioned. The first time a
+ * section physically holds something new, that list cannot know about it yet —
+ * and a counter who cannot record real stock writes it on paper instead, which
+ * is how stock goes missing. So every dept-scoped counting surface carries an
+ * explicit "add an item not on this list".
+ *
+ * Search runs on the server (/api/closing-stock?dept_items=1&search=…), which
+ * returns only CENTRAL materials this department does not already have — and
+ * blinds current_stock for non-admins exactly like every other closing surface,
+ * so the escape hatch can never become a way to read the system figure.
+ * Once the added item is counted and saved it joins the department's set for
+ * good (the closing_stock arm of DEPT_REQUESTED_ITEM_SQL).
+ * ══════════════════════════════════════════════════════════════════════════ */
+function AddOffListItem({ deptId, deptName, existingIds, onAdd, compact }: {
+  deptId: string;
+  deptName: string;
+  existingIds: Set<string>;
+  onAdd: (row: any) => void;
+  compact?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState('');
+  const [rows, setRows] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+
+  // Reset whenever the department changes — one dept's candidates are
+  // meaningless on another's sheet.
+  useEffect(() => { setOpen(false); setQ(''); setRows([]); setErr(''); }, [deptId]);
+
+  useEffect(() => {
+    if (!open) return;
+    const term = q.trim();
+    if (term.length < 2) { setRows([]); setErr(''); setLoading(false); return; }
+    let live = true;
+    setLoading(true);
+    const t = setTimeout(() => {
+      const qs = new URLSearchParams({ dept_items: '1', department_id: deptId, search: term });
+      fetch(`/api/closing-stock?${qs}`)
+        .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then(j => { if (live) { setRows(j?.candidates || []); setErr(''); } })
+        .catch(() => { if (live) { setRows([]); setErr('Could not search the catalogue. Try again, or record the count on the Store / Overall sheet.'); } })
+        .finally(() => { if (live) setLoading(false); });
+    }, 250);
+    return () => { live = false; clearTimeout(t); };
+  }, [q, open, deptId]);
+
+  const shown = rows.filter(r => !existingIds.has(String(r.id)));
+
+  return (
+    <div className={compact ? '' : 'w-full'}>
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-dashed border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] text-xs font-medium transition-colors"
+      >
+        <Plus className="w-3.5 h-3.5" />
+        {open ? 'Close' : 'Add an item not on this list'}
+      </button>
+      {open && (
+        <div className="mt-2 rounded-xl border border-[#E8D5C4] bg-[#FFFDF9] p-3 space-y-2">
+          <p className="text-[11px] text-[#6B5744]">
+            {deptName} is holding something it has never requisitioned? Find it here and it joins this
+            sheet. Once you save a count against it, it stays on {deptName}&apos;s list for good.
+          </p>
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />
+            <input
+              type="text"
+              value={q}
+              onChange={e => setQ(e.target.value)}
+              placeholder="Search the central catalogue by name or SKU…"
+              className="w-full pl-10 pr-3 py-2 bg-white border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+            />
+          </div>
+          {err && <p className="text-[11px] text-red-700">{err}</p>}
+          {loading && (
+            <p className="text-[11px] text-[#8B7355] flex items-center gap-1">
+              <Loader2 className="w-3 h-3 animate-spin" /> Searching…
+            </p>
+          )}
+          {!loading && !err && q.trim().length >= 2 && shown.length === 0 && (
+            <p className="text-[11px] text-[#8B7355]">
+              Nothing matching &ldquo;{q.trim()}&rdquo; outside this department&apos;s list. It may already be on
+              the sheet above, or it is liquor — count that in its own store&apos;s closing.
+            </p>
+          )}
+          {shown.length > 0 && (
+            <ul className="max-h-56 overflow-y-auto divide-y divide-[#E8D5C4]/60 rounded-lg border border-[#E8D5C4] bg-white">
+              {shown.map(r => (
+                <li key={r.id} className="flex items-center gap-2 px-3 py-1.5">
+                  <span className="flex-1 min-w-0">
+                    <span className="block text-xs font-medium text-[#2D1B0E] truncate">{r.name}</span>
+                    <span className="block text-[10px] text-[#8B7355]">
+                      {categoryLabel(r.category || 'other')}
+                      {r.sku ? ` · ${r.sku}` : ''} · counted in {r.purchase_unit || r.unit}
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => { onAdd(r); setQ(''); setRows([]); }}
+                    className="px-2.5 py-1 rounded bg-[#af4408] hover:bg-[#933807] text-white text-[11px] font-medium"
+                  >
+                    Add
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ClosingStockByLocationPage() {
   // Role gate — only admins see the "adjust system stock to match" shortcut.
   // Store managers would otherwise just click it without a physical recount,
@@ -294,6 +413,69 @@ export default function ClosingStockByLocationPage() {
     return () => { live = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me, canSeeAllDepts, activeDeptId]);
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   * REQUIREMENT 4 — A DEPARTMENT COUNTS ONLY THE ITEMS IT ACTUALLY USES
+   * ══════════════════════════════════════════════════════════════════════════
+   * Owner: "If a department requests the 40 items till now, only those items to
+   * be shown to the departments for their closing stock updating… once an item
+   * is requested by a department they will have that stock and it will be
+   * maximum their regular stock, so it may be 1 year also."
+   *
+   * EVER-REQUESTED, no recency window. The set is derived on the server from
+   * requisition_items → requisitions (rejected lines excluded) — see
+   * src/lib/dept-requested-items.ts — and returned as ready-to-render rows so
+   * an item the department requested but whose CATEGORY is outside the dept
+   * whitelist still reaches the sheet. Those rows arrive with current_stock
+   * blinded for non-admins, same as every other closing surface.
+   *
+   * This applies to EVERY tier, admins included: the question is "what does
+   * this department count?", not "what is this user allowed to see". Store /
+   * Overall ('') is untouched — the full catalogue, exactly as before.
+   *
+   * FAIL-OPEN, LOUDLY. If the scope call fails we fall back to the previous
+   * behaviour (full category-filtered list) and say so on screen, because a
+   * counter facing an empty sheet writes numbers on paper. Hiding rows is a
+   * convenience; losing a count is money.
+   */
+  const [deptRequested, setDeptRequested] = useState<{ deptId: string; rows: any[]; count: number } | null>(null);
+  const [deptScopeLoading, setDeptScopeLoading] = useState(false);
+  const [deptScopeError, setDeptScopeError] = useState(false);
+  /* Items a counter pulled in through the escape hatch, keyed by department so
+     switching departments never carries one dept's addition onto another's
+     sheet. Session-only: saving a count is what makes an addition permanent. */
+  const [extraByDept, setExtraByDept] = useState<Record<string, any[]>>({});
+  useEffect(() => {
+    if (!me) return;
+    if (!activeDeptId) { setDeptRequested(null); setDeptScopeError(false); setDeptScopeLoading(false); return; }
+    let live = true;
+    setDeptScopeLoading(true);
+    setDeptScopeError(false);
+    const qs = new URLSearchParams({ dept_items: '1', department_id: activeDeptId });
+    fetch(`/api/closing-stock?${qs}`)
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then(j => {
+        if (!live) return;
+        if (j?.scoped) setDeptRequested({ deptId: activeDeptId, rows: j.items || [], count: Number(j.count) || 0 });
+        else { setDeptRequested(null); setDeptScopeError(true); }
+      })
+      .catch(() => { if (live) { setDeptRequested(null); setDeptScopeError(true); } })
+      .finally(() => { if (live) setDeptScopeLoading(false); });
+    return () => { live = false; };
+  }, [me, activeDeptId]);
+
+  /** Is the ever-requested scope in force right now (loaded, for THIS dept)? */
+  const deptScopeActive = !!activeDeptId && !!deptRequested && deptRequested.deptId === activeDeptId;
+  const extraRows = activeDeptId ? (extraByDept[activeDeptId] || []) : [];
+  const addExtraRow = (row: any) => {
+    if (!activeDeptId) return;
+    setExtraByDept(prev => {
+      const cur = prev[activeDeptId] || [];
+      if (cur.some(r => String(r.id) === String(row.id))) return prev;
+      return { ...prev, [activeDeptId]: [...cur, row] };
+    });
+  };
+
   // Category whitelist (lowercased) of the ACTIVE department, resolved to its
   // MAIN department — sub-depts inherit the main's material_categories, so walk
   // parent_id via the departments payload. null = no filter: Store/Overall ('')
@@ -415,6 +597,27 @@ export default function ClosingStockByLocationPage() {
      category set — re-filters live when the dropdown changes. Store/Overall
      ('') or a dept with no configured categories → no filter (full list). */
   const deptScopedMaterials = useMemo(() => {
+    /* Requirement 4: a DEPARTMENT is selected and its ever-requested set has
+       loaded → that set IS the sheet (plus anything a counter added). The
+       category whitelist is deliberately NOT applied on top of it: the
+       requested set is the tighter, evidence-based scope, and an item the
+       department genuinely requisitioned must never be hidden because someone
+       forgot to tick its category. Same reason the old deptItemIds
+       intersection is skipped here — that set (ever ISSUED) is a subset of
+       this one, so applying it would silently re-narrow the owner's rule. */
+    if (deptScopeActive) {
+      const seen = new Set<string>();
+      const out: any[] = [];
+      for (const r of [...deptRequested!.rows, ...extraRows]) {
+        const id = String(r.id);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(r);
+      }
+      return out;
+    }
+    // Store / Overall, or the scope call has not answered yet / failed —
+    // previous behaviour, byte for byte.
     let list = materials;
     if (hasDeptChoice && deptCategorySet) {
       list = list.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()));
@@ -425,13 +628,103 @@ export default function ClosingStockByLocationPage() {
       list = list.filter((m: any) => deptItemIds.has(String(m.id)));
     }
     return list;
-  }, [materials, hasDeptChoice, deptCategorySet, canSeeAllDepts, deptItemIds]);
+  }, [materials, hasDeptChoice, deptCategorySet, canSeeAllDepts, deptItemIds, deptScopeActive, deptRequested, extraRows]);
+  /** Ids on the sheet — the escape hatch must not offer a duplicate. */
+  const sheetIds = useMemo(() => new Set(deptScopedMaterials.map((m: any) => String(m.id))), [deptScopedMaterials]);
   // Is a real category whitelist in effect for the active dept? Gates the base
   // CATEGORIES union below (no point offering categories outside the whitelist)
-  // and the "no filter configured" fallback hint in the modal.
-  const isDeptFiltered = !!activeDeptId && !!deptCategorySet;
+  // and the "no filter configured" fallback hint in the modal. Dept scoping
+  // narrows harder still, so it counts as "filtered" too.
+  const isDeptFiltered = (!!activeDeptId && !!deptCategorySet) || deptScopeActive;
   // Stale category from a previously-selected dept could blank the list.
   useEffect(() => { setClosingCategory(''); }, [activeDeptId]);
+
+  /* Seed an empty entry for every row on the sheet. openClosingStock seeds from
+     the /api/inventory list; a dept-scoped sheet (and anything added through
+     the escape hatch) can carry rows that list never had, and an unseeded row
+     would leave React flipping its inputs between controlled and uncontrolled.
+     Only ever ADDS missing keys — a value already typed is never touched. */
+  useEffect(() => {
+    if (!closingStockOpen) return;
+    setClosingItems(prev => {
+      let changed = false;
+      const next = { ...prev };
+      for (const m of deptScopedMaterials) {
+        const id = String(m.id);
+        if (!next[id]) { next[id] = { physical_stock: '', notes: '' }; changed = true; }
+      }
+      return changed ? next : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [closingStockOpen, deptScopedMaterials]);
+
+  /* ── Requirement 4, made VISIBLE ─────────────────────────────────────────
+     "Show the count so the scoping is visible rather than mysterious." A
+     counter must never have to wonder why an item is missing, and must always
+     see that store-wide mode is a different, unscoped thing. Rendered on all
+     three counting surfaces: the location board, a location's count screen and
+     the Record Closing Stock sheet. Carries the escape hatch when the caller
+     supplies an onAdd. Deliberately says nothing about system stock or
+     variance — blind counts are untouched by scoping. */
+  const activeDeptName = departments.find((d: any) => d.id === activeDeptId)?.name
+    || (activeDeptId ? 'this department' : 'Store / Overall');
+  const renderDeptScope = (onAdd?: (row: any) => void) => {
+    if (!activeDeptId) {
+      return (
+        <div className="flex items-start gap-2 rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] px-4 py-2.5 text-xs text-[#6B5744]">
+          <ListChecks className="w-4 h-4 flex-shrink-0 mt-0.5 text-[#8B7355]" />
+          <span>
+            <strong>Store / Overall</strong> — the full central list, not scoped to any department.
+            Pick a department above to count only the items that department actually uses.
+          </span>
+        </div>
+      );
+    }
+    if (deptScopeError) {
+      return (
+        <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-800">
+          <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+          <span>
+            Could not load {activeDeptName}&apos;s item list, so the full list is shown instead —
+            nothing is hidden and nothing is un-countable. Counts still save against {activeDeptName}.
+            Tell an admin if this keeps happening.
+          </span>
+        </div>
+      );
+    }
+    if (!deptScopeActive) {
+      return (
+        <div className="flex items-center gap-2 rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] px-4 py-2.5 text-xs text-[#8B7355]">
+          {deptScopeLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ListChecks className="w-4 h-4" />}
+          Loading {activeDeptName}&apos;s item list…
+        </div>
+      );
+    }
+    const ever = deptRequested!.count;
+    return (
+      <div className="rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] px-4 py-2.5 space-y-2">
+        <div className="flex items-start gap-2 text-xs text-[#6B5744]">
+          <ListChecks className="w-4 h-4 flex-shrink-0 mt-0.5 text-[#af4408]" />
+          <span>
+            <strong>{activeDeptName} uses {ever} item{ever === 1 ? '' : 's'}</strong> — every material this
+            department has ever requisitioned, with no time limit, so something it asked for months ago
+            stays on the list. Items it has never requested (or only ever had rejected) are not shown.
+            {extraRows.length > 0 && (
+              <> {' '}<span className="text-[#af4408] font-medium">+{extraRows.length} added by hand this session.</span></>
+            )}
+          </span>
+        </div>
+        {onAdd && (
+          <AddOffListItem
+            deptId={activeDeptId}
+            deptName={activeDeptName}
+            existingIds={sheetIds}
+            onAdd={onAdd}
+          />
+        )}
+      </div>
+    );
+  };
 
   /** Category options grouped by super_category so the modal dropdown renders
    *  with <optgroup> headers. Mirrors the derivation on the Raw Materials page,
@@ -791,22 +1084,51 @@ export default function ClosingStockByLocationPage() {
   const CSV_COLS = isAdmin
     ? ['Type', 'material_id', 'sub_recipe_id', 'SKU', 'Name', 'Category', 'Unit', 'System stock', 'Physical count']
     : ['Type', 'material_id', 'sub_recipe_id', 'SKU', 'Name', 'Category', 'Unit', 'Physical count'];
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   * ONE SOURCE FOR BOTH HALVES OF THE CSV CONTRACT
+   * ══════════════════════════════════════════════════════════════════════════
+   * The template EXPORTS a set of rows; the upload must RESOLVE that same set.
+   * They are two halves of one contract, so they read ONE source and cannot
+   * drift. When they were derived separately the template emitted a
+   * department's ever-requested rows (server-derived, deliberately NOT limited
+   * to the dept category whitelist — see deptScopedMaterials) while the parser
+   * matched against the /api/inventory list, so a counter who filled in the
+   * sheet the app had just handed them was told the rows do not exist.
+   * Measured on the live DB copy 2026-07-31: for a staff counter pinned to
+   * Akan Bar, 114 of the 148 rows the template emitted came back unmatched
+   * (FROZEN BLUEBERRIES, ICE CUBES, MASCARPONE CHEESE 400 GM, …) because the
+   * Bar whitelist is liquor categories that Central closing excludes.
+   *
+   * The source IS deptScopedMaterials — the rows on screen — so the sheet, the
+   * template, the parser and submitClosingStock's allowedIds all agree on what
+   * this department is counting. The only fallback is the one the template
+   * already carried: when the modal's material list has not loaded yet,
+   * re-fetch and re-apply the SAME narrowing the memo applies. A dept-scoped
+   * sheet never needs it — those rows come from the server, not /api/inventory.
+   * ────────────────────────────────────────────────────────────────────────── */
+  const closingSheetRows = async (): Promise<any[]> => {
+    if (deptScopeActive || materials.length) return deptScopedMaterials;
+    const all = await fetchMaterials();
+    let list = (hasDeptChoice && deptCategorySet)
+      ? all.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()))
+      : all;
+    // Same dept item-set intersection as deptScopedMaterials.
+    if (!canSeeAllDepts && deptItemIds) {
+      list = list.filter((m: any) => deptItemIds.has(String(m.id)));
+    }
+    return list;
+  };
+  /** The semi-finished half of the same contract — one source, same reason. */
+  const closingSheetSubRecipes = async (): Promise<SubRecipeRow[]> =>
+    (subRecipes.length ? subRecipes : await fetchSubRecipes());
+
   const downloadClosingTemplate = async () => {
     // Export the FILTERED set — the rows this user/department is being asked
-    // to count — not the full catalogue. (Upload stays global: it matches by
-    // id/SKU/name against whatever list the viewer fetched.)
-    let mats = deptScopedMaterials;
-    if (!materials.length) {
-      const all = await fetchMaterials();
-      mats = (hasDeptChoice && deptCategorySet)
-        ? all.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()))
-        : all;
-      // Same dept item-set intersection as deptScopedMaterials.
-      if (!canSeeAllDepts && deptItemIds) {
-        mats = mats.filter((m: any) => deptItemIds.has(String(m.id)));
-      }
-    }
-    const subs = subRecipes.length ? subRecipes : await fetchSubRecipes();
+    // to count — not the full catalogue. uploadClosingCsv resolves against the
+    // SAME closingSheetRows()/closingSheetSubRecipes() sets.
+    const mats = await closingSheetRows();
+    const subs = await closingSheetSubRecipes();
     const lines = [CSV_COLS.join(',')];
     for (const m of mats) {
       const base = [CSV_TYPE_RAW, m.id, '', m.sku || '', m.name || '', (m.super_category || m.category || ''), (m.purchase_unit || m.unit || '')];
@@ -836,9 +1158,11 @@ export default function ClosingStockByLocationPage() {
     setClosingSubmitting(true);
     setClosingResult(null);
     try {
-      let mats = materials;
-      if (!mats.length) mats = await fetchMaterials();
-      const subs = subRecipes.length ? subRecipes : await fetchSubRecipes();
+      // THE SAME SET THE TEMPLATE EXPORTED (see closingSheetRows above). Not
+      // `materials` — that list is fetched separately and, for a dept-scoped
+      // counter, does not contain the rows the template just handed them.
+      const mats = await closingSheetRows();
+      const subs = await closingSheetSubRecipes();
       const byId = new Map(mats.map(m => [String(m.id), m]));
       const bySku = new Map(mats.filter(m => m.sku).map(m => [String(m.sku).trim().toLowerCase(), m]));
       const byName = new Map(mats.map(m => [String(m.name).trim().toLowerCase(), m]));
@@ -858,6 +1182,13 @@ export default function ClosingStockByLocationPage() {
         for (const k of keys) if (row[k] != null && String(row[k]).trim() !== '') return String(row[k]).trim();
         return '';
       };
+      /* An unmatched raw row now means "not on THIS sheet", which is a
+         different problem from "no such material" and has a different remedy.
+         Say which, and name the escape hatch — never leave a counter holding a
+         number with nowhere to put it. */
+      const notOnSheet = (label: string) => (deptScopeActive
+        ? `${label}: not on ${activeDeptName}'s count sheet — add it with "Add an item not on this list" on the sheet, then download a fresh template (or check material_id / SKU / Name).`
+        : `${label}: material not found (check material_id / SKU / Name)`);
       for (const row of rows) {
         const pc = get(row, 'Physical count', 'Physical Count', 'physical_count', 'physical count');
         if (pc === '') continue;                               // blank = not counted → skip
@@ -905,7 +1236,7 @@ export default function ClosingStockByLocationPage() {
         const skuKey = get(row, 'SKU', 'sku').toLowerCase();
         const nameKey = get(row, 'Name', 'name').toLowerCase();
         const m = (idKey && byId.get(idKey)) || (skuKey && bySku.get(skuKey)) || (nameKey && byName.get(nameKey));
-        if (!m) { errors.push(`${label}: material not found (check material_id / SKU / Name)`); continue; }
+        if (!m) { errors.push(notOnSheet(label)); continue; }
         // Basis comes from the row's own Unit cell: new templates declare the
         // purchase unit (count ×pack → recipe), old files declare the recipe
         // unit (raw). Anything else is ambiguous — reject the row rather than
@@ -1113,6 +1444,19 @@ export default function ClosingStockByLocationPage() {
     } finally { setSaving(false); }
   };
 
+  /* Escape hatch on the per-location count screen (requirement 3). The row
+     joins this session's list immediately so the count can be typed now; the
+     SAVE is what makes it part of the department's set for good (the
+     closing_stock arm of the ever-requested query). today_count / today_variance
+     start null — there is no count yet, and this path never derives a variance,
+     so nothing about the system figure leaks to a counter. */
+  const addItemToLocation = (row: any) => {
+    addExtraRow(row);
+    setItems(prev => prev.some(i => String(i.id) === String(row.id))
+      ? prev
+      : [...prev, { ...(row as Item), today_count: null, today_variance: null }]);
+  };
+
   // Detail view
   if (active) {
     return (
@@ -1155,6 +1499,10 @@ export default function ClosingStockByLocationPage() {
             <CheckCircle2 size={16} /> {savedFlash}
           </div>
         )}
+
+        {/* Requirement 4 — why this area lists what it lists, plus the way out
+            when the section is holding something the list has never seen. */}
+        {renderDeptScope(addItemToLocation)}
 
         {/* Search + category chips — narrow the count table when an area has
             many items (e.g. dry store with 200+ groceries). Counts on chips
@@ -1439,6 +1787,11 @@ export default function ClosingStockByLocationPage() {
           </span>
         </div>
       ) : tierBanner}
+
+      {/* Requirement 4 — the count that makes the scoping visible. The board is
+          a summary, not an entry screen, so no escape hatch here: it lives on
+          the two surfaces where a count is actually typed. */}
+      {renderDeptScope()}
 
       {/* Per-area rollup — admin/HOD view of each area's overall closing value. */}
       {canSeeAllDepts && byArea.length > 0 && (
@@ -1857,9 +2210,16 @@ export default function ClosingStockByLocationPage() {
                 {/* Effective-tier banner — only when the dept picker is hidden. */}
                 {tierBanner}
 
+                {/* Requirement 4 — "40 items this department uses", plus the
+                    escape hatch for the first time it holds something new. */}
+                {renderDeptScope(addExtraRow)}
+
                 {/* Subtle fallback note — the active department has no category
-                    whitelist configured, so the full material list is shown. */}
-                {activeDeptId && departments.length > 0 && !deptCategorySet && (
+                    whitelist configured, so the full material list is shown.
+                    Silent once the ever-requested scope is in force: the sheet
+                    is then scoped by requisition history, not by category, and
+                    the banner above already says so. */}
+                {activeDeptId && departments.length > 0 && !deptCategorySet && !deptScopeActive && (
                   <p className="text-[11px] italic text-[#8B7355]">
                     No category filter is set for{' '}
                     {departments.find((d: any) => d.id === activeDeptId)?.name || 'this department'}

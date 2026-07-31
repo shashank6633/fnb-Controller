@@ -1,4 +1,9 @@
 import { getDb } from '@/lib/db';
+import { writeDirectItemLink } from './_lib/link-writer';
+import {
+  loadMaterialIndex, loadMenuIndex, resolveMenuItems, nameKey,
+  type MaterialRef, type MenuItemRef,
+} from './_lib/mapping-rows';
 
 /**
  * Discover "direct-sold items" — menu items sold as-is from a purchased raw material
@@ -413,6 +418,157 @@ export async function GET(request: Request) {
       }
     }
 
+    // ── EVERY SAVED MAPPING COMES BACK, whatever the sales say ──────────────
+    //
+    // The list above is built FROM sales and then narrowed twice: HAVING
+    // qty_sold >= min_sold (5 by default) and "POS category must map to Bar or
+    // Beverages". That is right for DISCOVERY — it answers "what am I selling
+    // that still needs mapping?".
+    //
+    // It is wrong as the only source, because it silently swallowed the user's
+    // own work. Measured on this database: of 415 saved links, 210 have no
+    // sales rows at all, another 32 sold fewer than five, and more are dropped
+    // by the category filter (Custom 46, Small Plates Non Veg 8, Party Package
+    // 8, thin-crust-pizza 5…). Over half of everything ever mapped could not be
+    // displayed back. From the counter's chair that reads as "it didn't save" —
+    // which was the actual bug report.
+    //
+    // So anything in direct_item_links that the sales pass did not already
+    // produce is appended here, flagged so the UI can say why it has no sales
+    // figures. A saved mapping is data; it does not stop existing because the
+    // item went out of season.
+    const seen = new Set(results.map(r => String(r.item_name || '').toLowerCase().trim()));
+    const matLookup = new Map(materials.map(m => [m.id, m]));
+    const savedLinks = db.prepare(`
+      SELECT d.item_name, d.material_id, d.qty_per_unit, d.dismissed, d.reviewed, d.updated_at
+        FROM direct_item_links d
+       ORDER BY d.item_name COLLATE NOCASE ASC
+    `).all() as any[];
+
+    for (const l of savedLinks) {
+      const key = String(l.item_name || '').toLowerCase().trim();
+      if (!key || seen.has(key)) continue;
+      if (!includeDismissed && l.dismissed) continue;
+      const mat = l.material_id ? matLookup.get(l.material_id) : null;
+      results.push({
+        item_name: l.item_name,
+        category: '',
+        qty_sold: 0, revenue: 0, line_count: 0, nc_qty: 0, nc_cost: 0,
+        matched: mat ? { id: mat.id, name: mat.name, unit: mat.unit } : null,
+        match_score: l.material_id ? 1 : 0,
+        reason: 'saved-mapping',
+        sold_per_unit_ml: null,
+        finalized: true,
+        linked_material_id: l.material_id || null,
+        department: null,
+        reviewed: !!l.reviewed,
+        qty_per_unit: Number(l.qty_per_unit) || 1,
+        dismissed: !!l.dismissed,
+        updated_at: l.updated_at,
+        /** No sales in the window that built the list above — mapping only. */
+        no_recent_sales: true,
+      });
+    }
+
+    /* ── BOTH ENDS OF THE CHAIN, on every row ──────────────────────────────
+     *
+     * Owner's ask: "in Recipes Direct Items it should show mapping for raw
+     * material items and menu items." A row is a sold ITEM NAME, and it has two
+     * independent links — a RAW MATERIAL (what it costs) and one or more MENU
+     * ITEMS (how the POS reaches it). Either can be missing, and a missing one
+     * is the actionable state, so both are resolved here for every row rather
+     * than only for the rows the sales pass happened to match.
+     *
+     * This is a separate pass on purpose. The three blocks above each build
+     * rows in their own shape (and the saved-mapping block must stay exactly as
+     * it is), so enriching them all in one place is the only way the screen can
+     * be sure every row carries the same chain fields.
+     *
+     * Nothing here touches leakage, revenue or any total — it only adds link
+     * information. The saved-mapping rows still carry zero money.
+     */
+    {
+      const matIdx = loadMaterialIndex(db);
+      const menuIdx = loadMenuIndex(db);
+      // POS item id per sold name, for the strong menu-item match.
+      const posByName = new Map<string, string>();
+      for (const s of salesAgg) {
+        const p = String(s.pos_item_id || '').trim();
+        if (p) posByName.set(nameKey(s.item_name), p);
+      }
+      // Which rows have a real direct_item_links row (vs. a link inherited from
+      // menu_items.material_id) — the owner needs to know where a link lives.
+      const dilByName = new Map<string, string | null>();
+      for (const l of db.prepare('SELECT item_name, material_id FROM direct_item_links').all() as any[]) {
+        dilByName.set(nameKey(l.item_name), l.material_id || null);
+      }
+
+      /** Wire shape for the linked material — carries the pack meta so the page
+       *  can lead with the PURCHASE unit via '@/lib/pack-units'. Quantities stay
+       *  in the stored RECIPE basis and are named for it. */
+      const materialWire = (m: MaterialRef) => ({
+        material_id: m.material_id,
+        material_name: m.material_name,
+        sku: m.sku,
+        unit: m.unit,                       // RECIPE unit (stored basis)
+        purchase_unit: m.purchase_unit || m.unit,
+        pack_size: m.pack_size,
+        case_size: m.case_size,
+        average_price: m.average_price,     // ₹ per RECIPE unit
+        current_stock_recipe: m.current_stock,
+      });
+      const menuWire = (mi: MenuItemRef) => ({
+        id: mi.id, name: mi.name, category: mi.category, pos_id: mi.pos_id,
+        material_id: mi.material_id, is_active: mi.is_active, matched_by: mi.matched_by,
+      });
+
+      for (const r of results) {
+        const key = nameKey(r.item_name);
+        /**
+         * ZERO SALES IN THIS WINDOW — the honest state, whichever block built
+         * the row. Two of the three blocks above produce sales-less rows: the
+         * manual block (a saved link whose item never came through the sales
+         * pass) and the saved-mapping block (flagged `no_recent_sales`). They
+         * are the same situation from the counter's chair, so the screen must
+         * label them the same way. Measured here: 333 manual + 19 appended =
+         * 352 of 464 rows carry no sales, against 112 that do. Rendering 352
+         * rows of zeroes as if they were dead items is what the bug report
+         * actually described. A sales-pass row can never land here — it had to
+         * clear HAVING SUM(quantity_sold) >= min_sold to exist.
+         */
+        r.zero_sales = !Number(r.qty_sold) && !Number(r.line_count);
+        const menuItems = resolveMenuItems(menuIdx, r.item_name, posByName.get(key));
+        r.menu_items = menuItems.map(menuWire);
+        r.menu_item_count = menuItems.length;
+        r.menu_item_missing = menuItems.length === 0;
+
+        // The SAVED link (what the mapping actually is), not the heuristic
+        // suggestion in `matched` — those are different things and conflating
+        // them is how a suggestion gets mistaken for a decision.
+        const dilMat = dilByName.has(key) ? dilByName.get(key) || null : null;
+        const menuMat = menuItems.find(m => m.material_id)?.material_id || null;
+        const linkedId = r.linked_material_id || dilMat || menuMat || null;
+        const linked = linkedId ? matIdx.byId.get(linkedId) || null : null;
+        r.material_link = linked ? materialWire(linked) : null;
+        r.material_missing = !linked;
+        // Pack meta for the material the `matched` figures are expressed in.
+        // It can be a DIFFERENT material from the saved link (the heuristic is a
+        // suggestion), and converting a number with the wrong pack factor is
+        // exactly the class of bug the purchase-unit lock exists to stop — so the
+        // basis travels with the numbers, not with the link.
+        const suggested = (r.matched?.material_id || r.matched?.id || null) as string | null;
+        const sm = suggested ? matIdx.byId.get(suggested) || null : null;
+        r.matched_meta = sm
+          ? { unit: sm.unit, purchase_unit: sm.purchase_unit || sm.unit, pack_size: sm.pack_size, case_size: sm.case_size }
+          : null;
+        r.link_source = linked ? (dilMat === linkedId ? 'direct_item_links' : 'menu_items') : null;
+        r.has_saved_mapping = dilByName.has(key);
+        // Heuristic disagrees with the saved link — worth surfacing, never applied.
+        const suggestedId = r.matched?.material_id || r.matched?.id || null;
+        r.suggestion_differs = !!(linked && suggestedId && suggestedId !== linked.material_id);
+      }
+    }
+
     // Summary totals
     const totalLeakageValue = results.reduce((a, r) => a + (r.leakage_value || 0), 0);
     const matched = results.filter(r => r.matched).length;
@@ -422,6 +578,16 @@ export async function GET(request: Request) {
       count: results.length,
       matched, unmatched,
       total_leakage_value: Math.round(totalLeakageValue * 100) / 100,
+      /** How many rows are saved mappings with no sales in the discovery window. */
+      saved_without_sales: results.filter(r => r.no_recent_sales).length,
+      /** Every row with no sales in this window — the appended saved mappings
+       *  above PLUS the manual block's rows, which are the same state. This is
+       *  the number the screen shows; saved_without_sales is the subset that had
+       *  no report row at all before the recovery block existed. */
+      no_sales_rows: results.filter(r => r.zero_sales).length,
+      /** Chain health — how many rows are missing one end of the mapping. */
+      material_missing: results.filter(r => r.material_missing).length,
+      menu_item_missing: results.filter(r => r.menu_item_missing).length,
       items: results,
     });
   } catch (error: any) {
@@ -460,29 +626,15 @@ export async function POST(request: Request) {
       if (!exists) return Response.json({ error: 'material_id not found' }, { status: 404 });
     }
 
-    const txn = db.transaction(() => {
-      // 1. Upsert into direct_item_links — works for any sold item name, even if no
-      //    matching menu_items row exists (e.g. POS variants, typos, direct-only items).
-      db.prepare(`
-        INSERT INTO direct_item_links (item_name, material_id, qty_per_unit, dismissed, reviewed, updated_at)
-        VALUES (?, ?, ?, ?, 1, datetime('now'))
-        ON CONFLICT(item_name) DO UPDATE SET
-          material_id  = excluded.material_id,
-          qty_per_unit = excluded.qty_per_unit,
-          dismissed    = excluded.dismissed,
-          reviewed     = 1,
-          updated_at   = datetime('now')
-      `).run(item_name, material_id || null, qpu, dismissedFlag);
-
-      // 2. Also update menu_items where the name exists — so every menu item with this
-      //    name (including variants that share a name) gets linked too.
-      const r = db.prepare(`
-        UPDATE menu_items
-        SET material_id = ?, direct_reviewed = 1, updated_at = datetime('now')
-        WHERE LOWER(name) = LOWER(?)
-      `).run(material_id || null, item_name);
-      return r.changes;
-    });
+    // The upsert + menu_items sweep live in _lib/link-writer.ts. The bulk CSV
+    // importer calls the SAME function, so a single-item edit and a bulk edit
+    // can never mean two different things.
+    const txn = db.transaction(() => writeDirectItemLink(db, {
+      item_name,
+      material_id: material_id || null,
+      qty_per_unit: qpu,
+      dismissed: !!dismissedFlag,
+    }));
 
     const updatedMenuItems = txn();
 

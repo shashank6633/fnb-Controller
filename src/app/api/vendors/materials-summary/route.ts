@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { materialsForVendor } from '@/lib/vendor-mapping';
 
 /**
  * Per-vendor → list of materials they've supplied, with stats.
@@ -77,6 +78,17 @@ export async function GET() {
         v.name, v.name, v.name, v.name, v.name, v.name, // 6× purchases lookups
         v.id, v.id, v.id,                              // 3× vendor_id for EXISTS/contract
       ) as any[];
+      // WHO declared each mapped pair, through the SAME resolver the PO rule
+      // uses. This screen now gates purchasing, so "is it mapped?" is no longer
+      // enough — an admin cleaning up the list has to be able to tell a row the
+      // history seed guessed from a row a person actually vouched for.
+      const declared = new Map(materialsForVendor(db, v.id).map(p => [p.material_id, p]));
+      for (const m of mats) {
+        const d = declared.get(m.material_id);
+        m.mapped_source = d?.source || null;      // 'history' | 'contracts' | 'person'
+        m.mapped_by     = d?.created_by || null;
+        m.mapped_at     = d?.created_at || null;
+      }
       const totalSpend = mats.reduce((s, m) => s + (m.total_spend || 0), 0);
       out.push({
         vendor_id: v.id,
@@ -86,6 +98,10 @@ export async function GET() {
         material_count: mats.length,
         with_mapping: mats.filter(m => m.is_mapped).length,
         with_contract: mats.filter(m => m.has_contract).length,
+        // Purchasing is BLOCKED for a vendor with none — the screen leads with this.
+        mapped_count: declared.size,
+        seeded_count: [...declared.values()].filter(p => p.source !== 'person').length,
+        human_count:  [...declared.values()].filter(p => p.source === 'person').length,
       });
     }
 

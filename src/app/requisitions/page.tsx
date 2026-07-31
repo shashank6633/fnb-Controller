@@ -2088,7 +2088,16 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     const r = await api(`/api/requisitions/${req.id}/store-process`, { method: 'POST', body });
     const j = await r.json();
     if (!r.ok) { alert(j.error || 'Failed'); setBusy(false); return; }
-    alert('Issuance recorded. If any items still need to be purchased, raise a vendor PO on the Purchase Orders page.');
+    // A shortfall line whose vendor is not mapped to the item is LEFT OFF the
+    // auto-PO rather than blocking the issue (store-process explains why). The
+    // server names those lines in po_skipped_note — say so, or the store user is
+    // told "Issuance recorded", walks away, and the purchase request is simply
+    // gone: no PO was raised and nothing on screen said one was missing.
+    alert(
+      j.po_skipped_note
+        ? `Issuance recorded — BUT A PURCHASE LINE WAS NOT ORDERED.\n\n${j.po_skipped_note}`
+        : 'Issuance recorded. If any items still need to be purchased, raise a vendor PO on the Purchase Orders page.',
+    );
     onDone();
   };
 

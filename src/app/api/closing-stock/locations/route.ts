@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
-import { allowedDeptSetExpanded, canSeeAllDeptStock, DEPT_ITEM_SET_SQL, deptItemSetParams } from '@/lib/dept-stock';
+import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
+import { DEPT_REQUESTED_ITEM_SQL, deptRequestedParams, selectedDeptSet } from '@/lib/dept-requested-items';
 
 /**
  * Storage-location summary for the EOD count workflow.
@@ -27,9 +28,12 @@ export async function GET(request: Request) {
     const rawDept = url.searchParams.get('department_id');
     const deptMatch = (() => { const s = (rawDept == null ? '' : String(rawDept)).trim(); return s === '' || s === '__store__' ? '' : s; })();
 
-    // Dept item-set scope for non-privileged callers — same restriction as
+    // Viewer floor for non-privileged callers — same restriction as
     // /api/closing-stock/by-location, so staff location cards count only THEIR
-    // items (locations with none of their items disappear entirely).
+    // items (locations with none of their items disappear entirely). Item
+    // definition is the owner's ever-REQUESTED rule, kept identical to
+    // by-location so a card's "x of y" can never disagree with the list behind
+    // it; see the note there for why it replaced DEPT_ITEM_SET_SQL.
     // JOIN placeholders (date, deptMatch) bind before any WHERE dept-scope params.
     const params: any[] = [date, deptMatch];
     let deptScopeSql = '';
@@ -37,8 +41,22 @@ export async function GET(request: Request) {
     if (me && !canSeeAllDeptStock(me)) {
       const deptSet = allowedDeptSetExpanded(db, me);
       if (deptSet.length > 0) {
-        deptScopeSql = ` AND ${DEPT_ITEM_SET_SQL}`;
-        params.push(...deptItemSetParams(deptSet));
+        deptScopeSql = ` AND ${DEPT_REQUESTED_ITEM_SQL}`;
+        params.push(...deptRequestedParams(deptSet));
+      }
+    }
+
+    /* SELECTED-department scope (owner requirement 4, 2026-07-31) — the
+       progress cards must count the SAME rows the count screen will list, so
+       they carry the identical ever-requested filter as ../by-location. An
+       area holding none of this department's items drops off the board
+       entirely instead of showing "0 of 137 counted" forever. Store / Overall
+       (deptMatch '') is unchanged: the whole catalogue, as before. */
+    if (deptMatch) {
+      const selSet = selectedDeptSet(db, deptMatch);
+      if (selSet.length > 0) {
+        deptScopeSql += ` AND ${DEPT_REQUESTED_ITEM_SQL}`;
+        params.push(...deptRequestedParams(selSet));
       }
     }
 

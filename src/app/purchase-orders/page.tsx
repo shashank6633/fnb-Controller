@@ -108,6 +108,20 @@ interface POItem {
   material_pack_size?: number;
   quantity: number; unit_price: number; total_price: number;
   current_avg_price?: number; last_purchase_price?: number; notes?: string;
+  /** LINE vendor — one PO legitimately spans several. Receiving is per vendor. */
+  vendor?: string; vendor_id?: string | null;
+}
+
+/**
+ * One vendor's stake in a PO, from GET /api/purchase-orders/:id/receive.
+ * `line_ids` are the lines this vendor still owes; `done` means there is
+ * nothing left for them to deliver (all in, or all store-mapped).
+ */
+interface VendorStake {
+  key: string; vendor_name: string; vendor_id: string | null;
+  line_ids: string[]; received_line_ids: string[]; blocked_line_ids: string[];
+  ordered_value: number; done: boolean; grn_numbers: string[];
+  bills: { id: string; bill_no: string; bill_date: string; received_by: string; created_at: string }[];
 }
 interface PO { id: string; po_number: string; date: string; vendor: string; status: string; total_cost: number; notes: string; drafted_by: string; submitted_at?: string; approved_by?: string; approved_at?: string; rejected_reason?: string; received_at?: string; item_count?: number; items?: POItem[]; }
 
@@ -554,6 +568,26 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   const [discountValue, setDiscountValue] = useState('');
   const [chargesNote, setChargesNote] = useState('');
   const [billNo, setBillNo] = useState('');
+  const [billDate, setBillDate] = useState<string>(new Date().toISOString().slice(0, 10));
+  /* ── ONE PO, MANY VENDORS, ONE BILL EACH ────────────────────────────────
+     A PO here is an internal approval document, so it legitimately spans
+     several vendors — each of whom turns up on their own day with their own
+     invoice. Receiving is therefore PER VENDOR: this modal books ONE vendor's
+     lines at a time, under that vendor's bill number, bill date and charges.
+     `stakes` comes from GET /api/purchase-orders/:id/receive, which is the only
+     endpoint that knows which lines are already in (the receipt ledger is
+     derived from the GRN rows, and a mixed PO now has one GRN per vendor —
+     more than purchase_orders.grn_id can describe). */
+  const [stakes, setStakes] = useState<VendorStake[]>([]);
+  const [vendorKey, setVendorKey] = useState<string | null>(null);
+  /* At least one vendor was booked in this session, so the list behind the
+     modal is stale even if the PO is still open — dismissing must refetch it. */
+  const [didReceive, setDidReceive] = useState(false);
+  /* Lines the receiver has taken OFF this bill because the vendor is sending
+     them later, on another invoice. NOT the same as receiving them at qty 0 —
+     that books them as received-and-short for good, while these simply stay
+     outstanding and keep the PO open. */
+  const [excluded, setExcluded] = useState<Record<string, boolean>>({});
 
   /* WHO MAY UNLOCK A LINE'S RATE.
    * The rate typed here is written to purchases.unit_price and then through
@@ -569,17 +603,65 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
    * the same person who already approves the PO. */
   const canChangeRate = role === 'admin';
 
-  useEffect(() => {
-    fetch(`/api/purchase-orders?id=${poId}`).then(r => r.json()).then(d => {
-      setPo(d.purchase_order);
-      const its = d.purchase_order?.items || [];
-      setItems(its);
-      const map: Record<string, { quantity: number; unit_price: number }> = {};
-      for (const it of its) map[it.id] = { quantity: it.quantity, unit_price: it.unit_price };
-      setOverrides(map);
+  /* Load (or reload) the PO and its vendor stakes. Called on mount and again
+     after each vendor is booked, so a receiver who takes two deliveries in one
+     sitting always sees the ledger as it now stands rather than a cached copy
+     that still lists vendor A as outstanding. */
+  const load = useCallback(async (keepVendor?: string | null) => {
+    setLoading(true);
+    // `.catch(() => ({}))` alone swallowed a non-OK response as well as a network
+    // failure: a 403/500 from either endpoint parsed to {}, and the modal then
+    // rendered a PO with NO vendor stakes — which reads as "nothing received yet"
+    // and invites the receiver to book a delivery twice. A failed load must look
+    // like a failure, so a non-OK status is turned into a throw and surfaced.
+    const [detail, recv] = await Promise.all([
+      fetch(`/api/purchase-orders?id=${poId}`).then(r => r.ok ? r.json() : Promise.reject(new Error(String(r.status)))).catch(() => null),
+      fetch(`/api/purchase-orders/${poId}/receive`).then(r => r.ok ? r.json() : Promise.reject(new Error(String(r.status)))).catch(() => null),
+    ]);
+    if (!detail || !recv) {
       setLoading(false);
-    });
+      alert('Could not load this purchase order. Reload the page before receiving — booking a delivery against a half-loaded PO can double-count it.');
+      return;
+    }
+    setPo(detail.purchase_order || null);
+    const its: POItem[] = detail.purchase_order?.items || [];
+    setItems(its);
+    const map: Record<string, { quantity: number; unit_price: number }> = {};
+    for (const it of its) map[it.id] = { quantity: it.quantity, unit_price: it.unit_price };
+    setOverrides(map);
+    // Every per-line and per-bill entry belongs to ONE vendor's delivery — none
+    // of it may carry over to the next vendor, so it is cleared with the reload.
+    setReasons({}); setRateUnlocked({}); setExcluded({});
+    setBillNo(''); setChargesNote('');
+    setDiscountValue(''); setDeliveryValue('');
+    setDiscountMode('amt'); setDeliveryMode('amt');
+    const list: VendorStake[] = Array.isArray(recv?.vendors) ? recv.vendors : [];
+    setStakes(list);
+    // Auto-select the vendor still owing goods when there is only one — that is
+    // the single-vendor PO, and it must feel exactly as it always has.
+    const open = list.filter(v => !v.done);
+    setVendorKey(
+      keepVendor && open.some(v => v.key === keepVendor) ? keepVendor
+      : open.length === 1 ? open[0].key
+      : null,
+    );
+    setLoading(false);
   }, [poId]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  /** The vendor whose delivery is on the table right now. */
+  const stake = useMemo(() => stakes.find(v => v.key === vendorKey) || null, [stakes, vendorKey]);
+  const openStakes = useMemo(() => stakes.filter(v => !v.done), [stakes]);
+  const isMultiVendor = stakes.length > 1;
+  /* THE LINES THIS RECEIPT COVERS — this vendor's still-outstanding ones, and
+     nothing else. Lines another vendor owes, and lines already received, are not
+     rendered at all: a row on screen is a row that will be booked. */
+  const visibleItems = useMemo(() => {
+    if (!stake) return [];
+    const allow = new Set(stake.line_ids);
+    return items.filter(it => allow.has(it.id));
+  }, [items, stake]);
 
   const setQty   = (id: string, v: number) => setOverrides(o => ({ ...o, [id]: { ...o[id], quantity: v } }));
   const setPrice = (id: string, v: number) => setOverrides(o => ({ ...o, [id]: { ...o[id], unit_price: v } }));
@@ -598,7 +680,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
    * receive/route.ts), so a line this screen demands a reason for is exactly a
    * line the server would refuse without one: an exact `!== 0` here blocked
    * Confirm on ₹900.002 vs ₹900, which the route treats as no change at all. */
-  const deviations = useMemo(() => items.map(it => {
+  const deviations = useMemo(() => visibleItems.map(it => {
     const ov = overrides[it.id] || { quantity: it.quantity, unit_price: it.unit_price };
     const qty       = Number(ov.quantity);
     const price     = Number(ov.unit_price);
@@ -619,27 +701,38 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     if (rateOff) {
       bits.push(`rate ₹${price.toFixed(2)}${u ? '/' + u : ''} vs ordered ₹${it.unit_price.toFixed(2)}${u ? '/' + u : ''}`);
     }
-    return { it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, meta, deviates: bits.length > 0, label: bits.join(' · ') };
-  }), [items, overrides]);
+    return { it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, meta,
+             // ON this bill? An excluded line is still rendered (so it can be
+             // put back) but is not received, not costed and not reasoned about.
+             included: !excluded[it.id],
+             deviates: bits.length > 0, label: bits.join(' · ') };
+  }), [visibleItems, overrides, excluded]);
+
+  /* THE LINES THIS BILL ACTUALLY BOOKS. Every downstream number — the reason
+     gate, both totals, the charge allocation and the posted payload — reads
+     this one list, so an excluded line can never leak into any of them. */
+  const activeDeviations = useMemo(() => deviations.filter(d => d.included), [deviations]);
 
   // Free text, trimmed, ≥ 3 chars — same floor the receive route enforces, so a
   // reason the server would reject can never look accepted here.
   const MIN_REASON = 3;
-  const missingReason = deviations.filter(d => d.deviates && (reasons[d.it.id] || '').trim().length < MIN_REASON);
+  const missingReason = activeDeviations.filter(d => d.deviates && (reasons[d.it.id] || '').trim().length < MIN_REASON);
   const missingList = (prefix: string) =>
     prefix + missingReason.map(d => `• ${d.it.material_name} — ${d.label}`).join('\n');
 
-  const total = items.reduce((s, it) => {
-    const ov = overrides[it.id] || it;
-    return s + (Number(ov.quantity) || 0) * (Number(ov.unit_price) || 0);
-  }, 0);
-  const orderedTotal = items.reduce((s, it) => s + it.quantity * it.unit_price, 0);
+  /* Both totals cover THIS VENDOR'S lines on THIS bill — the footer sits under
+     their rows and is the figure their invoice has to reconcile to. Summing the
+     whole PO here would show a receiver a number no invoice in their hand could
+     ever match. */
+  const total = activeDeviations.reduce((s, d) =>
+    s + (Number(d.ov.quantity) || 0) * (Number(d.ov.unit_price) || 0), 0);
+  const orderedTotal = activeDeviations.reduce((s, d) => s + d.it.quantity * d.it.unit_price, 0);
 
   /* The bill preview runs the SAME allocator the route runs, on the SAME
      effective numbers the deviations memo uses — so the figure the receiver
      confirms is the figure that gets booked. */
   const billCalc = useMemo(() => {
-    const chargeLines = deviations.map(d => ({
+    const chargeLines = activeDeviations.map(d => ({
       id: d.it.id, name: d.it.material_name,
       qty: Number(d.ov.quantity) || 0, rate: Number(d.ov.unit_price) || 0,
     }));
@@ -647,7 +740,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     const discount = resolveCharge(discountMode, discountValue, subtotal);
     const delivery = resolveCharge(deliveryMode, deliveryValue, subtotal);
     return { alloc: allocateBillCharges(chargeLines, { discount, delivery }), discount, delivery };
-  }, [deviations, discountMode, discountValue, deliveryMode, deliveryValue]);
+  }, [activeDeviations, discountMode, discountValue, deliveryMode, deliveryValue]);
 
   const alloc = billCalc.alloc;
   const hasCharges = alloc.discount_applied > 0 || alloc.delivery > 0;
@@ -666,10 +759,25 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     ...(alloc.subtotal <= 0 && hasCharges ? ['Nothing is being accepted, so there is nothing to apply the bill charges to.'] : []),
   ];
 
+  /* Dismissing the modal. If any vendor was booked in this session the PO list
+     behind it is stale (its total, and possibly its status, moved), so Cancel
+     has to refetch — onReceived() is the callback that does. */
+  const dismiss = () => { if (didReceive) onReceived(); else onClose(); };
+
   const submit = async () => {
+    // No vendor chosen on a mixed PO — the route refuses this outright (one
+    // bill number cannot cover three vendors' goods); say so before the trip.
+    if (!stake) {
+      alert('Pick which vendor is delivering. Each vendor on this PO is received separately, under their own bill number.');
+      return;
+    }
     // Belt-and-braces with the disabled button: the reason gate must not be
     // skippable by a stale click. (The receive route re-checks it anyway — that
     // is the real gate; this is only so the receiver gets a readable message.)
+    if (activeDeviations.length === 0) {
+      alert('Tick at least one line to put on this bill.');
+      return;
+    }
     if (missingReason.length > 0) {
       alert(missingList('Add a reason for these lines before receiving:\n'));
       return;
@@ -685,7 +793,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       // Only deviating lines are sent — and every one of them carries the reason
       // the receiver typed, as deviation_reason (why it differs from the PO).
       // rejection_reason stays what it always was: QC, why units were rejected.
-      const deviating = deviations.filter(d => d.deviates);
+      const deviating = activeDeviations.filter(d => d.deviates);
       const item_overrides = deviating.map(d => ({
         po_item_id: d.it.id,
         quantity: d.ov.quantity,
@@ -696,9 +804,20 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
         method: 'POST',
         body: {
           received_at: receivedAt, item_overrides,
+          // WHICH VENDOR is delivering. Only their outstanding lines are booked,
+          // and the bill below is filed against them alone.
+          vendor_key: stake.key,
+          // …and WHICH of their lines are on THIS bill. Always sent, so the
+          // server's scope is exactly the set of rows on screen; anything the
+          // receiver took off stays outstanding and keeps the PO open.
+          line_ids: activeDeviations.map(d => d.it.id),
           // Rupees, resolved from the %/₹ toggle here. The server re-allocates
           // from its own effective line values — it never trusts these shares.
-          bill_charges: hasCharges || billNo.trim() ? {
+          // bill_charges is the ONLY carrier for bill_date, so gate it on the
+          // date too: a receiver who only corrects the vendor's invoice date (no
+          // discount, no delivery, no bill no.) would otherwise post nothing and
+          // the route would file the bill under received_at instead.
+          bill_charges: hasCharges || billNo.trim() || chargesNote.trim() || billDate !== receivedAt ? {
             // Mode + raw value travel WITH the resolved rupees: this preview
             // sums every PO line, but the route allocates only over the lines it
             // actually receives (store-mapped ones are dropped), so a "5%" here
@@ -710,19 +829,23 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
             delivery_amount: alloc.delivery,
             charges_note: chargesNote.trim(),
             bill_no: billNo.trim(),
+            // The VENDOR'S invoice date — routinely older than the day the truck
+            // arrived, so it is recorded separately from received_at.
+            bill_date: billDate,
           } : undefined,
         },
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) {
         alert(j.error || 'Failed');
-        // 409 = someone else already received this PO (the route claims the row
-        // with UPDATE … WHERE status = 'approved' inside the txn). The list row
-        // behind this modal still says "approved", so close + refetch rather
-        // than leave a Receive button that can only fail again.
-        if (r.status === 409) onReceived();
+        // 409 = this delivery is already in (someone else received the PO, or
+        // this vendor's lines, or this exact bill number). Either way what is on
+        // screen is stale, so close + refetch rather than leave a Confirm button
+        // that can only fail again.
+        if (r.status === 409) { setDidReceive(true); onReceived(); }
         return;
       }
+      setDidReceive(true);
       // Store-mapped (liquor) lines are SKIPPED by the receive route so they
       // never touch Central stock — but the "Receive total" the receiver just
       // confirmed counted them, so name the lines that did NOT arrive.
@@ -758,13 +881,33 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       if (j.charges_applied && (j.charges_applied.discount_applied > 0 || j.charges_applied.delivery > 0)) {
         const c = j.charges_applied;
         notes.push(
-          `Bill charges booked: discount ${fmt(c.discount_applied)} (reduced the cost of stock)` +
+          `Bill charges booked against ${j.vendor || 'this vendor'} only: discount ${fmt(c.discount_applied)} (reduced the cost of stock)` +
           `${c.discount_clamped ? ' — capped at the bill value' : ''}` +
-          ` · delivery ${fmt(c.delivery)} (recorded against the bill, not added to item cost).`
+          ` · delivery ${fmt(c.delivery)} (recorded against the bill, not added to item cost).` +
+          ' No other vendor\'s lines on this PO were touched.'
         );
       }
-      if (notes.length > 0) alert('Received.\n\n' + notes.join('\n\n'));
-      onReceived();
+      // THE PARTIAL CASE. The PO stays open until every vendor's lines are in,
+      // so say plainly who is still to come rather than letting "Received" imply
+      // the whole order landed.
+      const complete = j.po_complete !== false;
+      if (!complete) {
+        // Always spoken: a receiver who is told nothing will assume the PO is done.
+        alert([
+          `${j.vendor || 'Vendor'} received (${j.lines_processed} line(s), GRN ${j.grn_number}).`,
+          `PO ${po?.po_number || ''} stays OPEN — still to deliver: ${(j.remaining_vendors || []).join(', ')}.`,
+          ...notes,
+        ].join('\n\n'));
+      } else if (notes.length > 0) {
+        // Unchanged: a clean receive stays silent, exactly as it always has.
+        alert(`Received${isMultiVendor ? ` — ${j.vendor || ''} (this PO is now complete)` : ''}.\n\n` + notes.join('\n\n'));
+      } else if (isMultiVendor) {
+        alert(`${j.vendor || 'Vendor'} received — PO ${po?.po_number || ''} is now complete.`);
+      }
+      if (complete) { onReceived(); return; }
+      // Still open: stay put and reload the ledger so the next vendor can be
+      // received right away, with every field of this bill cleared.
+      await load(null);
     } finally { setSaving(false); }
   };
 
@@ -782,18 +925,95 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
               Adjust the qty if you got more / less. The rate is locked to the PO
               {canChangeRate ? ' — unlock a line only if the vendor genuinely billed differently.' : ' and only an admin can change it.'}
               {' '}Any line that differs from the PO needs a reason and alerts the admin. Stock + recipe costs update on submit.
+              {isMultiVendor && ' This PO spans several vendors — each is received separately, on their own bill.'}
             </p>
           </div>
-          <button onClick={onClose} className="text-[#8B7355]">✕</button>
+          <button onClick={dismiss} className="text-[#8B7355]">✕</button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-3">
-          <label className="text-xs text-[#6B5744] flex flex-col gap-1 max-w-xs">
-            Received on
-            <input type="date" value={receivedAt} onChange={e => setReceivedAt(e.target.value)}
-                   className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
-          </label>
+          {/* ── WHOSE DELIVERY IS THIS ────────────────────────────────────────
+              Only shown when the PO actually spans more than one vendor, so a
+              plain single-vendor receive looks exactly as it always did. Each
+              card is one vendor's stake: what they still owe, or the bill they
+              already delivered against. */}
+          {!loading && isMultiVendor && (
+            <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2.5 space-y-2">
+              <div className="text-xs font-semibold text-[#2D1B0E]">
+                Which vendor is delivering?
+                <span className="ml-2 font-normal text-[10px] text-[#8B7355]">
+                  {openStakes.length === 0
+                    ? 'every vendor is in'
+                    : `${openStakes.length} of ${stakes.length} still to deliver — the PO stays open until all are in`}
+                </span>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {stakes.map(v => {
+                  const active = v.key === vendorKey;
+                  return (
+                    <button key={v.key} type="button" disabled={v.done}
+                            onClick={() => setVendorKey(v.key)}
+                            className={`text-left px-2.5 py-2 rounded-lg border text-[11px] transition-colors ${
+                              v.done ? 'border-[#E8D5C4] bg-white/50 opacity-70 cursor-default'
+                              : active ? 'border-[#af4408] bg-white ring-1 ring-[#af4408]'
+                              : 'border-[#D4B896] bg-white hover:border-[#af4408]'}`}>
+                      <div className="font-semibold text-[#2D1B0E] flex items-center gap-1.5">
+                        {v.done
+                          ? <CheckCircle2 className="w-3 h-3 text-green-600 shrink-0" />
+                          : <PackageCheck className={`w-3 h-3 shrink-0 ${active ? 'text-[#af4408]' : 'text-[#8B7355]'}`} />}
+                        <span className="truncate">{v.vendor_name || '(no vendor on these lines)'}</span>
+                      </div>
+                      {v.done ? (
+                        <div className="mt-0.5 text-[10px] text-[#6B5744]">
+                          Received{v.grn_numbers.length > 0 ? ` · ${v.grn_numbers.join(', ')}` : ''}
+                          {v.bills.length > 0 && (
+                            <span> · bill {v.bills.map(b => b.bill_no || '(no number)').join(', ')}</span>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="mt-0.5 text-[10px] text-[#6B5744]">
+                          {v.line_ids.length} line(s) · {fmt(v.ordered_value)} ordered
+                          {v.blocked_line_ids.length > 0 && (
+                            <span className="text-amber-700"> · {v.blocked_line_ids.length} store-mapped (not receivable here)</span>
+                          )}
+                        </div>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+              {!stake && openStakes.length > 0 && (
+                <div className="text-[10px] text-amber-800">
+                  Pick a vendor. Their bill number, bill date, delivery charge and discount apply to their lines only —
+                  never to another vendor&apos;s goods on this PO.
+                </div>
+              )}
+            </div>
+          )}
 
-          {loading ? <div className="text-center text-xs text-[#8B7355] py-4">Loading items…</div> : (
+          <div className="flex flex-wrap gap-3">
+            <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+              Received on
+              <input type="date" value={receivedAt} onChange={e => setReceivedAt(e.target.value)}
+                     className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+            </label>
+            {/* The VENDOR'S invoice date, which is routinely earlier than the day
+                the truck arrived — recorded on their bill row, never used as the
+                date the money is booked on (that is "Received on"). */}
+            <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+              Vendor bill date
+              <input type="date" value={billDate} onChange={e => setBillDate(e.target.value)}
+                     className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+            </label>
+          </div>
+
+          {loading ? <div className="text-center text-xs text-[#8B7355] py-4">Loading items…</div>
+           : !stake ? (
+            <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-6 text-center text-xs text-[#8B7355]">
+              {openStakes.length === 0
+                ? 'Every vendor on this PO has already delivered. Nothing left to receive.'
+                : 'Choose the vendor who is delivering to see their lines.'}
+            </div>
+           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead className="text-[#8B7355]">
@@ -813,7 +1033,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                       — NOT the recipe/stock unit (g, ml), which differs by
                       pack_size. `u` is that purchase unit and labels every
                       qty/rate cell so the receiver knows what they're confirming. */}
-                  {deviations.map(({ it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, meta, deviates, label }) => {
+                  {deviations.map(({ it, ov, qtyDiff, priceDiff, qtyOff, rateOff, u, meta, included, deviates, label }) => {
                     const lineTotal = Number(ov.quantity) * Number(ov.unit_price);
                     // Recipe hints — display only. Both bases are printed on the
                     // SAME row so an ordered "10 kg" and a received "10 kg" can
@@ -822,13 +1042,28 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     const rcvHint = recipeHint(Number(ov.quantity) || 0, meta);
                     const unlocked = !!rateUnlocked[it.id];
                     const reason = reasons[it.id] || '';
-                    const needsReason = deviates && reason.trim().length < MIN_REASON;
+                    // Only a line ON this bill can be off-PO — an excluded one
+                    // is not being received at all, so it owes no explanation.
+                    const needsReason = included && deviates && reason.trim().length < MIN_REASON;
                     return (
                       <Fragment key={it.id}>
-                      <tr className={`border-t border-[#E8D5C4]/50 ${deviates ? 'bg-amber-50/40' : ''}`}>
+                      <tr className={`border-t border-[#E8D5C4]/50 ${!included ? 'opacity-45' : deviates ? 'bg-amber-50/40' : ''}`}>
                         <td className="py-1.5 px-2">
-                          <div className="text-[#2D1B0E]">{it.material_name}</div>
-                          <div className="text-[10px] text-[#8B7355]">{it.material_sku} · {u}</div>
+                          {/* ON THIS BILL? Unticking leaves the line outstanding
+                              for the vendor's next invoice — which is a different
+                              record from receiving it at qty 0 (that books it as
+                              received-and-short and it can never be topped up). */}
+                          <label className="flex items-start gap-1.5 cursor-pointer">
+                            <input type="checkbox" checked={included} className="mt-0.5 accent-[#af4408]"
+                                   onChange={e => setExcluded(x => ({ ...x, [it.id]: !e.target.checked }))} />
+                            <span>
+                              <span className={`${included ? 'text-[#2D1B0E]' : 'text-[#8B7355] line-through'}`}>{it.material_name}</span>
+                              <span className="block text-[10px] text-[#8B7355]">
+                                {it.material_sku} · {u}
+                                {!included && <span className="text-amber-700"> · not on this bill — stays outstanding</span>}
+                              </span>
+                            </span>
+                          </label>
                         </td>
                         <td className="py-1.5 px-2 text-right font-mono">
                           {it.quantity.toLocaleString('en-IN')}
@@ -840,12 +1075,12 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                             {/* min=0 — receiving cannot be negative. Negative
                                 stock corrections belong on the GRN page's
                                 "back-correction" workflow, not here. */}
-                            <input type="number" step="any" min={0} value={ov.quantity}
+                            <input type="number" step="any" min={0} value={ov.quantity} disabled={!included}
                                    onChange={e => {
                                      const v = parseFloat(e.target.value);
                                      setQty(it.id, Number.isFinite(v) ? Math.max(0, v) : 0);
                                    }}
-                                   className={`w-full px-1.5 py-1 border rounded text-right ${qtyOff ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
+                                   className={`w-full px-1.5 py-1 border rounded text-right disabled:bg-[#F5EFE8] ${qtyOff && included ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
                             {u && <span className="text-[10px] text-[#8B7355]">{u}</span>}
                           </div>
                           {/* The box is a PURCHASE-unit box (same basis the PO
@@ -901,14 +1136,14 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                                 <Lock className="w-3 h-3 text-[#8B7355]" />
                                 ₹{Number(ov.unit_price).toFixed(2)}{u && <span className="text-[10px] text-[#8B7355]">/{u}</span>}
                               </div>
-                              {canChangeRate ? (
+                              {canChangeRate && included ? (
                                 <button type="button" onClick={() => setRateUnlocked(m => ({ ...m, [it.id]: true }))}
                                         className="mt-0.5 text-[9px] text-[#af4408] hover:text-[#8a3506] underline">
                                   Change rate
                                 </button>
-                              ) : (
+                              ) : !canChangeRate ? (
                                 <div className="mt-0.5 text-[9px] text-[#8B7355]">PO rate — admin only</div>
-                              )}
+                              ) : null}
                               {/* A ₹0 PO rate is rejected by the receive route
                                   (it would wipe average_price to 0), and the
                                   lock means only an admin can fix it — say so
@@ -918,7 +1153,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                                   received at 0 never reaches updateMaterialPrice,
                                   so the server accepts it and this must not
                                   claim otherwise. */}
-                              {Number(ov.quantity) > 0 && Number(ov.unit_price) <= 0 && (
+                              {included && Number(ov.quantity) > 0 && Number(ov.unit_price) <= 0 && (
                                 <div className="mt-0.5 text-[9px] text-red-600">
                                   PO rate is ₹0 — {canChangeRate ? 'set a real rate to receive this line.' : 'an admin must set a real rate before this can be received.'}
                                 </div>
@@ -932,7 +1167,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                           PO (short, excess, or a changed rate). Required: the
                           receive route rejects a deviating line without one, and
                           the admin alert quotes it. */}
-                      {deviates && (
+                      {deviates && included && (
                         <tr className="bg-amber-50/40">
                           <td colSpan={6} className="px-2 pb-2">
                             <div className="flex flex-col sm:flex-row sm:items-center gap-1.5">
@@ -975,9 +1210,17 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
               booked to purchases.unit_price, which is what average_price — and
               therefore every recipe cost — averages). Delivery is RECORDED only:
               it is stored against the bill and never enters item cost. */}
-          {!loading && (
+          {!loading && stake && (
             <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2.5 space-y-2">
-              <div className="text-xs font-semibold text-[#2D1B0E]">Bill charges (optional)</div>
+              <div className="text-xs font-semibold text-[#2D1B0E]">
+                Bill charges (optional)
+                {isMultiVendor && (
+                  <span className="ml-2 font-normal text-[10px] text-[#8B7355]">
+                    — {stake.vendor_name || '(no vendor)'}&apos;s bill only. Allocated across their {visibleItems.length} line(s);
+                    no other vendor&apos;s goods on this PO are re-costed.
+                  </span>
+                )}
+              </div>
               <ChargeRow label="Delivery Charges" hint="recorded on the bill — does not change item cost"
                          mode={deliveryMode} value={deliveryValue}
                          onMode={setDeliveryMode} onValue={setDeliveryValue}
@@ -1054,13 +1297,20 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           )}
         </div>
         <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
-          <button onClick={onClose} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
-          <button onClick={submit} disabled={saving || loading || missingReason.length > 0 || chargeBlockers.length > 0}
-                  title={missingReason.length > 0 ? missingList('Reason still needed on:\n')
+          <button onClick={dismiss} className="px-3 py-2 text-sm text-[#6B5744]">
+            {didReceive ? 'Done' : 'Cancel'}
+          </button>
+          <button onClick={submit}
+                  disabled={saving || loading || !stake || activeDeviations.length === 0
+                            || missingReason.length > 0 || chargeBlockers.length > 0}
+                  title={!stake ? 'Pick which vendor is delivering'
+                       : activeDeviations.length === 0 ? 'Tick at least one line to put on this bill'
+                       : missingReason.length > 0 ? missingList('Reason still needed on:\n')
                        : chargeBlockers.length > 0 ? chargeBlockers.join('\n') : undefined}
                   className="px-3 py-2 text-sm bg-green-600 hover:bg-green-700 text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <PackageCheck className="w-4 h-4" />}
-            Confirm Receive
+            {/* Names the vendor on a mixed PO so nobody confirms the wrong truck. */}
+            {isMultiVendor && stake ? `Receive ${stake.vendor_name || '(no vendor)'}` : 'Confirm Receive'}
           </button>
         </div>
       </div>
@@ -1110,6 +1360,12 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
   // page and show Ordered + Received side-by-side so any variance is obvious
   // on screen too (until now it was print-only).
   const isReceived = po.status === 'received';
+  // Per-vendor receiving leaves a PART-received PO at 'approved', so keying the
+  // received columns on the status alone hid goods already booked into stock,
+  // purchases and average_price. Mirror the print page: show them the moment any
+  // line has a GRN row. (received_line_total is the API's "matched to a GRN"
+  // marker; it is set even for a truthful ₹0 line, unlike a > 0 sum test.)
+  const anyReceived = isReceived || items.some(it => (it as any).received_line_total != null);
   return (
     <tr><td colSpan={7} className="py-3 px-3 bg-[#FFF8F0]">
       <div className="flex items-start gap-6">
@@ -1127,13 +1383,13 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               <th className="text-left  py-1 px-2 font-medium">SKU</th>
               <th className="text-left  py-1 px-2 font-medium">Material</th>
               <th className="text-left  py-1 px-2 font-medium">Vendor</th>
-              <th className="text-right py-1 px-2 font-medium">{isReceived ? 'Ordered Qty' : 'Qty'}</th>
+              <th className="text-right py-1 px-2 font-medium">{anyReceived ? 'Ordered Qty' : 'Qty'}</th>
               {/* Spelled out, same as the liquor Movement report's "Unit
                   (recipe)": every qty in this table is in the PURCHASE unit. */}
               <th className="text-left  py-1 px-2 font-medium">Unit (purchase)</th>
-              <th className="text-right py-1 px-2 font-medium">{isReceived ? 'Rate (Ord)' : 'Unit ₹'}</th>
-              <th className="text-right py-1 px-2 font-medium">{isReceived ? 'Ordered ₹' : 'Total ₹'}</th>
-              {isReceived && <>
+              <th className="text-right py-1 px-2 font-medium">{anyReceived ? 'Rate (Ord)' : 'Unit ₹'}</th>
+              <th className="text-right py-1 px-2 font-medium">{anyReceived ? 'Ordered ₹' : 'Total ₹'}</th>
+              {anyReceived && <>
                 <th className="text-right py-1 px-2 font-medium bg-emerald-50">Received Qty</th>
                 <th className="text-right py-1 px-2 font-medium bg-emerald-50">Rate (Act)</th>
                 <th className="text-right py-1 px-2 font-medium bg-emerald-50">Received ₹</th>
@@ -1149,9 +1405,14 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               const recQty   = (it as any).quantity_accepted ?? (it as any).quantity_received;
               const recPrice = (it as any).received_unit_price ?? it.unit_price;
               const recTotal = (it as any).received_line_total ?? (recQty != null ? Number(recQty) * Number(recPrice) : null);
-              const qtyDiff   = recQty != null ? Number(recQty) - Number(it.quantity) : 0;
-              const priceDiff = recPrice != null ? Number(recPrice) - Number(it.unit_price) : 0;
-              const valDiff   = recTotal != null ? Number(recTotal) - Number(it.total_price) : 0;
+              // On a part-received PO the un-delivered lines carry no GRN row, and
+              // recPrice falls back to the ORDERED rate — printing that would make
+              // an outstanding line look delivered at its ordered price. lineIn is
+              // the per-line "this one actually arrived" test.
+              const lineIn = (it as any).received_line_total != null;
+              const qtyDiff   = lineIn && recQty != null ? Number(recQty) - Number(it.quantity) : 0;
+              const priceDiff = lineIn && recPrice != null ? Number(recPrice) - Number(it.unit_price) : 0;
+              const valDiff   = lineIn && recTotal != null ? Number(recTotal) - Number(it.total_price) : 0;
               const rejected  = Number((it as any).quantity_rejected) || 0;
               // A PO line is expressed in the PURCHASE unit (kg/BTL/CASE) at
               // ₹/purchase-unit — never the recipe unit (g/ml), which differs by
@@ -1170,7 +1431,7 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                   <td className="py-1 px-2 font-mono text-[10px] text-[#8B7355]">{it.material_sku || '·'}</td>
                   <td className="py-1 px-2">
                     {it.material_name}
-                    {isReceived && rejected > 0 && (
+                    {anyReceived && rejected > 0 && (
                       <div className="text-[10px] text-red-700 mt-0.5">
                         {/* quantity_rejected is a GRN qty = PURCHASE units, and
                             it was printing raw (0.30000000000000004). */}
@@ -1188,16 +1449,16 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                   <td className="py-1 px-2 text-[#6B5744]">{u}</td>
                   <td className="py-1 px-2 text-right font-mono">{fmt(it.unit_price)}</td>
                   <td className="py-1 px-2 text-right font-mono font-semibold">{fmt(it.total_price)}</td>
-                  {isReceived && <>
+                  {anyReceived && <>
                     <td className={`py-1 px-2 text-right font-mono ${qtyDiff !== 0 ? (qtyDiff > 0 ? 'bg-amber-50 text-amber-900 font-semibold' : 'bg-red-50 text-red-700 font-semibold') : 'bg-emerald-50/30'}`}>
-                      {recQty != null ? Number(recQty).toLocaleString('en-IN') : '—'}
-                      {rcvHint && <div className={HINT_CLS}>{rcvHint}</div>}
+                      {lineIn && recQty != null ? Number(recQty).toLocaleString('en-IN') : '—'}
+                      {lineIn && rcvHint && <div className={HINT_CLS}>{rcvHint}</div>}
                     </td>
                     <td className={`py-1 px-2 text-right font-mono ${priceDiff !== 0 ? (priceDiff > 0 ? 'bg-red-50 text-red-700 font-semibold' : 'bg-emerald-50 text-emerald-800 font-semibold') : 'bg-emerald-50/30'}`}>
-                      {recPrice != null ? fmt(Number(recPrice)) : '—'}
+                      {lineIn && recPrice != null ? fmt(Number(recPrice)) : '—'}
                     </td>
                     <td className="py-1 px-2 text-right font-mono bg-emerald-50/30">
-                      {recTotal != null ? fmt(Number(recTotal)) : '—'}
+                      {lineIn && recTotal != null ? fmt(Number(recTotal)) : '—'}
                     </td>
                     <td className={`py-1 px-2 text-right font-mono text-[10px] ${valDiff === 0 ? 'text-[#8B7355]' : valDiff > 0 ? 'text-red-700' : 'text-amber-700'}`}>
                       {/* qfmt, not the raw float: 2.4 − 2.5 prints as
@@ -1218,10 +1479,12 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               );
             })}
           </tbody>
-          {isReceived && (
+          {anyReceived && (
             <tfoot>
               <tr className="border-t border-[#E8D5C4] font-semibold bg-white/60">
-                <td colSpan={6} className="py-1.5 px-2 text-right">Totals</td>
+                {/* "so far" while other vendors still owe goods — the received
+                    column sums only the lines with a GRN row. */}
+                <td colSpan={6} className="py-1.5 px-2 text-right">Totals{isReceived ? '' : ' (so far)'}</td>
                 <td className="py-1.5 px-2 text-right font-mono">
                   {fmt(items.reduce((s, it) => s + Number(it.total_price || 0), 0))}
                 </td>
@@ -1332,10 +1595,18 @@ function ContractFlag({ materialId, vendorId, unitPrice, onMatch }: {
   );
 }
 
-function EligibleVendorChips({ materialId, currentVendor, onPick }: {
+function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor, onBlockedPick }: {
   materialId: string;
   currentVendor: string;
   onPick: (v: EligibleVendor) => void;
+  /** STRICT MAPPING: these chips come from purchase HISTORY, which can name a
+   *  vendor nobody has since mapped to this item. When supplied, an unmapped
+   *  chip is shown greyed and cannot be clicked into the line — otherwise the
+   *  quickest control on the row would be the one that files a pair the save
+   *  refuses. History stays VISIBLE (it is real, and it tells the buyer who to
+   *  map) — it is just not selectable. */
+  isMappedVendor?: (v: EligibleVendor) => boolean;
+  onBlockedPick?: (v: EligibleVendor) => void;
 }) {
   const [list, setList] = useState<EligibleVendor[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1362,12 +1633,14 @@ function EligibleVendorChips({ materialId, currentVendor, onPick }: {
         // > 0, not != null: a ₹0 contract row means no rate was agreed, so it must
         // not show as a contract chip nor be picked as the line rate.
         const hasContract = Number(v.contract_price) > 0;
+        const blocked = !!isMappedVendor && !isMappedVendor(v);
         return (
           <button
             key={v.vendor}
             type="button"
-            onClick={() => onPick(v)}
+            onClick={() => (blocked ? onBlockedPick?.(v) : onPick(v))}
             title={[
+              blocked ? 'NOT MAPPED to this item — map the pair on Vendor Items before ordering' : null,
               `${v.purchase_count} purchase${v.purchase_count > 1 ? 's' : ''}`,
               v.last_date ? `last ${v.last_date}` : null,
               v.last_price != null ? `last ₹${v.last_price.toFixed(2)}` : null,
@@ -1377,13 +1650,16 @@ function EligibleVendorChips({ materialId, currentVendor, onPick }: {
               v.lead_time_days ? `${v.lead_time_days}d lead` : null,
             ].filter(Boolean).join(' · ')}
             className={`text-[10px] px-1.5 py-0.5 rounded border transition ${
-              active
-                ? 'bg-[#af4408] text-white border-[#af4408]'
-                : hasContract
-                  ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:border-emerald-500'
-                  : 'bg-white text-[#2D1B0E] border-[#E8D5C4] hover:border-[#af4408] hover:bg-[#FFF1E3]'
+              blocked
+                ? 'bg-[#F7F1E9] text-[#A08B76] border-dashed border-[#D4B896] cursor-not-allowed'
+                : active
+                  ? 'bg-[#af4408] text-white border-[#af4408]'
+                  : hasContract
+                    ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:border-emerald-500'
+                    : 'bg-white text-[#2D1B0E] border-[#E8D5C4] hover:border-[#af4408] hover:bg-[#FFF1E3]'
             }`}
           >
+            {blocked && <span className="mr-0.5">🔒</span>}
             {v.vendor}
             {hasContract ? (
               <span className={`ml-1 font-mono font-semibold ${active ? 'text-white' : 'text-emerald-700'}`}>
@@ -1405,6 +1681,145 @@ function EligibleVendorChips({ materialId, currentVendor, onPick }: {
   );
 }
 
+/* ============================================================ */
+/* STRICT VENDOR ↔ ITEM MAPPING (owner rule)                      */
+/*                                                                */
+/* "Vendor mapping should be done in Vendor Items first … 1 vendor */
+/* may have limited items but an item can have different vendors." */
+/*                                                                */
+/*   pick the VENDOR first → only that vendor's mapped items       */
+/*   pick the ITEM   first → only vendors mapped to that item      */
+/*                                                                */
+/* BOTH directions come out of ONE payload (/api/vendor-materials  */
+/* ?index=1, built by @/lib/vendor-mapping), which is the SAME     */
+/* `vendor_materials` rows the server checks in vendorMappingError */
+/* before it will write a line. A dropdown here can therefore      */
+/* never offer a pair the save refuses — the filter is the         */
+/* convenience, the server is the rule.                            */
+/* ============================================================ */
+const VENDOR_ITEMS_HREF = '/vendors/materials';
+const vendorItemsHref = (vendorId?: string) =>
+  vendorId ? `${VENDOR_ITEMS_HREF}?vendor=${encodeURIComponent(vendorId)}` : VENDOR_ITEMS_HREF;
+
+interface VendorItemIndexPayload {
+  by_vendor: Record<string, string[]>;
+  vendor_names: Record<string, string>;
+  vendors_no_items?: Array<{ id: string; name: string }>;
+  pair_count?: number;
+}
+const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
+const EMPTY_ID_LIST: readonly string[] = [];
+
+/** Loads the whole map once and answers both directions off it.
+ *  FAILS CLOSED: until the map has actually loaded, `ready` is false and the
+ *  callers show "loading" / the error instead of an unfiltered list — offering
+ *  every item and then having the save rejected is the exact failure this
+ *  screen is meant to remove. */
+function useVendorItemIndex() {
+  const [idx, setIdx] = useState<VendorItemIndexPayload | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [nonce, setNonce] = useState(0);
+  const reload = useCallback(() => setNonce(n => n + 1), []);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    fetch('/api/vendor-materials?index=1')
+      .then(async r => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(d => { if (!alive) return; setIdx(d); setError(''); })
+      .catch(e => {
+        if (!alive) return;
+        setIdx(null);
+        setError(e?.message || 'Could not load the vendor → item mapping.');
+      })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [nonce]);
+
+  const byVendor = useMemo(() => {
+    const m = new Map<string, Set<string>>();
+    for (const [vid, mids] of Object.entries(idx?.by_vendor || {})) m.set(vid, new Set(mids));
+    return m;
+  }, [idx]);
+  const byMaterial = useMemo(() => {
+    const m = new Map<string, string[]>();
+    for (const [vid, mids] of Object.entries(idx?.by_vendor || {})) {
+      for (const mid of mids) {
+        const list = m.get(mid);
+        if (list) list.push(vid); else m.set(mid, [vid]);
+      }
+    }
+    return m;
+  }, [idx]);
+
+  return {
+    ready: !!idx && !loading,
+    loading, error, reload,
+    /** Item ids this vendor is mapped to supply. */
+    itemsOf: (vendorId: string): ReadonlySet<string> => byVendor.get(vendorId) || EMPTY_ID_SET,
+    /** Vendor ids mapped to supply this item — an item can have many. */
+    vendorsOf: (materialId: string): readonly string[] => byMaterial.get(materialId) || EMPTY_ID_LIST,
+    itemCount: (vendorId: string) => byVendor.get(vendorId)?.size || 0,
+    isMapped: (vendorId: string, materialId: string) =>
+      !!vendorId && !!materialId && !!byVendor.get(vendorId)?.has(materialId),
+  };
+}
+type VendorItemIndex = ReturnType<typeof useVendorItemIndex>;
+
+/** The client's copy of the server rule, so the buyer is told BEFORE the round
+ *  trip. Deliberately worded like @/lib/vendor-mapping's messages; the server
+ *  still has the last word and its text is what gets shown on a 400. */
+function mappingProblem(
+  lineNo: number,
+  vm: VendorItemIndex,
+  vendorId: string,
+  vendorName: string,
+  materialId: string,
+  materialLabel: string,
+): string | null {
+  if (!materialId || (!vendorId && !vendorName)) return null;   // other rules own these
+  if (!vm.ready) return `Line ${lineNo}: the vendor → item mapping has not loaded, so this line cannot be checked. Reload the page.`;
+  if (!vendorId) {
+    return `Line ${lineNo}: "${vendorName}" is not in the Vendor master, so its item list cannot be checked. Pick the vendor from the dropdown.`;
+  }
+  if (vm.itemCount(vendorId) === 0) {
+    return `Line ${lineNo}: ${vendorName} has no items mapped yet, so nothing can be ordered from them. Add their item list on Vendor Items, then save again.`;
+  }
+  if (!vm.isMapped(vendorId, materialId)) {
+    return `Line ${lineNo}: ${vendorName} is not mapped to supply "${materialLabel}". Pick a vendor that supplies it, or map the item to ${vendorName} on Vendor Items.`;
+  }
+  return null;
+}
+
+/** Shown wherever a chosen vendor has no item list at all. THE EMPTY-MAP CASE:
+ *  strict blocks the line, so the way out has to be one click away — a buyer
+ *  standing at a delivery cannot debug a dropdown. */
+function NoItemsForVendor({ vendorId, vendorName, compact }: {
+  vendorId: string; vendorName: string; compact?: boolean;
+}) {
+  return (
+    <div className={`rounded-lg border border-red-300 bg-red-50 text-red-800 ${compact ? 'px-2 py-1.5 text-[10px]' : 'px-3 py-2 text-[11px]'}`}>
+      <div className="flex items-start gap-1.5">
+        <AlertTriangle className={`${compact ? 'w-3 h-3' : 'w-3.5 h-3.5'} mt-0.5 shrink-0`} />
+        <div className="flex-1">
+          <strong>{vendorName}</strong> has no items mapped yet, so nothing can be ordered from them.
+          {' '}Set up their item list first — mapping is done on Vendor Items.
+          <div className="mt-1">
+            <a href={vendorItemsHref(vendorId)} target="_blank" rel="noopener noreferrer"
+               className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#af4408] text-white hover:bg-[#8a3506] font-medium">
+              Open Vendor Items for {vendorName} →
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CreatePOModal({ materials, onClose, onCreated }: {
   materials: Material[]; onClose: () => void; onCreated: () => void;
 }) {
@@ -1417,15 +1832,18 @@ function CreatePOModal({ materials, onClose, onCreated }: {
     { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' },
   ]);
   const [saving, setSaving] = useState(false);
-  // Phase 1 §3 — pick vendor FIRST. Materials list filters to "purchased from this
-  // vendor before" (via purchases history OR an active vendor_contract). Toggle
-  // `showAllMaterials` to bypass the filter for first-time orders from a new vendor.
+  // STRICT MAPPING. The header vendor is a convenience that seeds every line;
+  // the rule is enforced per LINE, in both directions, off `vm` below.
+  // `showAllMaterials` no longer bypasses anything — it reveals the items that
+  // are NOT mapped to the line's vendor, greyed, each with a one-click "+ map"
+  // so a buyer who is mid-order can declare the pair and carry on. Picking one
+  // without mapping it is not possible: the save would be refused anyway.
   const [primaryVendorId, setPrimaryVendorId] = useState<string>('');
   const [primaryVendorName, setPrimaryVendorName] = useState<string>('');
   const [showAllMaterials, setShowAllMaterials] = useState(false);
-  const [vendorMaterialIds, setVendorMaterialIds] = useState<Set<string>>(new Set());
-  const [loadingVendorMats, setLoadingVendorMats] = useState(false);
   const [vendorLoadError, setVendorLoadError] = useState('');
+  const [mapBusy, setMapBusy] = useState(false);
+  const vm = useVendorItemIndex();
 
   // This list feeds BOTH the header dropdown and every line dropdown, and a line
   // vendor is required to save. A silently failed fetch would therefore leave the
@@ -1441,29 +1859,61 @@ function CreatePOModal({ materials, onClose, onCreated }: {
       .catch(() => setVendorLoadError('Could not load the vendor list — reload the page to try again.'));
   }, []);
 
-  // Whenever vendor changes, fetch the explicit vendor↔material MAPPINGS
-  // (vendor_materials table — distinct from vendor_contracts which carries
-  // negotiated prices). User manages this on /vendors/materials.
+  // Header vendor's display name. The mapping itself no longer needs a fetch of
+  // its own — `vm` already holds every pair (see useVendorItemIndex).
   useEffect(() => {
-    if (!primaryVendorId) { setVendorMaterialIds(new Set()); return; }
-    setLoadingVendorMats(true);
     const v = vendors.find(x => x.id === primaryVendorId);
     setPrimaryVendorName(v?.name || '');
-    fetch(`/api/vendor-materials?vendor_id=${primaryVendorId}`)
-      .then(r => r.json())
-      .then(d => {
-        const ids = new Set<string>();
-        for (const m of (d.mappings || [])) if (m.material_id) ids.add(m.material_id);
-        setVendorMaterialIds(ids);
-      })
-      .catch(() => setVendorMaterialIds(new Set()))
-      .finally(() => setLoadingVendorMats(false));
   }, [primaryVendorId, vendors]);
 
-  // Materials list shown to the SimpleMaterialPicker — narrowed when vendor is picked.
-  const eligibleMaterials = (primaryVendorId && !showAllMaterials && vendorMaterialIds.size > 0)
-    ? materials.filter(m => vendorMaterialIds.has(m.id))
-    : materials;
+  const headerItemCount = primaryVendorId ? vm.itemCount(primaryVendorId) : 0;
+
+  /** The two lists a line's item picker gets, resolved for the vendor that line
+   *  will actually be saved against (its own vendor, else the header vendor).
+   *  ONE function, so the "mapped" and "not mapped" halves can never overlap or
+   *  leave an item out. */
+  const pickListsFor = useCallback((lineVendorId: string) => {
+    if (!vm.ready) return { mapped: [] as Material[], unmapped: [] as Material[] };
+    if (lineVendorId) {
+      const ids = vm.itemsOf(lineVendorId);
+      return {
+        mapped:   materials.filter(m => ids.has(m.id)),
+        unmapped: materials.filter(m => !ids.has(m.id)),
+      };
+    }
+    // No vendor chosen yet — ITEM-FIRST mode. Only items that at least one
+    // vendor is mapped to supply can be ordered; the rest would be a dead end
+    // (their vendor dropdown would come back empty), so they are shown in the
+    // greyed half with the reason instead of silently disappearing.
+    return {
+      mapped:   materials.filter(m => vm.vendorsOf(m.id).length > 0),
+      unmapped: materials.filter(m => vm.vendorsOf(m.id).length === 0),
+    };
+  }, [vm, materials]);
+
+  /** Declare a (vendor, item) pair from here, then use it. The way out of the
+   *  strict rule that does not involve leaving a half-typed PO: it writes the
+   *  same `vendor_materials` row the Vendor Items screen writes, under the
+   *  buyer's own email, so it shows up there as human-added, not as seed. */
+  const mapAndUse = useCallback(async (vendorId: string, vendorName: string, mat: Material): Promise<boolean> => {
+    if (!vendorId) return false;
+    if (!window.confirm(
+      `Map "${mat.name}" to ${vendorName}?\n\n` +
+      `This says "${vendorName} supplies this item" and is saved on Vendor Items ` +
+      `(it is a mapping only — no price, no contract). It applies to every future PO.`
+    )) return false;
+    setMapBusy(true);
+    try {
+      const r = await api('/api/vendor-materials', {
+        method: 'POST',
+        body: { vendor_id: vendorId, material_id: mat.id },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { alert(j.error || `Could not map the item (HTTP ${r.status}).`); return false; }
+      vm.reload();
+      return true;
+    } finally { setMapBusy(false); }
+  }, [vm]);
 
   const addLine = () => setItems(prev => [...prev, { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' }]);
   /* material_id → the 1-based line it already sits on. Feeds the picker so a
@@ -1531,15 +1981,27 @@ function CreatePOModal({ materials, onClose, onCreated }: {
     items.forEach((it, i) => {
       const qty = Number(it.quantity);
       const px  = Number(it.unit_price);
-      const u   = poUnitOf(materials.find(m => m.id === it.material_id));
+      const mat = materials.find(m => m.id === it.material_id);
+      const u   = poUnitOf(mat);
       if (!it.material_id)      problems.push(`Line ${i + 1}: select an item (or remove the line)`);
       else if (!(qty > 0))      problems.push(`Line ${i + 1}: enter a quantity greater than 0`);
       // A ₹0 / negative rate reaches the purchases row at receive and drags
       // average_price toward (or below) zero — never let it be saved.
       else if (!(px > 0))       problems.push(`Line ${i + 1}: enter a unit rate greater than 0 (₹ per ${u || 'purchase unit'})`);
       else if (!it.vendor.trim()) problems.push(`Line ${i + 1}: pick a vendor — receiving files the purchase against it`);
+      else {
+        // STRICT (vendor, item) mapping — same rule the server will apply, said
+        // here first so the buyer is not told after a round trip.
+        const bad = mappingProblem(i + 1, vm, it.vendor_id, it.vendor.trim(), it.material_id,
+                                   mat ? `${mat.name}${mat.sku ? ` (${mat.sku})` : ''}` : it.material_id);
+        if (bad) problems.push(bad);
+      }
     });
-    if (problems.length) { alert(problems.join('\n')); return; }
+    if (problems.length) {
+      alert(problems.join('\n\n') +
+        '\n\nVendor ↔ item mapping is maintained on Vendor Items (/vendors/materials): a vendor supplies a limited list of items, and an item can have several vendors.');
+      return;
+    }
     setSaving(true);
     try {
       const r = await api('/api/purchase-orders', {
@@ -1595,10 +2057,10 @@ function CreatePOModal({ materials, onClose, onCreated }: {
               )}
               {primaryVendorId && (
                 <span className="text-[10px] text-[#8B7355]">
-                  {loadingVendorMats ? 'Loading mapped materials…' :
-                   vendorMaterialIds.size > 0
-                     ? <>Showing <strong>{vendorMaterialIds.size}</strong> materials mapped to {primaryVendorName} (Vendor → Items)</>
-                     : <>No materials mapped to {primaryVendorName}. <a href="/vendors/materials" className="text-[#af4408] underline">Map them</a> or tick &quot;Show all&quot; to proceed.</>}
+                  {!vm.ready ? 'Loading the vendor → item mapping…' :
+                   headerItemCount > 0
+                     ? <>Seeds every line. <strong>{headerItemCount}</strong> item{headerItemCount === 1 ? '' : 's'} mapped to {primaryVendorName} (<a href={vendorItemsHref(primaryVendorId)} target="_blank" rel="noopener noreferrer" className="text-[#af4408] underline">Vendor Items</a>)</>
+                     : <>No items mapped to {primaryVendorName} yet.</>}
                 </span>
               )}
             </label>
@@ -1614,10 +2076,35 @@ function CreatePOModal({ materials, onClose, onCreated }: {
               </div>
             </div>
           </div>
-          {primaryVendorId && vendorMaterialIds.size > 0 && (
-            <label className="flex items-center gap-2 text-[11px] text-[#6B5744]">
-              <input type="checkbox" checked={showAllMaterials} onChange={e => setShowAllMaterials(e.target.checked)} />
-              Show all materials (e.g. trying something new from this vendor)
+          {/* THE RULE, stated once at the top of the composer. */}
+          {vm.error ? (
+            <div className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-[11px] text-red-800 flex items-start gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <div className="flex-1">
+                Could not load the vendor → item mapping ({vm.error}). Item and vendor pickers stay
+                empty until it loads — a PO line is only accepted for a mapped pair.
+              </div>
+              <button type="button" onClick={vm.reload} className="underline font-medium shrink-0">Retry</button>
+            </div>
+          ) : (
+            <div className="text-[10px] text-[#8B7355] flex items-center gap-1.5 flex-wrap">
+              <Lock className="w-3 h-3 text-[#B8A590]" />
+              A line may only pair a vendor with an item mapped to them: pick the vendor and the item
+              list narrows, or pick the item and the vendor list narrows.
+              <a href={VENDOR_ITEMS_HREF} target="_blank" rel="noopener noreferrer" className="text-[#af4408] underline">Vendor Items</a>
+            </div>
+          )}
+          {/* THE EMPTY-MAP CASE — say it on screen, do not hand over an empty dropdown. */}
+          {primaryVendorId && vm.ready && headerItemCount === 0 && (
+            <NoItemsForVendor vendorId={primaryVendorId} vendorName={primaryVendorName} />
+          )}
+          {vm.ready && (
+            <label className="flex items-start gap-2 text-[11px] text-[#6B5744]">
+              <input type="checkbox" className="mt-0.5 shrink-0" checked={showAllMaterials} onChange={e => setShowAllMaterials(e.target.checked)} />
+              <span className="flex-1 min-w-0">
+                Also list items <em>not</em>{' '}mapped to the line&apos;s vendor — greyed, each with a one-click
+                &quot;+ map &amp; use&quot; that declares the pair on Vendor Items and then puts it on the line.
+              </span>
             </label>
           )}
 
@@ -1647,6 +2134,21 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                 {items.map((it, i) => {
                   const mat = materials.find(m => m.id === it.material_id);
                   const lineTotal = Number(it.quantity) * Number(it.unit_price);
+                  // The vendor this line will actually be SAVED against: its own,
+                  // else the header vendor that seeds it. Both dropdowns below are
+                  // resolved from it, so the two halves of the line always agree.
+                  const lineVendorId   = it.vendor_id || primaryVendorId;
+                  const lineVendorName = it.vendor_id
+                    ? (it.vendor || vendors.find(v => v.id === it.vendor_id)?.name || '')
+                    : primaryVendorName;
+                  const picks = pickListsFor(lineVendorId);
+                  const vendorHasNoItems = !!lineVendorId && vm.ready && vm.itemCount(lineVendorId) === 0;
+                  // A pair that is on the line but NOT declared — only reachable
+                  // when the mapping changed under a line already filled in
+                  // (another tab, another user). Never silently corrected: the
+                  // buyer is shown the conflict and given the two ways out.
+                  const pairConflict = !!it.material_id && !!it.vendor_id && vm.ready
+                    && !vm.isMapped(it.vendor_id, it.material_id);
                   return (
                     <tr key={it.uid} className={`border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0 ${
                       flashLine === i + 1 ? 'ring-2 ring-[#af4408] bg-[#FFF1E3]' : ''}`}>
@@ -1660,9 +2162,39 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                           <div className="px-2 py-1 rounded border border-[#E8D5C4] bg-[#FFF8F0] text-xs text-[#2D1B0E]">
                             <span className="font-mono text-[10px] text-[#8B7355] mr-1">{mat.sku}</span>{mat.name}
                           </div>
+                        ) : vendorHasNoItems ? (
+                          // Never an empty dropdown with no explanation.
+                          <NoItemsForVendor compact vendorId={lineVendorId} vendorName={lineVendorName || 'This vendor'} />
                         ) : (
-                          <SimpleMaterialPicker value={it.material_id} materials={eligibleMaterials}
+                          <SimpleMaterialPicker value={it.material_id} materials={picks.mapped}
                                               takenIds={takenIds} onPickTaken={goToTakenLine}
+                                              disabled={!vm.ready}
+                                              scopeNote={vm.ready
+                                                ? (lineVendorId
+                                                    ? `${picks.mapped.length} item${picks.mapped.length === 1 ? '' : 's'} mapped to ${lineVendorName || 'this vendor'}`
+                                                    : 'Items with at least one mapped vendor — pick one and the vendor list narrows')
+                                                : 'Loading the vendor → item mapping…'}
+                                              unmapped={showAllMaterials ? picks.unmapped : []}
+                                              unmappedLabel={lineVendorId
+                                                ? `Not mapped to ${lineVendorName || 'this vendor'}`
+                                                : 'No vendor mapped to these yet'}
+                                              unmappedHint={lineVendorId
+                                                ? 'Map the pair to order it — this is saved on Vendor Items.'
+                                                : 'Pick a vendor on this line first, or map these on Vendor Items.'}
+                                              mapBusy={mapBusy}
+                                              onMapAndPick={lineVendorId ? async (m) => {
+                                                const ok = await mapAndUse(lineVendorId, lineVendorName || 'this vendor', m);
+                                                if (!ok) return;
+                                                const taken = takenIds.get(m.id);
+                                                if (taken && taken !== i + 1) { goToTakenLine(taken); return; }
+                                                const patch: Partial<POLine> = { material_id: m.id };
+                                                if (!it.unit_price) patch.unit_price = poRateOf(m);
+                                                if (!it.vendor.trim()) {
+                                                  patch.vendor    = lineVendorName;
+                                                  patch.vendor_id = lineVendorId;
+                                                }
+                                                updateLine(i, patch);
+                                              } : undefined}
                                               onChange={(id, m) => {
                                                 // Belt-and-braces: keyboard selection or stale state could
                                                 // reach here even though the row renders as un-pickable.
@@ -1714,31 +2246,73 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                           // draft still round-trips instead of blanking itself.
                           const knownVendor = vendors.some(v => v.id === it.vendor_id);
                           const legacy = !!it.vendor.trim() && !knownVendor;
+                          // ITEM → VENDOR direction of the strict rule: once the
+                          // item is known, only the vendors mapped to supply it
+                          // are offered. An item can have MANY vendors, so this
+                          // is a narrowing, never a single answer. The currently
+                          // selected vendor is always kept in the list (flagged
+                          // below) so the row never silently rewrites itself.
+                          const offered = (it.material_id && vm.ready)
+                            ? vendors.filter(v => vm.isMapped(v.id, it.material_id) || v.id === it.vendor_id)
+                            : vendors;
                           return (
+                            <>
                             <select
                               value={legacy ? '__legacy__' : (it.vendor_id || '')}
+                              disabled={!vm.ready}
                               onChange={e => {
                                 if (e.target.value === '__legacy__') return;   // unchanged
                                 const v = vendors.find(x => x.id === e.target.value);
                                 updateLine(i, { vendor_id: v ? v.id : '', vendor: v ? v.name : '' });
                               }}
-                              className={`w-full px-1.5 py-1 border rounded text-xs bg-white ${legacy ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`}
+                              className={`w-full px-1.5 py-1 border rounded text-xs bg-white disabled:opacity-60 ${legacy || pairConflict ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`}
                             >
                               <option value="">Select vendor…</option>
                               {legacy && <option value="__legacy__">{it.vendor} — not in vendor master</option>}
-                              {vendors.map(v => (
+                              {offered.map(v => (
                                 <option key={v.id} value={v.id}>
                                   {v.name}
                                   {v.payment_terms ? ` · ${v.payment_terms}` : ''}
                                   {v.lead_time_days ? ` · ${v.lead_time_days}d lead` : ''}
+                                  {it.material_id && vm.ready && !vm.isMapped(v.id, it.material_id) ? ' · NOT MAPPED' : ''}
                                 </option>
                               ))}
                             </select>
+                            {it.material_id && vm.ready && (
+                              offered.length === 0 ? (
+                                <div className="text-[10px] text-red-700 mt-0.5">
+                                  No vendor is mapped to supply this item yet.{' '}
+                                  <a href={VENDOR_ITEMS_HREF} target="_blank" rel="noopener noreferrer" className="underline">Map it on Vendor Items</a>
+                                  {' '}(or remove the line).
+                                </div>
+                              ) : (
+                                <div className="text-[9px] text-[#B8A590] mt-0.5">
+                                  {offered.filter(v => vm.isMapped(v.id, it.material_id)).length} mapped vendor(s) for this item
+                                </div>
+                              )
+                            )}
+                            {pairConflict && (
+                              <div className="text-[10px] text-red-700 mt-0.5">
+                                ⚠ {lineVendorName || 'This vendor'} is not mapped to supply this item, so this line will be refused.{' '}
+                                {mat && (
+                                  <button type="button" disabled={mapBusy}
+                                          onClick={async () => { await mapAndUse(it.vendor_id, lineVendorName || 'this vendor', mat); }}
+                                          className="underline font-medium disabled:opacity-50">map it now</button>
+                                )}
+                                {' '}or pick a mapped vendor above.
+                              </div>
+                            )}
+                            </>
                           );
                         })()}
                         <EligibleVendorChips
                           materialId={it.material_id}
                           currentVendor={it.vendor}
+                          isMappedVendor={vm.ready ? (v => !!v.vendor_id && vm.isMapped(v.vendor_id, it.material_id)) : undefined}
+                          onBlockedPick={v => alert(
+                            `${v.vendor} has bought this item for you before, but the pair is not mapped, so a PO line cannot be filed against it.\n\n` +
+                            `Map "${mat?.name || 'the item'}" to ${v.vendor} on Vendor Items (${VENDOR_ITEMS_HREF}), then pick them here.`
+                          )}
                           onPick={v => {
                             // Chips come from purchase HISTORY, which can name a
                             // vendor the master no longer resolves. Re-resolve by
@@ -1876,9 +2450,27 @@ function CreatePOModal({ materials, onClose, onCreated }: {
  * maps material_id → the 1-based line it is already on; those rows stay VISIBLE
  * (hiding them reads as "we don't stock that") but cannot be picked, and
  * clicking one sends the user to the line that already has it. */
-function SimpleMaterialPicker({ value, materials, onChange, takenIds, onPickTaken }: {
+function SimpleMaterialPicker({
+  value, materials, onChange, takenIds, onPickTaken,
+  disabled, scopeNote, unmapped = [], unmappedLabel, unmappedHint, onMapAndPick, mapBusy,
+}: {
   value: string; materials: Material[]; onChange: (id: string, mat?: Material) => void;
   takenIds?: Map<string, number>; onPickTaken?: (lineNo: number) => void;
+  /** STRICT VENDOR ↔ ITEM MAPPING (all optional — callers that pass none get
+   *  exactly the previous behaviour):
+   *   disabled     — mapping not loaded yet; do not offer an unfiltered list
+   *   scopeNote    — one line saying WHAT this list is ("155 items mapped to …")
+   *   unmapped     — items outside the mapping, shown greyed BELOW the real list
+   *                  (hiding them reads as "we don't stock that")
+   *   onMapAndPick — the way out: declare the pair, then use it. Absent → the
+   *                  greyed rows are informational only. */
+  disabled?: boolean;
+  scopeNote?: string;
+  unmapped?: Material[];
+  unmappedLabel?: string;
+  unmappedHint?: string;
+  onMapAndPick?: (m: Material) => void | Promise<void>;
+  mapBusy?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
@@ -1887,11 +2479,20 @@ function SimpleMaterialPicker({ value, materials, onChange, takenIds, onPickTake
   // Portal the dropdown to <body> (fixed position) so the PO modal's overflow
   // can't clip it — the same clipping that hid this list inside the modal.
   const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null);
-  const sel = materials.find(m => m.id === value);
+  const sel = materials.find(m => m.id === value) || unmapped.find(m => m.id === value);
+  const matches = (m: Material, norm: string) =>
+    !norm || m.name.toLowerCase().includes(norm) || (m.sku || '').toLowerCase().includes(norm);
   const list = useMemo(() => {
     const norm = q.toLowerCase().trim();
-    return (norm ? materials.filter(m => m.name.toLowerCase().includes(norm) || (m.sku || '').toLowerCase().includes(norm)) : materials).slice(0, 1000);
+    return materials.filter(m => matches(m, norm)).slice(0, 1000);
   }, [q, materials]);
+  /* The greyed half — same search box, so a buyer who types an item name always
+     finds it, mapped or not, instead of concluding it does not exist. */
+  const offMatches = useMemo(() => {
+    const norm = q.toLowerCase().trim();
+    return unmapped.filter(m => matches(m, norm));
+  }, [q, unmapped]);
+  const offList = useMemo(() => offMatches.slice(0, 200), [offMatches]);
   const computePos = () => {
     const el = ref.current;
     if (!el || typeof window === 'undefined') return;
@@ -1917,10 +2518,12 @@ function SimpleMaterialPicker({ value, materials, onChange, takenIds, onPickTake
   }, []);
   return (
     <div ref={ref} className="relative">
-      <button type="button" onClick={() => { setOpen(!open); setQ(''); }}
-              className="w-full text-left px-2 py-1 border border-[#E8D5C4] rounded text-xs bg-[#FFF8F0]">
-        {sel ? (<><span className="text-[10px] font-mono text-[#8B7355] mr-1">{sel.sku}</span>{sel.name}</>) : <span className="text-[#8B7355]">Select…</span>}
+      <button type="button" disabled={disabled} onClick={() => { setOpen(!open); setQ(''); }}
+              className="w-full text-left px-2 py-1 border border-[#E8D5C4] rounded text-xs bg-[#FFF8F0] disabled:opacity-60 disabled:cursor-not-allowed">
+        {sel ? (<><span className="text-[10px] font-mono text-[#8B7355] mr-1">{sel.sku}</span>{sel.name}</>)
+             : <span className="text-[#8B7355]">{disabled ? 'Loading…' : 'Select…'}</span>}
       </button>
+      {scopeNote && <div className="text-[9px] text-[#B8A590] mt-0.5">{scopeNote}</div>}
       {open && pos && typeof document !== 'undefined' && createPortal(
         <div ref={dropRef} style={{ position: 'fixed', top: pos.top, left: pos.left, width: pos.width }}
              className="z-[100] max-w-[calc(100vw-1rem)] bg-white border border-[#D4B896] rounded shadow-lg p-2 max-h-[55vh] overflow-y-auto overscroll-contain">
@@ -1929,7 +2532,8 @@ function SimpleMaterialPicker({ value, materials, onChange, takenIds, onPickTake
           <div className="space-y-0.5">
             {list.length === 0 && (
               <div className="px-2 py-1 text-[11px] text-[#8B7355]">
-                {q.trim() ? <>No materials match &quot;{q}&quot;.</> : <>No materials loaded yet — refresh if this stays empty.</>}
+                {q.trim() ? <>No mapped item matches &quot;{q}&quot;.</> : <>No materials loaded yet — refresh if this stays empty.</>}
+                {unmapped.length > 0 && offList.length > 0 && <> Unmapped matches are listed below.</>}
               </div>
             )}
             {list.map(m => {
@@ -1961,6 +2565,41 @@ function SimpleMaterialPicker({ value, materials, onChange, takenIds, onPickTake
               );
             })}
           </div>
+          {/* THE GREYED HALF — items outside the mapping. Visible so the buyer
+              can see the item exists and act, never silently selectable. */}
+          {offList.length > 0 && (
+            <div className="mt-2 border-t border-dashed border-[#D4B896] pt-1.5">
+              <div className="px-2 pb-1 text-[10px] font-semibold text-[#A08B76] uppercase tracking-wide">
+                {unmappedLabel || 'Not mapped'} · {offList.length}
+              </div>
+              {unmappedHint && <div className="px-2 pb-1 text-[10px] text-[#8B7355]">{unmappedHint}</div>}
+              <div className="space-y-0.5">
+                {offList.map(m => (
+                  <div key={m.id} className="w-full px-2 py-1 rounded text-xs flex items-center gap-2 bg-[#FAF6F0] text-[#A08B76]">
+                    <span className="text-[10px] font-mono w-16 shrink-0">{m.sku || '·'}</span>
+                    <span className="flex-1 truncate">{m.name}</span>
+                    <span className="text-[10px]">{poUnitOf(m)}</span>
+                    {onMapAndPick ? (
+                      <button type="button" disabled={mapBusy}
+                              onClick={async () => { setOpen(false); setQ(''); await onMapAndPick(m); }}
+                              className="text-[10px] px-1.5 py-0.5 rounded border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] shrink-0 disabled:opacity-50">
+                        + map &amp; use
+                      </button>
+                    ) : (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#F0E4D6] shrink-0">not mapped</span>
+                    )}
+                  </div>
+                ))}
+                {/* Only when the list was actually TRUNCATED — comparing against
+                    the unfiltered total said "…772 more" under a single match. */}
+                {offMatches.length > offList.length && (
+                  <div className="px-2 py-1 text-[10px] text-[#B8A590]">
+                    …{offMatches.length - offList.length} more — narrow with the search box.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>,
         document.body,
       )}
@@ -1984,6 +2623,12 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
   })));
   const [vendors, setVendors] = useState<Array<{ id: string; name: string; payment_terms?: string; lead_time_days?: number }>>([]);
   const [saving, setSaving] = useState(false);
+  const [showUnmapped, setShowUnmapped] = useState(false);
+  const [mapBusy, setMapBusy] = useState(false);
+  // Same strict (vendor, item) mapping as the new-PO composer, off the same
+  // single payload. A draft is edited here and created there; a rule that
+  // applied on only one of the two would just move the problem.
+  const vm = useVendorItemIndex();
 
   // is_active filter matches the new-PO composer: a retired vendor must not be
   // offered for a fresh line. One already saved on this draft stays visible via
@@ -1994,6 +2639,36 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
       .then(d => setVendors((d.vendors || []).filter((v: any) => v.is_active)))
       .catch(() => {});
   }, []);
+
+  const pickListsFor = useCallback((lineVendorId: string) => {
+    if (!vm.ready) return { mapped: [] as Material[], unmapped: [] as Material[] };
+    if (lineVendorId) {
+      const ids = vm.itemsOf(lineVendorId);
+      return { mapped: materials.filter(m => ids.has(m.id)), unmapped: materials.filter(m => !ids.has(m.id)) };
+    }
+    return {
+      mapped:   materials.filter(m => vm.vendorsOf(m.id).length > 0),
+      unmapped: materials.filter(m => vm.vendorsOf(m.id).length === 0),
+    };
+  }, [vm, materials]);
+
+  /** Declare the pair from here — see the identical helper in the composer. */
+  const mapAndUse = useCallback(async (vendorId: string, vendorName: string, mat: Material): Promise<boolean> => {
+    if (!vendorId) return false;
+    if (!window.confirm(
+      `Map "${mat.name}" to ${vendorName}?\n\n` +
+      `This says "${vendorName} supplies this item" and is saved on Vendor Items ` +
+      `(mapping only — no price, no contract). It applies to every future PO.`
+    )) return false;
+    setMapBusy(true);
+    try {
+      const r = await api('/api/vendor-materials', { method: 'POST', body: { vendor_id: vendorId, material_id: mat.id } });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { alert(j.error || `Could not map the item (HTTP ${r.status}).`); return false; }
+      vm.reload();
+      return true;
+    } finally { setMapBusy(false); }
+  }, [vm]);
 
   const update = (i: number, patch: any) => setItems(prev => prev.map((it, j) => j === i ? { ...it, ...patch } : it));
   /* material_id → the 1-based line it already sits on. Feeds the picker so a
@@ -2038,13 +2713,20 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
     items.forEach((it, i) => {
       const qty = Number(it.quantity);
       const px  = Number(it.unit_price);
-      const u   = poUnitOf(materials.find(m => m.id === it.material_id));
+      const mat = materials.find(m => m.id === it.material_id);
+      const u   = poUnitOf(mat);
       if (!it.material_id)      problems.push(`Line ${i + 1}: select an item (or remove the line)`);
       else if (!(qty > 0))      problems.push(`Line ${i + 1}: enter a quantity greater than 0`);
       // ₹0 / negative rates reach the purchases row at receive and drag
       // average_price toward zero.
       else if (!(px > 0))       problems.push(`Line ${i + 1}: enter a unit rate greater than 0 (₹ per ${u || 'purchase unit'})`);
       else if (!it.vendor.trim()) problems.push(`Line ${i + 1}: pick a vendor — receiving files the purchase against it`);
+      else {
+        // STRICT (vendor, item) mapping — the server applies the same rule.
+        const bad = mappingProblem(i + 1, vm, it.vendor_id, it.vendor.trim(), it.material_id,
+                                   mat ? `${mat.name}${mat.sku ? ` (${mat.sku})` : ''}` : it.material_id);
+        if (bad) problems.push(bad);
+      }
     });
     if (problems.length) {
       // State it as POLICY, because it is one: Smart Reorder deliberately files
@@ -2077,6 +2759,28 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
         <input type="date" value={date} onChange={e => setDate(e.target.value)} className="px-2 py-1 border border-[#E8D5C4] rounded" />
         <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Notes" className="px-2 py-1 border border-[#E8D5C4] rounded col-span-2" />
       </div>
+      {/* Strict mapping — same rule and same wording as the new-PO composer. */}
+      {vm.error ? (
+        <div className="rounded border border-red-300 bg-red-50 px-2 py-1.5 text-[10px] text-red-800 flex items-start gap-1.5">
+          <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+          <span className="flex-1">Vendor → item mapping did not load ({vm.error}). Pickers stay empty until it does.</span>
+          <button type="button" onClick={vm.reload} className="underline font-medium">Retry</button>
+        </div>
+      ) : (
+        <div className="flex items-center justify-between gap-2 flex-wrap text-[10px] text-[#8B7355]">
+          <span className="inline-flex items-center gap-1">
+            <Lock className="w-3 h-3 text-[#B8A590]" />
+            A line only accepts a vendor mapped to the item (and an item mapped to the vendor).
+            <a href={VENDOR_ITEMS_HREF} target="_blank" rel="noopener noreferrer" className="text-[#af4408] underline">Vendor Items</a>
+          </span>
+          {vm.ready && (
+            <label className="inline-flex items-center gap-1.5 text-[#6B5744]">
+              <input type="checkbox" checked={showUnmapped} onChange={e => setShowUnmapped(e.target.checked)} />
+              show unmapped items (with &quot;+ map&quot;)
+            </label>
+          )}
+        </div>
+      )}
       <div className="grid grid-cols-12 gap-2 text-[10px] text-[#8B7355] font-medium px-1">
         <div className="col-span-4">Material</div>
         <div className="col-span-3">Vendor</div>
@@ -2087,6 +2791,11 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
       </div>
       {items.map((it, i) => {
         const mat = materials.find(m => m.id === it.material_id);
+        const lineVendorId   = it.vendor_id || '';
+        const lineVendorName = it.vendor || vendors.find(v => v.id === lineVendorId)?.name || '';
+        const picks = pickListsFor(lineVendorId);
+        const vendorHasNoItems = !!lineVendorId && vm.ready && vm.itemCount(lineVendorId) === 0;
+        const pairConflict = !!it.material_id && !!lineVendorId && vm.ready && !vm.isMapped(lineVendorId, it.material_id);
         return (
           <div key={it.uid} className={`grid grid-cols-12 gap-2 text-xs items-start rounded ${
             flashLine === i + 1 ? 'ring-2 ring-[#af4408] bg-[#FFF1E3]' : ''}`}>
@@ -2100,9 +2809,32 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
                     {packNote(packMetaOfMat(mat)) && <span className="ml-1 text-[#B8A590]">· {packNote(packMetaOfMat(mat))}</span>}
                   </div>
                 </div>
+              ) : vendorHasNoItems ? (
+                <NoItemsForVendor compact vendorId={lineVendorId} vendorName={lineVendorName || 'This vendor'} />
               ) : (
-                <SimpleMaterialPicker value={it.material_id} materials={materials}
+                <SimpleMaterialPicker value={it.material_id} materials={picks.mapped}
                                       takenIds={takenIds} onPickTaken={goToTakenLine}
+                                      disabled={!vm.ready}
+                                      scopeNote={vm.ready
+                                        ? (lineVendorId
+                                            ? `${picks.mapped.length} item${picks.mapped.length === 1 ? '' : 's'} mapped to ${lineVendorName || 'this vendor'}`
+                                            : 'Items with at least one mapped vendor')
+                                        : 'Loading the vendor → item mapping…'}
+                                      unmapped={showUnmapped ? picks.unmapped : []}
+                                      unmappedLabel={lineVendorId ? `Not mapped to ${lineVendorName || 'this vendor'}` : 'No vendor mapped to these yet'}
+                                      unmappedHint={lineVendorId
+                                        ? 'Map the pair to order it — this is saved on Vendor Items.'
+                                        : 'Pick a vendor on this line first, or map these on Vendor Items.'}
+                                      mapBusy={mapBusy}
+                                      onMapAndPick={lineVendorId ? async (m) => {
+                                        const ok = await mapAndUse(lineVendorId, lineVendorName || 'this vendor', m);
+                                        if (!ok) return;
+                                        const taken = takenIds.get(m.id);
+                                        if (taken && taken !== i + 1) { goToTakenLine(taken); return; }
+                                        const patch: any = { material_id: m.id };
+                                        if (!it.unit_price) patch.unit_price = poRateOf(m);
+                                        update(i, patch);
+                                      } : undefined}
                                       onChange={(id, m) => {
                   // Belt-and-braces — see the matching guard in the new-PO composer.
                   const taken = takenIds.get(id);
@@ -2129,25 +2861,59 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
               {(() => {
                 const knownVendor = vendors.some(v => v.id === it.vendor_id);
                 const legacy = !!it.vendor.trim() && !knownVendor;
+                // ITEM → VENDOR: only vendors mapped to this item (an item can
+                // have many). The line's current vendor is always kept in the
+                // list, flagged, so the row never rewrites itself silently.
+                const offered = (it.material_id && vm.ready)
+                  ? vendors.filter(v => vm.isMapped(v.id, it.material_id) || v.id === it.vendor_id)
+                  : vendors;
                 return (
+                  <>
                   <select
                     value={legacy ? '__legacy__' : (it.vendor_id || '')}
+                    disabled={!vm.ready}
                     onChange={e => {
                       if (e.target.value === '__legacy__') return;
                       const v = vendors.find(x => x.id === e.target.value);
                       update(i, { vendor_id: v ? v.id : '', vendor: v ? v.name : '' });
                     }}
-                    className={`w-full px-1.5 py-1 border rounded text-xs bg-white ${legacy ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`}
+                    className={`w-full px-1.5 py-1 border rounded text-xs bg-white disabled:opacity-60 ${legacy || pairConflict ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`}
                   >
                     <option value="">Select vendor…</option>
                     {legacy && <option value="__legacy__">{it.vendor} — not in vendor master</option>}
-                    {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                    {offered.map(v => (
+                      <option key={v.id} value={v.id}>
+                        {v.name}{it.material_id && vm.ready && !vm.isMapped(v.id, it.material_id) ? ' · NOT MAPPED' : ''}
+                      </option>
+                    ))}
                   </select>
+                  {it.material_id && vm.ready && offered.length === 0 && (
+                    <div className="text-[10px] text-red-700 mt-0.5">
+                      No vendor is mapped to supply this item.{' '}
+                      <a href={VENDOR_ITEMS_HREF} target="_blank" rel="noopener noreferrer" className="underline">Map it on Vendor Items</a>.
+                    </div>
+                  )}
+                  {pairConflict && (
+                    <div className="text-[10px] text-red-700 mt-0.5">
+                      ⚠ {lineVendorName || 'This vendor'} is not mapped to supply this item — this line will be refused.{' '}
+                      {mat && (
+                        <button type="button" disabled={mapBusy}
+                                onClick={async () => { await mapAndUse(lineVendorId, lineVendorName || 'this vendor', mat); }}
+                                className="underline font-medium disabled:opacity-50">map it now</button>
+                      )}
+                    </div>
+                  )}
+                  </>
                 );
               })()}
               <EligibleVendorChips
                 materialId={it.material_id}
                 currentVendor={it.vendor}
+                isMappedVendor={vm.ready ? (v => !!v.vendor_id && vm.isMapped(v.vendor_id, it.material_id)) : undefined}
+                onBlockedPick={v => alert(
+                  `${v.vendor} has supplied this item before, but the pair is not mapped, so a PO line cannot be filed against it.\n\n` +
+                  `Map "${mat?.name || 'the item'}" to ${v.vendor} on Vendor Items (${VENDOR_ITEMS_HREF}), then pick them here.`
+                )}
                 onPick={v => {
                   // Re-resolve the history name against the master so the select
                   // can show it — see the new-PO composer.

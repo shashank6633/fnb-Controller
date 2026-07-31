@@ -1282,6 +1282,84 @@ function initializeSchema(db: Database.Database) {
     db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('requisition_deduct_at_issue', '0')`);
   } catch (e) { console.error('requisition_issue_ledger schema failed:', e); }
 
+  // ── Purchasing: per-vendor receiving + petty cash ────────────────────────
+  try {
+    db.exec(`
+      -- A mixed-vendor PO is received one VENDOR at a time, because each vendor
+      -- turns up with their own invoice on their own day. One row per vendor per
+      -- PO: their bill number, their date, who took it in.
+      CREATE TABLE IF NOT EXISTS po_vendor_bills (
+        id          TEXT PRIMARY KEY,
+        po_id       TEXT NOT NULL,
+        vendor_id   TEXT,
+        vendor_name TEXT NOT NULL DEFAULT '',
+        bill_no     TEXT NOT NULL DEFAULT '',
+        bill_date   TEXT NOT NULL DEFAULT '',
+        received_by TEXT NOT NULL DEFAULT '',
+        notes       TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_po_vendor_bills_po ON po_vendor_bills(po_id);
+      -- One bill number per vendor per PO. A second delivery from the same
+      -- vendor on the same PO carries a different invoice, so this catches the
+      -- duplicate-entry case without blocking a genuine split delivery.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_po_vendor_bill
+        ON po_vendor_bills(po_id, vendor_name, bill_no);
+
+      -- Store petty cash. Every movement of physical cash the store holds:
+      -- a float top-up in, a cash purchase or delivery payment out. Balance is
+      -- SUM(in) - SUM(out) — never stored, always derived, so it cannot drift
+      -- away from its own ledger.
+      CREATE TABLE IF NOT EXISTS petty_cash_ledger (
+        id           TEXT PRIMARY KEY,
+        outlet_id    TEXT,
+        date         TEXT NOT NULL,
+        direction    TEXT NOT NULL,              -- 'in' | 'out'
+        amount       REAL NOT NULL DEFAULT 0,    -- always POSITIVE; direction carries the sign
+        category     TEXT NOT NULL DEFAULT '',   -- float_topup | cash_purchase | delivery | return | adjustment
+        purchase_id  TEXT,                       -- set when the cash paid for a recorded purchase
+        vendor       TEXT NOT NULL DEFAULT '',
+        reference    TEXT NOT NULL DEFAULT '',   -- bill / voucher number
+        notes        TEXT NOT NULL DEFAULT '',
+        recorded_by  TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_petty_date   ON petty_cash_ledger(date);
+      CREATE INDEX IF NOT EXISTS idx_petty_outlet ON petty_cash_ledger(outlet_id);
+    `);
+  } catch (e) { console.error('purchasing schema (po_vendor_bills / petty_cash) failed:', e); }
+
+  // SEED vendor_materials FROM REAL PURCHASE HISTORY — one-shot.
+  //
+  // Vendor mapping is about to become STRICT on the PO screen: a vendor offers
+  // only its own materials, and a material offers only its own vendors. The
+  // table is empty and there are 55 vendors, so shipping the rule against an
+  // empty map would stop every PO from being raised the next morning.
+  //
+  // Who has actually supplied what is already recorded in `purchases`: 527
+  // distinct vendor/material pairs across 38 vendors and 441 materials. That is
+  // a truer starting map than anything typed by hand, so it is seeded once and
+  // then owned by the Vendor Items screen. Matching is by vendor NAME because
+  // purchases stores the name, not the id.
+  //
+  // ONE-SHOT and INSERT OR IGNORE: after this the mapping is admin-owned, and a
+  // redeploy must never re-add a pair someone deliberately deleted.
+  try {
+    const seeded = db.prepare("SELECT value FROM settings WHERE key='vendor_materials_seed_v1'").get() as any;
+    if (!seeded) {
+      const n = db.prepare(`
+        INSERT OR IGNORE INTO vendor_materials (vendor_id, material_id, notes, created_by)
+        SELECT v.id, p.material_id, 'seeded from purchase history', 'system'
+          FROM purchases p
+          JOIN vendors v ON LOWER(TRIM(v.name)) = LOWER(TRIM(p.vendor))
+         WHERE TRIM(COALESCE(p.vendor,'')) <> '' AND p.material_id IS NOT NULL
+         GROUP BY v.id, p.material_id
+      `).run();
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('vendor_materials_seed_v1','1')").run();
+      if (n.changes > 0) console.log(`[migration] seeded ${n.changes} vendor→material pairs from purchase history`);
+    }
+  } catch (e) { console.error('vendor_materials seed failed:', e); }
+
   // ── WhatsApp templates for the guest-engagement features ─────────────────
   //
   // Seeded as DRAFTS: send_as_template = 0 and provider_template_name = ''.

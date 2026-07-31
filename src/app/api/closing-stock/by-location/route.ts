@@ -1,14 +1,21 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { allowedDeptSetExpanded, canSeeAllDeptStock, DEPT_ITEM_SET_SQL, deptItemSetParams } from '@/lib/dept-stock';
+import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
+import { DEPT_REQUESTED_ITEM_SQL, deptRequestedParams, selectedDeptSet } from '@/lib/dept-requested-items';
 
 /**
  * Materials in a specific storage location, with their current system stock
  * and today's closing count (if any). Drives the per-location count screen.
  *
  * Non-privileged users (not admin / manager / HOD / store manager) only see
- * their department's item set (materials issued to OR counted by their dept)
- * — a Tandoor cook counting a chiller must not see the whole catalogue.
+ * their department's item set (materials their dept ever REQUISITIONED, or has
+ * already counted) — a Tandoor cook counting a chiller must not see the whole
+ * catalogue.
+ *
+ * And whenever a department is SELECTED (department_id), the list is scoped to
+ * that department's ever-requested items for EVERY tier, admins included —
+ * owner requirement 4. department_id '' / '__store__' = Store / Overall, which
+ * is not department-scoped and lists the whole area exactly as it always has.
  *
  * Query: ?location=Walk-in%20chiller&date=YYYY-MM-DD
  *        Use location=__unassigned__ for materials without a storage_location set.
@@ -36,15 +43,39 @@ export async function GET(request: Request) {
     // JOIN placeholders (date, deptMatch) bind BEFORE the WHERE ones (location).
     const params: any[] = isUnassigned ? [date, deptMatch] : [date, deptMatch, location];
 
-    // Dept item-set scope for non-privileged callers. A dept-less staff user
-    // keeps the old full list (nothing sensible to intersect with).
+    // VIEWER floor — the departments this person may see at all. A dept-less
+    // staff user keeps the old full list (nothing sensible to intersect with).
+    //
+    // The ITEM definition here moved from dept-stock.DEPT_ITEM_SET_SQL (ever
+    // ISSUED) to the owner's ever-REQUESTED rule (2026-07-31), so the floor can
+    // never clip an item off the department's own sheet: a Bakery counter was
+    // shown 71 of Bakery's 75 items because 4 were requested but never issued.
+    // The requested set is a strict superset of the issued one (an issue
+    // implies a requisition line, and this version also keeps party lines), so
+    // this only ever widens — nothing that used to be countable disappears —
+    // and the department bound itself is unchanged.
     let deptScopeSql = '';
     const me = await getCurrentUser();
     if (me && !canSeeAllDeptStock(me)) {
       const deptSet = allowedDeptSetExpanded(db, me);
       if (deptSet.length > 0) {
-        deptScopeSql = ` AND ${DEPT_ITEM_SET_SQL}`;
-        params.push(...deptItemSetParams(deptSet));
+        deptScopeSql = ` AND ${DEPT_REQUESTED_ITEM_SQL}`;
+        params.push(...deptRequestedParams(deptSet));
+      }
+    }
+
+    /* SELECTED-department scope (owner requirement 4, 2026-07-31): when a
+       department is chosen, this area lists only the materials THAT department
+       has ever requisitioned — for every tier, admins included, because the
+       question being answered is "what does this department count?", not "what
+       is this user allowed to see". Store / Overall (deptMatch '') is
+       deliberately untouched: it still lists the whole area.
+       Appended AFTER the viewer floor above so SQL and params stay in step. */
+    if (deptMatch) {
+      const selSet = selectedDeptSet(db, deptMatch);
+      if (selSet.length > 0) {
+        deptScopeSql += ` AND ${DEPT_REQUESTED_ITEM_SQL}`;
+        params.push(...deptRequestedParams(selSet));
       }
     }
 

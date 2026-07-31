@@ -17,15 +17,35 @@ const qty = (v: number) => (Number(v) || 0).toLocaleString('en-IN', { maximumFra
 // you need a date+time stamp on the PO print.
 const dt = (s?: string | null) => fmtISTDate(s, { fallback: '—' });
 
+/** One vendor receipt on this PO: their bill, their GRN, their money. */
+interface Receipt {
+  grn_id: string; grn_number: string; date: string;
+  vendor: string; bill_no: string; bill_date: string; received_by: string;
+  line_count: number; gross: number; discount: number; delivery: number; net: number;
+}
+
 export default function POPrintPage() {
   const params = useParams<{ id: string }>();
   const [po, setPo] = useState<any>(null);
   const [vendor, setVendor] = useState<any>(null);
+  /* EVERY vendor receipt booked against this PO, oldest first. A PO here is an
+     internal approval document that legitimately spans several vendors, and each
+     of them delivers on their own day against their own invoice — so "what came
+     in" is a LIST, never one GRN. This is what /api/purchase-orders?id= now
+     returns; the old print read the single purchase_orders.grn_id, which holds
+     only the LATEST receipt, and printed one vendor's bill as the whole order. */
+  const [receipts, setReceipts] = useState<Receipt[]>([]);
+  /* Σ (accepted × gross rate) − discount over ALL those receipts — computed
+     server-side with the same expression the receive route accumulates into
+     purchase_orders.total_cost, so the printed total and the stored one agree. */
+  const [receivedNet, setReceivedNet] = useState<number | null>(null);
   const [biz, setBiz] = useState<{ name: string }>({ name: 'My Restaurant & Pub' });
 
   useEffect(() => {
     fetch(`/api/purchase-orders?id=${params.id}`).then(r => r.json()).then(async d => {
       setPo(d.purchase_order);
+      setReceipts(Array.isArray(d.receipts) ? d.receipts : []);
+      setReceivedNet(Number.isFinite(Number(d.received_net)) ? Number(d.received_net) : null);
       if (d.purchase_order?.vendor_id) {
         const v = await fetch(`/api/vendors?id=${d.purchase_order.vendor_id}`).then(r => r.json());
         setVendor(v.vendor);
@@ -40,11 +60,23 @@ export default function POPrintPage() {
 
   // Two distinct totals:
   //   orderedSubtotal — sum of ORIGINAL ordered amounts (po_items as drafted)
-  //   receivedSubtotal — sum of ACTUAL received amounts (from the linked GRN);
-  //                      mirrors po.total_cost which is rewritten on receive
+  //   receivedSubtotal — sum of ACTUAL received amounts, across EVERY vendor
+  //                      receipt on the PO; mirrors po.total_cost, which the
+  //                      receive route accumulates across receipts
   // For received POs we display BOTH so the print is honest about any
   // qty/price overrides made during receive.
+  //
+  // isReceived = the PO is CLOSED (every receivable line is in).
+  // anyReceived = at least one vendor has delivered. On a mixed-vendor PO the
+  // second is true long before the first — the PO deliberately stays 'approved'
+  // while other vendors still owe goods — and a sheet that showed nothing
+  // received for a delivery already booked into stock would be its own lie.
   const isReceived = po.status === 'received';
+  // `isReceived ||` keeps the legacy path intact: a closed PO whose GRN rows
+  // cannot be joined at all still shows the received block and falls back to the
+  // stored total, exactly as before.
+  const anyReceived = isReceived || receipts.length > 0
+    || (po.items || []).some((it: any) => it.received_line_total != null);
   // A PO may legitimately span several vendors (it is an internal approval and
   // costing document here, not a sheet sent to one vendor). When it does, the
   // header shows "Mixed (N vendors)" and the single-vendor identity block below
@@ -55,7 +87,9 @@ export default function POPrintPage() {
     (po.items || []).map((it: any) => String(it.vendor || '').trim()).filter(Boolean)
   ).size > 1;
   const orderedSubtotal = (po.items || []).reduce((s: number, it: any) => s + (Number(it.total_price) || 0), 0);
-  const receivedSubtotal = isReceived
+  // GROSS received value, summed over the lines of EVERY receipt (the API folds
+  // in each PO-linked GRN, not just the last one).
+  const receivedSubtotal = anyReceived
     ? (po.items || []).reduce((s: number, it: any) => s + (Number(it.received_line_total) || 0), 0)
     : 0;
   // GRN data is authoritative whenever the receive actually joined GRN lines —
@@ -64,23 +98,33 @@ export default function POPrintPage() {
   // matched to a GRN row), NOT by receivedSubtotal > 0, since a truthful zero
   // sums to 0. Fall back to po.total_cost (server-recomputed on receive) only
   // when no GRN line joined at all.
-  const hasGrnLines = isReceived && (po.items || []).some((it: any) => it.received_line_total != null);
-  // Bill charges recorded at receive. The GRN carries the GROSS rate + these
-  // figures, while purchase_orders.total_cost is NET of the discount — without
-  // showing them the printed subtotal and the stored total silently disagree.
-  const billDiscount = isReceived
+  const hasGrnLines = (po.items || []).some((it: any) => it.received_line_total != null);
+  // Bill charges recorded at receive — summed over every vendor's bill, since
+  // each allocates its own discount/delivery across its own lines. The GRN
+  // carries the GROSS rate + these figures, while purchase_orders.total_cost is
+  // NET of the discount; without showing them the printed subtotal and the
+  // stored total silently disagree.
+  const billDiscount = anyReceived
     ? (po.items || []).reduce((s: number, it: any) => s + (Number(it.received_discount) || 0), 0) : 0;
-  const billDelivery = isReceived
+  const billDelivery = anyReceived
     ? (po.items || []).reduce((s: number, it: any) => s + (Number(it.received_delivery) || 0), 0) : 0;
   // purchase_orders.total_cost is REAL NOT NULL DEFAULT 0 (db.ts:794) and the GET
   // returns SELECT po.*, so a real row always lands a finite number here. The
   // `?? NaN` + isFinite pair only guards a malformed payload (explicit null or a
   // non-numeric), which `|| 0` would silently print as a bogus ₹0.
   const storedTotal = Number(po.total_cost ?? NaN);
-  const grandTotal = isReceived
-    ? (hasGrnLines ? Math.round((receivedSubtotal - billDiscount) * 100) / 100
-                   : (Number.isFinite(storedTotal) ? storedTotal : orderedSubtotal))
+  // THE POST-RECEIVE TOTAL = the sum of every vendor bill on this PO.
+  // Prefer the server's `received_net` (Σ per-receipt net, the same expression
+  // that produced purchase_orders.total_cost, so the paper and the ledger cannot
+  // disagree); fall back to the line-derived figure, then to the stored total.
+  const receiptsNet = receipts.length > 0 && receivedNet != null ? receivedNet : null;
+  const grandTotal = anyReceived
+    ? (receiptsNet != null ? receiptsNet
+        : hasGrnLines ? Math.round((receivedSubtotal - billDiscount) * 100) / 100
+        : (Number.isFinite(storedTotal) ? storedTotal : orderedSubtotal))
     : orderedSubtotal;
+  // Lines still owed — a mixed PO prints while vendor B is still to come.
+  const outstandingLines = (po.items || []).filter((it: any) => it.received_line_total == null).length;
 
   return (
     <div className="min-h-screen bg-gray-100 print:bg-white">
@@ -149,7 +193,7 @@ export default function POPrintPage() {
               <th className="border border-gray-300 px-2 py-1.5 text-left">Unit (purchase)</th>
               <th className="border border-gray-300 px-2 py-1.5 text-right">Rate (Ord)</th>
               <th className="border border-gray-300 px-2 py-1.5 text-right">Ordered ₹</th>
-              {isReceived && <>
+              {anyReceived && <>
                 <th className="border border-gray-300 px-2 py-1.5 text-right bg-emerald-50">Received Qty</th>
                 <th className="border border-gray-300 px-2 py-1.5 text-right bg-emerald-50">Rate (Act)</th>
                 <th className="border border-gray-300 px-2 py-1.5 text-right bg-emerald-50">Received ₹</th>
@@ -163,15 +207,20 @@ export default function POPrintPage() {
               const recTotal = it.received_line_total ?? (recQty != null ? recQty * recPrice : null);
               // Highlight cells that actually differ from the order so the
               // accounting eye lands on the variances immediately.
-              const qtyDiffers   = isReceived && recQty != null && Number(recQty) !== Number(it.quantity);
-              const priceDiffers = isReceived && recPrice != null && Number(recPrice) !== Number(it.unit_price);
+              // A line nobody has delivered yet has NO received figures at all —
+              // `received_line_total` is the API's marker for "matched to a GRN
+              // row" — so it must not fall back to the ordered rate and print as
+              // though it had arrived at the quoted price.
+              const lineIn = it.received_line_total != null;
+              const qtyDiffers   = lineIn && recQty != null && Number(recQty) !== Number(it.quantity);
+              const priceDiffers = lineIn && recPrice != null && Number(recPrice) !== Number(it.unit_price);
               return (
                 <tr key={it.id}>
                   <td className="border border-gray-300 px-2 py-1.5">{i + 1}</td>
                   <td className="border border-gray-300 px-2 py-1.5 font-mono text-[10px]">{it.material_sku || '—'}</td>
                   <td className="border border-gray-300 px-2 py-1.5">
                     {it.material_name}
-                    {isReceived && (it.quantity_rejected || 0) > 0 && (
+                    {anyReceived && (it.quantity_rejected || 0) > 0 && (
                       <div className="text-[10px] text-red-700 mt-0.5">
                         Rejected: {qty(it.quantity_rejected)} {it.material_purchase_unit || it.material_unit}
                         {it.rejection_reason && <span className="capitalize"> ({it.rejection_reason.replace(/_/g, ' ')})</span>}
@@ -185,15 +234,15 @@ export default function POPrintPage() {
                   <td className="border border-gray-300 px-2 py-1.5">{it.material_purchase_unit || it.material_unit}</td>
                   <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{fmt(it.unit_price)}</td>
                   <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{fmt(it.total_price)}</td>
-                  {isReceived && <>
+                  {anyReceived && <>
                     <td className={`border border-gray-300 px-2 py-1.5 text-right font-mono ${qtyDiffers ? 'bg-amber-50 font-semibold' : 'bg-emerald-50/30'}`}>
-                      {recQty != null ? qty(recQty) : '—'}
+                      {lineIn && recQty != null ? qty(recQty) : '—'}
                     </td>
                     <td className={`border border-gray-300 px-2 py-1.5 text-right font-mono ${priceDiffers ? 'bg-amber-50 font-semibold' : 'bg-emerald-50/30'}`}>
-                      {recPrice != null ? fmt(Number(recPrice)) : '—'}
+                      {lineIn && recPrice != null ? fmt(Number(recPrice)) : '—'}
                     </td>
                     <td className="border border-gray-300 px-2 py-1.5 text-right font-mono bg-emerald-50/30">
-                      {recTotal != null ? fmt(Number(recTotal)) : '—'}
+                      {lineIn && recTotal != null ? fmt(Number(recTotal)) : '—'}
                     </td>
                   </>}
                 </tr>
@@ -205,14 +254,17 @@ export default function POPrintPage() {
               {/* +1 for the Vendor column that only a mixed-vendor PO renders. */}
               <td colSpan={isMixedVendor ? 7 : 6} className="border border-gray-300 px-2 py-2 text-right">Total Ordered</td>
               <td className="border border-gray-300 px-2 py-2 text-right font-mono">{fmt(orderedSubtotal)}</td>
-              {isReceived && <>
+              {anyReceived && <>
                 <td colSpan={2} className="border border-gray-300 px-2 py-2 text-right bg-emerald-50">Total Received</td>
                 <td className="border border-gray-300 px-2 py-2 text-right font-mono bg-emerald-50">{fmt(receivedSubtotal)}</td>
               </>}
             </tr>
+            {/* Variance only once the PO is CLOSED. On a part-received PO
+                "Received − Ordered" is just the value of what has not turned up
+                yet, and printing that as a variance reads as a short delivery. */}
             {isReceived && Math.abs(receivedSubtotal - orderedSubtotal) > 0.01 && (
               <tr className="bg-amber-50">
-                <td colSpan={(isReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-amber-900 text-[11px]">
+                <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-amber-900 text-[11px]">
                   Variance (Received − Ordered)
                 </td>
                 <td className="border border-gray-300 px-2 py-1.5 text-right font-mono text-amber-900">
@@ -224,34 +276,103 @@ export default function POPrintPage() {
                 goods were booked at (it is netted into the rate on the purchases
                 row); delivery is recorded against the bill and never enters item
                 cost — so it is shown, but not added into the Grand Total. */}
-            {isReceived && billDiscount > 0.005 && (
+            {anyReceived && billDiscount > 0.005 && (
               <tr>
-                <td colSpan={(isReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-[11px]">
+                <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-[11px]">
                   Less: bill discount
                 </td>
                 <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">− {fmt(billDiscount)}</td>
               </tr>
             )}
-            {isReceived && billDelivery > 0.005 && (
+            {anyReceived && billDelivery > 0.005 && (
               <tr>
-                <td colSpan={(isReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-[11px] text-gray-600">
+                <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-[11px] text-gray-600">
                   Delivery charges (recorded — not in item cost)
                 </td>
                 <td className="border border-gray-300 px-2 py-1.5 text-right font-mono text-gray-600">{fmt(billDelivery)}</td>
               </tr>
             )}
             <tr className="bg-gray-100">
-              <td colSpan={(isReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-2 text-right uppercase tracking-wider text-[11px]">
-                Grand Total {isReceived ? (billDiscount > 0.005 ? '(Final, net of discount)' : '(Final, post-receive)') : '(Ordered)'}
+              <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-2 text-right uppercase tracking-wider text-[11px]">
+                {/* The label has to match what the number IS. A part-received PO
+                    is not "Final" — that word on a figure covering one of three
+                    vendors is exactly how the wrong total got reconciled before. */}
+                Grand Total {isReceived
+                  ? (billDiscount > 0.005 ? '(Final, net of discount)' : '(Final, post-receive)')
+                  : anyReceived
+                    ? `(Received so far${outstandingLines ? ` — ${outstandingLines} line${outstandingLines > 1 ? 's' : ''} still to come` : ''})`
+                    : '(Ordered)'}
               </td>
               <td className="border border-gray-300 px-2 py-2 text-right font-mono text-[13px]">{fmt(grandTotal)}</td>
             </tr>
           </tfoot>
         </table>
-        {isReceived && po.grn_id && (
-          <div className="text-[10px] text-gray-600 mb-4 -mt-4 italic">
-            ✓ Received against GRN — actual qty &amp; price columns reflect what was physically accepted at the receiving bay.
-          </div>
+
+        {/* ── WHAT THAT TOTAL IS MADE OF ────────────────────────────────────
+            One row per vendor receipt, because a PO here can span several
+            vendors and each delivers against their OWN invoice. Without this
+            the post-receive total is a single figure that reconciles to no
+            document anyone holds; with it, every rupee traces to a bill number.
+            Net = accepted value − that bill's discount, the same expression the
+            receive route accumulates into purchase_orders.total_cost, so the
+            column sums to the Grand Total above. */}
+        {receipts.length > 0 && (
+          <section className="mb-6 -mt-4">
+            <p className="text-[10px] uppercase font-semibold text-gray-600 mb-1">
+              Vendor bills received ({receipts.length})
+            </p>
+            <table className="w-full text-[11px] border border-gray-300">
+              <thead className="bg-gray-100">
+                <tr>
+                  <th className="border border-gray-300 px-2 py-1 text-left">Vendor</th>
+                  <th className="border border-gray-300 px-2 py-1 text-left">Bill no.</th>
+                  <th className="border border-gray-300 px-2 py-1 text-left">Bill date</th>
+                  <th className="border border-gray-300 px-2 py-1 text-left">GRN</th>
+                  <th className="border border-gray-300 px-2 py-1 text-left">Received</th>
+                  <th className="border border-gray-300 px-2 py-1 text-right">Gross ₹</th>
+                  <th className="border border-gray-300 px-2 py-1 text-right">Discount ₹</th>
+                  <th className="border border-gray-300 px-2 py-1 text-right">Net ₹</th>
+                </tr>
+              </thead>
+              <tbody>
+                {receipts.map(r => (
+                  <tr key={r.grn_id}>
+                    <td className="border border-gray-300 px-2 py-1">{r.vendor || '—'}</td>
+                    <td className="border border-gray-300 px-2 py-1 font-mono">{r.bill_no || '—'}</td>
+                    <td className="border border-gray-300 px-2 py-1">{r.bill_date ? dt(r.bill_date) : '—'}</td>
+                    <td className="border border-gray-300 px-2 py-1 font-mono">{r.grn_number}</td>
+                    <td className="border border-gray-300 px-2 py-1">{dt(r.date)}</td>
+                    <td className="border border-gray-300 px-2 py-1 text-right font-mono">{fmt(r.gross)}</td>
+                    <td className="border border-gray-300 px-2 py-1 text-right font-mono">
+                      {Number(r.discount) > 0.005 ? `− ${fmt(r.discount)}` : '—'}
+                    </td>
+                    <td className="border border-gray-300 px-2 py-1 text-right font-mono">{fmt(r.net)}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot className="font-bold bg-gray-50">
+                <tr>
+                  <td colSpan={7} className="border border-gray-300 px-2 py-1 text-right">
+                    Total received {isReceived ? '(all vendors)' : 'so far'}
+                  </td>
+                  <td className="border border-gray-300 px-2 py-1 text-right font-mono">
+                    {fmt(receivedNet ?? receipts.reduce((s, r) => s + Number(r.net || 0), 0))}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+            {billDelivery > 0.005 && (
+              <p className="text-[10px] text-gray-600 mt-1">
+                Delivery charges of {fmt(billDelivery)} were recorded against these bills and are NOT included above —
+                they never enter item cost.
+              </p>
+            )}
+            <p className="text-[10px] text-gray-600 mt-1 italic">
+              ✓ Actual qty &amp; price columns reflect what was physically accepted at the receiving bay
+              {!isReceived && outstandingLines > 0
+                && ` — ${outstandingLines} line${outstandingLines > 1 ? 's have' : ' has'} not been delivered yet`}.
+            </p>
+          </section>
         )}
 
         {po.notes && (

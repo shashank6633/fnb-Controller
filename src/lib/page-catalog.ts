@@ -103,6 +103,17 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/vendors',             label: 'Vendors' },
       { path: '/vendors/materials',   label: 'Vendor → Items' },
       { path: '/contracts',           label: 'Contracts' },
+      // Store cash box — cash in hand + the debit/credit log (owner req 5).
+      // Deliberately NOT mgmtOnly, for the same reason as the Department Closing
+      // Sheet above: the storekeeper is the person who hands over the cash, and
+      // must be able to see the box and record the payment at the moment it
+      // happens — pushing them out returns cash purchases to an untracked
+      // notebook, which is the failure this page exists to fix. Access is still
+      // opt-in per user/role here, the API re-checks that page access on every
+      // read, writes are limited to Management + the Store Manager, and the one
+      // category that can conjure or vanish cash ('adjustment') is
+      // management-only server-side.
+      { path: '/petty-cash',          label: 'Petty Cash (store cash box)' },
     ],
   },
   {

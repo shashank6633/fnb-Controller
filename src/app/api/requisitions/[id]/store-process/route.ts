@@ -3,6 +3,7 @@ import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth'
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import { mergeDuplicateLines } from '@/lib/po-helpers';
 import { applyIssueDelta } from '@/lib/issue-stock';
+import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 
 /**
  * Store Manager processes a chef-approved requisition.
@@ -207,8 +208,102 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // back as the same array, unchanged.
     poLines = mergeDuplicateLines(poLines);
 
+    // ── STRICT VENDOR ↔ ITEM MAPPING — the FOURTH path that writes PO lines ──
+    // POST /api/purchase-orders, its PUT and [id]/edit-approved all run
+    // vendorMappingError() before inserting a line. So does this route now: it
+    // writes purchase_order_items from BODY-supplied vendor_id/material_id, and
+    // the PO it writes them into is born 'pending' — straight into the admin
+    // approval queue. Without this call a requisition shortfall could mint a
+    // pair no vendor is mapped to and hand it to an approver pre-queued. Not
+    // hypothetical either: the requisition modal's line-vendor dropdown falls
+    // back to "all active vendors" whenever a material has no mapping yet
+    // (requisitions/page.tsx:2378-2382), so an unmapped pair is one click away.
+    //
+    // WHY AN UNMAPPED LINE IS LEFT OFF THE PO INSTEAD OF FAILING THE REQUEST.
+    // The three human paths 400 the whole save, and they should — composing the
+    // PO is the entire act of those requests. Here the PO is a SIDE-EFFECT of
+    // ISSUING GOODS. Refusing would strand a storekeeper who is standing at the
+    // counter with the department's stock over a purchasing-config gap they
+    // cannot fix from this screen (only /vendors/materials can). The issue and
+    // the PO are separate acts, so they fail separately: the issue completes,
+    // the mapped shortfall lines still get their PO, the unmapped ones are left
+    // off it and named in the response. NOTHING IS LOST — quantity_to_purchase
+    // is still written onto the requisition_item below (that UPDATE reads `ln`,
+    // never poLines), so the shortfall stays visible on the requisition and a
+    // buyer can raise the PO on /purchase-orders once the mapping exists.
+    //
+    // AND NOT "keep the line with a blank vendor for a buyer to fill in": this
+    // PO is already in front of an approver, and receive/route.ts groups lines
+    // BY VENDOR into po_vendor_bills — a vendor-less line in an approved PO is
+    // one nobody can bill or receive. It would not even stay blank: the insert
+    // below falls back to the header vendor (`ln.vendor_id || headerVendorId`),
+    // silently re-pairing the item with a vendor that was never checked.
+    const poSkipped: { material: string; vendor: string; reason: string }[] = [];
+    if (poLines.length > 0) {
+      const keep: any[] = [];
+      // THE SAME RESOLVER vendorMappingError() uses internally, so the pair that
+      // is checked is the pair that is stored (POST does this too, at
+      // purchase-orders/route.ts:374). Every poLine already carries a vendor —
+      // the loop above refuses a PO line without one — so there is no header
+      // fallback to worry about here; what there IS, is a line naming vendor_id
+      // X alongside the name "Y". The helper resolves ID-FIRST and would clear
+      // that pair on X, while the insert below stored the typed "Y" — and
+      // receive, purchases and po_vendor_bills all key on the NAME.
+      const lineVendorOf = vendorResolver(db);
+      for (const ln of poLines) {
+        // ONE LINE AT A TIME: the helper returns on its first bad pair, and a
+        // per-line verdict is what a drop-the-line rule needs. Same helper, same
+        // payload shape and same resolution (id first, else vendor name) as the
+        // three human paths — there is no second copy of the rule here.
+        const why = vendorMappingError(db, [{
+          material_id: ln.material_id,
+          vendor_id:   ln.vendor_id || null,
+          vendor:      ln.vendor    || '',
+        }]);
+        if (why) {
+          // "Line 1: " is the helper numbering the 1-element array it was just
+          // handed — meaningless to a store user looking at a requisition. The
+          // material name takes its place; the rest of the sentence (the vendor,
+          // the Vendor Items screen, the vendors that DO supply the item) is
+          // kept verbatim so the way out is identical on all four paths.
+          poSkipped.push({
+            material: ln.material_name,
+            vendor:   ln.vendor || ln.vendor_id || '',
+            reason:   why.replace(/^Line\s+1:\s*/, ''),
+          });
+          continue;
+        }
+        // The pair was cleared against the vendor the helper RESOLVED, so the row
+        // is stored against that same vendor — id AND the master row's own
+        // spelling of the name. 'unknown' is unreachable (the rule above refuses
+        // it), but if it ever arrived, keep what came in rather than blanking the
+        // line silently. 'empty' likewise — the PO-line loop already refused it.
+        const lv = lineVendorOf(ln);
+        if (lv.status === 'known') {
+          ln.vendor    = lv.name;
+          ln.vendor_id = lv.id;
+        }
+        keep.push(ln);
+      }
+      poLines = keep;
+    }
+
     const outletId = await getCurrentOutletId();
     const result: any = {};
+    if (poSkipped.length > 0) {
+      // The store user is TOLD, in the same response that confirms the issue.
+      // Machine-readable rows AND one sentence a person can act on, because the
+      // difference between "the PO is short a line" and "no PO was raised at
+      // all" is the difference between two follow-up actions.
+      result.po_skipped_lines = poSkipped;
+      result.po_skipped_note =
+        (poLines.length > 0
+          ? `${poSkipped.length} shortfall line${poSkipped.length === 1 ? ' was' : 's were'} left OFF the purchase order`
+          : `No purchase order was raised: ${poSkipped.length === 1 ? 'the only shortfall line' : `all ${poSkipped.length} shortfall lines`} could not go on one`) +
+        ` because the vendor is not mapped to the item. The issue is recorded and the quantity is still on the ` +
+        `requisition — fix the mapping on Vendor Items, then raise the PO on Purchase Orders. ` +
+        poSkipped.map(s => `${s.material}: ${s.reason}`).join(' ');
+    }
 
     const txn = db.transaction(() => {
       // ── Atomic claim (MUST stay the first statement in this txn) ──────────
@@ -357,7 +452,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           const lineTotal = Math.round(ln.quantity * ln.unit_price * 100) / 100;
           total += lineTotal;
           insPoItem.run(generateId(), linkedPoId, ln.material_id, ln.quantity, ln.unit_price,
-                        lineTotal, ln.vendor || headerVendor || '', ln.vendor_id || headerVendorId,
+                        // Already resolved and CHECKED above — no fallback here,
+                        // or the stored pair could differ from the validated one.
+                        lineTotal, ln.vendor || '', ln.vendor_id || null,
                         `From ${r.req_number}: ${ln.notes || ''}`.trim());
         }
         db.prepare(`UPDATE purchase_orders SET total_cost = ? WHERE id = ?`).run(total, linkedPoId);
@@ -386,7 +483,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const got = Number(it.quantity_issued) || 0;
         return got >= eff && !it.deferred_until;
       });
-      const finalStatus = (linkedPoId || !allDone) ? 'store_processed' : 'fulfilled';
+      // A line left off the PO for an unmapped vendor counts as OUTSTANDING, the
+      // same as a PO that was raised. Without `poSkipped.length` here, the one
+      // case where dropping a line changes the status is a full issue plus a
+      // buy-extra line: pre-fix it raised a PO and stayed 'store_processed', and
+      // it would now close as 'fulfilled' — dropping out of the store queue with
+      // a purchase still to arrange and this requisition its only record.
+      const finalStatus = (linkedPoId || poSkipped.length > 0 || !allDone) ? 'store_processed' : 'fulfilled';
       const fulfilledAt = finalStatus === 'fulfilled' ? new Date().toISOString() : null;
 
       // --- 3a. PARTY requisition TRANSFER (store → department) ---
@@ -404,7 +507,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // the day it physically leaves — and because the party_consumption ledger
       // row makes the transfer one-shot, a later top-up could never move the
       // balance either. Status honesty and transfer timing are separate calls.
-      if (!linkedPoId && r.purpose === 'party') {
+      // `!linkedPoId` used to mean "nothing is on order, so what was issued is
+      // all the party is getting" — safe to move it to the department now.
+      //
+      // Dropping unmapped vendor lines broke that reading: a shortfall that
+      // WOULD have become a PO can now be skipped instead, leaving linkedPoId
+      // null while goods are still genuinely outstanding. The transfer would
+      // then fire on the partial quantity, and because the party_consumption
+      // ledger row makes it one-shot, the remainder could never move afterwards
+      // — the party would be permanently short on the books.
+      //
+      // So it is gated on nothing being outstanding: no PO raised AND no line
+      // dropped. A dropped line is exactly as "still to come" as a PO line.
+      if (!linkedPoId && poSkipped.length === 0 && r.purpose === 'party') {
         applyPartyFulfillment(db, id, me.email);
       }
       db.prepare(`

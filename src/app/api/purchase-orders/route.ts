@@ -2,6 +2,7 @@ import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { effectiveRole, effectiveActor, recalcTotal, poWriteGate, duplicateLineError } from '@/lib/po-helpers';
+import { vendorMappingError, vendorResolver, resolveVendorRef } from '@/lib/vendor-mapping';
 
 /** Phase B store guard for PO composition (create/edit are interactive, so we
  *  reject the request with a clear message instead of silently dropping lines).
@@ -145,22 +146,37 @@ export async function GET(request: Request) {
         WHERE poi.po_id = ?
       `).all(id) as any[];
 
-      // If this PO has been received, fold in the GRN item rows by po_item_id
-      // so callers (print page, detail UI) can show received-vs-ordered without
-      // a second round-trip. po_items themselves keep the original ORDERED
-      // numbers; the received numbers live on the GRN.
-      if (po.grn_id) {
-        const grnItems = db.prepare(`
-          SELECT po_item_id, quantity_received, quantity_accepted, quantity_rejected,
-                 unit_price AS received_unit_price, rejection_reason,
-                 discount AS received_discount, delivery_charges AS received_delivery
-          FROM goods_receipt_note_items
-          WHERE grn_id = ?
-        `).all(po.grn_id) as any[];
+      // Fold in the GRN item rows by po_item_id so callers (print page, detail
+      // UI) can show received-vs-ordered without a second round-trip. po_items
+      // themselves keep the original ORDERED numbers; the received numbers live
+      // on the GRN.
+      //
+      // EVERY GRN ON THE PO, not `purchase_orders.grn_id`. A mixed-vendor PO is
+      // received ONE VENDOR AT A TIME, each with their own bill and their own
+      // GRN, and grn_id holds only the LATEST of them — so keying the fold on it
+      // dropped every earlier vendor's lines, and the print page's "Grand Total
+      // (Final, post-receive)" showed the LAST vendor's bill as though it were
+      // the whole order. `g.po_id` is the honest link: this route's receive
+      // handler is the only writer of PO-linked GRN lines (/api/grn writes
+      // po_id = NULL and po_item_id = NULL on ad-hoc GRNs), and the receive
+      // route's per-line claim means one po_item can appear under at most one
+      // GRN — so the rows below never double-count a line.
+      const grnItems = db.prepare(`
+        SELECT gi.po_item_id, gi.quantity_received, gi.quantity_accepted, gi.quantity_rejected,
+               gi.unit_price AS received_unit_price, gi.rejection_reason,
+               gi.discount AS received_discount, gi.delivery_charges AS received_delivery,
+               g.grn_number, g.date AS received_on, g.vendor AS received_from,
+               g.invoice_number AS received_bill_no
+        FROM goods_receipt_note_items gi
+        JOIN goods_receipt_notes g ON g.id = gi.grn_id
+        WHERE g.po_id = ? AND gi.po_item_id IS NOT NULL AND TRIM(gi.po_item_id) != ''
+        ORDER BY g.date, g.created_at, g.grn_number
+      `).all(id) as any[];
+      if (grnItems.length > 0) {
         const byPoi = new Map<string, any>();
-        for (const g of grnItems) if (g.po_item_id) byPoi.set(g.po_item_id, g);
+        for (const g of grnItems) if (g.po_item_id) byPoi.set(String(g.po_item_id), g);
         for (const it of items) {
-          const g = byPoi.get(it.id);
+          const g = byPoi.get(String(it.id));
           if (g) {
             it.quantity_received     = g.quantity_received;
             it.quantity_accepted     = g.quantity_accepted;
@@ -173,12 +189,90 @@ export async function GET(request: Request) {
             it.received_discount     = Number(g.received_discount) || 0;
             it.received_delivery     = Number(g.received_delivery) || 0;
             it.received_line_total   = Math.round(g.quantity_accepted * g.received_unit_price * 100) / 100;
+            // WHOSE delivery this line came in on. On a mixed PO the reader
+            // cannot otherwise tell which of three bills a received line sits on.
+            it.received_grn_number   = g.grn_number;
+            it.received_on           = g.received_on;
+            it.received_from         = g.received_from;
+            it.received_bill_no      = g.received_bill_no || '';
           }
         }
       }
+
+      // ── ONE ROW PER VENDOR RECEIPT ────────────────────────────────────────
+      // po_vendor_bills IS the per-vendor record (one row per vendor bill taken
+      // in against this PO); the money for that bill lives on its GRN. Paired
+      // here so a mixed-vendor PO prints a total that can be reconciled invoice
+      // by invoice instead of one unattributable number.
+      //   net = Σ ROUND(accepted × gross rate, 2) − Σ allocated discount
+      // — byte-for-byte the expression the receive route accumulates into
+      // purchase_orders.total_cost, so Σ net over these rows IS the stored
+      // total. Delivery is carried but never added: it is recorded only and
+      // never enters item cost.
+      const receipts = db.prepare(`
+        SELECT g.id AS grn_id, g.grn_number, g.date AS date, g.vendor, g.vendor_id,
+               g.invoice_number AS bill_no, g.invoice_date AS bill_date,
+               g.received_by, g.status,
+               COUNT(gi.id) AS line_count,
+               COALESCE(SUM(ROUND(gi.quantity_accepted * gi.unit_price, 2)), 0) AS gross,
+               COALESCE(SUM(gi.discount), 0)         AS discount,
+               COALESCE(SUM(gi.delivery_charges), 0) AS delivery
+        FROM goods_receipt_notes g
+        LEFT JOIN goods_receipt_note_items gi ON gi.grn_id = g.id
+        WHERE g.po_id = ?
+        GROUP BY g.id
+        ORDER BY g.date, g.created_at, g.grn_number
+      `).all(id) as any[];
+      // The bill rows themselves — bill_date and who signed for it are recorded
+      // there, and on a legacy/blank-invoice GRN they are the only copy. Matched
+      // on the GRN number the receive txn writes into notes ('GRN <number>[ — …]'),
+      // falling back to vendor+bill number.
+      let vendorBills: any[] = [];
+      try {
+        vendorBills = db.prepare(`
+          SELECT id, vendor_id, vendor_name, bill_no, bill_date, received_by, notes, created_at
+          FROM po_vendor_bills WHERE po_id = ? ORDER BY created_at, id
+        `).all(id) as any[];
+      } catch { /* table absent on an un-migrated DB — receipts above still stand */ }
+      const billKey = (vendor: string, no: string) => `${String(vendor || '').trim().toLowerCase()}|${String(no || '').trim()}`;
+      const billByGrn = new Map<string, any>();
+      const billByKey = new Map<string, any>();
+      for (const b of vendorBills) {
+        const m = /^GRN\s+(\S+)/.exec(String(b.notes || ''));
+        if (m && !billByGrn.has(m[1])) billByGrn.set(m[1], b);
+        const k = billKey(b.vendor_name, b.bill_no);
+        if (!billByKey.has(k)) billByKey.set(k, b);
+      }
+      for (const r of receipts) {
+        const b = billByGrn.get(String(r.grn_number)) || billByKey.get(billKey(r.vendor, r.bill_no)) || null;
+        r.gross     = Math.round(Number(r.gross) * 100) / 100;
+        r.discount  = Math.round(Number(r.discount) * 100) / 100;
+        r.delivery  = Math.round(Number(r.delivery) * 100) / 100;
+        r.net       = Math.round((r.gross - r.discount) * 100) / 100;
+        r.vendor_bill_id = b?.id || null;
+        if (b) {
+          // The bill row is the authority on the vendor's own document.
+          r.bill_no    = r.bill_no || b.bill_no || '';
+          r.bill_date  = r.bill_date || b.bill_date || '';
+          r.vendor     = r.vendor || b.vendor_name || '';
+          r.received_by = r.received_by || b.received_by || '';
+        }
+      }
+      const receivedNet = Math.round(receipts.reduce((s, r) => s + Number(r.net || 0), 0) * 100) / 100;
+
       // Role travels at the TOP level (session-derived), exactly as the list
       // branch returns it — never nested on the row, where it looked like PO data.
-      return Response.json({ purchase_order: { ...po, items }, viewer_role: await effectiveRole() });
+      return Response.json({
+        purchase_order: { ...po, items },
+        // Additive; nothing that read this endpoint before knows these exist.
+        // `receipts` is EVERY vendor receipt on the PO (empty until the first
+        // one), `received_net` their sum — the figure a post-receive print must
+        // show, and equal to purchase_orders.total_cost once anything is in.
+        receipts,
+        received_net: receivedNet,
+        vendor_bills: vendorBills,
+        viewer_role: await effectiveRole(),
+      });
     }
 
     const status = url.searchParams.get('status');
@@ -236,14 +330,25 @@ export async function POST(request: Request) {
     if (badLine) return Response.json({ error: badLine }, { status: 400 });
     const dupLine = duplicateLineError(items);
     if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
+    // STRICT VENDOR ↔ ITEM MAPPING (owner rule). The composer filters both
+    // dropdowns off the same `vendor_materials` rows, but a filtered <select> is
+    // a convenience — this is the rule. Runs AFTER lineSanityError so an unknown
+    // item is named as such rather than as an unmapped pair.
+    //
+    // The header vendor is handed over because a line that carries no vendor of
+    // its own is not unchecked: receive files it under the header
+    // (api/purchase-orders/[id]/receive) and stocks and bills it under that
+    // name, so the rule has to check THAT pair.
+    const badPair = vendorMappingError(db, items, { headerVendor: { vendor_id, vendor } });
+    if (badPair) return Response.json({ error: badPair }, { status: 400 });
 
-    // Resolve vendor — prefer vendor_id, cache name for display
-    let resolvedVendorId: string | null = vendor_id || null;
-    let resolvedVendorName = vendor || '';
-    if (resolvedVendorId) {
-      const v = db.prepare('SELECT id, name FROM vendors WHERE id = ?').get(resolvedVendorId) as any;
-      if (v) resolvedVendorName = v.name;
-    }
+    // Resolve the header vendor through the same resolver the rule used, so the
+    // identity checked is the identity stored — id first, and the master row's
+    // own spelling of the name, never the caller's. An unresolvable header is
+    // left exactly as it arrived (deriveHeaderVendor usually rewrites it anyway).
+    const hdr = resolveVendorRef(db, { vendor_id, vendor });
+    const resolvedVendorId: string | null = hdr.status === 'known' ? hdr.id : (vendor_id || null);
+    const resolvedVendorName: string = hdr.status === 'known' ? hdr.name : (vendor || '');
 
     const id = generateId();
     const poNumber = nextPoNumber(db, isoDate);
@@ -260,25 +365,23 @@ export async function POST(request: Request) {
         INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
-      const lookupVendorId   = db.prepare('SELECT id FROM vendors WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1');
-      const lookupVendorName = db.prepare('SELECT name FROM vendors WHERE id = ?');
+      // THE SAME RESOLVER vendorMappingError() just used. What it returns is
+      // what gets stored — id AND the master row's own spelling of the name —
+      // so the pairing that was checked is the pairing that is filed. Storing
+      // `it.vendor` verbatim instead let a payload carrying vendor_id X with
+      // vendor "Y" pass the check on X and be received, stocked and paid under
+      // Y, because receive / purchases / po_vendor_bills all key on the NAME.
+      const lineVendorOf = vendorResolver(db);
       for (const it of items) {
         // Validated by lineSanityError above — no `|| 0` fallback, which would
         // silently rewrite a bad value instead of surfacing it.
         const qty = Number(it.quantity);
         const px  = Number(it.unit_price);
-        let lineVendor   = String(it.vendor || '').trim();
-        let lineVendorId = it.vendor_id || null;
-        if (!lineVendorId && lineVendor) {
-          const v = lookupVendorId.get(lineVendor) as any;
-          if (v) lineVendorId = v.id;
-        } else if (lineVendorId && !lineVendor) {
-          // The composer now sends an id from the vendor dropdown; backfill the
-          // display name so deriveHeaderVendor (which skips blank names) can
-          // still resolve the header, and the line reads correctly everywhere.
-          const v = lookupVendorName.get(lineVendorId) as any;
-          if (v) lineVendor = String(v.name || '').trim();
-        }
+        const lv = lineVendorOf(it);
+        // 'unknown' is unreachable — the rule above refuses it — but if it ever
+        // arrived, keep what came in rather than blanking the line silently.
+        const lineVendor   = lv.status === 'known' ? lv.name : (lv.status === 'empty' ? '' : lv.shown);
+        const lineVendorId = lv.status === 'known' ? lv.id   : (String(it.vendor_id ?? '').trim() || null);
         insItem.run(generateId(), id, it.material_id, qty, px,
                     Math.round(qty * px * 100) / 100,
                     lineVendor, lineVendorId, it.notes || '');
@@ -308,9 +411,20 @@ export async function PUT(request: Request) {
     const body = await request.json();
     const { id, date, vendor_id, vendor, notes, items } = body;
     if (!id) return Response.json({ error: 'id required' }, { status: 400 });
-    const po = db.prepare('SELECT status FROM purchase_orders WHERE id = ?').get(id) as any;
+    // vendor/vendor_id come along because they decide what a line carrying no
+    // vendor of its own is filed under — see the header-vendor block below.
+    const po = db.prepare('SELECT status, vendor, vendor_id FROM purchase_orders WHERE id = ?').get(id) as any;
     if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
     if (po.status !== 'draft') return Response.json({ error: 'Only drafts can be edited' }, { status: 400 });
+
+    // THE HEADER VENDOR THIS REQUEST LEAVES BEHIND. The UPDATE below is a
+    // COALESCE, so a field the request omits keeps its stored value; the vendor a
+    // blank line will inherit is therefore the request's header when it sends
+    // one, else the PO's own.
+    const headerGiven = String(vendor_id ?? '').trim() !== '' || String(vendor ?? '').trim() !== '';
+    const headerRef   = headerGiven ? { vendor_id, vendor } : { vendor_id: po.vendor_id, vendor: po.vendor };
+    const hdr = resolveVendorRef(db, headerRef);
+
     if (Array.isArray(items)) {
       // An items array that is present but empty would delete every line and
       // leave a submittable draft with nothing on it. The composer already
@@ -322,13 +436,40 @@ export async function PUT(request: Request) {
       if (badLine) return Response.json({ error: badLine }, { status: 400 });
       const dupLine = duplicateLineError(items);
       if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
+      // Same strict pair rule as create — this handler REPLACES the whole item
+      // set, so skipping it here would make "edit the draft" the way around it.
+      // Header vendor included for the same reason as in POST: a line with no
+      // vendor of its own is received under it.
+      const badPair = vendorMappingError(db, items, { headerVendor: headerRef });
+      if (badPair) return Response.json({ error: badPair }, { status: 400 });
+    } else if (headerGiven) {
+      // A HEADER-ONLY EDIT MOVES THE INHERITING LINES. No item set means
+      // deriveHeaderVendor() never runs, so this new header stands as written and
+      // every line already on the PO that carries no vendor of its own is now
+      // pointed at it. Only those lines are checked (the rest are passed as nulls
+      // so the numbering still matches the PO's own rows, and a pair that was
+      // fine before cannot be re-litigated by an unrelated header edit), and only
+      // when the header actually changes identity.
+      const stored = resolveVendorRef(db, { vendor_id: po.vendor_id, vendor: po.vendor });
+      const moved = hdr.status !== stored.status
+        || (hdr.id ?? hdr.shown.toLowerCase()) !== (stored.id ?? stored.shown.toLowerCase());
+      if (moved) {
+        const rows = db.prepare(`
+          SELECT material_id, vendor, vendor_id FROM purchase_order_items WHERE po_id = ? ORDER BY rowid
+        `).all(id) as any[];
+        const inheriting = rows.map(r =>
+          String(r.vendor ?? '').trim() === '' && String(r.vendor_id ?? '').trim() === '' ? r : null);
+        if (inheriting.some(Boolean)) {
+          const badPair = vendorMappingError(db, inheriting, { headerVendor: headerRef, headerIsFinal: true });
+          if (badPair) return Response.json({ error: badPair }, { status: 400 });
+        }
+      }
     }
 
-    let resolvedVendorName = vendor;
-    if (vendor_id) {
-      const v = db.prepare('SELECT name FROM vendors WHERE id = ?').get(vendor_id) as any;
-      if (v) resolvedVendorName = v.name;
-    }
+    // Header stored exactly as it was resolved and checked — id first, master
+    // spelling of the name. See the POST handler.
+    const resolvedVendorName = hdr.status === 'known' && headerGiven ? hdr.name : vendor;
+    const resolvedVendorId   = hdr.status === 'known' && headerGiven ? hdr.id   : (vendor_id ?? null);
 
     const txn = db.transaction(() => {
       db.prepare(`
@@ -339,7 +480,7 @@ export async function PUT(request: Request) {
           notes     = COALESCE(?, notes),
           updated_at = datetime('now')
         WHERE id = ?
-      `).run(date ?? null, vendor_id ?? null, resolvedVendorName ?? null, notes ?? null, id);
+      `).run(date ?? null, resolvedVendorId ?? null, resolvedVendorName ?? null, notes ?? null, id);
 
       if (Array.isArray(items)) {
         db.prepare('DELETE FROM purchase_order_items WHERE po_id = ?').run(id);
@@ -347,22 +488,15 @@ export async function PUT(request: Request) {
           INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
-        const lookupVendorId   = db.prepare('SELECT id FROM vendors WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1');
-        const lookupVendorName = db.prepare('SELECT name FROM vendors WHERE id = ?');
+        // Checked identity == stored identity — see the POST handler.
+        const lineVendorOf = vendorResolver(db);
         for (const it of items) {
           // Validated by lineSanityError above — see the POST handler.
           const qty = Number(it.quantity);
           const px  = Number(it.unit_price);
-          let lineVendor   = String(it.vendor || '').trim();
-          let lineVendorId = it.vendor_id || null;
-          if (!lineVendorId && lineVendor) {
-            const v = lookupVendorId.get(lineVendor) as any;
-            if (v) lineVendorId = v.id;
-          } else if (lineVendorId && !lineVendor) {
-            // Backfill the name from the id — see the POST handler.
-            const v = lookupVendorName.get(lineVendorId) as any;
-            if (v) lineVendor = String(v.name || '').trim();
-          }
+          const lv = lineVendorOf(it);
+          const lineVendor   = lv.status === 'known' ? lv.name : (lv.status === 'empty' ? '' : lv.shown);
+          const lineVendorId = lv.status === 'known' ? lv.id   : (String(it.vendor_id ?? '').trim() || null);
           ins.run(generateId(), id, it.material_id, qty, px,
                   Math.round(qty * px * 100) / 100,
                   lineVendor, lineVendorId, it.notes || '');

@@ -1,16 +1,24 @@
 'use client';
 
 /**
- * Vendor → Materials summary.
+ * VENDOR ITEMS — the master list of "which vendor supplies which item".
  *
- * For each active vendor: every material they've supplied, with stats.
- * Lets admin one-click "Backfill contracts from purchase history" to auto-
- * populate `vendor_contracts` for every (vendor, material) pair that's been
- * bought at least once.
+ * This screen is no longer a report. Since the PO composer went STRICT, this is
+ * where purchasing is decided: a PO line is only accepted for a pair declared
+ * here (server-side, in @/lib/vendor-mapping), so a vendor with an empty list
+ * cannot be ordered from at all. Everything on this page is arranged around
+ * that one job — see what is mapped, see what is missing, and fix it fast.
+ *
+ * Per vendor: every material they have supplied (purchase history) or been
+ * mapped to, with stats, plus assign / bulk-assign / remove, and where each
+ * mapped pair came from (the one-time history seed vs a person).
+ *
+ * Deep link: /vendors/materials?vendor=<id> opens straight onto that vendor —
+ * this is the link every "not mapped" message in the PO composer points at.
  */
 
-import { useEffect, useState } from 'react';
-import { Building2, Loader2, RefreshCw, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Link2, Plus, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Building2, Loader2, RefreshCw, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Link2, Plus, Trash2, Search, X } from 'lucide-react';
 import { api } from '@/lib/api';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 
@@ -33,6 +41,11 @@ interface MaterialStat {
   is_mapped: number;       // 1 if a vendor_materials row exists
   has_contract: number;    // 1 if an active vendor_contracts row exists
   contract_price?: number;
+  /** Where the mapping came from: the one-shot history seed, the contracts
+   *  backfill, or a person. Null when the row is not mapped at all. */
+  mapped_source?: 'history' | 'contracts' | 'person' | null;
+  mapped_by?: string | null;
+  mapped_at?: string | null;
 }
 interface VendorBlock {
   vendor_id: string;
@@ -42,8 +55,41 @@ interface VendorBlock {
   material_count: number;
   with_mapping: number;
   with_contract: number;
+  /** Items this vendor can actually be ordered — 0 means purchasing is blocked. */
+  mapped_count: number;
+  seeded_count: number;
+  human_count: number;
 }
 interface OrphanVendor { vendor_name: string; material_count: number; total_spend: number }
+
+/** Small provenance chip. An admin pruning this list has to be able to tell a
+ *  pair the seed GUESSED from real history apart from one a person vouched for. */
+function SourceBadge({ m }: { m: MaterialStat }) {
+  if (!m.is_mapped) return null;
+  const when = m.mapped_at ? ` on ${String(m.mapped_at).slice(0, 10)}` : '';
+  if (m.mapped_source === 'person') {
+    return (
+      <span title={`Mapped by ${m.mapped_by || 'a user'}${when}`}
+            className="text-[9px] px-1 py-0.5 rounded-full bg-[#FFF1E3] text-[#af4408] border border-[#E8D5C4]">
+        by {String(m.mapped_by || 'user').split('@')[0]}
+      </span>
+    );
+  }
+  if (m.mapped_source === 'contracts') {
+    return (
+      <span title={`Backfilled from an active contract${when}`}
+            className="text-[9px] px-1 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+        from contract
+      </span>
+    );
+  }
+  return (
+    <span title={`Seeded once from purchase history${when} — confirm or remove it`}
+          className="text-[9px] px-1 py-0.5 rounded-full bg-[#F0E4D6] text-[#8B7355] border border-[#E8D5C4]">
+      from history
+    </span>
+  );
+}
 
 export default function VendorMaterialsPage() {
   const [vendors, setVendors] = useState<VendorBlock[]>([]);
@@ -51,14 +97,24 @@ export default function VendorMaterialsPage() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
+  /** "Show only the vendors nothing can be ordered from." The whole reason a
+   *  buyer gets sent to this page. */
+  const [onlyUnmapped, setOnlyUnmapped] = useState(false);
   // Full catalog for the per-vendor "add material" picker
   const [allMaterials, setAllMaterials] = useState<any[]>([]);
   // Per-vendor draft pick for the add-material control: vendorId → material_id
   const [addPick, setAddPick] = useState<Record<string, string>>({});
-  // contracts cache: vendorId → list of {id, material_id} (so we can DELETE by contract id)
-  const [contractIdMap, setContractIdMap] = useState<Record<string, Record<string, string>>>({});
+  // Bulk-add panel: vendorId → open?, its search text, and the ticked ids
+  const [bulkOpen, setBulkOpen] = useState<Record<string, boolean>>({});
+  const [bulkQuery, setBulkQuery] = useState<Record<string, string>>({});
+  const [bulkPicked, setBulkPicked] = useState<Record<string, Set<string>>>({});
+  // Item-level filter inside an expanded vendor
+  const [itemFilter, setItemFilter] = useState<Record<string, string>>({});
+  const rowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const deepLinkDone = useRef(false);
 
   const load = async () => {
     setLoading(true); setError(null);
@@ -79,10 +135,31 @@ export default function VendorMaterialsPage() {
     fetch('/api/inventory?scope=all').then(r => r.json()).then(d => setAllMaterials(d.materials || []));
   }, []);
 
-  // contractIdMap kept around so the trash icon (delete) can look up the
-  // *contract* row id if we ever delete a contract from here. For pure
-  // mapping deletes we use vendor_id + material_id directly.
-  useEffect(() => { /* contractIdMap no longer required for mapping ops */ }, [vendors.length]);
+  /* Deep link from the PO composer: /vendors/materials?vendor=<id>.
+     Read off window.location rather than useSearchParams so this client page
+     needs no Suspense boundary. Runs once, after the vendors have loaded. */
+  useEffect(() => {
+    if (deepLinkDone.current || vendors.length === 0) return;
+    const want = new URLSearchParams(window.location.search).get('vendor');
+    if (!want) { deepLinkDone.current = true; return; }
+    if (!vendors.some(v => v.vendor_id === want)) return;
+    deepLinkDone.current = true;
+    setExpanded(p => new Set(p).add(want));
+    /* Keep asking until it sticks. A single scrollIntoView() loses the race
+       against the router's own scroll restoration on a fresh load, which drops
+       the buyer at the top of a 55-vendor page wondering where the link went.
+       Stops as soon as the block is on screen, or after ~1.5s. */
+    let tries = 0;
+    const settle = () => {
+      const el = rowRefs.current[want];
+      if (!el) { if (++tries < 30) requestAnimationFrame(settle); return; }
+      const top = el.getBoundingClientRect().top;
+      if (top >= 0 && top < window.innerHeight * 0.8) return;   // visible — done
+      el.scrollIntoView({ block: 'center' });
+      if (++tries < 30) setTimeout(settle, 50);
+    };
+    requestAnimationFrame(settle);
+  }, [vendors]);
 
   const addMaterialToVendor = async (vendorId: string) => {
     const materialId = addPick[vendorId];
@@ -122,14 +199,39 @@ export default function VendorMaterialsPage() {
     } finally { setBusy(false); }
   };
 
+  /** BULK ADD from the whole catalogue — the control that makes a brand-new
+   *  vendor usable in one pass instead of one typeahead pick at a time.
+   *  ("Map all unmapped" above can only offer what purchase history already
+   *  knows, which is exactly nothing for the vendors that need this most.) */
+  const bulkAdd = async (block: VendorBlock) => {
+    const picked = [...(bulkPicked[block.vendor_id] || new Set<string>())];
+    if (picked.length === 0) return;
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      const r = await api('/api/vendor-materials', {
+        method: 'POST',
+        body: { vendor_id: block.vendor_id, material_ids: picked },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
+      setNotice(`Mapped ${j.added} item${j.added === 1 ? '' : 's'} to ${block.vendor_name}${j.skipped_existing ? ` (${j.skipped_existing} already mapped)` : ''}. They can be ordered now.`);
+      setBulkPicked(p => ({ ...p, [block.vendor_id]: new Set() }));
+      setBulkQuery(p => ({ ...p, [block.vendor_id]: '' }));
+      await load();
+    } finally { setBusy(false); }
+  };
+
   const removeMaterialFromVendor = async (vendorId: string, materialId: string, materialName: string) => {
-    if (!window.confirm(`Remove "${materialName}" from this vendor's mapping?\n\n(Any existing contract / price on /contracts is NOT affected.)`)) return;
-    setBusy(true); setError(null);
+    if (!window.confirm(`Remove "${materialName}" from this vendor's mapping?\n\nAfter this, a PO line pairing them is refused (purchasing reads this mapping).\n(Any existing contract / price on /contracts is NOT affected.)`)) return;
+    setBusy(true); setError(null); setNotice(null);
     try {
       const r = await api(`/api/vendor-materials?vendor_id=${vendorId}&material_id=${materialId}`, { method: 'DELETE' });
-      if (!r.ok) {
-        const j = await r.json().catch(() => ({}));
-        setError(j.error || `HTTP ${r.status}`); return;
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
+      // Unmapping something that is on a LIVE PO is legal but consequential —
+      // that PO can no longer be edited or re-saved until the pair is restored.
+      if (Number(j.open_po_lines) > 0) {
+        setNotice(`Removed. Note: ${j.open_po_lines} open PO line(s) still pair this vendor with "${materialName}" — those POs cannot be edited or re-saved until the pair is mapped again.`);
       }
       await load();
     } finally { setBusy(false); }
@@ -170,26 +272,36 @@ export default function VendorMaterialsPage() {
   const expandAll = () => setExpanded(new Set(vendors.map(v => v.vendor_id)));
   const collapseAll = () => setExpanded(new Set());
 
-  const visible = search.trim()
-    ? vendors.filter(v => v.vendor_name.toLowerCase().includes(search.toLowerCase())
-        || v.materials.some(m => m.material_name.toLowerCase().includes(search.toLowerCase())))
-    : vendors;
+  const needAttention = useMemo(() => vendors.filter(v => (v.mapped_count || 0) === 0), [vendors]);
+
+  const visible = useMemo(() => {
+    let list = vendors;
+    if (onlyUnmapped) list = list.filter(v => (v.mapped_count || 0) === 0);
+    const q = search.trim().toLowerCase();
+    if (q) {
+      list = list.filter(v => v.vendor_name.toLowerCase().includes(q)
+        || v.materials.some(m => m.material_name.toLowerCase().includes(q) || (m.material_sku || '').toLowerCase().includes(q)));
+    }
+    return list;
+  }, [vendors, search, onlyUnmapped]);
 
   const totals = visible.reduce((acc, v) => ({
     spend: acc.spend + v.total_spend,
     mats: acc.mats + v.material_count,
+    mapped: acc.mapped + (v.mapped_count || 0),
     contracts: acc.contracts + v.with_contract,
-  }), { spend: 0, mats: 0, contracts: 0 });
+  }), { spend: 0, mats: 0, mapped: 0, contracts: 0 });
 
   return (
     <div className="p-6 space-y-5">
       <div className="flex items-center gap-3 flex-wrap">
         <Building2 className="text-[#af4408]" size={24} />
         <div className="flex-1">
-          <h1 className="text-xl font-semibold text-[#2D1B0E]">Vendor → Materials Summary</h1>
+          <h1 className="text-xl font-semibold text-[#2D1B0E]">Vendor Items</h1>
           <p className="text-xs text-[#8B7355]">
-            Every material each vendor has supplied, from purchase history. Use the backfill button
-            to auto-create vendor-material contracts.
+            Which vendor supplies which item. <strong>Purchase Orders read this list</strong>: a PO line is only
+            accepted for a mapped pair, so a vendor with no items here cannot be ordered from.
+            One vendor has a limited list; one item can have several vendors.
           </p>
         </div>
         <button onClick={load} disabled={loading}
@@ -207,20 +319,60 @@ export default function VendorMaterialsPage() {
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-700 rounded p-2 text-xs">{error}</div>
       )}
+      {notice && (
+        <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded p-2 text-xs flex items-start gap-2">
+          <CheckCircle2 size={13} className="mt-0.5 shrink-0" />
+          <span className="flex-1">{notice}</span>
+          <button onClick={() => setNotice(null)} className="text-emerald-700"><X size={12} /></button>
+        </div>
+      )}
+
+      {/* NOTHING CAN BE ORDERED FROM THESE — the headline, not a footnote. */}
+      {!loading && needAttention.length > 0 && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-800">
+          <div className="flex items-center gap-2 flex-wrap">
+            <AlertTriangle size={14} />
+            <span className="font-semibold">
+              {needAttention.length} of {vendors.length} vendors have no items mapped — no PO can be raised for them.
+            </span>
+            <button onClick={() => { setOnlyUnmapped(true); setSearch(''); }}
+                    className="ml-auto text-[11px] px-2 py-1 rounded bg-red-600 text-white hover:bg-red-700">
+              Show only these
+            </button>
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {needAttention.slice(0, 12).map(v => (
+              <button key={v.vendor_id}
+                      onClick={() => { setExpanded(p => new Set(p).add(v.vendor_id)); setTimeout(() => rowRefs.current[v.vendor_id]?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 50); }}
+                      className="text-[10px] px-1.5 py-0.5 rounded border border-red-300 bg-white hover:bg-red-100">
+                {v.vendor_name}
+              </button>
+            ))}
+            {needAttention.length > 12 && <span className="text-[10px] self-center">+{needAttention.length - 12} more</span>}
+          </div>
+        </div>
+      )}
 
       {/* Top stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <Stat label="Vendors" value={String(visible.length)} />
-        <Stat label="Total materials supplied" value={fmtNum(totals.mats, 0)} />
-        <Stat label="With contract" value={`${totals.contracts} / ${totals.mats}`} />
-        <Stat label="Total spend (lifetime)" value={fmt(totals.spend)} accent />
+        <Stat label="Mapped items (orderable)" value={fmtNum(totals.mapped, 0)} accent />
+        <Stat label="Seen in purchases" value={fmtNum(totals.mats, 0)} />
+        <Stat label="Total spend (lifetime)" value={fmt(totals.spend)} />
       </div>
 
       {/* Controls */}
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 flex items-center gap-2 flex-wrap">
-        <input value={search} onChange={e => setSearch(e.target.value)}
-               placeholder="Search vendor or material…"
-               className="flex-1 min-w-[180px] px-2 py-1.5 border border-[#E8D5C4] rounded text-sm" />
+        <div className="relative flex-1 min-w-[180px]">
+          <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#B8A590]" />
+          <input value={search} onChange={e => setSearch(e.target.value)}
+                 placeholder="Search vendor, item name or SKU…"
+                 className="w-full pl-6 pr-2 py-1.5 border border-[#E8D5C4] rounded text-sm" />
+        </div>
+        <label className="flex items-center gap-1.5 text-[11px] text-[#6B5744]">
+          <input type="checkbox" checked={onlyUnmapped} onChange={e => setOnlyUnmapped(e.target.checked)} />
+          Only vendors with no items
+        </label>
         <button onClick={expandAll} className="text-xs text-[#af4408] hover:underline">Expand all</button>
         <span className="text-[#E8D5C4]">·</span>
         <button onClick={collapseAll} className="text-xs text-[#af4408] hover:underline">Collapse all</button>
@@ -230,26 +382,44 @@ export default function VendorMaterialsPage() {
         <div className="p-10 text-center text-sm text-[#8B7355]"><Loader2 className="animate-spin inline mr-1" size={14}/>Loading…</div>
       ) : visible.length === 0 ? (
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-10 text-center text-sm text-[#8B7355]">
-          No vendors with purchases yet.
+          {onlyUnmapped ? 'Every vendor has at least one mapped item.' : 'No vendors match.'}
         </div>
       ) : (
         <div className="space-y-2">
           {visible.map(v => {
             const isOpen = expanded.has(v.vendor_id);
+            const blocked = (v.mapped_count || 0) === 0;
+            const filterQ = (itemFilter[v.vendor_id] || '').trim().toLowerCase();
+            const rows = filterQ
+              ? v.materials.filter(m => m.material_name.toLowerCase().includes(filterQ) || (m.material_sku || '').toLowerCase().includes(filterQ))
+              : v.materials;
+            const mappedIds = new Set(v.materials.filter(m => m.is_mapped).map(m => m.material_id));
+            const bulkQ = (bulkQuery[v.vendor_id] || '').trim().toLowerCase();
+            const bulkCandidates = bulkQ
+              ? allMaterials.filter((m: any) => !mappedIds.has(m.id)
+                  && (String(m.name || '').toLowerCase().includes(bulkQ) || String(m.sku || '').toLowerCase().includes(bulkQ))).slice(0, 60)
+              : [];
+            const picked = bulkPicked[v.vendor_id] || new Set<string>();
             return (
-              <div key={v.vendor_id} className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
-                <div className="px-4 py-3 bg-[#FFF1E3] flex items-center gap-3 flex-wrap cursor-pointer hover:bg-[#FFE8D0]"
+              <div key={v.vendor_id}
+                   ref={el => { rowRefs.current[v.vendor_id] = el; }}
+                   className={`bg-white border rounded-xl overflow-hidden ${blocked ? 'border-red-300' : 'border-[#E8D5C4]'}`}>
+                <div className={`px-4 py-3 flex items-center gap-3 flex-wrap cursor-pointer ${blocked ? 'bg-red-50 hover:bg-red-100' : 'bg-[#FFF1E3] hover:bg-[#FFE8D0]'}`}
                      onClick={() => toggle(v.vendor_id)}>
                   {isOpen ? <ChevronDown size={14} className="text-[#6B5744]" /> : <ChevronRight size={14} className="text-[#6B5744]" />}
                   <span className="text-sm font-semibold text-[#2D1B0E] flex-1">{v.vendor_name}</span>
-                  <span className="text-xs text-[#6B5744]">{v.material_count} item{v.material_count === 1 ? '' : 's'}</span>
+                  {blocked ? (
+                    <span className="text-[11px] font-semibold text-red-700 inline-flex items-center gap-1">
+                      <AlertTriangle size={11} /> no items mapped — cannot be ordered from
+                    </span>
+                  ) : (
+                    <span className="text-xs text-[#6B5744]">
+                      <strong>{v.mapped_count}</strong> mapped item{v.mapped_count === 1 ? '' : 's'}
+                      {v.human_count > 0 && <span className="text-[#8B7355]"> ({v.human_count} confirmed by a person)</span>}
+                    </span>
+                  )}
                   <span className="text-xs text-[#8B7355]">·</span>
-                  <span className="text-xs text-[#6B5744]">
-                    {v.with_mapping}/{v.material_count} mapped
-                    {v.with_mapping < v.material_count && (
-                      <span className="ml-1 text-amber-700">⚠</span>
-                    )}
-                  </span>
+                  <span className="text-xs text-[#6B5744]">{v.material_count} seen in purchases</span>
                   <span className="text-xs text-[#8B7355]">· {v.with_contract} contracted</span>
                   <span className="text-xs text-[#8B7355]">·</span>
                   <span className="text-sm font-mono font-semibold text-[#2D1B0E]">{fmt(v.total_spend)}</span>
@@ -267,13 +437,13 @@ export default function VendorMaterialsPage() {
                       already mapped to THIS vendor (others can still be mapped
                       — a material can belong to many vendors). */}
                   <div className="px-4 py-2 bg-[#FFF8F0] border-b border-[#E8D5C4] flex items-center gap-2 flex-wrap">
-                    <span className="text-[11px] text-[#6B5744] font-medium">+ Map a material to {v.vendor_name}:</span>
+                    <span className="text-[11px] text-[#6B5744] font-medium">+ Map an item to {v.vendor_name}:</span>
                     <div className="flex-1 min-w-[240px] max-w-md">
                       <MaterialTypeahead
                         materials={allMaterials as any} purchaseBasis
                         value={addPick[v.vendor_id] || ''}
                         onPick={(id: string) => setAddPick(p => ({ ...p, [v.vendor_id]: id }))}
-                        excludeIds={v.materials.filter(m => m.is_mapped).map(m => m.material_id)}
+                        excludeIds={[...mappedIds]}
                         placeholder="Search SKU or name…"
                         compact
                       />
@@ -283,16 +453,88 @@ export default function VendorMaterialsPage() {
                             className="inline-flex items-center gap-1 text-xs px-3 py-1 bg-[#af4408] hover:bg-[#933807] text-white rounded disabled:opacity-50">
                       <Plus size={11} /> Add
                     </button>
-                    <span className="text-[10px] text-[#8B7355] italic">Mapping only — no price/contract. The same material can be mapped to multiple vendors.</span>
+                    <button onClick={() => setBulkOpen(p => ({ ...p, [v.vendor_id]: !p[v.vendor_id] }))}
+                            className="text-xs px-2.5 py-1 border border-[#D4B896] text-[#6B5744] rounded hover:bg-[#FFF1E3]">
+                      {bulkOpen[v.vendor_id] ? 'Close bulk add' : 'Bulk add…'}
+                    </button>
+                    <span className="text-[10px] text-[#8B7355] italic">Mapping only — no price/contract. The same item can be mapped to several vendors.</span>
                   </div>
+
+                  {/* BULK ADD — search the catalogue, tick, add in one call. */}
+                  {bulkOpen[v.vendor_id] && (
+                    <div className="px-4 py-3 bg-white border-b border-[#E8D5C4] space-y-2">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <div className="relative flex-1 min-w-[220px]">
+                          <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#B8A590]" />
+                          <input autoFocus value={bulkQuery[v.vendor_id] || ''}
+                                 onChange={e => setBulkQuery(p => ({ ...p, [v.vendor_id]: e.target.value }))}
+                                 placeholder={`Search the item catalogue to add to ${v.vendor_name}…`}
+                                 className="w-full pl-6 pr-2 py-1.5 border border-[#E8D5C4] rounded text-xs" />
+                        </div>
+                        <span className="text-[11px] text-[#6B5744]">{picked.size} selected</span>
+                        <button onClick={() => bulkAdd(v)} disabled={picked.size === 0 || busy}
+                                className="text-xs px-3 py-1.5 bg-[#af4408] hover:bg-[#933807] text-white rounded disabled:opacity-50">
+                          {busy ? <Loader2 size={11} className="animate-spin inline" /> : <Plus size={11} className="inline" />} Map {picked.size || ''} to {v.vendor_name}
+                        </button>
+                        {picked.size > 0 && (
+                          <button onClick={() => setBulkPicked(p => ({ ...p, [v.vendor_id]: new Set() }))}
+                                  className="text-[11px] text-[#8B7355] hover:underline">clear</button>
+                        )}
+                      </div>
+                      {!bulkQ ? (
+                        <div className="text-[11px] text-[#8B7355]">Type at least part of an item name or SKU. Already-mapped items are hidden.</div>
+                      ) : bulkCandidates.length === 0 ? (
+                        <div className="text-[11px] text-[#8B7355]">No unmapped item matches &quot;{bulkQuery[v.vendor_id]}&quot;.</div>
+                      ) : (
+                        <div className="max-h-56 overflow-y-auto border border-[#E8D5C4] rounded divide-y divide-[#F0E4D6]">
+                          {bulkCandidates.map((m: any) => {
+                            const on = picked.has(m.id);
+                            return (
+                              <label key={m.id} className={`flex items-center gap-2 px-2 py-1 text-xs cursor-pointer ${on ? 'bg-[#FFF1E3]' : 'hover:bg-[#FFF8F0]'}`}>
+                                <input type="checkbox" checked={on}
+                                       onChange={() => setBulkPicked(p => {
+                                         const next = new Set(p[v.vendor_id] || []);
+                                         if (next.has(m.id)) next.delete(m.id); else next.add(m.id);
+                                         return { ...p, [v.vendor_id]: next };
+                                       })} />
+                                <span className="font-mono text-[10px] text-[#8B7355] w-20 shrink-0">{m.sku || '—'}</span>
+                                <span className="flex-1 truncate text-[#2D1B0E]">{m.name}</span>
+                                <span className="text-[10px] text-[#8B7355]">{m.purchase_unit || m.unit}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Per-vendor item filter — a 155-item vendor is unreadable without it. */}
+                  {v.materials.length > 8 && (
+                    <div className="px-4 py-2 bg-[#FFF8F0] border-b border-[#E8D5C4]">
+                      <div className="relative max-w-xs">
+                        <Search size={11} className="absolute left-2 top-1/2 -translate-y-1/2 text-[#B8A590]" />
+                        <input value={itemFilter[v.vendor_id] || ''}
+                               onChange={e => setItemFilter(p => ({ ...p, [v.vendor_id]: e.target.value }))}
+                               placeholder={`Filter ${v.materials.length} items…`}
+                               className="w-full pl-6 pr-2 py-1 border border-[#E8D5C4] rounded text-[11px]" />
+                      </div>
+                    </div>
+                  )}
+
+                  {blocked && (
+                    <div className="px-4 py-3 bg-red-50 border-b border-red-200 text-[11px] text-red-800">
+                      Nothing is mapped to {v.vendor_name}, and no purchase history exists to seed from.
+                      Add the items they supply above — the PO screen will offer exactly this list.
+                    </div>
+                  )}
 
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs">
                       <thead className="bg-white text-[#6B5744] border-b border-[#E8D5C4]">
                         <tr>
                           <th className="text-left  py-2 px-3 font-medium">SKU</th>
-                          <th className="text-left  py-2 px-3 font-medium">Material</th>
-                          <th className="text-center py-2 px-3 font-medium" title="Is this material mapped to this vendor in the simple mapping table (vendor_materials)?">Mapped?</th>
+                          <th className="text-left  py-2 px-3 font-medium">Item</th>
+                          <th className="text-center py-2 px-3 font-medium" title="Is this item mapped to this vendor? Purchase Orders only accept mapped pairs.">Mapped?</th>
                           <th className="text-right py-2 px-3 font-medium" title="Negotiated contract price (separate from mapping). Edit on /contracts.">Contract ₹</th>
                           <th className="text-right py-2 px-3 font-medium">Total Qty</th>
                           <th className="text-right py-2 px-3 font-medium">Last ₹/{v.materials[0]?.purchase_unit || 'unit'}</th>
@@ -303,13 +545,20 @@ export default function VendorMaterialsPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {v.materials.map(m => (
+                        {rows.length === 0 && (
+                          <tr><td colSpan={10} className="py-3 px-3 text-[11px] text-[#8B7355]">
+                            {v.materials.length === 0 ? 'No items yet.' : `No item matches "${itemFilter[v.vendor_id]}".`}
+                          </td></tr>
+                        )}
+                        {rows.map(m => (
                           <tr key={m.material_id} className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF8F0]">
                             <td className="py-1.5 px-3 font-mono text-[10px] text-[#8B7355]">{m.material_sku || '—'}</td>
                             <td className="py-1.5 px-3 text-[#2D1B0E]">{m.material_name}</td>
                             <td className="py-1.5 px-3 text-center">
                               {m.is_mapped ? (
-                                <span className="inline-flex items-center gap-1 text-emerald-700 text-xs"><CheckCircle2 size={11} /> mapped</span>
+                                <span className="inline-flex items-center gap-1 text-emerald-700 text-xs">
+                                  <CheckCircle2 size={11} /> mapped <SourceBadge m={m} />
+                                </span>
                               ) : (
                                 <button onClick={async () => {
                                   setBusy(true);
@@ -341,7 +590,7 @@ export default function VendorMaterialsPage() {
                             <td className="py-1.5 px-1 text-right">
                               {m.is_mapped && (
                                 <button onClick={() => removeMaterialFromVendor(v.vendor_id, m.material_id, m.material_name)}
-                                        title="Unmap (does not delete contract)"
+                                        title="Unmap (does not delete contract). PO lines pairing them will be refused after this."
                                         className="text-red-600 hover:text-red-700">
                                   <Trash2 size={11} />
                                 </button>
@@ -366,7 +615,7 @@ export default function VendorMaterialsPage() {
             <AlertTriangle size={14} /> {orphans.length} vendor name{orphans.length === 1 ? '' : 's'} in purchases not in /vendors master
           </div>
           <div className="text-[11px] mb-2 opacity-80">
-            These purchases used vendor names that don't match any active vendor record.
+            These purchases used vendor names that don&apos;t match any active vendor record.
             Add them on <a href="/vendors" className="underline">/vendors</a> and re-run the backfill.
           </div>
           <div className="overflow-x-auto">

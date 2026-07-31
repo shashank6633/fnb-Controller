@@ -310,6 +310,13 @@ export default function InventoryPage() {
         body: { mode: 'apply', rows: [{ id, priority }] },
       });
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Failed to set priority');
+      // A 200 does not mean a row moved: the route UPDATEs raw_materials WHERE
+      // id = ? and reports the row count, so an id that matches nothing (a
+      // semi-finished 'sub:' row, a material deleted in another tab) returns
+      // { applied: 0 }. Without this the optimistic star sticks on screen and
+      // silently vanishes on the next reload.
+      const j = await res.json().catch(() => ({} as any));
+      if (Number(j?.applied ?? 0) < 1) throw new Error('Priority was not saved');
     } catch {
       setMaterials(prev); // revert on failure
     } finally {
@@ -326,7 +333,10 @@ export default function InventoryPage() {
     try {
       if (!silent) setLoading(true);
       setError(null);
-      const res = await fetch('/api/inventory');
+      // include_semi is passed HERE and nowhere else: the 68 sub-recipes belong
+      // on the Raw Materials list, but must never appear in a Purchase, GRN,
+      // Wastage or Requisition picker — all of which read this same endpoint.
+      const res = await fetch('/api/inventory?include_semi=1');
       if (!res.ok) throw new Error('Failed to fetch inventory');
       const json = await res.json();
       setMaterials(json.materials ?? []);
@@ -967,7 +977,10 @@ export default function InventoryPage() {
                         <td className="px-4 py-3 text-[#2D1B0E] font-medium">
                           <div className="flex items-center gap-1.5 flex-wrap">
                             <span>{m.name}</span>
-                            {canBulkPriority ? (
+                            {/* A semi-finished row has no raw_materials row to
+                                update, so the picker would accept the change and
+                                save nothing — show the plain stars instead. */}
+                            {canBulkPriority && !(m as any).read_only ? (
                               <select
                                 value={m.priority ?? 2}
                                 disabled={savingPriorityId === m.id}
@@ -1076,8 +1089,20 @@ export default function InventoryPage() {
                         </td>
                         <td className="px-4 py-3 text-right text-[#6B5744] font-mono">
                           {/* Inline-editable rate: shown & entered in ₹ per purchase unit
-                              (₹/kg), auto-converted to per-recipe-unit average_price on save. */}
-                          <EditableRate m={m} onSaved={fetchMaterials} />
+                              (₹/kg), auto-converted to per-recipe-unit average_price on save.
+                              NOT offered on a semi-finished row (same reason as the Edit
+                              pencil below): its cost is computed from its recipe. Worse, the
+                              editor posts `sku || name` to update-rates, and a 'sub:' row has
+                              no sku — so the save would resolve BY NAME against raw_materials
+                              and could move a different material's rate. */}
+                          {(m as any).read_only ? (
+                            <span title="Semi-finished — cost is calculated from its recipe in Sub-Recipes">
+                              {formatCurrency((Number(m.average_price) || 0) * packFactor(m as any))}
+                              <span className="text-[9px] text-[#B8A590] ml-0.5">/{(m as any).purchase_unit || m.unit}</span>
+                            </span>
+                          ) : (
+                            <EditableRate m={m} onSaved={fetchMaterials} />
+                          )}
                         </td>
                         <td className="px-4 py-3 text-right text-[#3D2614] font-mono">
                           {formatCurrency(m.stock_value ?? 0)}
@@ -1115,13 +1140,25 @@ export default function InventoryPage() {
                           )}
                         </td>
                         <td className="px-4 py-3 text-center">
-                          <button
-                            onClick={() => openEditModal(m)}
-                            className="p-2 -m-0.5 rounded-lg text-[#8B7355] hover:text-[#2D1B0E] hover:bg-[#FFF1E3] transition-colors"
-                            title="Edit"
-                          >
-                            <Edit className="w-4 h-4" />
-                          </button>
+                          {(m as any).read_only ? (
+                            // A semi-finished item is made, not bought. Its name,
+                            // unit and cost all come from its recipe, so editing
+                            // it as a material would write a value the next cost
+                            // recalculation silently overwrites.
+                            <a href="/recipes"
+                               title="Semi-finished — edit this in Sub-Recipes, where its cost is calculated"
+                               className="inline-block p-2 -m-0.5 rounded-lg text-[#8B7355] hover:text-[#2D1B0E] hover:bg-[#FFF1E3] transition-colors">
+                              <Edit className="w-4 h-4" />
+                            </a>
+                          ) : (
+                            <button
+                              onClick={() => openEditModal(m)}
+                              className="p-2 -m-0.5 rounded-lg text-[#8B7355] hover:text-[#2D1B0E] hover:bg-[#FFF1E3] transition-colors"
+                              title="Edit"
+                            >
+                              <Edit className="w-4 h-4" />
+                            </button>
+                          )}
                         </td>
                       </tr>
                     );
@@ -1714,7 +1751,11 @@ export default function InventoryPage() {
 
       {showStorage && (
         <SetStorageLocationModal
-          materials={materials}
+          /* Semi-finished rows are not raw_materials, so the bulk endpoint can
+             never touch them: left in, they'd add a phantom "Semi Finished"
+             category whose Apply always 400s and a blank counter that can
+             never reach zero. */
+          materials={materials.filter((m) => !(m as any).read_only)}
           locationOptions={storageLocationOptions}
           onClose={() => setShowStorage(false)}
           onApplied={() => fetchMaterials(true)}

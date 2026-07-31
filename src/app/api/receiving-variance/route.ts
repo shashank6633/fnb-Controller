@@ -100,6 +100,23 @@ export async function GET(request: Request) {
       ORDER BY v.date DESC, ABS(accept_delta_value) DESC
     `).all(...params) as any[];
 
+    // How many PO-linked GRN lines exist in this window AT ALL — variance or not.
+    // The page has always read `summary.receipts_in_range` (it is what lets the
+    // empty state say "no receipts to compare" instead of wrongly congratulating
+    // the buyer on a clean month) but the route never sent it, so the optional
+    // field was permanently undefined and the honest branch was dead code.
+    // Same WHERE and the same INNER JOIN on raw_materials as the query above, minus
+    // only the variance predicate — otherwise a line whose material row is gone
+    // would be counted here but could never appear in `rows`, and "0 of 5 receipts
+    // flagged" would be unexplainable.
+    const receipts_in_range = (db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM goods_receipt_note_items gi
+      JOIN goods_receipt_notes g ON g.id = gi.grn_id
+      JOIN raw_materials rm ON rm.id = gi.material_id
+      WHERE ${where.join(' AND ')}
+    `).get(...params) as { c: number } | undefined)?.c ?? 0;
+
     let net_value_short = 0, net_value_excess = 0, total_rejected_value = 0;
     const reasonStats: Record<string, { count: number; qty: number; value: number }> = {};
     for (const r of rows) {
@@ -121,6 +138,7 @@ export async function GET(request: Request) {
         lines: rows.length,
         net_value_short, net_value_excess, total_rejected_value,
         reason_stats: reasonStats,
+        receipts_in_range,
       },
       rows,
     });

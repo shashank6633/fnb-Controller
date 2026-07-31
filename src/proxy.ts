@@ -48,6 +48,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/parties',             // event consumption
   '/api/staff-meals',
   '/api/purchases',           // legacy purchase entries
+  '/api/petty-cash',          // store cash box — every POST moves real cash
   '/api/import-materials',
   '/api/closing-stock',
   '/api/variance-approvals',  // approve/reject variance (admin) — mutates stock

@@ -9,6 +9,184 @@ import {
   type AllocatedLine,
 } from '@/lib/po-charges';
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * ONE PO, MANY VENDORS, ONE BILL EACH.
+ *
+ * A PO here is an internal approval/costing document, not a sheet sent to a
+ * vendor, so one PO legitimately spans several vendors (the composer requires a
+ * vendor on every LINE and writes "Mixed (N vendors)" on the header). Each of
+ * those vendors turns up separately, on their own day, with their own invoice.
+ * Receiving is therefore PER VENDOR: their bill number, their bill date, their
+ * lines, their charges. A single bill number stretched across three vendors'
+ * goods is wrong on its face and misfiles every rupee of it.
+ *
+ * WHAT COUNTS AS "ALREADY RECEIVED" — there is no per-line received flag on
+ * purchase_order_items (and no column may be added), so the receipt ledger is
+ * DERIVED: a PO line is received iff a goods_receipt_note_items row carries its
+ * po_item_id under a GRN whose po_id is this PO. That is sound because
+ * /api/grn writes po_id = NULL and po_item_id = NULL on every ad-hoc GRN — this
+ * route is the only writer of PO-linked GRN lines.
+ *
+ * THE STATUS RULE (exactly, and it is the whole of it):
+ *   A PO leaves 'approved' for 'received' only when EVERY RECEIVABLE line of
+ *   the PO has a GRN row against it. "Receivable" excludes store-mapped
+ *   (liquor) lines, which centralFlowBlock refuses on every path and which can
+ *   therefore never arrive here — waiting on them would hold the PO open
+ *   forever. Until then the PO STAYS 'approved' and stays receivable, which is
+ *   what keeps Friday's vendor able to deliver against it.
+ *   received_at is likewise stamped only on completion; each vendor's own
+ *   delivery date lives on that vendor's GRN and po_vendor_bills row.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * The vendor a PO line is filed under.
+ *
+ * BYTE-IDENTICAL to the expression that has always been written into
+ * `purchases.vendor` at receive time (`(it.vendor && trim) || po.vendor || ''`),
+ * and used for BOTH the grouping and that insert, deliberately: if the two ever
+ * disagreed a line could be received under vendor A's bill and booked against
+ * vendor B. A legacy PO whose lines carry no vendor collapses to the header
+ * vendor, i.e. exactly one group — such a PO behaves precisely as it does today.
+ */
+const lineVendorName = (it: any, po: any): string =>
+  (it.vendor && String(it.vendor).trim()) || po.vendor || '';
+/** Case/space-insensitive identity for a vendor group; the display name is kept separately. */
+const vendorKeyOf = (name: string): string => String(name || '').trim().toLowerCase();
+
+/** po_item_ids already covered by a GRN on this PO. THE receipt ledger. */
+function receivedPoItemIds(db: ReturnType<typeof getDb>, poId: string): Set<string> {
+  const rows = db.prepare(`
+    SELECT DISTINCT gi.po_item_id AS po_item_id
+    FROM goods_receipt_note_items gi
+    JOIN goods_receipt_notes g ON g.id = gi.grn_id
+    WHERE g.po_id = ? AND gi.po_item_id IS NOT NULL AND TRIM(gi.po_item_id) != ''
+  `).all(poId) as any[];
+  return new Set(rows.map(r => String(r.po_item_id)));
+}
+
+interface VendorGroup {
+  key: string;
+  vendor_name: string;
+  vendor_id: string | null;
+  lines: any[];
+}
+
+/** Group PO lines by their filing vendor, preserving first-seen order. */
+function groupByVendor(lines: any[], po: any): VendorGroup[] {
+  const out: VendorGroup[] = [];
+  const byKey = new Map<string, VendorGroup>();
+  for (const it of lines) {
+    const name = lineVendorName(it, po);
+    const key = vendorKeyOf(name);
+    let g = byKey.get(key);
+    if (!g) {
+      g = { key, vendor_name: name, vendor_id: null, lines: [] };
+      byKey.set(key, g);
+      out.push(g);
+    }
+    // First line that actually carries a vendor_id decides the FK. A group is
+    // one vendor by name, so any of its ids is that vendor's id.
+    if (!g.vendor_id && it.vendor_id) g.vendor_id = String(it.vendor_id);
+    g.lines.push(it);
+  }
+  return out;
+}
+
+/**
+ * GET /api/purchase-orders/:id/receive
+ * The receive screen's view of WHO still owes goods on this PO.
+ *
+ * Purely additive and read-only. It exists because /api/purchase-orders?id=
+ * folds in received figures from `purchase_orders.grn_id` — ONE GRN — which
+ * cannot describe a PO that now carries one GRN per vendor. Rather than change
+ * that endpoint's shape, the receive screen asks the receive route itself.
+ */
+export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const { id } = await params;
+    // Same gate as the POST: this lists vendor bill numbers and what is still
+    // owed, which is the receiver's screen, not a general read.
+    const gate = await poWriteGate();
+    if (gate === 'anon') return Response.json({ error: 'Sign in required' }, { status: 401 });
+    if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can receive POs' }, { status: 403 });
+    const db = getDb();
+    const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id) as any;
+    if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
+
+    const items = db.prepare(`
+      SELECT poi.id, poi.material_id, poi.quantity, poi.unit_price, poi.vendor, poi.vendor_id,
+             rm.name AS material_name
+      FROM purchase_order_items poi
+      JOIN raw_materials rm ON rm.id = poi.material_id
+      WHERE poi.po_id = ?
+    `).all(id) as any[];
+
+    const blocked = new Map<string, string>();
+    for (const it of items) {
+      const msg = centralFlowBlock(db, String(it.material_id || ''));
+      if (msg) blocked.set(String(it.id), msg);
+    }
+    const done = receivedPoItemIds(db, id);
+
+    const grnByItem = new Map<string, any>();
+    for (const r of db.prepare(`
+      SELECT gi.po_item_id, g.grn_number, g.date AS grn_date, g.invoice_number
+      FROM goods_receipt_note_items gi
+      JOIN goods_receipt_notes g ON g.id = gi.grn_id
+      WHERE g.po_id = ? AND gi.po_item_id IS NOT NULL
+    `).all(id) as any[]) grnByItem.set(String(r.po_item_id), r);
+
+    const bills = db.prepare(`
+      SELECT id, vendor_id, vendor_name, bill_no, bill_date, received_by, notes, created_at
+      FROM po_vendor_bills WHERE po_id = ? ORDER BY created_at, id
+    `).all(id) as any[];
+    const billsByVendor = new Map<string, any[]>();
+    for (const b of bills) {
+      const k = vendorKeyOf(b.vendor_name);
+      if (!billsByVendor.has(k)) billsByVendor.set(k, []);
+      billsByVendor.get(k)!.push(b);
+    }
+
+    const groups = groupByVendor(items, po).map(g => {
+      const receivable = g.lines.filter(l => !blocked.has(String(l.id)));
+      const outstanding = receivable.filter(l => !done.has(String(l.id)));
+      const receivedLines = receivable.filter(l => done.has(String(l.id)));
+      return {
+        key: g.key,
+        vendor_name: g.vendor_name,
+        vendor_id: g.vendor_id,
+        line_ids:          outstanding.map(l => String(l.id)),
+        received_line_ids: receivedLines.map(l => String(l.id)),
+        blocked_line_ids:  g.lines.filter(l => blocked.has(String(l.id))).map(l => String(l.id)),
+        ordered_value: r2(outstanding.reduce((s, l) => s + (Number(l.quantity) || 0) * (Number(l.unit_price) || 0), 0)),
+        // "Nothing left for this vendor to deliver" — either it all came in, or
+        // everything they had on this PO is store-mapped and never can.
+        done: outstanding.length === 0,
+        grn_numbers: [...new Set(receivedLines.map(l => grnByItem.get(String(l.id))?.grn_number).filter(Boolean))],
+        bills: billsByVendor.get(g.key) || [],
+      };
+    });
+
+    return Response.json({
+      po: {
+        id: po.id, po_number: po.po_number, status: po.status,
+        vendor: po.vendor, received_at: po.received_at, grn_id: po.grn_id,
+      },
+      vendors: groups,
+      multi_vendor: groups.length > 1,
+      outstanding_lines: groups.reduce((s, g) => s + g.line_ids.length, 0),
+      received_lines: groups.reduce((s, g) => s + g.received_line_ids.length, 0),
+      store_blocked: [...blocked.entries()].map(([lineId, error]) => {
+        const it = items.find(i => String(i.id) === lineId);
+        return { po_item_id: lineId, material_id: it?.material_id, material_name: it?.material_name, error };
+      }),
+    });
+  } catch (e: any) {
+    console.error('[receive PO GET]', e);
+    return Response.json({ error: e.message }, { status: 500 });
+  }
+}
+
 /**
  * Mark an approved PO as Received.
  * Side effects (atomic):
@@ -29,11 +207,31 @@ import {
  *   It is stored on the GRN line + the purchases row and alerted to the admin.
  *   Changing the rate at receive time is ADMIN-ONLY (403 otherwise).
  *
+ * Optional body: { line_ids? }
+ *   — a SUBSET of that vendor's outstanding lines, when they split the delivery
+ *   across two bills. Omitted = all of them. Lines left out stay outstanding and
+ *   keep the PO open, which is the honest record of "coming on the next bill" —
+ *   receiving them at qty 0 instead would book them as received-and-short.
+ *
+ * Optional body: { vendor_key? }
+ *   — WHICH VENDOR is delivering. Receiving is per vendor (see the block at the
+ *   top of this file): only that vendor's outstanding lines are received, only
+ *   their lines carry their bill's charges, and the PO stays 'approved' until
+ *   every vendor's lines are in. Omitted on a single-vendor PO (there is only
+ *   one group, so it is unambiguous); REQUIRED once the outstanding lines span
+ *   more than one vendor, because a bill number stretched across two vendors is
+ *   filed against goods that vendor never supplied.
+ *
  * Optional body: { bill_charges?: { discount_amount?, delivery_amount?,
- *                   charges_note?, bill_no? } }
+ *                   charges_note?, bill_no?, bill_date? } }
  *   — ONE bill-level figure for each, in RUPEES (a By-% entry is resolved to ₹ on
- *   the client; this route only ever takes an amount). Allocated across the
- *   accepted lines by src/lib/po-charges. The two rulings it encodes:
+ *   the client; this route only ever takes an amount). These belong to ONE
+ *   vendor's bill and are allocated ONLY across THAT vendor's accepted lines —
+ *   never spread over the whole PO. `bill_no` + `bill_date` are recorded as a
+ *   po_vendor_bills row for the vendor; UNIQUE(po_id, vendor_name, bill_no) is
+ *   the duplicate guard and its violation comes back as a friendly 409.
+ *   Allocated across the accepted lines by src/lib/po-charges. The two rulings
+ *   it encodes:
  *     DISCOUNT REDUCES COST — netted into purchases.unit_price, because that is
  *       the only column updateMaterialPrice() averages. purchases.discount stays
  *       0 on this path so the discount can never be subtracted twice.
@@ -141,6 +339,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     let chargeDelivery = chargeAmounts.delivery_amount;
     const chargesNote    = String((billCharges as any).charges_note || '').trim();
     const billNo         = String((billCharges as any).bill_no || '').trim();
+    // The VENDOR'S invoice date, which is a property of their document and is
+    // routinely older than the day the truck arrives — so it is NOT put through
+    // checkPurchaseDate (that guards the date this receive POSTS money on, which
+    // is receivedAt). Only the shape is checked; blank falls back to the receive
+    // date so a bill row always carries a usable date.
+    const billDateRaw = String((billCharges as any).bill_date || '').trim();
+    if (billDateRaw && !/^\d{4}-\d{2}-\d{2}$/.test(billDateRaw)) {
+      return Response.json({
+        error: `The vendor bill date must be YYYY-MM-DD — received "${billDateRaw}".`,
+        field: 'bill_date',
+      }, { status: 400 });
+    }
+    const billDate = billDateRaw || receivedAt;
     // A discount rewrites the cost basis of stock and every recipe downstream of
     // it, so it may never land as a bare number — the admin alert below quotes
     // this note, and "why was ₹9,900 taken off this bill" is the whole question.
@@ -192,6 +403,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const QTY_EPS  = 1e-6;
     const RATE_EPS = 0.005;   // ₹ — half a paisa
 
+    // WHICH vendor is delivering. Resolved against the PO's own groups below —
+    // an unknown key is refused rather than silently receiving everything.
+    const vendorKeyReq = vendorKeyOf(String(body?.vendor_key ?? body?.vendor ?? ''));
+
     const items = db.prepare(`
       SELECT poi.*, rm.id AS material_id, rm.name AS material_name,
              rm.unit AS material_unit, rm.purchase_unit AS material_purchase_unit,
@@ -220,6 +435,91 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }, { status: 400 });
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // PER-VENDOR SCOPING. `receivable` is the whole PO's receivable set and
+    // stays that way — it is what the completion test at the end of the txn
+    // measures against. `receiving` is the subset THIS call actually books:
+    // one vendor's still-outstanding lines.
+    // ────────────────────────────────────────────────────────────────────
+    const alreadyReceived = receivedPoItemIds(db, id);
+    const outstanding = receivable.filter((it: any) => !alreadyReceived.has(String(it.id)));
+    if (outstanding.length === 0) {
+      return Response.json({
+        error: `Every receivable line on ${po.po_number} has already been received. Reload the page.`,
+      }, { status: 409 });
+    }
+    const groups = groupByVendor(outstanding, po);
+    let group: VendorGroup;
+    if (vendorKeyReq) {
+      const found = groups.find(g => g.key === vendorKeyReq);
+      if (!found) {
+        // Three different facts, three different remedies — a receiver holding
+        // a bill at the gate needs to be told WHICH one it is.
+        const settled = groupByVendor(receivable, po).find(g => g.key === vendorKeyReq);
+        const blockedOnly = !settled && groupByVendor(items, po).find(g => g.key === vendorKeyReq);
+        let error: string;
+        let status: number;
+        if (settled) {
+          error = `${settled.vendor_name}'s lines on ${po.po_number} have already been received. Reload the page.`;
+          status = 409;
+        } else if (blockedOnly) {
+          error = `Every line ${blockedOnly.vendor_name} supplies on ${po.po_number} is a store-mapped material, which cannot be received into Central stock — procure it through Inventory → Liquor Store. ${storeBlocked[0]?.error || ''}`;
+          status = 400;
+        } else {
+          error = `No lines on ${po.po_number} are ordered from that vendor. Vendors still to deliver: ${groups.map(g => g.vendor_name || '(no vendor)').join(', ')}.`;
+          status = 400;
+        }
+        return Response.json({
+          error, field: 'vendor_key',
+          outstanding_vendors: groups.map(g => ({ key: g.key, vendor_name: g.vendor_name })),
+        }, { status });
+      }
+      group = found;
+    } else if (groups.length > 1) {
+      // No vendor named and the goods still owed come from several vendors.
+      // Receiving them together would file ONE bill number (and one bill's
+      // discount and delivery) across goods three different vendors supplied,
+      // which is precisely the defect this endpoint exists to stop. Refuse.
+      return Response.json({
+        error: `${po.po_number} spans ${groups.length} vendors (${groups.map(g => g.vendor_name || '(no vendor)').join(', ')}). Receive one vendor at a time — each has their own bill number, bill date and charges.`,
+        field: 'vendor_key',
+        outstanding_vendors: groups.map(g => ({ key: g.key, vendor_name: g.vendor_name, lines: g.lines.length })),
+      }, { status: 400 });
+    } else {
+      // Exactly one vendor still owes goods (the single-vendor PO, and every
+      // legacy PO whose lines carry no vendor at all) — unambiguous, so an
+      // older client that never sends vendor_key behaves exactly as before.
+      group = groups[0];
+    }
+    /** Does this PO span more than one vendor at all? Drives wording only. */
+    const isMultiVendorPo = groupByVendor(receivable, po).length > 1;
+    // OPTIONAL SUBSET WITHIN THE VENDOR. One vendor legitimately splits a PO
+    // across two bills a week apart, and "arrived on a later bill" is a
+    // different fact from "arrived short" — a 0-qty receive books the line as
+    // received-and-short forever, so leaving it OUT has to be possible.
+    // Omitted → the vendor's whole outstanding set, which is what a client that
+    // never sends the field (and every single-delivery receive) means.
+    let receiving = group.lines;
+    const lineIdsReq: string[] = Array.isArray(body?.line_ids)
+      ? [...new Set(body.line_ids.map((x: any) => String(x)))] as string[] : [];
+    if (lineIdsReq.length > 0) {
+      const mine = new Set(group.lines.map((l: any) => String(l.id)));
+      const unknown = lineIdsReq.filter(x => !mine.has(x));
+      if (unknown.length > 0) {
+        return Response.json({
+          error: `${unknown.length} of the lines sent are not ${group.vendor_name || '(no vendor)'}'s outstanding lines on ${po.po_number} — they belong to another vendor, are already received, or are store-mapped. Reload the page.`,
+          field: 'line_ids',
+        }, { status: 409 });
+      }
+      const want = new Set(lineIdsReq);
+      receiving = group.lines.filter((l: any) => want.has(String(l.id)));
+    }
+    if (receiving.length === 0) {
+      return Response.json({
+        error: `Nothing left to receive for ${group.vendor_name || '(no vendor)'} on ${po.po_number}.`,
+      }, { status: 400 });
+    }
+
     // Unit LABEL for a PO line = the PURCHASE unit, because a PO line's qty and
     // rate are both in purchase units (canon, see the boundary note below).
     // rm.purchase_unit is selected un-COALESCEd (line 74) so fall back to the
@@ -235,7 +535,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // else the stored PO line) — the same resolution the txn loop uses. Checking
     // only the override payload left the stored line unvalidated, and PO lines
     // saved before lineSanityError() existed can themselves carry a bad qty/rate.
-    for (const it of receivable) {
+    // Scoped to `receiving` — this vendor's outstanding lines. Another vendor's
+    // line is not this receiver's to justify, and one already received is not
+    // theirs to re-price.
+    for (const it of receiving) {
       const ov = overrides.get(it.id);
       const effRcv   = ov?.quantity   != null ? Number(ov.quantity) : Number(it.quantity);
       const effAcc   = ov?.accepted   != null ? Number(ov.accepted) : effRcv;
@@ -362,7 +665,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // so a partial/repeat receive cannot double-count a charge — the bill the
     // receiver is holding is the bill that is allocated.
     // ────────────────────────────────────────────────────────────────────
-    const chargeItems = [...receivable]
+    //
+    // AND OVER ONE VENDOR'S LINES ONLY. A delivery charge or a scheme discount
+    // is a line on ONE vendor's invoice; spreading it over a mixed PO would
+    // reduce the cost basis of another vendor's goods (and therefore that
+    // material's average_price, and every recipe under it) with money that
+    // vendor never took off. `receiving` IS the vendor scope, so feeding the
+    // allocator nothing but those lines is the whole of the fix.
+    const chargeItems = [...receiving]
       // PO item id ASC — a stable order matters because the allocator gives the
       // remainder to the LAST allocatable line, so DB row order must not decide
       // which line absorbs the odd paisa.
@@ -456,16 +766,38 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // The status === 'approved' check above is separated from every write by
       // two awaits (req.json + getCurrentUser), so two concurrent receives can
       // both pass it and each credit stock, write a purchases row and mint a
-      // GRN. better-sqlite3 txns are synchronous: whoever flips approved→received
-      // here wins, the loser's UPDATE matches 0 rows and throws, rolling back
-      // its whole txn before anything else is written.
+      // GRN. better-sqlite3 txns are synchronous: whoever wins this conditional
+      // UPDATE proceeds, the loser matches 0 rows and throws, rolling back its
+      // whole txn before anything else is written.
+      //
+      // WHY IT NO LONGER FLIPS THE STATUS. A multi-vendor PO must stay
+      // 'approved' after vendor A's delivery so vendor B can still deliver
+      // against it on Friday, so the flip moved to the end of this txn, behind
+      // the completion test. The claim keeps its two jobs regardless: it is
+      // still conditional on 'approved' (a cancelled/received PO is refused),
+      // and being a WRITE it takes SQLite's write lock as the txn's first
+      // statement — so the per-line conflict check immediately below reads
+      // under that lock and cannot be raced by a second connection.
       const claim = db.prepare(`
         UPDATE purchase_orders
-        SET status = 'received', received_at = ?, updated_at = datetime('now')
+        SET updated_at = datetime('now')
         WHERE id = ? AND status = 'approved'
-      `).run(receivedAt, id);
+      `).run(id);
       if (claim.changes === 0) {
         const err: any = new Error('This PO has already been received (or is no longer approved). Reload the page.');
+        err.httpStatus = 409;
+        throw err;
+      }
+
+      // ── Per-line claim ────────────────────────────────────────────────────
+      // The receipt ledger re-read INSIDE the lock. Two receivers who opened the
+      // same vendor's delivery in two tabs both passed the pre-txn check; this is
+      // where the second one loses, before a single unit of stock moves.
+      const doneNow = receivedPoItemIds(db, id);
+      const clash = receiving.filter((it: any) => doneNow.has(String(it.id)));
+      if (clash.length > 0) {
+        const err: any = new Error(
+          `${clash.length} line(s) on this delivery were already received (${clash.slice(0, 3).map((c: any) => c.material_name).join(', ')}${clash.length > 3 ? '…' : ''}). Reload the page.`);
         err.httpStatus = 409;
         throw err;
       }
@@ -508,13 +840,60 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       const lastGrn = db.prepare(`SELECT grn_number FROM goods_receipt_notes WHERE grn_number LIKE 'GRN-' || ? || '-%' ORDER BY grn_number DESC LIMIT 1`).get(yr) as any;
       const nextNum = lastGrn?.grn_number ? parseInt(lastGrn.grn_number.split('-').pop() || '0', 10) + 1 : 1;
       const grnNumber = `GRN-${yr}-${String(nextNum).padStart(4, '0')}`;
+      // ── The vendor bill row ───────────────────────────────────────────────
+      // ONE po_vendor_bills row per vendor receipt, written BEFORE any stock
+      // moves so a duplicate bill number costs nothing. Its UNIQUE index
+      // (po_id, vendor_name, bill_no) IS the duplicate guard — the constraint is
+      // caught here and re-thrown as a sentence a storekeeper can act on, rather
+      // than surfacing the driver's "UNIQUE constraint failed" as a 500.
+      // Written even when bill_no is blank: the row is the receipt event (who
+      // took delivery from this vendor, on what date, against which PO), and a
+      // blank number still keys uniquely per vendor.
+      const billVendorName = group.vendor_name;
+      // FK preference: the LINE's vendor_id; then the header's, but only when
+      // the header is genuinely this same vendor (on a mixed PO the header is
+      // "Mixed (N vendors)" with a NULL id, and on a legacy PO the group name IS
+      // the header name); then a name lookup. Never a foreign vendor's id.
+      const billVendorId =
+        group.vendor_id
+        || (vendorKeyOf(po.vendor) === group.key ? (po.vendor_id || null) : null)
+        || ((db.prepare(`SELECT id FROM vendors WHERE LOWER(TRIM(name)) = ? LIMIT 1`)
+              .get(group.key) as any)?.id ?? null);
+      try {
+        db.prepare(`
+          INSERT INTO po_vendor_bills
+            (id, po_id, vendor_id, vendor_name, bill_no, bill_date, received_by, notes, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        `).run(generateId(), id, billVendorId, billVendorName, billNo, billDate, receivedByEmail,
+                `GRN ${grnNumber}${chargesNote ? ` — ${chargesNote}` : ''}`);
+      } catch (e: any) {
+        if (String(e?.code || '').startsWith('SQLITE_CONSTRAINT')) {
+          const err: any = new Error(
+            billNo
+              ? `Bill no. "${billNo}" is already recorded for ${billVendorName || '(no vendor)'} on ${po.po_number}. Enter the vendor's actual bill number — the same bill cannot be received twice.`
+              : `A receipt from ${billVendorName || '(no vendor)'} with no bill number is already recorded on ${po.po_number}. Enter the vendor's bill number to record a second delivery.`);
+          err.httpStatus = 409;
+          throw err;
+        }
+        throw e;
+      }
+
+      // The GRN IS this vendor's bill document, so it carries THIS vendor and
+      // THIS vendor's invoice — not the PO header, which on a mixed PO reads
+      // "Mixed (N vendors)". On a single-vendor PO both resolve to the same
+      // name and the row is unchanged. invoice_number / invoice_date were
+      // simply never populated on this path before; filling them is additive
+      // and is what makes /grn and the inward register show the real bill.
       db.prepare(`
         INSERT INTO goods_receipt_notes
-          (id, grn_number, date, po_id, vendor_id, vendor, received_by, status, notes, outlet_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, datetime('now'))
-      `).run(grnId, grnNumber, receivedAt, id, po.vendor_id, po.vendor || '',
+          (id, grn_number, date, po_id, vendor_id, vendor, invoice_number, invoice_date,
+           received_by, status, notes, outlet_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, datetime('now'))
+      `).run(grnId, grnNumber, receivedAt, id, billVendorId, billVendorName || po.vendor || '',
+              billNo, billNo ? billDate : '',
               receivedByEmail,
-              `Auto-created from PO ${po.po_number} receive`,
+              `Auto-created from PO ${po.po_number} receive`
+                + (isMultiVendorPo ? ` — ${billVendorName || '(no vendor)'} only` : ''),
               po.outlet_id);
 
       // ── The BILL row (gross basis) ─────────────────────────────────────
@@ -538,7 +917,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // Excess + deviation detection happen inline below — the `excessLines` and
       // `deviationLines` arrays are hoisted at the outer function scope (filled
       // here, read post-txn for the admin audit + Slack ping).
-      for (const it of receivable) {
+      // ONE VENDOR'S LINES. Another vendor's line is not on this bill and must
+      // not get a GRN row here — that row is what marks it received.
+      for (const it of receiving) {
         const ov = overrides.get(it.id);
         const received = ov?.quantity   != null ? Number(ov.quantity)   : it.quantity;
         const accepted = ov?.accepted   != null ? Number(ov.accepted)   : received;
@@ -641,7 +1022,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // Stock + financials reflect ONLY the accepted qty (rejections never enter stock)
         if (accepted > 0) {
           const purchaseId = generateId();
-          const lineVendor = (it.vendor && String(it.vendor).trim()) || po.vendor || '';
+          // Same helper the grouping used, so the vendor a line is BOOKED
+          // against is by construction the vendor whose bill received it.
+          const lineVendor = lineVendorName(it, po);
           // ── Unit-basis boundary (CORE CONVENTION) ──────────────────────
           // A PO line carries qty in PURCHASE units and price in ₹/purchase-unit
           // (a PO is raised to a VENDOR — see /api/purchase-orders' items query
@@ -693,21 +1076,86 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         db.prepare(`UPDATE goods_receipt_notes SET status = 'partial' WHERE id = ?`).run(grnId);
       }
 
-      // Only the figures that could not be known until every line was priced.
-      // status + received_at are deliberately NOT re-written here: the atomic
-      // claim at the top of this txn is their sole writer, so it stays the one
-      // statement that guards the approved→received transition.
-      db.prepare(`
-        UPDATE purchase_orders
-        SET total_cost = ?, grn_id = ?, updated_at = datetime('now')
-        WHERE id = ?
-      `).run(total, grnId, id);
+      // ── IS THE PO DONE? ───────────────────────────────────────────────────
+      // THE RULE, in one line of SQL: the PO closes when no RECEIVABLE line of
+      // it is left without a GRN row. `receiving`'s rows were just inserted, so
+      // re-reading the ledger here counts them; store-mapped lines are excluded
+      // because centralFlowBlock refuses them on every path and waiting on them
+      // would hold the PO open forever.
+      const ledger = receivedPoItemIds(db, id);
+      const stillOwed = receivable.filter((it: any) => !ledger.has(String(it.id)));
+      const isComplete = stillOwed.length === 0;
+      const owedVendors = [...new Set(groupByVendor(stillOwed, po).map(g => g.vendor_name || '(no vendor)'))];
+
+      // total_cost accumulates the NET cost booked ACROSS receipts. Vendor A's
+      // delivery must not be erased when vendor B's lands on Friday, so the
+      // prior receipts' net is carried. `prior` is 0 on the first (and, on a
+      // single-vendor PO, only) receipt, which makes this byte-identical to the
+      // `SET total_cost = total` it replaces. Read back from the GRN rows rather
+      // than from purchase_orders.total_cost, which holds the ORDERED total
+      // right up until the PO closes (see the two branches below).
+      const prior = (db.prepare(`
+        SELECT COALESCE(SUM(ROUND(gi.quantity_accepted * gi.unit_price, 2) - gi.discount), 0) AS net
+        FROM goods_receipt_note_items gi
+        JOIN goods_receipt_notes g ON g.id = gi.grn_id
+        WHERE g.po_id = ? AND g.id != ?
+      `).get(id, grnId) as any)?.net || 0;
+      // status + received_at are written ONLY when the PO is actually complete —
+      // this is the sole writer of the approved→received transition, and it is
+      // inside the same txn as the claim that took the write lock.
+      //
+      // grn_id — WHAT IT MEANS NOW. One column cannot name the three GRNs a
+      // three-vendor PO produces, so it is kept populated (nothing that reads it
+      // has to change) but it is deliberately NOT authoritative: it holds the
+      // MOST RECENT receipt only. Every reader that needs the PO's receipts
+      // takes them from `goods_receipt_notes WHERE po_id = <po>` (the receipt
+      // ledger) or from po_vendor_bills — /api/purchase-orders?id= now folds
+      // received figures that way, because keying that fold on grn_id printed
+      // the LAST vendor's bill as the whole order's post-receive total.
+      if (isComplete) {
+        db.prepare(`
+          UPDATE purchase_orders
+          SET status = 'received', received_at = ?, total_cost = ?, grn_id = ?, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(receivedAt, r2(prior + total), grnId, id);
+      } else {
+        // STAYS 'approved' — that is what keeps the Receive button alive for the
+        // vendors who have not delivered yet. received_at stays NULL: the PO is
+        // not received; each vendor's own date is on their GRN + bill row.
+        //
+        // total_cost is DELIBERATELY LEFT ALONE here. On an 'approved' PO that
+        // column means "what was ORDERED" — recalcTotal (src/lib/po-helpers.ts)
+        // is its only other writer — and every reader still assumes exactly
+        // that: the PO list returns po.* with no partial marker and prints the
+        // figure beside a plain APPROVED badge. Moving it to the received-so-far
+        // net would show a part-delivered order at LESS than its order value
+        // with nothing on screen saying why, and a buyer reconciling open
+        // commitments would read that shortfall as the commitment. The received
+        // figure is stamped by the isComplete branch above, once 'received'
+        // makes the column mean that; until then it is on the response as
+        // po_total_cost and derivable from the GRN ledger.
+        db.prepare(`
+          UPDATE purchase_orders
+          SET grn_id = ?, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(grnId, id);
+      }
       (result as any).grn_id = grnId;
       (result as any).grn_number = grnNumber;
+      (result as any).po_total_cost = r2(prior + total);
+      (result as any).is_complete = isComplete;
+      (result as any).po_status = isComplete ? 'received' : 'approved';
+      (result as any).remaining_lines = stillOwed.length;
+      (result as any).remaining_vendors = owedVendors;
 
       // If this PO was auto-raised from a department requisition, the requisition is now fulfilled.
       // (Stock was already issued to the dept at store-process time; receiving the PO replenishes the store.)
-      if (po.requisition_id) {
+      // GATED ON COMPLETION. Half a delivery does not fulfil a requisition, and
+      // the party branch below DEDUCTS STOCK for the whole event — firing it when
+      // only vendor A's lines have landed would consume goods vendor B has not
+      // delivered. On a single-vendor PO the first receive IS the completion, so
+      // this fires exactly when it always did.
+      if (po.requisition_id && isComplete) {
         const reqRow = db.prepare(`SELECT * FROM requisitions WHERE id = ?`).get(po.requisition_id) as any;
         const willFulfill = reqRow && reqRow.status === 'store_processed';
         db.prepare(`
@@ -881,11 +1329,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const chargeSummary = chargeBits.length
           ? `${chargeBits.join(' · ')}${chargesNote ? ` — note: "${chargesNote}"` : ''}`
           : '';
+        // Name the VENDOR in the title on a mixed PO — the admin is being asked
+        // to review one vendor's delivery, and "PO-2026-0007 came in short" is
+        // unanswerable when three vendors are on that PO.
+        const vendorTag = isMultiVendorPo ? ` (${group.vendor_name || 'no vendor'})` : '';
         const devTitle = deviationLines.length > 0
-          ? `PO ${po.po_number}: ${deviationLines.length} line(s) received off-PO (${counts.join(', ')}; net ${money(netValueImpact)})`
-          : `PO ${po.po_number}: received with bill charges`;
+          ? `PO ${po.po_number}${vendorTag}: ${deviationLines.length} line(s) received off-PO (${counts.join(', ')}; net ${money(netValueImpact)})`
+          : `PO ${po.po_number}${vendorTag}: received with bill charges`;
         const title = chargeSummary ? `${devTitle} · ${chargeSummary}` : devTitle;
-        const body  = `Vendor: ${po.vendor || '—'}\nReceived by: ${receivedByEmail || 'system'}\nGRN: ${(result as any).grn_number}\n\n`
+        const body  = `Vendor: ${group.vendor_name || po.vendor || '—'}`
+          + (billNo ? `\nBill no: ${billNo} (${billDate})` : '')
+          + ((result as any).is_complete === false
+              ? `\nPO still OPEN — awaiting: ${((result as any).remaining_vendors || []).join(', ')}`
+              : '')
+          + `\nReceived by: ${receivedByEmail || 'system'}\nGRN: ${(result as any).grn_number}\n\n`
           + (lineSummary    ? `${lineSummary}\n\n`    : '')
           + (chargeSummary  ? `${chargeSummary}\n\n`  : '')
           + `Review on /purchase-orders or /audit.`;
@@ -925,8 +1382,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             // What the bill's own figures did to this receive. `basis` is the
             // point of the block: one number changed the cost of the stock, the
             // other was filed against it.
+            // WHOSE delivery this was, and what is still owed on the PO. An
+            // audit row that only said "PO-2026-0007" could not be answered on a
+            // three-vendor PO.
+            vendor: {
+              vendor_name: group.vendor_name,
+              vendor_id: group.vendor_id,
+              lines_received: receiving.length,
+              po_complete: (result as any).is_complete,
+              remaining_vendors: (result as any).remaining_vendors || [],
+            },
             bill_charges: {
               bill_no: billNo,
+              bill_date: billDate,
+              // Stated so a reader never has to assume: these figures were
+              // allocated over THIS VENDOR'S accepted lines only.
+              allocated_over: `${group.vendor_name || '(no vendor)'} lines only`,
               note: chargesNote,
               subtotal: chargeAlloc.subtotal,
               discount_requested: chargeAlloc.discount_requested,
@@ -959,14 +1430,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             UNIQUE (party_unique_id, kind, channel)
           )
         `);
-        // For a PO deviation we key uniqueness off the PO id via the
-        // party_unique_id slot so re-running receive on the same PO doesn't
-        // double-notify. One row per receive, listing every deviating line.
+        // Dedup key. It used to be `po:<id>`, on the reasoning that a PO is
+        // received once — but a mixed PO is received once PER VENDOR, and that
+        // UNIQUE(party_unique_id, kind, channel) then SILENTLY SWALLOWED every
+        // vendor after the first: vendor B could arrive short, or with a
+        // discount that rewrote average_price, and no admin would ever be told.
+        // Keyed per GRN instead, which is per vendor receipt. A single-vendor PO
+        // still mints exactly one row (it has exactly one GRN), and a second
+        // receive of the same PO is now refused outright by the claim above, so
+        // nothing is lost by dropping the PO-level dedup.
+        const notifKey = `po:${id}:grn:${(result as any).grn_id}`;
         db.prepare(`
           INSERT OR IGNORE INTO notifications
             (id, kind, party_unique_id, channel, recipient, title, body)
           VALUES (?, ?, ?, 'inapp', 'admin', ?, ?)
-        `).run(generateId(), notifKind, `po:${id}`, title, body);
+        `).run(generateId(), notifKind, notifKey, title, body);
 
         // 3. Optional Slack ping — uses the same webhook the party-refresh job
         // uses. Best-effort: failure here never blocks the receive flow.
@@ -985,7 +1463,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               db.prepare(`
                 UPDATE notifications SET sent_at = datetime('now'), channel = 'slack'
                 WHERE kind = ? AND party_unique_id = ?
-              `).run(notifKind, `po:${id}`);
+              `).run(notifKind, notifKey);
             } catch { /* never crash on bookkeeping */ }
           }).catch(() => { /* webhook dead — audit row + in-app already wrote */ });
         }
@@ -997,14 +1475,33 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     return Response.json({
       success: true,
-      status: 'received',
-      received_at: receivedAt,
+      // The PO's ACTUAL status after this receipt. On a mixed-vendor PO it stays
+      // 'approved' while another vendor still owes goods — this field used to be
+      // the literal 'received', which would now be a lie the UI repeats.
+      status: (result as any).po_status,
+      po_complete: (result as any).is_complete,
+      // Only stamped when the PO actually closed; null while it is still open.
+      received_at: (result as any).is_complete ? receivedAt : null,
+      // WHOSE delivery was booked, and who is still to come.
+      vendor: group.vendor_name,
+      vendor_key: group.key,
+      vendor_id: group.vendor_id,
+      bill_no: billNo,
+      bill_date: billDate,
+      remaining_lines: (result as any).remaining_lines,
+      remaining_vendors: (result as any).remaining_vendors,
       grn_id:     (result as any).grn_id,
       grn_number: (result as any).grn_number,
-      lines_processed: receivable.length,
+      // Lines THIS receipt booked (one vendor's), not the whole PO's.
+      lines_processed: receiving.length,
       store_blocked: storeBlocked,
       materials_touched: touchedMaterials.size,
+      // THIS receipt's net cost — unchanged meaning, still one vendor's bill.
       total_cost: total,
+      // The PO's running total across every receipt so far. On a single-vendor
+      // PO the two are equal; on a mixed one they never are, and a caller that
+      // read `total_cost` as the PO's total would under-report it.
+      po_total_cost: (result as any).po_total_cost,
       excess_lines: excessLines.length,           // expose to caller so the UI
       excess_value: excessLines.reduce((s, l) => s + l.excess_value, 0),  // can show a "notified admin" confirmation
       // Off-PO counts — the receive modal shows "admin notified" for short qty,
@@ -1028,6 +1525,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // the remainder-taking rounding the client cannot reproduce line-for-line.
       charges_applied: {
         bill_no: billNo,
+        bill_date: billDate,
+        // The base these were spread over: ONE vendor's accepted lines.
+        allocated_over_vendor: group.vendor_name,
         note: chargesNote,
         subtotal: chargeAlloc.subtotal,
         discount_requested: chargeAlloc.discount_requested,

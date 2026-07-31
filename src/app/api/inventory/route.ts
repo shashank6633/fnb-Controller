@@ -118,7 +118,57 @@ export async function GET(request: Request) {
 
     query += ' ORDER BY rm.name ASC';
 
-    const materials = db.prepare(query).all(...params);
+    const materials = db.prepare(query).all(...params) as any[];
+
+    // SEMI-FINISHED ITEMS — opt-in only, via ?include_semi=1.
+    //
+    // The 68 sub_recipes (Mint Chutney, GG Paste, Aioli…) are things the kitchen
+    // MAKES, not things anyone buys. They live in `sub_recipes`, costed from
+    // their own ingredients, and they are deliberately NOT copied into
+    // raw_materials — two rows for one thing is how a cost goes stale and how
+    // the same paste ends up counted twice.
+    //
+    // They are appended here ONLY when the caller asks, because twelve pages
+    // read this endpoint (Purchases, Wastage, GRN, Requisitions, Transfers…)
+    // and none of them should offer "Mint Chutney" as something to buy from a
+    // vendor. Today only the Raw Materials page passes the flag.
+    //
+    // The id is prefixed `sub:` so it can never be mistaken for a material id.
+    // Any write path that receives one will fail its lookup loudly instead of
+    // quietly writing against the wrong row.
+    if (url.searchParams.get('include_semi') === '1') {
+      const subs = db.prepare(`
+        SELECT id, name, yield_unit, cost_per_unit
+          FROM sub_recipes
+         WHERE COALESCE(is_active, 1) = 1
+         ORDER BY name ASC
+      `).all() as any[];
+      for (const s of subs) {
+        const unit = String(s.yield_unit || '').trim();
+        materials.push({
+          id: `sub:${s.id}`,
+          sub_recipe_id: s.id,
+          name: s.name,
+          category: 'Semi Finished',
+          // Made in, counted in and costed in ONE unit — there is no purchase
+          // unit and no pack, so purchase_unit mirrors the yield unit and
+          // pack_size is 1. That makes packFactor() return 1, so every
+          // purchase-unit display renders these unconverted, which is correct.
+          unit,
+          purchase_unit: unit,
+          pack_size: 1,
+          current_stock: 0,
+          average_price: Number(s.cost_per_unit) || 0,
+          stock_value: 0,
+          is_semifinished: 1,
+          /** Not editable as a material — the recipe screen owns it. */
+          read_only: true,
+          source: 'sub_recipe',
+        });
+      }
+      materials.sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
+    }
+
     return Response.json({ materials });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });

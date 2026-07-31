@@ -1,5 +1,8 @@
 import { getDb, generateId } from '@/lib/db';
-import { canSeeAllDeptStock } from '@/lib/dept-stock';
+import { allowedDeptIds, canSeeAllDeptStock } from '@/lib/dept-stock';
+import {
+  DEPT_REQUESTED_ITEM_SQL, NOT_STORE_MAPPED_SQL, deptRequestedParams, selectedDeptSet,
+} from '@/lib/dept-requested-items';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
 import { upsertVarianceApproval } from '@/lib/variance-approval';
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
@@ -106,6 +109,87 @@ export async function GET(request: Request) {
     //   area          — restrict to all departments in one area (kitchen/bar/…).
     const departmentId = url.searchParams.get('department_id');
     const area = url.searchParams.get('area');
+
+    /* ══════════════════════════════════════════════════════════════════════
+     * dept_items=1 — THE DEPARTMENT'S OWN COUNT LIST (owner requirement 4)
+     * ══════════════════════════════════════════════════════════════════════
+     * "If a department requests the 40 items till now, only those items to be
+     * shown to the departments for their closing stock updating." This mode
+     * answers exactly that: the materials `department_id` has EVER
+     * requisitioned (no recency window — see src/lib/dept-requested-items.ts),
+     * with rejected lines excluded, as ready-to-render rows.
+     *
+     * Purely additive: a brand-new query param with its own early return, so
+     * every existing caller of this route is byte-for-byte unaffected. Nothing
+     * here writes.
+     *
+     * BLIND COUNTS: current_stock is the system figure, so it is stripped for
+     * non-admins here exactly as it is in ../by-location. No variance is
+     * computed or returned on this path at all. average_price is COST data
+     * (same treatment as the rest of this route) and ships to everyone.
+     * ────────────────────────────────────────────────────────────────────── */
+    if (url.searchParams.get('dept_items') === '1') {
+      if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+      const wanted = (departmentId || '').trim();
+      // Store / Overall is NOT department-scoped — say so explicitly rather
+      // than returning an empty list the client could mistake for "no items".
+      if (!wanted || wanted === '__store__') {
+        return Response.json({ scoped: false, department: null, count: 0, items: [], candidates: [] });
+      }
+      const dept = db.prepare('SELECT id, name FROM departments WHERE id = ?').get(wanted) as
+        { id: string; name: string } | undefined;
+      if (!dept) return Response.json({ error: 'Unknown department' }, { status: 400 });
+      // Same gate as /api/department-stock: privileged tiers see any
+      // department, everyone else only their own + granted visible ones.
+      if (!canSeeAllDeptStock(me) && !allowedDeptIds(me).has(dept.id)) {
+        return Response.json({ error: 'Not allowed for this department' }, { status: 403 });
+      }
+      const deptSet = selectedDeptSet(db, dept.id);
+      const COLS = `rm.id, rm.sku, rm.name, rm.category, rm.super_category, rm.unit,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS purchase_unit,
+             COALESCE(rm.pack_size, 1) AS pack_size, COALESCE(rm.case_size, 1) AS case_size,
+             rm.current_stock, rm.average_price, rm.reorder_level,
+             rm.storage_location, rm.closing_cadence, rm.shelf_life_days`;
+      const rows = deptSet.length === 0 ? [] : db.prepare(`
+        SELECT ${COLS}
+        FROM raw_materials rm
+        WHERE ${NOT_STORE_MAPPED_SQL} AND ${DEPT_REQUESTED_ITEM_SQL}
+        ORDER BY rm.category, rm.name
+      `).all(...deptRequestedParams(deptSet)) as any[];
+
+      /* THE ESCAPE HATCH (requirement 3). The first time a department holds
+         something new the list cannot know about it yet, and a counter who
+         cannot record real stock writes it on paper instead. `search` returns
+         central materials NOT already on this department's list so the counter
+         can pull one in. Capped at 50 — this is a search box, not a catalogue
+         dump. Once counted, the closing_stock arm of DEPT_REQUESTED_ITEM_SQL
+         keeps it on the sheet permanently. */
+      const search = (url.searchParams.get('search') || '').trim();
+      let candidates: any[] = [];
+      if (search) {
+        const like = `%${search}%`;
+        candidates = db.prepare(`
+          SELECT ${COLS}
+          FROM raw_materials rm
+          WHERE ${NOT_STORE_MAPPED_SQL}
+            AND NOT (${DEPT_REQUESTED_ITEM_SQL})
+            AND (rm.name LIKE ? OR COALESCE(rm.sku,'') LIKE ?)
+          ORDER BY rm.name
+          LIMIT 50
+        `).all(...deptRequestedParams(deptSet), like, like) as any[];
+      }
+      const blind = (r: any) => (isAdmin ? r : { ...r, current_stock: null });
+      return Response.json({
+        scoped: true,
+        department: { id: dept.id, name: dept.name },
+        // Sub-departments folded in when a MAIN department is selected, the
+        // same rollup every other dept-scoped surface uses.
+        department_ids: deptSet,
+        count: rows.length,
+        items: rows.map(blind),
+        candidates: candidates.map(blind),
+      });
+    }
 
     // Get list of closing stock dates
     if (!date && !from) {
