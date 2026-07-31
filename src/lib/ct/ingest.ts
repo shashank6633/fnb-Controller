@@ -196,6 +196,36 @@ function safeStringify(raw: unknown): string {
   }
 }
 
+/**
+ * Fire-and-forget WhatsApp acknowledgement for a freshly detected missed call.
+ *
+ * Called ONLY when createRecovery actually inserted a row, so a re-delivered
+ * CDR (which resolves to the same ct_calls id and therefore the same UNIQUE
+ * ct_recoveries.call_id) never reaches this at all — and even if it did,
+ * maybeAckMissedCall claims a one-per-recovery slot before sending.
+ *
+ * Everything is off by default: with ct_settings.missed_call_whatsapp = '0'
+ * AND after_hours_whatsapp = '0', maybeAckMissedCall returns 'disabled'
+ * having written nothing. Dynamic import so the webhook path never pays for
+ * the WhatsApp module when the feature is off, and so a failure in it can
+ * never break ingestion. NEVER throws.
+ */
+function ackMissedCall(callId: string, phone: string): void {
+  try {
+    void import('./missed-ack')
+      .then(({ maybeAckMissedCall }) => maybeAckMissedCall(callId))
+      .then(outcome => {
+        // Refresh the Recovery board so the new attempts entry shows up.
+        if (outcome === 'sent' || outcome === 'send_failed') {
+          try { emitRecoveryUpdate(getDb(), phone); } catch { /* best-effort */ }
+        }
+      })
+      .catch(e => console.error('[ct-ingest] missed-call WhatsApp ack failed', e));
+  } catch (e) {
+    console.error('[ct-ingest] missed-call WhatsApp ack failed', e);
+  }
+}
+
 /** INSERT OR IGNORE a recovery for a missed call (call_id UNIQUE = the dedupe). */
 function createRecovery(
   db: Database.Database,
@@ -308,7 +338,10 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
         missedAt: m.endedAt || m.startedAt || now,
         detectedVia: 'cdr',
       });
-      if (madeNew) emitRecoveryUpdate(db, phone);
+      if (madeNew) {
+        emitRecoveryUpdate(db, phone);
+        ackMissedCall(callId, phone);
+      }
     }
 
     // ── Answered inbound → guest reached us themselves → auto-resolve ──
@@ -548,12 +581,16 @@ export function reconcileLiveEvents(): number {
     let n = 0;
     for (const call of stuck) {
       db.prepare(`UPDATE ct_calls SET status = 'missed', ended_at = ? WHERE id = ?`).run(now, call.id);
-      createRecovery(db, {
+      const madeNew = createRecovery(db, {
         callId: call.id,
         phone: call.phone_e164,
         missedAt: call.started_at || call.created_at || now,
         detectedVia: 'live_event',
       });
+      // Same missed call, other detection path — acknowledge it here too, and
+      // only on a genuinely new recovery. If the CDR later arrives for this
+      // call, createRecovery returns false there, so the guest is messaged once.
+      if (madeNew) ackMissedCall(call.id, call.phone_e164);
       n++;
     }
     if (n > 0) emitRecoveryUpdate(db);

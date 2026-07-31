@@ -15,6 +15,19 @@ import { getAgentMap, getUserNamesByEmail, resolveAgentLabel } from '@/lib/ct/ag
  * dashboardStats() verbatim: call counts by day/hour, Calls→Answered→Booked→
  * Seated funnel, recovery funnel, per-agent leaderboard, avg time-to-first-
  * callback, lapsed guests.
+ *
+ * Also returned (additive, same shape as DashboardStats):
+ *   byDowHour          7×24 dense IST weekday×hour grid (inbound) — the
+ *                      staffing heatmap; byHour is unchanged and still served.
+ *   weekdayOccurrences how many times each weekday falls in the window
+ *                      (index 0 = Sunday) — the heatmap's denominators.
+ *   unattributed       inbound calls in the window with no agent id, i.e. the
+ *                      ring-group misses that are in nobody's answer rate.
+ *   agents[]           now also carries inbound/outbound volume, answer_rate,
+ *                      connect_rate and asa_sec + asa_sample.
+ *
+ * Read-only: this route aggregates and never writes (sweep() aside, which is
+ * the pre-existing reconciliation pass).
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;

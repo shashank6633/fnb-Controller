@@ -1282,6 +1282,85 @@ function initializeSchema(db: Database.Database) {
     db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('requisition_deduct_at_issue', '0')`);
   } catch (e) { console.error('requisition_issue_ledger schema failed:', e); }
 
+  // ── CRM: topic tracking + win-back campaigns ─────────────────────────────
+  // Ideas worth taking from CallHippo, built on the stack we already own
+  // rather than bought (their Terms disclaim Indian PSTN termination, they
+  // have no DLT support, and their API exposes one call-data endpoint with no
+  // transcripts — so none of it could feed the guest 360 anyway).
+  try {
+    db.exec(`
+      -- Standing keyword rules run over call transcripts/analysis. CallHippo
+      -- calls this a "custom topic tracker"; ours reads the transcripts we
+      -- already hold, so it costs nothing per call.
+      CREATE TABLE IF NOT EXISTS ct_topic_rules (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        keywords    TEXT NOT NULL DEFAULT '[]',   -- JSON array, matched case-insensitively
+        severity    TEXT NOT NULL DEFAULT 'info', -- info | attention | urgent
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        notify      INTEGER NOT NULL DEFAULT 0,   -- raise an alert on a hit
+        created_by  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS ct_topic_hits (
+        id           TEXT PRIMARY KEY,
+        rule_id      TEXT NOT NULL,
+        call_id      TEXT NOT NULL,
+        guest_id     TEXT,
+        matched_term TEXT NOT NULL DEFAULT '',
+        excerpt      TEXT NOT NULL DEFAULT '',
+        acknowledged INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(rule_id, call_id, matched_term)      -- re-scanning a call is a no-op
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_topic_hits_call ON ct_topic_hits(call_id);
+      CREATE INDEX IF NOT EXISTS idx_ct_topic_hits_rule ON ct_topic_hits(rule_id);
+
+      -- Win-back / slow-night WhatsApp campaigns. One row per send so the
+      -- result is attributable: did this guest come back, and did they spend?
+      CREATE TABLE IF NOT EXISTS ct_campaigns (
+        id           TEXT PRIMARY KEY,
+        name         TEXT NOT NULL,
+        segment      TEXT NOT NULL DEFAULT '{}',  -- JSON: the bucket that produced the list
+        template     TEXT NOT NULL DEFAULT '',
+        status       TEXT NOT NULL DEFAULT 'draft', -- draft | sending | sent | failed
+        created_by   TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        sent_at      TEXT
+      );
+      CREATE TABLE IF NOT EXISTS ct_campaign_targets (
+        id           TEXT PRIMARY KEY,
+        campaign_id  TEXT NOT NULL,
+        guest_id     TEXT,
+        phone_e164   TEXT NOT NULL DEFAULT '',
+        name         TEXT NOT NULL DEFAULT '',
+        send_status  TEXT NOT NULL DEFAULT 'pending', -- pending | sent | failed | skipped
+        send_error   TEXT NOT NULL DEFAULT '',
+        sent_at      TEXT,
+        -- attribution: filled in when the guest comes back after the send
+        returned_at  TEXT,
+        return_value REAL,
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(campaign_id, phone_e164)             -- never message the same guest twice in one campaign
+      );
+      CREATE INDEX IF NOT EXISTS idx_ct_camp_targets_camp  ON ct_campaign_targets(campaign_id);
+      CREATE INDEX IF NOT EXISTS idx_ct_camp_targets_phone ON ct_campaign_targets(phone_e164);
+    `);
+    // Defaults are all OFF / conservative: nothing starts messaging guests or
+    // changing routing until someone turns it on in CRM Settings.
+    for (const [k, v] of [
+      ['missed_call_whatsapp', '0'],   // auto-acknowledge a missed call on WhatsApp
+      ['missed_call_wa_text',  'Sorry we missed your call. Reply here and we will help you book.'],
+      ['sticky_agent',         '0'],   // prefer the GRE who last spoke to this guest
+      ['vip_routing',          '0'],   // surface high-value guests first
+      ['vip_min_visits',       '5'],
+      ['vip_min_spend',        '25000'],
+      ['lapsed_days',          '60'],  // default win-back bucket
+    ] as [string, string][]) {
+      db.prepare(`INSERT OR IGNORE INTO ct_settings (key, value) VALUES (?, ?)`).run(k, v);
+    }
+  } catch (e) { console.error('ct topic/campaign schema failed:', e); }
+
   // Closing counts for SEMI-FINISHED items (sub_recipes) — Mint Chutney, GG
   // Paste, Aioli and 65 more. The kitchen holds real quantities of these at
   // close, but they live in sub_recipes, not raw_materials, so the ordinary

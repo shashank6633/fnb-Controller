@@ -64,6 +64,8 @@ import {
   PhoneCall,
   PhoneIncoming,
   CalendarCheck,
+  Radar,
+  HeartHandshake,
   type LucideIcon,
 } from "lucide-react";
 
@@ -237,7 +239,9 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Live Calls",      href: "/crm-calls/live",     icon: PhoneIncoming },
       { kind: "link", label: "Recovery Queue",  href: "/crm-calls/recovery", icon: PhoneMissed },
       { kind: "link", label: "Guests",          href: "/crm-calls/guests",   icon: Users },
+      { kind: "link", label: "Win-back",        href: "/crm-calls/win-back", icon: HeartHandshake },
       { kind: "link", label: "Call Log",        href: "/crm-calls/log",      icon: PhoneCall },
+      { kind: "link", label: "Topic Alerts",    href: "/crm-calls/topics",   icon: Radar },
       { kind: "link", label: "Bookings",        href: "/crm-calls/bookings", icon: CalendarCheck },
       { kind: "link", label: "CRM Settings",    href: "/crm-calls/settings", icon: Settings2 },
     ],

@@ -265,6 +265,42 @@ export interface AgentStat {
   bookings: number;           // bookings attributed to this agent's calls
   recoveries_handled: number; // recoveries assigned to them with ≥1 attempt
   avg_callback_min: number;   // avg missed_at → first_attempt_at (minutes)
+
+  // ── Scorecard extensions (additive) ──────────────────────────────────────
+  // Every rate below ships with the count it was divided by, because on a
+  // fortnight of restaurant traffic an agent may only have a handful of calls
+  // and "100%" on 2 must not read like "100%" on 200. Inbound and outbound are
+  // kept apart on purpose: an unanswered INBOUND call is the agent missing the
+  // guest, an unanswered OUTBOUND call is the guest not picking up. Averaging
+  // the two into one "answer rate" would blame agents for guests' phones.
+  /** Inbound calls in the window carrying this agent id. */
+  inbound_calls: number;
+  inbound_answered: number;
+  /** 0–100, inbound_answered ÷ inbound_calls. Read it with `unattributed`
+   *  below: a ring-group call missed by everyone carries NO agent id, so it
+   *  lands in nobody's denominator and every agent can sit at 100%. */
+  answer_rate: number;
+  /** Outbound (callback) attempts placed by this agent. */
+  outbound_calls: number;
+  outbound_answered: number;
+  /** 0–100, outbound_answered ÷ outbound_calls — did the guest pick up. */
+  connect_rate: number;
+  /** Average speed of answer, SECONDS: answered_at − started_at over inbound
+   *  answered calls that carry both timestamps (0 when none do). */
+  asa_sec: number;
+  /** Number of calls behind `asa_sec` — its denominator. */
+  asa_sample: number;
+}
+
+/**
+ * One cell of the IST weekday × hour grid.
+ * `dow` uses the SQLite/JS convention: 0 = Sunday … 6 = Saturday.
+ */
+export interface DowHourCell {
+  dow: number;   // 0=Sun … 6=Sat (IST)
+  hour: number;  // 0–23 (IST)
+  total: number;
+  missed: number;
 }
 
 export interface LapsedGuest {
@@ -285,6 +321,27 @@ export interface DashboardStats {
   };
   byDay: { date: string; total: number; answered: number; missed: number }[];
   byHour: { hour: number; total: number; missed: number }[];
+  /**
+   * 7×24 IST weekday × hour grid, inbound only — the same population as
+   * `byHour`, one dimension richer. `byHour` collapses every Monday 20:00 into
+   * the same bucket as every Saturday 20:00, so it cannot answer "which SHIFTS
+   * are we understaffed on"; this can. Dense: all 168 cells are present
+   * (zeros included), ordered dow 0→6 then hour 0→23.
+   */
+  byDowHour: DowHourCell[];
+  /**
+   * How many times each weekday actually occurs in the window (index 0 =
+   * Sunday) — the denominator behind every heatmap row. 12 calls spread over
+   * 13 Saturdays is a different staffing story from 12 over 1.
+   */
+  weekdayOccurrences: number[];
+  /**
+   * Inbound calls in the window that carry NO agent id (nobody picked up, so
+   * TeleCMI reports no agent on the CDR). These sit in no agent's answer-rate
+   * denominator — publish this beside the scorecards or a table full of 100%
+   * answer rates is a lie by omission.
+   */
+  unattributed: { calls: number; missed: number };
   /** Inbound-only conversion funnel over the window. */
   funnel: { calls: number; answered: number; booked: number; seated: number };
   recoveryFunnel: { missed: number; attempted: number; recovered: number; booked: number };
@@ -382,6 +439,51 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
     byHour.push({ hour: h, total: row?.total ?? 0, missed: row?.missed ?? 0 });
   }
 
+  // ── Weekday × hour grid (staffing heatmap) ───────────────────────────────
+  // Same population and filters as byHour above (inbound, same window) so the
+  // two can never disagree: summing a heatmap column reproduces byHour, and
+  // summing the whole grid reproduces funnel.calls.
+  const dowHourRows = db.prepare(`
+    SELECT CAST(strftime('%w', ${CALL_AT}, '+330 minutes') AS INTEGER)    AS w,
+           CAST(strftime('%H', ${CALL_AT}, '+330 minutes') AS INTEGER)    AS h,
+           COUNT(*)                                                       AS total,
+           SUM(CASE WHEN c.status IN ${MISSED_FAMILY} THEN 1 ELSE 0 END)  AS missed
+    FROM ct_calls c
+    WHERE ${CALL_AT} >= ? AND ${CALL_AT} < ? AND c.direction = 'inbound'
+    GROUP BY w, h
+  `).all(winStart, winEnd) as any[];
+
+  const dowHourMap = new Map<string, { total: number; missed: number }>();
+  for (const r of dowHourRows) {
+    if (r.w === null || r.w === undefined || r.h === null || r.h === undefined) continue;
+    dowHourMap.set(`${Number(r.w)}:${Number(r.h)}`, { total: num(r.total), missed: num(r.missed) });
+  }
+  const byDowHour: DowHourCell[] = [];
+  for (let w = 0; w < 7; w++) {
+    for (let h = 0; h < 24; h++) {
+      const cell = dowHourMap.get(`${w}:${h}`);
+      byDowHour.push({ dow: w, hour: h, total: cell?.total ?? 0, missed: cell?.missed ?? 0 });
+    }
+  }
+
+  // Weekday occurrences in the window — walk the same IST days byDay walks.
+  const weekdayOccurrences = [0, 0, 0, 0, 0, 0, 0];
+  for (let i = 0; i < days; i++) {
+    // Shifting by the IST offset makes getUTCDay() read the IST weekday.
+    const dow = new Date(winStartMs + i * DAY_MS + IST_OFFSET_MIN * 60_000).getUTCDay();
+    weekdayOccurrences[dow]++;
+  }
+
+  // Inbound calls nobody was attached to (ring-group misses) — the honesty
+  // footnote for the per-agent answer rates below.
+  const un = db.prepare(`
+    SELECT COUNT(*)                                                       AS calls,
+           SUM(CASE WHEN c.status IN ${MISSED_FAMILY} THEN 1 ELSE 0 END)  AS missed
+    FROM ct_calls c
+    WHERE ${CALL_AT} >= ? AND ${CALL_AT} < ? AND c.direction = 'inbound' AND c.agent_user = ''
+  `).get(winStart, winEnd) as any;
+  const unattributed = { calls: num(un?.calls), missed: num(un?.missed) };
+
   // ── Conversion funnel (inbound) ──────────────────────────────────────────
   const f = db.prepare(`
     SELECT COUNT(*)                                                       AS calls,
@@ -435,7 +537,12 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
   const ensureAgent = (agent: string): AgentStat => {
     let a = agentMap.get(agent);
     if (!a) {
-      a = { agent, handled: 0, bookings: 0, recoveries_handled: 0, avg_callback_min: 0 };
+      a = {
+        agent, handled: 0, bookings: 0, recoveries_handled: 0, avg_callback_min: 0,
+        inbound_calls: 0, inbound_answered: 0, answer_rate: 0,
+        outbound_calls: 0, outbound_answered: 0, connect_rate: 0,
+        asa_sec: 0, asa_sample: 0,
+      };
       agentMap.set(agent, a);
     }
     return a;
@@ -449,6 +556,44 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
     GROUP BY c.agent_user
   `).all(winStart, winEnd) as any[];
   for (const r of handledRows) ensureAgent(r.agent).handled = num(r.n);
+
+  // Volume split by direction + average speed of answer, one pass.
+  // ASA is INBOUND-ONLY on purpose: on an outbound callback the gap between
+  // started_at and answered_at is how long the GUEST took to pick up, which
+  // says nothing about the agent. Rows missing either timestamp, and rows
+  // where answered_at precedes started_at (clock skew / bad CDR), are excluded
+  // from the average AND from asa_sample so the denominator stays truthful.
+  const ANSWERED_AT = `REPLACE(c.answered_at, ' ', 'T')`;
+  const ASA_OK = `c.direction = 'inbound' AND c.status = 'answered'
+                  AND c.answered_at IS NOT NULL AND c.answered_at != ''
+                  AND ${ANSWERED_AT} >= ${CALL_AT}`;
+  const agentVolumeRows = db.prepare(`
+    SELECT c.agent_user                                                          AS agent,
+           SUM(CASE WHEN c.direction = 'inbound'  THEN 1 ELSE 0 END)             AS inbound_calls,
+           SUM(CASE WHEN c.direction = 'inbound'  AND c.status = 'answered'
+                    THEN 1 ELSE 0 END)                                           AS inbound_answered,
+           SUM(CASE WHEN c.direction = 'outbound' THEN 1 ELSE 0 END)             AS outbound_calls,
+           SUM(CASE WHEN c.direction = 'outbound' AND c.status = 'answered'
+                    THEN 1 ELSE 0 END)                                           AS outbound_answered,
+           SUM(CASE WHEN ${ASA_OK} THEN 1 ELSE 0 END)                            AS asa_sample,
+           AVG(CASE WHEN ${ASA_OK}
+                    THEN (julianday(${ANSWERED_AT}) - julianday(${CALL_AT})) * 86400.0
+               END)                                                              AS asa_sec
+    FROM ct_calls c
+    WHERE c.agent_user != '' AND ${CALL_AT} >= ? AND ${CALL_AT} < ?
+    GROUP BY c.agent_user
+  `).all(winStart, winEnd) as any[];
+  for (const r of agentVolumeRows) {
+    const a = ensureAgent(r.agent);
+    a.inbound_calls = num(r.inbound_calls);
+    a.inbound_answered = num(r.inbound_answered);
+    a.answer_rate = pct(a.inbound_answered, a.inbound_calls);
+    a.outbound_calls = num(r.outbound_calls);
+    a.outbound_answered = num(r.outbound_answered);
+    a.connect_rate = pct(a.outbound_answered, a.outbound_calls);
+    a.asa_sample = num(r.asa_sample);
+    a.asa_sec = a.asa_sample > 0 ? round1(num(r.asa_sec)) : 0;
+  }
 
   const agentBookingRows = db.prepare(`
     SELECT c.agent_user AS agent, COUNT(*) AS n
@@ -503,6 +648,9 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
     today,
     byDay,
     byHour,
+    byDowHour,
+    weekdayOccurrences,
+    unattributed,
     funnel,
     recoveryFunnel,
     agents,

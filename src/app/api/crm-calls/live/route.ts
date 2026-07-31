@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { latestCtSeq, recentCtSince } from '@/lib/ct/bus';
+import { isStickyAgentOn, isVipRoutingOn } from '@/lib/ct/routing';
 
 /**
  * GET /api/crm-calls/live?after=<seq> — polling fallback for the screen-pop.
@@ -55,5 +56,11 @@ export async function GET(req: Request) {
     seq: latestCtSeq(),
     events: recentCtSince(after),
     ringing,
+    // ADDITIVE: are the Live-board call hints switched on? Two ct_settings
+    // reads piggy-backed on a request the board already makes, so a board
+    // running with the (default) flags off issues NO extra HTTP call and
+    // touches no guest/call/order data. Only when a flag is true does the
+    // client go on to ask /api/crm-calls/live/routing for the hints.
+    routing: { sticky_agent: isStickyAgentOn(db), vip_routing: isVipRoutingOn(db) },
   });
 }

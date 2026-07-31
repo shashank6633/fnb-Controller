@@ -28,7 +28,16 @@ export const revalidate = 0;
 // 'auto_analyze' is not part of CT_SETTING_DEFAULTS (that lib is shared/owned
 // elsewhere) — it is an AI-call-scoring toggle ('0'|'1', default '0') surfaced
 // only here.
-const ALLOWED_KEYS: readonly string[] = [...Object.keys(CT_SETTING_DEFAULTS), 'telecmi_base_url', 'auto_analyze', 'analysis_retention'];
+// Likewise the four call-hint keys: they are seeded by the db.ts migration
+// (all conservative/off) rather than by CT_SETTING_DEFAULTS, so they are
+// allow-listed explicitly here. See src/lib/ct/routing.ts.
+const ROUTING_HINT_KEYS: readonly string[] = ['sticky_agent', 'vip_routing', 'vip_min_visits', 'vip_min_spend'];
+
+// Missed-call WhatsApp acknowledgement — also db.ts-seeded and off by default.
+// See src/lib/ct/missed-ack.ts.
+const MISSED_ACK_KEYS: readonly string[] = ['missed_call_whatsapp', 'missed_call_wa_text'];
+
+const ALLOWED_KEYS: readonly string[] = [...Object.keys(CT_SETTING_DEFAULTS), 'telecmi_base_url', 'auto_analyze', 'analysis_retention', ...ROUTING_HINT_KEYS, ...MISSED_ACK_KEYS];
 
 /** Keys that must never transit this route in either direction. */
 const SECRET_KEYS: readonly string[] = [
@@ -47,6 +56,21 @@ function publicSettings(db: Database.Database): Record<string, string> {
   // analysis_retention: default 'permanent' (keep scorecards) unless explicitly
   // set to 'ephemeral' (view-on-click, nothing stored).
   s.analysis_retention = s.analysis_retention === 'ephemeral' ? 'ephemeral' : 'permanent';
+  // Call-hint flags/thresholds: normalize so the editor always gets a usable
+  // value even on a DB where the migration row is somehow absent. Both flags
+  // default OFF — only an explicit '1' turns a hint on.
+  s.sticky_agent = s.sticky_agent === '1' ? '1' : '0';
+  s.vip_routing = s.vip_routing === '1' ? '1' : '0';
+  const nonNeg = (v: unknown, dflt: number) => {
+    const n = Number(v);
+    return String(Number.isFinite(n) && n >= 0 ? Math.floor(n) : dflt);
+  };
+  s.vip_min_visits = nonNeg(s.vip_min_visits, 5);
+  s.vip_min_spend = nonNeg(s.vip_min_spend, 25000);
+  // Missed-call auto-acknowledgement: OFF unless the stored value is exactly
+  // '1', so a missing/garbled row can never read as "messaging is on".
+  s.missed_call_whatsapp = s.missed_call_whatsapp === '1' ? '1' : '0';
+  s.missed_call_wa_text = typeof s.missed_call_wa_text === 'string' ? s.missed_call_wa_text : '';
   return s;
 }
 
@@ -113,11 +137,45 @@ function validate(key: string, value: any): { ok: true; value: string } | { ok: 
       if (v === null) return { ok: false, error: "after_hours_whatsapp must be '0' or '1'" };
       return { ok: true, value: v };
     }
+    // Missed-call auto-acknowledgement (src/lib/ct/missed-ack.ts). Strictly
+    // '0'|'1' so no truthy junk can ever switch guest messaging on.
+    case 'missed_call_whatsapp': {
+      const v = value === true || value === 1 || value === '1' ? '1'
+        : value === false || value === 0 || value === '0' ? '0' : null;
+      if (v === null) return { ok: false, error: "missed_call_whatsapp must be '0' or '1'" };
+      return { ok: true, value: v };
+    }
+    case 'missed_call_wa_text': {
+      const v = String(value ?? '');
+      if (v.length > 1000) return { ok: false, error: 'missed_call_wa_text must be 1000 characters or fewer' };
+      return { ok: true, value: v };
+    }
     case 'auto_analyze': {
       const v = value === true || value === 1 || value === '1' ? '1'
         : value === false || value === 0 || value === '0' ? '0' : null;
       if (v === null) return { ok: false, error: "auto_analyze must be '0' or '1'" };
       return { ok: true, value: v };
+    }
+    case 'sticky_agent':
+    case 'vip_routing': {
+      const v = value === true || value === 1 || value === '1' ? '1'
+        : value === false || value === 0 || value === '0' ? '0' : null;
+      if (v === null) return { ok: false, error: `${key} must be '0' or '1'` };
+      return { ok: true, value: v };
+    }
+    case 'vip_min_visits': {
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 0 || n > 10000) {
+        return { ok: false, error: 'vip_min_visits must be a whole number between 0 and 10000 (0 = ignore visits)' };
+      }
+      return { ok: true, value: String(n) };
+    }
+    case 'vip_min_spend': {
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 0 || n > 100000000) {
+        return { ok: false, error: 'vip_min_spend must be a whole number of rupees between 0 and 10,00,00,000 (0 = ignore spend)' };
+      }
+      return { ok: true, value: String(n) };
     }
     case 'analysis_retention': {
       const v = String(value ?? '').trim();

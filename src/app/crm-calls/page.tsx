@@ -27,6 +27,7 @@ import {
   AlertTriangle,
   BarChart3,
   CalendarCheck,
+  CalendarClock,
   ChevronRight,
   Clock3,
   Phone,
@@ -49,6 +50,8 @@ interface TodayStats {
 }
 interface DayPoint { date: string; total: number; answered: number; missed: number }
 interface HourPoint { hour: number; total: number; missed: number }
+/** dow 0 = Sunday … 6 = Saturday (IST). */
+interface DowHourCell { dow: number; hour: number; total: number; missed: number }
 interface FunnelStats { calls: number; answered: number; booked: number; seated: number }
 interface RecoveryFunnelStats { missed: number; attempted: number; recovered: number; booked: number }
 interface AgentStat {
@@ -58,13 +61,34 @@ interface AgentStat {
   bookings: number;
   recoveries_handled: number;
   avg_callback_min: number;
+  // Scorecard fields — every rate arrives with the count behind it.
+  inbound_calls?: number;
+  inbound_answered?: number;
+  answer_rate?: number;   // 0–100
+  outbound_calls?: number;
+  outbound_answered?: number;
+  connect_rate?: number;  // 0–100
+  asa_sec?: number;
+  asa_sample?: number;
 }
 interface LapsedGuest { guest_id: string; name: string; phone_e164: string; last_visit_at: string | null }
+
+type AgentSortKey = 'handled' | 'bookings' | 'answer_rate' | 'asa' | 'connect_rate';
+const AGENT_SORTS: { key: AgentSortKey; label: string }[] = [
+  { key: 'handled', label: 'Handled' },
+  { key: 'bookings', label: 'Bookings' },
+  { key: 'answer_rate', label: 'Answer rate' },
+  { key: 'asa', label: 'Fastest answer' },
+  { key: 'connect_rate', label: 'Connect rate' },
+];
 
 interface DashboardStats {
   today: TodayStats;
   byDay: DayPoint[];
   byHour: HourPoint[];
+  byDowHour?: DowHourCell[];       // 7×24 dense grid (older API builds omit it)
+  weekdayOccurrences?: number[];   // index 0 = Sunday
+  unattributed?: { calls: number; missed: number };
   funnel: FunnelStats;
   recoveryFunnel: RecoveryFunnelStats;
   agents: AgentStat[];
@@ -75,6 +99,59 @@ interface DashboardStats {
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** Heatmap row order — Monday first reads as a working week; the API's dow
+ *  index is the SQLite/JS one (0 = Sunday), so map through this. */
+const DOW_ROWS = [1, 2, 3, 4, 5, 6, 0];
+const DOW_LABEL = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+/** Full names for prose/tooltips — "across 13 Sundays" reads; "13 Suns" doesn't. */
+const DOW_FULL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+/** Below this many calls a percentage is noise, not a measurement. */
+const LOW_SAMPLE = 10;
+
+/** Discrete colour bands for the heatmap: at most 4, never wider than needed.
+ *  With max = 4 you get one band per integer (1,2,3,4) instead of a smooth
+ *  ramp nobody can read back to a number. */
+function heatBands(max: number): { lo: number; hi: number }[] {
+  if (max <= 0) return [];
+  const size = Math.ceil(max / Math.min(4, max));
+  const out: { lo: number; hi: number }[] = [];
+  for (let lo = 1; lo <= max; lo = lo + size) out.push({ lo, hi: Math.min(max, lo + size - 1) });
+  return out;
+}
+
+const HEAT_COLORS = {
+  missed: ['#FEE2E2', '#FCA5A5', '#EF4444', '#B91C1C'],
+  total: ['#F7E7D8', '#E8C6A4', '#CE8A4E', '#af4408'],
+} as const;
+
+/** Band index → swatch index, so the TOP band always gets the darkest colour
+ *  even when fewer than 4 bands exist. */
+function swatch(mode: 'missed' | 'total', bandIdx: number, bandCount: number): string {
+  const palette = HEAT_COLORS[mode];
+  if (bandCount <= 1) return palette[3];
+  return palette[Math.round((bandIdx * 3) / (bandCount - 1))];
+}
+
+/** Dark swatches need light text. */
+function heatText(mode: 'missed' | 'total', bandIdx: number, bandCount: number): string {
+  const i = bandCount <= 1 ? 3 : Math.round((bandIdx * 3) / (bandCount - 1));
+  return i >= 2 ? '#FFFFFF' : '#6B5744';
+}
+
+function bandOf(value: number, bands: { lo: number; hi: number }[]): number {
+  for (let i = 0; i < bands.length; i++) if (value >= bands[i].lo && value <= bands[i].hi) return i;
+  return bands.length - 1;
+}
+
+const hh = (h: number) => `${String(h).padStart(2, '0')}:00`;
+
+/** "1 in 3" style rate label — the number AND what it was divided by. */
+function rateLabel(pctVal: number | undefined, numer: number, denom: number): string {
+  if (!denom) return '—';
+  return `${Number(pctVal ?? 0)}% (${numer}/${denom})`;
+}
 
 /** "2026-07-18…" → "18 Jul" (string math only — no timezone surprises). */
 function shortDate(dateStr: string | null | undefined): string {
@@ -96,6 +173,10 @@ export default function CrmDashboardPage() {
   const [days, setDays] = useState(30);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
+  // Heatmap shades missed calls by default: an understaffed shift shows up as
+  // calls we DROPPED, not as calls we took.
+  const [heatMode, setHeatMode] = useState<'missed' | 'total'>('missed');
+  const [agentSort, setAgentSort] = useState<AgentSortKey>('handled');
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -153,6 +234,75 @@ export default function CrmDashboardPage() {
     return best;
   }, [stats]);
 
+  // ── Weekday × hour heatmap ────────────────────────────────────────────────
+  const grid = useMemo(() => {
+    const cells = stats?.byDowHour || [];
+    const at = new Map<string, DowHourCell>();
+    for (const c of cells) at.set(`${c.dow}:${c.hour}`, c);
+    const get = (dow: number, hour: number): DowHourCell =>
+      at.get(`${dow}:${hour}`) ?? { dow, hour, total: 0, missed: 0 };
+
+    let maxTotal = 0, maxMissed = 0, sumTotal = 0, sumMissed = 0;
+    let busiest: DowHourCell | null = null;
+    let worst: DowHourCell | null = null;
+    for (const c of cells) {
+      maxTotal = Math.max(maxTotal, c.total);
+      maxMissed = Math.max(maxMissed, c.missed);
+      sumTotal += c.total;
+      sumMissed += c.missed;
+      // Ties break toward the cell that also drops more calls / has more volume.
+      if (c.total > 0 && (!busiest || c.total > busiest.total || (c.total === busiest.total && c.missed > busiest.missed))) busiest = c;
+      if (c.missed > 0 && (!worst || c.missed > worst.missed || (c.missed === worst.missed && c.total > worst.total))) worst = c;
+    }
+    const rowTotals = DOW_ROWS.map(d => {
+      let t = 0, m = 0;
+      for (let h = 0; h < 24; h++) { const c = get(d, h); t += c.total; m += c.missed; }
+      return { dow: d, total: t, missed: m };
+    });
+    return { has: cells.length > 0, get, maxTotal, maxMissed, sumTotal, sumMissed, busiest, worst, rowTotals };
+  }, [stats]);
+
+  const heatMax = heatMode === 'missed' ? grid.maxMissed : grid.maxTotal;
+  const bands = useMemo(() => heatBands(heatMax), [heatMax]);
+  /** How many of this weekday the window actually contains (heatmap denominator). */
+  const occurrencesOf = useCallback(
+    (dow: number) => stats?.weekdayOccurrences?.[dow] ?? 0,
+    [stats]
+  );
+
+  // ── Agent scorecards ──────────────────────────────────────────────────────
+  // Default rank is CALLS HANDLED, descending — the same order the API and the
+  // old leaderboard used, and the only column whose "denominator" is the
+  // agent's own workload. Rates are sortable but never the default: on a
+  // fortnight of restaurant traffic a GRE may only have a dozen calls, and
+  // ranking people by a percentage over n=2 is a performance-review hazard.
+  // Rate sorts tie-break on the denominator so 100% of 20 outranks 100% of 2.
+  const sortedAgents = useMemo(() => {
+    const rows = [...(stats?.agents || [])];
+    const byName = (a: AgentStat, b: AgentStat) => (a.agent_display || a.agent).localeCompare(b.agent_display || b.agent);
+    switch (agentSort) {
+      case 'bookings':
+        return rows.sort((a, b) => b.bookings - a.bookings || b.handled - a.handled || byName(a, b));
+      case 'answer_rate':
+        return rows.sort((a, b) =>
+          (b.answer_rate ?? 0) - (a.answer_rate ?? 0) ||
+          (b.inbound_calls ?? 0) - (a.inbound_calls ?? 0) || byName(a, b));
+      case 'asa':
+        // Fastest first; agents with no measurable answer sink to the bottom.
+        return rows.sort((a, b) => {
+          const an = a.asa_sample ?? 0, bn = b.asa_sample ?? 0;
+          if (an === 0 || bn === 0) return (bn === 0 ? 0 : 1) - (an === 0 ? 0 : 1) || byName(a, b);
+          return (a.asa_sec ?? 0) - (b.asa_sec ?? 0) || bn - an || byName(a, b);
+        });
+      case 'connect_rate':
+        return rows.sort((a, b) =>
+          (b.connect_rate ?? 0) - (a.connect_rate ?? 0) ||
+          (b.outbound_calls ?? 0) - (a.outbound_calls ?? 0) || byName(a, b));
+      default:
+        return rows.sort((a, b) => b.handled - a.handled || b.bookings - a.bookings || byName(a, b));
+    }
+  }, [stats, agentSort]);
+
   if (loading && !stats) {
     return (
       <div className="min-h-screen bg-[#FFF8F0] p-6 animate-pulse">
@@ -203,7 +353,9 @@ export default function CrmDashboardPage() {
           </div>
           <div className="flex items-center gap-2">
             <div className="flex rounded-xl border border-[#E0D0BE] bg-white overflow-hidden shadow-sm">
-              {[7, 30].map(d => (
+              {/* 90d added for the weekday heatmap: over 7 days each weekday
+                  occurs once, so a "Saturday" column would be a single night. */}
+              {[7, 30, 90].map(d => (
                 <button
                   key={d}
                   onClick={() => setDays(d)}
@@ -406,13 +558,200 @@ export default function CrmDashboardPage() {
           </div>
         </Card>
 
-        {/* Leaderboard + lapsed guests */}
-        <div className="grid lg:grid-cols-2 gap-4">
-          <Card icon={<Trophy className="w-4 h-4" />} title="GRE Leaderboard" subtitle={`Last ${days} days`}>
+        {/* Shift heatmap — weekday × hour */}
+        <Card
+          icon={<CalendarClock className="w-4 h-4" />}
+          title="Shift Heatmap"
+          subtitle={`Inbound by weekday × hour (IST) · last ${days} days`}
+        >
+          {!grid.has || grid.sumTotal === 0 ? (
+            <Empty text="No inbound calls in this window yet." />
+          ) : (
+            <>
+              <div className="flex flex-wrap items-center gap-2 mb-3">
+                <div className="flex rounded-lg border border-[#E0D0BE] bg-white overflow-hidden text-xs">
+                  {([
+                    { k: 'missed' as const, label: 'Missed calls' },
+                    { k: 'total' as const, label: 'All calls' },
+                  ]).map(o => (
+                    <button
+                      key={o.k}
+                      onClick={() => setHeatMode(o.k)}
+                      className={`px-3 py-1.5 font-medium transition-colors ${
+                        heatMode === o.k ? 'bg-[#af4408] text-white' : 'text-[#6B5744] hover:bg-[#FFF1E3]'
+                      }`}
+                    >
+                      {o.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-[#8B7355]">
+                  Shading = {heatMode === 'missed' ? 'missed' : 'total'} calls in that weekday-hour
+                </p>
+              </div>
+
+              {heatMode === 'missed' && grid.sumMissed === 0 ? (
+                <p className="mb-3 text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                  No missed inbound calls anywhere in this window — the grid below is empty by
+                  luck, not by bug. Switch to <span className="font-semibold">All calls</span> to see volume.
+                </p>
+              ) : null}
+
+              <div className="overflow-x-auto -mx-1 px-1 pb-1">
+                <div className="min-w-[680px]">
+                  {/* Hour ruler — same flex skeleton as a data row (label
+                      spacer + 24 cells + row-total spacer) so the labels line
+                      up with the columns exactly, gaps included. */}
+                  <div className="flex items-end gap-[2px] mb-1">
+                    <div className="w-[52px] shrink-0" />
+                    {Array.from({ length: 24 }, (_, h) => (
+                      <div key={h} className="flex-1 min-w-[20px] text-center text-[9px] text-[#8B7355] tabular-nums">
+                        {h % 3 === 0 ? String(h).padStart(2, '0') : ''}
+                      </div>
+                    ))}
+                    <div className="w-[62px] shrink-0" />
+                  </div>
+
+                  {DOW_ROWS.map(dow => {
+                    const occ = occurrencesOf(dow);
+                    const row = grid.rowTotals.find(r => r.dow === dow);
+                    return (
+                      <div key={dow} className="flex items-center gap-[2px] mb-[2px]">
+                        <div className="w-[52px] shrink-0 text-[11px] text-[#6B5744] font-medium leading-tight">
+                          {DOW_LABEL[dow]}
+                          <span className="block text-[9px] text-[#A89078]">×{occ}</span>
+                        </div>
+                        {Array.from({ length: 24 }, (_, h) => {
+                          const c = grid.get(dow, h);
+                          const v = heatMode === 'missed' ? c.missed : c.total;
+                          const idx = v > 0 ? bandOf(v, bands) : -1;
+                          const bg = v > 0 ? swatch(heatMode, idx, bands.length) : '#FAF3EA';
+                          const fg = v > 0 ? heatText(heatMode, idx, bands.length) : 'transparent';
+                          return (
+                            <div
+                              key={h}
+                              className="flex-1 min-w-[20px] h-6 sm:h-7 rounded-[3px] border border-[#F0E4D6] relative flex items-center justify-center"
+                              style={{ backgroundColor: bg }}
+                              title={
+                                `${DOW_FULL[dow]} ${hh(h)} — ${c.total} call${c.total === 1 ? '' : 's'}, ` +
+                                `${c.missed} missed, across ${occ} ${DOW_FULL[dow]}${occ === 1 ? '' : 's'} in this window`
+                              }
+                            >
+                              <span className="text-[9px] sm:text-[10px] font-semibold tabular-nums" style={{ color: fg }}>
+                                {v > 0 ? v : ''}
+                              </span>
+                              {/* Missed calls stay visible even in volume mode. */}
+                              {heatMode === 'total' && c.missed > 0 && (
+                                <span className="absolute top-[1px] right-[1px] w-1.5 h-1.5 rounded-full bg-red-500" aria-hidden />
+                              )}
+                            </div>
+                          );
+                        })}
+                        <div className="w-[62px] shrink-0 pl-1.5 text-[10px] text-[#8B7355] tabular-nums leading-tight">
+                          {row?.total ?? 0} calls
+                          <span className={`block ${(row?.missed ?? 0) > 0 ? 'text-red-500 font-semibold' : ''}`}>
+                            {row?.missed ?? 0} missed
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Legend */}
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 mt-3 text-[11px] text-[#8B7355]">
+                <span className="font-medium text-[#6B5744]">
+                  {heatMode === 'missed' ? 'Missed' : 'Calls'} per cell
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <span className="w-3.5 h-3.5 rounded-[3px] border border-[#F0E4D6]" style={{ backgroundColor: '#FAF3EA' }} />0
+                </span>
+                {bands.map((b, i) => (
+                  <span key={`${b.lo}-${b.hi}`} className="inline-flex items-center gap-1">
+                    <span
+                      className="w-3.5 h-3.5 rounded-[3px] border border-[#F0E4D6]"
+                      style={{ backgroundColor: swatch(heatMode, i, bands.length) }}
+                    />
+                    {b.lo === b.hi ? b.lo : `${b.lo}–${b.hi}`}
+                  </span>
+                ))}
+                {heatMode === 'total' && (
+                  <span className="inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-red-500" /> cell contains missed calls
+                  </span>
+                )}
+                <span className="text-[#A89078]">·  ×N after a weekday = how many of that weekday the window holds</span>
+              </div>
+
+              {/* Honest peaks — with the denominator, not just the raw count */}
+              <div className="mt-3 pt-3 border-t border-[#F0E4D6] space-y-1 text-[11px] text-[#8B7355]">
+                {grid.busiest && (
+                  <p>
+                    Busiest shift:{' '}
+                    <span className="font-semibold text-[#6B5744]">
+                      {DOW_LABEL[grid.busiest.dow]} {hh(grid.busiest.hour)}
+                    </span>{' '}
+                    — {fmtNum(grid.busiest.total)} {grid.busiest.total === 1 ? 'call' : 'calls'}
+                    {grid.busiest.missed > 0 && (
+                      <span className="text-red-600 font-medium"> ({fmtNum(grid.busiest.missed)} missed)</span>
+                    )}
+                    {occurrencesOf(grid.busiest.dow) > 0 && (
+                      <span className="text-[#A89078]">
+                        {' '}across {occurrencesOf(grid.busiest.dow)} {DOW_FULL[grid.busiest.dow]}
+                        {occurrencesOf(grid.busiest.dow) === 1 ? '' : 's'} in this window ={' '}
+                        {(grid.busiest.total / occurrencesOf(grid.busiest.dow)).toFixed(1)} per {DOW_FULL[grid.busiest.dow]}
+                      </span>
+                    )}
+                  </p>
+                )}
+                {grid.worst ? (
+                  <p>
+                    Worst-served shift:{' '}
+                    <span className="font-semibold text-red-600">
+                      {DOW_LABEL[grid.worst.dow]} {hh(grid.worst.hour)}
+                    </span>{' '}
+                    — {fmtNum(grid.worst.missed)} of {fmtNum(grid.worst.total)} calls missed
+                    {grid.worst.total > 0 && ` (${Math.round((grid.worst.missed / grid.worst.total) * 100)}%)`}
+                  </p>
+                ) : (
+                  <p>No missed inbound calls in any weekday-hour in this window.</p>
+                )}
+                <p className="text-[#A89078]">
+                  {fmtNum(grid.sumTotal)} inbound calls over {days} days, {fmtNum(grid.sumMissed)} missed.
+                  Cells are small by nature — read a single cell as a hint and a row or column as the signal.
+                </p>
+              </div>
+            </>
+          )}
+        </Card>
+
+        {/* Scorecards + lapsed guests */}
+        <div className="grid lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-2">
+          <Card icon={<Trophy className="w-4 h-4" />} title="GRE Leaderboard" subtitle={`Agent scorecards · last ${days} days`}>
             {stats.agents.length === 0 ? (
               <Empty text="No agent activity in this window." />
             ) : (
               <>
+                {/* Sort control — ranking is a choice, so make it a visible one. */}
+                <div className="flex flex-wrap items-center gap-2 mb-3">
+                  <span className="text-[11px] text-[#8B7355] uppercase tracking-wide font-semibold">Rank by</span>
+                  <div className="flex flex-wrap rounded-lg border border-[#E0D0BE] bg-white overflow-hidden text-xs">
+                    {AGENT_SORTS.map(s => (
+                      <button
+                        key={s.key}
+                        onClick={() => setAgentSort(s.key)}
+                        className={`px-2.5 py-1.5 font-medium transition-colors ${
+                          agentSort === s.key ? 'bg-[#af4408] text-white' : 'text-[#6B5744] hover:bg-[#FFF1E3]'
+                        }`}
+                      >
+                        {s.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 {/* Desktop table */}
                 <div className="hidden md:block overflow-x-auto">
                   <table className="w-full text-sm">
@@ -421,21 +760,44 @@ export default function CrmDashboardPage() {
                         <th className="py-2 pr-2 font-semibold">#</th>
                         <th className="py-2 pr-3 font-semibold">GRE</th>
                         <th className="py-2 pr-3 font-semibold text-right">Handled</th>
+                        <th className="py-2 pr-3 font-semibold text-right" title="Inbound calls this agent answered ÷ inbound calls tagged to them">
+                          Answer rate
+                        </th>
+                        <th className="py-2 pr-3 font-semibold text-right" title="Average speed of answer: answered_at − started_at on inbound answered calls">
+                          ASA
+                        </th>
+                        <th className="py-2 pr-3 font-semibold text-right" title="Outbound calls the guest picked up ÷ outbound calls placed">
+                          Connect
+                        </th>
                         <th className="py-2 pr-3 font-semibold text-right">Bookings</th>
                         <th className="py-2 pr-3 font-semibold text-right">Recoveries</th>
                         <th className="py-2 font-semibold text-right">Avg Callback</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#F7EEE3]">
-                      {stats.agents.map((a, i) => (
-                        <tr key={a.agent} className="hover:bg-[#FFF8F0]">
+                      {sortedAgents.map((a, i) => (
+                        <tr key={a.agent} className="hover:bg-[#FFF8F0] align-top">
                           <td className="py-2.5 pr-2"><RankBadge rank={i + 1} /></td>
                           <td className="py-2.5 pr-3 font-medium truncate max-w-[180px]">{a.agent_display || a.agent}</td>
                           <td className="py-2.5 pr-3 text-right font-semibold">{fmtNum(a.handled)}</td>
+                          <td className="py-2.5 pr-3 text-right">
+                            <RateCell pctVal={a.answer_rate} numer={a.inbound_answered ?? 0} denom={a.inbound_calls ?? 0} unit="inbound" />
+                          </td>
+                          <td className="py-2.5 pr-3 text-right">
+                            <AsaCell sec={a.asa_sec} sample={a.asa_sample ?? 0} />
+                          </td>
+                          <td className="py-2.5 pr-3 text-right">
+                            <RateCell pctVal={a.connect_rate} numer={a.outbound_answered ?? 0} denom={a.outbound_calls ?? 0} unit="outbound" />
+                          </td>
                           <td className="py-2.5 pr-3 text-right text-[#af4408] font-semibold">{fmtNum(a.bookings)}</td>
                           <td className="py-2.5 pr-3 text-right">{fmtNum(a.recoveries_handled)}</td>
                           <td className="py-2.5 text-right text-[#8B7355]">
-                            {a.recoveries_handled > 0 ? `${a.avg_callback_min} min` : '—'}
+                            {a.recoveries_handled > 0 ? (
+                              <>
+                                {a.avg_callback_min} min
+                                <span className="block text-[10px] text-[#A89078]">n={fmtNum(a.recoveries_handled)}</span>
+                              </>
+                            ) : '—'}
                           </td>
                         </tr>
                       ))}
@@ -444,22 +806,57 @@ export default function CrmDashboardPage() {
                 </div>
                 {/* Mobile cards */}
                 <div className="md:hidden space-y-2">
-                  {stats.agents.map((a, i) => (
-                    <div key={a.agent} className="flex items-center gap-3 p-3 rounded-lg border border-[#F0E4D6] bg-[#FFFDFA]">
+                  {sortedAgents.map((a, i) => (
+                    <div key={a.agent} className="flex items-start gap-3 p-3 rounded-lg border border-[#F0E4D6] bg-[#FFFDFA]">
                       <RankBadge rank={i + 1} />
                       <div className="min-w-0 flex-1">
                         <p className="font-medium truncate">{a.agent_display || a.agent}</p>
                         <p className="text-[11px] text-[#8B7355] mt-0.5">
                           {fmtNum(a.handled)} handled · {fmtNum(a.bookings)} bookings · {fmtNum(a.recoveries_handled)} recoveries
-                          {a.recoveries_handled > 0 ? ` · ${a.avg_callback_min} min avg CB` : ''}
+                          {a.recoveries_handled > 0 ? ` · ${a.avg_callback_min} min avg CB (n=${a.recoveries_handled})` : ''}
                         </p>
+                        <p className="text-[11px] text-[#8B7355] mt-0.5">
+                          Answer {rateLabel(a.answer_rate, a.inbound_answered ?? 0, a.inbound_calls ?? 0)}
+                          <span className="mx-1 text-[#E0D0BE]">·</span>
+                          ASA {(a.asa_sample ?? 0) > 0 ? `${a.asa_sec}s (n=${a.asa_sample})` : '—'}
+                          <span className="mx-1 text-[#E0D0BE]">·</span>
+                          Connect {rateLabel(a.connect_rate, a.outbound_answered ?? 0, a.outbound_calls ?? 0)}
+                        </p>
+                        {Math.max(a.inbound_calls ?? 0, a.outbound_calls ?? 0) < LOW_SAMPLE && (
+                          <p className="text-[10px] text-amber-700 mt-0.5">Small sample — read the counts, not the percentages.</p>
+                        )}
                       </div>
                     </div>
                   ))}
                 </div>
+
+                {/* What the numbers do and do not mean */}
+                <div className="mt-4 pt-3 border-t border-[#F0E4D6] space-y-1 text-[11px] text-[#8B7355]">
+                  {stats.unattributed && stats.unattributed.calls > 0 && (
+                    <p className="text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+                      <AlertTriangle className="w-3 h-3 inline-block mr-1 -mt-0.5 text-amber-500" />
+                      {fmtNum(stats.unattributed.calls)} inbound {stats.unattributed.calls === 1 ? 'call' : 'calls'} in this
+                      window ({fmtNum(stats.unattributed.missed)} of them missed) rang out with no agent on the CDR, so they
+                      are in <span className="font-semibold">nobody&apos;s</span> answer-rate denominator. Read answer rate as
+                      &ldquo;of the calls that reached this GRE&rdquo;, not &ldquo;of all calls&rdquo; — the missed-call story
+                      lives in the Recovery Funnel and the Shift Heatmap.
+                    </p>
+                  )}
+                  <p>
+                    Every rate above shows its denominator. <span className="font-medium text-[#6B5744]">ASA</span> = average
+                    speed of answer (answered_at − started_at) on inbound answered calls only — on an outbound call that gap is
+                    the guest picking up, not the GRE.
+                  </p>
+                  <p>
+                    Ranked by <span className="font-medium text-[#6B5744]">{AGENT_SORTS.find(s => s.key === agentSort)?.label}</span>.
+                    Default is calls handled: with this much traffic a percentage over a handful of calls swings wildly, so
+                    volume ranks and rates inform. Anything under n={LOW_SAMPLE} is flagged.
+                  </p>
+                </div>
               </>
             )}
           </Card>
+          </div>
 
           <Card icon={<UserX className="w-4 h-4" />} title="Lapsed Guests" subtitle="Converted, but no visit in 45+ days — win-back list">
             {stats.lapsed.length === 0 ? (
@@ -570,6 +967,45 @@ function FunnelChart({ stages, barClasses }: {
         );
       })}
     </div>
+  );
+}
+
+/**
+ * A percentage that refuses to be read alone: the numerator/denominator sit
+ * under it, and anything below LOW_SAMPLE calls is visibly flagged so
+ * "100% (2/2)" cannot pass for "100% (200/200)".
+ */
+function RateCell({ pctVal, numer, denom, unit }: {
+  pctVal: number | undefined;
+  numer: number;
+  denom: number;
+  unit: string;
+}) {
+  if (!denom) {
+    return <span className="text-[#C4B09A]" title={`No ${unit} calls in this window`}>—</span>;
+  }
+  const low = denom < LOW_SAMPLE;
+  return (
+    <span className="inline-block text-right" title={`${numer} of ${denom} ${unit} calls`}>
+      <span className={`font-semibold ${low ? 'text-[#8B7355]' : 'text-[#2D1B0E]'}`}>{Number(pctVal ?? 0)}%</span>
+      <span className="block text-[10px] text-[#A89078] tabular-nums">{fmtNum(numer)}/{fmtNum(denom)}</span>
+      {low && <span className="block text-[9px] font-medium text-amber-600">small n</span>}
+    </span>
+  );
+}
+
+/** Average speed of answer, with the number of calls it averaged over. */
+function AsaCell({ sec, sample }: { sec: number | undefined; sample: number }) {
+  if (!sample) {
+    return <span className="text-[#C4B09A]" title="No inbound answered calls with usable timestamps">—</span>;
+  }
+  const low = sample < LOW_SAMPLE;
+  return (
+    <span className="inline-block text-right" title={`Averaged over ${sample} inbound answered call${sample === 1 ? '' : 's'}`}>
+      <span className={`font-semibold ${low ? 'text-[#8B7355]' : 'text-[#2D1B0E]'}`}>{Number(sec ?? 0)}s</span>
+      <span className="block text-[10px] text-[#A89078] tabular-nums">n={fmtNum(sample)}</span>
+      {low && <span className="block text-[9px] font-medium text-amber-600">small n</span>}
+    </span>
   );
 }
 

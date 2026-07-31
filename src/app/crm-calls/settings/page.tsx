@@ -19,7 +19,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Settings as SettingsIcon, PlugZap, Webhook, Copy, Check, Clock, UserCheck,
   Loader2, AlertCircle, CheckCircle2, Save, Lock, Database, DownloadCloud,
-  MessageCircle, RefreshCw, Sparkles, Zap, Users, Plus, Trash2, MonitorPlay,
+  MessageCircle, RefreshCw, Sparkles, Zap, Users, Plus, Trash2, MonitorPlay, Crown,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
@@ -36,6 +36,9 @@ const DEFAULTS: Record<string, string> = {
   auto_assign: 'off',
   after_hours_whatsapp: '0',
   after_hours_template: 'Sorry we missed your call! We open at {open}. Book a table: {link}',
+  // Instant missed-call acknowledgement — OFF by default (src/lib/ct/missed-ack.ts).
+  missed_call_whatsapp: '0',
+  missed_call_wa_text: 'Sorry we missed your call. Reply here and we will help you book.',
   auto_analyze: '0',
   analysis_retention: 'permanent',
   quick_send_links: '[]',
@@ -44,6 +47,11 @@ const DEFAULTS: Record<string, string> = {
   whatson_specials: '',
   whatson_capacity: '0',
   whatson_entertainment_mode: 'dj_only',
+  // Live Calls "who should take this call" hints — both OFF by default.
+  sticky_agent: '0',
+  vip_routing: '0',
+  vip_min_visits: '5',
+  vip_min_spend: '25000',
 };
 
 const EDITABLE_KEYS = Object.keys(DEFAULTS);
@@ -203,8 +211,12 @@ export default function CtSettingsPage() {
         if (k === 'attribution_hours') v = String(Math.max(1, Math.round(Number(v) || 48)));
         if (k === 'auto_assign' && v !== 'round_robin') v = 'off';
         if (k === 'after_hours_whatsapp') v = v === '1' ? '1' : '0';
+        if (k === 'missed_call_whatsapp') v = v === '1' ? '1' : '0';
         if (k === 'auto_analyze') v = v === '1' ? '1' : '0';
         if (k === 'analysis_retention') v = v === 'ephemeral' ? 'ephemeral' : 'permanent';
+        if (k === 'sticky_agent' || k === 'vip_routing') v = v === '1' ? '1' : '0';
+        if (k === 'vip_min_visits') v = String(Math.max(0, Math.round(Number(v) || 0)));
+        if (k === 'vip_min_spend') v = String(Math.max(0, Math.round(Number(v) || 0)));
         body[k] = v;
       }
       const r = await api('/api/crm-calls/settings', { method: 'PUT', body });
@@ -459,6 +471,9 @@ export default function CtSettingsPage() {
   const inputCls = 'w-full mt-0.5 px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]';
   const labelCls = 'text-[10px] uppercase tracking-wide text-[#6B5744]';
   const whatsappOn = form.after_hours_whatsapp === '1';
+  const missedAckOn = form.missed_call_whatsapp === '1';
+  const stickyOn = form.sticky_agent === '1';
+  const vipOn = form.vip_routing === '1';
   const autoAnalyzeOn = form.auto_analyze === '1';
   const ephemeral = form.analysis_retention === 'ephemeral';
 
@@ -799,13 +814,45 @@ export default function CtSettingsPage() {
             </select>
           </div>
 
+          {/* Instant acknowledgement — every missed call, any time of day. */}
+          <div className="border-t border-[#E8D5C4]/60 pt-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <MessageCircle className="w-3.5 h-3.5 text-[#af4408]" />
+              <span className="text-xs font-semibold text-[#2D1B0E]">Instantly WhatsApp a missed caller</span>
+              <Toggle checked={missedAckOn}
+                      onChange={(v) => set('missed_call_whatsapp', v ? '1' : '0')}
+                      size="sm"
+                      label="Instantly WhatsApp a missed caller"
+                      className="ml-auto" />
+            </div>
+            <p className="text-[10px] text-[#6B5744] mt-1">
+              OFF by default. When ON, an <strong>inbound</strong> call we miss gets this message
+              the moment it is detected — once per missed call, ever. If the guest replies, their
+              reply opens WhatsApp&rsquo;s free 24-hour service window, so the GRE can then chat in
+              plain text at no per-message cost. Outbound calls are never messaged.
+            </p>
+            <textarea value={form.missed_call_wa_text ?? ''}
+                      onChange={e => set('missed_call_wa_text', e.target.value)}
+                      rows={2} disabled={!missedAckOn}
+                      placeholder="Sorry we missed your call. Reply here and we will help you book."
+                      className={`${inputCls} mt-2 resize-y ${missedAckOn ? '' : 'opacity-50'}`} />
+            {missedAckOn && (
+              <p className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1.5 mt-2">
+                <strong>Meta rule:</strong> a phone call does <em>not</em> open the 24-hour window —
+                only a WhatsApp message from the guest does. So the first message to a guest who has
+                never messaged us must be an <strong>approved template</strong>. Add one under
+                Settings → Integrations → WhatsApp → Templates, named exactly{' '}
+                <code className="bg-white border border-amber-200 rounded px-1">ct_missed_call_ack</code>,
+                with &ldquo;Send as approved template&rdquo; on. Without it this text is sent as
+                free-form, which only reaches guests already inside a live 24-hour window.
+              </p>
+            )}
+          </div>
+
           <div className="border-t border-[#E8D5C4]/60 pt-3">
             <div className="flex flex-wrap items-center gap-2">
               <MessageCircle className="w-3.5 h-3.5 text-[#af4408]" />
               <span className="text-xs font-semibold text-[#2D1B0E]">After-hours auto-WhatsApp to missed callers</span>
-              <span className="px-1.5 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[10px] font-medium">
-                stub — logged only, not sent in Phase 1
-              </span>
               <Toggle checked={whatsappOn}
                       onChange={(v) => set('after_hours_whatsapp', v ? '1' : '0')}
                       size="sm"
@@ -813,16 +860,94 @@ export default function CtSettingsPage() {
                       className="ml-auto" />
             </div>
             <p className="text-[10px] text-[#6B5744] mt-1">
-              When ON (and once WhatsApp sending is wired up in a later phase), callers missed
-              outside business hours get this message automatically. Placeholders:{' '}
+              When ON, callers missed <em>outside</em> business hours get this message instead of the
+              one above (it can tell them when we open). Placeholders:{' '}
               <code className="bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">{'{open}'}</code>{' '}
-              <code className="bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">{'{link}'}</code>
+              = opening time,{' '}
+              <code className="bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">{'{link}'}</code>{' '}
+              = the first link in Quick-send documents above (the sentence is dropped if none is set).
             </p>
             <textarea value={form.after_hours_template ?? ''}
                       onChange={e => set('after_hours_template', e.target.value)}
                       rows={3} disabled={!whatsappOn}
                       placeholder="Sorry we missed your call! We open at {open}. Book a table: {link}"
                       className={`${inputCls} mt-2 resize-y ${whatsappOn ? '' : 'opacity-50'}`} />
+          </div>
+        </div>
+      </section>
+
+      {/* ── 4b · Call hints: sticky agent + VIP (Live Calls board) ── */}
+      <section className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+        <div className="px-3 sm:px-4 py-2.5 bg-[#FFF1E3] border-b border-[#E8D5C4] flex items-center gap-2">
+          <Crown className="w-4 h-4 text-[#af4408]" />
+          <h2 className="text-sm font-semibold text-[#2D1B0E]">Call hints — sticky agent &amp; VIP</h2>
+        </div>
+        <div className="p-3 sm:p-4 space-y-4">
+          <p className="text-xs text-[#6B5744]">
+            Extra context on the <strong>Live Calls</strong> board
+            (<code className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">/crm-calls/live</code>)
+            for whoever is about to pick up. <strong>These are hints, not routing</strong> — this app does
+            not control the phone system, so it cannot ring a different extension or move a caller up the
+            queue. It can only make the right answer obvious to the human. Both are OFF until you turn
+            them on here; with both off the board looks exactly as it does today.
+          </p>
+
+          {/* Sticky agent */}
+          <div className="border-t border-[#E8D5C4]/60 pt-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <UserCheck className="w-3.5 h-3.5 text-[#af4408]" />
+              <span className="text-xs font-semibold text-[#2D1B0E]">Sticky agent — &ldquo;last handled by&hellip;&rdquo;</span>
+              <Toggle checked={stickyOn}
+                      onChange={(v) => set('sticky_agent', v ? '1' : '0')}
+                      size="sm"
+                      label="Show the GRE who last handled this caller"
+                      className="ml-auto" />
+            </div>
+            <p className="text-[10px] text-[#6B5744] mt-1">
+              When a guest who has called before rings again, the ringing card names the GRE who last
+              <strong> answered</strong> them, so a regular keeps talking to the person who knows them.
+              Only answered <em>incoming</em> calls count — a missed call is not a conversation, and our
+              own outbound callbacks are handed out by the round-robin, so they would just echo the
+              rotation back. The hint expires after <strong>180 days</strong> (three times the win-back
+              window), past which nobody remembers the call and the GRE may have left.
+            </p>
+          </div>
+
+          {/* VIP */}
+          <div className="border-t border-[#E8D5C4]/60 pt-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Crown className="w-3.5 h-3.5 text-[#af4408]" />
+              <span className="text-xs font-semibold text-[#2D1B0E]">VIP badge — answer these first</span>
+              <Toggle checked={vipOn}
+                      onChange={(v) => set('vip_routing', v ? '1' : '0')}
+                      size="sm"
+                      label="Show a VIP badge for high-value callers"
+                      className="ml-auto" />
+            </div>
+            <p className="text-[10px] text-[#6B5744] mt-1">
+              Flags high-value callers on the ringing card <strong>with the numbers behind it</strong>{' '}
+              (&ldquo;VIP · 12 visits · Rs 48,000 spend&rdquo;) so the badge is auditable, never a
+              mysterious star. Visits and spend come from the guest 360 — the loyalty desk and settled
+              dining bills, matched on the last 10 digits of the phone. A caller qualifies on{' '}
+              <strong>either</strong> threshold. Set a threshold to <strong>0</strong> to ignore that
+              criterion (0 for both = nobody is a VIP).
+            </p>
+            <div className="grid grid-cols-2 gap-3 mt-2 max-w-sm">
+              <div>
+                <label className={labelCls}>Min visits</label>
+                <input type="number" min={0} max={10000} value={form.vip_min_visits ?? ''}
+                       onChange={e => set('vip_min_visits', e.target.value)}
+                       disabled={!vipOn}
+                       className={`${inputCls} ${vipOn ? '' : 'opacity-50'}`} />
+              </div>
+              <div>
+                <label className={labelCls}>Min spend (Rs)</label>
+                <input type="number" min={0} max={100000000} value={form.vip_min_spend ?? ''}
+                       onChange={e => set('vip_min_spend', e.target.value)}
+                       disabled={!vipOn}
+                       className={`${inputCls} ${vipOn ? '' : 'opacity-50'}`} />
+              </div>
+            </div>
           </div>
         </div>
       </section>

@@ -197,7 +197,12 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/crm-calls/live',     label: 'Live Calls' },
       { path: '/crm-calls/recovery', label: 'Recovery Queue' },
       { path: '/crm-calls/guests',   label: 'Guests (unified 360)' },
+      // Win-back: lapsed-guest segment → WhatsApp campaign → attribution.
+      // mgmtOnly — it exposes per-guest spend and it is the door that sends
+      // marketing to guests. See src/lib/ct/winback.ts.
+      { path: '/crm-calls/win-back', label: 'Win-back Campaigns', mgmtOnly: true },
       { path: '/crm-calls/log',      label: 'Call Log' },
+      { path: '/crm-calls/topics',   label: 'Topic Alerts' },
       { path: '/crm-calls/bookings', label: 'CRM Bookings' },
       { path: '/crm-calls/settings', label: 'CRM Call Settings', mgmtOnly: true },
     ],

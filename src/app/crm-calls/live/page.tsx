@@ -14,11 +14,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   PhoneIncoming, PhoneMissed, PhoneCall, Radio, Users, CalendarCheck, ArrowDownLeft, ArrowUpRight,
-  MessageCircle, Send, X,
+  MessageCircle, Send, X, Crown, UserCheck,
 } from 'lucide-react';
 import { formatPhone } from '@/lib/ct/phone';
 
 interface QuickDoc { label: string; url: string; message?: string }
+
+/* ── "Who should take this call" hints (both OFF by default) ────────────────
+ * /api/crm-calls/live/routing returns a sticky-agent line and a VIP badge for
+ * the ringing numbers. NOT routing: this app does not control the PBX, so the
+ * hints only tell the human at the counter what they'd otherwise look up
+ * mid-ring. Whether they are on at all rides along on the /api/crm-calls/live
+ * poll the board already makes, so with ct_settings.sticky_agent and
+ * vip_routing both off (the default) this file issues NO extra request and
+ * renders nothing extra — the board is byte-for-byte what it is today. */
+interface RoutingHint {
+  sticky: {
+    agent_user: string;
+    agent_label: string;
+    last_answered_at: string;
+    answered_calls: number;
+    total_answered_calls: number;
+    window_days: number;
+  } | null;
+  vip: { isVip: boolean; visits: number; spend: number; reasons: string[] };
+}
 
 // Build a wa.me deep link to a number with pre-filled text — opens the GRE's
 // WhatsApp to that caller so a menu / band list / corporate menu goes out in
@@ -99,6 +119,14 @@ interface RingingCall {
   queue?: string;
 }
 
+/** "11 Jul" — the day an answered call happened, for the sticky-agent line. */
+const istDay = (iso?: string) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short' });
+};
+
 const istTime = (iso?: string) => {
   if (!iso) return '';
   const d = new Date(iso);
@@ -116,6 +144,12 @@ export default function LiveCallsPage() {
   const [statsError, setStatsError] = useState(false);
   const [nowTick, setNowTick] = useState(Date.now());
   const [docs, setDocs] = useState<QuickDoc[]>([]);   // quick-send documents (menu, band list…)
+  // Routing hints — null until the first /api/crm-calls/live poll reports the
+  // flags; {sticky:false,vip:false} (the default) means the page never fetches
+  // hints and renders nothing extra.
+  const [hintFlags, setHintFlags] = useState<{ sticky: boolean; vip: boolean } | null>(null);
+  const [hints, setHints] = useState<Record<string, RoutingHint>>({});
+  const hintReqRef = useRef<Set<string>>(new Set());  // phones already requested (in-flight or done)
   const seqRef = useRef(0);
   const esRef = useRef<EventSource | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -133,6 +167,34 @@ export default function LiveCallsPage() {
       .then(j => { try { const a = JSON.parse(j?.settings?.quick_send_links || '[]'); if (Array.isArray(a)) setDocs(a.map((x: QuickDoc) => ({ label: String(x?.label || ''), url: String(x?.url || ''), message: String(x?.message || '') }))); } catch { /* ignore */ } })
       .catch(() => {});
   }, []);
+
+  // Fetch hints for any ringing number we haven't asked about yet. Skipped
+  // entirely while both flags are off.
+  useEffect(() => {
+    if (!hintFlags || (!hintFlags.sticky && !hintFlags.vip)) return;
+    const want = ringing
+      .map(r => r.phone_e164 || r.phone || '')
+      .filter(p => p && !hintReqRef.current.has(p));
+    if (want.length === 0) return;
+    const batch = Array.from(new Set(want)).slice(0, 20);
+    for (const p of batch) hintReqRef.current.add(p);
+    fetch(`/api/crm-calls/live/routing?phones=${encodeURIComponent(batch.join(','))}`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(j => {
+        const got = j?.hints;
+        if (!got || typeof got !== 'object') return;
+        setHints(prev => {
+          const next = { ...prev, ...got };
+          // Bound the cache on a wallboard that runs for days.
+          const keys = Object.keys(next);
+          if (keys.length > 60) {
+            for (const k of keys.slice(0, keys.length - 60)) { delete next[k]; hintReqRef.current.delete(k); }
+          }
+          return next;
+        });
+      })
+      .catch(() => { for (const p of batch) hintReqRef.current.delete(p); });   // allow a retry
+  }, [ringing, hintFlags]);
 
   const pushFeed = useCallback((item: FeedItem) => {
     setFeed(prev => {
@@ -153,11 +215,22 @@ export default function LiveCallsPage() {
     } catch { setStatsError(true); }
   }, []);
 
+  // The Live poll already tells us whether the call hints are switched on
+  // (two ct_settings reads on a request the board makes anyway), so a board
+  // with both flags off — the default — issues no extra request at all.
+  // Identity-stable when nothing changed, so it can't cause re-render churn.
+  const applyRoutingFlags = useCallback((routing: { sticky_agent?: boolean; vip_routing?: boolean } | null | undefined) => {
+    if (!routing) return;
+    const next = { sticky: routing.sticky_agent === true, vip: routing.vip_routing === true };
+    setHintFlags(prev => (prev && prev.sticky === next.sticky && prev.vip === next.vip ? prev : next));
+  }, []);
+
   const pollLive = useCallback(async () => {
     try {
       const r = await fetch(`/api/crm-calls/live?after=${seqRef.current}`);
       if (!r.ok) return;
       const j = await r.json();
+      applyRoutingFlags(j?.routing);
       if (typeof j?.seq === 'number') seqRef.current = Math.max(seqRef.current, j.seq);
       const ring: RingingCall[] = Array.isArray(j?.ringing) ? j.ringing : [];
       setRinging(ring);
@@ -178,9 +251,10 @@ export default function LiveCallsPage() {
       const r = await fetch(`/api/crm-calls/live?after=${seqRef.current}`);
       if (!r.ok) return;
       const j = await r.json();
+      applyRoutingFlags(j?.routing);   // also self-heals if an admin flips a flag
       if (Array.isArray(j?.ringing)) setRinging(j.ringing);
     } catch { /* transient */ }
-  }, []);
+  }, [applyRoutingFlags]);
 
   const handleEvent = useCallback((e: any) => {
     if (!e || !e.type) return;
@@ -329,6 +403,8 @@ export default function LiveCallsPage() {
             {ringing.map((r, i) => {
               const phone = r.phone_e164 || r.phone || '';
               const secs = ringSeconds(r);
+              // Undefined unless the feature is on AND the hint has arrived.
+              const hint = hints[phone];
               return (
                 <div key={r.telecmi_call_id || r.id || `${phone}-${i}`}
                      className="relative rounded-xl border-2 border-red-300 bg-red-50/60 p-4">
@@ -338,6 +414,31 @@ export default function LiveCallsPage() {
                       <p className="text-sm text-[#6B5744] font-mono truncate">{formatPhone(phone) || phone || '—'}</p>
                       {(r.queue || r.agent_user) && (
                         <p className="text-[11px] text-[#8B7355] mt-0.5 truncate">{[r.queue, r.agent_user].filter(Boolean).join(' · ')}</p>
+                      )}
+                      {/* VIP badge — always carries its own evidence, so it is
+                          auditable rather than a mysterious star. */}
+                      {hint?.vip?.isVip && (
+                        <p className="mt-1.5">
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300 align-middle">
+                            <Crown className="w-3 h-3" /> VIP
+                          </span>
+                          <span className="ml-1.5 text-[11px] text-amber-800 align-middle">
+                            {hint.vip.reasons.join(' · ')}
+                          </span>
+                        </p>
+                      )}
+                      {/* Sticky agent — continuity hint, NOT a re-route. */}
+                      {hint?.sticky && (
+                        <p className="mt-1 text-[11px] text-[#6B5744] flex items-start gap-1"
+                           title={`${hint.sticky.answered_calls} of this guest's ${hint.sticky.total_answered_calls} answered calls in the last ${hint.sticky.window_days} days were handled by ${hint.sticky.agent_label}. Hint only — the call is not re-routed.`}>
+                          <UserCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-px" />
+                          <span className="min-w-0">
+                            {hint.sticky.total_answered_calls > 1 ? 'Regular' : 'Called before'} — last handled by{' '}
+                            <b className="text-[#2D1B0E]">{hint.sticky.agent_label}</b>
+                            {hint.sticky.last_answered_at && <> · {istDay(hint.sticky.last_answered_at)}</>}
+                            {hint.sticky.answered_calls > 1 && <> · {hint.sticky.answered_calls} of {hint.sticky.total_answered_calls} calls</>}
+                          </span>
+                        </p>
                       )}
                     </div>
                     <div className="text-right shrink-0 ml-3 flex flex-col items-end gap-1.5">
