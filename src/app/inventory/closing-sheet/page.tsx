@@ -35,6 +35,24 @@
  * non-admin those keys never arrive, so the columns are not rendered at all.
  * `data.is_admin` (server-decided) is the only switch; there is no client-side
  * role guess anywhere on this page.
+ *
+ * ── BULK FILE ROUND-TRIP (blank template → upload → history) ───────────────
+ * Three additive controls sit in their own strip, deliberately NOT beside the
+ * header's "Export CSV": that button hands back what has already been COUNTED,
+ * while these hand out a BLANK sheet and take it back filled. A store manager
+ * who confuses the two loses an afternoon, so they never share a row.
+ *   • Download blank template  GET  …/dept-sheet/import?date=&template=1
+ *   • Upload counts            POST …/dept-sheet/import  {date, csv, mode}
+ *   • Download history         GET  /api/closing-stock/history?…&format=csv
+ * The upload is ALWAYS preview-then-apply. A 1,025-row file that silently
+ * writes into the wrong department is a day of recounting, so Apply is dead
+ * until a preview for THIS exact file has come back, and picking a new file
+ * throws the previous preview away.
+ *
+ * Units are the server's problem here on purpose: the CSV declares purchase
+ * units, the import route converts through packFactor, and this page only
+ * DISPLAYS the entered → stored sample the route returns. No conversion is
+ * duplicated client-side, so the two can never drift apart.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -43,7 +61,7 @@ import Papa from 'papaparse';
 import {
   ClipboardCheck, Loader2, AlertCircle, Download, Save, Search, X,
   CalendarDays, IndianRupee, Layers, Building2, ChevronDown, ChevronRight,
-  PackageX, ArrowUpRight, CheckCircle2,
+  PackageX, ArrowUpRight, CheckCircle2, FileDown, Upload, History,
 } from 'lucide-react';
 import Toggle from '@/components/Toggle';
 import Qty from '@/components/Qty';
@@ -111,6 +129,22 @@ interface Sheet {
   generated_at?: string;
 }
 
+/* ── Wire types (the …/dept-sheet/import contract) ───────────────────────── */
+
+interface ImportIssue { line: number; label: string; reason: string }
+
+interface ImportPreview {
+  date: string;
+  /** One entry per "<DEPT> Physical count" column found in the file. */
+  departments: { id: string; name: string; matched: boolean }[];
+  total_rows: number;
+  will_write: number;
+  skipped: number;
+  errors: ImportIssue[];
+  /** What the counter typed vs what will actually be stored, per the route. */
+  sample: { label: string; department: string; entered: string; unit: string; stored_purchase_qty: number; stored_unit: string }[];
+}
+
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
 const inr = (v: number, dp = 0) =>
@@ -141,6 +175,74 @@ const RATE_LABEL: Record<string, string> = {
 
 const BLIND_NOTE = 'System stock and variance are admin-only (blind count).';
 
+/**
+ * Calendar arithmetic on an IST date-only string ("YYYY-MM-DD"). Built from
+ * UTC parts on purpose: `new Date('2026-08-01')` + local-time getters lands on
+ * 31 Jul for anyone west of Greenwich, which would quietly shift the history
+ * window by a day. Falls back to the input when it is not a plain date.
+ */
+const shiftDays = (isoDate: string, days: number): string => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(isoDate || ''));
+  if (!m) return isoDate;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]) + days * 86400000);
+  if (isNaN(d.getTime())) return isoDate;
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+};
+
+/** Content-Disposition → filename, so the saved file keeps the server's name. */
+const filenameFrom = (cd: string | null, fallback: string): string => {
+  if (!cd) return fallback;
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+  if (star) { try { return decodeURIComponent(star[1]); } catch { /* fall through */ } }
+  const plain = /filename="?([^";]+)"?/i.exec(cd);
+  return plain ? plain[1].trim() : fallback;
+};
+
+/** Errors may arrive as objects or bare strings — render both, drop neither. */
+const asIssues = (v: unknown): ImportIssue[] => {
+  if (!Array.isArray(v)) return [];
+  return v.map((e): ImportIssue => (typeof e === 'string'
+    ? { line: 0, label: '', reason: e }
+    : {
+        line: Number((e as ImportIssue)?.line) || 0,
+        label: String((e as ImportIssue)?.label ?? ''),
+        reason: String((e as ImportIssue)?.reason ?? ''),
+      }));
+};
+
+/** Narrowing accessors — the preview payload is shaped by another route and is
+ *  read defensively, never trusted into the render as-is. */
+const rec = (v: unknown): Record<string, unknown> =>
+  (v && typeof v === 'object') ? v as Record<string, unknown> : {};
+const str = (v: unknown): string => (v == null ? '' : String(v));
+const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+
+const normalisePreview = (payload: unknown, fallbackDate: string): ImportPreview => {
+  const j = rec(payload);
+  return {
+    date: str(j.date) || fallbackDate,
+    departments: arr(j.departments).map(d => {
+      const o = rec(d);
+      return { id: str(o.id), name: str(o.name), matched: !!o.matched };
+    }),
+    total_rows: Number(j.total_rows) || 0,
+    will_write: Number(j.will_write) || 0,
+    skipped: Number(j.skipped) || 0,
+    errors: asIssues(j.errors),
+    sample: arr(j.sample).map(s => {
+      const o = rec(s);
+      return {
+        label: str(o.label),
+        department: str(o.department),
+        entered: str(o.entered),
+        unit: str(o.unit),
+        stored_purchase_qty: Number(o.stored_purchase_qty) || 0,
+        stored_unit: str(o.stored_unit),
+      };
+    }),
+  };
+};
+
 /* ── Page ────────────────────────────────────────────────────────────────── */
 
 export default function ClosingSheetPage() {
@@ -158,6 +260,22 @@ export default function ClosingSheetPage() {
   const [saving, setSaving] = useState(false);
   const [flash, setFlash] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null);
   const sectionRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+  /* Bulk file round-trip. `preview` is the gate on Apply — see the header. */
+  const [tplBusy, setTplBusy] = useState(false);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [file, setFile] = useState<File | null>(null);
+  const [csvText, setCsvText] = useState('');
+  const [preview, setPreview] = useState<ImportPreview | null>(null);
+  const [importBusy, setImportBusy] = useState<'' | 'preview' | 'apply'>('');
+  const [importErr, setImportErr] = useState('');
+
+  /* History window — last 30 days inclusive, in IST. */
+  const [histFrom, setHistFrom] = useState(() => shiftDays(todayIST(), -29));
+  const [histTo, setHistTo] = useState(todayIST);
+  const [histDept, setHistDept] = useState('');
+  const [histBusy, setHistBusy] = useState(false);
+  const [histErr, setHistErr] = useState('');
 
   /* Load. Seeds the entry boxes from whatever is already recorded for the date,
    * converted to purchase units so the box reads in the same basis it posts. */
@@ -199,6 +317,17 @@ export default function ClosingSheetPage() {
 
   const isAdmin = !!data?.is_admin;
   const departments = useMemo(() => data?.departments ?? [], [data]);
+
+  /**
+   * Who may pull closing-stock HISTORY. NOT a new permission concept: the API
+   * already answers this question with `scope`. It is 'all' exactly when
+   * canSeeAllDeptStock() passed server-side — admin, manager, HOD (head chef)
+   * or store manager — and 'limited' for a counter scoped to their own
+   * department. That is precisely "store manager / HOD / admin", so the page
+   * reuses the server's verdict instead of guessing a role client-side. The
+   * history route enforces the same thing again; this only hides the control.
+   */
+  const canSeeHistory = isAdmin || data?.scope === 'all';
 
   /* Filtered view — what the user is actually looking at. */
   const view = useMemo(() => {
@@ -349,6 +478,140 @@ export default function ClosingSheetPage() {
     URL.revokeObjectURL(url);
   };
 
+  /* ── Bulk file round-trip ──────────────────────────────────────────────── */
+
+  /**
+   * Save a server-generated CSV. Every failure path throws so the caller can
+   * SAY so: a 403 rendered as a downloaded file called "history.csv" that
+   * actually contains {"error":…} is worse than no download at all — the user
+   * only finds out when they open it. A JSON body counts as a failure even on
+   * a 200, because these endpoints only ever answer JSON to complain.
+   */
+  const downloadCsv = async (url: string, fallbackName: string) => {
+    const res = await fetch(url, { credentials: 'same-origin' });
+    const ct = res.headers.get('content-type') || '';
+    if (!res.ok || ct.includes('application/json')) {
+      let msg = res.ok ? 'The server did not return a CSV.' : `HTTP ${res.status}`;
+      try {
+        const j = await res.json();
+        if (j?.error) msg = String(j.error);
+      } catch {
+        // A Next error page answers in HTML — pasting that into the banner
+        // tells the user nothing, so keep the status line instead.
+        const t = (await res.text().catch(() => '')).trim();
+        if (t && !t.startsWith('<') && t.length <= 300) msg = t;
+      }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    if (blob.size === 0) throw new Error('The server returned an empty file.');
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = filenameFrom(res.headers.get('content-disposition'), fallbackName);
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(href);
+  };
+
+  const downloadBlankTemplate = async () => {
+    setTplBusy(true); setFlash(null);
+    try {
+      await downloadCsv(
+        `/api/closing-stock/dept-sheet/import?date=${encodeURIComponent(date)}&template=1`,
+        `closing-stock-all-departments-${date}.csv`,
+      );
+      setFlash({
+        tone: 'ok',
+        text: `Blank template for ${date} downloaded — one row per item, one column per department. Fill in the counts and upload the same file back.`,
+      });
+    } catch (e: unknown) {
+      setFlash({ tone: 'warn', text: `Template download failed — ${(e as Error)?.message || 'unknown error'}` });
+    } finally {
+      setTplBusy(false);
+    }
+  };
+
+  /** A new file invalidates any preview on screen — Apply must never be able
+   *  to fire the previous file's verdict at this file's contents. */
+  const pickFile = async (f: File | null) => {
+    setFile(f); setPreview(null); setCsvText(''); setImportErr('');
+    if (!f) return;
+    try {
+      setCsvText(await f.text());
+    } catch (e: unknown) {
+      setImportErr(`Could not read ${f.name} — ${(e as Error)?.message || 'unreadable file'}`);
+    }
+  };
+
+  const closeUpload = () => {
+    if (importBusy) return;                       // never abandon an in-flight apply
+    setUploadOpen(false); setFile(null); setCsvText(''); setPreview(null); setImportErr('');
+  };
+
+  const runImport = async (mode: 'preview' | 'apply') => {
+    if (!csvText.trim()) { setImportErr('Choose a filled-in CSV file first.'); return; }
+    if (mode === 'apply' && !preview) { setImportErr('Check the file before applying.'); return; }
+    setImportBusy(mode); setImportErr('');
+    try {
+      const res = await api('/api/closing-stock/dept-sheet/import', {
+        method: 'POST',
+        body: { date, csv: csvText, mode },
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+      if (mode === 'preview') { setPreview(normalisePreview(json, date)); return; }
+
+      const errs = asIssues(json?.errors);
+      const saved = Number(json?.saved) || 0;
+      const pending = Number(json?.pending) || 0;
+
+      // APPLY IS ALL-OR-NOTHING. The route refuses the whole file if ANY row has
+      // an error and answers { refused:true, saved:0, errors }. Closing the modal
+      // and calling that "N rows skipped" was the worst possible reading: it
+      // implies the good rows landed when NOTHING was written, and it threw away
+      // the very list that says which cells to fix. Keep the modal open, keep the
+      // errors on screen, and say plainly that nothing was saved.
+      if (json?.refused || (saved === 0 && errs.length)) {
+        setPreview(prev => (prev ? { ...prev, errors: errs.length ? errs : prev.errors } : prev));
+        setImportErr(
+          `Nothing was saved. This file is applied all-or-nothing, and ${errs.length.toLocaleString('en-IN')} `
+          + `row${errs.length === 1 ? '' : 's'} could not be read. Fix ${errs.length === 1 ? 'it' : 'them'} `
+          + `in the sheet and upload again — the list below says which.`,
+        );
+        return;
+      }
+
+      setUploadOpen(false); setFile(null); setCsvText(''); setPreview(null);
+      setFlash({
+        tone: saved === 0 ? 'warn' : 'ok',
+        text: `Uploaded for ${date} — saved ${saved.toLocaleString('en-IN')} count${saved === 1 ? '' : 's'}`
+          + (pending ? ` · ${pending.toLocaleString('en-IN')} sent for variance approval` : ''),
+      });
+      await load(date);
+    } catch (e: unknown) {
+      setImportErr((e as Error)?.message
+        || (mode === 'preview' ? 'Could not check the file' : 'Upload failed — nothing was saved'));
+    } finally {
+      setImportBusy('');
+    }
+  };
+
+  const downloadHistory = async () => {
+    if (!histFrom || !histTo) { setHistErr('Pick both a From and a To date.'); return; }
+    if (histFrom > histTo) { setHistErr('“From” is after “To” — swap the dates.'); return; }
+    setHistBusy(true); setHistErr('');
+    try {
+      const qs = new URLSearchParams({ from: histFrom, to: histTo, format: 'csv' });
+      if (histDept) qs.set('department_id', histDept);
+      await downloadCsv(`/api/closing-stock/history?${qs.toString()}`,
+                        `closing-stock-history-${histFrom}_${histTo}.csv`);
+    } catch (e: unknown) {
+      setHistErr((e as Error)?.message || 'History download failed');
+    } finally {
+      setHistBusy(false);
+    }
+  };
+
   /* ── Render ────────────────────────────────────────────────────────────── */
 
   if (loading && !data) {
@@ -393,7 +656,10 @@ export default function ClosingSheetPage() {
           <input type="date" value={date} onChange={e => setDate(e.target.value || todayIST())}
                  className="px-2.5 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-white text-[#2D1B0E]" />
         </div>
+        {/* This exports what has been COUNTED. The blank sheet to fill in lives
+            in the bulk strip below — the title spells the difference out. */}
         <button onClick={exportCsv} disabled={sheetCalc.items === 0}
+                title="Export the sheet as it stands now, with the counts already recorded. For a BLANK sheet to fill in, use “Download blank template” below."
                 className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 disabled:opacity-40 rounded-lg text-sm font-medium flex items-center gap-1.5">
           <Download className="w-4 h-4" /> Export CSV
         </button>
@@ -423,6 +689,74 @@ export default function ClosingSheetPage() {
           Showing only the departments you are assigned to or have been granted.
         </div>
       )}
+
+      {/* ── Bulk strip: blank template → upload → history ──────────────────
+          Its own card, never beside "Export CSV" — see the file header. */}
+      <div className="bg-white border border-[#E8D5C4] rounded-lg p-3 space-y-2.5">
+        <div className="text-[11px] font-medium text-[#8B7355]">
+          Bulk closing stock — every kitchen department in ONE file
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button onClick={downloadBlankTemplate} disabled={tplBusy}
+                  title="A BLANK sheet: one row per item, one column per department. Fill in the counts and upload it back."
+                  className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 disabled:opacity-40 rounded-lg text-sm font-medium flex items-center gap-1.5">
+            {tplBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileDown className="w-4 h-4" />}
+            Download blank template
+          </button>
+          <button onClick={() => { setUploadOpen(true); setImportErr(''); }}
+                  title="Upload the filled-in template. You always see a preview before anything is written."
+                  className="px-3 py-2 bg-[#af4408] text-white hover:bg-[#903905] rounded-lg text-sm font-medium flex items-center gap-1.5">
+            <Upload className="w-4 h-4" /> Upload counts
+          </button>
+          <span className="text-[11px] text-[#8B7355] leading-tight max-w-[420px]">
+            Counts land on <span className="font-semibold text-[#2D1B0E]">{date}</span> — change the date above first if that is wrong.
+            The <span className="font-mono">TOTAL Physical count</span>{' '}
+            column is ignored; each department&apos;s own column is what gets written.
+          </span>
+        </div>
+
+        {canSeeHistory && (
+          <div className="pt-2.5 border-t border-[#F0E4D6] flex flex-wrap items-end gap-2">
+            <div className="flex items-center gap-1.5 text-[11px] font-medium text-[#8B7355] mr-1">
+              <History className="w-3.5 h-3.5" /> Closing stock history
+            </div>
+            <label className="text-[10px] text-[#8B7355]">
+              <div className="mb-0.5">From</div>
+              <input type="date" value={histFrom} max={histTo || undefined}
+                     onChange={e => { setHistFrom(e.target.value); setHistErr(''); }}
+                     className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg text-xs bg-white text-[#2D1B0E]" />
+            </label>
+            <label className="text-[10px] text-[#8B7355]">
+              <div className="mb-0.5">To</div>
+              <input type="date" value={histTo} min={histFrom || undefined}
+                     onChange={e => { setHistTo(e.target.value); setHistErr(''); }}
+                     className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg text-xs bg-white text-[#2D1B0E]" />
+            </label>
+            <label className="text-[10px] text-[#8B7355]">
+              <div className="mb-0.5">Department</div>
+              <select value={histDept} onChange={e => { setHistDept(e.target.value); setHistErr(''); }}
+                      className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg text-xs bg-white text-[#2D1B0E] max-w-[200px]">
+                <option value="">All departments</option>
+                {departments.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+              </select>
+            </label>
+            <button onClick={downloadHistory} disabled={histBusy}
+                    className="px-3 py-1.5 bg-white border border-[#8B7355] text-[#6B5744] hover:bg-[#FFF8F0] disabled:opacity-40 rounded-lg text-xs font-medium flex items-center gap-1.5">
+              {histBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+              Download history (CSV)
+            </button>
+            <button type="button"
+                    onClick={() => { setHistFrom(shiftDays(todayIST(), -29)); setHistTo(todayIST()); setHistDept(''); setHistErr(''); }}
+                    className="text-[11px] text-[#af4408] hover:underline">Last 30 days</button>
+            {histErr && (
+              <span className="w-full text-[11px] text-red-700 flex items-center gap-1.5">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" /> {histErr}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* Sheet summary */}
       <div className={`grid grid-cols-2 md:grid-cols-3 gap-2.5 ${isAdmin ? 'lg:grid-cols-5' : 'lg:grid-cols-4'}`}>
@@ -731,11 +1065,257 @@ export default function ClosingSheetPage() {
           </button>
         </div>
       )}
+
+      {/* ── Upload counts: preview, THEN apply ───────────────────────────── */}
+      {uploadOpen && (
+        <ModalShell
+          wide
+          title="Upload closing counts — all departments"
+          icon={<Upload className="w-4 h-4 text-[#af4408]" />}
+          onClose={closeUpload}
+          footer={
+            <>
+              <span className="mr-auto text-[10px] text-[#8B7355]">
+                Recording for <span className="font-semibold text-[#2D1B0E]">{date}</span>
+              </span>
+              <button onClick={closeUpload} disabled={!!importBusy}
+                      className="px-3 py-2 border border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF8F0] disabled:opacity-40 rounded-lg text-sm">
+                Cancel
+              </button>
+              <button onClick={() => runImport('preview')} disabled={!csvText || !!importBusy}
+                      className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 disabled:opacity-40 rounded-lg text-sm font-medium flex items-center gap-1.5">
+                {importBusy === 'preview' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                {preview ? 'Re-check file' : 'Check file'}
+              </button>
+              {/* Dead until a preview for THIS file exists — the whole point.
+                  ALSO dead while the preview reports ANY error: the route applies
+                  all-or-nothing, so offering Apply there is offering a button whose
+                  only possible outcome is a refusal. Better to say why up front than
+                  to let the manager click it and read a failure as a partial save. */}
+              <button onClick={() => runImport('apply')}
+                      disabled={!preview || preview.will_write === 0 || preview.date !== date
+                                || preview.errors.length > 0 || !!importBusy}
+                      title={!preview ? 'Check the file first'
+                        : preview.errors.length > 0
+                          ? `Fix the ${preview.errors.length} problem row${preview.errors.length === 1 ? '' : 's'} first — the file is applied all-or-nothing`
+                        : preview.will_write === 0 ? 'This file has no counts to write'
+                        : preview.date !== date ? `The preview was checked for ${preview.date}, not ${date}`
+                        : undefined}
+                      className="px-3 py-2 bg-[#af4408] text-white hover:bg-[#903905] disabled:opacity-40 rounded-lg text-sm font-medium flex items-center gap-1.5">
+                {importBusy === 'apply' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                Apply{preview && preview.will_write > 0 ? ` ${preview.will_write.toLocaleString('en-IN')} count${preview.will_write === 1 ? '' : 's'}` : ''}
+              </button>
+            </>
+          }
+        >
+          <div className="rounded-lg bg-[#FFF8F0] border border-[#E8D5C4] p-2.5 text-[11px] text-[#6B5744] leading-relaxed">
+            One row per item, one column per department — the same file the
+            <span className="font-medium text-[#2D1B0E]"> Download blank template </span>
+            button produces. Counts are read in the unit each row declares and converted
+            by the server before storing. The <span className="font-mono">TOTAL Physical count</span>
+            {' '}column is ignored. Nothing is written until you press <b>Apply</b>.
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-[#6B5744] mb-1">Filled-in CSV</label>
+            <input type="file" accept=".csv,text/csv" disabled={!!importBusy}
+                   onChange={e => pickFile(e.target.files?.[0] ?? null)}
+                   className="block w-full text-xs text-[#6B5744] file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border file:border-[#af4408] file:bg-white file:text-[#af4408] file:text-xs file:font-medium hover:file:bg-[#af4408]/10" />
+            {file && (
+              <div className="mt-1 text-[11px] text-[#8B7355]">
+                {file.name} · {(file.size / 1024).toFixed(0)} KB
+                {csvText ? '' : ' · reading…'}
+              </div>
+            )}
+          </div>
+
+          {importErr && (
+            <div className="rounded-lg p-2.5 text-xs flex items-start gap-2 bg-red-50 border border-red-200 text-red-700">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-px" /> <span>{importErr}</span>
+            </div>
+          )}
+
+          {!preview ? (
+            <div className="rounded-lg border border-dashed border-[#E8D5C4] p-4 text-center text-xs text-[#8B7355]">
+              Press <span className="font-medium text-[#2D1B0E]">Check file</span>{' '}
+              to see which department each column maps to and exactly what would be written.
+              <div className="text-[11px] text-[#B9A896] mt-1">Apply stays disabled until then.</div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {/* The server echoes the date it read the file for. If that is not
+                  the date on screen, the counts would land on the wrong day —
+                  say so rather than let the footer's promise stand. */}
+              {preview.date !== date && (
+                <div className="rounded-lg p-2.5 text-xs flex items-start gap-2 bg-red-50 border border-red-200 text-red-700">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-px" />
+                  This file was checked for <b>{preview.date}</b>, not <b>{date}</b>. Close this,
+                  set the date at the top of the page, and check the file again.
+                </div>
+              )}
+              <div className="grid grid-cols-3 gap-2">
+                <PreviewStat label="Rows in file" value={preview.total_rows} />
+                <PreviewStat label="Will be written" value={preview.will_write}
+                             tone={preview.will_write > 0 ? 'ok' : 'warn'} />
+                <PreviewStat label="Skipped" value={preview.skipped}
+                             tone={preview.skipped > 0 ? 'warn' : 'muted'} />
+              </div>
+
+              {/* Column → department mapping. An unmatched column is the exact
+                  failure that costs a recount, so it is called out in red. */}
+              <div>
+                <div className="text-[11px] font-medium text-[#8B7355] mb-1">
+                  Department columns found ({preview.departments.length})
+                </div>
+                {preview.departments.length === 0 ? (
+                  <div className="text-[11px] text-red-700 flex items-center gap-1.5">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    No “&lt;Department&gt; Physical count” column was found in this file.
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex flex-wrap gap-1.5">
+                      {preview.departments.map((d, i) => (
+                        <span key={`${d.id || d.name}-${i}`}
+                              className={`px-2 py-1 rounded-full text-[11px] border ${
+                                d.matched ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                                          : 'bg-red-50 border-red-200 text-red-700'}`}>
+                          {d.matched ? '✓' : '✕'} {d.name || '(unnamed column)'}
+                        </span>
+                      ))}
+                    </div>
+                    {preview.departments.some(d => !d.matched) && (
+                      <div className="mt-1.5 text-[11px] text-red-700 flex items-start gap-1.5">
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                        <span>
+                          {preview.departments.filter(d => !d.matched).length} column(s) do not match a department
+                          you can write to — those counts will NOT be saved. Fix the column heading to match the
+                          department name exactly, or download a fresh blank template.
+                        </span>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {/* Entered → stored. The one place a unit mistake shows up before
+                  it is a thousand rows of wrong stock. */}
+              {preview.sample.length > 0 && (
+                <div>
+                  <div className="text-[11px] font-medium text-[#8B7355] mb-1">
+                    Sample — what will be stored ({preview.sample.length} of {preview.will_write.toLocaleString('en-IN')})
+                  </div>
+                  <div className="border border-[#E8D5C4] rounded-lg overflow-x-auto">
+                    <table className="w-full text-[11px] border-collapse">
+                      <thead>
+                        <tr className="bg-[#FFF8F0] text-[#6B5744]">
+                          <th className="text-left font-semibold px-2 py-1.5">Item</th>
+                          <th className="text-left font-semibold px-2 py-1.5">Department</th>
+                          <th className="text-right font-semibold px-2 py-1.5">Entered</th>
+                          <th className="text-right font-semibold px-2 py-1.5">Stored (recipe units)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {preview.sample.map((s, i) => (
+                          <tr key={`${s.label}-${s.department}-${i}`} className="border-t border-[#F0E4D6]">
+                            <td className="px-2 py-1 text-[#2D1B0E]">{s.label || '·'}</td>
+                            <td className="px-2 py-1 text-[#6B5744]">{s.department || '·'}</td>
+                            <td className="px-2 py-1 text-right tabular-nums text-[#2D1B0E]">
+                              {s.entered || '·'} <span className="text-[#B9A896]">{s.unit}</span>
+                            </td>
+                            <td className="px-2 py-1 text-right tabular-nums text-[#af4408]">
+                              {/* unit-lock: already PURCHASE units — the route converts the
+                                  stored recipe figure back via toPurchaseQty before sending it,
+                                  and stored_unit is the material's purchase_unit. The checker
+                                  cannot see that through the API boundary. */}
+                              {fmtQtyNum(s.stored_purchase_qty)} <span className="text-[#B9A896]">{s.stored_unit}</span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* EVERY error, with its line number. Scroll — never truncate:
+                  a hidden bad row is a count nobody knows is missing. */}
+              {preview.errors.length > 0 && (
+                <div>
+                  <div className="text-[11px] font-medium text-amber-800 mb-1 flex items-center gap-1.5">
+                    <AlertCircle className="w-3.5 h-3.5" />
+                    {preview.errors.length.toLocaleString('en-IN')} row{preview.errors.length === 1 ? '' : 's'} block this upload — nothing is saved until {preview.errors.length === 1 ? 'it is' : 'they are'} fixed
+                  </div>
+                  <div className="border border-amber-200 rounded-lg bg-amber-50 max-h-64 overflow-y-auto divide-y divide-amber-100">
+                    {preview.errors.map((e, i) => (
+                      <div key={`${e.line}-${i}`} className="px-2.5 py-1.5 text-[11px] text-amber-900 flex gap-2">
+                        <span className="font-mono text-amber-700 shrink-0 w-16">
+                          {e.line > 0 ? `line ${e.line}` : '—'}
+                        </span>
+                        <span>
+                          {e.label && <span className="font-medium">{e.label}: </span>}
+                          {e.reason}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {preview.will_write === 0 && (
+                <div className="rounded-lg p-2.5 text-xs flex items-start gap-2 bg-amber-50 border border-amber-200 text-amber-900">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-px" />
+                  Nothing in this file would be written. Check the department column headings and that the
+                  counts are filled in — a blank cell means “not counted”, which is skipped on purpose.
+                </div>
+              )}
+            </div>
+          )}
+        </ModalShell>
+      )}
     </div>
   );
 }
 
 /* ── Pieces ──────────────────────────────────────────────────────────────── */
+
+function ModalShell({ title, icon, onClose, children, footer, wide }: {
+  title: string; icon: React.ReactNode; onClose: () => void;
+  children: React.ReactNode; footer?: React.ReactNode; wide?: boolean;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto"
+         onClick={onClose}>
+      <div className={`bg-white rounded-xl border border-[#E8D5C4] w-full ${wide ? 'max-w-3xl' : 'max-w-lg'} shadow-xl flex flex-col overflow-hidden`}
+           style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
+        <div className="px-4 sm:px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2 text-sm">{icon} {title}</div>
+          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]" aria-label="Close">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-5 space-y-3">{children}</div>
+        {footer && (
+          <div className="px-4 sm:px-5 py-3 border-t border-[#E8D5C4] flex flex-wrap items-center justify-end gap-2 shrink-0 bg-white">
+            {footer}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PreviewStat({ label, value, tone = 'muted' }: {
+  label: string; value: number; tone?: 'muted' | 'ok' | 'warn';
+}) {
+  const cls = tone === 'ok' ? 'text-emerald-700' : tone === 'warn' ? 'text-amber-700' : 'text-[#2D1B0E]';
+  return (
+    <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2">
+      <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">{label}</div>
+      <div className={`text-base font-bold tabular-nums ${cls}`}>{value.toLocaleString('en-IN')}</div>
+    </div>
+  );
+}
 
 function SummaryCard({ icon, label, value, tone = 'muted', note }: {
   icon: React.ReactNode; label: string; value: string; tone?: 'muted' | 'warn'; note?: string;
