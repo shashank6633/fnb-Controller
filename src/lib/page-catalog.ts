@@ -216,6 +216,12 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/crm-calls/topics',   label: 'Topic Alerts' },
       { path: '/crm-calls/bookings', label: 'CRM Bookings' },
       { path: '/crm-calls/settings', label: 'CRM Call Settings', mgmtOnly: true },
+      // Telephony Console — TeleCMI account balance, agent extensions/passwords
+      // and outbound caller-ID. adminOnly (NOT mgmtOnly): every control here
+      // spends real money or rewires who can answer the restaurant's phone, and
+      // the routes behind it require the app secret. A manager or HOD must not
+      // reach it even with an explicit page_access grant.
+      { path: '/crm-calls/telephony', label: 'Telephony Console (TeleCMI)', adminOnly: true },
     ],
   },
   {

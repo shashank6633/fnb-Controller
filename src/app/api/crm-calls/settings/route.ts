@@ -52,11 +52,34 @@ const CREDENTIAL_KEYS: readonly string[] = ['telecmi_appid', 'telecmi_secret'];
 
 const ALLOWED_KEYS: readonly string[] = [...Object.keys(CT_SETTING_DEFAULTS), 'telecmi_base_url', 'auto_analyze', 'analysis_retention', ...ROUTING_HINT_KEYS, ...MISSED_ACK_KEYS, ...CREDENTIAL_KEYS];
 
-/** Keys that must never be READ back through this route. Includes the two
- *  credentials — writable above, but never returned. */
+/**
+ * ⚠ RELEASE GATE — read this before adding ANY key to ct_settings.
+ *
+ * publicSettings() below is a DENYLIST: it hands the browser every ct_settings
+ * row and then deletes the ones named here. So a key that is not on this list
+ * is PUBLIC by default, whether or not this route knows it exists — it does not
+ * have to be in ALLOWED_KEYS, seeded by db.ts, or referenced anywhere in this
+ * file. Any code anywhere that calls setCtSetting() with a new key has, by that
+ * act alone, published it to every admin's browser through this GET (and
+ * through the PUT echo).
+ *
+ * That is exactly how `telecmi_user_tokens` leaked: the caller-ID route
+ * (src/app/api/telecmi/callerid/route.ts) stashes each agent's 30-day TeleCMI
+ * USER TOKEN there, and neither file was wrong on its own. A user token can
+ * place calls and re-point caller ID for that agent until it expires, so it is
+ * a live credential, not config.
+ *
+ * If you store a token, password, secret, signing key or session in
+ * ct_settings, add the key HERE in the same commit. If it holds nothing an
+ * admin's browser may not see, leave it off and say so in a comment where you
+ * write it.
+ */
 const SECRET_KEYS: readonly string[] = [
   ...CREDENTIAL_KEYS, 'appid', 'secret',
   'webhook_token', 'telecmi_webhook_secret',
+  // Per-agent TeleCMI user tokens ({ agentId: { token, expires_at } }), written
+  // ONLY by /api/telecmi/callerid. Never readable and never writable here.
+  'telecmi_user_tokens',
 ];
 
 /** Keys refused in BOTH directions (everything secret that isn't a credential

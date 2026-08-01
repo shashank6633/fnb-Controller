@@ -64,6 +64,7 @@ import {
   PhoneMissed,
   PhoneCall,
   PhoneIncoming,
+  Headphones,
   CalendarCheck,
   Radar,
   HeartHandshake,
@@ -246,6 +247,8 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Topic Alerts",    href: "/crm-calls/topics",   icon: Radar },
       { kind: "link", label: "Bookings",        href: "/crm-calls/bookings", icon: CalendarCheck },
       { kind: "link", label: "CRM Settings",    href: "/crm-calls/settings", icon: Settings2 },
+      // Admin-only (page-catalog adminOnly) — canAccessPage hides it for everyone else.
+      { kind: "link", label: "Telephony",       href: "/crm-calls/telephony", icon: Headphones },
     ],
   },
 

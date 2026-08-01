@@ -542,6 +542,49 @@ export function ingestLive(raw: any): void {
       const row = telecmiId
         ? db.prepare(`SELECT id FROM ct_calls WHERE telecmi_call_id = ?`).get(telecmiId) as { id: string } | undefined
         : undefined;
+
+      // LEAVE THE RINGING STATE. This branch used to ONLY emit to the wallboard
+      // and never touch ct_calls, so status stayed 'ringing' in the database
+      // after the caller had already hung up: the Live Calls board kept the card
+      // up with its timer climbing, the screen-pop never dismissed, and the feed
+      // said "Call ended" directly beside it. Two ghosts were enough to make the
+      // board look like it only ever handles two calls.
+      //
+      // 'ringing' -> 'missed': the caller hung up before anyone picked up, which
+      // is the definition of a missed call, and it is what puts the number into
+      // the recovery queue. An already-'answered' row only gets its ended_at —
+      // it was answered, and re-labelling it missed would be a lie that also
+      // corrupts the answer rate.
+      //
+      // The CDR that follows is still authoritative: it fills in duration,
+      // billed seconds and the recording, and can correct the status. This just
+      // stops the board lying for the minutes in between.
+      //
+      // Matched on telecmi_call_id, which is why cmiuid had to be added to the
+      // mapper first — without an id this UPDATE could never find its row.
+      if (telecmiId) {
+        db.prepare(`
+          UPDATE ct_calls
+             SET status   = CASE WHEN status = 'ringing' THEN 'missed' ELSE status END,
+                 ended_at = COALESCE(ended_at, ?)
+           WHERE telecmi_call_id = ?
+             AND status IN ('ringing', 'answered')
+        `).run(m.at || now, telecmiId);
+      } else if (phone) {
+        // No id (an older/thinner live payload): fall back to the most recent
+        // still-ringing row for that number. Bounded to ringing only, so it can
+        // never reach back and rewrite a completed call.
+        db.prepare(`
+          UPDATE ct_calls
+             SET status = 'missed', ended_at = COALESCE(ended_at, ?)
+           WHERE id = (
+             SELECT id FROM ct_calls
+              WHERE phone_e164 = ? AND status = 'ringing'
+              ORDER BY started_at DESC LIMIT 1
+           )
+        `).run(m.at || now, phone);
+      }
+
       emit({
         type: 'call_ended',
         callId: row?.id,
