@@ -140,7 +140,15 @@ function pickTime(m: Norm, keys: string[]): string | null {
 
 // ---- candidate key sets (normKey'd: lowercase, punctuation stripped) -------
 
+// 'cmiuid' FIRST — it is TeleCMI's actual unique call id and the only one a real
+// payload carries. Its absence from this list was the whole reason live/CDR
+// correlation did not work: pickStr() returned '', ct_calls.telecmi_call_id went
+// in NULL, and the CDR that arrives at hangup could never find the ringing row it
+// was meant to finalise. Screen-pop matched nothing for the same reason. Every
+// other key here is a defensive alias for mocks and other PBXs — keep them, but
+// cmiuid is the one that fires in production.
 const ID_KEYS = [
+  'cmiuid',
   'id', 'callid', 'calluuid', 'uuid', 'sid', 'callsid', 'uniqueid',
   'callrefid', 'refid', 'requestid', 'cdrid',
 ];
@@ -170,8 +178,13 @@ const END_KEYS = [
   'endtime', 'endedat', 'endstamp', 'endtimestamp', 'end', 'hanguptime',
   'hangupat', 'completedat', 'closedat', 'finishtime',
 ];
+// 'duration' (total seconds) is what TeleCMI sends and is listed below; 'billedsec'
+// is its companion — the BILLED seconds, spelled with the 'ed' that 'billsec' and
+// 'billseconds' both miss, so it was falling through. It sits after 'duration'
+// deliberately: billed time excludes ring time and would understate how long the
+// guest was actually on the call.
 const DURATION_KEYS = [
-  'durationsec', 'durationseconds', 'duration', 'billsec', 'billseconds',
+  'durationsec', 'durationseconds', 'duration', 'billedsec', 'billsec', 'billseconds',
   'callduration', 'talktime', 'talkduration', 'conversationduration',
   'answeredsec', 'answerduration', 'totalduration',
 ];

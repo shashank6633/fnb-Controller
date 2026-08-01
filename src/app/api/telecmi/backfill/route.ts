@@ -25,7 +25,15 @@ const MAX_PAGES = 50; // hard stop: 5,000 CDRs per run
 function apiBase(setting: string): string {
   let b = (setting || '').trim().replace(/\/+$/, '');
   if (!b) return DEFAULT_BASE;
-  b = b.replace(/\/click_to_call$/i, '').replace(/\/+$/, '');
+  // Strip BOTH originate paths. telecmi_base_url is one shared setting, and
+  // click-to-call invites an admin to paste its full endpoint — which is now
+  // '/webrtc/click2call'. Stripping only the old '/click_to_call' would leave
+  // this route building '…/v2/webrtc/click2call/<cdr path>' and every backfill
+  // would 404. The legacy path stays listed: a value saved before the endpoint
+  // was corrected is still sitting in production's ct_settings.
+  b = b.replace(/\/webrtc\/click2call$/i, '')
+       .replace(/\/click_to_call$/i, '')
+       .replace(/\/+$/, '');
   return b || DEFAULT_BASE;
 }
 

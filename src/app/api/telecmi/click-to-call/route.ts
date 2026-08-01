@@ -12,6 +12,8 @@ import { emitCt, pushRecentCt } from '@/lib/ct/bus';
  *   - With real TeleCMI creds (env TELECMI_APPID/TELECMI_SECRET): POST the
  *     originate REST endpoint with a hard 5s timeout. Without creds the call is
  *     MOCKED ({ mocked: true }) so the whole flow is testable in dev.
+ *     TELECMI_APPID is not part of the admin click2call body — it stays in env
+ *     purely as the "are we live?" gate in isTelecmiConfigured().
  *   - recovery_id: on a successful originate (real or mocked), append an
  *     attempt { at, by, method: 'callback', outcome: 'initiated' }, move
  *     pending→attempting (expired recoveries may still be worked, per the
@@ -23,18 +25,33 @@ import { emitCt, pushRecentCt } from '@/lib/ct/bus';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-const DEFAULT_ORIGINATE_URL = 'https://rest.telecmi.com/v2/click_to_call';
+// Wire format below follows the TeleCMI "Click-To-Call (Admin)" doc verbatim:
+// POST /v2/webrtc/click2call with { user_id, secret, to, extra_params, webrtc,
+// followme, callerid }. An earlier revision guessed /v2/click_to_call with
+// { appid, secret, to, agent } — that path does not exist and "agent"/"appid"
+// are not request fields, so every real dial 404'd. Please do not "restore" it.
+const DEFAULT_ORIGINATE_URL = 'https://rest.telecmi.com/v2/webrtc/click2call';
 
 /** ctSetting('telecmi_base_url') may be a base ('https://rest.telecmi.com/v2')
- *  or the full originate endpoint — accept both. */
+ *  or the full originate endpoint — accept both, because the settings field
+ *  invites an admin to paste either. Also tolerate a base left over from the
+ *  wrong-path era ('…/v2/click_to_call'), which would otherwise concatenate
+ *  into a nonsense URL the moment we append the real path. */
 function originateUrl(base: string): string {
-  const b = (base || '').trim().replace(/\/+$/, '');
+  let b = (base || '').trim().replace(/\/+$/, '');
   if (!b) return DEFAULT_ORIGINATE_URL;
-  return /click_to_call$/i.test(b) ? b : `${b}/click_to_call`;
+  if (/\/webrtc\/click2call$/i.test(b)) return b;
+  b = b.replace(/\/click_to_call$/i, '');
+  return `${b}/webrtc/click2call`;
 }
 
-/** Reverse-lookup the caller's TeleCMI agent id from the agent_map setting
- *  ({ telecmiAgentId: fnbUserEmail }). '' when unmapped. */
+/** Reverse-lookup the caller's TeleCMI user id from the agent_map setting
+ *  ({ telecmiAgentId: fnbUserEmail }). '' when unmapped.
+ *
+ *  agent_map is the right source for click2call's `user_id`: TeleCMI's CDR
+ *  reports the handling extension as `agent: "201_1111112"` — the same
+ *  "<ext>_<appid>" shape click2call documents for `user_id` — so the ids we
+ *  already map per GRE are exactly the ids the originate call expects. */
 function telecmiAgentFor(db: ReturnType<typeof getDb>, email: string): string {
   try {
     const map = JSON.parse(ctSetting(db, 'agent_map') || '{}') as Record<string, string>;
@@ -79,15 +96,37 @@ export async function POST(req: Request) {
 
   if (isTelecmiConfigured()) {
     const url = originateUrl(ctSetting(db, 'telecmi_base_url'));
-    const appidRaw = process.env.TELECMI_APPID || '';
-    const digits = phone.replace(/^\+/, '');
-    const agent = telecmiAgentFor(db, me.email);
+
+    // click2call rings user_id FIRST, then dials `to` — so an absent user_id
+    // does not merely lose attribution, it means TeleCMI has no extension to
+    // ring and the dial cannot happen. Falling back to some other agent would
+    // ring the wrong GRE's handset, so refuse loudly and say where to fix it.
+    const userId = telecmiAgentFor(db, me.email);
+    if (!userId) {
+      return Response.json(
+        {
+          ok: false,
+          mocked: false,
+          error: `No TeleCMI agent is mapped to ${me.email}. Add the mapping in CRM Settings → Agent Mapping, then try the call again.`,
+          provider_response: null,
+        },
+        { status: 400 },
+      );
+    }
+
+    // `to` must be digits-only with country code, as a NUMBER (no plus/spaces/
+    // dashes) — normalizePhone already yields +<digits>, so drop the plus.
+    const digits = phone.replace(/\D/g, '');
     const payload = {
-      // TeleCMI expects numeric appid/to on most accounts; pass through as-is otherwise.
-      appid: /^\d+$/.test(appidRaw) ? Number(appidRaw) : appidRaw,
+      user_id: userId,                              // STRING, e.g. "101_1111112"
       secret: process.env.TELECMI_SECRET || '',
       to: /^\d+$/.test(digits) ? Number(digits) : digits,
-      ...(agent ? { agent } : {}),
+      extra_params: { crm: true },                  // echoed back on the CDR
+      webrtc: true,
+      followme: false,
+      // callerid is optional and we have no ct setting holding a DID; sending a
+      // made-up number would spoof the outbound id, so omit it and let TeleCMI
+      // use the account default.
     };
 
     const controller = new AbortController();

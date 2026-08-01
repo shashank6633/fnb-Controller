@@ -7,7 +7,8 @@
  * (key/value). TeleCMI appid/secret live ONLY in server env vars
  * (TELECMI_APPID / TELECMI_SECRET / TELECMI_WEBHOOK_SECRET) — this page just
  * reports whether they are present and hands the admin the webhook URLs to
- * paste into the TeleCMI CHUB dashboard.
+ * paste into the TeleCMI dashboard (SETTINGS → WEBHOOKS: type "call report" for
+ * the CDR URL, "notify" for the Live URL).
  *
  * GET /api/crm-calls/settings  → { settings, webhook urls/token, configured }
  * PUT /api/crm-calls/settings  → changed keys only
@@ -191,7 +192,18 @@ export default function CtSettingsPage() {
     return () => { cancelled = true; };
   }, [refreshKey]);
 
-  const set = (key: string, value: string) => setForm(prev => ({ ...prev, [key]: value }));
+  // Editing any field retires the previous save's verdict. Without this the red
+  // banner from a rejected PUT (e.g. "telecmi_base_url must be an http(s) URL")
+  // outlives the mistake: the owner clears the offending field, the form matches
+  // `saved` again, `dirty` goes false, the sticky Save bar unmounts — and there
+  // is then no save left to run that could clear the error. The result is a
+  // permanent red banner complaining about a visibly empty box. The green flash
+  // is stale for the same reason: it describes the last save, not this edit.
+  const set = (key: string, value: string) => {
+    setError(null);
+    setFlash(null);
+    setForm(prev => ({ ...prev, [key]: value }));
+  };
 
   const changedKeys = useMemo(
     () => EDITABLE_KEYS.filter(k => (form[k] ?? '') !== (saved[k] ?? '')),
@@ -521,8 +533,57 @@ export default function CtSettingsPage() {
             environment variables (<code className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">TELECMI_APPID</code>,{' '}
             <code className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">TELECMI_SECRET</code>) — they are
             never stored in the database and never shown here. The badge above just reports whether
-            they are present. Click-to-call and backfill run in mock mode until they are set.
+            they are present.
           </p>
+
+          {/* "Not configured" is a dead end without this: the values live three
+              clicks deep in a tab most admins never open, and the only place they
+              can be entered is a server file this screen deliberately cannot
+              write. Shown only while unconfigured — once the badge is green it is
+              noise. Never render the values themselves. */}
+          {!configured && (
+            <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] p-2.5 space-y-2">
+              <p className="text-[11px] font-semibold text-[#2D1B0E]">How to configure</p>
+              <ol className="text-[11px] text-[#6B5744] list-decimal ml-4 space-y-1.5">
+                <li>
+                  In the TeleCMI dashboard, click your <strong>business number</strong> → the{' '}
+                  <strong>DEVELOPER</strong> tab → <strong>APP SECRET</strong>. That panel holds both values.
+                </li>
+                <li>
+                  Add them to the env file on the <strong>server</strong> (e.g.{' '}
+                  <code className="bg-white border border-[#E8D5C4] rounded px-1">.env.local</code> beside the app) —
+                  there is deliberately no input for them here, so nothing typed on this screen can set them:
+                  <pre className="mt-1 bg-white border border-[#E8D5C4] rounded px-2 py-1.5 font-mono text-[10px] text-[#2D1B0E] leading-relaxed overflow-x-auto">
+{`TELECMI_APPID=<your app id>
+TELECMI_SECRET=<APP SECRET from the DEVELOPER tab>
+TELECMI_WEBHOOK_SECRET=<optional>`}
+                  </pre>
+                  <span className="block mt-1">
+                    <code className="bg-white border border-[#E8D5C4] rounded px-1">TELECMI_WEBHOOK_SECRET</code> is
+                    optional and only pins the token inside the webhook URLs below; leave it out and a random one is
+                    generated once and kept. It must be <strong>at least 12 characters</strong> — anything shorter is
+                    ignored and the generated token stays in use, so the URLs would not change and it would look like
+                    the setting did nothing. When it does take effect it <strong>changes those URLs</strong>, so
+                    re-paste them into TeleCMI.
+                  </span>
+                </li>
+                <li>
+                  <strong>Restart the app.</strong> Env vars are read at boot, so the badge above stays
+                  &ldquo;Not configured&rdquo; until it comes back up.
+                </li>
+                <li>
+                  Then map each GRE under <strong>Agent mapping</strong> below — click-to-call rings the mapped
+                  TeleCMI agent id first, so an unmapped GRE still cannot dial.
+                </li>
+              </ol>
+              <p className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+                Until <strong>both</strong> TELECMI_APPID and TELECMI_SECRET are present, click-to-call and backfill
+                run in <strong>mock mode</strong>: they report success but <strong>nothing is dialled and nothing is
+                pulled</strong>. Inbound webhooks are unaffected — they never use these credentials.
+              </p>
+            </div>
+          )}
+
           <div className="max-w-xl">
             <label className={labelCls}>TeleCMI API base URL override (optional)</label>
             <input value={form.telecmi_base_url ?? ''} onChange={e => set('telecmi_base_url', e.target.value)}
@@ -543,9 +604,17 @@ export default function CtSettingsPage() {
         </div>
         <div className="p-3 sm:p-4 space-y-3">
           <p className="text-xs text-[#6B5744]">
-            Paste these into the TeleCMI <strong>CHUB dashboard</strong> under your business number
-            → webhooks (method <strong>POST</strong>). The long token in the path is the shared
-            secret — treat these URLs like passwords.
+            In the TeleCMI dashboard: <strong>SETTINGS → WEBHOOKS → add</strong> (method{' '}
+            <strong>POST</strong>) — type <strong>call report</strong> for the CDR URL, type{' '}
+            <strong>notify</strong> for the Live URL. Swap those two and neither webhook delivers
+            anything we can use, silently.
+          </p>
+          {/* TeleCMI signs nothing and sends no shared header — the random token
+              in the path is the ONLY thing standing between these routes and the
+              open internet, which is why they must be handled like passwords. */}
+          <p className="text-xs text-[#6B5744]">
+            The long token in each path is the shared secret — TeleCMI sends no signature of its own,
+            so that token is the entire protection. Treat these URLs like passwords.
           </p>
           {[
             {
@@ -589,10 +658,10 @@ export default function CtSettingsPage() {
             </div>
           ))}
           <ol className="text-[11px] text-[#6B5744] list-decimal ml-4 space-y-0.5">
-            <li>CHUB dashboard → your business number → call flow / webhooks.</li>
-            <li>Add a webhook node of type <strong>call report</strong> → paste the CDR URL.</li>
-            <li>Add a webhook node of type <strong>notify</strong> → paste the Live events URL.</li>
-            <li>Save the flow, then test with a real call (or <code>npm run simulate:call</code> in dev).</li>
+            <li>TeleCMI dashboard → <strong>SETTINGS</strong> → <strong>WEBHOOKS</strong> → add.</li>
+            <li>Type <strong>call report</strong>, method <strong>POST</strong> → paste the <strong>CDR</strong> URL.</li>
+            <li>Type <strong>notify</strong>, method <strong>POST</strong> → paste the <strong>Live events</strong> URL.</li>
+            <li>Save, then test with a real call (or <code>npm run simulate:call</code> in dev).</li>
           </ol>
         </div>
       </section>
@@ -1244,7 +1313,10 @@ export default function CtSettingsPage() {
             <span className="text-xs text-[#6B5744] flex-1">
               {changedKeys.length} unsaved change{changedKeys.length === 1 ? '' : 's'}
             </span>
-            <button onClick={() => setForm({ ...saved })} disabled={saving}
+            {/* Discard is the other way the bar can unmount, so it has to retire
+                the last save's banner too — otherwise the rejected value is gone
+                but its red complaint stays on screen with no save left to clear it. */}
+            <button onClick={() => { setError(null); setFlash(null); setForm({ ...saved }); }} disabled={saving}
                     className="px-2.5 py-1.5 border border-[#E8D5C4] rounded text-xs text-[#6B5744] hover:bg-[#FFF8F0] disabled:opacity-50">
               Discard
             </button>
