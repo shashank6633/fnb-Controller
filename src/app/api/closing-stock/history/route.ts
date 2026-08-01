@@ -307,11 +307,15 @@ export async function GET(request: Request) {
         material: s.material,
         sku: '',
         category: s.category || 'sub-recipe',
-        // No purchase unit and no pack factor for a sub-recipe: leave the
-        // purchase columns blank instead of repeating the yield figure, which
-        // would imply a conversion that never happened.
-        purchase_unit: '',
-        counted_purchase: null,
+        // A sub-recipe has no purchase unit and no pack factor — it is counted
+        // in its own yield unit, which IS the unit it is handled in. So the
+        // yield figure goes in the single quantity column rather than being
+        // left blank: since the report narrowed to purchase units only, a blank
+        // here meant a SUB row listed the item with NO quantity at all, which
+        // is worse than useless in a stock history. No conversion is implied —
+        // the unit column says kg, and kg is exactly what was counted.
+        purchase_unit: unit,
+        counted_purchase: num(s.physical_stock),
         recipe_unit: unit,
         counted_recipe: num(s.physical_stock),
         rate: priced ? r2(num(s.rate)) : null,
