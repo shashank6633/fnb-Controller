@@ -109,6 +109,136 @@ function buildAgentRows(mapObj: Record<string, string>, seen: string[]): Array<{
   return rows;
 }
 
+/** Write-only credential status. The server sends a boolean, where the value
+ *  came from, and the last 4 characters — never the value. */
+interface CredField { set: boolean; source: 'env' | 'db' | 'none'; masked: string }
+interface CredStatus { configured: boolean; appid: CredField; secret: CredField }
+
+const EMPTY_CREDS: CredStatus = {
+  configured: false,
+  appid:  { set: false, source: 'none', masked: '' },
+  secret: { set: false, source: 'none', masked: '' },
+};
+
+/**
+ * App ID + Secret entry.
+ *
+ * SEPARATE FROM THE MAIN FORM ON PURPOSE. Every other field on this page is
+ * round-tripped: loaded into `saved`, compared against `form`, and only the
+ * difference is sent. A write-only credential can never be loaded, so it would
+ * read as permanently dirty and keep the sticky Save bar up forever. It also
+ * must not be swept into a bulk save of unrelated settings — a credential write
+ * is its own deliberate act, with its own confirmation.
+ *
+ * The input is emptied immediately after a successful save so the typed secret
+ * does not linger in the DOM, and so the field's resting state always shows the
+ * masked stored value rather than something that looks editable but is stale.
+ */
+function CredentialFields({ status, onSaved }: { status: CredStatus; onSaved: (s: CredStatus) => void }) {
+  const [appid, setAppid] = useState('');
+  const [secret, setSecret] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [ok, setOk] = useState<string | null>(null);
+
+  const inputCls = 'w-full mt-0.5 px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]';
+  const labelCls = 'text-[10px] uppercase tracking-wide text-[#6B5744]';
+
+  const badge = (f: CredField) => {
+    if (f.source === 'env') {
+      return <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 border border-blue-200 text-blue-800">from environment · {f.masked}</span>;
+    }
+    if (f.source === 'db') {
+      return <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-800">saved · {f.masked}</span>;
+    }
+    return <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-50 border border-gray-200 text-gray-500">not set</span>;
+  };
+
+  const save = async () => {
+    const a = appid.trim();
+    const s = secret.trim();
+    if (!a && !s) { setErr('Enter an App ID or a Secret to save.'); return; }
+    // Digits-only mirrors the server rule. Caught here too so the owner is told
+    // before a round trip, not after.
+    if (a && !/^\d+$/.test(a)) { setErr('App ID must be digits only — it is the number under the App ID label, not the UUID.'); return; }
+    setBusy(true); setErr(null); setOk(null);
+    try {
+      const body: Record<string, string> = {};
+      if (a) body.telecmi_appid = a;
+      if (s) body.telecmi_secret = s;
+      const r = await api('/api/crm-calls/settings', { method: 'PUT', body });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setErr(j?.error || `HTTP ${r.status}`); return; }
+      // Clear the boxes so a secret does not sit in the DOM after saving.
+      setAppid(''); setSecret('');
+      const fresh: CredStatus = j?.telecmi_credentials || EMPTY_CREDS;
+      onSaved(fresh);
+      setOk(fresh.configured
+        ? '✓ Saved — TeleCMI is connected. No restart needed.'
+        : '✓ Saved. Still missing the other value before calls can be placed.');
+    } catch (e: any) {
+      setErr(e?.message || 'Save failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] p-3 space-y-3 max-w-xl">
+      <div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className={labelCls}>App ID</label>
+          {badge(status.appid)}
+        </div>
+        <input
+          value={appid}
+          onChange={e => { setAppid(e.target.value); setErr(null); setOk(null); }}
+          inputMode="numeric"
+          autoComplete="off"
+          placeholder={status.appid.set ? 'Enter a new App ID to replace it' : 'e.g. 33338614'}
+          className={inputCls}
+        />
+      </div>
+
+      <div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className={labelCls}>App Secret</label>
+          {badge(status.secret)}
+        </div>
+        <input
+          value={secret}
+          onChange={e => { setSecret(e.target.value); setErr(null); setOk(null); }}
+          type="password"
+          autoComplete="new-password"
+          placeholder={status.secret.set ? 'Enter a new Secret to replace it' : 'the UUID from APP SECRET'}
+          className={inputCls}
+        />
+      </div>
+
+      {status.appid.source === 'env' || status.secret.source === 'env' ? (
+        <p className="text-[10px] text-blue-800 bg-blue-50 border border-blue-200 rounded px-2 py-1.5">
+          A value marked <em>from environment</em> is fixed on the server and wins over anything
+          saved here. Remove the variable and restart if you want to manage it from this screen.
+        </p>
+      ) : null}
+
+      {err && <p className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1.5">{err}</p>}
+      {ok && <p className="text-[11px] text-emerald-800 bg-emerald-50 border border-emerald-200 rounded px-2 py-1.5">{ok}</p>}
+
+      <button
+        onClick={save}
+        disabled={busy || (!appid.trim() && !secret.trim())}
+        className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-[#af4408] text-white hover:bg-[#8f3606] disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        {busy ? 'Saving…' : 'Save credentials'}
+      </button>
+      <p className="text-[10px] text-[#6B5744]">
+        Leave a box blank to keep the value already stored. Saving only replaces what you type.
+      </p>
+    </div>
+  );
+}
+
 export default function CtSettingsPage() {
   const [loading, setLoading] = useState(true);
   const [locked, setLocked] = useState(false);
@@ -118,6 +248,7 @@ export default function CtSettingsPage() {
   const [saved, setSaved] = useState<Record<string, string>>({ ...DEFAULTS });
   const [form, setForm] = useState<Record<string, string>>({ ...DEFAULTS });
   const [configured, setConfigured] = useState(false);
+  const [creds, setCreds] = useState<CredStatus>(EMPTY_CREDS);
   const [paths, setPaths] = useState<{ live: string; cdr: string }>({ live: '', cdr: '' });
   const [origin, setOrigin] = useState('');
 
@@ -170,6 +301,10 @@ export default function CtSettingsPage() {
         setSaved(next);
         setForm(next);
         setConfigured(Boolean(j?.configured ?? j?.telecmi_configured ?? src?.configured));
+        // Write-only status: boolean + source + masked tail, never the value.
+        // Falls back to EMPTY_CREDS so an older server that does not send the
+        // block yet renders "not set" rather than crashing on undefined.
+        setCreds((j?.telecmi_credentials as CredStatus) || EMPTY_CREDS);
         setPaths(extractWebhookPaths(j));
 
         // Agent mapping: staff picker + rows for every agent seen / mapped.
@@ -524,17 +659,32 @@ export default function CtSettingsPage() {
               : 'bg-gray-50 border-gray-200 text-gray-500'
           }`}>
             <span className={`w-1.5 h-1.5 rounded-full ${configured ? 'bg-emerald-500' : 'bg-gray-400'}`} />
-            {configured ? 'Configured (env)' : 'Not configured'}
+            {configured
+              ? `Configured${creds.secret.source === 'env' || creds.appid.source === 'env' ? ' (env)' : ''}`
+              : 'Not configured'}
           </span>
         </div>
         <div className="p-3 sm:p-4 space-y-3">
           <p className="text-xs text-[#6B5744]">
-            The TeleCMI <strong>appid</strong> and <strong>secret</strong> live only in server
-            environment variables (<code className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">TELECMI_APPID</code>,{' '}
-            <code className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">TELECMI_SECRET</code>) — they are
-            never stored in the database and never shown here. The badge above just reports whether
-            they are present.
+            Enter the <strong>App ID</strong> and <strong>Secret</strong> from the TeleCMI dashboard
+            (click your business number → <strong>DEVELOPER</strong> tab → <strong>APP SECRET</strong>).
+            They are stored <strong>write-only</strong>: saved values are never sent back to this
+            screen and never appear in any API response — you will only ever see the last four
+            characters. A saved value takes effect on the next request, with no restart.
           </p>
+          <p className="text-[10px] text-[#6B5744]">
+            The environment variables{' '}
+            <code className="text-[10px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">TELECMI_APPID</code> and{' '}
+            <code className="text-[10px] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1">TELECMI_SECRET</code>{' '}
+            still work and <strong>take priority</strong>. If one is set on the server, the field
+            below is marked <em>from environment</em> and anything saved here is ignored until the
+            variable is removed — otherwise a typed value would appear to save and change nothing.
+          </p>
+
+          <CredentialFields
+            status={creds}
+            onSaved={s => { setCreds(s); setConfigured(s.configured); }}
+          />
 
           {/* "Not configured" is a dead end without this: the values live three
               clicks deep in a tab most admins never open, and the only place they

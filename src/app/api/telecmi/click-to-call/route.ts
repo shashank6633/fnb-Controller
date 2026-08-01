@@ -1,7 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { normalizePhone } from '@/lib/ct/phone';
-import { ctSetting, isTelecmiConfigured } from '@/lib/ct/settings';
+import { ctSetting, isTelecmiConfigured, telecmiSecret } from '@/lib/ct/settings';
 import { emitCt, pushRecentCt } from '@/lib/ct/bus';
 
 /**
@@ -94,7 +94,7 @@ export async function POST(req: Request) {
   let mocked = false;
   let providerResponse: any = null;
 
-  if (isTelecmiConfigured()) {
+  if (isTelecmiConfigured(db)) {
     const url = originateUrl(ctSetting(db, 'telecmi_base_url'));
 
     // click2call rings user_id FIRST, then dials `to` — so an absent user_id
@@ -119,7 +119,9 @@ export async function POST(req: Request) {
     const digits = phone.replace(/\D/g, '');
     const payload = {
       user_id: userId,                              // STRING, e.g. "101_1111112"
-      secret: process.env.TELECMI_SECRET || '',
+      // Resolver, not process.env — a DB-configured account passes
+      // isTelecmiConfigured(db) above and must post a real secret here.
+      secret: telecmiSecret(db),
       to: /^\d+$/.test(digits) ? Number(digits) : digits,
       extra_params: { crm: true },                  // echoed back on the CDR
       webrtc: true,

@@ -64,9 +64,87 @@ export function webhookToken(db: Database.Database): string {
   return fresh;
 }
 
-/** True when real TeleCMI REST credentials are configured via env. */
-export function isTelecmiConfigured(): boolean {
-  return !!(process.env.TELECMI_APPID && process.env.TELECMI_SECRET);
+/* ── TeleCMI app credentials ──────────────────────────────────────────────
+ *
+ * ENV WINS, DB IS THE FALLBACK — the same precedence webhookToken() above has
+ * used since day one.
+ *
+ * These used to be env-only, which meant the owner could not configure their
+ * own telephony without an SSH session and a pm2 restart, and the Settings
+ * screen could only ever report "Not configured" at them. On a single-tenant
+ * box that is friction with no security win: the DB already holds guest phone
+ * numbers, sales and staff records, so a TeleCMI secret beside them is not a
+ * new class of exposure. Anyone who DOES want the stricter posture keeps it —
+ * set the env var and the DB value is ignored entirely.
+ *
+ * The DB path is also strictly more usable: a value saved here applies on the
+ * very next request, where an env var needs the process restarted first.
+ *
+ * WRITE-ONLY: the settings API must never return these. It returns
+ * telecmiCredentialStatus() instead — a boolean plus a masked tail — so the
+ * admin can confirm WHICH secret is stored without it being readable back.
+ */
+function credential(db: Database.Database | null, envKey: string, dbKey: string): string {
+  const env = String(process.env[envKey] || '').trim();
+  if (env) return env;
+  if (!db) return '';
+  const row = db.prepare(`SELECT value FROM ct_settings WHERE key = ?`).get(dbKey) as any;
+  return String(row?.value || '').trim();
+}
+
+export function telecmiAppId(db: Database.Database | null = null): string {
+  return credential(db, 'TELECMI_APPID', 'telecmi_appid');
+}
+
+export function telecmiSecret(db: Database.Database | null = null): string {
+  return credential(db, 'TELECMI_SECRET', 'telecmi_secret');
+}
+
+/**
+ * True when real TeleCMI REST credentials are available.
+ *
+ * The db argument is optional so the many existing call sites that pass nothing
+ * keep compiling and keep their env-only behaviour. Pass the handle wherever a
+ * DB-configured account should count as live — which is everywhere that has one.
+ */
+export function isTelecmiConfigured(db: Database.Database | null = null): boolean {
+  return !!(telecmiAppId(db) && telecmiSecret(db));
+}
+
+/** Where a credential came from — shown on Settings so a surprising value is
+ *  traceable (an env var silently overriding a freshly-typed one is otherwise
+ *  indistinguishable from the save having failed). */
+export type CredentialSource = 'env' | 'db' | 'none';
+
+export interface CredentialStatus {
+  configured: boolean;
+  appid: { set: boolean; source: CredentialSource; masked: string };
+  secret: { set: boolean; source: CredentialSource; masked: string };
+}
+
+/** Last 4 characters only, never the value. '' stays ''. */
+function mask(v: string): string {
+  if (!v) return '';
+  return v.length <= 4 ? '••••' : '••••' + v.slice(-4);
+}
+
+function sourceOf(db: Database.Database | null, envKey: string, dbKey: string): CredentialSource {
+  if (String(process.env[envKey] || '').trim()) return 'env';
+  if (db) {
+    const row = db.prepare(`SELECT value FROM ct_settings WHERE key = ?`).get(dbKey) as any;
+    if (String(row?.value || '').trim()) return 'db';
+  }
+  return 'none';
+}
+
+export function telecmiCredentialStatus(db: Database.Database | null = null): CredentialStatus {
+  const appid = telecmiAppId(db);
+  const secret = telecmiSecret(db);
+  return {
+    configured: !!(appid && secret),
+    appid:  { set: !!appid,  source: sourceOf(db, 'TELECMI_APPID', 'telecmi_appid'),   masked: mask(appid) },
+    secret: { set: !!secret, source: sourceOf(db, 'TELECMI_SECRET', 'telecmi_secret'), masked: mask(secret) },
+  };
 }
 
 // ─── Business-hours-aware SLA clock ────────────────────────────────────────

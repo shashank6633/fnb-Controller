@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
-import { ctSetting, isTelecmiConfigured } from '@/lib/ct/settings';
+import { ctSetting, isTelecmiConfigured, telecmiAppId, telecmiSecret } from '@/lib/ct/settings';
 import { ingestCdr } from '@/lib/ct/ingest';
 
 /**
@@ -60,16 +60,21 @@ export async function POST(req: Request) {
   try { body = await req.json(); } catch { /* optional body */ }
   const days = Math.min(90, Math.max(1, Number(body?.days) || 7));
 
-  if (!isTelecmiConfigured()) {
+  // db first: the configured-check now consults ct_settings as well as env, so
+  // an account whose credentials were saved in CRM Settings is just as live as
+  // one whose credentials came from the environment.
+  const db = getDb();
+  if (!isTelecmiConfigured(db)) {
     return Response.json({ ok: true, mocked: true, ingested: 0, created: 0, days });
   }
 
-  const db = getDb();
   const base = apiBase(ctSetting(db, 'telecmi_base_url'));
-  const appidRaw = process.env.TELECMI_APPID || '';
+  // Read through the same resolver, NOT process.env directly — otherwise a
+  // DB-configured account passes the gate above and then posts a blank secret.
+  const appidRaw = telecmiAppId(db);
   const credentials = {
     appid: /^\d+$/.test(appidRaw) ? Number(appidRaw) : appidRaw,
-    secret: process.env.TELECMI_SECRET || '',
+    secret: telecmiSecret(db),
   };
   const to = Date.now();
   const from = to - days * 86_400_000;

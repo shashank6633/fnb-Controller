@@ -7,6 +7,7 @@ import {
   setCtSetting,
   webhookToken,
   isTelecmiConfigured,
+  telecmiCredentialStatus,
   CT_SETTING_DEFAULTS,
 } from '@/lib/ct/settings';
 import { distinctCallAgents } from '@/lib/ct/agents';
@@ -14,13 +15,17 @@ import { distinctCallAgents } from '@/lib/ct/agents';
 /**
  * CRM Call-to-Table — Settings (/api/crm-calls/settings). Admin-only.
  *
- * GET → all ct_settings (defaults merged) EXCEPT the raw webhook token, plus
- *       computed webhook URLs (RELATIVE paths — the client prepends
- *       window.location.origin for the copy button) and
- *       telecmi_configured (env creds present, never the creds themselves).
+ * GET → all ct_settings (defaults merged) EXCEPT the raw webhook token and the
+ *       TeleCMI credentials, plus computed webhook URLs (RELATIVE paths — the
+ *       client prepends window.location.origin for the copy button),
+ *       telecmi_configured, and telecmi_credentials (booleans + a masked tail,
+ *       never the values).
  * PUT → { key: value, ... } partial update. Allowlist = CT_SETTING_DEFAULTS
- *       keys + 'telecmi_base_url'. TeleCMI appid/secret live in env ONLY and
- *       are NEVER accepted here nor returned anywhere.
+ *       keys + 'telecmi_base_url' + the two TeleCMI credentials.
+ *
+ * The credentials are WRITE-ONLY: an admin can save or clear them here so the
+ * owner can configure their own telephony from the UI, but no read path ever
+ * returns them. Everything else in SECRET_KEYS stays blocked both ways.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -37,13 +42,28 @@ const ROUTING_HINT_KEYS: readonly string[] = ['sticky_agent', 'vip_routing', 'vi
 // See src/lib/ct/missed-ack.ts.
 const MISSED_ACK_KEYS: readonly string[] = ['missed_call_whatsapp', 'missed_call_wa_text'];
 
-const ALLOWED_KEYS: readonly string[] = [...Object.keys(CT_SETTING_DEFAULTS), 'telecmi_base_url', 'auto_analyze', 'analysis_retention', ...ROUTING_HINT_KEYS, ...MISSED_ACK_KEYS];
+/**
+ * TeleCMI app credentials. WRITE-ONLY through this route: an admin may save or
+ * clear them (otherwise configuring telephony needs an SSH session and a
+ * restart), but they are stripped from every read — the GET reports
+ * telecmiCredentialStatus() instead, which is a boolean plus a masked tail.
+ */
+const CREDENTIAL_KEYS: readonly string[] = ['telecmi_appid', 'telecmi_secret'];
 
-/** Keys that must never transit this route in either direction. */
+const ALLOWED_KEYS: readonly string[] = [...Object.keys(CT_SETTING_DEFAULTS), 'telecmi_base_url', 'auto_analyze', 'analysis_retention', ...ROUTING_HINT_KEYS, ...MISSED_ACK_KEYS, ...CREDENTIAL_KEYS];
+
+/** Keys that must never be READ back through this route. Includes the two
+ *  credentials — writable above, but never returned. */
 const SECRET_KEYS: readonly string[] = [
-  'telecmi_appid', 'telecmi_secret', 'appid', 'secret',
+  ...CREDENTIAL_KEYS, 'appid', 'secret',
   'webhook_token', 'telecmi_webhook_secret',
 ];
+
+/** Keys refused in BOTH directions (everything secret that isn't a credential
+ *  the admin is allowed to rotate from the UI). The webhook token in particular
+ *  is a URL path component the client already receives pre-baked — letting it
+ *  be set here would just be a way to smuggle a chosen token in. */
+const WRITE_BLOCKED_KEYS: readonly string[] = SECRET_KEYS.filter(k => !CREDENTIAL_KEYS.includes(k));
 
 const HM_RE = /^([01]?\d|2[0-3]):[0-5]\d$/;
 
@@ -94,7 +114,12 @@ export async function GET() {
     // localhost / testing / production without storing a hostname).
     webhook_live_url: `/api/telecmi/webhook/live/${token}`,
     webhook_cdr_url: `/api/telecmi/webhook/cdr/${token}`,
-    telecmi_configured: isTelecmiConfigured(),
+    telecmi_configured: isTelecmiConfigured(db),
+    // Safe to send: { configured, appid:{set,source,masked}, secret:{…} }. The
+    // source tells the admin whether an env var is overriding what they just
+    // typed — without it, "saved but nothing changed" is indistinguishable from
+    // a failed save.
+    telecmi_credentials: telecmiCredentialStatus(db),
     agents_seen: distinctCallAgents(db),
     staff,
   });
@@ -209,6 +234,24 @@ function validate(key: string, value: any): { ok: true; value: string } | { ok: 
       }
       return { ok: true, value: JSON.stringify(clean) };
     }
+    // ── TeleCMI credentials (write-only) ────────────────────────────────────
+    // An empty string is a deliberate "clear it" — the caller gets the row
+    // DELETED, not an empty row, so credential() falls back to env/none instead
+    // of resolving to ''. Error messages describe the SHAPE only: echoing back
+    // even a rejected value would put a mistyped secret in a log or a toast.
+    case 'telecmi_appid': {
+      const v = String(value ?? '').trim();
+      if (!v) return { ok: true, value: '' };            // clear
+      if (!/^\d+$/.test(v)) return { ok: false, error: 'TeleCMI App ID must be digits only' };
+      if (v.length > 32) return { ok: false, error: 'TeleCMI App ID is too long' };
+      return { ok: true, value: v };
+    }
+    case 'telecmi_secret': {
+      const v = String(value ?? '').trim();
+      if (!v) return { ok: true, value: '' };            // clear
+      if (v.length > 300) return { ok: false, error: 'TeleCMI Secret is too long' };
+      return { ok: true, value: v };
+    }
     case 'telecmi_base_url': {
       const v = String(value ?? '').trim();
       if (v && !/^https?:\/\/\S+$/.test(v)) {
@@ -300,13 +343,21 @@ export async function PUT(req: Request) {
     return Response.json({ error: 'Body must be an object of { key: value } settings' }, { status: 400 });
   }
 
-  // Hard-refuse secrets — they live in env only, never in ct_settings.
+  // Hard-refuse the secrets that are not admin-rotatable (webhook token & co).
   for (const k of Object.keys(body)) {
-    if (SECRET_KEYS.includes(k)) {
+    if (WRITE_BLOCKED_KEYS.includes(k)) {
       return Response.json({
-        error: `'${k}' cannot be set via this API. TeleCMI credentials are configured server-side via environment variables only.`,
+        error: `'${k}' cannot be set via this API.`,
       }, { status: 400 });
     }
+  }
+
+  // Credentials are admin-only even if the gate above ever loosens: these spend
+  // real money and re-point the outlet's telephony, so the check is restated
+  // here rather than inherited.
+  const touchesCredentials = Object.keys(body).some(k => CREDENTIAL_KEYS.includes(k));
+  if (touchesCredentials && gate.user.role !== 'admin') {
+    return Response.json({ error: 'Admin role required to change TeleCMI credentials' }, { status: 403 });
   }
 
   const updates: Record<string, string> = {};
@@ -334,7 +385,16 @@ export async function PUT(req: Request) {
     return Response.json({ error: 'business_open must be earlier than business_close (same IST day)' }, { status: 400 });
   }
 
-  for (const [key, value] of Object.entries(updates)) setCtSetting(db, key, value);
+  for (const [key, value] of Object.entries(updates)) {
+    // Clearing a credential must REMOVE the row. Storing '' would leave a row
+    // that reads as "set" to anything doing a plain existence check, and would
+    // pin the value to empty forever instead of falling back to the env var.
+    if (CREDENTIAL_KEYS.includes(key) && value === '') {
+      db.prepare(`DELETE FROM ct_settings WHERE key = ?`).run(key);
+      continue;
+    }
+    setCtSetting(db, key, value);
+  }
 
   // Switching to 'ephemeral' means "keep nothing" — so PURGE any scorecards
   // stored while in 'permanent' mode. Otherwise old transcripts/scores would
@@ -358,5 +418,17 @@ export async function PUT(req: Request) {
     updated: Object.keys(updates),
     ...(updates.analysis_retention === 'ephemeral' ? { scorecards_purged: purged } : {}),
     settings: publicSettings(db),
+    // Fresh status after the write. This is how the client learns that an env
+    // var still wins (source stays 'env' even though the save succeeded) and
+    // which secret is now stored — the masked tail is the only echo it gets.
+    telecmi_configured: isTelecmiConfigured(db),
+    telecmi_credentials: telecmiCredentialStatus(db),
   });
+}
+
+/** Some clients POST settings instead of PUT-ing them; identical semantics.
+ *  /api/crm-calls is a CSRF-required prefix in src/proxy.ts, so this is covered
+ *  by the same double-submit check. */
+export async function POST(req: Request) {
+  return PUT(req);
 }
