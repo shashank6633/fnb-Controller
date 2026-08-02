@@ -159,6 +159,11 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Stock Overview",     href: "/inventory/stock-overview", icon: Layers },
       { kind: "link", label: "Closing Overview",   href: "/inventory/closing-overview", icon: ClipboardCheck },
       { kind: "link", label: "Dept Closing Sheet", href: "/inventory/closing-sheet", icon: ClipboardList },
+      // Sits directly under the entry sheet on purpose: one ENTERS a count, this
+      // one REVIEWS past counts side by side. Split apart in the list, a counter
+      // looking for "last month's figure" lands on the entry sheet and overwrites
+      // today's count instead of reading history.
+      { kind: "link", label: "Closing History & Compare", href: "/inventory/closing-history", icon: History },
       { kind: "link", label: "Store Transfers",    href: "/inventory/transfers", icon: ArrowLeftRight },
       { kind: "link", label: "Department Stock",   href: "/inventory/department-stock", icon: Warehouse },
       { kind: "link", label: "Sales vs Consumption", href: "/inventory/reconciliation", icon: Scale },

@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
-import { ShoppingCart, Send, Loader2, AlertTriangle, ShieldCheck } from 'lucide-react';
+import { ShoppingCart, Send, Loader2, AlertTriangle, ShieldCheck, ClipboardList } from 'lucide-react';
 
 /**
  * Settings → Purchasing: options for the Purchase Order flow.
@@ -30,6 +30,11 @@ import { ShoppingCart, Send, Loader2, AlertTriangle, ShieldCheck } from 'lucide-
  */
 export default function PurchasingSettingsPage() {
   const [sendToVendor, setSendToVendor] = useState(false);
+  // Which items the BULK closing sheet carries. true = the whole raw-material
+  // catalogue (the store's whole-building walk); false = only what each
+  // department has ever requested. Default true — an item missing from the
+  // sheet is an item nobody counts, which is the worse failure.
+  const [bulkAllItems, setBulkAllItems] = useState(true);
   // Starts ON, and every failure path below leaves it ON: this switch reports a
   // spend control, so a read that goes wrong must never render as "approval off".
   const [requireApproval, setRequireApproval] = useState(true);
@@ -60,6 +65,11 @@ export default function PurchasingSettingsPage() {
     Promise.all([
       fetch('/api/settings?key=po_send_to_vendor').then(r => r.json())
         .then(d => setSendToVendor(d?.value === '1')).catch(() => {}),
+      // Only an explicit 'requested' narrows the sheet. A missing row, an
+      // unreadable value or a 401 body all leave it on ALL — the safe default,
+      // because a short sheet silently drops items from the count.
+      fetch('/api/settings?key=closing_sheet_bulk_scope').then(r => r.json())
+        .then(d => setBulkAllItems(String(d?.value || 'all').trim() !== 'requested')).catch(() => {}),
       fetch('/api/settings?key=po_require_admin_approval').then(r => r.json())
         // FAIL-SAFE, and the mirror of requiresAdminApproval() on the server:
         // ONLY an explicit "0" is off. A missing row, a null, an unreadable value
@@ -109,6 +119,20 @@ export default function PurchasingSettingsPage() {
       if (!r.ok) { setSendToVendor(prev); flash(false, (await r.json().catch(() => ({}))).error || 'Failed to save'); }
       else flash(true, on ? 'Send to vendor enabled' : 'Send to vendor disabled');
     } catch { setSendToVendor(prev); flash(false, 'Failed to save'); }
+    setSaving(false);
+  };
+
+  const saveBulkScope = async (on: boolean) => {
+    const prev = bulkAllItems;
+    setBulkAllItems(on); setSaving(true);
+    try {
+      const r = await api('/api/settings', {
+        method: 'PUT',
+        body: { key: 'closing_sheet_bulk_scope', value: on ? 'all' : 'requested' },
+      });
+      if (!r.ok) { setBulkAllItems(prev); flash(false, (await r.json().catch(() => ({}))).error || 'Failed to save'); }
+      else flash(true, on ? 'Bulk sheet: all raw materials' : 'Bulk sheet: department-requested items only');
+    } catch { setBulkAllItems(prev); flash(false, 'Failed to save'); }
     setSaving(false);
   };
 
@@ -237,6 +261,31 @@ export default function PurchasingSettingsPage() {
                 </p>
               </div>
             )}
+          </div>
+        )}
+
+        {!loading && (
+          <div className="bg-white rounded-xl border border-[#E8D5C4] divide-y divide-[#E8D5C4]">
+            <div className="flex items-start justify-between gap-4 p-5">
+              <div>
+                <p className="font-semibold text-[#2D1B0E] flex items-center gap-1.5">
+                  <ClipboardList className="w-4 h-4 text-[#af4408]" /> Bulk closing sheet — all raw materials
+                </p>
+                <p className="text-sm text-[#8B7355] mt-0.5">
+                  Controls the <b>Download blank template</b> and upload on the Department Closing Sheet.
+                  <b> On</b> gives the store every raw material, because the store walks the whole building
+                  and an item missing from the sheet is an item nobody counts.
+                  <b> Off</b> narrows each department&rsquo;s columns to the items it has ever requested —
+                  fewer rows on the walk, but anything never requested cannot be counted.
+                </p>
+                <p className="text-sm text-[#8B7355] mt-1.5">
+                  This is the <b>bulk sheet only</b>. The on-screen Department Closing Sheet stays
+                  department-scoped either way, and liquor is always excluded — it is counted in its own store.
+                </p>
+              </div>
+              <Toggle checked={bulkAllItems} onChange={(v) => saveBulkScope(v)} disabled={!canEdit || saving}
+                      label="All raw materials on the bulk sheet" className="mt-1 shrink-0" />
+            </div>
           </div>
         )}
         {!loading && meLoaded && !canEdit && <p className="text-xs text-[#8B7355]">Manager or Admin access is required to change these settings.</p>}

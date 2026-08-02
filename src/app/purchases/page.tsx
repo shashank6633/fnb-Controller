@@ -28,6 +28,7 @@ import Papa from 'papaparse';
 import type { Purchase, RawMaterial } from '@/types';
 import { api } from '@/lib/api';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
+import Combobox from '@/components/Combobox';
 import { packFactor, fmtQtyNum } from '@/lib/pack-units';
 
 function formatCurrency(value: number): string {
@@ -49,6 +50,25 @@ function isoMinusDays(iso: string, n: number): string {
 }
 
 
+/**
+ * The GST rates this kitchen's bills actually carry. A fixed list, not a free
+ * number box: a typo'd "1.8" on a ₹40,000 bill is a tax figure nobody catches
+ * until the return is filed.
+ */
+const GST_RATES = ['0', '5', '12', '18'] as const;
+
+/**
+ * Client-side mirror of store-engine's SQL catNorm(): lower-case, then strip
+ * spaces / hyphens / underscores, so 'Single-Malt Whiskey', 'single malt
+ * whiskey' and 'singlemaltwhiskey' all compare equal. Both sides of every
+ * store_category_map ↔ raw_materials.category comparison must use it, or a
+ * liquor category spelled with a hyphen goes unrecognised and gets taxed.
+ */
+const catKey = (s: unknown) => String(s || '').trim().toLowerCase().replace(/[\s\-_]/g, '');
+
+/** Round to paisa. Every money figure on this form goes through this one place. */
+const r2 = (n: number) => Math.round(n * 100) / 100;
+
 // ---- Bill Entry Types ----
 interface BillLineItem {
   id: number;
@@ -63,6 +83,13 @@ interface BillLineItem {
   /** 'btl' = qty is bottles (default; price per bottle).
    *  'case' = qty is cases; submit-time we expand to qty × case_size bottles. */
   entry_mode?: 'btl' | 'case';
+  /**
+   * RAW select value. '' = inherit the bill-level rate; otherwise a percent
+   * string ('5', '12', '18'). Deliberately a STRING in state and parsed only
+   * inside billCalc — Number()-ing a rate box on every keystroke is what makes
+   * a decimal untypeable, the same trap the qty/price boxes already avoid.
+   */
+  gst_rate: string;
 }
 
 interface BillFormData {
@@ -75,6 +102,13 @@ interface BillFormData {
   /** REDUCES unit cost — a discount genuinely lowers what the goods cost. */
   discount_mode: 'percent' | 'amount';
   discount_value: string;
+  /**
+   * Bill-level GST % that every line inherits unless that line overrides it.
+   * One vendor bill is almost always one rate; retyping it on twenty lines is
+   * how one line silently ends up on the wrong rate. Raw string, same reason
+   * as BillLineItem.gst_rate.
+   */
+  gst_rate: string;
   notes: string;
   items: BillLineItem[];
 }
@@ -138,6 +172,7 @@ function emptyBillLine(): BillLineItem {
     delivery_share: 0,
     final_unit_price: 0,
     entry_mode: 'btl',
+    gst_rate: '',   // '' = follow the bill-level rate
   };
 }
 
@@ -149,6 +184,9 @@ const emptyBill: BillFormData = {
   delivery_value: '',
   discount_mode: 'percent',
   discount_value: '',
+  // Default 0% so a bill entered exactly the way it always was books exactly the
+  // same numbers. Tax is opt-in per bill, never assumed.
+  gst_rate: '0',
   notes: '',
   items: [emptyBillLine(), emptyBillLine()],
 };
@@ -156,6 +194,21 @@ const emptyBill: BillFormData = {
 export default function PurchasesPage() {
   const [purchases, setPurchases] = useState<Purchase[]>([]);
   const [materials, setMaterials] = useState<RawMaterial[]>([]);
+  /**
+   * Vendor master for the bill's Vendor field. `vendorsFailed` flips that field
+   * back to plain free text with a note: an empty dropdown that can't be filled
+   * is worse than a typo — it stops a bill being entered at all.
+   */
+  const [vendors, setVendors] = useState<Array<{ id: string; name: string }>>([]);
+  const [vendorsFailed, setVendorsFailed] = useState(false);
+  /**
+   * catKey()-normalised categories owned by an ACTIVE store location. A material
+   * in one of these is TGBCL liquor: it is taxed through the store's bill charges
+   * (excise / cess / TCS), never through GST, so its line is forced to 0%.
+   * Empty set = unknown (fetch failed / no stores) — we then leave rates alone
+   * rather than guess, and /api/purchases blocks store-mapped lines regardless.
+   */
+  const [storeCats, setStoreCats] = useState<Set<string>>(new Set());
   /**
    * PURCHASE-unit label resolver for every quantity/rate box on this page.
    * /api/purchases, /api/purchases/bulk and /api/purchases/opening-stock all
@@ -321,6 +374,55 @@ export default function PurchasesPage() {
     }
   };
 
+  const fetchVendors = async () => {
+    try {
+      const res = await fetch('/api/vendors');
+      if (!res.ok) throw new Error('Failed to fetch vendors');
+      const json = await res.json();
+      // Read the payload EXACTLY as the ad-hoc GRN form does (src/app/grn/page.tsx
+      // ~476): the route answers { vendors: [...] }, and an inactive vendor must
+      // never be offered — picking one would fragment spend onto a dead master row.
+      setVendors((json.vendors || []).filter((v: any) => v.is_active));
+      setVendorsFailed(false);
+    } catch {
+      setVendorsFailed(true);
+    }
+  };
+
+  /**
+   * Which categories belong to an ACTIVE store location. Any signed-in user may
+   * GET /api/stores, and it already returns each store's mapped categories, so
+   * the client can recognise a TGBCL/liquor line without a new endpoint.
+   */
+  const fetchStoreCategories = async () => {
+    try {
+      const res = await fetch('/api/stores');
+      if (!res.ok) return;                       // leave the set empty = "unknown"
+      const json = await res.json();
+      const next = new Set<string>();
+      for (const st of json.stores || []) {
+        // A deactivated store releases its categories back to Central behaviour —
+        // same rule materialStoreId() applies server-side.
+        if (!st?.is_active) continue;
+        for (const c of st.categories || []) {
+          const k = catKey(c?.category);
+          if (k) next.add(k);
+        }
+      }
+      setStoreCats(next);
+    } catch {
+      // Leave empty. Rates then behave normally and the server still refuses any
+      // store-mapped line outright (centralFlowBlock in /api/purchases POST).
+    }
+  };
+
+  /** Is this line a store-mapped (TGBCL liquor) material — i.e. zero-rated here? */
+  const storeMappedLine = (materialId: string) => {
+    if (storeCats.size === 0 || !materialId) return false;
+    const m = materials.find((x) => x.id === materialId) as any;
+    return !!m && storeCats.has(catKey(m.category));
+  };
+
   const fetchBackdateConfig = async () => {
     try {
       const [sRes, mRes] = await Promise.all([
@@ -343,7 +445,10 @@ export default function PurchasesPage() {
   useEffect(() => {
     const init = async () => {
       setLoading(true);
-      await Promise.all([fetchPurchases(), fetchMaterials(), fetchBackdateConfig()]);
+      await Promise.all([
+        fetchPurchases(), fetchMaterials(), fetchBackdateConfig(),
+        fetchVendors(), fetchStoreCategories(),
+      ]);
       setLoading(false);
     };
     init();
@@ -454,9 +559,22 @@ export default function PurchasesPage() {
     }));
   };
 
-  // Calculate bill totals and split the two bill-level charges across the lines.
-  // No GST anywhere on this path: Discount is netted OFF each line rate, Delivery
-  // is carried per line for reporting only, and unit_price stays the goods rate.
+  // Calculate bill totals, split the two bill-level charges across the lines, and
+  // derive each line's GST.
+  //
+  // GST is computed and carried ALONGSIDE the goods rate — it is NEVER folded into
+  // unit_price / line_total / final_unit_price. Input GST is reclaimable credit,
+  // not part of what the food costs: fold it in and average_price, and every
+  // recipe cost derived from it, inflates by the GST rate silently and forever.
+  // (That is exactly the bug the old bill-level GST control caused.)
+  //
+  // Order of operations, per line, in this order:
+  //   goods   = qty × rate
+  //   taxable = goods − its share of the bill discount   (a discount really does
+  //                                                       lower the cost)
+  //   tax     = taxable × gst%                           (tax is charged on the
+  //                                                       post-discount value)
+  //   cgst + sgst = tax
   const billCalc = (() => {
     const items = billData.items.map((item) => {
       const qty = parseFloat(item.quantity) || 0;
@@ -479,9 +597,10 @@ export default function PurchasesPage() {
     const discountClamped = rawDiscount > subtotal;
     const deliveryAmount = pctOrFlat(billData.delivery_mode, billData.delivery_value);
 
-    // What you actually pay the vendor. Delivery is part of the bill total but NOT
-    // of the goods cost — see the per-line split below.
-    const grandTotal = Math.round((subtotal - discountAmount + deliveryAmount) * 100) / 100;
+    // The bill-level rate is a DEFAULT that lines inherit. Parsed here, once —
+    // the selects keep raw strings so nothing round-trips through Number() while
+    // the storekeeper is still typing.
+    const billRate = parseFloat(billData.gst_rate) || 0;
 
     const pricedItems = items.map((item) => {
       const proportion = subtotal > 0 ? item.line_total / subtotal : 0;
@@ -494,11 +613,66 @@ export default function PurchasesPage() {
       // inflated average_price and every recipe cost built on it.)
       const netTotal = item.line_total - discountShare;
       const qty = parseFloat(item.quantity) || 0;
+      // STILL the post-discount GOODS rate. Tax is derived below and shipped in
+      // its own fields — adding it here is the one change that would break every
+      // recipe cost in the app.
       const finalUnitPrice = qty > 0 ? Math.round(netTotal / qty * 100) / 100 : 0;
-      return { ...item, discount_share: discountShare, delivery_share: deliveryShare, final_unit_price: finalUnitPrice };
+
+      // TGBCL liquor carries excise / cess / TCS on the store's own bill, not GST.
+      // Force 0% rather than trusting whatever the select happens to hold — the
+      // material can be swapped on a line that was already set to 18%.
+      const zeroRated = storeMappedLine(item.material_id);
+      const rate = zeroRated
+        ? 0
+        : (item.gst_rate === '' ? billRate : (parseFloat(item.gst_rate) || 0));
+
+      const taxable = r2(netTotal);
+      const taxValue = r2(taxable * rate / 100);
+      // House invariant: tax_value = cgst + sgst. Rounding BOTH halves up
+      // overshoots by a paisa on odd amounts (₹1.01 → 0.51 + 0.51 = 1.02), so
+      // sgst takes the rounded half and cgst absorbs the remainder.
+      // INTEGER PAISE, and the odd paisa lands in CGST — byte-identical to the
+      // server (api/purchases/route.ts: sgstPaise = floor(taxPaise/2), cgst =
+      // remainder). r2(taxValue/2) rounds the half UP, which put the spare paisa
+      // in SGST instead: on a Rs 1.01 tax the screen said CGST 0.50 / SGST 0.51
+      // while the row stored CGST 0.51 / SGST 0.50. The totals matched, so
+      // nothing looked wrong — until someone reconciled a GST return line by line.
+      const taxPaise = Math.round(taxValue * 100);
+      const sgst = Math.floor(taxPaise / 2) / 100;
+      const cgst = r2(taxValue - sgst);
+
+      return {
+        ...item,
+        discount_share: discountShare,
+        delivery_share: deliveryShare,
+        final_unit_price: finalUnitPrice,
+        gst_rate_effective: rate,
+        zero_rated: zeroRated,
+        taxable,
+        tax_value: taxValue,
+        cgst,
+        sgst,
+        line_incl_tax: r2(taxable + taxValue),
+      };
     });
 
-    return { items: pricedItems, subtotal, discountAmount, deliveryAmount, grandTotal, discountClamped };
+    const cgstTotal = r2(pricedItems.reduce((s, i) => s + i.cgst, 0));
+    const sgstTotal = r2(pricedItems.reduce((s, i) => s + i.sgst, 0));
+    const taxTotal = r2(cgstTotal + sgstTotal);
+    // Bill-level taxable is goods − discount computed once, not the sum of the
+    // per-line shares (those can drift a paisa on rounding). This is the figure
+    // printed on the paper bill.
+    const taxableTotal = r2(subtotal - discountAmount);
+
+    // What you actually pay the vendor: goods, less discount, plus the tax the
+    // vendor charges, plus delivery. Delivery and tax are both part of the bill
+    // total but NOT of the goods cost — see the per-line split above.
+    const grandTotal = r2(taxableTotal + taxTotal + deliveryAmount);
+
+    return {
+      items: pricedItems, subtotal, discountAmount, deliveryAmount, grandTotal, discountClamped,
+      taxableTotal, cgstTotal, sgstTotal, taxTotal,
+    };
   })();
 
   const handleBillSubmit = async (e: React.FormEvent) => {
@@ -600,8 +774,19 @@ export default function PurchasesPage() {
           // a ₹1,000 discount on a ₹10,000 bill rendered ₹8,500 instead of
           // ₹9,500. The rupees stay visible in the note below.
           delivery_charges: item.delivery_share,
+          // GST, per the wire contract. These travel BESIDE unit_price, never
+          // inside it: unit_price above is the discount-net goods rate, and the
+          // server re-derives tax from (line_total − discount_share) × gst_rate
+          // rather than trusting these figures. Sent even when 0 so an exempt or
+          // zero-rated (TGBCL) line is recorded as deliberately 0%, not missing.
+          gst_rate: item.gst_rate_effective,
+          cgst: item.cgst,
+          sgst: item.sgst,
           notes: [`Bill #${billData.bill_number || 'N/A'}`,
                   item.discount_share > 0 ? `Discount ₹${item.discount_share} (netted off rate)` : '',
+                  item.tax_value > 0
+                    ? `GST ${item.gst_rate_effective}% ₹${item.tax_value} (CGST ₹${item.cgst} + SGST ₹${item.sgst}, not in rate)`
+                    : (item.zero_rated ? 'GST 0% (store/TGBCL item — taxed on the store bill)' : ''),
                   item.delivery_share > 0 ? `Delivery ₹${item.delivery_share} (not in rate)` : '',
                   billData.notes, ...noteExtras].filter(Boolean).join(' | '),
         };
@@ -1642,7 +1827,11 @@ export default function PurchasesPage() {
               tall bill content OUT of the card. The overlay above (items-start +
               overflow-y-auto) scrolls the grown card, and — unlike an internal
               scroll — never clips the material typeahead dropdown. */}
-          <div style={{ maxHeight: 'none' }} className="relative w-full max-w-4xl bg-white rounded-2xl shadow-xl border border-[#E8D5C4] mx-4">
+          {/* max-w-6xl (was 4xl): the line table now carries the goods → discount →
+              taxable → tax → incl-tax reading across, and at 4xl every bill needed
+              sideways scrolling to see the tax it was entered for. Still capped, and
+              the table keeps its own overflow-x for narrower screens. */}
+          <div style={{ maxHeight: 'none' }} className="relative w-full max-w-6xl bg-white rounded-2xl shadow-xl border border-[#E8D5C4] mx-4">
             {/* Bill Header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4]">
               <div className="flex items-center gap-3">
@@ -1651,7 +1840,7 @@ export default function PurchasesPage() {
                 </div>
                 <div>
                   <h2 className="text-lg font-semibold text-[#2D1B0E]">Enter Full Bill</h2>
-                  <p className="text-xs text-[#8B7355]">One vendor bill, many items — Delivery &amp; Discount auto-split across the lines. Enter each rate as the plain goods rate (no tax added in).</p>
+                  <p className="text-xs text-[#8B7355]">One vendor bill, many items — Delivery &amp; Discount auto-split across the lines. Enter each rate as the plain goods rate (no tax added in); GST is worked out per line after discount and recorded on its own.</p>
                 </div>
               </div>
               <button onClick={() => setBillModalOpen(false)} className="p-1 text-[#8B7355] hover:text-[#2D1B0E]">
@@ -1671,14 +1860,58 @@ export default function PurchasesPage() {
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div>
                   <label className="block text-xs font-medium text-[#6B5744] mb-1">Vendor *</label>
-                  <input
-                    type="text"
-                    value={billData.vendor}
-                    onChange={(e) => updateBillField('vendor', e.target.value)}
-                    placeholder="Vendor name"
-                    className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-                    required
-                  />
+                  {/* Picker over the vendor master, same interaction as the ad-hoc
+                      GRN form so the two purchase-entry screens behave alike.
+                      allowCustom because a real bill can arrive from a vendor
+                      nobody has added yet — blocking it would just get the bill
+                      entered somewhere worse. The badge below makes a NEW name
+                      visible, so a typo'd second spelling of an existing vendor
+                      isn't accepted in silence and split in spend reporting.
+                      billData.vendor still carries the submitted string, so the
+                      API contract is untouched. */}
+                  {vendorsFailed ? (
+                    <>
+                      <input
+                        type="text"
+                        value={billData.vendor}
+                        onChange={(e) => updateBillField('vendor', e.target.value)}
+                        placeholder="Vendor name"
+                        className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+                        required
+                      />
+                      <p className="mt-1 text-[10px] text-amber-800">
+                        Vendor list unavailable — type the name exactly as it is spelled on other bills.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <Combobox
+                        options={vendors.map((v) => ({ value: v.name, label: v.name }))}
+                        value={billData.vendor}
+                        allowCustom
+                        placeholder="Type or pick"
+                        onChange={(typed) => updateBillField('vendor', typed)}
+                        className="w-full pr-7 px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+                      />
+                      {(() => {
+                        const typed = billData.vendor.trim();
+                        if (!typed) return null;
+                        const known = vendors.some(
+                          (v) => v.name.toLowerCase().trim() === typed.toLowerCase()
+                        );
+                        return known ? (
+                          <p className="mt-1 text-[10px] text-emerald-700 flex items-center gap-1">
+                            <CheckCircle className="w-3 h-3 shrink-0" /> In the vendor master
+                          </p>
+                        ) : (
+                          <p className="mt-1 text-[10px] text-amber-800 flex items-start gap-1">
+                            <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
+                            <span>New vendor — check the spelling against an earlier bill before saving.</span>
+                          </p>
+                        );
+                      })()}
+                    </>
+                  )}
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-[#6B5744] mb-1">Bill Number</label>
@@ -1753,6 +1986,34 @@ export default function PurchasesPage() {
                     so the cost can&apos;t go negative.
                   </p>
                 )}
+
+                {/* GST is NOT a bill-level charge like the two rows above — it is a
+                    DEFAULT rate each line inherits, and the tax is worked out per
+                    line AFTER that line's discount share. Set once here because one
+                    bill is normally one rate; a line can still override it. The tax
+                    is recorded beside the goods rate and never inside it, so input
+                    credit stays reclaimable and item cost stays true. */}
+                <div className="flex items-center gap-4 flex-wrap border-t border-[#E8D5C4] pt-3">
+                  <span className="text-sm font-medium text-[#6B5744] min-w-[130px]">
+                    GST Rate
+                    <span className="block text-[10px] font-normal text-[#8B7355]">every line follows this unless the line overrides it</span>
+                  </span>
+                  <select
+                    value={billData.gst_rate}
+                    onChange={(e) => updateBillField('gst_rate', e.target.value)}
+                    className="px-3 py-1.5 bg-white border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+                  >
+                    {GST_RATES.map((r) => <option key={r} value={r}>{r}%</option>)}
+                  </select>
+                  <span className="text-sm font-medium ml-auto text-[#6B5744]">
+                    CGST {formatCurrency(billCalc.cgstTotal)} + SGST {formatCurrency(billCalc.sgstTotal)}
+                    {' = '}<span className="text-[#2D1B0E]">{formatCurrency(billCalc.taxTotal)}</span>
+                  </span>
+                </div>
+                <p className="text-[10px] text-[#8B7355]">
+                  Tax is charged on the value <strong>after</strong> discount, shown per line, and recorded separately —
+                  it is never added into the item rate, so recipe costs stay on the true goods price.
+                </p>
               </div>
 
               {/* Line Items */}
@@ -1776,21 +2037,33 @@ export default function PurchasesPage() {
                   set in inventory, a <strong>BTL / CASE</strong> toggle appears next to the qty input — pick CASE and type the case count + per-case price.
                 </div>
                 <div className="overflow-x-auto rounded-xl border border-[#E8D5C4]">
-                  <table className="w-full text-sm block md:table">
+                  {/* md:min-w forces the horizontal scroll of the wrapper above
+                      instead of crushing eleven columns; on mobile the rows are
+                      block cards, where a min-width would only add a pointless
+                      sideways scroll. */}
+                  <table className="w-full md:min-w-[1180px] text-sm block md:table">
                     <thead className="bg-[#FFF1E3] hidden md:table-header-group">
                       <tr className="text-[#6B5744]">
-                        <th className="text-left py-2.5 px-3 font-medium w-[30%]">Material *</th>
-                        <th className="text-left py-2.5 px-3 font-medium w-[12%]">Brand</th>
+                        <th className="text-left py-2.5 px-3 font-medium w-[19%]">Material *</th>
+                        <th className="text-left py-2.5 px-3 font-medium w-[9%]">Brand</th>
                         {/* These two headers used to be hard-coded "(bottles)" and
                             "/btl" — true for a liquor bill, plain wrong for the kg /
                             L / PKT lines that make up most of a grocery bill. Both
                             columns are the material's own PURCHASE unit, printed
                             per line under each box. */}
-                        <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="In the material's purchase unit — bottles / kg / L / PKT (not cases, unless you switch the line to CASE)">Qty * <span className="text-[10px] font-normal text-[#8B7355]">(purchase units)</span></th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[12%]" title="Vendor rate per purchase unit (per bottle / per kg / per L)">Unit Price (₹) * <span className="text-[10px] font-normal text-[#8B7355]">/ purchase unit</span></th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[10%]">Line Total</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[10%]">Discount</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[12%]">Final Unit ₹</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[9%]" title="In the material's purchase unit — bottles / kg / L / PKT (not cases, unless you switch the line to CASE)">Qty * <span className="text-[10px] font-normal text-[#8B7355]">(purchase units)</span></th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="Vendor rate per purchase unit (per bottle / per kg / per L)">Unit Price (₹) * <span className="text-[10px] font-normal text-[#8B7355]">/ purchase unit</span></th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[8%]">Line Total</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[8%]">Discount</th>
+                        {/* Reads left to right exactly as the arithmetic runs:
+                            goods − discount = taxable, × GST% = tax, + tax = what
+                            the bill charges. Final Unit ₹ sits last and stays the
+                            GOODS rate — it is the number that becomes cost. */}
+                        <th className="text-right py-2.5 px-3 font-medium w-[8%]" title="Line Total minus its discount share — the value GST is charged on">Taxable</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[8%]">GST %</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="Charged on the taxable value above, split into CGST + SGST. Recorded separately — never added into the item rate.">Tax (C+S)</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[9%]" title="Taxable + tax — what this line adds to the bill">Incl. Tax</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="Post-discount GOODS rate — this is what is stored as the purchase price. Tax is NOT in it.">Final Unit ₹</th>
                         <th className="py-2.5 px-2 w-8"></th>
                       </tr>
                     </thead>
@@ -1911,8 +2184,48 @@ export default function PurchasesPage() {
                             <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Discount</span>
                             {item.discount_share > 0 ? `- ${formatCurrency(item.discount_share)}` : formatCurrency(0)}
                           </td>
+                          <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744] block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Taxable (after discount)</span>
+                            {formatCurrency(item.taxable)}
+                          </td>
+                          <td className="py-2 px-2 text-right block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">GST %</span>
+                            {item.zero_rated ? (
+                              // The rate is not the storekeeper's to set here: this
+                              // material belongs to a store location, where excise /
+                              // cess / TCS are charged on the store's own bill. A
+                              // GST% on it would be tax that was never paid.
+                              <div className="text-[10px] text-blue-700 leading-tight">
+                                0%
+                                <span className="block text-[9px] text-[#8B7355]">store item — taxed on the TGBCL bill</span>
+                              </div>
+                            ) : (
+                              <select
+                                value={item.gst_rate}
+                                onChange={(e) => updateBillLine(item.id, 'gst_rate', e.target.value)}
+                                className="w-full px-1.5 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
+                                title="Blank follows the bill's GST rate. Change it only for a line the vendor billed at a different rate."
+                              >
+                                <option value="">Bill ({billData.gst_rate}%)</option>
+                                {GST_RATES.map((r) => <option key={r} value={r}>{r}%</option>)}
+                              </select>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744] block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Tax (CGST + SGST)</span>
+                            {formatCurrency(item.tax_value)}
+                            {item.tax_value > 0 && (
+                              <span className="block text-[9px] text-[#8B7355]">
+                                {formatCurrency(item.cgst)} + {formatCurrency(item.sgst)}
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-right text-xs font-mono text-[#2D1B0E] block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Incl. Tax</span>
+                            {formatCurrency(item.line_incl_tax)}
+                          </td>
                           <td className="py-2 px-3 text-right text-xs font-mono font-semibold text-[#af4408] block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Final Unit ₹</span>
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Final Unit ₹ (goods, no tax)</span>
                             {formatCurrency(item.final_unit_price)}
                           </td>
                           <td className="py-2 px-1 block md:table-cell">
@@ -1940,15 +2253,29 @@ export default function PurchasesPage() {
               </div>
 
               {/* Bill Summary */}
+              {/* Reads in the same order as the paper bill in the storekeeper's
+                  hand, so the screen can be reconciled against it line by line. */}
               <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4">
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-center">
+                <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-7 gap-4 text-center">
                   <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">Items Subtotal</p>
+                    <p className="text-xs text-[#8B7355] mb-0.5">Goods Total</p>
                     <p className="text-lg font-bold text-[#2D1B0E]">{formatCurrency(billCalc.subtotal)}</p>
                   </div>
                   <div>
                     <p className="text-xs text-[#8B7355] mb-0.5">Discount</p>
                     <p className="text-lg font-bold text-emerald-700">- {formatCurrency(billCalc.discountAmount)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-[#8B7355] mb-0.5">Taxable</p>
+                    <p className="text-lg font-bold text-[#2D1B0E]">{formatCurrency(billCalc.taxableTotal)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-[#8B7355] mb-0.5">CGST</p>
+                    <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.cgstTotal)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-[#8B7355] mb-0.5">SGST</p>
+                    <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.sgstTotal)}</p>
                   </div>
                   <div>
                     <p className="text-xs text-[#8B7355] mb-0.5">Delivery</p>
@@ -1961,9 +2288,11 @@ export default function PurchasesPage() {
                 </div>
                 <p className="text-[10px] text-[#8B7355] text-center mt-2">
                   Discount and Delivery are split across items in proportion to line value.
-                  Final Unit Price = (Line Total − Discount Share) ÷ Qty, and that is what is stored as the purchase price
-                  (case-mode lines are stored per bottle, expanded by case size: rate ÷ case size against qty × case size) —
-                  so a discount lowers item cost while delivery is recorded on the bill without changing it.
+                  Per line: Taxable = Line Total − Discount Share, Tax = Taxable × GST% (split half CGST, half SGST).
+                  Final Unit Price = Taxable ÷ Qty, and that is what is stored as the purchase price
+                  (case-mode lines are stored per bottle, expanded by case size: rate ÷ case size against qty × case size).
+                  So a discount lowers item cost, while delivery and GST are recorded on the bill without changing it —
+                  GST is reclaimable input credit, not part of what the food costs.
                 </p>
               </div>
 

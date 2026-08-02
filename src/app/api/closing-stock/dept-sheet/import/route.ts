@@ -316,12 +316,30 @@ export async function GET(request: Request) {
     const date = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get('date') || '')
       ? String(url.searchParams.get('date'))
       : todayIST();
-    // Default: only what the included departments actually count. A store
-    // manager scoped to two departments must not be handed a sheet for eight,
-    // and a sheet padded with items nobody in scope holds is 1,000 rows of
-    // noise on a physical walk. `items=all` is the escape hatch for a full
-    // stock-take, and the importer accepts either file.
-    const wholeCatalogue = url.searchParams.get('items') === 'all';
+    // WHICH ITEMS GO ON THE SHEET — an admin setting, not a hardcoded rule.
+    //
+    // Two legitimate ways to run a count, and the house does both:
+    //   all        the STORE walks the building and counts everything, so the
+    //              sheet must carry the whole raw-material catalogue. An item
+    //              missing from the sheet is an item nobody counts.
+    //   requested  each department counts only what it has ever asked for —
+    //              the department-scoped concept the rest of the app uses. A
+    //              sheet padded with items that department never holds is a
+    //              thousand rows of noise on a physical walk.
+    //
+    // Owner-selectable in Settings -> Purchasing & Stock. Default 'all',
+    // because the bulk sheet exists FOR the store's whole-building count; the
+    // on-screen department sheet is unchanged and stays department-scoped.
+    //
+    // ?items= still wins when present, so a one-off run either way needs no
+    // settings trip: ?items=all or ?items=requested.
+    const scopeParam = String(url.searchParams.get('items') || '').toLowerCase();
+    const scopeSetting = String(
+      (db.prepare(`SELECT value FROM settings WHERE key = 'closing_sheet_bulk_scope'`).get() as any)?.value || 'all',
+    ).toLowerCase();
+    const wholeCatalogue = scopeParam
+      ? scopeParam === 'all'
+      : scopeSetting !== 'requested';
 
     const depts = countableDepts(db, scope.scopedIds, date);
     if (depts.length === 0) {

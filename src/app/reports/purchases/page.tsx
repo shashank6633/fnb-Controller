@@ -1,18 +1,37 @@
 'use client';
 
 /**
- * Purchase Report (/reports/purchases) — management-only.
+ * Purchase Report (/reports/purchases) — management-only. Two views:
  *
- * Purchase SPEND over a date range, broken down by month, vendor, category,
- * super-category, payment mode, and top items. Reads GET /api/reports/purchases
- * (isManagement-gated); CSV export is built client-side from the aggregates.
- * Reconciles with the Purchases page (same data set).
+ *  1. Summary — purchase SPEND over a date range, broken down by month, vendor,
+ *     category, super-category, payment mode, and top items. Reads
+ *     GET /api/reports/purchases (isManagement-gated); CSV built client-side.
+ *     Reconciles with the Purchases page (same data set).
+ *
+ *  2. Purchase log (itemwise) — one row per ITEM per BILL from all three
+ *     document sources (purchases / PO bills / GRN bills) in ONE downloadable
+ *     file. Reads GET /api/reports/purchase-log.
+ *
+ * WHY THE LOG SHOWS THREE SEPARATE TOTALS AND NEVER A GRAND TOTAL:
+ * receiving a purchase order writes BOTH a GRN and `purchases` rows — the same
+ * physical goods recorded twice, for two different purposes. Adding the three
+ * source values together would roughly double the real spend, so this page
+ * prints them side by side, each labelled, with an explicit warning, and never
+ * sums them. `link_key` on each row ties a GRN line to the purchase row it
+ * created so the overlap is visible instead of silently resolved.
+ *
+ * UNITS: quantities and rates on all three sources are already in PURCHASE
+ * units (₹ per purchase unit) — no pack-factor conversion here, ever.
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { todayIST } from '@/lib/format-date';
-import { ShoppingCart, TrendingUp, Building2, Package, AlertTriangle, Download, CalendarDays } from 'lucide-react';
+import MaterialTypeahead, { type MaterialLite } from '@/components/MaterialTypeahead';
+import {
+  ShoppingCart, TrendingUp, Building2, Package, AlertTriangle, Download, CalendarDays,
+  ScrollText, Info, Loader2, BarChart3,
+} from 'lucide-react';
 
 interface Row { spend: number; count: number; [k: string]: any }
 interface Report {
@@ -23,8 +42,32 @@ interface Report {
   vendors: string[]; categories: string[];
 }
 
+/** One row per ITEM per BILL, from whichever document source recorded it. */
+type LogSource = 'PURCHASE' | 'PO' | 'GRN';
+interface LogRow {
+  source: LogSource;
+  date: string; doc_no: string;
+  invoice_id: string;            // OURS   — PINV-yyyy-####, one per vendor bill
+  bill_no: string;               // VENDOR — the number printed on their bill
+  vendor: string;
+  material: string; sku: string; category: string;
+  qty: number; purchase_unit: string; rate: number; value: number;
+  qty_rejected: number | null;   // GRN lines only
+  discount: number; cgst: number; sgst: number;
+  special_excise_cess: number; tcs: number; delivery_charges: number; mrp_round_off: number;
+  link_key: string;              // ties a GRN line to the purchases row it created
+  notes: string;
+}
+interface LogResponse {
+  rows: LogRow[];
+  totals: { lines: number; purchase_value: number; po_value: number; grn_value: number };
+  truncated: boolean; from: string; to: string;
+}
+
 const fmtINR = (n: number) => '₹' + (Math.round((Number(n) || 0) * 100) / 100).toLocaleString('en-IN');
 const fmtNum = (n: number) => (Number(n) || 0).toLocaleString('en-IN');
+/** Quantities can be fractional (0.5 CTN etc.) — never round them away. */
+const fmtQty = (n: number) => (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
 
 function firstOfMonth(iso: string) { return iso.slice(0, 8) + '01'; }
 function addMonths(iso: string, n: number) {
@@ -65,6 +108,7 @@ export default function PurchaseReportPage() {
   const [error, setError] = useState('');
   const [itemSearch, setItemSearch] = useState('');
   const [itemSort, setItemSort] = useState<'spend' | 'qty' | 'count' | 'avg' | 'name'>('spend');
+  const [view, setView] = useState<'summary' | 'log'>('summary');
 
   const load = useCallback(async () => {
     setLoading(true); setError('');
@@ -110,6 +154,23 @@ export default function PurchaseReportPage() {
           <Link href="/purchases" className="text-sm font-medium text-[#af4408] hover:underline">Go to Purchases →</Link>
         </div>
 
+        {/* View switch — Summary (spend analysis) vs Purchase log (itemwise document log) */}
+        <div className="flex flex-wrap gap-1.5">
+          {([
+            ['summary', 'Summary', <BarChart3 key="i" className="w-3.5 h-3.5" />],
+            ['log', 'Purchase log (itemwise)', <ScrollText key="i" className="w-3.5 h-3.5" />],
+          ] as const).map(([k, label, icon]) => (
+            <button key={k} onClick={() => setView(k as 'summary' | 'log')}
+              className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold border transition-colors ${
+                view === k ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4] hover:bg-[#FFF1E3]'}`}>
+              {icon}{label}
+            </button>
+          ))}
+        </div>
+
+        {view === 'log' && <PurchaseLog from={from} to={to} setFrom={setFrom} setTo={setTo} vendors={data?.vendors || []} />}
+
+        {view === 'summary' && (<>
         {/* Filters */}
         <div className="bg-white border border-[#E8D5C4] rounded-2xl shadow-sm p-4 space-y-3">
           <div className="flex flex-wrap items-end gap-3">
@@ -225,6 +286,280 @@ export default function PurchaseReportPage() {
             )}
             <p className="text-[11px] text-[#8B7355]">Spend = invoice total of purchase entries in the range. Matches the Purchases page. {data.vendor && `Vendor: ${data.vendor}. `}{data.category && `Category: ${data.category}.`}</p>
           </>
+        )}
+        </>)}
+      </div>
+    </div>
+  );
+}
+
+/* ────────────────────────── Purchase log (itemwise) ──────────────────────────
+ * A LOG, not an aggregate: one row per item per bill, with Purchases, PO bills
+ * and GRN bills interleaved and each row stamped with the source it came from.
+ * The date range is shared with the Summary view so switching tabs keeps the
+ * same window; every other filter is local to this section.
+ */
+
+const SOURCE_OPTIONS = [
+  { k: 'all', label: 'All sources' },
+  { k: 'purchase', label: 'Purchases' },
+  { k: 'po', label: 'PO bills' },
+  { k: 'grn', label: 'GRN bills' },
+] as const;
+type SourceFilter = (typeof SOURCE_OPTIONS)[number]['k'];
+
+/** Visual stamp so a row's origin is unmistakable when the three are interleaved. */
+function SourceBadge({ source }: { source: LogSource }) {
+  const style = source === 'PURCHASE' ? 'bg-[#FFF1E3] text-[#af4408] border-[#F0CDAE]'
+    : source === 'PO' ? 'bg-[#F4EFE9] text-[#6B5744] border-[#E8D5C4]'
+    : 'bg-[#EDF4EE] text-[#3F6B4C] border-[#CFE2D4]';
+  return <span className={`inline-block px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide ${style}`}>{source}</span>;
+}
+
+/** Rows the browser will paint before asking for confirmation — a full year of
+ *  purchases is thousands of lines and painting them all locks the tab. */
+const ROW_PAINT_CAP = 600;
+
+function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
+  from: string; to: string; setFrom: (v: string) => void; setTo: (v: string) => void; vendors: string[];
+}) {
+  const today = todayIST();
+  const [vendor, setVendor] = useState('');
+  const [vendorQ, setVendorQ] = useState('');   // debounced copy — see below
+  const [materialId, setMaterialId] = useState('');
+  const [source, setSource] = useState<SourceFilter>('all');
+  const [materials, setMaterials] = useState<MaterialLite[]>([]);
+  const [data, setData] = useState<LogResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [downloading, setDownloading] = useState(false);
+  const [showCharges, setShowCharges] = useState(false);
+  const [paintAll, setPaintAll] = useState(false);
+
+  // Item filter needs ids, not names — the API filters on material_id.
+  // Non-fatal: if the list fails the log still loads unfiltered, but say so
+  // rather than leave an item picker that silently finds nothing.
+  const [materialsError, setMaterialsError] = useState(false);
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/inventory?scope=all', { cache: 'no-store' });
+        if (!res.ok) { setMaterialsError(true); return; }
+        const j = await res.json();
+        setMaterials(Array.isArray(j.materials) ? j.materials : []);
+      } catch { setMaterialsError(true); }
+    })();
+  }, []);
+
+  // The vendor box is free text, so without this every keystroke would re-run a
+  // multi-thousand-row query against a live production DB.
+  useEffect(() => {
+    const id = setTimeout(() => setVendorQ(vendor.trim()), 400);
+    return () => clearTimeout(id);
+  }, [vendor]);
+
+  const qs = useCallback((format: 'json' | 'csv') => {
+    const p = new URLSearchParams({ from, to, source, format });
+    if (vendorQ) p.set('vendor', vendorQ);
+    if (materialId) p.set('material_id', materialId);
+    return p.toString();
+  }, [from, to, source, vendorQ, materialId]);
+
+  const load = useCallback(async () => {
+    setLoading(true); setError(''); setPaintAll(false);
+    try {
+      const res = await fetch(`/api/reports/purchase-log?${qs('json')}`, { cache: 'no-store' });
+      // A failed load must never look like "no purchases" — clear the rows and say why.
+      if (res.status === 401) { setError('Sign in required.'); setData(null); return; }
+      if (res.status === 403) { setError('Management only — you don’t have access to the purchase log.'); setData(null); return; }
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as any));
+        setError(j?.error || `Failed to load the purchase log (HTTP ${res.status}).`); setData(null); return;
+      }
+      const j = (await res.json()) as LogResponse;
+      setData({ ...j, rows: Array.isArray(j.rows) ? j.rows : [] });
+    } catch { setError('Network error — please try again.'); setData(null); }
+    finally { setLoading(false); }
+  }, [qs]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const download = async () => {
+    setDownloading(true); setError('');
+    try {
+      const res = await fetch(`/api/reports/purchase-log?${qs('csv')}`, { cache: 'no-store' });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as any));
+        setError(j?.error || (res.status === 403 ? 'Management only — download refused.' : `Download failed (HTTP ${res.status}).`));
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `purchase-log-${from}_${to}.csv`; a.click();
+      URL.revokeObjectURL(url);
+    } catch { setError('Network error — download failed.'); }
+    finally { setDownloading(false); }
+  };
+
+  const rows = data?.rows || [];
+  const shown = paintAll ? rows : rows.slice(0, ROW_PAINT_CAP);
+  const t = data?.totals;
+  const CHARGE_COLS: { k: keyof LogRow; label: string }[] = [
+    { k: 'discount', label: 'Discount' }, { k: 'cgst', label: 'CGST' }, { k: 'sgst', label: 'SGST' },
+    { k: 'special_excise_cess', label: 'Excise/Cess' }, { k: 'tcs', label: 'TCS' },
+    { k: 'delivery_charges', label: 'Delivery' }, { k: 'mrp_round_off', label: 'MRP Round-off' },
+  ];
+  const colCount = 13 + (showCharges ? CHARGE_COLS.length : 0);
+
+  return (
+    <div className="space-y-4">
+      {/* Filters */}
+      <div className="bg-white border border-[#E8D5C4] rounded-2xl shadow-sm p-4 space-y-3">
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="block"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">From</span>
+            <input type="date" value={from} onChange={e => e.target.value && setFrom(e.target.value)} className="mt-1 block px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]" /></label>
+          <label className="block"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">To</span>
+            <input type="date" value={to} onChange={e => e.target.value && setTo(e.target.value)} className="mt-1 block px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]" /></label>
+          {/* Free text + datalist, not a <select>: PO and GRN bills carry vendors
+              that may never appear on a `purchases` row, so a fixed list would hide them. */}
+          <label className="block min-w-[180px]"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">Vendor</span>
+            <input list="purchase-log-vendors" value={vendor} onChange={e => setVendor(e.target.value)} placeholder="All vendors"
+              className="mt-1 block w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]" />
+            <datalist id="purchase-log-vendors">{vendors.map(v => <option key={v} value={v} />)}</datalist></label>
+          <div className="block min-w-[240px] flex-1"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">Item</span>
+            <div className="mt-1"><MaterialTypeahead materials={materials} value={materialId} onPick={setMaterialId} compact={false} showStock={false} placeholder="All items — type name, SKU or category…" /></div>
+            {materialsError && <p className="text-[10px] text-amber-700 mt-0.5">Item list didn’t load — showing all items.</p>}</div>
+          <label className="block min-w-[150px]"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">Source</span>
+            <select value={source} onChange={e => setSource(e.target.value as SourceFilter)} className="mt-1 block w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]">
+              {SOURCE_OPTIONS.map(o => <option key={o.k} value={o.k}>{o.label}</option>)}
+            </select></label>
+          <button onClick={download} disabled={downloading}
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-60 text-white">
+            {downloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />} Download CSV
+          </button>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {([
+            ['This month', firstOfMonth(today), today],
+            ['Last 3 months', addMonths(firstOfMonth(today), -2), today],
+            ['This FY', fyStart(today), today],
+          ] as const).map(([label, f, tt]) => (
+            <button key={label} onClick={() => { setFrom(f); setTo(tt); }}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium border bg-white text-[#6B5744] border-[#E8D5C4] hover:bg-[#FFF1E3]">{label}</button>
+          ))}
+          <span className="mx-1 w-px h-5 bg-[#F0E4D6]" />
+          <label className="inline-flex items-center gap-1.5 text-xs text-[#6B5744] cursor-pointer">
+            <input type="checkbox" checked={showCharges} onChange={e => setShowCharges(e.target.checked)} className="accent-[#af4408]" />
+            Show charge columns
+          </label>
+          {(vendor || materialId || source !== 'all') && (
+            <button onClick={() => { setVendor(''); setMaterialId(''); setSource('all'); }}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium border bg-white text-[#af4408] border-[#E8D5C4] hover:bg-[#FFF1E3]">Clear filters</button>
+          )}
+        </div>
+      </div>
+
+      {error && <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-800">{error}</div>}
+
+      {/* THE three totals — deliberately never added up. This warning is the most
+          important text on the page: without it the totals get summed and the
+          owner reads roughly twice the real spend. */}
+      {t && (
+        <div className="space-y-2">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <Card icon={<ShoppingCart className="w-4 h-4" />} label="Purchases value" value={fmtINR(t.purchase_value)} sub="source = PURCHASE" tone="accent" />
+            <Card icon={<Package className="w-4 h-4" />} label="PO bills value" value={fmtINR(t.po_value)} sub="source = PO" />
+            <Card icon={<Building2 className="w-4 h-4" />} label="GRN bills value" value={fmtINR(t.grn_value)} sub="source = GRN" />
+          </div>
+          <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-900 flex gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <p>
+              <strong>Do not add these three totals together.</strong> Receiving a purchase order records
+              <em> both</em> a GRN <em>and</em> purchase entries for the same goods, so the same physical purchase
+              appears under two sources. Each total is what that document type says on its own — the sum would
+              roughly double your real spend. Use the <strong>Link key</strong> column to see which GRN line and
+              purchase row are the same delivery.
+            </p>
+          </div>
+          <p className="text-[11px] text-[#8B7355]">
+            {fmtNum(t.lines)} line{t.lines === 1 ? '' : 's'} · {from} to {to}. Quantities and rates are in PURCHASE units.
+            GRN rates are gross (as the vendor bill reads); purchase rates are net of the allocated discount, so the same
+            delivery can legitimately show two rates. The seven per-line charges are recorded only — they are NOT folded
+            into Value.
+          </p>
+        </div>
+      )}
+
+      {data?.truncated && (
+        <div className="bg-[#af4408] text-white rounded-xl px-4 py-3 text-sm font-semibold flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          This list was TRUNCATED by the server — it is not the full log. Narrow the date range or filters, or download the CSV.
+        </div>
+      )}
+
+      {/* Log table */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl shadow-sm p-4 sm:p-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+          <h2 className="text-sm font-bold flex items-center gap-2"><span className="text-[#af4408]"><ScrollText className="w-4 h-4" /></span>
+            Purchase log — one row per item per bill
+            <span className="text-[11px] text-[#8B7355] font-normal">({fmtNum(rows.length)} row{rows.length === 1 ? '' : 's'})</span></h2>
+          {loading && <span className="text-xs text-[#8B7355] inline-flex items-center gap-1.5"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading…</span>}
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm whitespace-nowrap">
+            <thead><tr className="text-left text-[11px] uppercase text-[#8B7355] border-b border-[#F0E4D6]">
+              <th className="py-2 pr-3">Source</th>
+              <th className="py-2 px-3">Date</th>
+              <th className="py-2 px-3">Doc No</th>
+              <th className="py-2 px-3">Invoice ID (ours)</th>
+              <th className="py-2 px-3">Bill No (vendor)</th>
+              <th className="py-2 px-3">Vendor</th>
+              <th className="py-2 px-3">Item</th>
+              <th className="py-2 px-3">Category</th>
+              <th className="py-2 px-3 text-right">Qty</th>
+              <th className="py-2 px-3 text-right">Rate</th>
+              <th className="py-2 px-3 text-right">Value</th>
+              <th className="py-2 px-3 text-right">Rejected</th>
+              {showCharges && CHARGE_COLS.map(c => <th key={String(c.k)} className="py-2 px-3 text-right">{c.label}</th>)}
+              <th className="py-2 pl-3">Link key</th>
+            </tr></thead>
+            <tbody>
+              {loading && rows.length === 0 ? (
+                <tr><td colSpan={colCount} className="py-6 text-center text-[#8B7355] animate-pulse">Loading purchase log…</td></tr>
+              ) : rows.length === 0 ? (
+                <tr><td colSpan={colCount} className="py-6 text-center text-[#8B7355]">{error ? 'Not loaded — see the message above.' : 'No purchase, PO or GRN lines in this range.'}</td></tr>
+              ) : shown.map((r, i) => (
+                <tr key={`${r.source}-${r.doc_no}-${r.link_key}-${i}`} className="border-b border-[#F7EEE3] last:border-0 align-top">
+                  <td className="py-2 pr-3"><SourceBadge source={r.source} /></td>
+                  <td className="py-2 px-3 text-[#6B5744]">{r.date || '—'}</td>
+                  <td className="py-2 px-3 font-medium">{r.doc_no || '—'}</td>
+                  <td className="py-2 px-3 text-[#6B5744]">{r.invoice_id || '—'}</td>
+                  <td className="py-2 px-3 text-[#6B5744]">{r.bill_no || '—'}</td>
+                  <td className="py-2 px-3 text-[#6B5744]">{r.vendor || '—'}</td>
+                  <td className="py-2 px-3 font-medium whitespace-normal min-w-[180px]">{r.material || '—'}
+                    {r.sku && <span className="block text-[10px] text-[#8B7355] font-normal">{r.sku}</span>}</td>
+                  <td className="py-2 px-3 text-[#8B7355]">{r.category || '—'}</td>
+                  <td className="py-2 px-3 text-right tabular-nums">{fmtQty(r.qty)} <span className="text-[11px] text-[#8B7355]">{r.purchase_unit || ''}</span></td>
+                  <td className="py-2 px-3 text-right tabular-nums">{fmtINR(r.rate)}</td>
+                  <td className="py-2 px-3 text-right tabular-nums font-semibold">{fmtINR(r.value)}</td>
+                  <td className="py-2 px-3 text-right tabular-nums">{r.qty_rejected == null ? '—' : <span className={Number(r.qty_rejected) > 0 ? 'text-amber-700 font-semibold' : ''}>{fmtQty(r.qty_rejected)} {r.purchase_unit || ''}</span>}</td>
+                  {showCharges && CHARGE_COLS.map(c => <td key={String(c.k)} className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtINR(Number(r[c.k]) || 0)}</td>)}
+                  <td className="py-2 pl-3 text-[11px] text-[#8B7355] font-mono">{r.link_key || '—'}
+                    {r.notes && <span className="block text-[10px] text-[#B8A48E] font-sans whitespace-normal max-w-[220px]">{r.notes}</span>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {rows.length > shown.length && (
+          <div className="pt-3 flex items-center gap-2 text-xs text-[#8B7355]">
+            <Info className="w-3.5 h-3.5 shrink-0" />
+            Showing the first {fmtNum(shown.length)} of {fmtNum(rows.length)} loaded rows on screen — the CSV contains all of them.
+            <button onClick={() => setPaintAll(true)} className="px-2.5 py-1 rounded-md border border-[#E8D5C4] text-[#af4408] hover:bg-[#FFF1E3] font-semibold">Show all {fmtNum(rows.length)}</button>
+          </div>
         )}
       </div>
     </div>

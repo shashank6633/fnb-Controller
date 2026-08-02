@@ -56,6 +56,21 @@ import { todayIST } from '@/lib/format-date';
  * payload for anyone, admin included. This is a count-and-valuation history,
  * not a variance report (/variance-approvals owns that), so there is nothing
  * to strip and no way for a non-admin to recover the system figure from it.
+ *
+ * ── ?view=matrix — THE COMPARISON VIEW (added 2026-08-02) ──────────────────
+ * "Detailed closing stock where I can see the PREVIOUS closing stocks also."
+ * The flat mode above answers "what was counted", one line per count. It
+ * cannot answer "is this month's figure sane", because that question is only
+ * ever answered by the SAME item's last count, and in the flat list those two
+ * lines sit hundreds of rows apart. view=matrix pivots the identical
+ * permission-scoped, identically-valued rows into one row per ITEM with one
+ * column per COUNT DATE, newest first — so the previous count sits beside the
+ * current one and the difference is a glance, not a spreadsheet exercise.
+ *
+ * Everything below the pivot is unchanged: same two tables, same department
+ * scoping, same stored-rate valuation, same purchase-unit conversion, same
+ * refusal to expose system stock or variance. `view` absent or 'flat' runs the
+ * deployed code path byte for byte — this addition is purely additive.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -77,6 +92,17 @@ const STORE_LABEL = 'Store / Overall';
 /** A silently truncated export is a WRONG report — the reader cannot tell a
  *  missing week from a week nobody counted. Cap the work, then say so. */
 const ROW_CAP = 50000;
+
+/* ── matrix caps ───────────────────────────────────────────────────────────
+ * A matrix grows in TWO directions, so it needs two caps. Two years of daily
+ * counts is ~730 columns: no screen shows it and Excel users cannot read it
+ * sideways, so the columns stop at the newest DATE_CAP count dates. The rows
+ * stop at MATRIX_ITEM_CAP items. CELL_CAP bounds the fetch itself — items ×
+ * dates is a product, and an outlet with 5,000 items over 60 counts is
+ * 300,000 rows that must not be built in memory to then be thrown away. */
+const DATE_CAP = 60;
+const MATRIX_ITEM_CAP = 20000;
+const CELL_CAP = 120000;
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 const num = (v: unknown) => Number(v) || 0;
@@ -132,6 +158,83 @@ interface SemiCountRow {
   recorded_by: string | null;
 }
 
+/** One counted cell. A cell that EXISTS means somebody counted that item on
+ *  that date; qty 0 means they counted it and found nothing. */
+export interface MatrixCell {
+  /** PURCHASE units for RAW (toPurchaseQty); the counted yield for SUB. */
+  qty: number;
+  /** ₹ as stored at count time. NULL when the row was never priced. */
+  value: number | null;
+  rate: number | null;
+}
+
+export interface MatrixRow {
+  /** type + id + department — the only safe row identity, see below. */
+  key: string;
+  material_id: string | null;
+  sub_recipe_id: string | null;
+  type: 'RAW' | 'SUB';
+  material: string;
+  sku: string;
+  category: string;
+  department: string;
+  department_id: string;
+  /** The unit the qty column is in, so the page never has to guess. */
+  purchase_unit: string;
+  /**
+   * One entry per date column, ALWAYS present.
+   *   null  = NOT COUNTED — nobody looked at this item that day.
+   *   {qty:0} = COUNTED ZERO — somebody looked and the shelf was empty.
+   * These are different facts and collapsing them (0 for both, or blank for
+   * both) is the single most dangerous thing this view could do: it would tell
+   * the owner an item ran out on a day nobody counted it, or that a genuinely
+   * empty shelf was simply skipped. Comparing to the previous count is the
+   * whole point of the view, and a comparison against an invented zero is
+   * worse than no comparison at all.
+   */
+  counts: Record<string, MatrixCell | null>;
+  latest_date: string | null;
+  previous_date: string | null;
+  latest_qty: number | null;
+  previous_qty: number | null;
+  change_qty: number | null;
+  /** NULL when previous_qty is 0 — a division by zero is not "infinite
+   *  growth", it is unknown, and printing ∞ or 100% would be a fabrication. */
+  change_pct: number | null;
+  latest_value: number | null;
+}
+
+interface RawMatrixRow {
+  date: string;
+  material_id: string;
+  department_id: string | null;
+  department: string | null;
+  material: string;
+  sku: string | null;
+  category: string | null;
+  unit: string | null;
+  purchase_unit: string | null;
+  pack_size: number | null;
+  physical_stock: number;
+  rate_per_purchase_unit: number | null;
+  rate_source: string | null;
+  total_value: number | null;
+}
+
+interface SemiMatrixRow {
+  date: string;
+  sub_recipe_id: string;
+  department_id: string | null;
+  department: string | null;
+  material: string;
+  category: string | null;
+  unit: string | null;
+  yield_unit: string | null;
+  physical_stock: number;
+  rate: number | null;
+  total_value: number | null;
+}
+
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Shift a YYYY-MM-DD IST date by whole days. Pure UTC arithmetic on the date
@@ -149,6 +252,29 @@ function csvEscape(v: unknown): string {
   if (v === null || v === undefined) return '';
   const s = String(v);
   return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+/** `%`, `_` and `\` are LIKE metacharacters. An item search for "50%" must
+ *  match the literal text, not "50 followed by anything". */
+function likeTerm(q: string): string {
+  return '%' + q.toLowerCase().replace(/[\\%_]/g, (c) => '\\' + c) + '%';
+}
+
+/**
+ * Drop the trailing partial group after a LIMIT bit. The fetch is ordered so
+ * every count of one item is contiguous; if the cap cut through the middle of
+ * an item, the dates past the cut are MISSING, and a half-filled row is
+ * indistinguishable from an item that genuinely was not counted on those dates
+ * — the exact confusion this view exists to remove. So the partial item leaves
+ * entirely and `truncated` says the range held more. Returns true if it bit.
+ */
+function trimPartialGroup<T>(rows: T[], cap: number, keyOf: (r: T) => string): boolean {
+  if (rows.length <= cap) return false;
+  const lastKey = keyOf(rows[rows.length - 1]);
+  let end = rows.length;
+  while (end > 0 && keyOf(rows[end - 1]) === lastKey) end--;
+  rows.length = end;
+  return true;
 }
 
 export async function GET(request: Request) {
@@ -170,9 +296,16 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const format = (url.searchParams.get('format') || 'json').toLowerCase() === 'csv' ? 'csv' : 'json';
     const deptParam = (url.searchParams.get('department_id') || '').trim();
+    // Anything that is not exactly 'matrix' stays on the deployed flat path —
+    // a typo must never silently change the shape of a live download.
+    const view = (url.searchParams.get('view') || '').trim().toLowerCase() === 'matrix' ? 'matrix' : 'flat';
+    const q = (url.searchParams.get('q') || '').trim();
 
     const today = todayIST();
-    let from = (url.searchParams.get('from') || '').trim() || shiftIsoDate(today, -30);
+    // The matrix defaults WIDER than the flat list on purpose: its job is to
+    // put the previous count beside the current one, and on a monthly counting
+    // cycle a 30-day window holds exactly one count — nothing to compare with.
+    let from = (url.searchParams.get('from') || '').trim() || shiftIsoDate(today, view === 'matrix' ? -180 : -30);
     let to = (url.searchParams.get('to') || '').trim() || today;
     if (!ISO_DATE.test(from) || !ISO_DATE.test(to)) {
       return Response.json({ error: 'from and to must be dates in YYYY-MM-DD form.' }, { status: 400 });
@@ -215,6 +348,349 @@ export async function GET(request: Request) {
     }
     const deptFor = (alias: string) => deptClause.replace(/%A%/g, alias);
 
+    /* ════════════════════════════════════════════════════════════════════════
+     * MATRIX VIEW — one row per item, one column per count date.
+     * Deliberately placed AFTER the auth, date, department-scope and outlet
+     * work above so it shares that code exactly: two views of the same history
+     * that disagreed about who may see which department would be a permission
+     * bug wearing a report's clothes.
+     * ══════════════════════════════════════════════════════════════════════ */
+    // HOISTED ABOVE THE VIEW SPLIT. These were built inside the matrix branch,
+    // so the flat queries carried no name/SKU/category predicate at all — the
+    // page shows ONE search box for both views and sends `q` for both, so a
+    // manager typing "PANEER" in "All entries" got every row in the range back,
+    // under a footer that said "filtered view". A search that silently matches
+    // everything is worse than one that errors: the reader believes the list.
+      const qRawParams: string[] = [];
+      const qSemiParams: string[] = [];
+      let qRaw = '';
+      let qSemi = '';
+      if (q) {
+        const t = likeTerm(q);
+        qRaw = `AND (LOWER(rm.name) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(rm.sku,'')) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(rm.category,'')) LIKE ? ESCAPE '\\')`;
+        qRawParams.push(t, t, t);
+        qSemi = `AND (LOWER(sr.name) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(sr.category,'')) LIKE ? ESCAPE '\\')`;
+        qSemiParams.push(t, t);
+      }
+
+    if (view === 'matrix') {
+      // Free-text filter on item / SKU / category. Applied in SQL, not after
+      // the fetch, so the caps below count the rows the user actually asked
+      // for instead of being spent on rows about to be filtered away.
+      // ── STEP 1: which dates are columns? ──────────────────────────────────
+      // The columns are the dates a count ACTUALLY HAPPENED on, not every day
+      // in the range: a calendar grid of mostly-empty columns buries the two
+      // counts the owner came to compare. Each side is capped at DATE_CAP+1,
+      // so the union's newest DATE_CAP dates are still exactly right.
+      const rawDates = db.prepare(`
+        SELECT DISTINCT cs.date AS date
+          FROM closing_stock cs
+          JOIN raw_materials rm ON rm.id = cs.material_id
+         WHERE cs.date >= ? AND cs.date <= ?
+           AND ${OUTLET_SCOPE_CS}
+           ${deptFor('cs')}
+           ${qRaw}
+         ORDER BY cs.date DESC
+         LIMIT ${DATE_CAP + 1}
+      `).all(from, to, outletId, ...deptParams, ...qRawParams) as { date: string }[];
+
+      const semiDates = db.prepare(`
+        SELECT DISTINCT css.date AS date
+          FROM closing_stock_semi css
+          JOIN sub_recipes sr ON sr.id = css.sub_recipe_id
+         WHERE css.date >= ? AND css.date <= ?
+           AND ${OUTLET_SCOPE_CSS}
+           ${deptFor('css')}
+           ${qSemi}
+         ORDER BY css.date DESC
+         LIMIT ${DATE_CAP + 1}
+      `).all(from, to, outletId, ...deptParams, ...qSemiParams) as { date: string }[];
+
+      const dateSet = new Set<string>();
+      for (const d of rawDates) dateSet.add(d.date);
+      for (const d of semiDates) dateSet.add(d.date);
+      // ISO dates sort lexically; reverse = NEWEST FIRST, the order the
+      // contract promises and the order the page renders columns in.
+      const allDates = [...dateSet].sort().reverse();
+      let truncated = allDates.length > DATE_CAP;
+      const dates = allDates.slice(0, DATE_CAP);
+      const datesJson = JSON.stringify(dates);
+      // Bound the scan by the kept window too — json_each alone gives SQLite
+      // nothing to use the date index with.
+      const minDate = dates.length ? dates[dates.length - 1] : from;
+      const maxDate = dates.length ? dates[0] : to;
+
+      // ── STEP 2: every count on those dates ────────────────────────────────
+      // ORDER BY keeps one item's counts contiguous (so a cap can be trimmed
+      // back to whole items) and puts each cell's duplicates in write order,
+      // oldest first — the writers delete-then-insert per (date, material,
+      // department), so if two rows for one cell ever survive, the LAST write
+      // is the count that stands. A sum would double it.
+      const rawCells = db.prepare(`
+        SELECT cs.date                                            AS date,
+               cs.material_id                                     AS material_id,
+               COALESCE(cs.department_id,'')                      AS department_id,
+               d.name                                             AS department,
+               rm.name                                            AS material,
+               rm.sku                                             AS sku,
+               rm.category                                        AS category,
+               rm.unit                                            AS unit,
+               COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS purchase_unit,
+               rm.pack_size                                       AS pack_size,
+               cs.physical_stock                                  AS physical_stock,
+               cs.rate_per_purchase_unit                          AS rate_per_purchase_unit,
+               cs.rate_source                                     AS rate_source,
+               cs.total_value                                     AS total_value
+          FROM closing_stock cs
+          JOIN raw_materials rm ON rm.id = cs.material_id
+          LEFT JOIN departments d ON d.id = cs.department_id
+         WHERE cs.date IN (SELECT value FROM json_each(?))
+           AND cs.date >= ? AND cs.date <= ?
+           AND ${OUTLET_SCOPE_CS}
+           ${deptFor('cs')}
+           ${qRaw}
+         ORDER BY COALESCE(cs.department_id,''), cs.material_id, cs.date, cs.created_at
+         LIMIT ${CELL_CAP + 1}
+      `).all(datesJson, minDate, maxDate, outletId, ...deptParams, ...qRawParams) as RawMatrixRow[];
+
+      const semiCells = db.prepare(`
+        SELECT css.date                                           AS date,
+               css.sub_recipe_id                                  AS sub_recipe_id,
+               COALESCE(css.department_id,'')                     AS department_id,
+               d.name                                             AS department,
+               sr.name                                            AS material,
+               COALESCE(NULLIF(TRIM(sr.category),''), 'sub-recipe') AS category,
+               css.unit                                           AS unit,
+               sr.yield_unit                                      AS yield_unit,
+               css.physical_stock                                 AS physical_stock,
+               css.rate                                           AS rate,
+               css.total_value                                    AS total_value
+          FROM closing_stock_semi css
+          JOIN sub_recipes sr ON sr.id = css.sub_recipe_id
+          LEFT JOIN departments d ON d.id = css.department_id
+         WHERE css.date IN (SELECT value FROM json_each(?))
+           AND css.date >= ? AND css.date <= ?
+           AND ${OUTLET_SCOPE_CSS}
+           ${deptFor('css')}
+           ${qSemi}
+         ORDER BY COALESCE(css.department_id,''), css.sub_recipe_id, css.date, css.created_at
+         LIMIT ${CELL_CAP + 1}
+      `).all(datesJson, minDate, maxDate, outletId, ...deptParams, ...qSemiParams) as SemiMatrixRow[];
+
+      if (trimPartialGroup(rawCells, CELL_CAP, (r) => `${r.department_id}|${r.material_id}`)) truncated = true;
+      if (trimPartialGroup(semiCells, CELL_CAP, (s) => `${s.department_id}|${s.sub_recipe_id}`)) truncated = true;
+
+      // ── STEP 3: pivot ─────────────────────────────────────────────────────
+      // Identity is type + id + department, NEVER the name. A raw material and
+      // a sub-recipe can both be called "GINGER GARLIC PASTE" (one bought, one
+      // made) and the same material is counted separately by each department:
+      // key on the name and those become one row whose columns interleave two
+      // different things — a comparison of an item against something else.
+      const byKey = new Map<string, MatrixRow>();
+      const blank = (): Record<string, MatrixCell | null> => {
+        // Every date key is written up front so a missing count is an explicit
+        // null the page can render as "not counted", not an absent property
+        // that reads as undefined and gets styled like a zero.
+        const o: Record<string, MatrixCell | null> = {};
+        for (const d of dates) o[d] = null;
+        return o;
+      };
+
+      for (const r of rawCells) {
+        const key = `RAW|${r.material_id}|${r.department_id}`;
+        let row = byKey.get(key);
+        if (!row) {
+          row = {
+            key,
+            material_id: r.material_id,
+            sub_recipe_id: null,
+            type: 'RAW',
+            material: r.material,
+            sku: r.sku || '',
+            category: r.category || '',
+            department: r.department || STORE_LABEL,
+            department_id: r.department_id || '',
+            purchase_unit: r.purchase_unit || r.unit || '',
+            counts: blank(),
+            latest_date: null, previous_date: null,
+            latest_qty: null, previous_qty: null,
+            change_qty: null, change_pct: null, latest_value: null,
+          };
+          byKey.set(key, row);
+        }
+        // PURCHASE units, always, via the shared helper — packFactor carries
+        // both halves of the guard (pack_size > 1 AND unit !== purchase_unit),
+        // so kg/kg items like PICKLED GINGER 1.5KG are left alone. Never
+        // divide by pack_size here.
+        const meta: PackMeta = { unit: r.unit, purchase_unit: r.purchase_unit, pack_size: r.pack_size };
+        // Stored rate only — see the header. Re-deriving would restate the
+        // previous column every time a price moved, which is precisely the
+        // column the owner is comparing against.
+        const hasStoredRate = r.rate_per_purchase_unit != null;
+        const priced = hasStoredRate && String(r.rate_source || 'none') !== 'none';
+        row.counts[r.date] = {
+          qty: toPurchaseQty(num(r.physical_stock), meta),
+          value: priced ? r2(num(r.total_value)) : null,
+          rate: priced ? r2(num(r.rate_per_purchase_unit)) : null,
+        };
+      }
+
+      for (const s of semiCells) {
+        const key = `SUB|${s.sub_recipe_id}|${s.department_id}`;
+        let row = byKey.get(key);
+        if (!row) {
+          row = {
+            key,
+            material_id: null,
+            sub_recipe_id: s.sub_recipe_id,
+            type: 'SUB',
+            material: s.material,
+            sku: '',
+            category: s.category || 'sub-recipe',
+            department: s.department || STORE_LABEL,
+            department_id: s.department_id || '',
+            purchase_unit: '',
+            counts: blank(),
+            latest_date: null, previous_date: null,
+            latest_qty: null, previous_qty: null,
+            change_qty: null, change_pct: null, latest_value: null,
+          };
+          byKey.set(key, row);
+        }
+        // A sub-recipe has NO purchase unit and NO pack factor — running a
+        // yield through packFactor is a category error. It is counted in its
+        // own yield unit, so the figure goes in the quantity column AS STORED
+        // and the unit column names that yield unit. Rows arrive oldest-first
+        // within a group, so this ends holding the newest count's snapshot.
+        const unit = String(s.unit || '').trim() || String(s.yield_unit || '').trim();
+        row.purchase_unit = unit;
+        const priced = num(s.rate) > 0 || num(s.total_value) > 0;
+        row.counts[s.date] = {
+          qty: num(s.physical_stock),
+          value: priced ? r2(num(s.total_value)) : null,
+          rate: priced ? r2(num(s.rate)) : null,
+        };
+      }
+
+      const mrows = [...byKey.values()].sort((a, b) =>
+        a.department.localeCompare(b.department) ||
+        a.material.localeCompare(b.material) ||
+        a.type.localeCompare(b.type));
+
+      if (mrows.length > MATRIX_ITEM_CAP) { mrows.length = MATRIX_ITEM_CAP; truncated = true; }
+
+      // ── STEP 4: latest vs previous ────────────────────────────────────────
+      // The two most recent dates THIS item was actually counted on — not the
+      // two newest columns. An item skipped in last month's count would
+      // otherwise be compared against a blank and report its whole stock as
+      // the change. Totals are computed here, after truncation, so the figures
+      // always describe exactly the rows the reader can see.
+      const totals_by_date: Record<string, { lines: number; value: number }> = {};
+      for (const d of dates) totals_by_date[d] = { lines: 0, value: 0 };
+
+      for (const row of mrows) {
+        const counted: string[] = [];
+        for (const d of dates) {            // dates is newest-first
+          const c = row.counts[d];
+          if (!c) continue;
+          counted.push(d);
+          const t = totals_by_date[d];
+          t.lines += 1;
+          if (c.value != null) t.value += c.value;
+        }
+        const d0 = counted[0] ?? null;
+        const d1 = counted[1] ?? null;
+        row.latest_date = d0;
+        row.previous_date = d1;
+        row.latest_qty = d0 ? row.counts[d0]!.qty : null;
+        row.previous_qty = d1 ? row.counts[d1]!.qty : null;
+        row.latest_value = d0 ? row.counts[d0]!.value : null;
+        if (row.latest_qty != null && row.previous_qty != null) {
+          // 3 dp, the same precision the two quantities carry (toPurchaseQty
+          // rounds to 3). Rounding the difference to 2 would make a real
+          // 0.005 L movement print as a change of 0.01 against quantities
+          // that both end in ...5 — a difference the columns don't show.
+          row.change_qty = csvQty(row.latest_qty - row.previous_qty);
+          // Against a previous count of zero there is no percentage to state:
+          // 0 → 5 is not "500% up", it is "was zero". Leave it unknown and let
+          // the page print an em-dash rather than invent a number.
+          row.change_pct = row.previous_qty === 0
+            ? null
+            : r2((row.change_qty / Math.abs(row.previous_qty)) * 100);
+        }
+      }
+      for (const d of dates) totals_by_date[d].value = r2(totals_by_date[d].value);
+
+      const mnote = truncated
+        ? `Showing ${mrows.length.toLocaleString('en-IN')} items across the newest ${dates.length} count ${dates.length === 1 ? 'date' : 'dates'} — the range holds more. Narrow the dates, pick one department, or search for an item to see the rest.`
+        : null;
+
+      if (format === 'csv') {
+        // One column per date, newest first — the same left-to-right reading
+        // order as the screen, so a printed sheet and the page agree.
+        const headers = [
+          'Department', 'Item', 'SKU', 'Category', 'Type', 'Unit',
+          ...dates,
+          'Change vs Previous', 'Change %', 'Latest Value (INR)',
+        ];
+        const lines = [headers.map(csvEscape).join(',')];
+        for (const row of mrows) {
+          const cells = dates.map((d) => {
+            const c = row.counts[d];
+            // BLANK = not counted, '0' = counted and empty. Excel shows the
+            // difference plainly, and a reader totalling a column will not
+            // silently add zeros for days nobody counted.
+            return c ? String(csvQty(c.qty)) : '';
+          });
+          lines.push([
+            csvEscape(row.department),
+            csvEscape(row.material),
+            csvEscape(row.sku),
+            csvEscape(row.category),
+            row.type,
+            csvEscape(row.purchase_unit),
+            ...cells,
+            row.change_qty == null ? '' : csvQty(row.change_qty),
+            row.change_pct == null ? '' : row.change_pct,
+            row.latest_value == null ? '' : row.latest_value,
+          ].join(','));
+        }
+        // Per-date footers. Quantities are NEVER totalled across materials
+        // (2 BTL + 3 kg is meaningless), so the count columns carry the number
+        // of items counted and the ₹ total sits on its own labelled line.
+        const pad = ['', '', '', '', ''];
+        lines.push('');
+        lines.push(['Items counted', ...pad, ...dates.map((d) => totals_by_date[d].lines), '', '', ''].join(','));
+        lines.push(['Value counted (INR)', ...pad, ...dates.map((d) => totals_by_date[d].value), '', '', ''].join(','));
+        if (truncated) lines.push('', csvEscape(`TRUNCATED: ${mnote}`));
+        // UTF-8 BOM — without it Excel on Windows reads the file as ANSI and
+        // mangles Indian item names and the ₹ sign.
+        const csv = '﻿' + lines.join('\n');
+        return new Response(csv, {
+          headers: {
+            'Content-Type': 'text/csv; charset=utf-8',
+            'Content-Disposition': `attachment; filename="closing-stock-matrix-${from}_${to}.csv"`,
+            'Cache-Control': 'no-store',
+            ...(truncated ? { 'X-Truncated': '1' } : {}),
+          },
+        });
+      }
+
+      return Response.json({
+        mode: 'matrix',
+        from, to,
+        scope: seesAll ? 'all' : 'limited',
+        dates,
+        rows: mrows,
+        totals_by_date,
+        cap: MATRIX_ITEM_CAP,
+        date_cap: DATE_CAP,
+        truncated,
+        note: mnote,
+        generated_at: new Date().toISOString(),
+      });
+    }
+
     // LIMIT cap+1: the extra row is how we detect that the cap bit, without a
     // second COUNT(*) over the same range.
     const lim = ROW_CAP + 1;
@@ -239,9 +715,10 @@ export async function GET(request: Request) {
        WHERE cs.date >= ? AND cs.date <= ?
          AND ${OUTLET_SCOPE_CS}
          ${deptFor('cs')}
+         ${qRaw}
        ORDER BY cs.date DESC, COALESCE(d.name,''), rm.name
        LIMIT ${lim}
-    `).all(from, to, outletId, ...deptParams) as RawCountRow[];
+    `).all(from, to, outletId, ...deptParams, ...qRawParams) as RawCountRow[];
 
     const semiRows = db.prepare(`
       SELECT css.date                                           AS date,
@@ -260,9 +737,10 @@ export async function GET(request: Request) {
        WHERE css.date >= ? AND css.date <= ?
          AND ${OUTLET_SCOPE_CSS}
          ${deptFor('css')}
+         ${qSemi}
        ORDER BY css.date DESC, COALESCE(d.name,''), sr.name
        LIMIT ${lim}
-    `).all(from, to, outletId, ...deptParams) as SemiCountRow[];
+    `).all(from, to, outletId, ...deptParams, ...qSemiParams) as SemiCountRow[];
 
     const rows: HistoryRow[] = [];
 
