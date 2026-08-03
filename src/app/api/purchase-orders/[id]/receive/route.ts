@@ -1,7 +1,7 @@
 import { getDb, generateId, updateMaterialPrice, logAuditEvent } from '@/lib/db';
 import { poWriteGate } from '@/lib/po-helpers';
 import { getCurrentUser } from '@/lib/auth';
-import { centralFlowBlock } from '@/lib/store-engine';
+import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { todayIST } from '@/lib/format-date';
 import {
@@ -197,7 +197,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
  *   5. Insert inventory_transactions.
  *
  * Optional body: { received_at?, item_overrides?: [{po_item_id, quantity?, unit_price?,
- *                   accepted?, rejection_reason?, deviation_reason?}] }
+ *                   accepted?, rejection_reason?, deviation_reason?,
+ *                   gst_rate?, cgst?, sgst?}] }
  *   — lets the receiver record short/over-shipments before commit.
  *   `rejection_reason` stays QC-only (why some units were REJECTED).
  *   `deviation_reason` is the separate "why does this line differ from the PO":
@@ -205,7 +206,29 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
  *   received qty ≠ ordered qty, accepted qty ≠ ordered qty (a full delivery
  *   part-rejected at QC counts), or the rate ≠ the ordered rate.
  *   It is stored on the GRN line + the purchases row and alerted to the admin.
- *   Changing the rate at receive time is ADMIN-ONLY (403 otherwise).
+ *
+ *   THE RATE IS EDITABLE BY ANYONE PERMITTED TO RECEIVE (owner ruling).
+ *   It used to be a hard admin-only 403 on this route (see the removed lock in
+ *   the per-line loop below). The bill the vendor hands over at the gate IS the
+ *   price; the PO rate was an estimate, and requiring an admin to stand next to
+ *   the storekeeper did not make the number truer — it just stopped the goods.
+ *   What replaces the stoppage is VISIBILITY, and none of it was relaxed: an
+ *   off-rate line still cannot commit without a `deviation_reason` (the gate
+ *   below, 400), and it still raises the audit event + notification + Slack ping
+ *   to the admin with that reason quoted. The bill-discount cap
+ *   (NON_ADMIN_DISCOUNT_CAP_PCT) is a DIFFERENT control and is untouched.
+ *
+ *   `gst_rate` is the line's GST PERCENT (0 | 5 | 12 | 18 …); 0/absent = no tax
+ *   recorded. `cgst`/`sgst` may be sent (the modal computes them to show the
+ *   split before saving) but are NEVER trusted — the server re-derives both from
+ *   THIS route's own accepted value and discount share, with the identical
+ *   integer-paise rounding /api/purchases uses, and stores what it computed.
+ *   TAX NEVER ENTERS unit_price / total_price / average_price on either the GRN
+ *   line or the purchases row: GST on a purchase is reclaimable input credit,
+ *   not food cost. It is recorded in goods_receipt_note_items.cgst/.sgst, which
+ *   readers add back (Total Inward = value − discount + cgst + sgst + …).
+ *   A payload with no gst_rate writes precisely the row it wrote before this
+ *   field existed.
  *
  * Optional body: { line_ids? }
  *   — a SUBSET of that vendor's outstanding lines, when they split the delivery
@@ -277,16 +300,30 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // plus deviation_reason — the mandatory "why is this line not what the PO
     // says" (see the deviation gate below). It is DISTINCT from
     // rejection_reason: that one only explains rejected units.
-    const overrides: Map<string, { quantity?: number; unit_price?: number; accepted?: number; rejection_reason?: string; deviation_reason?: string }> = new Map();
+    // gst_rate/cgst/sgst ride along per line. cgst/sgst are carried ONLY so a
+    // client that disagrees with the server can be logged (same as
+    // /api/purchases) — the stored figures are always the server's own.
+    const overrides: Map<string, { quantity?: number; unit_price?: number; accepted?: number; rejection_reason?: string; deviation_reason?: string; gst_rate?: any; cgst?: any; sgst?: any }> = new Map();
     if (Array.isArray(body?.item_overrides)) {
       for (const o of body.item_overrides) {
         if (o?.po_item_id) overrides.set(o.po_item_id, {
           quantity: o.quantity, unit_price: o.unit_price,
           accepted: o.accepted, rejection_reason: o.rejection_reason,
           deviation_reason: o.deviation_reason,
+          gst_rate: o.gst_rate, cgst: o.cgst, sgst: o.sgst,
         });
       }
     }
+    /**
+     * Was a usable gst_rate sent for this line?
+     * ABSENT means exactly what it meant before this field existed — no tax
+     * recorded, nothing else changed — because older clients (and any script
+     * that posts a receive) send no gst_rate at all. Byte-identical test to
+     * /api/purchases' `gstProvided`, so the two purchase paths agree on what
+     * "no tax" is.
+     */
+    const gstProvidedFor = (ov: any): boolean =>
+      ov?.gst_rate !== undefined && ov?.gst_rate !== null && String(ov.gst_rate).trim() !== '';
 
     // ── Bill-level charges (shape only — the money gates need the accepted
     // lines and run after the per-line validation below) ──────────────────
@@ -574,44 +611,55 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // reject. A 0 rate is only fatal on lines that actually enter stock/books
       // (accepted > 0) — a fully-rejected line never reaches updateMaterialPrice.
       if (effAcc > 0 && effPrice <= 0) {
-        // The remedy differs by role, and saying the wrong one wastes a delivery
-        // standing at the gate: only an admin may supply a rate at receive time
-        // (the rate lock below is a hard 403), so a non-admin's ONLY route out of
-        // a ₹0 line is to have the PO line rate corrected and re-approved.
-        const remedy = me?.role === 'admin'
-          ? 'edit the PO line rate (or send a unit_price override) before receiving'
-          : 'only an admin can set a rate while receiving, so ask an admin to correct the PO line rate and re-approve the PO (or to receive this line)';
+        // ONE remedy for everyone now. This message used to fork on role because
+        // the rate lock below was a hard admin-only 403, which left a non-admin
+        // holding a ₹0 PO line with no way out but "get it re-approved". The rate
+        // is editable by any receiver, so the fix is the same for all of them:
+        // type the rate off the vendor's bill (and say why, per the deviation
+        // gate) — or fix the PO line if the bill really says ₹0.
         return Response.json({
-          error: `Missing or zero rate on "${it.material_name}". A receive rewrites this material's average price, so the line needs a real ₹/${puLabel(it) || 'unit'} — ${remedy}.`,
+          error: `Missing or zero rate on "${it.material_name}". A receive rewrites this material's average price, so the line needs a real ₹/${puLabel(it) || 'unit'} — enter the rate the vendor actually billed, or correct the PO line rate.`,
           material: it.material_name,
           field: 'unit_price',
         }, { status: 400 });
       }
-      // Rate lock — ADMIN ONLY, enforced HERE, not in the modal.
-      // The receive modal renders the rate read-only for non-admins, but that is
-      // only which input mounts: poWriteGate() above admits every storekeeper,
-      // HOD, Floor Manager and Bar Manager, so without this check any of them
-      // could POST a unit_price override straight at the route and rewrite
-      // last_purchase_price + average_price for the material — cascading a bogus
-      // cost through every recipe that uses it — while the screen told them
-      // "PO rate — admin only". A UI lock the API does not back is not a lock.
-      // me.role is the REAL tier off the session (already trusted above for the
-      // backdate exemption); effectiveRole() must NOT be used here because it
-      // collapses 'staff' into 'manager'.
-      // Consequence, deliberate: a PO line approved at ₹0 cannot be repaired from
-      // the receive screen by a non-admin (the zero-rate gate above refuses the
-      // line and this gate refuses the override). The documented remedy is the PO
-      // edit + re-approve path — say so instead of pointing at the PO rate.
-      if (ov?.unit_price != null && Math.abs(effPrice - Number(it.unit_price)) > RATE_EPS && me?.role !== 'admin') {
-        const ordRatePO = Number(it.unit_price);
-        return Response.json({
-          error: ordRatePO > 0
-            ? `Only an admin can change the rate while receiving. "${it.material_name}" was ordered at ₹${ordRatePO}/${puLabel(it) || 'unit'} — receive at the PO rate, or ask an admin to receive this line.`
-            : `Only an admin can set the rate while receiving, and "${it.material_name}" was ordered with no rate (₹0) — which cannot be received either. Ask an admin to correct the PO line rate and re-approve the PO (or to receive this line); it cannot be fixed from this screen.`,
-          material: it.material_name,
-          field: 'unit_price',
-        }, { status: 403 });
+      // GST percent — shape only, and only when the line actually sent one.
+      // A PRESENT but unusable value is REFUSED rather than quietly zeroed:
+      // silently dropping the tax on a bill forfeits the input credit, and
+      // nothing in the stored row would ever show that it went missing. Same
+      // bounds and same wording as /api/purchases.
+      if (gstProvidedFor(ov)) {
+        const g = Number(ov!.gst_rate);
+        if (!Number.isFinite(g) || g < 0 || g > 100) {
+          return Response.json({
+            error: `GST on "${it.material_name}" must be a percentage between 0 and 100 (0 = exempt) — received "${ov!.gst_rate}". Send no gst_rate at all to record the line with no tax.`,
+            material: it.material_name,
+            field: 'gst_rate',
+          }, { status: 400 });
+        }
       }
+      // ── THE RATE LOCK IS GONE, AND WHAT REPLACED IT ─────────────────────
+      // This route used to 403 any non-admin who sent a unit_price override that
+      // differed from the PO line (`me?.role !== 'admin'` → hard refusal). The
+      // owner's ruling removed it: a storekeeper at the receiving bay must be
+      // able to enter what the vendor ACTUALLY billed, because the bill is the
+      // bill and the PO rate was only an estimate. Waiting for an admin to walk
+      // to the gate did not make the number truer; it either stopped the goods or
+      // pushed the real price into a later hand-correction nobody reviews.
+      //
+      // NOTHING ELSE WAS RELAXED — the trade is a stoppage for VISIBILITY:
+      //   • the deviation gate immediately below still REFUSES (400) an off-rate
+      //     line that carries no deviation_reason, and it is unchanged;
+      //   • the reason is still persisted on the GRN line AND the purchases row;
+      //   • the admin is still alerted after commit (audit event + notifications
+      //     row + Slack), with the reason and the ₹ impact quoted, and
+      //     `rate_changed` is still one of the four axes that alert reports.
+      // The bill-DISCOUNT cap (Guard 2, NON_ADMIN_DISCOUNT_CAP_PCT) is a separate
+      // control on a separate figure and is deliberately left in force.
+      // poWriteGate() at the top of the handler is still the whole of who may
+      // reach this code — the rate is editable by "anyone permitted to receive",
+      // not by anyone at all.
+      //
       // Deviation gate — receiving OFF-PO must say why.
       // The three ways a receive silently rewrites what was approved: a RECEIVED
       // qty that isn't the ordered qty (short OR over) moves stock and money, an
@@ -758,6 +806,98 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }, { status: 400 });
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // PER-LINE GST — derived HERE, server-side, from this route's own figures.
+    //
+    // WHY IT SITS AFTER THE ALLOCATION: tax is charged on the POST-DISCOUNT
+    // goods value, so a line's taxable base is its accepted value MINUS its
+    // share of the bill discount — which does not exist until allocateBillCharges
+    // has run. Placing it earlier would tax the gross and over-state the input
+    // credit on every discounted bill.
+    //
+    // WHY THE CLIENT'S cgst/sgst ARE DISCARDED: this is the input-credit record.
+    // The figure on it must follow from the goods value on the SAME row, or a
+    // miscalculating modal — or a replayed/hand-edited payload — writes a tax the
+    // row cannot justify to an auditor. The client's numbers are read only to log
+    // a divergence, exactly as /api/purchases does.
+    //
+    // THE ARITHMETIC IS /api/purchases' ARITHMETIC, DELIBERATELY BYTE-FOR-BYTE:
+    //   taxable  = r2(accepted × rate − discount_share)     ← 2-dp rupees
+    //   taxPaise = round(taxable × rate%)   (the ÷100 for percent and the ×100
+    //                                        for paise cancel — whole paise)
+    //   sgst     = floor(taxPaise / 2) ; cgst = taxPaise − sgst   (odd paisa → CGST)
+    // Halving in integer paise is what keeps cgst + sgst re-adding to the tax
+    // EXACTLY (the house invariant tax_value = cgst + sgst that every reader
+    // re-adds); halving in floats drifts a paisa. A third rounding convention
+    // between the two purchase paths is how a GST return stops reconciling.
+    // ────────────────────────────────────────────────────────────────────
+    interface LineTax { gst_rate: number; taxable: number; tax: number; cgst: number; sgst: number; forced_zero: boolean }
+    const taxByPoItem = new Map<string, LineTax>();
+    for (const it of receiving) {
+      const ov = overrides.get(it.id);
+      const effRcv   = ov?.quantity   != null ? Number(ov.quantity)   : Number(it.quantity);
+      const effAcc   = ov?.accepted   != null ? Number(ov.accepted)   : effRcv;
+      const effPrice = ov?.unit_price != null ? Number(ov.unit_price) : Number(it.unit_price);
+      // LIQUOR IS ZERO-RATED — its duty rides on the TGBCL bill (excise / cess /
+      // TCS), never on GST, so an input-credit figure here would be claimed
+      // twice. Uses the EXISTING store-mapping guard, not a category test, so it
+      // tracks whatever the store engine considers store-mapped. centralFlowBlock
+      // already dropped these lines from `receivable` above, so in practice this
+      // never fires — it is the second lock, mirroring /api/purchases: if that
+      // guard is ever relaxed for a category, a client that sent 18% must still
+      // not write a credit the TGBCL charges already carry.
+      const storeMapped = isStoreMappedMaterial(db, String(it.material_id || ''));
+      const gstRate = (!gstProvidedFor(ov) || storeMapped) ? 0 : Number(ov!.gst_rate);
+      // GROSS accepted value — identical expression to `acceptedTotal` in the txn
+      // loop, and to the GRN row's ROUND(quantity_accepted × unit_price, 2) that
+      // every register totals from. A fully-rejected line is 0 here and therefore
+      // carries no tax: it was never accepted, so no credit is claimable on it.
+      const grossTotal = Math.round((effAcc > 0 ? effAcc : 0) * effPrice * 100) / 100;
+      const discShare  = chargeByPoItem.get(String(it.id))?.discount_share || 0;
+      const taxable    = r2(grossTotal - discShare);
+      const taxPaise   = gstRate > 0 ? Math.max(0, Math.round(taxable * gstRate)) : 0;
+      const sgstPaise  = Math.floor(taxPaise / 2);
+      const cgstPaise  = taxPaise - sgstPaise;   // odd paisa lands in CGST, per the contract
+      taxByPoItem.set(String(it.id), {
+        gst_rate: gstRate,
+        taxable,
+        tax:  taxPaise / 100,
+        cgst: cgstPaise / 100,
+        sgst: sgstPaise / 100,
+        forced_zero: storeMapped && gstProvidedFor(ov) && Number(ov!.gst_rate) > 0,
+      });
+      // A client whose split disagrees with the server's is LOGGED, never
+      // obeyed — a UI drift must stay visible instead of being silently
+      // corrected on every bill for months. Compared in INTEGER paise with a
+      // 1-paisa allowance: the client's round2(taxable × rate ÷ 100)
+      // legitimately lands a paisa off on half-paisa amounts, and that is
+      // agreement, not drift.
+      if (ov?.cgst !== undefined || ov?.sgst !== undefined) {
+        const sentTax = (Number(ov?.cgst) || 0) + (Number(ov?.sgst) || 0);
+        if (Math.abs(Math.round(sentTax * 100) - taxPaise) > 1) {
+          console.warn(
+            `[receive PO] client tax ₹${sentTax.toFixed(2)} ≠ server-derived ₹${(taxPaise / 100).toFixed(2)} ` +
+            `(PO ${po.po_number}, line "${it.material_name}", taxable ₹${taxable.toFixed(2)} @ ${gstRate}%) — stored the derived figure`
+          );
+        }
+      }
+    }
+    /**
+     * Σ of the server-derived tax, for the response + audit payload.
+     * `taxable` counts ONLY the lines that actually carry a rate — an exempt or
+     * no-GST line is not a ₹0-tax taxable supply, and folding its value in here
+     * would report a taxable base the tax on it can never reconcile to.
+     */
+    const taxTotals = [...taxByPoItem.values()].reduce(
+      (acc, t) => ({
+        cgst: r2(acc.cgst + t.cgst),
+        sgst: r2(acc.sgst + t.sgst),
+        tax:  r2(acc.tax  + t.tax),
+        taxable: t.gst_rate > 0 ? r2(acc.taxable + t.taxable) : acc.taxable,
+      }),
+      { cgst: 0, sgst: 0, tax: 0, taxable: 0 },
+    );
+
     let total = 0;
     const touchedMaterials = new Set<string>();
 
@@ -814,6 +954,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // discount figure are not lost — they are on the GRN line written just
       // below, which is the bill document.
       // `delivery_charges` is recorded only and never enters any rate.
+      //
+      // AND NEITHER DOES TAX. unit_price / total_price on this row are the GOODS
+      // figures — GST is deliberately NOT bound here and no cgst/sgst column is
+      // written on this path. updateMaterialPrice() averages exactly
+      // SUM(quantity × unit_price) / SUM(quantity) into average_price, which every
+      // recipe and sub-recipe cost in the app derives from, so a tax-inclusive
+      // rate would inflate every one of them by the GST rate — silently, forever —
+      // and the tax, once buried inside a cost, is no longer reclaimable as input
+      // credit. The tax for this receipt lives on the GRN line written just above,
+      // which IS the bill document; this row is the COST mirror of it, and
+      // src/lib/purchase-log.ts reads the two separately (is_mirror) precisely so
+      // the same rupee is not counted on both.
       const insPurchase = db.prepare(`
         INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, outlet_id,
                                discount, delivery_charges, bill_no, created_at)
@@ -906,12 +1058,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // ordered rate, so a net rate would report a rate variance the vendor
       // never billed. Discount + delivery are per-line shares of the bill-level
       // figures, allocated by value before the txn opened.
+      //
+      // cgst/sgst are the SERVER-DERIVED halves of the line's GST (taxByPoItem,
+      // computed above) and they are RECORDED ONLY — unit_price here stays the
+      // pure GOODS rate, never tax-inclusive. Every register reads this row as
+      //   Total Inward = qty × unit_price − discount + cgst + sgst + … ,
+      // so folding the tax into the rate would both double it on read and, via
+      // the mirrored purchases row, inflate average_price and every recipe cost
+      // built on it — which is exactly why the old bill-level GST control was
+      // deleted. Both are 0 when no gst_rate was sent, so a payload without one
+      // writes precisely the row this route wrote before the field existed.
       const insGrnItem = db.prepare(`
         INSERT INTO goods_receipt_note_items
           (id, grn_id, po_item_id, material_id, quantity_ordered, quantity_received,
            quantity_accepted, quantity_rejected, rejection_reason, unit_price, notes,
-           discount, delivery_charges)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           discount, cgst, sgst, delivery_charges)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       // Excess + deviation detection happen inline below — the `excessLines` and
@@ -949,6 +1111,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const share       = chargeByPoItem.get(String(it.id));
         const discShare   = share ? share.discount_share : 0;
         const delivShare  = share ? share.delivery_share : 0;
+        // This line's SERVER-DERIVED tax (0/0 when no gst_rate was sent, and
+        // always 0 for a store-mapped material). Recorded only — read the block
+        // where taxByPoItem is built for the base and the rounding.
+        const lineTax     = taxByPoItem.get(String(it.id));
+        const cgstAmt     = lineTax ? lineTax.cgst : 0;
+        const sgstAmt     = lineTax ? lineTax.sgst : 0;
         // The NET basis is substituted ONLY when a discount was actually
         // applied. With no discount the allocator's net_rate is a re-derivation
         // (r2(r2(qty × rate) / qty)) that can differ from the typed rate in the
@@ -1014,10 +1182,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const noteBits: string[] = [];
         if (rejected > 0) noteBits.push(`Rejected ${rejected} (${reason || 'no reason given'})`);
         if (deviated && devReason) noteBits.push(`PO deviation: ${devReason}`);
+        // `price` is bound to unit_price GROSS OF TAX and gross of the discount —
+        // the goods rate off the vendor's bill. cgstAmt/sgstAmt go in their own
+        // columns; they must never be added into the rate (see the prepare above).
         insGrnItem.run(generateId(), grnId, it.id, it.material_id,
                        it.quantity, received, accepted, rejected, reason, price,
                        noteBits.join(' | '),
-                       discShare, delivShare);
+                       discShare, cgstAmt, sgstAmt, delivShare);
 
         // Stock + financials reflect ONLY the accepted qty (rejections never enter stock)
         if (accepted > 0) {
@@ -1413,6 +1584,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
                 net_total: l.net_total, net_rate: l.net_rate,
               })),
             },
+            // Per-line GST as the SERVER derived it — recorded on the GRN lines,
+            // never inside any rate. Stated in the audit row so "what input
+            // credit did this receipt claim" is answerable without re-deriving
+            // it, and so a client/server disagreement is visible after the fact.
+            tax: {
+              basis: 'GST on the post-discount goods value; recorded in goods_receipt_note_items.cgst/.sgst, never in unit_price / average_price',
+              taxable: taxTotals.taxable,
+              cgst: taxTotals.cgst,
+              sgst: taxTotals.sgst,
+              tax_value: taxTotals.tax,
+              lines: [...taxByPoItem.entries()]
+                .filter(([, t]) => t.gst_rate > 0 || t.forced_zero)
+                .map(([poItemId, t]) => ({
+                  po_item_id: poItemId,
+                  material_name: chargeItemById.get(poItemId)?.material_name
+                    || receiving.find((r: any) => String(r.id) === poItemId)?.material_name || '',
+                  gst_rate: t.gst_rate, taxable: t.taxable,
+                  cgst: t.cgst, sgst: t.sgst, tax_value: t.tax,
+                  // true = a store-mapped (liquor) line whose sent GST was
+                  // forced to 0 here; its duty is on the TGBCL bill instead.
+                  zero_rated_store_item: t.forced_zero,
+                })),
+            },
           },
           note: title,
         });
@@ -1541,6 +1735,27 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           discount_share: l.discount_share, delivery_share: l.delivery_share,
           net_total: l.net_total, net_rate: l.net_rate,
         })),
+      },
+      // What GST was ACTUALLY recorded, per line and in total — the SERVER's
+      // figures, so the modal echoes what was committed instead of re-showing
+      // what it sent (the two differ by a paisa on half-paisa amounts, and by
+      // the whole amount on a store-mapped line that was zero-rated here).
+      // All zeroes, with an empty `lines`, when no gst_rate was sent anywhere —
+      // a client that never sends one sees a response it can ignore entirely.
+      tax_applied: {
+        taxable:   taxTotals.taxable,
+        cgst:      taxTotals.cgst,
+        sgst:      taxTotals.sgst,
+        tax_value: taxTotals.tax,     // === cgst + sgst, exactly (integer paise)
+        basis: 'GST on the post-discount goods value — recorded only; never added into unit_price, total_price or average_price',
+        lines: [...taxByPoItem.entries()]
+          .filter(([, t]) => t.gst_rate > 0 || t.forced_zero)
+          .map(([poItemId, t]) => ({
+            po_item_id: poItemId,
+            gst_rate: t.gst_rate, taxable: t.taxable,
+            cgst: t.cgst, sgst: t.sgst, tax_value: t.tax,
+            zero_rated_store_item: t.forced_zero,
+          })),
       },
     });
   } catch (e: any) {

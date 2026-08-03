@@ -7,7 +7,7 @@ import {
   ShieldCheck, PackageCheck, RefreshCw, AlertTriangle, ChevronDown, Printer, Lock,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { allocateBillCharges, resolveCharge, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT } from '@/lib/po-charges';
+import { allocateBillCharges, resolveCharge, r2, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT } from '@/lib/po-charges';
 import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
 
 // Always 2 dp: at 0 dp the paise were dropped per row, so the item column
@@ -19,6 +19,48 @@ import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-
 const fmt = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const dateLabel = (s?: string | null) =>
   s ? new Date(s).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
+/** Today on the LOCAL calendar, as YYYY-MM-DD. `toISOString().slice(0,10)`
+ *  answers in UTC, which is 5½ h behind IST — before 05:30 it names YESTERDAY,
+ *  so a delivery that fell due yesterday would not read as overdue until half
+ *  past five in the morning. Only the expected-delivery test uses this; the
+ *  date-input defaults elsewhere on this page are unchanged. */
+const todayIso = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+/** Statuses that mean "nothing more is coming": a PO closed out or fully in can
+ *  never be late. Everything else — including 'approved', which is where a
+ *  PART-received PO sits — is still owed goods, so a passed delivery date is a
+ *  real overdue. */
+const SETTLED_STATUSES = ['received', 'cancelled', 'rejected'];
+/** Is this PO past its expected delivery date and still owed goods? Purely
+ *  client-side off the row we already hold — no extra fetch. NULL delivery_date
+ *  is never overdue: we do not know when it was due, and inventing a date here
+ *  would put a red flag on every PO raised before the column existed. */
+const isDeliveryOverdue = (deliveryDate?: string | null, status?: string): boolean => {
+  const due = String(deliveryDate || '').slice(0, 10);
+  if (!due) return false;
+  if (SETTLED_STATUSES.includes(String(status || ''))) return false;
+  return due < todayIso();
+};
+/** Vendor line-tally on a list row: [{ vendor_name, line_count }, …].
+ *
+ *  ONE reader, because the field is absent on the detail branch and on any
+ *  payload a tab cached from before the aggregate shipped — anything but an
+ *  array must read as "the server did not say", not as an empty vendor.
+ *
+ *  Note what this deliberately does NOT do: split a comma-joined string. The
+ *  route ships objects precisely because a vendor name legitimately contains a
+ *  comma ("Solo Traders, Hyd"), and splitting one would invent a second vendor
+ *  who is owed goods. Display joins below use ' · ' for the same reason. */
+type VendorTally = { vendor_name: string; line_count: number };
+const vendorTally = (v: unknown): VendorTally[] =>
+  Array.isArray(v)
+    ? v.map((x: any) => ({
+        vendor_name: String(x?.vendor_name ?? '').trim() || '(no vendor)',
+        line_count: Number(x?.line_count) || 0,
+      }))
+    : [];
 /** QTY for humans. Binary floats make 2.4 − 2.5 = −0.09999999999999964, and that
  *  string was being read out to the receiver in the deviation hint, the blocking
  *  banner, the button tooltip and the submit alert. 6 dp is far finer than any
@@ -29,6 +71,15 @@ const qfmt = (n: number) => (Number(n) || 0).toLocaleString('en-IN', { maximumFr
  *  demands a reason for a difference the server would ignore, or vice versa. */
 const QTY_EPS = 1e-6;
 const RATE_EPS = 0.005;   // ₹ — half a paisa
+
+/**
+ * The GST rates a vendor bill in this kitchen actually carries. A fixed list and
+ * not a free number box, for the same reason as the Enter Full Bill modal on
+ * /purchases: a typo'd "1.8" on a ₹40,000 bill is a tax figure nobody catches
+ * until the return is filed. Same four values, same order — the two screens that
+ * take a vendor bill must not offer different tax rates.
+ */
+const GST_RATES = ['0', '5', '12', '18'] as const;
 
 interface Material { id: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; sku?: string; average_price: number; primary_vendor?: string; last_purchase_price?: number; }
 
@@ -123,7 +174,30 @@ interface VendorStake {
   ordered_value: number; done: boolean; grn_numbers: string[];
   bills: { id: string; bill_no: string; bill_date: string; received_by: string; created_at: string }[];
 }
-interface PO { id: string; po_number: string; date: string; vendor: string; status: string; total_cost: number; notes: string; drafted_by: string; submitted_at?: string; approved_by?: string; approved_at?: string; rejected_reason?: string; received_at?: string; item_count?: number; items?: POItem[]; }
+interface PO {
+  id: string; po_number: string; date: string; vendor: string; status: string; total_cost: number;
+  notes: string; drafted_by: string; submitted_at?: string; approved_by?: string; approved_at?: string;
+  rejected_reason?: string; received_at?: string; item_count?: number; items?: POItem[];
+  /** purchase_orders.delivery_date — the date the vendor PROMISED, labelled
+   *  "Expected Delivery Date" everywhere a human sees it. Nullable and never
+   *  backfilled: a PO raised before the column existed has no promise on record,
+   *  and no surface may invent one. */
+  delivery_date?: string;
+  /* ── PER-PO RECEIPT AGGREGATE (list branch only) ─────────────────────────
+   * Optional on purpose. The detail branch does not send them, and a tab left
+   * open across the deploy holds a cached payload that predates them — so every
+   * reader below null-checks rather than assuming a number. LINE counts, never
+   * summed quantities: 2 kg + 3 BTL is not a quantity. */
+  received_line_count?: number;
+  total_line_count?: number;
+  /** Who is still owed / who has already delivered, with the LINE count each.
+   *  A vendor who part-delivered appears in both. Read through vendorTally(). */
+  outstanding_vendors?: VendorTally[];
+  delivered_vendors?: VendorTally[];
+  /** Vendor bill numbers taken in against this PO (the "Bill Number" half of
+   *  vendor-wise receiving). Empty on an un-migrated DB — never assumed. */
+  vendor_bills?: Array<{ vendor_name: string; bill_no: string; bill_date: string }>;
+}
 
 const STATUS_COLOR: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-700',
@@ -319,7 +393,11 @@ export default function PurchaseOrdersPage() {
                 <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
                   <tr>
                     <th className="text-left  py-2.5 px-3 font-medium">PO #</th>
-                    <th className="text-left  py-2.5 px-3 font-medium">Date</th>
+                    {/* Two dates now sit on this row, so neither may be called
+                        just "Date": the one the PO was raised on, and the one
+                        the vendor promised. */}
+                    <th className="text-left  py-2.5 px-3 font-medium">PO Date</th>
+                    <th className="text-left  py-2.5 px-3 font-medium">Expected Delivery</th>
                     <th className="text-left  py-2.5 px-3 font-medium">Vendor</th>
                     <th className="text-right py-2.5 px-3 font-medium">Items</th>
                     <th className="text-right py-2.5 px-3 font-medium">Total</th>
@@ -347,6 +425,32 @@ export default function PurchaseOrdersPage() {
                     const canCancel = ['draft', 'pending', 'rejected'].includes(p.status);
                     const canReceive = p.status === 'approved';
                     const canDelete = p.status === 'draft';
+                    // Late on the vendor's own promise, and still owed goods.
+                    const overdue = isDeliveryOverdue(p.delivery_date, p.status);
+                    /* PART-RECEIVED. Per-vendor receiving leaves a PO at
+                       'approved' until the LAST vendor is in, so "APPROVED"
+                       alone reads as "nothing has arrived" on a PO that is
+                       already half booked into stock, priced and paid for.
+                       Every field here is optional — the detail branch never
+                       sends them and a tab open across the deploy holds a
+                       payload from before they existed — so `Number(x) || 0`
+                       collapses "the server did not say" to 0, which shows no
+                       chip. Silence is the safe answer; a wrong count is not.
+                       item_count backs total_line_count for the same reason:
+                       it is the same COUNT of purchase_order_items rows. */
+                    const linesIn    = Number(p.received_line_count) || 0;
+                    const linesTotal = Number(p.total_line_count) || Number(p.item_count) || 0;
+                    const owedVendors = vendorTally(p.outstanding_vendors);
+                    const inVendors   = vendorTally(p.delivered_vendors);
+                    const partReceived = p.status === 'approved' && linesIn > 0;
+                    /* The full picture on hover: who came, under which bill, and
+                       who is still out. The chip itself stays short — a row in a
+                       list cannot carry three vendors and two bill numbers. */
+                    const partTitle = !partReceived ? undefined : [
+                      inVendors.length > 0 && `Delivered: ${inVendors.map(v => `${v.vendor_name} (${v.line_count} line${v.line_count === 1 ? '' : 's'})`).join(' · ')}`,
+                      (p.vendor_bills || []).length > 0 && `Bills: ${(p.vendor_bills || []).map(b => `${b.vendor_name || '?'} ${b.bill_no || '(no number)'}`).join(' · ')}`,
+                      owedVendors.length > 0 && `Still to deliver: ${owedVendors.map(v => `${v.vendor_name} (${v.line_count} line${v.line_count === 1 ? '' : 's'})`).join(' · ')}`,
+                    ].filter(Boolean).join('\n') || undefined;
                     return (
                       // Key belongs on the FRAGMENT, not the inner <tr>: a row can
                       // render up to three siblings (row + detail + review), so a
@@ -362,13 +466,40 @@ export default function PurchaseOrdersPage() {
                             </button>
                           </td>
                           <td className="py-2 px-3 text-xs">{dateLabel(p.date)}</td>
+                          {/* Expected delivery. NULL prints an em-dash — a PO
+                              raised before the column existed carries no promise
+                              and must not be given one here. */}
+                          <td className="py-2 px-3 text-xs">
+                            {p.delivery_date ? (
+                              <span className={overdue ? 'text-red-700 font-semibold' : ''}>
+                                {dateLabel(p.delivery_date)}
+                                {overdue && <span className="ml-1 text-[10px] uppercase tracking-wide">overdue</span>}
+                              </span>
+                            ) : <span className="text-[#8B7355]">—</span>}
+                          </td>
                           <td className="py-2 px-3 text-xs">{p.vendor || <span className="text-[#8B7355]">—</span>}</td>
                           <td className="py-2 px-3 text-xs text-right font-mono">{p.item_count ?? '-'}</td>
                           <td className="py-2 px-3 text-xs text-right font-mono font-semibold">{fmt(p.total_cost)}</td>
                           <td className="py-2 px-3 text-xs">
-                            <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-semibold ${STATUS_COLOR[p.status] || 'bg-gray-100'}`}>
-                              {p.status.toUpperCase()}
-                            </span>
+                            <div className="flex flex-wrap items-center gap-1">
+                              <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-semibold ${STATUS_COLOR[p.status] || 'bg-gray-100'}`}>
+                                {p.status.toUpperCase()}
+                              </span>
+                              {/* Beside the badge, never instead of it: the PO
+                                  really is still 'approved' — this says how much
+                                  of it has already walked in the door, and who
+                                  is still owed. Lines, not quantities. */}
+                              {partReceived && (
+                                <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800"
+                                      title={partTitle}>
+                                  PART-RECEIVED
+                                  <span className="font-normal">
+                                    {' · '}{linesIn} of {linesTotal || '?'} lines in
+                                    {owedVendors.length > 0 && <> · awaiting {owedVendors.map(v => v.vendor_name).join(' · ')}</>}
+                                  </span>
+                                </span>
+                              )}
+                            </div>
                           </td>
                           <td className="py-2 px-3 text-xs text-right">
                             <div className="inline-flex items-center gap-1 justify-end">
@@ -554,9 +685,32 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   const [receivedAt, setReceivedAt] = useState<string>(new Date().toISOString().slice(0, 10));
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
-  // Per-line rate unlock + per-line "why does this differ from the PO" reason.
-  const [rateUnlocked, setRateUnlocked] = useState<Record<string, boolean>>({});
+  /* Per-line "why does this differ from the PO" reason. (There is no longer a
+     per-line rate LOCK — see the note above canEditRate.) */
   const [reasons, setReasons] = useState<Record<string, string>>({});
+  /* RAW keystrokes for the rate box, per line. The committed rate lives in
+     `overrides` as a NUMBER, but a controlled number input fed straight from it
+     is untypeable: `<input type="number">` reports "" for a half-typed "900.",
+     which parses to NaN → 0, so the field wipes itself the moment the receiver
+     reaches the decimal point. That was survivable while only an admin ever
+     unlocked a rate; now every receiver types one. The draft holds the raw
+     string, the number is committed only when the string parses, and the draft
+     is dropped on reset so the box falls back to the committed value. */
+  const [rateDraft, setRateDraft] = useState<Record<string, string>>({});
+  /* GST — mirrors /purchases exactly. `billGstRate` is the bill-level DEFAULT
+     every line inherits ('0' so a bill entered the way it always was books the
+     same numbers); `lineGst[id]` is a per-line override where '' means "follow
+     the bill". Both are RAW STRINGS in state and are parsed only inside the
+     compute — Number()-ing a rate box on every keystroke is the same trap the
+     rate draft above exists for. */
+  const [billGstRate, setBillGstRate] = useState<string>('0');
+  const [lineGst, setLineGst] = useState<Record<string, string>>({});
+  /* po_item_id → why that line cannot come in through Central (the server's own
+     centralFlowBlock message, from GET …/receive). These are TGBCL/liquor lines:
+     they are taxed on the store's bill through excise / cess / TCS, never GST,
+     so they are forced to 0% in the COMPUTE below — a rate typed against one
+     would be tax that was never paid. */
+  const [storeBlocked, setStoreBlocked] = useState<Record<string, string>>({});
   /* BILL CHARGES — entered once for the whole delivery, allocated per line by
      the server. Discount REDUCES cost (it is netted into the rate written to
      purchases.unit_price, which is what average_price averages); Delivery is
@@ -589,19 +743,33 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
      outstanding and keep the PO open. */
   const [excluded, setExcluded] = useState<Record<string, boolean>>({});
 
-  /* WHO MAY UNLOCK A LINE'S RATE.
-   * The rate typed here is written to purchases.unit_price and then through
+  /* WHO MAY TYPE A LINE'S RATE — now: anyone who may receive.
+   *
+   * The rate typed here is still written to purchases.unit_price and then through
    * updateMaterialPrice into raw_materials.average_price — i.e. into the cost of
-   * every recipe that uses the material. A silent re-type at the receiving bay is
-   * exactly what must not happen, so the rate is plain text by default.
-   * Only 'admin' unlocks it. `role` comes from /api/purchase-orders' viewer_role,
-   * which is effectiveRole() — and that collapses staff → 'manager'. So on this
-   * page 'manager' means "everyone who got past poWriteGate and is doing the
-   * receiving" (manager, HOD, storekeeper): precisely the people the lock exists
-   * for. Admin is the only tier this response can actually distinguish, so admin
-   * is the unlock. A manager who genuinely got a re-rated bill asks an admin —
-   * the same person who already approves the PO. */
-  const canChangeRate = role === 'admin';
+   * every recipe that uses the material. That has not changed, and it is why the
+   * rate used to be admin-only.
+   *
+   * What changed is the OWNER'S RULING: the bill is the bill. The PO rate was an
+   * estimate agreed before the goods moved; the vendor's invoice is what was
+   * actually charged. Locking the box did not make the number right — it made
+   * the storekeeper either wait for an admin to walk to the receiving bay, or
+   * book a rate everybody present knew was wrong.
+   *
+   * The control the lock carried is NOT removed, it is TRADED: a rate that
+   * differs from the PO still demands a typed deviation_reason (see the
+   * `deviations` memo), still raises the admin alert server-side, and is now
+   * spelled out on the row at the moment the number is typed. Visibility and a
+   * mandatory reason, instead of a stoppage. Weakening the reason gate to smooth
+   * this out would turn it into an unaudited licence to rewrite agreed prices —
+   * so the gate below is untouched. */
+  const canEditRate: boolean = true;
+  /* ADMIN, for the money gates that are NOT the rate. `role` comes from
+   * /api/purchase-orders' viewer_role (effectiveRole(), which collapses staff →
+   * 'manager'), so admin is the only tier this response can distinguish. It now
+   * governs one thing here: the cap on how large a discount a non-admin may book
+   * (NON_ADMIN_DISCOUNT_CAP_PCT), which the receive route enforces too. */
+  const isAdmin = role === 'admin';
 
   /* Load (or reload) the PO and its vendor stakes. Called on mount and again
      after each vendor is booked, so a receiver who takes two deliveries in one
@@ -631,10 +799,22 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     setOverrides(map);
     // Every per-line and per-bill entry belongs to ONE vendor's delivery — none
     // of it may carry over to the next vendor, so it is cleared with the reload.
-    setReasons({}); setRateUnlocked({}); setExcluded({});
+    setReasons({}); setRateDraft({}); setExcluded({});
     setBillNo(''); setChargesNote('');
     setDiscountValue(''); setDeliveryValue('');
     setDiscountMode('amt'); setDeliveryMode('amt');
+    // Tax belongs to the vendor's bill, not to the PO — the next vendor's bill
+    // starts at the 0% default with no per-line overrides carried over.
+    setBillGstRate('0'); setLineGst({});
+    // The server's own verdict on which lines are store/TGBCL materials. Read
+    // from the payload rather than re-derived from categories here: the receive
+    // route decides this with centralFlowBlock, and a second client-side guess
+    // is how one screen taxes a bottle the other zero-rates.
+    const sb: Record<string, string> = {};
+    for (const b of (Array.isArray(recv?.store_blocked) ? recv.store_blocked : [])) {
+      if (b?.po_item_id) sb[String(b.po_item_id)] = String(b.error || 'store item — taxed on the TGBCL bill');
+    }
+    setStoreBlocked(sb);
     const list: VendorStake[] = Array.isArray(recv?.vendors) ? recv.vendors : [];
     setStakes(list);
     // Auto-select the vendor still owing goods when there is only one — that is
@@ -654,6 +834,19 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   const stake = useMemo(() => stakes.find(v => v.key === vendorKey) || null, [stakes, vendorKey]);
   const openStakes = useMemo(() => stakes.filter(v => !v.done), [stakes]);
   const isMultiVendor = stakes.length > 1;
+  /* WHOSE delivery is being booked, in words, for the header and the strip.
+   * `stake` is null while the PO is still loading AND on a multi-vendor PO
+   * before the receiver picks, so every step is optional-chained — reading
+   * stake.vendor_name straight would blank the whole modal.
+   * The single-stake fallback covers the ordinary one-vendor PO in the tick
+   * before load() auto-selects it. It is deliberately NOT taken when the PO
+   * spans several vendors: naming vendor A while the receiver is about to book
+   * vendor B is precisely the mix-up this is here to prevent, and there the
+   * header vendor ("Mixed (N vendors)") is the honest answer. */
+  const vendorLabel = useMemo(
+    () => (stake?.vendor_name || (stakes.length === 1 ? stakes[0]?.vendor_name : '') || po?.vendor || '').trim(),
+    [stake, stakes, po],
+  );
   /* THE LINES THIS RECEIPT COVERS — this vendor's still-outstanding ones, and
      nothing else. Lines another vendor owes, and lines already received, are not
      rendered at all: a row on screen is a row that will be booked. */
@@ -728,9 +921,34 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     s + (Number(d.ov.quantity) || 0) * (Number(d.ov.unit_price) || 0), 0);
   const orderedTotal = activeDeviations.reduce((s, d) => s + d.it.quantity * d.it.unit_price, 0);
 
+  /* ZERO-RATED LINES. A store/TGBCL material carries excise, cess and TCS on the
+     store's own bill and no GST at all, so it can never take a rate here. The
+     receive route already refuses to bring these into Central stock, which is
+     why they are normally not even rendered (they sit in blocked_line_ids, not
+     line_ids) — this set is belt-and-braces for any payload that still shows
+     one, and it is applied in the COMPUTE, not just the UI, so a rate left over
+     from a swapped material cannot leak tax into the bill. */
+  const storeZeroRated = useMemo(() => {
+    const s = new Set<string>(Object.keys(storeBlocked));
+    for (const id of (stake?.blocked_line_ids || [])) s.add(String(id));
+    return s;
+  }, [storeBlocked, stake]);
+
   /* The bill preview runs the SAME allocator the route runs, on the SAME
      effective numbers the deviations memo uses — so the figure the receiver
-     confirms is the figure that gets booked. */
+     confirms is the figure that gets booked.
+     …and then GST, per line, in this order (identical to /purchases' billCalc,
+     because a bill must cost the same whichever screen books it):
+        goods   = qty × rate
+        taxable = goods − that line's share of the bill discount
+        tax     = taxable × gst%
+        cgst + sgst = tax, with the odd paisa in CGST
+     TAX IS CARRIED ALONGSIDE THE GOODS RATE AND NEVER INSIDE IT. Input GST is
+     reclaimable credit, not part of what the food costs: fold it into the rate
+     and average_price — and every recipe cost derived from it — inflates by the
+     GST rate, silently and forever. That is exactly the bug the old bill-level
+     GST control caused, which is why nothing below touches unit_price,
+     net_rate, or either of the two goods totals. */
   const billCalc = useMemo(() => {
     const chargeLines = activeDeviations.map(d => ({
       id: d.it.id, name: d.it.material_name,
@@ -739,17 +957,73 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     const subtotal = chargeLines.reduce((s, l) => s + (l.qty > 0 && l.rate > 0 ? l.qty * l.rate : 0), 0);
     const discount = resolveCharge(discountMode, discountValue, subtotal);
     const delivery = resolveCharge(deliveryMode, deliveryValue, subtotal);
-    return { alloc: allocateBillCharges(chargeLines, { discount, delivery }), discount, delivery };
-  }, [activeDeviations, discountMode, discountValue, deliveryMode, deliveryValue]);
+    const allocation = allocateBillCharges(chargeLines, { discount, delivery });
+
+    // The bill-level rate is a DEFAULT lines inherit. Parsed here, once — the
+    // selects hold raw strings so nothing round-trips through Number() mid-edit.
+    const billRate = parseFloat(billGstRate) || 0;
+    /* The discount share is taken from the allocator's own line, never
+       re-derived: the allocator gives the LAST allocatable line the remainder so
+       the shares sum to the bill exactly, and a second proportional calculation
+       here would disagree with it by a paisa on most bills. `net_total` is
+       already gross − discount_share, which is the taxable value. */
+    const byId = new Map<string, {
+      zero_rated: boolean; zero_reason: string; rate: number; discount_share: number;
+      taxable: number; tax_value: number; cgst: number; sgst: number; incl_tax: number;
+    }>();
+    for (const l of allocation.lines) {
+      const zeroRated = storeZeroRated.has(l.id);
+      const raw = lineGst[l.id];
+      const rate = zeroRated ? 0 : ((raw == null || raw === '') ? billRate : (parseFloat(raw) || 0));
+      const taxable = r2(l.net_total);
+      const taxValue = r2(taxable * rate / 100);
+      /* House invariant: tax_value = cgst + sgst. INTEGER PAISE, and the odd
+         paisa lands in CGST — byte-identical to /purchases and to the server
+         (api/purchases: sgstPaise = floor(taxPaise / 2), cgst = remainder).
+         Rounding both halves independently overshoots by a paisa on an odd
+         amount (₹1.01 → 0.51 + 0.51), and putting the spare paisa in SGST makes
+         the screen and the stored row disagree — totals still match, so nothing
+         looks wrong until someone reconciles a GST return line by line. */
+      const taxPaise = Math.round(taxValue * 100);
+      const sgst = Math.floor(taxPaise / 2) / 100;
+      const cgst = r2(taxValue - sgst);
+      byId.set(l.id, {
+        zero_rated: zeroRated,
+        zero_reason: storeBlocked[l.id] || 'store item — taxed on the TGBCL bill, not GST',
+        // Carried so the row can SAY the taxable value is net of a discount,
+        // without comparing two floats that differ only by rounding.
+        discount_share: l.discount_share,
+        rate, taxable, tax_value: taxValue, cgst, sgst, incl_tax: r2(taxable + taxValue),
+      });
+    }
+    const cgstTotal = r2([...byId.values()].reduce((s, t) => s + t.cgst, 0));
+    const sgstTotal = r2([...byId.values()].reduce((s, t) => s + t.sgst, 0));
+    const taxTotal  = r2(cgstTotal + sgstTotal);
+    // Goods − discount, computed ONCE rather than summed from the per-line
+    // shares (those can drift a paisa on rounding). This is the figure printed
+    // on the paper bill in the receiver's hand.
+    const taxableTotal = r2(allocation.subtotal - allocation.discount_applied);
+    // What is actually owed the vendor: goods, less discount, plus their tax,
+    // plus delivery. Tax and delivery are both on the bill but NOT in the cost
+    // of the goods — that stays `net_subtotal`.
+    const billTotal = r2(taxableTotal + taxTotal + allocation.delivery);
+    const inclTaxTotal = r2(taxableTotal + taxTotal);
+    return {
+      alloc: allocation, discount, delivery,
+      tax: { byId, cgstTotal, sgstTotal, taxTotal, taxableTotal, billTotal, inclTaxTotal },
+    };
+  }, [activeDeviations, discountMode, discountValue, deliveryMode, deliveryValue,
+      billGstRate, lineGst, storeZeroRated, storeBlocked]);
 
   const alloc = billCalc.alloc;
+  const tax = billCalc.tax;
   const hasCharges = alloc.discount_applied > 0 || alloc.delivery > 0;
   // A discount changes what stock cost — it needs the same "say why" discipline
   // as an off-PO line, and the server enforces the identical floor.
   const needsChargeNote = alloc.discount_applied > 0 && chargesNote.trim().length < MIN_REASON;
   // > cap + half a paisa — the same headroom the route uses, so an exactly-25%
   // discount is not refused here while the server would accept it.
-  const overDiscountCap = !canChangeRate && alloc.subtotal > 0
+  const overDiscountCap = !isAdmin && alloc.subtotal > 0
     && alloc.discount_applied - (alloc.subtotal * NON_ADMIN_DISCOUNT_CAP_PCT) / 100 > 0.005;
   const zeroCost = alloc.zero_cost_lines;
   const chargeBlockers: string[] = [
@@ -790,16 +1064,39 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     }
     setSaving(true);
     try {
-      // Only deviating lines are sent — and every one of them carries the reason
-      // the receiver typed, as deviation_reason (why it differs from the PO).
-      // rejection_reason stays what it always was: QC, why units were rejected.
+      // Every deviating line is sent, carrying the reason the receiver typed as
+      // deviation_reason (why it differs from the PO). rejection_reason stays
+      // what it always was: QC, why units were rejected. `deviating` is also
+      // what the post-commit notes below count, so it stays the deviation set
+      // and nothing else.
       const deviating = activeDeviations.filter(d => d.deviates);
-      const item_overrides = deviating.map(d => ({
-        po_item_id: d.it.id,
-        quantity: d.ov.quantity,
-        unit_price: d.ov.unit_price,
-        deviation_reason: (reasons[d.it.id] || '').trim(),
-      }));
+      /* …plus any line that carries TAX, deviating or not: gst_rate is per line
+         on the wire (there is no bill-level tax field), so a taxed line that
+         matches its PO exactly still has to say so or its GST is lost. A line
+         at 0% is left out — an absent gst_rate and an explicit 0 mean the same
+         thing to the server, so on a bill with no GST at all this payload is
+         byte-identical to the one this screen has always sent. */
+      const taxedOrDeviating = activeDeviations.filter(
+        d => d.deviates || (billCalc.tax.byId.get(d.it.id)?.rate || 0) > 0);
+      const item_overrides = taxedOrDeviating.map(d => {
+        const t = billCalc.tax.byId.get(d.it.id);
+        return {
+          po_item_id: d.it.id,
+          // THE GOODS RATE, still. Tax rides in its own fields below and is
+          // never folded into this number — it is what becomes
+          // purchases.unit_price → average_price → every recipe cost.
+          quantity: d.ov.quantity,
+          unit_price: d.ov.unit_price,
+          deviation_reason: (reasons[d.it.id] || '').trim(),
+          // Percent (0 | 5 | 12 | 18); 0 = exempt or a store/TGBCL line. The
+          // server RE-DERIVES the tax from (line value − discount share) × this
+          // rate and stores its own figure — cgst/sgst travel only so a mismatch
+          // between the two is detectable rather than silent.
+          gst_rate: t?.rate ?? 0,
+          cgst: t?.cgst ?? 0,
+          sgst: t?.sgst ?? 0,
+        };
+      });
       const r = await api(`/api/purchase-orders/${poId}/receive`, {
         method: 'POST',
         body: {
@@ -887,6 +1184,24 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           ' No other vendor\'s lines on this PO were touched.'
         );
       }
+      /* GST as the SERVER committed it, not as this screen computed it — the two
+         differ by a paisa on half-paisa amounts, and by the whole amount on a
+         line the server zero-rated as a store item. The receiver is signing off
+         a tax figure, so they are shown the one that was actually stored. */
+      if (j.tax_applied && Number(j.tax_applied.tax_value) > 0) {
+        const t = j.tax_applied;
+        notes.push(
+          `GST recorded: taxable ${fmt(t.taxable)} · CGST ${fmt(t.cgst)} + SGST ${fmt(t.sgst)} = ${fmt(t.tax_value)}. ` +
+          'Recorded against the bill as input credit — it is NOT in the item rate, so no recipe cost moved because of it.'
+        );
+      }
+      const forcedZero = (j.tax_applied?.lines || []).filter((l: any) => l?.zero_rated_store_item);
+      if (forcedZero.length > 0) {
+        notes.push(
+          `${forcedZero.length} line(s) were recorded at 0% GST: they are store/TGBCL materials, ` +
+          'which are taxed through excise / cess / TCS on the store bill, never through GST.'
+        );
+      }
       // THE PARTIAL CASE. The PO stays open until every vendor's lines are in,
       // so say plainly who is still to come rather than letting "Received" imply
       // the whole order landed.
@@ -916,15 +1231,30 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       {/* Capped shell (header + footer pinned, body scrolls): the charges card
           made this modal tall enough to push Confirm below the fold on phones —
           the same bug the create-PO modal already fixed once. */}
-      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-4 shadow-xl flex flex-col overflow-hidden"
+      {/* max-w-5xl (was 3xl): the four tax columns read left-to-right off the
+          Line Total, and at 3xl they were permanently behind a sideways scroll.
+          The table still sits in its own overflow-x-auto for narrow screens. */}
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-5xl my-4 shadow-xl flex flex-col overflow-hidden"
            style={{ maxHeight: 'calc(100vh - 1.5rem)' }}>
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
           <div>
-            <h2 className="font-bold text-[#2D1B0E]">Receive PO {po?.po_number}</h2>
+            {/* The header named the PO but never the vendor, so a receiver had
+                no on-screen confirmation of WHOSE goods they were booking into
+                stock — and on a PO that spans vendors, that is a wrong-supplier
+                purchase row, not a cosmetic gap. */}
+            <h2 className="font-bold text-[#2D1B0E]">
+              Receive PO {po?.po_number}
+              {vendorLabel && <span className="font-normal text-[#6B5744]"> · {vendorLabel}</span>}
+            </h2>
+            {/* Says what the screen now actually does. The old sentence ("the
+                rate is locked to the PO and only an admin can change it")
+                described a lock that no longer exists — and a header that lies
+                about who may change a price is worse than no header at all. */}
             <p className="text-xs text-[#8B7355] mt-0.5">
-              Adjust the qty if you got more / less. The rate is locked to the PO
-              {canChangeRate ? ' — unlock a line only if the vendor genuinely billed differently.' : ' and only an admin can change it.'}
-              {' '}Any line that differs from the PO needs a reason and alerts the admin. Stock + recipe costs update on submit.
+              Adjust the qty if you got more / less. The rate starts at the PO rate and can be corrected
+              to what the vendor actually billed — any line that differs from the PO needs a reason, and the admin is
+              notified with it. GST is worked out per line after discount and recorded on its own; it never enters the rate.
+              Stock + recipe costs update on submit.
               {isMultiVendor && ' This PO spans several vendors — each is received separately, on their own bill.'}
             </p>
           </div>
@@ -1014,6 +1344,22 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                 : 'Choose the vendor who is delivering to see their lines.'}
             </div>
            ) : (
+            <>
+            {/* ── WHOSE DELIVERY IS THIS (always) ───────────────────────────
+                Pinned directly above the lines and NOT gated on isMultiVendor:
+                the single-vendor PO is the common case, and it named no vendor
+                anywhere in this modal. Sticky, because the vendor is the one
+                fact the receiver must not lose while scrolling down twenty
+                lines — booking a bill against the wrong supplier writes that
+                supplier onto every purchase row and into their ledger. */}
+            <div className="sticky top-0 z-10 -mx-5 px-5 py-2 bg-[#FFF1E3] border-y border-[#E8D5C4] flex items-center gap-2 flex-wrap">
+              <PackageCheck className="w-4 h-4 text-[#af4408] shrink-0" />
+              <span className="text-xs text-[#8B7355]">Receiving from</span>
+              <span className="text-sm font-bold text-[#2D1B0E]">{vendorLabel || '—'}</span>
+              <span className="text-[10px] text-[#6B5744] ml-auto">
+                {visibleItems.length} line{visibleItems.length === 1 ? '' : 's'} outstanding · {fmt(stake.ordered_value)} ordered
+              </span>
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead className="text-[#8B7355]">
@@ -1024,6 +1370,14 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     <th className="text-right py-1 px-2 font-medium">Ordered ₹</th>
                     <th className="text-right py-1 px-2 font-medium">Actual ₹</th>
                     <th className="text-right py-1 px-2 font-medium">Line Total</th>
+                    {/* TAX, reading left to right off the goods figure the way
+                        the vendor's bill does: value → less discount → taxable
+                        → × GST% → tax → incl. tax. Same columns, same order and
+                        same wording as the Enter Full Bill modal on /purchases. */}
+                    <th className="text-right py-1 px-2 font-medium" title="Line Total minus this line's share of the bill discount — the value GST is charged on">Taxable</th>
+                    <th className="text-right py-1 px-2 font-medium">GST %</th>
+                    <th className="text-right py-1 px-2 font-medium" title="Charged on the taxable value, split into CGST + SGST. Recorded on the bill — never added into the rate, so recipe costs stay on the true goods price.">Tax (C+S)</th>
+                    <th className="text-right py-1 px-2 font-medium" title="Taxable + tax — what this line adds to the vendor's bill">Incl. Tax</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1040,8 +1394,12 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     // never be read against a sibling cell in grams.
                     const ordHint = recipeHint(it.quantity, meta);
                     const rcvHint = recipeHint(Number(ov.quantity) || 0, meta);
-                    const unlocked = !!rateUnlocked[it.id];
                     const reason = reasons[it.id] || '';
+                    /* This line's tax, from the ONE compute. Absent for an
+                       excluded line — it is not on the bill, so it has no
+                       taxable value and its cells read "—" rather than a figure
+                       nothing will book. */
+                    const t = tax.byId.get(it.id);
                     // Only a line ON this bill can be off-PO — an excluded one
                     // is not being received at all, so it owes no explanation.
                     const needsReason = included && deviates && reason.trim().length < MIN_REASON;
@@ -1097,71 +1455,108 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                         <td className="py-1.5 px-2 text-right font-mono text-[10px] text-[#8B7355]">
                           ₹{it.unit_price.toFixed(2)}{u && <span>/{u}</span>}
                         </td>
-                        {/* RATE — read-only unless this line was explicitly
-                            unlocked by an admin (see canChangeRate). It is the
-                            number that rewrites average_price, so it is never
-                            a stray keystroke away. */}
+                        {/* RATE — the vendor's actual billed rate, typed by
+                            whoever is receiving. It seeds from the PO and is the
+                            number that rewrites average_price, so the moment it
+                            stops matching the PO the row says so out loud: what
+                            the PO agreed, the delta, and that a reason is now
+                            required and the admin will be told. That statement
+                            IS the control that replaced the padlock — the gate
+                            itself (deviations → reasons → server alert) is
+                            unchanged and cannot be skipped. */}
                         <td className="py-1.5 px-2">
-                          {unlocked ? (
+                          <div className="flex items-center gap-1 justify-end">
+                            {/* Raw draft in, parsed number out — see rateDraft.
+                                min=0: a negative rate is a credit note, not a
+                                purchase. */}
+                            <input type="number" step="any" min={0} disabled={!included || !canEditRate}
+                                   value={rateDraft[it.id] ?? String(ov.unit_price)}
+                                   onChange={e => {
+                                     const raw = e.target.value;
+                                     setRateDraft(m => ({ ...m, [it.id]: raw }));
+                                     const v = parseFloat(raw);
+                                     setPrice(it.id, Number.isFinite(v) ? Math.max(0, v) : 0);
+                                   }}
+                                   className={`w-full px-1.5 py-1 border rounded text-right disabled:bg-[#F5EFE8] ${rateOff && included ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
+                            {u && <span className="text-[10px] text-[#8B7355]">/{u}</span>}
+                          </div>
+                          {rateOff && included && (
                             <>
-                              <div className="flex items-center gap-1 justify-end">
-                                <input type="number" step="any" min={0} value={ov.unit_price} autoFocus
-                                       onChange={e => {
-                                         const v = parseFloat(e.target.value);
-                                         setPrice(it.id, Number.isFinite(v) ? Math.max(0, v) : 0);
-                                       }}
-                                       className={`w-full px-1.5 py-1 border rounded text-right ${rateOff ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
-                                {u && <span className="text-[10px] text-[#8B7355]">/{u}</span>}
+                              <div className={`text-[9px] mt-0.5 text-right ${priceDiff > 0 ? 'text-red-600' : 'text-green-700'}`}>
+                                PO ₹{it.unit_price.toFixed(2)}{u && `/${u}`}
+                                {' · '}{priceDiff > 0 ? '+' : ''}₹{priceDiff.toFixed(2)}{u && `/${u}`}
                               </div>
-                              {rateOff && (
-                                <div className={`text-[9px] mt-0.5 text-right ${priceDiff > 0 ? 'text-red-600' : 'text-green-700'}`}>
-                                  {priceDiff > 0 ? '+' : ''}₹{priceDiff.toFixed(2)}{u && `/${u}`} vs ordered
-                                </div>
-                              )}
-                              <button type="button"
-                                      onClick={() => {
-                                        // Re-locking restores the PO rate, so a
-                                        // half-typed change can't survive as a
-                                        // deviation nobody meant to make.
-                                        setPrice(it.id, it.unit_price);
-                                        setRateUnlocked(m => ({ ...m, [it.id]: false }));
-                                      }}
-                                      className="mt-0.5 block ml-auto text-[9px] text-[#8B7355] hover:text-[#af4408] underline">
-                                Reset to PO rate
-                              </button>
+                              <div className="text-[9px] text-right text-amber-800">reason required · admin notified</div>
                             </>
-                          ) : (
-                            <div className="text-right">
-                              <div className="font-mono text-[#2D1B0E] flex items-center gap-1 justify-end">
-                                <Lock className="w-3 h-3 text-[#8B7355]" />
-                                ₹{Number(ov.unit_price).toFixed(2)}{u && <span className="text-[10px] text-[#8B7355]">/{u}</span>}
-                              </div>
-                              {canChangeRate && included ? (
-                                <button type="button" onClick={() => setRateUnlocked(m => ({ ...m, [it.id]: true }))}
-                                        className="mt-0.5 text-[9px] text-[#af4408] hover:text-[#8a3506] underline">
-                                  Change rate
-                                </button>
-                              ) : !canChangeRate ? (
-                                <div className="mt-0.5 text-[9px] text-[#8B7355]">PO rate — admin only</div>
-                              ) : null}
-                              {/* A ₹0 PO rate is rejected by the receive route
-                                  (it would wipe average_price to 0), and the
-                                  lock means only an admin can fix it — say so
-                                  here instead of failing on submit.
-                                  Gated on qty > 0 the same way the route is
-                                  (`effAcc > 0 && effPrice <= 0`): a line
-                                  received at 0 never reaches updateMaterialPrice,
-                                  so the server accepts it and this must not
-                                  claim otherwise. */}
-                              {included && Number(ov.quantity) > 0 && Number(ov.unit_price) <= 0 && (
-                                <div className="mt-0.5 text-[9px] text-red-600">
-                                  PO rate is ₹0 — {canChangeRate ? 'set a real rate to receive this line.' : 'an admin must set a real rate before this can be received.'}
-                                </div>
-                              )}
+                          )}
+                          {/* Restores the PO rate — a half-typed change must not
+                              survive as a deviation nobody meant to make. The
+                              draft is cleared with it, or the box would keep
+                              showing the abandoned keystrokes. */}
+                          {rateOff && included && (
+                            <button type="button"
+                                    onClick={() => {
+                                      setPrice(it.id, it.unit_price);
+                                      setRateDraft(m => { const n = { ...m }; delete n[it.id]; return n; });
+                                    }}
+                                    className="mt-0.5 block ml-auto text-[9px] text-[#8B7355] hover:text-[#af4408] underline">
+                              Reset to PO rate
+                            </button>
+                          )}
+                          {/* A line accepted at ₹0 is rejected by the receive
+                              route (it would wipe average_price to 0). Anyone
+                              receiving can now fix it in place, so this only
+                              has to say what to do.
+                              Gated on qty > 0 the same way the route is
+                              (`effAcc > 0 && effPrice <= 0`): a line received at
+                              0 never reaches updateMaterialPrice, so the server
+                              accepts it and this must not claim otherwise. */}
+                          {included && Number(ov.quantity) > 0 && Number(ov.unit_price) <= 0 && (
+                            <div className="mt-0.5 text-[9px] text-red-600 text-right">
+                              Rate is ₹0 — type the billed rate to receive this line.
                             </div>
                           )}
                         </td>
                         <td className="py-1.5 px-2 text-right font-mono font-semibold">{fmt(lineTotal)}</td>
+                        {/* ── TAX, per line ─────────────────────────────────
+                            Read straight off the one compute; nothing here
+                            re-derives a share or a rounding. */}
+                        <td className="py-1.5 px-2 text-right font-mono text-[#6B5744]">
+                          {t ? fmt(t.taxable) : '—'}
+                          {t && t.discount_share > 0 && (
+                            <div className={HINT_CLS}>− {fmt(t.discount_share)} discount</div>
+                          )}
+                        </td>
+                        <td className="py-1.5 px-2 text-right">
+                          {!included ? <span className="text-[#8B7355]">—</span>
+                           : t?.zero_rated ? (
+                            /* Not the receiver's to set: this material belongs
+                               to a store location, where excise / cess / TCS are
+                               charged on the store's own bill. A GST% on it
+                               would be tax that was never paid. */
+                            <div className="text-[10px] text-blue-700 leading-tight text-right" title={t.zero_reason}>
+                              0%
+                              <span className="block text-[9px] text-[#8B7355]">store item — taxed on the TGBCL bill</span>
+                            </div>
+                           ) : (
+                            <select value={lineGst[it.id] ?? ''}
+                                    onChange={e => setLineGst(m => ({ ...m, [it.id]: e.target.value }))}
+                                    title="Blank follows the bill's GST rate. Change it only for a line the vendor billed at a different rate."
+                                    className="w-full px-1 py-1 bg-white border border-[#E8D5C4] rounded text-right text-[11px]">
+                              <option value="">Bill ({billGstRate}%)</option>
+                              {GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
+                            </select>
+                           )}
+                        </td>
+                        <td className="py-1.5 px-2 text-right font-mono text-[#6B5744]">
+                          {t ? fmt(t.tax_value) : '—'}
+                          {t && t.tax_value > 0 && (
+                            <div className={HINT_CLS}>{fmt(t.cgst)} + {fmt(t.sgst)}</div>
+                          )}
+                        </td>
+                        <td className="py-1.5 px-2 text-right font-mono text-[#2D1B0E]">
+                          {t ? fmt(t.incl_tax) : '—'}
+                        </td>
                       </tr>
                       {/* REASON — appears the moment a line stops matching the
                           PO (short, excess, or a changed rate). Required: the
@@ -1169,7 +1564,8 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                           the admin alert quotes it. */}
                       {deviates && included && (
                         <tr className="bg-amber-50/40">
-                          <td colSpan={6} className="px-2 pb-2">
+                          {/* colSpan matches the 10 columns above (6 goods + 4 tax). */}
+                          <td colSpan={10} className="px-2 pb-2">
                             <div className="flex flex-col sm:flex-row sm:items-center gap-1.5">
                               <span className={`text-[10px] shrink-0 ${needsReason ? 'text-amber-800 font-semibold' : 'text-[#6B5744]'}`}>
                                 <AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5" />
@@ -1188,10 +1584,14 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                   })}
                 </tbody>
                 <tfoot>
+                  {/* Both rows carry all 10 columns, so the tax columns total
+                      under their own headings and the row still reads left to
+                      right: goods → taxable → tax → incl. tax. */}
                   <tr className="border-t border-[#E8D5C4] font-semibold">
                     <td className="py-2 px-2 text-right" colSpan={3}>Ordered total</td>
                     <td colSpan={2} className="py-2 px-2 text-right font-mono text-[#8B7355]">{fmt(orderedTotal)}</td>
                     <td></td>
+                    <td colSpan={4}></td>
                   </tr>
                   <tr className="font-semibold">
                     <td className="py-2 px-2 text-right" colSpan={3}>Receive total</td>
@@ -1199,10 +1599,20 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     <td className={`py-2 px-2 text-right font-mono text-xs ${total !== orderedTotal ? (total > orderedTotal ? 'text-red-600' : 'text-amber-700') : 'text-[#8B7355]'}`}>
                       {total !== orderedTotal ? `${total > orderedTotal ? '+' : ''}${fmt(total - orderedTotal)}` : '—'}
                     </td>
+                    <td className="py-2 px-2 text-right font-mono">{fmt(tax.taxableTotal)}</td>
+                    <td></td>
+                    <td className="py-2 px-2 text-right font-mono">
+                      {fmt(tax.taxTotal)}
+                      {tax.taxTotal > 0 && (
+                        <div className={`${HINT_CLS} font-normal`}>{fmt(tax.cgstTotal)} + {fmt(tax.sgstTotal)}</div>
+                      )}
+                    </td>
+                    <td className="py-2 px-2 text-right font-mono text-[#af4408]">{fmt(tax.inclTaxTotal)}</td>
                   </tr>
                 </tfoot>
               </table>
             </div>
+            </>
           )}
 
           {/* BILL CHARGES — what the vendor's bill carries beyond the goods.
@@ -1231,6 +1641,30 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                          onMode={setDiscountMode} onValue={setDiscountValue}
                          placeholder={discountMode === 'pct' ? 'e.g. 5' : 'e.g. 250'}
                          resolved={alloc.discount_applied} tone="text-emerald-700" negative />
+              {/* GST is NOT a bill-level charge like the two rows above — it is
+                  a DEFAULT rate each line inherits, and the tax is worked out
+                  per line AFTER that line's discount share. Set once here
+                  because one vendor bill is normally one rate; a line can still
+                  override it in its own GST % cell. The tax is recorded beside
+                  the goods rate and never inside it, so input credit stays
+                  reclaimable and item cost stays true. */}
+              <div className="flex items-center gap-3 flex-wrap border-t border-[#E8D5C4] pt-2">
+                <span className="text-xs font-medium text-[#6B5744] min-w-[120px]">
+                  GST Rate
+                  <span className="block text-[10px] font-normal text-[#8B7355]">every line follows this unless the line overrides it</span>
+                </span>
+                <select value={billGstRate} onChange={e => setBillGstRate(e.target.value)}
+                        className="px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-[#2D1B0E]">
+                  {GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
+                </select>
+                <span className="text-xs font-semibold ml-auto text-[#6B5744]">
+                  CGST {fmt(tax.cgstTotal)} + SGST {fmt(tax.sgstTotal)} = <span className="text-[#2D1B0E]">{fmt(tax.taxTotal)}</span>
+                </span>
+              </div>
+              <p className="text-[10px] text-[#8B7355]">
+                Tax is charged on the value <strong>after</strong> discount, shown per line, and recorded separately —
+                it is never added into the item rate, so recipe costs stay on the true goods price.
+              </p>
               <div className="flex flex-col sm:flex-row gap-2">
                 <input value={billNo} onChange={e => setBillNo(e.target.value)}
                        placeholder="Vendor bill no. (optional)"
@@ -1241,20 +1675,37 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                          className={`flex-1 min-w-0 px-2 py-1 border rounded text-[11px] bg-white ${needsChargeNote ? 'border-amber-400' : 'border-[#E8D5C4]'}`} />
                 )}
               </div>
-              {hasCharges && alloc.subtotal > 0 && (
+              {/* RECONCILE AGAINST THE PAPER BILL IN THE RECEIVER'S HAND. Reads
+                  in the same order the vendor's invoice does — goods, discount,
+                  taxable, CGST, SGST, delivery, bill total — so it can be
+                  checked line by line before Confirm. Shown whenever there are
+                  charges OR any tax: a bill with 18% GST and no discount still
+                  has to be reconciled. The one figure that is NOT on the paper
+                  bill is called out on its own: what actually becomes the cost
+                  of the stock, which excludes both tax and delivery. */}
+              {(hasCharges || tax.taxTotal > 0) && alloc.subtotal > 0 && (
                 <div className="border-t border-[#E8D5C4] pt-1.5 text-[11px] font-mono space-y-0.5">
-                  <div className="flex justify-between text-[#6B5744]"><span>Accepted subtotal</span><span>{fmt(alloc.subtotal)}</span></div>
-                  {alloc.discount_applied > 0 && (
-                    <div className="flex justify-between text-emerald-700"><span>− Discount</span><span>− {fmt(alloc.discount_applied)}</span></div>
-                  )}
-                  <div className="flex justify-between font-semibold text-[#2D1B0E]">
-                    <span>= Cost basis booked to stock</span><span>{fmt(alloc.net_subtotal)}</span>
+                  <div className="flex justify-between text-[#6B5744]"><span>Goods (accepted subtotal)</span><span>{fmt(alloc.subtotal)}</span></div>
+                  <div className="flex justify-between text-emerald-700">
+                    <span>− Discount</span><span>{alloc.discount_applied > 0 ? `− ${fmt(alloc.discount_applied)}` : fmt(0)}</span>
                   </div>
-                  {alloc.delivery > 0 && (
-                    <div className="flex justify-between text-[#8B7355]"><span>+ Delivery (recorded only)</span><span>{fmt(alloc.delivery)}</span></div>
-                  )}
-                  <div className="flex justify-between text-[#6B5744] border-t border-[#E8D5C4]/60 pt-0.5">
-                    <span>Bill total</span><span>{fmt(alloc.net_subtotal + alloc.delivery)}</span>
+                  <div className="flex justify-between text-[#2D1B0E]">
+                    <span>= Taxable</span><span>{fmt(tax.taxableTotal)}</span>
+                  </div>
+                  <div className="flex justify-between text-[#6B5744]"><span>+ CGST</span><span>{fmt(tax.cgstTotal)}</span></div>
+                  <div className="flex justify-between text-[#6B5744]"><span>+ SGST</span><span>{fmt(tax.sgstTotal)}</span></div>
+                  <div className="flex justify-between text-[#8B7355]">
+                    <span>+ Delivery (recorded only)</span><span>{fmt(alloc.delivery)}</span>
+                  </div>
+                  <div className="flex justify-between font-semibold text-[#af4408] border-t border-[#E8D5C4]/60 pt-0.5">
+                    <span>Bill total</span><span>{fmt(tax.billTotal)}</span>
+                  </div>
+                  <div className="flex justify-between text-[#2D1B0E] border-t border-[#E8D5C4]/60 pt-0.5">
+                    <span className="font-semibold">Cost basis booked to stock</span><span className="font-semibold">{fmt(alloc.net_subtotal)}</span>
+                  </div>
+                  <div className="text-[9px] text-[#8B7355] font-sans leading-tight">
+                    Goods less discount — GST and delivery are on the bill but not in the cost of the stock.
+                    GST is reclaimable input credit, not part of what the food costs.
                   </div>
                 </div>
               )}
@@ -1348,11 +1799,11 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
   }, [po.id]);
 
   if (loading) {
-    return <tr><td colSpan={7} className="py-3 px-3 text-xs text-[#8B7355] bg-[#FFF8F0]">Loading items…</td></tr>;
+    return <tr><td colSpan={8} className="py-3 px-3 text-xs text-[#8B7355] bg-[#FFF8F0]">Loading items…</td></tr>;
   }
   if (editing) {
-    return <tr><td colSpan={7} className="py-3 px-3 bg-[#FFF8F0]">
-      <EditPOItems poId={po.id} initialDate={po.date} initialVendor={po.vendor} initialNotes={po.notes}
+    return <tr><td colSpan={8} className="py-3 px-3 bg-[#FFF8F0]">
+      <EditPOItems poId={po.id} initialDate={po.date} initialDeliveryDate={po.delivery_date} initialVendor={po.vendor} initialNotes={po.notes}
                    initialItems={items} materials={materials} onCancel={onCancelEdit} onSaved={onSaved} />
     </td></tr>;
   }
@@ -1367,9 +1818,23 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
   // marker; it is set even for a truthful ₹0 line, unlike a > 0 sum test.)
   const anyReceived = isReceived || items.some(it => (it as any).received_line_total != null);
   return (
-    <tr><td colSpan={7} className="py-3 px-3 bg-[#FFF8F0]">
+    <tr><td colSpan={8} className="py-3 px-3 bg-[#FFF8F0]">
       <div className="flex items-start gap-6">
         <div className="text-xs text-[#6B5744] space-y-1">
+          {/* The two dates that bracket the order, side by side: when we raised
+              it, and when the vendor said it would land. An overdue promise is
+              called out here too — the detail panel is where a buyer chasing a
+              late delivery actually looks. */}
+          <div><span className="font-semibold">PO Date:</span> {dateLabel(po.date)}</div>
+          <div>
+            <span className="font-semibold">Expected Delivery:</span>{' '}
+            {po.delivery_date ? (
+              <span className={isDeliveryOverdue(po.delivery_date, po.status) ? 'text-red-700 font-semibold' : ''}>
+                {dateLabel(po.delivery_date)}
+                {isDeliveryOverdue(po.delivery_date, po.status) && ' — overdue'}
+              </span>
+            ) : <span className="text-[#8B7355]">—</span>}
+          </div>
           {po.notes && <div><span className="font-semibold">Notes:</span> {po.notes}</div>}
           {po.submitted_at && <div><span className="font-semibold">Submitted:</span> {dateLabel(po.submitted_at)}</div>}
           {po.approved_at  && <div><span className="font-semibold">Approved:</span>  {dateLabel(po.approved_at)} by {po.approved_by}</div>}
@@ -1825,6 +2290,10 @@ function CreatePOModal({ materials, onClose, onCreated }: {
 }) {
   const today = new Date().toISOString().slice(0, 10);
   const [date, setDate] = useState(today);
+  /* The vendor's promised date. Starts BLANK, never seeded from `today`: an
+     unasked-for default would be recorded as a promise nobody made, and the
+     whole point of the column is that a missing promise stays missing. */
+  const [deliveryDate, setDeliveryDate] = useState('');
   const [vendors, setVendors] = useState<Array<{ id: string; name: string; payment_terms?: string; lead_time_days?: number }>>([]);
   const [notes, setNotes] = useState('');
   // Lazy initializer — newLineUid() must be called once, not on every render.
@@ -1978,6 +2447,13 @@ function CreatePOModal({ materials, onClose, onCreated }: {
       alert('Pick a vendor — on the header, or per line.'); return;
     }
     const problems: string[] = [];
+    // Same rule the route applies (deliveryDateError), said here first so the
+    // buyer is not told after filling in the whole order. A vendor cannot
+    // deliver before the order exists; every other date, including far-future
+    // ones, is legitimate — a promised date is SUPPOSED to be ahead of today.
+    if (deliveryDate && deliveryDate < date) {
+      problems.push(`Expected delivery date ${deliveryDate} is before the PO date ${date} — a vendor cannot deliver before the order is placed.`);
+    }
     items.forEach((it, i) => {
       const qty = Number(it.quantity);
       const px  = Number(it.unit_price);
@@ -2008,6 +2484,10 @@ function CreatePOModal({ materials, onClose, onCreated }: {
         method: 'POST',
         body: {
           date,
+          // NULL, not '': the column is nullable and "no promise on record" is a
+          // real state the list renders as an em-dash. An empty string would
+          // sort and compare as a date-shaped value that is not one.
+          delivery_date: deliveryDate || null,
           notes,
           // Seed only: the route INSERTs the header with these, then
           // deriveHeaderVendor() rewrites it from the LINE vendors before the
@@ -2044,7 +2524,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
           {/* Header vendor is OPTIONAL: it seeds the line vendors and narrows the
               material list to that vendor's mapped items. A PO that spans several
               vendors just leaves it blank and sets the vendor per line. */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             <label className="text-xs text-[#6B5744] flex flex-col gap-1">
               Vendor <span className="text-[#8B7355] font-normal">(optional — filters the item list)</span>
               <select value={primaryVendorId} onChange={e => setPrimaryVendorId(e.target.value)}
@@ -2065,9 +2545,24 @@ function CreatePOModal({ materials, onClose, onCreated }: {
               )}
             </label>
             <label className="text-xs text-[#6B5744] flex flex-col gap-1">
-              Date
+              PO Date
               <input type="date" value={date} onChange={e => setDate(e.target.value)}
                      className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+            </label>
+            {/* When the vendor said it would arrive. Optional — plenty of orders
+                are placed before a date is agreed — and the list flags it in red
+                once it passes with goods still outstanding. */}
+            <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+              Expected Delivery Date <span className="text-[#8B7355] font-normal">(optional)</span>
+              <input type="date" value={deliveryDate} min={date}
+                     onChange={e => setDeliveryDate(e.target.value)}
+                     className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+              {/* min= is only a picker hint — a typed/pasted value slips past it.
+                  Flag it live here; submit() blocks on the same test, which is
+                  the rule the route itself enforces. */}
+              {deliveryDate && deliveryDate < date && (
+                <span className="text-[10px] text-amber-700">Earlier than the PO date — check this.</span>
+              )}
             </label>
             <div className="text-xs text-[#6B5744] flex flex-col gap-1 justify-end">
               <span className="text-[10px] text-[#8B7355]">Vendor(s) on this PO</span>
@@ -2608,9 +3103,16 @@ function SimpleMaterialPicker({
 }
 
 /* Inline edit of items (drafts only) */
-function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialItems, materials, onCancel, onSaved }:
-  { poId: string; initialDate: string; initialVendor: string; initialNotes: string; initialItems: POItem[]; materials: Material[]; onCancel: () => void; onSaved: () => void }) {
+function EditPOItems({ poId, initialDate, initialDeliveryDate, initialVendor, initialNotes, initialItems, materials, onCancel, onSaved }:
+  { poId: string; initialDate: string; initialDeliveryDate?: string; initialVendor: string; initialNotes: string; initialItems: POItem[]; materials: Material[]; onCancel: () => void; onSaved: () => void }) {
   const [date, setDate] = useState(initialDate);
+  /* Seeded from the draft, blank when it has no promise on record. The `|| ''`
+     keeps the input controlled — a NULL delivery_date would otherwise flip it to
+     uncontrolled and React would warn on the first keystroke. slice(0,10)
+     because <input type="date"> silently BLANKS anything that is not exactly
+     YYYY-MM-DD, and a blanked field saves back as NULL — i.e. a promise the
+     buyer never touched would be quietly erased by opening the editor. */
+  const [deliveryDate, setDeliveryDate] = useState(String(initialDeliveryDate || '').slice(0, 10));
   const [notes, setNotes] = useState(initialNotes || '');
   // Lazy initializer — newLineUid() must be called once per row, not per render.
   const [items, setItems] = useState(() => initialItems.map(i => ({
@@ -2710,6 +3212,11 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
       return;
     }
     const problems: string[] = [];
+    // Same rule as the new-PO composer and as the route (deliveryDateError):
+    // a vendor cannot deliver before the order is placed.
+    if (deliveryDate && deliveryDate < date) {
+      problems.push(`Expected delivery date ${deliveryDate} is before the PO date ${date} — a vendor cannot deliver before the order is placed.`);
+    }
     items.forEach((it, i) => {
       const qty = Number(it.quantity);
       const px  = Number(it.unit_price);
@@ -2746,7 +3253,9 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
       const r = await api('/api/purchase-orders', {
         method: 'PUT',
         // uid is client-only row identity — strip it off the wire.
-        body: { id: poId, date, notes, items: items.map(({ uid, ...line }) => line) },
+        // delivery_date goes as NULL when cleared, so a promise can be withdrawn
+        // as well as set — see the composer for why not ''.
+        body: { id: poId, date, delivery_date: deliveryDate || null, notes, items: items.map(({ uid, ...line }) => line) },
       });
       if (!r.ok) { alert((await r.json()).error || 'Failed'); return; }
       onSaved();
@@ -2755,9 +3264,26 @@ function EditPOItems({ poId, initialDate, initialVendor, initialNotes, initialIt
 
   return (
     <div ref={linesRef} className="space-y-3">
-      <div className="grid grid-cols-3 gap-2 text-xs">
-        <input type="date" value={date} onChange={e => setDate(e.target.value)} className="px-2 py-1 border border-[#E8D5C4] rounded" />
-        <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Notes" className="px-2 py-1 border border-[#E8D5C4] rounded col-span-2" />
+      {/* These three boxes carried no labels at all: two bare date pickers and a
+          placeholder are not enough to tell a buyer which date is which, and
+          getting them the wrong way round makes the PO permanently overdue. */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+        <label className="flex flex-col gap-1 text-[#6B5744]">
+          PO Date
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} className="px-2 py-1 border border-[#E8D5C4] rounded" />
+        </label>
+        <label className="flex flex-col gap-1 text-[#6B5744]">
+          Expected Delivery Date
+          <input type="date" value={deliveryDate} min={date} onChange={e => setDeliveryDate(e.target.value)}
+                 className="px-2 py-1 border border-[#E8D5C4] rounded" />
+          {deliveryDate && deliveryDate < date && (
+            <span className="text-[10px] text-amber-700">Earlier than the PO date — check this.</span>
+          )}
+        </label>
+        <label className="flex flex-col gap-1 text-[#6B5744] col-span-2">
+          Notes
+          <input value={notes} onChange={e => setNotes(e.target.value)} placeholder="Notes" className="px-2 py-1 border border-[#E8D5C4] rounded" />
+        </label>
       </div>
       {/* Strict mapping — same rule and same wording as the new-PO composer. */}
       {vm.error ? (
@@ -2999,12 +3525,12 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
       .then(setData).catch(e => setErr(e.message)).finally(() => setLoading(false));
   }, [poId]);
 
-  if (loading) return <tr><td colSpan={7} className="px-3 py-4 bg-amber-50/30 text-xs text-[#8B7355]">Loading approval context…</td></tr>;
-  if (err)     return <tr><td colSpan={7} className="px-3 py-4 bg-red-50 text-xs text-red-700">Error: {err}</td></tr>;
+  if (loading) return <tr><td colSpan={8} className="px-3 py-4 bg-amber-50/30 text-xs text-[#8B7355]">Loading approval context…</td></tr>;
+  if (err)     return <tr><td colSpan={8} className="px-3 py-4 bg-red-50 text-xs text-red-700">Error: {err}</td></tr>;
   if (!data)   return null;
 
   return (
-    <tr><td colSpan={7} className="bg-amber-50/30 px-3 py-3 border-b border-amber-200">
+    <tr><td colSpan={8} className="bg-amber-50/30 px-3 py-3 border-b border-amber-200">
       <div className="space-y-2">
         <div className="flex items-center gap-2 flex-wrap">
           <AlertTriangle className="w-4 h-4 text-amber-700" />
