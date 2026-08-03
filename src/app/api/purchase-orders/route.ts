@@ -88,6 +88,43 @@ function lineSanityError(db: ReturnType<typeof getDb>, items: any[]): string | n
 }
 
 /**
+ * Gate for the Expected Delivery Date (purchase_orders.delivery_date).
+ *
+ * DELIBERATELY NOT checkPurchaseDate() from @/lib/purchase-guard. That helper
+ * hard-rejects any future date for a non-admin — correct for a purchase/GRN
+ * date, which records something that already happened, and fatal here: an
+ * expected delivery date is SUPPOSED to be in the future, so routing this
+ * through it would make the field unusable for every non-admin in the building.
+ *
+ * A promised date has only two ways to be wrong:
+ *   - malformed (the column is read as a plain YYYY-MM-DD string everywhere), or
+ *   - earlier than the PO date — a vendor cannot deliver before the order exists.
+ * Empty/absent is a valid state: NULL means "no date promised yet".
+ *
+ * Returns null when acceptable, else the message to show the composer.
+ */
+function deliveryDateError(deliveryDate: unknown, poDate: string): string | null {
+  const s = typeof deliveryDate === 'string' ? deliveryDate.trim() : '';
+  if (!s) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    return `Expected delivery date must be YYYY-MM-DD — received "${s}".`;
+  }
+  const ordered = String(poDate || '').trim();
+  // Both are the same fixed-width format, so a plain string compare IS a date
+  // compare — no Date parsing, no timezone to get wrong.
+  if (ordered && s < ordered) {
+    return `Expected delivery date ${s} is before the PO date ${ordered} — a vendor cannot deliver before the order is placed.`;
+  }
+  return null;
+}
+
+/** Storage form of the field: a blank/absent value is NULL ("no promised date"), never ''. */
+function normalizeDeliveryDate(deliveryDate: unknown): string | null {
+  const s = typeof deliveryDate === 'string' ? deliveryDate.trim() : '';
+  return s || null;
+}
+
+/**
  * Recompute the PO's header vendor from its line items.
  * - If all lines share one vendor → that's the PO vendor.
  * - If multiple → header reads "Mixed (N)" so reports/printouts make sense.
@@ -140,7 +177,22 @@ export async function GET(request: Request) {
                COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
                rm.pack_size AS material_pack_size,
                rm.average_price AS current_avg_price, rm.last_purchase_price,
-               rm.primary_vendor AS material_default_vendor
+               rm.primary_vendor AS material_default_vendor,
+               -- The master's GST/cess rates ride along so the RECEIVE screen can
+               -- SEED each line's GST% from the material. They come from
+               -- raw_materials on purpose: purchase_order_items has no tax column
+               -- and must not grow one — a PO is an ORDER, and the rate that ends
+               -- up in the books belongs to the vendor's BILL, which only exists
+               -- at receive time. Do not "tidy" this into a stored po_item field.
+               -- COALESCE is belt-and-braces (both columns are NOT NULL DEFAULT 0),
+               -- kept so a future schema loosening cannot ship NULL to a Number().
+               -- Tax NEVER touches unit_price/total_price here; it travels beside
+               -- the goods rate in its own columns, or input credit gets folded
+               -- into cost and every recipe inflates.
+               COALESCE(rm.tax_percent, 0)  AS material_tax_percent,
+               -- Exposed for future use only; nothing consumes cess today
+               -- (purchases.special_excise_cess means TGBCL excise, not GST cess).
+               COALESCE(rm.cess_percent, 0) AS material_cess_percent
         FROM purchase_order_items poi
         JOIN raw_materials rm ON rm.id = poi.material_id
         WHERE poi.po_id = ?
@@ -293,11 +345,107 @@ export async function GET(request: Request) {
     if (to)     { where.push('po.date <= ?'); params.push(to); }
 
     const rows = db.prepare(`
-      SELECT po.*, (SELECT COUNT(*) FROM purchase_order_items WHERE po_id = po.id) AS item_count
+      SELECT po.*, (SELECT COUNT(*) FROM purchase_order_items WHERE po_id = po.id) AS item_count,
+             -- ── HOW MUCH OF THIS PO HAS ACTUALLY TURNED UP ──────────────────
+             -- A PARTIALLY received PO deliberately stays status='approved' so a
+             -- second vendor can still deliver against it, so status alone cannot
+             -- tell "nobody has delivered" from "vendor A came on Monday". These
+             -- two say it. Bounded per row: g.po_id rides idx_grn_po and
+             -- gi.grn_id rides idx_grni_grn, so each row touches only its OWN
+             -- receipts — no full scan and no query-per-row from the caller.
+             --
+             -- LINES, NEVER QUANTITIES. purchase_order_items.quantity values are
+             -- purchase units of DIFFERENT materials, so adding 2 kg to 3 BTL
+             -- yields a number that means nothing — the same reasoning
+             -- /api/grn/route.ts:99-106 spells out for rejected quantities.
+             (SELECT COUNT(DISTINCT gi.po_item_id)
+                FROM goods_receipt_note_items gi
+                JOIN goods_receipt_notes g ON g.id = gi.grn_id
+               WHERE g.po_id = po.id AND gi.po_item_id IS NOT NULL AND TRIM(gi.po_item_id) != '')
+                                                                          AS received_line_count,
+             (SELECT COUNT(*) FROM purchase_order_items WHERE po_id = po.id) AS total_line_count
       FROM purchase_orders po
       WHERE ${where.join(' AND ')}
       ORDER BY po.date DESC, po.created_at DESC
-    `).all(...params);
+    `).all(...params) as any[];
+
+    // ── WHO IS STILL OWED ───────────────────────────────────────────────────
+    // The counts above say how much is outstanding; the buyer also needs to know
+    // WHOSE. Rather than a subselect per vendor (GROUP_CONCAT would have to pick
+    // a separator, and a vendor name legitimately contains a comma — "Solo
+    // Traders, Hyd" would split into two phantom vendors), the whole page's
+    // line/vendor split is fetched in ONE grouped pass over the SAME filtered PO
+    // set, then stitched below.
+    //
+    // BOUNDED: two extra statements for the entire list, never one per row, so
+    // the statement count is constant and the work tracks the number of PO LINES
+    // on the page. goods_receipt_note_items has no index on po_item_id, so the
+    // planner builds one AUTOMATIC COVERING INDEX for the join — paid once for
+    // the whole query, not once per PO, which is exactly what a per-row subselect
+    // would have cost.
+    const byPo = new Map<string, any>();
+    for (const r of rows) byPo.set(String(r.id), r);
+    if (byPo.size > 0) {
+      // The vendor a line is FILED under, byte-for-byte the rule
+      // [id]/receive/route.ts uses: the line's own vendor, else the PO header.
+      // Anything else would name a vendor the goods will not be booked against.
+      const lineRows = db.prepare(`
+        SELECT poi.po_id AS po_id,
+               COALESCE(NULLIF(TRIM(poi.vendor), ''), NULLIF(TRIM(po.vendor), ''), '') AS vendor_name,
+               MAX(CASE WHEN g.id IS NULL THEN 0 ELSE 1 END) AS received
+        FROM purchase_order_items poi
+        JOIN purchase_orders po ON po.id = poi.po_id
+        -- g is joined ON g.po_id too, so a GRN row that happens to carry this
+        -- po_item_id under a DIFFERENT PO cannot mark the line delivered.
+        LEFT JOIN goods_receipt_note_items gi ON gi.po_item_id = poi.id
+        LEFT JOIN goods_receipt_notes g ON g.id = gi.grn_id AND g.po_id = poi.po_id
+        WHERE ${where.join(' AND ')}
+        GROUP BY poi.id
+      `).all(...params) as any[];
+      for (const r of rows) {
+        r.delivered_vendors   = [];
+        r.outstanding_vendors = [];
+        r.vendor_bills        = [];
+      }
+      // name → {delivered, outstanding} line counts, per PO.
+      const tally = new Map<string, Map<string, { delivered: number; outstanding: number }>>();
+      for (const l of lineRows) {
+        const poId = String(l.po_id);
+        if (!byPo.has(poId)) continue;
+        let t = tally.get(poId);
+        if (!t) { t = new Map(); tally.set(poId, t); }
+        const name = String(l.vendor_name || '').trim() || '(no vendor)';
+        let c = t.get(name);
+        if (!c) { c = { delivered: 0, outstanding: 0 }; t.set(name, c); }
+        if (l.received) c.delivered++; else c.outstanding++;
+      }
+      for (const [poId, t] of tally) {
+        const row = byPo.get(poId);
+        for (const [vendor_name, c] of t) {
+          // A vendor who part-delivered appears in BOTH lists on purpose — some
+          // of their lines are in, some are still owed, and collapsing that to
+          // one bucket is exactly the blindness this block exists to remove.
+          if (c.delivered   > 0) row.delivered_vendors.push({ vendor_name, line_count: c.delivered });
+          if (c.outstanding > 0) row.outstanding_vendors.push({ vendor_name, line_count: c.outstanding });
+        }
+      }
+      // Vendor bill numbers taken in against each PO — the "Bill Number" half of
+      // vendor-wise receiving. Guarded: po_vendor_bills is a later migration and
+      // the detail branch already treats it as optional; an un-migrated DB must
+      // still get its list, not a 500.
+      try {
+        const bills = db.prepare(`
+          SELECT b.po_id, b.vendor_name, b.bill_no, b.bill_date
+          FROM po_vendor_bills b
+          JOIN purchase_orders po ON po.id = b.po_id
+          WHERE ${where.join(' AND ')}
+          ORDER BY b.created_at, b.id
+        `).all(...params) as any[];
+        for (const b of bills) byPo.get(String(b.po_id))?.vendor_bills.push({
+          vendor_name: b.vendor_name || '', bill_no: b.bill_no || '', bill_date: b.bill_date || '',
+        });
+      } catch { /* table absent on an un-migrated DB — the counts above still stand */ }
+    }
 
     const role = await effectiveRole();
     const actor = await effectiveActor();
@@ -318,9 +466,14 @@ export async function POST(request: Request) {
     if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can create POs' }, { status: 403 });
     const db = getDb();
     const body = await request.json();
-    const { date, vendor_id, vendor, notes, items } = body;
+    const { date, delivery_date, vendor_id, vendor, notes, items } = body;
 
     const isoDate = String(date || new Date().toISOString().slice(0, 10));
+    // Checked against the date this PO is actually filed under, not the payload's
+    // — an omitted `date` defaults to today above, and that default is the order
+    // date the promise has to sit on or after.
+    const badDelivery = deliveryDateError(delivery_date, isoDate);
+    if (badDelivery) return Response.json({ error: badDelivery }, { status: 400 });
     if (!Array.isArray(items) || items.length === 0) {
       return Response.json({ error: 'items array required' }, { status: 400 });
     }
@@ -357,9 +510,9 @@ export async function POST(request: Request) {
 
     const txn = db.transaction(() => {
       db.prepare(`
-        INSERT INTO purchase_orders (id, po_number, date, vendor_id, vendor, status, notes, drafted_by, outlet_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, datetime('now'), datetime('now'))
-      `).run(id, poNumber, isoDate, resolvedVendorId, resolvedVendorName, notes || '', actor, outletId);
+        INSERT INTO purchase_orders (id, po_number, date, delivery_date, vendor_id, vendor, status, notes, drafted_by, outlet_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, datetime('now'), datetime('now'))
+      `).run(id, poNumber, isoDate, normalizeDeliveryDate(delivery_date), resolvedVendorId, resolvedVendorName, notes || '', actor, outletId);
 
       const insItem = db.prepare(`
         INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes)
@@ -409,13 +562,28 @@ export async function PUT(request: Request) {
     if (gate === 'denied') return Response.json({ error: 'Only Management or the store manager can edit POs' }, { status: 403 });
     const db = getDb();
     const body = await request.json();
-    const { id, date, vendor_id, vendor, notes, items } = body;
+    const { id, date, delivery_date, vendor_id, vendor, notes, items } = body;
     if (!id) return Response.json({ error: 'id required' }, { status: 400 });
     // vendor/vendor_id come along because they decide what a line carrying no
     // vendor of its own is filed under — see the header-vendor block below.
-    const po = db.prepare('SELECT status, vendor, vendor_id FROM purchase_orders WHERE id = ?').get(id) as any;
+    // `date` and `delivery_date` come along because the delivery-date rule is
+    // relative to the PO date, and either of the two can be the one this request
+    // changes — checking the payload alone would miss "move the PO date forward
+    // past a delivery date that is already stored".
+    const po = db.prepare('SELECT status, date, delivery_date, vendor, vendor_id FROM purchase_orders WHERE id = ?').get(id) as any;
     if (!po) return Response.json({ error: 'Not found' }, { status: 404 });
     if (po.status !== 'draft') return Response.json({ error: 'Only drafts can be edited' }, { status: 400 });
+
+    // Sending the key at all (even as '' or null) is how the composer CLEARS the
+    // promised date; omitting it leaves the stored one alone — the same
+    // present-vs-omitted distinction the COALESCE UPDATE below gives every other
+    // field, which a plain COALESCE cannot express for a nullable column.
+    const deliveryGiven = Object.prototype.hasOwnProperty.call(body, 'delivery_date');
+    const deliveryNext  = deliveryGiven ? normalizeDeliveryDate(delivery_date) : (po.delivery_date || null);
+    // The dates this request LEAVES BEHIND, since the UPDATE is a COALESCE.
+    const dateNext = String(date ?? '').trim() || po.date;
+    const badDelivery = deliveryDateError(deliveryNext, dateNext);
+    if (badDelivery) return Response.json({ error: badDelivery }, { status: 400 });
 
     // THE HEADER VENDOR THIS REQUEST LEAVES BEHIND. The UPDATE below is a
     // COALESCE, so a field the request omits keeps its stored value; the vendor a
@@ -475,12 +643,16 @@ export async function PUT(request: Request) {
       db.prepare(`
         UPDATE purchase_orders SET
           date      = COALESCE(?, date),
+          -- NOT a COALESCE: NULL is a MEANING here ("no promised date"), so the
+          -- flag below is what says whether the caller sent the field at all.
+          delivery_date = CASE WHEN ? = 1 THEN ? ELSE delivery_date END,
           vendor_id = COALESCE(?, vendor_id),
           vendor    = COALESCE(?, vendor),
           notes     = COALESCE(?, notes),
           updated_at = datetime('now')
         WHERE id = ?
-      `).run(date ?? null, resolvedVendorId ?? null, resolvedVendorName ?? null, notes ?? null, id);
+      `).run(date ?? null, deliveryGiven ? 1 : 0, deliveryGiven ? deliveryNext : null,
+             resolvedVendorId ?? null, resolvedVendorName ?? null, notes ?? null, id);
 
       if (Array.isArray(items)) {
         db.prepare('DELETE FROM purchase_order_items WHERE po_id = ?').run(id);

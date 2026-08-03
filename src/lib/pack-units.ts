@@ -11,7 +11,16 @@
  *
  * Only four things stay in recipe units, and each must be LABELLED as recipe on
  * screen — never silently converted, never silently assumed:
- *   1. recipes / sub-recipes / cookbook / menu-item costing (authored in grams)
+ *   1. recipes / cookbook / menu-item costing (authored in grams), and a
+ *      sub-recipe's own YIELD (1 kg of gravy is the batch, not a purchase).
+ *      CARVE-OUT — sub-recipe INGREDIENT lines: these LEAD with the purchase
+ *      unit like everything else on Purchase/Inventory. A sub-recipe is
+ *      batch-produced in bulk, so the chef buys and reasons in kg / L / BTL,
+ *      and the owner asked for the line qty AND its rate in that basis. This is
+ *      display + entry only: sub_recipe_ingredients.quantity is still stored in
+ *      that row's own `unit` string (Option B — the table has always worked
+ *      this way), and recalculateSubRecipeCost() still converts through
+ *      convertToMaterialUnit() before touching money. Nothing is re-based.
  *   2. food consumption computed FROM a recipe
  *   3. exact-balance ledger reports (liquor Movement, variance reconciliation)
  *   4. cross-material sums — never add ml + g + pcs. Print an em-dash, keep ₹.

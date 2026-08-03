@@ -176,8 +176,9 @@ const insertMaterial = db.prepare(`
 `);
 
 const insertPurchase = db.prepare(`
-  INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, created_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
+                         cgst, sgst, special_excise_cess, mrp_round_off, created_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
 `);
 
 const insertTx = db.prepare(`
@@ -221,7 +222,6 @@ const txn = db.transaction(() => {
       // Convert to raw_material's unit — expands CASE → pcs and pcs → ml for volume-tracked items
       const { qty, rate } = convertToMaterialUnit(rawQty, rawRate, pack, material);
       const subtotal = parseFloat(r[idxSubtotal]) || (qty * rate);
-      const total = parseFloat(r[idxTotal]) || subtotal;
       const date = toISO(r[idxInwardDate]) || toISO(r[idxCreatedDt]) || new Date().toISOString().split('T')[0];
       const supplier = String(r[idxSupplier] || '').trim();
       const invoiceId = String(r[idxInvoiceId] || '').trim();
@@ -235,7 +235,29 @@ const txn = db.transaction(() => {
         inwardId ? `Inward: ${inwardId}` : null,
       ].filter(Boolean).join(' · ');
 
-      insertPurchase.run(purchaseId, materialId, supplier, '', qty, rate, total, date, notes);
+      // MONEY IS CONSERVED HERE — the sheet's TOTAL INWARD AMOUNT must be
+      // reconstructable from what we store, or importing it destroys a fact.
+      //   total_price          = SUBTOTAL, goods only (feeds nothing but reports;
+      //                          the cost basis is unit_price, untouched by any of this)
+      //   cgst / sgst          = reclaimable input credit, recorded so it can be claimed
+      //   special_excise_cess  = the NON-CREDITABLE residual (TGBCL excise / special
+      //                          cess / TCS). It is genuine landed cost on liquor, so
+      //                          it must be RECORDED, not dropped — writing only
+      //                          SUBTOTAL made that money disappear from the books.
+      // Total Inward = total_price + cgst + sgst + cess + round_off then equals the
+      // sheet's own TOTAL INWARD AMOUNT exactly, which is the invariant to preserve.
+      // A negative residual is MRP rounding, so it goes to its own signed column
+      // rather than being stored as a negative excise figure.
+      const sheetCgst  = parseFloat(r[idxCgst])  || 0;
+      const sheetSgst  = parseFloat(r[idxSgst])  || 0;
+      const sheetTotal = parseFloat(r[idxTotal]) || 0;
+      const residual = sheetTotal > 0
+        ? Math.round((sheetTotal - subtotal - sheetCgst - sheetSgst) * 100) / 100
+        : 0;
+      const nonCreditable = residual > 0 ? residual : 0;
+      const roundOff      = residual < 0 ? residual : 0;
+      insertPurchase.run(purchaseId, materialId, supplier, '', qty, rate, subtotal, date, notes,
+                         sheetCgst, sheetSgst, nonCreditable, roundOff);
       insertTx.run(randomUUID(), materialId, qty, purchaseId, `Purchase from ${supplier || 'unknown'}`);
       bumpStock.run(qty, materialId);
 

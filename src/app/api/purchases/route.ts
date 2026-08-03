@@ -2,6 +2,187 @@ import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
+import { resolveVendorRef, isPairMapped } from '@/lib/vendor-mapping';
+
+/** ₹ for a human-readable note/message. */
+function inr(n: number): string {
+  return `₹${Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/**
+ * What the mapping side of a purchase did, reported back on the POST response.
+ *
+ * `mapped` is the field the bill modal should branch on: FALSE means the pair
+ * (this vendor, this item) is still not declared on Vendor Items, and the modal
+ * should say so AFTER the successful save. It is a warning, never a refusal —
+ * see the header comment on learnVendorMaterialPair().
+ */
+type VendorMappingOutcome = {
+  status: 'learned' | 'already_mapped' | 'vendor_not_in_master' | 'no_vendor' | 'respected_removal' | 'error';
+  /** Is the (vendor, item) pair declared in vendor_materials now that we are done? */
+  mapped: boolean;
+  vendor_id?: string;
+  vendor_name?: string;
+  /** Ready-to-show copy for the storekeeper. Present only when `mapped` is false
+   *  AND there is something a human can act on. */
+  warning?: string;
+  /** Why, for the log / for a developer. */
+  detail?: string;
+};
+
+/**
+ * A BILL IS A FACT — THIS PATH NEVER APPLIES THE STRICT PO MAPPING RULE.
+ *
+ * DO NOT "align" this with /api/purchase-orders by calling vendorMappingError()
+ * here. A PO is a document WE author, so refusing an undeclared (vendor, item)
+ * pair costs nothing but a correction. A purchase is a bill the vendor has
+ * ALREADY raised and goods already delivered — refusing it leaves a storekeeper
+ * holding an invoice with nowhere to enter it, and the usual escape is to enter
+ * it wrong (under another vendor, another item) rather than not at all. So an
+ * unmapped pair here WARNS (the `vendor_mapping` block in the POST response,
+ * which the bill modal surfaces) and always saves. The divergence is deliberate.
+ *
+ * What this function does instead is LEARN. Recording a purchase is the
+ * strongest evidence there is that this vendor supplies this item, yet until
+ * now NO purchase path wrote `vendor_materials` — the map could only grow from
+ * the one-shot history seed, hand entry, or the backfill button, which is
+ * exactly why it goes stale and the owner reads it as "sync not working".
+ *
+ * ─ IT MUST NEVER RESURRECT A DELETED MAPPING ─
+ * `vendor_materials` has no tombstone: DELETE (/api/vendor-materials) removes
+ * the row outright, so the SCHEMA CANNOT TELL "never mapped" FROM "unmapped on
+ * purpose". This codebase already carries that bug shape once (a boot backfill
+ * re-adding pairs an admin had deleted), so learning is gated on two durable
+ * pieces of evidence instead of guessing:
+ *
+ *   1. AN ADDITIVE-ONCE MARKER. When (and ONLY when) this function creates a
+ *      pair, it writes a `settings` row `vm_learned:<vendor_id>:<material_id>`.
+ *      That row OUTLIVES the vendor_materials row, so a pair this code added
+ *      can never be added by it a second time — once an admin deletes it, the
+ *      deletion is final no matter how many more bills name that pair. Written
+ *      on the learn path alone to keep this out of the generic settings KV:
+ *      one row per pair ever auto-created, not one per pair ever purchased.
+ *   2. PRE-SEED PURCHASE HISTORY. db.ts seeded the map once from `purchases`,
+ *      so a pair that already had a purchase BEFORE that seed ran was offered
+ *      to the map; if it is absent today, a human removed it. The seed instant
+ *      is read back from the seeded rows' own created_at (settings has no
+ *      timestamp column). If no seeded row survives, we fall back to treating
+ *      ALL prior history as pre-seed — the conservative direction: skip the
+ *      learn rather than risk the resurrection.
+ *
+ * A pair with only POST-seed history and no marker was never offered to
+ * anybody, so creating it is genuinely additive.
+ *
+ * THE ONE CASE THE SCHEMA CANNOT SETTLE, stated rather than guessed at: a pair
+ * typed BY HAND on Vendor Items, never purchased before the seed, and later
+ * deleted, leaves no trace at all — a later bill for it will be learned once.
+ * It is bounded to ONCE by rule 1, which is the deliberate difference from the
+ * boot-backfill bug this codebase already had (that one re-added on every
+ * restart). Closing it properly needs a tombstone column on vendor_materials
+ * and a DELETE that writes one; that is a schema change, not a route change.
+ *
+ * Returns a short status for the response; never throws (the caller also wraps
+ * it — a mapping problem must not roll back a recorded bill).
+ */
+function learnVendorMaterialPair(
+  db: ReturnType<typeof getDb>,
+  args: { vendorRaw: string; materialId: string; purchaseRowId: string; invoiceId: string; actor: string },
+): VendorMappingOutcome {
+  const materialId = String(args.materialId || '').trim();
+  const rawName = String(args.vendorRaw || '').trim();
+  if (!materialId || !rawName) return { status: 'no_vendor', mapped: false };
+
+  // The SAME resolver the PO rule and the PO insert loops use — never a raw
+  // name match. A bill from someone not in the Vendor master has no vendors.id
+  // to map, and inventing a vendors row from a typed bill name is how the
+  // master fills up with near-duplicates. Skip and say so.
+  const vendor = resolveVendorRef(db, { vendor: rawName });
+  if (vendor.status !== 'known' || !vendor.id) {
+    return {
+      status: 'vendor_not_in_master', mapped: false, detail: vendor.shown,
+      warning: `The bill was saved, but "${rawName}" is not in the Vendor master, so this item could not be added to their Vendor Items list. Add the vendor under Vendors to keep vendor mapping accurate.`,
+    };
+  }
+
+  const markerKey = `vm_learned:${vendor.id}:${materialId}`;
+
+  // The common case by far: nothing to do, and nothing to warn about.
+  if (isPairMapped(db, vendor.id, materialId)) {
+    return { status: 'already_mapped', mapped: true, vendor_id: vendor.id, vendor_name: vendor.name };
+  }
+
+  // Copy shared by both "we are deliberately not re-adding this" outcomes: the
+  // bill is recorded either way, and the only correct fix is a human decision on
+  // Vendor Items — which is exactly what we must not make on their behalf.
+  const removalWarning = `The bill was saved. ${vendor.name} is not mapped to supply this item, and it was NOT added back automatically because that pair was mapped before and removed. If it should be there, add it on Vendor Items (/vendors/materials?vendor=${vendor.id}).`;
+
+  const marker = db.prepare('SELECT value FROM settings WHERE key = ?').get(markerKey) as any;
+  if (marker) {
+    return {
+      status: 'respected_removal', mapped: false, vendor_id: vendor.id, vendor_name: vendor.name,
+      warning: removalWarning,
+      detail: 'this pair was mapped before and is not mapped now — treated as a deliberate removal',
+    };
+  }
+
+  // The history seed's own timestamp, read off the rows it wrote. The
+  // 'Backfilled from vendor_contracts' rows are a DIFFERENT migration and are
+  // excluded. Sentinel '9999-12-31' = "no seeded row survives", which makes the
+  // comparison below treat every prior purchase as pre-seed (skip, don't guess).
+  const seed = db.prepare(`
+    SELECT MIN(created_at) AS t FROM vendor_materials
+    WHERE created_by = 'system' AND notes = 'seeded from purchase history'
+  `).get() as any;
+  const seedAt = String(seed?.t || '') || '9999-12-31';
+
+  // Matched the way the seed matched: on the vendor NAME stored in `purchases`,
+  // case/whitespace-insensitive — under BOTH the master's spelling and the
+  // spelling this bill used, because the row we just wrote stores the caller's
+  // string verbatim and an older row may carry either.
+  const priorPreSeed = db.prepare(`
+    SELECT 1 FROM purchases
+    WHERE material_id = ?
+      AND id <> ?
+      AND LOWER(TRIM(COALESCE(vendor, ''))) IN (?, ?)
+      AND COALESCE(created_at, '') < ?
+    LIMIT 1
+  `).get(materialId, args.purchaseRowId, vendor.name.toLowerCase(), rawName.toLowerCase(), seedAt);
+  if (priorPreSeed) {
+    // No marker written: this branch is deterministic (the history and the seed
+    // instant do not change), so it will keep answering "removed" on its own
+    // without a row per unmapped pair in the settings KV.
+    return {
+      status: 'respected_removal', mapped: false, vendor_id: vendor.id, vendor_name: vendor.name,
+      warning: removalWarning,
+      detail: 'this pair was already in purchase history when the map was seeded, so its absence is a removal',
+    };
+  }
+
+  // created_by = 'system' (not the actor's email) on purpose: lib/vendor-mapping
+  // pairSource() reads created_by='system' + a non-contract note as source
+  // 'history', which is precisely what this is — the Vendor Items screen should
+  // show it as learned from a purchase, not as somebody's hand entry. Who
+  // entered the bill is kept in the note.
+  // The note deliberately does NOT read exactly 'seeded from purchase history':
+  // that exact string identifies the db.ts seed rows, and the seed-instant query
+  // above must not start matching rows this function wrote.
+  //
+  // Keep these comments OUT of the template literal below. `//` is a JS comment,
+  // not a SQL one — inside the string SQLite parses it as an operator and throws
+  // `near "/": syntax error`, which this function catches and turns into a bland
+  // status:'error'. That is exactly how the learner shipped silently broken:
+  // every bill reported "saved", and not one pair was ever mapped.
+  db.prepare(`
+    INSERT OR IGNORE INTO vendor_materials (vendor_id, material_id, notes, created_by)
+    VALUES (?, ?, ?, 'system')
+  `).run(vendor.id, materialId, `learned from purchase ${args.invoiceId || '(no invoice id)'} entered by ${args.actor}`);
+  // THE ADDITIVE-ONCE RECORD. Written only here, and never deleted: from now on
+  // this pair is the admin's to keep or remove, and this code will not re-create
+  // it. (INSERT OR IGNORE so a re-entry of the same bill cannot fail the write.)
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
+    .run(markerKey, new Date().toISOString());
+  return { status: 'learned', mapped: true, vendor_id: vendor.id, vendor_name: vendor.name };
+}
 
 export async function GET(request: Request) {
   try {
@@ -69,7 +250,7 @@ export async function POST(request: Request) {
     const body = await request.json();
     const { material_id, vendor, brand, quantity, unit_price, date, notes,
             is_emergency, payment_mode, emergency_reason, bill_no,
-            discount, delivery_charges, gst_rate } = body;
+            discount, delivery_charges, gst_rate, cess_rate } = body;
     // cgst/sgst ARE accepted on the wire (the bill modal computes them so it can
     // show the split before saving) and are then DISCARDED — see the derivation
     // below. Read here only to flag a client that disagrees with the server.
@@ -113,6 +294,22 @@ export async function POST(request: Request) {
       }, { status: 400 });
     }
 
+    // GST COMPENSATION CESS, also a PERCENT. A SEPARATE levy from CGST/SGST —
+    // 12% on aerated drinks, and tobacco at the bar — NOT a third slice of the
+    // GST split, and NOT the TGBCL `special_excise_cess` column, which means
+    // state excise everywhere it is read and labelled. Same absent/present
+    // contract as gst_rate above, and rejected rather than zeroed for the same
+    // reason. The rupees are ONLY EVER server-derived: unlike cgst/sgst there is
+    // no legacy client posting a figure, so a `compensation_cess` in the body is
+    // not read at all and cannot write money this row's goods value can't justify.
+    const cessProvided = cess_rate !== undefined && cess_rate !== null && String(cess_rate).trim() !== '';
+    const cessRateRaw = cessProvided ? Number(cess_rate) : 0;
+    if (cessProvided && (!Number.isFinite(cessRateRaw) || cessRateRaw < 0 || cessRateRaw > 100)) {
+      return Response.json({
+        error: 'cess_rate must be a percentage between 0 and 100 (0 = none) — send no cess_rate at all to record a line with no compensation cess',
+      }, { status: 400 });
+    }
+
     // Configurable backdate window: non-admins can't save a date older than N days
     // or in the future; admins are exempt. (`me` is resolved and null-checked at
     // the top of the handler.)
@@ -147,6 +344,11 @@ export async function POST(request: Request) {
     // if that guard is ever relaxed for a category, a client that sent 18% must
     // still not write an input-credit figure the TGBCL charges already carry.
     const gstRate = isStoreMappedMaterial(db, material_id) ? 0 : gstRateRaw;
+    // Same lock, same reason, and it matters MORE here: the TGBCL bill already
+    // carries its own special cess, so a master cess% seeded onto a liquor line
+    // would charge the venue the cess twice over — once in the store's excise
+    // figure and once again as a compensation cess that was never levied.
+    const cessRate = isStoreMappedMaterial(db, material_id) ? 0 : cessRateRaw;
 
     // RECORDED-ONLY discount, matching db.ts's contract: it never changes
     // unit_price/total_price, and readers compute
@@ -185,6 +387,16 @@ export async function POST(request: Request) {
     const cgstAmt = cgstPaise / 100;
     const sgstAmt = sgstPaise / 100;
 
+    // Compensation cess rides the SAME post-discount `taxable`, in the same
+    // whole paise — and there the similarity ends. It is ONE figure, never
+    // halved into a CGST/SGST pair, and it is deliberately kept OUT of
+    // cgstAmt/sgstAmt: the house invariant tax_value = cgst + sgst is a
+    // statement about GST alone, and folding cess into it would overstate the
+    // GST claimed on a return. Readers pick cess up as its own Total Inward
+    // term, exactly like the other recorded-only charges.
+    const cessPaise = cessRate > 0 ? Math.max(0, Math.round(taxable * cessRate)) : 0;
+    const compensationCess = cessPaise / 100;
+
     // The client's own cgst/sgst are never stored. This row is the input-credit
     // record, so the figure on it must follow from the goods value on the SAME
     // row — a miscalculating client, or a replayed / hand-edited payload, must
@@ -203,59 +415,220 @@ export async function POST(request: Request) {
       }
     }
 
+    // The transaction RETURNS its outcome rather than writing to outer `let`s —
+    // `recordedId` is the row this line ended up in (its own new row, or the
+    // same-bill row it was folded into by the duplicate guard below), and it is
+    // what the inventory ledger and the response point at.
     const insertPurchase = db.transaction(() => {
-      // Create purchase record (with optional emergency / cash flags)
-      // bill_no = the VENDOR's own bill number (from the "Enter Full Bill"
-      // modal). invoice_id (OUR number) is minted per vendor bill: reuse the id
-      // already assigned to this (vendor, bill_no, date) so every line of one
-      // bill shares it; otherwise take the next free PINV-<year>-#### number.
+      let recordedId = id;
+      let mergedInto: string | null = null;
+      let mergedQty = qty;
+      let learned: VendorMappingOutcome = { status: 'no_vendor', mapped: false };
+
+      // bill_no = the VENDOR's own bill number (from the "Enter Full Bill" modal).
       const billNo = String(bill_no || '').trim();
-      let invoiceId = '';
-      if (billNo) {
-        const prior = db.prepare(`
-          SELECT invoice_id FROM purchases
-          WHERE COALESCE(invoice_id, '') <> ''
-            AND LOWER(TRIM(COALESCE(vendor, ''))) = ?
-            AND LOWER(TRIM(COALESCE(bill_no, ''))) = ?
-            AND date = ?
-          LIMIT 1
-        `).get(String(vendor || '').toLowerCase().trim(), billNo.toLowerCase(), date) as any;
-        if (prior?.invoice_id) invoiceId = prior.invoice_id;
+      const vendorKey = String(vendor || '').toLowerCase().trim();
+
+      /* ─────────────────────────────────────────────────────────────────────
+       * DUPLICATE GUARD — THE LAST LINE, SERVER SIDE.
+       *
+       * The owner's report: the bill modal let CHAR COAL be typed twice on one
+       * bill (600 kg and 400 kg, both @ ₹35), and each line became its OWN
+       * `purchases` row. The modal now merges before saving, but the modal posts
+       * ONE REQUEST PER LINE, so the merge has to hold here too — for a retry, a
+       * half-failed save loop, or any hand-rolled POST. There is no multi-line
+       * payload to scan on this endpoint: the two lines arrive as two separate
+       * requests, so a duplicate is detected against what the SAME BILL has
+       * already written rather than against a sibling line in one body.
+       *
+       * BILL IDENTITY = (vendor, bill_no, date, outlet) — the exact tuple the
+       * invoice_id block below already treats as one bill. A BLANK bill_no is NOT
+       * an identity: two market runs for the same item from the same vendor on
+       * the same day are two real purchases, and folding them would destroy a
+       * fact. So no bill number ⇒ no merge, always a new row.
+       *
+       * SAME RATE → MERGE. Two lines of one item at one rate are one line.
+       * DIFFERENT RATE → KEEP BOTH. A split-rate bill is legitimate (part of the
+       * quantity at an old price, part at a new one); averaging them would invent
+       * a rate that appears on no document. Every derived figure stays per row,
+       * so the rows still sum to the bill.
+       *
+       * THE INVARIANT, either way: the stock credited and the money booked equal
+       * the bill, EXACTLY ONCE. Merging never adds or drops quantity — it sums
+       * what was entered into one row and credits stock for this line's quantity
+       * alone, so 600 + 400 ends as one row of 1,000 kg and one 1,000 kg credit.
+       * average_price is untouched by the merge: updateMaterialPrice() recomputes
+       * SUM(quantity × unit_price) / SUM(quantity) over the whole table, and at
+       * one rate that sum is identical whether it sits in one row or two.
+       * ────────────────────────────────────────────────────────────────────── */
+      const dupe = billNo ? db.prepare(`
+        SELECT id, quantity, unit_price, brand, notes,
+               COALESCE(discount, 0) AS discount, COALESCE(cgst, 0) AS cgst,
+               COALESCE(sgst, 0) AS sgst, COALESCE(delivery_charges, 0) AS delivery_charges,
+               COALESCE(compensation_cess, 0) AS compensation_cess
+        FROM purchases
+        WHERE material_id = ?
+          AND date = ?
+          AND LOWER(TRIM(COALESCE(vendor, ''))) = ?
+          AND LOWER(TRIM(COALESCE(bill_no, ''))) = ?
+          AND COALESCE(outlet_id, '') = COALESCE(?, '')
+          -- ONLY a hand-recorded vendor-bill line may be merged into. Five other
+          -- paths write the purchases table, and two stamp a bill_no: the PO
+          -- receive MIRROR (a cost mirror of a GRN line, its quantity is the QC
+          -- ACCEPTED figure and the PO⇄receipt reconciliation depends on it) and
+          -- the inward-import commit. Neither mints an invoice_id, so requiring
+          -- a PINV number scopes this to the two screens that record a bill by
+          -- hand — this route and /api/purchases/bulk — and a bill line can
+          -- never silently inflate a receipt somebody signed for at the bay.
+          AND COALESCE(invoice_id, '') LIKE 'PINV-%'
+          -- …and only a PLAIN line. A row carrying inward-register figures this
+          -- route cannot re-apportion (TGBCL excise/cess, TCS, MRP round-off) or
+          -- an ordered-vs-received po_qty would be left with those numbers
+          -- attached to a quantity that changed underneath them.
+          AND COALESCE(po_qty, 0) = 0
+          AND COALESCE(special_excise_cess, 0) = 0
+          AND COALESCE(tcs, 0) = 0
+          AND COALESCE(mrp_round_off, 0) = 0
+          -- compensation_cess is DELIBERATELY absent from those zero tests. The
+          -- three above are bill-level figures this route cannot re-apportion
+          -- across a quantity that changed underneath them; cess, like cgst/sgst,
+          -- is a per-line share of the same bill that simply ADDS. So a
+          -- cess-bearing line stays mergeable and its cess is summed below —
+          -- excluding it here would silently split one bill line back into two.
+        ORDER BY created_at ASC
+        LIMIT 1
+      `).get(material_id, date, vendorKey, billNo.toLowerCase(), outletId) as any : null;
+
+      // Compared in ten-thousandths of a rupee, not 2 dp: a case-entry line
+      // divides the per-case rate by the case size (₹700/6 = ₹116.6667), and
+      // rounding that to paise would call two genuinely different rates equal.
+      const sameRate = !!dupe && Math.round(Number(dupe.unit_price) * 10000) === Math.round(px * 10000);
+
+      if (dupe && sameRate) {
+        mergedInto = String(dupe.id);
+        recordedId = mergedInto;
+        mergedQty = Number(dupe.quantity) + qty;
+        // total_price is re-derived from the merged quantity × the shared rate,
+        // NOT summed from the two line totals. The two agree to within a paisa,
+        // and a row whose total_price ≠ quantity × unit_price is internally
+        // inconsistent — every reader that re-derives one from the other would
+        // disagree with the stored figure.
+        const mergedTotal = Math.round(mergedQty * px * 100) / 100;
+        // The recorded-only charges are per-line SHARES of one bill's charges,
+        // so they add. Tax halves are summed rather than re-derived because the
+        // bill's tax total is the sum of its line taxes: re-deriving on the
+        // merged base could shift a paisa and stop the entry reconciling with
+        // the paper bill. Summing two valid splits keeps the house invariant
+        // tax_value = cgst + sgst intact.
+        const mergedDiscount = Math.min(Number(dupe.discount) + discountRecorded, mergedTotal);
+        const mergedCgst = Math.round((Number(dupe.cgst) + cgstAmt) * 100) / 100;
+        const mergedSgst = Math.round((Number(dupe.sgst) + sgstAmt) * 100) / 100;
+        // Cess sums the same way, and MUST be carried into the UPDATE below:
+        // this row is the only place the merged line's cess survives, so
+        // omitting it from the SET list would drop the second line's cess with
+        // no error anywhere — the one way this column can silently lose money.
+        const mergedCess = Math.round((Number(dupe.compensation_cess) + compensationCess) * 100) / 100;
+        const mergedDelivery = Math.round((Number(dupe.delivery_charges) + Math.max(0, Number(delivery_charges) || 0)) * 100) / 100;
+
+        // Keep the audit trail: the merge is stated on the row, and a differing
+        // brand is recorded rather than silently dropped. Brand is NOT part of
+        // the key — the key is material_id + rate, which extends the modal's
+        // material-only key (po-helpers duplicateLineError) with the one test
+        // this side must add, since by the time two lines reach the server there
+        // is no human left to be asked about a split rate.
+        const incomingBrand = String(brand || '').trim();
+        const keptBrand = String(dupe.brand || '').trim();
+        const stamp = [
+          `Merged duplicate bill line: +${qty} @ ${inr(px)}/unit (now ${mergedQty})`,
+          incomingBrand && keptBrand && incomingBrand.toLowerCase() !== keptBrand.toLowerCase()
+            ? `merged line's brand: ${incomingBrand}` : '',
+        ].filter(Boolean).join(' — ');
+        const incomingNotes = String(notes || '').trim();
+        const mergedNotes = [
+          String(dupe.notes || '').trim(),
+          incomingNotes && incomingNotes !== String(dupe.notes || '').trim() ? incomingNotes : '',
+          stamp,
+        ].filter(Boolean).join(' | ');
+
+        db.prepare(`
+          UPDATE purchases
+             SET quantity = ?, total_price = ?, discount = ?, cgst = ?, sgst = ?,
+                 compensation_cess = ?, delivery_charges = ?, brand = ?, notes = ?
+           WHERE id = ?
+        `).run(mergedQty, mergedTotal, mergedDiscount, mergedCgst, mergedSgst, mergedCess, mergedDelivery,
+                keptBrand || incomingBrand, mergedNotes, mergedInto);
+
+        console.warn(
+          `[purchases] folded a duplicate bill line into ${mergedInto}: ${material_id} ` +
+          `+${qty} @ ${inr(px)} (bill ${billNo}, ${vendor || 'unknown'}, ${date}) → qty ${mergedQty}`
+        );
+      } else {
+        // Create purchase record (with optional emergency / cash flags).
+        // invoice_id (OUR number) is minted per vendor bill: reuse the id already
+        // assigned to this (vendor, bill_no, date) so every line of one bill
+        // shares it; otherwise take the next free PINV-<year>-#### number.
+        // A DIFFERENT-RATE duplicate lands here and therefore keeps the bill's
+        // existing invoice_id — two rows, one invoice, which is exactly what a
+        // split-rate bill line is.
+        let invoiceId = '';
+        if (billNo) {
+          const prior = db.prepare(`
+            SELECT invoice_id FROM purchases
+            WHERE COALESCE(invoice_id, '') <> ''
+              AND LOWER(TRIM(COALESCE(vendor, ''))) = ?
+              AND LOWER(TRIM(COALESCE(bill_no, ''))) = ?
+              AND date = ?
+            LIMIT 1
+          `).get(vendorKey, billNo.toLowerCase(), date) as any;
+          if (prior?.invoice_id) invoiceId = prior.invoice_id;
+        }
+        if (!invoiceId) {
+          const yr = new Date().getFullYear();
+          const last = db.prepare(
+            `SELECT MAX(CAST(substr(invoice_id, length('PINV-' || ? || '-') + 1) AS INTEGER)) AS n
+             FROM purchases WHERE invoice_id LIKE 'PINV-' || ? || '-%'`
+          ).get(String(yr), String(yr)) as any;
+          invoiceId = `PINV-${yr}-${String((Number(last?.n) || 0) + 1).padStart(4, '0')}`;
+        }
+        // unit_price (px) and total_price stay the GOODS figures — tax is NEVER
+        // folded into them, and no "simplification" may ever add it. average_price
+        // is derived from these columns and feeds every recipe cost in the app, so
+        // folding GST in inflates every recipe by the tax rate, silently and
+        // forever; and the tax, once inside the rate, is no longer reclaimable as
+        // input credit. It belongs in cgst/sgst, which are RECORDED-ONLY columns
+        // readers add back: Total Inward = total_price − discount + cgst + sgst
+        // + compensation_cess + … The same holds for the cess: it is a levy paid
+        // BESIDE the goods, so it stays out of the rate even though — unlike GST
+        // — it is creditable only against cess output liability, never a general
+        // input credit. Nothing may label it one.
+        db.prepare(`
+          INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
+                                 is_emergency, payment_mode, emergency_reason, invoice_id, bill_no, outlet_id,
+                                 discount, cgst, sgst, compensation_cess, delivery_charges, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        `).run(id, material_id, vendor || '', brand || '', qty, px, total_price, date, notes || '',
+                is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '', invoiceId, billNo, outletId,
+                discountRecorded,
+                // Server-derived halves of the tax on the post-discount value, never
+                // the client's own numbers. cgstAmt + sgstAmt === the tax exactly
+                // (integer paise), holding the house invariant tax_value = cgst + sgst.
+                // Both are 0 when no gst_rate was sent — an older client or the CSV
+                // importer writes precisely the row it wrote before this field existed.
+                cgstAmt, sgstAmt,
+                // Compensation cess, derived on the same base but NOT part of
+                // that invariant — one figure, no halves. 0 when no cess_rate
+                // was sent, so an older client or the CSV importer writes
+                // precisely the row it wrote before this column existed.
+                compensationCess,
+                Math.max(0, Number(delivery_charges) || 0));
       }
-      if (!invoiceId) {
-        const yr = new Date().getFullYear();
-        const last = db.prepare(
-          `SELECT MAX(CAST(substr(invoice_id, length('PINV-' || ? || '-') + 1) AS INTEGER)) AS n
-           FROM purchases WHERE invoice_id LIKE 'PINV-' || ? || '-%'`
-        ).get(String(yr), String(yr)) as any;
-        invoiceId = `PINV-${yr}-${String((Number(last?.n) || 0) + 1).padStart(4, '0')}`;
-      }
-      // unit_price (px) and total_price stay the GOODS figures — tax is NEVER
-      // folded into them, and no "simplification" may ever add it. average_price
-      // is derived from these columns and feeds every recipe cost in the app, so
-      // folding GST in inflates every recipe by the tax rate, silently and
-      // forever; and the tax, once inside the rate, is no longer reclaimable as
-      // input credit. It belongs in cgst/sgst, which are RECORDED-ONLY columns
-      // readers add back: Total Inward = total_price − discount + cgst + sgst + …
-      db.prepare(`
-        INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
-                               is_emergency, payment_mode, emergency_reason, invoice_id, bill_no, outlet_id,
-                               discount, cgst, sgst, delivery_charges, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      `).run(id, material_id, vendor || '', brand || '', qty, px, total_price, date, notes || '',
-              is_emergency ? 1 : 0, payment_mode || '', emergency_reason || '', invoiceId, billNo, outletId,
-              discountRecorded,
-              // Server-derived halves of the tax on the post-discount value, never
-              // the client's own numbers. cgstAmt + sgstAmt === the tax exactly
-              // (integer paise), holding the house invariant tax_value = cgst + sgst.
-              // Both are 0 when no gst_rate was sent — an older client or the CSV
-              // importer writes precisely the row it wrote before this field existed.
-              cgstAmt, sgstAmt,
-              Math.max(0, Number(delivery_charges) || 0));
 
       // Stock is kept in RECIPE units (sales deduction, closing-stock variance
       // × average_price). quantity is entered in PURCHASE units, so multiply by
       // pack_size when recipe_unit ≠ purchase_unit — mirroring updateMaterialPrice().
+      // THIS LINE'S OWN qty, on both branches: the merge folded the ROW, it did
+      // not re-deliver the goods, so crediting mergedQty here would stock the
+      // first line twice.
       const packSize = Number(material.pack_size) || 1;
       const ru = String(material.unit || '').toLowerCase().trim();
       const pu = String(material.purchase_unit || material.unit || '').toLowerCase().trim();
@@ -266,20 +639,57 @@ export async function POST(request: Request) {
         UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?
       `).run(stockQty, material_id);
 
-      // Create inventory transaction
+      // Create inventory transaction. reference_id points at the row this line
+      // actually lives in, so a merged line's ledger entry still resolves to a
+      // real purchase instead of an id that was never inserted.
       db.prepare(`
         INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
         VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
-      `).run(generateId(), material_id, stockQty, id, `Purchase from ${vendor || 'unknown'}`, outletId);
+      `).run(generateId(), material_id, stockQty, recordedId,
+              `Purchase from ${vendor || 'unknown'}${mergedInto ? ' (merged into an existing line of the same bill)' : ''}`,
+              outletId);
 
       // Update material price and cascade
       updateMaterialPrice(db, material_id);
+
+      // LEARN THE VENDOR ↔ ITEM PAIR — inside the same transaction, but wrapped:
+      // a caught error does not roll a better-sqlite3 transaction back, so a
+      // mapping problem can never undo a bill that is already recorded. The
+      // purchase is the point of this request; the mapping is a by-product.
+      try {
+        const row = db.prepare('SELECT invoice_id FROM purchases WHERE id = ?').get(recordedId) as any;
+        learned = learnVendorMaterialPair(db, {
+          vendorRaw: String(vendor || ''),
+          materialId: material_id,
+          purchaseRowId: recordedId,
+          invoiceId: String(row?.invoice_id || ''),
+          actor: me.email,
+        });
+      } catch (e: any) {
+        learned = { status: 'error', mapped: false, detail: String(e?.message || e) };
+        console.error('[purchases] vendor↔item learning failed (purchase still recorded):', e);
+      }
+
+      return { recordedId, mergedInto, mergedQty, learned };
     });
 
-    insertPurchase();
+    const { recordedId, mergedInto, mergedQty, learned } = insertPurchase();
 
-    const purchase = db.prepare('SELECT * FROM purchases WHERE id = ?').get(id);
-    return Response.json({ purchase }, { status: 201 });
+    const purchase = db.prepare('SELECT * FROM purchases WHERE id = ?').get(recordedId);
+    // `vendor_mapping` is the WARN half of the bill rule: the save always
+    // succeeds, and the client decides whether to tell the storekeeper that this
+    // vendor is not declared to supply this item. `merged` lets the bill modal
+    // report the fold instead of the fold being invisible.
+    return Response.json({
+      purchase,
+      merged: !!mergedInto,
+      merged_into: mergedInto,
+      merged_quantity: mergedInto ? mergedQty : undefined,
+      merge_message: mergedInto
+        ? `This item was already on bill ${String(bill_no || '').trim()} at ${inr(px)}/unit — the two lines were combined into one line of ${mergedQty}.`
+        : undefined,
+      vendor_mapping: learned,
+    }, { status: mergedInto ? 200 : 201 });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });
   }

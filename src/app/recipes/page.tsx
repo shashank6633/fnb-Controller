@@ -39,6 +39,11 @@ import Papa from 'papaparse';
 import { allergenLabel, allergenEmoji } from '@/lib/allergens';
 import { api } from '@/lib/api';
 import { convert } from '@/lib/units';
+// Sub-recipe INGREDIENT lines read in the PURCHASE basis (2 kg @ ₹180/kg), per the
+// carve-out declared in the pack-units header: a sub-recipe is batch-produced in
+// bulk, so the chef reasons in kg / L / BTL, not in grams. Display + entry only —
+// nothing stored or costed changes. Never re-derive the pack rule locally.
+import { packFactor, toPurchaseQty, purchasePrice, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,6 +61,12 @@ interface Ingredient {
   brand_preference: string;
   average_price?: number;
   effective_cost?: number;
+  // Material columns joined on by /api/sub-recipes (and, for material_pack_size,
+  // /api/recipes). `unit` above is the LINE's own unit (Option B — the stored qty
+  // is denominated in it); these describe the MATERIAL behind the line.
+  material_unit?: string;
+  purchase_unit?: string;
+  pack_size?: number;
 }
 
 interface SubRecipeRef {
@@ -110,6 +121,9 @@ interface RawMaterial {
   category: string;
   /** Recipe-units per purchase-unit — bridges count↔weight/volume in cost previews. */
   pack_size?: number;
+  /** PURCHASE unit (kg / L / BTL / CASE) — what sub-recipe ingredient lines lead with. */
+  purchase_unit?: string;
+  sku?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +180,126 @@ function computeIngredientCost(ing: {
   const matUnit = ing.material_unit || ing.unit || '';
   const qtyInMatUnit = convertQtyToMaterialUnit(ing.quantity, ing.unit, matUnit, ing.material_name || undefined, ing.pack_size);
   return (qtyInMatUnit * price * (1 + wastage)) / effectiveYield;
+}
+
+// ---------------------------------------------------------------------------
+// Sub-recipe ingredient lines — PURCHASE basis (display + entry only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pack meta for a sub-recipe ingredient line. Prefers the row's own material
+ * columns (/api/sub-recipes joins them) and falls back to the loaded catalog, so
+ * a payload cached before that join existed still renders instead of blanking.
+ * Everything is optional — packFactor() degrades to 1 and the row simply reads
+ * unconverted, which is the honest answer when we cannot know the pack.
+ */
+function ingPackMeta(ing: Ingredient, mat?: RawMaterial): PackMeta {
+  return {
+    // The MATERIAL's recipe unit, never the line's own unit — packFactor's
+    // second half compares this against purchase_unit and a line unit standing
+    // in for it would flip the guard (a 'kg' line on a g/kg material reads
+    // ru === pu and kills a conversion that is real).
+    unit: ing.material_unit ?? mat?.unit ?? null,
+    purchase_unit: ing.purchase_unit ?? mat?.purchase_unit ?? null,
+    pack_size: ing.pack_size ?? (ing as any).material_pack_size ?? mat?.pack_size ?? null,
+  };
+}
+
+/**
+ * A sub-recipe ingredient line resolved for display: the stored quantity is in
+ * THAT ROW'S OWN unit (Option B), so it lands in the material's recipe unit
+ * first — the exact hop recalculateSubRecipeCost() makes before it touches money
+ * — and only then divides into purchase units. Skipping that hop would divide a
+ * qty already written as "2 kg" by the pack factor and show 0.002.
+ */
+function subLineDisplay(ing: Ingredient, mat?: RawMaterial) {
+  const meta = ingPackMeta(ing, mat);
+  const matUnit = String(meta.unit || ing.unit || '');
+  const lineUnit = String(ing.unit || '').trim();
+  const matName = ing.material_name || mat?.name;
+  const price = ing.average_price ?? mat?.average_price ?? 0;
+  const qtyRecipe = convertQtyToMaterialUnit(Number(ing.quantity) || 0, ing.unit, matUnit, matName, meta.pack_size);
+  const purchaseUnit = String(meta.purchase_unit || matUnit || lineUnit || '');
+  const entered = `${fmtQtyNum(Number(ing.quantity) || 0)} ${lineUnit}`.trim();
+  const converts = packFactor(meta) > 1;
+  // ONE hint line, and it carries whichever figure the purchase lead hides: the
+  // number the chef actually typed when the line was authored in some third unit
+  // (500 g of a kg-bought material leads as "0.5 kg"), otherwise the recipe-basis
+  // equivalent. Both are always on the cell's tooltip.
+  const hint = lineUnit && lineUnit.toLowerCase() !== purchaseUnit.toLowerCase()
+    ? `= ${entered} as entered`
+    : converts ? `= ${fmtQtyNum(qtyRecipe)} ${matUnit}` : null;
+  return {
+    matUnit,
+    purchaseUnit,
+    hint,
+    title: `As entered: ${entered} · recipe basis: ${fmtQtyNum(qtyRecipe)} ${matUnit}`,
+    /** ₹/purchase-unit — display only. Line cost still runs off ₹/recipe-unit. */
+    rate: purchasePrice(price, meta),
+    qtyPurchase: toPurchaseQty(qtyRecipe, meta),
+    effCost: computeIngredientCost({
+      ...ing,
+      average_price: price,
+      material_unit: matUnit,
+      material_name: matName,
+      pack_size: meta.pack_size,
+    }),
+  };
+}
+
+/** The legacy hardcoded entry units — kept as the tail of the sub-recipe list. */
+const STD_UNITS = ['kg', 'g', 'l', 'ml', 'pcs', 'dozen'];
+
+/**
+ * Unit choices for a sub-recipe ingredient row: the material's own PURCHASE unit
+ * first (BTL / CASE / PKT — none of which the hardcoded six can express), its
+ * recipe unit second, the legacy six after that.
+ */
+function ingredientUnitOptions(mat: RawMaterial | undefined, current: string): string[] {
+  const out: string[] = [];
+  const push = (u?: string | null) => {
+    const s = String(u || '').trim();
+    if (!s || out.some((o) => o.toLowerCase() === s.toLowerCase())) return;
+    out.push(s);
+  };
+  push(mat?.purchase_unit);
+  push(mat?.unit);
+  STD_UNITS.forEach(push);
+  // The stored value must appear VERBATIM: a <select> whose value is absent from
+  // its options renders blank, and the first change event then silently rewrites
+  // the line's unit and re-costs it. A case-only clash ('BTL' stored, 'btl'
+  // offered) is the same bug, so the stored spelling takes that slot.
+  const cur = String(current || '').trim();
+  if (cur) {
+    const i = out.findIndex((o) => o.toLowerCase() === cur.toLowerCase());
+    if (i === -1) out.push(cur); else out[i] = cur;
+  }
+  return out;
+}
+
+/**
+ * Qty cell that keeps the raw keystrokes in local state. In the purchase basis a
+ * chef types "0.75", and parsing on every keystroke makes the decimal point
+ * untypeable — "0." parses to 0 and the controlled value snaps back to "0". The
+ * parsed number is still committed on every change so the live cost stays live;
+ * only what is ON SCREEN is left alone until blur.
+ */
+function QtyInput({ value, onCommit, className }: {
+  value: number;
+  onCommit: (n: number) => void;
+  className: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  return (
+    <input
+      type="number"
+      step="any"
+      className={className}
+      value={draft ?? (value || '')}
+      onChange={(e) => { setDraft(e.target.value); onCommit(parseFloat(e.target.value) || 0); }}
+      onBlur={() => setDraft(null)}
+    />
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,8 +1535,22 @@ export default function RecipesPage() {
   function renderIngredientRows(
     list: Ingredient[],
     setter: React.Dispatch<React.SetStateAction<Ingredient[]>>,
+    // Sub-recipe rows opt in to the PURCHASE basis (owner rule: bulk batches are
+    // bought and reasoned about in kg / L / BTL). Main recipes are authored in
+    // grams and must keep behaving exactly as they do today — hence a flag the
+    // main caller never passes, not a change to the shared body.
+    opts?: { purchaseBasis?: boolean },
   ) {
-    return list.map((ing, idx) => (
+    const purchaseBasis = opts?.purchaseBasis === true;
+    return list.map((ing, idx) => {
+      const rowMat = purchaseBasis ? materials.find((m) => m.id === ing.material_id) : undefined;
+      // Rate is what the chef is buying at — ₹/purchase-unit. Display only:
+      // the cost beside it still comes from computeIngredientCost, which runs
+      // ₹/recipe-unit exactly like the server engine.
+      const rowRate = rowMat
+        ? `${formatCurrency(purchasePrice(rowMat.average_price || 0, rowMat))}/${rowMat.purchase_unit || rowMat.unit}`
+        : null;
+      return (
       <div key={idx} className="grid grid-cols-12 gap-2 items-end mb-2">
         {/* Material */}
         <div className="col-span-4">
@@ -1410,34 +1558,57 @@ export default function RecipesPage() {
           <MaterialPicker
             value={ing.material_id}
             materials={materials}
+            purchaseBasis={purchaseBasis}
             onChange={(id) => {
               // Auto-set the recipe unit to the material's stock unit (the
               // unit recipes are denominated in for that material). Saves the
               // user a click and prevents mismatches like picking 'kg' when
               // the material is denominated in 'g'.
+              //
+              // In the purchase basis it defaults to the PURCHASE unit instead —
+              // but only when packFactor() confirms a real conversion exists.
+              // With no pack bridge (pack_size 1) the purchase unit is either the
+              // same string or unreachable data, and defaulting to it would seed
+              // a line the cost engine cannot convert.
               const mat = materials.find((m) => m.id === id);
+              const nextUnit = purchaseBasis && mat && packFactor(mat) > 1
+                ? (mat.purchase_unit || mat.unit)
+                : mat?.unit;
               setter((prev) => {
                 const copy = [...prev];
                 copy[idx] = {
                   ...copy[idx],
                   material_id: id,
-                  unit: mat?.unit || copy[idx].unit,
+                  unit: nextUnit || copy[idx].unit,
                 };
                 return copy;
               });
             }}
           />
+          {purchaseBasis && rowRate && (
+            <div className="text-[9px] text-[#B8A590] mt-0.5 truncate">{rowRate}</div>
+          )}
         </div>
         {/* Qty */}
         <div className="col-span-1">
           {idx === 0 && <label className="block text-xs text-[#8B7355] mb-1">Qty</label>}
-          <input
-            type="number"
-            step="any"
-            className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-2 py-2 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
-            value={ing.quantity || ''}
-            onChange={(e) => updateFormIngredient(setter, idx, 'quantity', parseFloat(e.target.value) || 0)}
-          />
+          {purchaseBasis ? (
+            // Purchase-unit quantities are small and decimal ("0.75 kg"), so the
+            // raw keystrokes have to survive — see QtyInput.
+            <QtyInput
+              value={ing.quantity}
+              onCommit={(n) => updateFormIngredient(setter, idx, 'quantity', n)}
+              className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-2 py-2 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
+            />
+          ) : (
+            <input
+              type="number"
+              step="any"
+              className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-2 py-2 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
+              value={ing.quantity || ''}
+              onChange={(e) => updateFormIngredient(setter, idx, 'quantity', parseFloat(e.target.value) || 0)}
+            />
+          )}
         </div>
         {/* Unit */}
         <div className="col-span-1">
@@ -1447,12 +1618,18 @@ export default function RecipesPage() {
             value={ing.unit}
             onChange={(e) => updateFormIngredient(setter, idx, 'unit', e.target.value)}
           >
-            <option value="kg">kg</option>
-            <option value="g">g</option>
-            <option value="l">l</option>
-            <option value="ml">ml</option>
-            <option value="pcs">pcs</option>
-            <option value="dozen">dozen</option>
+            {purchaseBasis ? (
+              ingredientUnitOptions(rowMat, ing.unit).map((u) => <option key={u} value={u}>{u}</option>)
+            ) : (
+              <>
+                <option value="kg">kg</option>
+                <option value="g">g</option>
+                <option value="l">l</option>
+                <option value="ml">ml</option>
+                <option value="pcs">pcs</option>
+                <option value="dozen">dozen</option>
+              </>
+            )}
           </select>
         </div>
         {/* Yield % */}
@@ -1521,7 +1698,8 @@ export default function RecipesPage() {
           </button>
         </div>
       </div>
-    ));
+      );
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1814,6 +1992,7 @@ export default function RecipesPage() {
         <div className="card">
           <h2 className="text-lg font-semibold text-[#2D1B0E] mb-4 flex items-center gap-2">
             <Layers size={18} /> Ingredients ({sr.ingredients.length})
+            <span className="text-[10px] font-normal text-[#8B7355]">— quantities &amp; rates in purchase units</span>
           </h2>
           {sr.ingredients.length === 0 ? (
             <p className="text-[#8B7355] text-sm">No ingredients.</p>
@@ -1827,18 +2006,34 @@ export default function RecipesPage() {
                     <th className="text-left py-2 px-2 font-medium">Unit</th>
                     <th className="text-right py-2 px-2 font-medium">Yield%</th>
                     <th className="text-right py-2 px-2 font-medium">Wastage%</th>
+                    <th className="text-right py-2 px-2 font-medium">Rate</th>
+                    <th className="text-right py-2 px-2 font-medium">Eff. Cost</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {sr.ingredients.map((ing, i) => (
-                    <tr key={i} className="border-b border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30">
-                      <td className="py-2 px-2 text-[#3D2614]">{ing.material_name || ing.material_id}</td>
-                      <td className="py-2 px-2 text-right text-[#6B5744]">{ing.quantity}</td>
-                      <td className="py-2 px-2 text-[#8B7355]">{ing.unit}</td>
-                      <td className="py-2 px-2 text-right text-[#6B5744]">{ing.yield_percent}%</td>
-                      <td className="py-2 px-2 text-right text-[#6B5744]">{ing.wastage_percent}%</td>
-                    </tr>
-                  ))}
+                  {sr.ingredients.map((ing, i) => {
+                    // The row carries the material's own unit columns (/api/sub-recipes
+                    // joins them); the loaded catalog is the fallback for a payload
+                    // cached before that join existed.
+                    const d = subLineDisplay(ing, materials.find((mm) => mm.id === ing.material_id));
+                    return (
+                      <tr key={i} className="border-b border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30">
+                        <td className="py-2 px-2 text-[#3D2614]">{ing.material_name || ing.material_id}</td>
+                        <td className="py-2 px-2 text-right text-[#6B5744] tabular-nums" title={d.title}>
+                          {fmtQtyNum(d.qtyPurchase)}
+                          {d.hint && <div className="text-[9px] text-[#B8A590]">{d.hint}</div>}
+                        </td>
+                        <td className="py-2 px-2 text-[#8B7355]">{d.purchaseUnit}</td>
+                        <td className="py-2 px-2 text-right text-[#6B5744]">{ing.yield_percent}%</td>
+                        <td className="py-2 px-2 text-right text-[#6B5744]">{ing.wastage_percent}%</td>
+                        <td className="py-2 px-2 text-right text-[#6B5744] tabular-nums">
+                          {formatCurrency(d.rate)}
+                          <span className="text-[9px] text-[#B8A590]">/{d.purchaseUnit}</span>
+                        </td>
+                        <td className="py-2 px-2 text-right font-medium text-[#2D1B0E] tabular-nums">{formatCurrency(d.effCost)}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -2869,7 +3064,8 @@ export default function RecipesPage() {
                   <p className="text-sm text-[#8B7355]">No ingredients yet. Click &quot;Add Ingredient&quot; to begin.</p>
                 ) : (
                   <div className="overflow-x-auto">
-                    {renderIngredientRows(srFormIngredients, setSrFormIngredients)}
+                    {/* Purchase basis: a sub-recipe batch is bought in kg / L / BTL. */}
+                    {renderIngredientRows(srFormIngredients, setSrFormIngredients, { purchaseBasis: true })}
                   </div>
                 )}
               </div>
@@ -4476,10 +4672,14 @@ function MaterialPicker({
   value,
   materials,
   onChange,
+  purchaseBasis = false,
 }: {
   value: string;
-  materials: Array<{ id: string; name: string; unit: string; average_price: number; sku?: string; category?: string }>;
+  materials: Array<{ id: string; name: string; unit: string; average_price: number; sku?: string; category?: string;
+                     purchase_unit?: string; pack_size?: number }>;
   onChange: (id: string) => void;
+  /** Sub-recipe rows: list the PURCHASE unit and ₹/purchase-unit, not ₹/g. */
+  purchaseBasis?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -4613,9 +4813,14 @@ function MaterialPicker({
                 >
                   <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0">{m.sku || '·'}</span>
                   <span className="flex-1 text-[#2D1B0E]" title={m.name}>{m.name}</span>
-                  <span className="text-[10px] text-[#6B5744] shrink-0">{m.unit}</span>
+                  <span className="text-[10px] text-[#6B5744] shrink-0">
+                    {purchaseBasis ? (m.purchase_unit || m.unit) : m.unit}
+                  </span>
                   <span className={`text-[10px] font-mono shrink-0 ${m.average_price > 0 ? 'text-[#6B5744]' : 'text-red-500'}`}>
-                    ₹{m.average_price.toFixed(2)}
+                    {/* Purchase basis: ₹/purchase-unit (₹180/kg reads as a price;
+                        ₹0.18/g reads as a rounding error). purchasePrice() also
+                        tolerates a null average_price, which .toFixed() does not. */}
+                    ₹{(purchaseBasis ? purchasePrice(m.average_price, m) : m.average_price).toFixed(2)}
                   </span>
                 </button>
               ))}

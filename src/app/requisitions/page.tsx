@@ -1953,6 +1953,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   const [busy, setBusy] = useState(false);
   const [raisePo, setRaisePo] = useState(false);
   const [poDate, setPoDate] = useState(new Date().toISOString().slice(0, 10));
+  // Deliberately BLANK, unlike poDate. Defaulting this to today would put an
+  // invented delivery promise on the vendor PO that nobody agreed to, and the
+  // GRN/ageing screens would then chase the vendor against a date we made up.
+  const [poDeliveryDate, setPoDeliveryDate] = useState('');
 
   // Vendor lookup state — only fetched when the PO checkbox is ticked, so the
   // modal stays light when the store user is just issuing items.
@@ -2084,6 +2088,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     if (raisePo) {
       body.auto_create_po = true;
       body.po_date = poDate;
+      // Blank means "no date agreed with the vendor" — send nothing at all so the
+      // PO column stays NULL instead of holding an empty string that later date
+      // comparisons (overdue/ageing) would have to special-case.
+      body.po_delivery_date = poDeliveryDate || undefined;
     }
     const r = await api(`/api/requisitions/${req.id}/store-process`, { method: 'POST', body });
     const j = await r.json();
@@ -2416,7 +2424,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             </table>
           </div>
 
-          <div className={`grid grid-cols-1 ${raisePo ? 'sm:grid-cols-2' : ''} gap-3`}>
+          <div className={`grid grid-cols-1 ${raisePo ? 'sm:grid-cols-3' : ''} gap-3`}>
             <label className="text-xs text-[#6B5744] flex flex-col gap-1">
               Store note (optional)
               <textarea value={note} onChange={e => setNote(e.target.value)} rows={2}
@@ -2428,6 +2436,14 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                 Vendor PO date
                 <input type="date" value={poDate} onChange={e => setPoDate(e.target.value)}
                        className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0]" />
+              </label>
+            )}
+            {raisePo && (
+              <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+                Expected Delivery Date
+                <input type="date" value={poDeliveryDate} onChange={e => setPoDeliveryDate(e.target.value)}
+                       className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0]" />
+                <span className="text-[9px] text-[#B8A590]">Optional — leave blank if the vendor hasn&apos;t committed a date.</span>
               </label>
             )}
           </div>

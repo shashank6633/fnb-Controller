@@ -6,7 +6,7 @@ import {
 } from '@/lib/recaho-inward';
 import { requireRole, getCurrentOutletId } from '@/lib/auth';
 import { findUnitLock } from '@/lib/unit-audit-lock';
-import { centralFlowBlock } from '@/lib/store-engine';
+import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 
 /**
  * Step 2 — actually persist the inward report into the DB.
@@ -19,6 +19,11 @@ import { centralFlowBlock } from '@/lib/store-engine';
  *       2) for ml/l materials with a pack volume in the name, multiply by that volume
  *      so e.g. "20 CASE(24PC) of BUDWEISER (330ML)" → 20×24×330 = 158,400 ml
  *   - Insert into purchases (outlet-scoped to the user's current outlet).
+ *       total_price = quantity × unit_price (GOODS only). Every charge the sheet
+ *       carries travels BESIDE the rate in its own column — GST is a reclaimable
+ *       input credit and must never enter a rate, a total or a recipe cost;
+ *       TGBCL excise / TCS is non-creditable landed cost and is recorded apart
+ *       from GST so the two are never confused on a return.
  *   - Insert into inventory_transactions (audit trail).
  *   - Bump raw_materials.current_stock + last_purchase_price + last_purchase_date.
  *
@@ -71,8 +76,11 @@ export async function POST(req: Request) {
       VALUES (?, ?, 1, datetime('now'), datetime('now'))
     `);
     const insertPurchase = db.prepare(`
-      INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, outlet_id, created_at)
-      VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, datetime('now'))
+      INSERT INTO purchases (
+        id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, outlet_id,
+        discount, cgst, sgst, special_excise_cess, tcs, delivery_charges, mrp_round_off, created_at
+      )
+      VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     `);
     const insertTx = db.prepare(`
       INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id, created_at)
@@ -94,6 +102,13 @@ export async function POST(req: Request) {
                     unit_audit_warnings: [] as Array<{
                       material: string; sku?: string;
                       locked_purchase_unit?: string; incoming_purchase_unit?: string;
+                      reason: string;
+                    }>,
+                    // Rows whose sheet TOTAL does not reconcile against the charge
+                    // columns we can actually store. Reported, never folded.
+                    charge_warnings: [] as Array<{
+                      material: string; vendor: string;
+                      expected: number; recorded: number; unreconciled: number;
                       reason: string;
                     }> };
     const touchedMaterials = new Set<string>();
@@ -195,9 +210,90 @@ export async function POST(req: Request) {
 
           const purchaseId = randomUUID();
           const date = r.inwardDate || new Date().toISOString().split('T')[0];
+
+          // total_price is the GOODS value, nothing else. It used to be bound
+          // from r.totalAmount ("TOTAL INWARD AMOUNT"), which is tax-INCLUSIVE,
+          // while unit_price held the clean purchase rate — so reclaimable GST
+          // was folded into spend and the sheet's own CGST/SGST were dropped on
+          // the floor. Binding qty × rate makes the house identity
+          // total_price = quantity × unit_price hold by construction (measured:
+          // the sheet's SUBTOTAL equals qty × rate to within ₹0.005 on all
+          // 10,012 detail rows of the three real exports).
+          // Recipe cost cannot move: updateMaterialPrice reads
+          // SUM(quantity × unit_price)/SUM(quantity) and never total_price.
+          const goods = Math.round(purchaseQty * purchaseRate * 100) / 100;
+
+          // Zero-rating wins over whatever the sheet says. A store-mapped line
+          // bears TGBCL duty on the store bill and no GST on our side. In
+          // practice centralFlowBlock above already skipped it; this is the
+          // second lock, for the day that guard is relaxed per-category.
+          const zeroRated = isStoreMappedMaterial(db, mat.id);
+
+          // Re-derive the split from the sheet's tax TOTAL instead of storing
+          // r.cgst / r.sgst verbatim: Recaho emits 3-dp halves (454.283 each)
+          // which cannot both round to 2 dp and still satisfy the invariant
+          // tax_value = cgst + sgst that every reader re-adds. Whole paise, odd
+          // paisa to CGST — the canon lives at api/purchases/route.ts:363-367.
+          const taxValue = zeroRated ? 0 : Math.round((r.cgst + r.sgst) * 100) / 100;
+          const taxPaise = Math.round(taxValue * 100);
+          const sgst = Math.floor(taxPaise / 2) / 100;
+          const cgst = Math.round((taxValue - sgst) * 100) / 100;
+
+          // The non-creditable bucket, kept apart from GST on purpose. The sheet
+          // ships ONE combined "TCS + SPECIAL EXCISE CESS" figure we cannot
+          // honestly split, and on TGBCL lines it runs ~11.5% of subtotal —
+          // Indian TCS is 0.1-1%, so the money is overwhelmingly special excise
+          // cess. It lands in special_excise_cess (with EXCISE added in) and
+          // `tcs` stays 0 rather than carrying a number we invented. The
+          // verbatim sheet label rides along in the row note as provenance.
+          // Mapped per COLUMN, never per vendor: 12 of the 10,012 real detail
+          // rows carry this levy WITHOUT being billed by GOVERNMENT OF TELANGANA,
+          // and 21 GST rows also carry delivery. An if/else on vendor silently
+          // drops one side of those; the sheet already separates them per line.
+          const specialCess = Math.round((r.tcsPlusSpecialCess + r.excise) * 100) / 100;
+          const discountAmt = Math.round(r.discount * 100) / 100;
+          const deliveryAmt = Math.round(r.deliveryCharges * 100) / 100;
+          const mrpRoundOff = Math.round(r.mrpRoundOff * 100) / 100;
+
+          // Residual guard. VAT and GST-compensation CESS are real sheet columns
+          // with no DB home (0 on every row of the real exports so far). Folding
+          // them into special_excise_cess would report an excise figure the
+          // government never levied, so instead the row commits with its correct
+          // goods value and the unreconciled rupees are named. Money is never
+          // silently lost and never silently mis-posted. Worst-case measured
+          // reconciliation error on real data is ₹0.12, so ₹1.00 is signal.
+          const recorded = Math.round(
+            (goods - discountAmt + cgst + sgst + specialCess + deliveryAmt + mrpRoundOff) * 100
+          ) / 100;
+          const resid = Math.round((r.totalAmount - recorded) * 100) / 100;
+          if (Math.abs(resid) > 1) {
+            stats.charge_warnings.push({
+              material: r.itemName, vendor: r.supplier || 'unknown vendor',
+              expected: Math.round(r.totalAmount * 100) / 100, recorded, unreconciled: resid,
+              reason: 'Sheet TOTAL INWARD AMOUNT does not reconcile against the charge columns we can store (VAT / GST compensation cess have no column yet). Goods value recorded correctly; the difference is NOT inside the rate.',
+            });
+          }
+          if (zeroRated && (r.cgst + r.sgst) > 0) {
+            const dropped = Math.round((r.cgst + r.sgst) * 100) / 100;
+            stats.charge_warnings.push({
+              material: r.itemName, vendor: r.supplier || 'unknown vendor',
+              expected: dropped, recorded: 0, unreconciled: dropped,
+              reason: 'Store-mapped (liquor) line carried GST on the sheet. Zero-rating wins — no input credit recorded on our side.',
+            });
+          }
+
+          const noteBits = [r.notes || 'Imported from inward report'];
+          if (taxValue > 0) {
+            noteBits.push(`GST ₹${taxValue.toFixed(2)} (CGST ₹${cgst.toFixed(2)} + SGST ₹${sgst.toFixed(2)}, not in rate)`);
+          }
+          if (specialCess !== 0) {
+            noteBits.push(`TGBCL TCS + Special Excise Cess ₹${specialCess.toFixed(2)} (sheet column, non-creditable landed cost)`);
+          }
+
           insertPurchase.run(
-            purchaseId, mat.id, r.supplier, purchaseQty, purchaseRate, r.totalAmount, date,
-            r.notes || `Imported from inward report`, outletId,
+            purchaseId, mat.id, r.supplier, purchaseQty, purchaseRate, goods, date,
+            noteBits.join(' · '), outletId,
+            discountAmt, cgst, sgst, specialCess, 0, deliveryAmt, mrpRoundOff,
           );
           insertTx.run(randomUUID(), mat.id, stockQty, purchaseId,
                        `Inward import — ${r.supplier || 'unknown vendor'}`, outletId);

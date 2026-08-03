@@ -33,6 +33,39 @@ export async function POST(req: Request) {
     const suppliers = new Set(rows.map(r => r.supplier).filter(Boolean));
     const total = rows.reduce((s, r) => s + r.totalAmount, 0);
 
+    // The bill total alone hid WHERE the money goes: reclaimable GST rides beside the
+    // goods rate, TGBCL excise/cess/TCS is genuine landed cost, and the two are settled
+    // differently. Split it here so the clerk sees it BEFORE committing rather than
+    // discovering it in the inward register.
+    //
+    // Charge columns are read defensively: the sheet carries VAT / CESS / EXCISE columns
+    // that have no home on `purchases`, and the parser gained the landed-cost fields
+    // separately from this route. A missing field reads 0 and its money therefore
+    // surfaces in `unreconciled_amount` instead of silently vanishing from the preview.
+    type InwardCharges = Partial<Record<
+      'discount' | 'tcsPlusSpecialCess' | 'excise' | 'deliveryCharges' | 'mrpRoundOff',
+      number
+    >>;
+    const chg = (row: unknown, key: keyof InwardCharges): number => {
+      const v = (row as InwardCharges)[key];
+      return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+    };
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+
+    // subtotal is the sheet's own goods figure; fall back to qty x rate on the legacy
+    // export, which has no SUBTOTAL column.
+    const goodsAmount = r2(rows.reduce((s, r) => s + (r.subtotal || r.inwardQty * r.rate), 0));
+    const gstAmount   = r2(rows.reduce((s, r) => s + r.cgst + r.sgst, 0));
+    const otherChargesAmount = r2(rows.reduce((s, r) => s
+      + chg(r, 'tcsPlusSpecialCess')
+      + chg(r, 'excise')
+      + chg(r, 'deliveryCharges')
+      + chg(r, 'mrpRoundOff')
+      - chg(r, 'discount'), 0));
+    // Rounded parts, so the four numbers on screen genuinely add up to the bill total.
+    const totalAmount = r2(total);
+    const unreconciledAmount = r2(totalAmount - goodsAmount - gstAmount - otherChargesAmount);
+
     return Response.json({
       sheets: wb.SheetNames,
       rows: rows.length,
@@ -41,7 +74,11 @@ export async function POST(req: Request) {
         unique_suppliers: suppliers.size,
         date_from:        dates[0] ?? null,
         date_to:          dates[dates.length - 1] ?? null,
-        total_amount:     Math.round(total * 100) / 100,
+        total_amount:     totalAmount,
+        goods_amount:         goodsAmount,
+        gst_amount:           gstAmount,
+        other_charges_amount: otherChargesAmount,
+        unreconciled_amount:  unreconciledAmount,
       },
       sample: rows.slice(0, 6),
     });

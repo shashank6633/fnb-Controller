@@ -146,7 +146,18 @@ export default function POPrintPage() {
           </div>
           <div className="text-right">
             <div className="text-2xl font-bold text-[#af4408]">{po.po_number}</div>
-            <div className="text-xs text-gray-700 mt-1">Date: {dt(po.date)}</div>
+            <div className="text-xs text-gray-700 mt-1">PO Date: {dt(po.date)}</div>
+            {/* The date we PROMISED, not a date anything happened on — so it sits
+                beside the PO date in the header the vendor reads first, never in
+                the status timeline below (that block is a log of past events).
+                Rendered only when a date was actually agreed: an "Expected
+                delivery: —" on a document going out to a vendor is noise, and a
+                fallback to the PO date would print a deadline nobody committed to.
+                "Expected delivery" in full — bare "Delivery" already means the
+                vendor's delivery CHARGE further down this sheet. */}
+            {po.delivery_date && (
+              <div className="text-xs text-gray-700 mt-1">Expected delivery: {dt(po.delivery_date)}</div>
+            )}
             <div className="text-xs mt-1">
               Status: <span className="font-semibold uppercase">{po.status}</span>
             </div>

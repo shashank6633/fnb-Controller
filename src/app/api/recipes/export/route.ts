@@ -1,5 +1,6 @@
 import { getDb, convertToMaterialUnit } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { toPurchaseQty, purchasePrice } from '@/lib/pack-units';
 import * as XLSX from 'xlsx';
 
 /**
@@ -117,9 +118,12 @@ export async function GET(request: Request) {
     const subRows: any[] = [];
     let totalSubIngredients = 0;
     for (const sr of subRecipes) {
+      // purchase_unit + average_price ride along so each ingredient line can also
+      // be shown in the PURCHASE basis (owner rule: sub-recipe ingredient lines
+      // lead with kg / L / BTL — see the carve-out in src/lib/pack-units.ts).
       const ings = db.prepare(`
         SELECT sri.*, rm.name AS material_name, rm.average_price, rm.unit AS material_unit,
-               rm.pack_size AS material_pack_size
+               rm.purchase_unit, rm.pack_size AS material_pack_size
         FROM sub_recipe_ingredients sri JOIN raw_materials rm ON rm.id = sri.material_id
         WHERE sri.sub_recipe_id = ? ORDER BY rm.name
       `).all(sr.id) as any[];
@@ -131,12 +135,31 @@ export async function GET(request: Request) {
           'Total Cost (₹)': Math.round(sr.total_cost || 0),
           'Cost / Unit (₹)': Math.round((sr.cost_per_unit || 0) * 100) / 100,
           Ingredient: '(no ingredients yet)',
-          Qty: '', Unit: '', 'Line Cost (₹)': '',
+          Qty: '', Unit: '',
+          // Emitted blank rather than omitted: json_to_sheet derives headers from
+          // the keys it meets first, so a yield-only row must still carry them or
+          // the purchase columns land after 'Line Cost' for the rest of the sheet.
+          'Qty (Purchase)': '', 'Purchase Unit': '', 'Rate / Purchase Unit (₹)': '',
+          'Line Cost (₹)': '',
         });
         continue;
       }
       for (const ing of ings) {
         const lineCost = engineLineCost(ing);
+        // The both-halves guard reads the MATERIAL's own unit pair — sri.unit is
+        // the line's authored unit (Option B) and feeding it here would compare
+        // the wrong pair and convert materials that have no pack conversion.
+        const meta = {
+          unit: ing.material_unit,
+          purchase_unit: ing.purchase_unit,
+          pack_size: ing.material_pack_size,
+        };
+        // The line qty is authored in sri.unit; normalise to the material's recipe
+        // unit first (same hop engineLineCost makes) or a "0.5 kg" line divides by
+        // pack_size a second time.
+        const qtyInMatUnit = convertToMaterialUnit(
+          ing.quantity || 0, ing.unit, ing.material_unit, ing.material_name, ing.material_pack_size,
+        );
         subRows.push({
           'Sub-Recipe': sr.name,
           'Yield Qty':   sr.yield_quantity || 1,
@@ -145,6 +168,11 @@ export async function GET(request: Request) {
           'Cost / Unit (₹)': Math.round((sr.cost_per_unit || 0) * 100) / 100,
           Ingredient: ing.material_name,
           Qty: ing.quantity, Unit: ing.unit,
+          'Qty (Purchase)': toPurchaseQty(qtyInMatUnit, meta),
+          'Purchase Unit': ing.purchase_unit || ing.material_unit || '',
+          // average_price is ₹/recipe-unit; × packFactor gives ₹/purchase-unit.
+          // Display only — 'Line Cost (₹)' stays on the recipe-basis engine math.
+          'Rate / Purchase Unit (₹)': purchasePrice(ing.average_price || 0, meta),
           'Line Cost (₹)': lineCost,
         });
         totalSubIngredients++;
@@ -242,7 +270,9 @@ export async function GET(request: Request) {
     const wsSub = XLSX.utils.json_to_sheet(subRows.length ? subRows : [{ 'Sub-Recipe': '(no sub-recipes)' }]);
     wsSub['!cols'] = [
       { wch: 30 }, { wch: 10 }, { wch: 10 }, { wch: 16 }, { wch: 16 },
-      { wch: 36 }, { wch: 10 }, { wch: 8 }, { wch: 14 },
+      { wch: 36 }, { wch: 10 }, { wch: 8 },
+      { wch: 14 }, { wch: 14 }, { wch: 22 },
+      { wch: 14 },
     ];
     XLSX.utils.book_append_sheet(wb, wsSub, 'Sub-Recipes');
 

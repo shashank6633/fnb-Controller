@@ -36,6 +36,9 @@ import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
  *   po_vendor_id?: string,               // optional default vendor for the auto-PO
  *   po_vendor_name?: string,             // free-text fallback
  *   po_date?: string,                    // ISO date for the new PO (defaults today)
+ *   po_delivery_date?: string,           // "Expected Delivery Date" promised by the vendor
+ *                                        // (YYYY-MM-DD, never earlier than po_date, future is
+ *                                        // normal). Omitted/blank = no promised date (NULL).
  *   lines: [
  *     {
  *       id: string,                       // requisition_item id
@@ -424,6 +427,44 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         }
 
         const isoDate = String(body?.po_date || new Date().toISOString().slice(0, 10));
+        // ── Expected Delivery Date (optional) ────────────────────────────────
+        // Blank stays NULL. purchase_orders.delivery_date was added with no
+        // backfill precisely so "no promised date" stays distinguishable from a
+        // fabricated one — defaulting it to isoDate here would invent a vendor
+        // commitment for every requisition-raised PO.
+        //
+        // NOT checkPurchaseDate(): that guard refuses FUTURE dates for
+        // non-admins, which is exactly what a promised delivery is — it would
+        // reject every honest entry a storekeeper makes. What a delivery date
+        // cannot be is earlier than the order it belongs to.
+        //
+        // Round-tripped through Date as well as the shape test, because the
+        // column is TEXT: '2026-02-31' passes the regex, is un-renderable as a
+        // promised date, and would sit in the row forever once written.
+        //
+        // Thrown, not returned: isoDate only exists inside this transaction, so
+        // the comparison has to happen here. The throw rolls the whole issue
+        // back before anything commits and the catch turns httpStatus into a
+        // plain 400 — same net effect as the pre-txn validators above.
+        const rawDelivery = typeof body?.po_delivery_date === 'string' ? body.po_delivery_date.trim() : '';
+        let deliveryDate: string | null = null;
+        if (rawDelivery) {
+          const asDate = new Date(`${rawDelivery}T00:00:00Z`);
+          const wellFormed = /^\d{4}-\d{2}-\d{2}$/.test(rawDelivery)
+            && !Number.isNaN(asDate.getTime())
+            && asDate.toISOString().slice(0, 10) === rawDelivery;
+          if (!wellFormed) {
+            const err: any = new Error(`Expected Delivery Date must be a valid date (YYYY-MM-DD) — got "${rawDelivery}".`);
+            err.httpStatus = 400;
+            throw err;
+          }
+          if (rawDelivery < isoDate) {
+            const err: any = new Error(`Expected Delivery Date (${rawDelivery}) cannot be earlier than the PO date (${isoDate}).`);
+            err.httpStatus = 400;
+            throw err;
+          }
+          deliveryDate = rawDelivery;
+        }
         const year = isoDate.slice(0, 4);
         const lastPo = db.prepare(`
           SELECT po_number FROM purchase_orders
@@ -436,11 +477,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         linkedPoId = generateId();
         // PO is created in 'pending' (i.e. submitted) so it lands directly in the admin's approval queue.
         db.prepare(`
-          INSERT INTO purchase_orders (id, po_number, date, vendor_id, vendor, status, notes, drafted_by,
+          INSERT INTO purchase_orders (id, po_number, date, delivery_date, vendor_id, vendor, status, notes, drafted_by,
                                        submitted_at, submitted_by, requisition_id, outlet_id,
                                        created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, datetime('now'), ?, ?, ?, datetime('now'), datetime('now'))
-        `).run(linkedPoId, poNumber, isoDate, headerVendorId, headerVendor || '',
+          VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, datetime('now'), ?, ?, ?, datetime('now'), datetime('now'))
+        `).run(linkedPoId, poNumber, isoDate, deliveryDate, headerVendorId, headerVendor || '',
                 `Auto-raised from requisition ${r.req_number}`, me.email, me.email, id, outletId);
 
         const insPoItem = db.prepare(`

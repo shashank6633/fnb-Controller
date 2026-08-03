@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useMemo, useState, useRef } from 'react';
 import Link from 'next/link';
 import { fmtISTDate, todayIST } from '@/lib/format-date';
 import {
@@ -23,6 +23,8 @@ import {
   CheckCircle,
   AlertCircle,
   Download,
+  Merge,
+  Link2,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import type { Purchase, RawMaterial } from '@/types';
@@ -55,7 +57,7 @@ function isoMinusDays(iso: string, n: number): string {
  * number box: a typo'd "1.8" on a ₹40,000 bill is a tax figure nobody catches
  * until the return is filed.
  */
-const GST_RATES = ['0', '5', '12', '18'] as const;
+const GST_RATES = ['0', '5', '12', '18', '28'] as const;
 
 /**
  * Client-side mirror of store-engine's SQL catNorm(): lower-case, then strip
@@ -90,6 +92,16 @@ interface BillLineItem {
    * a decimal untypeable, the same trap the qty/price boxes already avoid.
    */
   gst_rate: string;
+  /**
+   * GST COMPENSATION CESS %, per line. A separate levy from GST — never folded
+   * into gst_rate, never split into halves, and NEVER added to tax_value: doing
+   * either corrupts the CGST/SGST figure that a return is filed on.
+   * Per-line only, with no bill-level default: one bill is almost always one GST
+   * rate, but cess is item-specific (the Coke cases on a bill carry it, the rest
+   * of the bill does not), so a bill-level default would seed cess onto lines
+   * that never bore it. '' = none. Raw string, same reason as gst_rate.
+   */
+  cess_rate: string;
 }
 
 interface BillFormData {
@@ -173,6 +185,7 @@ function emptyBillLine(): BillLineItem {
     final_unit_price: 0,
     entry_mode: 'btl',
     gst_rate: '',   // '' = follow the bill-level rate
+    cess_rate: '',  // '' = no compensation cess (there is no bill-level cess to follow)
   };
 }
 
@@ -267,6 +280,13 @@ export default function PurchasesPage() {
 
   // Toast
   const [toast, setToast] = useState<string | null>(null);
+  /** Non-blocking notes the SERVER returned on an otherwise successful bill save:
+   *  a vendor↔item pair it would not map (not in the master / deliberately
+   *  removed before), or lines it folded together. The save succeeded either
+   *  way — these must never look like failures, and must never auto-dismiss:
+   *  "N items added" followed by fewer rows is exactly the moment a storekeeper
+   *  needs the reason on screen. */
+  const [billNotices, setBillNotices] = useState<string[]>([]);
 
   // Backdate limit (configurable) + admin exemption. Server is the real guard;
   // these drive the date-input min/max (UX only) and the admin editor below.
@@ -423,6 +443,60 @@ export default function PurchasesPage() {
     return !!m && storeCats.has(catKey(m.category));
   };
 
+  /**
+   * The GST% a line should START at when this material is picked — the master's
+   * raw_materials.tax_percent, which until now was a write-only field nobody on
+   * the purchase side ever read (the whole reported bug).
+   *
+   * It SEEDS, it does not FORCE: a bill is a fact, and the printed vendor
+   * invoice wins over a possibly-stale master. The storekeeper can change the
+   * select immediately after.
+   *
+   * Two refusals, both deliberate — do not "simplify" either away:
+   *   · store-mapped (TGBCL liquor) is zero-rated here and returns '' so no rate
+   *     can ever be seeded onto it. tax_percent is a free field on the master
+   *     with no liquor guard, so a manager CAN type 18 on a TGBCL item; the
+   *     existing zero-rate locks (billCalc + the server) stay the authority and
+   *     this sits strictly beneath them.
+   *   · a rate that is not in GST_RATES (say 7) returns '' rather than a value
+   *     matching no <option> — React would render the select blank, the
+   *     storekeeper would read 0%, and billCalc would book 7%.
+   * '' means "follow the bill-level rate", which is the pre-existing default.
+   */
+  const seedGstForMaterial = (materialId: string): string => {
+    if (!materialId) return '';
+    if (storeMappedLine(materialId)) return '';
+    const m = materials.find((x) => x.id === materialId) as any;
+    const t = Number(m?.tax_percent) || 0;
+    if (t <= 0) return '';
+    const s = String(t);
+    return (GST_RATES as readonly string[]).includes(s) ? s : '';
+  };
+
+  /**
+   * The COMPENSATION CESS % a line should start at — raw_materials.cess_percent,
+   * the other half of the reported bug ("GST % and Cess % are added in the Raw
+   * Material Master, but they are not picking automatically during Purchase
+   * Entry"). Seeds exactly like the GST rate above, and the TGBCL refusal is the
+   * same: a store-mapped line's duty rides on the store's own bill, so no rate
+   * may be seeded onto it.
+   *
+   * ONE DELIBERATE DIFFERENCE from seedGstForMaterial: there is no GST_RATES
+   * membership test. That test exists only because the GST control is a <select>
+   * — a value matching no <option> renders blank and the storekeeper reads 0%.
+   * The cess control is a free number input (mirroring the master's own free
+   * 0-100 field), so any in-range value renders honestly and refusing e.g. 12.5
+   * would silently drop real money. Only non-finite / <=0 / >100 are refused.
+   */
+  const seedCessForMaterial = (materialId: string): string => {
+    if (!materialId) return '';
+    if (storeMappedLine(materialId)) return '';
+    const m = materials.find((x) => x.id === materialId) as any;
+    const c = Number(m?.cess_percent);
+    if (!Number.isFinite(c) || c <= 0 || c > 100) return '';
+    return String(c);
+  };
+
   const fetchBackdateConfig = async () => {
     try {
       const [sRes, mRes] = await Promise.all([
@@ -531,6 +605,11 @@ export default function PurchasesPage() {
     billLineIdCounter = 1;
     setBillData({ ...emptyBill, date: todayString(), items: [emptyBillLine(), emptyBillLine()] });
     setBillError(null);
+    // A "keep both" acknowledgement belongs to ONE bill — never carry it into
+    // the next one. Same for the mapping panel's transient note/expansion.
+    setDupAck([]);
+    setBillMapNote(null);
+    setVendorItemsOpen(false);
     setBillModalOpen(true);
   };
 
@@ -553,10 +632,392 @@ export default function PurchasesPage() {
   const updateBillLine = (id: number, field: keyof BillLineItem, value: string) => {
     setBillData((prev) => ({
       ...prev,
-      items: prev.items.map((item) =>
-        item.id === id ? { ...item, [field]: value } : item
-      ),
+      items: prev.items.map((item) => {
+        if (item.id !== id) return item;
+        if (field !== 'material_id') return { ...item, [field]: value };
+        // Picking/swapping the material re-seeds the line's GST% from the new
+        // material's master rate — but ONLY when the current rate is still
+        // machine-set: either untouched ('') or exactly what the PREVIOUS
+        // material would have seeded. Anything else is a rate the storekeeper
+        // deliberately typed off the printed bill, and silently resetting it is
+        // a tax error nobody notices until the return is filed. The test must
+        // stay "equals the previous seed" — a hardcoded '' would clobber every
+        // seeded line on a material swap.
+        const prevSeed = seedGstForMaterial(item.material_id);
+        const keepRate = !(item.gst_rate === '' || item.gst_rate === prevSeed);
+        // Compensation cess re-seeds under the SAME test, judged against its own
+        // previous seed — a storekeeper who typed 5% cess off the printed bill
+        // keeps it through a material swap exactly as they keep a typed GST%.
+        const prevCessSeed = seedCessForMaterial(item.material_id);
+        const keepCess = !(item.cess_rate === '' || item.cess_rate === prevCessSeed);
+        return {
+          ...item,
+          material_id: value,
+          gst_rate: keepRate ? item.gst_rate : seedGstForMaterial(value),
+          cess_rate: keepCess ? item.cess_rate : seedCessForMaterial(value),
+        };
+      }),
     }));
+  };
+
+  /* ==============================================================
+   * A. DUPLICATE LINES ON ONE BILL
+   *
+   * WHY IT MATTERS, in one sentence: handleBillSubmit POSTs each line to
+   * /api/purchases SEPARATELY, so the same material on two lines writes TWO
+   * purchases rows — stock is credited twice and the item passes through
+   * updateMaterialPrice's weighted average twice, which then re-costs every
+   * recipe that uses it. (The reported case: MAT-00192 CHAR COAL entered as
+   * 600 kg AND 400 kg at ₹35/kg — one bill line typed as two.)
+   *
+   * WHY THE RULE IS MIRRORED HERE INSTEAD OF IMPORTED: the shared
+   * duplicateLineError() / mergeDuplicateLines() live in src/lib/po-helpers.ts,
+   * whose module scope imports @/lib/db → better-sqlite3, a native Node addon.
+   * This page is a 'use client' component, so importing that module drags the
+   * driver into the browser bundle and the build fails. No client file in this
+   * repo imports a lib module that reaches db.ts, and this is not the place to
+   * become the first. The semantics below are deliberately the SAME rule:
+   *   · identity is material_id ALONE, trimmed (po-helpers' lineKey)
+   *   · blank rows are legal and skipped (the form opens with two)
+   *   · a merge SUMS the quantity onto the FIRST occurrence, which keeps its own
+   *     rate (po-helpers' mergeDuplicateLines semantics)
+   * If those two helpers are ever moved into a db-free module (e.g.
+   * src/lib/line-dedupe.ts, re-exported from po-helpers), this block should
+   * import them instead of restating them — that is a cross-file change.
+   * ============================================================== */
+
+  /** Trimmed material id — the identity a duplicate is judged on. */
+  const lineMat = (it: BillLineItem) => String(it.material_id || '').trim();
+
+  /**
+   * Everything that must be IDENTICAL before two lines of one material may be
+   * folded into one. The rate is the headline — a split-rate bill is a
+   * LEGITIMATE bill shape, and silently averaging two rates would corrupt both
+   * the stored rate and every recipe cost derived from it — but three more
+   * fields change what a merged line would MEAN:
+   *   · GST %   — a merge carries the FIRST line's rate onto the summed
+   *               quantity, which would re-tax the other line's value.
+   *   · Cess %  — same trap, its own levy: merging a 12%-cess line into a
+   *               0%-cess line re-applies 12% to the summed quantity.
+   *   · BTL/CASE— a per-case rate and a per-bottle rate are different numbers
+   *               even when they read the same (billSubmit expands cases).
+   *   · Brand   — one material_id billed under two brands is two things.
+   * Anything that differs lands in the "you decide" branch, never in a merge.
+   */
+  const lineMergeKey = (it: BillLineItem, billRate: number) => {
+    const rate = r2(parseFloat(it.unit_price) || 0);
+    // Mirrors billCalc's rate resolution exactly, TGBCL zero-rating included.
+    const zeroRated = storeMappedLine(it.material_id);
+    const gst = zeroRated
+      ? 0
+      : (it.gst_rate === '' ? billRate : (parseFloat(it.gst_rate) || 0));
+    // No bill-level fallback: '' simply means no cess on this line.
+    const cess = zeroRated ? 0 : (parseFloat(it.cess_rate) || 0);
+    const basis = caseBasis(it.material_id, it.entry_mode).on ? 'case' : 'unit';
+    const brand = String(it.brand || '').trim().toLowerCase();
+    return `${rate}|${gst}|${cess}|${basis}|${brand}`;
+  };
+
+  /** Which field(s) actually differ between two+ merge keys — so the warning
+   *  says "a different rate", not just "these are different". */
+  const keyDiffLabels = (keys: string[]) => {
+    // Order MUST track lineMergeKey's field order — these read positionally.
+    const fields = [
+      'a different rate',
+      'a different GST %',
+      'a different Cess %',
+      'a different BTL / CASE basis',
+      'a different brand',
+    ];
+    const parts = keys.map((k) => k.split('|'));
+    return fields.filter((_, i) => new Set(parts.map((p) => p[i])).size > 1);
+  };
+
+  /**
+   * Duplicates AS THEY ARE ENTERED (recomputed every keystroke), never only at
+   * submit. `bookable` counts the rows that would really be written — a line
+   * with no quantity or no rate is dropped by validItems, so it cannot
+   * double-credit anything and must not block a save on its own.
+   */
+  const dupInfo = useMemo(() => {
+    const billRate = parseFloat(billData.gst_rate) || 0;
+    type Row = { idx: number; line: BillLineItem; key: string; bookable: boolean };
+    const byMat = new Map<string, Row[]>();
+    billData.items.forEach((line, idx) => {
+      const mid = lineMat(line);
+      if (!mid) return;                       // blank draft rows are legal
+      const row: Row = {
+        idx, line,
+        key: lineMergeKey(line, billRate),
+        bookable: (parseFloat(line.quantity) || 0) > 0 && (parseFloat(line.unit_price) || 0) > 0,
+      };
+      const arr = byMat.get(mid);
+      if (arr) arr.push(row); else byMat.set(mid, [row]);
+    });
+
+    const groups: Array<{
+      materialId: string; name: string; unit: string; sig: string;
+      lineNos: number[];
+      mergeable: Array<{ key: string; lineNos: number[]; parts: number[]; total: number; rate: number; bookable: number }>;
+      differs: string[]; conflictBookable: boolean;
+    }> = [];
+    const flagged = new Set<number>();
+
+    for (const [mid, rows] of byMat) {
+      if (rows.length < 2) continue;
+      rows.forEach((r) => flagged.add(r.idx));
+      const mat = materials.find((m) => String(m.id) === mid) as any;
+      const unit = matUnits(mid).pu || String(mat?.unit || '') || 'unit';
+      const bySub = new Map<string, Row[]>();
+      for (const r of rows) {
+        const a = bySub.get(r.key);
+        if (a) a.push(r); else bySub.set(r.key, [r]);
+      }
+      const mergeable = [...bySub.entries()]
+        .filter(([, rs]) => rs.length > 1)
+        .map(([key, rs]) => ({
+          key,
+          lineNos: rs.map((r) => r.idx + 1),
+          parts: rs.map((r) => parseFloat(r.line.quantity) || 0),
+          // 4 dp so 600 + 400 reads 1,000 and not 999.9999999999999.
+          total: Math.round(rs.reduce((s, r) => s + (parseFloat(r.line.quantity) || 0), 0) * 10000) / 10000,
+          rate: r2(parseFloat(rs[0].line.unit_price) || 0),
+          bookable: rs.filter((r) => r.bookable).length,
+        }));
+      const keys = [...bySub.keys()];
+      const differs = keys.length > 1 ? keyDiffLabels(keys) : [];
+      // A split-rate warning only has to be answered when both sides would
+      // actually be written.
+      const conflictBookable = new Set(rows.filter((r) => r.bookable).map((r) => r.key)).size > 1;
+      groups.push({
+        materialId: mid,
+        name: mat?.name || mid,
+        unit,
+        // The acknowledgement is keyed to the EXACT shape of the conflict, so
+        // editing a rate afterwards invalidates a stale "keep both".
+        sig: `${mid}::${[...keys].sort().join('~')}`,
+        lineNos: rows.map((r) => r.idx + 1),
+        mergeable, differs, conflictBookable,
+      });
+    }
+
+    return {
+      groups,
+      flagged,
+      /** Same-everything repeats that would really be booked twice. */
+      blockingMerges: groups.flatMap((g) => g.mergeable.filter((m) => m.bookable > 1).map((m) => ({ g, m }))),
+      conflicts: groups.filter((g) => g.differs.length > 0 && g.conflictBookable),
+    };
+    // storeCats/materials feed lineMergeKey + the labels; billData.gst_rate is
+    // the inherited GST every un-overridden line resolves to.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [billData.items, billData.gst_rate, materials, storeCats]);
+
+  /** Split-rate conflicts the user has explicitly said are real ("keep both"),
+   *  by conflict signature. Cleared with the modal. */
+  const [dupAck, setDupAck] = useState<string[]>([]);
+  const toggleDupAck = (sig: string) =>
+    setDupAck((prev) => (prev.includes(sig) ? prev.filter((s) => s !== sig) : [...prev, sig]));
+
+  /**
+   * Fold one exact-match group into a single line: quantity SUMMED onto the
+   * FIRST occurrence, which keeps its own rate / brand / GST / basis — the same
+   * semantics as po-helpers' mergeDuplicateLines. Nothing is averaged, and the
+   * taxable base is not carried over: billCalc re-derives goods, discount share,
+   * taxable, CGST and SGST from the merged quantity × the unchanged rate, so
+   * tax can never leak into unit_price.
+   * Re-derives the group from CURRENT state (never from the memo's snapshot) so
+   * a keystroke between render and click cannot merge the wrong pair.
+   */
+  const mergeBillLines = (materialId: string, key: string) => {
+    setBillData((prev) => {
+      const billRate = parseFloat(prev.gst_rate) || 0;
+      const idxs = prev.items
+        .map((it, i) => ({ it, i }))
+        .filter(({ it }) => lineMat(it) === materialId && lineMergeKey(it, billRate) === key)
+        .map(({ i }) => i);
+      if (idxs.length < 2) return prev;              // state moved on — do nothing
+      const keepAt = idxs[0];
+      const total = Math.round(
+        idxs.reduce((s, i) => s + (parseFloat(prev.items[i].quantity) || 0), 0) * 10000,
+      ) / 10000;
+      const drop = new Set(idxs.slice(1));
+      return {
+        ...prev,
+        items: prev.items
+          .map((l, i) => (i === keepAt ? { ...l, quantity: String(total) } : l))
+          .filter((_, i) => !drop.has(i)),
+      };
+    });
+    setBillError(null);
+  };
+
+  /* ==============================================================
+   * B. VENDOR ↔ ITEM MAPPING — CONSULTED, NEVER BLOCKING
+   *
+   * A PURCHASE ORDER is a document we author, so /purchase-orders refuses an
+   * unmapped vendor↔item pair outright. A BILL IS A FACT: it already happened,
+   * the goods are in the store, and refusing it here would only leave the
+   * storekeeper holding an invoice with nowhere to enter it. So this screen
+   * WARNS and still saves. That divergence from the strict PO rule is
+   * deliberate — do not "align" the two.
+   *
+   * AUTO-LEARN — IT EXISTS, AND IT LEARNS ONCE. Saving a bill DOES write
+   * vendor_materials, server-side (learnVendorMaterialPair in
+   * src/app/api/purchases/route.ts). A bill is the strongest evidence there is
+   * that a vendor supplies an item, so a pair that has NEVER existed is
+   * recorded on first sight. What it must never do is resurrect a mapping an
+   * admin deliberately deleted (the boot-backfill bug shape this codebase
+   * already had), so the server stamps a one-time
+   * `vm_learned:<vendor>:<material>` marker in `settings`:
+   * marker present + row absent == a human removed it, and the learner
+   * stays out. Do not "simplify" that marker away — it is the only thing
+   * separating learn-once from re-add-forever.
+   *
+   * The "Add to this vendor's items" button below is therefore NOT the only
+   * path; it is for the pairs the learner will not touch — a removed pair the
+   * admin now wants back, or a vendor typed as free text (no master row, so
+   * nothing to map against). The server WARNS in its response rather than
+   * blocking; handleBillSubmit surfaces those warnings after the save.
+   * ============================================================== */
+
+  /** The bill's vendor as a MASTER ROW, or '' when the typed name is new/custom.
+   *  The Vendor field is free text by design (allowCustom), and a mapping can
+   *  only be read or written against a real vendor id. */
+  const billVendorId = useMemo(() => {
+    const typed = billData.vendor.trim().toLowerCase();
+    if (!typed) return '';
+    return vendors.find((v) => v.name.trim().toLowerCase() === typed)?.id || '';
+  }, [billData.vendor, vendors]);
+
+  /** { vendorId, ids } once loaded. null = unknown (never fetched, or the fetch
+   *  failed) — in which case every mapping hint stays hidden and the form
+   *  behaves exactly as it did before. A hint is not worth blocking bill entry. */
+  const [vendorMap, setVendorMap] = useState<{ vendorId: string; ids: Set<string> } | null>(null);
+  const [vendorMapBusy, setVendorMapBusy] = useState(false);
+  const [vendorItemsOpen, setVendorItemsOpen] = useState(false);
+  const [billMapNote, setBillMapNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!billModalOpen || !billVendorId) { setVendorMap(null); return; }
+    let alive = true;
+    // Same endpoint and same payload shape the ad-hoc GRN form reads.
+    fetch(`/api/vendor-materials?vendor_id=${encodeURIComponent(billVendorId)}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((d) => {
+        if (!alive) return;
+        setVendorMap({
+          vendorId: billVendorId,
+          ids: new Set<string>((d.mappings || []).map((m: any) => String(m.material_id))),
+        });
+      })
+      .catch(() => { if (alive) setVendorMap(null); });   // degrade to today's behaviour
+    return () => { alive = false; };
+  }, [billModalOpen, billVendorId]);
+
+  /** Only trust the map when it belongs to the vendor currently in the field —
+   *  otherwise a mid-typing vendor change would annotate lines against the
+   *  previous vendor's item list. */
+  const vendorMapIds = vendorMap && vendorMap.vendorId === billVendorId && billVendorId
+    ? vendorMap.ids : null;
+  const vendorShort = billData.vendor.trim() || 'this vendor';
+
+  /** The vendor's mapped items, alphabetical — the "show these first" list. */
+  const vendorMappedMaterials = useMemo(() => {
+    if (!vendorMapIds || vendorMapIds.size === 0) return [];
+    return materials
+      .filter((m) => vendorMapIds.has(String(m.id)))
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  }, [vendorMapIds, materials]);
+
+  /**
+   * The picker's list, with this vendor's items MARKED. MaterialTypeahead is a
+   * shared component (also mounted by /recipes) that re-sorts internally, so
+   * array order cannot express priority and the mark has to travel on a field
+   * it renders: the category line. Marking there — not in the name — keeps the
+   * component's name-prefix relevance scoring intact, and as a bonus the mark
+   * joins its search haystack, so typing the vendor's name lists their items.
+   * EVERY material stays in the list; nothing is filtered out.
+   */
+  const billPickerMaterials = useMemo(() => {
+    if (!vendorMapIds || vendorMapIds.size === 0) return materials;
+    return materials.map((m: any) =>
+      vendorMapIds.has(String(m.id))
+        ? { ...m, category: `★ ${vendorShort}${m.category ? ` · ${m.category}` : ''}` }
+        : m,
+    );
+  }, [materials, vendorMapIds, vendorShort]);
+
+  /** Put a mapped item on the first empty line (else a new one). Refuses to add
+   *  an item the bill already carries — this panel must not create the very
+   *  duplicate the block above exists to catch. */
+  const placeMaterialOnLine = (materialId: string, name: string) => {
+    // Read the decision off current state and act OUTSIDE the updater — a
+    // setState call inside another setState's updater is not safe (React may
+    // re-run the updater).
+    const at = billData.items.findIndex((l) => lineMat(l) === materialId);
+    if (at >= 0) {
+      setBillMapNote(`${name} is already on line ${at + 1} — add the quantity there.`);
+      return;
+    }
+    setBillMapNote(null);
+    // Seed the GST% here too — this panel is the second way a material lands on
+    // a line, and a line seeded only on the dropdown path would tax differently
+    // depending on which control the storekeeper happened to use. Unconditional
+    // is safe on both branches: a fresh emptyBillLine() and an empty slot both
+    // carry gst_rate '' (no human edit to clobber).
+    const line = {
+      ...emptyBillLine(),
+      material_id: materialId,
+      gst_rate: seedGstForMaterial(materialId),
+      cess_rate: seedCessForMaterial(materialId),
+    };
+    setBillData((prev) => {
+      const empty = prev.items.findIndex((l) => !lineMat(l));
+      if (empty >= 0) {
+        return {
+          ...prev,
+          items: prev.items.map((l, i) => (i === empty
+            ? {
+                ...l,
+                material_id: materialId,
+                gst_rate: seedGstForMaterial(materialId),
+                cess_rate: seedCessForMaterial(materialId),
+              }
+            : l)),
+        };
+      }
+      return { ...prev, items: [...prev.items, line] };
+    });
+  };
+
+  /** The one action that actually keeps the map current, offered where the gap
+   *  is noticed. Additive only (the route's INSERT OR IGNORE), one pair, on
+   *  purpose. */
+  const addToVendorItems = async (materialId: string, name: string) => {
+    if (!billVendorId || !materialId) return;
+    setVendorMapBusy(true);
+    setBillMapNote(null);
+    try {
+      const res = await api('/api/vendor-materials', {
+        method: 'POST',
+        body: { vendor_id: billVendorId, material_id: materialId },
+      });
+      const j = await res.json().catch(() => null);
+      if (!res.ok) {
+        setBillMapNote(j?.error || `Could not add ${name} to ${vendorShort}'s items.`);
+        return;
+      }
+      setVendorMap((prev) =>
+        prev && prev.vendorId === billVendorId
+          ? { vendorId: prev.vendorId, ids: new Set(prev.ids).add(materialId) }
+          : prev);
+      setBillMapNote(`${name} added to ${vendorShort}'s items.`);
+    } catch (err: any) {
+      setBillMapNote(err?.message || `Could not add ${name} to ${vendorShort}'s items.`);
+    } finally {
+      setVendorMapBusy(false);
+    }
   };
 
   // Calculate bill totals, split the two bill-level charges across the lines, and
@@ -641,43 +1102,66 @@ export default function PurchasesPage() {
       const sgst = Math.floor(taxPaise / 2) / 100;
       const cgst = r2(taxValue - sgst);
 
+      // GST COMPENSATION CESS — a SEPARATE levy on the same post-discount base.
+      // Deliberately absent from taxValue/cgst/sgst: it is not GST, it is not
+      // halved into CGST/SGST, and adding it to that sum would misstate the very
+      // figure a GST return is filed on. It is also NOT input credit against GST
+      // (only against cess output liability), so no label here may call it one.
+      // Whole paise, byte-identical to the server's expression — the ÷100 for
+      // percent and the ×100 for paise cancel, which is why there is no /100 in
+      // sight. Same zero-rate lock: TGBCL duty rides on the store's own bill.
+      const cessRate = zeroRated ? 0 : (parseFloat(item.cess_rate) || 0);
+      const cessPaise = cessRate > 0 ? Math.max(0, Math.round(taxable * cessRate)) : 0;
+      const compensationCess = cessPaise / 100;
+
       return {
         ...item,
         discount_share: discountShare,
         delivery_share: deliveryShare,
         final_unit_price: finalUnitPrice,
         gst_rate_effective: rate,
+        cess_rate_effective: cessRate,
+        compensation_cess: compensationCess,
         zero_rated: zeroRated,
         taxable,
         tax_value: taxValue,
         cgst,
         sgst,
-        line_incl_tax: r2(taxable + taxValue),
+        line_incl_tax: r2(taxable + taxValue + compensationCess),
       };
     });
 
     const cgstTotal = r2(pricedItems.reduce((s, i) => s + i.cgst, 0));
     const sgstTotal = r2(pricedItems.reduce((s, i) => s + i.sgst, 0));
     const taxTotal = r2(cgstTotal + sgstTotal);
+    // Kept OUT of taxTotal on purpose — see the per-line note above.
+    const cessTotal = r2(pricedItems.reduce((s, i) => s + i.compensation_cess, 0));
     // Bill-level taxable is goods − discount computed once, not the sum of the
     // per-line shares (those can drift a paisa on rounding). This is the figure
     // printed on the paper bill.
     const taxableTotal = r2(subtotal - discountAmount);
 
     // What you actually pay the vendor: goods, less discount, plus the tax the
-    // vendor charges, plus delivery. Delivery and tax are both part of the bill
-    // total but NOT of the goods cost — see the per-line split above.
-    const grandTotal = r2(taxableTotal + taxTotal + deliveryAmount);
+    // vendor charges, plus compensation cess, plus delivery. Cess belongs here
+    // — the vendor really does charge it — even though it is kept out of
+    // taxTotal so the GST figure stays exactly the GST figure.
+    const grandTotal = r2(taxableTotal + taxTotal + cessTotal + deliveryAmount);
 
     return {
       items: pricedItems, subtotal, discountAmount, deliveryAmount, grandTotal, discountClamped,
-      taxableTotal, cgstTotal, sgstTotal, taxTotal,
+      taxableTotal, cgstTotal, sgstTotal, taxTotal, cessTotal,
     };
   })();
 
   const handleBillSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBillError(null);
+    // Clear notes from the PREVIOUS bill before this one starts, or a warning
+    // about last night's vendor sits on screen looking like it belongs to this
+    // save. Collected per-line below and published once, after the save lands.
+    setBillNotices([]);
+    const notices: string[] = [];
+    let merged = 0;
 
     if (!billData.vendor.trim()) {
       setBillError('Vendor name is required.');
@@ -685,6 +1169,36 @@ export default function PurchasesPage() {
     }
     if (!billData.date) {
       setBillError('Date is required.');
+      return;
+    }
+
+    // DUPLICATE LINES. Checked before any money check because it is the one
+    // error that silently doubles STOCK as well as cost: every line below is
+    // POSTed as its own purchases row.
+    // Only lines that would really be written count (quantity AND rate present)
+    // — a half-typed second row cannot double anything, so it warns on screen
+    // without holding the bill up.
+    if (dupInfo.blockingMerges.length > 0) {
+      const { g, m } = dupInfo.blockingMerges[0];
+      setBillError(
+        `${g.name} is on line ${m.lineNos.join(' and line ')} twice at the same rate ` +
+        `(₹${m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/${g.unit}). ` +
+        `Each line books its own purchase row, so stock would be credited twice. ` +
+        `Use "Merge into one line" above — ${m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = ${fmtQtyNum(m.total)} ${g.unit}.`
+      );
+      return;
+    }
+    // Different rates are NOT the same line. Nothing is merged and nothing is
+    // averaged; the user says which it is.
+    const unackedDup = dupInfo.conflicts.filter((g) => !dupAck.includes(g.sig));
+    if (unackedDup.length > 0) {
+      const g = unackedDup[0];
+      setBillError(
+        `${g.name} is on lines ${g.lineNos.join(', ')} with ${g.differs.join(' and ')}. ` +
+        `Those are not the same line, so nothing is merged automatically — averaging them would ` +
+        `corrupt the item's rate and every recipe cost built on it. ` +
+        `Fix the lines, or tick "Keep both" above to confirm the bill really is split that way.`
+      );
       return;
     }
 
@@ -782,11 +1296,20 @@ export default function PurchasesPage() {
           gst_rate: item.gst_rate_effective,
           cgst: item.cgst,
           sgst: item.sgst,
+          // COMPENSATION CESS as a RATE only. Unlike cgst/sgst — which still
+          // accept figures purely for back-compat with this modal's pre-existing
+          // wire shape — the server derives the rupees itself and does not take
+          // a client amount. There is no legacy caller to keep, so the narrower
+          // contract is the better one.
+          cess_rate: item.cess_rate_effective,
           notes: [`Bill #${billData.bill_number || 'N/A'}`,
                   item.discount_share > 0 ? `Discount ₹${item.discount_share} (netted off rate)` : '',
                   item.tax_value > 0
                     ? `GST ${item.gst_rate_effective}% ₹${item.tax_value} (CGST ₹${item.cgst} + SGST ₹${item.sgst}, not in rate)`
                     : (item.zero_rated ? 'GST 0% (store/TGBCL item — taxed on the store bill)' : ''),
+                  item.compensation_cess > 0
+                    ? `Compensation cess ${item.cess_rate_effective}% ₹${item.compensation_cess} (not in rate)`
+                    : '',
                   item.delivery_share > 0 ? `Delivery ₹${item.delivery_share} (not in rate)` : '',
                   billData.notes, ...noteExtras].filter(Boolean).join(' | '),
         };
@@ -796,16 +1319,35 @@ export default function PurchasesPage() {
           body: body,
         });
 
+        const json = await res.json().catch(() => null);
+
         if (!res.ok) {
-          const errJson = await res.json().catch(() => null);
-          throw new Error(errJson?.error || `Failed to add purchase for item`);
+          throw new Error(json?.error || `Failed to add purchase for item`);
         }
+
+        // The save SUCCEEDED. Anything below is the server telling us something
+        // the storekeeper needs to know anyway — a pair it would not map, or a
+        // line it folded into an existing one. Dropping the body (which this
+        // loop used to do) made both invisible: "4 items added" then 3 rows,
+        // with no explanation on screen.
+        const warn = json?.vendor_mapping?.warning;
+        if (warn) notices.push(warn);
+        if (json?.merge_message) notices.push(json.merge_message);
+        if (json?.merged) merged += 1;
       }
 
       setBillModalOpen(false);
       setBillData({ ...emptyBill });
+      setBillNotices(notices);
       await fetchPurchases(appliedFilters);
-      setToast(`Bill entered: ${validItems.length} items from ${billData.vendor} added!`);
+      // Count what LANDED, not what was sent: merged lines fold into an existing
+      // row, so promising 4 new rows when 3 appear is the same lie as before.
+      const landed = validItems.length - merged;
+      setToast(
+        merged > 0
+          ? `Bill entered: ${landed} item${landed === 1 ? '' : 's'} from ${billData.vendor} added, ${merged} combined with a line already on this bill.`
+          : `Bill entered: ${validItems.length} items from ${billData.vendor} added!`
+      );
       setTimeout(() => setToast(null), 4000);
     } catch (err: any) {
       setBillError(err.message);
@@ -881,9 +1423,29 @@ export default function PurchasesPage() {
       const cgst = num(r.cgst ?? r.CGST);
       const sgst = num(r.sgst ?? r.SGST);
       const specialExciseCess = num(r.special_excise_cess ?? r['SPECIAL EXCISE CESS'] ?? r.cess ?? r.CESS);
+      // The EIGHTH charge. Read it under its FULL name only: a bare `cess`
+      // column belongs to special_excise_cess above (TGBCL sheets have used it
+      // that way for as long as the liquor register has existed), and quietly
+      // re-pointing it here would move excise money into a GST levy.
+      const compensationCess = num(r.compensation_cess ?? r['COMPENSATION CESS'] ?? r['Compensation Cess']);
       const tcs = num(r.tcs ?? r.TCS);
       const deliveryCharges = num(r.delivery_charges ?? r['DELIVERY CHARGES'] ?? r.delivery ?? r.Delivery);
       const mrpRoundOff = num(r.mrp_round_off ?? r['MRP ROUND OFF'] ?? r.mrp_rounding ?? r['MRP Round Off']);
+      // A lump `gst_amount` column becomes CGST + SGST BESIDE the goods rate —
+      // it is a reclaimable input credit and must never touch unit_price (that
+      // feeds updateMaterialPrice → average_price → every recipe cost; a
+      // bill-level GST control was deleted from this codebase for doing exactly
+      // that). Same integer-paise split the bill form and the server use, odd
+      // paisa to CGST, so tax_value === cgst + sgst exactly.
+      // If the sheet already itemised cgst/sgst, those win and gst_amount is
+      // ignored — otherwise the same rupee would be recorded twice.
+      let cgstOut = cgst;
+      let sgstOut = sgst;
+      if (gstAmount > 0 && cgst === 0 && sgst === 0) {
+        const taxPaise = Math.round(gstAmount * 100);
+        sgstOut = Math.floor(taxPaise / 2) / 100;
+        cgstOut = Math.round((gstAmount - sgstOut) * 100) / 100;
+      }
 
       // Parse date - handle various formats
       let date = r.date || r.DATE || r.Date || r['INWARD DATE'] || r.inward_date || '';
@@ -906,12 +1468,21 @@ export default function PurchasesPage() {
       // folding them into unit_price would bake them into the weighted-average
       // cost AND count them a second time in Total Inward. When only the
       // charge-inclusive TOTAL INWARD AMOUNT is available, back the charges out.
-      const chargeBlock = -discount + cgst + sgst + specialExciseCess + tcs + deliveryCharges + mrpRoundOff;
+      // GST rides in the charge block (cgstOut/sgstOut), never in the rate —
+      // so it is backed out of a charge-INCLUSIVE total exactly like every
+      // other charge, and the derived rate stays charge-free.
+      // compensationCess is in here for the same reason as every other charge:
+      // when only the charge-INCLUSIVE total is given, anything left out of this
+      // sum stays baked into the derived rate — and unit_price feeds
+      // updateMaterialPrice → average_price → every recipe cost. Omitting the
+      // 8th charge quietly folded GST compensation cess into the cost basis on
+      // exactly the sheets that carry it (aerated drinks, tobacco).
+      const chargeBlock = -discount + cgstOut + sgstOut + compensationCess + specialExciseCess + tcs + deliveryCharges + mrpRoundOff;
       let finalUnitPrice = unitPrice;
       if (finalUnitPrice === 0 && quantity > 0) {
         const base = totalAmount > 0 ? totalAmount
           : (totalInward !== 0 ? totalInward - chargeBlock : 0);
-        if (base > 0) finalUnitPrice = Math.round(((base + gstAmount) / quantity) * 100) / 100;
+        if (base > 0) finalUnitPrice = Math.round((base / quantity) * 100) / 100;
       }
       // Report the charge-free base so the preview total and the list's
       // Total Inward reconcile back to the source sheet.
@@ -933,7 +1504,8 @@ export default function PurchasesPage() {
         purchase_unit: String(purchaseUnit).trim(),
         category_name: String(categoryName).trim(),
         po_qty: poQty,
-        discount, cgst, sgst, special_excise_cess: specialExciseCess,
+        discount, cgst: cgstOut, sgst: sgstOut,
+        compensation_cess: compensationCess, special_excise_cess: specialExciseCess,
         tcs, delivery_charges: deliveryCharges, mrp_round_off: mrpRoundOff,
       };
     }).filter((r: any) => r.item_name || r.sku); // keep rows identified by name OR sku
@@ -1013,7 +1585,7 @@ export default function PurchasesPage() {
     // generated by the system.
     const header = ['date', 'vendor', 'bill_no', 'category_name', 'sku', 'item_name',
       'po_qty', 'quantity', 'purchase_unit', 'unit_price', 'total_amount',
-      'discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off',
+      'discount', 'cgst', 'sgst', 'compensation_cess', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off',
       'total_inward_amount', 'brand', 'gst_amount', 'notes'];
     const unitOf = (m: any) => String(m?.purchase_unit || m?.unit || '').trim();
     const rows = [
@@ -1021,7 +1593,7 @@ export default function PurchasesPage() {
         date: todayString(), vendor: 'ABC Traders', bill_no: 'ABC/2026/117',
         category_name: ex1?.category || '', sku: ex1?.sku || '', item_name: ex1?.name || 'Tomato',
         po_qty: 10, quantity: 10, purchase_unit: unitOf(ex1) || 'kg', unit_price: 25, total_amount: 250,
-        discount: '', cgst: '', sgst: '', special_excise_cess: '', tcs: '', delivery_charges: '', mrp_round_off: '',
+        discount: '', cgst: '', sgst: '', compensation_cess: '', special_excise_cess: '', tcs: '', delivery_charges: '', mrp_round_off: '',
         total_inward_amount: '', brand: '', gst_amount: '',
         notes: 'SAMPLE — delete before uploading',
       },
@@ -1029,9 +1601,9 @@ export default function PurchasesPage() {
         date: todayString(), vendor: 'XYZ Supplies', bill_no: 'XYZ-8842',
         category_name: ex2?.category || '', sku: ex2?.sku || '', item_name: ex2?.name || 'Refined Oil',
         po_qty: 5, quantity: 5, purchase_unit: unitOf(ex2) || 'L', unit_price: 180, total_amount: 900,
-        discount: 50, cgst: 45, sgst: 45, special_excise_cess: '', tcs: '', delivery_charges: 30, mrp_round_off: '',
-        total_inward_amount: 970, brand: '', gst_amount: '',
-        notes: 'SAMPLE — 900 − 50 + 45 + 45 + 30 = 970 total inward; rate stays 180',
+        discount: 50, cgst: 45, sgst: 45, compensation_cess: 102, special_excise_cess: '', tcs: '', delivery_charges: 30, mrp_round_off: '',
+        total_inward_amount: 1072, brand: '', gst_amount: '',
+        notes: 'SAMPLE — 900 − 50 + 45 + 45 + 102 + 30 = 1072 total inward; rate stays 180',
       },
     ];
     const ws = XLSX.utils.json_to_sheet(rows, { header });
@@ -1047,12 +1619,13 @@ export default function PurchasesPage() {
       ['category_name', 'optional', "Informational only — the item's real category comes from the Raw Material master."],
       ['total_inward_amount', 'optional', 'Charge-INCLUSIVE bill total for the line. Only used to derive the rate when unit_price AND total_amount are both blank (the charges are backed out first). Never let it fill total_amount — that must be charge-free.'],
       ['unit_price', 'YES*', '₹ per PURCHASE unit. *Optional if you fill total_amount instead — the unit price is then derived.'],
-      ['total_amount', 'optional', 'SUBTOTAL — the CHARGE-FREE line amount (qty × rate). If given without unit_price: unit_price = (total_amount + gst_amount) ÷ quantity. Do NOT put the charge-inclusive Total Inward here.'],
-      ['gst_amount', 'optional', '₹ GST for the line. Folded into the effective unit price.'],
+      ['total_amount', 'optional', 'SUBTOTAL — the CHARGE-FREE line amount (qty × rate). If given without unit_price: unit_price = total_amount ÷ quantity. Do NOT put the charge-inclusive Total Inward here.'],
+      ['gst_amount', 'optional', '₹ GST for the line. Recorded as CGST + SGST beside the rate — never added into the item price. Leave blank if you filled cgst/sgst yourself (those win).'],
       ['vendor', 'optional', 'Supplier name.'],
       ['bill_no', 'optional', "The VENDOR's own bill number, as printed on the bill they give you (aliases: bill_number, invoice_no, INVOICE ID). Part of the duplicate check — the same bill re-uploaded is skipped, but two different bills are both kept. Do NOT put our Invoice ID here."],
       ['(Invoice ID)', 'AUTO', 'NOT a column — our own system number (PINV-2026-0001) is generated automatically on upload. Lines sharing the same vendor + bill_no + date get ONE Invoice ID.'],
-      ['discount / cgst / sgst / special_excise_cess / tcs / delivery_charges / mrp_round_off', 'optional', '₹ per-line charges (GRN-Inward format). RECORDED ONLY — they do NOT change the unit cost/weighted-average. Total Inward = (qty × rate) − discount + cgst + sgst + cess + tcs + delivery + mrp_round_off. Leave blank/0 if not applicable. mrp_round_off may be negative.'],
+      ['discount / cgst / sgst / compensation_cess / special_excise_cess / tcs / delivery_charges / mrp_round_off', 'optional', '₹ per-line charges (GRN-Inward format). RECORDED ONLY — they do NOT change the unit cost/weighted-average. Total Inward = (qty × rate) − discount + cgst + sgst + compensation_cess + special_excise_cess + tcs + delivery + mrp_round_off. Leave blank/0 if not applicable. mrp_round_off may be negative.'],
+      ['compensation_cess', 'optional', '₹ GST COMPENSATION CESS for the line (e.g. 12% on aerated/carbonated drinks, and tobacco). A SEPARATE levy from GST — do not add it into cgst/sgst. DISTINCT from special_excise_cess, which means TGBCL Special Excise Cess on the liquor inward register. Write the header out in full: a bare "cess" column is still read as special_excise_cess for back-compat with those TGBCL sheets.'],
       ['brand', 'optional', 'Brand, if you track it.'],
       ['date', 'optional', 'DD-MM-YYYY, DD/MM/YYYY or YYYY-MM-DD. Defaults to today. Non-admins cannot backdate beyond the allowed window or use future dates.'],
       ['notes', 'optional', 'Any remark.'],
@@ -1485,10 +2058,27 @@ export default function PurchasesPage() {
                     </td>
                     <td className="py-3 px-4 text-right font-mono">
                       {(() => {
+                        // ALWAYS print a number. This is a right-aligned money
+                        // column sitting next to Total; a dash reads as "the
+                        // system lost the value" — which is exactly how it was
+                        // reported. Every other inward surface (GRN detail, GRN
+                        // print, both register CSVs, the bulk-upload preview on
+                        // this same page) prints one unconditionally.
+                        // The emphasis test is "is ANY charge column recorded",
+                        // NOT "does the net come to zero": a ₹100 discount plus
+                        // ₹100 delivery nets to zero and both are real.
                         const c = (k: string) => Number((p as any)[k]) || 0;
-                        const charges = -c('discount') + c('cgst') + c('sgst') + c('special_excise_cess') + c('tcs') + c('delivery_charges') + c('mrp_round_off');
-                        if (charges === 0) return <span className="text-[#8B7355]">—</span>;
-                        return <span className="text-[#af4408] font-medium">{formatCurrency((Number(p.total_price) || 0) + charges)}</span>;
+                        // compensation_cess is the EIGHTH charge column: GST
+                        // Compensation Cess, distinct from special_excise_cess
+                        // (which means TGBCL Special Excise Cess everywhere it
+                        // is read). Both are recorded-only and both add.
+                        const KEYS = ['discount', 'cgst', 'sgst', 'compensation_cess', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off'];
+                        const anyCharge = KEYS.some((k) => c(k) !== 0);
+                        const charges = -c('discount') + c('cgst') + c('sgst') + c('compensation_cess') + c('special_excise_cess') + c('tcs') + c('delivery_charges') + c('mrp_round_off');
+                        const val = (Number(p.total_price) || 0) + charges;
+                        return anyCharge
+                          ? <span className="text-[#af4408] font-medium">{formatCurrency(val)}</span>
+                          : <span className="text-[#8B7355]" title="No inward charges recorded — same as Total">{formatCurrency(val)}</span>;
                       })()}
                     </td>
                     <td className="py-3 px-4 text-[#8B7355] max-w-[200px] truncate">
@@ -1559,6 +2149,33 @@ export default function PurchasesPage() {
       </div>
 
       {/* Toast */}
+      {/* Server notes from the last successful bill. AMBER, not red, and it
+          never auto-dismisses: the bill IS saved (see the "a bill is a fact"
+          rule above), but a pair the map refused to learn is a decision only a
+          human can finish, on Vendor Items. */}
+      {billNotices.length > 0 && (
+        <div className="fixed bottom-24 right-6 z-50 max-w-md rounded-lg border border-amber-300 bg-amber-50 shadow-lg">
+          <div className="flex items-start gap-2 px-4 py-3">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+            <div className="flex-1 space-y-1.5">
+              <p className="text-xs font-semibold text-amber-900">
+                Bill saved — {billNotices.length === 1 ? 'one thing' : `${billNotices.length} things`} to know
+              </p>
+              {billNotices.map((n, i) => (
+                <p key={i} className="text-[11px] leading-snug text-amber-800">{n}</p>
+              ))}
+            </div>
+            <button
+              onClick={() => setBillNotices([])}
+              className="shrink-0 text-amber-700 hover:opacity-70 transition-opacity"
+              aria-label="Dismiss notes"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {toast && (
         <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3 bg-green-600 text-white rounded-lg shadow-lg animate-[fadeIn_0.3s_ease-out]">
           <span className="text-sm font-medium">{toast}</span>
@@ -1646,6 +2263,7 @@ export default function PurchasesPage() {
                       const sub = bulkParsedData.reduce((s, r) => s + (r.total_amount || r.unit_price * r.quantity), 0);
                       const chg = bulkParsedData.reduce((s, r) => s
                         - (Number(r.discount) || 0) + (Number(r.cgst) || 0) + (Number(r.sgst) || 0)
+                        + (Number(r.compensation_cess) || 0)
                         + (Number(r.special_excise_cess) || 0) + (Number(r.tcs) || 0)
                         + (Number(r.delivery_charges) || 0) + (Number(r.mrp_round_off) || 0), 0);
                       return (
@@ -2029,6 +2647,82 @@ export default function PurchasesPage() {
                   </button>
                 </div>
 
+                {/* VENDOR ↔ ITEM MAPPING — consulted, never blocking. Shown only
+                    when the typed vendor resolves to a master row AND the map
+                    actually loaded; a failed fetch leaves this whole block out
+                    and the form behaves exactly as it did before. */}
+                {billVendorId && vendorMapIds && (
+                  <div className="mb-2 rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2">
+                    {vendorMappedMaterials.length === 0 ? (
+                      /* Said ONCE, at the top — annotating twenty lines with the
+                         same sentence would be noise, not information. */
+                      <p className="text-[11px] text-[#6B5744] flex items-start gap-1.5">
+                        <Link2 className="w-3.5 h-3.5 shrink-0 mt-px text-[#8B7355]" />
+                        <span>
+                          No items are mapped to <strong>{vendorShort}</strong> yet, so there is nothing to
+                          suggest on these lines. Saving this bill records each new pair automatically —
+                          once. Use <strong>Add to this vendor&apos;s items</strong> on a line to bring back a
+                          pair someone removed, or manage the list on{' '}
+                          <Link
+                            href={`/vendors/materials?vendor=${encodeURIComponent(billVendorId)}`}
+                            target="_blank"
+                            className="text-[#af4408] underline"
+                          >
+                            Vendor Items
+                          </Link>.
+                        </span>
+                      </p>
+                    ) : (
+                      <>
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <p className="text-[11px] text-[#6B5744] flex items-start gap-1.5">
+                            <Link2 className="w-3.5 h-3.5 shrink-0 mt-px text-[#af4408]" />
+                            <span>
+                              <strong>{vendorMappedMaterials.length}</strong> item
+                              {vendorMappedMaterials.length === 1 ? ' is' : 's are'} mapped to{' '}
+                              <strong>{vendorShort}</strong> — marked <span className="text-[#af4408]">★</span> in
+                              every picker below. Any other material can still be picked and still saves.
+                            </span>
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => setVendorItemsOpen((o) => !o)}
+                            className="px-2 py-1 text-[10px] font-medium text-[#af4408] border border-[#af4408] rounded-lg hover:bg-[#af4408]/10"
+                          >
+                            {vendorItemsOpen ? 'Hide' : 'Show'} their items
+                          </button>
+                        </div>
+                        {vendorItemsOpen && (
+                          <div className="mt-2 max-h-40 overflow-y-auto flex flex-wrap gap-1.5">
+                            {/* One click drops the item on the first empty line —
+                                the vendor's own list, reachable before touching
+                                the 900-row picker. */}
+                            {vendorMappedMaterials.slice(0, 300).map((m: any) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() => placeMaterialOnLine(String(m.id), String(m.name))}
+                                title={`${m.sku ? m.sku + ' — ' : ''}${m.name}`}
+                                className="px-2 py-1 rounded-full border border-[#E8D5C4] bg-white text-[10px] text-[#2D1B0E] hover:border-[#af4408] hover:bg-[#FFF1E3]"
+                              >
+                                {m.name}
+                              </button>
+                            ))}
+                            {vendorMappedMaterials.length > 300 && (
+                              <span className="self-center text-[10px] text-[#8B7355]">
+                                +{(vendorMappedMaterials.length - 300).toLocaleString('en-IN')} more — use the picker
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {billMapNote && (
+                      <p className="mt-1.5 text-[10px] text-[#af4408]">{billMapNote}</p>
+                    )}
+                  </div>
+                )}
+
                 {/* Entry convention reminder */}
                 <div className="text-[11px] text-[#6B5744] bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5 mb-2">
                   <span className="font-semibold text-amber-900">Default: enter at bottle level.</span>
@@ -2036,6 +2730,78 @@ export default function PurchasesPage() {
                   &nbsp;<span className="text-amber-900">Want to type cases instead?</span> If the material has a <code>case_size</code>
                   set in inventory, a <strong>BTL / CASE</strong> toggle appears next to the qty input — pick CASE and type the case count + per-case price.
                 </div>
+                {/* SAME ITEM ON MORE THAN ONE LINE — flagged as it is typed, not
+                    at submit. Merge is offered for an exact repeat; a split-rate
+                    repeat is never merged, only surfaced for a decision. */}
+                {dupInfo.groups.length > 0 && (
+                  <div className="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 space-y-2">
+                    <p className="text-[11px] text-amber-900 flex items-start gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                      <span>
+                        <strong>The same item is on more than one line.</strong> Every line is saved as its
+                        own purchase row — so a repeated item credits stock twice and is averaged into the
+                        item&apos;s cost twice, which then re-costs every recipe that uses it.
+                      </span>
+                    </p>
+                    {dupInfo.groups.map((g) => (
+                      <div key={g.materialId} className="rounded-md border border-amber-200 bg-white px-2.5 py-2 space-y-1.5">
+                        <p className="text-xs font-medium text-[#2D1B0E]">
+                          {g.name}{' '}
+                          <span className="font-normal text-[#8B7355]">— lines {g.lineNos.join(', ')}</span>
+                        </p>
+
+                        {/* Identical in every respect → one line, one click. The
+                            quantity is summed onto the first of them; the rate is
+                            untouched, so cost and tax are unchanged. */}
+                        {g.mergeable.map((m) => (
+                          <div key={m.key} className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-[11px] text-[#6B5744]">
+                              Lines {m.lineNos.join(' + ')} are identical at{' '}
+                              ₹{m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/{g.unit} —{' '}
+                              <strong className="text-[#2D1B0E]">
+                                {m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = {fmtQtyNum(m.total)} {g.unit}
+                              </strong>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => mergeBillLines(g.materialId, m.key)}
+                              className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-white bg-[#af4408] hover:bg-[#8a3506] rounded-lg"
+                            >
+                              <Merge className="w-3 h-3" /> Merge into one line
+                            </button>
+                          </div>
+                        ))}
+
+                        {/* Not the same thing. A bill really can charge two rates
+                            for one item, so the choice is the user's — merging
+                            would average the rate and corrupt every recipe cost
+                            derived from it. */}
+                        {g.differs.length > 0 && (
+                          <div className="rounded border border-amber-200 bg-amber-50/70 px-2 py-1.5 space-y-1">
+                            <p className="text-[11px] text-amber-900">
+                              These lines have {g.differs.join(' and ')}, so they are <strong>not</strong> the
+                              same line and nothing is merged automatically. Correct the entry if it was a
+                              mis-type — or say the bill really is split this way.
+                            </p>
+                            <label className="flex items-start gap-1.5 text-[11px] text-[#6B5744] cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={dupAck.includes(g.sig)}
+                                onChange={() => { toggleDupAck(g.sig); setBillError(null); }}
+                                className="mt-0.5 accent-[#af4408]"
+                              />
+                              <span>
+                                Keep both — the vendor really billed {g.name} at more than one rate/brand on
+                                this bill.
+                              </span>
+                            </label>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 <div className="overflow-x-auto rounded-xl border border-[#E8D5C4]">
                   {/* md:min-w forces the horizontal scroll of the wrapper above
                       instead of crushing eleven columns; on mobile the rows are
@@ -2060,23 +2826,52 @@ export default function PurchasesPage() {
                             the bill charges. Final Unit ₹ sits last and stays the
                             GOODS rate — it is the number that becomes cost. */}
                         <th className="text-right py-2.5 px-3 font-medium w-[8%]" title="Line Total minus its discount share — the value GST is charged on">Taxable</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[8%]">GST %</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="Charged on the taxable value above, split into CGST + SGST. Recorded separately — never added into the item rate.">Tax (C+S)</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[9%]" title="Taxable + tax — what this line adds to the bill">Incl. Tax</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[6%]">GST %</th>
+                        <th className="text-right py-2.5 px-2 font-medium w-[6%]" title="GST Compensation Cess % — a SEPARATE levy from GST (12% on aerated drinks, other rates on tobacco). Charged on the same taxable value, recorded beside the rate, and never folded into CGST/SGST.">Cess %</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[8%]" title="Charged on the taxable value above, split into CGST + SGST. Recorded separately — never added into the item rate.">Tax (C+S)</th>
+                        <th className="text-right py-2.5 px-3 font-medium w-[8%]" title="Taxable + GST + compensation cess — what this line adds to the bill">Incl. Tax</th>
                         <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="Post-discount GOODS rate — this is what is stored as the purchase price. Tax is NOT in it.">Final Unit ₹</th>
                         <th className="py-2.5 px-2 w-8"></th>
                       </tr>
                     </thead>
                     <tbody className="block md:table-row-group">
                       {billCalc.items.map((item, idx) => (
-                        <tr key={item.id} className="border-t border-[#E8D5C4]/50 block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:border-t md:space-y-0">
+                        <tr key={item.id}
+                            /* Tinted while this line shares its material with
+                               another — the panel above names the pair, this
+                               shows WHICH rows it is talking about. */
+                            className={`border-t border-[#E8D5C4]/50 block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:border-t md:space-y-0 ${
+                              dupInfo.flagged.has(idx) ? 'bg-amber-50/70' : ''}`}>
                           <td className="py-2 px-2 block md:table-cell">
                             <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
+                            {/* billPickerMaterials = the same full catalogue with
+                                this vendor's mapped items marked ★. Nothing is
+                                filtered out — every material stays pickable. */}
                             <MaterialTypeahead
-                              materials={materials as any} purchaseBasis
+                              materials={billPickerMaterials as any} purchaseBasis
                               value={item.material_id}
                               onPick={(id) => updateBillLine(item.id, 'material_id', id)}
                             />
+                            {/* A bill is a fact: an unmapped pair is a NOTE with a
+                                one-click fix, never a block on saving. */}
+                            {vendorMapIds && vendorMapIds.size > 0 && item.material_id
+                              && !vendorMapIds.has(item.material_id) && (() => {
+                              const mat = materials.find((m) => String(m.id) === String(item.material_id)) as any;
+                              const nm = String(mat?.name || item.material_id);
+                              return (
+                                <div className="mt-1 text-[9px] leading-tight text-amber-800">
+                                  Not in {vendorShort}&apos;s items.{' '}
+                                  <button
+                                    type="button"
+                                    disabled={vendorMapBusy}
+                                    onClick={() => addToVendorItems(String(item.material_id), nm)}
+                                    className="underline font-medium text-[#af4408] disabled:opacity-50"
+                                  >
+                                    Add to this vendor&apos;s items
+                                  </button>
+                                </div>
+                              );
+                            })()}
                           </td>
                           <td className="py-2 px-2 block md:table-cell">
                             <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Brand</span>
@@ -2211,6 +3006,33 @@ export default function PurchasesPage() {
                               </select>
                             )}
                           </td>
+                          <td className="py-2 px-2 text-right block md:table-cell">
+                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Cess %</span>
+                            {item.zero_rated ? (
+                              // Same reason as the GST cell: a TGBCL line's cess
+                              // is levied on the store's own bill, not ours.
+                              <div className="text-[10px] text-blue-700 leading-tight">0%</div>
+                            ) : (
+                              // A FREE number input, not a select — compensation
+                              // cess has no fixed rate card (12% on aerated
+                              // drinks, other rates on tobacco), and it mirrors
+                              // the master's own free 0-100 field. Raw string in
+                              // state so a decimal stays typeable.
+                              <input
+                                type="number" step="0.01" min="0" max="100"
+                                value={item.cess_rate}
+                                onChange={(e) => updateBillLine(item.id, 'cess_rate', e.target.value)}
+                                placeholder="0"
+                                className="w-full px-1.5 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
+                                title="GST Compensation Cess % for this line (e.g. 12 on aerated drinks). Seeded from the Raw Material master; change it if the printed bill says otherwise. A separate levy — it is NOT part of CGST/SGST."
+                              />
+                            )}
+                            {item.compensation_cess > 0 && (
+                              <span className="block text-[9px] text-[#8B7355] font-mono">
+                                {formatCurrency(item.compensation_cess)}
+                              </span>
+                            )}
+                          </td>
                           <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744] block md:table-cell">
                             <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Tax (CGST + SGST)</span>
                             {formatCurrency(item.tax_value)}
@@ -2256,7 +3078,7 @@ export default function PurchasesPage() {
               {/* Reads in the same order as the paper bill in the storekeeper's
                   hand, so the screen can be reconciled against it line by line. */}
               <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4">
-                <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-7 gap-4 text-center">
+                <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-4 text-center">
                   <div>
                     <p className="text-xs text-[#8B7355] mb-0.5">Goods Total</p>
                     <p className="text-lg font-bold text-[#2D1B0E]">{formatCurrency(billCalc.subtotal)}</p>
@@ -2278,6 +3100,10 @@ export default function PurchasesPage() {
                     <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.sgstTotal)}</p>
                   </div>
                   <div>
+                    <p className="text-xs text-[#8B7355] mb-0.5" title="GST Compensation Cess — a separate levy, deliberately NOT part of CGST/SGST above">Cess</p>
+                    <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.cessTotal)}</p>
+                  </div>
+                  <div>
                     <p className="text-xs text-[#8B7355] mb-0.5">Delivery</p>
                     <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.deliveryAmount)}</p>
                   </div>
@@ -2291,8 +3117,10 @@ export default function PurchasesPage() {
                   Per line: Taxable = Line Total − Discount Share, Tax = Taxable × GST% (split half CGST, half SGST).
                   Final Unit Price = Taxable ÷ Qty, and that is what is stored as the purchase price
                   (case-mode lines are stored per bottle, expanded by case size: rate ÷ case size against qty × case size).
-                  So a discount lowers item cost, while delivery and GST are recorded on the bill without changing it —
+                  So a discount lowers item cost, while delivery, GST and cess are recorded on the bill without changing it —
                   GST is reclaimable input credit, not part of what the food costs.
+                  Compensation Cess is a separate levy (it is not GST and is not split into CGST/SGST); it is
+                  recorded beside the rate the same way and is also kept out of item cost.
                 </p>
               </div>
 
@@ -2433,6 +3261,24 @@ function RecahoInwardModal({ onClose, onCommitted }:
                 <Stat label="Suppliers" value={preview.summary?.unique_suppliers?.toLocaleString('en-IN') || '0'} />
                 <Stat label="Total ₹" value={'₹' + (preview.summary?.total_amount || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })} />
               </div>
+              {/* The SPLIT of that Total, because the split is the whole point:
+                  the importer used to write the tax-inclusive Total Inward into
+                  purchases.total_price, so the goods rate itself carried the tax.
+                  Now only Goods becomes the purchase value and the rest is
+                  recorded in its own charge columns beside it. Showing all three
+                  lets the file be reconciled against the sheet BEFORE committing. */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                <Stat label="Goods ₹" value={'₹' + (preview.summary?.goods_amount || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })} />
+                <Stat label="GST ₹" value={'₹' + (preview.summary?.gst_amount || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })} />
+                <Stat label="Other charges ₹" value={'₹' + (preview.summary?.other_charges_amount || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })} />
+              </div>
+              <p className="text-[10px] text-[#6B5744] leading-relaxed">
+                Only <b>Goods</b> goes into the purchase rate and therefore into recipe cost.
+                <b> GST</b> is recorded beside it as reclaimable input credit.
+                <b> Other charges</b> — TGBCL excise / special cess / TCS, delivery, MRP round-off —
+                are recorded beside it as non-creditable landed cost.
+                Goods + GST + Other charges = Total (Other charges is net of any discount on the line).
+              </p>
               <div className="text-[11px] text-[#6B5744]">
                 Date range: <b>{preview.summary?.date_from || '?'}</b> → <b>{preview.summary?.date_to || '?'}</b>
                 {preview.sheets?.length > 1 && <> · Sheets in file: {preview.sheets.join(', ')}</>}
@@ -2447,8 +3293,13 @@ function RecahoInwardModal({ onClose, onCommitted }:
                         <th className="text-left  py-1 px-2 font-medium">Item</th>
                         <th className="text-right py-1 px-2 font-medium">Qty</th>
                         <th className="text-left  py-1 px-2 font-medium">Unit</th>
-                        <th className="text-right py-1 px-2 font-medium">Rate</th>
-                        <th className="text-right py-1 px-2 font-medium">Total</th>
+                        <th className="text-right py-1 px-2 font-medium" title="Qty × Rate — the charge-free goods value. THIS is what becomes the purchase amount.">Subtotal</th>
+                        {/* Two visibly different quantities, side by side. They were
+                            being conflated: the tax-inclusive figure was written into
+                            total_price, so a GoT (TGBCL) line's goods value silently
+                            carried its excise. On an ordinary GST vendor the gap is
+                            the reclaimable tax. */}
+                        <th className="text-right py-1 px-2 font-medium" title="Subtotal − discount + GST + excise / cess / TCS + delivery + round-off — what the bill charges.">Total Inward</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2460,7 +3311,8 @@ function RecahoInwardModal({ onClose, onCommitted }:
                           <td className="py-1 px-2 text-right font-mono">{r.inwardQty}</td>
                           <td className="py-1 px-2">{r.purchaseUnit}</td>
                           <td className="py-1 px-2 text-right font-mono">₹{r.rate}</td>
-                          <td className="py-1 px-2 text-right font-mono">₹{r.totalAmount}</td>
+                          <td className="py-1 px-2 text-right font-mono">₹{r.subtotal}</td>
+                          <td className="py-1 px-2 text-right font-mono font-semibold text-[#af4408]">₹{r.totalAmount}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -2491,6 +3343,61 @@ function RecahoInwardModal({ onClose, onCommitted }:
               </ul>
               {committed.errors?.length > 0 && (
                 <div className="text-[10px] text-amber-700">First errors: {committed.errors.slice(0,3).join(' · ')}</div>
+              )}
+            </div>
+          )}
+
+          {/* Unreconciled-charge popup — the sheet carries a charge column this
+              system has no home for (its VAT / CESS columns, which are 0 in every
+              real export so far). The row is NOT rejected: its goods value is the
+              one figure we are certain of, and refusing the line would lose the
+              stock as well as the charge. So the purchase lands correct-by-goods
+              and the rupees we could not file are named here rather than being
+              silently dropped — or, worse, silently posted into special_excise_cess
+              and reported as an excise the government never levied. */}
+          {committed && committed.charge_warnings?.length > 0 && (
+            <div className="bg-amber-50 border-2 border-amber-300 rounded-lg p-4 space-y-2">
+              <h3 className="text-sm font-semibold text-amber-900 inline-flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4" /> {committed.charge_warnings.length} line(s) with a charge that could not be recorded
+              </h3>
+              <p className="text-[11px] text-amber-900">
+                These rows <b>were imported</b>, with their correct goods-only value — stock and cost
+                are right, and the charge was <b>never folded into the rate</b>. Only the amount below
+                could not be filed: either the sheet carries a charge this system has no column for,
+                or it charged GST on a store/TGBCL line where zero-rating wins. It is therefore
+                <b> missing from Total Inward</b> on those lines. Every other charge on them
+                (GST, excise / cess / TCS, delivery, round-off) was recorded normally.
+              </p>
+              <div className="bg-white border border-amber-200 rounded max-h-44 overflow-y-auto">
+                <table className="w-full text-[10px]">
+                  <thead className="bg-amber-100 text-amber-900 sticky top-0">
+                    <tr>
+                      <th className="text-left  py-1 px-2 font-medium">Material</th>
+                      <th className="text-left  py-1 px-2 font-medium">Vendor</th>
+                      <th className="text-right py-1 px-2 font-medium">Unreconciled ₹</th>
+                      <th className="text-left  py-1 px-2 font-medium">Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {committed.charge_warnings.slice(0, 50).map((w: any, i: number) => (
+                      <tr key={i} className="border-t border-amber-100">
+                        <td className="py-1 px-2">{w.material || '—'}</td>
+                        <td className="py-1 px-2">{w.vendor || '—'}</td>
+                        {/* resid is signed — the sheet total can come in UNDER what
+                            we recorded as well as over. Sign first, then the ₹, so
+                            it never reads as "₹-" mid-figure. */}
+                        <td className="py-1 px-2 text-right font-mono">
+                          {(Number(w.unreconciled) || 0) < 0 ? '- ' : ''}
+                          ₹{Math.abs(Number(w.unreconciled) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </td>
+                        <td className="py-1 px-2 text-amber-800">{w.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {committed.charge_warnings.length > 50 && (
+                <div className="text-[10px] text-amber-700">…and {committed.charge_warnings.length - 50} more.</div>
               )}
             </div>
           )}

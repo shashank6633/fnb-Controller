@@ -1,5 +1,39 @@
 import { getDb, generateId, recalculateSubRecipeCost } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { materialRate, rateMap } from '@/lib/closing-valuation';
+
+/**
+ * Attach the ₹-per-PURCHASE-unit rate to each ingredient row.
+ *
+ * The obvious `average_price × packFactor` is WRONG on this database often
+ * enough to matter: of the 281 packed materials that carry a rate, 50 hold the
+ * PURCHASE-unit price in the ₹/recipe-unit column, so multiplying by the pack
+ * inflates them by pack_size — COCO POWDER comes out at ₹846,570/kg. Every one
+ * of those 50 has zero purchase history, which is exactly why nothing ever
+ * corrected them.
+ *
+ * So the rate is derived by the SAME ladder the closing sheet uses
+ * (src/lib/closing-valuation.ts): the most recent purchases.unit_price first
+ * (authoritative — ₹ per purchase unit by canon, and what we actually paid),
+ * then average_price × packFactor, then nothing. `rate_source` travels with the
+ * number so the screen can show where it came from and flag an unverified one:
+ * a rate nobody can trace is a rate nobody should cost a recipe with.
+ *
+ * rateMap() is loaded ONCE per request and passed in, so a sub-recipe with 20
+ * ingredients does one query, not 20.
+ */
+function withRates(db: any, ingredients: any[], preloaded: Map<string, { unit_price: number; date: string }>) {
+  return ingredients.map((ing: any) => {
+    const r = materialRate(db, {
+      id: ing.material_id,
+      unit: ing.material_unit,
+      purchase_unit: ing.purchase_unit,
+      pack_size: ing.pack_size,
+      average_price: ing.average_price,
+    }, preloaded.get(ing.material_id) ?? null);
+    return { ...ing, rate_per_purchase_unit: r.ratePerPurchaseUnit, rate_source: r.source, rate_as_of: r.asOf };
+  });
+}
 
 export async function GET(request: Request) {
   try {
@@ -13,14 +47,29 @@ export async function GET(request: Request) {
       SELECT * FROM sub_recipes WHERE is_active = 1 ORDER BY name ASC
     `).all() as any[];
 
+    // ONE query for every material's latest purchase rate, before the loop —
+    // otherwise 68 sub-recipes x N ingredients each run their own lookup.
+    const rates = rateMap(db);
+
     const result = subRecipes.map((sr) => {
       const ingredients = db.prepare(`
-        SELECT sri.*, rm.name as material_name
+        SELECT sri.*, rm.name as material_name,
+               -- Pack meta so every sub-recipe surface can LEAD with the purchase
+               -- unit (kg / L / BTL) instead of the recipe unit. Sub-recipes are
+               -- batch-produced in bulk, so the chef reasons in kg, not grams.
+               -- average_price is RUPEES PER RECIPE UNIT — the client multiplies by
+               -- packFactor() to show the rate per purchase unit; it is sent raw so
+               -- the both-halves guard is applied in exactly one place.
+               rm.unit AS material_unit,
+               COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS purchase_unit,
+               COALESCE(rm.pack_size, 1) AS pack_size,
+               COALESCE(rm.case_size, 0) AS case_size,
+               rm.average_price, rm.sku
         FROM sub_recipe_ingredients sri
         JOIN raw_materials rm ON sri.material_id = rm.id
         WHERE sri.sub_recipe_id = ?
       `).all(sr.id);
-      return { ...sr, ingredients };
+      return { ...sr, ingredients: withRates(db, ingredients as any[], rates) };
     });
 
     return Response.json({ sub_recipes: result });
@@ -71,13 +120,24 @@ export async function POST(request: Request) {
 
     const subRecipe = db.prepare('SELECT * FROM sub_recipes WHERE id = ?').get(id);
     const subIngredients = db.prepare(`
-      SELECT sri.*, rm.name as material_name
+      SELECT sri.*, rm.name as material_name,
+               -- Pack meta so every sub-recipe surface can LEAD with the purchase
+               -- unit (kg / L / BTL) instead of the recipe unit. Sub-recipes are
+               -- batch-produced in bulk, so the chef reasons in kg, not grams.
+               -- average_price is RUPEES PER RECIPE UNIT — the client multiplies by
+               -- packFactor() to show the rate per purchase unit; it is sent raw so
+               -- the both-halves guard is applied in exactly one place.
+               rm.unit AS material_unit,
+               COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS purchase_unit,
+               COALESCE(rm.pack_size, 1) AS pack_size,
+               COALESCE(rm.case_size, 0) AS case_size,
+               rm.average_price, rm.sku
       FROM sub_recipe_ingredients sri
       JOIN raw_materials rm ON sri.material_id = rm.id
       WHERE sri.sub_recipe_id = ?
     `).all(id);
 
-    return Response.json({ sub_recipe: { ...(subRecipe as any), ingredients: subIngredients } }, { status: 201 });
+    return Response.json({ sub_recipe: { ...(subRecipe as any), ingredients: withRates(db, subIngredients as any[], rateMap(db)) } }, { status: 201 });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });
   }
@@ -143,13 +203,24 @@ export async function PUT(request: Request) {
 
     const subRecipe = db.prepare('SELECT * FROM sub_recipes WHERE id = ?').get(id);
     const subIngredients = db.prepare(`
-      SELECT sri.*, rm.name as material_name
+      SELECT sri.*, rm.name as material_name,
+               -- Pack meta so every sub-recipe surface can LEAD with the purchase
+               -- unit (kg / L / BTL) instead of the recipe unit. Sub-recipes are
+               -- batch-produced in bulk, so the chef reasons in kg, not grams.
+               -- average_price is RUPEES PER RECIPE UNIT — the client multiplies by
+               -- packFactor() to show the rate per purchase unit; it is sent raw so
+               -- the both-halves guard is applied in exactly one place.
+               rm.unit AS material_unit,
+               COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS purchase_unit,
+               COALESCE(rm.pack_size, 1) AS pack_size,
+               COALESCE(rm.case_size, 0) AS case_size,
+               rm.average_price, rm.sku
       FROM sub_recipe_ingredients sri
       JOIN raw_materials rm ON sri.material_id = rm.id
       WHERE sri.sub_recipe_id = ?
     `).all(id);
 
-    return Response.json({ sub_recipe: { ...(subRecipe as any), ingredients: subIngredients } });
+    return Response.json({ sub_recipe: { ...(subRecipe as any), ingredients: withRates(db, subIngredients as any[], rateMap(db)) } });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });
   }

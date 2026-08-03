@@ -84,12 +84,20 @@ import { todayIST } from './format-date';
  * • invoice_id vs bill_no are different things and get their own columns:
  *   invoice_id = OUR generated PINV-<yyyy>-#### (one per vendor bill, purchases
  *   only — POs and GRNs never mint one). bill_no = the VENDOR's own number.
- *   purchases.invoice_number is the legacy vendor-number column (no live
- *   writer) and is kept only as a fallback so historic rows are not blank.
- * • The 7 per-line charges (discount, cgst, sgst, special_excise_cess, tcs,
- *   delivery_charges, mrp_round_off) are RECORDED-ONLY. `value` is the item
- *   value and does NOT include them. They are null — not 0 — on PO rows,
- *   because purchase_order_items has no such columns at all.
+ *   There is NO third fallback: purchases.invoice_number is not in this schema
+ *   (see the note on the PURCHASE branch below). goods_receipt_notes DOES have
+ *   an invoice_number — that one is real and is used on the GRN branch.
+ * • The 8 per-line charges (discount, cgst, sgst, special_excise_cess,
+ *   compensation_cess, tcs, delivery_charges, mrp_round_off) are RECORDED-ONLY.
+ *   `value` is the item value and does NOT include them. They are null — not 0
+ *   — on PO rows, because purchase_order_items has no such columns at all.
+ *   compensation_cess is GST COMPENSATION CESS (the levy under the GST
+ *   (Compensation to States) Act — aerated drinks, tobacco). It is NOT
+ *   special_excise_cess, which means TGBCL Special Excise Cess everywhere it is
+ *   read or labelled, and it is NOT part of the cgst + sgst invariant: it is a
+ *   separate levy, never halved, and adding it to that pair would misstate the
+ *   GST on a return. It exists on `purchases` only — goods_receipt_note_items
+ *   has no such column — so it is null on GRN rows as well as PO rows.
  * • GRN qty is quantity_ACCEPTED (what became stock and became a purchases
  *   row), so qty × rate = value holds. quantity_rejected rides in its own
  *   column; received = qty + qty_rejected.
@@ -141,6 +149,8 @@ export interface PurchaseLogRow {
   cgst: number | null;
   sgst: number | null;
   special_excise_cess: number | null;
+  /** GST compensation cess. PURCHASE rows only — null on GRN and PO rows. */
+  compensation_cess: number | null;
   tcs: number | null;
   delivery_charges: number | null;
   mrp_round_off: number | null;
@@ -311,12 +321,18 @@ function buildUnion(f: {
         p.id                                              AS row_id,
         COALESCE(p.material_id, '')                       AS material_id,
         p.date                                            AS date,
+        -- DO NOT add p.invoice_number back as a fallback here. That column is
+        -- NOT part of this schema: CREATE TABLE purchases never declares it
+        -- and no ALTER adds it, unlike the eight columns that are migrated at
+        -- db.ts:2134-2155. Databases that happen to carry it got it out of band,
+        -- and it is empty in every row even there — so referencing it bought
+        -- nothing and made this whole report a hard 500 ("no such column:
+        -- p.invoice_number") on any database without it. The vendor's own
+        -- number lives in p.bill_no; ours is p.invoice_id.
         COALESCE(NULLIF(TRIM(p.invoice_id), ''),
-                 NULLIF(TRIM(p.bill_no), ''),
-                 NULLIF(TRIM(p.invoice_number), ''), '')  AS doc_no,
+                 NULLIF(TRIM(p.bill_no), ''), '')         AS doc_no,
         COALESCE(TRIM(p.invoice_id), '')                  AS invoice_id,
-        COALESCE(NULLIF(TRIM(p.bill_no), ''),
-                 TRIM(COALESCE(p.invoice_number, '')))    AS bill_no,
+        COALESCE(TRIM(p.bill_no), '')                     AS bill_no,
         COALESCE(TRIM(p.vendor), '')                      AS vendor,
         COALESCE(rm.name, '(unknown item)')               AS material,
         COALESCE(rm.sku, '')                              AS sku,
@@ -326,8 +342,13 @@ function buildUnion(f: {
         p.unit_price                                      AS rate,
         COALESCE(p.total_price, p.quantity * p.unit_price) AS value,
         NULL                                              AS qty_rejected,
-        p.discount, p.cgst, p.sgst, p.special_excise_cess, p.tcs,
-        p.delivery_charges, p.mrp_round_off,
+        p.discount, p.cgst, p.sgst, p.special_excise_cess,
+        -- GST compensation cess. A DIFFERENT levy from special_excise_cess
+        -- (which is TGBCL's) and deliberately outside the cgst + sgst pair —
+        -- it is never split into halves and must not be folded into the GST
+        -- figure a return is filed on. Recorded-only, like its 7 siblings.
+        p.compensation_cess,
+        p.tcs, p.delivery_charges, p.mrp_round_off,
         -- Tail of the note starting at the GRN number, if any. The regex that
         -- turns this into a link_key lives in JS; SQLite has no REGEXP here.
         CASE WHEN instr(COALESCE(p.notes, ''), 'GRN-') > 0
@@ -380,8 +401,14 @@ function buildUnion(f: {
         gi.unit_price                                     AS rate,
         ROUND(gi.quantity_accepted * gi.unit_price, 2)    AS value,
         gi.quantity_rejected                              AS qty_rejected,
-        gi.discount, gi.cgst, gi.sgst, gi.special_excise_cess, gi.tcs,
-        gi.delivery_charges, gi.mrp_round_off,
+        gi.discount, gi.cgst, gi.sgst, gi.special_excise_cess,
+        -- goods_receipt_note_items has NO compensation_cess column; GST
+        -- compensation cess is recorded on the purchases table only. NULL, not
+        -- 0 (a receipt note carries no such levy, it is not "zero cess"), and
+        -- aliased explicitly — with ?source=grn this branch is the FIRST of the
+        -- compound SELECT and its names become the outer SELECT *'s names.
+        NULL AS compensation_cess,
+        gi.tcs, gi.delivery_charges, gi.mrp_round_off,
         g.grn_number                                      AS link_raw,
         0                                                 AS is_mirror,
         COALESCE(NULLIF(TRIM(gi.notes), ''), TRIM(COALESCE(g.notes, ''))) AS notes
@@ -425,7 +452,7 @@ function buildUnion(f: {
         -- Aliased explicitly — with ?source=po this branch is the FIRST of the
         -- compound SELECT and its names become the outer SELECT *'s names.
         NULL AS discount, NULL AS cgst, NULL AS sgst,
-        NULL AS special_excise_cess, NULL AS tcs,
+        NULL AS special_excise_cess, NULL AS compensation_cess, NULL AS tcs,
         NULL AS delivery_charges, NULL AS mrp_round_off,
         -- The GRN this ordered line was received on, via po_item_id. NULL until
         -- it is received (or when the receipt fell outside this date window).
@@ -571,6 +598,7 @@ export function getPurchaseLog(
       cgst: nullNum(r.cgst),
       sgst: nullNum(r.sgst),
       special_excise_cess: nullNum(r.special_excise_cess),
+      compensation_cess: nullNum(r.compensation_cess),
       tcs: nullNum(r.tcs),
       delivery_charges: nullNum(r.delivery_charges),
       mrp_round_off: nullNum(r.mrp_round_off),
@@ -615,6 +643,7 @@ export const PURCHASE_LOG_COLUMNS: PurchaseLogColumn[] = [
   { key: 'cgst',                label: 'CGST', numeric: true },
   { key: 'sgst',                label: 'SGST', numeric: true },
   { key: 'special_excise_cess', label: 'Spl Excise Cess', numeric: true },
+  { key: 'compensation_cess',   label: 'Compensation Cess', numeric: true },
   { key: 'tcs',                 label: 'TCS', numeric: true },
   { key: 'delivery_charges',    label: 'Delivery Charges', numeric: true },
   { key: 'mrp_round_off',       label: 'MRP Round Off', numeric: true },

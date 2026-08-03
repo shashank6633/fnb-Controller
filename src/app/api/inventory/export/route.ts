@@ -52,6 +52,24 @@ function csvEscape(v: any): string {
   return s;
 }
 
+// WIPE GUARD — do not "simplify" this back to a plain csvEscape().
+// round-trip-import's coerce() skips an EMPTY cell (value preserved) but writes
+// an explicit 0 for a cell containing '0'. These two columns are almost always
+// 0 (they are set one material at a time, by hand, on the master), so exporting
+// a literal '0' on every row turns any stale sheet into a loaded gun: Export
+// today → edit one unrelated cell → Re-upload next week silently zeroes every
+// GST%/cess% typed in between, and nothing in the app reads those columns loudly
+// enough for anyone to notice. A blank cell means exactly what the 0 meant
+// ("not set") and round-trips as a no-op instead. A non-zero rate still exports
+// as its number, and a user who genuinely wants 18 → 0 types 0 themselves and it
+// still writes 0 — the importer is deliberately left untouched.
+const BLANK_WHEN_ZERO = new Set(['tax_percent', 'cess_percent']);
+
+function csvCell(col: string, v: any): string {
+  if (BLANK_WHEN_ZERO.has(col) && (v == null || Number(v) === 0)) return '';
+  return csvEscape(v);
+}
+
 export async function GET() {
   try {
     const me = await getCurrentUser();
@@ -92,7 +110,7 @@ export async function GET() {
       const reorderPU = packed
         ? Math.round(((r.reorder_level || 0) / pack) * 1000) / 1000
         : (r.reorder_level ?? 0);
-      lines.push([...COLUMNS.map(c => csvEscape(r[c])), csvEscape(perPU), csvEscape(stockPU), csvEscape(reorderPU)].join(','));
+      lines.push([...COLUMNS.map(c => csvCell(c, r[c])), csvEscape(perPU), csvEscape(stockPU), csvEscape(reorderPU)].join(','));
     }
     const csv = lines.join('\n') + '\n';
 

@@ -52,9 +52,9 @@ import { getPurchaseLog, type PurchaseLogRow } from '@/lib/purchase-log';
  * is NET of the allocated discount. The same delivery can legitimately show two
  * different rates on two rows. They are labelled, never reconciled silently.
  *
- * CHARGES: the seven per-line charges (discount, CGST, SGST, special excise
- * cess, TCS, delivery, MRP round-off) are RECORDED-ONLY — they are carried in
- * their own columns and are NOT folded into `value`.
+ * CHARGES: the eight per-line charges (discount, CGST, SGST, special excise
+ * cess, GST compensation cess, TCS, delivery, MRP round-off) are RECORDED-ONLY
+ * — they are carried in their own columns and are NOT folded into `value`.
  * ══════════════════════════════════════════════════════════════════════════ */
 
 // A purchase report served from cache is a wrong purchase report — the log
@@ -115,6 +115,14 @@ const COLUMNS: { header: string; cell: (r: PurchaseLogRow) => unknown }[] = [
   { header: 'CGST INR (recorded only)',                 cell: r => r.cgst },
   { header: 'SGST INR (recorded only)',                 cell: r => r.sgst },
   { header: 'Special Excise Cess INR (recorded only)',  cell: r => r.special_excise_cess },
+  // A DIFFERENT levy from the column above it, and the header says so because in
+  // a spreadsheet two adjacent columns both reading "Cess" get summed as one.
+  // Special Excise Cess is TGBCL's, non-creditable, and rides on the store bill;
+  // this is the GST compensation cess on a normal vendor bill. It is also NOT
+  // part of the CGST+SGST invariant — never add it into a GST figure on a return.
+  // Blank (not 0) on GRN and PO rows: goods_receipt_note_items has no such
+  // column, so a 0 there would assert "no cess was levied" on a bill nobody asked.
+  { header: 'Compensation Cess INR (GST comp. cess, recorded only)', cell: r => r.compensation_cess },
   { header: 'TCS INR (recorded only)',                  cell: r => r.tcs },
   { header: 'Delivery Charges INR (recorded only)',     cell: r => r.delivery_charges },
   { header: 'MRP Round Off INR (recorded only)',        cell: r => r.mrp_round_off },

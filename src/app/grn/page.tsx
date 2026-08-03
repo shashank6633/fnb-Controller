@@ -29,26 +29,55 @@ const isoMinusDays = (iso: string, n: number): string => {
   return dt.toISOString().slice(0, 10);
 };
 
+/**
+ * The GST rates this kitchen's bills actually carry. A fixed list, not a free
+ * number box: a typo'd "1.8" on a ₹40,000 bill is a tax figure nobody catches
+ * until the return is filed. Transcribed from purchases/page.tsx:60 — the two
+ * manual purchase-entry surfaces must offer the SAME rate card.
+ */
+const GST_RATES = ['0', '5', '12', '18', '28'] as const;
+
+/**
+ * Client-side mirror of store-engine's SQL catNorm(): lower-case, then strip
+ * spaces / hyphens / underscores, so 'Single-Malt Whiskey', 'single malt
+ * whiskey' and 'singlemaltwhiskey' all compare equal. Both sides of every
+ * store_category_map ↔ raw_materials.category comparison must use it, or a
+ * liquor category spelled with a hyphen goes unrecognised and gets taxed.
+ */
+const catKey = (s: unknown) => String(s || '').trim().toLowerCase().replace(/[\s\-_]/g, '');
+
+/** Round to paisa. Every derived money figure on this form goes through here. */
+const r2 = (v: number) => Math.round((Number(v) || 0) * 100) / 100;
+
 /* GRN Inward line (entry form). The seven ₹ charge fields mirror the sheet:
    Discount, CGST, SGST, Special Excise Cess, TCS, Delivery Charges, MRP Round Off.
    SUBTOTAL = received × rate; TOTAL INWARD = subtotal − discount + cgst + sgst
-   + cess + tcs + delivery + round-off. */
+   + cess + tcs + delivery + round-off.
+   gst_rate is a WIRE/UI field only — like /api/purchases, the purchases table
+   stores the derived rupees, never the rate. Kept as a raw STRING so a decimal
+   stays typeable and '' can mean "Manual (type the ₹ yourself)". */
 interface GrnLine {
   material_id: string; quantity_received: string; quantity_accepted: string;
   rejection_reason: string; unit_price: string; notes: string;
+  gst_rate: string;
   discount: string; cgst: string; sgst: string; special_excise_cess: string;
   tcs: string; delivery_charges: string; mrp_round_off: string;
 }
 const blankLine = (): GrnLine => ({
   material_id: '', quantity_received: '', quantity_accepted: '', rejection_reason: '', unit_price: '', notes: '',
+  gst_rate: '',
   discount: '', cgst: '', sgst: '', special_excise_cess: '', tcs: '', delivery_charges: '', mrp_round_off: '',
 });
 const n0 = (s?: string) => { const v = Number(s); return Number.isFinite(v) ? v : 0; };
 /** SUBTOTAL = inward qty × rate. */
 const lineSubtotal = (l: GrnLine) => n0(l.quantity_received) * n0(l.unit_price);
-/** TOTAL INWARD AMOUNT for a line (same formula the server + register use). */
-const lineTotal = (l: GrnLine) =>
-  lineSubtotal(l) - n0(l.discount) + n0(l.cgst) + n0(l.sgst) + n0(l.special_excise_cess)
+/** TOTAL INWARD AMOUNT for a line (same formula the server + register use).
+ *  `tax` overrides the two hand-typed ₹ boxes with the figures derived from the
+ *  line's GST% — pass it wherever a rate is in play, or the screen total lags
+ *  the rate the clerk just picked. Every other term is untouched. */
+const lineTotal = (l: GrnLine, tax?: { cgst: number; sgst: number }) =>
+  lineSubtotal(l) - n0(l.discount) + (tax ? tax.cgst : n0(l.cgst)) + (tax ? tax.sgst : n0(l.sgst))
+  + n0(l.special_excise_cess)
   + n0(l.tcs) + n0(l.delivery_charges) + n0(l.mrp_round_off);
 /** Same TOTAL formula for a saved GRN item row (server fields). */
 const itemInwardTotal = (it: any) =>
@@ -200,13 +229,16 @@ export default function GrnPage() {
           <div className="p-8 text-center text-sm text-[#8B7355]">No GRNs in this range. They're created automatically when you receive a PO.</div>
         ) : (
           <div className="overflow-x-auto">
-          <table className="w-full text-xs min-w-[880px]">
+          {/* min-w grows with the column count — the wrapper scrolls horizontally
+              rather than letting a 13th column squeeze the others into wrapping. */}
+          <table className="w-full text-xs min-w-[980px]">
             <thead className="bg-[#FFF1E3] text-[#6B5744]">
               <tr>
                 <th className="w-6"></th>
                 <th className="text-left py-1.5 px-3 font-medium">GRN #</th>
                 <th className="text-left py-1.5 px-3 font-medium">Date</th>
                 <th className="text-left py-1.5 px-3 font-medium">Vendor</th>
+                <th className="text-left py-1.5 px-3 font-medium">Bill No.</th>
                 <th className="text-left py-1.5 px-3 font-medium">Linked PO</th>
                 <th className="text-right py-1.5 px-3 font-medium">Lines</th>
                 <th className="text-right py-1.5 px-3 font-medium">Rejected qty</th>
@@ -244,6 +276,10 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
         <td className="py-2 px-3 font-mono font-semibold text-[#2D1B0E]">{g.grn_number}</td>
         <td className="py-2 px-3">{g.date}</td>
         <td className="py-2 px-3 text-[#6B5744]">{g.vendor || '—'}</td>
+        {/* The VENDOR's bill/invoice number — what the store clerk matches the
+            paper against. Our own GRN # is two columns left; these are different
+            numbers and mixing them up is how a bill gets paid twice. */}
+        <td className="py-2 px-3 font-mono text-[#6B5744]">{g.invoice_number || '—'}</td>
         <td className="py-2 px-3 font-mono">{g.po_number ? <a href="/purchase-orders" className="text-[#af4408] hover:underline">{g.po_number}</a> : <span className="text-[#8B7355]">—</span>}</td>
         <td className="py-2 px-3 text-right font-mono">{g.line_count}</td>
         {/* Rejected qty is a SUM ACROSS MATERIALS and GRN qtys are PURCHASE units,
@@ -280,8 +316,10 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
         <td className="py-2 px-3 text-[10px] text-[#8B7355]">{g.received_by || '—'}</td>
         <td className="py-2 px-3"><a href={`/grn/print/${g.id}`} target="_blank" className="text-[10px] text-[#af4408] hover:underline">Print</a></td>
       </tr>
+      {/* colSpan tracks the header column count (13 since Bill No. was added) —
+          if it under-counts, the detail panel stops short of the table width. */}
       {expanded && (
-        <tr><td colSpan={12} className="bg-[#FFF8F0] py-3 px-4">
+        <tr><td colSpan={13} className="bg-[#FFF8F0] py-3 px-4">
           {!detail ? (
             <div className="text-xs text-[#8B7355]"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Loading line items…</div>
           ) : (
@@ -468,6 +506,102 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     fetch('/api/inventory?scope=all').then(r => r.json()).then(d => setMaterials(d.materials || []));
   }, []);
 
+  /**
+   * Which categories belong to an ACTIVE store location. Any signed-in user may
+   * GET /api/stores, and it already returns each store's mapped categories, so
+   * the client can recognise a TGBCL/liquor line without a new endpoint. Same
+   * source purchases/page.tsx uses (fetchStoreCategories).
+   */
+  const [storeCats, setStoreCats] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/stores');
+        if (!res.ok) return;                     // leave the set empty = "unknown"
+        const json = await res.json();
+        const next = new Set<string>();
+        for (const st of json.stores || []) {
+          // A deactivated store releases its categories back to Central behaviour —
+          // same rule materialStoreId() applies server-side.
+          if (!st?.is_active) continue;
+          for (const c of st.categories || []) { const k = catKey(c?.category); if (k) next.add(k); }
+        }
+        setStoreCats(next);
+      } catch {
+        // Leave empty. Rates then behave normally, and the server still refuses a
+        // store-mapped line outright (centralFlowBlock in /api/grn POST).
+      }
+    })();
+  }, []);
+
+  /** Is this line a store-mapped (TGBCL liquor) material — i.e. zero-rated here? */
+  const storeMappedLine = (materialId: string) => {
+    if (storeCats.size === 0 || !materialId) return false;
+    const m = materials.find(x => x.id === materialId) as any;
+    return !!m && storeCats.has(catKey(m.category));
+  };
+
+  /**
+   * The GST% a line should START at when this material is picked — the master's
+   * raw_materials.tax_percent, which the ad-hoc GRN never read (the reported bug:
+   * the rate is keyed on the master and the clerk still hand-types the rupees).
+   *
+   * It SEEDS, it does not FORCE: a bill is a fact, and the printed vendor invoice
+   * wins over a possibly-stale master. Both refusals are transcribed verbatim from
+   * purchases/page.tsx (seedGstForMaterial) — do not "simplify" either away:
+   *   · store-mapped (TGBCL liquor) is zero-rated here and returns '' so no rate
+   *     can ever be seeded onto it. tax_percent is a free field on the master with
+   *     no liquor guard, so a manager CAN type 18 on a TGBCL item.
+   *   · a rate that is not in GST_RATES (say 7) returns '' rather than a value
+   *     matching no <option> — React renders the select blank, the clerk reads
+   *     0%, and the calc books 7%.
+   * '' here means MANUAL (type the ₹ yourself), not "inherit" — this form has no
+   * bill-level rate, so an unseeded line behaves exactly as it does today.
+   */
+  const seedGstForMaterial = (materialId: string): string => {
+    if (!materialId) return '';
+    if (storeMappedLine(materialId)) return '';
+    const m = materials.find(x => x.id === materialId) as any;
+    const t = Number(m?.tax_percent) || 0;
+    if (t <= 0) return '';
+    const s = String(t);
+    return (GST_RATES as readonly string[]).includes(s) ? s : '';
+  };
+
+  /**
+   * Per-line tax, derived. Pure — reads the line, writes nothing, so the display
+   * can never drift from what submit() sends.
+   *
+   * BASE = ACCEPTED qty × rate − discount, not received. This is deliberate and
+   * is the one place the panel departs from lineSubtotal (received-based): PO
+   * Receive already books its GRN rows' cgst/sgst off the accepted gross
+   * (api/purchase-orders/[id]/receive/route.ts:852, `effAcc > 0 ? effAcc : 0`).
+   * If ad-hoc taxed the received qty, the same bill would carry different tax
+   * depending on which screen booked it and the inward register — which mixes
+   * rows from both sources — would stop being homogeneous. Copying the
+   * `> 0 ? … : 0` clamp also settles back-corrections for free: a negative line
+   * derives 0 tax, which is what the server's chg() (api/grn/route.ts:195, floors
+   * negatives to 0) would have stored anyway, so screen and stored row agree.
+   *
+   * SPLIT canon: api/purchases/route.ts:363-367. Whole-paise arithmetic (the ÷100
+   * for percent and the ×100 for paise cancel), SGST takes the floored half and
+   * CGST absorbs the odd paisa, so the house invariant tax_value === cgst + sgst
+   * holds EXACTLY. Do not re-derive either half with a float divide.
+   */
+  const lineTax = (l: GrnLine) => {
+    const derived = l.gst_rate !== '' && !storeMappedLine(l.material_id);
+    const qa = l.quantity_accepted !== '' ? n0(l.quantity_accepted) : n0(l.quantity_received);
+    const q = qa > 0 ? qa : 0;
+    const taxable = r2(q * n0(l.unit_price) - n0(l.discount));
+    if (!derived) return { rate: 0, taxable, tax: 0, cgst: n0(l.cgst), sgst: n0(l.sgst), derived };
+    const rate = parseFloat(l.gst_rate) || 0;
+    const taxPaise = rate > 0 ? Math.max(0, Math.round(taxable * rate)) : 0;
+    const tax = taxPaise / 100;
+    const sgst = Math.floor(taxPaise / 2) / 100;
+    const cgst = r2(tax - sgst);
+    return { rate, taxable, tax, cgst, sgst, derived };
+  };
+
   // When a vendor is picked, fetch their MAPPED materials (vendor_materials
   // table — not contracts). User manages mappings on /vendors/materials.
   // Empty mapping → fall back to all materials.
@@ -509,6 +643,27 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const addLine = () => setItems(p => [...p, blankLine()]);
   const removeLine = (i: number) => setItems(p => p.filter((_, j) => j !== i));
   const updateLine = (i: number, patch: any) => setItems(p => p.map((it, j) => j === i ? { ...it, ...patch } : it));
+
+  /**
+   * Picking/swapping the material re-seeds the line's GST% from the new material's
+   * master rate — but ONLY when the current rate is still MACHINE-set: either
+   * untouched ('') or exactly what the PREVIOUS material would have seeded.
+   * Anything else is a rate the clerk deliberately picked off the printed bill,
+   * and silently resetting it is a tax error nobody notices until the return is
+   * filed. The test must stay "equals the previous seed" — a hardcoded '' would
+   * clobber every seeded line on a material swap. (purchases/page.tsx:646-648.)
+   *
+   * One guard this form needs and the bill form does not: it still has the two
+   * hand-typed ₹ boxes. Never seed a rate on top of rupees a human already
+   * entered — that would take the boxes read-only and silently overwrite them.
+   */
+  const pickMaterial = (i: number, id: string) => {
+    const cur = items[i];
+    const prevSeed = seedGstForMaterial(cur.material_id);
+    const keep = !(cur.gst_rate === '' || cur.gst_rate === prevSeed)
+      || n0(cur.cgst) !== 0 || n0(cur.sgst) !== 0;
+    updateLine(i, { material_id: id, gst_rate: keep ? cur.gst_rate : seedGstForMaterial(id) });
+  };
 
   const submit = async () => {
     // Validate qtys BEFORE filtering so the user sees errors instead of silent drops.
@@ -565,10 +720,16 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             rejection_reason:  i.rejection_reason,
             unit_price:        parseFloat(i.unit_price) || 0,
             notes:             i.notes,
+            // The RATE rides along so the server can re-derive the split and be
+            // the authority (as /api/purchases and PO Receive already are).
+            // undefined on a Manual line → the server keeps the hand-typed ₹.
+            gst_rate:            i.gst_rate === '' ? undefined : Number(i.gst_rate),
             // GRN Inward per-line charges (₹). Blank → 0 on the server.
+            // cgst/sgst come from lineTax so what was on screen is what is sent —
+            // on a rated line these are DERIVED, never the stale box contents.
             discount:            n0(i.discount),
-            cgst:                n0(i.cgst),
-            sgst:                n0(i.sgst),
+            cgst:                lineTax(i).cgst,
+            sgst:                lineTax(i).sgst,
             special_excise_cess: n0(i.special_excise_cess),
             tcs:                 n0(i.tcs),
             delivery_charges:    n0(i.delivery_charges),
@@ -717,9 +878,21 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               MaterialTypeahead dropdown when it opens below the input.
               Same applies to the inner div; we let absolute children escape. */}
           <div className="border border-[#E8D5C4] rounded-lg">
-            <div className="bg-[#FFF1E3] px-3 py-1.5 text-[#6B5744] flex items-center justify-between rounded-t-lg">
-              <span className="font-semibold">Line Items</span>
-              <button onClick={addLine} className="hidden md:flex text-xs text-[#af4408] hover:underline items-center gap-1"><Plus className="w-3 h-3" /> Add line</button>
+            {/* Sticky within the modal BODY's scroll region (the body is the
+                nearest scrolling ancestor; no ancestor here clips it). By the time
+                the clerk is typing materials the Vendor combobox — five fields up —
+                has scrolled off screen, so the name is echoed here and follows the
+                rows down. z-10 is safe: the MaterialTypeahead dropdown is portaled
+                to <body> at z-[100], so it still opens OVER this bar. */}
+            <div className="sticky top-0 z-10 bg-[#FFF1E3] px-3 py-1.5 text-[#6B5744] flex items-center gap-2 rounded-t-lg">
+              <span className="font-semibold shrink-0">Line Items</span>
+              <span className="flex-1 min-w-0 truncate text-right" title={vendor.trim() || 'No vendor selected yet'}>
+                <span className="text-[9px] uppercase tracking-wide text-[#8B7355] mr-1">Vendor</span>
+                {vendor.trim()
+                  ? <b className="text-[#2D1B0E]">{vendor.trim()}</b>
+                  : <span className="text-[#B8A590]">no vendor selected</span>}
+              </span>
+              <button onClick={addLine} className="hidden md:flex shrink-0 text-xs text-[#af4408] hover:underline items-center gap-1"><Plus className="w-3 h-3" /> Add line</button>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs block md:table md:min-w-[600px]">
@@ -754,7 +927,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                         <MaterialTypeahead
                           materials={filteredMaterials as any} purchaseBasis
                           value={it.material_id}
-                          onPick={(id) => updateLine(i, { material_id: id })}
+                          onPick={(id) => pickMaterial(i, id)}
                           excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                         />
                       </td>
@@ -819,13 +992,22 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                       <td className="py-1 px-2 text-right block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Charges / Total</span>
                         <div className="flex items-center justify-end gap-1.5">
+                          {/* The charges panel is collapsed by default, so a rate
+                              seeded from the master would otherwise change the row
+                              total with nothing on screen explaining it. */}
+                          {it.gst_rate !== '' && !storeMappedLine(it.material_id) && (
+                            <span className="px-1.5 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-800 text-[10px] font-semibold"
+                                  title="GST% on this line — from the material master, editable in the charges panel">
+                              GST {it.gst_rate}%
+                            </span>
+                          )}
                           <button type="button" onClick={() => toggleCharges(i)}
                                   className={`px-1.5 py-0.5 rounded border text-[10px] flex items-center gap-1 ${
                                     openCharges.has(i) ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
                             <Percent className="w-2.5 h-2.5" /> {openCharges.has(i) ? 'hide' : 'charges'}
                           </button>
                           <span className="font-mono font-semibold text-[#2D1B0E] min-w-[64px] text-right">
-                            {(n0(it.quantity_received) && n0(it.unit_price)) ? `₹${lineTotal(it).toLocaleString('en-IN', { maximumFractionDigits: 2 })}` : '—'}
+                            {(n0(it.quantity_received) && n0(it.unit_price)) ? `₹${lineTotal(it, lineTax(it)).toLocaleString('en-IN', { maximumFractionDigits: 2 })}` : '—'}
                           </span>
                         </div>
                       </td>
@@ -836,24 +1018,76 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                         <td colSpan={7} className="block md:table-cell px-2 pb-3 md:pb-2">
                           <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-2.5">
                             <div className="text-[10px] font-semibold text-[#6B5744] mb-1.5">Line charges (₹) — leave 0 if not applicable</div>
-                            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+                            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
                               {([
                                 ['discount', 'Discount'], ['cgst', 'CGST'], ['sgst', 'SGST'],
                                 ['special_excise_cess', 'Special Excise Cess'], ['tcs', 'TCS'],
                                 ['delivery_charges', 'Delivery Charges'], ['mrp_round_off', 'MRP Round Off'],
-                              ] as const).map(([k, label]) => (
-                                <label key={k} className="flex flex-col gap-0.5 text-[9px] uppercase tracking-wide text-[#8B7355]">
+                              ] as const).map(([k, label]) => {
+                                const tx = lineTax(it);
+                                const isTaxBox = k === 'cgst' || k === 'sgst';
+                                return (
+                                <Fragment key={k}>
+                                {/* GST % sits immediately BEFORE the two boxes it drives. */}
+                                {k === 'cgst' && (
+                                  <label className="flex flex-col gap-0.5 text-[9px] uppercase tracking-wide text-[#8B7355]">
+                                    GST %
+                                    {storeMappedLine(it.material_id) ? (
+                                      // The rate is not the clerk's to set here: this material
+                                      // belongs to a store location, where excise / cess / TCS
+                                      // are charged on the store's own bill. A GST% on it would
+                                      // be tax that was never paid.
+                                      <div className="text-[10px] text-blue-700 leading-tight normal-case px-1.5 py-1">
+                                        0%
+                                        <span className="block text-[9px] text-[#8B7355]">store item — taxed on the TGBCL bill</span>
+                                      </div>
+                                    ) : (
+                                      <select value={it.gst_rate}
+                                              onChange={e => {
+                                                const v = e.target.value;
+                                                // Dropping back to Manual freezes the last derived
+                                                // figures into the boxes ONCE, so they don't blank
+                                                // out under the clerk mid-edit.
+                                                if (v === '' && tx.derived) updateLine(i, { gst_rate: '', cgst: String(tx.cgst), sgst: String(tx.sgst) });
+                                                else updateLine(i, { gst_rate: v });
+                                              }}
+                                              title="Seeded from the material master (raw_materials.tax_percent). Change it for a line the vendor billed at a different rate; Manual lets you type the ₹ yourself."
+                                              className="px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs bg-white text-[#2D1B0E] normal-case">
+                                        <option value="">Manual (enter ₹)</option>
+                                        {GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
+                                      </select>
+                                    )}
+                                  </label>
+                                )}
+                                <label className="flex flex-col gap-0.5 text-[9px] uppercase tracking-wide text-[#8B7355]">
                                   {label}
-                                  <input type="number" step="any" value={(it as any)[k]}
+                                  <input type="number" step="any"
+                                         readOnly={isTaxBox && tx.derived}
+                                         value={isTaxBox && tx.derived
+                                           ? (k === 'cgst' ? tx.cgst : tx.sgst).toFixed(2)
+                                           : (it as any)[k]}
                                          onChange={e => updateLine(i, { [k]: e.target.value })}
                                          placeholder="0"
-                                         className="px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs bg-white text-[#2D1B0E] normal-case" />
+                                         className={`px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs text-[#2D1B0E] normal-case ${
+                                           isTaxBox && tx.derived ? 'bg-[#F3EEE7] cursor-not-allowed' : 'bg-white'}`} />
+                                  {isTaxBox && tx.derived && (
+                                    <span className="text-[8px] text-[#8B7355] normal-case">derived from GST %</span>
+                                  )}
                                 </label>
-                              ))}
+                                </Fragment>
+                              ); })}
                             </div>
                             <div className="flex flex-wrap justify-end gap-4 mt-2 text-[11px] text-[#6B5744]">
                               <span>Subtotal <b className="text-[#2D1B0E] font-mono">₹{lineSubtotal(it).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</b></span>
-                              <span>Total Inward <b className="text-[#af4408] font-mono">₹{lineTotal(it).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</b></span>
+                              {lineTax(it).derived && (
+                                // Named explicitly because it is NOT the Subtotal beside it:
+                                // tax rides on the ACCEPTED qty (what PO Receive books), so on a
+                                // partially-rejected line the two figures legitimately differ.
+                                <span title="GST is charged on the accepted quantity, after discount — the same base the PO → Receive path uses.">
+                                  Taxable (accepted, after discount) <b className="text-[#2D1B0E] font-mono">₹{lineTax(it).taxable.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</b>
+                                </span>
+                              )}
+                              <span>Total Inward <b className="text-[#af4408] font-mono">₹{lineTotal(it, lineTax(it)).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</b></span>
                             </div>
                           </div>
                         </td>
@@ -870,7 +1104,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                   const filled = items.filter(ln => ln.material_id && (parseFloat(ln.quantity_received) || 0) !== 0);
                   const totRec = items.reduce((s, ln) => s + (parseFloat(ln.quantity_received) || 0), 0);
                   const totAcc = items.reduce((s, ln) => s + (parseFloat(ln.quantity_accepted) || parseFloat(ln.quantity_received) || 0), 0);
-                  const totInward = items.reduce((s, ln) => s + (ln.material_id ? lineTotal(ln) : 0), 0);
+                  const totInward = items.reduce((s, ln) => s + (ln.material_id ? lineTotal(ln, lineTax(ln)) : 0), 0);
                   const lineCount = filled.length;
                   if (lineCount === 0) return null;
                   // A qty total only exists when every filled line is in the SAME

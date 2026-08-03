@@ -128,6 +128,15 @@ const CATEGORIES = [
 
 const UNITS = ['kg', 'g', 'ml', 'l', 'pcs', 'bottle', 'dozen', 'bunch'] as const;
 
+/** The ONLY rates a purchase line can represent. This list must stay in step with
+ *  GST_RATES in the purchase screens (src/app/purchases/page.tsx and the PO
+ *  receive modal) — the master's Tax % SEEDS the GST% on a new purchase line, and
+ *  a <select> whose value matches no <option> renders BLANK in React. So a master
+ *  free-typed to, say, 28 with 28 missing from the purchase list would show the
+ *  storekeeper 0% while the bill books 28%. Do not "simplify" this back to a free
+ *  number box: the constraint at the source is half of that guard. */
+const MASTER_GST_RATES = [0, 5, 12, 18, 28] as const;
+
 const CATEGORY_COLORS: Record<string, { bg: string; text: string }> = {
   veg: { bg: 'bg-green-500/15', text: 'text-green-400' },
   'non-veg': { bg: 'bg-red-500/15', text: 'text-red-400' },
@@ -1018,6 +1027,19 @@ export default function InventoryPage() {
                                 {(m as any).shelf_life_days}d
                               </span>
                             )}
+                            {/* The ONLY read-back of the master's Tax % anywhere in
+                                the app. Without it the owner sets a rate, saves, and
+                                has no way to tell it persisted — which is most of why
+                                this reads as "GST not saving". Hidden at 0 so the 900+
+                                untaxed rows stay uncluttered. Display only: this is a
+                                seed for purchase entry, never a cost input — GST is a
+                                reclaimable credit and must never reach average_price. */}
+                            {Number((m as any).tax_percent) > 0 && (
+                              <span title={`Master GST ${Number((m as any).tax_percent)}% — seeds the GST% on new purchase-entry lines. Not part of cost; input credit is recorded beside the rate.`}
+                                    className="text-[9px] px-1.5 py-0.5 rounded bg-[#FFF1E3] text-[#8B7355] border border-[#E8D5C4]">
+                                GST {Number((m as any).tax_percent)}%
+                              </span>
+                            )}
                           </div>
                         </td>
                         <td className="px-4 py-3 text-[10px] font-mono text-[#8B7355]">
@@ -1648,17 +1670,43 @@ export default function InventoryPage() {
                   </label>
                   <label className="text-xs text-[#6B5744] flex flex-col gap-1">
                     Tax % (GST)
-                    <input type="number" min={0} max={100} step="any"
-                           value={formData.tax_percent ?? 0}
-                           onChange={e => setFormData(f => ({ ...f, tax_percent: Number(e.target.value) }))}
-                           className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+                    <select value={String(formData.tax_percent ?? 0)}
+                            onChange={e => setFormData(f => ({ ...f, tax_percent: Number(e.target.value) }))}
+                            title="Seeds the GST% on new purchase-entry lines for this item. The storekeeper can still change it to match the vendor bill. Liquor/store items are always 0%."
+                            className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
+                      {/* A legacy row may hold a rate typed before this became a
+                          fixed list (it used to be a free 0-100 number box). Keep
+                          it selectable so merely opening and saving such a row
+                          does not silently rewrite the owner's figure to 0 — the
+                          drop only happens when a human picks a listed rate. */}
+                      {!MASTER_GST_RATES.includes((formData.tax_percent ?? 0) as any) && (
+                        <option value={String(formData.tax_percent ?? 0)}>
+                          {formData.tax_percent}% (legacy)
+                        </option>
+                      )}
+                      {MASTER_GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
+                    </select>
                   </label>
                   <label className="text-xs text-[#6B5744] flex flex-col gap-1">
                     Cess %
+                    {/* Two traps this field used to walk into silently, hence the
+                        title and the caption. (1) "Cess" here is the GST
+                        Compensation Cess (aerated drinks, tobacco) — NOT the
+                        TGBCL Special Excise Cess, which arrives on the Liquor
+                        Store bill, is non-creditable landed cost, and lives in a
+                        different column. Same word, different levy, different
+                        money. (2) It carried no help at all while Tax % above it
+                        did, so it read as if it reached every purchase surface.
+                        It does not: only Purchase Entry consumes it. Say where it
+                        lands so the field can never imply a reach it lacks. */}
                     <input type="number" min={0} max={100} step="any"
                            value={formData.cess_percent ?? 0}
                            onChange={e => setFormData(f => ({ ...f, cess_percent: Number(e.target.value) }))}
+                           title="Seeds the GST Compensation Cess % on new Purchase Entry lines (Enter Full Bill) for this item. The storekeeper can still change it to match the vendor bill. Liquor/store items are always 0%. This is a separate levy from the TGBCL Special Excise Cess on the Liquor Store bill — that one comes off the store bill's own charges, never from here."
                            className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+                    <span className="text-[10px] text-[#8B7355]">
+                      Used by Purchase Entry (Enter Full Bill) only — recorded beside the rate, never added into cost.
+                    </span>
                   </label>
                   <label className="text-xs text-[#6B5744] flex flex-col gap-1 sm:col-span-2">
                     Closing-Stock Cadence

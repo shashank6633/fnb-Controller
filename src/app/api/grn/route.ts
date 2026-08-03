@@ -1,6 +1,6 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { centralFlowBlock } from '@/lib/store-engine';
+import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 
 /**
@@ -16,9 +16,16 @@ import { checkPurchaseDate } from '@/lib/purchase-guard';
  *     date, vendor_id?, vendor, invoice_number?, invoice_date?, qc_by?, notes?,
  *     items: [{
  *       material_id, quantity_received, quantity_accepted?, rejection_reason?,
- *       unit_price, notes?
+ *       unit_price, notes?, gst_rate?
  *     }]
  *   }
+ *
+ *   gst_rate is a PERCENT (5 | 12 | 18 …), per line. When it is present the
+ *   server DERIVES cgst/sgst from this route's own accepted value and IGNORES
+ *   whatever cgst/sgst the client sent (they are read only to log a divergence),
+ *   exactly as /api/purchases and the PO-receive path already do. When it is
+ *   absent the hand-typed cgst/sgst are stored as-is — the pre-existing manual
+ *   path, unchanged.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -163,6 +170,29 @@ export async function POST(request: Request) {
       }, { status: 400 });
     }
 
+    // Per-line GST, as a PERCENT (5 | 12 | 18 …). Validated HERE, before the
+    // transaction opens, because a Response cannot be returned from inside
+    // db.transaction() — a bad rate has to be a clean 400 with no GRN number
+    // burned and no row written. ABSENT means exactly what it meant before this
+    // field existed: the clerk's hand-typed cgst/sgst are stored as-is, so every
+    // older client (and the manual half of the /grn modal) keeps working. A
+    // PRESENT but unusable value is REJECTED rather than quietly zeroed —
+    // silently dropping the tax on a bill forfeits the input credit, and nothing
+    // in the stored row would ever show that it went missing. Wording is
+    // /api/purchases' wording verbatim; two purchase surfaces answering the same
+    // mistake differently is how a clerk learns to distrust the message.
+    const gstProvided = (it: any) =>
+      it?.gst_rate !== undefined && it?.gst_rate !== null && String(it.gst_rate).trim() !== '';
+    for (const it of receivable) {
+      if (!gstProvided(it)) continue;
+      const n = Number(it.gst_rate);
+      if (!Number.isFinite(n) || n < 0 || n > 100) {
+        return Response.json({
+          error: 'gst_rate must be a percentage between 0 and 100 (0 = exempt) — send no gst_rate at all to record a line with no tax',
+        }, { status: 400 });
+      }
+    }
+
     // Generate GRN number
     const yr = String(date).slice(0, 4);
     const lastGrn = db.prepare(`SELECT grn_number FROM goods_receipt_notes WHERE grn_number LIKE 'GRN-' || ? || '-%' ORDER BY grn_number DESC LIMIT 1`).get(yr) as any;
@@ -226,9 +256,64 @@ export async function POST(request: Request) {
         if (received === 0 && accepted === 0) continue;
         if (rejected > 0) hasReject = true;
 
+        // ── PER-LINE GST — DERIVED HERE, server-side, from this route's own figures ──
+        // This row is the input-credit record. The figure on it must follow from
+        // the goods value on the SAME row, or a miscalculating modal — or a
+        // replayed/hand-edited payload — writes a tax the row cannot justify to
+        // an auditor. So when a rate is sent, the client's cgst/sgst are read
+        // ONLY to log a divergence, never obeyed. Same contract as
+        // /api/purchases and PO-receive; this was the one manual purchase
+        // surface still trusting the browser's arithmetic.
+        //
+        // THE BASE IS THE ACCEPTED GROSS, NOT THE RECEIVED GROSS, and that is
+        // deliberate: receive/route.ts taxes `effAcc` too, so the inward
+        // register — which mixes rows from BOTH GRN sources — stays homogeneous.
+        // A rejected quantity was never accepted, so no credit is claimable on
+        // it. A back-correction (negative) floors to 0 here, which is what the
+        // chg() below would have stored for it anyway — screen and row agree.
+        //
+        // ARITHMETIC IS api/purchases/route.ts:363-367 BYTE-FOR-BYTE. `taxable`
+        // is already 2-dp rupees, so taxable × rate IS the tax in whole paise
+        // (the ÷100 for percent and the ×100 for paise cancel). Halving in
+        // integer paise is what keeps cgst + sgst re-adding to the tax EXACTLY —
+        // the house invariant every reader re-adds; halving in floats drifts a
+        // paisa. A third rounding convention across the purchase paths is how a
+        // GST return stops reconciling.
+        const hasGst = gstProvided(it);
+        // LIQUOR IS ZERO-RATED — its duty rides on the TGBCL bill (excise / cess
+        // / TCS), never on GST, so a credit here would be claimed twice.
+        // centralFlowBlock already dropped these lines from `receivable`, so in
+        // practice this never fires; it is the second lock, mirroring
+        // receive/route.ts. If that guard is ever relaxed per-category, a client
+        // sending 18% still must not write a credit the TGBCL charges carry.
+        const gstRate = (!hasGst || isStoreMappedMaterial(db, String(it.material_id || '')))
+          ? 0 : Number(it.gst_rate);
+        const grossTax  = Math.round((accepted > 0 ? accepted : 0) * price * 100) / 100;
+        const taxable   = Math.round((grossTax - chg(it.discount)) * 100) / 100;
+        const taxPaise  = gstRate > 0 ? Math.max(0, Math.round(taxable * gstRate)) : 0;
+        const sgstPaise = Math.floor(taxPaise / 2);
+        const cgstPaise = taxPaise - sgstPaise;   // odd paisa lands in CGST, per the contract
+        // Compared in INTEGER paise with a 1-paisa allowance: a client doing
+        // round2(taxable × rate ÷ 100) legitimately lands a paisa off on
+        // half-paisa amounts, and that is agreement, not drift. Anything wider
+        // is a real UI divergence and must stay visible rather than be silently
+        // corrected on every bill for months.
+        if (hasGst && (it.cgst !== undefined || it.sgst !== undefined)) {
+          const sentTax = (Number(it.cgst) || 0) + (Number(it.sgst) || 0);
+          if (Math.abs(Math.round(sentTax * 100) - taxPaise) > 1) {
+            console.warn(
+              `[grn POST] client tax ₹${sentTax.toFixed(2)} ≠ server-derived ₹${(taxPaise / 100).toFixed(2)} ` +
+              `(${grnNumber}, material ${it.material_id}, taxable ₹${taxable.toFixed(2)} @ ${gstRate}%) — stored the derived figure`
+            );
+          }
+        }
+
         insGrnItem.run(generateId(), grnId, it.material_id, received, accepted, rejected, reason, price,
                        it.notes || (rejected > 0 ? `Rejected ${rejected} (${reason || 'no reason given'})` : ''),
-                       chg(it.discount), chg(it.cgst), chg(it.sgst), chg(it.special_excise_cess),
+                       chg(it.discount),
+                       hasGst ? cgstPaise / 100 : chg(it.cgst),
+                       hasGst ? sgstPaise / 100 : chg(it.sgst),
+                       chg(it.special_excise_cess),
                        chg(it.tcs), chg(it.delivery_charges), chgSigned(it.mrp_round_off));
 
         // Mirror into purchases + inventory_transactions for ANY non-zero

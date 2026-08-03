@@ -2050,6 +2050,26 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('po.requisition_id migration failed:', e); }
 
+  // Expected Delivery Date — the date the VENDOR PROMISED, as distinct from
+  // purchase_orders.date, which is the date the PO was raised.
+  //
+  // Nullable with NO backfill on purpose: every PO written before this column
+  // existed genuinely has no promised date, and defaulting it to the order date
+  // would fabricate a commitment the vendor never made — which is worse than
+  // blank, because an overdue-delivery view would then be built on invented
+  // promises. NULL reads as "no promised date" everywhere.
+  //
+  // Named delivery_date in the DB but labelled "Expected Delivery Date" in the
+  // UI: in this domain "delivery" on its own already means the vendor's
+  // delivery CHARGE (goods_receipt_note_items.delivery_charges, the PO print
+  // page's "Delivery charges" line), so the bare word would read as money.
+  try {
+    const cols = db.prepare("PRAGMA table_info(purchase_orders)").all() as any[];
+    if (!cols.some((c: any) => c.name === 'delivery_date')) {
+      db.exec(`ALTER TABLE purchase_orders ADD COLUMN delivery_date TEXT`);
+    }
+  } catch (e) { console.error('po.delivery_date migration failed:', e); }
+
   // Phase 1 §1: units registry — editable from /units page.
   // We mirror the built-in UNIT_REGISTRY into this table on first run so admins
   // can add/adjust units (toBase factors, aliases, labels) without code changes.
@@ -2123,10 +2143,31 @@ function initializeSchema(db: Database.Database) {
     if (!has('invoice_id'))        db.exec(`ALTER TABLE purchases ADD COLUMN invoice_id TEXT DEFAULT ''`);
     if (!has('bill_no'))           db.exec(`ALTER TABLE purchases ADD COLUMN bill_no TEXT DEFAULT ''`);
     // GRN-Inward-style per-line charges (₹) on a purchase — RECORDED ONLY, they
-    // do NOT change unit_price/total_price (the weighted-avg cost basis). Total
-    // Inward Amount = total_price − discount + cgst + sgst + special_excise_cess
-    // + tcs + delivery_charges + mrp_round_off (computed on read). All default 0.
-    for (const col of ['discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off']) {
+    // do NOT change unit_price/total_price (the weighted-avg cost basis), and
+    // updateMaterialPrice never reads them, so average_price and every recipe
+    // cost stay clean. Total Inward Amount = total_price − discount + cgst
+    // + sgst + compensation_cess + special_excise_cess + tcs + delivery_charges
+    // + mrp_round_off (computed on read — eight terms). All default 0.
+    //
+    // TWO DIFFERENT CESSES — do not conflate, they are different levies:
+    //   compensation_cess   — GST Compensation Cess (GST (Compensation to
+    //                         States) Act). Ours: aerated/carbonated beverages
+    //                         and tobacco at the bar. Seeded per line from
+    //                         raw_materials.cess_percent on the Purchase Entry
+    //                         surfaces. NOT part of the CGST/SGST invariant
+    //                         (tax_value === cgst + sgst) — cess is a separate
+    //                         levy, is never halved, and adding it to that sum
+    //                         would overstate GST on a return. Zero on liquor:
+    //                         TGBCL lines are zero-rated on our side.
+    //   special_excise_cess — TGBCL Special Excise Cess off the liquor store
+    //                         bill. Non-creditable landed cost. Every reader
+    //                         and label already means exactly this by it, which
+    //                         is why compensation cess needed its own column
+    //                         rather than sharing this one.
+    // The bulk CSV alias chain still maps a bare 'cess'/'CESS' header into
+    // special_excise_cess — the TGBCL inward sheets use CESS to mean excise.
+    // A compensation-cess CSV must name the column compensation_cess.
+    for (const col of ['discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off', 'compensation_cess']) {
       if (!has(col)) db.exec(`ALTER TABLE purchases ADD COLUMN ${col} REAL NOT NULL DEFAULT 0`);
     }
     // PO QTY from the inward sheet — what the PO asked for, vs `quantity` which

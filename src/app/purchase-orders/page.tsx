@@ -76,10 +76,15 @@ const RATE_EPS = 0.005;   // ₹ — half a paisa
  * The GST rates a vendor bill in this kitchen actually carries. A fixed list and
  * not a free number box, for the same reason as the Enter Full Bill modal on
  * /purchases: a typo'd "1.8" on a ₹40,000 bill is a tax figure nobody catches
- * until the return is filed. Same four values, same order — the two screens that
+ * until the return is filed. Same five values, same order — the two screens that
  * take a vendor bill must not offer different tax rates.
+ *
+ * 28 is here because the master's Tax % now SEEDS this select (see `load`).
+ * A material set to 28% (aerated drinks, the classic case) whose rate is not an
+ * <option> renders the select BLANK — the receiver reads 0%, the compute books
+ * 28%. Do not trim this list without also trimming what the master accepts.
  */
-const GST_RATES = ['0', '5', '12', '18'] as const;
+const GST_RATES = ['0', '5', '12', '18', '28'] as const;
 
 interface Material { id: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; sku?: string; average_price: number; primary_vendor?: string; last_purchase_price?: number; }
 
@@ -158,6 +163,20 @@ interface POItem {
   /** raw_materials.pack_size — recipe units per purchase unit. */
   material_pack_size?: number;
   quantity: number; unit_price: number; total_price: number;
+  /** raw_materials.tax_percent — the master's GST rate, carried by the PO detail
+   *  API purely to SEED this line's GST% on Receive. It is a default, not a
+   *  verdict: the printed vendor bill wins, so the receiver can change it. */
+  material_tax_percent?: number;
+  /** raw_materials.cess_percent — carried, but NOT consumed on THIS screen.
+   *  It does have a home now: /purchases books it into purchases.compensation_cess,
+   *  an eighth charge column of its own. That column is NOT special_excise_cess,
+   *  which still means TGBCL Special Excise Cess everywhere it is read — writing
+   *  GST compensation cess into it would report an excise figure nobody levied.
+   *  Receive cannot follow, because it records tax on goods_receipt_note_items and
+   *  that table has no compensation-cess column yet (db.ts's GRN-item charge loop
+   *  still lists seven). Kept on the payload so the seed is already in hand the
+   *  day it gains an eighth. */
+  material_cess_percent?: number;
   current_avg_price?: number; last_purchase_price?: number; notes?: string;
   /** LINE vendor — one PO legitimately spans several. Receiving is per vendor. */
   vendor?: string; vendor_id?: string | null;
@@ -804,8 +823,9 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     setDiscountValue(''); setDeliveryValue('');
     setDiscountMode('amt'); setDeliveryMode('amt');
     // Tax belongs to the vendor's bill, not to the PO — the next vendor's bill
-    // starts at the 0% default with no per-line overrides carried over.
-    setBillGstRate('0'); setLineGst({});
+    // starts at the 0% default. (The per-line rates are seeded from the master
+    // further down, once the store/TGBCL verdict is in hand.)
+    setBillGstRate('0');
     // The server's own verdict on which lines are store/TGBCL materials. Read
     // from the payload rather than re-derived from categories here: the receive
     // route decides this with centralFlowBlock, and a second client-side guess
@@ -815,6 +835,37 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       if (b?.po_item_id) sb[String(b.po_item_id)] = String(b.error || 'store item — taxed on the TGBCL bill');
     }
     setStoreBlocked(sb);
+    /* SEED each line's GST% from raw_materials.tax_percent (delivered as
+       material_tax_percent by the PO detail API). Until now the master's Tax %
+       was a write-only field — nothing in the purchase / PO / GRN flow ever read
+       it, so a rate typed on the master never reached a bill and cgst/sgst were
+       never written on anything.
+         SEED, NOT FORCE. A bill is a fact: the printed vendor invoice wins over
+       the master, so this only fills the select and the receiver may change it.
+       A line with no seed keeps '' = follow the bill's rate.
+         ORDER MATTERS — this must stay BELOW setStoreBlocked/`sb`. A store/TGBCL
+       line is zero-rated unconditionally (liquor is taxed on the store's own
+       bill), and while billCalc's zero_rated short-circuit would discard a rate
+       anyway, writing one into lineGst would show a rate the server then throws
+       away, and would surface for real if the store mapping ever changed. Never
+       hoist this back up beside the setBillGstRate reset.
+         The GST_RATES membership test is not decoration: the master accepts any
+       number, and a rate with no matching <option> renders the select blank
+       while the compute books the rate — the receiver would read 0% and sign a
+       28% bill. Anything off the list falls back to follow-the-bill.
+       (Only tax_percent is seeded. cess_percent has a home on /purchases now —
+       purchases.compensation_cess, its own column, distinct from the TGBCL
+       special_excise_cess — but Receive books tax onto goods_receipt_note_items,
+       which carries no compensation-cess column, so a rate seeded here would
+       have nowhere to land. See material_cess_percent on POItem.) */
+    const gseed: Record<string, string> = {};
+    for (const it of its) {
+      if (sb[String(it.id)]) continue;
+      const t = Number(it.material_tax_percent) || 0;
+      const s = String(t);
+      if (t > 0 && (GST_RATES as readonly string[]).includes(s)) gseed[it.id] = s;
+    }
+    setLineGst(gseed);
     const list: VendorStake[] = Array.isArray(recv?.vendors) ? recv.vendors : [];
     setStakes(list);
     // Auto-select the vendor still owing goods when there is only one — that is

@@ -54,6 +54,11 @@ interface LogRow {
   qty: number; purchase_unit: string; rate: number; value: number;
   qty_rejected: number | null;   // GRN lines only
   discount: number; cgst: number; sgst: number;
+  // compensation_cess is GST Compensation Cess (aerated drinks, tobacco) — a SEPARATE
+  // levy from special_excise_cess, which means TGBCL Special Excise Cess everywhere it
+  // is read or labelled. Never fold it into cgst/sgst: it is not halved and it must not
+  // join the tax_value === cgst + sgst invariant.
+  compensation_cess: number;
   special_excise_cess: number; tcs: number; delivery_charges: number; mrp_round_off: number;
   link_key: string;              // ties a GRN line to the purchases row it created
   notes: string;
@@ -407,7 +412,8 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
   const t = data?.totals;
   const CHARGE_COLS: { k: keyof LogRow; label: string }[] = [
     { k: 'discount', label: 'Discount' }, { k: 'cgst', label: 'CGST' }, { k: 'sgst', label: 'SGST' },
-    { k: 'special_excise_cess', label: 'Excise/Cess' }, { k: 'tcs', label: 'TCS' },
+    { k: 'special_excise_cess', label: 'Excise/Cess' }, { k: 'compensation_cess', label: 'Comp. Cess' },
+    { k: 'tcs', label: 'TCS' },
     { k: 'delivery_charges', label: 'Delivery' }, { k: 'mrp_round_off', label: 'MRP Round-off' },
   ];
   const colCount = 13 + (showCharges ? CHARGE_COLS.length : 0);
@@ -485,8 +491,8 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
           <p className="text-[11px] text-[#8B7355]">
             {fmtNum(t.lines)} line{t.lines === 1 ? '' : 's'} · {from} to {to}. Quantities and rates are in PURCHASE units.
             GRN rates are gross (as the vendor bill reads); purchase rates are net of the allocated discount, so the same
-            delivery can legitimately show two rates. The seven per-line charges are recorded only — they are NOT folded
-            into Value.
+            delivery can legitimately show two rates. The {CHARGE_COLS.length} per-line charges are recorded only — they
+            are NOT folded into Value.
           </p>
         </div>
       )}

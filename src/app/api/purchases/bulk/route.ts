@@ -25,7 +25,14 @@ interface BulkPurchaseItem {
   category_name?: string;
   po_qty?: number;
   // GRN-Inward per-line charges (₹) — recorded only, never change unit cost.
-  discount?: number; cgst?: number; sgst?: number;
+  // compensation_cess is GST Compensation Cess, a DIFFERENT levy from
+  // special_excise_cess (TGBCL Special Excise Cess). It arrives here as a plain
+  // rupee figure and is stored as one: this importer never derives it from
+  // raw_materials.cess_percent — a sheet states what the vendor actually
+  // charged, and re-deriving it from a master rate would overwrite the bill.
+  // It is NOT part of the house invariant tax_value === cgst + sgst either;
+  // cess is never halved and adding it to that sum overstates GST on a return.
+  discount?: number; cgst?: number; sgst?: number; compensation_cess?: number;
   special_excise_cess?: number; tcs?: number; delivery_charges?: number; mrp_round_off?: number;
 }
 
@@ -37,7 +44,8 @@ interface SkippedRow {
   quantity: any; unit_price: any; total_amount: any; gst_amount: any;
   date: string; notes: string; bill_no: string;
   category_name: string; po_qty: any; purchase_unit: string;
-  discount: any; cgst: any; sgst: any; special_excise_cess: any; tcs: any; delivery_charges: any; mrp_round_off: any;
+  discount: any; cgst: any; sgst: any; compensation_cess: any;
+  special_excise_cess: any; tcs: any; delivery_charges: any; mrp_round_off: any;
   kind: SkipKind; reason: string;
 }
 /** Per-line charge coercion. mrp_round_off is signed; the rest ≥ 0. */
@@ -108,6 +116,7 @@ export async function POST(request: Request) {
         date: item.date || '', notes: item.notes || '', bill_no: item.bill_no || '',
         category_name: item.category_name || '', po_qty: item.po_qty ?? '', purchase_unit: item.purchase_unit || '',
         discount: item.discount ?? '', cgst: item.cgst ?? '', sgst: item.sgst ?? '',
+        compensation_cess: item.compensation_cess ?? '',
         special_excise_cess: item.special_excise_cess ?? '', tcs: item.tcs ?? '',
         delivery_charges: item.delivery_charges ?? '', mrp_round_off: item.mrp_round_off ?? '',
         kind, reason,
@@ -116,8 +125,8 @@ export async function POST(request: Request) {
 
     const insertPurchase = db.prepare(`
       INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, invoice_id, bill_no,
-                             discount, cgst, sgst, special_excise_cess, tcs, delivery_charges, mrp_round_off, po_qty, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                             discount, cgst, sgst, compensation_cess, special_excise_cess, tcs, delivery_charges, mrp_round_off, po_qty, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     `);
 
     // ── Invoice ID (OUR number) — auto-generated, never taken from the upload.
@@ -250,12 +259,18 @@ export async function POST(request: Request) {
         // charges are stored separately, so folding them in here would bake
         // them into the weighted-average cost AND count them twice. The client
         // parser backs charges out before sending (see purchases/page.tsx).
+        //
+        // gst_amount is DELIBERATELY absent from this derivation. GST is a
+        // reclaimable input credit and must never enter unit_price: this loop
+        // ends in updateMaterialPrice(), which averages SUM(qty × unit_price)
+        // / SUM(qty) into average_price, which every recipe cost is built on.
+        // Adding it here inflates the cost of every dish that uses the item —
+        // the exact failure that got the bill-level GST control deleted. The
+        // rate is the rate; tax travels BESIDE it in cgst/sgst below. Do not
+        // "restore" the old gross-up folds, and do not add a second branch that
+        // grosses up a supplied unit_price by the tax.
         if (totalAmount > 0 && unitPrice === 0 && quantity > 0) {
-          unitPrice = Math.round(((totalAmount + gstAmount) / quantity) * 100) / 100;
-        }
-        if (unitPrice > 0 && gstAmount > 0 && totalAmount === 0) {
-          const lineTotal = unitPrice * quantity;
-          unitPrice = Math.round(((lineTotal + gstAmount) / quantity) * 100) / 100;
+          unitPrice = Math.round((totalAmount / quantity) * 100) / 100;
         }
         if (quantity <= 0 || unitPrice <= 0) {
           skip(item, rowNum, 'invalid', `Invalid quantity or price for "${item.item_name}"`);
@@ -274,10 +289,28 @@ export async function POST(request: Request) {
         seenInFile.add(key);
 
         const totalPrice = Math.round(quantity * unitPrice * 100) / 100;
+
+        // A sheet's single `gst_amount` column becomes the CGST/SGST pair, so the
+        // credit is recorded beside the goods rate instead of inside it. Split in
+        // integer paise — halving in floats drifts a paisa and breaks the house
+        // invariant tax = cgst + sgst that every reader re-adds — with the odd
+        // paisa landing in CGST. This is character-for-character the split used by
+        // POST /api/purchases and by the /purchases client preview; changing it on
+        // one side alone makes the preview and the stored row disagree by ₹0.01.
+        // If the sheet already itemised cgst/sgst, gst_amount is IGNORED: the tax
+        // is already booked and adding it again would double the input credit.
+        let cgstOut = chg(item.cgst), sgstOut = chg(item.sgst);
+        if (gstAmount > 0 && cgstOut === 0 && sgstOut === 0) {
+          const taxPaise = Math.round(gstAmount * 100);
+          sgstOut = Math.floor(taxPaise / 2) / 100;
+          cgstOut = Math.round((gstAmount - sgstOut) * 100) / 100;
+        }
+
         const id = generateId();
         const invoiceId = nextInvoiceId(item.vendor || '', billNo, item.date);
         insertPurchase.run(id, materialId, item.vendor || '', item.brand || '', quantity, unitPrice, totalPrice, item.date, item.notes || '', invoiceId, billNo,
-          chg(item.discount), chg(item.cgst), chg(item.sgst), chg(item.special_excise_cess), chg(item.tcs), chg(item.delivery_charges), chgSigned(item.mrp_round_off),
+          chg(item.discount), cgstOut, sgstOut, chg(item.compensation_cess),
+          chg(item.special_excise_cess), chg(item.tcs), chg(item.delivery_charges), chgSigned(item.mrp_round_off),
           chg(item.po_qty));
         const stockQty = toStockQty(mat, quantity);
         updateStock.run(stockQty, materialId);

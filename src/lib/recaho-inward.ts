@@ -14,6 +14,11 @@
  *    ("HYPERPURE", "GROCERY", "FRESH CREAM 1 LTR") and qty/rate cells contain "-".
  *    These rows must be SKIPPED.
  *  - Detail rows have an empty first cell, a date in CREATED DATE, and numeric INWARD QTY.
+ *  - Nine charge columns sit between SUBTOTAL and TOTAL INWARD AMOUNT, published per line:
+ *    DISCOUNT, CGST, SGST, VAT, CESS, EXCISE, DELIVERY CHARGES, TCS + SPECIAL EXCISE CESS,
+ *    MRP ROUND OFF. TOTAL INWARD AMOUNT is SUBTOTAL less discount plus all of them, i.e. it
+ *    is tax-INCLUSIVE and is NOT the goods value. Anything that needs a goods figure must
+ *    use quantity x rate (or SUBTOTAL), never totalAmount.
  *
  * Returns a normalized array of `ParsedInward` rows ready for DB insert.
  */
@@ -32,8 +37,24 @@ export interface ParsedInward {
   purchaseUnit: string;            // raw POS unit (e.g. "PKT(1LTR)", "CASE(24PC)")
   rate:         number;            // per purchase-unit
   subtotal:     number;
-  cgst:         number;
-  sgst:         number;
+  // Per-line charges, in sheet-column order. The sheet already separates reclaimable GST
+  // (cgst/sgst) from non-creditable TGBCL landed cost (excise, tcsPlusSpecialCess) ON EVERY
+  // ROW, so callers must map these columns, never branch on the vendor name. Measured over
+  // 10,012 real detail rows: 21 GST rows ALSO carry deliveryCharges, and 12 rows carrying
+  // tcsPlusSpecialCess are NOT billed by "GOVERNMENT OF TELANGANA" — so a vendor-based
+  // if/else drops one side of a mixed row and misclassifies those 12.
+  // `cess` is the sheet's own CESS column (GST compensation cess) and is DISTINCT from
+  // `excise` / `tcsPlusSpecialCess`; conflating them reports an excise figure nobody levied.
+  // Older narrow exports lack these columns entirely — num() yields 0, so they stay inert.
+  discount:           number;
+  cgst:               number;
+  sgst:               number;
+  vat:                number;
+  cess:               number;
+  excise:             number;
+  deliveryCharges:    number;
+  tcsPlusSpecialCess: number;
+  mrpRoundOff:        number;
   totalAmount:  number;
   createdBy:    string;
   notes:        string;            // formatted "Invoice X · Inward Y"
@@ -181,8 +202,15 @@ export function parseInwardWorkbook(xlsx: typeof XLSX, workbook: XLSX.WorkBook):
       purchaseUnit: String(row[h['PURCHASE UNIT'] ?? -1] ?? '').trim(),
       rate:         num(row[h['RATE']     ?? -1]),
       subtotal:     num(row[h['SUBTOTAL'] ?? -1]),
-      cgst:         num(row[h['CGST']     ?? -1]),
-      sgst:         num(row[h['SGST']     ?? -1]),
+      discount:           num(row[h['DISCOUNT']         ?? -1]),
+      cgst:               num(row[h['CGST']             ?? -1]),
+      sgst:               num(row[h['SGST']             ?? -1]),
+      vat:                num(row[h['VAT']              ?? -1]),
+      cess:               num(row[h['CESS']             ?? -1]),
+      excise:             num(row[h['EXCISE']           ?? -1]),
+      deliveryCharges:    num(row[h['DELIVERY CHARGES'] ?? -1]),
+      tcsPlusSpecialCess: num(row[h['TCS + SPECIAL EXCISE CESS'] ?? -1]),
+      mrpRoundOff:        num(row[h['MRP ROUND OFF']    ?? -1]),
       totalAmount:  num(row[h['TOTAL INWARD AMOUNT'] ?? -1]),
       createdBy:    String(row[h['CREATED BY'] ?? -1] ?? '').trim(),
       notes:        [
