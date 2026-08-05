@@ -4720,6 +4720,24 @@ export function deductInventoryForSale(
 ): void {
   const floorStoreId = opts?.storeId ? String(opts.storeId).trim() : '';
 
+  // DEDUCT-AT-ISSUE master switch, read ONCE per sale. When it is on, the gram
+  // already left central stock on the requisition issue (src/lib/issue-stock.ts),
+  // so recipe consumption must NOT withdraw it a second time — see applyDeduct.
+  // Read INLINE rather than importing issueDeductionEnabled from './issue-stock':
+  // that module imports generateId from here, so the import would be circular.
+  // A future engineer "tidying" this into an import will reintroduce the cycle.
+  // Fails CLOSED to false: an unreadable flag keeps today's behaviour (deduct)
+  // rather than silently halting all stock movement, same as routeEnabled below.
+  let issueAtIssue = false;
+  try {
+    issueAtIssue = String((db.prepare(
+      `SELECT value FROM settings WHERE key = 'requisition_deduct_at_issue'`,
+    ).get() as any)?.value ?? '0') === '1';
+  } catch (e) {
+    console.error('deduct-at-issue: setting read failed, keeping central deduction', e);
+    issueAtIssue = false;
+  }
+
   // Resolve the floor-routing helpers + master switch ONCE, lazily, and only
   // when a caller actually asked to route to a store (keeps the 3 non-dine-in
   // call sites on the exact original code path). Any failure here disables
@@ -4746,6 +4764,10 @@ export function deductInventoryForSale(
    * floor store ledger when routing is enabled and the material is store-held;
    * on any problem (including a store-held check miss) falls back to the central
    * raw_materials.current_stock UPDATE. Always safe to call.
+   *
+   * With requisition_deduct_at_issue == "1", recipe consumption is still RECORDED
+   * but withdraws nothing from central stock, because the requisition issue
+   * already took the gram out of the store.
    */
   const applyDeduct = (materialId: string, category: string | null, totalDeduct: number): void => {
     if (routeEnabled && se && floorStoreId && totalDeduct > 0) {
@@ -4768,6 +4790,15 @@ export function deductInventoryForSale(
         // fall through to central UPDATE below
       }
     }
+    // STOCK IS REMOVED EXACTLY ONCE. Under deduct-at-issue, central stock is the
+    // store's own holding and the requisition already debited it; a sale of the
+    // dish must not debit it again. The caller's inventory_transactions row is
+    // written either way and is what the Variance Report / Daily Roll-up read,
+    // so the theoretical Sales-vs-Purchase figure is unaffected by this return.
+    // Do NOT "simplify" this by gating the transaction row too — recipe_to_date
+    // would collapse to 0 and every variance line would report the whole
+    // purchase history as shrinkage.
+    if (issueAtIssue) return;
     db.prepare('UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime(\'now\') WHERE id = ?')
       .run(totalDeduct, materialId);
   };

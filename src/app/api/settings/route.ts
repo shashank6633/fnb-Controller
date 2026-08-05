@@ -48,6 +48,21 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
     write: 'admin',
     writeError: 'Admin role required to change the PO approval requirement',
   }],
+  // The cutover switch for WHERE stock leaves the building: '0' (shipped
+  // default) debits central current_stock at recipe consumption, '1' debits it
+  // when the store issues to a department. It re-bases every stock figure in
+  // the system at once — on-hand, closing valuation, low-stock/buy-list,
+  // variance — and it is a ONE-WAY DOOR operationally: flipping it back stops
+  // new debits but does NOT restore stock a run of issues already removed. That
+  // is a decision for whoever owns the count, not for whoever happens to be on
+  // shift. Nothing in SECRET_KEY_RE matches this name, so without this row a
+  // manager PUT writes it — do not "simplify" the entry away as redundant.
+  // READ stays open so the Purchasing settings page can show a manager the
+  // switch read-only; the value is not a secret, only the flip is privileged.
+  ['requisition_deduct_at_issue', {
+    write: 'admin',
+    writeError: 'Admin role required to change when stock is deducted',
+  }],
   // Owned keys. Each has a dedicated admin-only route that VALIDATES the value
   // (Slack host check, service-account JSON parse, printer normalisation) and
   // masks it on read — writing it through here would bypass both gate and

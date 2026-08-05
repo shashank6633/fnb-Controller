@@ -52,12 +52,27 @@ export async function GET(request: Request) {
            FROM purchases p
            WHERE p.material_id = rm.id AND p.quantity > 0 AND COALESCE(p.total_price, 0) > 0
            ORDER BY p.date DESC, p.created_at DESC LIMIT 1), 0) as latest_price_purchase_unit,
-        -- Exclude 'transfer' rows (Option B grocery→floor bridge writes a
-        -- negative type='transfer' row per grocery-source issue): a transfer
-        -- relocates stock, it is NOT consumption, so counting it here would
-        -- inflate the material's consumed metric. real consumption channels
-        -- (recipe/requisition/issue/sale/party/staff_meal/wastage) still count.
-        COALESCE((SELECT SUM(ABS(quantity)) FROM inventory_transactions WHERE material_id = rm.id AND quantity < 0 AND type != 'transfer'), 0) as total_consumed,
+        -- CONSUMPTION IS A WHITELIST, NOT "everything that isn't a transfer".
+        -- Do not "simplify" this back to type != 'transfer' — that blacklist is
+        -- what this line is fixing, and it fails open on every movement type
+        -- added later.
+        --   'transfer'          — Option B grocery→floor bridge writes a negative
+        --                         row per grocery-source issue. A transfer
+        --                         RELOCATES stock between pools; nothing is used up.
+        --   'requisition_issue' — written by applyIssueDelta (src/lib/issue-stock.ts)
+        --                         once settings.requisition_deduct_at_issue is '1'.
+        --                         That row means the gram MOVED from the central
+        --                         store to a department, not that it was consumed.
+        --                         The same gram is consumed later, on the recipe
+        --                         rail, as a 'sale' row — so counting both would
+        --                         report it twice, and all 131 recipe-ingredient
+        --                         materials are also requisition-issued, i.e. a
+        --                         straight doubling across the whole recipe set.
+        -- The whitelist below is the one the Variance Report (api/variance-report
+        -- :90) and the Daily Roll-up (api/daily-rollup:76) already use, so every
+        -- 'consumed' surface now agrees on a single definition. No-op today:
+        -- inventory_transactions holds only purchase/sale/nc rows.
+        COALESCE((SELECT SUM(ABS(quantity)) FROM inventory_transactions WHERE material_id = rm.id AND quantity < 0 AND type IN ('sale','nc','party','staff_meal','wastage')), 0) as total_consumed,
         ROUND(rm.current_stock * rm.average_price, 2) as stock_value,
         -- Recency view: rolling 30-day (monthly) weighted avg drives recipe / req cost.
         -- Also expose 90-day + all-time for the UI comparison column.

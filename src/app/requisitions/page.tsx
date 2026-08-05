@@ -159,6 +159,42 @@ function lineUnits(it: ReqItem) {
   };
 }
 
+/**
+ * HOD-effective demand for a line, in the line's STORED unit.
+ *
+ * `!= null` is the rule, NOT `> 0`: it is what the server uses to decide whether
+ * a requisition is fully issued (store-issue/route.ts `allDone`) and what the
+ * full item table prints under "HOD OK". The store-issue MODAL further insists
+ * on `> 0`, which is a different question (what to pre-fill an editable box
+ * with) — copying that variant here would make a line the HOD deliberately cut
+ * to 0 silently re-inflate to the department's original ask.
+ */
+function effectiveQty(it: ReqItem): number {
+  return (it.chef_approved_qty != null
+    ? Number(it.chef_approved_qty)
+    : Number(it.quantity_requested)) || 0;
+}
+
+/**
+ * The ONE quantity a department should be shown for a line — in the line's
+ * stored unit, so it still needs lineUnits().toPU() to be printed.
+ *
+ * Once the store has processed the requisition, the only figure that means
+ * anything to a kitchen is what physically arrived. Before that there is
+ * nothing issued yet, so the effective demand is the honest answer.
+ *
+ * The owner's report: "requested 7 kg of Curd 1, store issued 5, the screen
+ * still says 7." A kitchen reads the headline number and plans around it, so
+ * the headline has to be the truth about goods, not the truth about paperwork.
+ *
+ * Rejected lines return 0 — they are excluded from the requisition's value and
+ * render as an em-dash, matching the full table.
+ */
+function deptLeadQty(it: ReqItem, storeHasIssued: boolean): number {
+  if (it.is_rejected) return 0;
+  return storeHasIssued ? (Number(it.quantity_issued) || 0) : effectiveQty(it);
+}
+
 const STATUS_BADGE: Record<string, string> = {
   draft:           'bg-[#E8D5C4] text-[#6B5744]',
   submitted:       'bg-amber-100 text-amber-800',
@@ -946,12 +982,34 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
   // HOD, admin, store and manager keep the full table (the else branch below).
   const isPlainDept = viewer.role !== 'admin' && viewer.role !== 'manager'
     && !viewer.can_chef && !viewer.can_mgmt && !viewer.can_store && !viewer.can_issue;
-  // Overall requisition cost = Σ requested-qty × pack-factor × ₹/recipe-unit.
+  // Has the store actually handed anything over? This MUST stay the same
+  // predicate the full item table uses to reveal its Issued / To Purchase
+  // columns (both call sites below read this const) — the department view and
+  // the store view render the same lines, and if the two ever disagreed about
+  // whether a requisition had been issued they would print different
+  // quantities for the same row to two people standing next to each other.
+  //
+  // Deliberately status-only, NOT `lines_issued_any` (which the tab predicates
+  // use): a requisition cancelled after a partial issue would keep showing the
+  // requested figure. There are zero such rows today; if one ever appears this
+  // is the one line to change, in lockstep with the store table.
+  const storeHasIssued = detail.status === 'store_processed' || detail.status === 'fulfilled';
+  // Closed = nothing more is coming. Drives "short" vs "still to come" on a
+  // part-issued line — see the note on isPartIssued: 45% of `fulfilled`
+  // requisitions here were closed SHORT months ago, so "still to come" would be
+  // a lie on most of the rows this sub-line will ever render on.
+  const reqIsClosed = TERMINAL_STATUSES.includes(detail.status);
+  // Overall requisition cost = Σ lead-qty × pack-factor × ₹/recipe-unit.
   // reqPackFactor converts a purchase-unit request (e.g. 1 BTL) to recipe units
   // before costing at average_price (₹/recipe-unit) — same convention as party
-  // costing. Rejected lines excluded (they won't be issued).
+  // costing. Rejected lines excluded by deptLeadQty (they won't be issued).
+  //
+  // The BASIS follows the table above it (deptLeadQty), because a table reading
+  // 5 kg above a total pricing 7 kg is worse than either number alone. The
+  // arithmetic convention is untouched — toRecipe(q) === q × reqPackFactor(it),
+  // so this is still qty × pack × ₹/recipe-unit, only a different qty.
   const reqTotal = (detail.items || []).reduce(
-    (s, it) => s + (it.is_rejected ? 0 : (it.quantity_requested || 0) * reqPackFactor(it) * (it.average_price || 0)), 0);
+    (s, it) => s + deptLeadQty(it, storeHasIssued) * reqPackFactor(it) * (it.average_price || 0), 0);
 
   const submit = async () => {
     if (!confirm('Submit this requisition for head-chef approval?')) return;
@@ -1016,14 +1074,53 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                     const rejected = !!it.is_rejected;
                     // Owner rule: purchase basis leads, recipe figure as the hint.
                     const U = lineUnits(it);
+                    // ONE headline figure per line — the truth about goods (see
+                    // deptLeadQty). Everything below is the exception report.
+                    const lead = deptLeadQty(it, storeHasIssued);
+                    const approved = effectiveQty(it);
+                    const issued = Number(it.quantity_issued) || 0;
+                    const open = Math.max(0, approved - issued);
+                    const over = issued - approved;
+                    // "requested" vs "approved" — say which number the line fell
+                    // short OF, or the department reads its own ask back at it
+                    // when it was actually the HOD who cut the line.
+                    const basis = it.chef_approved_qty != null ? 'approved' : 'requested';
+                    // QUIET BY DEFAULT. A line that arrived whole, or has not
+                    // reached the store yet, renders exactly as it did before
+                    // this change: one figure, no commentary. Only a line that
+                    // did NOT arrive whole earns a second line of text.
+                    //
+                    // The `approved > 0` guard is load-bearing, not defensive:
+                    // 3,395 imported lines carry quantity_requested = 0 with a
+                    // real issued qty, and "of 0 kg requested" on a fifth of
+                    // every list is how a genuine warning stops being read.
+                    const caveat = rejected
+                      ? 'Rejected by HOD — not issued'
+                      : (!storeHasIssued && it.chef_approved_qty != null
+                          && Number(it.chef_approved_qty) !== Number(it.quantity_requested))
+                        ? `HOD approved · requested ${fmtNum(U.toPU(it.quantity_requested))} ${U.pu}`
+                      : (storeHasIssued && approved > 0 && open > 1e-9)
+                        ? `of ${fmtNum(U.toPU(approved))} ${U.pu} ${basis} · ${fmtNum(U.toPU(open))} ${reqIsClosed ? 'short' : 'still to come'}`
+                      : (storeHasIssued && approved > 0 && over > 1e-9)
+                        ? `${fmtNum(U.toPU(over))} ${U.pu} over the ${fmtNum(U.toPU(approved))} ${U.pu} ${basis}`
+                      : null;
                     return (
                       <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`}>
                         <td className="py-1 px-2">{it.material_name}</td>
                         <td className="py-1 px-2 text-right font-mono">
-                          {fmtNum(U.toPU(it.quantity_requested))}
-                          {U.pf > 1 && (
+                          {/* Rejected prints an em-dash, same as the full table.
+                              It used to print the placeholder 1 that
+                              chef-approve/route.ts writes on a rejected line —
+                              a quantity nobody ever asked for or issued. */}
+                          {rejected ? <span className="text-red-700 no-underline">—</span> : fmtNum(U.toPU(lead))}
+                          {!rejected && U.pf > 1 && (
                             <div className="text-[9px] text-[#B8A590] font-normal no-underline">
-                              = {fmtNum(U.toRecipe(it.quantity_requested))} {U.recipeUnit}
+                              = {fmtNum(U.toRecipe(lead))} {U.recipeUnit}
+                            </div>
+                          )}
+                          {caveat && (
+                            <div className={`text-[9px] font-normal no-underline ${rejected ? 'text-red-700' : 'text-amber-700'}`}>
+                              {caveat}
                             </div>
                           )}
                         </td>
@@ -1034,7 +1131,10 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                 </tbody>
               </table>
               <div className="mt-2 flex items-center justify-between border-t-2 border-[#D4B896] pt-2">
-                <span className="text-xs font-semibold text-[#2D1B0E]">Requisition total</span>
+                {/* Relabelled once the basis moves, so the number changing is
+                    legible rather than mysterious to someone who saw it before
+                    the store issued. */}
+                <span className="text-xs font-semibold text-[#2D1B0E]">{storeHasIssued ? 'Issued value' : 'Requisition total'}</span>
                 <span className="text-sm font-mono font-semibold text-[#2D1B0E]">{fmt(reqTotal)}</span>
               </div>
             </>
@@ -1048,7 +1148,8 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                 <th className="text-right py-1 px-2 font-medium">Requested</th>
                 <th className="text-right py-1 px-2 font-medium" title="HOD-approved quantity (overrides Requested when set)">HOD OK</th>
                 <th className="text-right py-1 px-2 font-medium">On Hand</th>
-                {(detail.status === 'store_processed' || detail.status === 'fulfilled') && (
+                {/* Same const the department table leads with — see storeHasIssued. */}
+                {storeHasIssued && (
                   <>
                     <th className="text-right py-1 px-2 font-medium">Issued</th>
                     <th className="text-right py-1 px-2 font-medium">To Purchase</th>
@@ -1110,7 +1211,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                             </div></>
                         : <>{fmtNum(it.current_stock)} {puLbl}{short && ' ⚠'}</>}
                     </td>
-                    {(detail.status === 'store_processed' || detail.status === 'fulfilled') && (
+                    {storeHasIssued && (
                       <>
                         <td className="py-1 px-2 text-right font-mono text-emerald-700">
                           {rejected ? '—' : <>{fmtNum(U.toPU(it.quantity_issued))} {puLbl}{hint(it.quantity_issued || 0)}</>}

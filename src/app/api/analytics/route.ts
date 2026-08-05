@@ -218,6 +218,29 @@ export async function GET(request: Request) {
       FROM raw_materials rm
       LEFT JOIN inventory_transactions it ON it.material_id = rm.id
         AND it.created_at >= ? AND it.created_at <= ?
+        -- Consumption = the recipe + wastage channels ONLY. Same set of
+        -- channels /api/variance-report and /api/inventory count; keep the
+        -- three in step. Two deliberate differences from variance-report:
+        -- it splits recipe and wastage into separate columns (this is one
+        -- rolled-up "consumed" figure), and it omits 'nc'. 'nc' stays in here
+        -- because comped food really did leave the store and the 36 live 'nc'
+        -- rows are already in this number today -- dropping them would change
+        -- a reported figure under cover of a no-op change.
+        -- Unfiltered, this sums EVERY negative row, so the moment
+        -- requisition_deduct_at_issue goes to '1' the type='requisition_issue'
+        -- rows (issue-stock.ts writes one negative row per issued line) land
+        -- here as well. All 131 recipe-ingredient materials are also
+        -- requisition-issued, so each would be counted twice, and a material
+        -- that is only ever issued and never sold would be promoted into this
+        -- top-15 on movement that is not consumption at all. 'transfer' is out
+        -- for the reason /api/inventory gives: relocating stock is not
+        -- consuming it.
+        --
+        -- THIS PREDICATE BELONGS IN THE ON, NOT A WHERE. Moved to a WHERE it
+        -- degrades the LEFT JOIN to an inner join and the 863 materials with
+        -- no transactions in the window vanish from the list instead of
+        -- reporting consumed = 0.
+        AND it.type IN ('sale', 'nc', 'party', 'staff_meal', 'wastage')
       GROUP BY rm.id
       ORDER BY consumed DESC
       LIMIT 15
