@@ -484,9 +484,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         `).run(linkedPoId, poNumber, isoDate, deliveryDate, headerVendorId, headerVendor || '',
                 `Auto-raised from requisition ${r.req_number}`, me.email, me.email, id, outletId);
 
+        // req_item_id is THE traceability link and this is the ONLY place in the
+        // app where it is in scope at PO-insert time: poLines carries it from the
+        // shortfall loop above (`req_item_id: it.id`). Until now it lived only in
+        // memory and the sole surviving trace of which requisition a PO line came
+        // from was the `From REQ-...` note text below — which names the
+        // REQUISITION, never the LINE, so a material requested twice at different
+        // quantities could not be told apart afterwards. Do NOT "simplify" this
+        // away as redundant with that note: the note is prose, this is the join
+        // key the purchase → requisition → issue log reads.
+        //
+        // FIRST-LINE-PRECISE ON THE MERGED PATH, stated rather than hidden:
+        // mergeDuplicateLines() (src/lib/line-dedupe.ts:116) folds two
+        // requisition lines for the same material into ONE PO line and keeps the
+        // FIRST occurrence's fields, so the merged line stores the FIRST
+        // req_item_id while its joined ' | ' notes carry both lines' text.
+        // Nothing is lost that today's note text does not already lose.
         const insPoItem = db.prepare(`
-          INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes, req_item_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         let total = 0;
         for (const ln of poLines) {
@@ -496,7 +512,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
                         // Already resolved and CHECKED above — no fallback here,
                         // or the stored pair could differ from the validated one.
                         lineTotal, ln.vendor || '', ln.vendor_id || null,
-                        `From ${r.req_number}: ${ln.notes || ''}`.trim());
+                        `From ${r.req_number}: ${ln.notes || ''}`.trim(),
+                        // NULL, not '', when absent: this column is a soft link to
+                        // requisition_items.id and every other writer of this table
+                        // leaves it NULL. An empty string would join to nothing and
+                        // read as "linked" to any IS NOT NULL filter.
+                        ln.req_item_id || null);
         }
         db.prepare(`UPDATE purchase_orders SET total_cost = ? WHERE id = ?`).run(total, linkedPoId);
         result.linked_po_id = linkedPoId;

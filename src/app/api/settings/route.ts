@@ -1,5 +1,14 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+// SECRET_KEY_RE lives in @/lib/secret-keys, not in this file, because the
+// read-only Database console (/api/admin/database) masks its query results with
+// the SAME pattern: a raw `SELECT * FROM settings` there must redact exactly
+// what this route redacts, or the console becomes the back door around it. Do
+// NOT "simplify" it back to a local const — two copies drift the day one of
+// them gains a key, and the copy that lags is the one that leaks. It is still
+// pattern-matched rather than a fixed list, so a secret added later is redacted
+// by DEFAULT instead of leaking until someone remembers to list it.
+import { SECRET_KEY_RE } from '@/lib/secret-keys';
 
 /**
  * ONE table for every key this generic endpoint treats specially. BOTH halves
@@ -88,10 +97,6 @@ function ownerRoute(key: string): string | null {
   if (owned) return owned;
   return OWNED_PREFIXES.find((p) => p.re.test(key))?.route ?? null;
 }
-
-// Pattern-matched, not a fixed list, so a secret added later is redacted by
-// DEFAULT rather than leaking until someone remembers to list it.
-const SECRET_KEY_RE = /(token|api[_-]?key|_keys|secret|password|passwd|webhook|credential|sa_json|private)/i;
 
 /** Admin-only to READ: looks like a secret, or is listed read:'admin' above. */
 const isSecret = (k: string) => SECRET_KEY_RE.test(k) || KEY_POLICY.get(k)?.read === 'admin';

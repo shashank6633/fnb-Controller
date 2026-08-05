@@ -224,10 +224,21 @@ export async function POST(request: Request) {
       // Per-line inward charges (₹). mrp_round_off is signed; the rest ≥ 0.
       const chg = (v: any) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0; };
       const chgSigned = (v: any) => { const n = Number(v); return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; };
+      // grn_id is the HARD link from the cost row back to the delivery that
+      // created it. Before it existed the only tie was the sentence in
+      // `notes` below, which purchase-log.ts has to regex back out — a link
+      // that breaks the moment anyone rewords a note. The column is additive
+      // and soft (no FK: SQLite cannot ADD one, and rebuilding `purchases` on
+      // a live system is not a trade worth making), so the two writers that
+      // genuinely hold a GRN in scope — this route and PO-receive — bind it,
+      // and the five that do not (direct purchase, opening stock, bulk,
+      // inward-import, seed) correctly leave it NULL. Old rows stay NULL: no
+      // backfill, and the note text below is unchanged so the regex path
+      // keeps reading history exactly as it did.
       const insPurchase = db.prepare(`
         INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
-                               is_emergency, payment_mode, emergency_reason, outlet_id, created_at)
-        VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, 0, '', '', ?, datetime('now'))
+                               is_emergency, payment_mode, emergency_reason, outlet_id, grn_id, created_at)
+        VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, 0, '', '', ?, ?, datetime('now'))
       `);
       const bumpStock = db.prepare(`
         UPDATE raw_materials
@@ -326,8 +337,14 @@ export async function POST(request: Request) {
           const noteTag = accepted < 0
             ? `BACK-CORRECTION GRN ${grnNumber}${invoice_number ? ' · invoice ' + invoice_number : ''}`
             : `Ad-hoc GRN ${grnNumber}${invoice_number ? ' · invoice ' + invoice_number : ''}`;
+          // grnId is minted above and inserted in THIS same transaction, so the
+          // link is never dangling — the GRN header row and its cost rows commit
+          // or roll back together. A BACK-CORRECTION (negative accepted) is bound
+          // to its own GRN too, deliberately: the reversal is a delivery event in
+          // its own right and the log must show it against the GRN that recorded
+          // it, not silently under the original receipt.
           insPurchase.run(purchaseId, it.material_id, vendor || '', accepted, price, lineTotal, date,
-                          noteTag, outletId);
+                          noteTag, outletId, grnId);
           // ── Unit-basis boundary (CORE CONVENTION) ──────────────────────
           // GRN lines are entered in PURCHASE units at ₹/purchase-unit (same
           // basis as /api/purchases — also the only reading consistent with

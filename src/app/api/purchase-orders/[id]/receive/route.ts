@@ -966,10 +966,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // which IS the bill document; this row is the COST mirror of it, and
       // src/lib/purchase-log.ts reads the two separately (is_mirror) precisely so
       // the same rupee is not counted on both.
+      //
+      // TRACEABILITY (Break 2) — `grn_id` is the HARD link from the cost row back
+      // to the delivery that created it. Until it existed the ONLY tie between a
+      // purchases row and its GRN was the English sentence in `notes` ("Received
+      // against PO-… (GRN GRN-…)"), which src/lib/purchase-log.ts has to parse back
+      // out with an anchored regex. A sentence is not a key: rewrite the wording
+      // once and every downstream join dies silently. So the id is bound here, in
+      // the SAME transaction that mints the GRN, where it is knowable for free.
+      // Two rules a future edit must not "simplify" away:
+      //   1. The `notes` text STAYS character-for-character as it is. It is history
+      //      on ~every existing row, purchase-log.ts still parses it, and older rows
+      //      predate this column — the regex is the fallback, not dead code.
+      //   2. `grn_id` is NULL on every purchases writer that has no GRN in scope
+      //      (direct purchase, opening stock, bulk, inward-import, seed). NULL there
+      //      is the honest value; do not invent a GRN to fill it, and do not backfill
+      //      historical rows, which have no recoverable delivery.
+      // Soft link, deliberately no FOREIGN KEY: SQLite cannot ADD one by ALTER and
+      // rebuilding `purchases` on a live system to gain a constraint nothing enforces
+      // today is not a trade worth making.
       const insPurchase = db.prepare(`
         INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, outlet_id,
-                               discount, delivery_charges, bill_no, created_at)
-        VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, ?, ?, datetime('now'))
+                               discount, delivery_charges, bill_no, grn_id, created_at)
+        VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, datetime('now'))
       `);
       const bumpStock = db.prepare(`
         UPDATE raw_materials
@@ -1218,8 +1237,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // Stamp the receipt with the PO's outlet (the GRN header above already
           // does). A NULL here gets backfilled to the DEFAULT outlet by the
           // startup migration, silently moving another outlet's purchase.
+          // grnId is the LAST bind and the only new one: the GRN minted a few lines
+          // above in this same transaction, so the cost row and its delivery are
+          // committed together or not at all. Nothing else on this call changes —
+          // quantity, netPrice, netTotal, delivShare and purchaseNote are untouched.
           insPurchase.run(purchaseId, it.material_id, lineVendor, accepted, netPrice, netTotal, receivedAt,
-            purchaseNote, po.outlet_id, delivShare, billNo);
+            purchaseNote, po.outlet_id, delivShare, billNo, grnId);
           // last_purchase_price keeps the GROSS rate, and that divergence from
           // the purchases.unit_price written one line above is deliberate: this
           // column is the vendor's LIST rate, and it seeds the next PO's rate

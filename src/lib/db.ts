@@ -829,6 +829,29 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('purchase_orders schema failed:', e); }
 
+  // The PO line forgot which requisition LINE it buys for. When a shortfall
+  // becomes a PO, store-process holds ln.req_item_id in memory all the way to
+  // the insert and then drops it; only "From REQ-2026-0123" survives in the line
+  // notes, and that names the requisition, not the line. Soft link, no FK
+  // (SQLite cannot ADD one by ALTER). NOT backfilled; the note text is unchanged.
+  //
+  // Placed AFTER the CREATE TABLE above on purpose. The older per-line-vendor
+  // migration for this same table sits BEFORE it, so on a brand-new database
+  // its PRAGMA sees no table and the columns only appear on the second boot.
+  // Do not copy that ordering.
+  //
+  // Known limitation, stated rather than papered over: mergeDuplicateLines()
+  // (src/lib/line-dedupe.ts) folds two requisition lines for the same material
+  // into one PO line keeping the first row's fields, so a merged line names the
+  // FIRST requisition line. The joined notes still carry both.
+  try {
+    const cols = db.prepare("PRAGMA table_info(purchase_order_items)").all() as any[];
+    if (cols.length > 0 && !cols.some((c: any) => c.name === 'req_item_id')) {
+      db.exec(`ALTER TABLE purchase_order_items ADD COLUMN req_item_id TEXT`);
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_poi_req_item ON purchase_order_items(req_item_id)`);
+  } catch (e) { console.error('po_items.req_item_id migration failed:', e); }
+
   // Settings: current_role (manager | admin) — fallback when no auth session is present
   try {
     db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('current_role', 'admin')`);
@@ -1226,25 +1249,66 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('department_materials schema failed:', e); }
 
-  // Requisition issue ledger — the audit spine for "stock is deducted once, at
-  // issue" (settings key `requisition_deduct_at_issue`, default OFF).
+  // Requisition issue ledger — the audit spine for the store→department
+  // handover, and the one table the end-to-end material log is built on.
   //
   // Every writer of requisition_items.quantity_issued calls applyIssueDelta()
   // (src/lib/issue-stock.ts) inside its own transaction with the before/after
-  // line quantities, and exactly one row lands here per non-zero delta. The
-  // invariant that makes this safe against retries, absolute overwrites and
-  // zeroings alike:
+  // line quantities, and exactly one row lands here per non-zero delta.
   //
-  //   SUM(delta_recipe_qty) == (quantity_issued - baseline_line_qty) x pack_factor
+  // TWO QUANTITIES, AND THEY ARE NOT THE SAME NUMBER. Do not "simplify" them
+  // back into one column — that is the ALMOND bug waiting to happen:
+  //
+  //   recorded_recipe_qty  what physically left the store on this call. Written
+  //                        on EVERY issue, ALWAYS, whatever
+  //                        settings.requisition_deduct_at_issue says. This is
+  //                        the column the log reads.        ALWAYS-RECORD.
+  //   delta_recipe_qty     the SUBSET of that which actually moved
+  //                        raw_materials.current_stock — 0 whenever no stock
+  //                        moved. Sole input to the credit clamp in
+  //                        issue-stock.ts.                  FLAG-GATED-DEDUCT.
+  //
+  // The flag gates only the DEDUCT. It must never again gate the RECORD: while
+  // it did, this table stayed empty through 14,148 real issues and no log of
+  // them could be built at all.
+  //
+  // INVARIANTS, per req_item_id:
+  //
+  //   SUM(recorded_recipe_qty) == (quantity_issued - baseline_line_qty) x pack_factor
+  //   SUM(delta_recipe_qty)    <= SUM(recorded_recipe_qty)                always
+  //
+  // The first of those used to be stated on delta_recipe_qty, and held only
+  // while a row could not exist without a deduction. With the deduct flag OFF
+  // every row now carries delta_recipe_qty = 0 and the record still lands, so
+  // the hand-over invariant moved to its own column.
+  //
+  // WHY THE SPLIT: overloading delta_recipe_qty with hand-overs that moved no
+  // stock poisons the credit clamp. A line issued while the flag was off and
+  // then undone after it was switched on would credit stock that was never
+  // debited — measured on ALMOND: 4,000 g became 5,000 g and the department
+  // balance went to -1,000. Two meanings, two columns, two independent clamps.
+  //
+  // stock_applied is 1 iff the row moved current_stock. lineHasMovedStock() /
+  // requisitionHasMovedStock() MUST filter on it. They ask "has stock moved",
+  // never "does a record exist", and four daily operations — requisition PUT,
+  // cancel, chef-reject, requisitions-import — start REFUSING the moment the
+  // two are confused.
+  //
+  // effective_line_qty (chef_approved_qty ?? quantity_requested) is SNAPSHOTTED
+  // at issue time, so FULL-vs-PART is a stamped fact: a chef editing the
+  // approved quantity next week must not retro-rewrite what the store handed
+  // over this morning.
   //
   // baseline_line_qty is stamped ONLY on the first row for a req_item_id, from
   // whatever quantity_issued already held. That is what makes forward-only
-  // structural rather than a promise: the 14,147 lines of imported history are
-  // the baseline, so a new issue against an old requisition moves only the
-  // increment and can never retro-deduct the past.
+  // structural rather than a promise: the 14,148 lines of imported history are
+  // the baseline, so a new issue against an old requisition records and moves
+  // only the increment and can never retro-deduct the past.
   //
   // pack_factor is stored per row because a later Unit Audit rebase changes a
-  // material's factor; the audit must reconcile with the factor actually used.
+  // material's factor; the audit must reconcile with the factor actually used,
+  // and the log's pre-ledger remainder — quantity_issued minus
+  // SUM(recorded_recipe_qty / pack_factor) — only reverses exactly if it does.
   try {
     db.exec(`
       CREATE TABLE IF NOT EXISTS requisition_issue_ledger (
@@ -1281,6 +1345,46 @@ function initializeSchema(db: Database.Database) {
     `);
     db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('requisition_deduct_at_issue', '0')`);
   } catch (e) { console.error('requisition_issue_ledger schema failed:', e); }
+
+  // The four columns that let an issue be RECORDED without being DEDUCTED.
+  // Additive, guarded one at a time, no backfill. The CREATE TABLE above is
+  // left exactly as it shipped — THIS block is the single source of truth for
+  // fresh and existing databases alike, the same pattern the purchases
+  // migration further down uses. Adding them to the CREATE would give a fresh
+  // database one shape and an existing one another.
+  try {
+    const cols = db.prepare("PRAGMA table_info(requisition_issue_ledger)").all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    if (cols.length > 0) {
+      // ALWAYS-RECORD: recipe units physically handed over on this call, written
+      // on every issue whatever the deduct flag says. Do NOT fold this back into
+      // delta_recipe_qty to save a column — that column feeds the credit clamp
+      // and means "what left current_stock". See the ALMOND note above.
+      if (!has('recorded_recipe_qty'))
+        db.exec(`ALTER TABLE requisition_issue_ledger ADD COLUMN recorded_recipe_qty REAL NOT NULL DEFAULT 0`);
+      // 1 iff this row moved raw_materials.current_stock. The has-stock-moved
+      // guards filter on it; without that filter they begin refusing requisition
+      // PUT, cancel, chef-reject and import the moment a flag-off record lands.
+      if (!has('stock_applied'))
+        db.exec(`ALTER TABLE requisition_issue_ledger ADD COLUMN stock_applied INTEGER NOT NULL DEFAULT 0`);
+      // chef_approved_qty ?? quantity_requested, snapshotted at issue time so
+      // FULL vs PART (7 kg asked, 5 kg given) is a stamped fact, not a live
+      // recomputation a later approval edit can rewrite.
+      if (!has('effective_line_qty'))
+        db.exec(`ALTER TABLE requisition_issue_ledger ADD COLUMN effective_line_qty REAL`);
+      // '' | flag_off | party | unit_review — why no stock moved, stated on the
+      // row's own face. The setting's value at the time is unrecoverable later,
+      // so a reader must not have to infer it.
+      if (!has('skip_reason'))
+        db.exec(`ALTER TABLE requisition_issue_ledger ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''`);
+    }
+    // Once recording is unconditional this table goes from 0 rows to roughly
+    // 14,000 a year, and the end-to-end log filters by date and by department.
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_req_issue_ledger_created ON requisition_issue_ledger(created_at);
+      CREATE INDEX IF NOT EXISTS idx_req_issue_ledger_dept    ON requisition_issue_ledger(department_id);
+    `);
+  } catch (e) { console.error('requisition_issue_ledger additive columns failed:', e); }
 
   // ── Purchasing: per-vendor receiving + petty cash ────────────────────────
   try {
@@ -2174,6 +2278,23 @@ function initializeSchema(db: Database.Database) {
     // is what actually came IN. Record-only (no stock/costing effect); lets the
     // inward register show ordered-vs-received without a linked PO.
     if (!has('po_qty')) db.exec(`ALTER TABLE purchases ADD COLUMN po_qty REAL NOT NULL DEFAULT 0`);
+    // The cost row did not know its delivery. A PO receive writes po_vendor_bills
+    // + goods_receipt_notes + goods_receipt_note_items + purchases in ONE
+    // transaction, and yet the only tie from the purchase back to the GRN was a
+    // sentence in purchases.notes ("Received against PO-… (GRN GRN-…)") that
+    // purchase-log.ts has to re-parse with a regex.
+    //
+    // Soft link, deliberately no FK: SQLite cannot ADD one by ALTER, and
+    // rebuilding purchases on a live restaurant system to gain a constraint
+    // nothing enforces today is not a trade worth making.
+    //
+    // Populated ONLY where a GRN genuinely exists in scope — the PO receive path
+    // and the ad-hoc GRN path. The other purchases writers (direct purchase,
+    // opening stock, bulk, inward-import, seed) have no GRN and NULL is the
+    // honest value there. NOT backfilled, and purchases.notes keeps its exact
+    // wording: it is history, and purchase-log.ts still reads it.
+    if (!has('grn_id')) db.exec(`ALTER TABLE purchases ADD COLUMN grn_id TEXT`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_purchases_grn ON purchases(grn_id)`);
   } catch (e) { console.error('purchases.is_emergency migration failed:', e); }
 
   // Phase 1 §5: Goods Receipt Note (GRN) — formal record at the receiving bay.

@@ -162,6 +162,8 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/reports',             label: 'Reports' },
       { path: '/reports/sales',       label: 'Sales Reports', mgmtOnly: true },
       { path: '/reports/purchases',   label: 'Purchase Report', mgmtOnly: true },
+      { path: '/reports/issue-log',   label: 'Purchase to Issue Log', mgmtOnly: true },   // mgmtOnly for the SAME reason as Purchase Report directly above: it joins vendor spend and purchase rates onto material rows. Do NOT "simplify" this to an open page — the store's own issue view (/store-requisitions, /api/store-issued-log) is untouched and still carries no money.
+      { path: '/reports/menu-recipe-gap', label: 'Menu Items Without Recipe', mgmtOnly: true }, // mgmtOnly: ranks the un-costed menu by actual SALES VALUE (revenue on the page), and its review-gated bulk attach rewrites the food cost of every FUTURE sale of a dish. Not a staff surface.
       { path: '/menu-engineering',    label: 'Menu Engineering', hodOnly: true },
       { path: '/variance-report',     label: 'Variance Report' },
       { path: '/department-consumption', label: 'Dept Consumption' },
@@ -265,6 +267,11 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/settings/errors', label: 'Settings — App Errors', adminOnly: true },
       { path: '/admin/data-hygiene',  label: 'Admin — Data Hygiene' },
       { path: '/admin/reset',         label: 'Admin — Reset' },
+      // adminOnly is NOT the only gate, and must not be treated as one:
+      // canAccessPage() FAILS OPEN for a legacy user whose page_access is null,
+      // so this entry is what stops the proxy waving them through — but the
+      // route's own requireRole('admin') is the real lock and must stay.
+      { path: '/admin/database',      label: 'Admin — Database (read-only)', adminOnly: true },
     ],
   },
 ];
