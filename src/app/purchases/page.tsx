@@ -3,6 +3,12 @@
 import { useEffect, useMemo, useState, useRef } from 'react';
 import Link from 'next/link';
 import { fmtISTDate, todayIST } from '@/lib/format-date';
+// THE duplicate rule — one material = one line — lives in exactly one module now
+// (see block A below). src/lib/line-dedupe.ts imports NOTHING, which is the only
+// reason a 'use client' page may touch it: po-helpers.ts, where this rule used to
+// live alone, reaches @/lib/db → better-sqlite3 and would drag a native Node addon
+// into the browser bundle. Never add an import to line-dedupe.ts.
+import { lineKey, duplicateLineGroups, SPLIT_RATE_REMEDY } from '@/lib/line-dedupe';
 import {
   ShoppingCart,
   Plus,
@@ -323,7 +329,7 @@ export default function PurchasesPage() {
       quantity: any; unit_price: any; total_amount: any; gst_amount: any;
       date: string; notes: string; bill_no: string;
       category_name: string; po_qty: any; purchase_unit: string;
-      discount: any; cgst: any; sgst: any; special_excise_cess: any; tcs: any; delivery_charges: any; mrp_round_off: any;
+      discount: any; cgst: any; sgst: any; compensation_cess: any; special_excise_cess: any; tcs: any; delivery_charges: any; mrp_round_off: any;
       kind: string; reason: string;
     }>;
   } | null>(null);
@@ -333,11 +339,18 @@ export default function PurchasesPage() {
   const downloadSkippedRows = () => {
     const rows = bulkResult?.skipped_rows || [];
     if (rows.length === 0) return;
-    // Must mirror the Bulk template's columns (incl. the 7 charges the server
-    // echoes back) so fix-and-re-upload never silently zeroes a charge.
+    // Must mirror the Bulk template's columns (incl. ALL EIGHT charges the
+    // server echoes back) so fix-and-re-upload never silently zeroes a charge.
+    // compensation_cess was missed when it was added as the 8th charge, so a
+    // skipped row lost its cess on the way back out — the recovery file is the
+    // one path where a dropped column is invisible, because the uploader is
+    // re-uploading what they believe is their own data. If a ninth charge is
+    // ever added, it belongs in THREE places: the template, the server echo,
+    // and here.
     const header = ['date', 'vendor', 'bill_no', 'category_name', 'sku', 'item_name',
       'po_qty', 'quantity', 'purchase_unit', 'unit_price', 'total_amount',
-      'discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off',
+      'discount', 'cgst', 'sgst', 'compensation_cess', 'special_excise_cess', 'tcs',
+      'delivery_charges', 'mrp_round_off',
       'brand', 'gst_amount', 'notes', 'reason'];
     const esc = (v: any) => {
       let s = v == null ? '' : String(v);
@@ -348,7 +361,8 @@ export default function PurchasesPage() {
     const lines = [header.join(',')].concat(rows.map(r =>
       [r.date, r.vendor, r.bill_no, r.category_name, r.sku, r.item_name,
        r.po_qty, r.quantity, r.purchase_unit, r.unit_price, r.total_amount,
-       r.discount, r.cgst, r.sgst, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off,
+       r.discount, r.cgst, r.sgst, r.compensation_cess, r.special_excise_cess, r.tcs,
+       r.delivery_charges, r.mrp_round_off,
        r.brand, r.gst_amount, r.notes, r.reason].map(esc).join(',')));
     const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -605,9 +619,9 @@ export default function PurchasesPage() {
     billLineIdCounter = 1;
     setBillData({ ...emptyBill, date: todayString(), items: [emptyBillLine(), emptyBillLine()] });
     setBillError(null);
-    // A "keep both" acknowledgement belongs to ONE bill — never carry it into
-    // the next one. Same for the mapping panel's transient note/expansion.
-    setDupAck([]);
+    // Nothing to reset for duplicates any more: a repeat is refused outright,
+    // so there is no per-bill acknowledgement that could leak into the next
+    // bill. Only the mapping panel's transient note/expansion needs clearing.
     setBillMapNote(null);
     setVendorItemsOpen(false);
     setBillModalOpen(true);
@@ -670,41 +684,59 @@ export default function PurchasesPage() {
    * recipe that uses it. (The reported case: MAT-00192 CHAR COAL entered as
    * 600 kg AND 400 kg at ₹35/kg — one bill line typed as two.)
    *
-   * WHY THE RULE IS MIRRORED HERE INSTEAD OF IMPORTED: the shared
-   * duplicateLineError() / mergeDuplicateLines() live in src/lib/po-helpers.ts,
-   * whose module scope imports @/lib/db → better-sqlite3, a native Node addon.
-   * This page is a 'use client' component, so importing that module drags the
-   * driver into the browser bundle and the build fails. No client file in this
-   * repo imports a lib module that reaches db.ts, and this is not the place to
-   * become the first. The semantics below are deliberately the SAME rule:
-   *   · identity is material_id ALONE, trimmed (po-helpers' lineKey)
-   *   · blank rows are legal and skipped (the form opens with two)
-   *   · a merge SUMS the quantity onto the FIRST occurrence, which keeps its own
-   *     rate (po-helpers' mergeDuplicateLines semantics)
-   * If those two helpers are ever moved into a db-free module (e.g.
-   * src/lib/line-dedupe.ts, re-exported from po-helpers), this block should
-   * import them instead of restating them — that is a cross-file change.
+   * THE RULE IS IMPORTED, NOT RESTATED. It lives in src/lib/line-dedupe.ts and
+   * nowhere else: lineKey (identity) and duplicateLineGroups (the scan) are the
+   * SAME functions the PO routes reach through po-helpers, which now merely
+   * re-exports them. This page used to MIRROR that logic inline because
+   * po-helpers' module scope imports @/lib/db → better-sqlite3 and a 'use client'
+   * file cannot drag a native Node addon into the browser bundle. The mirror is
+   * exactly why the bill and the PO drifted apart — the bill grew a split-rate
+   * escape hatch the PO never had — so line-dedupe.ts was carved out db-free to
+   * end that. DO NOT RESTATE THE RULE HERE AGAIN, in any form; extend the shared
+   * module instead. (line-dedupe.ts must keep ZERO imports, type-only ones
+   * included, or this page stops building.)
+   *
+   * IDENTITY IS material_id ALONE, exactly like a PO. Rate, GST %, cess, brand
+   * and BTL/CASE basis do NOT enter it: the same item twice on one bill is
+   * refused whatever the numbers say. Blank rows stay legal and are skipped —
+   * the form opens with empty ones.
+   *
+   * THE ONE PLACE THIS IS LOOSER THAN A PO, deliberately: the bill only REFUSES
+   * on repeats among rows that would actually be POSTed (quantity > 0 AND rate
+   * > 0 — the `bookable` notion, i.e. what validItems keeps). A half-typed
+   * second row is dropped by validItems and never becomes a purchases row, so
+   * refusing it would be a false refusal on a line that cannot exist. A PO line
+   * with no quantity IS still ordered, which is why the PO has no such carve-out.
+   * Repeats that are not yet bookable still raise the amber panel; they just do
+   * not hold the save up. Do not "align" this away.
    * ============================================================== */
 
-  /** Trimmed material id — the identity a duplicate is judged on. */
-  const lineMat = (it: BillLineItem) => String(it.material_id || '').trim();
+  /** Trimmed material id — the identity a duplicate is judged on. THE SHARED
+   *  function, not a local copy: BillLineItem is structurally assignable to
+   *  line-dedupe's DedupeLineLike (every field there is optional + unknown). */
+  const lineMat = lineKey;
 
   /**
-   * Everything that must be IDENTICAL before two lines of one material may be
-   * folded into one. The rate is the headline — a split-rate bill is a
-   * LEGITIMATE bill shape, and silently averaging two rates would corrupt both
-   * the stored rate and every recipe cost derived from it — but three more
-   * fields change what a merged line would MEAN:
-   *   · GST %   — a merge carries the FIRST line's rate onto the summed
+   * NOT IDENTITY. Identity is material_id alone (lineKey, imported above) and a
+   * repeat is refused on that alone. This key answers a narrower, purely
+   * arithmetic question: would the one-click "Merge into one line" leave the
+   * money untouched? A merge sums the quantities onto the FIRST row and keeps
+   * that row's rate/GST/cess/basis/brand, so it is only neutral when all five
+   * already match:
+   *   · Rate    — the headline. Folding 600 kg @ ₹35 into 400 kg @ ₹40 would
+   *               re-price the lot at ₹35 and corrupt every recipe cost built
+   *               on the item's weighted average.
+   *   · GST %   — the merge carries the FIRST line's rate onto the summed
    *               quantity, which would re-tax the other line's value.
    *   · Cess %  — same trap, its own levy: merging a 12%-cess line into a
    *               0%-cess line re-applies 12% to the summed quantity.
    *   · BTL/CASE— a per-case rate and a per-bottle rate are different numbers
    *               even when they read the same (billSubmit expands cases).
    *   · Brand   — one material_id billed under two brands is two things.
-   * Anything that differs lands in the "you decide" branch, never in a merge.
+   * When these differ the repeat is still REFUSED — it simply gets no merge
+   * button, because there is no arithmetic the button could safely do.
    */
-  const lineMergeKey = (it: BillLineItem, billRate: number) => {
+  const mergeSafeKey = (it: BillLineItem, billRate: number) => {
     const rate = r2(parseFloat(it.unit_price) || 0);
     // Mirrors billCalc's rate resolution exactly, TGBCL zero-rating included.
     const zeroRated = storeMappedLine(it.material_id);
@@ -718,10 +750,10 @@ export default function PurchasesPage() {
     return `${rate}|${gst}|${cess}|${basis}|${brand}`;
   };
 
-  /** Which field(s) actually differ between two+ merge keys — so the warning
-   *  says "a different rate", not just "these are different". */
+  /** Which field(s) actually differ between two+ merge-safe keys — so the
+   *  refusal says "a different rate", not just "these are different". */
   const keyDiffLabels = (keys: string[]) => {
-    // Order MUST track lineMergeKey's field order — these read positionally.
+    // Order MUST track mergeSafeKey's field order — these read positionally.
     const fields = [
       'a different rate',
       'a different GST %',
@@ -735,44 +767,45 @@ export default function PurchasesPage() {
 
   /**
    * Duplicates AS THEY ARE ENTERED (recomputed every keystroke), never only at
-   * submit. `bookable` counts the rows that would really be written — a line
-   * with no quantity or no rate is dropped by validItems, so it cannot
-   * double-credit anything and must not block a save on its own.
+   * submit. The IDENTITY SCAN is the shared one — duplicateLineGroups, the same
+   * material_id-alone rule the PO routes enforce; everything added below it is
+   * presentation (name, unit, merge-safety, which rows would really be written).
    */
   const dupInfo = useMemo(() => {
     const billRate = parseFloat(billData.gst_rate) || 0;
-    type Row = { idx: number; line: BillLineItem; key: string; bookable: boolean };
-    const byMat = new Map<string, Row[]>();
-    billData.items.forEach((line, idx) => {
-      const mid = lineMat(line);
-      if (!mid) return;                       // blank draft rows are legal
-      const row: Row = {
-        idx, line,
-        key: lineMergeKey(line, billRate),
-        bookable: (parseFloat(line.quantity) || 0) > 0 && (parseFloat(line.unit_price) || 0) > 0,
-      };
-      const arr = byMat.get(mid);
-      if (arr) arr.push(row); else byMat.set(mid, [row]);
-    });
+    const bookableAt = (line: BillLineItem) =>
+      (parseFloat(line.quantity) || 0) > 0 && (parseFloat(line.unit_price) || 0) > 0;
 
     const groups: Array<{
-      materialId: string; name: string; unit: string; sig: string;
+      materialId: string; name: string; unit: string;
       lineNos: number[];
       mergeable: Array<{ key: string; lineNos: number[]; parts: number[]; total: number; rate: number; bookable: number }>;
-      differs: string[]; conflictBookable: boolean;
+      differs: string[]; bookable: number;
     }> = [];
     const flagged = new Set<number>();
 
-    for (const [mid, rows] of byMat) {
-      if (rows.length < 2) continue;
+    // Blank material_id rows are skipped inside the shared helper, so the two
+    // empty rows the form opens with are never a "duplicate".
+    for (const grp of duplicateLineGroups(billData.items)) {
+      const mid = grp.key;
+      const rows = grp.indices.map((idx) => ({
+        idx,
+        line: billData.items[idx],
+        key: mergeSafeKey(billData.items[idx], billRate),
+        bookable: bookableAt(billData.items[idx]),
+      }));
+      // EVERY repeated row is highlighted, bookable or not — the panel is a
+      // warning surface and a half-typed repeat is still worth seeing.
       rows.forEach((r) => flagged.add(r.idx));
       const mat = materials.find((m) => String(m.id) === mid) as any;
       const unit = matUnits(mid).pu || String(mat?.unit || '') || 'unit';
-      const bySub = new Map<string, Row[]>();
+      const bySub = new Map<string, typeof rows>();
       for (const r of rows) {
         const a = bySub.get(r.key);
         if (a) a.push(r); else bySub.set(r.key, [r]);
       }
+      // Sub-groups that a merge would leave arithmetically untouched — the only
+      // ones that may be offered a one-click fold.
       const mergeable = [...bySub.entries()]
         .filter(([, rs]) => rs.length > 1)
         .map(([key, rs]) => ({
@@ -785,44 +818,43 @@ export default function PurchasesPage() {
           bookable: rs.filter((r) => r.bookable).length,
         }));
       const keys = [...bySub.keys()];
-      const differs = keys.length > 1 ? keyDiffLabels(keys) : [];
-      // A split-rate warning only has to be answered when both sides would
-      // actually be written.
-      const conflictBookable = new Set(rows.filter((r) => r.bookable).map((r) => r.key)).size > 1;
       groups.push({
         materialId: mid,
         name: mat?.name || mid,
         unit,
-        // The acknowledgement is keyed to the EXACT shape of the conflict, so
-        // editing a rate afterwards invalidates a stale "keep both".
-        sig: `${mid}::${[...keys].sort().join('~')}`,
-        lineNos: rows.map((r) => r.idx + 1),
-        mergeable, differs, conflictBookable,
+        lineNos: grp.lineNos,
+        mergeable,
+        differs: keys.length > 1 ? keyDiffLabels(keys) : [],
+        bookable: rows.filter((r) => r.bookable).length,
       });
     }
 
     return {
       groups,
       flagged,
-      /** Same-everything repeats that would really be booked twice. */
-      blockingMerges: groups.flatMap((g) => g.mergeable.filter((m) => m.bookable > 1).map((m) => ({ g, m }))),
-      conflicts: groups.filter((g) => g.differs.length > 0 && g.conflictBookable),
+      /**
+       * THE REFUSAL LIST — one list, no rate/GST/brand/basis exemption, because
+       * one material = one line on a bill exactly as on a PO.
+       * BOOKABLE CARVE-OUT (the single deliberate divergence from the PO, see
+       * block A): a row without a quantity or without a rate is dropped by
+       * validItems and never POSTed, so it cannot double stock and must not
+       * falsely refuse the bill. Two-or-more BOOKABLE rows of one material is
+       * the exact condition under which /api/purchases would be asked to write
+       * the item onto this bill twice.
+       */
+      blocking: groups.filter((g) => g.bookable > 1),
     };
-    // storeCats/materials feed lineMergeKey + the labels; billData.gst_rate is
+    // storeCats/materials feed mergeSafeKey + the labels; billData.gst_rate is
     // the inherited GST every un-overridden line resolves to.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [billData.items, billData.gst_rate, materials, storeCats]);
 
-  /** Split-rate conflicts the user has explicitly said are real ("keep both"),
-   *  by conflict signature. Cleared with the modal. */
-  const [dupAck, setDupAck] = useState<string[]>([]);
-  const toggleDupAck = (sig: string) =>
-    setDupAck((prev) => (prev.includes(sig) ? prev.filter((s) => s !== sig) : [...prev, sig]));
-
   /**
    * Fold one exact-match group into a single line: quantity SUMMED onto the
    * FIRST occurrence, which keeps its own rate / brand / GST / basis — the same
-   * semantics as po-helpers' mergeDuplicateLines. Nothing is averaged, and the
+   * semantics as mergeDuplicateLines in the shared module. This is NOT an escape
+   * hatch from the refusal above; it is the one-click way to DO what the refusal
+   * asks for ("put the full quantity on one line"). Nothing is averaged, and the
    * taxable base is not carried over: billCalc re-derives goods, discount share,
    * taxable, CGST and SGST from the merged quantity × the unchanged rate, so
    * tax can never leak into unit_price.
@@ -834,7 +866,7 @@ export default function PurchasesPage() {
       const billRate = parseFloat(prev.gst_rate) || 0;
       const idxs = prev.items
         .map((it, i) => ({ it, i }))
-        .filter(({ it }) => lineMat(it) === materialId && lineMergeKey(it, billRate) === key)
+        .filter(({ it }) => lineMat(it) === materialId && mergeSafeKey(it, billRate) === key)
         .map(({ i }) => i);
       if (idxs.length < 2) return prev;              // state moved on — do nothing
       const keepAt = idxs[0];
@@ -1161,7 +1193,6 @@ export default function PurchasesPage() {
     // save. Collected per-line below and published once, after the save lands.
     setBillNotices([]);
     const notices: string[] = [];
-    let merged = 0;
 
     if (!billData.vendor.trim()) {
       setBillError('Vendor name is required.');
@@ -1172,32 +1203,28 @@ export default function PurchasesPage() {
       return;
     }
 
-    // DUPLICATE LINES. Checked before any money check because it is the one
-    // error that silently doubles STOCK as well as cost: every line below is
-    // POSTed as its own purchases row.
-    // Only lines that would really be written count (quantity AND rate present)
-    // — a half-typed second row cannot double anything, so it warns on screen
-    // without holding the bill up.
-    if (dupInfo.blockingMerges.length > 0) {
-      const { g, m } = dupInfo.blockingMerges[0];
+    // DUPLICATE LINES — ONE MATERIAL = ONE LINE, refused outright, exactly like
+    // a PO. Checked before any money check because it is the one error that
+    // silently doubles STOCK as well as cost: every line below is POSTed as its
+    // own purchases row. There is no acknowledgement to tick past: a differing
+    // rate/GST/brand/basis does NOT buy a second line any more (the owner asked
+    // for the PO rule verbatim). /api/purchases refuses the same repeat
+    // server-side, so removing this gate would only move the error later.
+    // Only rows that would really be written count — see dupInfo.blocking.
+    if (dupInfo.blocking.length > 0) {
+      const g = dupInfo.blocking[0];
+      // An exact repeat has a safe one-click answer, so name it and show the sum.
+      const m = g.mergeable.find((x) => x.bookable > 1);
       setBillError(
-        `${g.name} is on line ${m.lineNos.join(' and line ')} twice at the same rate ` +
-        `(₹${m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/${g.unit}). ` +
-        `Each line books its own purchase row, so stock would be credited twice. ` +
-        `Use "Merge into one line" above — ${m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = ${fmtQtyNum(m.total)} ${g.unit}.`
-      );
-      return;
-    }
-    // Different rates are NOT the same line. Nothing is merged and nothing is
-    // averaged; the user says which it is.
-    const unackedDup = dupInfo.conflicts.filter((g) => !dupAck.includes(g.sig));
-    if (unackedDup.length > 0) {
-      const g = unackedDup[0];
-      setBillError(
-        `${g.name} is on lines ${g.lineNos.join(', ')} with ${g.differs.join(' and ')}. ` +
-        `Those are not the same line, so nothing is merged automatically — averaging them would ` +
-        `corrupt the item's rate and every recipe cost built on it. ` +
-        `Fix the lines, or tick "Keep both" above to confirm the bill really is split that way.`
+        m
+          ? `${g.name} is on line ${m.lineNos.join(' and line ')} twice at the same rate ` +
+            `(₹${m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/${g.unit}). ` +
+            `Each line books its own purchase row, so stock would be credited twice. ` +
+            `Use "Merge into one line" above — ${m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = ${fmtQtyNum(m.total)} ${g.unit}.`
+          : `${g.name} is on line ${g.lineNos.join(' and line ')}` +
+            `${g.differs.length > 0 ? ` (${g.differs.join(' and ')})` : ''}. ` +
+            `One item = one line on a bill, so this bill cannot be saved as it stands. ` +
+            SPLIT_RATE_REMEDY
       );
       return;
     }
@@ -1247,6 +1274,13 @@ export default function PurchasesPage() {
     }
 
     setBillSubmitting(true);
+    // Lines that the server has already ACCEPTED. The loop below POSTs one
+    // request per line and is not a transaction, so a failure halfway leaves
+    // the earlier lines written. Since /api/purchases now REFUSES a repeat on
+    // the same bill instead of merging it, a naive retry of the whole bill
+    // stops dead on the first already-saved line — correct, but baffling unless
+    // we say how far the first attempt got.
+    let savedCount = 0;
     try {
       // Submit each line item as a separate purchase. unit_price here is the
       // DISCOUNT-NET, GST-FREE goods rate (final_unit_price above) — nothing is
@@ -1326,31 +1360,31 @@ export default function PurchasesPage() {
         }
 
         // The save SUCCEEDED. Anything below is the server telling us something
-        // the storekeeper needs to know anyway — a pair it would not map, or a
-        // line it folded into an existing one. Dropping the body (which this
-        // loop used to do) made both invisible: "4 items added" then 3 rows,
-        // with no explanation on screen.
+        // the storekeeper needs to know anyway — e.g. a vendor↔item pair it
+        // would not map. Dropping the body (which this loop used to do) made
+        // that invisible: "4 items added" with no explanation on screen.
+        savedCount += 1;
         const warn = json?.vendor_mapping?.warning;
         if (warn) notices.push(warn);
-        if (json?.merge_message) notices.push(json.merge_message);
-        if (json?.merged) merged += 1;
       }
 
       setBillModalOpen(false);
       setBillData({ ...emptyBill });
       setBillNotices(notices);
       await fetchPurchases(appliedFilters);
-      // Count what LANDED, not what was sent: merged lines fold into an existing
-      // row, so promising 4 new rows when 3 appear is the same lie as before.
-      const landed = validItems.length - merged;
-      setToast(
-        merged > 0
-          ? `Bill entered: ${landed} item${landed === 1 ? '' : 's'} from ${billData.vendor} added, ${merged} combined with a line already on this bill.`
-          : `Bill entered: ${validItems.length} items from ${billData.vendor} added!`
-      );
+      // One line in = one purchases row out. The server no longer folds a line
+      // into an existing one, so the count sent IS the count landed.
+      setToast(`Bill entered: ${validItems.length} items from ${billData.vendor} added!`);
       setTimeout(() => setToast(null), 4000);
     } catch (err: any) {
-      setBillError(err.message);
+      // Say how far we got, or the storekeeper retries the whole bill and meets
+      // a refusal on a line they have no way of knowing is already recorded.
+      setBillError(
+        savedCount > 0
+          ? `${err.message} — ${savedCount} of ${validItems.length} lines were already saved. ` +
+            `Remove those lines from this bill before saving again.`
+          : err.message
+      );
     } finally {
       setBillSubmitting(false);
     }
@@ -2731,8 +2765,10 @@ export default function PurchasesPage() {
                   set in inventory, a <strong>BTL / CASE</strong> toggle appears next to the qty input — pick CASE and type the case count + per-case price.
                 </div>
                 {/* SAME ITEM ON MORE THAN ONE LINE — flagged as it is typed, not
-                    at submit. Merge is offered for an exact repeat; a split-rate
-                    repeat is never merged, only surfaced for a decision. */}
+                    at submit, and REFUSED at submit whatever the rate says. Merge
+                    is offered only for an exact repeat, where summing the
+                    quantities changes no money; a split-rate repeat gets the
+                    remedy sentence and no button. There is nothing to tick past. */}
                 {dupInfo.groups.length > 0 && (
                   <div className="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 space-y-2">
                     <p className="text-[11px] text-amber-900 flex items-start gap-1.5">
@@ -2772,29 +2808,18 @@ export default function PurchasesPage() {
                           </div>
                         ))}
 
-                        {/* Not the same thing. A bill really can charge two rates
-                            for one item, so the choice is the user's — merging
-                            would average the rate and corrupt every recipe cost
-                            derived from it. */}
+                        {/* NO MERGE BUTTON HERE, ON PURPOSE. Folding two different
+                            rates onto the first line would silently re-price the
+                            whole quantity and corrupt every recipe cost built on
+                            the item's weighted average. The save is refused either
+                            way — the user picks one of the two honest fixes. */}
                         {g.differs.length > 0 && (
-                          <div className="rounded border border-amber-200 bg-amber-50/70 px-2 py-1.5 space-y-1">
+                          <div className="rounded border border-amber-200 bg-amber-50/70 px-2 py-1.5">
                             <p className="text-[11px] text-amber-900">
-                              These lines have {g.differs.join(' and ')}, so they are <strong>not</strong> the
-                              same line and nothing is merged automatically. Correct the entry if it was a
-                              mis-type — or say the bill really is split this way.
+                              These lines have {g.differs.join(' and ')}, so they cannot be merged — one item
+                              = one line on a bill, and <strong>this bill will not save</strong> while{' '}
+                              {g.name} is on two lines. {SPLIT_RATE_REMEDY}
                             </p>
-                            <label className="flex items-start gap-1.5 text-[11px] text-[#6B5744] cursor-pointer">
-                              <input
-                                type="checkbox"
-                                checked={dupAck.includes(g.sig)}
-                                onChange={() => { toggleDupAck(g.sig); setBillError(null); }}
-                                className="mt-0.5 accent-[#af4408]"
-                              />
-                              <span>
-                                Keep both — the vendor really billed {g.name} at more than one rate/brand on
-                                this bill.
-                              </span>
-                            </label>
                           </div>
                         )}
                       </div>
