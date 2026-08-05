@@ -2,6 +2,12 @@ import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { getCurrentUser } from '@/lib/auth';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
+// The "one item = one line on a bill" remedy sentence is SHARED, not restated:
+// the PO routes, the bill modal and POST /api/purchases already print it
+// verbatim, and a storekeeper who is told one thing on screen and another in a
+// skipped-rows CSV has been told nothing. line-dedupe imports nothing, so this
+// costs the bundle nothing. Edit it there or not at all.
+import { SPLIT_RATE_REMEDY } from '@/lib/line-dedupe';
 
 interface BulkPurchaseItem {
   item_name: string;
@@ -51,6 +57,9 @@ interface SkippedRow {
 /** Per-line charge coercion. mrp_round_off is signed; the rest ≥ 0. */
 const chg = (v: any) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? Math.round(x * 100) / 100 : 0; };
 const chgSigned = (v: any) => { const x = Number(v); return Number.isFinite(x) ? Math.round(x * 100) / 100 : 0; };
+/** ₹ for a human-readable skip reason — the same shape POST /api/purchases
+ *  prints in its 409, so the two refusals read alike. */
+const inr = (n: number) => `₹${Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 export async function POST(request: Request) {
   try {
@@ -202,9 +211,45 @@ export async function POST(request: Request) {
       LIMIT 1
     `);
 
+    // ── ONE MATERIAL = ONE LINE ON A NAMED BILL. The rule /api/purchase-orders
+    // has always had and that POST /api/purchases took on when the owner said
+    // "YES WANT LIKE PO". Identity is material_id ALONE, scoped to one document.
+    //
+    // WHY THIS IS A SECOND STATEMENT AND NOT A WIDENING OF dupCheck ABOVE: that
+    // one carries the empty-bill WILDCARD, and THE WILDCARD MUST NEVER BE
+    // COMBINED WITH A MATERIAL-LEVEL KEY. Behind qty AND rate the wildcard can
+    // only ever match a genuinely identical line, which is what makes it safe.
+    // Widen the key to the material and it inverts into data loss: a stored
+    // blank-bill row for item X on date D would swallow a legitimately different
+    // bill for X that day, and two real same-day market runs for one item would
+    // collapse into one. So this statement matches bill_no EXACTLY — scoped to a
+    // named document, a stored blank-bill row is BY DEFINITION a different
+    // document — and the wildcard stays where it is, in dupCheck.
+    //
+    // WHAT IS DELIBERATELY *NOT* COPIED from POST /api/purchases' 409 query: its
+    // `invoice_id LIKE 'PINV-%'` scope test and its po_qty / special_excise_cess
+    // / tcs / mrp_round_off zero tests. That route wrote none of those columns,
+    // so excluding such rows only kept it off other flows' toes. THIS importer
+    // writes all of them, so the same filters would make a re-uploaded inward
+    // sheet invisible to its own guard and double the stock — the one failure
+    // this file exists to prevent.
+    const billLineCheck = db.prepare(`
+      SELECT quantity, unit_price, COALESCE(invoice_id, '') AS invoice_id
+      FROM purchases
+      WHERE material_id = ?
+        AND LOWER(TRIM(COALESCE(vendor, ''))) = ?
+        AND LOWER(TRIM(COALESCE(bill_no, ''))) = ?
+        AND date = ?
+      ORDER BY created_at ASC
+      LIMIT 1
+    `);
+
     const touchedMaterials = new Set<string>();
-    // Also dedupe WITHIN the uploaded file (same row twice in one upload).
+    // Also dedupe WITHIN the uploaded file (same row twice in one upload) — one
+    // set per branch, mirroring the two DB checks. seenBillItem remembers the
+    // 1-based row number so the skip reason can point at the earlier line.
     const seenInFile = new Set<string>();
+    const seenBillItem = new Map<string, number>();
     const dupKey = (mid: string, vendor: string, billNo: string, date: string, q: number, up: number) =>
       `${mid}|${(vendor || '').toLowerCase().trim()}|${(billNo || '').toLowerCase().trim()}|${date}|${Math.round(q * 1000)}|${Math.round(up * 100)}`;
 
@@ -278,15 +323,68 @@ export async function POST(request: Request) {
         }
 
         const billNo = String(item.bill_no || '').trim();
-        // Duplicate guard — already uploaded (DB) OR repeated earlier in this file.
+        const vendorKey = String(item.vendor || '').toLowerCase().trim();
+        const vendorLabel = String(item.vendor || '').trim() || 'this vendor';
+
+        /* ── DUPLICATE GUARD, TWO BRANCHES. Which one applies is decided by the
+         * INCOMING row, because that is what decides whether there is a document
+         * to judge against. Both SKIP the row; neither fails the upload. A sheet
+         * is hundreds of rows and the recovery-CSV flow is built on per-row
+         * skips — failing 500 rows because row 300 repeats would take that away.
+         * The reason string IS the product here, so it names the row, the item,
+         * the bill and what to do instead.
+         *
+         *  A · bill_no PRESENT → a bill is a document and one item appears on it
+         *      once. Judge at MATERIAL level against that same named bill, and
+         *      the same way within this sheet. billLineCheck has no wildcard, on
+         *      purpose — see the note over it; the wildcard and a material-level
+         *      key together are the trap.
+         *  B · bill_no BLANK → no document identity at all. Two market runs for
+         *      one item from one vendor on one day are two real purchases, so
+         *      the only thing honestly on offer is re-upload protection: the
+         *      six-part exact match, wildcard and all, unchanged. This is the
+         *      same carve-out POST /api/purchases makes.
+         *
+         * BRANCH A DOES NOT REPLACE THE SIX-PART CHECK — it runs BEFORE it, and
+         * a named-bill row still falls through to it. Skipping it for named
+         * bills would reopen the exact hole the wildcard exists to plug: a sheet
+         * first uploaded with the bill_no column empty stores rows with bill_no
+         * '', and the same sheet re-uploaded once the numbers are filled in
+         * would find no named-bill match and book every line's goods a second
+         * time. So the set of rows caught here is a strict SUPERSET of what was
+         * caught before this change. Keep it that way. */
         const key = dupKey(materialId, item.vendor || '', billNo, item.date, quantity, unitPrice);
+        const billItemKey = `${materialId}|${vendorKey}|${billNo.toLowerCase()}|${item.date}`;
+
+        if (billNo) {
+          const priorRow = seenBillItem.get(billItemKey);
+          if (priorRow !== undefined) {
+            skip(item, rowNum, 'duplicate',
+              `"${mat.name}" is already on bill ${billNo} from ${vendorLabel} dated ${item.date} — row ${priorRow} of this sheet. `
+              + `One item = one line on a bill, so row ${rowNum} was NOT imported. ${SPLIT_RATE_REMEDY}`);
+            continue;
+          }
+          const prior = billLineCheck.get(materialId, vendorKey, billNo.toLowerCase(), item.date) as
+            { quantity: number; unit_price: number; invoice_id: string } | undefined;
+          if (prior) {
+            skip(item, rowNum, 'duplicate',
+              `"${mat.name}" is already recorded on bill ${billNo} from ${vendorLabel} dated ${item.date} — `
+              + `${prior.quantity} @ ${inr(prior.unit_price)}${prior.invoice_id ? ` (${prior.invoice_id})` : ''}. `
+              + `One item = one line on a bill, so row ${rowNum} was NOT imported. ${SPLIT_RATE_REMEDY}`);
+            continue;
+          }
+        }
+
         const already = seenInFile.has(key) || !!dupCheck.get(materialId, item.vendor || '', billNo, item.date, quantity, unitPrice);
         if (already) {
           skip(item, rowNum, 'duplicate',
-            `Already uploaded — same item + vendor + bill no + date + qty + rate already exists. Skipped to avoid double-counting.`);
+            `"${mat.name}"${billNo ? ` (bill ${billNo})` : ''} from ${vendorLabel} dated ${item.date} — `
+            + `already uploaded: same item + vendor + bill no + date + qty (${quantity}) + rate (${inr(unitPrice)}). `
+            + `Row ${rowNum} was skipped so the stock is not counted twice.`);
           continue;
         }
         seenInFile.add(key);
+        if (billNo) seenBillItem.set(billItemKey, rowNum);
 
         const totalPrice = Math.round(quantity * unitPrice * 100) / 100;
 
