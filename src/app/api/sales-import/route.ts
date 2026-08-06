@@ -16,6 +16,17 @@ import * as XLSX from 'xlsx';
  *        - Idempotent: a per-import "import_batch_id" is stored in `sales.notes`-style field
  *          so a re-upload of the same file can be detected by the user via duplicate-day-totals
  *
+ * DEPARTMENT ATTRIBUTION (deduct-at-issue rail).
+ * Recipe consumption no longer leaves central stock — the gram left central at the
+ * requisition issue. It now leaves the DEPARTMENT that cooked the dish, resolved from
+ * the menu item's station. A bulk import is the one place where that resolution can
+ * fail silently at scale: 600 lines can commit, every sale row can look right, and not
+ * one gram can move because the stations on those items are not mapped to a department.
+ * So this route classifies every committed line into four mutually-exclusive buckets
+ * (department / station_unmapped / liquor_store_rail / no_recipe), returns the counts
+ * plus a per-station breakdown of the unmapped ones, and reports the same projection on
+ * the PREVIEW response so the operator sees the gap before committing rather than after.
+ *
  * Form data:
  *   file                       (required) — the .xlsx
  *   commit                     'true' | 'false' (default false)
@@ -85,8 +96,12 @@ export async function POST(request: Request) {
     const db = getDb();
 
     // -------- Match menu items by mapped_code first, then normalised name --------
+    // `station` is selected because it is the ONLY input to department attribution
+    // below. It was missing here before deduct-at-issue and nothing noticed, because
+    // nothing read it; the re-match SELECT further down (pos-import items) already
+    // carried it. Both paths must supply it or half an import attributes to nobody.
     const allMenu = db.prepare(`
-      SELECT id, name, pos_id, recipe_id, item_type, selling_price
+      SELECT id, name, pos_id, recipe_id, item_type, selling_price, station
       FROM menu_items WHERE is_active = 1
     `).all() as any[];
     const byPos  = new Map<string, any>();
@@ -196,9 +211,111 @@ export async function POST(request: Request) {
       unmatched.push(...stillUnmatched);
     }
 
+    // -------- Station → department attribution --------
+    // Read the map ONCE per import, outside the commit transaction.
+    //
+    // WHICH station? The MENU ITEM's, never the Recaho STATION column on the sheet.
+    // The live rail copies menu_items.station verbatim into order_items.station
+    // (dine-in/orders/[id]/route.ts:148) and applyDeduct resolves the department from
+    // that. Falling back to the sheet's station would be an external POS vocabulary,
+    // so the same dish would land in a different kitchen depending on whether it was
+    // rung up in the app or imported from a file. Do not "improve" this into a fallback
+    // chain — an unmapped station must stay unmapped and be reported, not guessed.
+    const stationDept = new Map<string, string>();
+    let stationMapConfigured = false;
+    try {
+      const rows = db.prepare(
+        `SELECT station, department_id FROM station_departments WHERE is_active = 1`,
+      ).all() as any[];
+      for (const r of rows) {
+        if (r.station && r.department_id) {
+          stationDept.set(String(r.station).toLowerCase().trim(), String(r.department_id));
+        }
+      }
+      stationMapConfigured = stationDept.size > 0;
+    } catch (e) {
+      // Table absent or unreadable. This map is an OBSERVATION used for reporting;
+      // the stock decision itself is made inside applyDeduct on the same rule. Fail
+      // toward "nothing was attributed" so the response says so loudly, rather than
+      // toward a guessed department — a wrong kitchen debited in bulk is far worse
+      // than a visible zero.
+      console.error('[sales-import] station_departments unreadable — reporting all lines as unmapped', e);
+      stationMapConfigured = false;
+    }
+
+    // Liquor rides the TGBCL store ledger (store_stock_ledger / store_locations), not
+    // the department raw-material rail. Counted as its own bucket so an operator does
+    // not read "0 department rows" on a bar-heavy sheet as a broken import.
+    const isLiquorLine = (menu: any, line: ParsedSaleLine) =>
+      String(menu.item_type || line.item_type || '').toLowerCase().startsWith('liquor')
+      || String(menu.station || '').toLowerCase().trim() === 'liquor';
+
+    const stationOf = (menu: any) => String(menu.station || '').trim();
+
+    // Four buckets, MUTUALLY EXCLUSIVE and summing to the committed matched-line count.
+    // If a future edit makes a line fall into two of them, the totals stop reconciling
+    // and the whole point of this summary (no silent zero) is lost.
+    const classify = (menu: any, line: ParsedSaleLine):
+      'department' | 'station_unmapped' | 'liquor_store_rail' | 'no_recipe' => {
+      if (!menu.recipe_id) return isLiquorLine(menu, line) ? 'liquor_store_rail' : 'no_recipe';
+      const st = stationOf(menu).toLowerCase();
+      // Blank station is deliberately NOT treated as "kitchen": 'kitchen' is the
+      // blank-station sentinel the KOT writer stamps, and 'Kitchen' is a real
+      // department (the main-kitchen roll-up). Resolving it would silently debit the
+      // busiest kitchen in the building for every station-less item.
+      return st && stationDept.has(st) ? 'department' : 'station_unmapped';
+    };
+
+    const newAttribution = () => ({
+      station_map_configured: stationMapConfigured,
+      department_rows: 0,
+      station_unmapped_rows: 0,
+      liquor_store_rail_rows: 0,
+      no_recipe_rows: 0,
+      unmapped_by_station: {} as Record<string, number>,
+      warning: null as string | null,
+    });
+    type Attribution = ReturnType<typeof newAttribution>;
+
+    const countLine = (acc: Attribution, menu: any, line: ParsedSaleLine) => {
+      switch (classify(menu, line)) {
+        case 'department':        acc.department_rows        += 1; break;
+        case 'liquor_store_rail': acc.liquor_store_rail_rows += 1; break;
+        case 'no_recipe':         acc.no_recipe_rows         += 1; break;
+        default: {
+          acc.station_unmapped_rows += 1;
+          const key = stationOf(menu) || '(blank)';
+          acc.unmapped_by_station[key] = (acc.unmapped_by_station[key] || 0) + 1;
+        }
+      }
+    };
+
+    const finishAttribution = (acc: Attribution): Attribution => {
+      if (!acc.station_map_configured) {
+        acc.warning = 'No station → department mapping is configured, so no recipe line '
+          + 'can be attributed to a department. Map the stations in Settings, then re-import.';
+      } else if (acc.station_unmapped_rows > 0) {
+        const names = Object.entries(acc.unmapped_by_station)
+          .sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s} (${n})`).join(', ');
+        acc.warning = `${acc.station_unmapped_rows} recipe line(s) consumed nothing from any `
+          + `department because their station is not mapped: ${names}. `
+          + 'Central stock was NOT touched for these — map the stations and record the '
+          + 'difference as a department count.';
+      }
+      return acc;
+    };
+
     // -------- Preview only --------
     if (!commit) {
       const matched_with_recipe = matched.filter(x => x.menu.recipe_id).length;
+      // Same classification the commit will perform, run read-only, so the station gap
+      // is visible BEFORE the sales rows exist rather than in the post-mortem.
+      const previewAttribution = newAttribution();
+      for (const { line, menu } of matched) {
+        if (!VALID_BILL_TYPES.has(line.bill_type)) continue;
+        countLine(previewAttribution, menu, line);
+      }
+      finishAttribution(previewAttribution);
       return Response.json({
         preview: true,
         date_range: { start: parsed.start_date_iso, end: parsed.end_date_iso, anchor: anchorDate },
@@ -208,6 +325,8 @@ export async function POST(request: Request) {
         matched_count:        matched.length,
         matched_with_recipe,
         matched_no_recipe:    matched.length - matched_with_recipe,
+        station_attribution:  previewAttribution,
+        station_warning:      previewAttribution.warning,
         unmatched_count:      unmatched.length,
         unmatched_items:      unmatched.slice(0, 50).map(u => ({
           product_name: u.product_name, mapped_code: u.mapped_code,
@@ -239,6 +358,9 @@ export async function POST(request: Request) {
       recipe_deducted_count: 0,
       skipped_unmatched: unmatched.length,
       bill_types: { normal: 0, comp: 0, nc: 0 } as Record<string, number>,
+      // Where each committed line's consumption actually landed. Populated in the
+      // commit loop below; the four row counts sum to sales_created by construction.
+      station_attribution: newAttribution(),
     };
 
     // Helper: look up direct-item link (material_id + qty_per_unit) for an item name
@@ -280,9 +402,19 @@ export async function POST(request: Request) {
           line.category || null, menu.pos_id || line.mapped_code || null, line.product_name,
         );
         if (menu.recipe_id) {
-          deductInventoryForSale(db, menu.recipe_id, line.total_qty, id, line.bill_type);
+          // Pass the station so applyDeduct can resolve the DEPARTMENT that cooked this
+          // dish. Central is not touched here any more — the gram left central at the
+          // requisition issue. When the station resolves to nothing, applyDeduct posts
+          // to no stock rail at all and records a consumption_skip; it still writes the
+          // inventory_transactions row, which is what keeps Sales-vs-Purchase and the
+          // Variance recipe_to_date figure bit-identical to a pre-change import.
+          deductInventoryForSale(
+            db, menu.recipe_id, line.total_qty, id, line.bill_type,
+            { station: stationOf(menu) },
+          );
           summary.recipe_deducted_count += 1;
         }
+        countLine(summary.station_attribution, menu, line);
         summary.sales_created += 1;
         summary.qty_total     += line.total_qty;
         summary.revenue_total += totalRevenue;
@@ -290,12 +422,16 @@ export async function POST(request: Request) {
       }
     });
     txn();
+    finishAttribution(summary.station_attribution);
 
     return Response.json({
       success: true,
       committed: true,
       anchor_date: anchorDate,
       summary,
+      // Lifted out of `summary` as well so a caller rendering only the top level cannot
+      // miss it. An import that attributed nothing must never look like a clean import.
+      station_warning: summary.station_attribution.warning,
       unmatched_items: unmatched.slice(0, 100).map(u => u.product_name),
       auto_created_menu_items: createdMenuItemsSummary
         ? { count: createdMenuItemsSummary.count, sample: createdMenuItemsSummary.items.slice(0, 10) }

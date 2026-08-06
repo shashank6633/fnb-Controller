@@ -166,6 +166,23 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/reports/menu-recipe-gap', label: 'Menu Items Without Recipe', mgmtOnly: true }, // mgmtOnly: ranks the un-costed menu by actual SALES VALUE (revenue on the page), and its review-gated bulk attach rewrites the food cost of every FUTURE sale of a dish. Not a staff surface.
       { path: '/menu-engineering',    label: 'Menu Engineering', hodOnly: true },
       { path: '/variance-report',     label: 'Variance Report' },
+      // Department variance — issued-to-a-department vs what recipe consumption
+      // says that department used, measured against its physical count. Sits
+      // beside the central variance surface above because it answers the other
+      // half of the same question: the central report stops at the store door,
+      // this one starts there.
+      //
+      // mgmtOnly, NOT open: /api/department-variance answers 403 'Management
+      // only' to anyone outside isManagement() (admin | manager | HOD), so a
+      // staff-tier grant here would hand someone a page that loads and then
+      // fails — mgmtOnly is what makes the catalog agree with the route. Do NOT
+      // "simplify" this to match /variance-report directly above (which is
+      // open): that report is a store-side counting aid, while this one names a
+      // KITCHEN against a difference, and the difference is un-interpretable
+      // until recipes are attached (18 of 628 menu items today) and stations are
+      // mapped. A number that reads as an accusation belongs in front of the
+      // people who know why it is a data gap.
+      { path: '/department-variance', label: 'Department Variance', mgmtOnly: true },
       { path: '/department-consumption', label: 'Dept Consumption' },
       { path: '/staff-meals',         label: 'Staff Meals' },
       { path: '/dine-in/kot-analytics', label: 'KOT Data Points' },
@@ -259,6 +276,28 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/settings/roles',      label: 'Settings — Roles' },
       { path: '/settings/print-design', label: 'Settings — Print Design' },
       { path: '/settings/stores',     label: 'Settings — Store Locations' },
+      // Station → Department map. Recipe consumption leaves the DEPARTMENT, not
+      // central, so every sold line has to answer "which kitchen cooked this?"
+      // from order_items.station — free text, and the department names do not
+      // string-match it ('Akan  Indian' has TWO spaces, station 'tandoor' vs
+      // 'Akan Tandoori', 'Akan - Bakery' is hyphenated). This page is where that
+      // map is owner-edited.
+      //
+      // adminOnly, and it must stay that way: a wrong row here silently debits
+      // the WRONG kitchen's books, and it does not announce itself — it surfaces
+      // weeks later as an unexplained difference against a chef. Same reasoning
+      // that kept the old requisition_deduct_at_issue flip admin-write.
+      //
+      // This entry is the ONLY page-level lock on the surface: GET
+      // /api/settings/station-departments is deliberately un-tiered (it answers
+      // can_edit so managers could read the map), and only PUT re-checks
+      // role === 'admin'. So do NOT downgrade this to mgmtOnly on the grounds
+      // that "the API allows managers" — the API allows managers to LOOK, not to
+      // change, and there is no read-only rendering of this page. Losing the
+      // adminOnly here would put a live dropdown in front of a manager whose
+      // every save 403s. If manager read is ever wanted, build the read-only
+      // view first, then loosen this.
+      { path: '/settings/station-departments', label: 'Settings — Station → Department Map', adminOnly: true },
       { path: '/settings/page-access', label: 'Settings — Page Access' },
       { path: '/settings/integrations', label: 'Settings — Integrations' },
       { path: '/settings/integrations/whatsapp', label: 'Settings — WhatsApp' },

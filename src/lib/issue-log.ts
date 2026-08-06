@@ -8,11 +8,14 @@ import { resolvePurchaseLogRange } from './purchase-log';
  * END-TO-END TRACEABILITY LOG — one material followed all the way through:
  *
  *   RECEIPT -> REQUISITION -> ISSUE (full or partial) -> CONSUMPTION
+ *                                  \-> REVERSAL        \-> CONSUMPTION (skipped)
  *
  * in one chronological list, every row stamped with its document number and its
  * link key, downloadable as a single CSV. The owner's words: "I need proper log
  * from purchase to department requestitions, issueings, partial and normal
- * everything."
+ * everything." The cutover spec sharpened that into a requirement this report
+ * has to be able to satisfy literally: "preserve a clear, auditable movement
+ * history for every issue, consumption and reversal."
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * READ src/lib/purchase-log.ts FIRST. This file is its sibling and inherits
@@ -20,13 +23,15 @@ import { resolvePurchaseLogRange } from './purchase-log';
  * SUMMED. There is deliberately NO grand total anywhere in the payload.
  * ═══════════════════════════════════════════════════════════════════════════
  * purchase-log had to solve that for three tables holding the SAME money. This
- * report is worse exposed, not better, because its five stages disagree about
+ * report is worse exposed, not better, because its seven stages disagree about
  * BOTH the unit AND the event:
  *
  *   RECEIPT      purchase units, rupees      goods arriving at the store
  *   REQUISITION  the LINE's own unit         a request, not a movement
  *   ISSUE        recipe units                goods leaving the store
+ *   REVERSAL     recipe units                goods going back, department->store
  *   CONSUMPTION  recipe units                goods being cooked, days later
+ *   CONS. SKIP   recipe units                a cook that moved NOTHING, and why
  *
  * Add any two of those and the number is wrong in its unit AND in its meaning.
  * A 5 kg receipt plus a 5,000 g issue is not 10 of anything. So each stage
@@ -76,14 +81,18 @@ import { resolvePurchaseLogRange } from './purchase-log';
  * WHY recorded_recipe_qty AND NOT delta_recipe_qty. They are two different
  * facts and the log wants the first one:
  *   recorded_recipe_qty  what was physically handed over (always written)
- *   delta_recipe_qty     the subset of that which moved current_stock (0 while
- *                        the deduct flag is off, which is production today)
- * Reading delta_recipe_qty here would make the whole issue leg read zero and
- * push every gram into the pre-ledger remainder. `stock_moved` carries the
- * second fact in its own column, so the log can say "handed over, stock not
- * deducted" instead of pretending one of the two did not happen. A future
- * engineer narrowing this report to rows that moved stock would erase most of
- * the log — that separation is the point of the ledger, not an oversight.
+ *   delta_recipe_qty     the subset of that which moved current_stock
+ * The deduct is UNCONDITIONAL since the department cutover, so the two now
+ * agree on an ordinary line — but they still part company on the three
+ * carve-outs applyIssueDelta stamps a skip_reason for (party, store-mapped
+ * liquor, an ambiguous line unit), and on every row written before the cutover
+ * while the old setting was off. Reading delta_recipe_qty here would zero the
+ * issue leg for all of those and push their grams into the pre-ledger
+ * remainder, where they do not belong. `stock_moved` carries the second fact in
+ * its own column, so the log can say "handed over, stock not deducted" instead
+ * of pretending one of the two did not happen. A future engineer narrowing this
+ * report to rows that moved stock would erase most of the log — that separation
+ * is the point of the ledger, not an oversight.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * FULL vs PART — a stamped fact, not a live recomputation
@@ -99,7 +108,8 @@ import { resolvePurchaseLogRange } from './purchase-log';
  * ═══════════════════════════════════════════════════════════════════════════
  *   RECEIPT                        "<grn_number>#<material_id>"
  *   REQUISITION / ISSUE / PRELEDGER "<req_number>#<req_item_id>"
- *   CONSUMPTION                    "<material_id>"
+ *   REVERSAL                       "<req_number>#<req_item_id>"  (same as its ISSUE)
+ *   CONSUMPTION / CONS. SKIP       "<material_id>"
  *
  * The RECEIPT key is the SAME SHAPE purchase-log.ts mints, so the two reports
  * reconcile line for line on a delivery. Its source is now the hard column
@@ -112,10 +122,47 @@ import { resolvePurchaseLogRange } from './purchase-log';
  * traceable as one line, and its issues, its remainder and its shortfall PO all
  * carry the same key.
  *
- * CONSUMPTION keys on the material ALONE and says so on the row's own face.
- * Recipe consumption fires at KOT-complete against central stock; nothing in
- * the schema ties a cooked gram back to the issue it came from. Guessing an
- * attribution would be the one kind of number this report refuses to print.
+ * CONSUMPTION still keys on the material ALONE, and says so on the row's own
+ * face. What CHANGED at the department cutover is WHICH question that answers.
+ *
+ *   BEFORE  recipe consumption fired at KOT-complete against CENTRAL stock, and
+ *           nothing in the schema tied a cooked gram to anything but a material.
+ *           This report printed department_id NULL and stock_moved 1 as literals
+ *           because there was nothing else honest to print.
+ *   NOW     the gram leaves CENTRAL at the requisition issue and leaves the
+ *           DEPARTMENT at consumption. deductInventoryForSale resolves the
+ *           department from order_items.station through the owner-editable
+ *           station_departments map, and postDeptLedger stamps that department
+ *           — plus the station that resolved it and the order line it came from
+ *           — on a signed department_material_transactions row.
+ *
+ * SO THE STATION MAP IS THE LINK, and this report reads it rather than
+ * recomputing it: the department on a CONSUMPTION row is the one the LEDGER
+ * recorded at cook time, matched on (material_id, reference_id). A later remap
+ * in Settings therefore cannot retro-rewrite what a past cook was charged to —
+ * the same stamped-fact discipline as effective_line_qty on an ISSUE row.
+ *
+ * WHAT IS STILL NOT KNOWABLE, AND IS STILL NOT INVENTED. The link is to a
+ * DEPARTMENT, never to a specific ISSUE. Without lot tracking the grams on a
+ * kitchen's shelf are genuinely fungible — requisition A's flour and
+ * requisition B's flour are the same flour — so "this dish consumed that issue"
+ * remains the one kind of number this report refuses to print. The link key
+ * stays the material, deliberately.
+ *
+ * AND WHEN THE MAP CANNOT ANSWER, THE ROW SAYS SO. An unmapped station (sushi,
+ * terracegrill), a blank one, the 'kitchen' sentinel, or a store-mapped liquor
+ * material means NOTHING moved on any department rail — applyDeduct writes a
+ * consumption_skips row instead. Those surface here twice over: as
+ * stock_moved 0 with the skip reason on the CONSUMPTION row itself, and as
+ * their own CONSUMPTION (skipped) stage naming the station and the quantity
+ * that did not move. Printing `1 AS stock_moved` over them, as this file used
+ * to, is a lie in an audit trail, and it is the lie that would make a data gap
+ * look like a balanced book.
+ *
+ * PRE-CUTOVER CONSUMPTION IS NOT REINTERPRETED. Rows dated before
+ * settings.dept_ledger_cutover_at DID debit central, and still read
+ * stock_moved 1 with no department — exactly as they always did. There is no
+ * backfill and no retro-attribution; the cutover stamp is the boundary.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * UNITS — three bases in one list, never converted into each other
@@ -167,10 +214,26 @@ import { resolvePurchaseLogRange } from './purchase-log';
  * ═══════════════════════════════════════════════════════════════════════════
  * A filter a stage cannot answer removes that stage rather than silently
  * matching nothing:
- *   department_id / req_number  -> RECEIPT and CONSUMPTION drop out (neither
- *                                  carries a department or a requisition)
- *   vendor                      -> only RECEIPT survives (only a purchase has
- *                                  a vendor)
+ *   department_id  -> RECEIPT and CONSUMPTION (skipped) drop out. A receipt
+ *                     lands in the CENTRAL store and has no department; a SKIP
+ *                     is BY DEFINITION the case where no department could be
+ *                     named, so filtering skips by department would always
+ *                     return nothing and read as "this kitchen skipped none".
+ *   req_number     -> RECEIPT, CONSUMPTION and CONSUMPTION (skipped) drop out
+ *                     (a cook answers to an order, never to a requisition)
+ *   vendor         -> only RECEIPT survives (only a purchase has a vendor)
+ *
+ * CONSUMPTION NOW ANSWERS A DEPARTMENT FILTER, and that is the point of this
+ * change. Before the cutover it dropped out beside RECEIPT, so "show me
+ * everything for Akan Continental" listed what the kitchen ASKED FOR and what
+ * it RECEIVED and then stopped — the department's outflow, the half the
+ * variance question actually turns on, was missing from its own log. Filtered
+ * to one department the chain now reads: ISSUE in (+), REVERSAL back out (−),
+ * CONSUMPTION out (−) — the same three movements the department ledger sums,
+ * which is what makes this log checkable against a balance instead of merely
+ * suggestive. (Their quantities are printed as positive magnitudes per the
+ * convention below; the DIRECTION is the stage, not the sign.)
+ *
  * `totals.stages_present` reports which stages the filter set can answer, so a
  * reader cannot mistake "this filter cannot see receipts" for "there were none".
  *
@@ -193,7 +256,9 @@ export type IssueLogStage =
   | 'REQUISITION'
   | 'ISSUE'
   | 'ISSUE_PRELEDGER'
-  | 'CONSUMPTION';
+  | 'CONSUMPTION'
+  | 'REVERSAL'
+  | 'CONSUMPTION_SKIP';
 
 /**
  * ?stage= filter values accepted on the wire.
@@ -202,9 +267,20 @@ export type IssueLogStage =
  * one is a recorded ledger row with an actor and a time, and the other is an
  * arithmetic remainder with neither. Folding them into one value would let a
  * reader ask for "issues" and be handed rows that look sourced but are derived.
+ *
+ * `reversal` is SEPARATE from `issue` for the same reason inverted: the ISSUE
+ * stage already carries a give-back as a NEGATIVE ledger row, so asking for
+ * "issues" correctly nets them. The REVERSAL stage is the DEPARTMENT side of
+ * that same event, and folding the two together would count one give-back
+ * twice. See STAGE_BASIS.REVERSAL.
+ *
+ * `skip` is SEPARATE from `consumption` because a skip moved NOTHING. It is a
+ * cook that happened with no stock behind it, and a reader who asks for
+ * consumption must not be handed rows that look like movement.
  */
 export type IssueLogStageFilter =
-  | 'all' | 'receipt' | 'requisition' | 'issue' | 'pre_ledger' | 'preledger' | 'consumption';
+  | 'all' | 'receipt' | 'requisition' | 'issue' | 'pre_ledger' | 'preledger'
+  | 'consumption' | 'reversal' | 'skip' | 'consumption_skip';
 
 /** Which basis `qty`/`unit` are stated in. NEVER add across two of these. */
 export type IssueLogQtyBasis = 'purchase' | 'line' | 'recipe';
@@ -212,7 +288,18 @@ export type IssueLogQtyBasis = 'purchase' | 'line' | 'recipe';
 /** What `value` may be used for. 'memo' must never be added to 'spend'. */
 export type IssueLogValueBasis = 'spend' | 'memo' | '';
 
-/** '' means nothing was skipped. 'pre_ledger' means it is unknowable. */
+/**
+ * '' means nothing was skipped. 'pre_ledger' means it is unknowable.
+ *
+ * The ISSUE leg's reasons come off requisition_issue_ledger.skip_reason
+ * ('party' | 'store_mapped' | 'unit_review'). The CONSUMPTION leg's come off
+ * consumption_skips.reason, written by applyDeduct when it could not name a
+ * department it was entitled to debit ('blank' | 'unmapped' | 'inactive' |
+ * 'store_mapped' | 'store_check_unavailable' | 'dept_post_failed' |
+ * 'no_department'). Two writers, one column, and the union is open on purpose —
+ * a reason this file has never heard of must still reach the screen verbatim
+ * rather than being normalised into a shrug.
+ */
 export type IssueLogSkipReason = '' | 'flag_off' | 'party' | 'unit_review' | 'pre_ledger' | string;
 
 export interface IssueLogRow {
@@ -237,6 +324,21 @@ export interface IssueLogRow {
 
   department_id: string | null;
   department: string;
+  /**
+   * The kitchen station that ATTRIBUTED this row to its department, as stamped
+   * at the time — never re-resolved on read.
+   *
+   * Populated on CONSUMPTION (off the department ledger row) and on
+   * CONSUMPTION (skipped) (off consumption_skips, where it is the whole point
+   * of the row: it NAMES the station nobody has mapped). '' everywhere else,
+   * and '' on a consumption whose line carried no station at all — which is
+   * itself the answer, and is why the skip reason beside it reads 'blank'.
+   *
+   * The station→department map is owner-editable. Reading the station off the
+   * stored row rather than looking it up again is what stops a remap in
+   * Settings from retro-rewriting what a past cook was charged to.
+   */
+  station: string;
   /** RECEIPT rows only — no other stage has a vendor. */
   vendor: string;
 
@@ -273,7 +375,23 @@ export interface IssueLogRow {
   still_open: number | null;
   fulfilment: 'FULL' | 'PART' | 'OPEN' | null;
 
-  /** true moved current_stock, false did not, null unknowable. */
+  /**
+   * true moved stock, false did not, null unknowable — and all three values
+   * are load-bearing on a CONSUMPTION row since the department cutover:
+   *
+   *   true   pre-cutover (it debited central, as it always did), or a
+   *          department ledger row exists for the event (the kitchen lost it)
+   *   false  a consumption_skips row exists: nothing moved, and `skip_reason`
+   *          says why
+   *   null   post-cutover, and NEITHER record exists. Genuinely unknowable
+   *          here, not zero: the opt-in floor-store rail (tm_floor_autodeduct)
+   *          posts to store_stock_ledger and writes neither, so printing
+   *          `false` would assert that stock stood still when it may not have.
+   *
+   * Which rail is a property of the stage, not of this flag — a `true` on a
+   * CONSUMPTION row after the cutover means the DEPARTMENT lost the gram, and
+   * on an ISSUE row it means CENTRAL did.
+   */
   stock_moved: boolean | null;
   skip_reason: IssueLogSkipReason;
   needs_unit_review: boolean;
@@ -307,7 +425,16 @@ export interface IssueLogStageTotal {
   /** Rs. Real spend on RECEIPT, a memo on ISSUE, null elsewhere. */
   value: number | null;
   value_basis: IssueLogValueBasis;
-  /** ISSUE only: how many of those rows actually moved current_stock. */
+  /**
+   * How many of this stage's rows actually moved stock on some rail. Non-null
+   * on the three movement stages (ISSUE, CONSUMPTION, REVERSAL) and null on the
+   * stages where the question does not arise — a REQUISITION is a request, a
+   * RECEIPT always moved, and a CONSUMPTION (skipped) never did.
+   *
+   * A shortfall against `lines` is the number that matters: on ISSUE it counts
+   * the party / liquor / unit-review carve-outs, and on CONSUMPTION it counts
+   * the cooks whose station nobody has mapped.
+   */
   stock_moved_lines: number | null;
   /** Printed VERBATIM beneath the card. Never paraphrased on screen. */
   basis: string;
@@ -317,11 +444,11 @@ export interface IssueLogStageTotal {
  * PER STAGE, and ONLY per stage.
  *
  * THERE IS DELIBERATELY NO GRAND TOTAL FIELD, and adding one is the bug this
- * whole file is shaped around — re-read purchase-log.ts:222-224. The five
+ * whole file is shaped around — re-read purchase-log.ts:222-224. The seven
  * stages are different units and different events; any single number "covering
  * everything" is wrong in both, and it is the number that would get quoted.
  *
- * The same five totals are exposed TWICE, as named fields and as an array. Both
+ * The same totals are exposed TWICE, as named fields and as an array. Both
  * views hold THE SAME OBJECTS, so they cannot disagree. This is not indecision:
  * the route reads `totals.receipt`, the page iterates `totals.by_stage`, and
  * both shipped alongside this file. Removing either view breaks a live surface.
@@ -332,7 +459,9 @@ export interface IssueLogTotals {
   issue: IssueLogStageTotal;
   pre_ledger: IssueLogStageTotal;
   consumption: IssueLogStageTotal;
-  /** The same five objects, in flow order, for callers that would rather map. */
+  reversal: IssueLogStageTotal;
+  consumption_skip: IssueLogStageTotal;
+  /** The same objects, in STAGE_ORDER, for callers that would rather map. */
   by_stage: IssueLogStageTotal[];
   /** Rows matching the filters BEFORE any truncation, for the cap check only. */
   lines: number;
@@ -373,8 +502,11 @@ const TOTALS_BASIS =
   + 'RECEIPT is purchase units and rupees (goods arriving). REQUISITION is the line unit '
   + '(a request, not a movement). ISSUE and ISSUE (pre-ledger) are the goods leaving the store '
   + 'and together count each hand-over exactly once. CONSUMPTION is a separate event (cooking), '
-  + 'days later. The ISSUE rupee figure is a VALUED MEMO at average price, not a spend — the '
-  + 'spend was booked at RECEIPT. There is deliberately no grand total.';
+  + 'days later, and comes out of the DEPARTMENT, not central. REVERSAL is the department side of a '
+  + 'give-back the ISSUE figure has ALREADY netted as a negative row — two views of one event, never '
+  + 'to be added. CONSUMPTION (skipped) moved no stock at all: it is a data gap (an unmapped station, '
+  + 'or liquor on its own rail), never a loss. The ISSUE rupee figure is a VALUED MEMO at average '
+  + 'price, not a spend — the spend was booked at RECEIPT. There is deliberately no grand total.';
 
 /** The per-stage sentence printed under each card, and in the CSV totals block. */
 const STAGE_BASIS: Record<IssueLogStage, string> = {
@@ -396,8 +528,24 @@ const STAGE_BASIS: Record<IssueLogStage, string> = {
     + 'requisition figure.',
   CONSUMPTION:
     'Stock consumed by cooking, sales, wastage and the like, in RECIPE units, from '
-    + 'inventory_transactions. A separate event from the issue, days later, and NOT attributable '
-    + 'to any specific issue — the schema records no such link and this report will not invent one.',
+    + 'inventory_transactions. A separate event from the issue, days later. Since the department '
+    + 'cutover this comes out of the DEPARTMENT the station map named, not out of central — the '
+    + 'Department column is the one the ledger stamped at cook time. It is attributable to a '
+    + 'department, and still NOT to any specific issue: without lot tracking a kitchen\'s grams are '
+    + 'fungible, so this report will not invent that link. Rows dated before the cutover debited '
+    + 'central and are shown exactly as they always were.',
+  REVERSAL:
+    'Goods handed BACK by a department to the central store — the department side of an undo or a '
+    + 'store rejection, in RECIPE units, from the department ledger. Shown as the positive quantity '
+    + 'that went back. THIS IS THE SAME EVENT the ISSUE stage already carries as a NEGATIVE row: two '
+    + 'views of one give-back, so never add them and never count a reversal twice. It carries no '
+    + 'money for that reason — the ISSUE memo already nets it.',
+  CONSUMPTION_SKIP:
+    'A cook that moved NO STOCK ANYWHERE, and the reason, in RECIPE units — the quantity that WOULD '
+    + 'have been deducted. Written when the sold line\'s station is blank, unmapped (sushi, '
+    + 'terracegrill), switched off, or the material is store-mapped liquor on the TGBCL rail. These '
+    + 'are a DATA GAP, not a loss: nothing was taken from any department, so nothing here may be read '
+    + 'as shrinkage. Map the station in Settings and the same cook starts deducting.',
 };
 
 /**
@@ -407,8 +555,28 @@ const STAGE_BASIS: Record<IssueLogStage, string> = {
  */
 const EPS = 1e-6;
 
+/**
+ * THE TWO NEW STAGES ARE APPENDED, NOT INSERTED IN FLOW ORDER, AND THAT IS
+ * DELIBERATE — do not "tidy" REVERSAL up next to ISSUE here.
+ *
+ * src/app/reports/issue-log/page.tsx holds its own copy of this list and its
+ * own normStage(), whose fallback for a stage string it does not recognise is
+ * the literal 'CONSUMPTION'. It then picks each stage card with
+ * `totals.find(x => normStage(x.stage) === st)` over THIS array's order. Put
+ * REVERSAL ahead of CONSUMPTION and an un-updated page renders the reversal
+ * total inside the Consumption card — a wrong number under a right heading,
+ * which is the exact failure this whole file is built to prevent. Appended,
+ * the worst an un-updated page can do is not show them.
+ *
+ * (The page still needs its own stages added — see the handoff. This ordering
+ * is the seatbelt for the window where it has not been.)
+ *
+ * ROW ordering inside the chain is stage_rank, set per branch, and it is
+ * unaffected: a REVERSAL shares its link key with its ISSUE and sorts after it.
+ */
 const STAGE_ORDER: IssueLogStage[] =
-  ['RECEIPT', 'REQUISITION', 'ISSUE', 'ISSUE_PRELEDGER', 'CONSUMPTION'];
+  ['RECEIPT', 'REQUISITION', 'ISSUE', 'ISSUE_PRELEDGER', 'CONSUMPTION',
+   'REVERSAL', 'CONSUMPTION_SKIP'];
 
 const STAGE_QTY_BASIS: Record<IssueLogStage, IssueLogQtyBasis> = {
   RECEIPT: 'purchase',
@@ -416,6 +584,10 @@ const STAGE_QTY_BASIS: Record<IssueLogStage, IssueLogQtyBasis> = {
   ISSUE: 'recipe',
   ISSUE_PRELEDGER: 'line',
   CONSUMPTION: 'recipe',
+  // Both read the department rail, which is RECIPE units throughout
+  // (dept-ledger.ts: "Every quantity in this file is RECIPE units").
+  REVERSAL: 'recipe',
+  CONSUMPTION_SKIP: 'recipe',
 };
 
 const STAGE_VALUE_BASIS: Record<IssueLogStage, IssueLogValueBasis> = {
@@ -424,6 +596,14 @@ const STAGE_VALUE_BASIS: Record<IssueLogStage, IssueLogValueBasis> = {
   ISSUE: 'memo',
   ISSUE_PRELEDGER: '',
   CONSUMPTION: '',
+  // NO MONEY ON A REVERSAL, and this is not an omission. A give-back writes a
+  // NEGATIVE requisition_issue_ledger row too, so the ISSUE stage's valued memo
+  // has ALREADY netted these rupees. Valuing them again here would put the same
+  // money on the report twice, under two headings, with nothing to say they are
+  // one event.
+  REVERSAL: '',
+  // A skip moved nothing, so there is nothing to value.
+  CONSUMPTION_SKIP: '',
 };
 
 /** Human label for the CSV and any plain-text surface. */
@@ -433,6 +613,8 @@ const STAGE_LABEL: Record<IssueLogStage, string> = {
   ISSUE: 'ISSUE',
   ISSUE_PRELEDGER: 'ISSUE (pre-ledger)',
   CONSUMPTION: 'CONSUMPTION',
+  REVERSAL: 'REVERSAL (department -> store)',
+  CONSUMPTION_SKIP: 'CONSUMPTION (skipped — no stock moved)',
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -492,6 +674,59 @@ function toPu(qty: number, basis: IssueLogQtyBasis, lineUnit: string, m: PackMet
   return toPurchaseQty(qty * lf.factor, m);
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * SCHEMA TOLERANCE — what this database can actually be asked
+ * ───────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * Which of the department-rail objects exist HERE, probed once per call.
+ *
+ * NOT decoration, and not defensive noise. consumption_skips and
+ * station_departments are created by the cutover block at the tail of db.ts's
+ * migration, and department_material_transactions gained req_item_id / station
+ * / source as PRAGMA-guarded ALTERs in the same block — dept-ledger.ts probes
+ * for exactly the same reason (see its "SCHEMA TOLERANCE" note). Three things
+ * reach this function with a handle that has not run that block: a restored
+ * backup, a test fixture, and getIssueLog's own `dbArg` escape hatch. Naming a
+ * missing table inside a compound SELECT is a hard SQLite error, and it would
+ * take down the WHOLE report — every stage, including the five that have
+ * nothing to do with departments.
+ *
+ * So a missing object DROPS ITS STAGE (and `stages_present` then says the
+ * filter set could not answer it) rather than blanking the report or, worse,
+ * printing a zero. This is a pure read: it never creates anything.
+ */
+interface IssueLogSchema {
+  /** department_material_transactions exists (shipped long before the cutover). */
+  deptLedger: boolean;
+  /** …and carries the additive audit columns req_item_id / station / source. */
+  deptTrace: boolean;
+  /** consumption_skips exists (created by the cutover migration block). */
+  skips: boolean;
+}
+
+function probeSchema(db: DatabaseT.Database): IssueLogSchema {
+  const has = (name: string): boolean => {
+    try {
+      return !!db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`,
+      ).get(name);
+    } catch { return false; }
+  };
+  const deptLedger = has('department_material_transactions');
+  let deptTrace = false;
+  if (deptLedger) {
+    try {
+      const cols = db.prepare(
+        'PRAGMA table_info(department_material_transactions)',
+      ).all() as Array<{ name: string }>;
+      const names = new Set(cols.map(c => String(c.name)));
+      deptTrace = names.has('req_item_id') && names.has('station') && names.has('source');
+    } catch { deptTrace = false; }
+  }
+  return { deptLedger, deptTrace, skips: has('consumption_skips') };
+}
+
 /**
  * FULL / PART / OPEN against the effective quantity. On an ISSUE row that
  * effective quantity is the SNAPSHOT taken at issue time — see the header.
@@ -526,6 +761,7 @@ function buildUnion(f: {
   from: string; to: string;
   departmentId: string; materialId: string; vendor: string; reqNumber: string;
   stage: IssueLogStageFilter;
+  schema: IssueLogSchema;
 }): { sql: string; params: unknown[]; stages: IssueLogStage[] } {
   const parts: string[] = [];
   const params: unknown[] = [];
@@ -537,6 +773,10 @@ function buildUnion(f: {
   // department received nothing", which is a different and false claim.
   const reqChain = !f.vendor;                       // no stage here has a vendor
   const central = !f.departmentId && !f.reqNumber;  // no dept, no requisition
+  // CONSUMPTION sits between the two since the cutover: the department ledger
+  // names a department for it, but a cook still answers to an order and never
+  // to a requisition, and never to a vendor.
+  const cooked = !f.vendor && !f.reqNumber;
   const want = (k: IssueLogStageFilter, ok: boolean) =>
     ok && (f.stage === 'all' || f.stage === k);
 
@@ -582,6 +822,8 @@ function buildUnion(f: {
         NULL                                              AS department_id,
         ''                                                AS department,
         COALESCE(TRIM(p.vendor), '')                      AS vendor,
+        -- A receipt has no kitchen station; goods land in the central store.
+        ''                                                AS station,
         -- ALREADY purchase units. Never multiplied or divided by pack_size.
         COALESCE(p.quantity, 0)                           AS qty,
         COALESCE(NULLIF(rm.purchase_unit, ''), rm.unit, '') AS unit,
@@ -648,6 +890,8 @@ function buildUnion(f: {
         COALESCE(NULLIF(ri.department_id, ''), r.department_id) AS department_id,
         COALESCE(d.name, '')                              AS department,
         ''                                                AS vendor,
+        -- A requisition names a DEPARTMENT directly; no station is involved.
+        ''                                                AS station,
         -- The headline quantity is the EFFECTIVE one (what the chef approved,
         -- falling back to what was asked). Requested, issued and still-open ride
         -- in their own columns so nothing has to be inferred from this number.
@@ -712,10 +956,21 @@ function buildUnion(f: {
         l.department_id                                   AS department_id,
         COALESCE(d.name, '')                              AS department,
         ''                                                AS vendor,
+        -- An issue is addressed to a department on the requisition itself. The
+        -- station map is only ever consulted the other way round, at cook time.
+        ''                                                AS station,
         -- recorded_recipe_qty, NOT delta_recipe_qty. See the header: the first
         -- is what was handed over, the second is only the part that also moved
-        -- current_stock, which is 0 on every row while the deduct flag is off.
-        -- Reading delta here would empty the entire issue leg of this report.
+        -- current_stock. The deduct is UNCONDITIONAL since the cutover, so the
+        -- two agree on an ordinary line — but they still part company on every
+        -- carve-out (party, store-mapped liquor, an ambiguous line unit) and on
+        -- every row written while the old setting was off, where delta is 0.
+        -- Reading delta here would empty the issue leg for all of those and
+        -- push their grams into the pre-ledger remainder, breaking the exact
+        -- partition the header depends on. stock_moved carries that second fact
+        -- in its own column; do not fold the two together. (No backticks in
+        -- this comment: it lives INSIDE a SQL template literal and one would
+        -- end the literal — rule 5 of this repo, and it bit here once already.)
         COALESCE(l.recorded_recipe_qty, 0)                AS qty,
         COALESCE(rm.unit, '')                             AS unit,
         -- VALUED MEMO, never a spend. average_price is Rs per RECIPE unit (the
@@ -800,6 +1055,7 @@ function buildUnion(f: {
         COALESCE(NULLIF(ri.department_id, ''), r.department_id) AS department_id,
         COALESCE(d.name, '')                              AS department,
         ''                                                AS vendor,
+        ''                                                AS station,
         ${REMAINDER}                                      AS qty,
         COALESCE(NULLIF(TRIM(ri.unit), ''), rm.unit, '')  AS unit,
         NULL                                              AS value,
@@ -845,8 +1101,105 @@ function buildUnion(f: {
   }
 
   // ── CONSUMPTION ───────────────────────────────────────────────────────────
-  if (want('consumption', central)) {
+  // Still sourced from inventory_transactions, and that is deliberate: those
+  // rows are what the Variance Report, the Daily Roll-up and Sales-vs-Purchase
+  // read, they cover every consuming event (sale, nc, party, staff meal,
+  // wastage) rather than only the recipe path, and they are the ONLY record of
+  // the years of consumption that predate the department rail. Re-sourcing this
+  // stage from the department ledger would silently drop all three.
+  //
+  // What is NEW is the ATTRIBUTION laid over them — see the block below.
+  if (want('consumption', cooked)) {
     stages.push('CONSUMPTION');
+
+    /* ── ATTRIBUTION, BY SCALAR SUBQUERY AND NEVER BY A JOIN ────────────────
+     * Read a column off the department ledger row that the SAME event wrote,
+     * matched on (material_id, reference_id) — the sale id / wastage id that
+     * both rails stamp (deductInventoryForSale passes referenceId: saleId,
+     * /api/wastage passes the wastage id, and each writes its
+     * inventory_transactions row with the identical reference).
+     *
+     * DO NOT "SIMPLIFY" THIS INTO A LEFT JOIN. One sale writes TWO
+     * inventory_transactions rows for one material when it appears both as a
+     * direct ingredient and inside a sub-recipe (db.ts's two applyDeduct
+     * loops), and the ledger gets two matching rows. A join fans those 2x2 and
+     * DOUBLES the CONSUMPTION stage quantity — a wrong number, on the stage
+     * whose whole purpose is to be checkable against a department balance. A
+     * scalar subquery returns at most one value per row and cannot fan out.
+     *
+     * The ±1 day bound on created_at costs nothing in accuracy — both rows are
+     * written microseconds apart inside ONE db.transaction() — and it lets
+     * SQLite range-scan idx_dept_mat_tx_created for each outer row instead of
+     * scanning the whole ledger once per row. Correlated, so it adds no
+     * parameter and cannot disturb the positional param order below.
+     *
+     * quantity < 0 picks the OUTFLOW. A party 'received' credit shares neither
+     * the sign nor the meaning and must not be mistaken for a cook. */
+    const consDept = (col: string) => (f.schema.deptLedger ? `(
+          SELECT dmt.${col}
+            FROM department_material_transactions dmt
+           WHERE dmt.material_id = it.material_id
+             AND TRIM(COALESCE(it.reference_id, '')) <> ''
+             AND dmt.reference_id = it.reference_id
+             AND dmt.quantity < 0
+             AND dmt.created_at >= datetime(it.created_at, '-1 day')
+             AND dmt.created_at <= datetime(it.created_at, '+1 day')
+           ORDER BY dmt.created_at ASC, dmt.id ASC
+           LIMIT 1)` : 'NULL');
+    const consDeptId = consDept('department_id');
+    // `station` is one of the PRAGMA-guarded additive columns; on a database
+    // that has not run the cutover block it simply is not there yet.
+    const consStation = f.schema.deptTrace ? consDept('station') : `''`;
+
+    /* WHY nothing MOVED, read off consumption_skips.
+     *
+     * TRAP, STATED SO IT IS FIXABLE AND NOT MERELY SURPRISING: consumption_skips
+     * has no sale/reference column. db.ts's recordSkip() puts the sale id in the
+     * NOTES, as the literal tail `sale:<saleId>`, so that tail is the only join
+     * key that exists and this LIKE is coupled to that exact wording. If the
+     * note format ever changes, this match stops finding rows and stock_moved
+     * degrades from `false` to `null` — "unknowable" instead of "did not move".
+     * That is a SAFE degradation (the log gets vaguer, never wrong), which is
+     * why a fragile key is tolerable here and would not be anywhere that a
+     * number came out of it. The real fix is a reference_id column on
+     * consumption_skips — see the handoff.
+     *
+     * cs.date is the IST calendar day while it.created_at is UTC, so the window
+     * is widened a day each way; it is bounded at all only so the leading edge
+     * of idx_consumption_skips_date_station can be used. */
+    const consSkipReason = f.schema.skips ? `COALESCE((
+          SELECT cs.reason
+            FROM consumption_skips cs
+           WHERE cs.material_id = it.material_id
+             AND TRIM(COALESCE(it.reference_id, '')) <> ''
+             AND cs.notes LIKE '%sale:' || it.reference_id
+             AND cs.date >= date(it.created_at, '-1 day')
+             AND cs.date <= date(it.created_at, '+1 day')
+           ORDER BY cs.created_at ASC, cs.id ASC
+           LIMIT 1), '')` : `''`;
+
+    /* THE CUTOVER BOUNDARY, AND WHY IT IS NOT OPTIONAL.
+     *
+     * Before settings.dept_ledger_cutover_at, recipe consumption debited
+     * CENTRAL — that is what the code did and what the books recorded. There is
+     * no department ledger row for any of it, by decision (no backfill). Judge
+     * those rows by the presence of a ledger row and every one of them flips
+     * from "moved stock" to "moved nothing", which is this report rewriting
+     * history on a shipped page. So the boundary is read here and pre-cutover
+     * rows keep reading exactly as they always have.
+     *
+     * SUBSTR(...,1,19) + T->space is dept-ledger.ts's LEDGER_TS_SQL normaliser,
+     * repeated rather than imported because it is one SQL expression: the stamp
+     * is written with milliseconds (nowMs()) and inventory_transactions.
+     * created_at is second-resolution datetime('now'), and 'T' (0x54) sorts
+     * ABOVE ' ' (0x20), so comparing raw stamps shifts a whole day.
+     *
+     * '' (the seeded value, meaning "the owner has not cut over yet") is
+     * handled by its own arm: `x < ''` is false for every timestamp, so without
+     * it a pre-cutover database would report all consumption as unattributed. */
+    const CUTOVER = `REPLACE(SUBSTR((SELECT COALESCE(value, '') FROM settings
+                                      WHERE key = 'dept_ledger_cutover_at'), 1, 19), 'T', ' ')`;
+
     parts.push(`
       SELECT
         'CONSUMPTION'                                     AS stage,
@@ -855,25 +1208,51 @@ function buildUnion(f: {
         substr(it.created_at, 1, 10)                      AS date,
         COALESCE(it.created_at, '')                       AS at,
         COALESCE(it.reference_id, '')                     AS doc_no,
-        -- Material ALONE. Recipe consumption fires at KOT-complete against
-        -- central stock and nothing in the schema ties a cooked gram back to the
-        -- issue it came from. The row says so in its notes rather than guessing.
+        -- Material ALONE, still. The department is now known (see below) but
+        -- the ISSUE it came from is not: without lot tracking a kitchen's grams
+        -- are fungible and "this dish ate that issue" is unknowable. Keying on
+        -- the material keeps a material's whole chain together without claiming
+        -- an attribution the schema cannot support.
         COALESCE(it.material_id, '')                      AS link_raw,
         ''                                                AS ref_no,
         COALESCE(it.material_id, '')                      AS material_id,
         COALESCE(rm.name, '(unknown item)')               AS material,
         COALESCE(rm.sku, '')                              AS sku,
         COALESCE(rm.category, '')                         AS category,
-        NULL                                              AS department_id,
-        ''                                                AS department,
+        -- THE DEPARTMENT THAT LOST THE GRAM, as the ledger stamped it at cook
+        -- time — NOT re-resolved through today's station map, which the owner
+        -- can edit. NULL where the map could not answer, or before the cutover;
+        -- a NULL here is an honest "no department", never a zero.
+        ${consDeptId}                                     AS department_id,
+        COALESCE((SELECT dp.name FROM departments dp WHERE dp.id = ${consDeptId}), '') AS department,
         ''                                                AS vendor,
+        -- The station that RESOLVED that department, kept for the audit.
+        COALESCE(${consStation}, '')                      AS station,
         -- Stock-reducing rows are stored negative; negated here so a consumption
         -- reads positive and a reversal keeps its minus sign.
         -COALESCE(it.quantity, 0)                         AS qty,
         COALESCE(rm.unit, '')                             AS unit,
         NULL                                              AS value,
-        1                                                 AS stock_moved,
-        ''                                                AS skip_reason,
+        -- WAS THE LITERAL 1. It is now a question with three answers, and the
+        -- middle one is the reason this changed: a cook whose station nobody has
+        -- mapped moved NOTHING, and stamping "yes, stock moved" on it is a lie
+        -- in an audit trail — the lie that makes a data gap look like a
+        -- balanced book. Order matters; the first arm wins.
+        CASE
+          -- Pre-cutover (or no cutover yet): it debited CENTRAL, as it always
+          -- did. Not reinterpreted. See the CUTOVER note above.
+          WHEN ${CUTOVER} = '' OR COALESCE(it.created_at, '') < ${CUTOVER} THEN 1
+          -- A department ledger row exists: the DEPARTMENT lost it.
+          WHEN ${consDeptId} IS NOT NULL THEN 1
+          -- A skip was recorded: nothing moved, on any rail, and we know why.
+          WHEN ${consSkipReason} <> '' THEN 0
+          -- Neither record. NOT zero: the opt-in floor-store rail
+          -- (tm_floor_autodeduct) posts to store_stock_ledger and writes
+          -- neither of the two above, so 0 would assert stock stood still when
+          -- it may well not have. Unknowable is the honest answer.
+          ELSE NULL
+        END                                               AS stock_moved,
+        ${consSkipReason}                                 AS skip_reason,
         0                                                 AS needs_unit_review,
         NULL                                              AS requested_qty,
         NULL                                              AS effective_qty,
@@ -885,6 +1264,16 @@ function buildUnion(f: {
         ''                                                AS mgmt_approved_at,
         ''                                                AS actor,
         TRIM(COALESCE(it.notes, '')
+             || CASE WHEN ${consDeptId} IS NOT NULL
+                     THEN ' | department attributed from station '''
+                          || COALESCE(NULLIF(${consStation}, ''), '(none)')
+                          || ''' at cook time'
+                     ELSE '' END
+             || CASE WHEN ${consSkipReason} <> ''
+                     THEN ' | NO STOCK MOVED (' || ${consSkipReason} || ') — station '''
+                          || COALESCE(NULLIF(${consStation}, ''), '(none recorded on the line)')
+                          || ''' could not be charged; map it in Settings'
+                     ELSE '' END
              || ' | not attributable to a specific issue')  AS notes,
         ''                                                AS req_number,
         ''                                                AS req_item_id,
@@ -896,7 +1285,184 @@ function buildUnion(f: {
       LEFT JOIN raw_materials rm ON rm.id = it.material_id
       WHERE substr(it.created_at, 1, 10) >= ? AND substr(it.created_at, 1, 10) <= ?
         AND it.type IN ('sale', 'nc', 'party_consumption', 'staff_meal', 'wastage')
-        ${matFilter('it.material_id')}
+        ${matFilter('it.material_id')}${deptFilter(consDeptId)}
+    `);
+    params.push(f.from, f.to);
+    if (f.materialId) params.push(f.materialId);
+    // The department filter is applied to the ATTRIBUTED department, so a
+    // department sees only the cooks its own kitchen was charged for. Pushed
+    // AFTER the material param because deptFilter() is appended after
+    // matFilter() in the WHERE above — compound-SELECT params are positional
+    // and this file has no other guard against getting that pairing wrong.
+    if (f.departmentId) params.push(f.departmentId);
+  }
+
+  // ── REVERSAL (department -> central) ──────────────────────────────────────
+  // The give-back leg the spec asks for by name: "reversing an issue moves
+  // stock back Department -> Central for the reversed quantity."
+  //
+  // WHY THIS IS A STAGE AT ALL, given the ISSUE stage already shows a reversal
+  // as a NEGATIVE requisition_issue_ledger row: because that row is the CENTRAL
+  // side of the event, and it is exactly the shape the department rail was
+  // built to stop being the only record. postDeptLedger stamps the department
+  // side under its own type — `issue_reversal`, added precisely because
+  // creditDepartment used to write a give-back as type 'issued' with a negative
+  // quantity, and every report grouping by type read it as another issue.
+  //
+  // TWO VIEWS OF ONE EVENT, THEREFORE. They must never be added, which is why
+  // this stage carries no money (the ISSUE memo has already netted the rupees)
+  // and why STAGE_BASIS.REVERSAL says so in the words printed under the card.
+  if (want('reversal', reqChain && f.schema.deptLedger)) {
+    stages.push('REVERSAL');
+    // req_item_id is one of the additive columns. Without it the row still
+    // reports the movement honestly; it just cannot name the requisition LINE,
+    // so the link key degrades to the requisition header.
+    const revLine = f.schema.deptTrace ? `COALESCE(dmt.req_item_id, '')` : `''`;
+    parts.push(`
+      SELECT
+        'REVERSAL'                                        AS stage,
+        6                                                 AS stage_rank,
+        dmt.id                                            AS row_id,
+        substr(dmt.created_at, 1, 10)                     AS date,
+        COALESCE(dmt.created_at, '')                      AS at,
+        COALESCE(rq.req_number, '')                       AS doc_no,
+        -- THE SAME KEY SHAPE AS ITS ISSUE, on purpose: filter or sort by the
+        -- link key and a line's issue and its undo sit together, which is the
+        -- whole point of asking for the reversal in the log.
+        CASE WHEN ${revLine} <> ''
+             THEN COALESCE(rq.req_number, '') || '#' || ${revLine}
+             ELSE COALESCE(rq.req_number, '') END         AS link_raw,
+        ''                                                AS ref_no,
+        COALESCE(dmt.material_id, '')                     AS material_id,
+        COALESCE(rm.name, '(unknown item)')               AS material,
+        COALESCE(rm.sku, '')                              AS sku,
+        COALESCE(rm.category, '')                         AS category,
+        dmt.department_id                                 AS department_id,
+        COALESCE(d.name, '')                              AS department,
+        ''                                                AS vendor,
+        ''                                                AS station,
+        -- The ledger stores this SIGNED and negative (out of the department).
+        -- Negated to the positive magnitude that went back, matching the
+        -- CONSUMPTION convention: quantities read positive and the DIRECTION is
+        -- the stage, never the sign. Do not "restore" the minus — a column that
+        -- is sometimes signed and sometimes not is unsummable by anyone.
+        -COALESCE(dmt.quantity, 0)                        AS qty,
+        COALESCE(rm.unit, '')                             AS unit,
+        -- No money. See STAGE_VALUE_BASIS.REVERSAL: the ISSUE stage's valued
+        -- memo already went negative for this same give-back.
+        NULL                                              AS value,
+        -- A reversal row is only ever written when the stock actually moved:
+        -- applyIssueDelta calls postDeptLedger inside its stockQty-non-zero
+        -- branch, so there is no such thing as a recorded-but-unmoved reversal.
+        1                                                 AS stock_moved,
+        ''                                                AS skip_reason,
+        0                                                 AS needs_unit_review,
+        NULL                                              AS requested_qty,
+        NULL                                              AS effective_qty,
+        NULL                                              AS issued_qty,
+        1                                                 AS snapshot_factor,
+        'issue_reversal'                                  AS status,
+        ''                                                AS raised_at,
+        ''                                                AS chef_approved_at,
+        ''                                                AS mgmt_approved_at,
+        COALESCE(dmt.user, '')                            AS actor,
+        TRIM(COALESCE(dmt.notes, '')
+             || ' | returned to the central store; the ISSUE stage carries the '
+             || 'same give-back as a negative row — do not count it twice') AS notes,
+        COALESCE(rq.req_number, '')                       AS req_number,
+        ${revLine}                                        AS req_item_id,
+        COALESCE(rm.unit, '')                             AS rm_unit,
+        COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
+        COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
+        ''                                                AS line_unit
+      FROM department_material_transactions dmt
+      LEFT JOIN raw_materials rm ON rm.id = dmt.material_id
+      LEFT JOIN departments d ON d.id = dmt.department_id
+      LEFT JOIN requisitions rq ON rq.id = dmt.reference_id
+      WHERE substr(dmt.created_at, 1, 10) >= ? AND substr(dmt.created_at, 1, 10) <= ?
+        AND dmt.type = 'issue_reversal'
+        ${deptFilter('dmt.department_id')}${matFilter('dmt.material_id')}${reqFilter("COALESCE(rq.req_number, '')")}
+    `);
+    params.push(f.from, f.to);
+    if (f.departmentId) params.push(f.departmentId);
+    if (f.materialId) params.push(f.materialId);
+    if (f.reqNumber) params.push(f.reqNumber);
+  }
+
+  // ── CONSUMPTION (skipped) ─────────────────────────────────────────────────
+  // Cooks that moved NO STOCK ANYWHERE, and why. Without this stage "we sold
+  // forty sushi rolls and nothing came off any shelf" is indistinguishable in
+  // the log from "nothing was sold" — the silence reads as a balanced book.
+  //
+  // A SKIP HAS NO DEPARTMENT, BY DEFINITION — that is the whole event: no
+  // department could be named, so none was charged. It therefore drops out
+  // under a department filter (stages_present says so) rather than matching
+  // nothing and implying this kitchen skipped none. Do not "fix" that by
+  // attributing a skip to a guessed department: guessing is the thing the skip
+  // exists to refuse.
+  if (want('skip', central && f.schema.skips)) {
+    stages.push('CONSUMPTION_SKIP');
+    parts.push(`
+      SELECT
+        'CONSUMPTION_SKIP'                                AS stage,
+        7                                                 AS stage_rank,
+        cs.id                                             AS row_id,
+        -- cs.date is the IST calendar day the skip happened (the column
+        -- defaults to date('now','+330 minutes')), where the other stages window
+        -- on a UTC timestamp. Filtering on it is what lets
+        -- idx_consumption_skips_date_station carry this scan, and a skip is a
+        -- service-day fact, so the IST day is the right one to file it under.
+        COALESCE(cs.date, substr(cs.created_at, 1, 10))   AS date,
+        COALESCE(cs.created_at, '')                       AS at,
+        COALESCE(cs.order_id, '')                         AS doc_no,
+        -- Keyed on the material, like CONSUMPTION, so a skipped cook sits in the
+        -- same chain as the cooks that did move stock for that item.
+        COALESCE(cs.material_id, '')                      AS link_raw,
+        ''                                                AS ref_no,
+        COALESCE(cs.material_id, '')                      AS material_id,
+        COALESCE(rm.name, '(unknown item)')               AS material,
+        COALESCE(rm.sku, '')                              AS sku,
+        COALESCE(rm.category, '')                         AS category,
+        NULL                                              AS department_id,
+        ''                                                AS department,
+        ''                                                AS vendor,
+        -- THE POINT OF THE ROW. '' means the sold line carried no station at
+        -- all, which is itself the finding and is why the reason reads 'blank'.
+        COALESCE(cs.station, '')                          AS station,
+        -- What WOULD have been deducted. Stored positive already; not negated.
+        COALESCE(cs.quantity, 0)                          AS qty,
+        COALESCE(rm.unit, '')                             AS unit,
+        NULL                                              AS value,
+        0                                                 AS stock_moved,
+        COALESCE(NULLIF(TRIM(cs.reason), ''), 'unmapped') AS skip_reason,
+        0                                                 AS needs_unit_review,
+        NULL                                              AS requested_qty,
+        NULL                                              AS effective_qty,
+        NULL                                              AS issued_qty,
+        1                                                 AS snapshot_factor,
+        COALESCE(cs.source, '')                           AS status,
+        ''                                                AS raised_at,
+        ''                                                AS chef_approved_at,
+        ''                                                AS mgmt_approved_at,
+        ''                                                AS actor,
+        TRIM('NO STOCK MOVED. Station '''
+             || COALESCE(NULLIF(TRIM(cs.station), ''), '(none on the sold line)')
+             || ''' could not be charged ('
+             || COALESCE(NULLIF(TRIM(cs.reason), ''), 'unmapped')
+             || '). This is a DATA GAP, not a loss — nothing was taken from any '
+             || 'department, so none of it is shrinkage. '
+             || COALESCE(NULLIF(TRIM(cs.notes), ''), '')) AS notes,
+        ''                                                AS req_number,
+        ''                                                AS req_item_id,
+        COALESCE(rm.unit, '')                             AS rm_unit,
+        COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
+        COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
+        ''                                                AS line_unit
+      FROM consumption_skips cs
+      LEFT JOIN raw_materials rm ON rm.id = cs.material_id
+      WHERE COALESCE(cs.date, substr(cs.created_at, 1, 10)) >= ?
+        AND COALESCE(cs.date, substr(cs.created_at, 1, 10)) <= ?
+        ${matFilter('cs.material_id')}
     `);
     params.push(f.from, f.to);
     if (f.materialId) params.push(f.materialId);
@@ -921,22 +1487,40 @@ export function getIssueLog(
   const materialId = s(filters.material_id);
   const vendor = s(filters.vendor);
   const reqNumber = s(filters.req_number);
-  // BOTH spellings of the pre-ledger token are accepted and normalised to one.
+  // EVERY spelling of a token is accepted and normalised to ONE.
+  //
   // The route maps its wire values to 'pre_ledger' and the page sends
   // 'preledger'; a token this function does not recognise falls back to 'all',
   // which means an unmapped spelling would quietly return EVERY stage under a
   // heading that says "pre-ledger only". Accepting both closes that hole, and
   // bookmarked report URLs outlive any later tidy-up of the spelling.
+  //
+  // The underscore strip is why this is a MAP and not a `switch` on the raw
+  // token: it collapses 'pre_ledger'->'preledger' and
+  // 'consumption_skip'->'consumptionskip', so the keys below are the STRIPPED
+  // forms. Note 'consumptionskip' cannot collide with 'consumption' — these are
+  // exact lookups, not prefixes — and a wrong answer there would be the report
+  // handing back real movements when asked for skipped ones.
+  const STAGE_TOKENS: Record<string, IssueLogStageFilter> = {
+    receipt: 'receipt',
+    requisition: 'requisition',
+    issue: 'issue',
+    preledger: 'preledger',
+    consumption: 'consumption',
+    reversal: 'reversal',
+    skip: 'skip',
+    consumptionskip: 'skip',
+  };
   const rawStage = s(filters.stage).toLowerCase().replace(/_/g, '');
-  const stage: IssueLogStageFilter =
-    rawStage === 'receipt' || rawStage === 'requisition' || rawStage === 'issue'
-      || rawStage === 'consumption'
-      ? (rawStage as IssueLogStageFilter)
-      : rawStage === 'preledger' ? 'preledger'
-      : 'all';
+  const stage: IssueLogStageFilter = STAGE_TOKENS[rawStage] ?? 'all';
+
+  // Probed ONCE and handed down, so a stage that names a table this database
+  // has not migrated yet is dropped rather than killing the whole compound
+  // SELECT. See probeSchema().
+  const schema = probeSchema(db);
 
   const { sql: union, params, stages } = buildUnion({
-    from, to, departmentId, materialId, vendor, reqNumber, stage,
+    from, to, departmentId, materialId, vendor, reqNumber, stage, schema,
   });
 
   const blankTotal = (st: IssueLogStage): IssueLogStageTotal => ({
@@ -952,7 +1536,13 @@ export function getIssueLog(
     // of a zero — and stops it reconciling with purchase-log, which returns 0.
     value: STAGE_VALUE_BASIS[st] === '' ? null : 0,
     value_basis: STAGE_VALUE_BASIS[st],
-    stock_moved_lines: st === 'ISSUE' ? 0 : null,
+    // Non-null on the three MOVEMENT stages only. null is not "none moved" —
+    // it is "this stage does not move stock, so the count would be noise": a
+    // REQUISITION is a request, a RECEIPT always moved, and a CONSUMPTION
+    // (skipped) never did (its `lines` IS its count). Same 0-vs-null discipline
+    // as `value` directly above.
+    stock_moved_lines:
+      st === 'ISSUE' || st === 'CONSUMPTION' || st === 'REVERSAL' ? 0 : null,
     basis: STAGE_BASIS[st],
   });
   // Every stage gets a total object even when the filters excluded it, so a
@@ -965,6 +1555,8 @@ export function getIssueLog(
     ISSUE: blankTotal('ISSUE'),
     ISSUE_PRELEDGER: blankTotal('ISSUE_PRELEDGER'),
     CONSUMPTION: blankTotal('CONSUMPTION'),
+    REVERSAL: blankTotal('REVERSAL'),
+    CONSUMPTION_SKIP: blankTotal('CONSUMPTION_SKIP'),
   };
   const totals: IssueLogTotals = {
     receipt: byName.RECEIPT,
@@ -972,6 +1564,8 @@ export function getIssueLog(
     issue: byName.ISSUE,
     pre_ledger: byName.ISSUE_PRELEDGER,
     consumption: byName.CONSUMPTION,
+    reversal: byName.REVERSAL,
+    consumption_skip: byName.CONSUMPTION_SKIP,
     // THE SAME OBJECTS, not copies — the two views cannot drift apart.
     by_stage: STAGE_ORDER.map(st => byName[st]),
     lines: 0,
@@ -1016,7 +1610,13 @@ export function getIssueLog(
     // avoid. `unit` follows it so no surface can print the figure bare.
     t.qty = materialId ? r6(a.qty) : null;
     t.unit = materialId ? s(a.unit) : '';
-    if (a.stage === 'ISSUE') t.stock_moved_lines = num(a.moved);
+    // Only where blankTotal() already opened the field — the null-vs-0 meaning
+    // is decided there and must not be re-decided here. Note the aggregate
+    // counts `stock_moved = 1` strictly, so a CONSUMPTION row whose rail is
+    // UNKNOWABLE (NULL) is excluded from `moved` rather than counted either
+    // way, and `lines - stock_moved_lines` is therefore "did not move OR we
+    // cannot say", not "did not move".
+    if (t.stock_moved_lines !== null) t.stock_moved_lines = num(a.moved);
     totals.lines += num(a.lines);
   }
 
@@ -1085,6 +1685,11 @@ export function getIssueLog(
       category: s(r.category),
       department_id: s(r.department_id) || null,
       department: s(r.department),
+      // Lower-cased at the source (resolveStationDepartment normalises the key
+      // before it is stamped), so it is passed through verbatim rather than
+      // re-cased here — a display that title-cases 'pan-asian' into 'Pan-Asian'
+      // stops matching what an owner types into the Settings map.
+      station: s(r.station),
       vendor: s(r.vendor),
       qty,
       unit: s(r.unit),
@@ -1149,6 +1754,11 @@ export const ISSUE_LOG_COLUMNS: IssueLogColumn[] = [
   { key: 'sku',               label: 'SKU' },
   { key: 'category',          label: 'Category' },
   { key: 'department',        label: 'Department' },
+  // Beside Department deliberately: on a CONSUMPTION row this is the station
+  // that PRODUCED the department to its left, and on a skipped one it is the
+  // station that produced nothing. Read apart they are two facts; read together
+  // they are the attribution and its evidence.
+  { key: 'station',           label: 'Station (attributed via)' },
   { key: 'vendor',            label: 'Vendor' },
   { key: 'qty',               label: 'Qty', numeric: true },
   { key: 'unit',              label: 'Unit' },
@@ -1253,9 +1863,13 @@ export function issueLogToCsv(input: IssueLogRow[] | IssueLogResult): string {
       const val = t.value === null || t.value === undefined
         ? 'no money on this stage'
         : `Rs ${t.value} (${t.value_basis === 'memo' ? 'VALUED MEMO, not a spend' : 'spend'})`;
+      // "moved stock", not "moved CENTRAL stock". Since the department cutover
+      // the rail depends on the stage — an ISSUE debits central, a CONSUMPTION
+      // debits the department — and naming the wrong one in the artefact that
+      // gets mailed around is how a reader concludes the store is short.
       const moved = t.stock_moved_lines === null || t.stock_moved_lines === undefined
         ? ''
-        : ` | ${t.stock_moved_lines} of ${t.lines} also moved central stock`;
+        : ` | ${t.stock_moved_lines} of ${t.lines} moved stock on this stage's rail`;
       out.push(csvBanner(`${STAGE_LABEL[t.stage]}: ${t.lines} lines | ${qty} | ${val}${moved}`));
       out.push(csvBanner(`    ${t.basis}`));
     }

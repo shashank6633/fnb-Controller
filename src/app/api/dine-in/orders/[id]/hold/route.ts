@@ -74,6 +74,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const alreadyDeducted = !!(freshDeduct.get(it.id) as any)?.recipe_deducted_at;
         recordSale(db, {
           item_name: it.name, recipe_id: it.recipe_id, quantity_sold: it.quantity,
+          // DEPARTMENT ROUTING: pass the LINE's station (order_items.station) so the
+          // deduct lands on the department that actually cooked it. It must be this
+          // column and never kots.station — the KOT writer coerces a blank line
+          // station to the literal 'kitchen', and 'Kitchen' is a real department
+          // (the main-kitchen roll-up), so resolving off the ticket would silently
+          // debit the wrong kitchen for every station-less item.
+          // Pass it RAW. Do not default it to 'kitchen' and do not fall back to a
+          // parent department: a blank or unmapped station (sushi, terracegrill) is
+          // meant to SKIP the department debit and log why, because guessing the
+          // wrong kitchen is worse than not deducting. Liquor lines land here too
+          // and are carved out downstream on the store rail — not here.
+          station: it.station || null,
           skip_inventory: alreadyDeducted, store_id: floorStoreId,
           bill_type: order.bill_type || 'normal', selling_price: it.unit_price, date, sale_time: saleTime,
           order_id: order.id, category: it.station || null, server: order.server_name || null,

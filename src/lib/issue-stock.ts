@@ -5,64 +5,76 @@
  *
  * The owner's rule is "stock is deducted once, at issue": goods leaving the
  * central store on a requisition debit raw_materials.current_stock and credit
- * the receiving department. Nothing else in this codebase may move stock for a
- * requisition — every writer of requisition_items.quantity_issued calls
- * applyIssueDelta() instead of rolling its own.
+ * the receiving DEPARTMENT's ledger. Nothing else in this codebase may move
+ * stock for a requisition — every writer of requisition_items.quantity_issued
+ * calls applyIssueDelta() instead of rolling its own.
+ *
+ * ── THE FLAG IS GONE. THE DEDUCT IS UNCONDITIONAL. ─────────────────────────
+ * The old deduct-at-issue setting key no longer gates anything. Nothing in this
+ * file — or anywhere else — reads it. Its settings ROW is deliberately LEFT IN
+ * THE TABLE, inert and ignored: deleting admin-owned state inside a deploy is
+ * not this change's business, and scripts/check-boot-migrations.js exists to
+ * stop exactly that. The key is named once, in the db.ts comment that marks the
+ * row inert, and NOWHERE ELSE ON PURPOSE — this file is grep-clean of it so a
+ * reviewer can prove in one command that no functional read survived. Do not
+ * reintroduce one, and do not "restore" the toggle: a switch that writes a key
+ * nothing consults is worse than no switch at all.
+ *
+ * THIS EDIT CANNOT BE SPLIT ACROSS COMMITS OR DEPLOYS. Recipe consumption at
+ * KOT-complete (src/lib/db.ts applyDeduct) used to debit central too, and all
+ * 131 recipe-ingredient materials are ALSO requisition-issued. Removing the
+ * flag here while applyDeduct still points at central removes every gram
+ * twice — once leaving the store, once being cooked. The two edits ship
+ * together or not at all.
  *
  * ── ALWAYS RECORD, GATE ONLY THE DEDUCT ────────────────────────────────────
  * READ THIS BEFORE YOU "SIMPLIFY" ANYTHING BELOW.
  *
- * This function used to open with `if (!issueDeductionEnabled(db)) return`, so
- * settings key `requisition_deduct_at_issue` (shipped '0', still '0' in
- * production) made the WHOLE function a no-op. One flag was gating two
- * unrelated things, and the cost was measured: 14,148 requisition lines carry
- * quantity_issued > 0 and requisition_issue_ledger has ZERO rows. The store
- * hands goods to a kitchen every day and the database keeps no movement row of
- * it, so no purchase → requisition → issue → consumption log can be built.
+ * The deduct is unconditional but not universal: three cases still hand goods
+ * over WITHOUT this rail moving a gram — party requisitions (their own rail),
+ * store-mapped/liquor materials (the TGBCL store ledger), and an ambiguous
+ * line unit (we refuse to guess). The ledger row is written on EVERY issue in
+ * ALL of those cases. The hand-over is a real event and the owner's log must
+ * see it; only the stock write is skipped, and the row says why on its face.
  *
- * The flag now gates the DEDUCT only. The ledger row is written on EVERY issue
- * in BOTH flag states. Stock behaviour is exactly three writes — UPDATE
- * raw_materials, INSERT inventory_transactions, creditDepartment() — and all
- * three are driven by `stockQty`, which is 0 on every path while the flag is
- * off. So with the flag off nothing about stock changes, and a record appears.
- *
- * DO NOT collapse this back into one flag, and DO NOT "tidy" the two quantity
- * columns into one. Which brings us to the trap:
+ * That is why there are still two quantity columns, and why they are not
+ * interchangeable:
  *
  * ── TWO QUANTITIES, TWO CLAMPS ─────────────────────────────────────────────
  *   delta_recipe_qty     recipe units THIS CALL ACTUALLY REMOVED from
  *                        raw_materials.current_stock. 0 whenever no stock moved.
- *                        Sole input to the stock credit clamp. Meaning unchanged
- *                        from the day it was written.
+ *                        Sole input to the stock credit clamp, and the sole
+ *                        input to lineHasMovedStock()/requisitionHasMovedStock().
  *   recorded_recipe_qty  recipe units PHYSICALLY HANDED OVER on this call,
  *                        written whether or not stock moved. The end-to-end log
  *                        reads this and only this.
  *
  * Writing the hand-over into delta_recipe_qty instead — the obvious "why two
- * columns?" simplification — passes every test today (flag off, nothing moves)
- * and then MANUFACTURES STOCK the first time the owner switches the flag on: a
- * line issued while the flag was off has a positive delta_recipe_qty behind it
- * with no debit, so the credit clamp happily gives it back on undo. That is the
- * measured ALMOND bug (g/kg, pack 1000: current_stock 4,000 -> 5,000, the
- * department balance to -1,000) restated in a new costume.
+ * columns?" simplification — MANUFACTURES STOCK: a line handed over on a path
+ * that moved nothing (party, liquor, or any of the 14,148 pre-ledger lines)
+ * would carry a positive delta_recipe_qty with no debit behind it, so the
+ * credit clamp would happily give it back on undo. That is the measured ALMOND
+ * bug (g/kg, pack 1000: current_stock 4,000 -> 5,000, the department balance to
+ * -1,000) restated in a new costume.
  *
  * Each quantity is therefore clamped against ITS OWN running sum, so neither
  * can run past zero and neither can borrow the other's history.
  *
  * SUM(delta_recipe_qty) <= SUM(recorded_recipe_qty), always, per req_item_id.
  *
- * stock_applied (1 iff this row moved stock) exists so the log can say which of
- * the two happened without inferring it from a setting whose value at the time
- * is unrecoverable — and because lineHasMovedStock()/requisitionHasMovedStock()
- * key on it. See their doc comment: that is not cosmetic, it is what stops four
- * daily operations from refusing the moment the first ledger row lands.
+ * stock_applied (1 iff this row moved stock) is still stamped for the log's
+ * benefit, but the has-stock-moved guards no longer key on it — see their doc
+ * comment for the deadlock that caused.
  *
- * WHY THE DEDUCT IS STILL OFF: recipe consumption at KOT-complete ALREADY
- * debits central current_stock (src/lib/db.ts applyDeduct, reached from the KDS
- * bump and the sales routes), and all 131 recipe-ingredient materials are also
- * requisition-issued. Turning this on before the sales side is repointed at
- * department balances would remove the same gram twice — once leaving the
- * store, once being cooked.
+ * ── ONE DEPARTMENT BALANCE, DERIVED FROM ONE LEDGER ────────────────────────
+ * The credit goes through postDeptLedger() in src/lib/dept-ledger.ts, which
+ * owns department_material_transactions (the truth: SUM of signed quantity,
+ * anchored on the cutover/closing count) and maintains department_materials
+ * .on_hand as a CACHE. computeDeptStock() in dept-stock.ts reads that same
+ * ledger. There is now exactly ONE derivation of a department balance in this
+ * codebase; the old warning here — that computeDeptStock derived its own from
+ * requisition_items and must not also add on_hand, or every issue counts twice
+ * — is retired because the second derivation is gone. Do not bring it back.
  *
  * ── THE CALLER CONTRACT ────────────────────────────────────────────────────
  * Unchanged. Callers pass the BEFORE and AFTER line quantities and this
@@ -86,7 +98,8 @@
  *      undo and reject zero quantity_issued and blank issue_history in the same
  *      statement, destroying the pre-image.
  *   2. Call inside your own transaction. This function never opens one, so its
- *      writes roll back with yours.
+ *      writes roll back with yours — which is the whole mechanism behind the
+ *      reversal guard below: it THROWS, and your transaction unwinds.
  *
  * ── THE INVARIANTS ─────────────────────────────────────────────────────────
  * For any req_item_id, neither SUM(delta_recipe_qty) nor
@@ -106,6 +119,9 @@
  *     quantity_issued values would log a department issuing minus 1,000 g out
  *     of nowhere.
  *
+ * A THIRD mechanism now sits on top of the stock clamp, and it is not a clamp:
+ * the department must actually still HOLD the goods. See assertReversible.
+ *
  * pack_factor is stored per row so the log can reverse each row's conversion
  * with the factor ACTUALLY USED — a later Unit Audit rebase changes a
  * material's factor, and the pre-ledger remainder arithmetic in the end-to-end
@@ -114,6 +130,7 @@
 import { packFactor } from '@/lib/pack-units';
 import { generateId } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
+import { postDeptLedger, assertReversible } from '@/lib/dept-ledger';
 
 export interface IssueDeltaInput {
   reqItemId: string;
@@ -131,10 +148,10 @@ export interface IssueDeltaResult {
   applied: boolean;
   /**
    * Why STOCK did not move, when applied === false. Mirrors the row's
-   * skip_reason. Note that 'flag_off' / 'party' / 'unit_review' no longer mean
+   * skip_reason. Note that 'party' / 'store_mapped' / 'unit_review' do NOT mean
    * "nothing was written" — a ledger row is still recorded; see the header.
    */
-  skipped?: 'flag_off' | 'party' | 'unit_review' | 'zero_delta' | 'missing_line';
+  skipped?: 'party' | 'store_mapped' | 'unit_review' | 'zero_delta' | 'missing_line';
   /** Recipe units removed from current_stock — 0 unless applied. */
   deltaRecipeQty?: number;
   /** Recipe units recorded as handed over, deducted or not. */
@@ -144,53 +161,60 @@ export interface IssueDeltaResult {
   needsUnitReview?: boolean;
 }
 
-/** Is deduct-at-issue switched on? Default OFF — see the file header. */
-export function issueDeductionEnabled(db: any): boolean {
-  try {
-    const row = db.prepare(`SELECT value FROM settings WHERE key = 'requisition_deduct_at_issue'`).get() as
-      | { value: string } | undefined;
-    return String(row?.value ?? '0') === '1';
-  } catch { return false; }
-}
+/**
+ * Float slack. Declared up here because the has-stock-moved guards below now
+ * compare a SUM against it, not just the arithmetic further down.
+ */
+const EPS = 1e-9;
 
 /**
- * Has this line ever moved stock? Destructive edits (cancel, chef-reject,
- * requisition PUT, which deletes and reinserts lines with new ids) must refuse
- * on such a line, because they would orphan the ledger and strand the stock.
+ * Has this line moved stock ON NET, right now? Destructive edits (cancel,
+ * chef-reject, requisition PUT, which deletes and reinserts lines with new ids)
+ * must refuse on such a line, because they would orphan the ledger and strand
+ * the stock.
  *
- * `AND stock_applied = 1` IS LOAD-BEARING. DO NOT DROP IT.
+ * THE SUM IS LOAD-BEARING, AND SO IS THE COLUMN IT SUMS. DO NOT REVERT EITHER.
  *
- * The question these two helpers ask has always been "has stock moved", never
- * "does a record exist" — the distinction simply did not exist while the flag
- * gated recording too, because then no ledger row could exist at all. Now a row
- * is written on every issue in both flag states, so a bare EXISTS would start
- * REFUSING four operations the owner performs daily, with the deduct flag still
- * off and not one gram moved:
+ * This used to be `EXISTS(... AND stock_applied = 1)`. That reads as "did stock
+ * EVER move", which is a different question and creates a dead end: insertLedger
+ * stamps stock_applied = 1 whenever deltaRecipe != 0, and a REVERSAL row has a
+ * non-zero (negative) delta too. So a line that was issued and then fully undone
+ * — every gram back in the store, net zero — stays permanently "moved", and
+ * cancel / PUT / chef-reject refuse forever. Worse, the escape hatch
+ * api/requisitions/[id]/cancel:51 offers ("undo the issued lines first") is the
+ * very action that created the blocking row, so the advice can never work.
  *
- *   api/requisitions/route.ts:496          PUT (deletes and reinserts lines)
- *   api/requisitions/[id]/cancel:49        cancel
+ * It MUST be delta_recipe_qty and NEVER recorded_recipe_qty. recorded is
+ * written on hand-overs that moved no stock at all — party lines, store-mapped
+ * liquor, and every pre-cutover hand-over — so summing it would start refusing
+ * these four daily operations on lines where not one gram left central:
+ *
+ *   api/requisitions/route.ts:496            PUT (deletes and reinserts lines)
+ *   api/requisitions/[id]/cancel:49          cancel
  *   api/requisitions/[id]/items/[itemId]:83  chef reject
  *   api/requisitions-import (documented in that file's header)
  *
- * With the flag off no row carries stock_applied = 1, so all four behave
- * exactly as they do today; with the flag on they behave exactly as designed.
+ * Provable no-op on today's data: requisition_issue_ledger holds 1 row, with
+ * delta_recipe_qty 0.0 and stock_applied 0, and the 14,149 imported issued lines
+ * have no ledger row at all. Old form and new form both return false for every
+ * line in the database.
  */
 export function lineHasMovedStock(db: any, reqItemId: string): boolean {
   try {
     const row = db.prepare(
-      `SELECT 1 FROM requisition_issue_ledger WHERE req_item_id = ? AND stock_applied = 1 LIMIT 1`,
+      `SELECT COALESCE(SUM(delta_recipe_qty), 0) AS net FROM requisition_issue_ledger WHERE req_item_id = ?`,
     ).get(reqItemId) as any;
-    return !!row;
+    return (Number(row?.net) || 0) > EPS;
   } catch { return false; }
 }
 
-/** Same question for a whole requisition. The stock_applied filter above applies verbatim. */
+/** Same question for a whole requisition. The net-sum reasoning above applies verbatim. */
 export function requisitionHasMovedStock(db: any, reqId: string): boolean {
   try {
     const row = db.prepare(
-      `SELECT 1 FROM requisition_issue_ledger WHERE req_id = ? AND stock_applied = 1 LIMIT 1`,
+      `SELECT COALESCE(SUM(delta_recipe_qty), 0) AS net FROM requisition_issue_ledger WHERE req_id = ?`,
     ).get(reqId) as any;
-    return !!row;
+    return (Number(row?.net) || 0) > EPS;
   } catch { return false; }
 }
 
@@ -229,8 +253,6 @@ export function lineFactor(
   return { factor: 1, needsReview: true };                   // unrecognised unit — refuse
 }
 
-const EPS = 1e-9;
-
 export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResult {
   // quantity_requested and chef_approved_qty are read HERE rather than passed
   // in, which is what keeps store-issue — the hottest, most carefully reasoned
@@ -238,10 +260,18 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   // caller's UPDATE touches either column: updIssue/updIssuePartial/updUndo/
   // updReject set quantity_issued, the issued_* pair, the defer pair and
   // issue_history; store-process sets quantity_issued and quantity_to_purchase.
+  //
+  // department_id is RESOLVED IN SQL as COALESCE(line, requisition), matching
+  // dept-stock.ts:182 and party-fulfillment.ts:119 — the line's own department
+  // wins because a multi-department requisition splits its goods per line, and
+  // crediting the header department would give the wrong kitchen the stock.
+  // Provable no-op on today's data: 0 of the 14,149 issued lines have a line
+  // department that differs from their requisition's, and 0 resolve to NULL.
   const line = db.prepare(`
     SELECT ri.id, ri.req_id, ri.material_id, ri.unit AS line_unit,
            ri.quantity_requested, ri.chef_approved_qty,
-           r.purpose, r.department_id, r.outlet_id,
+           r.purpose, r.outlet_id,
+           COALESCE(ri.department_id, r.department_id) AS department_id,
            rm.unit, rm.purchase_unit, rm.pack_size
       FROM requisition_items ri
       JOIN requisitions  r  ON r.id  = ri.req_id
@@ -250,18 +280,27 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   `).get(input.reqItemId) as any;
   if (!line) return { applied: false, skipped: 'missing_line' };
 
-  // Read ONCE, and used for NOTHING except gating the three stock writes. It is
-  // no longer an early return: see "ALWAYS RECORD, GATE ONLY THE DEDUCT" in the
-  // header before you move this line back to the top of the function.
-  const deductOn = issueDeductionEnabled(db);
-
   // Party requisitions already deduct at fulfilment, from three separate
   // implementations that all dedup on inventory_transactions.type =
   // 'party_consumption'. A row typed 'requisition_issue' walks straight past
   // those guards, so the only safe move is to leave the party rail's STOCK
-  // alone. The hand-over itself is still a real hand-over and belongs in the
-  // owner's log, so it is recorded with skip_reason 'party'.
+  // alone — central AND department. The hand-over itself is still a real
+  // hand-over and belongs in the owner's log, so it is recorded with
+  // skip_reason 'party'.
   const isParty = String(line.purpose || '') === 'party';
+
+  // LIQUOR CARVE-OUT. Store-mapped materials live on the TGBCL store ledger
+  // (store_stock_ledger / store_locations) and every other central writer
+  // already refuses them via centralFlowBlock. This used to be a PASSIVE stamp:
+  // the debit happened anyway and the row was merely marked for someone to
+  // reconcile later. Under department stock that is the one outcome worse than
+  // doing nothing — it takes the gram out of central and gives it to nobody,
+  // so the material simply evaporates from both rails. So the flag now GATES
+  // BOTH SIDES: no central debit, no department credit, one honest ledger row
+  // stamped store_mapped. If you are tempted to "restore" the debit because
+  // liquor stock looks wrong on the central screen, fix it on the store rail.
+  let storeMapped = false;
+  try { storeMapped = centralFlowBlock(db, String(line.material_id)) !== null; } catch { /* not fatal */ }
 
   const { factor, needsReview } = lineFactor(line.line_unit, line);
   const deltaLine = (Number(input.afterLineQty) || 0) - (Number(input.beforeLineQty) || 0);
@@ -276,7 +315,7 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   // duplicate record.
   if (Math.abs(deltaLine) < EPS) return { applied: false, skipped: 'zero_delta', packFactor: factor };
 
-  // ── THE RECORD: always, in both flag states ───────────────────────────────
+  // ── THE RECORD: always, on every path ─────────────────────────────────────
   // An ambiguous unit records 0 for the same reason it deducts 0 — we do not
   // know whether the line means grams or kilos, and a 750x number in the log is
   // worse than a gap in it. The row's own quantities stay honest either way.
@@ -287,7 +326,7 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     // the 14,148 lines that carried quantity_issued from before this shipped
     // must record nothing, because nothing was ever recorded as handed over.
     // Sharing one clamp between the two columns is how stock gets manufactured
-    // the day the deduct flag is switched on — see the header.
+    // — see the ALMOND note in the header.
     const recRow = db.prepare(
       `SELECT COALESCE(SUM(recorded_recipe_qty), 0) AS recorded FROM requisition_issue_ledger WHERE req_item_id = ?`,
     ).get(input.reqItemId) as any;
@@ -296,19 +335,20 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     if (Math.abs(recordQty) < EPS) recordQty = 0;
   }
 
-  // ── THE DEDUCT: gated, and ONLY the deduct ────────────────────────────────
+  // ── THE DEDUCT: unconditional, minus the three carve-outs ─────────────────
   let stockQty = 0;
-  if (deductOn && !isParty && !needsReview) {
+  if (!isParty && !storeMapped && !needsReview) {
     stockQty = deltaRecipe;
     // NEVER GIVE BACK MORE THAN THIS RAIL TOOK.
     //
     // baseline_line_qty anchors the first row, but it does not stop a CREDIT
     // from running past zero. A line that already carried quantity_issued from
-    // before the flag was switched on has had nothing debited here — yet
-    // undo/reject set quantity_issued = 0, producing a negative delta and
-    // manufacturing stock that never left the store. Measured on ALMOND (g/kg,
-    // pack 1000) with a pre-flag quantity_issued of 1: current_stock went
-    // 4,000 -> 5,000 g and the department balance went to -1,000.
+    // before the cutover has had nothing debited here — yet undo/reject set
+    // quantity_issued = 0, producing a negative delta and manufacturing stock
+    // that never left the store. Measured on ALMOND (g/kg, pack 1000) with a
+    // pre-cutover quantity_issued of 1: current_stock went 4,000 -> 5,000 g and
+    // the department balance went to -1,000. This clamp is what keeps the
+    // 14,148 pre-ledger lines safe to undo, so it stays whatever else changes.
     //
     // So the credit is clamped to the running total this rail has actually
     // moved for the line. The property that keeps stock honest is therefore:
@@ -327,6 +367,55 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
 
   let invTxnId: string | null = null;
   if (stockQty !== 0) {
+    // A DEBIT WITHOUT A CREDIT DESTROYS A GRAM SILENTLY, so the department is
+    // resolved and validated BEFORE central is touched. 0 of the 14,149 issued
+    // lines resolve to NULL today, so this throws for nobody — it exists so
+    // that a future requisition created without a department fails loudly at
+    // the store counter instead of quietly evaporating stock. Do not soften it
+    // back into an early return.
+    if (!line.department_id) {
+      throw new Error(
+        `Requisition line ${input.reqItemId} has no department — stock cannot leave the central store ` +
+        `without a receiving department. Set the department on the requisition and try again.`,
+      );
+    }
+
+    if (stockQty < 0) {
+      // REVERSALS REFUSE, THEY DO NOT CLAMP.
+      //
+      // The clamp above answers "did this rail take that much from central".
+      // This answers the other half: "does the department still HOLD it". If a
+      // KOT already cooked the goods, putting them back in the store would
+      // invent stock in one place and drive the department negative in the
+      // other.
+      //
+      // It must THROW, not clamp. Every caller has ALREADY written
+      // quantity_issued before calling us (store-issue:277->278 and :289->290,
+      // store-process:384->394), so a silent clamp commits a line reading
+      // "0 issued" against grams that never came back — the two rails diverge
+      // with nothing on screen to show it. A throw unwinds the caller's
+      // transaction (we never open one; see the caller contract), so
+      // quantity_issued stays exactly as it was. store-issue already relies on
+      // this same pattern at :368-387 for the status race.
+      //
+      // The cap is POOLED per (department, material), not per line, because
+      // without lot tracking the goods genuinely are fungible: requisition A's
+      // consumption can legitimately block requisition B's reversal. That is
+      // physically correct, which is why dept-ledger's message says "the
+      // department holds only X" and never "you consumed this line".
+      // `qty` is the POSITIVE magnitude we want to push back to central.
+      // reqItemId is passed so dept-ledger can apply its per-line cap too: it
+      // recomputes the same SUM(delta_recipe_qty) the clamp above used, which
+      // is belt-and-braces rather than duplication — the clamp keeps this call
+      // honest, and the cap keeps a future caller that forgets the clamp honest.
+      assertReversible(db, {
+        reqItemId: input.reqItemId,
+        departmentId: String(line.department_id),
+        materialId: String(line.material_id),
+        qty: -stockQty,
+      });
+    }
+
     // Positive delta = goods left the store.
     db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ? WHERE id = ?`)
       .run(stockQty, line.material_id);
@@ -340,7 +429,7 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   }
 
   // Nothing to record and nothing moved. The live case is an undo of one of the
-  // 14,148 pre-ledger issues: the record clamp took it to 0, and writing a row
+  // 14,149 pre-ledger issues: the record clamp took it to 0, and writing a row
   // of two zeroes would only teach the log that a department gave back
   // something it was never logged as receiving.
   //
@@ -358,14 +447,6 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     return { applied: false, skipped: 'zero_delta', packFactor: factor };
   }
 
-  // Liquor / store-mapped materials are governed by the store ledger, not the
-  // central pool, and every other central writer refuses them via
-  // centralFlowBlock. Their central stock is where the goods actually sit
-  // today, so we still move it, but the row is stamped so the liquor rail can
-  // reconcile later. Flagged in the design brief as an owner decision.
-  let storeMapped = false;
-  try { storeMapped = centralFlowBlock(db, String(line.material_id)) !== null; } catch { /* not fatal */ }
-
   // effective_line_qty is SNAPSHOTTED, not recomputed on read. FULL vs PART is
   // a fact about what the store did that morning; a chef editing
   // chef_approved_qty next week must not retro-rewrite it. (The owner's case:
@@ -374,30 +455,50 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     ? (Number(line.chef_approved_qty) || 0)
     : (Number(line.quantity_requested) || 0);
 
+  // Why no stock moved, stamped on the row's own face, in precedence order.
+  // party and store_mapped are PERMANENT facts about the rail; unit_review is a
+  // fixable data problem, so it comes last — telling a storekeeper to fix a
+  // unit on a liquor line would send him after a deduct that is never coming.
+  const skipReason = isParty ? 'party' : storeMapped ? 'store_mapped' : needsReview ? 'unit_review' : '';
+
   const ledgerId = insertLedger(db, input, line, {
     factor, deltaLine, deltaRecipe: stockQty, recordedRecipe: recordQty,
-    needsReview, invTxnId, storeMapped, effectiveLineQty,
-    // Why no stock moved, stamped on the row's own face. Inferring it later
-    // from settings.requisition_deduct_at_issue is impossible — the value it
-    // held at the time is unrecoverable.
-    skipReason: !deductOn ? 'flag_off' : isParty ? 'party' : needsReview ? 'unit_review' : '',
+    needsReview, invTxnId, storeMapped, effectiveLineQty, skipReason,
   });
 
-  if (stockQty !== 0) creditDepartment(db, line, stockQty, input);
+  if (stockQty !== 0) {
+    // THE MIRROR OF THE CENTRAL DEBIT. Signed, in RECIPE units: positive = into
+    // the department, negative = back out of it. The TYPE is what the audit
+    // reads and the SIGN is what the balance sums — they are stamped separately
+    // on purpose, because the old code wrote type 'issued' with a negative
+    // quantity for a reversal and any report grouping by type or summing
+    // ABS(quantity) read a give-back as another issue.
+    postDeptLedger(db, {
+      outletId: line.outlet_id || null,
+      departmentId: String(line.department_id),
+      materialId: String(line.material_id),
+      type: stockQty > 0 ? 'issued' : 'issue_reversal',
+      quantity: stockQty,
+      referenceId: line.req_id,
+      reqItemId: input.reqItemId,
+      source: 'requisition_issue',
+      notes: `Requisition issue (${input.reason})`,
+      user: input.actor || '',
+    });
+  }
 
   return {
     applied: stockQty !== 0,
     ...(stockQty === 0
-      ? { skipped: (!deductOn ? 'flag_off' : isParty ? 'party' : needsReview ? 'unit_review' : 'zero_delta') as IssueDeltaResult['skipped'] }
+      ? { skipped: (skipReason || 'zero_delta') as IssueDeltaResult['skipped'] }
       : {}),
     deltaRecipeQty: stockQty,
     recordedRecipeQty: recordQty,
     packFactor: factor,
     ledgerId,
-    // Surfaced ONLY when the deduct is on. store-process turns this into
-    // result.issue_unit_review; with the flag off there is no refused deduction
-    // to report, so its response body stays byte-identical to today's.
-    ...(deductOn && needsReview ? { needsUnitReview: true } : {}),
+    // store-process turns this into result.issue_unit_review. Now that the
+    // deduct is unconditional, a refused line is always worth reporting.
+    ...(needsReview ? { needsUnitReview: true } : {}),
   };
 }
 
@@ -437,47 +538,4 @@ function insertLedger(
     o.invTxnId, input.clientToken || null, input.actor || null,
   );
   return id;
-}
-
-/**
- * Mirror of the central debit: the department that asked for the goods now
- * holds them. Written in RECIPE units, matching party-fulfillment.ts, so both
- * rails speak the same basis.
- *
- * NOTE for whoever wires the department views: computeDeptStock currently
- * DERIVES a department's balance from requisition_items directly. It must not
- * also add department_materials.on_hand, or every issue counts twice. The two
- * representations are mutually exclusive by design.
- */
-function creditDepartment(db: any, line: any, deltaRecipe: number, input: IssueDeltaInput) {
-  const deptId = line.department_id || null;
-  if (!deptId) return;
-
-  const existing = db.prepare(
-    `SELECT id, on_hand FROM department_materials WHERE department_id = ? AND material_id = ?`,
-  ).get(deptId, line.material_id) as any;
-
-  let balanceAfter: number;
-  if (existing) {
-    balanceAfter = (Number(existing.on_hand) || 0) + deltaRecipe;
-    db.prepare(`UPDATE department_materials SET on_hand = ?, updated_at = datetime('now') WHERE id = ?`)
-      .run(balanceAfter, existing.id);
-  } else {
-    balanceAfter = deltaRecipe;
-    db.prepare(`
-      INSERT INTO department_materials (id, outlet_id, department_id, material_id, on_hand)
-      VALUES (?,?,?,?,?)
-    `).run(generateId(), line.outlet_id || null, deptId, line.material_id, balanceAfter);
-  }
-
-  db.prepare(`
-    INSERT INTO department_material_transactions
-      (id, outlet_id, department_id, material_id, type, quantity, balance_after,
-       reference_id, notes, user)
-    VALUES (?,?,?,?,'issued',?,?,?,?,?)
-  `).run(
-    generateId(), line.outlet_id || null, deptId, line.material_id,
-    deltaRecipe, balanceAfter, line.req_id,
-    `Requisition issue (${input.reason})`, input.actor || '',
-  );
 }

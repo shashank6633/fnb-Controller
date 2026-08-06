@@ -11,6 +11,19 @@
  *                  stays open and surfaces under the Deferred filter.
  *   - Undo     → clear actions on a line (mistakes happen).
  *
+ * UNDO IS OFFERED ON A FULFILLED REQUISITION TOO, and that is deliberate. The
+ * requisition auto-advances to 'fulfilled' the instant the last line is
+ * satisfied, so the ordinary mistake — the storekeeper issues the final line,
+ * the card flips to fulfilled, he immediately sees the quantity was wrong — has
+ * to be correctable from here or it is not correctable at all. Do not re-hide
+ * the button behind a status test; the reversal itself is gated server-side.
+ *
+ * REVERSALS CAN BE REFUSED. Under department-based inventory an undo/reject
+ * hands goods back from the kitchen to central, and the kitchen may have
+ * already cooked them. The server refuses rather than clamping (see
+ * BlockedReversal below); this page shows that refusal ON THE LINE, not as a
+ * toast that disappears with the numbers still on it.
+ *
  * Status auto-advances:
  *   mgmt_approved / chef_approved → store_processed (once any action taken)
  *   store_processed → fulfilled (when every non-rejected, non-deferred line
@@ -27,7 +40,7 @@
  * + req-level audit_events written by the store-issue endpoint.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Package, Loader2, RefreshCw, Search, Clock, CheckCircle2, AlertCircle,
   Send, RotateCcw, ChevronRight, ChevronDown, History, User as UserIcon, XCircle,
@@ -155,6 +168,78 @@ function lineUnits(line: ReqLine) {
   };
 }
 
+/* ── A REFUSED REVERSAL ────────────────────────────────────────────────────
+   Undo and store-Reject both pull goods BACK from the department to central.
+   Under department-based inventory that can be physically impossible: the
+   kitchen may already have cooked the ingredients, so there is nothing left to
+   hand back. The server REFUSES such a reversal (code DEPT_REVERSAL_BLOCKED)
+   instead of quietly clamping it to whatever is left.
+
+   Why refusing matters to this screen: the route writes quantity_issued BEFORE
+   it asks the stock rail to move, so a clamp would commit a line reading
+   "0 issued" while the grams never came back to central — the two rails
+   disagree and NOTHING on screen says so. The throw rolls that whole
+   transaction back, and this panel is the only place the storekeeper ever
+   learns why.
+
+   `requested` and `available` arrive in RECIPE units, because the department
+   ledger is material-level and stores recipe units. They therefore render
+   through U.stockPU — the same converter the In-store column uses — and NEVER
+   through U.toPU, which is the LINE's basis and would print grams as kilos on
+   a purchase-unit line. */
+const BLOCKED_CODE = 'DEPT_REVERSAL_BLOCKED';
+
+interface BlockedReversal {
+  material: string;
+  /** Which kitchen still owes the goods. Blank if the server didn't name one. */
+  department: string;
+  /** Both in RECIPE units. 0 = the server refused without giving a figure. */
+  requested: number;
+  available: number;
+  message: string;
+}
+
+/**
+ * Read the server's refusal into a per-line map.
+ *
+ * Deliberately forgiving about shape. The one thing this page must never do is
+ * swallow a refusal because a field arrived under a different name — a
+ * swallowed refusal reads to the storekeeper as "the app ignored me", and he
+ * clicks undo again. When the payload names no line but the batch held exactly
+ * one, the refusal can only belong to that line, so attach it. When nothing at
+ * all is recognisable, return {} and let the caller fall back to the alert it
+ * has always shown.
+ */
+function readBlockedReversals(
+  payload: any,
+  submitted: { id: string; material_name: string }[],
+): Record<string, BlockedReversal> {
+  const out: Record<string, BlockedReversal> = {};
+  const rows: any[] = Array.isArray(payload?.blocked) ? payload.blocked : [];
+  for (const b of rows) {
+    const id = String(b?.line_id || b?.id || (submitted.length === 1 ? submitted[0].id : ''));
+    if (!id) continue;
+    out[id] = {
+      material: String(b?.material || submitted.find(s => s.id === id)?.material_name || 'this item'),
+      department: String(b?.department || ''),
+      requested: Number(b?.requested) || 0,
+      available: Number(b?.available) || 0,
+      message: String(b?.message || b?.error || payload?.error || '').trim(),
+    };
+  }
+  // Typed refusal, no per-line detail, single-line batch → it is that line.
+  if (Object.keys(out).length === 0
+      && String(payload?.code || '') === BLOCKED_CODE
+      && submitted.length === 1) {
+    out[submitted[0].id] = {
+      material: submitted[0].material_name,
+      department: '', requested: 0, available: 0,
+      message: String(payload?.error || '').trim(),
+    };
+  }
+  return out;
+}
+
 export default function StoreRequisitionsPage() {
   const [list, setList] = useState<Requisition[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
@@ -208,6 +293,22 @@ export default function StoreRequisitionsPage() {
   // A key here is also what turns the defer panel into the combined action.
   const [splitIssueQty, setSplitIssueQty] = useState<Record<string, { qty: number; token: string }>>({});
   const [showHistoryFor, setShowHistoryFor] = useState<string | null>(null);
+  // Refused reversals, keyed by requisition_item id — see BlockedReversal above.
+  // Held OUTSIDE the requisition list on purpose: a reload must not wipe the
+  // reason off the screen, and the entry is cleared only when the storekeeper
+  // acts on that same line again.
+  const [blockedReversals, setBlockedReversals] = useState<Record<string, BlockedReversal>>({});
+  // Flipped false the first time the pre-check route answers 404/405 — see
+  // precheckReversal. A ref, not state: nothing renders from it, and a re-render
+  // per undo to record "that endpoint isn't there" would be noise. Resets on
+  // page load, so deploying the route later needs no code change here.
+  const precheckAvailable = useRef(true);
+  const clearBlocked = (...lineIds: string[]) =>
+    setBlockedReversals(s => {
+      const hit = lineIds.filter(id => id in s);
+      if (hit.length === 0) return s;                 // no-op keeps the ref stable
+      const n = { ...s }; for (const id of hit) delete n[id]; return n;
+    });
   // "Issue All Items" confirmation — holds the requisition whose bulk-issue is
   // awaiting confirmation (null = no modal). We compute the lines to issue at
   // confirm time from the same req object.
@@ -248,6 +349,10 @@ export default function StoreRequisitionsPage() {
     const lines = openIssuableLines(req).filter(l => sel.has(l.id));
     if (lines.length === 0) { alert('No selected items to issue.'); return; }
     setIssuingSelected(req.id);
+    // Same reason as the single issue: handing over MORE changes what the
+    // kitchen holds, so a "it only has 1.2 kg left" panel from an earlier undo
+    // is now a lie. Stale figures on a refusal panel are worse than no panel.
+    clearBlocked(...lines.map(l => l.id));
     try {
       const resolvedLines = lines.map(l => ({ l, r: resolveIssueQty(l, l.remaining) }));
       const needReason = resolvedLines.filter(x => x.r.over && x.r.note.length < 3);
@@ -426,6 +531,10 @@ export default function StoreRequisitionsPage() {
     const qty = qtyOverride != null ? qtyOverride : resolved.qty;
     if (!qty || qty <= 0) { alert('Enter a quantity > 0'); return; }
     setBusyLine(line.id);
+    // Issuing MORE changes what the kitchen holds, so any earlier "you can only
+    // get 1.2 kg back" figure on this line is now wrong. Stale numbers on a
+    // refusal panel are worse than no panel.
+    clearBlocked(line.id);
     try {
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
         method: 'POST',
@@ -448,6 +557,7 @@ export default function StoreRequisitionsPage() {
     const cfg = editDefer[line.id];
     if (!cfg?.until) { alert('Pick a date/time you can issue this'); return; }
     setBusyLine(line.id);
+    clearBlocked(line.id);
     try {
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
         method: 'POST',
@@ -521,6 +631,7 @@ export default function StoreRequisitionsPage() {
     if (!cfg?.until) { alert('Pick the date/time you can issue the balance'); return; }
     const restPU = fmtNum(U.toPU(s.outstanding - qty));
     setBusyLine(line.id);
+    clearBlocked(line.id);
     try {
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
         method: 'POST',
@@ -543,16 +654,76 @@ export default function StoreRequisitionsPage() {
     } finally { setBusyLine(null); }
   };
 
+  /* ── Reversal pre-check ────────────────────────────────────────────────────
+     A courtesy, and IT FAILS OPEN ON PURPOSE. It exists so the storekeeper sees
+     "the kitchen only has 1.2 kg left" on the line before a round-trip, not so
+     the client gets to decide. The endpoint may legitimately not answer — an
+     older server, a route not deployed yet, an HTML login redirect, a dropped
+     LAN packet — and none of those may stop someone undoing a line.
+
+     NEVER promote this to the gate. Between this call and the POST a KOT can
+     complete and eat the balance, so the SERVER THROW is the correctness gate
+     and the POST's own error is parsed by the very same reader below. If you
+     find yourself adding a "precheck said it was fine" short-circuit around
+     that error handling, stop. */
+  const precheckReversal = async (
+    reqId: string,
+    batch: { id: string; material_name: string }[],
+    action: 'undo' | 'reject',
+  ): Promise<Record<string, BlockedReversal>> => {
+    if (!precheckAvailable.current) return {};
+    try {
+      const r = await api(`/api/requisitions/${reqId}/reversal-precheck`, {
+        method: 'POST',
+        body: { lines: batch.map(l => ({ id: l.id, action })) },
+      });
+      // 404/405 = the route is not on this server. Stop asking: at the time of
+      // writing it genuinely does not exist (the reversal gate lives in the
+      // store-issue POST), and probing it on every single undo buys the
+      // storekeeper nothing but a wasted round-trip on a slow venue LAN. Any
+      // OTHER failure — 500, a login redirect, a dropped packet — is treated as
+      // transient and retried next time, because those do come back.
+      if (r.status === 404 || r.status === 405) { precheckAvailable.current = false; return {}; }
+      if (!r.ok) return {};
+      if (!(r.headers.get('content-type') || '').includes('application/json')) return {};
+      return readBlockedReversals(await r.json(), batch);
+    } catch { return {}; }
+  };
+
+  /* Shared tail for both reversal actions: turn a non-ok response into either an
+     inline per-line refusal or the alert this page has always shown. ONLY the
+     typed refusal goes inline — a requisition-level failure (wrong status,
+     signed out, CSRF) has nothing to do with any one line, and burying it in a
+     red box under a single row is how it gets missed. Returns true when it was
+     handled as a refusal. */
+  const showReversalError = (
+    j: any, batch: { id: string; material_name: string }[], fallback: string,
+  ): boolean => {
+    const blocked = readBlockedReversals(j, batch);
+    if (Object.keys(blocked).length > 0) {
+      setBlockedReversals(s => ({ ...s, ...blocked }));
+      return true;
+    }
+    alert(j?.error || fallback);
+    return false;
+  };
+
   const undoLine = async (req: Requisition, line: ReqLine) => {
     if (!confirm(`Undo all actions on ${line.material_name}?`)) return;
+    const batch = [{ id: line.id, material_name: line.material_name }];
     setBusyLine(line.id);
+    // Drop last attempt's refusal FIRST — a stale red panel sitting next to a
+    // line that has just been undone successfully reads as "it failed again".
+    clearBlocked(line.id);
     try {
+      const pre = await precheckReversal(req.id, batch, 'undo');
+      if (Object.keys(pre).length > 0) { setBlockedReversals(s => ({ ...s, ...pre })); return; }
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
         method: 'POST',
         body: { lines: [{ id: line.id, action: 'undo' }] },
       });
       const j = await r.json();
-      if (!r.ok) { alert(j.error || 'Undo failed'); return; }
+      if (!r.ok) { showReversalError(j, batch, 'Undo failed'); return; }
       setRefreshKey(k => k + 1);
     } finally { setBusyLine(null); }
   };
@@ -563,14 +734,21 @@ export default function StoreRequisitionsPage() {
   const rejectLine = async (req: Requisition, line: ReqLine) => {
     const reason = prompt(`Reject "${line.material_name}"? Give a reason (the store cannot fulfil this line):`, '');
     if (reason === null) return;                       // cancelled
+    const batch = [{ id: line.id, material_name: line.material_name }];
     setBusyLine(line.id);
+    clearBlocked(line.id);
     try {
+      // A store-reject on an ALREADY-ISSUED line is a reversal too — it zeroes
+      // quantity_issued, so the goods have to come back from the kitchen exactly
+      // as an undo does. Same pre-check, same refusal panel.
+      const pre = await precheckReversal(req.id, batch, 'reject');
+      if (Object.keys(pre).length > 0) { setBlockedReversals(s => ({ ...s, ...pre })); return; }
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
         method: 'POST',
         body: { lines: [{ id: line.id, action: 'reject', reason: reason.trim() }] },
       });
       const j = await r.json();
-      if (!r.ok) { alert(j.error || 'Reject failed'); return; }
+      if (!r.ok) { showReversalError(j, batch, 'Reject failed'); return; }
       setRefreshKey(k => k + 1);
     } finally { setBusyLine(null); }
   };
@@ -597,6 +775,7 @@ export default function StoreRequisitionsPage() {
     const lines = openIssuableLines(req);
     if (lines.length === 0) { alert('No open items to issue.'); return; }
     setIssuingAll(true);
+    clearBlocked(...lines.map(l => l.id));           // see issueSelected
     try {
       const resolvedLines = lines.map(l => ({ l, r: resolveIssueQty(l, l.remaining) }));
       const needReason = resolvedLines.filter(x => x.r.over && x.r.note.length < 3);
@@ -743,6 +922,7 @@ export default function StoreRequisitionsPage() {
                      onIssueDeferRest={(line) => issueAndDeferRest(req, line)}
                      onIssue={(line, qty) => issueLine(req, line, qty)}
                      onDefer={(line) => deferLine(req, line)}
+                     blockedReversals={blockedReversals}
                      onUndo={(line) => undoLine(req, line)}
                      onReject={(line) => rejectLine(req, line)}
                      onUnreject={(line) => unrejectLine(req, line)}
@@ -869,7 +1049,8 @@ function effectiveQty(line: ReqLine): number {
  * ever lands, and every caller renders whichever parts are non-zero.
  */
 /**
- * Red / Amber / Green on the store's in-hand quantity.
+ * Red / Amber / Green on the CENTRAL STORE's quantity — see the "In store"
+ * header for why that word matters.
  *
  * The bands are about THIS hand-over, not a generic reorder alert — the
  * question at the counter is "can I give what is being asked for", so the
@@ -898,7 +1079,15 @@ function stockLevel(line: ReqLine): {
   if (qty <= 0 || qty < need) {
     return {
       qty, dot: 'bg-red-500', text: 'text-red-700 font-semibold',
-      title: qty <= 0 ? 'Out of stock in the store' : 'Short — less on the shelf than this line still needs',
+      // A NEGATIVE book balance is a real state once every issue debits central,
+      // and it is not the same statement as "out of stock" — it says the book
+      // has been over-issued against and needs a count, which is a different
+      // instruction to the storekeeper. Never floor this to 0 to make it read
+      // nicer: a floor invents stock the shelf does not have.
+      title: qty < 0
+        ? 'Book balance is NEGATIVE — more has been issued than the book ever received. Needs a physical count.'
+        : qty === 0 ? 'Out of stock in the store'
+        : 'Short — less on the shelf than this line still needs',
     };
   }
   if (reorder > 0 && qty - need <= reorder) {
@@ -1127,6 +1316,8 @@ function ReqCard(props: {
   onIssueDeferRest: (line: ReqLine) => void;
   onIssue: (line: ReqLine, qty?: number) => void;
   onDefer: (line: ReqLine) => void;
+  /** Refused reversals by line id — rendered on the line, not as a toast. */
+  blockedReversals: Record<string, BlockedReversal>;
   onUndo: (line: ReqLine) => void;
   onReject: (line: ReqLine) => void;
   onUnreject: (line: ReqLine) => void;
@@ -1266,7 +1457,15 @@ function ReqCard(props: {
                     packed materials. This tooltip used to say "recipe unit", which
                     is exactly how the store was reading the numbers. */}
                 <th className="text-right py-1.5 px-2 font-medium" title="Quantity requested, in the PURCHASE unit (BTL / kg / PKT / pcs). The small grey line is the recipe equivalent.">Requested</th>
-                <th className="text-right py-1.5 px-2 font-medium" title="What the STORE holds right now, in the PURCHASE unit. Red = nothing, or less than this line still needs. Amber = enough, but the store hits its reorder point once it goes out. Green = enough to spare.">In hand</th>
+                {/* "In store", NOT "In hand". Under department-based inventory a
+                    gram leaves central the moment it is issued, so this number is
+                    the CENTRAL STORE's shelf and nothing else — goods already
+                    handed to a kitchen are gone from it even though they are
+                    still in the building. "In hand" read as "what the company
+                    has", which is now a different and larger number. Kept to two
+                    short words so the row still fits a tablet without the table
+                    going into horizontal scroll. */}
+                <th className="text-right py-1.5 px-2 font-medium whitespace-nowrap" title="What the central store holds. Goods already issued to a kitchen are not counted here. Shown in the PURCHASE unit. Red = nothing, or less than this line still needs. Amber = enough, but the store hits its reorder point once it goes out. Green = enough to spare.">In store</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="HOD-approved quantity, in the PURCHASE unit (overrides requested if set)">HOD OK</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="Handed over so far, in the PURCHASE unit">Issued so far</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="Still owed, in the PURCHASE unit">Outstanding</th>
@@ -1288,6 +1487,7 @@ function ReqCard(props: {
                          onBeginIssueDeferRest={props.onBeginIssueDeferRest}
                          onIssueDeferRest={props.onIssueDeferRest}
                          onIssue={props.onIssue} onDefer={props.onDefer}
+                         blocked={props.blockedReversals[line.id]}
                          onUndo={props.onUndo} onReject={props.onReject} onUnreject={props.onUnreject}
                          onShowHistory={props.onShowHistory} />
               ))}
@@ -1322,6 +1522,8 @@ function LineRow(props: {
   onIssueDeferRest: (line: ReqLine) => void;
   onIssue: (line: ReqLine, qty?: number) => void;
   onDefer: (line: ReqLine) => void;
+  /** Set when the server refused a reversal on THIS line. */
+  blocked?: BlockedReversal;
   onUndo: (line: ReqLine) => void;
   onReject: (line: ReqLine) => void;
   onUnreject: (line: ReqLine) => void;
@@ -1454,10 +1656,15 @@ function LineRow(props: {
         {fmtNum(U.toPU(line.quantity_requested))}{unitTag}
         {hint(line.quantity_requested)}
       </td>
-      {/* IN-HAND — what the store can actually give, read at the moment of
-          deciding. Without it the storekeeper approved a hand-over blind and
+      {/* IN STORE — what the CENTRAL STORE can actually give, read at the moment
+          of deciding. Without it the storekeeper approved a hand-over blind and
           found out at the shelf. current_stock is RECIPE units (material-level),
-          so it converts with stockPU, never the line-basis toPU. */}
+          so it converts with stockPU, never the line-basis toPU.
+          This is not "what the company has": issuing moves the gram out of
+          central and into the receiving department, so a kitchen's shelf is
+          invisible here by design. Do not "helpfully" add department stock into
+          this figure — the storekeeper cannot hand over what is already in
+          somebody else's fridge. */}
       <td className="py-1.5 px-2 text-right font-mono">
         {(() => {
           const st = stockLevel(line);
@@ -1550,6 +1757,61 @@ function LineRow(props: {
         </button>
       </td>
       <td className="py-1.5 px-2 align-top">
+        {/* REFUSED REVERSAL — on the line, above whichever action set it applies.
+            Rendered OUTSIDE the three action branches on purpose: an undo and a
+            store-reject leave the line in different states, and the reason must
+            survive whichever one it lands in. It is a panel and not a toast
+            because the whole point is the number in it — "the kitchen only has
+            1.2 kg left" is unusable three seconds after it fades.
+            Everything here reads in the PURCHASE unit via stockPU (material
+            basis), never toPU (line basis) — see BlockedReversal. */}
+        {props.blocked && (() => {
+          const b = props.blocked!;
+          const qty = (q: number) => (
+            <>
+              <b>{fmtNum(U.stockPU(q))}</b>{u ? ` ${u}` : ''}
+              {U.pf > 1 ? <span className="text-[9px] opacity-70"> (= {fmtNum(q)} {U.recipeUnit})</span> : null}
+            </>
+          );
+          // Kitchen, not "the kitchen", when the server named one — the
+          // storekeeper is often holding a docket for two departments at once.
+          const where = b.department || 'that kitchen';
+          return (
+            // Width is capped in ch-ish terms and stepped UP at md, not down:
+            // the store counter runs on a 768-wide tablet, and a 24rem block in
+            // the action column is what pushes this table into a sideways
+            // scroll on it. The card's own wrapper is overflow-x-auto, so a
+            // wider panel would scroll the TABLE, hiding the In-store column
+            // the storekeeper is reading at the same moment.
+            <div className="mb-1 rounded border border-rose-300 bg-rose-50 px-1.5 py-1 text-[10px] leading-snug text-rose-900 max-w-[15rem] md:max-w-[22rem]">
+              <div className="font-semibold flex items-start gap-1">
+                <AlertCircle className="w-3 h-3 mt-[1px] shrink-0" />
+                <span>Cannot take this back{b.department ? <> from {b.department}</> : null}</span>
+              </div>
+              {/* The available figure is POOLED per department + material — the
+                  kitchen's goods are fungible without lot tracking, so ANOTHER
+                  requisition's cooking can legitimately be what leaves nothing
+                  here. Never word this as "you consumed this line", and never
+                  say "cooked" either: the gap can equally be wastage, a staff
+                  meal or an approved count adjustment. State the holding, name
+                  no cause. */}
+              {b.requested > 0 ? (
+                <div className="mt-0.5">
+                  Putting {qty(b.requested)} back needs it to still be with {where}.
+                  {b.available > 0
+                    ? <> It holds {qty(b.available)} — the rest has already left that stock.</>
+                    : <> It holds none of it now.</>}
+                </div>
+              ) : b.available > 0 ? (
+                <div className="mt-0.5">{where} holds only {qty(b.available)}.</div>
+              ) : null}
+              {b.message ? <div className="mt-0.5 opacity-90">{b.message}</div> : null}
+              <div className="mt-0.5 opacity-90">
+                Nothing was changed on this line. Every other line is untouched.
+              </div>
+            </div>
+          );
+        })()}
         {line.is_rejected ? (
           <span className="text-[10px] text-[#8B7355]">no action — rejected by chef</span>
         ) : line.store_rejected ? (
@@ -1678,9 +1940,26 @@ function LineRow(props: {
                         className={`text-[10px] px-1 ${splitMode ? 'text-violet-700' : 'text-blue-700'}`}>cancel</button>
               </div>
             )}
+            {/* UNDO STAYS VISIBLE ON A FULFILLED REQUISITION. The condition is
+                the LINE's own state (something was issued, or a time was
+                promised) and never the requisition's status — the card flips to
+                'fulfilled' the moment the last line is satisfied, which is
+                exactly when the storekeeper notices the quantity was wrong.
+                Hiding it there would leave the most common mistake in the
+                building with no in-app correction at all. The reversal is gated
+                server-side, two ways, and both are correct here:
+                  · the department has nothing left to hand back → typed refusal,
+                    rendered in the rose panel above;
+                  · the requisition is a fulfilled PARTY req → the route keeps
+                    those outside the widened window (their stock moved on the
+                    party rail, which an undo cannot re-fire), so it answers with
+                    an ordinary status error and this page alerts. That alert is
+                    the intended outcome; do not add a status test here to
+                    pre-hide the button, because the party carve-out is the
+                    route's call to make and it may change. */}
             {(issued > 0 || line.deferred_until) && (
               <button onClick={() => props.onUndo(line)} disabled={busy}
-                      title="Clear all issue/defer actions on this line"
+                      title="Clear all issue/defer actions on this line — the goods come back from the kitchen to the store"
                       className="px-1.5 py-0.5 bg-white border border-[#E8D5C4] text-[#8B7355] hover:bg-[#FFF1E3] rounded text-[10px] flex items-center gap-1">
                 <RotateCcw className="w-3 h-3" /> undo
               </button>

@@ -13,12 +13,58 @@
  * > 1) we show the bar Cases + Bottles + loose (CBL) breakdown beneath the raw
  * qty, reusing pack-units (tripleToRecipe/fmtBreakdown) so the math never
  * drifts from the Liquor Store / closing pages.
+ *
+ * ── WHAT CHANGED WHEN STOCK STARTED MOVING AT ISSUE ────────────────────────
+ * raw_materials.current_stock used to be, loosely, "what the outlet owns":
+ * goods stayed on it until a recipe consumed them, so a kitchen's working
+ * stock was still counted here. It is not that any more. Central now loses the
+ * gram the moment the storekeeper issues a requisition, and the department
+ * carries it until recipe consumption (or wastage / a staff meal) removes it.
+ *
+ * So the old "Grocery" column is now, precisely, the CENTRAL STORE ONLY — and
+ * it is renamed to say so. On its own it is NOT the outlet's inventory, and a
+ * Total built from central + stores would quietly under-count the building by
+ * everything sitting on the kitchens' shelves. Hence the Departments column.
+ *
+ * ── THE DEPARTMENTS COLUMN ────────────────────────────────────────────────
+ * Sourced from GET /api/department-variance, whose `ledger_balance` is
+ * deptOnHandBulk()'s onHand verbatim — the ONE derivation of a department
+ * balance in the codebase. This page deliberately does not re-derive it and
+ * must never read department_materials.on_hand (that column is a maintained
+ * CACHE, not a truth). Two derivations of one number is how a kitchen ends up
+ * holding 4,000 g on one screen and −1,000 g on another.
+ *
+ * FOUR RULES A FUTURE ENGINEER WILL WANT TO "SIMPLIFY". DO NOT:
+ *  1. BEFORE THE CUTOVER THE COLUMN READS "not started", NEVER 0. The route
+ *     answers 400 with cutover_at: null until the opening balances exist. A 0
+ *     there would read as "the kitchens hold nothing", which is a claim about
+ *     the building; "not started" is a claim about the system, and only the
+ *     second one is true. Same for a (dept, material) pair that has never been
+ *     counted: null → "not counted", never 0.
+ *  2. WHEN DEPARTMENTS ARE MISSING, THE TOTAL IS RELABELLED, NOT PATCHED. If
+ *     the cutover has not run, or the viewer is a store manager (the dept
+ *     report is isManagement-only, this board is not), the Total column and
+ *     the Total value card say "central + stores". They must not keep reading
+ *     as the outlet total while the kitchens' holdings have silently left it.
+ *  3. THE LIQUOR CARVE-OUT. Store-mapped (TGBCL) materials never enter the
+ *     department raw-material rail — they are skipped by the central debit at
+ *     issue and by applyDeduct at consumption, and the variance route drops
+ *     them from its row set. Their Departments cell is a dash, not a zero, and
+ *     the footnote says how many were excluded. Do not "fill it in" from the
+ *     store columns: those grams are already counted there.
+ *  4. AN UNMAPPED STATION IS A VISIBLE WARNING, NOT A ROUNDING ERROR. Sales at
+ *     a station with no department mapping record a consumption_skip and debit
+ *     nobody, so those kitchens read HIGH here. The banner names the stations
+ *     rather than letting the number pass as a count.
+ *
+ * The department leg is fetched in PARALLEL and rendered independently: the
+ * board must still load if the dept report is slow, forbidden or unmigrated.
  */
 
 import { useEffect, useMemo, useState } from 'react';
 import {
   Wine, Search, X, Loader2, AlertCircle, Download, Layers,
-  IndianRupee, Store as StoreIcon, AlertTriangle, PackageX, Warehouse,
+  IndianRupee, Store as StoreIcon, AlertTriangle, PackageX, Warehouse, ChefHat,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { fmtBreakdown, PackMeta, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
@@ -36,13 +82,54 @@ interface Row {
   sku: string;
   purchase_unit: string;
   by_store: Record<string, number>;
-  /** Central grocery backstock (recipe units) = raw_materials.current_stock. */
+  /** CENTRAL STORE ONLY (recipe units) = raw_materials.current_stock. Since
+   *  deduct-at-issue this excludes everything already issued to a kitchen —
+   *  see the header block. Field name kept as the API ships it. */
   grocery_qty: number;
   /** grocery_qty × raw_materials.average_price. Folded into total_value. */
   grocery_value: number;
+  /** Central + every store. Does NOT include departments — the page adds
+   *  those on top, because /api/stores/overview knows nothing about them. */
   total_qty: number;
   total_value: number;
 }
+
+/** One material's holding across ALL departments, from the department ledger. */
+interface DeptAgg {
+  /** Σ ledger_balance over the departments that HAVE a baseline. Recipe units. */
+  qty: number;
+  /** Σ balance_value (₹, at average_price) over those same departments. */
+  value: number;
+  /** How many (dept, material) pairs contributed a number… */
+  counted: number;
+  /** …and how many are still never_counted (excluded from qty/value). */
+  uncounted: number;
+}
+
+type DeptState =
+  | { kind: 'loading' }
+  /** The cut-over has not been run: there are no opening balances, so there is
+   *  no department position to show. NOT the same as "the kitchens are empty". */
+  | { kind: 'not_started'; detail: string }
+  /** This board is admin/manager/store-manager/HOD; the dept report is
+   *  isManagement only. A store manager sees the board minus this column. */
+  | { kind: 'restricted' }
+  | { kind: 'error'; message: string }
+  | {
+      kind: 'ready';
+      byMaterial: Map<string, DeptAgg>;
+      cutoverAt: string;
+      /** Σ balance_value across every department — the reconciliation figure. */
+      totalValue: number;
+      /** (dept, material) pairs with no baseline yet. */
+      uncountedPairs: number;
+      /** Store-mapped (TGBCL) materials the dept rail excludes by design. */
+      liquorExcluded: number;
+      /** Live stations with no usable department mapping (deliberate ones —
+       *  'liquor', 'kitchen' — filtered out; they must never be mapped). */
+      unmappedStations: string[];
+      consumptionSkips: number;
+    };
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
@@ -55,12 +142,32 @@ const packMeta = (r: Row): PackMeta => ({
 });
 const PAGE_SIZE = 50;
 
+/** The department leg of one material, or null when it cannot be shown. A
+ *  material absent from the map is NOT a zero — it is a material the
+ *  department rail has never carried (liquor, or simply never issued). */
+const deptFor = (d: DeptState, materialId: string): DeptAgg | null =>
+  d.kind === 'ready' ? (d.byMaterial.get(materialId) || null) : null;
+
+/** Contributable ₹/qty: only departments with a baseline. `counted === 0`
+ *  means every pair is never_counted, so qty is 0 by absence of evidence and
+ *  must not be summed into a total that reads as a position. */
+const deptQtyOf = (a: DeptAgg | null) => (a && a.counted > 0 ? a.qty : 0);
+const deptValueOf = (a: DeptAgg | null) => (a && a.counted > 0 ? a.value : 0);
+
+/** Short label for the state a Departments cell / header is in. */
+const deptStateLabel = (d: DeptState) =>
+  d.kind === 'loading' ? 'loading…'
+    : d.kind === 'not_started' ? 'not started'
+      : d.kind === 'restricted' ? 'restricted'
+        : d.kind === 'error' ? 'unavailable'
+          : 'kitchens';
+
 /* One qty cell — owner rule: the PURCHASE figure leads ("2 l", "3 BTL"); the
  * cases+bottles+loose breakdown stays as the hint for bar materials; the exact
  * recipe number lives in the tooltip (it is the stored truth the ₹ column and
  * the deductions use). qty stays recipe-basis in state — display converts here
  * and ONLY here on this page. */
-function QtyCell({ qty, r, strong }: { qty: number; r: Row; strong?: boolean }) {
+function QtyCell({ qty, r, strong, note }: { qty: number; r: Row; strong?: boolean; note?: string }) {
   const neg = qty < 0;
   const meta = packMeta(r);
   const dual = (r.pack_size > 1 || (r.case_size ?? 1) > 1) ? fmtBreakdown(qty, meta) : null;
@@ -68,12 +175,54 @@ function QtyCell({ qty, r, strong }: { qty: number; r: Row; strong?: boolean }) 
   const puQty = toPurchaseQty(qty, meta);
   const puLbl = r.purchase_unit || r.unit || '';
   const converts = puQty !== qty || String(r.purchase_unit || '').toLowerCase().trim() !== String(r.unit || '').toLowerCase().trim();
+  const exact = converts ? `= ${fmtQtyNum(qty)} ${r.unit || ''} (exact stored balance)` : '';
+  const title = [exact, note].filter(Boolean).join(' · ') || undefined;
   return (
     <div className={`text-right tabular-nums ${neg ? 'text-red-700' : zero ? 'text-[#B9A896]' : 'text-[#2D1B0E]'}`}
-         title={converts ? `= ${fmtQtyNum(qty)} ${r.unit || ''} (exact stored balance)` : undefined}>
+         title={title}>
       <span className={strong ? 'font-semibold' : ''}>{fmtQtyNum(puQty)}{puLbl ? ' ' + puLbl : ''}</span>
       {dual && <div className="text-[10px] text-[#8B7355] font-normal leading-tight">{dual}</div>}
     </div>
+  );
+}
+
+/* The Departments cell. Every non-numeric outcome prints WORDS, never 0 —
+ * "not started" (no cutover), "not counted" (no baseline for this pair), "—"
+ * (never on the department rail, e.g. every TGBCL bottle). */
+function DeptCell({ r, dept, right = true }: { r: Row; dept: DeptState; right?: boolean }) {
+  const cls = `text-[11px] text-[#B9A896] ${right ? 'text-right' : ''}`;
+  if (dept.kind !== 'ready') {
+    return (
+      <div className={cls} title={
+        dept.kind === 'not_started'
+          ? 'Department opening balances have not been recorded yet, so there is no department position to show. This is not a claim that the kitchens are empty.'
+          : dept.kind === 'restricted'
+            ? 'Department holdings need management access (admin / manager / HOD).'
+            : dept.kind === 'error' ? dept.message : undefined
+      }>{deptStateLabel(dept)}</div>
+    );
+  }
+  const a = deptFor(dept, r.material_id);
+  if (!a) {
+    return (
+      <div className={cls} title="This material has never been on the department rail. Store-mapped (TGBCL / liquor) materials never enter it by design — their grams are already in the store columns.">—</div>
+    );
+  }
+  if (a.counted === 0) {
+    return (
+      <div className={cls} title={`${a.uncounted} department(s) hold this material but none has an opening count yet — reported as "not counted", never as 0.`}>not counted</div>
+    );
+  }
+  const partial = a.uncounted > 0
+    ? `${a.uncounted} more department(s) hold this material with no opening count yet — not included`
+    : undefined;
+  return (
+    <>
+      <QtyCell qty={a.qty} r={r} note={partial} />
+      {a.uncounted > 0 && (
+        <div className="text-[10px] text-amber-700 leading-tight text-right" title={partial}>+{a.uncounted} not counted</div>
+      )}
+    </>
   );
 }
 
@@ -85,6 +234,7 @@ export default function StockOverviewPage() {
   const [stores, setStores] = useState<StoreCol[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
   const [generatedAt, setGeneratedAt] = useState('');
+  const [dept, setDept] = useState<DeptState>({ kind: 'loading' });
 
   const [q, setQ] = useState('');
   const [cat, setCat] = useState('');
@@ -111,6 +261,70 @@ export default function StockOverviewPage() {
     return () => { alive = false; };
   }, []);
 
+  // Department leg — its own request, its own failure mode. A slow, forbidden
+  // or pre-cutover department report must never stop the store board loading;
+  // it downgrades the Total label instead (rule 2 in the header block).
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch('/api/department-variance', { credentials: 'same-origin' });
+        const data = await res.json().catch(() => ({} as any));
+        if (!alive) return;
+        if (res.status === 403) { setDept({ kind: 'restricted' }); return; }
+        // The route answers 400 + cutover_at: null until opening balances
+        // exist. That is a STATE, not an error — anything else with a 400 is.
+        if (res.status === 400 && data?.cutover_at === null) {
+          setDept({ kind: 'not_started', detail: String(data?.detail || '') });
+          return;
+        }
+        if (!res.ok) { setDept({ kind: 'error', message: String(data?.error || `HTTP ${res.status}`) }); return; }
+
+        const byMaterial = new Map<string, DeptAgg>();
+        let totalValue = 0, uncountedPairs = 0;
+        for (const row of (Array.isArray(data.rows) ? data.rows : [])) {
+          const id = String(row?.material_id || '');
+          if (!id) continue;
+          let a = byMaterial.get(id);
+          if (!a) { a = { qty: 0, value: 0, counted: 0, uncounted: 0 }; byMaterial.set(id, a); }
+          const bal = row?.ledger_balance;
+          // null = never_counted. Excluded from every sum on purpose: a
+          // balance we do not have is not a balance of zero.
+          if (bal === null || bal === undefined) { a.uncounted++; uncountedPairs++; continue; }
+          a.qty += Number(bal) || 0;
+          a.value += Number(row?.balance_value) || 0;
+          a.counted++;
+          totalValue += Number(row?.balance_value) || 0;
+        }
+        const cov = data?.coverage || {};
+        const unmapped: string[] = Array.isArray(cov.unmapped_station_detail)
+          // 'liquor' and 'kitchen' are unmapped ON PURPOSE (the store rail, and
+          // kot-fire's blank-station sentinel). Naming them as a gap would send
+          // an owner to map two stations that must never be mapped.
+          ? cov.unmapped_station_detail
+              .filter((u: any) => !u?.deliberate && Number(u?.menu_items) > 0)
+              .map((u: any) => String(u?.station || ''))
+              .filter(Boolean)
+          : [];
+        setDept({
+          kind: 'ready',
+          byMaterial,
+          cutoverAt: String(data?.cutover_at || ''),
+          totalValue,
+          uncountedPairs,
+          liquorExcluded: Number(cov.liquor_materials_excluded) || 0,
+          unmappedStations: unmapped,
+          consumptionSkips: Number(cov.consumption_skips_since_cutover) || 0,
+        });
+      } catch (e: any) {
+        if (alive) setDept({ kind: 'error', message: e?.message || 'Failed to load department holdings' });
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const deptReady = dept.kind === 'ready';
+
   const categories = useMemo(() => {
     const set = new Set<string>();
     for (const r of rows) if (r.category) set.add(r.category);
@@ -136,32 +350,62 @@ export default function StockOverviewPage() {
     [filtered, pageSafe],
   );
 
+  /* THE WHOLE-BUILDING TOTAL, built as one identity so it reconciles against
+   * the columns beside it:  central + stores + departments.
+   * `r.total_value` is the API's central+stores figure; the department leg is
+   * added HERE because /api/stores/overview cannot see it. When the department
+   * leg is missing the addend is 0 AND the label changes — the number is never
+   * left to pass as an outlet total. */
+  const rowTotalQty = (r: Row) => r.total_qty + deptQtyOf(deptFor(dept, r.material_id));
+  const rowTotalValue = (r: Row) => r.total_value + deptValueOf(deptFor(dept, r.material_id));
+
   // Summary over the FILTERED set (what the user is looking at).
   const summary = useMemo(() => {
-    let value = 0, grocery = 0, negative = 0, out = 0;
+    let value = 0, central = 0, deptValue = 0, negative = 0, out = 0;
     for (const r of filtered) {
-      value += r.total_value;
-      grocery += r.grocery_value;
-      if (r.total_qty < 0) negative++;
-      else if (r.total_qty === 0) out++;
+      const dv = deptValueOf(deptFor(dept, r.material_id));
+      value += r.total_value + dv;
+      central += r.grocery_value;
+      deptValue += dv;
+      const tq = r.total_qty + deptQtyOf(deptFor(dept, r.material_id));
+      if (tq < 0) negative++;
+      else if (tq === 0) out++;
     }
-    return { value, grocery, negative, out, items: filtered.length };
-  }, [filtered]);
+    // Stores = the residual of the same identity, so the four cards always add
+    // up on screen. Deriving it (rather than re-summing per store) keeps ONE
+    // definition of "stores" — the API's.
+    return { value, central, deptValue, stores: value - central - deptValue, negative, out, items: filtered.length };
+  }, [filtered, dept]);
 
   const exportCsv = () => {
     // Both bases, named columns: purchase leads (what the store reads), the
     // recipe figures follow (the exact stored truth the ₹ column uses).
-    const header = ['Material', 'SKU', 'Category', 'Purchase Unit', 'Grocery (central)',
-                    ...stores.map(s => s.name), 'Total Qty',
-                    'Recipe Unit', 'Grocery (recipe)', 'Total Qty (recipe)', 'Total Value'];
+    // "Grocery" is gone from the header row on purpose — the column is the
+    // CENTRAL STORE only now, and a sheet that still said Grocery would be
+    // re-summed by someone as the outlet's stock.
+    const header = ['Material', 'SKU', 'Category', 'Purchase Unit', 'Central store',
+                    ...stores.map(s => s.name), 'Departments', 'Total Qty',
+                    'Recipe Unit', 'Central store (recipe)', 'Departments (recipe)', 'Total Qty (recipe)',
+                    'Central Value', 'Departments Value', 'Total Value'];
     const body = filtered.map(r => {
       const meta = packMeta(r);
+      const a = deptFor(dept, r.material_id);
+      const dq = deptQtyOf(a);
+      const dv = deptValueOf(a);
+      // Words, not zeros, for every non-numeric department state — the CSV
+      // carries the same honesty as the screen (rule 1).
+      const deptText = !deptReady ? deptStateLabel(dept)
+        : !a ? ''
+          : a.counted === 0 ? 'not counted'
+            : null;
       return [
         r.name, r.sku || '', r.category || '', r.purchase_unit || r.unit || '',
         toPurchaseQty(Number(r.grocery_qty), meta),
         ...stores.map(s => toPurchaseQty(Number(r.by_store[s.id] ?? 0), meta)),
-        toPurchaseQty(Number(r.total_qty), meta),
-        r.unit || '', Number(r.grocery_qty), Number(r.total_qty), Number(r.total_value),
+        deptText ?? toPurchaseQty(dq, meta),
+        toPurchaseQty(Number(r.total_qty) + dq, meta),
+        r.unit || '', Number(r.grocery_qty), deptText ?? dq, Number(r.total_qty) + dq,
+        Number(r.grocery_value), deptText ?? dv, Number(r.total_value) + dv,
       ];
     });
     const csv = Papa.unparse([header, ...body]);
@@ -198,6 +442,8 @@ export default function StockOverviewPage() {
     );
   }
 
+  const totalLabel = deptReady ? 'Central + stores + departments' : 'Central + stores';
+
   return (
     <div className="p-4 sm:p-6 max-w-7xl mx-auto space-y-4">
       {/* Header */}
@@ -207,7 +453,8 @@ export default function StockOverviewPage() {
             <Wine className="w-6 h-6 text-[#af4408]" /> Consolidated Stock
           </h1>
           <p className="text-xs text-[#6B5744] mt-0.5">
-            Central grocery backstock plus every material across the Liquor Store and each floor bar, with total qty and value.
+            Every material across the <b>central store</b>, the Liquor Store and each floor bar, plus what the
+            <b> departments</b> are holding — stock leaves central at issue, so the kitchens&apos; shelves are a separate column now.
             {' '}Every quantity reads in <b>purchase units</b> (kg / BTL / CASE); the small line beneath is the cases + bottles + loose
             breakdown, and hovering a figure shows the exact recipe-unit balance the ₹ column is computed from.
             {generatedAt && <span className="text-[#B9A896]"> · as of {new Date(generatedAt).toLocaleString('en-IN')}</span>}
@@ -219,10 +466,17 @@ export default function StockOverviewPage() {
         </button>
       </div>
 
-      {/* Summary cards */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2.5">
-        <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label="Total value" value={inr(summary.value)} />
-        <SummaryCard icon={<Warehouse className="w-4 h-4" />} label="Grocery value" value={inr(summary.grocery)} />
+      {/* Summary cards — Total = Central + Stores + Departments, and the three
+          addends are on screen beside it so the identity is checkable by eye. */}
+      <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-2.5">
+        <SummaryCard icon={<IndianRupee className="w-4 h-4" />}
+                     label={deptReady ? 'Total value' : 'Total value (central + stores)'}
+                     value={inr(summary.value)} />
+        <SummaryCard icon={<Warehouse className="w-4 h-4" />} label="Central store" value={inr(summary.central)} />
+        <SummaryCard icon={<StoreIcon className="w-4 h-4" />} label="Stores (bars)" value={inr(summary.stores)} />
+        <SummaryCard icon={<ChefHat className="w-4 h-4" />} label="Departments"
+                     value={deptReady ? inr(summary.deptValue) : deptStateLabel(dept)}
+                     tone={deptReady ? 'muted' : 'warn'} />
         <SummaryCard icon={<StoreIcon className="w-4 h-4" />} label="Locations" value={String(stores.length)} />
         <SummaryCard icon={<Layers className="w-4 h-4" />} label="Materials" value={summary.items.toLocaleString('en-IN')} />
         <SummaryCard
@@ -232,6 +486,49 @@ export default function StockOverviewPage() {
           tone={summary.negative > 0 ? 'warn' : 'muted'}
         />
       </div>
+
+      {/* The department leg's state, said out loud. An absent column is a
+          caveat on the TOTAL, not a detail of one column. */}
+      {dept.kind === 'not_started' && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 text-amber-900 p-3 text-xs flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div>
+            <b>Departments: not started.</b> {dept.detail
+              || 'Department opening balances have not been recorded yet. Take a complete department closing count and record the opening balances (Settings → Department Ledger → Cutover).'}
+            {' '}Until then the totals here are <b>central + stores only</b> — they do not include what the kitchens are holding.
+            This is not a statement that the kitchens are empty.
+          </div>
+        </div>
+      )}
+      {dept.kind === 'restricted' && (
+        <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] text-[#6B5744] p-3 text-xs flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div>Department holdings are limited to admins, managers and HODs, so the totals below are <b>central + stores only</b>.</div>
+        </div>
+      )}
+      {dept.kind === 'error' && (
+        <div className="rounded-lg border border-red-200 bg-red-50 text-red-700 p-3 text-xs flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div>Department holdings could not be loaded ({dept.message}). Totals below are <b>central + stores only</b>.</div>
+        </div>
+      )}
+      {dept.kind === 'ready' && (dept.unmappedStations.length > 0 || dept.uncountedPairs > 0) && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 text-amber-900 p-3 text-xs flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            {dept.unmappedStations.length > 0 && (
+              <div>
+                <b>{dept.unmappedStations.length} station(s) are not mapped to a department</b> ({dept.unmappedStations.join(', ')}).
+                Sales at those stations deduct from no kitchen{dept.consumptionSkips > 0 ? ` (${dept.consumptionSkips.toLocaleString('en-IN')} skipped since the cut-over)` : ''},
+                so those departments read HIGH here. Map them in Settings → Station → Department.
+              </div>
+            )}
+            {dept.uncountedPairs > 0 && (
+              <div>{dept.uncountedPairs.toLocaleString('en-IN')} department/material pair(s) have no opening count yet — shown as “not counted”, never as 0, and excluded from the totals.</div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Search + category filter */}
       <div className="flex flex-wrap items-center gap-2">
@@ -274,15 +571,27 @@ export default function StockOverviewPage() {
                 <tr className="bg-[#FFF1E3] text-[#6B5744] text-xs">
                   <th className="text-left font-semibold px-3 py-2 sticky left-0 bg-[#FFF1E3] z-10 min-w-[200px]">Material</th>
                   <th className="text-left font-semibold px-3 py-2 min-w-[110px]">Category</th>
-                  <th className="text-right font-semibold px-3 py-2 min-w-[90px] whitespace-nowrap bg-[#FBF0E6] border-l border-[#F0E4D6]">
-                    Grocery
-                    <div className="text-[9px] font-normal text-[#B9A896] leading-none">central</div>
+                  <th className="text-right font-semibold px-3 py-2 min-w-[100px] whitespace-nowrap bg-[#FBF0E6] border-l border-[#F0E4D6]">
+                    Central store
+                    <div className="text-[9px] font-normal text-[#B9A896] leading-none">store shelf only</div>
                   </th>
                   {stores.map(s => (
                     <th key={s.id} className="text-right font-semibold px-3 py-2 min-w-[90px] whitespace-nowrap">{s.name}</th>
                   ))}
-                  <th className="text-right font-semibold px-3 py-2 min-w-[90px] bg-[#FBE7D3]">Total</th>
-                  <th className="text-right font-semibold px-3 py-2 min-w-[100px] bg-[#FBE7D3]">Value</th>
+                  <th className="text-right font-semibold px-3 py-2 min-w-[110px] whitespace-nowrap bg-[#FBF0E6] border-l border-[#F0E4D6]">
+                    Departments
+                    <div className={`text-[9px] font-normal leading-none ${deptReady ? 'text-[#B9A896]' : 'text-amber-700'}`}>
+                      {deptStateLabel(dept)}
+                    </div>
+                  </th>
+                  <th className="text-right font-semibold px-3 py-2 min-w-[90px] bg-[#FBE7D3] whitespace-nowrap">
+                    Total
+                    <div className="text-[9px] font-normal text-[#B9A896] leading-none">{totalLabel}</div>
+                  </th>
+                  <th className="text-right font-semibold px-3 py-2 min-w-[100px] bg-[#FBE7D3] whitespace-nowrap">
+                    Value
+                    <div className="text-[9px] font-normal text-[#B9A896] leading-none">{totalLabel}</div>
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -297,8 +606,9 @@ export default function StockOverviewPage() {
                     {stores.map(s => (
                       <td key={s.id} className="px-3 py-2"><QtyCell qty={Number(r.by_store[s.id] ?? 0)} r={r} /></td>
                     ))}
-                    <td className="px-3 py-2 bg-[#FEF6EE]"><QtyCell qty={r.total_qty} r={r} strong /></td>
-                    <td className="px-3 py-2 bg-[#FEF6EE] text-right tabular-nums text-[#2D1B0E]">{inr(r.total_value)}</td>
+                    <td className="px-3 py-2 bg-[#FDF7F1] border-l border-[#F0E4D6]"><DeptCell r={r} dept={dept} /></td>
+                    <td className="px-3 py-2 bg-[#FEF6EE]"><QtyCell qty={rowTotalQty(r)} r={r} strong /></td>
+                    <td className="px-3 py-2 bg-[#FEF6EE] text-right tabular-nums text-[#2D1B0E]">{inr(rowTotalValue(r))}</td>
                   </tr>
                 ))}
               </tbody>
@@ -313,16 +623,19 @@ export default function StockOverviewPage() {
                   {stores.map(s => (
                     <td key={s.id} className="px-3 py-2 text-right text-xs text-[#B9A896]">—</td>
                   ))}
+                  <td className="px-3 py-2 text-right text-xs text-[#B9A896] bg-[#FBF0E6] border-l border-[#F0E4D6]">—</td>
                   <td className="px-3 py-2 text-right text-xs text-[#B9A896] bg-[#FBE7D3]">—</td>
                   <td className="px-3 py-2 text-right tabular-nums bg-[#FBE7D3]">
-                    {inr(paged.reduce((a, r) => a + r.total_value, 0))}
+                    {inr(paged.reduce((a, r) => a + rowTotalValue(r), 0))}
                   </td>
                 </tr>
               </tfoot>
             </table>
           </div>
 
-          {/* Mobile: stacked cards */}
+          {/* Mobile: stacked cards. The location breakdown stays a 2-column
+              grid with truncating labels — the added Departments line must not
+              push the card into a horizontal scroll. */}
           <div className="sm:hidden space-y-2.5">
             {paged.map(r => (
               <div key={r.material_id} className="border border-[#E8D5C4] rounded-lg bg-white p-3">
@@ -332,14 +645,14 @@ export default function StockOverviewPage() {
                     <div className="text-[11px] text-[#8B7355]">{r.category}{r.sku ? ` · ${r.sku}` : ''}</div>
                   </div>
                   <div className="text-right shrink-0">
-                    <div className="text-[10px] text-[#8B7355] uppercase tracking-wide">Total</div>
-                    <QtyCell qty={r.total_qty} r={r} strong />
-                    <div className="text-[11px] text-[#af4408] font-medium">{inr(r.total_value)}</div>
+                    <div className="text-[10px] text-[#8B7355] uppercase tracking-wide">{deptReady ? 'Total' : 'Central + stores'}</div>
+                    <QtyCell qty={rowTotalQty(r)} r={r} strong />
+                    <div className="text-[11px] text-[#af4408] font-medium">{inr(rowTotalValue(r))}</div>
                   </div>
                 </div>
                 <div className="mt-2 pt-2 border-t border-[#F0E4D6] grid grid-cols-2 gap-x-3 gap-y-1">
                   <div className="flex items-center justify-between gap-2 text-xs min-w-0">
-                    <span className="text-[#8B7355] font-medium truncate min-w-0">Grocery</span>
+                    <span className="text-[#8B7355] font-medium truncate min-w-0">Central</span>
                     <QtyCell qty={r.grocery_qty} r={r} />
                   </div>
                   {stores.map(s => (
@@ -348,6 +661,10 @@ export default function StockOverviewPage() {
                       <QtyCell qty={Number(r.by_store[s.id] ?? 0)} r={r} />
                     </div>
                   ))}
+                  <div className="flex items-center justify-between gap-2 text-xs min-w-0">
+                    <span className="text-[#8B7355] font-medium truncate min-w-0">Departments</span>
+                    <div className="min-w-0"><DeptCell r={r} dept={dept} /></div>
+                  </div>
                 </div>
               </div>
             ))}
@@ -368,6 +685,16 @@ export default function StockOverviewPage() {
               </div>
             </div>
           )}
+
+          {/* What the numbers exclude, on the page rather than in a wiki. */}
+          {dept.kind === 'ready' && (
+            <p className="text-[11px] text-[#8B7355] leading-relaxed">
+              Departments = each kitchen&apos;s own holding from the department ledger, anchored on its latest count and
+              counted from the cut-over{dept.cutoverAt ? ` (${new Date(dept.cutoverAt.replace(' ', 'T') + 'Z').toLocaleDateString('en-IN')})` : ''}.
+              Requisition issues before that date are <b>not backfilled</b> and are in no column here.
+              {dept.liquorExcluded > 0 && <> Store-mapped (TGBCL / liquor) materials never enter the department rail — {dept.liquorExcluded.toLocaleString('en-IN')} excluded; their stock is already in the store columns.</>}
+            </p>
+          )}
         </>
       )}
     </div>
@@ -380,11 +707,11 @@ function SummaryCard({ icon, label, value, tone = 'muted' }: {
   icon: React.ReactNode; label: string; value: string; tone?: 'muted' | 'warn';
 }) {
   return (
-    <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+    <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 min-w-0">
       <div className={`flex items-center gap-1.5 text-[11px] font-medium ${tone === 'warn' ? 'text-amber-700' : 'text-[#8B7355]'}`}>
-        {icon} {label}
+        <span className="shrink-0">{icon}</span> <span className="truncate min-w-0">{label}</span>
       </div>
-      <div className="mt-1 text-lg font-bold text-[#2D1B0E] tabular-nums">{value}</div>
+      <div className="mt-1 text-lg font-bold text-[#2D1B0E] tabular-nums truncate">{value}</div>
     </div>
   );
 }

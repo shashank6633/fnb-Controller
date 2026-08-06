@@ -39,6 +39,76 @@ const ISSUE_DATE = `COALESCE(NULLIF(SUBSTR(ri.issued_at,1,10),''), r.date)`;
 
 /* ── shared: average daily use (recipe units/day) over the last N days ── */
 
+/**
+ * inventory_transactions types that mean "goods LEFT THE OUTLET" — the only
+ * ones a usage rate may be built from. Whitelist, never a blacklist: a new type
+ * must be argued into this list, not silently absorbed by it.
+ *
+ * The type vocabulary actually written by the app is purchase, sale, nc,
+ * adjustment, wastage, transfer, requisition_issue, party_issue,
+ * party_consumption, party_return, staff_meal_issue, staff_meal_return,
+ * butchering_input, butchering_output. Of those:
+ *
+ *   requisition_issue  EXCLUDED — an INTERNAL store→department transfer. Goods
+ *                      moved shelf-to-shelf; the outlet still owns every gram.
+ *                      Before the department cutover this row did not exist
+ *                      (the deduct was flag-gated), so the unfiltered SUM below
+ *                      was harmless. It exists on every issue now, and counting
+ *                      it here would (a) double-count against the primary leg
+ *                      and (b) smuggle in lines the primary leg deliberately
+ *                      drops via REQ_ISSUED — draft / cancelled / chef_rejected
+ *                      requisitions. Do not "simplify" it back in.
+ *   transfer,          EXCLUDED for the same reason — internal movements. The
+ *   party_issue,       party rail's real usage is party_consumption; its issue
+ *   party_return       and return legs are transfers around it.
+ *   butchering_*       EXCLUDED — a yield conversion, not consumption. Counting
+ *                      the input as usage double-books it against the output.
+ *   adjustment         EXCLUDED — a count correction (also staff-meal deletes
+ *                      and party leftover returns). A correction is not a rate;
+ *                      averaging one over 14 days invents a daily burn.
+ *   purchase           EXCLUDED — inflow.
+ *
+ * staff_meal_return and party_return come back POSITIVE, so `quantity < 0`
+ * already keeps them out of the sum; the rate is therefore gross-of-returns,
+ * exactly as it was before this change.
+ */
+const OUTFLOW_TX_TYPES = ['sale', 'nc', 'wastage', 'staff_meal_issue', 'party_consumption'] as const;
+const OUTFLOW_TX_IN = OUTFLOW_TX_TYPES.map(t => `'${t}'`).join(',');
+
+/**
+ * Average daily USE, recipe units/day, over the last N days.
+ *
+ * BASIS — read this before touching either leg. Every caller divides an ON-HAND
+ * figure by this rate, so the two must describe the same pocket of stock:
+ *
+ *   numerator   outletOnHandMap() = central + everything the departments hold
+ *   denominator this map          = the rate at which goods leave the OUTLET
+ *
+ * A requisition issue appears in the primary leg not as an outflow in its own
+ * right but as the best available PROXY for what the kitchen then cooks: only
+ * 18 of 628 menu items carry a recipe, so recorded recipe consumption covers
+ * almost nothing and the issue rate is the only usage signal most materials
+ * have. That proxy is safe against an outlet-wide numerator (issuing does not
+ * change it) and unsafe against a central-only one — against central, the same
+ * issue event lowers the numerator AND raises the denominator, and a material
+ * issued daily grows its own suggested order by (days × daily issue) while the
+ * goods sit untouched on the kitchen shelf. That is the trap this pairing
+ * exists to close; see outletOnHandMap().
+ *
+ * MEASURED, so nobody has to re-argue it. Replaying the 2026-04-15..28 issue
+ * fortnight against live data and counting materials that trip
+ * days_of_stock_left < 7 (the reorder trigger below):
+ *
+ *   central ÷ issue rate, pre-cutover  (today's shipped numbers)  38, none negative
+ *   central ÷ issue rate, post-cutover (the trap, if left alone)  97, 46 negative
+ *   outlet  ÷ issue rate, post-cutover (this pairing)             38, none negative
+ *
+ * Those 59 extra rows are not a shortage — they are one fortnight of goods
+ * sitting on the kitchen shelves, and /api/crm/reorder drafts them straight
+ * into a purchase order. Total suggested packs come out identical (1069) with
+ * and without the fix, which is the real test: the order must not drift upward
+ * with elapsed time just because the store keeps issuing.
+ */
 function dailyUseMap(db: DB, days = 14): Map<string, number> {
   const since = daysAgo(days - 1);
   const m = new Map<string, number>();
@@ -52,16 +122,72 @@ function dailyUseMap(db: DB, days = 14): Map<string, number> {
     GROUP BY ri.material_id
   `).all(since) as { id: string; qty: number }[];
   for (const row of rows) if (row.qty > 0) m.set(row.id, row.qty / days);
-  // Fallback: materials with no requisition history — use negative inventory
-  // transactions (sales deductions / wastage / adjustments) as consumption.
+  // Fallback for materials with NO requisition history in the window: measured
+  // consumption/loss out of the outlet. Type-whitelisted — see OUTFLOW_TX_TYPES
+  // for why an unfiltered "quantity < 0" is now wrong.
   const tx = db.prepare(`
     SELECT material_id AS id, SUM(-quantity) AS qty
     FROM inventory_transactions
-    WHERE quantity < 0 AND SUBSTR(created_at,1,10) >= ?
+    WHERE quantity < 0 AND type IN (${OUTFLOW_TX_IN})
+      AND SUBSTR(created_at,1,10) >= ?
     GROUP BY material_id
   `).all(since) as { id: string; qty: number }[];
   for (const row of tx) if (!m.has(row.id) && row.qty > 0) m.set(row.id, row.qty / days);
   return m;
+}
+
+/**
+ * What the OUTLET holds of each material, recipe units — central store plus
+ * every department shelf.
+ *
+ *   outlet on-hand = raw_materials.current_stock + Σ(signed department ledger)
+ *
+ * WHY THE SUM IS EXACTLY RIGHT, type by type. department_material_transactions
+ * is signed (+ into the department, − out) by contract (src/lib/db.ts, the
+ * department ledger block; every writer obeys it — issue-stock postDeptLedger,
+ * party-fulfillment 'received', the reconcile route's 'consumed'/'returned').
+ * Each movement therefore lands on exactly one side of the identity:
+ *
+ *   issued / issue_reversal   central ∓q AND dept ±q  → total unchanged (a
+ *                             transfer between two of our own shelves)
+ *   received / returned       party rail, same mirror → total unchanged
+ *   consumption, consumed,    dept −q, central untouched → total falls once
+ *   wastage, staff_meal
+ *   opening (cutover count)   dept +counted; the admin re-bases central in the
+ *                             same action → total = the counted total
+ *   adjustment                dept ±delta → total moves by the correction, the
+ *                             same way a central adjustment does
+ *   purchase / GRN            central +q (no department_id column on
+ *                             `purchases` — every receipt lands in the store by
+ *                             construction) → total rises once
+ *
+ * So the total moves ONCE per real event and NEVER on an internal transfer.
+ * That is the whole point: reordering must not be triggered by the store handing
+ * goods to the kitchen. The liquor carve-out needs no code here — store-mapped
+ * materials are skipped by BOTH the central debit and the department credit, so
+ * neither term of the sum moves for them and they keep their own TGBCL rail.
+ *
+ * PROVABLE NO-OP TODAY: the ledger is empty (0 rows), so the sum is 0 and every
+ * caller sees raw_materials.current_stock exactly as before.
+ */
+function outletOnHandMap(db: DB): Map<string, number> {
+  const held = new Map<string, number>();
+  // Unguarded on purpose: db.ts getDb() calls initializeSchema() on the first
+  // connection, and that runs an unconditional CREATE TABLE IF NOT EXISTS for
+  // department_material_transactions (db.ts:1251) — no settings flag, no
+  // migration gate. It is therefore present before any query here can run, the
+  // same guarantee every other table this file names relies on. If that ever
+  // becomes conditional, this prepare() throws and takes the whole AI analyst
+  // down with it, so move the CREATE, don't gate it.
+  for (const row of db.prepare(`
+    SELECT material_id AS id, SUM(quantity) AS qty
+    FROM department_material_transactions
+    GROUP BY material_id
+  `).all() as { id: string; qty: number }[]) {
+    const q = Number(row.qty) || 0;
+    if (q !== 0) held.set(row.id, q);
+  }
+  return held;
 }
 
 /** Most recent store-issue date on record — lets the AI flag stale data. */
@@ -76,14 +202,20 @@ function latestIssueDate(db: DB): string | null {
 
 interface MaterialRow {
   id: string; name: string; sku: string | null; category: string;
+  /** CENTRAL store only — raw_materials.current_stock, unchanged meaning. */
   current_stock: number; unit: string; purchase_unit: string | null;
   pack_size: number; reorder_level: number; average_price: number;
   /** Priority stars: 3 = critical, 2 = standard, 1 = low. */
   priority: number;
+  /** Σ signed department ledger — what the kitchens hold. 0 before the cutover. */
+  dept_held: number;
+  /** central + dept_held. The ONLY figure the days-of-cover math may divide. */
+  outlet_on_hand: number;
 }
 
 function activeMaterials(db: DB): MaterialRow[] {
-  return db.prepare(`
+  const held = outletOnHandMap(db);
+  const rows = db.prepare(`
     SELECT id, name, sku, COALESCE(NULLIF(category,''),'other') AS category,
            current_stock, unit, purchase_unit,
            COALESCE(pack_size,1) AS pack_size,
@@ -92,6 +224,11 @@ function activeMaterials(db: DB): MaterialRow[] {
     FROM raw_materials
     WHERE COALESCE(is_active,1) = 1
   `).all() as MaterialRow[];
+  for (const m of rows) {
+    m.dept_held = held.get(m.id) || 0;
+    m.outlet_on_hand = (Number(m.current_stock) || 0) + m.dept_held;
+  }
+  return rows;
 }
 
 /** Purchase-unit equivalent of an on-hand qty (null when same unit / no pack). */
@@ -110,12 +247,17 @@ export function stockAlerts(db: DB) {
     .filter(m => m.reorder_level > 0 && m.current_stock <= m.reorder_level);
   const rows = mats.map(m => {
     const avg = use.get(m.id) || 0;
-    const daysLeft = avg > 0 ? r2(Math.max(0, m.current_stock) / avg) : null;
+    // OUTLET on-hand over an OUTLET usage rate — see dailyUseMap's BASIS note.
+    // The reorder_level trigger above still reads CENTRAL on purpose: a reorder
+    // level is a level for the STORE's own shelf, and it is the owner's number.
+    const daysLeft = avg > 0 ? r2(Math.max(0, m.outlet_on_hand) / avg) : null;
     return {
       name: m.name, sku: m.sku || '', category: m.category,
       priority: m.priority,                  // 3★ critical first (see sort)
       current_stock: r3(m.current_stock), unit: m.unit,
       in_purchase_units: purchaseEquivalent(m),
+      in_departments: r3(m.dept_held),       // 0 until the department cutover
+      outlet_on_hand: r3(m.outlet_on_hand),  // central + departments
       reorder_level: r3(m.reorder_level),
       avg_daily_use_14d: r3(avg),
       days_of_stock_left: daysLeft,          // null = no recent usage recorded
@@ -131,7 +273,7 @@ export function stockAlerts(db: DB) {
     low_stock_count: mats.length,
     critical_3star_count: mats.filter(m => m.priority === 3).length,
     latest_issue_date: latestIssueDate(db),  // if older than 14d, usage averages read 0 (stale data)
-    note: 'Materials at/below their reorder level, CRITICAL (priority 3★) first. days_of_stock_left = on-hand ÷ avg daily issued qty (last 14 days). null = no recent usage data.',
+    note: 'Materials at/below their reorder level (reorder level is a CENTRAL-store level, so current_stock is what trips it), CRITICAL (priority 3★) first. days_of_stock_left = outlet_on_hand (central + departments) ÷ avg daily use (last 14 days) — goods handed to a kitchen are still ours, so an issue does not shorten cover. null = no recent usage data.',
     rows,
   };
 }
@@ -141,13 +283,30 @@ export function reorderSuggestions(db: DB) {
   const out: any[] = [];
   for (const m of activeMaterials(db)) {
     const avg = use.get(m.id) || 0;
+    // TWO ARMS, TWO BASES, ON PURPOSE.
+    //   reorder_level arm — CENTRAL. A reorder level is the level the owner set
+    //     for the store's own shelf; it is his number and it is not rebased here.
+    //     Leaving it on central is safe against the cutover by measurement, not
+    //     by argument: 107 of 929 active materials carry a level at all (1–10),
+    //     every one of them already sits at current_stock = 0, so all 107 trip
+    //     today. The set is SATURATED — central can only fall further, and a
+    //     material with no level (reorder_level = 0) can never enter. So the
+    //     cutover cannot add a single row through this arm.
+    //   days-of-cover arm — OUTLET (central + departments). Dividing central by
+    //     a rate that is driven by issues makes the store handing goods to the
+    //     kitchen look like consumption: cover shortens, the 7-day need is
+    //     measured against a numerator the issue just emptied, and the order
+    //     grows by (elapsed days × daily issue) for goods already on the kitchen
+    //     shelf. These rows are drafted straight into a PO, so that is real
+    //     money. See dailyUseMap's BASIS note and outletOnHandMap().
     const belowReorder = m.reorder_level > 0 && m.current_stock <= m.reorder_level;
-    const daysLeft = avg > 0 ? m.current_stock / avg : null;
+    const daysLeft = avg > 0 ? m.outlet_on_hand / avg : null;
     if (!belowReorder && !(daysLeft != null && daysLeft < 7)) continue;
     const packF = packFactor(m);           // recipe units per purchase unit (1 = no conversion)
     const need7 = avg * 7;                                        // recipe units for 7-day cover
-    let packs = Math.ceil(Math.max(0, need7 - m.current_stock) / packF);
+    let packs = Math.ceil(Math.max(0, need7 - m.outlet_on_hand) / packF);
     if (packs <= 0 && belowReorder) {
+      // Central top-up to the owner's level — the one place central is right.
       packs = Math.max(1, Math.ceil((m.reorder_level - m.current_stock) / packF));
     }
     if (packs <= 0) continue;
@@ -155,6 +314,8 @@ export function reorderSuggestions(db: DB) {
       name: m.name, sku: m.sku || '', category: m.category,
       priority: m.priority,                  // 3★ critical first (see sort)
       current_stock: r3(m.current_stock), unit: m.unit,
+      in_departments: r3(m.dept_held),       // 0 until the department cutover
+      outlet_on_hand: r3(m.outlet_on_hand),
       avg_daily_use_14d: r3(avg),
       days_of_stock_left: daysLeft == null ? null : r2(daysLeft),
       suggested_order_qty: packs,
@@ -171,7 +332,7 @@ export function reorderSuggestions(db: DB) {
   return {
     as_of: today(),
     latest_issue_date: latestIssueDate(db),  // if older than 14d, suggestions fall back to reorder-level top-ups
-    note: 'Suggested order quantity = ceil((7-day need − on-hand) ÷ pack factor), in PURCHASE units, for a 7-day cover. Pack factor = pack_size only when the recipe unit differs from the purchase unit, else 1. est_cost in ₹.',
+    note: 'Suggested order quantity = ceil((7-day need − outlet_on_hand) ÷ pack factor), in PURCHASE units, for a 7-day cover. outlet_on_hand = central store + what the departments hold, because a requisition issue moves goods between our own shelves and does not consume them. Pack factor = pack_size only when the recipe unit differs from the purchase unit, else 1. est_cost in ₹.',
     rows: out.slice(0, 15),
   };
 }
@@ -407,14 +568,31 @@ export function wastageSummary(db: DB) {
 
 export function slowMovers(db: DB) {
   const from30 = daysAgo(29);
+  // DEAD STOCK IS AN OUTLET QUESTION, NOT A STORE ONE. The value tested is
+  // central + department shelves (ON_HAND below). Two failures this avoids:
+  //   · a material issued to a kitchen 40 days ago and never cooked drains
+  //     central to 0 after the cutover, so a central-only test would drop it off
+  //     the list at the exact moment it became dead — silently.
+  //   · it also cannot create a FALSE positive out of a department move: a move
+  //     IS a requisition issue, and the first NOT EXISTS already excludes any
+  //     material issued inside the window.
+  // The idle tests themselves are untouched. Note the second one stays a
+  // deliberately BROAD "any negative transaction" — here we want proof of ANY
+  // movement, which is the opposite question from dailyUseMap's usage RATE, so
+  // it does not take OUTFLOW_TX_TYPES. requisition_issue rows landing in this
+  // table after the cutover only reinforce the first test.
+  const ON_HAND = `(rm.current_stock + COALESCE((
+        SELECT SUM(dmt.quantity) FROM department_material_transactions dmt
+        WHERE dmt.material_id = rm.id), 0))`;
   const rows = db.prepare(`
     SELECT rm.name, rm.sku, COALESCE(NULLIF(rm.category,''),'other') AS category,
            ROUND(rm.current_stock, 3) AS current_stock, rm.unit,
-           ROUND(rm.current_stock * rm.average_price, 2) AS stock_value
+           ROUND(${ON_HAND}, 3) AS outlet_on_hand,
+           ROUND(${ON_HAND} * rm.average_price, 2) AS stock_value
     FROM raw_materials rm
     WHERE COALESCE(rm.is_active,1) = 1
-      AND rm.current_stock > 0 AND rm.average_price > 0
-      AND rm.current_stock * rm.average_price > 500
+      AND ${ON_HAND} > 0 AND rm.average_price > 0
+      AND ${ON_HAND} * rm.average_price > 500
       AND NOT EXISTS (
         SELECT 1 FROM requisition_items ri
         JOIN requisitions r ON r.id = ri.req_id
@@ -430,7 +608,7 @@ export function slowMovers(db: DB) {
   `).all(from30, from30) as any[];
   return {
     as_of: today(),
-    note: 'Stock worth >₹500 with NO issues or consumption in the last 30 days. stock_value in ₹.',
+    note: 'Stock worth >₹500 with NO issues or consumption in the last 30 days. Value is OUTLET on-hand (central store + department shelves) × average price, in ₹ — goods parked in a kitchen are still capital sitting idle.',
     rows,
   };
 }
@@ -567,9 +745,13 @@ export function reorderSuggestionsEnriched(db: DB) {
   const out: any[] = [];
   for (const m of activeMaterials(db)) {
     // ── trigger + suggested qty: IDENTICAL math to reorderSuggestions ──
+    // Including the two bases: reorder_level against CENTRAL, days-of-cover and
+    // the 7-day need against OUTLET on-hand. Keep the two functions byte-aligned
+    // — this is the copy whose rows /api/crm/reorder turns into a draft PO, so a
+    // divergence here is the one that spends money.
     const avg = use.get(m.id) || 0;
     const belowReorder = m.reorder_level > 0 && m.current_stock <= m.reorder_level;
-    const daysLeft = avg > 0 ? m.current_stock / avg : null;
+    const daysLeft = avg > 0 ? m.outlet_on_hand / avg : null;
     if (!belowReorder && !(daysLeft != null && daysLeft < 7)) continue;
     const pack = m.pack_size > 0 ? m.pack_size : 1;
     // Recipe units per purchase unit — 1 unless pack_size > 1 AND the recipe
@@ -579,8 +761,9 @@ export function reorderSuggestionsEnriched(db: DB) {
     // factor here becomes a wrong purchases.unit_price.
     const packF = packFactor(m);
     const need7 = avg * 7;
-    let packs = Math.ceil(Math.max(0, need7 - m.current_stock) / packF);
+    let packs = Math.ceil(Math.max(0, need7 - m.outlet_on_hand) / packF);
     if (packs <= 0 && belowReorder) {
+      // Central top-up to the owner's level — the one place central is right.
       packs = Math.max(1, Math.ceil((m.reorder_level - m.current_stock) / packF));
     }
     if (packs <= 0) continue;
@@ -618,9 +801,12 @@ export function reorderSuggestionsEnriched(db: DB) {
       name: m.name, sku: m.sku || '', category: m.category,
       priority: m.priority,                  // 3★/2★/1★ — page pre-ticks 3★
       current_stock: r3(m.current_stock), unit: m.unit,
+      in_departments: r3(m.dept_held),                 // 0 until the department cutover
+      outlet_on_hand: r3(m.outlet_on_hand),            // central + departments
       purchase_unit: m.purchase_unit || m.unit,
       pack_size: pack,
       current_stock_pu: r2(m.current_stock / packF),   // packF = 1 when there is no conversion
+      outlet_on_hand_pu: r2(m.outlet_on_hand / packF),
       avg_daily_use_14d: r3(avg),
       days_of_stock_left: daysLeft == null ? null : r2(daysLeft),
       suggested_order_qty: packs,
@@ -644,7 +830,7 @@ export function reorderSuggestionsEnriched(db: DB) {
   return {
     as_of: today(),
     latest_issue_date: latestIssueDate(db),
-    note: 'Suggested qty = ceil((7-day need − on-hand) ÷ pack factor), in PURCHASE units, CRITICAL (3★) materials first. Pack factor = pack_size only when the recipe unit differs from the purchase unit, else 1. unit_price is ₹/purchase-unit (contract → last purchase → average × pack factor).',
+    note: 'Suggested qty = ceil((7-day need − outlet_on_hand) ÷ pack factor), in PURCHASE units, CRITICAL (3★) materials first. outlet_on_hand = current_stock (central store) + in_departments (kitchen shelves) — a requisition issue moves goods between our own shelves, so it must not trigger a purchase. Pack factor = pack_size only when the recipe unit differs from the purchase unit, else 1. unit_price is ₹/purchase-unit (contract → last purchase → average × pack factor).',
     rows: out.slice(0, 60),
   };
 }

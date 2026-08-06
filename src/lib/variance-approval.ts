@@ -4,18 +4,35 @@
  * A closing physical count that disagrees with the system NEVER changes stock on
  * its own. Instead it creates a PENDING `variance_approvals` row. An admin then
  * reviews it (records the staff's reason) and either:
- *   - APPROVES  → stock is moved to the counted (physical) number, and the
- *                 adjustment is logged (central: inventory_transactions;
- *                 liquor: a store_stock_ledger 'adjustment' movement).
- *   - REJECTS   → stock is left untouched; the variance stands as an open loss
+ *   - APPROVES  → the counted DELTA is posted to the rail the count belongs to,
+ *                 and logged (central: inventory_transactions; liquor: a
+ *                 store_stock_ledger movement; department: a signed
+ *                 department_material_transactions 'adjustment').
+ *   - REJECTS   → nothing moves on any rail; the variance stands as an open loss
  *                 to investigate (theft / spillage / miscount).
  *
- * Covers both CENTRAL raw-material counts (source='central', keyed by department)
- * and LIQUOR/floor-bar counts (source='liquor', keyed by store).
+ * A DELTA, NEVER AN ABSOLUTE SET. This is the whole shape of the file and the
+ * one thing not to "simplify" back. An approval is deferred by hours — the count
+ * happens at 10am and the admin clears the queue at 4pm — and stock keeps moving
+ * in between. `SET current_stock = physical_stock` (what this used to do) writes
+ * the 10am shelf over the 4pm book, so a noon issue of 40 kg to a kitchen is
+ * silently un-issued: central gets it back on paper while the department still
+ * physically holds it, and the same 40 kg then exists twice. Posting
+ * (physical − system-at-count-time) instead leaves every movement made after the
+ * count standing, which is the only reading under which stock moves exactly once.
+ *
+ * THREE RAILS, AND A COUNT ONLY EVER TOUCHES ITS OWN:
+ *   source='liquor'                  → store_stock_ledger  (TGBCL store rail)
+ *   source='central', dept = ''      → raw_materials.current_stock (central store)
+ *   source='central', dept = <id>    → department_material_transactions
+ * A department count must never reach central and a central count must never
+ * reach a department. Crossing them is the "department clobber" that
+ * varianceApprovalBlock() has guarded since the queue shipped.
  */
 import type Database from 'better-sqlite3';
 import { generateId } from '@/lib/db';
-import { postLedger } from '@/lib/store-engine';
+import { postLedger, isStoreMappedMaterial } from '@/lib/store-engine';
+import { deptOnHand, postDeptLedger } from '@/lib/dept-ledger';
 
 export type VarianceSource = 'central' | 'liquor';
 
@@ -139,47 +156,142 @@ export function listVarianceApprovals(
   `).all(...params) as VarianceRow[];
   // Additive: tell the queue up front which rows approveVariance() will refuse,
   // so the admin sees the reason instead of discovering it on click.
-  return rows.map(r => ({ ...r, approve_blocked: varianceApprovalBlock(r, r.department_name) }));
+  return rows.map(r => ({ ...r, approve_blocked: varianceApprovalBlock(db, r, r.department_name) }));
 }
 
 export interface DecisionResult { ok: boolean; error?: string; applied?: boolean }
 
 /**
  * Can this variance safely be APPROVED? Returns null when yes, otherwise the
- * reason to refuse (shown verbatim to the admin).
+ * reason to refuse (shown verbatim to the admin, and surfaced on the queue by
+ * listVarianceApprovals so the refusal is visible before the click).
  *
- * THE DEPARTMENT CLOBBER. A central count is stored against the CENTRAL number:
- * /api/closing-stock POST reads `material.current_stock` as `systemStock` for
- * every row (src/app/api/closing-stock/route.ts:226) no matter which department
- * the row is tagged to. Approving then does an ABSOLUTE
- * `SET current_stock = physical_stock` (below). So approving a count that the
- * KITCHEN took would write the kitchen's shelf quantity straight over the
- * central store's stock — a real loss of the store's number, not a rounding
- * nuance. Refuse it here rather than at count time, so the discrepancy is still
- * recorded and the admin can Reject it (Reject moves no stock).
+ * A department count is now APPROVABLE — it posts a signed 'adjustment' to that
+ * department's own ledger and leaves central alone (see approveVariance). What
+ * survives here are the three states in which that posting would be a lie:
  *
- * Only central+department is blocked. Central Store/Overall (department_id '')
- * is exactly the number being SET, and liquor rows post a signed store-ledger
- * adjustment scoped to their own store — both unchanged.
+ *  1. STORE-MAPPED (liquor). Store-mapped materials live on the TGBCL rail and
+ *     are skipped by BOTH the central debit and the department credit at issue,
+ *     so they never have a department ledger balance to correct. Posting one
+ *     here would invent the department rail's only liquor row and put the same
+ *     bottle on two rails. This carve-out is deliberate, not an oversight —
+ *     do not "complete" it.
+ *  2. NEVER COUNTED. No cutover `opening` row and no anchor, so the department
+ *     has no balance to take a delta FROM. The first measurement of a
+ *     department is an OPENING, which is an admin action with its own
+ *     idempotency (POST /api/department-ledger/cutover) — minting one from the
+ *     approval queue would stack a second opening and skip that guard.
+ *  3. THE DOUBLE-ANCHOR. dept-ledger's latestCount() anchors a department
+ *     balance on the newest closing_stock row, so the count re-bases the
+ *     balance the moment it is SAVED — measured: an opening of 5000 plus a
+ *     PENDING count of 4800 already reads 4800, with anchorSource flipping to
+ *     'count', before anyone approves. While that is true, the count and this
+ *     adjustment are two mechanisms for one correction and applying both takes
+ *     the difference off twice (4800 → 4600). It also makes Reject a lie: the
+ *     balance already moved. Refusing is the honest state until the anchor is
+ *     resolved; see the handoff on dept-ledger.ts. The post-condition assert in
+ *     approveVariance is the second line of defence and must stay even after
+ *     this one is retired.
  *
- * Comparing a department count against that department's own computed balance
- * (computeDeptStock) is the real fix and a separate build; it is deliberately
- * NOT attempted here.
+ * Central Store/Overall (department_id '') and liquor rows are never blocked:
+ * each posts a delta to its own rail.
  */
 export function varianceApprovalBlock(
-  row: { source: string; department_id?: string | null },
+  db: Database.Database,
+  row: { source: string; department_id?: string | null; material_id?: string },
   deptName?: string | null,
 ): string | null {
   if (String(row.source) !== 'central') return null;
-  if (!norm(row.department_id)) return null;
-  const who = norm(deptName) || 'a department';
-  return (
-    `Department count — cannot be approved against central stock. This count belongs to ${who}, ` +
-    `but it was compared against the CENTRAL store's stock, and approving sets central stock to the ` +
-    `counted number — so ${who}'s shelf quantity would overwrite the store's. ` +
-    `Reject it (stock stays untouched) and re-count at the central store, or fix it as a department-stock ` +
-    `correction. Approving a department count against its own department balance is not built yet.`
-  );
+  const deptId = norm(row.department_id);
+  if (!deptId) return null;
+
+  const who = norm(deptName) || 'this department';
+  const matId = norm(row.material_id);
+  if (!matId) return 'Count has no material — cannot be approved.';
+
+  if (isStoreMappedMaterial(db, matId)) {
+    return (
+      `Liquor / store-mapped item — cannot be approved as a department count. This item is tracked on the ` +
+      `liquor store ledger, not on ${who}'s raw-material stock, so there is no department balance to correct. ` +
+      `Reject it and record the count against the store it belongs to.`
+    );
+  }
+
+  const bal = deptOnHand(db, deptId, matId);
+  if (bal.neverCounted || bal.onHand === null) {
+    return (
+      `${who} has no opening balance for this item yet, so a counted difference cannot be worked out. ` +
+      `Record the department's opening stock first (the cutover count), then re-count. ` +
+      `Reject this one — nothing moves.`
+    );
+  }
+  if (bal.anchorSource === 'count') {
+    return (
+      `${who}'s balance is already anchored on a closing count, so this count has ALREADY moved the ` +
+      `department's stock on its own. Approving would take the difference off a second time. ` +
+      `Reject it — and note the department balance has moved regardless, which is a bug to fix in the ` +
+      `department ledger (a count must not re-base a balance before it is approved).`
+    );
+  }
+  return null;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * The department delta, as of the COUNT — not as of the approval.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/** 3 dp, the rounding this table has always stored variances in. */
+const r3 = (n: number): number => Math.round(n * 1000) / 1000;
+
+/** Floating-point slack. Below this a delta is nothing, not a movement. */
+const EPS = 1e-6;
+
+/**
+ * The instant a count speaks for, in the ledger's UTC basis.
+ *
+ * MIRRORS dept-ledger's countAnchorAt(): MIN(IST day-end of the count date,
+ * when it was saved). MIN, not MAX, and both directions of getting it wrong
+ * lose real movement — a count typed at 3pm must not swallow the 5pm issue that
+ * followed it, and a count for the 1st typed on the 5th must not swallow four
+ * days. 23:59:59 IST = 18:29:59 UTC on the SAME day (IST = UTC+5:30), so no
+ * date rollover.
+ *
+ * This is a DUPLICATE of a rule that should have one home. It exists only
+ * because deptOnHand() has no `asOf` parameter; when it gets one, delete this
+ * and the query below. Do not let the two definitions drift in the meantime.
+ */
+function deptCountInstant(date: string, createdAt: string): string {
+  const raw = String(createdAt || '').trim();
+  // Same bare-date rule as dept-ledger's normTs(): a date with no time means the
+  // START of that day. An import path that stamps created_at as 'YYYY-MM-DD'
+  // would otherwise compare as a 10-char string and sort BEFORE the same day's
+  // 00:00:00 here while sorting AT 00:00:00 there — the two windows would then
+  // disagree on exactly the rows an import creates.
+  const saved = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw} 00:00:00` : raw.slice(0, 19).replace('T', ' ');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || '').trim())) return saved;
+  const dayEnd = `${String(date).trim()} 18:29:59`;
+  return saved && saved < dayEnd ? saved : dayEnd;
+}
+
+/**
+ * Signed department movement strictly after `instant`. Same normalisation as
+ * dept-ledger (19 chars, 'T' → ' '): comparing a raw ISO 'T' timestamp against
+ * a raw ledger timestamp silently shifts a whole day, because 'T' > ' '.
+ *
+ * Deliberately NOT wrapped in a try/catch. A swallowed error here would return
+ * 0, which reads as "nothing moved since the count" and would put every
+ * post-count movement into the adjustment — the very overwrite this file exists
+ * to stop. Throwing rolls the caller's transaction back instead.
+ */
+function deptMovementsAfter(db: Database.Database, deptId: string, matId: string, instant: string): number {
+  if (!instant) return 0;
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(quantity), 0) AS s
+      FROM department_material_transactions
+     WHERE department_id = ? AND material_id = ?
+       AND REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ') > ?
+  `).get(deptId, matId, instant) as { s: number } | undefined;
+  return r3(Number(row?.s) || 0);
 }
 
 /**
@@ -202,7 +314,7 @@ export function approveVariance(
         { name?: string } | undefined)?.name || '';
     } catch { /* name is cosmetic */ }
   }
-  const blocked = varianceApprovalBlock(row, deptName);
+  const blocked = varianceApprovalBlock(db, row, deptName);
   if (blocked) return { ok: false, error: blocked };
 
   const apply = db.transaction(() => {
@@ -218,23 +330,127 @@ export function approveVariance(
         notes: `Approved variance ${row.date}: system ${row.system_stock} → physical ${row.physical_stock} ${row.unit}`,
         created_by: reviewer,
       });
+    } else if (norm(row.department_id)) {
+      // ── DEPARTMENT count → the department's own ledger. CENTRAL IS NOT TOUCHED.
+      //
+      // The count says: at count time this department's shelf held `physical`,
+      // while its ledger said `baseline`. The correction is that difference, and
+      // ONLY that difference — every movement the department made after the
+      // count (the lunch service it cooked while the approval sat in the queue)
+      // has to survive, exactly as on the central branch above.
+      //
+      //   baseline = balance_now − movements_since_the_count
+      //   delta    = counted − baseline
+      //   result   = counted + movements_since_the_count
+      //
+      // Forcing the balance to `counted` instead would erase that service and
+      // book it as a correction, which is the department-side twin of the
+      // absolute-set bug.
+      const deptId = norm(row.department_id);
+      const counted = Number(row.physical_stock) || 0;
+
+      const bal = deptOnHand(db, deptId, row.material_id);
+      // varianceApprovalBlock() has already refused neverCounted; belt-and-braces
+      // so a future caller that skips the block cannot post against a null.
+      if (bal.onHand === null) throw new Error(`${deptName || 'Department'} has no opening balance for this item`);
+
+      const countAt = deptCountInstant(String(row.date), String(row.created_at));
+
+      // A COUNT THAT PREDATES THE ANCHOR CANNOT BE APPLIED. `baseline` below
+      // rewinds the balance by the movements made after the count, which only
+      // means anything while the count sits INSIDE the current window. For a
+      // count dated before the opening row (or before the cutover floor), the
+      // rewind subtracts movement the balance never included and the arithmetic
+      // is nonsense — measured on a backdated count: a −200 correction came out
+      // as +4800. It is also decision D: nothing dated before the cutover may
+      // enter a department balance, and a backdated count is exactly how that
+      // floor gets walked around. Refuse, and say which date wins.
+      //
+      // Strictly before, not `<=`: a count stamped in the SAME second as the
+      // opening is the cutover day itself — the ordinary "count the kitchen,
+      // enter it as opening, count again" morning — and is legitimately
+      // approvable against that opening.
+      if (countAt < bal.windowFrom) {
+        throw new Error(
+          `This count (${row.date}) is dated before ${deptName || 'the department'}'s opening balance ` +
+          `(${bal.windowFrom}), so it cannot be applied — it would reach back past the cutover. ` +
+          `Reject it and re-count.`,
+        );
+      }
+
+      const movedSince = deptMovementsAfter(db, deptId, row.material_id, countAt);
+      const baseline = r3(bal.onHand - movedSince);
+      const delta = r3(counted - baseline);
+
+      if (Math.abs(delta) > EPS) {
+        // NO inventory_transactions ROW HERE. That table is the CENTRAL rail and
+        // is what the Variance and Sales-vs-Purchase reports read; writing this
+        // department correction into it would fabricate a central adjustment out
+        // of stock that never left the store. The two writes below/above look
+        // parallel and are not — do not merge them.
+        postDeptLedger(db, {
+          departmentId: deptId,
+          materialId: row.material_id,
+          type: 'adjustment',
+          quantity: delta,              // SIGNED. − = the shelf held less than the ledger said.
+          outletId: norm(row.outlet_id as string) || null,
+          referenceId: id,
+          source: 'variance-approval',
+          user: norm(reviewer),
+          notes:
+            `Approved department count ${row.date}: counted ${counted} ${row.unit} vs ledger ${baseline} ` +
+            `at count time (${movedSince === 0 ? 'no movement since' : `${movedSince} moved since`})`,
+        });
+
+        // POST-CONDITION, and the reason this branch can never double-correct.
+        // If some other mechanism also re-bases a department balance from a
+        // count (see the double-anchor note in varianceApprovalBlock), the
+        // arithmetic below will not land and this throws, rolling the whole
+        // approval back. Keep it even when that anchor is fixed: it is what
+        // makes "the ledger is the one truth" checkable rather than asserted.
+        const after = deptOnHand(db, deptId, row.material_id);
+        const expected = r3(counted + movedSince);
+        if (after.onHand === null || Math.abs(after.onHand - expected) > EPS) {
+          throw new Error(
+            `Department balance did not land where the count says it should ` +
+            `(expected ${expected}, got ${after.onHand}). Nothing was changed. ` +
+            `Another mechanism is re-basing this balance from the same count.`,
+          );
+        }
+      }
     } else {
-      // Central raw material: set live stock to the counted number. Log the ACTUAL
-      // delta (current → physical), which may differ from the count-time variance
-      // if stock moved between the count and this (deferred) approval — so the
-      // ledger movement always matches the change actually applied.
+      // ── CENTRAL STORE count → raw_materials.current_stock.
+      //
+      // Post the COUNT-TIME delta (physical − system-as-counted) on top of
+      // whatever central holds now. Recomputed from the two stored figures
+      // rather than read off the stored `variance` column, so a row whose
+      // variance was written by some other path still applies its own
+      // definition.
+      //
+      // WHY NOT `SET current_stock = physical_stock`: count the store at 100 at
+      // 10am, issue 40 kg to a kitchen at noon, approve at 4pm. The absolute set
+      // writes 100 back — un-issuing the 40 kg that a department is standing
+      // there holding, so the same 40 kg is on two rails at once. The delta
+      // lands at 60 and the issue survives, which is the invariant: every gram
+      // leaves central exactly once.
+      //
+      // NO FLOOR AT ZERO. If the delta takes central negative, central goes
+      // negative and says so. Clamping would manufacture stock that nobody
+      // bought, and hide the very gap a count exists to reveal.
       const cur = db.prepare(`SELECT current_stock FROM raw_materials WHERE id = ?`).get(row.material_id) as { current_stock: number } | undefined;
-      const before = Number(cur?.current_stock) || 0;
-      const appliedDelta = Math.round((row.physical_stock - before) * 1000) / 1000;
-      db.prepare(`UPDATE raw_materials SET current_stock = ?, updated_at = datetime('now') WHERE id = ?`)
-        .run(row.physical_stock, row.material_id);
-      if (appliedDelta !== 0) {
+      const before = r3(Number(cur?.current_stock) || 0);
+      const appliedDelta = r3(Number(row.physical_stock) - Number(row.system_stock));
+      const after = r3(before + appliedDelta);
+      if (Math.abs(appliedDelta) > EPS) {
+        db.prepare(`UPDATE raw_materials SET current_stock = ?, updated_at = datetime('now') WHERE id = ?`)
+          .run(after, row.material_id);
         db.prepare(`
           INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
           VALUES (?, ?, 'adjustment', ?, ?, ?, datetime('now'))
         `).run(
           generateId(), row.material_id, appliedDelta, id,
-          `Approved variance ${row.date}: counted ${row.physical_stock} ${row.unit} (was ${before}; count-time system ${row.system_stock})`,
+          `Approved variance ${row.date}: counted ${row.physical_stock} ${row.unit} against count-time system ` +
+          `${row.system_stock} (delta ${appliedDelta}); central ${before} → ${after}`,
         );
       }
     }

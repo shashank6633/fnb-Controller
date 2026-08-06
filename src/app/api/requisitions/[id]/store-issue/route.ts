@@ -2,6 +2,7 @@ import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore } from '@/lib/auth';
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import { applyIssueDelta } from '@/lib/issue-stock';
+import { isDeptReversalBlocked } from '@/lib/dept-ledger';
 
 /**
  * A replayed POST carrying a client_token it already spent collides on
@@ -49,9 +50,12 @@ function isIssueTokenReplay(e: any): boolean {
  *   issue    → quantity_issued += qty (append to issue_history JSON);
  *              issued_at=now, issued_by=me; clears the deferred fields ONLY
  *              when the line is now fully satisfied (see THE DEFER RULE below).
- *              current_stock moves only through applyIssueDelta, and only when
- *              settings.requisition_deduct_at_issue = '1' (default '0' = the
- *              historical behaviour: recipe-deduction owns current_stock).
+ *              Stock moves only through applyIssueDelta, which now deducts
+ *              UNCONDITIONALLY: the old deduct-at-issue setting is gone and no
+ *              switch is consulted. Central loses the gram here, the receiving
+ *              department gains it, and recipe consumption at KOT-complete
+ *              takes it out of the DEPARTMENT — not out of central a second
+ *              time.
  *   defer    → deferred_until + defer_reason set. quantity_issued unchanged.
  *   undo     → clears issued/deferred fields. Use to fix mistakes.
  *              (Does NOT clear a store rejection — use 'unreject' for that.)
@@ -66,6 +70,41 @@ function isIssueTokenReplay(e: any): boolean {
  * OR by the store (store_rejected) counts as "done" and is not required to be
  * issued. Otherwise stays 'mgmt_approved' / 'chef_approved' / 'store_processed'
  * so it remains in the store queue.
+ *
+ * ── 'fulfilled' IS REVERSIBLE. IT IS NOT ISSUABLE. ─────────────────────────
+ * The status gate accepts 'fulfilled' for 'undo' and 'reject' ONLY, and only
+ * when EVERY line in the batch is one of those two. This is not a loosening for
+ * convenience: the auto-advance below fires the instant the last line is
+ * satisfied, so the ordinary mistake — the storekeeper issues the final line,
+ * the requisition flips to 'fulfilled', he immediately sees the quantity was
+ * wrong — had NO in-app correction, while store-requisitions/page.tsx still
+ * rendered the Undo button for it. 1,620 of the 1,630 requisitions in this
+ * database are 'fulfilled', so without this the spec's partial-reversal
+ * requirement is unmet for 99% of them.
+ *
+ * 'issue', 'defer' and 'unreject' stay blocked on 'fulfilled' — all three push
+ * a finished requisition FORWARD, and re-opening one by adding to it (rather
+ * than by correcting it) is a different decision that nobody has taken. Mixing
+ * a reversal and an issue in one batch therefore refuses too: the batch is
+ * judged as a whole, deliberately, so a stray 'issue' entry cannot ride in on
+ * an undo's widened window.
+ *
+ * PARTY REQUISITIONS ARE EXCLUDED FROM THE WIDENED WINDOW, on purpose. Their
+ * stock moves on the party rail (applyPartyFulfillment), which applyIssueDelta
+ * skips entirely and which is one-shot via its 'party_consumption' ledger row.
+ * A reversal there would zero quantity_issued while the party transfer stayed
+ * on the books, and the transfer could never re-fire. Provable no-op today:
+ * both party requisitions are 'submitted', neither is 'fulfilled', so this
+ * carve-out changes nothing that exists — it stops a future divergence. Do not
+ * "tidy" it away; parties are out of scope for department stock by decision.
+ *
+ * PRE-CUTOVER REQUISITIONS UNDO WITHOUT MOVING STOCK, and that is correct.
+ * The 14,149 imported issued lines have no requisition_issue_ledger row, so
+ * applyIssueDelta's credit clamp gives back exactly what this rail took —
+ * nothing. Undoing one of those 1,620 historic fulfilled requisitions zeroes
+ * quantity_issued and returns no grams to central, because no gram ever left it
+ * through this rail. That is the no-backfill rule, not a bug; "fixing" it by
+ * dropping the clamp manufactures stock (the measured ALMOND bug).
  *
  * ── THE DEFER RULE (half-transfer) ─────────────────────────────────────────
  * An 'issue' used to blank deferred_until + defer_reason unconditionally, so
@@ -89,9 +128,18 @@ function isIssueTokenReplay(e: any): boolean {
  * immediately before the UPDATE (undo/reject zero the column and blank
  * issue_history in one statement — read it late and the pre-image is gone),
  * and calls the helper inside this route's own transaction so its writes roll
- * back with ours. The helper owns the settings flag, the party skip, the unit
- * conversion, the inventory_transactions row, the ledger row and the
- * department credit; none of that is duplicated here.
+ * back with ours. The helper owns the party skip, the liquor carve-out, the
+ * unit conversion, the inventory_transactions row, the ledger row, the
+ * department credit AND the negative-balance guard; none of that is duplicated
+ * here.
+ *
+ * That last one is why "roll back with ours" is load-bearing rather than tidy:
+ * a reversal the department cannot honour THROWS out of applyIssueDelta, and
+ * the only thing standing between that throw and a half-committed batch is this
+ * route's own transaction. Do not wrap a per-line try/catch around the helper
+ * to "keep the rest of the batch going" — quantity_issued is already written by
+ * then, so the surviving lines would be committed against stock that never came
+ * back. The batch is atomic; the catch below only improves the MESSAGE.
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -108,15 +156,44 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const db = getDb();
     const r = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(id) as any;
     if (!r) return Response.json({ error: 'Not found' }, { status: 404 });
-    // Allow store actions on every "post-approval, pre-final" state.
-    const okStatuses = new Set(['mgmt_approved', 'chef_approved', 'store_processed']);
-    if (!okStatuses.has(r.status)) {
-      return Response.json({ error: `Cannot issue items — current status: ${r.status}` }, { status: 400 });
-    }
 
     const body = await req.json().catch(() => ({}));
     const note: string = body?.note || '';
     const lines = Array.isArray(body?.lines) ? body.lines : [];
+
+    // THE STATUS GATE IS NOW ACTION-AWARE, so it has to read the body first.
+    // That reordering is deliberate and its only visible effect is on a POST
+    // with zero lines against a dead status: the empty-lines 400 below used to
+    // be unreachable there. The status refusal still wins — the gate sits ahead
+    // of that check, exactly where it sat before.
+    const REVERSAL_ACTIONS = new Set(['undo', 'reject']);
+    const actions: string[] = lines.map((ln: { action?: unknown }) => String(ln?.action || '').toLowerCase());
+    // EVERY line, not SOME. A batch is reversal-only or it is not; `[].every()`
+    // is true, hence the length guard. See "'fulfilled' IS REVERSIBLE" above.
+    const reversalOnly = actions.length > 0 && actions.every(a => REVERSAL_ACTIONS.has(a));
+    const isParty = String(r.purpose || '') === 'party';
+
+    // Allow store actions on every "post-approval, pre-final" state, plus the
+    // final one when the batch is purely a correction. ONE set object, shared
+    // with the in-transaction re-check below so the two can never drift apart —
+    // if they disagreed, a reversal could clear the pre-flight gate and then be
+    // refused by the re-check (or worse, the reverse).
+    const okStatuses = new Set(['mgmt_approved', 'chef_approved', 'store_processed']);
+    if (reversalOnly && !isParty) okStatuses.add('fulfilled');
+    if (!okStatuses.has(r.status)) {
+      // Name the party carve-out rather than hiding it behind the generic
+      // status message — otherwise the storekeeper goes looking for a status
+      // problem that is not there.
+      const partyBlocked = reversalOnly && isParty && r.status === 'fulfilled';
+      return Response.json({
+        error: partyBlocked
+          ? 'Cannot reverse a fulfilled party requisition here — its stock moved on the party '
+            + 'rail (store → department at fulfilment), which this screen does not unwind. '
+            + 'Adjust it from the department reconcile screen.'
+          : `Cannot issue items — current status: ${r.status}`,
+      }, { status: 400 });
+    }
+
     if (lines.length === 0) return Response.json({ error: 'No lines submitted' }, { status: 400 });
     // Optional per-gesture idempotency token. One token covers the whole batch:
     // the unique index is (client_token, req_item_id), so distinct lines of the
@@ -200,6 +277,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // null would defeat the check below, because TS does not track assignments
     // made inside a closure.
     const abort: { statusConflict?: string } = {};
+    // Same trick, different failure: a DeptReversalBlocked knows the material
+    // and the department but NOT which requisition line asked. In a three-line
+    // batch that is the only thing the storekeeper needs, so the line being
+    // worked on is stamped here and read after the rollback.
+    const failing: { lineId?: string; material?: string } = {};
 
     const txn = db.transaction(() => {
       // TOCTOU. The status read at the top of this handler happened BEFORE
@@ -218,6 +300,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       for (const ln of lines) {
         const it = itemMap.get(ln.id);
         if (!it) continue;                          // unknown line — skip silently
+        // Stamped BEFORE any work on this line, so whatever throws below is
+        // attributable. Overwritten each iteration on purpose: the last line
+        // touched is the one that threw, because a throw ends the loop.
+        failing.lineId = it.id;
+        failing.material = it.material_name;
         // STALE SNAPSHOT. itemMap was read before the transaction opened, so
         // two 'issue' entries for the SAME line id in one POST both computed
         // their new total from the same base and the second UPDATE silently
@@ -348,7 +435,36 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       } else {
         // Mark in-progress so the queue knows it's been touched.
         // rNow, not r: r.status was read before the body parse yielded.
-        if (rNow.status === 'mgmt_approved' || rNow.status === 'chef_approved') {
+        if (rNow.status === 'fulfilled') {
+          // THE DEMOTION. A reversal took a line back below its effective
+          // quantity, so the requisition is no longer finished and must return
+          // to the store queue — leaving it 'fulfilled' would hide an item the
+          // kitchen is still owed on the one screen meant to surface it.
+          //
+          // fulfilled_at / fulfilled_by are CLEARED, not kept. Both re-fulfilment
+          // paths stamp them through COALESCE (here, and store-process:591), so
+          // a leftover timestamp would survive the round trip and the eventual
+          // re-fulfilment would report the FIRST attempt's time forever. It also
+          // reads as a lie meanwhile: /requisitions renders "Fulfilled: <date>"
+          // on the strength of the column alone, whatever the status says.
+          // Nothing is lost — the reversal itself is in audit_events and in
+          // requisition_issue_ledger, which is where the history belongs.
+          //
+          // store_processed_at/by are NOT cleared: the store genuinely did
+          // process this requisition, and COALESCE backfills the pair for the
+          // imported rows that never had one.
+          db.prepare(`
+            UPDATE requisitions
+            SET status = 'store_processed',
+                fulfilled_at = NULL,
+                fulfilled_by = NULL,
+                store_processed_at = COALESCE(store_processed_at, datetime('now')),
+                store_processed_by = COALESCE(store_processed_by, ?),
+                store_note = CASE WHEN ? != '' THEN ? ELSE store_note END,
+                updated_at = datetime('now')
+            WHERE id = ?
+          `).run(me.email, note, note, id);
+        } else if (rNow.status === 'mgmt_approved' || rNow.status === 'chef_approved') {
           db.prepare(`
             UPDATE requisitions
             SET status = 'store_processed',
@@ -374,6 +490,43 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           { error: `Cannot issue items — current status: ${abort.statusConflict}` },
           { status: 400 },
         );
+      }
+      // THE DEPARTMENT WILL NOT GIVE THE GOODS BACK. assertReversible() throws
+      // instead of clamping, and that throw is what rolled this whole batch
+      // back. THE ROLLBACK IS THE CORRECT ANSWER AND IS NOT WHAT IS BEING
+      // SOFTENED HERE — every caller writes quantity_issued BEFORE calling
+      // applyIssueDelta, so a partial commit would leave a line reading "0
+      // issued" against grams that never came back. All lines of the batch,
+      // including the ones that succeeded before this one, are unchanged.
+      //
+      // What was missing is WHICH line refused. The error names the material
+      // and the department; `failing` supplies the requisition line, so a
+      // three-line undo points at the offending row instead of failing blind.
+      //
+      // 400, matching this route's other operator-answerable refusals (the
+      // status conflict above) rather than the 409 the department-materials
+      // reconcile route uses. The client does not branch on the number — it
+      // keys off `code` (store-requisitions/page.tsx:232) and renders `blocked`
+      // inline against the named line instead of an alert.
+      if (isDeptReversalBlocked(e)) {
+        console.warn('[req store-issue] reversal blocked:', e.message);
+        return Response.json({
+          error: e.message,
+          code: e.code,
+          blocked: [{
+            // Fall back to the sole submitted line rather than an empty id: a
+            // single-line undo is the common case and the client can still
+            // place the message without it, but naming it is free.
+            line_id: failing.lineId || (lines.length === 1 ? String(lines[0]?.id || '') : ''),
+            material: e.materialName || failing.material || '',
+            department: e.departmentName,
+            requested: e.requested,
+            available: e.available,
+            consumed_since: e.consumedSince,
+            message: e.message,
+          }],
+          applied: 0,
+        }, { status: 400 });
       }
       // Replayed gesture token. Also fully rolled back, so the earlier POST's
       // effect is the only one that exists — report success, not failure.

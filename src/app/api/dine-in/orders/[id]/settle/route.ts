@@ -154,6 +154,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // Route the backstop deduct to the floor bar store (no-op unless
           // tm_floor_autodeduct is on and skip_inventory is false).
           store_id: floorStoreId,
+          // DEPARTMENT ROUTING (deduct-at-issue): the recipe consumption debit now
+          // leaves the DEPARTMENT that cooked the dish, not central — so the
+          // backstop must resolve the same department the KDS bump would have.
+          // Same field, same row, per line: order_items.station. The bump reads it
+          // off the order_items rows under the KOT; we read it off the same rows
+          // here, so a bumped order and a quick-settled one land in one department.
+          //   - NEVER resolve from kots.station: a blank line station is coerced to
+          //     the literal 'kitchen' when the KOT is written, and 'Kitchen' is a
+          //     real department — that would silently debit the main kitchen for
+          //     every station-less line.
+          //   - NOT the `category` field above. It happens to carry the station on
+          //     this route, but /api/sales-import puts the Recaho menu CATEGORY
+          //     there; a future engineer "simplifying" the two into one field would
+          //     hand deductInventoryForSale 'Starters' as a station.
+          //   - Blank / unmapped (sushi, terracegrill) / liquor stations: the
+          //     deduct SKIPS the department and records why. Do not add a fallback
+          //     department here — a wrong kitchen debited silently reads as theft
+          //     on the very variance report this change exists to produce.
+          station: it.station || null,
           bill_type: order.bill_type || 'normal',
           selling_price: it.unit_price,
           date,

@@ -32,12 +32,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const apply = db.transaction(() => {
       db.prepare("UPDATE kots SET status = ?, updated_at = datetime('now') WHERE id = ?").run(next, id);
       // When the ticket is COMPLETE (served), the food is consumed → deduct each
-      // recipe-linked item's ingredients from stock, exactly once (idempotent via
+      // recipe-linked item's ingredients, exactly once (idempotent via
       // recipe_deducted_at). This is the "consume on KOT complete" model: settle
       // later records revenue but skips inventory for these already-deducted items.
       //   - non-chargeable / complimentary orders STILL consume (deduct runs);
       //   - a cancelled item never reaches a fired KOT, so it never deducts here;
       //   - a voided order is skipped (nothing was really cooked/served).
+      // The gram now leaves the DEPARTMENT that cooked it (resolved from the
+      // line's own station, below), not central — central already lost it when
+      // the store issued it on a requisition. The stamp+transaction pairing below
+      // is what keeps STOCK MOVES EXACTLY ONCE true; do not loosen either.
       if (next === 'served') {
         // Stamp served_at once (item-journey tracking) and advance status. A line
         // already scanned 'kitchen_sent' still moves to 'served' here (terminal).
@@ -60,15 +64,32 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             floorStoreId = undefined;
           }
           const cook = db.prepare(`
-            SELECT id, recipe_id, quantity FROM order_items
+            SELECT id, recipe_id, quantity, station FROM order_items
             WHERE kot_id = ? AND recipe_id IS NOT NULL AND recipe_id != '' AND recipe_deducted_at IS NULL
           `).all(id) as any[];
           const stamp = db.prepare("UPDATE order_items SET recipe_deducted_at = datetime('now') WHERE id = ?");
           for (const it of cook) {
             try {
+              // DEPARTMENT ROUTING READS THE LINE'S station, NEVER kot.station.
+              // kot-fire.ts coerces a blank line station to the literal 'kitchen'
+              // when it groups lines into tickets, and 'Kitchen' is a REAL
+              // department (the main-kitchen roll-up) — so resolving from
+              // kot.station would silently debit the whole main kitchen for every
+              // station-less item. One ticket can also legitimately carry lines
+              // from more than one station, which a per-KOT value cannot express.
+              // Pass it.station through even when it is blank or unmapped
+              // (sushi, terracegrill): applyDeduct records the skip and its reason
+              // and moves nothing, because debiting the WRONG kitchen is worse
+              // than debiting none. Do NOT "simplify" this to kot.station, and do
+              // NOT add a fallback department here.
+              //
+              // opts is now passed unconditionally so station always reaches the
+              // deduct. That is a no-op for floor routing: deductInventoryForSale
+              // normalises a missing/blank opts.storeId to '' and takes the exact
+              // central path, which is what `undefined` did before.
               deductInventoryForSale(
                 db, it.recipe_id, it.quantity, it.id, order.bill_type || 'normal',
-                floorStoreId ? { storeId: floorStoreId } : undefined,
+                { storeId: floorStoreId, station: it.station },
               );
               stamp.run(it.id);   // stamp only on success → settle backstops any that threw
             } catch (e) { console.error('[kds bump recipe-deduct]', it.id, e); }

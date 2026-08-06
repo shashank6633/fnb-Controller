@@ -28,13 +28,23 @@ import { ShoppingCart, Send, Loader2, AlertTriangle, ShieldCheck, ClipboardList,
  * vendor B. So the send action never sends a combined sheet — it produces one
  * document per vendor, carrying only that vendor's lines.
  *
- * The third card, `requisition_deduct_at_issue`, is the CUTOVER SWITCH for the
- * stock model itself, and it reads FAIL-SAFE IN THE OPPOSITE DIRECTION to the
- * approval switch: only an explicit "1" is ON. OFF is what the app does today,
- * so a missing row, a null, an unreadable value or a 401 body must all render
- * OFF — a card that over-reported ON would tell the owner the cutover had
- * already happened when the server is still deducting at KOT-complete, and they
- * would go looking for the second deduction that this page claimed was gone.
+ * THE THIRD CARD USED TO BE A SWITCH, AND IS NOW A STATUS LINE. It reported the
+ * old deduct-at-issue settings key — the on/off gate for WHERE a gram left stock.
+ * That gate is gone: the app now ALWAYS deducts central at the issue and always
+ * draws recipe consumption from the receiving department's stock. Nothing reads
+ * the key any more, so the switch is not merely redundant — a live control that
+ * writes a key nothing reads is worse than no control at all, because an admin
+ * flips it, sees the toast, and believes the stock model changed when it did
+ * not. The settings ROW is deliberately left in place (admin-owned state is not
+ * something a deploy rewrites), inert and ignored; do NOT re-add a reader.
+ *
+ * What replaces it is read-only and states the ONE thing that is still a
+ * decision: whether the department opening balances have been counted and
+ * recorded. That is an explicit admin action against
+ * POST /api/department-ledger/cutover — never a boot migration — and until it
+ * runs, department balances read "not counted yet" rather than 0. The date
+ * shown here is settings.dept_ledger_cutover_at as reported by the cutover
+ * route, i.e. the server's own stamp, never a date this page infers.
  */
 export default function PurchasingSettingsPage() {
   const [sendToVendor, setSendToVendor] = useState(false);
@@ -51,12 +61,15 @@ export default function PurchasingSettingsPage() {
   // ON-because-the-server-says-so — and the second one suppresses the amber
   // "approval is OFF" banner. This flag tells the two apart on screen.
   const [approvalRead, setApprovalRead] = useState<'ok' | 'failed'>('ok');
-  // The stock-model cutover. Starts OFF and every failure path below leaves it
-  // OFF, because OFF is the live behaviour: stock falls when a dish is SOLD, not
-  // when the store issues it. There is deliberately no `deductRead` twin of
-  // approvalRead here — an unreadable key and a genuine "not switched on yet"
-  // describe the same live system, so there is nothing to warn about.
-  const [deductAtIssue, setDeductAtIssue] = useState(false);
+  // The department opening cut-over, read from the server's own stamp. THREE
+  // states, not two, and the third is the point: 'unread' must never collapse
+  // into 'none'. "Opening balances not recorded yet" is a factual claim about
+  // the ledger that sends an admin off to run a cut-over; if the read merely
+  // failed, that claim is a guess, and a second cut-over run is answered 409
+  // per (department, material) precisely because nobody should be guessing here.
+  const [cutover, setCutover] = useState<{ state: 'none' | 'done' | 'unread'; at: string | null }>(
+    { state: 'unread', at: null },
+  );
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [me, setMe] = useState<{ role?: string } | null>(null);
@@ -103,16 +116,20 @@ export default function PurchasingSettingsPage() {
           if (!d || typeof d !== 'object' || !('value' in d)) { setApprovalRead('failed'); return; }
           setRequireApproval(String(d.value ?? '').trim() !== '0');
         }).catch(() => setApprovalRead('failed')),
-      // The exact mirror of issueDeductionEnabled() in src/lib/issue-stock.ts —
-      // `String(row?.value ?? '0') === '1'`. Note what is NOT here: a .trim().
-      // The switch above trims on purpose; this one must NOT, because the server
-      // does not. A stored " 1 " is OFF to issue-stock.ts, and a trim here would
-      // paint the card ON over a system still deducting at KOT-complete. Keeping
-      // the two comparisons character-identical is the point — if you "tidy" this
-      // into the trimmed form used two lines up, the page starts lying in the one
-      // direction that matters.
-      fetch('/api/settings?key=requisition_deduct_at_issue').then(r => r.json())
-        .then(d => setDeductAtIssue(String(d?.value ?? '0') === '1')).catch(() => {}),
+      // Asked of the cut-over route, NOT of /api/settings, even though the value
+      // it reports IS settings.dept_ledger_cutover_at. The route is the owner of
+      // that stamp — it is the only writer, it writes it once from the first
+      // opening row's own timestamp, and it 503s with a "run the migration"
+      // message when the ledger tables are absent. Reading the settings key
+      // directly would answer null in that case and this line would then say
+      // "not recorded yet" over a database that cannot record one. GET is
+      // signed-in, not admin, so a Manager sees the same status an Admin does.
+      fetch('/api/department-ledger/cutover').then(r => r.json())
+        .then(d => {
+          if (!d || typeof d !== 'object' || !('cutover_at' in d)) return; // stays 'unread'
+          const at = String(d.cutover_at ?? '').trim();
+          setCutover(at ? { state: 'done', at } : { state: 'none', at: null });
+        }).catch(() => {}),
     ]).finally(() => setLoading(false));
     fetch('/api/vendors').then(r => r.json())
       .then(d => {
@@ -133,14 +150,11 @@ export default function PurchasingSettingsPage() {
   // POST alias), which 403s a non-admin write of this key — this is the UI half
   // of an enforced rule, not intent. Keep the two in sync.
   const canEditApproval = !!me && me.role === 'admin';
-  // Same shape as canEditApproval, and for a bigger reason. This key changes WHEN
-  // a gram leaves raw_materials.current_stock for the whole outlet; flipped at the
-  // wrong moment it double-counts or under-counts every recipe material at once.
-  // The real gate is the server's (KEY_POLICY write:'admin' in /api/settings) —
-  // this is only its UI half. Keep the two in sync: a UI-only restriction with no
-  // server counterpart is exactly the gap po_require_admin_approval sat in for a
-  // whole release.
-  const canEditDeductAtIssue = !!me && me.role === 'admin';
+  // There is no canEditDeductAtIssue any more, and no admin/manager split on the
+  // stock-model status below: it is read-only for EVERY role, because there is
+  // nothing left on this page to write. The one privileged action it points at —
+  // recording the department opening balances — is admin-gated at
+  // POST /api/department-ledger/cutover, which is where that check belongs.
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 2500); };
 
   const save = async (on: boolean) => {
@@ -186,20 +200,20 @@ export default function PurchasingSettingsPage() {
     setSaving(false);
   };
 
-  // Its own optimistic set + revert, like the three above. The revert matters in
-  // BOTH directions here: this switch decides which of two mutually exclusive
-  // deduction points is live, so a switch stuck out of step with the server does
-  // not merely mislead — it invites someone to "fix" the arithmetic they think is
-  // running and remove the same gram twice.
-  const saveDeductAtIssue = async (on: boolean) => {
-    const prev = deductAtIssue;
-    setDeductAtIssue(on); setSaving(true);
-    try {
-      const r = await api('/api/settings', { method: 'PUT', body: { key: 'requisition_deduct_at_issue', value: on ? '1' : '0' } });
-      if (!r.ok) { setDeductAtIssue(prev); flash(false, (await r.json().catch(() => ({}))).error || 'Failed to save'); }
-      else flash(true, on ? 'Stock now deducts when the store issues' : 'Stock deducts when a dish is sold');
-    } catch { setDeductAtIssue(prev); flash(false, 'Failed to save'); }
-    setSaving(false);
+  // There is deliberately NO saveDeductAtIssue here. The stock model is no longer
+  // a preference, so this page has no write path to it — if a future change wants
+  // one back, the question to answer first is which of the two deduction points
+  // it would turn OFF, because both of them are now load-bearing at once.
+
+  // 'YYYY-MM-DD HH:MM:SS' from SQLite, which `new Date()` reads as Invalid Date
+  // unless the space becomes a T. Same helper as /department-variance, on purpose:
+  // both surfaces are naming the SAME stamp and must not disagree by a day.
+  const cutoverLabel = (s: string | null) => {
+    if (!s) return '';
+    const d = new Date(String(s).replace(' ', 'T'));
+    return isNaN(d.getTime())
+      ? String(s).slice(0, 10)
+      : d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
   };
 
   return (
@@ -337,81 +351,73 @@ export default function PurchasingSettingsPage() {
           </div>
         )}
 
+        {/* READ-ONLY BY DESIGN. This was a switch until the stock model stopped
+            being optional. Do not put a Toggle back here: nothing on the server
+            reads the old deduct-at-issue key any more, so a control here would
+            write a key into `settings`, flash a green toast, and change nothing —
+            which is how an owner ends up hunting for a second deduction that was
+            never configurable in the first place. The settings row itself is left
+            alone on purpose (a deploy does not rewrite admin-owned state); it is
+            simply inert. */}
         {!loading && (
           <div className="bg-white rounded-xl border border-[#E8D5C4] divide-y divide-[#F0E6D8]">
-            <div className="flex items-start justify-between gap-4 p-5">
-              <div>
-                <p className="font-semibold text-[#2D1B0E] flex items-center gap-1.5">
-                  <PackageMinus className="w-4 h-4 text-[#af4408]" /> Deduct stock when the store issues it
-                </p>
-                <p className="text-sm text-[#8B7355] mt-0.5">
-                  Decides <b>when</b> a gram leaves raw-material stock. It is only ever one of the two —
-                  the point of this switch is that the same gram is never removed twice.
-                </p>
-                <p className="text-sm text-[#8B7355] mt-1.5">
-                  <b>Off (today).</b> Stock falls when a <b>dish is sold</b> — the recipe is costed out at
-                  KOT-complete. Issuing goods to a kitchen on a requisition records the issue but moves no
-                  stock, so raw-material stock stands for everything the outlet holds, store and kitchens
-                  together.
-                </p>
-                <p className="text-sm text-[#8B7355] mt-1.5">
-                  <b>On.</b> Stock falls the moment goods <b>leave the store</b> on a requisition, for the
-                  quantity the store actually issued. Recipe consumption at KOT-complete <b>stops deducting
-                  a second time</b> — it is still recorded against every ingredient, and still drives the
-                  <b> Variance</b> and <b>Sales vs Purchase</b> reports exactly as it does now. Nothing is
-                  lost from those reports; the figure simply stops being a second withdrawal.
-                </p>
-                <p className="text-sm text-[#8B7355] mt-1.5">
-                  What changes in meaning: raw-material stock becomes what the <b>central store</b> holds,
-                  not what the outlet holds. What a kitchen holds moves to{' '}
-                  <a href="/inventory/department-stock" className="underline">Inventory → Department Stock</a>.
-                  That is the whole reason for the switch — the gap between what the store issued to a
-                  department and what the recipes say should have been used is what tells you <i>where</i> a
-                  loss happened.
-                </p>
-                <p className="text-sm text-[#8B7355] mt-1.5">
-                  The <b>Issued Items Log</b> and department consumption already record the issued quantity
-                  and are unaffected either way — this switch changes the stock arithmetic only.
-                </p>
-                {meLoaded && canEdit && !canEditDeductAtIssue && (
-                  <p className="text-xs text-[#8B7355] mt-1.5">
-                    Admin only — this changes how stock is counted for the whole outlet.
-                  </p>
-                )}
-              </div>
-              <Toggle checked={deductAtIssue} onChange={(v) => saveDeductAtIssue(v)} disabled={!canEditDeductAtIssue || saving}
-                      label="Deduct stock when the store issues it" className="mt-1 shrink-0" />
+            <div className="p-5">
+              <p className="font-semibold text-[#2D1B0E] flex items-center gap-1.5">
+                <PackageMinus className="w-4 h-4 text-[#af4408]" /> How stock is deducted
+              </p>
+              <p className="text-sm text-[#8B7355] mt-0.5">
+                Stock is deducted when the store issues it to a department. Recipe consumption then
+                draws on that department&apos;s stock. Department opening balances:{' '}
+                {cutover.state === 'done'
+                  ? <b className="text-[#2D1B0E]">recorded on {cutoverLabel(cutover.at)}</b>
+                  : cutover.state === 'none'
+                    ? <b className="text-[#2D1B0E]">not recorded yet</b>
+                    /* NOT "not recorded yet". An unread status and a genuinely
+                       un-run cut-over look the same on screen but send an admin
+                       to two different places, and only one of them is a real
+                       instruction. */
+                    : <b className="text-[#2D1B0E]">could not be read</b>}.
+              </p>
+              <p className="text-sm text-[#8B7355] mt-1.5">
+                A gram leaves the <b>central store</b> the moment it is issued on a requisition, for the
+                quantity actually issued, and leaves the <b>department</b> when a recipe consumes it at
+                KOT-complete. Never both — each gram moves exactly once at each step. Raw-material stock
+                therefore means what the <b>central store</b> holds; what a kitchen holds is on{' '}
+                <a href="/inventory/department-stock" className="underline">Inventory → Department Stock</a>.
+              </p>
+              <p className="text-sm text-[#8B7355] mt-1.5">
+                Two carve-outs, both deliberate. <b>Liquor keeps its own ledger</b> — store-mapped
+                materials are skipped by both legs and are counted in the Liquor Store, not here. And a
+                sale from a station that has not been mapped to a department <b>deducts nothing</b>
+                {' '}rather than guessing a kitchen; map it under{' '}
+                <a href="/settings/station-departments" className="underline">Settings → Station Departments</a>.
+              </p>
             </div>
 
-            {/* Neutral, NOT amber. Off is the correct, shipped state — an amber
-                block here would read as a fault to be cleared and invite exactly
-                the casual flip the note is warning against. */}
-            {!deductAtIssue && (
+            {/* Neutral, not amber, when the cut-over is outstanding: this is a
+                task to schedule around a physical count, not a fault to clear. */}
+            {cutover.state === 'none' && (
               <div className="flex items-start gap-2 p-5 bg-[#FDF6EE]">
                 <Info className="w-4 h-4 text-[#8B7355] mt-0.5 shrink-0" />
                 <p className="text-sm text-[#8B7355]">
-                  <b>This cannot be switched on casually.</b> It is a cutover, not a preference: take a full
-                  central <b>closing count</b> first and clear the <b>variance-approval queue</b>, so the
-                  opening figure on the new basis is a counted number rather than a carried-over one.
-                  Read the day-of steps — including what happens to a requisition half-issued across the
-                  boundary, and how to reverse it — in{' '}
+                  <b>Department opening balances have not been recorded.</b> Until an Admin records them,
+                  a department balance reads <b>not counted yet</b> rather than a number — that is
+                  correct, not a fault. Issues from before the cut-over are shown separately and are never
+                  added into a balance, so recording an opening is a physical count, not a catch-up.
+                  The day-of steps are in{' '}
                   <code className="text-xs bg-[#F0E6D8] px-1 py-0.5 rounded">docs/requisition-deduct-at-issue-cutover.md</code>.
                 </p>
               </div>
             )}
 
-            {deductAtIssue && (
+            {cutover.state === 'unread' && (
               <div className="flex items-start gap-2 p-5 bg-amber-50">
                 <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
                 <p className="text-sm text-amber-800">
-                  <b>Stock figures now mean the central store only.</b> Inventory, Low Stock, the Buy List
-                  and the Consolidated Stock board will all read <b>lower</b> than before — that is the
-                  switch working, not stock going missing; the difference is sitting in the kitchens, on
-                  Department Stock. Two things to know: <b>wastage and staff meals still debit central
-                  stock</b>, even for goods already issued to a kitchen, so recording either against
-                  something the store no longer holds will push central stock down again. And <b>do not
-                  migrate the Liquor Store while this is on</b> — it keeps its own ledger and has not been
-                  moved to this basis.
+                  <b>Could not read the cut-over status.</b> The line above is not saying the opening
+                  balances are missing — it is saying this page could not find out. Reload, or check{' '}
+                  <a href="/inventory/department-stock" className="underline">Department Stock</a>, before
+                  acting on it.
                 </p>
               </div>
             )}

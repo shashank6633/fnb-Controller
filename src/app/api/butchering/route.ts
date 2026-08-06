@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { deptOnHandBulk, deptKey } from '@/lib/dept-ledger';
 
 /**
  * Butchering — carcass breakdown into named cuts.
@@ -18,10 +19,15 @@ import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
  *        body: { id, outputs?: [...], butcher?, head_chef?, notes?, action?: 'close' | 'cancel' }
  * DELETE /api/butchering?id=<uuid>              → delete open batch only
  *
- * On close: validates reconciliation gap ≤ 1.5%, then atomically:
+ * On close: validates reconciliation gap ≤ 1.5%, refuses if a DEPARTMENT holds
+ * the carcass (see the guard in PUT), then atomically:
  *   1. Debits source_material.current_stock by gross_weight
  *   2. Credits each cut's material.current_stock by its weight (pro-rata cost)
  *   3. Writes inventory_transactions rows for the audit log
+ *
+ * Butchering is a CENTRAL-STORE operation, start to finish. Both stock legs
+ * above are raw_materials.current_stock — the store's pool. Nothing here posts
+ * to the department ledger, and v1 deliberately does not learn how to.
  */
 export const dynamic = 'force-dynamic';
 
@@ -327,8 +333,56 @@ export async function PUT(request: Request) {
         }, { status: 400 });
       }
 
+      // DEPARTMENT-HELD CARCASS — REFUSE, do not transform.
+      //
+      // Since the department-inventory cutover, a carcass issued on a
+      // requisition has ALREADY left central: applyIssueDelta debited
+      // raw_materials.current_stock at issue and credited the receiving
+      // department's ledger. The grams are on the kitchen's shelf. Closing a
+      // batch on it would then (1) debit central a SECOND time for the whole
+      // gross weight — the same gram removed twice, which is exactly the
+      // invariant this cutover exists to protect — and (2) credit the cuts
+      // into the CENTRAL pool, which is not the pool that holds the carcass.
+      // Two wrong numbers and no screen showing either.
+      //
+      // v1 refuses instead of posting a department-side transform (debit the
+      // carcass from the department, credit the cuts back to the same
+      // department). That transform is a real feature, and a real SECOND
+      // movement path with its own negative-balance and reversal questions; it
+      // does not belong inside a cutover. Do NOT "simplify" this into a clamp,
+      // a partial debit, or a silent central debit "because the batch is
+      // already reconciled" — the honest answer is that the goods must come
+      // back to the store before the store can break them down.
+      //
+      // WHAT IT READS: the LEDGER, via deptOnHand — never
+      // department_materials.on_hand, which is a maintained cache and not a
+      // truth. A never-counted department still HOLDS whatever the ledger says
+      // moved in, so movementsSince is the fallback: onHand is NULL by design
+      // for that pair, and treating NULL as 0 would wave the carcass straight
+      // through the guard on day one, before any cutover count exists.
+      // Inactive departments are included deliberately — deactivating a
+      // department does not empty its shelf.
+      const HOLD_EPS = 1e-6;
+      const allDepts = db.prepare('SELECT id, name FROM departments').all() as Array<{ id: string; name: string }>;
+      const holdMap = deptOnHandBulk(db, allDepts.map(d => d.id), [fresh.source_material_id]);
+      const holders = allDepts
+        .map(d => {
+          const h = holdMap.get(deptKey(d.id, fresh.source_material_id));
+          return { name: d.name, qty: h ? (h.onHand ?? h.movementsSince) : 0 };
+        })
+        .filter(h => h.qty > HOLD_EPS)
+        .sort((a, b) => b.qty - a.qty);
+      if (holders.length > 0) {
+        const unit = fresh.source_unit || '';
+        const who = holders.map(h => `${h.name} (${Number(h.qty.toFixed(3))}${unit ? ' ' + unit : ''})`).join(', ');
+        return Response.json({
+          error: `This carcass is currently held by ${who}. Butchering from department stock is not supported yet — return it to the store first.`,
+        }, { status: 409 });
+      }
+
       const txn = db.transaction(() => {
-        // 1. Debit source carcass stock
+        // 1. Debit source carcass stock — CENTRAL only, and only reachable
+        //    because the guard above proved no department holds this carcass.
         db.prepare(`UPDATE raw_materials SET current_stock = COALESCE(current_stock, 0) - ? WHERE id = ?`)
           .run(fresh.gross_weight, fresh.source_material_id);
         db.prepare(`

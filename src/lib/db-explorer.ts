@@ -614,11 +614,17 @@ export interface SavedQuery {
  */
 export const SAVED_QUERIES: readonly SavedQuery[] = [
   {
-    id: 'deduct_at_issue',
-    title: 'Is deduct-at-issue on?',
+    // Replaced the old "Is deduct-at-issue on?" query. That setting no longer
+    // decides anything — the department basis is now unconditional — so asking
+    // for its value would return a stale row and read as if a switch still
+    // existed. The useful question now is whether the cutover has been run,
+    // because every department balance is anchored on that timestamp.
+    id: 'dept_cutover_state',
+    title: 'Has the department cutover been run?',
     explains:
-      'Whether stock leaves the books when the store ISSUES to a department, or later when the recipe is consumed. Currently 0 = at consumption.',
-    sql: "SELECT key, value\nFROM settings\nWHERE key = 'requisition_deduct_at_issue'",
+      'Stock now leaves Central when the store ISSUES it and leaves the Department when a recipe consumes it. Department balances start from the cutover count — until that has been run, they are incomplete. A row here means it has.',
+    sql:
+      "SELECT key, value AS cutover_at\nFROM settings\nWHERE key = 'dept_ledger_cutover_at'",
   },
   {
     id: 'menu_items_no_recipe',

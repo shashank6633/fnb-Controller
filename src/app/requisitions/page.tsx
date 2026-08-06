@@ -1964,16 +1964,36 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         : it.quantity_requested;
       // requested-unit → recipe-unit factor (1 BTL = pack_size recipe units).
       const reqFactor = reqPackFactor(it);
-      // Clamp current_stock to 0 for "issuable" math — a negative stock means
-      // the books are already over-consumed (a prior recipe-deduction outran
-      // purchases). We must NOT propose issuing a negative qty as if the
-      // material were on the shelf; default issue stays 0 and the entire
-      // requested amount becomes a shortfall the store must source via PO.
+      // THE BOOK BALANCE IS A CAP ONLY WHILE IT IS STILL A BALANCE.
+      //
+      // current_stock is the STORE's book figure. Once it reaches 0 or goes
+      // below, it has stopped describing the shelf and is only describing the
+      // arithmetic: issues have outrun recorded purchases. That is the normal
+      // state after the deduct-at-issue cutover — every requisition now debits
+      // central, so a material carrying months of un-reconciled history reads
+      // deeply negative while the sacks are physically stacked in the store.
+      //
+      // The old code clamped to Math.max(0, stock), which made the cap 0 and
+      // therefore the DEFAULT ISSUE 0 — the storekeeper handing over 5 kg saw a
+      // blank, disabled box, and the whole 5 kg fell through to `shortfall` and
+      // out to the PO block below as real vendor spend for goods already on the
+      // premises. Measured on this db: 308 of 737 issued materials sit at
+      // current_stock <= 0 today, and that count only grows.
+      //
+      // So: cap against the books only when the books are still positive; when
+      // they are not, seed the full approved demand and let the storekeeper type
+      // what he physically hands over. The true figure (negative and all) is
+      // printed in red on the row — we show the deficit, we do not act on it.
+      // DO NOT "tidy" this back into a Math.max(0, …): that is the same clamp
+      // wearing a different hat, and it manufactures a PO for stock we own.
       // Stock is in RECIPE units — convert to requested units before comparing
       // (floor when packs: you can't hand over 0.4 of a bottle against a BTL ask).
-      const safeStock = Math.max(0, Number(it.current_stock) || 0);
-      const stockInReqUnits = reqFactor > 1 ? Math.floor(safeStock / reqFactor) : safeStock;
-      const issuable  = Math.min(effective, stockInReqUnits);
+      const bookStock = Number(it.current_stock) || 0;
+      const stockInReqUnits = reqFactor > 1 ? Math.floor(bookStock / reqFactor) : bookStock;
+      // bookStock > 0, NOT stockInReqUnits > 0 — a positive book balance smaller
+      // than one pack (300 ml against a 750 ml BTL ask) must keep floor()'s 0 and
+      // behave exactly as it did before this change. Only <= 0 relaxes.
+      const issuable  = bookStock > 0 ? Math.min(effective, stockInReqUnits) : effective;
       const shortfall = Math.max(0, effective - issuable);
       // Purchase-unit metadata so the PO math can switch between recipe-unit
       // (kg / ml / pcs) and purchase-unit (BTL / PKT / CASE) entry. pack_size
@@ -2047,8 +2067,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       };
     })
   );
-  // Lines whose system stock is negative — surfaced in a red banner so the
-  // store user knows to raise a vendor PO immediately for those materials.
+  // Lines whose central BOOK balance is negative — surfaced in a red banner so
+  // the store user knows the figure beside them is un-reconciled and needs a
+  // physical recount. Reporting only: it no longer gates what can be issued.
   const negativeStockLines = lines.filter(ln => Number(ln.current_stock) < 0);
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
@@ -2242,15 +2263,28 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             </div>
           )}
 
-          {/* Negative-stock warning. When system stock is below 0, the books say
-              we've already over-consumed — recipe-deduction outran purchases.
-              Issuing more would deepen the deficit. We force these lines to 0
-              issue, count the whole demand as shortfall, and push the store to
-              raise a PO immediately. */}
+          {/* Negative book balance. The store's BOOK figure is below 0: issues
+              have outrun recorded purchases on these materials. That is an
+              accounting deficit, not a statement about the shelf, and it is the
+              expected state after the deduct-at-issue cutover until a physical
+              recount re-bases central.
+
+              This banner used to say "Issuing 0 here" and the rows enforced it.
+              It no longer does either: the storekeeper issues what he is
+              physically handing over, and the deficit is reported, not acted on.
+              Do not restore the block — it converted a bookkeeping gap into a
+              vendor PO for goods already sitting in the store. */}
           {negativeStockLines.length > 0 && (
             <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900 space-y-1">
               <div className="font-semibold">
-                🚨 {negativeStockLines.length} line{negativeStockLines.length === 1 ? '' : 's'} have <b>negative system stock</b> — raise a vendor PO ASAP.
+                🚨 {negativeStockLines.length} line{negativeStockLines.length === 1 ? '' : 's'} show a <b>negative store book balance</b> — recount pending.
+              </div>
+              <div className="text-[10px]">
+                Issue what you are actually handing over. The figures below are the
+                store&apos;s books, not a count of the shelf — get a physical count
+                recorded so central can be re-based, and raise a PO on{' '}
+                <a href="/purchase-orders" className="underline">Purchase Orders</a> only
+                if the material is genuinely finished.
               </div>
               <ul className="ml-5 list-disc">
                 {negativeStockLines.map(ln => (
@@ -2258,10 +2292,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                     {/* current_stock is a MATERIAL-level recipe figure — stockPU,
                         never the line-basis toPU. (Was a local re-derivation of
                         the pack guard; one resolver now answers it.) */}
-                    <b>{ln.material_name}</b> — system shows {ln.U.pf > 1
+                    <b>{ln.material_name}</b> — books show {ln.U.pf > 1
                       ? `${fmtNum(ln.U.stockPU(ln.current_stock))} ${ln.U.pu} (= ${fmtNum(ln.current_stock)} ${ln.U.recipeUnit})`
                       : `${fmtNum(ln.current_stock)} ${ln.U.pu}`}.
-                    Issuing 0 here; raise a PO on <a href="/purchase-orders" className="underline">Purchase Orders</a> immediately.
                   </li>
                 ))}
               </ul>
@@ -2288,7 +2321,11 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                 <tr>
                   <th className="text-left  py-1.5 px-2 font-medium">Material</th>
                   <th className="text-right py-1.5 px-2 font-medium">Requested</th>
-                  <th className="text-right py-1.5 px-2 font-medium" title="Purchased − recipe-consumed (informational only — issuing does not change this)">In Stock*</th>
+                  {/* The old tooltip said "issuing does not change this". Under
+                      deduct-at-issue it is the opposite: the issue IS the central
+                      debit. Left stale, this label would have told the storekeeper
+                      the exact inverse of what the button he is about to press does. */}
+                  <th className="text-right py-1.5 px-2 font-medium" title="Central store book balance. Issuing debits it — a negative figure means issues have outrun recorded purchases, not that the shelf is empty.">In Stock*</th>
                   <th className="text-right py-1.5 px-2 font-medium">Issue Now</th>
                   <th className="text-right py-1.5 px-2 font-medium">Shortfall</th>
                   {raisePo && <>
@@ -2313,8 +2350,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                      it just submitted the seeded number. The value is allowed
                      and recorded as-is; this only makes it visible. */
                   const overIssued = issued - ln.requested > 1e-9;
-                  // Negative-stock guard — disable the input and force qty to 0.
-                  // The accompanying red banner above tells the user to raise a PO.
+                  // Negative BOOK balance — a red flag on the row, NOT a lock on
+                  // the box. It used to disable the input and force 0; that made
+                  // the honest figure untypeable and pushed the line into the PO
+                  // block. It now only drives colour + the "recount pending" label.
                   const negStock = Number(ln.current_stock) < 0;
                   /** Recipe-unit hint under a purchase-lead figure. Takes a qty in
                    *  the LINE's stored unit — same signature as the approve grid's
@@ -2327,7 +2366,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                       <td className="py-1.5 px-2 font-medium">
                         {ln.material_name}
                         {negStock && (
-                          <div className="text-[9px] text-red-700 font-semibold">⚠ Negative stock — raise PO ASAP</div>
+                          <div className="text-[9px] text-red-700 font-semibold">⚠ Store book balance — recount pending</div>
                         )}
                       </td>
                       {/* Approved demand — printed in the unit the HOD approved
@@ -2352,16 +2391,20 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                             approved in. min= stops the spinner walking past zero;
                             a typed/pasted minus is stripped here and the value is
                             clamped at USE (issuedOf), so "2." stays typeable. */}
+                        {/* NOT disabled on a negative book balance. The books
+                            being below 0 says purchases were under-recorded, not
+                            that the shelf is empty — locking the box made the
+                            storekeeper unable to record a handover he had just
+                            physically made. */}
                         <input type="number" step="any" min={0}
-                               value={negStock ? '' : ln.issued_pu}
-                               disabled={negStock}
+                               value={ln.issued_pu}
                                onChange={e => update(i, { issued_pu: e.target.value.replace(/^-/, '') })}
                                title={negStock
-                                 ? 'System stock is negative — cannot issue. Raise a vendor PO immediately.'
+                                 ? `Quantity actually handed over, in ${U.pu || 'units'}. The store book balance is negative (recount pending) — issue what physically left the shelf, not what the books say.`
                                  : `Quantity actually handed over, in ${U.pu || 'units'}. Seeded with the approved qty — type the real figure if more or less left the store.`}
                                className={`w-20 px-1.5 py-1 border rounded text-right text-xs ${
-                                 negStock ? 'border-red-200 bg-red-50/40 cursor-not-allowed'
-                                 : overIssued ? 'border-amber-400 bg-amber-50'
+                                 overIssued ? 'border-amber-400 bg-amber-50'
+                                 : negStock ? 'border-red-300'
                                  : 'border-[#E8D5C4]'}`} />
                         {/* Same warning as before, said in purchase units: the
                             over-issue is measured on the exact stored basis, only

@@ -1,6 +1,7 @@
 import { getDb, recalculateCostsForMaterials } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { upsertUnitLock } from '@/lib/unit-audit-lock';
+import { deptOnHand, postDeptLedger } from '@/lib/dept-ledger';
 
 /**
  * Unit-of-Measure audit.
@@ -211,6 +212,161 @@ export async function GET(request: Request) {
   }
 }
 
+interface DeptRebase {
+  material_id: string; name: string;
+  department_id: string; department_name: string;
+  old_qty: number; new_qty: number; delta: number;
+}
+
+/**
+ * THE DEPARTMENT LEG OF THE PACK-FACTOR REBASE.
+ *
+ * raw_materials.current_stock and department stock are the SAME basis (recipe
+ * units), so a pack-factor change that multiplies central by fNew/fOld has to
+ * multiply every department's holding by the identical ratio, in the identical
+ * transaction. Rebase one rail and not the other and you get the GREEN CURRY
+ * PASTE bug pointed at a kitchen: central reads 5,000 g while the kitchen
+ * holding those same five tins still reads 5, the two rails are 1000× apart,
+ * and the department variance report calls the difference a loss.
+ *
+ * THIS IS NOT A REWRITE OF HISTORY. Every ledger row already posted stays
+ * exactly as it was written — each one is a fact about what physically moved
+ * that day, and re-scaling them would be the retroactive reinterpretation the
+ * no-undo rule forbids. The restatement is ONE signed 'adjustment' row per
+ * (department, material) that carries the BALANCE to the new basis and leaves
+ * the reason on the record; dept-ledger.ts reserves 'adjustment' for precisely
+ * this and for an approved variance count.
+ *
+ * LIQUOR NEEDS NO BRANCH HERE. Store-mapped materials never reach the
+ * department rail at all — the issue path skips both the central debit and the
+ * department credit — so they own no rows for this loop to find and it returns
+ * empty on its own. Do not "helpfully" add a store-mapped lookup: the carve-out
+ * belongs to the caller that moves the stock, and a second opinion about it
+ * here is how two rails start disagreeing about one bottle.
+ *
+ * A THROW FROM HERE IS THE POINT. It runs inside the PUT's db.transaction, so a
+ * refusal from postDeptLedger rolls the whole unit change back — central and
+ * the departments move together or not at all. Wrapping this in a try/catch
+ * that logs and continues is exactly how the 1000× drift comes back.
+ */
+function rebaseDepartmentHoldings(
+  db: ReturnType<typeof getDb>,
+  materialId: string,
+  materialName: string,
+  fOld: number,
+  fNew: number,
+  runId: string,
+  actor?: string,
+): DeptRebase[] {
+  const out: DeptRebase[] = [];
+  if (!(fOld > 0) || !(fNew > 0) || fOld === fNew) return out;
+
+  // THE HOLDER SET MUST MATCH WHAT deptOnHand CAN REPORT A BALANCE FOR, which is
+  // three sources, not one:
+  //   ledger rows      — the department has moved this material;
+  //   cache rows       — a department can only appear here alone if something is
+  //                      already wrong, and skipping it would hide that;
+  //   closing counts   — a counted department holds stock from the moment of the
+  //                      count, with no ledger row of its own. Leaving those out
+  //                      was a measured miss: the count anchors the balance at 5
+  //                      while central rebases to 5,000 and the two rails sit
+  //                      1000× apart with nothing on screen to say why.
+  // Central counts (no department_id) are excluded — they are the central rail,
+  // already handled by the current_stock rebase above.
+  const holders = db.prepare(`
+    SELECT department_id,
+           MAX(outlet_id) AS outlet_id,
+           (SELECT d.name FROM departments d WHERE d.id = department_id) AS department_name
+      FROM (
+        SELECT department_id, outlet_id FROM department_material_transactions WHERE material_id = ?
+        UNION ALL
+        SELECT department_id, outlet_id FROM department_materials         WHERE material_id = ?
+        UNION ALL
+        SELECT department_id, outlet_id FROM closing_stock                WHERE material_id = ?
+           AND department_id IS NOT NULL AND TRIM(department_id) != ''
+      )
+     GROUP BY department_id
+  `).all(materialId, materialId, materialId) as any[];
+
+  // THE ONE FIGURE THIS REBASE IS ABOUT, read the same way before and after.
+  // deptOnHand reports NULL — never 0 — for a pair nobody has counted yet, so
+  // fall back to the signed movement sum inside the window. That is the same
+  // figure assertReversible() caps a give-back with, so leaving it in the old
+  // basis would refuse tomorrow's legitimate undo by a factor of 1,000.
+  // Reading it through ONE helper is what lets the post-condition below compare
+  // like with like; two hand-rolled reads would drift apart the first time the
+  // never-counted rule changes.
+  const readHeld = (deptId: string): number => {
+    const bal = deptOnHand(db, deptId, materialId);
+    return bal.neverCounted ? bal.movementsSince : Number(bal.onHand ?? 0);
+  };
+
+  for (const h of holders) {
+    const deptId = String(h.department_id || '');
+    if (!deptId) continue;
+
+    const held = readHeld(deptId);
+    if (!Number.isFinite(held) || Math.abs(held) < 1e-9) continue;
+
+    // 3dp — the SAME rounding the central newStock uses above, so the two rails
+    // land on one number for one input instead of parting company in the fourth
+    // decimal and tripping the drift check for no physical reason.
+    const restated = Math.round(held * (fNew / fOld) * 1000) / 1000;
+    const delta = Math.round((restated - held) * 1e6) / 1e6;
+    if (Math.abs(delta) < 1e-6) continue;
+
+    try {
+      postDeptLedger(db, {
+        outletId: h.outlet_id || null,
+        departmentId: deptId,
+        materialId,
+        type: 'adjustment',
+        quantity: delta,
+        referenceId: runId,
+        source: 'unit_audit_rebase',
+        notes: `Unit Audit pack-factor rebase ${fOld} → ${fNew}: ${materialName} ${held} → ${restated} (${runId})`,
+        user: actor || '',
+      });
+    } catch (e: any) {
+      // Re-thrown, never swallowed: naming the pair turns an opaque 500 into a
+      // fixable message, and the rollback is what keeps the rails in step.
+      throw new Error(
+        `Unit rebase aborted for ${materialName}: could not restate ` +
+        `${h.department_name || deptId}'s holding (${held} → ${restated}) — ${e?.message || e}`,
+      );
+    }
+
+    // POSTING THE ROW IS NOT THE SAME AS MOVING THE BALANCE, and assuming it is
+    // was a measured bug here. The balance is anchor + movements STRICTLY AFTER
+    // the anchor, and a count anchors at MIN(IST day-end, when it was saved) at
+    // one-second resolution (dept-ledger.ts countAnchorAt / LEDGER_TS_SQL). So a
+    // department counted in the same second as this run — or holding a count row
+    // with no created_at, which anchors at the day's end and therefore in the
+    // future — swallows the adjustment: the cache takes the +4,995, the balance
+    // keeps reading 5, and the two rails sit 1000× apart with only the drift
+    // check to notice. Assert the restatement actually took, and refuse if it
+    // did not: the throw rolls the whole PUT back, so central does not move
+    // either and the rails stay in step. Downgrading this to a console.warn
+    // re-opens exactly the GREEN CURRY PASTE split, one kitchen at a time.
+    const landed = readHeld(deptId);
+    if (Math.abs(landed - restated) > Math.max(1e-3, Math.abs(restated) * 1e-9)) {
+      throw new Error(
+        `Unit rebase aborted for ${materialName}: ${h.department_name || deptId} still reads ` +
+        `${landed} after the correction (expected ${restated}). Its stock is anchored by a count ` +
+        `dated at or after this run, which excludes the correction from the balance. ` +
+        `Re-save the unit change after that count's timestamp, or re-count the department first.`,
+      );
+    }
+
+    out.push({
+      material_id: materialId, name: materialName,
+      department_id: deptId, department_name: String(h.department_name || deptId),
+      old_qty: held, new_qty: restated, delta,
+    });
+  }
+  return out;
+}
+
 /**
  * Bulk update units / categories.
  * body: { updates: [{ id, recipe_unit?, purchase_unit?, category? }] }
@@ -263,6 +419,10 @@ export async function PUT(request: Request) {
       return p > 1 && un !== pn ? p : 1;
     };
     const rebased: Array<{ id: string; name: string; old_avg: number; new_avg: number; old_stock: number; new_stock: number }> = [];
+    const deptRebased: DeptRebase[] = [];
+    // One id for this save, stamped on every ledger row it causes, so the owner
+    // can ask "what did that audit run do to my kitchens" and get one answer.
+    const runId = `unit-audit:${new Date().toISOString()}`;
     const txn = db.transaction(() => {
       for (const u of updates) {
         if (!u?.id) continue;
@@ -286,12 +446,21 @@ export async function PUT(request: Request) {
         if (before) {
           const fOld = factorOf(before.unit, before.purchase_unit, before.pack_size);
           const fNew = factorOf(recipeUnit ?? before.unit, purchaseUnit ?? before.purchase_unit, packSize ?? before.pack_size);
-          if (fOld !== fNew && ((Number(before.average_price) || 0) !== 0 || (Number(before.current_stock) || 0) !== 0)) {
-            const newAvg   = Math.round(((Number(before.average_price) || 0) * fOld / fNew) * 10000) / 10000;
-            const newStock = Math.round(((Number(before.current_stock) || 0) * fNew / fOld) * 1000) / 1000;
-            db.prepare('UPDATE raw_materials SET average_price = ?, current_stock = ? WHERE id = ?').run(newAvg, newStock, u.id);
-            rebased.push({ id: u.id, name: before.name, old_avg: Number(before.average_price) || 0, new_avg: newAvg,
-                           old_stock: Number(before.current_stock) || 0, new_stock: newStock });
+          if (fOld !== fNew) {
+            if ((Number(before.average_price) || 0) !== 0 || (Number(before.current_stock) || 0) !== 0) {
+              const newAvg   = Math.round(((Number(before.average_price) || 0) * fOld / fNew) * 10000) / 10000;
+              const newStock = Math.round(((Number(before.current_stock) || 0) * fNew / fOld) * 1000) / 1000;
+              db.prepare('UPDATE raw_materials SET average_price = ?, current_stock = ? WHERE id = ?').run(newAvg, newStock, u.id);
+              rebased.push({ id: u.id, name: before.name, old_avg: Number(before.average_price) || 0, new_avg: newAvg,
+                             old_stock: Number(before.current_stock) || 0, new_stock: newStock });
+            }
+            // The department leg sits OUTSIDE the price/stock test on purpose.
+            // Central having nothing on the shelf says nothing about what the
+            // kitchens hold, and a material the store has fully issued out is
+            // the most likely one to sit at current_stock 0 with a department
+            // still holding the goods. Gating this behind central's numbers
+            // would leave exactly those departments 1000× out.
+            deptRebased.push(...rebaseDepartmentHoldings(db, u.id, before.name, fOld, fNew, runId, me?.email));
           }
         }
         // Snapshot the FULL post-update row to unit_audit_locks so the curation
@@ -313,7 +482,11 @@ export async function PUT(request: Request) {
       recalculateCostsForMaterials(db, updates.map((u: any) => u?.id));
     });
     txn();
-    return Response.json({ success: true, updated, rebased });
+    // dept_rebased is additive: the page reads `rebased` and must keep working
+    // untouched. It is reported rather than left silent because a department
+    // balance changing by 1000× without a line of explanation is the exact
+    // "numbers moved on their own" complaint the central rebase note answers.
+    return Response.json({ success: true, updated, rebased, dept_rebased: deptRebased });
   } catch (e: any) {
     return Response.json({ error: e.message }, { status: 500 });
   }

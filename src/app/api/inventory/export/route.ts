@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { packFactor } from '@/lib/pack-units';
+import { cutoverAt } from '@/lib/dept-ledger';
 
 /**
  * Export every raw_material as a round-trip CSV — every editable field
@@ -14,6 +15,14 @@ import { packFactor } from '@/lib/pack-units';
  * NOTE: includes inactive rows too so a user can re-activate by editing
  * `is_active` from 0 → 1 in the spreadsheet. Excluding them would silently
  * drop them on the round-trip.
+ *
+ * LAYOUT (deliberate, see HEADER_ALIASES and the `_note` block below):
+ *   line 1 = headers, `_note` first
+ *   line 2 = the banner row — one sentence saying this sheet is CENTRAL STORE
+ *            stock only, and every other cell blank
+ *   line 3+ = the materials
+ * The banner is a ROW and not a line above the headers because line 1 IS the
+ * header row to the re-upload parser.
  */
 export const dynamic = 'force-dynamic';
 
@@ -44,6 +53,88 @@ const COLUMNS = [
   'storage_location',
   'shelf_life_days',
 ];
+
+/**
+ * Presentation-only header renames: the KEY is the real raw_materials column
+ * (it goes into the SELECT and indexes every row), the VALUE is what the
+ * spreadsheet says. Kept apart on purpose — aliasing in SQL instead would force
+ * every `r[c]` lookup below onto the display name, and the next person adding a
+ * column would have to know that.
+ *
+ * WHY current_stock READS central_stock: since the department cutover a
+ * requisition issue debits central at the MOMENT OF ISSUE, so this number is
+ * the central store's own holding — grams sitting on a kitchen's shelf are no
+ * longer inside it. The value did not change basis (still RECIPE units, still
+ * the same column) but its MEANING did, and a column that keeps its old name
+ * while its number falls by a third is exactly how a manager concludes the app
+ * has broken. The rename is half the answer; the `_note` banner is the other.
+ *
+ * SAFE ON THE ROUND TRIP, and this is load-bearing rather than lucky:
+ * round-trip-import only ever writes FIELD_TYPES / WRITABLE_FIELDS
+ * (round-trip-import/route.ts:39-51) and current_stock has never been in it —
+ * the column is informational on the way back in, so no rename here can change
+ * what an upload writes. Do NOT alias a WRITABLE column: the importer matches
+ * on header NAME, so renaming e.g. average_price would silently stop that
+ * column being imported at all, with no error anywhere.
+ */
+const HEADER_ALIASES: Record<string, string> = {
+  current_stock: 'central_stock',
+};
+const headerLabel = (c: string) => HEADER_ALIASES[c] ?? c;
+
+/**
+ * THE BANNER COLUMN. `_note` holds one sentence, in one row (the first data
+ * row), telling whoever opens the sheet why central_stock dropped.
+ *
+ * DO NOT "simplify" this into a comment line above the header. The inventory
+ * page re-uploads this exact file with Papa.parse({ header: true })
+ * (src/app/inventory/page.tsx:677), which takes LINE 1 as the header row. A
+ * preamble line would BECOME the header, every real column would disappear,
+ * and Export → edit → Re-upload would break for the whole catalog.
+ *
+ * WHY THE TEXT SITS UNDER `_note` AND NOT UNDER `id` — the page keeps only rows
+ * matching `(r.id || r.name)` (page.tsx:681). The banner is blank in both, so it
+ * is dropped before the request is even built; and if some other caller ever
+ * posts it anyway the server skips it on the empty name (round-trip-import
+ * route.ts:155-156). Two independent guards. Parked under `id` or `name` it
+ * would survive the filter and report "Skipped 1" on every import forever;
+ * parked under `sku` it would enter the duplicate-SKU pre-scan
+ * (round-trip-import route.ts:136-150) and abort any file a manager built by
+ * concatenating two exports. `_note` is in no importer field list at all, so
+ * even the impossible path writes nothing.
+ */
+const NOTE_COLUMN = '_note';
+
+/**
+ * The banner sentence. Reads the ONE cutover boundary
+ * (settings.dept_ledger_cutover_at via cutoverAt) rather than hard-coding or
+ * re-deriving a date — a second copy of that timestamp is how two different
+ * "history excluded" dates end up on screen. Before the cutover is run the
+ * stamp is '' and the wording changes, because claiming a re-basing date that
+ * has not happened is worse than saying it has not happened.
+ *
+ * Note what this does NOT claim: the issue-time debit is unconditional from
+ * this release, NOT from the cutover. Only the re-basing count and the
+ * department balances start at the cutover.
+ */
+function centralStockNote(db: ReturnType<typeof getDb>): string {
+  const d = cutoverAt(db).slice(0, 10);
+  const base =
+    'NOTE — "central_stock" is the CENTRAL STORE holding only. Goods issued on a requisition are '
+    + 'deducted from central the moment the store issues them and are carried on the receiving '
+    + "department's ledger instead (Inventory > Department Stock), so they are NOT in this column. "
+    + 'It was named "current_stock" in earlier exports, when it still included them.';
+  const boundary = d
+    ? ` Central was re-based to a physical count at the department cutover on ${d}, and issues dated `
+      + `before ${d} were never deducted from it, so this column is not comparable with an export taken `
+      + `before ${d} — the fall is stock that now sits with the departments, not a loss.`
+    : ' The department cutover has not been run yet, so central has not been re-based to a physical'
+      + ' count and this column will keep falling as issues are deducted. Treat it as not comparable'
+      + ' with earlier exports until the cutover count is taken.';
+  return base + boundary
+    + ' This column, and every column ending "_purchase_unit", are informational: re-uploading this'
+    + ' file never writes them.';
+}
 
 function csvEscape(v: any): string {
   if (v == null) return '';
@@ -94,7 +185,20 @@ export async function GET() {
     // twins the importer ignores (not in WRITABLE_FIELDS), so a manager reading
     // the sheet sees the same numbers the screen shows without being able to
     // corrupt the stored basis by editing the wrong cell.
-    lines.push([...COLUMNS, 'avg_price_per_purchase_unit', 'current_stock_purchase_unit', 'reorder_level_purchase_unit'].join(','));
+    // central_stock_purchase_unit is the PURCHASE-unit twin of central_stock and
+    // was renamed with it — same reason, same basis, and equally inert on the way
+    // back in: the importer's twin pre-scan reads only the ₹ and reorder twins
+    // (round-trip-import/route.ts:77-78), never the stock one.
+    const headers = [
+      NOTE_COLUMN,
+      ...COLUMNS.map(headerLabel),
+      'avg_price_per_purchase_unit', 'central_stock_purchase_unit', 'reorder_level_purchase_unit',
+    ];
+    lines.push(headers.join(','));
+    // Banner row: the note under `_note`, every other cell blank and padded to
+    // the full width so Excel keeps the columns aligned and the sentence
+    // overflows across the empty cells instead of being clipped.
+    lines.push([csvEscape(centralStockNote(db)), ...Array(headers.length - 1).fill('')].join(','));
     for (const r of rows) {
       // packFactor IS the both-halves guard (pack_size > 1 AND recipe unit ≠
       // purchase unit) — imported, never re-derived, so this sheet can't drift
@@ -110,7 +214,9 @@ export async function GET() {
       const reorderPU = packed
         ? Math.round(((r.reorder_level || 0) / pack) * 1000) / 1000
         : (r.reorder_level ?? 0);
-      lines.push([...COLUMNS.map(c => csvCell(c, r[c])), csvEscape(perPU), csvEscape(stockPU), csvEscape(reorderPU)].join(','));
+      // Leading '' = the empty `_note` cell. Every row carries it so the data
+      // stays under the headers; only the banner row above fills it.
+      lines.push(['', ...COLUMNS.map(c => csvCell(c, r[c])), csvEscape(perPU), csvEscape(stockPU), csvEscape(reorderPU)].join(','));
     }
     const csv = lines.join('\n') + '\n';
 
