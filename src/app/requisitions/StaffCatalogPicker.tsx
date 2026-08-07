@@ -641,7 +641,23 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
                   <div className="shrink-0 flex items-center gap-1 bg-blue-50 border border-blue-200 rounded-lg">
                     <button onClick={() => setQty(m, qty - 1)} aria-label={`Decrease ${m.name}`}
                             className="px-2.5 py-2 text-blue-700"><Minus className="w-4 h-4" /></button>
-                    <span className="min-w-[2ch] text-center text-sm font-bold text-[#2D1B0E] tabular-nums">{qty}</span>
+                    {/* TYPEABLE, not a read-only count. This is the control the owner
+                        was looking at when he reported req 68: a +/- stepper cannot
+                        express 0.2 kg, and the span it replaces could not be edited at
+                        all. Mirrors the cart row below — same qtyText buffer, so a
+                        half-typed "0." survives the keystroke instead of being parsed
+                        to 0 and deleting the line. */}
+                    <input type="number" step="any" min={0}
+                           aria-label={`Quantity for ${m.name}`}
+                           value={qtyText[m.id] ?? String(qty)}
+                           onChange={e => {
+                             const v = e.target.value;
+                             setQtyText(p => ({ ...p, [m.id]: v }));
+                             const n = Number(v);
+                             if (v.trim() !== '' && Number.isFinite(n) && n > 0) setQty(m, n);
+                           }}
+                           onBlur={() => setQtyText(p => { const n = { ...p }; delete n[m.id]; return n; })}
+                           className="w-16 text-center text-sm font-bold text-[#2D1B0E] tabular-nums bg-transparent border-0 focus:outline-none" />
                     <button onClick={() => setQty(m, qty + 1)} aria-label={`Increase ${m.name}`}
                             className="px-2.5 py-2 text-blue-700"><Plus className="w-4 h-4" /></button>
                   </div>
@@ -721,9 +737,18 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
                       <div className="shrink-0 flex items-center gap-1 bg-blue-50 border border-blue-200 rounded-lg">
                         <button onClick={() => setQty(m, qty - 1)} disabled={saving} aria-label={`Decrease ${m.name}`}
                                 className="px-2 py-1.5 text-blue-700"><Minus className="w-3.5 h-3.5" /></button>
-                        {isParty ? (
-                          // Parties order fractional quantities (2.5 kg paneer) that
-                          // whole-step buttons can't express.
+                        {(
+                          // TYPEABLE FOR EVERY REQUISITION, NOT JUST PARTIES.
+                          // This input was originally added for parties alone —
+                          // "fractional quantities (2.5 kg paneer) that whole-step
+                          // buttons can't express" — and internal requisitions were
+                          // left with a read-only span between +/- buttons. That is
+                          // exactly the same problem: a kitchen asking for 200 g of
+                          // lemon grass needs 0.2 kg, and a +1 stepper cannot say it.
+                          // The owner reported it as "the system only allows whole
+                          // numbers" (req 68). The column is REAL and the server does
+                          // no rounding, so the ONLY thing that blocked a decimal was
+                          // this control. Do NOT re-gate it on isParty.
                           <input type="number" step="any" min={0} disabled={saving}
                                  aria-label={`Quantity for ${m.name}`}
                                  value={qtyText[m.id] ?? String(qty)}
@@ -735,8 +760,6 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
                                  }}
                                  onBlur={() => setQtyText(p => { const n = { ...p }; delete n[m.id]; return n; })}
                                  className="w-14 text-center text-xs font-bold tabular-nums bg-transparent border-0 focus:outline-none" />
-                        ) : (
-                          <span className="min-w-[2ch] text-center text-xs font-bold tabular-nums">{qty}</span>
                         )}
                         <button onClick={() => setQty(m, qty + 1)} disabled={saving} aria-label={`Increase ${m.name}`}
                                 className="px-2 py-1.5 text-blue-700"><Plus className="w-3.5 h-3.5" /></button>
