@@ -49,23 +49,30 @@ const catKey = (s: unknown) => String(s || '').trim().toLowerCase().replace(/[\s
 /** Round to paisa. Every derived money figure on this form goes through here. */
 const r2 = (v: number) => Math.round((Number(v) || 0) * 100) / 100;
 
-/* GRN Inward line (entry form). The seven ₹ charge fields mirror the sheet:
-   Discount, CGST, SGST, Special Excise Cess, TCS, Delivery Charges, MRP Round Off.
+/* GRN Inward line (entry form). The seven hand-typed ₹ charge fields mirror the
+   sheet: Discount, CGST, SGST, Special Excise Cess, TCS, Delivery Charges, MRP
+   Round Off. GST COMPENSATION CESS is the eighth charge and is DERIVED ONLY —
+   it has a rate box and no ₹ box (see cess_rate below).
    SUBTOTAL = received × rate; TOTAL INWARD = subtotal − discount + cgst + sgst
-   + cess + tcs + delivery + round-off.
-   gst_rate is a WIRE/UI field only — like /api/purchases, the purchases table
-   stores the derived rupees, never the rate. Kept as a raw STRING so a decimal
-   stays typeable and '' can mean "Manual (type the ₹ yourself)". */
+   + comp. cess + special excise cess + tcs + delivery + round-off.
+   gst_rate / cess_rate are WIRE/UI fields only — like /api/purchases, the stored
+   row carries the derived rupees, never the rate. Kept as raw STRINGs so a
+   decimal stays typeable and '' can mean "no rate on this line".
+   For gst_rate '' additionally means "Manual (type the ₹ yourself)"; cess_rate
+   has no manual counterpart, so '' there simply means no cess.
+   THE TWO RATES DO NOT SHARE A TAXABLE BASE — see lineTax / lineCess. */
 interface GrnLine {
   material_id: string; quantity_received: string; quantity_accepted: string;
   rejection_reason: string; unit_price: string; notes: string;
   gst_rate: string;
+  /** GST compensation cess %, seeded from raw_materials.cess_percent. */
+  cess_rate: string;
   discount: string; cgst: string; sgst: string; special_excise_cess: string;
   tcs: string; delivery_charges: string; mrp_round_off: string;
 }
 const blankLine = (): GrnLine => ({
   material_id: '', quantity_received: '', quantity_accepted: '', rejection_reason: '', unit_price: '', notes: '',
-  gst_rate: '',
+  gst_rate: '', cess_rate: '',
   discount: '', cgst: '', sgst: '', special_excise_cess: '', tcs: '', delivery_charges: '', mrp_round_off: '',
 });
 const n0 = (s?: string) => { const v = Number(s); return Number.isFinite(v) ? v : 0; };
@@ -74,15 +81,22 @@ const lineSubtotal = (l: GrnLine) => n0(l.quantity_received) * n0(l.unit_price);
 /** TOTAL INWARD AMOUNT for a line (same formula the server + register use).
  *  `tax` overrides the two hand-typed ₹ boxes with the figures derived from the
  *  line's GST% — pass it wherever a rate is in play, or the screen total lags
- *  the rate the clerk just picked. Every other term is untouched. */
-const lineTotal = (l: GrnLine, tax?: { cgst: number; sgst: number }) =>
+ *  the rate the clerk just picked. Every other term is untouched.
+ *  `cess` is the GST COMPENSATION CESS ₹ (lineCess().cess). It has no hand-typed
+ *  box to fall back on — there is no `l.compensation_cess` — so it is always
+ *  passed in or absent, and it is a SEPARATE term: never folded into cgst/sgst
+ *  (that sum is a GST-return figure) and never into special_excise_cess (that
+ *  column means the TGBCL levy). */
+const lineTotal = (l: GrnLine, tax?: { cgst: number; sgst: number }, cess?: number) =>
   lineSubtotal(l) - n0(l.discount) + (tax ? tax.cgst : n0(l.cgst)) + (tax ? tax.sgst : n0(l.sgst))
+  + (cess || 0)
   + n0(l.special_excise_cess)
   + n0(l.tcs) + n0(l.delivery_charges) + n0(l.mrp_round_off);
 /** Same TOTAL formula for a saved GRN item row (server fields). */
 const itemInwardTotal = (it: any) =>
   (Number(it.quantity_received) || 0) * (Number(it.unit_price) || 0)
   - (Number(it.discount) || 0) + (Number(it.cgst) || 0) + (Number(it.sgst) || 0)
+  + (Number(it.compensation_cess) || 0)
   + (Number(it.special_excise_cess) || 0) + (Number(it.tcs) || 0)
   + (Number(it.delivery_charges) || 0) + (Number(it.mrp_round_off) || 0);
 
@@ -142,15 +156,20 @@ export default function GrnPage() {
       // signed numbers (negative MRP round-off, back-correction qtys/totals)
       // stay as real numbers Excel can sum (not text). Number('') is 0 → fine.
       const clean = (v: any) => { let s = String(v ?? ''); if (/^[=+\-@]/.test(s) && !Number.isFinite(Number(s))) s = "'" + s; return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+      // COMPENSATION CESS sits between SGST and SPECIAL EXCISE CESS — the order
+      // db.ts's Total Inward term list uses. The two "cess" columns are different
+      // levies and must never be read as one: COMPENSATION CESS is the GST-regime
+      // cess (raw_materials.cess_percent, charged on the gross line value before
+      // discount), SPECIAL EXCISE CESS is the TGBCL liquor levy off the store bill.
       const header = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
         'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
-        'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
+        'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
         'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE'];
       const lines = [header.join(',')];
       for (const r of rows) lines.push([
         r.grn_number, r.invoice_number, r.inward_date, r.supplier, r.category_name, r.item_name,
         r.po_qty, r.inward_qty, r.purchase_unit, r.rate, r.subtotal, r.discount, r.cgst, r.sgst,
-        r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
+        r.compensation_cess, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
         r.quantity_accepted, r.quantity_rejected, r.rejection_reason, r.status, r.received_by, r.invoice_date,
       ].map(clean).join(','));
       const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
@@ -374,6 +393,12 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
                     <th className="text-right py-1 px-2 font-medium">Discount</th>
                     <th className="text-right py-1 px-2 font-medium">CGST</th>
                     <th className="text-right py-1 px-2 font-medium">SGST</th>
+                    {/* Two DIFFERENT levies, side by side on purpose: Comp. Cess is
+                        the GST-regime compensation cess (material master's Cess %),
+                        Sp. Excise Cess is the TGBCL liquor levy. Total Inward now
+                        carries both, so both have to be printed or the row's own
+                        breakdown no longer adds up to the total beside it. */}
+                    <th className="text-right py-1 px-2 font-medium" title="GST compensation cess — a separate levy from CGST/SGST, charged on the gross line value before discount.">Comp. Cess</th>
                     <th className="text-right py-1 px-2 font-medium">Sp. Excise Cess</th>
                     <th className="text-right py-1 px-2 font-medium">TCS</th>
                     <th className="text-right py-1 px-2 font-medium">Delivery</th>
@@ -405,6 +430,7 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
                       {chargeCell(it.discount)}
                       {chargeCell(it.cgst)}
                       {chargeCell(it.sgst)}
+                      {chargeCell(it.compensation_cess)}
                       {chargeCell(it.special_excise_cess)}
                       {chargeCell(it.tcs)}
                       {chargeCell(it.delivery_charges)}
@@ -420,7 +446,11 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
                   <tr>
                     <td className="py-1.5 px-2" colSpan={6}>{detail.items.length} line(s)</td>
                     <td className="py-1.5 px-2 text-right font-mono">{m2(detail.items.reduce((s: number, it: any) => s + (Number(it.subtotal) || 0), 0))}</td>
-                    <td className="py-1.5 px-2 text-right font-mono" colSpan={7}></td>
+                    {/* Spans the CHARGE columns: discount, cgst, sgst, comp. cess,
+                        sp. excise cess, tcs, delivery, round-off — eight since
+                        Comp. Cess was added. Under-count and the Total Inward
+                        figure slides left out of its own column. */}
+                    <td className="py-1.5 px-2 text-right font-mono" colSpan={8}></td>
                     <td className="py-1.5 px-2 text-right font-mono text-[#af4408]">{m2(detail.items.reduce((s: number, it: any) => s + (Number(it.total_inward_amount) || 0), 0))}</td>
                     <td colSpan={3}></td>
                   </tr>
@@ -569,6 +599,30 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   };
 
   /**
+   * The COMPENSATION CESS % a line should START at — raw_materials.cess_percent,
+   * the other half of the same reported bug ("GST % and Cess % are added in the
+   * Raw Material Master, but they are not picking automatically"). Seeds exactly
+   * like the GST rate above, and the TGBCL refusal is identical: a store-mapped
+   * line's duty rides on the store's own bill, so no rate may be seeded onto it.
+   *
+   * ONE DELIBERATE DIFFERENCE from seedGstForMaterial, transcribed from the
+   * shipped bill form (purchases/page.tsx:498-512): there is NO GST_RATES
+   * membership test. That test exists only because the GST control is a <select>
+   * — a value matching no <option> renders blank and the clerk reads 0%. The cess
+   * control here is a free number input (mirroring the master's own free 0-100
+   * field), so any in-range value renders honestly and refusing e.g. 12.5 would
+   * silently drop real money. Only non-finite / <=0 / >100 are refused.
+   */
+  const seedCessForMaterial = (materialId: string): string => {
+    if (!materialId) return '';
+    if (storeMappedLine(materialId)) return '';
+    const m = materials.find(x => x.id === materialId) as any;
+    const c = Number(m?.cess_percent);
+    if (!Number.isFinite(c) || c <= 0 || c > 100) return '';
+    return String(c);
+  };
+
+  /**
    * Per-line tax, derived. Pure — reads the line, writes nothing, so the display
    * can never drift from what submit() sends.
    *
@@ -600,6 +654,46 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     const sgst = Math.floor(taxPaise / 2) / 100;
     const cgst = r2(tax - sgst);
     return { rate, taxable, tax, cgst, sgst, derived };
+  };
+
+  /**
+   * Per-line GST COMPENSATION CESS, derived. Pure, like lineTax.
+   *
+   * ⚠ ITS TAXABLE BASE IS NOT lineTax's. THIS IS NOT A BUG AND MUST NOT BE
+   * "SIMPLIFIED" INTO ONE EXPRESSION:
+   *     GST  → accepted × rate − discount   (POST-discount, see lineTax above)
+   *     CESS → accepted × rate              (GROSS, BEFORE discount)
+   * The owner ruled the two bases apart for this requirement: on 10 kg @ ₹100
+   * with a ₹100 discount, GST 18% is charged on ₹900 (= ₹162) while cess 12% is
+   * charged on ₹1,000 (= ₹120). The server computes the same two bases from the
+   * same two variables (api/grn/route.ts: `grossTax` for cess, `taxable` for
+   * GST), so screen and stored row agree by construction. Collapse them and the
+   * screen quietly under-charges cess on every discounted line.
+   *
+   * Everything else is inherited from lineTax verbatim: ACCEPTED qty (not
+   * received) with the same `> 0 ? … : 0` clamp, so a fully-rejected line and a
+   * negative back-correction both carry ₹0 cess exactly as they carry ₹0 GST;
+   * and store-mapped (TGBCL) lines derive nothing at all.
+   *
+   * Whole paise, byte-identical in shape to api/purchases/route.ts's cess
+   * expression — the ÷100 for percent and the ×100 for paise cancel, which is
+   * why there is no /100 in sight. NEVER halved and NEVER added into cgst/sgst:
+   * compensation cess is a separate levy and the house invariant
+   * tax_value === cgst + sgst is not its business.
+   *
+   * rate-basis: `base` is ₹ (accepted PURCHASE-unit qty × ₹ per PURCHASE unit,
+   * the same product lineTax uses); `rate` is a PERCENT, not a ₹ rate — the
+   * product is paise, resolved by the /100 below.
+   */
+  const lineCess = (l: GrnLine) => {
+    const derived = l.cess_rate !== '' && !storeMappedLine(l.material_id);
+    const qa = l.quantity_accepted !== '' ? n0(l.quantity_accepted) : n0(l.quantity_received);
+    const q = qa > 0 ? qa : 0;
+    const base = r2(q * n0(l.unit_price));          // GROSS — no discount subtracted
+    if (!derived) return { rate: 0, base, cess: 0, derived };
+    const rate = parseFloat(l.cess_rate) || 0;
+    const cessPaise = rate > 0 ? Math.max(0, Math.round(base * rate)) : 0;
+    return { rate, base, cess: cessPaise / 100, derived };
   };
 
   // When a vendor is picked, fetch their MAPPED materials (vendor_materials
@@ -662,7 +756,18 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     const prevSeed = seedGstForMaterial(cur.material_id);
     const keep = !(cur.gst_rate === '' || cur.gst_rate === prevSeed)
       || n0(cur.cgst) !== 0 || n0(cur.sgst) !== 0;
-    updateLine(i, { material_id: id, gst_rate: keep ? cur.gst_rate : seedGstForMaterial(id) });
+    // Compensation cess re-seeds under the SAME "still machine-set?" test, judged
+    // against ITS OWN previous seed. The `|| n0(cgst) !== 0 || n0(sgst) !== 0`
+    // clause above has NO cess analogue and must not be given one: it guards the
+    // two hand-typed ₹ boxes, and cess has no ₹ box on any surface — its rupees
+    // are derived from the rate and nowhere else.
+    const prevCessSeed = seedCessForMaterial(cur.material_id);
+    const keepCess = !(cur.cess_rate === '' || cur.cess_rate === prevCessSeed);
+    updateLine(i, {
+      material_id: id,
+      gst_rate:  keep     ? cur.gst_rate  : seedGstForMaterial(id),
+      cess_rate: keepCess ? cur.cess_rate : seedCessForMaterial(id),
+    });
   };
 
   const submit = async () => {
@@ -724,6 +829,12 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             // the authority (as /api/purchases and PO Receive already are).
             // undefined on a Manual line → the server keeps the hand-typed ₹.
             gst_rate:            i.gst_rate === '' ? undefined : Number(i.gst_rate),
+            // The COMPENSATION CESS % rides along the same way, and ONLY the
+            // percent does: no compensation_cess ₹ figure is sent. Unlike
+            // cgst/sgst there is no legacy client posting one, so the server is
+            // the sole author of that rupee and no payload can write money this
+            // line's goods value cannot justify. undefined → no cess on the line.
+            cess_rate:           i.cess_rate === '' ? undefined : Number(i.cess_rate),
             // GRN Inward per-line charges (₹). Blank → 0 on the server.
             // cgst/sgst come from lineTax so what was on screen is what is sent —
             // on a rated line these are DERIVED, never the stale box contents.
@@ -1001,13 +1112,24 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                               GST {it.gst_rate}%
                             </span>
                           )}
+                          {/* Same reason as the GST badge: the panel is collapsed by
+                              default, so a cess rate seeded from the master would
+                              otherwise move the row total with nothing on screen
+                              explaining it. Its own badge, never merged into the GST
+                              one — they are separate levies on different bases. */}
+                          {it.cess_rate !== '' && !storeMappedLine(it.material_id) && (
+                            <span className="px-1.5 py-0.5 rounded border border-violet-200 bg-violet-50 text-violet-800 text-[10px] font-semibold"
+                                  title="Compensation cess% on this line — from the material master (Cess %), charged on the gross line value before discount. Editable in the charges panel.">
+                              Cess {it.cess_rate}%
+                            </span>
+                          )}
                           <button type="button" onClick={() => toggleCharges(i)}
                                   className={`px-1.5 py-0.5 rounded border text-[10px] flex items-center gap-1 ${
                                     openCharges.has(i) ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
                             <Percent className="w-2.5 h-2.5" /> {openCharges.has(i) ? 'hide' : 'charges'}
                           </button>
                           <span className="font-mono font-semibold text-[#2D1B0E] min-w-[64px] text-right">
-                            {(n0(it.quantity_received) && n0(it.unit_price)) ? `₹${lineTotal(it, lineTax(it)).toLocaleString('en-IN', { maximumFractionDigits: 2 })}` : '—'}
+                            {(n0(it.quantity_received) && n0(it.unit_price)) ? `₹${lineTotal(it, lineTax(it), lineCess(it).cess).toLocaleString('en-IN', { maximumFractionDigits: 2 })}` : '—'}
                           </span>
                         </div>
                       </td>
@@ -1025,6 +1147,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                 ['delivery_charges', 'Delivery Charges'], ['mrp_round_off', 'MRP Round Off'],
                               ] as const).map(([k, label]) => {
                                 const tx = lineTax(it);
+                                const cs = lineCess(it);
                                 const isTaxBox = k === 'cgst' || k === 'sgst';
                                 return (
                                 <Fragment key={k}>
@@ -1059,6 +1182,48 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                     )}
                                   </label>
                                 )}
+                                {/* COMPENSATION CESS sits between the GST pair and the
+                                    TGBCL Special Excise Cess box, so the reading order
+                                    matches the Total Inward term order and the two
+                                    "cess" controls are visibly different levies.
+                                    A RATE box and a DERIVED ₹ readout — there is no
+                                    hand-typed cess ₹ anywhere in this app, which is
+                                    why the rate box needs no Manual escape hatch. */}
+                                {k === 'special_excise_cess' && (
+                                  <>
+                                    <label className="flex flex-col gap-0.5 text-[9px] uppercase tracking-wide text-[#8B7355]">
+                                      Cess %
+                                      {storeMappedLine(it.material_id) ? (
+                                        // Same refusal as GST%: this material belongs to a
+                                        // store location, where the duty is charged on the
+                                        // store's own bill. A cess% here would be money
+                                        // that was never levied on this receipt.
+                                        <div className="text-[10px] text-blue-700 leading-tight normal-case px-1.5 py-1">
+                                          0%
+                                          <span className="block text-[9px] text-[#8B7355]">store item — cess rides on the TGBCL bill</span>
+                                        </div>
+                                      ) : (
+                                        // A FREE number box, not a <select>: compensation cess
+                                        // has no fixed rate card, the master's own field is a
+                                        // free 0-100, and refusing e.g. 12.5 would silently
+                                        // drop real money.
+                                        <input type="number" step="0.01" min={0} max={100}
+                                               value={it.cess_rate}
+                                               onChange={e => updateLine(i, { cess_rate: e.target.value })}
+                                               placeholder="0"
+                                               title="GST compensation cess %, seeded from the material master (Cess %). Editable — the printed vendor bill wins. Charged on the GROSS line value BEFORE discount, which is NOT the base GST uses."
+                                               className="px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs bg-white text-[#2D1B0E] normal-case" />
+                                      )}
+                                    </label>
+                                    <label className="flex flex-col gap-0.5 text-[9px] uppercase tracking-wide text-[#8B7355]">
+                                      Compensation Cess
+                                      <input type="number" step="any" readOnly value={cs.cess.toFixed(2)}
+                                             title="Derived from Cess % — the server re-derives the same figure and is the authority. Never added into CGST/SGST."
+                                             className="px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs text-[#2D1B0E] normal-case bg-[#F3EEE7] cursor-not-allowed" />
+                                      <span className="text-[8px] text-[#8B7355] normal-case">derived from Cess %</span>
+                                    </label>
+                                  </>
+                                )}
                                 <label className="flex flex-col gap-0.5 text-[9px] uppercase tracking-wide text-[#8B7355]">
                                   {label}
                                   <input type="number" step="any"
@@ -1087,7 +1252,17 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                   Taxable (accepted, after discount) <b className="text-[#2D1B0E] font-mono">₹{lineTax(it).taxable.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</b>
                                 </span>
                               )}
-                              <span>Total Inward <b className="text-[#af4408] font-mono">₹{lineTotal(it, lineTax(it)).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</b></span>
+                              {lineCess(it).derived && (
+                                // Printed BESIDE the taxable figure, not instead of it,
+                                // because on a discounted line the two are DIFFERENT
+                                // numbers and that is deliberate: cess is charged on the
+                                // gross, GST after the discount. Shown side by side so a
+                                // reader checking the bill sees the rule rather than a bug.
+                                <span title="Compensation cess is charged on the accepted quantity BEFORE the discount — a different base from GST, on purpose.">
+                                  Cess base (accepted, before discount) <b className="text-[#2D1B0E] font-mono">₹{lineCess(it).base.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</b>
+                                </span>
+                              )}
+                              <span>Total Inward <b className="text-[#af4408] font-mono">₹{lineTotal(it, lineTax(it), lineCess(it).cess).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</b></span>
                             </div>
                           </div>
                         </td>
@@ -1104,7 +1279,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                   const filled = items.filter(ln => ln.material_id && (parseFloat(ln.quantity_received) || 0) !== 0);
                   const totRec = items.reduce((s, ln) => s + (parseFloat(ln.quantity_received) || 0), 0);
                   const totAcc = items.reduce((s, ln) => s + (parseFloat(ln.quantity_accepted) || parseFloat(ln.quantity_received) || 0), 0);
-                  const totInward = items.reduce((s, ln) => s + (ln.material_id ? lineTotal(ln, lineTax(ln)) : 0), 0);
+                  const totInward = items.reduce((s, ln) => s + (ln.material_id ? lineTotal(ln, lineTax(ln), lineCess(ln).cess) : 0), 0);
                   const lineCount = filled.length;
                   if (lineCount === 0) return null;
                   // A qty total only exists when every filled line is in the SAME

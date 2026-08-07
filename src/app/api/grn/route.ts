@@ -16,7 +16,7 @@ import { checkPurchaseDate } from '@/lib/purchase-guard';
  *     date, vendor_id?, vendor, invoice_number?, invoice_date?, qc_by?, notes?,
  *     items: [{
  *       material_id, quantity_received, quantity_accepted?, rejection_reason?,
- *       unit_price, notes?, gst_rate?
+ *       unit_price, notes?, gst_rate?, cess_rate?
  *     }]
  *   }
  *
@@ -26,6 +26,24 @@ import { checkPurchaseDate } from '@/lib/purchase-guard';
  *   exactly as /api/purchases and the PO-receive path already do. When it is
  *   absent the hand-typed cgst/sgst are stored as-is — the pre-existing manual
  *   path, unchanged.
+ *
+ *   cess_rate is ALSO a PERCENT, and it is GST COMPENSATION CESS — a SEPARATE
+ *   levy (12% on aerated drinks, tobacco at the bar), never a third slice of the
+ *   GST split and never the TGBCL `special_excise_cess`, which means state excise
+ *   everywhere it is read and labelled. It is seeded from raw_materials.cess_percent
+ *   the way gst_rate is seeded from tax_percent. TWO THINGS DIFFER FROM GST AND
+ *   BOTH ARE DELIBERATE:
+ *     • THE TAXABLE BASE IS DIFFERENT. GST is charged on the POST-DISCOUNT line
+ *       value; cess is charged on the GROSS line value, BEFORE discount. The
+ *       owner ruled it that way on 2026-08-07, so on 10 kg @ ₹100 with a ₹100
+ *       discount: GST 18% on ₹900 = ₹162, CESS 12% on ₹1,000 = ₹120. The two
+ *       bases are NOT a bug to be tidied into one.
+ *     • THE RUPEES ARE ONLY EVER SERVER-DERIVED. Unlike cgst/sgst there is no
+ *       legacy client posting a hand-typed figure, so a `compensation_cess` in
+ *       the body is not read at all and cannot write money this line's goods
+ *       value can't justify.
+ *   Like the other recorded-only charges it never touches unit_price /
+ *   total_price / the weighted average — it joins Total Inward on read.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -43,12 +61,18 @@ export async function GET(request: Request) {
         WHERE g.id = ?
       `).get(id);
       if (!grn) return Response.json({ error: 'Not found' }, { status: 404 });
+      // compensation_cess is the EIGHTH charge and it is summed HERE, on read,
+      // exactly like the other seven — a levy that was actually paid and is not
+      // in the rate has to reach Total Inward, or the GRN totals to less than
+      // the vendor was paid. gi.* already ships the raw column; this is the
+      // computed total that every reader trusts.
       const items = db.prepare(`
         SELECT gi.*, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
                rm.pack_size, rm.purchase_unit, rm.category AS material_category,
                ROUND(gi.quantity_received * gi.unit_price, 2) AS subtotal,
                ROUND(gi.quantity_received * gi.unit_price
-                     - gi.discount + gi.cgst + gi.sgst + gi.special_excise_cess
+                     - gi.discount + gi.cgst + gi.sgst + gi.compensation_cess
+                     + gi.special_excise_cess
                      + gi.tcs + gi.delivery_charges + gi.mrp_round_off, 2) AS total_inward_amount
         FROM goods_receipt_note_items gi
         JOIN raw_materials rm ON rm.id = gi.material_id
@@ -68,6 +92,10 @@ export async function GET(request: Request) {
     // Flat inward register — one row PER LINE, header fields repeated, in the
     // sheet's column order + our extras. Used by the "Download Inward Register"
     // export. Same filters as the list.
+    // compensation_cess ships as its own column beside the other charges and is
+    // inside total_inward_amount: it is GST compensation cess, NOT the TGBCL
+    // special excise cess sitting next to it, and a register that folded the two
+    // together would report an excise figure the state never levied.
     if (register) {
       const rw: string[] = ['1=1']; const rp: any[] = [];
       if (outletId) { rw.push('(g.outlet_id = ? OR g.outlet_id IS NULL)'); rp.push(outletId); }
@@ -82,9 +110,11 @@ export async function GET(request: Request) {
                COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS purchase_unit,
                gi.unit_price AS rate,
                ROUND(gi.quantity_received * gi.unit_price, 2) AS subtotal,
-               gi.discount, gi.cgst, gi.sgst, gi.special_excise_cess, gi.tcs,
+               gi.discount, gi.cgst, gi.sgst, gi.compensation_cess,
+               gi.special_excise_cess, gi.tcs,
                gi.delivery_charges, gi.mrp_round_off,
                ROUND(gi.quantity_received * gi.unit_price - gi.discount + gi.cgst + gi.sgst
+                     + gi.compensation_cess
                      + gi.special_excise_cess + gi.tcs + gi.delivery_charges + gi.mrp_round_off, 2) AS total_inward_amount,
                gi.quantity_accepted, gi.quantity_rejected, gi.rejection_reason,
                g.status, g.received_by, g.invoice_date
@@ -122,7 +152,8 @@ export async function GET(request: Request) {
              (SELECT COUNT(*) FROM goods_receipt_note_items WHERE grn_id = g.id AND quantity_rejected > 0) AS rejected_lines,
              (SELECT SUM(quantity_accepted * unit_price) FROM goods_receipt_note_items WHERE grn_id = g.id) AS accepted_value,
              (SELECT SUM(quantity_received * unit_price
-                         - discount + cgst + sgst + special_excise_cess + tcs + delivery_charges + mrp_round_off)
+                         - discount + cgst + sgst + compensation_cess
+                         + special_excise_cess + tcs + delivery_charges + mrp_round_off)
                 FROM goods_receipt_note_items WHERE grn_id = g.id) AS inward_value
       FROM goods_receipt_notes g
       LEFT JOIN purchase_orders po ON po.id = g.po_id
@@ -183,12 +214,29 @@ export async function POST(request: Request) {
     // mistake differently is how a clerk learns to distrust the message.
     const gstProvided = (it: any) =>
       it?.gst_rate !== undefined && it?.gst_rate !== null && String(it.gst_rate).trim() !== '';
+    // GST COMPENSATION CESS, also a per-line PERCENT, seeded from the material
+    // master's cess_percent the way gst_rate is seeded from tax_percent. Same
+    // absent/present contract, same pre-transaction validation, and rejected
+    // rather than quietly zeroed for the same reason: a cess silently dropped is
+    // real money the venue paid and can no longer show it paid. NOT a slice of
+    // the GST split and NOT special_excise_cess — see the header doc.
+    const cessProvided = (it: any) =>
+      it?.cess_rate !== undefined && it?.cess_rate !== null && String(it.cess_rate).trim() !== '';
     for (const it of receivable) {
       if (!gstProvided(it)) continue;
       const n = Number(it.gst_rate);
       if (!Number.isFinite(n) || n < 0 || n > 100) {
         return Response.json({
           error: 'gst_rate must be a percentage between 0 and 100 (0 = exempt) — send no gst_rate at all to record a line with no tax',
+        }, { status: 400 });
+      }
+    }
+    for (const it of receivable) {
+      if (!cessProvided(it)) continue;
+      const n = Number(it.cess_rate);
+      if (!Number.isFinite(n) || n < 0 || n > 100) {
+        return Response.json({
+          error: 'cess_rate must be a percentage between 0 and 100 (0 = none) — send no cess_rate at all to record a line with no compensation cess',
         }, { status: 400 });
       }
     }
@@ -218,8 +266,9 @@ export async function POST(request: Request) {
         INSERT INTO goods_receipt_note_items
           (id, grn_id, po_item_id, material_id, quantity_ordered, quantity_received,
            quantity_accepted, quantity_rejected, rejection_reason, unit_price, notes,
-           discount, cgst, sgst, special_excise_cess, tcs, delivery_charges, mrp_round_off)
-        VALUES (?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           discount, cgst, sgst, compensation_cess, special_excise_cess, tcs,
+           delivery_charges, mrp_round_off)
+        VALUES (?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       // Per-line inward charges (₹). mrp_round_off is signed; the rest ≥ 0.
       const chg = (v: any) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0; };
@@ -299,11 +348,48 @@ export async function POST(request: Request) {
         // sending 18% still must not write a credit the TGBCL charges carry.
         const gstRate = (!hasGst || isStoreMappedMaterial(db, String(it.material_id || '')))
           ? 0 : Number(it.gst_rate);
+        // rate-basis: purchase — `accepted` is purchase units (quantity_accepted,
+        // by canon) and `price` is ₹/purchase-unit, the same pairing the
+        // `purchases` mirror and updateMaterialPrice below already assume.
         const grossTax  = Math.round((accepted > 0 ? accepted : 0) * price * 100) / 100;
         const taxable   = Math.round((grossTax - chg(it.discount)) * 100) / 100;
         const taxPaise  = gstRate > 0 ? Math.max(0, Math.round(taxable * gstRate)) : 0;
         const sgstPaise = Math.floor(taxPaise / 2);
         const cgstPaise = taxPaise - sgstPaise;   // odd paisa lands in CGST, per the contract
+
+        // ── COMPENSATION CESS — SAME LINE, DIFFERENT TAXABLE BASE ──────────────
+        // READ THIS BEFORE "SIMPLIFYING" THE TWO INTO ONE. The bases genuinely
+        // differ and the difference is the owner's ruling of 2026-08-07:
+        //     GST  → `taxable`  = gross MINUS the discount (POST-discount)
+        //     CESS → `grossTax` = the gross line value, BEFORE any discount
+        // On his worked example — 10 kg @ ₹100 = ₹1,000, discount ₹100 —
+        // GST 18% on ₹900 = ₹162 and CESS 12% on ₹1,000 = ₹120. Collapsing cess
+        // onto `taxable` would quietly under-declare the cess on every
+        // discounted line, and collapsing GST onto `grossTax` would over-claim
+        // the input credit. They are two levies with two bases, not one with a
+        // typo. The identical pair sits in receive/route.ts for PO receipts, so
+        // the inward register stays homogeneous across both GRN sources.
+        //
+        // Everything else is GST's contract verbatim: ACCEPTED (not received)
+        // and floored at 0, so a fully-rejected line and a back-correction both
+        // carry ₹0 cess exactly as they carry ₹0 GST; whole-paise, since
+        // `grossTax` is already 2-dp rupees so grossTax × rate IS paise (the
+        // ÷100 for percent and the ×100 for paise cancel).
+        //
+        // NEVER HALVED, and never folded into cgst/sgst: the house invariant
+        // tax_value = cgst + sgst is a statement about GST alone, and adding a
+        // separate levy into it would misstate the GST on a return.
+        //
+        // Zero-rated on store-mapped (TGBCL liquor) lines for a REASON SHARPER
+        // than GST's: that bill already carries its own special excise cess, so
+        // a master cess% seeded onto a liquor line would charge the venue the
+        // cess twice — once as excise on the store ledger and once again here.
+        const hasCess = cessProvided(it);
+        const cessRate = (!hasCess || isStoreMappedMaterial(db, String(it.material_id || '')))
+          ? 0 : Number(it.cess_rate);
+        // rate-basis: purchase — `grossTax` is the purchase-basis line value
+        // computed above; `cessRate` is a PERCENT, not a ₹/unit rate.
+        const cessPaise = cessRate > 0 ? Math.max(0, Math.round(grossTax * cessRate)) : 0;
         // Compared in INTEGER paise with a 1-paisa allowance: a client doing
         // round2(taxable × rate ÷ 100) legitimately lands a paisa off on
         // half-paisa amounts, and that is agreement, not drift. Anything wider
@@ -324,6 +410,12 @@ export async function POST(request: Request) {
                        chg(it.discount),
                        hasGst ? cgstPaise / 100 : chg(it.cgst),
                        hasGst ? sgstPaise / 100 : chg(it.sgst),
+                       // No chg(it.compensation_cess) fallback, deliberately: cgst/sgst
+                       // keep one because a hand-typed ₹ predates the rate field on this
+                       // modal, but cess has never had a hand-typed box on any surface —
+                       // so the body's figure is never read and can't write money this
+                       // line's goods value can't justify. Absent rate ⇒ a stored 0.
+                       cessPaise / 100,
                        chg(it.special_excise_cess),
                        chg(it.tcs), chg(it.delivery_charges), chgSigned(it.mrp_round_off));
 

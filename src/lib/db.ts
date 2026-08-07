@@ -2410,12 +2410,44 @@ function initializeSchema(db: Database.Database) {
 
     // GRN Inward financial columns (TGBCL-style inward register) — per LINE ₹
     // amounts captured at receive time. SUBTOTAL = inward qty × rate (computed),
-    // TOTAL INWARD AMOUNT = subtotal − discount + cgst + sgst + special excise
-    // cess + tcs + delivery + mrp round off (computed on read). Only these seven
-    // inputs are stored; all default 0 so every existing GRN line is unchanged.
+    // TOTAL INWARD AMOUNT = subtotal − discount + cgst + sgst + compensation
+    // cess + special excise cess + tcs + delivery + mrp round off (computed on
+    // read — eight terms). Only these eight inputs are stored; all default 0 so
+    // every existing GRN line is unchanged. RECORDED ONLY: none of them touch
+    // unit_price/total_price, so the weighted-average cost and every recipe cost
+    // stay clean.
+    //
+    // TWO DIFFERENT CESSES — the same distinction already drawn on `purchases`
+    // above, and for the same reason; do not conflate them, they are different
+    // levies:
+    //   compensation_cess   — GST Compensation Cess (GST (Compensation to
+    //                         States) Act). Seeded per line from
+    //                         raw_materials.cess_percent when the material is
+    //                         picked on PO Receive and on the ad-hoc GRN, the
+    //                         same way tax_percent seeds GST. NOT part of the
+    //                         CGST/SGST invariant (tax_value === cgst + sgst) —
+    //                         cess is a separate levy, is never halved, and
+    //                         adding it to that sum would overstate GST on a
+    //                         return. Zero on liquor: store-mapped/TGBCL lines
+    //                         are zero-rated on our side, exactly as for GST.
+    //   special_excise_cess — TGBCL Special Excise Cess off the liquor store
+    //                         bill. Non-creditable landed cost. Every reader and
+    //                         label already means exactly this by it, which is
+    //                         why compensation cess needed its own column rather
+    //                         than sharing this one.
+    //
+    // THE TWO CESS/GST TAXABLE BASES ARE DELIBERATELY DIFFERENT — a future
+    // reader will assume they match and "simplify" one into the other. They do
+    // not match, by the owner's ruling:
+    //   cgst + sgst are charged on the POST-discount line value (gross − discount)
+    //   compensation_cess is charged on the GROSS line value, BEFORE discount
+    // e.g. 10 kg @ ₹100 = ₹1,000 with ₹100 discount → GST 18% on ₹900 = ₹162,
+    // cess 12% on ₹1,000 = ₹120. Both figures are derived server-side at receive
+    // time (the wire carries a cess PERCENT only, never a rupee amount) and only
+    // stored here; nothing recomputes them from this row.
     const grniCols = db.prepare("PRAGMA table_info(goods_receipt_note_items)").all() as any[];
     const hasGI = (n: string) => grniCols.some((c: any) => c.name === n);
-    for (const col of ['discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off']) {
+    for (const col of ['discount', 'cgst', 'sgst', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off', 'compensation_cess']) {
       if (!hasGI(col)) db.exec(`ALTER TABLE goods_receipt_note_items ADD COLUMN ${col} REAL NOT NULL DEFAULT 0`);
     }
   } catch (e) { console.error('GRN schema failed:', e); }

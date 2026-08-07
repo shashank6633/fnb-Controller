@@ -23,13 +23,28 @@ interface GrnItem {
   // GRN Inward per-line charges (₹) + computed subtotal / total.
   discount?: number; cgst?: number; sgst?: number; special_excise_cess?: number;
   tcs?: number; delivery_charges?: number; mrp_round_off?: number;
+  // 8th charge — GST compensation cess, seeded from raw_materials.cess_percent.
+  // A SEPARATE levy from the two above it, on two counts: it is never halved
+  // into cgst/sgst (tax_value === cgst + sgst stays a GST-only invariant), and
+  // it is not the TGBCL special_excise_cess this note already prints as "Cess".
+  compensation_cess?: number;
   subtotal?: number; total_inward_amount?: number;
 }
 /** Sum the per-line charges (₹) for a compact print sub-line. */
 const chargeParts = (it: GrnItem): string => {
   const parts: string[] = [];
   const add = (label: string, v?: number) => { if (Number(v)) parts.push(`${label} ${Math.round((Number(v) || 0) * 100) / 100}`); };
+  // These are RECORDED rupees read straight off the GRN line — this page computes
+  // no tax base of its own, and must not, because the two levies do not share one.
+  // GST is charged on the POST-discount line value; compensation cess is charged
+  // on the GROSS line value BEFORE discount (owner's ruling: 10 kg @ ₹100 less ₹100
+  // discount → GST 18% on ₹900 = ₹162, cess 12% on ₹1,000 = ₹120). So CGST+SGST and
+  // Comp. Cess here will NOT reconcile to a single base — do not "simplify" them
+  // into one, and do not derive either from subtotal.
   add('Disc', it.discount); add('CGST', it.cgst); add('SGST', it.sgst);
+  // Comp. Cess sits beside the GST pair it accompanies and ahead of the TGBCL
+  // "Cess", whose label is left untouched so existing notes reprint byte-identical.
+  add('Comp. Cess', it.compensation_cess);
   add('Cess', it.special_excise_cess); add('TCS', it.tcs);
   add('Deliv', it.delivery_charges); add('Round', it.mrp_round_off);
   return parts.join(' · ');

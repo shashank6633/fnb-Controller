@@ -309,7 +309,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // gst_rate/cgst/sgst ride along per line. cgst/sgst are carried ONLY so a
     // client that disagrees with the server can be logged (same as
     // /api/purchases) — the stored figures are always the server's own.
-    const overrides: Map<string, { quantity?: number; unit_price?: number; accepted?: number; rejection_reason?: string; deviation_reason?: string; gst_rate?: any; cgst?: any; sgst?: any }> = new Map();
+    // cess_rate is the GST COMPENSATION CESS percent for the line, seeded on the
+    // receive screen from raw_materials.cess_percent. Only the PERCENT rides the
+    // wire: unlike cgst/sgst there is no legacy client posting a rupee figure, so
+    // a `compensation_cess` in the body is deliberately NOT read here and cannot
+    // write money this line's goods value can't justify (same stance as
+    // /api/purchases:310-312).
+    const overrides: Map<string, { quantity?: number; unit_price?: number; accepted?: number; rejection_reason?: string; deviation_reason?: string; gst_rate?: any; cgst?: any; sgst?: any; cess_rate?: any }> = new Map();
     if (Array.isArray(body?.item_overrides)) {
       for (const o of body.item_overrides) {
         if (o?.po_item_id) overrides.set(o.po_item_id, {
@@ -317,6 +323,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           accepted: o.accepted, rejection_reason: o.rejection_reason,
           deviation_reason: o.deviation_reason,
           gst_rate: o.gst_rate, cgst: o.cgst, sgst: o.sgst,
+          cess_rate: o.cess_rate,
         });
       }
     }
@@ -330,6 +337,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
      */
     const gstProvidedFor = (ov: any): boolean =>
       ov?.gst_rate !== undefined && ov?.gst_rate !== null && String(ov.gst_rate).trim() !== '';
+    /**
+     * Was a usable cess_rate sent for this line?
+     * Byte-identical in shape to gstProvidedFor above, and for the same reason:
+     * ABSENT means "no compensation cess recorded, nothing else changed", which
+     * is exactly what every client that predates this field sends. A line with
+     * no cess_rate must write the GRN row this route wrote before the field
+     * existed — a rate is never inferred, and 0 is never assumed to be a rate.
+     */
+    const cessProvidedFor = (ov: any): boolean =>
+      ov?.cess_rate !== undefined && ov?.cess_rate !== null && String(ov.cess_rate).trim() !== '';
 
     // ── Bill-level charges (shape only — the money gates need the accepted
     // lines and run after the per-line validation below) ──────────────────
@@ -644,6 +661,23 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           }, { status: 400 });
         }
       }
+      // GST COMPENSATION CESS percent — same shape check, same absent/present
+      // contract, and refused rather than quietly zeroed for the same reason: a
+      // dropped cess forfeits reclaimable input credit and leaves nothing in the
+      // stored row to show it went missing. It is a SEPARATE levy from CGST/SGST
+      // (12% on aerated drinks, tobacco at the bar), not a third slice of the GST
+      // split, and not the TGBCL `special_excise_cess`, which means state excise
+      // everywhere it is read and labelled. Wording mirrored from /api/purchases.
+      if (cessProvidedFor(ov)) {
+        const c = Number(ov!.cess_rate);
+        if (!Number.isFinite(c) || c < 0 || c > 100) {
+          return Response.json({
+            error: `Compensation cess on "${it.material_name}" must be a percentage between 0 and 100 (0 = none) — received "${ov!.cess_rate}". Send no cess_rate at all to record the line with no compensation cess.`,
+            material: it.material_name,
+            field: 'cess_rate',
+          }, { status: 400 });
+        }
+      }
       // ── THE RATE LOCK IS GONE, AND WHAT REPLACED IT ─────────────────────
       // This route used to 403 any non-admin who sent a unit_price override that
       // differed from the PO line (`me?.role !== 'admin'` → hard refusal). The
@@ -837,7 +871,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // re-adds); halving in floats drifts a paisa. A third rounding convention
     // between the two purchase paths is how a GST return stops reconciling.
     // ────────────────────────────────────────────────────────────────────
-    interface LineTax { gst_rate: number; taxable: number; tax: number; cgst: number; sgst: number; forced_zero: boolean }
+    // COMPENSATION CESS RIDES ALONG HERE, ON A DIFFERENT BASE ON PURPOSE.
+    //   GST  → the POST-discount goods value  (taxable = grossTotal − discShare)
+    //   CESS → the GROSS line value, BEFORE the discount (grossTotal)
+    // That is the owner's ruling, not an oversight: 10 kg @ ₹100 with a ₹100
+    // discount books GST 18% on ₹900 = ₹162 and cess 12% on ₹1,000 = ₹120. The
+    // two bases are DELIBERATELY different — a future reader will assume they
+    // match and "simplify" one into the other, and that quietly under-recovers
+    // the cess on every discounted bill. Cess is also ONE figure, never halved,
+    // and never added into cgst/sgst: the house invariant tax_value = cgst + sgst
+    // is a statement about GST alone, and folding cess into it would overstate
+    // the GST claimed on a return. Readers pick it up as its own Total Inward
+    // term, exactly like the other recorded-only charges.
+    interface LineTax { gst_rate: number; taxable: number; tax: number; cgst: number; sgst: number; forced_zero: boolean; cess_rate: number; cess_base: number; cess: number; cess_forced_zero: boolean }
     const taxByPoItem = new Map<string, LineTax>();
     for (const it of receiving) {
       const ov = overrides.get(it.id);
@@ -852,8 +898,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // never fires — it is the second lock, mirroring /api/purchases: if that
       // guard is ever relaxed for a category, a client that sent 18% must still
       // not write a credit the TGBCL charges already carry.
+      // A store-mapped (TGBCL) line is zero-rated for the COMPENSATION CESS on
+      // the same reasoning as the GST above: its cess is levied on the TGBCL
+      // bill as `special_excise_cess`, so booking a GST compensation cess here
+      // as well would claim the same duty twice under a levy the government
+      // never charged on it.
       const storeMapped = isStoreMappedMaterial(db, String(it.material_id || ''));
       const gstRate = (!gstProvidedFor(ov) || storeMapped) ? 0 : Number(ov!.gst_rate);
+      const cessRate = (!cessProvidedFor(ov) || storeMapped) ? 0 : Number(ov!.cess_rate);
       // GROSS accepted value — identical expression to `acceptedTotal` in the txn
       // loop, and to the GRN row's ROUND(quantity_accepted × unit_price, 2) that
       // every register totals from. A fully-rejected line is 0 here and therefore
@@ -864,6 +916,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       const taxPaise   = gstRate > 0 ? Math.max(0, Math.round(taxable * gstRate)) : 0;
       const sgstPaise  = Math.floor(taxPaise / 2);
       const cgstPaise  = taxPaise - sgstPaise;   // odd paisa lands in CGST, per the contract
+      // CESS IS ON `grossTotal`, NOT ON `taxable` — the ONE line where this route
+      // deliberately diverges from the GST arithmetic directly above it. GST is
+      // charged on the post-discount value (`taxable`, line above); the owner's
+      // ruling is that compensation cess is charged on the GROSS, pre-discount
+      // line value. Do not "align" this to `taxable`. Whole paise in the same
+      // shape as taxPaise (the ÷100 for percent and the ×100 for paise cancel),
+      // floored at 0, and driven off the same accepted-only grossTotal — so a
+      // fully-rejected line and a negative back-correction both carry ₹0 cess,
+      // exactly as they carry ₹0 GST.
+      const cessPaise  = cessRate > 0 ? Math.max(0, Math.round(grossTotal * cessRate)) : 0;
       taxByPoItem.set(String(it.id), {
         gst_rate: gstRate,
         taxable,
@@ -871,6 +933,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         cgst: cgstPaise / 100,
         sgst: sgstPaise / 100,
         forced_zero: storeMapped && gstProvidedFor(ov) && Number(ov!.gst_rate) > 0,
+        cess_rate: cessRate,
+        // Stated alongside the figure so a reader of the audit row can see WHICH
+        // base the cess was taken on without re-deriving it from the discount.
+        cess_base: grossTotal,
+        cess: cessPaise / 100,
+        cess_forced_zero: storeMapped && cessProvidedFor(ov) && Number(ov!.cess_rate) > 0,
       });
       // A client whose split disagrees with the server's is LOGGED, never
       // obeyed — a UI drift must stay visible instead of being silently
@@ -902,6 +970,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         taxable: t.gst_rate > 0 ? r2(acc.taxable + t.taxable) : acc.taxable,
       }),
       { cgst: 0, sgst: 0, tax: 0, taxable: 0 },
+    );
+    /**
+     * Σ of the server-derived COMPENSATION CESS — its OWN accumulator, kept out
+     * of taxTotals on purpose. taxTotals.tax is the GST figure that must keep
+     * re-adding to cgst + sgst exactly, and every reader re-adds it; a cess
+     * folded in there would report GST the government never levied. `cess_base`
+     * is likewise summed separately from taxTotals.taxable because the two are
+     * different bases (gross vs post-discount) and adding them would state a
+     * taxable value neither levy reconciles to.
+     */
+    const cessTotals = [...taxByPoItem.values()].reduce(
+      (acc, t) => ({
+        cess: r2(acc.cess + t.cess),
+        cess_base: t.cess_rate > 0 ? r2(acc.cess_base + t.cess_base) : acc.cess_base,
+      }),
+      { cess: 0, cess_base: 0 },
     );
 
     let total = 0;
@@ -1093,12 +1177,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // built on it — which is exactly why the old bill-level GST control was
       // deleted. Both are 0 when no gst_rate was sent, so a payload without one
       // writes precisely the row this route wrote before the field existed.
+      //
+      // `compensation_cess` is the 8th recorded-only charge and is appended LAST,
+      // additively, so the existing column order is untouched. It is the GST
+      // compensation cess taken on the GROSS (pre-discount) line value — a
+      // different base from cgst/sgst, which are on the post-discount value; see
+      // the taxByPoItem block above. It is NOT the TGBCL `special_excise_cess`
+      // (a state excise levy, on a different table's charges) and it is NOT part
+      // of the cgst + sgst invariant. Like the others it joins Total Inward as
+      // its own term and never enters unit_price. 0 when no cess_rate was sent,
+      // so a payload without one writes the row this route wrote before.
       const insGrnItem = db.prepare(`
         INSERT INTO goods_receipt_note_items
           (id, grn_id, po_item_id, material_id, quantity_ordered, quantity_received,
            quantity_accepted, quantity_rejected, rejection_reason, unit_price, notes,
-           discount, cgst, sgst, delivery_charges)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           discount, cgst, sgst, delivery_charges, compensation_cess)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       // Excess + deviation detection happen inline below — the `excessLines` and
@@ -1152,6 +1246,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const lineTax     = taxByPoItem.get(String(it.id));
         const cgstAmt     = lineTax ? lineTax.cgst : 0;
         const sgstAmt     = lineTax ? lineTax.sgst : 0;
+        // This line's SERVER-DERIVED compensation cess (0 when no cess_rate was
+        // sent, and always 0 for a store-mapped material). Taken on the GROSS
+        // line value, NOT on the post-discount base cgst/sgst use — read the
+        // taxByPoItem block for why the two bases differ.
+        const cessAmt     = lineTax ? lineTax.cess : 0;
         // The NET basis is substituted ONLY when a discount was actually
         // applied. With no discount the allocator's net_rate is a re-derivation
         // (r2(r2(qty × rate) / qty)) that can differ from the typed rate in the
@@ -1226,12 +1325,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         if (rejected > 0) noteBits.push(`Rejected ${rejected} (${reason || 'no reason given'})`);
         if (deviated && devReason) noteBits.push(`PO deviation: ${devReason}`);
         // `price` is bound to unit_price GROSS OF TAX and gross of the discount —
-        // the goods rate off the vendor's bill. cgstAmt/sgstAmt go in their own
-        // columns; they must never be added into the rate (see the prepare above).
+        // the goods rate off the vendor's bill. cgstAmt/sgstAmt/cessAmt go in
+        // their own columns; none of them may ever be added into the rate (see
+        // the prepare above).
         insGrnItem.run(generateId(), grnId, it.id, it.material_id,
                        it.quantity, received, accepted, rejected, reason, price,
                        noteBits.join(' | '),
-                       discShare, cgstAmt, sgstAmt, delivShare);
+                       discShare, cgstAmt, sgstAmt, delivShare, cessAmt);
 
         // Stock + financials reflect ONLY the accepted qty (rejections never enter stock)
         if (accepted > 0) {
@@ -1655,8 +1755,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               cgst: taxTotals.cgst,
               sgst: taxTotals.sgst,
               tax_value: taxTotals.tax,
+              // COMPENSATION CESS, reported as its own total and deliberately
+              // OUTSIDE tax_value: tax_value is the GST figure and must keep
+              // equalling cgst + sgst. Its base is the GROSS, pre-discount line
+              // value — a different base from `taxable` above, per the owner's
+              // ruling — hence a separate cess_base rather than reusing it.
+              cess_basis: 'compensation cess on the GROSS (pre-discount) goods value; recorded in goods_receipt_note_items.compensation_cess, outside tax_value and never in unit_price / average_price',
+              cess_base: cessTotals.cess_base,
+              compensation_cess: cessTotals.cess,
               lines: [...taxByPoItem.entries()]
-                .filter(([, t]) => t.gst_rate > 0 || t.forced_zero)
+                .filter(([, t]) => t.gst_rate > 0 || t.forced_zero || t.cess_rate > 0 || t.cess_forced_zero)
                 .map(([poItemId, t]) => ({
                   po_item_id: poItemId,
                   material_name: chargeItemById.get(poItemId)?.material_name
@@ -1666,6 +1774,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
                   // true = a store-mapped (liquor) line whose sent GST was
                   // forced to 0 here; its duty is on the TGBCL bill instead.
                   zero_rated_store_item: t.forced_zero,
+                  cess_rate: t.cess_rate, cess_base: t.cess_base, cess_value: t.cess,
+                  // Same story as zero_rated_store_item, for the cess: a
+                  // store-mapped line's cess is on the TGBCL bill.
+                  zero_cess_store_item: t.cess_forced_zero,
                 })),
             },
           },
@@ -1809,13 +1921,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         sgst:      taxTotals.sgst,
         tax_value: taxTotals.tax,     // === cgst + sgst, exactly (integer paise)
         basis: 'GST on the post-discount goods value — recorded only; never added into unit_price, total_price or average_price',
+        // Compensation cess echoed as its OWN term, outside tax_value — it is a
+        // separate levy, never halved into the CGST/SGST pair, and it is taken on
+        // the GROSS (pre-discount) line value, NOT on `taxable` above. The two
+        // bases differ on purpose; see the taxByPoItem block.
+        cess_basis: 'compensation cess on the GROSS (pre-discount) goods value — recorded only, outside tax_value; never added into unit_price, total_price or average_price',
+        cess_base:  cessTotals.cess_base,
+        compensation_cess: cessTotals.cess,
         lines: [...taxByPoItem.entries()]
-          .filter(([, t]) => t.gst_rate > 0 || t.forced_zero)
+          .filter(([, t]) => t.gst_rate > 0 || t.forced_zero || t.cess_rate > 0 || t.cess_forced_zero)
           .map(([poItemId, t]) => ({
             po_item_id: poItemId,
             gst_rate: t.gst_rate, taxable: t.taxable,
             cgst: t.cgst, sgst: t.sgst, tax_value: t.tax,
             zero_rated_store_item: t.forced_zero,
+            cess_rate: t.cess_rate, cess_base: t.cess_base, cess_value: t.cess,
+            zero_cess_store_item: t.cess_forced_zero,
           })),
       },
     });

@@ -183,15 +183,21 @@ interface POItem {
    *  API purely to SEED this line's GST% on Receive. It is a default, not a
    *  verdict: the printed vendor bill wins, so the receiver can change it. */
   material_tax_percent?: number;
-  /** raw_materials.cess_percent — carried, but NOT consumed on THIS screen.
-   *  It does have a home now: /purchases books it into purchases.compensation_cess,
-   *  an eighth charge column of its own. That column is NOT special_excise_cess,
-   *  which still means TGBCL Special Excise Cess everywhere it is read — writing
-   *  GST compensation cess into it would report an excise figure nobody levied.
-   *  Receive cannot follow, because it records tax on goods_receipt_note_items and
-   *  that table has no compensation-cess column yet (db.ts's GRN-item charge loop
-   *  still lists seven). Kept on the payload so the seed is already in hand the
-   *  day it gains an eighth. */
+  /** raw_materials.cess_percent — the master's GST COMPENSATION CESS rate, and
+   *  it IS consumed on this screen now: it seeds the line's Cess % on Receive
+   *  exactly the way material_tax_percent seeds the GST%. Same standing as that
+   *  seed — a default, not a verdict; the printed vendor bill wins.
+   *  The rupees land on goods_receipt_note_items.compensation_cess, the eighth
+   *  charge column of the GRN item (the bill document this path books tax onto),
+   *  NOT on purchases.compensation_cess — the purchases row written here is the
+   *  deliberately tax-free COST mirror of the GRN line, and putting the same
+   *  rupee on both is what purchase-log's is_mirror split exists to prevent.
+   *  It is also NOT special_excise_cess, which still means TGBCL Special Excise
+   *  Cess everywhere it is read — writing GST compensation cess into that column
+   *  would report an excise figure nobody levied.
+   *  And it is NOT part of the cgst + sgst invariant: cess is a separate levy,
+   *  never halved. It is charged on the GROSS line value, BEFORE the bill
+   *  discount, while GST is charged AFTER it — see billCalc. */
   material_cess_percent?: number;
   /** raw_materials.average_price — Rs per RECIPE unit. Scale by pack_size before
    *  putting it next to a PO rate. No last-purchase-rate field rides here: the
@@ -744,6 +750,16 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
      rate draft above exists for. */
   const [billGstRate, setBillGstRate] = useState<string>('0');
   const [lineGst, setLineGst] = useState<Record<string, string>>({});
+  /* COMPENSATION CESS %, per line, raw string — same storage discipline as
+     lineGst above and for the same reason (a number input re-parsed on every
+     keystroke eats the decimal point).
+     There is NO bill-level cess counterpart to billGstRate, and that is
+     deliberate: one vendor bill is normally one GST rate, but cess is
+     item-specific — the aerated-drink cases on a bill carry it and the rest of
+     the bill does not — so a bill-level default would seed cess onto lines that
+     were never charged any. Here '' means simply "no cess on this line", never
+     "follow the bill". */
+  const [lineCess, setLineCess] = useState<Record<string, string>>({});
   /* po_item_id → why that line cannot come in through Central (the server's own
      centralFlowBlock message, from GET …/receive). These are TGBCL/liquor lines:
      they are taxed on the store's bill through excise / cess / TCS, never GST,
@@ -872,12 +888,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
          The GST_RATES membership test is not decoration: the master accepts any
        number, and a rate with no matching <option> renders the select blank
        while the compute books the rate — the receiver would read 0% and sign a
-       28% bill. Anything off the list falls back to follow-the-bill.
-       (Only tax_percent is seeded. cess_percent has a home on /purchases now —
-       purchases.compensation_cess, its own column, distinct from the TGBCL
-       special_excise_cess — but Receive books tax onto goods_receipt_note_items,
-       which carries no compensation-cess column, so a rate seeded here would
-       have nowhere to land. See material_cess_percent on POItem.) */
+       28% bill. Anything off the list falls back to follow-the-bill. */
     const gseed: Record<string, string> = {};
     for (const it of its) {
       if (sb[String(it.id)]) continue;
@@ -886,6 +897,36 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       if (t > 0 && (GST_RATES as readonly string[]).includes(s)) gseed[it.id] = s;
     }
     setLineGst(gseed);
+    /* …and SEED each line's COMPENSATION CESS % from raw_materials.cess_percent
+       (delivered as material_cess_percent by the same PO detail API). This used
+       to be the one half that could not be done: Receive books tax onto
+       goods_receipt_note_items, and that table carried no compensation-cess
+       column, so a rate seeded here had nowhere to land. It has one now — the
+       eighth charge on the GRN item — so the master's Cess % finally reaches a
+       bill, which is the whole of the reported gap.
+         Every rule above applies unchanged: SEED, NOT FORCE (the printed vendor
+       bill wins, so the receiver may retype it), and this must stay BELOW
+       setStoreBlocked/`sb` for exactly the same reason — a store/TGBCL line's
+       cess is levied on the store's own bill, so seeding one here would show a
+       rate the compute then throws away.
+         ONE DELIBERATE DIFFERENCE from the GST seed above: there is no GST_RATES
+       membership test. That test exists only because GST is a <select>, where a
+       value matching no <option> renders blank while the compute books the rate.
+       The cess control below is a free number input mirroring the master's own
+       free 0-100 field, so any in-range value renders honestly and refusing e.g.
+       12.5 would silently drop real money. Only non-finite / <=0 / >100 are
+       refused — the same test seedCessForMaterial applies on /purchases.
+         Like setLineGst above, this REPLACES the map wholesale, so it is also
+       the per-vendor clear: the next vendor's bill starts from their own lines'
+       seeds and nothing carries over. */
+    const cseed: Record<string, string> = {};
+    for (const it of its) {
+      if (sb[String(it.id)]) continue;
+      const c = Number(it.material_cess_percent);
+      if (!Number.isFinite(c) || c <= 0 || c > 100) continue;
+      cseed[it.id] = String(c);
+    }
+    setLineCess(cseed);
     const list: VendorStake[] = Array.isArray(recv?.vendors) ? recv.vendors : [];
     setStakes(list);
     // Auto-select the vendor still owing goods when there is only one — that is
@@ -1025,6 +1066,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
         taxable = goods − that line's share of the bill discount
         tax     = taxable × gst%
         cgst + sgst = tax, with the odd paisa in CGST
+        cess    = goods × cess%   ← the GROSS, not `taxable`. See below.
+     THE TWO TAXABLE BASES ARE DIFFERENT ON PURPOSE. GST is charged on the
+     POST-discount value; compensation cess is charged on the GROSS line value,
+     BEFORE the discount. That is the owner's ruling, and the receive route
+     computes it off its own `grossTotal` for the same reason — collapsing the
+     two into one base to "tidy" this would under-charge cess on every
+     discounted bill and put the screen at odds with the server.
      TAX IS CARRIED ALONGSIDE THE GOODS RATE AND NEVER INSIDE IT. Input GST is
      reclaimable credit, not part of what the food costs: fold it into the rate
      and average_price — and every recipe cost derived from it — inflates by the
@@ -1052,6 +1100,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     const byId = new Map<string, {
       zero_rated: boolean; zero_reason: string; rate: number; discount_share: number;
       taxable: number; tax_value: number; cgst: number; sgst: number; incl_tax: number;
+      cess_rate: number; compensation_cess: number; gross: number;
     }>();
     for (const l of allocation.lines) {
       const zeroRated = storeZeroRated.has(l.id);
@@ -1069,6 +1118,36 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       const taxPaise = Math.round(taxValue * 100);
       const sgst = Math.floor(taxPaise / 2) / 100;
       const cgst = r2(taxValue - sgst);
+
+      /* GST COMPENSATION CESS — a SEPARATE levy on a DELIBERATELY DIFFERENT
+         BASE. Read this before "simplifying" the two bases into one:
+             GST  is charged on `taxable` = l.net_total = gross − discount share
+             CESS is charged on `l.gross` = qty × rate, BEFORE any discount
+         On the owner's own worked example — 10 kg @ ₹100 = ₹1,000 with a ₹100
+         bill discount — GST 18% is ₹162 on ₹900 while cess 12% is ₹120 on
+         ₹1,000. Moving cess onto `taxable` would quietly under-charge it on
+         every discounted bill AND disagree with the receive route, which
+         derives it from its own `grossTotal` for exactly this reason.
+         `l.gross` is the allocator's own figure, not a second multiplication:
+         the allocator hands the last line the discount remainder, so a re-derived
+         gross here could differ by a paisa on some bills. Because cess is taken
+         BEFORE the discount, no allocation rounding can move it at all.
+         NOT halved and NOT added into cgst/sgst: tax_value = cgst + sgst is the
+         figure a GST return is filed on, and cess is not GST (nor is it input
+         credit against GST — only against cess output liability), so no label
+         may fold it in. RECORDED ONLY, like delivery: it never touches
+         unit_price, net_rate, average_price or any recipe cost.
+         Whole paise, byte-identical in shape to the server's expression — the
+         ÷100 for percent and the ×100 for paise cancel, which is why there is
+         no /100 in sight. Same zero-rate lock as GST: a store/TGBCL line's cess
+         is levied on the store's own bill, never on ours. */
+      // rate-basis: purchase — `l.gross` is the allocator's PURCHASE-unit qty ×
+      // Rs/purchase-unit; `cessRate` is a PERCENT, not a per-unit rate, so it
+      // carries no basis of its own and cannot disagree with that quantity.
+      const cessRate = zeroRated ? 0 : (parseFloat(lineCess[l.id] ?? '') || 0);
+      const cessPaise = cessRate > 0 ? Math.max(0, Math.round(l.gross * cessRate)) : 0;
+      const compensationCess = cessPaise / 100;
+
       byId.set(l.id, {
         zero_rated: zeroRated,
         zero_reason: storeBlocked[l.id] || 'store item — taxed on the TGBCL bill, not GST',
@@ -1076,26 +1155,40 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
         // without comparing two floats that differ only by rounding.
         discount_share: l.discount_share,
         rate, taxable, tax_value: taxValue, cgst, sgst, incl_tax: r2(taxable + taxValue),
+        // The CESS base, carried so the row can NAME it. Kept distinct from
+        // `taxable` on purpose — a reader who sees only one base will assume
+        // both levies share it, which is the mistake this whole block guards.
+        gross: l.gross,
+        cess_rate: cessRate, compensation_cess: compensationCess,
       });
     }
     const cgstTotal = r2([...byId.values()].reduce((s, t) => s + t.cgst, 0));
     const sgstTotal = r2([...byId.values()].reduce((s, t) => s + t.sgst, 0));
     const taxTotal  = r2(cgstTotal + sgstTotal);
+    // Kept OUT of taxTotal on purpose — see the per-line note above. taxTotal is
+    // the GST figure and must stay exactly the GST figure.
+    const cessTotal = r2([...byId.values()].reduce((s, t) => s + t.compensation_cess, 0));
     // Goods − discount, computed ONCE rather than summed from the per-line
     // shares (those can drift a paisa on rounding). This is the figure printed
-    // on the paper bill in the receiver's hand.
+    // on the paper bill in the receiver's hand. It is the GST base only: cess
+    // is charged on the goods subtotal above it, before the discount.
     const taxableTotal = r2(allocation.subtotal - allocation.discount_applied);
     // What is actually owed the vendor: goods, less discount, plus their tax,
-    // plus delivery. Tax and delivery are both on the bill but NOT in the cost
-    // of the goods — that stays `net_subtotal`.
-    const billTotal = r2(taxableTotal + taxTotal + allocation.delivery);
+    // plus compensation cess, plus delivery. Cess belongs here — the vendor
+    // really does charge it — even though it is held out of taxTotal. Tax, cess
+    // and delivery are all on the bill but NOT in the cost of the goods — that
+    // stays `net_subtotal`.
+    const billTotal = r2(taxableTotal + taxTotal + cessTotal + allocation.delivery);
+    // GST-only, deliberately: this is the sum of the per-line Incl. Tax column,
+    // and that column is taxable + GST. Cess is shown on its own line instead of
+    // being buried inside a column headed "Incl. Tax".
     const inclTaxTotal = r2(taxableTotal + taxTotal);
     return {
       alloc: allocation, discount, delivery,
-      tax: { byId, cgstTotal, sgstTotal, taxTotal, taxableTotal, billTotal, inclTaxTotal },
+      tax: { byId, cgstTotal, sgstTotal, taxTotal, cessTotal, taxableTotal, billTotal, inclTaxTotal },
     };
   }, [activeDeviations, discountMode, discountValue, deliveryMode, deliveryValue,
-      billGstRate, lineGst, storeZeroRated, storeBlocked]);
+      billGstRate, lineGst, lineCess, storeZeroRated, storeBlocked]);
 
   const alloc = billCalc.alloc;
   const tax = billCalc.tax;
@@ -1152,14 +1245,19 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       // what the post-commit notes below count, so it stays the deviation set
       // and nothing else.
       const deviating = activeDeviations.filter(d => d.deviates);
-      /* …plus any line that carries TAX, deviating or not: gst_rate is per line
-         on the wire (there is no bill-level tax field), so a taxed line that
-         matches its PO exactly still has to say so or its GST is lost. A line
-         at 0% is left out — an absent gst_rate and an explicit 0 mean the same
-         thing to the server, so on a bill with no GST at all this payload is
-         byte-identical to the one this screen has always sent. */
-      const taxedOrDeviating = activeDeviations.filter(
-        d => d.deviates || (billCalc.tax.byId.get(d.it.id)?.rate || 0) > 0);
+      /* …plus any line that carries TAX, deviating or not: gst_rate and
+         cess_rate are per line on the wire (there is no bill-level tax field),
+         so a taxed line that matches its PO exactly still has to say so or its
+         tax is lost. CESS COUNTS ON ITS OWN: a line with 12% cess and no GST at
+         all — which is a real bill, cess is item-specific — must still be sent,
+         or the cess is silently dropped. A line at 0% on BOTH is left out: an
+         absent rate and an explicit 0 mean the same thing to the server, so on a
+         bill with no GST and no cess this payload is byte-identical to the one
+         this screen has always sent. */
+      const taxedOrDeviating = activeDeviations.filter(d => {
+        const t = billCalc.tax.byId.get(d.it.id);
+        return d.deviates || (t?.rate || 0) > 0 || (t?.cess_rate || 0) > 0;
+      });
       const item_overrides = taxedOrDeviating.map(d => {
         const t = billCalc.tax.byId.get(d.it.id);
         return {
@@ -1177,6 +1275,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           gst_rate: t?.rate ?? 0,
           cgst: t?.cgst ?? 0,
           sgst: t?.sgst ?? 0,
+          // COMPENSATION CESS — the PERCENT only, never a rupee figure. Unlike
+          // cgst/sgst there is no legacy client posting a cess amount here, so
+          // the server reads the rate and derives the money itself off its own
+          // GROSS line value (before discount, the opposite base to GST). A ₹
+          // figure on the wire could only ever be a second opinion this row's
+          // goods value cannot justify, so none is sent.
+          cess_rate: t?.cess_rate ?? 0,
         };
       });
       const r = await api(`/api/purchase-orders/${poId}/receive`, {
@@ -1456,8 +1561,8 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                         the vendor's bill does: value → less discount → taxable
                         → × GST% → tax → incl. tax. Same columns, same order and
                         same wording as the Enter Full Bill modal on /purchases. */}
-                    <th className="text-right py-1 px-2 font-medium" title="Line Total minus this line's share of the bill discount — the value GST is charged on">Taxable</th>
-                    <th className="text-right py-1 px-2 font-medium">GST %</th>
+                    <th className="text-right py-1 px-2 font-medium" title="Line Total minus this line's share of the bill discount — the value GST is charged on. Compensation cess is NOT charged on this: it is charged on the Line Total, before the discount.">Taxable</th>
+                    <th className="text-right py-1 px-2 font-medium" title="GST % is charged on the Taxable value (after discount). Compensation cess % is a separate levy charged on the Line Total (before discount) — it is never part of CGST + SGST.">GST % · Cess %</th>
                     <th className="text-right py-1 px-2 font-medium" title="Charged on the taxable value, split into CGST + SGST. Recorded on the bill — never added into the rate, so recipe costs stay on the true goods price.">Tax (C+S)</th>
                     <th className="text-right py-1 px-2 font-medium" title="Taxable + tax — what this line adds to the vendor's bill">Incl. Tax</th>
                   </tr>
@@ -1614,20 +1719,47 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                            : t?.zero_rated ? (
                             /* Not the receiver's to set: this material belongs
                                to a store location, where excise / cess / TCS are
-                               charged on the store's own bill. A GST% on it
-                               would be tax that was never paid. */
+                               charged on the store's own bill. A GST% — or a
+                               compensation cess % — on it would be tax that was
+                               never paid, so NEITHER control is offered and the
+                               compute forces both to 0 regardless. */
                             <div className="text-[10px] text-blue-700 leading-tight text-right" title={t.zero_reason}>
-                              0%
+                              GST 0% · Cess 0%
                               <span className="block text-[9px] text-[#8B7355]">store item — taxed on the TGBCL bill</span>
                             </div>
                            ) : (
-                            <select value={lineGst[it.id] ?? ''}
-                                    onChange={e => setLineGst(m => ({ ...m, [it.id]: e.target.value }))}
-                                    title="Blank follows the bill's GST rate. Change it only for a line the vendor billed at a different rate."
-                                    className="w-full px-1 py-1 bg-white border border-[#E8D5C4] rounded text-right text-[11px]">
-                              <option value="">Bill ({billGstRate}%)</option>
-                              {GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
-                            </select>
+                            <div className="space-y-1">
+                              <select value={lineGst[it.id] ?? ''}
+                                      onChange={e => setLineGst(m => ({ ...m, [it.id]: e.target.value }))}
+                                      title="Blank follows the bill's GST rate. Change it only for a line the vendor billed at a different rate."
+                                      className="w-full px-1 py-1 bg-white border border-[#E8D5C4] rounded text-right text-[11px]">
+                                <option value="">Bill ({billGstRate}%)</option>
+                                {GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
+                              </select>
+                              {/* COMPENSATION CESS %, seeded from the Raw
+                                  Material master and freely editable — the
+                                  printed bill wins over the master, same as the
+                                  GST rate above it.
+                                  A FREE number input, not a <select>: cess has
+                                  no fixed rate card (12 on aerated drinks, other
+                                  rates on tobacco), it mirrors the master's own
+                                  free 0-100 field, and a select would render a
+                                  12.5 blank while the compute booked it.
+                                  Blank means NO CESS on this line — there is no
+                                  bill-level cess to follow, unlike GST. */}
+                              <input type="number" step="0.01" min="0" max="100"
+                                     value={lineCess[it.id] ?? ''}
+                                     onChange={e => setLineCess(m => ({ ...m, [it.id]: e.target.value }))}
+                                     placeholder="Cess %"
+                                     title="GST Compensation Cess % for this line (e.g. 12 on aerated drinks). Seeded from the Raw Material master; retype it if the printed bill says otherwise. Charged on the GROSS line value BEFORE the bill discount — unlike GST, which is charged after it. A separate levy: it is never part of CGST + SGST, and it is recorded beside the rate, never inside it."
+                                     className="w-full px-1 py-1 bg-white border border-[#E8D5C4] rounded text-right text-[11px]" />
+                              {t && t.compensation_cess > 0 && (
+                                <div className={`${HINT_CLS} font-mono`}>
+                                  cess {fmt(t.compensation_cess)}
+                                  <span className="block font-sans">on gross {fmt(t.gross)}, pre-discount</span>
+                                </div>
+                              )}
+                            </div>
                            )}
                         </td>
                         <td className="py-1.5 px-2 text-right font-mono text-[#6B5744]">
@@ -1668,7 +1800,9 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                 <tfoot>
                   {/* Both rows carry all 10 columns, so the tax columns total
                       under their own headings and the row still reads left to
-                      right: goods → taxable → tax → incl. tax. */}
+                      right: goods → taxable → cess → tax → incl. tax. (Cess
+                      totals under the GST % · Cess % column, where its per-line
+                      control is — never inside the Tax (C+S) cell beside it.) */}
                   <tr className="border-t border-[#E8D5C4] font-semibold">
                     <td className="py-2 px-2 text-right" colSpan={3}>Ordered total</td>
                     <td colSpan={2} className="py-2 px-2 text-right font-mono text-[#8B7355]">{fmt(orderedTotal)}</td>
@@ -1682,7 +1816,18 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                       {total !== orderedTotal ? `${total > orderedTotal ? '+' : ''}${fmt(total - orderedTotal)}` : '—'}
                     </td>
                     <td className="py-2 px-2 text-right font-mono">{fmt(tax.taxableTotal)}</td>
-                    <td></td>
+                    {/* The cess total sits under its own column, NOT inside the
+                        Tax (C+S) cell beside it: that cell is the GST figure a
+                        return is filed on, and cess is a separate levy on a
+                        different base — each line's gross value, before the discount. */}
+                    <td className="py-2 px-2 text-right font-mono text-[#6B5744]">
+                      {tax.cessTotal > 0 && (
+                        <>
+                          {fmt(tax.cessTotal)}
+                          <div className={`${HINT_CLS} font-normal`}>comp. cess · on gross</div>
+                        </>
+                      )}
+                    </td>
                     <td className="py-2 px-2 text-right font-mono">
                       {fmt(tax.taxTotal)}
                       {tax.taxTotal > 0 && (
@@ -1744,8 +1889,11 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                 </span>
               </div>
               <p className="text-[10px] text-[#8B7355]">
-                Tax is charged on the value <strong>after</strong> discount, shown per line, and recorded separately —
+                GST is charged on the value <strong>after</strong> discount, shown per line, and recorded separately —
                 it is never added into the item rate, so recipe costs stay on the true goods price.
+                Compensation cess (per line, seeded from the Raw Material master) is charged on the line&apos;s
+                <strong> gross value, before the discount</strong> — a different base on purpose — and it is a
+                separate levy, never part of CGST + SGST. It is recorded beside the rate the same way.
               </p>
               <div className="flex flex-col sm:flex-row gap-2">
                 <input value={billNo} onChange={e => setBillNo(e.target.value)}
@@ -1759,13 +1907,15 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
               </div>
               {/* RECONCILE AGAINST THE PAPER BILL IN THE RECEIVER'S HAND. Reads
                   in the same order the vendor's invoice does — goods, discount,
-                  taxable, CGST, SGST, delivery, bill total — so it can be
-                  checked line by line before Confirm. Shown whenever there are
-                  charges OR any tax: a bill with 18% GST and no discount still
-                  has to be reconciled. The one figure that is NOT on the paper
+                  taxable, CGST, SGST, compensation cess, delivery, bill total —
+                  so it can be checked line by line before Confirm. Shown
+                  whenever there are charges OR any tax: a bill with 18% GST and
+                  no discount still has to be reconciled, and so does one with
+                  cess but no GST at all (cess is item-specific, so that is a
+                  real bill — hence cessTotal in the gate, not just taxTotal). The one figure that is NOT on the paper
                   bill is called out on its own: what actually becomes the cost
                   of the stock, which excludes both tax and delivery. */}
-              {(hasCharges || tax.taxTotal > 0) && alloc.subtotal > 0 && (
+              {(hasCharges || tax.taxTotal > 0 || tax.cessTotal > 0) && alloc.subtotal > 0 && (
                 <div className="border-t border-[#E8D5C4] pt-1.5 text-[11px] font-mono space-y-0.5">
                   <div className="flex justify-between text-[#6B5744]"><span>Goods (accepted subtotal)</span><span>{fmt(alloc.subtotal)}</span></div>
                   <div className="flex justify-between text-emerald-700">
@@ -1776,6 +1926,18 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                   </div>
                   <div className="flex justify-between text-[#6B5744]"><span>+ CGST</span><span>{fmt(tax.cgstTotal)}</span></div>
                   <div className="flex justify-between text-[#6B5744]"><span>+ SGST</span><span>{fmt(tax.sgstTotal)}</span></div>
+                  {/* ON ITS OWN LINE, AND ON ITS OWN BASE. Compensation cess is
+                      not GST: it is never halved into CGST/SGST above, and it is
+                      charged on each line's GROSS value BEFORE the discount, not
+                      on the Taxable line. Stated in the label because the two bases
+                      differ by design and the arithmetic otherwise looks wrong. */}
+                  <div className="flex justify-between text-[#6B5744]">
+                    {/* NOT "on {alloc.subtotal}": cess is item-specific, so only
+                        the lines that carry a rate contribute. The base named
+                        here is the per-line one, which is what each row shows. */}
+                    <span>+ Comp. cess <span className="font-sans text-[9px] text-[#8B7355]">(each line&apos;s gross, before discount)</span></span>
+                    <span>{fmt(tax.cessTotal)}</span>
+                  </div>
                   <div className="flex justify-between text-[#8B7355]">
                     <span>+ Delivery (recorded only)</span><span>{fmt(alloc.delivery)}</span>
                   </div>
@@ -1786,8 +1948,9 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     <span className="font-semibold">Cost basis booked to stock</span><span className="font-semibold">{fmt(alloc.net_subtotal)}</span>
                   </div>
                   <div className="text-[9px] text-[#8B7355] font-sans leading-tight">
-                    Goods less discount — GST and delivery are on the bill but not in the cost of the stock.
-                    GST is reclaimable input credit, not part of what the food costs.
+                    Goods less discount — GST, compensation cess and delivery are on the bill but not in the cost
+                    of the stock. GST is reclaimable input credit, not part of what the food costs; compensation
+                    cess is a separate levy, recorded the same way and likewise kept out of item cost.
                   </div>
                 </div>
               )}

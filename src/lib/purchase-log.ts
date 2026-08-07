@@ -96,8 +96,15 @@ import { todayIST } from './format-date';
  *   special_excise_cess, which means TGBCL Special Excise Cess everywhere it is
  *   read or labelled, and it is NOT part of the cgst + sgst invariant: it is a
  *   separate levy, never halved, and adding it to that pair would misstate the
- *   GST on a return. It exists on `purchases` only — goods_receipt_note_items
- *   has no such column — so it is null on GRN rows as well as PO rows.
+ *   GST on a return. It exists on BOTH `purchases` and goods_receipt_note_items,
+ *   so it is reported on PURCHASE rows and on GRN rows alike; it stays null on
+ *   PO rows, which genuinely have no charge columns.
+ *   ITS TAXABLE BASE IS NOT THE GST BASE, and a reader comparing the two
+ *   figures on one GRN row will assume it is. GST is charged on the line value
+ *   AFTER the discount; compensation cess is charged on the GROSS line value
+ *   BEFORE the discount. On 10 kg @ Rs 100 with a Rs 100 discount that is GST
+ *   18% on Rs 900 = Rs 162 but cess 12% on Rs 1,000 = Rs 120. The two bases
+ *   differ deliberately — do not "reconcile" them, here or at the writers.
  * • GRN qty is quantity_ACCEPTED (what became stock and became a purchases
  *   row), so qty × rate = value holds. quantity_rejected rides in its own
  *   column; received = qty + qty_rejected.
@@ -149,7 +156,11 @@ export interface PurchaseLogRow {
   cgst: number | null;
   sgst: number | null;
   special_excise_cess: number | null;
-  /** GST compensation cess. PURCHASE rows only — null on GRN and PO rows. */
+  /**
+   * GST compensation cess. PURCHASE and GRN rows — null on PO rows.
+   * Charged on the GROSS line value, BEFORE discount — NOT on the
+   * post-discount base cgst/sgst use. See the header note.
+   */
   compensation_cess: number | null;
   tcs: number | null;
   delivery_charges: number | null;
@@ -402,12 +413,18 @@ function buildUnion(f: {
         ROUND(gi.quantity_accepted * gi.unit_price, 2)    AS value,
         gi.quantity_rejected                              AS qty_rejected,
         gi.discount, gi.cgst, gi.sgst, gi.special_excise_cess,
-        -- goods_receipt_note_items has NO compensation_cess column; GST
-        -- compensation cess is recorded on the purchases table only. NULL, not
-        -- 0 (a receipt note carries no such levy, it is not "zero cess"), and
-        -- aliased explicitly — with ?source=grn this branch is the FIRST of the
+        -- GST compensation cess, now REAL on this branch: the GRN item carries
+        -- its own compensation_cess column and PO Receive / ad-hoc GRN book the
+        -- levy onto the GRN line (the bill document), not onto the tax-free
+        -- purchases mirror. Reporting NULL here printed a blank for a cess
+        -- that was actually levied and stored.
+        -- ITS BASE IS NOT THE GST BASE, and the two sit side by side on this
+        -- row: gi.cgst/gi.sgst are charged on the line value AFTER discount,
+        -- gi.compensation_cess on the GROSS line value BEFORE it. They will not
+        -- agree with each other's rate arithmetic and are not meant to.
+        -- Aliased explicitly — with ?source=grn this branch is the FIRST of the
         -- compound SELECT and its names become the outer SELECT *'s names.
-        NULL AS compensation_cess,
+        gi.compensation_cess AS compensation_cess,
         gi.tcs, gi.delivery_charges, gi.mrp_round_off,
         g.grn_number                                      AS link_raw,
         0                                                 AS is_mirror,
