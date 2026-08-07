@@ -3318,6 +3318,10 @@ function RecahoInwardModal({ onClose, onCommitted }:
                         <th className="text-left  py-1 px-2 font-medium">Item</th>
                         <th className="text-right py-1 px-2 font-medium">Qty</th>
                         <th className="text-left  py-1 px-2 font-medium">Unit</th>
+                        {/* This header was missing, so all three money cells printed one
+                            column to the left and the RATE appeared under "Subtotal" — a
+                            5-BTL @ ₹180 line read as ₹180 of value instead of ₹900. */}
+                        <th className="text-right py-1 px-2 font-medium" title="₹ per PURCHASE unit — the vendor's rate. Same basis as the Qty beside it (purchase units), so Qty × Rate = Subtotal.">Rate</th>
                         <th className="text-right py-1 px-2 font-medium" title="Qty × Rate — the charge-free goods value. THIS is what becomes the purchase amount.">Subtotal</th>
                         {/* Two visibly different quantities, side by side. They were
                             being conflated: the tax-inclusive figure was written into

@@ -1,5 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, canProcessAsStore } from '@/lib/auth';
+import { packFactor } from '@/lib/pack-units';
+import { rateMap, materialRate } from '@/lib/closing-valuation';
 
 /**
  * Cross-requisition issued-items log.
@@ -53,11 +55,23 @@ export async function GET(request: Request) {
     // Pull every line that has at least one issue event, then expand in JS.
     // SQLite's JSON1 could do this server-side, but keeping it in JS makes the
     // shape much easier to evolve.
+    //
+    // The stored last-purchase-price column on raw_materials is DELIBERATELY NOT
+    // SELECTED here, and must not be added back. It holds mixed bases on this
+    // database: of the 190 packed materials carrying both that column and a
+    // purchase history, 115 hold Rs per PURCHASE unit and 71 already hold Rs per
+    // RECIPE unit. This route used to divide it by pack_size unconditionally,
+    // which converted those 71 a second time — 100 PIPERS (750ML) stores 2.2112
+    // (Rs/ml, matching its average_price 2.5404), divided again by 750 gives
+    // Rs 0.00295/ml, 862x low, so a 2-BTL issue logged Rs 4.42 instead of ~Rs 3811.
+    // Rates now come from src/lib/closing-valuation.ts, the sanctioned ladder:
+    // latest purchases.unit_price (Rs per PURCHASE unit by canon), then
+    // average_price x packFactor, then none.
     const rows = db.prepare(`
       SELECT ri.id AS item_id, ri.req_id, ri.material_id, ri.department_id AS line_dept_id,
              ri.quantity_requested, ri.chef_approved_qty, ri.quantity_issued, ri.is_rejected,
              ri.issue_history, ri.notes, ri.unit AS line_unit,
-             rm.name AS material_name, rm.unit, rm.average_price, rm.last_purchase_price,
+             rm.name AS material_name, rm.unit, rm.average_price,
              rm.purchase_unit AS rm_purchase_unit, COALESCE(rm.pack_size, 1) AS rm_pack_size,
              r.req_number, r.department_id AS req_dept_id, r.purpose, r.event_name,
              COALESCE(d_line.name, d_req.name) AS department_name
@@ -74,7 +88,32 @@ export async function GET(request: Request) {
     let totalValue = 0;
     const dists = { materials: new Set<string>(), departments: new Set<string>() };
 
+    // ONE query for the whole log: the latest priced purchase per material. Passing
+    // the hit (or an explicit null) into materialRate as `preloaded` keeps it from
+    // running its own per-material SELECT inside the loop.
+    const rates = rows.length ? rateMap(db) : new Map<string, { unit_price: number; date: string }>();
+
     for (const row of rows) {
+      // PackMeta + average_price, the shape closing-valuation reads. `unit` is the
+      // RECIPE unit, `purchase_unit` the PURCHASE unit; packFactor/toPurchaseQty
+      // apply the both-halves guard (pack_size > 1 AND unit !== purchase_unit), so
+      // a kg/kg pack_size-1.5 material like PICKLED GINGER is never converted.
+      const mat = {
+        id: row.material_id as string,
+        unit: row.unit,
+        purchase_unit: row.rm_purchase_unit,
+        pack_size: row.rm_pack_size,
+        average_price: row.average_price,
+      };
+      const preloaded = rates.get(row.material_id) ?? null;
+      const matPackFactor = packFactor(mat);
+      // Resolved ONCE per requisition line: the rate depends only on the material,
+      // never on the individual issue event, so a split issue (30 kg now + 20 kg
+      // later) is costed at one consistent rate. ratePerPurchaseUnit is Rs per
+      // PURCHASE unit by construction on every rung of the ladder.
+      const rate = materialRate(db, mat, preloaded);
+      const ratePU = rate.ratePerPurchaseUnit;
+
       let history: Array<{ qty: number; at: string; by: string; note?: string }> = [];
       try { history = JSON.parse(row.issue_history || '[]'); } catch { continue; }
       if (!Array.isArray(history) || history.length === 0) continue;
@@ -102,12 +141,22 @@ export async function GET(request: Request) {
         const rawQty = Number(h.qty) || 0;
         const recipeQty   = lineIsPU ? rawQty * vPack : rawQty;
         const qtyPurchase = Math.round((lineIsPU ? rawQty : rawQty / ((vPack > 1 && vDiffer) ? vPack : 1)) * 1000) / 1000;
-        // unitCost is ₹/RECIPE-unit (lpp is ₹/purchase-unit → ÷pack; average_price
-        // already is). Value = recipeQty × ₹/recipe — ONE basis, never mixed.
-        const vLpp = (vPack > 1 && vDiffer)
-          ? (Number(row.last_purchase_price) || 0) / vPack
-          : Number(row.last_purchase_price) || 0;
-        const unitCost = vLpp || Number(row.average_price) || 0;
+        // ── MONEY: one basis on BOTH halves of the multiplication ───────────
+        // Both halves are RECIPE basis here:
+        //     value = recipeQty [ml] × unitCost [Rs/ml]
+        // and unitCost is derived from the ladder's Rs-per-PURCHASE-unit rate by
+        // dividing ONCE by the same packFactor that carries the both-halves guard,
+        // so the pack cancels exactly instead of being applied twice.
+        //
+        // Deliberately NOT valueCount(): that helper multiplies toPurchaseQty(qty)
+        // × ratePU, and toPurchaseQty ROUNDS TO 3 dp before the multiply — the very
+        // thing pack-units.ts warns against ("Money never round-trips through the
+        // purchase basis"). It is exact for a whole-bottle issue but collapses on
+        // the small pours this log exists to record: 12 ml of KF PREMIUM DRAUGHT
+        // 50 LTRS (pack 50,000) rounds to 0.000 kegs and values at Rs 0.00 instead
+        // of Rs 1.90, and 30 ml values 66% HIGH at Rs 7.91 against Rs 4.75.
+        // valueCount stays right for closing stock, where counts are whole packs.
+        const unitCost = matPackFactor > 1 ? ratePU / matPackFactor : ratePU;
         const lineValue = Math.round(recipeQty * unitCost * 100) / 100;
         totalValue += lineValue;
         dists.materials.add(row.material_id);
@@ -134,7 +183,19 @@ export async function GET(request: Request) {
           purpose: row.purpose,
           event_name: row.event_name || '',
           item_id: row.item_id,
+          // RECIPE basis (₹ per g / ml) — pairs with `qty` above. Unchanged field,
+          // unchanged basis; consumers that multiply qty × unit_cost still balance.
           unit_cost: unitCost,
+          // PURCHASE basis (₹ per kg / L / BTL) — pairs with `qty_purchase`, which
+          // is what this log LEADS with. A reader multiplying the two visible
+          // purchase-unit columns now lands on `value` instead of a pack_size-off
+          // number. Equal to unit_cost when the material is not packed.
+          unit_cost_purchase: ratePU,
+          // Which rung of the closing-valuation ladder this rate came from
+          // ('last_purchase' | 'average_cost' | 'none') and the purchase date behind
+          // it. A valuation nobody can trace is a valuation nobody trusts.
+          rate_source: rate.source,
+          rate_as_of: rate.asOf || null,
           value: lineValue,
         });
       }

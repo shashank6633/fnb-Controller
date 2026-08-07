@@ -46,7 +46,26 @@ const SELECT_BASE = `
          COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
          COALESCE(rm.pack_size, 1) AS material_pack_size,
          rm.average_price AS material_avg_price,
-         rm.last_purchase_price AS material_last_price,
+         -- material_last_price is served PURCHASE-BASIS BY CONSTRUCTION, from the
+         -- live purchase row — NOT from rm.last_purchase_price. That stored column
+         -- is mixed-basis: some rows hold ₹/PURCHASE unit, others ₹/RECIPE unit,
+         -- and nothing on the row says which, so no conversion (here or on the
+         -- client) can be correct for both. purchases.unit_price is ₹ per PURCHASE
+         -- unit by the core convention (purchases.quantity is in purchase units),
+         -- so this needs no pack_size factor at all.
+         --   contracts/page.tsx:235 prints it beside material_avg_price x
+         --   packFactor under a header that says "per PURCHASE unit":
+         --     LHS = ₹/recipe-unit × (recipe units per purchase unit) = ₹/purchase-unit
+         --     RHS = ₹/purchase-unit                                  = ₹/purchase-unit
+         --   Both halves now agree with the label. Served raw, the RHS was
+         --   pack_size too low on every recipe-basis row — MALA STRAWBERRY CRUSH
+         --   5 LTR (ml/BTL, pack 5000) read ₹0.13/BTL next to a correct ₹674.00/BTL
+         --   average, making an overpriced contract look like a bargain.
+         -- Identical expression to /api/inventory/route.ts:40, so the table half of
+         -- that page agrees with its form half (rateOf reads the inventory catalog).
+         -- 0 = no purchase history yet; it is the same "no data" sentinel both
+         -- consumers already treat as absent, never a real ₹0 rate.
+         COALESCE((SELECT unit_price FROM purchases WHERE material_id = rm.id ORDER BY date DESC, created_at DESC LIMIT 1), 0) AS material_last_price,
          CASE
            WHEN vc.is_active = 1
             AND vc.valid_from <= date('now')

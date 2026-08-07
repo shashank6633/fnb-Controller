@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
+import { packFactor, purchasePrice as ratePerPurchaseUnit, type PackMeta } from '@/lib/pack-units';
 import {
   Utensils,
   Plus,
@@ -21,9 +22,140 @@ import {
   Calendar,
 } from 'lucide-react';
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * THE DIMENSIONAL INVARIANT THIS PAGE MUST NEVER BREAK
+ *
+ *     line value  =  issued_quantity  ×  purchase_price
+ *
+ * and BOTH factors are stored in the SAME basis: staff_meal_items.unit is the
+ * line's unit, issued_quantity counts that unit, purchase_price is ₹ for ONE of
+ * that unit. The API (/api/staff-meals/items) multiplies them verbatim, so the
+ * pairing has to be made correct HERE, at entry — there is no second chance.
+ *
+ * The two bases, from raw_materials (the house canon):
+ *   unit           RECIPE unit (g, ml)      average_price is ₹ PER RECIPE UNIT
+ *   purchase_unit  PURCHASE unit (kg, BTL)  ₹/purchase-unit = average_price × packFactor
+ *   pack_size      recipe units per purchase unit
+ *
+ * The bug this replaces: the row seeded unit:'kg' (a PURCHASE unit) while
+ * purchase_price was copied straight from average_price (₹ per RECIPE unit).
+ * ALMOND is g/kg/1000 at ₹1.0468/g, so "2 kg" booked ₹2.09 for ₹2,093.60 of
+ * almonds — a silent pack_size (1000×) error that reads as a plausible number.
+ *
+ * So: the unit is now a CLOSED list of the two units the material actually
+ * declares, and every write of `unit` recomputes `purchase_price` in the same
+ * breath (updateRow) so the two can never drift apart again.
+ *
+ * BOTH-HALVES GUARD: conversion only exists when pack_size > 1 AND the recipe
+ * unit differs from the purchase unit — that is packFactor()'s whole job, which
+ * is why it is imported and never re-derived here. PICKLED GINGER 1.5KG is
+ * kg/kg/1.5: packFactor 1, ONE unit option ('kg'), rate = average_price
+ * untouched. Multiplying it by 1.5 would be the mirror-image bug.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** Money TOTAL (a ₹ amount, not a rate). 0 dp — used for headline roll-ups. */
 function formatCurrency(value: number): string {
   return '₹' + value.toLocaleString('en-IN', { maximumFractionDigits: 0 });
 }
+
+/**
+ * Money TOTAL at line level, 2 dp. A row must reconcile on screen:
+ * Issued × Cost/Unit has to equal Net Cost when the reader multiplies the two
+ * printed columns. 2,000 g × ₹0.4851/g = ₹970.20, and rounding that to "₹970"
+ * is exactly the kind of un-checkable cell this audit exists to remove.
+ */
+function formatMoney2(value: number): string {
+  return '₹' + (Number(value) || 0).toLocaleString('en-IN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+/**
+ * A RATE — ₹ for one unit — printed WITH its denominator, never through the
+ * 0-dp total formatter. Sub-rupee recipe rates are real and common (ARBORIO
+ * ₹0.4851/g, APPLE CIDER VINEGAR ₹0.1605/ml); the 0-dp formatter printed every
+ * one of them as "₹0", which made the row impossible to reconcile.
+ *
+ * PRECISION IS NOT A MAGNITUDE QUESTION — it is a "does the printed rate still
+ * multiply out" question, and the two come apart above ₹1. A first pass here
+ * kept 4 dp only BELOW ₹1 and rounded everything else to 2, which quietly broke
+ * the reconciliation it was added to fix: ALMOND is ₹1.0468/g, just over the
+ * threshold, so it printed "₹1.05/g" and 3,000 g × ₹1.05 reads ₹3,150 against a
+ * true ₹3,140.40. Measured on the live catalog (735 materials with a non-zero
+ * average_price): 96 rows are ≥ ₹1 AND carry more than 2 dp — every one of them
+ * was being rounded — and ZERO rows carry more than 4 dp. So 4 dp is not a
+ * guess, it is the catalog's actual precision; min 2 keeps ₹1,046.80/kg reading
+ * like money instead of "₹1046.8".
+ */
+function formatRate(value: number, unit?: string | null): string {
+  const n = Number(value) || 0;
+  const s = '₹' + n.toLocaleString('en-IN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  });
+  const u = String(unit || '').trim();
+  return u ? `${s}/${u}` : s;
+}
+
+/**
+ * The units a material may be issued in — its OWN declared pair, nothing else.
+ * De-duplicated: a kg/kg material offers one option. When there is no real pack
+ * conversion (packFactor 1) only the recipe unit is offered, because that is the
+ * one basis whose rate (average_price) is known to be right; offering a second
+ * label with a factor of 1 would invite a case/piece mix-up nobody can convert.
+ * Purchase unit LEADS (owner rule, 2026-07-29) and is therefore the default.
+ *
+ * Two live shapes land on the single-option branch, and NEITHER loses money:
+ *   PICKLED GINGER 1.5KG  kg/kg/1.5  → ['kg'], rate = average_price untouched.
+ *   BUDWEISER (330ML)     pcs/BTL/1  → ['pcs']. 14 catalog rows look like this;
+ *     1 pcs IS 1 BTL, so the rate is the same number either way and only the
+ *     label differs. Offering 'BTL' as a second option would imply a conversion
+ *     the row does not declare — exactly the invented factor to avoid.
+ */
+function unitOptionsFor(m: PackMeta | null | undefined): string[] {
+  if (!m) return [];
+  const recipeUnit = String(m.unit || '').trim();
+  const buyUnit = String(m.purchase_unit || '').trim() || recipeUnit;
+  if (packFactor(m) <= 1) return recipeUnit ? [recipeUnit] : [];
+  return [buyUnit, recipeUnit];
+}
+
+/**
+ * ₹ for ONE `unit` — the other half of the multiplication, resolved from the
+ * SAME unit string the quantity will be counted in.
+ *   unit === purchase unit → average_price × packFactor  (₹/kg, ₹/BTL)
+ *   unit === recipe unit   → average_price as stored     (₹/g,  ₹/ml)
+ * average_price is ALWAYS ₹ per recipe unit; it is the only rate on the row that
+ * has a guaranteed basis (last_purchase_price is mixed-basis and is never used
+ * here). packFactor carries the both-halves guard, so a kg/kg material lands on
+ * the recipe branch by construction.
+ */
+function rateForUnit(m: (PackMeta & { average_price?: number }) | null | undefined, unit: string): number {
+  const perRecipeUnit = Number(m?.average_price) || 0;
+  if (!m) return perRecipeUnit;
+  const buyUnit = String(m.purchase_unit || '').trim().toLowerCase();
+  const chosen = String(unit || '').trim().toLowerCase();
+  if (packFactor(m) > 1 && chosen === buyUnit) return ratePerPurchaseUnit(perRecipeUnit, m);
+  return perRecipeUnit;
+}
+
+/**
+ * A blank issue row. Was three copy-pasted literals; one factory now, so the
+ * seeded unit cannot drift away from the default the unit <select> lands on.
+ *
+ * 'kg' is deliberate and unchanged: it is the free-text placeholder for a row
+ * with no material yet, and it agrees with the select's default once a material
+ * IS picked, because unitOptionsFor() leads with the PURCHASE unit. Picking a
+ * material always overwrites both unit AND purchase_price together, so this
+ * literal never survives next to a rate.
+ */
+function blankRow() {
+  return { item_name: '', material_id: '', quantity: '', unit: 'kg', purchase_price: '', notes: '' };
+}
+
+/** The two fields that identify which material an issue row is about. */
+type IssueRowRef = { material_id?: string | null; item_name?: string | null };
 
 function todayString(): string {
   return new Date().toISOString().split('T')[0];
@@ -70,7 +202,15 @@ interface MealItem {
 interface RawMaterial {
   id: string;
   name: string;
+  /** RECIPE unit (g, ml) — the basis average_price is quoted in. */
   unit: string;
+  /** PURCHASE unit (kg, L, BTL). /api/inventory selects rm.*, so it is on the
+   *  wire already; the page simply never declared it, which is how the rate and
+   *  the quantity ended up in different bases. */
+  purchase_unit?: string | null;
+  /** Recipe units per purchase unit. Feeds packFactor's both-halves guard. */
+  pack_size?: number | null;
+  /** ₹ PER RECIPE UNIT. Never ₹ per pack. */
   average_price: number;
   category: string;
 }
@@ -106,7 +246,7 @@ export default function StaffMealsPage() {
 
   // Issue Items
   const [issueOpen, setIssueOpen] = useState(false);
-  const [newRows, setNewRows] = useState<any[]>([{ item_name: '', material_id: '', quantity: '', unit: 'kg', purchase_price: '', notes: '' }]);
+  const [newRows, setNewRows] = useState<any[]>([blankRow()]);
   const [issuing, setIssuing] = useState(false);
   const [issueResult, setIssueResult] = useState<any>(null);
 
@@ -197,26 +337,60 @@ export default function StaffMealsPage() {
   const openIssue = () => {
     setIssueOpen(true);
     setIssueResult(null);
-    setNewRows([{ item_name: '', material_id: '', quantity: '', unit: 'kg', purchase_price: '', notes: '' }]);
+    setNewRows([blankRow()]);
   };
+
+  /**
+   * The material a row is really about: the picked one, or — on the free-text
+   * name path — the one whose name it matches exactly. The server resolves that
+   * same name match and fills the price from average_price (₹/RECIPE unit), so
+   * the row's unit has to be pinned to the same basis on this side too.
+   */
+  const materialForRow = useCallback((row: IssueRowRef | null | undefined): RawMaterial | null => {
+    if (row?.material_id) return materials.find(m => m.id === row.material_id) || null;
+    const typed = String(row?.item_name || '').toLowerCase().trim();
+    if (!typed) return null;
+    return materials.find(m => m.name.toLowerCase().trim() === typed) || null;
+  }, [materials]);
 
   const updateRow = (idx: number, field: string, value: any) => {
     setNewRows(prev => {
       const copy = [...prev];
       copy[idx] = { ...copy[idx], [field]: value };
+
+      // UNIT AND RATE MOVE TOGETHER — ALWAYS. Every branch below writes both, so
+      // a quantity in kg can never sit beside a rate in ₹/g (the pack_size bug).
       if (field === 'material_id' && value) {
         const mat = materials.find(m => m.id === value);
         if (mat) {
+          // Purchase unit leads (owner rule) and matches the 'kg' this row was
+          // already seeded with, so the kitchen's mental model is unchanged —
+          // only the rate beside it becomes right.
+          const unit = unitOptionsFor(mat)[0] || mat.unit;
           copy[idx].item_name = mat.name;
-          copy[idx].unit = mat.unit;
-          copy[idx].purchase_price = mat.average_price;
+          copy[idx].unit = unit;
+          copy[idx].purchase_price = rateForUnit(mat, unit);
+        }
+      } else if (field === 'unit') {
+        // Re-price into the newly chosen basis. Without this branch, switching
+        // g → kg would multiply a kg count by a ₹/g rate: 1000× low.
+        const mat = materialForRow(copy[idx]);
+        if (mat) copy[idx].purchase_price = rateForUnit(mat, value);
+      } else if (field === 'item_name') {
+        // Free-text that lands on a real material: adopt its declared basis so
+        // the row stops being a kg quantity with an unset (→ recipe) rate.
+        const mat = materialForRow(copy[idx]);
+        if (mat && !copy[idx].material_id) {
+          const unit = unitOptionsFor(mat)[0] || mat.unit;
+          copy[idx].unit = unit;
+          copy[idx].purchase_price = rateForUnit(mat, unit);
         }
       }
       return copy;
     });
   };
 
-  const addRow = () => setNewRows(prev => [...prev, { item_name: '', material_id: '', quantity: '', unit: 'kg', purchase_price: '', notes: '' }]);
+  const addRow = () => setNewRows(prev => [...prev, blankRow()]);
   const removeRow = (idx: number) => setNewRows(prev => prev.length === 1 ? prev : prev.filter((_, i) => i !== idx));
 
   const submitIssue = async () => {
@@ -224,17 +398,49 @@ export default function StaffMealsPage() {
     setIssuing(true);
     setIssueResult(null);
     try {
-      const payload = newRows
-        .filter(r => r.item_name.trim() && parseFloat(r.quantity) > 0)
-        .map(r => ({
+      const usable = newRows.filter(r => r.item_name.trim() && parseFloat(r.quantity) > 0);
+
+      // CLOSED-LIST GUARD. The API multiplies issued_quantity × purchase_price
+      // verbatim and (department branch) converts the quantity with lineFactor(),
+      // which only recognises the material's OWN two unit strings — anything else
+      // is treated as factor 1 and silently mis-books. Refuse the whole batch
+      // rather than post part of it: this route runs one transaction per batch.
+      const unitErrors: string[] = [];
+      for (let i = 0; i < usable.length; i++) {
+        const mat = materialForRow(usable[i]);
+        if (!mat) continue; // genuinely ad-hoc item, no declared basis to check
+        const allowed = unitOptionsFor(mat);
+        const chosen = String(usable[i].unit || '').trim().toLowerCase();
+        if (allowed.length > 0 && !allowed.some(u => u.toLowerCase() === chosen)) {
+          unitErrors.push(
+            `Row ${i + 1}: ${mat.name} is stocked in ${allowed.join(' or ')} — ` +
+            `"${usable[i].unit || '(blank)'}" is not a unit it declares, so the rate cannot be matched to it.`,
+          );
+        }
+      }
+      if (unitErrors.length > 0) {
+        setIssueResult({ success: 0, errors: unitErrors });
+        return;
+      }
+
+      const payload = usable.map(r => {
+        const mat = materialForRow(r);
+        const typed = parseFloat(r.purchase_price);
+        // A blank/zero rate on a known material would make the server fall back
+        // to average_price — ₹ per RECIPE unit — beside whatever unit this row
+        // carries. Pin it to the row's own basis instead. A rate the user typed
+        // is respected as-is: a one-off price is a legitimate entry.
+        const rate = typed > 0 ? typed : (mat ? rateForUnit(mat, r.unit) : 0);
+        return {
           meal_id: selectedMeal.id,
           item_name: r.item_name,
           material_id: r.material_id || null,
           issued_quantity: parseFloat(r.quantity),
           unit: r.unit,
-          purchase_price: parseFloat(r.purchase_price) || 0,
+          purchase_price: rate,
           notes: r.notes,
-        }));
+        };
+      });
 
       if (payload.length === 0) {
         setIssueResult({ success: 0, errors: ['No valid rows'] });
@@ -248,7 +454,7 @@ export default function StaffMealsPage() {
       const json = await res.json();
       setIssueResult(json);
       if (json.success > 0) {
-        setNewRows([{ item_name: '', material_id: '', quantity: '', unit: 'kg', purchase_price: '', notes: '' }]);
+        setNewRows([blankRow()]);
         await viewMeal(selectedMeal);
         await fetchMeals();
         await fetchMaterials();
@@ -511,8 +717,11 @@ export default function StaffMealsPage() {
                                 <td className="py-2 px-3 text-right text-xs font-mono text-[#af4408] font-semibold">{item.issued_quantity} {item.unit}</td>
                                 <td className="py-2 px-3 text-right text-xs font-mono text-green-600">{isOpen ? <span className="text-[#C4B09A]">—</span> : `${item.returned_quantity} ${item.unit}`}</td>
                                 <td className="py-2 px-3 text-right text-xs font-mono text-red-500 font-semibold">{isOpen ? <span className="text-[#C4B09A]">pending</span> : `${item.quantity} ${item.unit}`}</td>
-                                <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744]">{formatCurrency(item.purchase_price)}</td>
-                                <td className="py-2 px-3 text-right text-xs font-mono text-red-500 font-semibold">{isOpen ? <span className="text-[#C4B09A]">—</span> : formatCurrency(item.total_cost)}</td>
+                                {/* A RATE, not a total: printed with the unit it is
+                                    quoted per, and with enough precision to be real.
+                                    Issued × Cost/Unit must reconcile to Net Cost. */}
+                                <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744]">{formatRate(item.purchase_price, item.unit)}</td>
+                                <td className="py-2 px-3 text-right text-xs font-mono text-red-500 font-semibold">{isOpen ? <span className="text-[#C4B09A]">—</span> : formatMoney2(item.total_cost)}</td>
                                 <td className="py-2 px-2 text-center">
                                   {isOpen ? <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 border border-blue-200">Open</span> : <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-100 text-green-700 border border-green-200">Closed</span>}
                                 </td>
@@ -621,32 +830,73 @@ export default function StaffMealsPage() {
                 <table className="w-full text-sm">
                   <thead className="bg-[#FFF1E3]">
                     <tr className="text-[#6B5744]">
-                      <th className="text-left py-2.5 px-2 font-medium w-[35%]">Material</th>
-                      <th className="text-right py-2.5 px-2 font-medium w-[12%]">Issue Qty *</th>
-                      <th className="text-left py-2.5 px-2 font-medium w-[10%]">Unit</th>
-                      <th className="text-right py-2.5 px-2 font-medium w-[14%]">Cost/Unit</th>
-                      <th className="text-left py-2.5 px-2 font-medium w-[20%]">Notes</th>
+                      <th className="text-left py-2.5 px-2 font-medium w-[30%]">Material</th>
+                      <th className="text-right py-2.5 px-2 font-medium w-[11%]">Issue Qty *</th>
+                      <th className="text-left py-2.5 px-2 font-medium w-[11%]">Unit</th>
+                      <th className="text-right py-2.5 px-2 font-medium w-[15%]">Cost/Unit</th>
+                      <th className="text-right py-2.5 px-2 font-medium w-[14%]">Line Value</th>
+                      <th className="text-left py-2.5 px-2 font-medium w-[16%]">Notes</th>
                       <th className="py-2.5 px-2 w-8"></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {newRows.map((row, idx) => (
+                    {newRows.map((row, idx) => {
+                      // Everything below reads ONE resolved material, so the unit
+                      // list, the rate and the previewed value cannot disagree.
+                      const mat = materialForRow(row);
+                      const options = unitOptionsFor(mat);
+                      const rowQty = parseFloat(row.quantity);
+                      const rowRate = parseFloat(row.purchase_price);
+                      // Same multiplication the API performs (totalCost =
+                      // purchase_price × issued_quantity) — shown before posting
+                      // so a mis-paired basis is visible as a wrong ₹, not hidden.
+                      const lineValue = isFinite(rowQty) && isFinite(rowRate) ? rowQty * rowRate : null;
+                      const recipeHint = mat && packFactor(mat) > 1 && String(row.unit || '').trim().toLowerCase() === String(mat.purchase_unit || '').trim().toLowerCase()
+                        ? `= ${(Number(rowQty) || 0) * packFactor(mat)} ${mat.unit}`
+                        : null;
+                      return (
                       <tr key={idx} className="border-t border-[#E8D5C4]/50">
                         <td className="py-2 px-2">
                           <select value={row.material_id} onChange={e => updateRow(idx, 'material_id', e.target.value)} className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs focus:outline-none focus:ring-1 focus:ring-[#af4408]">
                             <option value="">Select from inventory...</option>
-                            {materials.map(m => <option key={m.id} value={m.id}>{m.name} ({m.unit}) — ₹{m.average_price}</option>)}
+                            {/* Label the rate in the SAME unit it is quoted for.
+                                The old label printed the recipe unit beside a bare
+                                average_price ("ALMOND (g) — ₹1.0468"), which reads
+                                like a kilo price for a gram rate. */}
+                            {materials.map(m => {
+                              const u = unitOptionsFor(m)[0] || m.unit;
+                              return <option key={m.id} value={m.id}>{m.name} — {formatRate(rateForUnit(m, u), u)}</option>;
+                            })}
                           </select>
                           <input type="text" value={row.item_name} onChange={e => updateRow(idx, 'item_name', e.target.value)} placeholder="Or enter name" className="w-full mt-1 px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
                         </td>
                         <td className="py-2 px-2">
                           <input type="number" step="0.01" min="0" value={row.quantity} onChange={e => updateRow(idx, 'quantity', e.target.value)} placeholder="0" className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right font-mono focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                          {recipeHint && <div className="text-[9px] text-[#B8A590] text-right mt-0.5">{recipeHint}</div>}
                         </td>
                         <td className="py-2 px-2">
-                          <input type="text" value={row.unit} onChange={e => updateRow(idx, 'unit', e.target.value)} className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                          {options.length > 0 ? (
+                            // CLOSED LIST — only the units this material declares.
+                            // Changing it re-prices the row (updateRow), so the two
+                            // halves of the multiplication move as one.
+                            <select value={row.unit} onChange={e => updateRow(idx, 'unit', e.target.value)} className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs focus:outline-none focus:ring-1 focus:ring-[#af4408]">
+                              {!options.some(u => u.toLowerCase() === String(row.unit || '').trim().toLowerCase()) && (
+                                <option value={row.unit}>{row.unit || '—'}</option>
+                              )}
+                              {options.map(u => <option key={u} value={u}>{u}</option>)}
+                            </select>
+                          ) : (
+                            <input type="text" value={row.unit} onChange={e => updateRow(idx, 'unit', e.target.value)} className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                          )}
                         </td>
                         <td className="py-2 px-2">
-                          <input type="number" step="0.01" min="0" value={row.purchase_price} onChange={e => updateRow(idx, 'purchase_price', e.target.value)} placeholder="0" className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right font-mono focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                          <input type="number" step="0.0001" min="0" value={row.purchase_price} onChange={e => updateRow(idx, 'purchase_price', e.target.value)} placeholder="0" className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right font-mono focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                          {/* The denominator is the whole point: a bare number in
+                              this cell is what let ₹/g pass for ₹/kg. */}
+                          <div className="text-[9px] text-[#B8A590] text-right mt-0.5">₹ per {String(row.unit || '').trim() || 'unit'}</div>
+                        </td>
+                        <td className="py-2 px-2 text-right text-xs font-mono text-[#af4408] font-semibold">
+                          {lineValue !== null ? formatMoney2(lineValue) : <span className="text-[#C4B09A]">—</span>}
                         </td>
                         <td className="py-2 px-2">
                           <input type="text" value={row.notes} onChange={e => updateRow(idx, 'notes', e.target.value)} placeholder="Optional" className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
@@ -655,7 +905,8 @@ export default function StaffMealsPage() {
                           {newRows.length > 1 && <button onClick={() => removeRow(idx)} className="p-1 text-red-400 hover:text-red-600"><Trash2 className="w-3.5 h-3.5" /></button>}
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -722,7 +973,10 @@ export default function StaffMealsPage() {
                             {consumed !== null ? `${consumed} ${item.unit}` : '—'}
                           </td>
                           <td className="py-2 px-3 text-right text-xs font-mono text-red-500">
-                            {costPreview !== null ? formatCurrency(costPreview) : '—'}
+                            {/* consumed (line unit) × purchase_price (₹ per that
+                                same line unit) — 2 dp so a sub-rupee rate does not
+                                collapse the preview to ₹0. */}
+                            {costPreview !== null ? formatMoney2(costPreview) : '—'}
                           </td>
                           <td className="py-2 px-2">
                             <input type="text" value={draft.notes} onChange={e => updateReturn(item.id, 'notes', e.target.value)} placeholder="Optional" className="w-full px-2 py-1 bg-white border border-[#D4B896] rounded text-xs focus:outline-none focus:ring-1 focus:ring-[#af4408]" />

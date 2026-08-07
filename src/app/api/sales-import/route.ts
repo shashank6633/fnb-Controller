@@ -1,6 +1,7 @@
 import { getDb, generateId, deductInventoryForSale } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { parseRecahoSalesWorkbook, ParsedSaleLine } from '@/lib/recaho-sales';
+import { packFactor } from '@/lib/pack-units';
 import * as XLSX from 'xlsx';
 
 /**
@@ -305,17 +306,163 @@ export async function POST(request: Request) {
       return acc;
     };
 
+    /* ── DIRECT-ITEM COST BASIS (lines with no recipe) ─────────────────────
+     * THE DIMENSION RULE. A line's cost is quantity × rate, and the two halves
+     * must be in the SAME basis. Name the basis of each factor:
+     *
+     *   line.total_qty        — ITEMS SOLD (pegs, plates, bottles). It is a
+     *                           COUNT. It is never a weight and never a volume.
+     *   rm.average_price      — ₹ per RECIPE unit (₹/ml, ₹/g, ₹/pcs) per the
+     *                           house canon. It is NOT ₹ per item sold.
+     *   dil.qty_per_unit      — RECIPE units consumed per ITEM SOLD (30 for a
+     *                           30 ml peg, 700 for a full bottle, 4 for a
+     *                           bucket of beer). This is the ONLY factor that
+     *                           converts ₹/recipe-unit into ₹/item-sold.
+     *
+     * So the one dimensionally sound product is
+     *     ₹/recipe-unit  ×  recipe-units-per-item  ×  items-sold.
+     *
+     * When qty_per_unit is unset it defaults to 1, and for a MEASURED material
+     * (ml / l / g / kg) "1" is never a real portion — nobody sells one
+     * millilitre of gin or one gram of mutton. The default therefore silently
+     * priced ITEMS SOLD at ₹ per RECIPE unit: HENDRICKS 30ML booked
+     * 62 pegs × ₹5,641.83 = ₹3,49,793 of cost against ₹54,498 of revenue, a
+     * 642% food cost that reads as a plausible number on screen.
+     *
+     * /api/menu-items:56-62 already refuses to DISPLAY a cost in exactly this
+     * case (its CASE expression returns NULL so the UI shows "—"). This is the
+     * same guard on the WRITER, which is where the money is actually booked.
+     * ₹0 + a named un-costed line is the honest answer: the hole stays visible
+     * and /api/reports/menu-recipe-gap measures it, instead of a fabricated
+     * cost that reconciles with nothing.
+     *
+     * PIECE-COUNTED materials (unit = pcs / btl / nos / …) keep the
+     * 1-sold = 1-piece default, because for them that IS the portion — one
+     * bottled beer sold is one bottle out. They are unaffected by this guard.
+     *
+     * NOT A BACKFILL. Sales rows already carrying the old product are left
+     * exactly as they are; rewriting the owner's booked history is not this
+     * route's call. The guard stops new imports compounding it.
+     * ─────────────────────────────────────────────────────────────────────── */
+
+    // Recipe units that are a MEASURE, not a count. Same list, same order as
+    // the menu-items CASE expression — if one is edited the other must be.
+    const MEASURED_RECIPE_UNITS = new Set(['ml', 'l', 'g', 'kg']);
+
+    const findDirectLink = db.prepare(`
+      SELECT material_id, qty_per_unit FROM direct_item_links WHERE item_name = ? COLLATE NOCASE
+    `);
+    // unit / purchase_unit / pack_size ride along so the guard can tell a
+    // measure from a count, and so the un-costed line can name the pack size
+    // the operator most likely wants as the portion. packFactor() carries the
+    // both-halves guard (pack_size > 1 AND unit !== purchase_unit), so a
+    // kg/kg material like PICKLED GINGER 1.5KG reports no pack hint at all
+    // rather than a bogus one.
+    const findMat = db.prepare(`
+      SELECT id, name, unit, purchase_unit, pack_size, average_price
+      FROM raw_materials WHERE id = ?
+    `);
+
+    type DirectCost = {
+      lineCost: number;
+      /** Set only when the cost was SUPPRESSED by the portion-size guard. */
+      uncosted: null | {
+        item_name: string;
+        material_name: string;
+        material_unit: string;
+        qty_sold: number;
+        revenue: number;
+        /** Recipe units in one purchase unit, when a real pack conversion exists. */
+        pack_hint: number | null;
+        purchase_unit: string | null;
+        reason: string;
+      };
+    };
+
+    const directCostOf = (menu: any, line: ParsedSaleLine): DirectCost => {
+      // Try the explicit direct-item link first, then menu_items.material_id.
+      const dil = findDirectLink.get(line.product_name) as any;
+      const matId = dil?.material_id || menu.material_id || null;
+      if (!matId) return { lineCost: 0, uncosted: null };
+      const mat = findMat.get(matId) as any;
+      if (!mat || !(mat.average_price > 0)) return { lineCost: 0, uncosted: null };
+
+      // qty_per_unit = RECIPE units per ITEM SOLD. Absent → 1.
+      const qpu = Number(dil?.qty_per_unit) > 0 ? Number(dil.qty_per_unit) : 1;
+      const isMeasured = MEASURED_RECIPE_UNITS.has(
+        String(mat.unit || '').toLowerCase().trim(),
+      );
+
+      if (isMeasured && qpu === 1) {
+        // ₹/ml × items-sold would be dimensionally wrong by the portion size.
+        // Book nothing and say so.
+        const pf = packFactor(mat);
+        return {
+          lineCost: 0,
+          uncosted: {
+            item_name: line.product_name,
+            material_name: mat.name,
+            material_unit: String(mat.unit || ''),
+            qty_sold: line.total_qty,
+            revenue: line.amount,
+            pack_hint: pf > 1 ? pf : null,
+            purchase_unit: mat.purchase_unit || null,
+            reason: 'no_portion_size',
+          },
+        };
+      }
+
+      // Dimensionally sound: ₹/recipe-unit × recipe-units-per-item × items-sold.
+      return { lineCost: mat.average_price * qpu * line.total_qty, uncosted: null };
+    };
+
+    const newUncosted = () => ({
+      rows: 0,
+      qty: 0,
+      revenue: 0,
+      items: [] as NonNullable<DirectCost['uncosted']>[],
+      warning: null as string | null,
+    });
+    type Uncosted = ReturnType<typeof newUncosted>;
+
+    const countUncosted = (acc: Uncosted, u: NonNullable<DirectCost['uncosted']>) => {
+      acc.rows    += 1;
+      acc.qty     += u.qty_sold;
+      acc.revenue += u.revenue;
+      acc.items.push(u);
+    };
+
+    const finishUncosted = (acc: Uncosted): Uncosted => {
+      if (acc.rows > 0) {
+        acc.warning = `${acc.rows} direct-sell line(s) booked ZERO food cost because their `
+          + 'material is measured (ml/g) and no portion size is configured. Set '
+          + 'direct_item_links.qty_per_unit (recipe units per item sold — e.g. 30 for a '
+          + '30 ml peg, 700 for a full bottle) on the Menu Items page, then re-import. '
+          + 'A zero here is deliberate: costing a peg at ₹ per millilitre overstates food '
+          + 'cost by the portion size and cannot be unwound once booked.';
+      }
+      return acc;
+    };
+
     // -------- Preview only --------
     if (!commit) {
       const matched_with_recipe = matched.filter(x => x.menu.recipe_id).length;
       // Same classification the commit will perform, run read-only, so the station gap
       // is visible BEFORE the sales rows exist rather than in the post-mortem.
       const previewAttribution = newAttribution();
+      // Same reason, run read-only for the portion-size guard: an operator must
+      // see WHICH lines will book zero food cost before committing, not after.
+      const previewUncosted = newUncosted();
       for (const { line, menu } of matched) {
         if (!VALID_BILL_TYPES.has(line.bill_type)) continue;
         countLine(previewAttribution, menu, line);
+        if (!menu.recipe_id) {
+          const u = directCostOf(menu, line).uncosted;
+          if (u) countUncosted(previewUncosted, u);
+        }
       }
       finishAttribution(previewAttribution);
+      finishUncosted(previewUncosted);
       return Response.json({
         preview: true,
         date_range: { start: parsed.start_date_iso, end: parsed.end_date_iso, anchor: anchorDate },
@@ -327,6 +474,13 @@ export async function POST(request: Request) {
         matched_no_recipe:    matched.length - matched_with_recipe,
         station_attribution:  previewAttribution,
         station_warning:      previewAttribution.warning,
+        uncosted_direct_items: {
+          count:   previewUncosted.rows,
+          qty:     previewUncosted.qty,
+          revenue: Math.round(previewUncosted.revenue * 100) / 100,
+          items:   previewUncosted.items.slice(0, 50),
+        },
+        uncosted_warning:     previewUncosted.warning,
         unmatched_count:      unmatched.length,
         unmatched_items:      unmatched.slice(0, 50).map(u => ({
           product_name: u.product_name, mapped_code: u.mapped_code,
@@ -361,13 +515,11 @@ export async function POST(request: Request) {
       // Where each committed line's consumption actually landed. Populated in the
       // commit loop below; the four row counts sum to sales_created by construction.
       station_attribution: newAttribution(),
+      // Direct-sell lines whose cost was SUPPRESSED by the portion-size guard.
+      // Not a bucket of station_attribution — it cuts across it and must never
+      // be added to those counts.
+      uncosted_direct_items: newUncosted(),
     };
-
-    // Helper: look up direct-item link (material_id + qty_per_unit) for an item name
-    const findDirectLink = db.prepare(`
-      SELECT material_id, qty_per_unit FROM direct_item_links WHERE item_name = ? COLLATE NOCASE
-    `);
-    const findMatPrice = db.prepare(`SELECT average_price FROM raw_materials WHERE id = ?`);
 
     const txn = db.transaction(() => {
       for (const { line, menu } of matched) {
@@ -375,24 +527,19 @@ export async function POST(request: Request) {
         const sellingPrice = line.total_qty > 0 ? (line.amount / line.total_qty) : (menu.selling_price || 0);
         const totalRevenue = line.bill_type === 'normal' ? line.amount : 0;
         // Cost computation:
-        //   - Recipe-linked → recipe.total_cost × qty
-        //   - Direct item (material_id) → material.average_price × qty × qty_per_unit
-        //   - Otherwise → 0 (unmatched, surfaces as 100% margin in reports)
+        //   - Recipe-linked → recipe.total_cost × qty  (both per-serving: sound)
+        //   - Direct item   → directCostOf(), which enforces the dimension rule
+        //                     documented above and books 0 + an un-costed record
+        //                     rather than ₹/ml × items-sold
+        //   - Otherwise     → 0 (unmatched, surfaces as 100% margin in reports)
         let lineCost = 0;
         if (menu.recipe_id) {
           const r = db.prepare('SELECT total_cost FROM recipes WHERE id = ?').get(menu.recipe_id) as any;
           if (r) lineCost = (r.total_cost || 0) * line.total_qty;
         } else {
-          // Try direct-item link first, then menu_items.material_id as fallback
-          const dil = findDirectLink.get(line.product_name) as any;
-          const matId = dil?.material_id || menu.material_id || null;
-          if (matId) {
-            const mat = findMatPrice.get(matId) as any;
-            const qpu = Number(dil?.qty_per_unit) > 0 ? Number(dil.qty_per_unit) : 1;
-            if (mat && mat.average_price > 0) {
-              lineCost = mat.average_price * line.total_qty * qpu;
-            }
-          }
+          const dc = directCostOf(menu, line);
+          lineCost = dc.lineCost;
+          if (dc.uncosted) countUncosted(summary.uncosted_direct_items, dc.uncosted);
         }
         const id = generateId();
         insSale.run(
@@ -423,6 +570,12 @@ export async function POST(request: Request) {
     });
     txn();
     finishAttribution(summary.station_attribution);
+    finishUncosted(summary.uncosted_direct_items);
+    // The item list is capped for the wire; rows / qty / revenue above it are
+    // accumulated over EVERY suppressed line, so the cap can never understate.
+    summary.uncosted_direct_items.revenue =
+      Math.round(summary.uncosted_direct_items.revenue * 100) / 100;
+    summary.uncosted_direct_items.items = summary.uncosted_direct_items.items.slice(0, 50);
 
     return Response.json({
       success: true,
@@ -432,6 +585,10 @@ export async function POST(request: Request) {
       // Lifted out of `summary` as well so a caller rendering only the top level cannot
       // miss it. An import that attributed nothing must never look like a clean import.
       station_warning: summary.station_attribution.warning,
+      // Same reasoning as station_warning: lifted to the top level so a caller
+      // rendering only the envelope cannot miss that some lines booked ₹0 cost
+      // on purpose. A zero food cost must never look like a clean import.
+      uncosted_warning: summary.uncosted_direct_items.warning,
       unmatched_items: unmatched.slice(0, 100).map(u => u.product_name),
       auto_created_menu_items: createdMenuItemsSummary
         ? { count: createdMenuItemsSummary.count, sample: createdMenuItemsSummary.items.slice(0, 10) }

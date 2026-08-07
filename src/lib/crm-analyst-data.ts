@@ -13,6 +13,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type Database from 'better-sqlite3';
 import { packFactor } from '@/lib/pack-units';
+import { materialRate, rateMap } from '@/lib/closing-valuation';
 
 type DB = Database.Database;
 
@@ -699,11 +700,40 @@ export function pendingApprovals(db: DB) {
  *                  from the contract) merged with plain vendor_materials mappings.
  *   preferred    — cheapest active contract's vendor; else the first mapped
  *                  vendor; else null.
- *   unit_price   — ₹/PURCHASE-unit: contract price → last_purchase_price (already
- *                  ₹/PU — same derivation the Requisitions page shows as "Last ₹")
- *                  → average_price (₹/recipe-unit) × packFactor — which is
- *                  pack_size ONLY when the recipe unit differs from the
- *                  purchase unit, else 1.
+ *   unit_price   — ₹/PURCHASE-unit: contract price, else the sanctioned rate
+ *                  ladder in src/lib/closing-valuation.ts.
+ *
+ * ── WHY THE LADDER AND NOT raw_materials.last_purchase_price ───────────────
+ * This function used to read last_purchase_price straight off raw_materials and
+ * assert it was ₹/purchase-unit. It is not — that column is stored in MIXED
+ * bases. Of the packed materials holding both a stored LPP and a purchase
+ * history, 115 are ₹/purchase-unit (the canon) and 71 are ₹/RECIPE-unit. On
+ * those 71 the number is pack_size too LOW, and here it was multiplied by a
+ * PURCHASE-unit pack count:
+ *
+ *     MALA STRAWBERRY CRUSH 5 LTR (unit ml, purchase_unit BTL, pack_size 5000)
+ *       stored last_purchase_price 0.13482   ← ₹/ml, i.e. recipe basis
+ *       real latest purchases.unit_price     ₹674.10 / BTL
+ *       2 BTL priced at ₹0.27 instead of ₹1,348.20 — 5,000× low.
+ *
+ * That is not a display bug: /api/crm/reorder turns these rows into a DRAFT PO
+ * line, receive writes the line into `purchases`, and updateMaterialPrice()
+ * then divides it by pack_size into average_price. A wrong rate here spends
+ * money and then poisons the costing.
+ *
+ * materialRate() resolves the same intent without the ambiguity:
+ *   rung 1 'last_purchase' — purchases.unit_price of the most recent priced
+ *          purchase. ₹/PURCHASE unit by canon, unambiguous, and it is what the
+ *          LPP column was only ever trying to approximate.
+ *   rung 2 'average_cost'  — average_price (₹/RECIPE unit) × packFactor. The
+ *          identical lift the old else-branch did, kept because it was right.
+ *   rung 3 'none'          — no basis at all: rate 0, reported as 0 rather than
+ *          dressed up as an "average" the row does not have.
+ *
+ * DIMENSIONS OF THE MULTIPLICATION BELOW — both halves are PURCHASE basis:
+ *     line_estimate = packs [PURCHASE units] × unit_price [₹ / PURCHASE unit]
+ * `packs` is already ceil(recipe need ÷ packFactor), so do NOT pair it with a
+ * ₹/recipe-unit rate, and do NOT "simplify" the ×packFactor out of rung 2.
  */
 export function reorderSuggestionsEnriched(db: DB) {
   const use = dailyUseMap(db, 14);
@@ -734,13 +764,11 @@ export function reorderSuggestionsEnriched(db: DB) {
     arr.push(m); mappingsByMat.set(m.material_id, arr);
   }
 
-  // last_purchase_price is ₹/purchase-unit (see /requisitions "PUoM · Last ₹").
-  const lastPrice = new Map<string, number>();
-  for (const r of db.prepare(`
-    SELECT id, last_purchase_price FROM raw_materials WHERE COALESCE(last_purchase_price,0) > 0
-  `).all() as { id: string; last_purchase_price: number }[]) {
-    lastPrice.set(r.id, r.last_purchase_price);
-  }
+  // Rung 1 of the sanctioned ladder, batched: the latest priced `purchases` row
+  // per material, ₹ per PURCHASE unit by canon. One SELECT for the whole sheet
+  // so materialRate() never queries per row. A material with no purchase
+  // history is simply absent and falls through to average_price × packFactor.
+  const rates = rateMap(db);
 
   const out: any[] = [];
   for (const m of activeMaterials(db)) {
@@ -788,13 +816,25 @@ export function reorderSuggestionsEnriched(db: DB) {
       ?? matMappings[0]                            // else first plain mapping
       ?? null;                                     // else unassigned
 
-    // ── ₹/purchase-unit ──
+    // ── ₹/PURCHASE-unit — the ONLY basis allowed here, because it multiplies
+    //    `packs`, which is a count of PURCHASE units. ─────────────────────────
     let unitPrice: number;
-    let priceSource: 'contract' | 'last_purchase' | 'average';
-    if (matContracts[0]) { unitPrice = r2(matContracts[0].unit_price); priceSource = 'contract'; }
-    else if (lastPrice.has(m.id)) { unitPrice = r2(lastPrice.get(m.id)); priceSource = 'last_purchase'; }
-    // average_price is ₹/RECIPE-unit — ×packF (never ×pack) lifts it to ₹/purchase-unit.
-    else { unitPrice = r2(m.average_price * packF); priceSource = 'average'; }
+    let priceSource: 'contract' | 'last_purchase' | 'average' | 'none';
+    if (matContracts[0]) {
+      // A negotiated vendor_contracts.unit_price is ₹/purchase-unit and beats
+      // history outright — it is the price we are contractually going to pay.
+      unitPrice = r2(matContracts[0].unit_price);
+      priceSource = 'contract';
+    } else {
+      // No contract: derive, never read raw last_purchase_price (mixed basis —
+      // see the header note). Rung 1 returns purchases.unit_price as-is
+      // (₹/purchase-unit); rung 2 returns average_price × packFactor, i.e. the
+      // ₹/recipe-unit average lifted to ₹/purchase-unit by the SAME packFactor
+      // that produced `packs`, so the two halves stay dimensionally paired.
+      const rate = materialRate(db, m, rates.get(m.id) ?? null);
+      unitPrice = r2(rate.ratePerPurchaseUnit);
+      priceSource = rate.source === 'average_cost' ? 'average' : rate.source;
+    }
 
     out.push({
       material_id: m.id,
@@ -830,7 +870,7 @@ export function reorderSuggestionsEnriched(db: DB) {
   return {
     as_of: today(),
     latest_issue_date: latestIssueDate(db),
-    note: 'Suggested qty = ceil((7-day need − outlet_on_hand) ÷ pack factor), in PURCHASE units, CRITICAL (3★) materials first. outlet_on_hand = current_stock (central store) + in_departments (kitchen shelves) — a requisition issue moves goods between our own shelves, so it must not trigger a purchase. Pack factor = pack_size only when the recipe unit differs from the purchase unit, else 1. unit_price is ₹/purchase-unit (contract → last purchase → average × pack factor).',
+    note: 'Suggested qty = ceil((7-day need − outlet_on_hand) ÷ pack factor), in PURCHASE units, CRITICAL (3★) materials first. outlet_on_hand = current_stock (central store) + in_departments (kitchen shelves) — a requisition issue moves goods between our own shelves, so it must not trigger a purchase. Pack factor = pack_size only when the recipe unit differs from the purchase unit, else 1. unit_price is ₹/purchase-unit and line_estimate = suggested_order_qty (purchase units) × unit_price, so both halves are on the purchase basis. price_source names the rung actually used: contract (vendor_contracts.unit_price) → last_purchase (unit_price of the latest purchases row) → average (average_price ₹/recipe-unit × pack factor) → none (no priced basis at all; unit_price 0, treat the estimate as unknown, not as zero cost).',
     rows: out.slice(0, 60),
   };
 }

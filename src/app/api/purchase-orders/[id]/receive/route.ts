@@ -1377,7 +1377,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             });
           } else {
             const reqItems = db.prepare(`
-              SELECT ri.*, rm.name AS material_name, rm.last_purchase_price, rm.average_price,
+              -- No last_purchase_price here on purpose. That column is stored in
+              -- MIXED bases (some rows ₹/purchase-unit, some already ₹/recipe-unit),
+              -- so it cannot be normalised by any formula. average_price is the
+              -- sanctioned single-basis rate — see src/lib/closing-valuation.ts and
+              -- src/app/api/department-variance/route.ts:620-622.
+              SELECT ri.*, rm.name AS material_name, rm.average_price,
                      rm.unit AS rm_unit, rm.purchase_unit AS rm_purchase_unit,
                      COALESCE(rm.pack_size, 1) AS rm_pack_size
               FROM requisition_items ri
@@ -1423,8 +1428,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               // src/lib/party-fulfillment.ts and the department-consumption SQL;
               // keep the three byte-equivalent.
               const rPack = Number(it.rm_pack_size) || 1;
-              const rUnitsDiffer = String(it.rm_unit || '').toLowerCase().trim()
-                !== String(it.rm_purchase_unit || it.rm_unit || '').toLowerCase().trim();
               const reqPackFactor =
                 (String(it.unit ?? '').trim() !== '' &&
                  it.unit === it.rm_purchase_unit &&
@@ -1434,12 +1437,23 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               const issued = issuedReq * reqPackFactor;   // RECIPE units
               decStock.run(issued, it.material_id);
               insPartyTx.run(generateId(), it.material_id, -issued, po.requisition_id, partyNote, partyOutletId);
-              // last_purchase_price is ₹/PURCHASE-unit (canon) — normalise to
-              // ₹/recipe-unit before multiplying by the recipe-unit `issued`.
-              const lppRecipe = (rPack > 1 && rUnitsDiffer)
-                ? (Number(it.last_purchase_price) || 0) / rPack
-                : Number(it.last_purchase_price) || 0;
-              const unitCost = lppRecipe || Number(it.average_price) || 0;
+              /* BOTH SIDES OF THIS MULTIPLICATION ARE ON THE RECIPE BASIS.
+                 LEFT  — `issued` is RECIPE units (ml/g): issuedReq is in the LINE's
+                         own unit and reqPackFactor above lifted a purchase-unit
+                         line into recipe units.
+                 RIGHT — raw_materials.average_price is ₹ per RECIPE unit by canon,
+                         so it needs NO pack conversion. Dividing it by rPack, or
+                         multiplying it up, would break the trio.
+                 It used to read last_purchase_price / rPack here. That column is
+                 stored in MIXED bases: of the 190 packed materials that hold both a
+                 stored LPP and a purchase history, 71 are ALREADY ₹/recipe-unit, so
+                 the divide fired a second time — MALA STRAWBERRY CRUSH 5 LTR
+                 (ml/BTL, pack 5000, avg ₹0.13482/ml) logged ₹0.13 for a full bottle
+                 instead of ₹674.10, and `lppRecipe || average_price` short-circuited
+                 on that non-zero wrong value so the correct rate on the same row was
+                 never reached. average_price is the sanctioned rate for a
+                 recipe-unit quantity (src/lib/closing-valuation.ts ladder). */
+              const unitCost = Number(it.average_price) || 0;   // ₹ / RECIPE unit
               const lineCost = Math.round(issued * unitCost * 100) / 100;
               totalCost += lineCost;
               auditItems.push({

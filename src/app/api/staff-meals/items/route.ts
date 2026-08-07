@@ -25,7 +25,7 @@
  * cook staff food out of its own shelf, and 0 rows existed at cutover so there
  * is no history that has to pick a side.
  *
- * ── THREE RULES A FUTURE ENGINEER WILL WANT TO "SIMPLIFY". DO NOT ──────────
+ * ── FOUR RULES A FUTURE ENGINEER WILL WANT TO "SIMPLIFY". DO NOT ───────────
  *  1. THE PACK FACTOR ON THE DEPARTMENT BRANCH. issued_quantity is in the LINE's
  *     unit (staff_meal_items.unit, which the UI defaults to 'kg'); the ledger and
  *     current_stock are in RECIPE units. 2 "kg" of a g/kg/1000 material is
@@ -48,12 +48,42 @@
  *     the asymmetry is deliberate: the NULL/central branch keeps its existing
  *     behaviour untouched, because changing what a shipped path does to central
  *     is not this change's business.
+ *  4. THE RATE BASIS, RESOLVED SERVER-SIDE (2026-08-06). The trio this route
+ *     writes — issued_quantity, purchase_price, total_cost — must be in ONE
+ *     basis, and the client cannot be relied on to deliver one: /staff-meals
+ *     seeds every row with unit 'kg' and copies raw_materials.average_price
+ *     (Rs per RECIPE unit) straight into the rate box. 2 "kg" x Rs 0.4851/g =
+ *     Rs 0.97 for Rs 970.20 of ARBORIO rice, a clean pack_size (1000x) error
+ *     that looks like a plausible number on screen. So POST now decides the
+ *     basis itself: a rate KNOWN to be recipe basis (server-filled from
+ *     average_price, or the catalog value echoed back unedited) is lifted with
+ *     purchasePrice() from pack-units whenever lineFactor() says the line is in
+ *     purchase units. A rate a human actually typed is left alone — it is
+ *     already Rs per the unit shown next to it. The quantity is NEVER re-labelled
+ *     to "fix" this: re-labelling 2 kg as 2 g would move the error from the rate
+ *     onto the ledger, where lineFactor() is currently getting it right.
+ *
+ * WHAT RULE 4 DELIBERATELY DOES NOT DO: it does not touch the CENTRAL stock
+ * write. That statement still subtracts the raw line quantity (see the
+ * PRE-EXISTING BUG note on it), so on a central staff meal the MONEY is now
+ * right and the GRAMS are still short by pack_size. That is not an oversight and
+ * it is not a reason to revert the money: two wrong numbers were never
+ * "consistent", and the stock half changes a shipped figure on the central
+ * variance report, which needs the owner's eyes and its own change. On the
+ * DEPARTMENT branch there is no such gap — lineFactor() converts the ledger
+ * debit and now the rate through the same factor, so 2000 g debited books
+ * Rs 970.20.
  *
  * Nothing here fires unless deduct_inventory / restore_inventory is set — that
  * gate is unchanged and predates the cutover.
  */
 import { getDb, generateId } from '@/lib/db';
 import { lineFactor } from '@/lib/issue-stock';
+// `purchasePrice` is the DISPLAY-basis lift Rs/recipe-unit -> Rs/purchase-unit.
+// Aliased because the loop below already owns a local named purchasePrice, and
+// two things called the same name in one scope is how a basis gets swapped by
+// accident.
+import { packFactor, purchasePrice as ratePerPurchaseUnit } from '@/lib/pack-units';
 import { postDeptLedger, deptOnHand } from '@/lib/dept-ledger';
 import { centralFlowBlock } from '@/lib/store-engine';
 
@@ -219,7 +249,13 @@ export async function POST(request: Request) {
       } catch { return false; }
     })();
 
-    const allMaterials = db.prepare('SELECT id, name, average_price, unit, category, current_stock FROM raw_materials').all() as any[];
+    // purchase_unit + pack_size are SELECTed so packFactor()/lineFactor() can be
+    // applied to the RATE as well as the quantity (Rule 4). Without them the
+    // catalog row cannot answer "is this line's unit the purchase unit?", which
+    // is the whole question the rate basis turns on.
+    const allMaterials = db.prepare(
+      'SELECT id, name, average_price, unit, purchase_unit, pack_size, category, current_stock FROM raw_materials',
+    ).all() as any[];
     const materialByName = new Map<string, any>();
     const materialById = new Map<string, any>();
     for (const m of allMaterials) {
@@ -242,11 +278,18 @@ export async function POST(request: Request) {
         let category = item.category || '';
         let unit = item.unit || '';
 
+        // Rule 4 (see header) — WHICH BASIS IS THIS RATE IN?
+        // raw_materials.average_price is Rs per RECIPE unit (Rs/g, Rs/ml). A rate
+        // a human typed into the box that sits beside the unit box is Rs per that
+        // LINE unit. The two are pack_size apart and nothing on the wire says
+        // which arrived, so it is tracked from the moment the number is chosen.
+        let rateIsRecipeBasis = false;
+
         if (!materialId && item.item_name) {
           const matched = materialByName.get(item.item_name.toLowerCase().trim());
           if (matched) {
             materialId = matched.id;
-            if (purchasePrice === 0) purchasePrice = matched.average_price || 0;
+            if (purchasePrice === 0) { purchasePrice = matched.average_price || 0; rateIsRecipeBasis = true; }
             if (!category) category = matched.category || 'grocery';
             if (!unit) unit = matched.unit || 'kg';
           }
@@ -255,6 +298,7 @@ export async function POST(request: Request) {
           const mat = materialById.get(materialId);
           if (mat) {
             purchasePrice = mat.average_price || 0;
+            rateIsRecipeBasis = true;
             if (!category) category = mat.category || 'grocery';
             if (!unit) unit = mat.unit || 'kg';
           }
@@ -266,10 +310,103 @@ export async function POST(request: Request) {
           continue;
         }
 
-        const totalCost = Math.round(purchasePrice * issuedQuantity * 100) / 100;
         const id = generateId();
         const lineUnit = unit || 'kg';
         const departmentId = normDept(item.department_id) ?? batchDept;
+
+        // ── Rule 4: THE RATE MOVES WITH THE UNIT, SERVER-SIDE ──────────────────
+        // The trio written below is (issued_quantity, purchase_price, total_cost)
+        // and it must be SINGLE-BASIS:
+        //     issued_quantity is in `lineUnit`  ->  purchase_price must be
+        //     Rs per lineUnit  ->  total_cost = the product of the two.
+        // The client cannot be trusted to pair them: /staff-meals seeds every new
+        // row with unit 'kg' and, on the catalog dropdown, copies average_price
+        // (Rs/RECIPE unit) straight into the rate box. That pairs 2 kg with
+        // Rs 0.4851/g and books Rs 0.97 for Rs 970.20 of rice — the exact
+        // dimensional error the owner asked about. So the basis is settled here,
+        // where both halves are visible, and no client path can separate them.
+        const rateMat = materialId ? materialById.get(materialId) : null;
+        if (rateMat) {
+          // The catalog echo — a BELT-AND-BRACES check against a client that
+          // pairs a purchase-unit line with a raw average_price. A rate that
+          // still EQUALS average_price to the paise was never re-typed, so it
+          // is recipe basis exactly like the two branches above.
+          //
+          // The CURRENT /staff-meals bundle no longer does this: rateForUnit()
+          // there resolves the rate from the same unit string the quantity is
+          // counted in, so a kg line arrives already lifted and this test
+          // correctly does not fire (485.10 !== 0.4851 — no double lift). Do
+          // not delete it as dead code on that basis. It is what protects an
+          // OLD bundle, and this app ships as a PWA with an IndexedDB outbox:
+          // a tablet running last week's cached JS, or replaying a queued
+          // offline POST, still posts the pre-fix pairing at any time. The
+          // server is the only place that sees every client.
+          const avg = Number(rateMat.average_price) || 0;
+          if (!rateIsRecipeBasis && purchasePrice > 0 && avg > 0
+              && Math.abs(purchasePrice - avg) <= 1e-9 * Math.max(1, Math.abs(avg))) {
+            rateIsRecipeBasis = true;
+          }
+
+          // packFactor() carries the BOTH-HALVES guard (pack_size > 1 AND recipe
+          // unit !== purchase unit). PICKLED GINGER 1.5KG (kg/kg, pack_size 1.5)
+          // returns 1 here and is therefore never lifted, on either half.
+          if (rateIsRecipeBasis && purchasePrice > 0 && packFactor(rateMat) > 1) {
+            // lineFactor answers RECIPE UNITS PER LINE UNIT for this exact line:
+            //   line unit === purchase unit -> pack_size  (2 "kg" = 2000 g)
+            //   line unit === recipe  unit  -> 1          (already recipe basis)
+            // It is the same helper the department ledger below converts with, so
+            // the money and the grams cannot disagree about what "2" means.
+            const { factor, needsReview } = lineFactor(lineUnit, rateMat);
+            if (needsReview) {
+              // Neither unit. Any rate we wrote would be a guess, and a guess is
+              // a pack_size-sized rupee error. Refuse the line the same way the
+              // department branch refuses an unconvertible quantity — and
+              // `continue`, never throw, so the rest of the batch still commits.
+              results.errors.push(
+                `Row ${i + 1}: "${rateMat.name}" is packed (${rateMat.pack_size} ${rateMat.unit} per ` +
+                `${rateMat.purchase_unit}) but this line's unit "${String(lineUnit).trim() || '(blank)'}" is ` +
+                `neither, so its rate cannot be stated per "${lineUnit}". Set the line unit to ` +
+                `"${rateMat.purchase_unit}" or "${rateMat.unit}".`,
+              );
+              continue;
+            }
+            if (factor > 1) {
+              // Line is in PURCHASE units, rate was in RECIPE units -> lift the
+              // rate, do NOT re-label the quantity. The owner's purchase-unit rule
+              // wants the kg on screen; this is what makes the rate beside it a
+              // Rs/kg. Rs 0.4851/g x 1000 = Rs 485.10/kg, and 2 kg x 485.10 =
+              // Rs 970.20 — identical to 2000 g x Rs 0.4851.
+              //
+              // YES, THIS IGNORES ONE LINE OF pack-units's OWN DOC. That helper
+              // is headed "DISPLAY-ONLY ... never use the output to compute a
+              // line value", because on a DISPLAY surface the stored recipe
+              // number is still the truth and rounding the rate would make two
+              // screens disagree by paise. Here the lifted rate is not a
+              // derivative of a stored truth — it IS the stored truth:
+              // staff_meal_items.purchase_price is a real column, PATCH
+              // recomputes total_cost from it on every return, and the owner's
+              // complaint is precisely that the two visible columns must
+              // multiply out to the third. A rate carried at full precision
+              // would reconcile on no screen at all.
+              // Measured cost of the 2-dp rounding on live data: of 282 packed
+              // materials holding a price, 17 are not exact at 2 dp, and the
+              // worst is KAHLUA LIQUEUR (750ML) — Rs 3.3063/ml x 750 = Rs
+              // 2,479.725 stored as Rs 2,479.73, i.e. 5 PAISE on a ten-bottle
+              // line. Five paise is the price of a column that adds up; the bug
+              // being fixed here is 1,000x. Do not "restore precision" and
+              // reintroduce a trio that does not multiply.
+              purchasePrice = ratePerPurchaseUnit(purchasePrice, rateMat);
+            }
+            // factor === 1 means the line is ALREADY in recipe units, so a
+            // recipe-basis rate is correct beside it. Leave it alone: converting a
+            // right number is how this bug gets reintroduced from the other side.
+          }
+        }
+
+        // Both operands are now in the LINE basis, so the product is the line's
+        // real value and — the part that was broken on screen — the two stored
+        // columns multiply out to the stored total.
+        const totalCost = Math.round(purchasePrice * issuedQuantity * 100) / 100;
 
         // EVERY department check happens BEFORE the row is written. postDeptLedger
         // throws by design (it is built to roll a caller's transaction back), and
@@ -340,6 +477,10 @@ export async function POST(request: Request) {
             // needs its own change with the owner's eyes on it — see handoff.
             // Do NOT route this raw quantity at a department to "make them
             // consistent": that would copy the error into a second ledger.
+            // Nor "restore consistency" by undoing Rule 4's rate lift above —
+            // total_cost is now right on this branch while current_stock is still
+            // short by pack_size. One right number and one wrong one is strictly
+            // better than two wrong ones, and it is the wrong one that has to move.
             db.prepare(`
               UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now')
               WHERE id = ?

@@ -16,26 +16,89 @@ import { useEffect, useState } from 'react';
 import { Wine, Loader2, RefreshCw, AlertTriangle, Plus, X, Trash2 } from 'lucide-react';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import { api } from '@/lib/api';
+import { packFactor, purchasePrice, type PackMeta } from '@/lib/pack-units';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
+// Rates need paise: a sub-rupee ₹/recipe-unit rate rounds to "₹0" under fmt(),
+// which is how a wrong basis hides. Used only for the rate-provenance hint.
+const rate2 = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 
 // Per-line unit switching for the consumption recorder. The material's base
 // recipe unit (and its average_price) stay canonical; these helpers just let
 // the bar manager enter/read in a friendlier unit (e.g. L instead of 17820 ml).
-function unitOptions(base?: string): string[] {
-  const b = (base || '').toLowerCase();
-  if (b === 'ml' || b === 'l') return ['ml', 'L'];
-  if (b === 'g'  || b === 'kg') return ['g', 'kg'];
+//
+// PURCHASE-UNIT ENTRY (additive, 2026-08-06)
+// -----------------------------------------
+// The copy on this page tells the bar manager to "Enter bottle / unit counts
+// consumed", but the picker only ever offered the metric ladder — for a ml/BTL
+// material there was no way to say "3 bottles", so "3" was silently booked as
+// 3 ml. This adds the material's PURCHASE unit as an entry option and teaches
+// toBaseQty to multiply it by pack_size.
+//
+// THE BASES, so the next reader cannot get the multiplication wrong:
+//   raw_materials.unit           RECIPE unit   (ml, g)  <- what we STORE
+//   raw_materials.purchase_unit  PURCHASE unit (BTL, CASE, CAN, kg, L)
+//   raw_materials.pack_size      RECIPE units per PURCHASE unit (750 ml / BTL)
+//   raw_materials.average_price  RUPEES PER RECIPE UNIT  (₹/ml, ₹/g)
+// toBaseQty ALWAYS returns RECIPE units, so every `toBaseQty(...) * average_price`
+// downstream stays recipe-qty × ₹/recipe-unit. Nothing on the money side changes
+// and no packFactor may ever be applied to average_price here — that would be
+// wrong by pack_size (750×) in the other direction.
+//
+function unitOptions(base?: string, m?: PackMeta): string[] {
+  // PURCHASE UNIT ONLY — the owner's call, 2026-08-06: "Keep it as Purchase
+  // unit only because 3ml is wrong thing."
+  //
+  // A bar manager counts BOTTLES off a shelf. Offering the metric ladder beside
+  // the purchase unit meant a stray pick booked "3" as 3 ml of ABSOLUT —
+  // Rs 8.70 instead of the Rs 6,522 that three 750 ml bottles are worth. Making
+  // the purchase unit the ONLY option removes the mis-pick rather than relying
+  // on the person to notice it. DO NOT "restore" ml / L / g / kg here.
+  //
+  // packFactor() carries the BOTH-HALVES guard (pack_size > 1 AND recipe unit
+  // !== purchase unit). When it returns 1 there is no distinct purchase unit to
+  // offer — PICKLED GINGER 1.5KG (kg/kg, pack 1.5) and BUDWEISER 330ML
+  // (pcs/BTL, pack 1) both fall here — so the material's own unit IS the
+  // purchase unit and entry stays in it. Either way exactly one option is
+  // offered, and toBaseQty converts it to the stored RECIPE unit.
+  if (m && packFactor(m) > 1) {
+    const pu = String(m.purchase_unit || '').trim();
+    if (pu) return [pu];
+  }
   return [base || 'pcs'];
 }
-// Convert a qty typed in `display` unit back to the material's `base` unit.
-function toBaseQty(qty: number, display?: string, base?: string): number {
+
+/** The unit a NEW line must be seeded with — always the single option
+ *  unitOptions() will offer for that material.
+ *
+ *  These two MUST agree. When the line was seeded with the recipe unit while
+ *  the select offered only the purchase unit, the browser rendered the first
+ *  option (BTL) but state still held 'ml', so toBaseQty saw display === base,
+ *  converted nothing, and booked 3 ml while the screen read 3 BTL. That is the
+ *  original bug wearing the fix as a disguise. Seed from the same function the
+ *  select renders and they cannot drift. */
+function entryUnit(m?: PackMeta & { unit?: string }): string {
+  return unitOptions(m?.unit, m)[0] || m?.unit || 'pcs';
+}
+// Convert a qty typed in `display` unit back to the material's `base` (RECIPE) unit.
+// `m` is optional so the two metric ladders below behave bit-for-bit as before
+// when it is absent.
+function toBaseQty(qty: number, display?: string, base?: string, m?: PackMeta): number {
   const d = (display || '').toLowerCase(), b = (base || '').toLowerCase();
   if (!d || d === b) return qty;
   if (d === 'l'  && b === 'ml') return qty * 1000;
   if (d === 'ml' && b === 'l')  return qty / 1000;
   if (d === 'kg' && b === 'g')  return qty * 1000;
   if (d === 'g'  && b === 'kg') return qty / 1000;
+  // PURCHASE unit -> RECIPE units. Only reached for a unit the metric ladder
+  // above does not recognise (BTL / CASE / CAN / PKT), so ml<->L and g<->kg are
+  // untouched. 3 BTL x 750 ml/BTL = 2250 ml, which then multiplies the
+  // ₹/ml average_price — purchase count in, recipe qty out, bases matched.
+  if (m) {
+    const pf = packFactor(m);
+    const pu = String(m.purchase_unit || '').toLowerCase().trim();
+    if (pf > 1 && pu && d === pu) return qty * pf;
+  }
   return qty;
 }
 // Friendly read-only display: 17820 ml → "17.82 L", 2500 g → "2.5 kg".
@@ -263,7 +326,9 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 
   const totalCost = lines.reduce((acc, l) => {
     const m = materials.find(x => x.id === l.material_id);
-    const baseQty = toBaseQty(Number(l.qty) || 0, l.unit || m?.unit, m?.unit);
+    // baseQty is RECIPE units (ml/g); average_price is ₹ per RECIPE unit.
+    // recipe x recipe — do NOT introduce a pack factor on the price side.
+    const baseQty = toBaseQty(Number(l.qty) || 0, l.unit || m?.unit, m?.unit, m);
     return acc + baseQty * (m?.average_price || 0);
   }, 0);
 
@@ -284,7 +349,9 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
           event_date: target.event_date,
           items: cleaned.map(l => {
             const m = materials.find(x => x.id === l.material_id);
-            return { material_id: l.material_id, qty: toBaseQty(Number(l.qty), l.unit || m?.unit, m?.unit), notes: l.notes };
+            // Posts RECIPE units — the API stores qty_consumed in the material's
+            // own unit and values it at ₹/recipe-unit. 3 BTL leaves here as 2250 ml.
+            return { material_id: l.material_id, qty: toBaseQty(Number(l.qty), l.unit || m?.unit, m?.unit, m), notes: l.notes };
           }),
         },
       });
@@ -394,16 +461,27 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 
           {lines.map((l, i) => {
             const m = materials.find(x => x.id === l.material_id);
-            const dispUnit = l.unit || m?.unit || '';
-            const opts = unitOptions(m?.unit);
-            const cost = toBaseQty(Number(l.qty) || 0, dispUnit, m?.unit) * (m?.average_price || 0);
+            const opts = unitOptions(m?.unit, m);
+            // Never trust a stored unit the select cannot show. A line saved
+            // before purchase-unit-only entry (or one whose material was
+            // swapped) can hold 'ml' while opts is ['BTL']; rendering that as
+            // the first option while state says 'ml' is exactly how 3 bottles
+            // became 3 ml. Fall back to the offered unit so what is displayed
+            // is what toBaseQty converts.
+            const stored = l.unit || m?.unit || '';
+            const dispUnit = opts.some(o => o.toLowerCase() === stored.toLowerCase())
+              ? stored
+              : (opts[0] || stored);
+            // recipe qty x ₹/recipe-unit. The pack factor lives inside toBaseQty
+            // (quantity side) and must never be applied to average_price.
+            const cost = toBaseQty(Number(l.qty) || 0, dispUnit, m?.unit, m) * (m?.average_price || 0);
             return (
               <div key={i} className="grid grid-cols-12 gap-2 items-start">
                 <div className="col-span-6">
                   <MaterialTypeahead
                     materials={materials as any}
                     value={l.material_id}
-                    onPick={(id: string) => { const mat = materials.find(x => x.id === id); update(i, { material_id: id, unit: mat?.unit || '' }); }}
+                    onPick={(id: string) => { const mat = materials.find(x => x.id === id); update(i, { material_id: id, unit: entryUnit(mat as any) }); }}
                     excludeIds={lines.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                   />
                   {l.material_id && recordedMaterialIds.has(l.material_id) && (
@@ -418,7 +496,7 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                   <select value={dispUnit} onChange={e => update(i, { unit: e.target.value })}
                           disabled={!l.material_id}
                           className="col-span-1 text-xs border border-[#D4B896] rounded bg-white py-1.5 px-1 disabled:opacity-50"
-                          title="Switch the unit you enter the quantity in — cost stays the same">
+                          title="The unit your quantity is typed in. Everything is stored in the material's recipe unit, so switching this rescales the qty (3 BTL = 2250 ml) and the cost with it.">
                     {opts.map(u => <option key={u} value={u}>{u}</option>)}
                   </select>
                 ) : (
@@ -432,6 +510,33 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                   <button type="button" onClick={() => removeLine(i)}
                           className="text-red-600 hover:text-red-700"><X size={12} /></button>
                 </div>
+                {/*
+                  RATE PROVENANCE (display-only). Now that a bottle count is
+                  enterable, the line value swings by pack_size, so the rate it
+                  leans on has to be visible and traceable — closing-valuation.ts:
+                  "a valuation nobody can trace is a valuation nobody trusts".
+                  Both figures are ₹ per PURCHASE unit so they are comparable:
+                    • avg cost   = purchasePrice(average_price, m) = tier 2 of the
+                      sanctioned ladder (₹/recipe-unit × packFactor).
+                    • last purchase = latest_price_purchase_unit, already served by
+                      /api/inventory as total/qty of the newest purchases row =
+                      tier 1, the authoritative basis.
+                  When they disagree by orders of magnitude, this material's
+                  average_price is mis-based and the line value is not to be
+                  trusted — 12 packed materials with no purchase history are in
+                  exactly that state (e.g. HENDRICKS GIN reads ₹5,641.83 per ml).
+                  Shown, never silently "repaired": mis-based rows are data for
+                  the ₹-audit to fix, not something to guess at per row.
+                */}
+                {m && packFactor(m) > 1 && (
+                  <div className="col-span-12 -mt-1 text-[9px] text-[#B8A590]">
+                    Rate {rate2(purchasePrice(m.average_price || 0, m))}/{m.purchase_unit} from avg cost
+                    {Number(m.latest_price_purchase_unit) > 0
+                      ? <> · last purchase {rate2(m.latest_price_purchase_unit)}/{m.purchase_unit}</>
+                      : <> · no purchase history to cross-check</>}
+                    {' '}· stored as ₹{m.average_price}/{m.unit}
+                  </div>
+                )}
                 <input value={l.notes} onChange={e => update(i, { notes: e.target.value })}
                        placeholder="Line notes (optional)"
                        className="col-span-12 px-2 py-1 border border-[#E8D5C4] rounded text-[11px] text-[#6B5744] -mt-1" />
