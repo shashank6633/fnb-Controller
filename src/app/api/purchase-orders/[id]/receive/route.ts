@@ -158,6 +158,12 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         line_ids:          outstanding.map(l => String(l.id)),
         received_line_ids: receivedLines.map(l => String(l.id)),
         blocked_line_ids:  g.lines.filter(l => blocked.has(String(l.id))).map(l => String(l.id)),
+        // `outstanding` narrows `items`, the purchase_order_items rows selected
+        // at the top of this GET, so quantity is PURCHASE units and unit_price
+        // is Rs/purchase-unit by canon. Both halves come off the same row; no
+        // pack conversion belongs here, and the figure is what this vendor's
+        // invoice must reconcile to.
+        // rate-basis: purchase (purchase_order_items.quantity x .unit_price)
         ordered_value: r2(outstanding.reduce((s, l) => s + (Number(l.quantity) || 0) * (Number(l.unit_price) || 0), 0)),
         // "Nothing left for this vendor to deliver" — either it all came in, or
         // everything they had on this PO is store-mapped and never can.
@@ -1124,6 +1130,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // "accepting less qty" alert hangs on.
         const accShort   = accepted < ordQty - QTY_EPS;
         const deviated   = qtyShort || qtyExcess || rateChanged || accShort;
+        // `accepted` descends from it.quantity (a purchase_order_items row =
+        // PURCHASE units) or from ov.accepted / ov.quantity, which the receive
+        // screen collects in the box labelled material_purchase_unit. `price`
+        // is it.unit_price or ov.unit_price, Rs per PURCHASE unit on both paths.
+        // This product is written straight to purchases.total_price beside
+        // quantity = accepted and unit_price = netPrice, so the books stay in
+        // one basis. The recipe basis is entered exactly once, further down,
+        // where stockQty = accepted x packSize feeds current_stock — the pack
+        // factor belongs on the QUANTITY there, never on this money line.
+        // rate-basis: purchase (accepted PU x Rs/PU -> purchases.total_price)
         const acceptedTotal = Math.round(accepted * price * 100) / 100;
         // This line's share of the bill-level charges (0/0 when none were sent,
         // or when the line is fully rejected and so was never allocated).
@@ -1190,6 +1206,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             qty_excess:    qtyExcess,
             rate_changed:  rateChanged,
             acc_short:     accShort,
+            // Both products are PURCHASE units x Rs/purchase-unit, so the
+            // difference is a real rupee delta and not a pack artefact.
+            // accepted/price are the billed pair (see acceptedTotal above);
+            // ordQty/ordRate are it.quantity/it.unit_price straight off the
+            // purchase_order_items row. Mixing a basis across the minus sign
+            // would report a pack_size-scaled deviation to the admin alert —
+            // Rs 900 read as Rs 900,000 on a 1 kg pack.
+            // rate-basis: purchase (billed PU pair minus ordered PU pair)
             value_impact:  Math.round((accepted * Number(price) - ordQty * ordRate) * 100) / 100,
             reason:        devReason,
           });

@@ -2442,12 +2442,20 @@ export default function ClosingStockByLocationPage() {
                 )}
 
                 {/* ═══ VALUED SHEET (req 2 + 3) ═══════════════════════════════
-                    What the server RESOLVED AND STORED for the counts just
-                    saved: the rate that applied, Quantity × Rate per line, and
-                    the sheet total. Read back from /api/closing-stock, never
-                    recomputed here — the browser must not derive a rate, and
-                    raw_materials.last_purchase_price is unusable anyway (mixed
-                    bases on live data). */}
+                  * What the server RESOLVED AND STORED for the counts just
+                  * saved: the rate that applied, Quantity × Rate per line, and
+                  * the sheet total. Read back from /api/closing-stock, never
+                  * recomputed here — the browser must not derive a rate, and
+                  * raw_materials.last_purchase_price is unusable anyway (mixed
+                  * bases on live data).
+                  *
+                  * The column name above is PROSE, not a read: this file never
+                  * touches last_purchase_price. Every rate rendered below is
+                  * `it.rate_per_purchase_unit`, stamped by the server through
+                  * src/lib/closing-valuation.ts. Continuation lines carry the
+                  * leading `*` so the rate-basis lock reads them as prose
+                  * (scripts/check-rate-basis.js isProseLine) instead of as an
+                  * LPP read — the sentence stays, the false hit goes. */}
                 {valued && (valued.items.length > 0 || valued.semi.length > 0) && (
                   <div className="rounded-lg border border-[#E8D5C4] overflow-hidden">
                     <div className="px-3 py-2 bg-[#FFF1E3] flex items-center justify-between gap-3 flex-wrap">

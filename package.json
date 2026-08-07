@@ -14,7 +14,7 @@
     "dev:webpack": "next dev -H 0.0.0.0",
     "simulate:call": "npx tsx scripts/simulate-call.ts",
     "test:ct": "npx tsx scripts/ct-tests.ts",
-    "test": "node scripts/check-boot-migrations.js && node scripts/check-purchase-units.js && node scripts/run-tests.js",
+    "test": "node scripts/check-boot-migrations.js && node scripts/check-purchase-units.js && node scripts/check-rate-basis.js && node scripts/run-tests.js",
     "backup": "bash scripts/backup-db.sh",
     "check:boot": "node scripts/check-boot-migrations.js"
   },

@@ -657,6 +657,20 @@ export default function UnitAuditPage() {
                           shown raw, so a never-purchased pack material silently read
                           ~pack× smaller than its neighbours in the same column. */}
                       <td className="py-1.5 px-2 text-right font-mono">
+                        {/* ALIAS TRAP — read this before you reuse the name.
+                          * `m.last_purchase_price` here is NOT the mixed-basis
+                          * raw_materials column. This page's only source is
+                          * GET /api/unit-audit, whose SELECT aliases
+                          * (SELECT unit_price FROM purchases ... ORDER BY date DESC
+                          * LIMIT 1) AS last_purchase_price — api/unit-audit/route.ts
+                          * :118. purchases.unit_price is Rs per PURCHASE unit by
+                          * canon, so this branch is purchase-basis. The fallback
+                          * purchasePrice(average_price, m) lifts the Rs/recipe-unit
+                          * average through packFactor, landing in the same basis.
+                          * Both match the /purchase_unit label printed beside it.
+                          * (Continuation lines carry the leading `*` so the lock
+                          * reads this explanation as prose, not as an LPP read.) */}
+                        {/* rate-basis: purchase (alias over purchases.unit_price) */}
                         {fmt(m.last_purchase_price || purchasePrice(m.average_price, m))}
                         <span className="text-[9px] text-[#8B7355]">/{(m.purchase_unit || m.unit) as string}</span>
                       </td>

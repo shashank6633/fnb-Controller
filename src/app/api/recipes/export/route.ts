@@ -107,6 +107,15 @@ export async function GET(request: Request) {
           Ingredient: `[SUB] ${sr.sub_recipe_name}`,
           Qty: sr.quantity, Unit: sr.unit,
           'Yield %': 100, 'Wastage %': 0,
+          // sr.cost_per_unit here is sub_recipes.cost_per_unit, which
+          // recalculateSubRecipeCost (src/lib/db.ts) writes as total_cost ÷
+          // yield_quantity — ₹ per the sub-recipe's own YIELD unit, not ₹ per raw
+          // material unit. recipe_sub_recipes.unit is stamped from that same
+          // yield_unit (updateFormSubRecipe in src/app/recipes/page.tsx locks it),
+          // so rs.quantity is in the yield unit too. A sub-recipe is never
+          // bought — it has no purchase unit and no pack size, so nothing
+          // converts. Same product as the engine's `sr.quantity * sr.cost_per_unit`.
+          // rate-basis: recipe (₹ per sub-recipe yield unit × qty in that same unit)
           'Line Cost (₹)': Math.round((sr.quantity || 0) * (sr.cost_per_unit || 0) * 100) / 100,
         });
         totalIngredients++;

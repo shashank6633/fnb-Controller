@@ -4934,6 +4934,16 @@ export function recalculateRecipeCost(db: Database.Database, recipeId: string): 
   `).all(recipeId) as any[];
 
   for (const sr of subRecipes) {
+    // NOT a raw-material pair at all: a sub-recipe is an intermediate, it has
+    // no purchase unit and no pack. sr.cost_per_unit is sub_recipes.cost_per_unit
+    // = total_cost ÷ yield_quantity (written by recalculateSubRecipeCost just
+    // below), i.e. ₹ per the sub's OWN yield_unit. sr.quantity is
+    // recipe_sub_recipes.quantity, which every writer pins to that same
+    // yield_unit: /recipes locks the Unit cell to sub.yield_unit on create and
+    // on edit, /api/recipes/bulk raises a unit warning when a CSV row disagrees,
+    // and the workbook importer writes 'g' on both sides. So no conversion
+    // belongs here, and /recipes mirrors this exact product client-side.
+    // rate-basis: recipe (qty in the sub's yield unit × ₹ per that yield unit)
     totalCost += sr.quantity * sr.cost_per_unit;
   }
 

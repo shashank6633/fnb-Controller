@@ -514,6 +514,16 @@ export default function LiquorStorePage() {
       if (ref !== '' && group.length > 1) {
         out.push({
           kind: 'bill', ref, count: group.length,
+          // BOTH halves are store_stock_ledger columns, and that table is
+          // recipe-basis on both: `quantity` is signed RECIPE units and
+          // `unit_cost` is ₹ per RECIPE unit (src/lib/store-engine.ts:68,80).
+          // The writer proves it: /api/stores/[id]/procure-bill converts the
+          // cases/bottles/loose entry to a recipe quantity and divides the
+          // per-bottle price by the pack factor before storing, then books its
+          // own line_total as recipe_qty × unit_cost. This subtotal reproduces that
+          // sum, so it equals the invoice line total. NOTE: `unit_cost` is
+          // purchase-basis in the PURCHASE tables — it is recipe-basis only here.
+          // rate-basis: recipe (store_stock_ledger.quantity × .unit_cost)
           total: Math.round(group.reduce((s, g) => s + (Number(g.quantity) || 0) * (Number(g.unit_cost) || 0), 0) * 100) / 100,
           supplier: group[0].supplier || '',
           charges: billCharges[ref.toLowerCase()] || null,
@@ -2401,6 +2411,16 @@ function MigrateModal({ storeId, storeName, candidates, blockedCount, onClose, o
   // Preview: central qty at central average_price (exactly what the API posts).
   const eligible = candidates.filter(r => (Number(r.central_stock) || 0) > 0 && !r.has_ledger);
   const ineligible = candidates.filter(r => !((Number(r.central_stock) || 0) > 0) || r.has_ledger);
+  // `central_stock` is raw_materials.current_stock (RECIPE units;
+  // /api/stores/[id]/stock sets central_stock from that column) and
+  // `average_price` is raw_materials.average_price (₹ per RECIPE unit by canon).
+  // Recipe qty × recipe rate = a rupee VALUE, and a value is basis-invariant, so
+  // it sits safely beside the purchase-unit quantity column below — the same
+  // shape the Inventory audit certified. Live proof: SUNFLOWER OIL 1LTR
+  // 1,182,000 ml × ₹0.1785/ml = ₹210,987 = 1,182 BTL × ₹178.50/BTL. This is also
+  // exactly what /api/stores/[id]/migrate posts (qty = current_stock,
+  // unit_cost = average_price), so the preview matches the API to the paisa.
+  // rate-basis: recipe (raw_materials.current_stock × raw_materials.average_price)
   const totalValue = eligible.reduce(
     (s, r) => s + (Number(r.central_stock) || 0) * (Number(r.average_price) || 0), 0);
 
@@ -2460,6 +2480,11 @@ function MigrateModal({ storeId, storeName, candidates, blockedCount, onClose, o
                       {packConv(r) > 1 && <span className="text-[10px]"> · {fq(r.central_stock)} {r.unit}</span>}
                     </td>
                     <td className="px-3 py-1.5 text-right whitespace-nowrap font-medium text-[#2D1B0E]">
+                      {/* Same pair as totalValue above: current_stock (RECIPE
+                          units) × average_price (₹/RECIPE unit). The rupee VALUE
+                          is basis-invariant, so it is correct beside the
+                          purchase-unit qty rendered in the cell to its left.
+                          rate-basis: recipe (current_stock × average_price) */}
                       {inr((Number(r.central_stock) || 0) * (Number(r.average_price) || 0))}
                     </td>
                   </tr>

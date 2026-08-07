@@ -542,6 +542,16 @@ export default function StaffMealsPage() {
     );
   }
 
+  // THE INVARIANT AT THE TOP OF THIS FILE, SUMMED. Each addend is one STORED row
+  // read back from /api/staff-meals/items: `quantity` is the consumed count in
+  // staff_meal_items.unit (POST writes issued_quantity there, PATCH overwrites it
+  // with issued − returned, both in the line unit) and `purchase_price` is Rs for
+  // one of that same unit, settled server-side by items/route.ts Rule 4 before the
+  // row existed. So each product is a rupee VALUE, and a sum of values is
+  // basis-invariant — which is why rows lined in kg and rows lined in g add up.
+  // Never re-scale either factor here: pack-units is applied at ENTRY (rateForUnit)
+  // and on the SERVER, and a third application would be the 1000x bug reintroduced.
+  // rate-basis: mixed — per-row LINE basis, single-basis within each row.
   const totalConsumed = mealItems.reduce((s, i) => s + i.quantity * i.purchase_price, 0);
   const openItemsCount = mealItems.filter(i => i.status === 'issued').length;
 

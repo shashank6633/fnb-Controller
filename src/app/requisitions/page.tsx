@@ -1485,6 +1485,32 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                 const postReq  = mat ? (mat.current_stock - reqRecipe) : 0;
                 const belowBuffer = mat && buffer > 0 && postReq < buffer;
                 const pu = mat?.purchase_unit || mat?.unit || '';
+                // ── "Last ₹" cell (below) — resolved HERE so the basis can be stated
+                // once, in code, instead of inside a JSX ternary.
+                //
+                // NAME TRAP: this is NOT raw_materials.last_purchase_price. `materials`
+                // is loaded from GET /api/inventory, which projects
+                //   `SELECT rm.*, COALESCE((SELECT unit_price FROM purchases
+                //      WHERE material_id = rm.id ORDER BY date DESC, created_at DESC
+                //      LIMIT 1), 0) as last_purchase_price`
+                // (api/inventory/route.ts:39-40). The alias comes AFTER rm.*, so it
+                // overwrites the raw column in the returned row — checked against a copy
+                // of the live db: CURD raw 86 → 80, MALA STRAWBERRY CRUSH 5 LTR raw
+                // 0.13482 → 674.10. So the value is purchases.unit_price = ₹/PURCHASE
+                // unit by canon, which is what the "/{pu}" suffix below prints.
+                // rate-basis: purchase
+                const lastPaidPerPU = Number(mat?.last_purchase_price) || 0;
+                // Fallback = step 2 of the closing-valuation ladder: average_price is
+                // ₹/recipe-unit, × packFactor lifts it to ₹/purchase-unit. packFactor()
+                // rather than the inline `purchase_unit !== unit && packSize > 1` test
+                // this replaced — the shared helper lower/trims both units, so 'Kg' vs
+                // 'kg' can no longer be read as a real pack conversion and multiply the
+                // rate by pack_size. Identical output on all 929 materials today (0 rows
+                // differ only by case/whitespace); the change is to the latent rule.
+                // rate-basis: purchase
+                const lastRatePerPU = lastPaidPerPU > 0
+                  ? lastPaidPerPU
+                  : (mat ? (mat.average_price || 0) * packFactor(mat) : 0);
                 // Tiny inline field label — mobile only (desktop uses the header row).
                 const Lbl = ({ children }: { children: React.ReactNode }) => (
                   <div className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] mb-0.5">{children}</div>
@@ -1618,10 +1644,7 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                                 the only auditable price on the row. */}
                             <div className="font-mono text-[#6B5744]"
                                  title={`avg ₹${(mat.average_price || 0).toFixed(4)}/${mat.unit}${mat.last_purchase_date ? ' · last bought ' + mat.last_purchase_date : ''}`}>
-                              ₹{(Number(mat.last_purchase_price) > 0
-                                  ? Number(mat.last_purchase_price)
-                                  : (mat.average_price || 0) * (mat.purchase_unit && mat.purchase_unit !== mat.unit && packSize > 1 ? packSize : 1)
-                                ).toFixed(2)}
+                              ₹{lastRatePerPU.toFixed(2)}
                               <span className="text-[#8B7355]">/{pu}</span>
                             </div>
                           </>
@@ -2022,6 +2045,18 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // (PO-receive + db backfill write it that way); average_price is ₹ per
       // RECIPE unit. The old code asserted the opposite and multiplied lpp by
       // pack_size again — a 500 g line estimated at ₹89,825 instead of ₹89.82.
+      //
+      // AND THE FIELD IS SAFE HERE DESPITE THE NAME, which is the thing to check
+      // before reusing this pattern. `req` is the detail payload from GET
+      // /api/requisitions?id= (fetched at page.tsx:950), whose items SELECT
+      // projects `(SELECT unit_price FROM purchases WHERE material_id = rm.id
+      // ORDER BY date DESC, created_at DESC LIMIT 1) AS last_purchase_price`
+      // (api/requisitions/route.ts:92). It is an ALIAS over purchases.unit_price —
+      // ₹/purchase-unit by canon — not raw_materials.last_purchase_price, which is
+      // stored in mixed bases (CURD 86 where ₹/g truth is 0.086) and may never be
+      // valued from. Same ladder as src/lib/closing-valuation.ts materialRate():
+      // latest purchases.unit_price first, average_price × packConv second.
+      // rate-basis: purchase
       const lpp = Number((it as any).last_purchase_price) || 0;
       // Driven by the SAME canon guard as the qty above — the two bases only
       // diverge when the pack conversion is real, so one test must decide both

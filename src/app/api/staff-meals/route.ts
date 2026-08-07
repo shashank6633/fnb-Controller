@@ -20,7 +20,22 @@ export async function GET(request: Request) {
       LEFT JOIN (
         SELECT meal_id,
           COUNT(*) as total_items,
+          -- NOT THE DANGEROUS KIND OF MIXED. staff_meal_items.purchase_price is Rs
+          -- for ONE of staff_meal_items.unit (the LINE unit) and issued_quantity
+          -- counts that SAME unit, so each row's product is that line's real rupee
+          -- value and the SUM is a sum of values. The basis is per-row rather than
+          -- fixed -- the entry screen leads with the material's purchase unit
+          -- (kg, BTL) but a packed material may also be lined in its recipe unit --
+          -- which is why this is declared mixed and not purchase. What guarantees
+          -- the two halves agree is the SERVER: see Rule 4 in the header of
+          -- api/staff-meals/items/route.ts, which resolves the rate into the line's
+          -- own unit before the row is written and refuses the line when the unit is
+          -- neither of the material's two. Nothing may be rescaled here.
+          -- rate-basis: mixed (per-row LINE basis; single-basis within each row)
           SUM(issued_quantity * purchase_price) as total_issued_value,
+          -- Same column pair, returned half: returned_quantity is capped at
+          -- issued_quantity by PATCH and counted in that same LINE unit.
+          -- rate-basis: mixed (per-row LINE basis; single-basis within each row)
           SUM(returned_quantity * purchase_price) as total_returned_value,
           SUM(total_cost) as total_consumed_cost,
           SUM(CASE WHEN status = 'issued' THEN 1 ELSE 0 END) as open_items,

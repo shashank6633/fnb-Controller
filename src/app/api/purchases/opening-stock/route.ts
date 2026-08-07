@@ -89,6 +89,11 @@ export async function POST(request: Request) {
         // price and stock conversions always apply to the same set of materials.
         const conv = (packSize > 1 && recipeUnit !== purchaseUnit) ? packSize : 1;
         const stockQty = qty * conv;                          // recipe/stock units
+        // `qty` is PURCHASE units — the line above multiplies it BY pack_size to reach
+        // recipe units, and insPurchase below writes it to purchases.quantity. `rate`
+        // is written to purchases.unit_price = ₹ per PURCHASE unit by canon (that is
+        // what lets updateMaterialPrice() divide by pack_size to get ₹/recipe-unit).
+        // rate-basis: purchase
         const total = Math.round(qty * rate * 100) / 100;     // invoice amount (purchase units)
         const pid = generateId();
         // Row in PURCHASE units + per-purchase-unit rate (same as bulk import) →

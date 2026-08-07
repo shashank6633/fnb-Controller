@@ -561,6 +561,15 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
     estValue += est;
     if (a.pre_cutover_issued > 0) {
       preItems++;
+      // a.pre_cutover_issued is accumulated in the PRE-CUTOVER HISTORY loop
+      // above as (issued qty × factor), where factor comes from the unit-lift
+      // helper at the top of this file — it lifts a requisition line recorded
+      // in the material's purchase unit up to RECIPE units, and returns 1
+      // whenever the two unit names are the same (so a kg/kg 1.5-pack item is
+      // left alone). The interface field is documented "RECIPE units" too.
+      // a.average_price is raw_materials.average_price, ₹ per recipe unit by
+      // canon. Same pair as `est` above.
+      // rate-basis: recipe (recipe-unit qty × ₹ per recipe unit)
       preValue += a.pre_cutover_issued * a.average_price;
     }
 

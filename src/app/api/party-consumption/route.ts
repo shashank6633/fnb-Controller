@@ -87,6 +87,19 @@ export async function POST(request: Request) {
         const qty = Number(it.qty) || 0;
         if (!it.material_id || qty <= 0) continue;
         const mat = getMat.get(it.material_id) as { average_price?: number } | undefined;
+        // BASIS PROOF — both halves are RECIPE, so no pack factor belongs here.
+        //  · RATE: raw_materials.average_price is ₹ per RECIPE unit by canon
+        //    (₹/ml, ₹/g). It is read straight off the material row above, not
+        //    through last_purchase_price, so there is no mixed-basis exposure.
+        //  · QTY: `it.qty` is posted ALREADY CONVERTED to recipe units. The only
+        //    writer is the recorder in src/app/party-pnl/page.tsx:354, which
+        //    sends toBaseQty(qty, entryUnit, m.unit, m) — 3 BTL × pack_size 750
+        //    leaves the browser as 2250 ml. The same number is stored in
+        //    party_consumption.qty_consumed, which the rate-basis canon fixes as
+        //    recipe-basis, and is rendered back through prettyQty(..., rm.unit)
+        //    (the RECIPE unit) by the GET above. Re-applying the pack rule on
+        //    either side here would double-count the pack by 750×.
+        // rate-basis: recipe
         const cost = (mat?.average_price || 0) * qty;
         ins.run(
           generateId(),

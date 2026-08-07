@@ -380,6 +380,24 @@ export async function PUT(request: Request) {
         }, { status: 409 });
       }
 
+      // ── THE DENOMINATOR COMES FROM DATA, NEVER FROM A LITERAL ──────────────
+      // Both audit notes written below used to end in a hardcoded "/kg". Weights
+      // in this module are stored in each material's OWN RECIPE unit (see the
+      // header, and page.tsx's fmtWt, which already labels from data), and
+      // butchering_batches.cost_per_unit is a snapshot of that material's
+      // raw_materials.average_price — Rs per RECIPE unit — taken at POST. So the
+      // literal was a real misstatement, not a cosmetic one: MUTTON BHEJA is
+      // g/kg/pack 1000 at average_price 0.12, and the note stamped "₹0.12/kg" onto
+      // the central inventory_transactions row for a rate that is ₹0.12/g = ₹120/kg
+      // — 1000x, in the line the store reads back. MUTTON PAYA is 'pcs' at ₹75 and
+      // read "₹75/kg" for a rate that is per piece.
+      // These strings are the LABEL only; no stored number changes. When the unit
+      // is unknown the denominator is dropped rather than guessed — an unlabelled
+      // rate is honest, a wrongly labelled one is not.
+      const srcRateUnit = String(fresh.source_unit || '').trim();
+      // rate-basis: recipe — cost_per_unit is average_price snapshotted at POST.
+      const srcRateLabel = `₹${fresh.cost_per_unit}${srcRateUnit ? '/' + srcRateUnit : ''}`;
+
       const txn = db.transaction(() => {
         // 1. Debit source carcass stock — CENTRAL only, and only reachable
         //    because the guard above proved no department holds this carcass.
@@ -389,19 +407,28 @@ export async function PUT(request: Request) {
           INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id)
           VALUES (?, ?, 'butchering_input', ?, ?, ?, ?)
         `).run(generateId(), fresh.source_material_id, -fresh.gross_weight, fresh.id,
-                `Carcass breakdown ${fresh.batch_id} @ ₹${fresh.cost_per_unit}/kg`, fresh.outlet_id || null);
+                `Carcass breakdown ${fresh.batch_id} @ ${srcRateLabel}`, fresh.outlet_id || null);
 
         // 2. Credit each cut
         for (const o of outs) {
           if (o.output_type !== 'cut' || !o.material_id) continue;
           db.prepare(`UPDATE raw_materials SET current_stock = COALESCE(current_stock, 0) + ? WHERE id = ?`)
             .run(o.weight, o.material_id);
+          // cost_allocated is a RUPEE VALUE (a pro-rata slice of batch total_cost,
+          // basis-invariant); o.weight is this CUT material's own recipe unit, the
+          // same number credited to its current_stock two lines up. So the quotient
+          // is Rs per the CUT's recipe unit — o.material_unit, joined in above —
+          // and not per kg. A 500 g cut costing ₹280 is ₹0.56/g, which the old
+          // literal published as "₹0.56/kg".
+          // rate-basis: recipe — value ÷ recipe-unit weight, both off this row.
           const unitCost = o.weight > 0 ? o.cost_allocated / o.weight : 0;
+          const cutRateUnit = String(o.material_unit || '').trim();
+          const cutRateLabel = `₹${unitCost.toFixed(2)}${cutRateUnit ? '/' + cutRateUnit : ''}`;
           db.prepare(`
             INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id)
             VALUES (?, ?, 'butchering_output', ?, ?, ?, ?)
           `).run(generateId(), o.material_id, o.weight, fresh.id,
-                  `Cut from ${fresh.batch_id} (${o.yield_pct.toFixed(1)}% yield, ₹${unitCost.toFixed(2)}/kg)`, fresh.outlet_id || null);
+                  `Cut from ${fresh.batch_id} (${o.yield_pct.toFixed(1)}% yield, ${cutRateLabel})`, fresh.outlet_id || null);
         }
 
         // 3. Log waste rows against the source material

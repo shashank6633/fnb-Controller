@@ -533,10 +533,29 @@ export function purchaseTrends(db: DB) {
   };
 }
 
+/**
+ * WASTAGE — RECIPE BASIS ON BOTH HALVES, proved from the writers.
+ *
+ * `wastages.quantity` is recipe units. It has exactly two writers and both spend
+ * the same number against recipe-unit rails:
+ *   · src/app/api/wastage/route.ts — central losses do
+ *     `UPDATE raw_materials SET current_stock = current_stock - qty` (current_stock
+ *     is recipe units by canon); department losses post the same qty to the dept
+ *     ledger; BOTH also write inventory_transactions.quantity = -qty, which the
+ *     canon fixes as recipe-basis.
+ *   · src/app/api/butchering/route.ts — waste outputs log `o.weight`, the same
+ *     number that credits/debits current_stock for the cuts on the lines above.
+ * `raw_materials.average_price` is ₹ per RECIPE unit by canon.
+ * So `w.quantity * rm.average_price` is recipe qty × ₹/recipe-unit — a rupee
+ * VALUE, basis-invariant once multiplied out. No pack_size belongs anywhere in
+ * this function; adding one would inflate every packed material by pack_size.
+ */
 export function wastageSummary(db: DB) {
   const from30 = daysAgo(29);
   const total = db.prepare(`
     SELECT COUNT(*) AS entries,
+           -- rate-basis: recipe  (wastages.quantity is recipe units — it debits
+           -- current_stock 1:1; average_price is ₹/recipe-unit)
            COALESCE(ROUND(SUM(w.quantity * rm.average_price),2),0) AS value
     FROM wastages w JOIN raw_materials rm ON rm.id = w.material_id
     WHERE w.date >= ?
@@ -544,6 +563,8 @@ export function wastageSummary(db: DB) {
   const byMaterial = db.prepare(`
     SELECT rm.name, rm.unit,
            ROUND(SUM(w.quantity),3) AS qty,
+           -- rate-basis: recipe  (same pair as above; rm.unit is projected beside
+           -- the qty so the reader sees the recipe unit the number is counted in)
            ROUND(SUM(w.quantity * rm.average_price),2) AS value,
            COUNT(*) AS entries
     FROM wastages w JOIN raw_materials rm ON rm.id = w.material_id
@@ -552,6 +573,7 @@ export function wastageSummary(db: DB) {
   `).all(from30) as any[];
   const byReason = db.prepare(`
     SELECT COALESCE(NULLIF(w.reason,''),'unspecified') AS reason,
+           -- rate-basis: recipe  (same pair as above — recipe qty × ₹/recipe-unit)
            ROUND(SUM(w.quantity * rm.average_price),2) AS value, COUNT(*) AS entries
     FROM wastages w JOIN raw_materials rm ON rm.id = w.material_id
     WHERE w.date >= ?

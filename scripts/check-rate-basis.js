@@ -1042,23 +1042,24 @@ Every declaration is echoed above, so a stated basis stays reviewable.
 Structural exceptions go in the ALLOW list in ${path.relative(process.cwd(), __filename)}.
 `));
 
-// ── REPORT-ONLY, DELIBERATELY, UNTIL THE BACKLOG IS DECLARED ────────────────
-// Owner's call, 2026-08-07. This script found 57 sites on the day it was
-// written: 14 direct reads of the mixed-basis last_purchase_price column, 41
-// rate x quantity pairs with no stated basis, 2 wrong labels. MOST OF THOSE ARE
-// ARITHMETICALLY CORRECT and need a one-line `rate-basis:` declaration, not a
-// code change — so failing the build on them would have blocked every commit
-// over a documentation backlog, and the usual result of that is the check gets
-// deleted rather than the backlog cleared.
+// ── BLOCKING, AS OF 2026-08-07 ───────────────────────────────────────────────
+// It shipped report-only. On the day it was written it found 57 sites: 14 direct
+// reads of the mixed-basis last_purchase_price column, 41 rate x quantity pairs
+// with no stated basis, 2 wrong labels. Most were arithmetically correct and
+// needed a one-line `rate-basis:` declaration rather than a code change, so
+// failing the build on them would have blocked every commit over a documentation
+// backlog — and the usual result of that is the check gets deleted rather than
+// the backlog cleared.
 //
-// So it prints and exits 0. It is NOT in `npm test` for the same reason: the
-// two locks that ARE there (boot-migrations, purchase-units) are green and must
-// stay a real signal.
+// THE BACKLOG IS NOW ZERO. The 14 LPP reads are gone or routed through
+// src/lib/closing-valuation.ts, and the remaining 47 pairings each state their
+// basis in writing (they are echoed above on every run, so a stated basis stays
+// reviewable). With nothing left to hide among, a NEW violation is unambiguous —
+// which is exactly the condition under which this must fail rather than print.
 //
-// TO PROMOTE IT TO BLOCKING — and it should be promoted — work the list down to
-// zero, add it to the test script in package.json, and change the line below to
-// `process.exit(1)`. Until then a NEW violation hides among the existing ones,
-// which is the honest cost of shipping it this way.
-//
-// `--strict` fails now, so CI or a pre-commit hook can opt in early:
-process.exit(process.argv.includes('--strict') ? 1 : 0);
+// So it is blocking, and it is in the `test` script in package.json alongside
+// the boot-migrations and purchase-units locks. Reaching this line means
+// violations.length > 0 — the clean path already exited 0 further up.
+// `--strict` is retained as a no-op so existing CI / pre-commit invocations
+// that pass it keep working.
+process.exit(1);

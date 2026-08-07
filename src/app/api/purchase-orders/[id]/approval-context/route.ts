@@ -7,7 +7,9 @@ import { getCurrentUser } from '@/lib/auth';
  * For every line item the admin/approver gets:
  *   - last_purchases  : 2 most-recent purchase rows (date, vendor, qty, unit_price)
  *   - current_stock   : as-of-now in raw_materials
- *   - last_purchase_price + last_purchase_date (cached on raw_materials)
+ *   - last_purchase_date (cached on raw_materials). The cached last-purchase
+ *     RATE beside it is deliberately NOT returned: that column is mixed-basis,
+ *     so `last_purchases[].unit_price` is the only last-rate this payload gives.
  *   - usage_30d / usage_60d / usage_90d : units consumed (sum of negative inventory_transactions)
  *   - avg_daily_usage_30d : usage_30d / 30
  *   - days_of_stock      : current_stock / avg_daily_usage_30d (Infinity if no usage)
@@ -48,7 +50,16 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       SELECT poi.*, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
              COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
              COALESCE(rm.pack_size, 1) AS material_pack_size,
-             rm.current_stock, rm.last_purchase_price, rm.last_purchase_date, rm.average_price
+             -- The stored last-purchase-rate column is NOT selected, on purpose.
+             -- It is mixed-basis on live data (some rows Rs/purchase-unit, some
+             -- Rs/recipe-unit), so there is no conversion that is right for the
+             -- whole column and it may not be shown to an approver as a rate.
+             -- The honest last-rate on this payload is last_purchases below,
+             -- read straight from purchases.unit_price (Rs/purchase-unit by
+             -- canon); the comparable average is average_price_purchase_unit.
+             -- last_purchase_date IS kept: it is a DATE, carries no basis, and
+             -- days_since_last_purchase is computed from it.
+             rm.current_stock, rm.last_purchase_date, rm.average_price
       FROM purchase_order_items poi
       JOIN raw_materials rm ON rm.id = poi.material_id
       WHERE poi.po_id = ?
@@ -127,7 +138,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         current_stock: it.current_stock,
         average_price: it.average_price,
         average_price_purchase_unit: avgPricePO,
-        last_purchase_price: it.last_purchase_price,
+        // No last_purchase_* RATE here — see the SELECT. `last_purchases[0].unit_price`
+        // is the reviewable one (purchases.unit_price = Rs/purchase-unit).
         last_purchase_date: it.last_purchase_date,
         days_since_last_purchase: daysSinceLast,
         last_purchases: lastPurchases,

@@ -1,5 +1,32 @@
 import { getDb, generateId } from '@/lib/db';
 
+/**
+ * PARTY ITEMS — Issue → Return → Consumption, with the stock movement it drives.
+ *
+ * THE BASIS CONTRACT OF THIS TABLE (audited 2026-08-07, rate-basis lock)
+ * ─────────────────────────────────────────────────────────────────────
+ * party_items is a RECIPE-BASIS table on both halves. Nothing here is in
+ * purchase units, and no packFactor may ever be introduced on either side.
+ *
+ *   party_items.issued_quantity / returned_quantity / quantity
+ *       RECIPE units. Proved by the movement this route posts: the SAME number
+ *       debits raw_materials.current_stock (POST, "Deduct from main inventory")
+ *       and credits it back (PATCH / DELETE), and current_stock is recipe units
+ *       by canon; the mirror rows go into inventory_transactions.quantity,
+ *       which the canon also fixes as recipe-basis.
+ *
+ *   party_items.purchase_price
+ *       ₹ per RECIPE unit — despite the column NAME, which is a trap for the
+ *       next reader. The server fills it from raw_materials.average_price (₹ per
+ *       recipe unit) whenever the caller does not supply one; it is NEVER read
+ *       from raw_materials.last_purchase_price, the mixed-basis column.
+ *
+ * So a caller-supplied `purchase_price` must ALSO be ₹/recipe-unit, because it
+ * multiplies the same quantity that debits current_stock. There is no in-app
+ * caller today (this route is reached through src/proxy.ts by the external AKAN
+ * event client); a caller that sends ₹ per bottle beside a bottle count would be
+ * mis-stating BOTH halves, and the stock debit would be wrong first.
+ */
 export async function GET(request: Request) {
   try {
     const db = getDb();
@@ -96,6 +123,11 @@ export async function POST(request: Request) {
         }
 
         // At issue time, consumed = issued (no return recorded yet)
+        // purchasePrice is ₹/RECIPE unit — it falls back to matched.average_price
+        // (canon: ₹ per recipe unit) above and never touches last_purchase_price.
+        // issuedQuantity is RECIPE units — the same number debits
+        // raw_materials.current_stock ~20 lines below. See the file header.
+        // rate-basis: recipe
         const totalCost = Math.round(purchasePrice * issuedQuantity * 100) / 100;
         const totalRevenue = isComp ? 0 : Math.round(sellingPrice * issuedQuantity * 100) / 100;
 
@@ -179,6 +211,11 @@ export async function PATCH(request: Request) {
         }
 
         const consumedQty = item.issued_quantity - returnedQty;
+        // Re-costing the SAME stored row, so both halves keep the basis the POST
+        // wrote: item.purchase_price is ₹/RECIPE unit and consumedQty is RECIPE
+        // units (issued − returned, the pair that moves current_stock). No pack
+        // factor — introducing one here would disagree with the issue-time cost.
+        // rate-basis: recipe
         const totalCost = Math.round(item.purchase_price * consumedQty * 100) / 100;
         const totalRevenue = item.is_complimentary
           ? 0

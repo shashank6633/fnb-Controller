@@ -76,11 +76,18 @@ export async function GET(request: Request) {
         ROUND(rm.current_stock * rm.average_price, 2) as stock_value,
         -- Recency view: rolling 30-day (monthly) weighted avg drives recipe / req cost.
         -- Also expose 90-day + all-time for the UI comparison column.
-        (SELECT ROUND(SUM(quantity * unit_price) / NULLIF(SUM(quantity), 0), 2)
+        -- BOTH HALVES COME OUT OF the purchases table: quantity is PURCHASE units and
+        -- unit_price is Rs per PURCHASE unit (core convention), so
+        -- SUM(qty x price) / SUM(qty) is a weighted Rs/PURCHASE-unit rate — the
+        -- same basis as latest_price_purchase_unit above and as
+        -- raw_materials.average_price x pack_size. Proved on live data:
+        -- SUNFLOWER OIL 1LTR = Rs 178.43/BTL here vs average_price 0.1785/ml x
+        -- pack 1000 = Rs 178.50/BTL. No pack conversion belongs on these lines.
+        (SELECT ROUND(SUM(quantity * unit_price) / NULLIF(SUM(quantity), 0), 2)   -- rate-basis: purchase (purchases.quantity x purchases.unit_price)
            FROM purchases WHERE material_id = rm.id AND date >= date('now','-30 day')) AS avg_price_30d,
-        (SELECT ROUND(SUM(quantity * unit_price) / NULLIF(SUM(quantity), 0), 2)
+        (SELECT ROUND(SUM(quantity * unit_price) / NULLIF(SUM(quantity), 0), 2)   -- rate-basis: purchase (purchases.quantity x purchases.unit_price)
            FROM purchases WHERE material_id = rm.id AND date >= date('now','-90 day')) AS avg_price_90d,
-        (SELECT ROUND(SUM(quantity * unit_price) / NULLIF(SUM(quantity), 0), 2)
+        (SELECT ROUND(SUM(quantity * unit_price) / NULLIF(SUM(quantity), 0), 2)   -- rate-basis: purchase (purchases.quantity x purchases.unit_price)
            FROM purchases WHERE material_id = rm.id) AS avg_price_all_time,
         -- Unit-audit lock: when set, the edit modal disables the unit fields and
         -- points at /unit-audit (the only writer) instead of silently discarding.

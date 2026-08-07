@@ -103,12 +103,34 @@ function lineFactor(m: Material, unit: string): number {
   const ru = String(m.unit || '').toLowerCase().trim();
   return (lu !== '' && pu !== '' && lu === pu && lu !== ru) ? packFactor(m) : 1;
 }
-/** ₹ per PURCHASE unit: prefer last_purchase_price (already ₹/PU), else
- *  average_price (₹/recipe-unit) × pack factor. Mirrors the classic form. */
+/**
+ * ₹ per PURCHASE unit.
+ *
+ * THE FIELD NAME IS A TRAP, so read this before touching it. `m.last_purchase_price`
+ * here is NOT raw_materials.last_purchase_price — that column is stored in MIXED
+ * bases and may never be valued from. Both pages that mount this picker fill
+ * `materials` from GET /api/inventory, whose SELECT is
+ *   `SELECT rm.*, COALESCE((SELECT unit_price FROM purchases WHERE material_id = rm.id
+ *      ORDER BY date DESC, created_at DESC LIMIT 1), 0) as last_purchase_price`
+ * (src/app/api/inventory/route.ts:39-40). The alias is projected AFTER `rm.*`, so it
+ * overwrites the raw column in the row object better-sqlite3 hands back — verified on
+ * a copy of the live db: CURD raw column 86 → resolved 80; MALA STRAWBERRY CRUSH 5 LTR
+ * raw 0.13482 → resolved 674.10. What arrives here is purchases.unit_price, which is
+ * ₹ per PURCHASE unit by canon. Draft-only "phantom" rows (matById below) inherit the
+ * same field from GET /api/requisitions?id=, whose items SELECT aliases it over the
+ * same `(SELECT unit_price FROM purchases … LIMIT 1)` (requisitions/route.ts:92).
+ *
+ * The two branches are exactly steps 1 and 2 of the sanctioned ladder in
+ * src/lib/closing-valuation.ts (materialRate): latest purchases.unit_price, else
+ * average_price (₹/recipe-unit) × packFactor. That library takes a db handle and
+ * cannot run in this client component, so the ladder is mirrored — not re-invented:
+ * the pack rule itself comes from the shared packFactor(), never hand-rolled here.
+ */
 function pricePerPU(m: Material): number {
-  return Number(m.last_purchase_price) > 0
-    ? Number(m.last_purchase_price)
-    : (m.average_price || 0) * packFactor(m);
+  // rate-basis: purchase — an alias over purchases.unit_price (see above), ₹/purchase-unit
+  const lastPaidPerPU = Number(m.last_purchase_price) || 0;
+  // rate-basis: purchase — average_price is ₹/recipe-unit; × packFactor lifts it to ₹/PU
+  return lastPaidPerPU > 0 ? lastPaidPerPU : (m.average_price || 0) * packFactor(m);
 }
 /** Ordering unit label. */
 function pu(m: Material): string { return m.purchase_unit || m.unit || ''; }

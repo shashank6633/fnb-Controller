@@ -105,6 +105,22 @@ const poUnitOf = (m?: Partial<Material> | null): string =>
  *  purchase price (already ₹/purchase-unit); otherwise converts the recipe-unit
  *  average by pack size. Returns 0 when we genuinely have no price. */
 const poRateOf = (m?: Partial<Material> | null): number => {
+  // NAME TRAP — read this before touching the line below.
+  // `Material` is filled from GET /api/inventory?scope=all (see fetchAll), and
+  // that route does NOT ship the stored raw_materials column of this name. It
+  // ships a SQL ALIAS over the newest purchases row:
+  //     COALESCE((SELECT unit_price FROM purchases
+  //               WHERE material_id = rm.id
+  //               ORDER BY date DESC, created_at DESC LIMIT 1), 0)
+  //               AS last_purchase_price          (api/inventory/route.ts:40)
+  // The alias is listed AFTER `rm.*`, so it overwrites the stored column in the
+  // row object — verified on live data: CURD comes back 80 (the real Rs/kg off
+  // purchases) while the stored column holds 86, a Rs/kg figure parked in a
+  // Rs/g column. purchases.unit_price is Rs per PURCHASE unit by canon, which is
+  // exactly the basis a PO line is raised in, so this seed needs no conversion.
+  // Anything reaching this helper from a payload that did NOT alias the column
+  // would be mixed-basis and must not be used — go through /api/inventory.
+  // rate-basis: purchase (alias over purchases.unit_price, NOT the stored column)
   const last = Number(m?.last_purchase_price) || 0;
   if (last > 0) return last;
   const pack = Number(m?.pack_size) || 1;
@@ -177,7 +193,11 @@ interface POItem {
    *  still lists seven). Kept on the payload so the seed is already in hand the
    *  day it gains an eighth. */
   material_cess_percent?: number;
-  current_avg_price?: number; last_purchase_price?: number; notes?: string;
+  /** raw_materials.average_price — Rs per RECIPE unit. Scale by pack_size before
+   *  putting it next to a PO rate. No last-purchase-rate field rides here: the
+   *  detail API stopped sending that mixed-basis column, and the composer's seed
+   *  rate comes from the Material list (/api/inventory), not from a PO item. */
+  current_avg_price?: number; notes?: string;
   /** LINE vendor — one PO legitimately spans several. Receiving is per vendor. */
   vendor?: string; vendor_id?: string | null;
 }
@@ -968,8 +988,19 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
      their rows and is the figure their invoice has to reconcile to. Summing the
      whole PO here would show a receiver a number no invoice in their hand could
      ever match. */
+  // BOTH halves of both products share a basis; no conversion needed.
+  // `d.ov` defaults to `{ quantity: it.quantity, unit_price: it.unit_price }`
+  // (the deviations memo) and is otherwise whatever setQty/setPrice wrote from
+  // the two receive-screen inputs, which render `{u}` and `/{u}` where
+  // u = material_purchase_unit — so ov is billed PURCHASE units at Rs per
+  // purchase unit. `d.it` is a purchase_order_items row: quantity = PURCHASE
+  // units, unit_price = Rs/purchase-unit by canon. These are the same two
+  // numbers POST /receive multiplies for acceptedTotal, so this footer and the
+  // booked bill agree by construction.
+  // rate-basis: purchase (billed PURCHASE units x Rs/purchase-unit)
   const total = activeDeviations.reduce((s, d) =>
     s + (Number(d.ov.quantity) || 0) * (Number(d.ov.unit_price) || 0), 0);
+  // rate-basis: purchase — purchase_order_items quantity x unit_price, as ordered.
   const orderedTotal = activeDeviations.reduce((s, d) => s + d.it.quantity * d.it.unit_price, 0);
 
   /* ZERO-RATED LINES. A store/TGBCL material carries excise, cess and TCS on the
@@ -2468,6 +2499,14 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   const updateLine = (i: number, patch: Partial<POLine>) =>
     setItems(prev => prev.map((it, j) => j === i ? { ...it, ...patch } : it));
 
+  // POLine.quantity and POLine.unit_price are the two
+  // composer inputs rendered a few hundred lines below, labelled `poUnitOf(mat)`
+  // and `/ {poUnitOf(mat)}` (= purchase_unit, falling back to the recipe unit).
+  // They POST verbatim into purchase_order_items, whose canon is PURCHASE units
+  // at Rs/purchase-unit — so this draft total is the same product the server
+  // stores as total_price. The recipeHint() beside the qty box is display-only
+  // and never feeds this sum.
+  // rate-basis: purchase (composer PURCHASE units x Rs/purchase-unit)
   const total = items.reduce((s, i) => s + (Number(i.quantity) || 0) * (Number(i.unit_price) || 0), 0);
 
   // Header derives "Vendor(s) used" from line items so user has a quick visual summary
@@ -3535,6 +3574,10 @@ function EditPOItems({ poId, initialDate, initialDeliveryDate, initialVendor, in
                               onMatch={p => update(i, { unit_price: p })} />
               )}
             </div>
+            {/* The two boxes immediately above are this row's qty and rate,
+                labelled poUnitOf(mat) and / poUnitOf(mat); a PO line is stored
+                in PURCHASE units at Rs/purchase-unit.
+                rate-basis: purchase */}
             <div className="col-span-1 text-right font-mono pt-1">{fmt((it.quantity || 0) * (it.unit_price || 0))}</div>
             <button onClick={() => remove(i)} className="col-span-1 text-red-500"><Trash2 className="w-3 h-3" /></button>
           </div>

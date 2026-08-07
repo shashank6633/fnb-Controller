@@ -386,6 +386,15 @@ export async function POST(request: Request) {
         seenInFile.add(key);
         if (billNo) seenBillItem.set(billItemKey, rowNum);
 
+        // `quantity` is PURCHASE units by contract, enforced twice in this route: the
+        // sheet's purchase_unit column must equal the material's configured purchase
+        // unit or the row is skipped (line 288-296), and the stock credit below is
+        // toStockQty(mat, quantity) = qty × pack_size, i.e. it treats qty as purchase
+        // units to reach recipe units. `unitPrice` is the sheet rate (or totalAmount ÷
+        // quantity, same basis) and goes straight into purchases.unit_price = ₹ per
+        // PURCHASE unit by canon; updateMaterialPrice() later divides it by pack_size
+        // to get ₹/recipe-unit. So total_price = purchase qty × ₹/purchase unit.
+        // rate-basis: purchase
         const totalPrice = Math.round(quantity * unitPrice * 100) / 100;
 
         // A sheet's single `gst_amount` column becomes the CGST/SGST pair, so the

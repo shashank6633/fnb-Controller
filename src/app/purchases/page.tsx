@@ -1072,6 +1072,13 @@ export default function PurchasesPage() {
     const items = billData.items.map((item) => {
       const qty = parseFloat(item.quantity) || 0;
       const price = parseFloat(item.unit_price) || 0;
+      // Both halves are the SAME typed entry basis, whichever it is. The two boxes are
+      // labelled from data by caseBasis(): BTL mode prints the material's purchase unit
+      // + "₹ / {pu}", CASE mode prints "case (N pu)" + "per case". billSubmit() then
+      // expands a CASE line as qty × case_size and rate ÷ case_size before POSTing, so
+      // purchases.quantity / .unit_price land in the canon's purchase basis — and this
+      // product is the same money either way (cases × ₹/case ≡ btl × ₹/btl).
+      // rate-basis: purchase
       return { ...item, line_total: Math.round(qty * price * 100) / 100 };
     });
 
@@ -2294,6 +2301,14 @@ export default function PurchasesPage() {
                         cost basis uses); Total Inward adds the per-line charges
                         (CGST/SGST/cess/TCS/delivery/round-off − discount). */}
                     {(() => {
+                      // Sheet rows go to POST /api/purchases/bulk verbatim. That route
+                      // REJECTS a row whose `purchase_unit` column disagrees with the
+                      // material's configured purchase unit (bulk/route.ts:288-296) and
+                      // then does toStockQty(mat, quantity) = qty × pack_size to credit
+                      // stock — so `quantity` is purchase units by contract, and
+                      // `unit_price` is what lands in purchases.unit_price (₹/purchase
+                      // unit). total_amount is the charge-free qty × rate, same basis.
+                      // rate-basis: purchase
                       const sub = bulkParsedData.reduce((s, r) => s + (r.total_amount || r.unit_price * r.quantity), 0);
                       const chg = bulkParsedData.reduce((s, r) => s
                         - (Number(r.discount) || 0) + (Number(r.cgst) || 0) + (Number(r.sgst) || 0)
@@ -2352,6 +2367,11 @@ export default function PurchasesPage() {
                             </td>
                             <td className="py-1.5 px-3 text-right text-[#2D1B0E] font-mono text-xs">{formatCurrency(row.unit_price)}</td>
                             <td className="py-1.5 px-3 text-right text-green-600 font-mono text-xs">
+                              {/* Same pair as the Subtotal roll-up above: the Qty header
+                                  declares purchase units and the Unit Price header
+                                  declares ₹ per purchase unit, which is the contract
+                                  /api/purchases/bulk verifies and stores. */}
+                              {/* rate-basis: purchase */}
                               {formatCurrency(row.total_amount || row.unit_price * row.quantity)}
                             </td>
                             <td className="py-1.5 px-3 text-right text-amber-600 font-mono text-xs">

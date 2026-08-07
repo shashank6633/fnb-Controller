@@ -659,6 +659,15 @@ export default function RecipesPage() {
     for (const sr of formSubRecipes) {
       const sub = subRecipes.find((s) => s.id === sr.sub_recipe_id);
       if (sub) {
+        // sub.cost_per_unit is sub_recipes.cost_per_unit = total_cost ÷
+        // yield_quantity (recalculateSubRecipeCost, src/lib/db.ts) — ₹ per the
+        // sub-recipe's YIELD unit, not ₹ per raw-material unit. sr.quantity is
+        // authored in that same yield unit: updateFormSubRecipe below copies
+        // sub.yield_unit onto the row and the form renders it read-only. A
+        // sub-recipe is never bought, so it has no purchase unit and no pack
+        // size — there is nothing to convert. Mirrors the server engine's
+        // `sr.quantity * sr.cost_per_unit` in recalculateRecipeCost.
+        // rate-basis: recipe (₹ per sub-recipe yield unit × qty in that same unit)
         srCost += sr.quantity * (sub.cost_per_unit || 0);
       }
     }
@@ -1921,6 +1930,12 @@ export default function RecipesPage() {
                       <td className="py-2 px-2 text-right text-[#6B5744]">{sr.quantity}</td>
                       <td className="py-2 px-2 text-[#8B7355]">{sr.unit}</td>
                       <td className="py-2 px-2 text-right text-[#6B5744]">{formatCurrency(sr.cost_per_unit || 0)}</td>
+                      {/* sr.cost_per_unit = sub_recipes.cost_per_unit = total_cost ÷ yield_quantity
+                          (recalculateSubRecipeCost, src/lib/db.ts) — ₹ per the sub-recipe's YIELD unit.
+                          sr.quantity is stored in that same unit (recipe_sub_recipes.unit is stamped
+                          from yield_unit on select), and the Unit column beside it prints sr.unit, so
+                          the row is self-consistent. A sub-recipe is never bought: no pack conversion.
+                          rate-basis: recipe (₹ per sub-recipe yield unit × qty in that same unit) */}
                       <td className="py-2 px-2 text-right font-medium text-[#2D1B0E]">{formatCurrency(sr.quantity * (sr.cost_per_unit || 0))}</td>
                     </tr>
                   ))}
@@ -2763,6 +2778,11 @@ export default function RecipesPage() {
                           {(() => {
                             const sub = subRecipes.find((s) => s.id === sr.sub_recipe_id);
                             if (!sub) return '-';
+                            // sub.cost_per_unit = total_cost ÷ yield_quantity, ₹ per the
+                            // sub-recipe's YIELD unit; the Unit cell two columns left is
+                            // locked to that same sub.yield_unit, so the qty typed here is
+                            // in it. A sub-recipe is never bought — no pack conversion exists.
+                            // rate-basis: recipe (₹ per yield unit × qty in that same unit)
                             return formatCurrency(sr.quantity * (sub.cost_per_unit || 0));
                           })()}
                         </span>

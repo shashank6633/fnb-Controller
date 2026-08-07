@@ -176,7 +176,15 @@ export async function GET(request: Request) {
         SELECT poi.*, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
                COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS material_purchase_unit,
                rm.pack_size AS material_pack_size,
-               rm.average_price AS current_avg_price, rm.last_purchase_price,
+               -- current_avg_price is Rs per RECIPE unit (raw_materials.average_price
+               -- by canon) — the UI must scale it by pack_size before comparing it
+               -- to a PO rate. The stored last-purchase-rate column used to ride
+               -- along here and has been dropped: it is mixed-basis on live data
+               -- (some rows Rs/purchase-unit, some Rs/recipe-unit) and nothing on
+               -- this payload's two consumers (/purchase-orders and its print page)
+               -- ever read it. The PO composer seeds its rate from /api/inventory,
+               -- whose same-named field is an alias over purchases.unit_price.
+               rm.average_price AS current_avg_price,
                rm.primary_vendor AS material_default_vendor,
                -- The master's GST/cess rates ride along so the RECEIVE screen can
                -- SEED each line's GST% from the material. They come from

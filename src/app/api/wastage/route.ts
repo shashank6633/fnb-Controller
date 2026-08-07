@@ -105,6 +105,17 @@ export async function GET(request: Request) {
              COALESCE(rm.pack_size, 1) AS material_pack_size,
              rm.average_price, r.name AS recipe_name,
              d.name AS department_name,
+             -- wastages.quantity is STORED in recipe units. The entry screen takes
+             -- the number in the purchase unit (owner display rule) and does the
+             -- pack conversion ONCE, client-side, before POST; POST is documented
+             -- "quantity (in recipe units)" and hands that same number straight to
+             -- raw_materials.current_stock on the central branch and to the
+             -- department ledger on the other — both recipe-unit stores, so the
+             -- ledger itself certifies the basis. rm.average_price is Rs per recipe
+             -- unit by the house canon. Rs/g x g = the real rupee loss. Do NOT
+             -- convert again here: the display columns selected above exist so the
+             -- CLIENT can render the purchase-unit view off this recipe quantity.
+             -- rate-basis: recipe (recipe-unit qty x Rs per recipe unit)
              (w.quantity * rm.average_price) AS value
       FROM wastages w
       JOIN raw_materials rm ON rm.id = w.material_id
@@ -234,6 +245,12 @@ export async function POST(request: Request) {
     }
     const wastage = db.prepare(`
       SELECT w.*, rm.name AS material_name, rm.unit AS material_unit, rm.average_price,
+             -- Read-back of the row this handler just INSERTed with qty — the
+             -- recipe-unit quantity POST validated above and handed to
+             -- current_stock / postDeptLedger unchanged. Same pair, same proof as
+             -- the GET projection; the two projections are kept identical on
+             -- purpose so a refetched row matches the one just returned.
+             -- rate-basis: recipe (recipe-unit qty x Rs per recipe unit)
              (w.quantity * rm.average_price) AS value
       FROM wastages w JOIN raw_materials rm ON rm.id = w.material_id
       WHERE w.id = ?

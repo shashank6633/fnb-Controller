@@ -311,6 +311,15 @@ export function storeStock(db: Database, storeId: string): StoreStockRow[] {
       unit: r.unit,
       qty,
       avg_cost: Math.round(avg * 10000) / 10000,
+      // BOTH halves come off store_stock_ledger. qty = SUM(l.quantity), which
+      // postLedger documents and validates as signed RECIPE units; avg is the
+      // weighted mean of l.unit_cost, which postLedger documents as ₹ per
+      // RECIPE unit and which every writer (stores procure / procure-bulk /
+      // procure-bill / adjust / adjust-bulk / migrate, variance-approval,
+      // the KOT floor auto-deduct) already converts down before posting —
+      // e.g. procure posts quantity × the pack and unit_price ÷ the pack.
+      // The fallback leg is raw_materials.average_price, ₹/recipe unit by canon.
+      // rate-basis: recipe (recipe-unit qty × ₹ per recipe unit)
       value: Math.round(qty * avg * 100) / 100,
     };
   });
@@ -456,6 +465,11 @@ export function consolidatedStock(db: Database): ConsolidatedStockRow[] {
       const avg = a && a.in_qty > 0 ? a.in_value / a.in_qty : (Number(m.average_price) || 0);
       byStore[sid] = Math.round(qty * 10000) / 10000;
       totalQty += qty;
+      // Identical pair to storeStock() above: qty is SUM(l.quantity) from
+      // store_stock_ledger (RECIPE units per postLedger's contract) and avg is
+      // that store's weighted l.unit_cost (₹ per RECIPE unit), falling back to
+      // raw_materials.average_price (₹ per recipe unit by canon).
+      // rate-basis: recipe (recipe-unit qty × ₹ per recipe unit)
       totalValue += qty * avg;
     }
     // Central grocery backstock column — raw_materials.current_stock valued at
@@ -1586,6 +1600,13 @@ export function floorReconciliation(
         category: meta.category || '',
         unit: meta.unit || '',
         qty: r4(qty),
+        // party_consumption.qty_consumed is stored in RECIPE units: the only
+        // recorder (/party-pnl RecordConsumptionModal) converts the typed
+        // figure to the material's own unit before POSTing — "3 BTL leaves
+        // here as 2250 ml" — and /api/party-consumption snapshots
+        // cost_at_time as average_price × that same qty. avg here is
+        // raw_materials.average_price, ₹ per recipe unit by canon.
+        // rate-basis: recipe (recipe-unit qty × ₹ per recipe unit)
         value: r2(qty * avg),
       };
     })
@@ -1752,6 +1773,11 @@ export function overallReconciliation(db: Database, opts: { from: string; to: st
   const partyRows = db.prepare(`SELECT material_id, SUM(qty_consumed) AS qty FROM party_consumption WHERE event_date >= ? AND event_date <= ? GROUP BY material_id`).all(from, to) as { material_id: string; qty: number }[];
   const unattributed_party = partyRows.filter(p => (Number(p.qty) || 0) !== 0).map(p => {
     const meta = metaOf(p.material_id); const avg = Number(meta.average_price) || 0; const qty = Number(p.qty) || 0;
+    // Same pair as the per-store branch above: party_consumption.qty_consumed
+    // is written in RECIPE units (the recorder converts to the material's own
+    // unit before POST) and avg is raw_materials.average_price, ₹ per recipe
+    // unit by canon.
+    // rate-basis: recipe (recipe-unit qty × ₹ per recipe unit)
     return { material_id: p.material_id, material_name: meta.name, category: meta.category || '', unit: meta.unit || '', qty: r4(qty), value: r2(qty * avg) };
   }).sort((a, b) => a.material_name.localeCompare(b.material_name, undefined, { sensitivity: 'base' }));
 

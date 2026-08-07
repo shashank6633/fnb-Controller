@@ -96,8 +96,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const lineMap = new Map<string, any>();
     for (const ln of lines) if (ln?.id) lineMap.set(ln.id, ln);
 
+    // rm.last_purchase_price IS DELIBERATELY NOT SELECTED BELOW — do not add it back.
+    // It was a dead payload column here: nothing in this route ever read the value
+    // (the PO line's rate comes from the request body's ln.unit_price, refused
+    // unless > 0), yet the column is stored in MIXED bases on live data. Checked on
+    // a copy of the production db: CURD holds 86 where the Rs/recipe-unit truth is
+    // 0.0828, and MALA STRAWBERRY CRUSH 5 LTR holds 0.13482 against a real
+    // Rs 674.10/BTL from purchases. A mixed-basis number sitting in an items row is
+    // one property read away from being multiplied by a quantity, which is the
+    // whole shape of the error the rate-basis lock exists to stop. If a rate is
+    // ever genuinely needed here, derive it with src/lib/closing-valuation.ts
+    // (materialRate → Rs per purchase unit), never from this column.
     const items = db.prepare(`
-      SELECT ri.*, rm.name AS material_name, rm.current_stock, rm.last_purchase_price, rm.average_price,
+      SELECT ri.*, rm.name AS material_name, rm.current_stock, rm.average_price,
              rm.unit AS material_unit,
              -- purchase-unit basis for the auto-PO lines below (a blank
              -- purchase_unit means the material is bought in its recipe unit)
@@ -506,6 +517,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         `);
         let total = 0;
         for (const ln of poLines) {
+          // BOTH halves are purchase-basis by construction, ~320 lines up in the
+          // shortfall loop: `quantity: poQty` and `unit_price: poPrice`, where
+          // poQty/poPrice are `purchase`/`explicitPrice` already ÷ / × packSize
+          // whenever the caller declared po_entry_unit as the RECIPE unit (the
+          // `isPack && declaredUnit === recipeUnit` pair). Omitted po_entry_unit
+          // means the caller posted purchase basis — what the requisition modal
+          // does, converting before it submits. mergeDuplicateLines only sums
+          // quantities of the same material, so it cannot change a basis. This is
+          // exactly the row purchase_order_items requires.
+          // rate-basis: purchase   (₹/purchase-unit × purchase units)
           const lineTotal = Math.round(ln.quantity * ln.unit_price * 100) / 100;
           total += lineTotal;
           insPoItem.run(generateId(), linkedPoId, ln.material_id, ln.quantity, ln.unit_price,

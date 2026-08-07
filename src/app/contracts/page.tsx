@@ -62,7 +62,23 @@ const puOf = (m?: PackMeta | null): string =>
  *  purchase price (already ₹/purchase-unit); otherwise converts the recipe-unit
  *  average by pack size. 0 when we genuinely have no price. */
 const rateOf = (m?: Partial<Material> | null): number => {
-  const last = Number(m?.last_purchase_price) || 0;
+  // ALIAS TRAP — the field read below IS NOT the mixed-basis stored column.
+  // Every `m` reaching this function is a row from GET /api/inventory (the only
+  // loader on this page: reload() and QuickCreateMaterial both fetch
+  // /api/inventory?scope=all). That SELECT lists `rm.*` FIRST and then re-aliases
+  //   COALESCE((SELECT unit_price FROM purchases … LIMIT 1), 0) AS last_purchase_price
+  // (api/inventory/route.ts:40). The later duplicate key wins in better-sqlite3,
+  // so what arrives is purchases.unit_price = ₹ per PURCHASE unit, never the
+  // stored raw_materials value. Proved against the live DB:
+  //   CURD                       stored 86      → arrives 80      (₹/kg)
+  //   SUNFLOWER OIL 1LTR         stored 0.1779  → arrives 182.76  (₹/BTL)
+  //   MALA STRAWBERRY CRUSH 1LTR stored 0.2016  → arrives 0       (no purchases)
+  // /api/vendor-contracts serves material_last_price the same way and says so at
+  // route.ts:49-68. A material created in this session has no purchase history,
+  // so it arrives 0 and falls through to the average branch.
+  // The ladder here is closing-valuation.ts's ladder expressed client-side:
+  // latest purchases.unit_price → average_price × packFactor → 0.
+  const last = Number(m?.last_purchase_price) || 0;   // rate-basis: purchase — this is purchases.unit_price under an alias, see above
   if (last > 0) return last;
   const avg = Number(m?.average_price) || 0;
   return Math.round(avg * packFactor(m || {}) * 100) / 100;
@@ -336,11 +352,20 @@ export default function ContractsPage() {
                 const delta = ref ? (((Number(editing.unit_price) || 0) - ref) / ref) * 100 : 0;
                 return (
                   <div className="text-[10px] text-[#6B5744] bg-[#FFF1E3] px-2 py-1 rounded">
+                    {/* Both references are ₹ per PURCHASE unit, the basis of unit_price:
+                        avgPu = average_price (₹/recipe-unit) × packFactor, and `last` is
+                        the /api/inventory alias over purchases.unit_price — NOT the
+                        mixed-basis stored column (see the ALIAS TRAP note on rateOf). */}
+                    {/* rate-basis: purchase */}
                     Reference (per {editUnit || m.unit}): avg {fmt(avgPu)} · last {fmt(m.last_purchase_price || 0)}
                     {ref > 0 && Number(editing.unit_price) > 0 && (
                       <span className={`ml-2 font-medium ${
                         Math.abs(delta) < 5 ? 'text-emerald-700' : delta < 0 ? 'text-emerald-700' : 'text-red-700'
                       }`}>
+                        {/* Names WHICH rung of rateOf's ladder `ref` came from. Same alias
+                            as above, so "last" means purchases.unit_price (₹/purchase-unit)
+                            and the % is purchase-basis ÷ purchase-basis. */}
+                        {/* rate-basis: purchase */}
                         contract is {delta > 0 ? '+' : ''}{delta.toFixed(1)}% vs {m.last_purchase_price ? 'last' : 'avg'}
                       </span>
                     )}

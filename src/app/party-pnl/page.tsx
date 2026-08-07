@@ -473,7 +473,10 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
               ? stored
               : (opts[0] || stored);
             // recipe qty x ₹/recipe-unit. The pack factor lives inside toBaseQty
-            // (quantity side) and must never be applied to average_price.
+            // (quantity side) and must never be applied to average_price:
+            // toBaseQty ALWAYS returns the material's RECIPE unit (3 BTL × 750 =
+            // 2250 ml, see its body), and average_price is ₹/recipe-unit by canon.
+            // rate-basis: recipe
             const cost = toBaseQty(Number(l.qty) || 0, dispUnit, m?.unit, m) * (m?.average_price || 0);
             return (
               <div key={i} className="grid grid-cols-12 gap-2 items-start">

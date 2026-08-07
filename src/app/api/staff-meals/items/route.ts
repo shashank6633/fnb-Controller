@@ -539,6 +539,14 @@ export async function PATCH(request: Request) {
         }
 
         const consumedQty = item.issued_quantity - returnedQty;
+        // BOTH OPERANDS ARE THE STORED ROW'S OWN LINE BASIS. consumedQty is
+        // issued_quantity minus returned_quantity, both counted in `item.unit`;
+        // item.purchase_price is Rs for one of that same unit because POST above
+        // settled it there (Rule 4) before the row was ever written. Nothing here
+        // re-derives a rate, and re-labelling either half would break the trio.
+        // Declared "mixed" because the LINE unit is per-row (kg on a packed line,
+        // g when the recipe unit was chosen) — single-basis WITHIN a row, which is
+        // all this multiplication needs.  rate-basis: mixed
         const totalCost = Math.round(item.purchase_price * consumedQty * 100) / 100;
 
         // The return goes back to whichever rail the ISSUE came out of — read
