@@ -17,6 +17,7 @@ import { canApproveTasks } from '@/lib/tasks';
  *   - admin            : vendor POs awaiting approval ('pending' | 'pending_reapproval')
  *   - kitchen/admin    : open KOT trouble alerts (kot_alerts.resolved_at IS NULL)
  *   - HOD/store/admin  : materials at/below reorder level
+ *   - admin            : closing counts parked in the variance-approval queue
  *   - plain staff      : their OWN requisitions by stage (with HOD / being
  *                        issued / fulfilled today)
  *
@@ -121,6 +122,42 @@ export async function GET() {
         [],
       );
       push('reorder', 'Critical items below reorder level', n, '/crm/reorder');
+    }
+
+    // ── Closing counts parked in the variance-approval queue ──────────────
+    // Why this bucket exists: a count whose physical figure differs from system
+    // stock does NOT move stock — it writes a PENDING variance_approvals row and
+    // waits for an admin. Nothing else in the app surfaced that number, so counts
+    // were entered, silently parked, and later read back as "stock didn't update".
+    // An admin who ticks "Adjust system stock" on /closing-stock approves CENTRAL
+    // rows at save time, so those never land here — but two cases deliberately do,
+    // and a maintainer who reads "badge > 0 means the box wasn't ticked" will be
+    // wrong about both: DEPARTMENT-tagged rows are carved out of the auto-approve
+    // (closing-stock/route.ts, `if (adjustStock && !deptId && approvalId)`) because
+    // a department count re-anchors its own balance and central must not move; and
+    // any auto-approve that FAILS leaves its row pending by design rather than
+    // swallowing the error.
+    // ADMIN-ONLY, and it has to stay that way: /variance-approvals is adminOnly in
+    // the page catalog and GET /api/variance-approvals is requireRole('admin'),
+    // which is exactly `me.role === 'admin'` — the same test as isAdmin. Widening
+    // this gate would badge every staff member with a page they can only 403 on.
+    // OUTLET SCOPE: the default 'outlet', deliberately. A badge must count what
+    // the page it links to will actually show, and /variance-approvals reads the
+    // reviewer's current outlet only — counting with 'all' here would deep-link
+    // an admin to an empty queue. This is the same reason the API's own
+    // `pending_count` is documented not to move with ?outlet. If that page ever
+    // grows an all-outlets view, move BOTH together: a badge and its destination
+    // disagreeing is worse than either alone.
+    // Isolated like the other additive buckets so a variance_approvals schema
+    // issue can never break the whole inbox.
+    if (isAdmin) {
+      try {
+        const { pendingVarianceCount } = await import('@/lib/variance-approval');
+        push('variance_approvals', 'Closing counts awaiting approval',
+          pendingVarianceCount(db, outletId), '/variance-approvals');
+      } catch (vaErr) {
+        console.error('[/api/notifications/inbox] variance bucket failed:', vaErr);
+      }
     }
 
     // ── Bill discounts awaiting REMOTE approval ──────────────────────────

@@ -477,9 +477,10 @@ export default function LiquorStorePage() {
     [stock],
   );
 
-  // Store has NO ledger history at all: saved closing counts are a pure
-  // register (they never post ledger rows), so stock stays empty — look up the
-  // latest count date once per stock load and surface the explainer banner.
+  // Store has NO ledger history at all: saving a closing count is a pure
+  // register write (it posts no ledger row), so stock stays empty until an
+  // admin approves the variance it raised — look up the latest count date once
+  // per stock load and surface the explainer banner.
   const noLedgerYet = stockLoadedFor === storeId && stock.every(r => !r.has_ledger);
   useEffect(() => {
     if (!storeId || stockLoadedFor !== storeId) return;
@@ -723,16 +724,28 @@ export default function LiquorStorePage() {
             )}
           </div>
 
-          {/* Counts-without-ledger explainer: counts are a register, not stock */}
+          {/* Counts-without-ledger explainer: counts are a register, not stock.
+              The old instruction here (“re-save each date with Adjust system
+              stock ticked”) was doubly wrong — that tick has never existed on
+              this screen, and the store closing route retired the flag when the
+              approval queue shipped. The route now raises a PENDING variance
+              approval per non-zero count, so the only way stock catches up is an
+              admin decision in /variance-approvals.
+              The double-post warning SURVIVES the rewrite, in a new shape: each
+              pending row froze its difference against this store's EMPTY ledger,
+              so every date approved posts the whole counted quantity again. */}
           {noLedgerYet && latestCountByStore[storeId] && (
             <div className="bg-amber-50 border border-amber-200 rounded-xl px-3 sm:px-4 py-2.5 text-xs text-amber-900 flex flex-wrap items-center gap-x-3 gap-y-1.5">
               <span className="flex-1 min-w-[240px]">
                 <AlertTriangle className="w-3.5 h-3.5 inline mr-1 -mt-0.5" />
-                Closing counts recorded (latest {latestCountByStore[storeId]}) — counts are a register and
-                never change stock. To make stock match the physical counts, open Closing Stock and,
-                starting from the <b>oldest</b> count date, re-save each date with “Adjust system stock”
-                ticked (admin) — always adjust oldest-first; adjusting an older date after a newer one
-                posts the variance twice. Or set opening stock via Adjustment / a transfer.
+                Closing counts recorded (latest {latestCountByStore[storeId]}) — a count is a register entry, so
+                saving one gave this store no stock. Re-save the <b>latest</b> count date in Closing Stock to send
+                it to{' '}
+                {isAdmin
+                  ? <a href="/variance-approvals" className="text-amber-900 underline font-medium">Variance Approvals</a>
+                  : 'Variance Approvals'}; stock reconciles to it only once an admin approves. Send <b>one</b> date
+                only — every count here measured itself against an empty ledger, so approving two dates for one item
+                posts its quantity twice. Or set opening stock via Adjustment / a transfer.
               </span>
               {access.can_close_stock && (
                 <button onClick={() => setTab('closing')}
@@ -2568,7 +2581,10 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   const [notes, setNotes] = useState<Record<string, string>>({});   // per-row note
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [csvResult, setCsvResult] = useState<{ success: number; errors: string[] } | null>(null);
+  // `pending` mirrors summary.pending_count so the import panel can say the same
+  // thing the manual Save toast says. Optional because every failure path sets a
+  // result with nothing imported — and therefore nothing queued for approval.
+  const [csvResult, setCsvResult] = useState<{ success: number; pending?: number; errors: string[] } | null>(null);
   // Filters
   const [catFilter, setCatFilter] = useState('');
   const [q, setQ] = useState('');
@@ -2724,8 +2740,9 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   /* ── CSV template + bulk upload ──────────────────────────────────────
      Template exports the currently-filtered material set with blank
      Cases/Bottles/Loose columns; upload matches by material_id → SKU → Name,
-     converts the triple to recipe units and posts to the SAME endpoint with
-     adjust_to_physical forced OFF (a bulk file must never reconcile stock). */
+     converts the triple to recipe units and posts to the SAME endpoint as the
+     manual Save — so a bulk file records counts and raises the same PENDING
+     variance approvals. Neither path reconciles stock on its own. */
   const downloadTemplate = () => {
     // Blind count: non-admins get the template WITHOUT any System stock column.
     const cols = isAdmin
@@ -2791,13 +2808,32 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
       }
       const r = await api(`/api/stores/${storeId}/closing`, {
         method: 'POST',
-        body: { date, items, adjust_to_physical: false },   // bulk never adjusts
+        // `adjust_to_physical` is retired — the route ignores it and sends every
+        // non-zero variance to the approval queue. Kept pinned to false so the
+        // bulk path can never opt into an inline reconcile if the flag returns.
+        body: { date, items, adjust_to_physical: false },
       });
       const j = await r.json();
       if (!r.ok) { setCsvResult({ success: 0, errors: [...errors, j.error || `HTTP ${r.status}`] }); return; }
-      setCsvResult({ success: j.summary?.items || 0, errors });
+      // Same POST as the manual Save, so the same thing happened to the counts —
+      // say so in the SAME words, or a spreadsheet counter (the usual path here)
+      // never learns their variances are sitting in a queue.
+      const imported = j.summary?.items || 0;
+      const queued = j.summary?.pending_count || 0;
+      setCsvResult({ success: imported, pending: queued, errors });
       await loadDay(date, true);
-      onSaved(`Imported ${j.summary?.items || 0} closing count${(j.summary?.items || 0) === 1 ? '' : 's'} for ${date}`);
+      // BLIND COUNTS: the "N queued" / "all match the system" pair is an exact
+      // oracle for the figure this screen deliberately withholds — upload one
+      // line, nudge the number, and the message flips at precisely system stock.
+      // downloadTemplate() strips the system columns and the GET route nulls
+      // shortage/excess/match for non-admins for this reason. Admins get the
+      // count; everyone else gets a variance-independent confirmation.
+      onSaved(`Imported ${imported} closing count${imported === 1 ? '' : 's'} for ${date}` +
+        (isAdmin
+          ? (queued
+              ? ` — ${queued} sent to Variance Approvals for review`
+              : ' — all match the system, nothing to approve')
+          : ' — recorded; any difference goes to Variance Approvals for review'));
     } catch (e: any) { setCsvResult({ success: 0, errors: [e.message] }); }
     finally { setBusy(false); }
   };
@@ -2888,10 +2924,14 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
             </div>
           </div>
 
+          {/* The Variance Approvals link is ADMIN-only — the page is adminOnly in
+              the catalog, so linking a counter there just sends them to a door
+              that will not open. Non-admins get the same sentence, unlinked. */}
           <p className="text-[11px] text-[#8B7355]">
             Physical count for <b>{date}</b>. Saving records the count only — any difference from the system is
-            sent to <a href="/variance-approvals" className="text-[#af4408] underline">Variance Approvals</a> for an
-            admin to review; stock changes only after approval.
+            sent to {isAdmin
+              ? <a href="/variance-approvals" className="text-[#af4408] underline">Variance Approvals</a>
+              : 'Variance Approvals'} for an admin to review; stock changes only after approval.
             {!isAdmin && ' The system figure is hidden so your count is unbiased.'}
           </p>
 
@@ -2900,7 +2940,17 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
               <div className="flex items-start gap-2 text-sm">
                 {csvResult.success > 0 ? <CheckCircle2 className="w-4 h-4 text-green-600 mt-0.5" /> : <AlertCircle className="w-4 h-4 text-red-500 mt-0.5" />}
                 <div>
-                  {csvResult.success > 0 && <p className="text-green-700">Imported {csvResult.success} count{csvResult.success === 1 ? '' : 's'} from CSV.</p>}
+                  {csvResult.success > 0 && (
+                    <p className="text-green-700">
+                      Imported {csvResult.success} count{csvResult.success === 1 ? '' : 's'} from CSV
+                      {/* Admin-only figures — same blind-count oracle as the toast above. */}
+                      {isAdmin
+                        ? (csvResult.pending
+                            ? ` — ${csvResult.pending} sent to Variance Approvals for review; stock changes only after approval.`
+                            : ' — all match the system, nothing to approve.')
+                        : ' — recorded; any difference goes to Variance Approvals for review, and stock changes only after approval.'}
+                    </p>
+                  )}
                   {csvResult.errors.map((e, i) => <p key={i} className="text-red-600 text-xs">{e}</p>)}
                 </div>
               </div>

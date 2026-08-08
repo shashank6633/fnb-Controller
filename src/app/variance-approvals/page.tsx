@@ -5,9 +5,22 @@
  *
  * A closing physical count that disagrees with the system lands here as PENDING
  * — stock is NOT changed. The admin asks the staff who counted, records the
- * reason, and either APPROVES (stock → physical count) or REJECTS (stock stays;
- * the variance stands as an open loss to investigate). Route is adminOnly in the
- * page catalog and every API is admin-gated server-side.
+ * reason, and either APPROVES or REJECTS (stock stays; the variance stands as an
+ * open loss to investigate). Route is adminOnly in the page catalog and every
+ * API is admin-gated server-side.
+ *
+ * APPROVE IS A DELTA, NEVER AN ABSOLUTE SET — and this page must not say
+ * otherwise. approveVariance() posts the COUNT-TIME difference
+ * (physical − system-as-counted) on top of whatever the rail holds at the moment
+ * the admin clicks, so the balance lands on the counted figure PLUS anything
+ * that moved in between. Worked example: system 5,000 g, counted 10,000 g at
+ * 10:00; a 2,000 g issue at 12:00 takes live stock to 3,000; approving at 16:00
+ * gives 8,000 g, not 10,000. That is deliberate — see the header comment in
+ * lib/variance-approval.ts for why it is the only reading under which stock
+ * moves exactly once — and it holds on all three rails (central, liquor ledger,
+ * department ledger), because each posts the count-time difference to its own.
+ * This page used to promise the counted figure outright ("set stock to counted",
+ * "If approved → physical"); it now labels that a projection and caveats it.
  *
  * GET  /api/variance-approvals?status=pending|approved|rejected|all
  * POST /api/variance-approvals/[id]/approve  { reason }
@@ -17,9 +30,9 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from '@/lib/api';
 import {
   ScrollText, ShieldCheck, Loader2, RefreshCw, CheckCircle2, XCircle,
-  AlertTriangle, Lock, PackageX, PackagePlus, Store, Boxes,
+  AlertTriangle, Info, Lock, PackageX, PackagePlus, Store, Boxes,
 } from 'lucide-react';
-import { packFactor, toPurchaseQty } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 
 interface Approval {
   id: string; source: 'central' | 'liquor'; material_id: string; material_name: string; material_sku: string;
@@ -33,6 +46,21 @@ interface Approval {
 
 const inr = (v: number) => '₹' + Math.abs(Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 const qty = (v: number) => Number(Number(v || 0).toFixed(3)).toLocaleString('en-IN');
+/**
+ * The two pack fields listVarianceApprovals() joins on but `Approval` above has
+ * never declared. Optional on purpose: a cached pre-conversion payload can
+ * arrive without them, and packFactor() already degrades to 1 (no conversion)
+ * when they are missing — which is the honest reading, not a silent divide.
+ */
+type ApprovalWire = Approval & { material_purchase_unit?: string; material_pack_size?: number };
+/** Pack meta for the purchase-unit display layer, read in ONE place. */
+const metaOf = (r: Approval): PackMeta => ({
+  unit: r.unit,
+  purchase_unit: (r as ApprovalWire).material_purchase_unit,
+  pack_size: (r as ApprovalWire).material_pack_size,
+});
+/** Purchase unit to print beside a converted quantity (falls back to recipe). */
+const puOf = (r: Approval): string => (r as ApprovalWire).material_purchase_unit || r.unit;
 function istWhen(iso: string | null): string {
   if (!iso) return '—';
   const d = new Date(iso.includes('Z') || iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z');
@@ -76,12 +104,17 @@ export default function VarianceApprovalsPage() {
     if (reason.length < 2) { flash('Enter a reason first — ask the staff what caused it.'); return; }
     setBusy(row.id);
     try {
-      const vm = { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size };
       const res = await api(`/api/variance-approvals/${row.id}/${action}`, { method: 'POST', body: { reason } });
       const j = await res.json();
       if (!res.ok) throw new Error(j?.error || 'Failed');
+      // NO RESULTING FIGURE IN THIS TOAST. It used to read "stock set to
+      // <physical>", which is the absolute-set claim the approval does not make
+      // (see the delta note at the top of this file). The approve route replies
+      // { ok, applied } and nothing more, so the balance the item actually
+      // landed on is not knowable here — naming the counted figure again would
+      // just repeat the old promise. Say what was applied instead.
       flash(action === 'approve'
-        ? `Approved — ${row.material_name} stock set to ${qty(toPurchaseQty(row.physical_stock, vm))} ${(row as any).material_purchase_unit || row.unit}`
+        ? `Approved — ${row.material_name}: counted difference applied to live stock`
         : `Rejected — ${row.material_name} stock unchanged; logged as an open loss`);
       setReasons(p => { const n = { ...p }; delete n[row.id]; return n; });
       await load();
@@ -124,7 +157,8 @@ export default function VarianceApprovalsPage() {
         <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3 text-[12px] text-[#6B5744] flex gap-2">
           <ShieldCheck className="w-4 h-4 text-[#af4408] shrink-0 mt-0.5" />
           <span>
-            <b>Approve</b> = the count is correct → stock is set to the counted number (loss written off with your reason).
+            <b>Approve</b> = the count is correct → the counted difference is applied to live stock (loss written off with your reason).
+            It lands on the counted number only if nothing has moved since the count.
             <b className="ml-2">Reject</b> = keep system stock → the shortage stands as an open loss to chase. Staff never see the system number, so the count is blind.
           </span>
         </div>
@@ -164,6 +198,9 @@ export default function VarianceApprovalsPage() {
             {rows.map(row => {
               const shortage = row.variance < 0;
               const decided = row.status !== 'pending';
+              // The counted figure in purchase units. Quoted twice in the caveat
+              // below, so derive it once — the two readings cannot then drift.
+              const countedTxt = `${qty(toPurchaseQty(row.physical_stock, metaOf(row)))} ${puOf(row)}`;
               return (
                 <div key={row.id} className="bg-white border border-[#E8D5C4] rounded-xl p-4 shadow-sm">
                   <div className="flex flex-wrap items-start justify-between gap-3">
@@ -201,10 +238,51 @@ export default function VarianceApprovalsPage() {
                       <div className="font-semibold">{qty(toPurchaseQty(row.physical_stock, { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }))} <span className="text-[11px] font-normal text-[#8B7355]">{(row as any).material_purchase_unit || row.unit}</span></div>
                     </div>
                     <div className={`rounded-lg py-2 border ${shortage ? 'bg-red-50 border-red-200' : 'bg-emerald-50 border-emerald-200'}`}>
-                      <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">If approved</div>
-                      <div className="font-semibold">→ {qty(toPurchaseQty(row.physical_stock, { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }))} <span className="text-[11px] font-normal text-[#8B7355]">{(row as any).material_purchase_unit || row.unit}</span></div>
+                      {/* PROJECTION, NOT A PROMISE. This tile read "If approved
+                          → <physical>", which is the absolute set approval does
+                          not do. The honest reading of the same number is "where
+                          it lands if nothing has moved since the count" — the
+                          count-time projection — so it is labelled as one. */}
+                      <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">If approved · projected</div>
+                      <div className="font-semibold">→ {qty(toPurchaseQty(row.physical_stock, metaOf(row)))} <span className="text-[11px] font-normal text-[#8B7355]">{puOf(row)}</span></div>
+                      <div className="text-[9px] text-[#B8A590] leading-tight">only if nothing moved since</div>
                     </div>
                   </div>
+
+                  {/* WHY THIS CAVEAT IS UNCONDITIONAL — and what would retire it.
+                      The useful warning is the narrow one: flag only the rows
+                      where stock HAS moved since the count, and print the real
+                      projection beside the counted figure. That needs the LIVE
+                      balance per row, and the list API sends none —
+                      listVarianceApprovals() selects va.*, rm.name, rm.sku,
+                      rm.purchase_unit, rm.pack_size and the two names, so there
+                      is no rm.current_stock, no store-ledger on-hand and no
+                      deptOnHand to compare against. Guessing one would put back
+                      exactly the confident-but-wrong number this tile was fixed
+                      to stop showing, so the page names the uncertainty instead.
+                      WHEN ADDING THAT FIELD, RESOLVE IT PER RAIL. Do not reach
+                      for a generic materials endpoint: raw_materials.current_stock
+                      is the CENTRAL rail only. A liquor row's live balance is its
+                      store_stock_ledger on-hand and a department row's is its
+                      dept-ledger balance, so that shortcut would be wrong on two
+                      of the three rails while looking authoritative on all three.
+                      SHOWN ONLY WHERE APPROVE IS LIVE. A decided row has no
+                      click left to inform, and a blocked row cannot be approved
+                      at all — there, the amber refusal below is the whole
+                      message and stacking a second notice above it would bury
+                      the one that matters. */}
+                  {!decided && !row.approve_blocked && (
+                    <div className="mt-3 bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-2.5 text-[11px] leading-relaxed text-[#6B5744] flex gap-2">
+                      <Info className="w-3.5 h-3.5 text-[#af4408] shrink-0 mt-0.5" />
+                      <span>
+                        Approving applies the counted <b>difference</b> to the balance as it stands when you click —
+                        it does not force the balance to {countedTxt}. It lands on {countedTxt} plus anything that has
+                        moved since the count on {row.date}, so if this item was issued, received or transferred after
+                        that date the result differs by exactly that much. Worth a look at its movement since {row.date}
+                        before you approve.
+                      </span>
+                    </div>
+                  )}
 
                   {decided ? (
                     <div className="mt-3 text-[12px] border-t border-[#F0E4D6] pt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -238,7 +316,10 @@ export default function VarianceApprovalsPage() {
                                 title={row.approve_blocked || undefined}
                                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white disabled:opacity-50 disabled:cursor-not-allowed">
                           {busy === row.id ? <Loader2 className="w-4 h-4 animate-spin" /> : row.approve_blocked ? <Lock className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
-                          {row.approve_blocked ? 'Approve blocked (department count)' : 'Approve → set stock to counted'}
+                          {/* NOT "set stock to counted" — approval posts the
+                              count-time difference, it does not set an absolute.
+                              The blocked label is unchanged. */}
+                          {row.approve_blocked ? 'Approve blocked (department count)' : 'Approve → apply counted difference'}
                         </button>
                       </div>
                     </div>

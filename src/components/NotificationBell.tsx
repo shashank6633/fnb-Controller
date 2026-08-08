@@ -1,18 +1,25 @@
 'use client';
 
 /**
- * NotificationBell — the global "Action Inbox" bell.
+ * NotificationBell — the ORIGINAL docked header "Action Inbox" bell.
+ *
+ * NOT MOUNTED ANYWHERE. Editing this file changes nothing on screen. The Action
+ * Inbox was folded into the single floating draggable bell in
+ * src/components/CaptainAlertsProvider.tsx (mounted once in AppShell, so it is
+ * on every route) and the three header mounts this used to have — UserBar pill,
+ * MobileTopBar dark strip, Captain sidebar header — were removed with it. Kept
+ * only as the docked-chrome variant in case a header bell is ever wanted again;
+ * `dark` / `align` exist for those layouts.
+ *
+ * To ADD a notification, do not touch either bell: buckets are computed
+ * server-side in GET /api/notifications/inbox and both components render
+ * whatever that route returns.
  *
  * Polls GET /api/notifications/inbox (live COUNTs of pending states for the
  * signed-in user — no notifications table) every 45s and on window focus.
  * Tap → dropdown panel listing "NEEDS YOUR ACTION" buckets; tapping a row
  * navigates to the owning page. Items with count 0 never arrive (API omits
  * them); an empty inbox shows "All clear ✓".
- *
- * Mounted in three headers:
- *   - UserBar (desktop floating pill)         → light chrome, panel drops right
- *   - MobileTopBar (dark strip, < lg)         → dark chrome
- *   - Captain sidebar header (dark, tablet)   → dark chrome, panel opens leftward
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';

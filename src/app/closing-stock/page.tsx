@@ -510,7 +510,13 @@ export default function ClosingStockByLocationPage() {
   const [loose, setLoose] = useState<Record<string, string>>({});
   const [adjustStock, setAdjustStock] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [savedFlash, setSavedFlash] = useState('');
+  /* Save flash on the per-area count screen. `tone` is what the server DID, not
+     how the save went: 'applied' means stock has already moved (Adjust system
+     stock ticked, central rows), 'ok' means the counts are recorded and any
+     variance is waiting on an approver, 'warn' means the server reported
+     something it could not do. Those three must not look identical — the banner
+     used to be emerald in every case, so a parked count read as a done deal. */
+  const [savedFlash, setSavedFlash] = useState<{ text: string; tone: 'ok' | 'applied' | 'warn' } | null>(null);
   const [filterUncountedOnly, setFilterUncountedOnly] = useState(false);
   // Category filter — narrows the detail-view item list to one super_category
   // (or category fallback). Empty string = all categories. Item search box
@@ -551,7 +557,13 @@ export default function ClosingStockByLocationPage() {
   const [closingCategory, setClosingCategory] = useState('');
   const [adjustStockModal, setAdjustStockModal] = useState(false);
   const [closingSubmitting, setClosingSubmitting] = useState(false);
-  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[]; semi?: number } | null>(null);
+  /* `pending` / `applied` split the saved counts by WHAT HAPPENED TO STOCK — the
+     whole point of the Adjust-system-stock tick. `applied` rows had their variance
+     approved on the spot and stock HAS already moved; `pending` rows are parked in
+     the variance queue for an admin to clear later. Both optional: the early-exit
+     error paths below set neither, and only the raw-material leg reports them (a
+     semi-finished count never moves raw stock). */
+  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[]; semi?: number; pending?: number; applied?: number } | null>(null);
   /* The saved sheet, re-read from the server after a save/upload so the rate and
      Quantity × Rate shown are exactly the ones the server RESOLVED AND STORED
      (req 2/3) — never a browser-side recomputation. */
@@ -1034,6 +1046,11 @@ export default function ClosingStockByLocationPage() {
       }
 
       let rawSaved = 0;
+      // Read the server's own verdict on each variance instead of assuming one.
+      // The tick does NOT decide this on its own: department rows are carved out
+      // server-side and stay pending even when it is on, and a blocked approval
+      // falls back to pending with a reason in `errors`.
+      let rawPending = 0, rawApplied = 0;
       if (itemsToSubmit.length > 0) {
         const res = await api('/api/closing-stock', {
           method: 'POST',
@@ -1044,9 +1061,11 @@ export default function ClosingStockByLocationPage() {
         const json = await res.json();
         for (const e of json.errors || []) errors.push(e);
         rawSaved = json.success || 0;
+        rawPending = json.pending || 0;
+        rawApplied = json.applied || 0;
       }
       const semiSaved = await postSemiCounts(closingDate, semiToSubmit, errors);
-      setClosingResult({ success: rawSaved, errors, semi: semiSaved });
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied });
       if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
@@ -1067,7 +1086,9 @@ export default function ClosingStockByLocationPage() {
   // parser converts to recipe units before POSTing (storage never changes
   // basis). Old files whose Unit column says the recipe unit still parse
   // correctly — the row's own Unit cell decides the basis. adjust_stock is
-  // FORCED off for the CSV path — a bulk file must never overwrite system stock.
+  // FORCED off for the CSV path even for an admin: a spreadsheet nobody has read
+  // line by line must never self-approve its own variances onto system stock.
+  // Every variance in an uploaded file goes to the approval queue.
   const csvEscape = (v: any) => {
     if (v == null) return '';
     const s = String(v);
@@ -1260,6 +1281,11 @@ export default function ClosingStockByLocationPage() {
         return;
       }
       let rawSaved = 0;
+      // `applied` is structurally 0 on this path — adjust_stock is forced off for
+      // a bulk file (see the header comment), so every variance in the sheet goes
+      // to the approval queue. Still read it from the reply rather than hard-coding
+      // 0, so the banner cannot drift from what the server actually did.
+      let rawPending = 0, rawApplied = 0;
       if (items.length > 0) {
         const res = await api('/api/closing-stock', {
           method: 'POST',
@@ -1268,10 +1294,12 @@ export default function ClosingStockByLocationPage() {
         const json = await res.json();
         for (const e of json.errors || []) errors.push(e);
         rawSaved = json.success || 0;
+        rawPending = json.pending || 0;
+        rawApplied = json.applied || 0;
       }
       // Sub-recipe rows from the same file go to the semi route.
       const semiSaved = await postSemiCounts(closingDate, semiItems, errors);
-      setClosingResult({ success: rawSaved, errors, semi: semiSaved });
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied });
       if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
@@ -1348,7 +1376,7 @@ export default function ClosingStockByLocationPage() {
     setEntries({});
     setCases({});
     setLoose({});
-    setSavedFlash('');
+    setSavedFlash(null);
     const qs = new URLSearchParams({ date, location: loc === '— Unassigned —' ? '__unassigned__' : loc, department_id: activeDeptId });
     const d = await fetch(`/api/closing-stock/by-location?${qs}`).then(r => r.json());
     setItems(d.items || []);
@@ -1432,14 +1460,48 @@ export default function ClosingStockByLocationPage() {
       if (!r.ok) {
         alert(j.error || 'Save failed');
       } else {
-        setSavedFlash(`✓ Saved ${j.success} count${j.success === 1 ? '' : 's'} for "${active}"`);
+        /* Say what became of the variances, not just how many rows were written.
+           One save can produce both outcomes: with the tick on, central rows are
+           approved on the spot (`applied`) while a department-scoped count — or
+           a row the server refused to approve — stays in the queue (`pending`).
+           The errors the route pushes ("count saved, but system stock was NOT
+           adjusted — …") were being dropped on the floor here; they are the only
+           place the counter learns why a row they expected to move did not. */
+        const errs: string[] = Array.isArray(j.errors) ? j.errors : [];
+        const flash = {
+          tone: (errs.length ? 'warn' : (j.applied ? 'applied' : 'ok')) as 'ok' | 'applied' | 'warn',
+          // BLIND COUNTS: the applied/pending clauses are ADMIN-ONLY, and this is
+          // load-bearing, not cosmetic. "N sent for variance approval" answers
+          // "does my figure differ from system stock?" — a counter can save one
+          // item, watch the clause appear or vanish, and bisect their way to
+          // raw_materials.current_stock in a handful of saves. That is exactly
+          // what by-location/route.ts blinds the System and Variance columns to
+          // prevent. A non-admin gets the plain count back and nothing else.
+          // `errs` is safe for everyone: it names rows that were REJECTED, and
+          // says nothing about how the accepted figures compare to system stock.
+          text: `✓ Saved ${j.success} count${j.success === 1 ? '' : 's'} for "${active}"`
+            + (isAdmin && j.applied ? ` · ${j.applied} applied to stock` : '')
+            + (isAdmin && j.pending ? ` · ${j.pending} sent for variance approval` : '')
+            + (errs.length ? ` · ${errs.length} skipped: ${errs.slice(0, 2).join(' | ')}` : ''),
+        };
         setEntries({});
         setCases({});
         setLoose({});
         // Refresh both detail and the location summary
         await openLocation(active!);
         await reloadLocations();
-        setTimeout(() => setSavedFlash(''), 4000);
+        // RAISE THE FLASH LAST. openLocation() clears savedFlash — it is the
+        // "entering an area" reset — so a flash set before this line was wiped
+        // in the same tick and never reached the screen at all. The old
+        // "✓ Saved N counts" message has been invisible on this path for that
+        // reason; there is no point reporting applied/pending here unless the
+        // banner is raised after the reload.
+        setSavedFlash(flash);
+        // Unchanged 4s auto-dismiss for a clean save. A 'warn' flash STAYS: it
+        // now carries the server's reason a row was not applied, and a reason
+        // that wipes itself after four seconds is the same as no reason at all.
+        // It clears on the next save or when the area is left.
+        if (!errs.length) setTimeout(() => setSavedFlash(null), 4000);
       }
     } finally { setSaving(false); }
   };
@@ -1479,10 +1541,13 @@ export default function ClosingStockByLocationPage() {
             <input type="checkbox" checked={filterUncountedOnly} onChange={e => setFilterUncountedOnly(e.target.checked)} />
             Only show un-counted
           </label>
-          {/* Admin-only — store managers must not be able to one-click overwrite
-              system stock without physically counting. */}
+          {/* Admin-only — store managers must not be able to one-click clear a
+              variance without an approver looking at it. The server forces the
+              flag off for everyone else regardless, so hiding it here just
+              matches. Unticked (the default) the count still only raises a
+              pending variance, which stays the normal route for admins too. */}
           {isAdmin && (
-            <label className="flex items-center gap-1.5 text-xs text-[#6B5744]" title="Admin-only: set system stock to physical count and write an inventory adjustment line">
+            <label className="flex items-center gap-1.5 text-xs text-[#6B5744]" title="Admin-only: approve these counts' variances as you save, so system stock moves to the physical figure now instead of waiting in the approval queue. Central-store counts only — a department count never moves central stock.">
               <input type="checkbox" checked={adjustStock} onChange={e => setAdjustStock(e.target.checked)} />
               Adjust system stock to match
             </label>
@@ -1494,9 +1559,18 @@ export default function ClosingStockByLocationPage() {
           </button>
         </div>
 
+        {/* Amber = stock actually moved, red = the server could not do something,
+            emerald = recorded and queued. Same palette as the modal, where amber
+            is already "this touches system stock". */}
         {savedFlash && (
-          <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl px-4 py-2 text-sm flex items-center gap-2">
-            <CheckCircle2 size={16} /> {savedFlash}
+          <div className={`border rounded-xl px-4 py-2 text-sm flex items-start gap-2 ${
+            savedFlash.tone === 'warn' ? 'bg-red-50 border-red-200 text-red-700'
+              : savedFlash.tone === 'applied' ? 'bg-amber-50 border-amber-200 text-amber-800'
+              : 'bg-emerald-50 border-emerald-200 text-emerald-800'}`}>
+            {savedFlash.tone === 'warn' ? <AlertCircle size={16} className="mt-0.5 flex-shrink-0" />
+              : savedFlash.tone === 'applied' ? <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" />
+              : <CheckCircle2 size={16} className="mt-0.5 flex-shrink-0" />}
+            {savedFlash.text}
           </div>
         )}
 
@@ -2196,9 +2270,12 @@ export default function ClosingStockByLocationPage() {
                       ))}
                     </select>
                   </div>
-                  {/* Only admins may overwrite system stock from a count. The
-                      server also forces adjust_stock=false for non-admins (see
-                      /api/closing-stock POST), so hiding it here just matches. */}
+                  {/* Only admins may clear a count's variance as they save it.
+                      The server still computes `isAdmin && adjust_stock === true`
+                      and forces the flag false for everyone else (see
+                      /api/closing-stock POST), so hiding it here just matches —
+                      it is not the gate. Leaving it unticked is the default for
+                      admins too, and keeps the count on the approval queue. */}
                   {isAdmin && (
                     <label className="flex items-center gap-2 cursor-pointer bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
                       <input type="checkbox" checked={adjustStockModal} onChange={e => setAdjustStockModal(e.target.checked)} className="accent-[#af4408] w-4 h-4" />
@@ -2227,10 +2304,37 @@ export default function ClosingStockByLocationPage() {
                   </p>
                 )}
 
+                {/* WHAT THE TICK ACTUALLY DOES, told in two halves, because the
+                    old one-liner ("System stock will be updated to match physical
+                    counts") was true for a central count and flatly wrong for a
+                    department one. The server carves department rows out: saving
+                    the count already re-anchors that department's own balance, so
+                    approving it too would take the difference off twice. Say which
+                    half the admin is on right now — activeDeptId is exactly the
+                    department_id this sheet will POST — instead of making them
+                    work it out from the picker. */}
                 {adjustStockModal && (
-                  <div className="flex items-center gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs">
-                    <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-                    System stock will be updated to match physical counts. Variances will be logged as inventory adjustments.
+                  <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs">
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    {activeDeptId ? (
+                      <span>
+                        You are counting for{' '}
+                        <strong>{departments.find(d => d.id === activeDeptId)?.name || 'a department'}</strong>,
+                        so this tick will not move anything. A department count updates that
+                        department&apos;s own balance and never touches central store stock — its
+                        variance is still listed in the approval queue, but only to be cleared
+                        there, not posted: the count has already re-anchored this department, so
+                        approving it would take the difference off twice. Switch the sheet to the
+                        store to adjust central stock.
+                      </span>
+                    ) : (
+                      <span>
+                        On save, each central-store variance is approved straight away in your name:
+                        system stock moves to the counted figure and the difference is logged as an
+                        inventory adjustment — no separate approval step. Leave this unticked and the
+                        counts are still recorded, but the variances wait for an approver.
+                      </span>
+                    )}
                   </div>
                 )}
 
@@ -2430,6 +2534,26 @@ export default function ClosingStockByLocationPage() {
                       {(closingResult.success > 0 || (closingResult.semi ?? 0) > 0) ? <CheckCircle className="w-4 h-4 text-green-600 mt-0.5" /> : <AlertCircle className="w-4 h-4 text-red-500 mt-0.5" />}
                       <div>
                         {closingResult.success > 0 && <p className="text-green-700">Closing stock recorded for {closingResult.success} items!</p>}
+                        {/* "Recorded" is not "posted". Split the same save by what
+                            became of each variance so the two are never mistaken
+                            for one another: amber = stock has moved and there is
+                            nothing left to approve, muted = still sitting in the
+                            queue. Zeroes stay hidden, so a save with no variance
+                            at all reads exactly as it did before. */}
+                        {((closingResult.applied ?? 0) > 0 || (closingResult.pending ?? 0) > 0) && (
+                          <p className="text-xs flex flex-wrap items-center gap-x-2">
+                            {/* ADMIN-ONLY — see the blind-count note on the saveAll
+                                flash above. Both clauses reveal whether the counted
+                                figure matched system stock, which is the one thing a
+                                blind count must not tell the counter. */}
+                            {isAdmin && (closingResult.applied ?? 0) > 0 && (
+                              <span className="text-amber-800 font-medium">· {closingResult.applied} applied to stock</span>
+                            )}
+                            {isAdmin && (closingResult.pending ?? 0) > 0 && (
+                              <span className="text-[#8B7355]">· {closingResult.pending} sent for variance approval</span>
+                            )}
+                          </p>
+                        )}
                         {(closingResult.semi ?? 0) > 0 && (
                           <p className="text-green-700">
                             {closingResult.semi} semi-finished item{closingResult.semi === 1 ? '' : 's'} recorded.

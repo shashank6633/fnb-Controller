@@ -4,7 +4,7 @@ import {
   DEPT_REQUESTED_ITEM_SQL, NOT_STORE_MAPPED_SQL, deptRequestedParams, selectedDeptSet,
 } from '@/lib/dept-requested-items';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
-import { upsertVarianceApproval } from '@/lib/variance-approval';
+import { upsertVarianceApproval, approveVariance } from '@/lib/variance-approval';
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 
@@ -384,12 +384,26 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    // Admin gate on `adjust_stock` — we still let store managers save counts,
-    // but only admins can overwrite raw_materials.current_stock from the same
-    // submit. Otherwise a store user could one-click reconcile away genuine
-    // shrinkage. Counts themselves are unaffected and remain writable by all.
+    // ADMIN GATE ON `adjust_stock` (2026-08). The flag decides WHEN a count's
+    // variance is posted, never IF it is reviewed:
+    //   unticked (and ALWAYS for non-admins) → the count raises a PENDING
+    //     variance_approvals row and stock does not move. This stays the default
+    //     for everyone, admins included.
+    //   ticked by an admin → the same pending row is raised and then approved
+    //     immediately, through the SAME approveVariance() the queue calls. That
+    //     is the one place a count is allowed to move stock, so "approve now"
+    //     and "approve later" post the identical count-time delta and leave the
+    //     identical audit trail (inventory_transactions + reviewed_by).
+    // Forced false for non-admins even though the UI hides the checkbox — the
+    // route must not trust the client, or a store user could one-click
+    // reconcile away genuine shrinkage. Saving counts is unaffected and remains
+    // open to all. DEPARTMENT-tagged rows are carved out below: a department
+    // count already re-anchors its own balance the moment it is saved, which is
+    // why varianceApprovalBlock() refuses them, so ticking the box leaves those
+    // rows pending exactly as before.
     const authMod = await import('@/lib/auth');
     const me = await authMod.getCurrentUser();
+    const isAdmin = me?.role === 'admin';
     // Tag every saved count with the current outlet so outlet-scoped reads (e.g.
     // the Variance Report) see it immediately — without this the row is written
     // outlet_id NULL and only appears after the next server-boot backfill.
@@ -397,6 +411,9 @@ export async function POST(request: Request) {
     const db = getDb();
     const body = await request.json();
     const { date, items } = body;
+    // Strict `=== true`: a truthy string from an old client must not turn a
+    // routine save into a stock adjustment.
+    const adjustStock = isAdmin && body.adjust_stock === true;
     // Department-wise counts (2026-07): a top-level department_id applies to every
     // item unless the item carries its own. Normalize '' / null / '__store__' to
     // NULL so store/overall counts (no owning department) are stored consistently.
@@ -410,7 +427,10 @@ export async function POST(request: Request) {
       return Response.json({ error: 'date and items array are required' }, { status: 400 });
     }
 
-    const results = { success: 0, pending: 0, errors: [] as string[], total_value: 0 };
+    // `pending` = variances left for an admin to clear later; `applied` = variances
+    // this submit already posted to stock (adjust_stock, admin, central rows only).
+    // Every non-zero variance lands in exactly one of the two.
+    const results = { success: 0, pending: 0, applied: 0, errors: [] as string[], total_value: 0 };
 
     // ONE purchase lookup for the entire submit, resolved BEFORE the write
     // transaction opens. A sheet posts several hundred lines; a per-line
@@ -451,8 +471,6 @@ export async function POST(request: Request) {
           continue;
         }
 
-        delOne.run(date, item.material_id, deptId);
-
         // KNOWN LIMITATION — the system figure is the CENTRAL pool
         // (raw_materials.current_stock) even for a row tagged to a department.
         // A department's count is therefore NOT comparable to it. Left as-is
@@ -468,6 +486,15 @@ export async function POST(request: Request) {
           results.errors.push(`Invalid physical stock for ${material.name}`);
           continue;
         }
+
+        // THE UPSERT-DELETE RUNS ONLY AFTER THE LINE IS KNOWN GOOD. It used to
+        // run before this validation, so a typo'd quantity DELETED the count
+        // already stored for (date, material, department) and inserted nothing
+        // in its place — the day's figure vanished and any pending approval
+        // pointing at it was orphaned. Every per-line rejection above (missing
+        // material, store-mapped item, bad quantity) must stay upstream of this
+        // line. Same ordering as the sibling writer, ../dept-sheet.
+        delOne.run(date, item.material_id, deptId);
 
         const variance = Math.round((physicalStock - systemStock) * 1000) / 1000;
         const varianceValue = Math.round(variance * material.average_price * 100) / 100;
@@ -489,10 +516,11 @@ export async function POST(request: Request) {
 
         results.total_value = r2(results.total_value + valued.totalValue);
 
-        // A non-zero variance NEVER changes stock here — it creates a PENDING
-        // approval for an admin to review. Stock moves only on approval. A
-        // re-count that now matches clears any stale pending row (handled inside).
-        upsertVarianceApproval(db, {
+        // A non-zero variance never changes stock from HERE — it creates a
+        // PENDING approval, and stock moves only when that approval is granted.
+        // A re-count that now matches clears any stale pending row and returns
+        // null (handled inside).
+        const approvalId = upsertVarianceApproval(db, {
           source: 'central',
           material_id: item.material_id,
           department_id: deptId || '',
@@ -504,7 +532,47 @@ export async function POST(request: Request) {
           count_note: item.notes || '',
           outlet_id: outletId,
         });
-        if (variance !== 0) results.pending++;
+        if (variance !== 0) {
+          // `adjust_stock` ticked by an admin on a CENTRAL row = grant that
+          // approval right now, in the same breath, as the admin who saved.
+          // It is the queue's own approveVariance() — never a second
+          // UPDATE of raw_materials.current_stock — so the delta posted, the
+          // negative-stock behaviour, the inventory_transactions log and the
+          // reviewed_by trail are byte-for-byte what "approve later" produces.
+          //
+          // It lands exactly on the counted figure because `systemStock` above
+          // IS live current_stock at this instant, so approveVariance's
+          // (physical − system-at-count) delta is (physical − current):
+          // before + delta == physical. That equality is only true here, at
+          // save time — which is precisely why the deferred path posts a delta
+          // instead of an absolute set.
+          //
+          // DEPARTMENT rows are excluded on purpose: saving the count has
+          // already re-anchored that department's own balance (dept-ledger
+          // prefers the count as anchor), so approving would take the same
+          // difference off twice — varianceApprovalBlock() refuses them for
+          // exactly this reason. They stay pending, and central is not touched.
+          let applied = false;
+          if (adjustStock && !deptId && approvalId) {
+            // Failure must NOT be silent and must NOT cost the count: the
+            // approval simply stays pending and the admin is told why. The
+            // saved closing_stock row survives because better-sqlite3 nests
+            // approveVariance's transaction as a SAVEPOINT inside ours, so its
+            // rollback unwinds only its own writes.
+            try {
+              const res = approveVariance(
+                db, approvalId, me?.email || 'admin',
+                `Adjust system stock ticked on the closing sheet for ${date} — approved at count time by the admin who saved the count.`,
+              );
+              if (res.ok) applied = true;
+              else results.errors.push(`${material.name}: count saved, but system stock was NOT adjusted — ${res.error}`);
+            } catch (e: any) {
+              results.errors.push(`${material.name}: count saved, but system stock was NOT adjusted — ${e?.message || 'approval failed'}`);
+            }
+          }
+          if (applied) results.applied++;
+          else results.pending++;
+        }
 
         results.success++;
       }

@@ -110,12 +110,49 @@ export function upsertVarianceApproval(db: Database.Database, inp: CreateVarianc
   return id;
 }
 
-/** Count of pending approvals (optionally scoped to one outlet). */
-export function pendingVarianceCount(db: Database.Database, outletId?: string | null): number {
-  const oid = norm(outletId);
+/**
+ * Which outlets a queue read covers.
+ *   'outlet' → rows stamped with the reader's own outlet, plus rows stamped
+ *              with no outlet at all (''). The DEFAULT, and byte-for-byte what
+ *              every caller got before this type existed.
+ *   'all'    → every outlet. OPT-IN ONLY, never inferred.
+ *
+ * WHY 'all' HAD TO EXIST. A pending row carries the outlet of whoever COUNTED,
+ * but the queue is read under the outlet of whoever REVIEWS, and those are two
+ * different people. POST /api/outlets/switch moves any signed-in user to any
+ * active outlet with no role gate, so a count saved from outlet B is invisible
+ * to an admin sitting in outlet A — and pendingVarianceCount carried the
+ * identical filter, so the badge read zero too and nothing hinted the row was
+ * there. A variance nobody can see is a variance nobody reviews, which is the
+ * one failure this whole queue exists to prevent.
+ *
+ * 'all' makes those rows REACHABLE. It does not remove outlet isolation: the
+ * default stays 'outlet', so a single-outlet day looks exactly as it did.
+ */
+export type VarianceOutletScope = 'outlet' | 'all';
+
+/**
+ * Count of pending approvals, scoped like the list below.
+ *
+ * `scope` and `outletId` must be read together: 'all' ignores `outletId`
+ * entirely. Passing no outlet at all has always meant "every outlet" here, but
+ * that is implicit and easy to hit by accident — say `'all'` when you mean it.
+ */
+export function pendingVarianceCount(
+  db: Database.Database,
+  outletId?: string | null,
+  scope: VarianceOutletScope = 'outlet',
+): number {
+  // The INNER JOIN mirrors listVarianceApprovals. Without it the two disagree:
+  // a pending row whose material was deleted is COUNTED here but can never be
+  // LISTED there, so the bell would show "3 waiting" over a queue rendering
+  // "All counts reconcile with the system — no variances to review." Counting
+  // only what the admin can actually open keeps the badge honest; a row orphaned
+  // that way is unreviewable and nagging about it helps nobody.
+  const oid = scope === 'all' ? '' : norm(outletId);
   const row = oid
-    ? db.prepare(`SELECT COUNT(*) AS n FROM variance_approvals WHERE status='pending' AND (outlet_id = ? OR outlet_id = '')`).get(oid) as { n: number }
-    : db.prepare(`SELECT COUNT(*) AS n FROM variance_approvals WHERE status='pending'`).get() as { n: number };
+    ? db.prepare(`SELECT COUNT(*) AS n FROM variance_approvals va JOIN raw_materials m ON m.id = va.material_id WHERE va.status='pending' AND (va.outlet_id = ? OR va.outlet_id = '')`).get(oid) as { n: number }
+    : db.prepare(`SELECT COUNT(*) AS n FROM variance_approvals va JOIN raw_materials m ON m.id = va.material_id WHERE va.status='pending'`).get() as { n: number };
   return row?.n || 0;
 }
 
@@ -129,34 +166,94 @@ export interface VarianceRow {
   approve_blocked?: string | null;
 }
 
-/** List approvals (default: pending first, newest first). */
+export interface VarianceListResult {
+  rows: VarianceRow[];
+  /** Rows matching the SAME filters with no LIMIT — what `rows` is a slice of. */
+  total: number;
+  /** True when the LIMIT cut rows off the end, i.e. `rows` is not the whole story. */
+  truncated: boolean;
+  /** The limit actually applied, after clamping. */
+  limit: number;
+  /** The scope the rows were read under, echoed so a caller cannot mislabel them. */
+  outletScope: VarianceOutletScope;
+}
+
+/**
+ * List approvals (default: pending first, newest first) WITH the honest total.
+ *
+ * WHY THIS RETURNS A TOTAL AND NOT JUST ROWS. The LIMIT here is not a page —
+ * there is no offset to fetch the remainder with, so whatever falls past it is
+ * simply absent from the admin's screen with nothing saying so. ORDER BY puts
+ * pending first and then date DESC, so what overflows is the OLDEST pending
+ * counts: precisely the ones that have waited longest and most need a decision.
+ * With ~950 raw materials one closing sheet can fill the limit by itself. The
+ * caller cannot be honest about that without knowing how many rows actually
+ * matched, so it is counted here.
+ *
+ * The count runs the IDENTICAL FROM/JOIN/WHERE as the list — that is the whole
+ * point of `fromWhere` below, and it must stay shared. Counting over a
+ * different shape would report truncation that never happened: the JOIN on
+ * raw_materials is an INNER join, so a row whose material was deleted is
+ * dropped from BOTH here, and a count without that join would sit permanently
+ * above the row count and pin `truncated` to true forever.
+ */
 export function listVarianceApprovals(
   db: Database.Database,
-  opts: { status?: string; outletId?: string | null; limit?: number } = {},
-): VarianceRow[] {
+  opts: { status?: string; outletId?: string | null; limit?: number; outletScope?: VarianceOutletScope } = {},
+): VarianceListResult {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.status && opts.status !== 'all') { where.push('va.status = ?'); params.push(opts.status); }
-  const oid = norm(opts.outletId);
+  // Outlet scope. 'all' drops the filter entirely so rows stamped with ANOTHER
+  // outlet become reachable — see VarianceOutletScope for why that is needed
+  // and why it is opt-in.
+  const scope: VarianceOutletScope = opts.outletScope === 'all' ? 'all' : 'outlet';
+  const oid = scope === 'all' ? '' : norm(opts.outletId);
   if (oid) { where.push("(va.outlet_id = ? OR va.outlet_id = '')"); params.push(oid); }
-  const limit = Math.min(Math.max(Number(opts.limit) || 200, 1), 1000);
+  // FLOOR, not just clamp. `limit` is interpolated straight into `LIMIT ${limit}`
+  // below (it cannot be bound as a parameter there), and SQLite throws
+  // "datatype mismatch" on a fractional LIMIT — so `?limit=1.5` from the API
+  // would 500 the entire queue and show the admin an empty list. Clamping alone
+  // does not stop that; 1.5 is already inside 1..1000.
+  const limit = Math.floor(Math.min(Math.max(Number(opts.limit) || 200, 1), 1000));
+
+  // ONE source of truth for the row set. Both queries below bind `params` in
+  // this same order, so they can only ever describe the same rows.
+  const fromWhere = `
+    FROM variance_approvals va
+    JOIN raw_materials rm ON rm.id = va.material_id
+    LEFT JOIN store_locations sl ON sl.id = va.store_id
+    LEFT JOIN departments d ON d.id = va.department_id
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+  `;
+
   const rows = db.prepare(`
     SELECT va.*, rm.name AS material_name, rm.sku AS material_sku,
            COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS material_purchase_unit,
            COALESCE(rm.pack_size, 1) AS material_pack_size,
            COALESCE(sl.name, '')  AS store_name,
            COALESCE(d.name, '')   AS department_name
-    FROM variance_approvals va
-    JOIN raw_materials rm ON rm.id = va.material_id
-    LEFT JOIN store_locations sl ON sl.id = va.store_id
-    LEFT JOIN departments d ON d.id = va.department_id
-    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ${fromWhere}
     ORDER BY (va.status = 'pending') DESC, va.date DESC, va.created_at DESC
     LIMIT ${limit}
   `).all(...params) as VarianceRow[];
-  // Additive: tell the queue up front which rows approveVariance() will refuse,
-  // so the admin sees the reason instead of discovering it on click.
-  return rows.map(r => ({ ...r, approve_blocked: varianceApprovalBlock(db, r, r.department_name) }));
+
+  // The two LEFT JOINs are kept in the count even though they cannot change its
+  // value (both join on a primary key, so no fan-out) — carrying the identical
+  // FROM is what makes "same rows" true by construction rather than by review.
+  const total = Number(
+    (db.prepare(`SELECT COUNT(*) AS n ${fromWhere}`).get(...params) as { n: number } | undefined)?.n,
+  ) || 0;
+
+  return {
+    // Additive: tell the queue up front which rows approveVariance() will refuse,
+    // so the admin sees the reason instead of discovering it on click.
+    rows: rows.map(r => ({ ...r, approve_blocked: varianceApprovalBlock(db, r, r.department_name) })),
+    total,
+    truncated: total > rows.length,
+    limit,
+    outletScope: scope,
+  };
 }
 
 export interface DecisionResult { ok: boolean; error?: string; applied?: boolean }
