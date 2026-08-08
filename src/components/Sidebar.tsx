@@ -36,6 +36,7 @@ import {
   Layers,
   ArrowLeftRight,
   Warehouse,
+  Database,
   Scissors,
   Printer,
   Smartphone,
@@ -185,6 +186,13 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
       { kind: "link", label: "Issue Requisitions", href: "/store-requisitions", icon: Package },
       { kind: "link", label: "Closing Stock",      href: "/closing-stock",      icon: ClipboardCheck },
+      // Sits directly under Closing Stock because it is the second half of that
+      // flow, not a separate feature: a count whose physical figure differs from
+      // system stock does NOT move stock — it parks a PENDING row here for an
+      // admin to approve, and stock moves only on approval. Without this link the
+      // queue was unreachable except by typing the URL, so counts were entered,
+      // silently parked, and read back as "stock didn't update".
+      { kind: "link", label: "Variance Approvals", href: "/variance-approvals", icon: ClipboardCheck },
       { kind: "link", label: "Daily Roll-up",      href: "/daily-rollup",       icon: ClipboardCheck },
       { kind: "link", label: "Wastage",            href: "/wastage",            icon: ClipboardCheck },
       { kind: "link", label: "Unit Audit",         href: "/unit-audit",         icon: ShieldAlert },
@@ -215,6 +223,8 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Reports",            href: "/reports",                icon: BarChart3 },
       { kind: "link", label: "Sales Reports",      href: "/reports/sales",          icon: BarChart3 },
       { kind: "link", label: "Purchase Report",    href: "/reports/purchases",      icon: ShoppingCart },
+      { kind: "link", label: "Purchase Bill Summary", href: "/reports/purchase-bill-summary", icon: FileText },
+      { kind: "link", label: "Purchase to Issue Log", href: "/reports/issue-log",   icon: ListChecks },
       // Return Report — both kinds of return in one list, and mgmtOnly in the
       // page-catalog because a vendor row carries the GRN line's unit price and
       // the credit note the vendor owes us, i.e. vendor money. It deliberately
@@ -224,9 +234,12 @@ const navTree: NavEntry[] = [
       // figure would be arithmetically meaningless. Totals are per source.
       { kind: "link", label: "Return Report",      href: "/reports/returns",        icon: Undo2 },
       { kind: "link", label: "Menu Engineering",   href: "/menu-engineering",       icon: BarChart3 },
+      { kind: "link", label: "Menu Items Without Recipe", href: "/reports/menu-recipe-gap", icon: AlertTriangle },
       { kind: "link", label: "Variance Report",    href: "/variance-report",        icon: ClipboardCheck },
+      { kind: "link", label: "Department Variance", href: "/department-variance",   icon: BarChart3 },
       { kind: "link", label: "Dept Consumption",   href: "/department-consumption", icon: BarChart3 },
       { kind: "link", label: "Staff Meals",        href: "/staff-meals",            icon: Utensils },
+      { kind: "link", label: "End-of-Day",         href: "/eod",                    icon: ClipboardCheck },
       { kind: "link", label: "KOT Data Points",    href: "/dine-in/kot-analytics",  icon: BarChart3 },
       { kind: "link", label: "Captain Response Times", href: "/dine-in/captain-performance", icon: Timer },
       { kind: "link", label: "Production Reports", href: "/kitchen-production/reports", icon: BarChart3 },
@@ -326,6 +339,12 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Outlets",        href: "/outlets",                icon: Store },
       { kind: "link", label: "Audit Log",      href: "/audit",                  icon: History },
       { kind: "link", label: "App Errors",     href: "/settings/errors",        icon: ShieldAlert },
+      // Station → Department map: unmapped stations make a KOT skip recipe
+      // consumption entirely (it logs a warning and moves on), so this being
+      // unreachable meant nobody could fix the mapping that silently drops
+      // consumption. adminOnly in the page-catalog.
+      { kind: "link", label: "Station → Department", href: "/settings/station-departments", icon: Link2 },
+      { kind: "link", label: "Database (read-only)", href: "/admin/database",   icon: Database },
       { kind: "link", label: "Data Hygiene",   href: "/admin/data-hygiene",     icon: ShieldAlert },
       { kind: "link", label: "Reset Data",     href: "/admin/reset",            icon: ShieldAlert },
     ],
