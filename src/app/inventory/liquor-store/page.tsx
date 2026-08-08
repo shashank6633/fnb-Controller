@@ -2729,10 +2729,16 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
       await loadDay(date, true);
+      // BLIND COUNTS: the server now returns pending_count as null for non-admins,
+      // so branch on isAdmin rather than on the value — a null would otherwise fall
+      // into the "all match the system" arm and tell the counter their figure was
+      // right, which is the exact disclosure the null is there to prevent.
       onSaved(`Saved ${j.summary.items} closing count${j.summary.items === 1 ? '' : 's'} for ${date}` +
-        (j.summary.pending_count
-          ? ` — ${j.summary.pending_count} sent to Variance Approvals for review`
-          : ' — all match the system, nothing to approve'));
+        (isAdmin
+          ? (j.summary.pending_count
+              ? ` — ${j.summary.pending_count} sent to Variance Approvals for review`
+              : ' — all match the system, nothing to approve')
+          : ' — recorded; any difference goes to Variance Approvals for review'));
     } catch (e: any) { setErr(e.message); }
     finally { setBusy(false); }
   };

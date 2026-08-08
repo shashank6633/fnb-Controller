@@ -2540,7 +2540,12 @@ export default function ClosingStockByLocationPage() {
                             nothing left to approve, muted = still sitting in the
                             queue. Zeroes stay hidden, so a save with no variance
                             at all reads exactly as it did before. */}
-                        {((closingResult.applied ?? 0) > 0 || (closingResult.pending ?? 0) > 0) && (
+                        {/* isAdmin gates the WRAPPER, not just the spans inside it.
+                            Gating only the children still emitted an empty <p> exactly
+                            when a variance existed — invisible on screen, but a
+                            DOM-level oracle for anyone who opens the inspector, which
+                            is the same tell in a thinner disguise. */}
+                        {isAdmin && ((closingResult.applied ?? 0) > 0 || (closingResult.pending ?? 0) > 0) && (
                           <p className="text-xs flex flex-wrap items-center gap-x-2">
                             {/* ADMIN-ONLY — see the blind-count note on the saveAll
                                 flash above. Both clauses reveal whether the counted

@@ -272,6 +272,28 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     });
     txn();
 
+    // BLIND COUNTS ON THE WAY BACK OUT — the same rule GET applies (see the
+    // summary it builds and its `safeCounts`), which this POST was missing.
+    //
+    // Every field below is a system-stock oracle, not just a statistic. The
+    // sharpest is `pending_count`: a variance creates a pending row, so saving
+    // ONE line and watching the number flip between 1 and 0 tells the counter
+    // exactly whether their figure matched — and a few bisecting re-saves
+    // recover system_qty precisely. That is the number downloadTemplate()
+    // strips from their CSV and GET nulls out of every row, so handing it back
+    // in the save confirmation defeated the whole control. shortage/excess/
+    // match/value leak the same thing in aggregate.
+    //
+    // Admins get the real figures; everyone else gets nulls and a
+    // variance-INDEPENDENT confirmation on screen (see the callers in
+    // inventory/liquor-store/page.tsx — they must not render "all match the
+    // system" as the null branch, or the oracle comes straight back).
+    // `summary` stays FULL and unblinded: it feeds logAuditEvent below, which
+    // spreads it into `after` and interpolates total_variance_value into the
+    // note. Blinding this object would write nulls and "variance ₹null" into the
+    // audit trail for precisely the saves worth auditing — a non-admin counter's.
+    // Blinding belongs on the wire, not in the record. See `safeSummary` below.
+    const postIsAdmin = user.role === 'admin';
     const summary = {
       items: prepared.length,
       shortage_count: prepared.filter(p => p.variance < 0).length,
@@ -279,6 +301,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       match_count: prepared.filter(p => p.variance === 0).length,
       total_variance_value: Math.round(prepared.reduce((s, p) => s + p.variance_value, 0) * 100) / 100,
       pending_count: pendingCount,
+    };
+    const safeSummary = postIsAdmin ? summary : {
+      ...summary,
+      shortage_count: null, excess_count: null, match_count: null,
+      total_variance_value: null, pending_count: null,
     };
 
     logAuditEvent(db, {
@@ -298,14 +325,23 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       note: `${store.name}: closing count ${date} — ${prepared.length} item(s), variance ₹${summary.total_variance_value}${pendingCount ? ` (${pendingCount} sent for approval)` : ''}`,
     });
 
+    // `results` is the bluntest leak of the three: per item it carried
+    // system_qty, variance, variance_value AND `pending` — a literal per-line
+    // "did your count match the system?" boolean. Nothing reads it (no consumer
+    // in the app at the time of writing), so a non-admin gets back only what
+    // they typed. Mirrors GET's `safeCounts`. If you ever add a consumer, gate
+    // it on isAdmin rather than un-blinding this.
+    const safeResults = prepared.map(p => ({
+      material_id: p.material_id,
+      physical_qty: p.physical_qty,
+      system_qty: postIsAdmin ? p.system_qty : null,
+      variance: postIsAdmin ? p.variance : null,
+      variance_value: postIsAdmin ? p.variance_value : null,
+      pending: postIsAdmin ? p.variance !== 0 : null,
+    }));
+
     return Response.json({
-      ok: true, date, summary,
-      results: prepared.map(p => ({
-        material_id: p.material_id,
-        system_qty: p.system_qty, physical_qty: p.physical_qty,
-        variance: p.variance, variance_value: p.variance_value,
-        pending: p.variance !== 0,
-      })),
+      ok: true, date, summary: safeSummary, results: safeResults,
     }, { status: 201 });
   } catch (e: any) {
     console.error('[/api/stores/[id]/closing POST]', e);
