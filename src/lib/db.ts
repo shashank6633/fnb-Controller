@@ -4793,6 +4793,188 @@ function initializeSchema(db: Database.Database) {
   try {
     db.exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('dept_ledger_cutover_at', '')");
   } catch (e) { console.error('dept_ledger_cutover_at seed failed:', e); }
+
+  // ── RETURNS MODULE (spreadsheet reqs 72-79) ───────────────────────────────
+  // Two new tables. Nothing else in this block: no ALTER of any existing table,
+  // no backfill, no settings seed. A returns deploy must be able to land without
+  // touching a single row that already exists.
+  //
+  // READ THIS BEFORE YOU WRITE AGAINST THESE TABLES — two rules the schema
+  // cannot enforce on its own, and both of them are the expensive kind:
+  //
+  //   1. STOCK MOVES ONLY ON STORE ACCEPT. Raising a return moves nothing.
+  //      Department-head approval moves nothing. The ONLY moment any quantity
+  //      changes hands is inside the store-verify transaction, and only for a
+  //      line the store actually accepted. A rejected line leaves stock exactly
+  //      where it was. That single stage is also the reason there is no separate
+  //      "returned stock" bucket: while a ticket sits at hod_approved the goods
+  //      are physically on the store counter and nothing has moved yet, so the
+  //      holding state the requirement asks for is the WORKFLOW state, not a
+  //      second stock scalar. Adding a second scalar would leave the variance
+  //      report, closing valuation, recipe costing, the requisition picker and
+  //      reorder all wrong-by-omission.
+  //
+  //   2. A VENDOR RETURN AND AN INTERNAL RETURN DO OPPOSITE THINGS TO CENTRAL
+  //      STOCK, and `kind` is what decides which:
+  //        kind='internal' → department DOWN, central UP. The goods came out of
+  //                          the store on a requisition and are going back in;
+  //                          they never leave the building.
+  //        kind='vendor'   → central DOWN, no department leg at all. The goods
+  //                          go back out to the supplier. Crediting central here
+  //                          would invent inventory that has physically left.
+  //      So `kind` is set at creation and NEVER updated afterwards — a route that
+  //      lets it be edited turns a settled movement into the wrong one. The CHECK
+  //      below is the last line of defence, not the first.
+  //
+  // Quantity is carried in THREE columns because one is not enough. The screens
+  // lead with the PURCHASE unit (owner rule) but the department ledger and
+  // inventory_transactions take RECIPE units only and refuse to convert. So the
+  // line stores what the user typed (quantity + unit), the factor used at the
+  // time (pack_factor, snapshotted the same way requisition_issue_ledger snapshots
+  // its own), and the derived recipe_qty. Storing the factor is what lets a
+  // movement be reversed with the factor it was MADE with rather than with
+  // whatever pack_size happens to say next month.
+  //
+  // What is deliberately NOT here: no column on goods_receipt_note_items (its
+  // quantity_accepted is what decides PO completion — "how much of this GRN line
+  // was already returned" is DERIVED by summing accepted_recipe_qty over verified
+  // tickets, the same no-flag-column discipline receivedPoItemIds() already uses);
+  // no column on po_vendor_bills (its UNIQUE key is the receive dedupe); no closed
+  // status on purchase_orders (req 75's return window is read-time only, measured
+  // from the GRN date, so nothing unattended ever shuts a real PO); no row in
+  // wastages; and no seed for po_return_window_days — an absent key reads as '0',
+  // meaning NO LIMIT, which is exactly today's behaviour.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS material_returns (
+        id                    TEXT PRIMARY KEY,
+        ret_number            TEXT NOT NULL UNIQUE,        -- RET-YYYY-NNNN
+        -- THE FORK. Immutable after creation. See rule 2 above.
+        kind                  TEXT NOT NULL CHECK (kind IN ('internal','vendor')),
+        date                  TEXT NOT NULL,               -- YYYY-MM-DD, IST
+        status                TEXT NOT NULL DEFAULT 'draft',
+        -- draft | submitted | hod_approved | verified | hod_rejected | cancelled
+        -- Its own vocabulary, not the requisition one: reusing those would put
+        -- return tickets in front of store-issue's status gates.
+        department_id         TEXT,                        -- REQUIRED when kind='internal', NULL for vendor
+        -- Vendor anchor (req 72). Populated only when kind='vendor'; the ticket is
+        -- raised FROM a GRN line, so PO No. and GRN No. are a real join and never
+        -- a nearest match. NULL on internal tickets, where the chain genuinely
+        -- does not exist.
+        grn_id                TEXT,
+        po_id                 TEXT,                        -- NULL for ad-hoc GRNs, which are common
+        vendor_id             TEXT,
+        vendor                TEXT DEFAULT '',             -- cached display name, as goods_receipt_notes does
+        -- Credit note: RECORDED-ONLY. Never feeds stock, price or cost. There is
+        -- no negative purchases row and no po_vendor_bills row for a return —
+        -- updateMaterialPrice would take the return as the latest price and
+        -- cascade that into every sub-recipe and recipe.
+        credit_note_no        TEXT DEFAULT '',
+        credit_note_date      TEXT DEFAULT '',
+        credit_note_amount    REAL NOT NULL DEFAULT 0,
+        notes                 TEXT DEFAULT '',
+        outlet_id             TEXT,
+        -- Stage 1 — raised by the department
+        drafted_by            TEXT DEFAULT '',
+        submitted_at          TEXT,
+        submitted_by          TEXT DEFAULT '',
+        -- Stage 2 — Department Head / Manager (req 73). Gated on canApproveAsChef,
+        -- the ROLE flag. A department's head_user_id decides who SEES a ticket,
+        -- never who may act on it; conflating the two was a live bug once.
+        hod_approved_at       TEXT,
+        hod_approved_by       TEXT DEFAULT '',
+        hod_note              TEXT DEFAULT '',
+        hod_rejected_at       TEXT,
+        hod_rejected_by       TEXT DEFAULT '',
+        hod_rejected_reason   TEXT DEFAULT '',             -- mandatory on reject, enforced in the route
+        -- Stage 3 — Store verification (req 74), gated on canIssueAsStore.
+        -- THE ONLY STAGE THAT MOVES STOCK.
+        store_verified_at     TEXT,
+        store_verified_by     TEXT DEFAULT '',
+        store_note            TEXT DEFAULT '',
+        store_rejected_at     TEXT,                        -- whole-ticket; per-line rejection lives on the line
+        store_rejected_by     TEXT DEFAULT '',
+        store_rejected_reason TEXT DEFAULT '',             -- mandatory
+        cancelled_at          TEXT,
+        cancelled_by          TEXT DEFAULT '',
+        created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at            TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (department_id) REFERENCES departments(id),
+        FOREIGN KEY (grn_id)        REFERENCES goods_receipt_notes(id),
+        FOREIGN KEY (po_id)         REFERENCES purchase_orders(id),
+        FOREIGN KEY (vendor_id)     REFERENCES vendors(id),
+        FOREIGN KEY (outlet_id)     REFERENCES outlets(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS material_return_items (
+        id                    TEXT PRIMARY KEY,
+        return_id             TEXT NOT NULL,
+        material_id           TEXT NOT NULL,
+        -- Quantity, three columns. See the note above the CREATE.
+        quantity              REAL NOT NULL,               -- as typed, in the unit below
+        unit                  TEXT NOT NULL DEFAULT '',    -- normally the PURCHASE unit
+        pack_factor           REAL NOT NULL DEFAULT 1,     -- recipe units per that unit, snapshotted, both-halves guarded
+        recipe_qty            REAL NOT NULL DEFAULT 0,     -- quantity * pack_factor. The only number stock ever moves by.
+        reason                TEXT NOT NULL DEFAULT '',    -- req 72's per-line Reason
+        -- req 78. A disposition code, NOT a second ledger: the production module
+        -- already treats wasted and disposed as siblings and sums them together
+        -- in its own reports. An internal line marked wastage or disposal debits
+        -- the DEPARTMENT only and credits nothing — unusable goods must never
+        -- re-enter the sellable pool.
+        disposition           TEXT NOT NULL DEFAULT 'reusable'
+                              CHECK (disposition IN ('reusable','wastage','disposal')),
+        -- req 72 auto-fill anchor for a vendor line. PO No. and GRN No. are read
+        -- THROUGH grn_item_id rather than stored twice.
+        grn_item_id           TEXT,
+        po_item_id            TEXT,
+        -- Internal reference only, usually NULL. Department stock is pooled per
+        -- (department, material) with no lot tracking, so most returns cannot name
+        -- one requisition line. Never used as a reversal cap, and never written
+        -- back to requisition_items.quantity_issued — returns are not a writer of
+        -- the store's record of what it handed over.
+        req_item_id           TEXT,
+        -- Store verification outcome (req 74), per line
+        accepted_qty          REAL NOT NULL DEFAULT 0,     -- in the unit above
+        accepted_recipe_qty   REAL NOT NULL DEFAULT 0,     -- RECIPE units, what actually moved
+        store_rejected        INTEGER NOT NULL DEFAULT 0,
+        store_reject_reason   TEXT DEFAULT '',             -- set and cleared TOGETHER with the flag
+        -- MOVEMENT RECEIPTS, written back inside the accept transaction. A
+        -- non-null id is the on-the-row proof that this line moved, and moved
+        -- once. A verified line with accepted_recipe_qty > 0 and a NULL receipt is
+        -- a detectable integrity fault rather than a silent zero-credit.
+        dept_txn_id           TEXT,                        -- department_material_transactions.id (internal only)
+        inv_txn_id            TEXT,                        -- inventory_transactions.id (both kinds)
+        notes                 TEXT DEFAULT '',
+        created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (return_id)   REFERENCES material_returns(id) ON DELETE CASCADE,
+        FOREIGN KEY (material_id) REFERENCES raw_materials(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_mat_returns_status     ON material_returns(status);
+      CREATE INDEX IF NOT EXISTS idx_mat_returns_kind       ON material_returns(kind);
+      CREATE INDEX IF NOT EXISTS idx_mat_returns_date       ON material_returns(date);
+      CREATE INDEX IF NOT EXISTS idx_mat_returns_dept       ON material_returns(department_id);
+      CREATE INDEX IF NOT EXISTS idx_mat_returns_grn        ON material_returns(grn_id);
+      CREATE INDEX IF NOT EXISTS idx_mat_returns_outlet     ON material_returns(outlet_id);
+      CREATE INDEX IF NOT EXISTS idx_mat_return_items_ret   ON material_return_items(return_id);
+      CREATE INDEX IF NOT EXISTS idx_mat_return_items_mat   ON material_return_items(material_id);
+      CREATE INDEX IF NOT EXISTS idx_mat_return_items_grni  ON material_return_items(grn_item_id);
+    `);
+
+    // Req 78 (owner-approved 2026-08-08): a returned item written off as
+    // wastage/disposal must show on /wastage, not only in the department ledger.
+    // src/lib/return-stock.ts writes the wastages row and stamps this column, so
+    // the spoilage is traceable to the ticket that produced it by a real id
+    // rather than a sentence in `notes`.
+    //
+    // ONE-SHOT and NULLABLE, so /api/wastage's own INSERT — which does not name
+    // this column — keeps working unchanged and gets NULL, which is exactly
+    // right: a shelf-found spoilage has no return behind it.
+    const wCols = db.prepare('PRAGMA table_info(wastages)').all() as any[];
+    if (!wCols.some((c: any) => c.name === 'return_item_id')) {
+      db.exec(`ALTER TABLE wastages ADD COLUMN return_item_id TEXT`);
+    }
+  } catch (e) { console.error('material_returns schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

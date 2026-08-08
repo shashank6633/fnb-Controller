@@ -181,6 +181,21 @@ export const DEPT_TXN_TYPES = {
   consumed: { sign: '-', rail: 'party', doc: 'Party post-event consumption' },
   /** Party leftovers returned to the store. PARTY RAIL. */
   returned: { sign: '-', rail: 'party', doc: 'Party leftovers returned to store' },
+  /** A department sent goods back to the central store on an ACCEPTED return
+   *  ticket (reqs 76/77). Written only by acceptInternalReturnLine() in
+   *  src/lib/return-stock.ts, and only at Store Verify — never on raise, never
+   *  on HOD approval, never on any reject.
+   *
+   *  IT IS ITS OWN TYPE FOR A REASON. The obvious reuses are both wrong:
+   *    · 'returned' is the PARTY rail, and /api/admin/reset credits central for
+   *      SUM(quantity) over ('received','consumed','returned') — a store return
+   *      typed that way would be credited to central a SECOND time on a reset,
+   *      inventing stock that does not exist.
+   *    · 'issue_reversal' means "the issue itself was undone", which changes
+   *      what the requisition says was issued. A return is a NEW event: the
+   *      issue stands, and some of it came back later.
+   *  Do not collapse this into either of them. */
+  store_return: { sign: '-', rail: 'returns', doc: 'Returned from department to central store' },
   /** Signed correction: an approved department variance count, or the Unit Audit
    *  pack-factor rebase. Never rewrite a historical row to correct a balance —
    *  post one of these, so the reason stays on the record. */

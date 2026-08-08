@@ -100,6 +100,33 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/purchase-orders',     label: 'Purchase Orders' },
       { path: '/grn',                 label: 'Goods Receipt (GRN)' },
       { path: '/receiving-variance',  label: 'Receiving Variance' },
+      // Returns — the return TICKET queue. One workflow, two kinds of return,
+      // forked by an immutable `kind` column on the ticket. Two facts a reader
+      // needs before they touch this line or the pages behind it:
+      //
+      //   1. STOCK MOVES ONLY ON STORE ACCEPT. Raising a ticket moves nothing.
+      //      HOD approval moves nothing. The one and only stock write happens
+      //      inside the store-verify transaction, and a rejected line leaves
+      //      stock exactly where it was. So a grant here is not a grant to move
+      //      inventory — the accept step is its own server-side gate.
+      //   2. THE TWO KINDS PULL CENTRAL STOCK IN OPPOSITE DIRECTIONS. A VENDOR
+      //      return sends goods back OUT of the building against a PO/GRN, so
+      //      central stock goes DOWN. An INTERNAL department return sends goods
+      //      from a kitchen back to the store, so department stock goes DOWN
+      //      and central stock goes UP. There is no single "return" direction.
+      //      Anyone reasoning about this page as "returns add stock back" will
+      //      invent inventory on the vendor half; anyone reasoning about it as
+      //      "returns remove stock" will destroy it on the internal half.
+      //
+      // Deliberately NOT mgmtOnly, for the same reason as the store cash box
+      // below: the storekeeper is the person who physically receives the
+      // returned goods over the counter, and Accept/Reject-with-a-reason is
+      // that physical moment being recorded. Pushing them out sends returns
+      // back to a verbal hand-back that nobody books. Access is still opt-in
+      // per user/role here, and the accept route re-checks the store-issue role
+      // itself (no admin bypass — accepting goods is a physical act), so this
+      // entry widens who can SEE the queue, never who can move stock.
+      { path: '/returns',             label: 'Returns' },
       { path: '/vendors',             label: 'Vendors' },
       { path: '/vendors/materials',   label: 'Vendor → Items' },
       { path: '/contracts',           label: 'Contracts' },
@@ -163,6 +190,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/reports/sales',       label: 'Sales Reports', mgmtOnly: true },
       { path: '/reports/purchases',   label: 'Purchase Report', mgmtOnly: true },
       { path: '/reports/purchase-bill-summary', label: 'Purchase Bill Summary', mgmtOnly: true }, // mgmtOnly for the SAME reason as Purchase Report directly above: vendor-level spend, GST and cess, one row per vendor bill. Two traps a future reader will hit: (1) a "bill" here is DERIVED, not stored — purchases holds one row per ITEM, so the report groups on invoice_id > grn_id > vendor|bill_no|date|outlet > vendor|date|outlet, and since ~2,151 of 2,165 rows carry no vendor bill number most rows are a vendor-day consolidation flagged DAY_RUN, not a paper bill. (2) it reads the purchases table ALONE — goods_receipt_note_items / po_vendor_bills restate the SAME money (see the header of src/lib/purchase-log.ts), so joining them back in to "enrich" a PO-receive bill with its GRN tax would double-count; PO-receive purchases rows are deliberately tax-free cost mirrors and are labelled as booked cost, not bill face value. This line is NOT the security boundary: /api/reports/purchase-bill-summary refuses non-management with its own 403.
+      { path: '/reports/returns',     label: 'Return Report', mgmtOnly: true },           // mgmtOnly for the SAME vendor-spend reason recorded on the Purchase Report line above: a vendor-return row carries the GRN line's unit price and the credit note the vendor owes us, so this is vendor money, not a counting aid. Two things not to "simplify": (1) it reports BOTH kinds of return in one list and deliberately has NO grand-total field — a vendor return takes stock OUT of the building (central DOWN) while an internal department return puts it back (central UP), and the two are even measured in different unit bases (purchase vs recipe), so a combined figure would be arithmetically meaningless; totals are per source, each printing its basis. (2) PO No. / GRN No. print BLANK on internal rows rather than a nearest match — the department ledger carries no purchase link, so any value there would be fabricated. As with every report line here, this flag is NOT the security boundary: the route behind it refuses non-management with its own 403.
       { path: '/reports/issue-log',   label: 'Purchase to Issue Log', mgmtOnly: true },   // mgmtOnly for the SAME reason as Purchase Report directly above: it joins vendor spend and purchase rates onto material rows. Do NOT "simplify" this to an open page — the store's own issue view (/store-requisitions, /api/store-issued-log) is untouched and still carries no money.
       { path: '/reports/menu-recipe-gap', label: 'Menu Items Without Recipe', mgmtOnly: true }, // mgmtOnly: ranks the un-costed menu by actual SALES VALUE (revenue on the page), and its review-gated bulk attach rewrites the food cost of every FUTURE sale of a dish. Not a staff surface.
       { path: '/menu-engineering',    label: 'Menu Engineering', hodOnly: true },
@@ -274,6 +302,26 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/users',               label: 'Users' },
       { path: '/settings/dashboard',  label: 'Settings — Dashboard' },
       { path: '/settings/purchasing', label: 'Settings — Purchasing' },
+      // Settings — Returns. A separate page rather than a new section on
+      // Settings — Purchasing directly above, because that page is committed
+      // code and already carries its own warning against re-adding a control
+      // for a retired key; this module is additive and does not edit it.
+      //
+      // It holds ONE control: how many days a PO stays open for VENDOR returns
+      // (owner req 75). Read at ticket-CREATION time as a refusal, measured
+      // from the GRN date. Default is 0 = NO LIMIT, which is exactly today's
+      // behaviour — nothing anywhere closes a PO on its own. There is no
+      // "closed" PO status, no cron and no boot migration, so a deploy can
+      // never retroactively shut a real approved PO.
+      //
+      // adminOnly, and it must stay that way: lowering this number silently
+      // makes older POs un-returnable for everybody, and the refusal surfaces
+      // at the store counter with the goods already in hand, not here. Same
+      // reasoning that keeps the Station → Department map admin-write below.
+      // Note this catalog entry is the page-level lock only — a KEY_POLICY
+      // entry is what would make the SETTING WRITE admin-only server-side, and
+      // that lives in the committed settings route (see handoff).
+      { path: '/settings/returns',    label: 'Settings — Returns', adminOnly: true },
       { path: '/settings/roles',      label: 'Settings — Roles' },
       { path: '/settings/print-design', label: 'Settings — Print Design' },
       { path: '/settings/stores',     label: 'Settings — Store Locations' },

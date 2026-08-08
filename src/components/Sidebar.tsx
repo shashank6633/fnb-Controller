@@ -68,6 +68,7 @@ import {
   CalendarCheck,
   Radar,
   HeartHandshake,
+  Undo2,
   type LucideIcon,
 } from "lucide-react";
 
@@ -142,6 +143,20 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Purchase Orders",    href: "/purchase-orders",    icon: ClipboardList },
       { kind: "link", label: "Goods Receipt (GRN)", href: "/grn",               icon: ClipboardList },
       { kind: "link", label: "Receiving Variance", href: "/receiving-variance", icon: AlertTriangle },
+      // Returns — sits right after Receiving Variance on purpose: that page is
+      // where a short/damaged delivery is spotted, and this is where the goods
+      // physically go back. Two facts a reader needs before touching it:
+      //   · STOCK MOVES ONLY ON STORE ACCEPT. Raising a ticket moves nothing;
+      //     HOD approval moves nothing. The single stock write lives inside the
+      //     store-verify transaction, and a rejected line leaves stock exactly
+      //     where it was. Seeing this link is not permission to move inventory —
+      //     the accept route re-checks the store-issue role itself.
+      //   · THE TWO KINDS PULL CENTRAL STOCK OPPOSITE WAYS. A VENDOR return
+      //     sends goods back OUT of the building against a PO/GRN, so central
+      //     stock goes DOWN. An INTERNAL department return sends goods from a
+      //     kitchen back to the store, so department stock goes DOWN and central
+      //     goes UP. There is no single "return" direction to reason from.
+      { kind: "link", label: "Returns",            href: "/returns",            icon: Undo2 },
       { kind: "link", label: "Vendors",            href: "/vendors",            icon: Building2 },
       { kind: "link", label: "Vendor → Items",     href: "/vendors/materials",  icon: Building2 },
       { kind: "link", label: "Contracts",          href: "/contracts",          icon: FileText },
@@ -200,6 +215,14 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Reports",            href: "/reports",                icon: BarChart3 },
       { kind: "link", label: "Sales Reports",      href: "/reports/sales",          icon: BarChart3 },
       { kind: "link", label: "Purchase Report",    href: "/reports/purchases",      icon: ShoppingCart },
+      // Return Report — both kinds of return in one list, and mgmtOnly in the
+      // page-catalog because a vendor row carries the GRN line's unit price and
+      // the credit note the vendor owes us, i.e. vendor money. It deliberately
+      // has NO grand total: a VENDOR return takes stock OUT of the building
+      // (central DOWN) while an INTERNAL department return puts it back (central
+      // UP), and the two are even measured in different unit bases, so a summed
+      // figure would be arithmetically meaningless. Totals are per source.
+      { kind: "link", label: "Return Report",      href: "/reports/returns",        icon: Undo2 },
       { kind: "link", label: "Menu Engineering",   href: "/menu-engineering",       icon: BarChart3 },
       { kind: "link", label: "Variance Report",    href: "/variance-report",        icon: ClipboardCheck },
       { kind: "link", label: "Dept Consumption",   href: "/department-consumption", icon: BarChart3 },
@@ -287,6 +310,12 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Users",          href: "/users",                  icon: Users },
       { kind: "link", label: "Dashboard",      href: "/settings/dashboard",     icon: BarChart3 },
       { kind: "link", label: "Purchasing",     href: "/settings/purchasing",    icon: ShoppingCart },
+      // Returns — its own page rather than a section on Purchasing above, which
+      // is committed code this module does not edit. One control: how many days
+      // a PO stays open for VENDOR returns. Default 0 = no limit = exactly
+      // today's behaviour; nothing closes a PO on its own. adminOnly in the
+      // page-catalog, so canAccessPage hides this row for everyone else.
+      { kind: "link", label: "Returns",        href: "/settings/returns",       icon: Undo2 },
       { kind: "link", label: "Roles",          href: "/settings/roles",         icon: Users },
       { kind: "link", label: "Print Design",   href: "/settings/print-design",  icon: Printer },
       { kind: "link", label: "Store Locations", href: "/settings/stores",       icon: Warehouse },

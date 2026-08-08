@@ -18,6 +18,7 @@ import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
  *                             − Central wastage (store's own shelf only)
  *                             − Party issues / consumption (net of returns)
  *                             − Staff-meal issues (net of returns)
+ *                             − Vendor returns (goods sent back to the supplier)
  *   Loss (Variance)           = Theoretical − Physical Closing Stock
  *
  * WHY RECIPE CONSUMPTION IS NOT IN THIS FORMULA — do not "restore" it.
@@ -197,6 +198,23 @@ export async function GET(request: Request) {
                         WHERE it.material_id = cs.material_id
                           AND it.type IN ('staff_meal_issue', 'staff_meal_return')
                           AND DATE(it.created_at) <= cs.date), 0) AS staff_meal_to_date,
+             -- VENDOR RETURNS (req 72-75). Goods physically LEFT THE BUILDING on
+             -- an accepted vendor return ticket, so central is legitimately short
+             -- by that much. Written NEGATIVE by acceptVendorReturnLine(), so the
+             -- negation here makes it a positive outflow like every other term.
+             --
+             -- WITHOUT THIS TERM THE RETURN READS AS SHRINKAGE. Every term in this
+             -- formula is a CLOSED type list, so a new type is invisible: physical
+             -- stock would drop while theoretical did not, and the owner would be
+             -- chasing a theft that is actually a credit note.
+             --
+             -- An INTERNAL department return needs no term here. It is written as
+             -- a POSITIVE 'requisition_issue' row, which nets itself out inside
+             -- issues_to_date above — the same trick a requisition reversal uses.
+             COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
+                        WHERE it.material_id = cs.material_id
+                          AND it.type = 'vendor_return'
+                          AND DATE(it.created_at) <= cs.date), 0) AS vendor_return_to_date,
              -- DIAGNOSTIC ONLY. Not in the formula. Recipe consumption debits the
              -- department, never central. Split so the 'nc' exclusion is visible.
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
@@ -226,10 +244,11 @@ export async function GET(request: Request) {
       // add a channel, add it here AND to report.formula — a screen that shows
       // Purchases − <one column> = Theoretical must have that column to show.
       r.central_outflow_to_date =
-          (r.issues_to_date     || 0)
-        + (r.wastage_to_date    || 0)
-        + (r.party_to_date      || 0)
-        + (r.staff_meal_to_date || 0);
+          (r.issues_to_date         || 0)
+        + (r.wastage_to_date        || 0)
+        + (r.party_to_date          || 0)
+        + (r.staff_meal_to_date     || 0)
+        + (r.vendor_return_to_date  || 0);
       // Diagnostic roll-up of the DEPARTMENT rail. Excluded from theoretical.
       r.recipe_to_date = (r.recipe_sale_to_date || 0) + (r.recipe_nc_to_date || 0);
       r.recipe_in_central_formula = false;
@@ -365,7 +384,7 @@ export async function GET(request: Request) {
         subtitle: REPORT_SUBTITLE,
         export_title: REPORT_TITLE,
         export_filename_prefix: 'central-store-variance',
-        formula: 'Theoretical = Purchases − Requisition issues − Central wastage − Party − Staff meals',
+        formula: 'Theoretical = Purchases − Requisition issues − Central wastage − Party − Staff meals − Vendor returns',
         outflow_column: 'central_outflow_to_date',
         excludes: [
           'Recipe consumption (sales) — debits the department, not the store',
