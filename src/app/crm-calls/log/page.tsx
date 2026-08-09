@@ -383,31 +383,25 @@ export default function CallLogPage() {
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
       <div className="max-w-[100rem] mx-auto px-3 sm:px-6 py-5 sm:py-6 space-y-4 sm:space-y-5">
 
-        {/* Header */}
-        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
-          <div>
+        {/* Header — THE FILTER CHIPS LIVE IN THIS ROW ON PURPOSE.
+            They used to occupy a full band of their own below the title, which
+            on a phone meant three stacked rows of pills pushing the actual call
+            list below the fold, while the header wasted the whole gap between
+            "Call Log" and Refresh. They now fill that gap instead: same
+            controls, no extra vertical band, and the space that was empty is
+            doing the work. Styling is deliberately minimal (no borders, tinted
+            only when active) so six labels sitting next to an H1 read as a
+            filter strip rather than six competing buttons. Counts still ignore
+            the active chip, so they stay stable as you switch filters. */}
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 lg:gap-6">
+          <div className="shrink-0">
             <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">CRM · Call to Table</p>
             <h1 className="text-2xl sm:text-3xl font-bold text-[#2D1B0E] mt-0.5 flex items-center gap-3">
               <Phone className="w-6 h-6 text-[#af4408]" /> Call Log
             </h1>
           </div>
-          <button
-            onClick={() => fetchCalls()}
-            className="self-start sm:self-auto flex items-center gap-2 px-3 sm:px-4 py-2.5 bg-white border border-[#E0D0BE] hover:bg-[#FFF1E3] text-[#6B5744] rounded-xl text-sm font-medium shadow-sm transition-colors"
-          >
-            <RefreshCw className={`w-4 h-4 ${fetching ? 'animate-spin' : ''}`} /> Refresh
-          </button>
-        </div>
 
-        {/* Summary chips (counts ignore the active chip so they stay stable).
-            GRID, not flex-wrap: these are six-to-seven chips of very different
-            label lengths, so wrapping packed them into ragged rows (3 then 2
-            then 1) that read as clutter on a phone. A fixed column count keeps
-            every chip the same width and lines the labels and counts up, and
-            the count is stable per breakpoint instead of reflowing with the
-            longest label. Above xl they all fit on one line, so it falls back
-            to an inline row and the chips shrink to their natural width. */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:flex xl:flex-wrap xl:items-center gap-2">
+          <div className="flex flex-wrap items-center gap-x-0.5 gap-y-1 lg:flex-1 lg:min-w-0">
           <SummaryChip label="All" count={summary.total} active={!direction && !status && !needsDisposition} onClick={pickAll} />
           <SummaryChip label="Inbound" count={summary.inbound} active={direction === 'inbound'} onClick={() => pickDirection('inbound')}
                        icon={<ArrowDownLeft className="w-3.5 h-3.5" />} />
@@ -418,7 +412,15 @@ export default function CallLogPage() {
           {summary.ringing > 0 && (
             <SummaryChip label="Ringing" count={summary.ringing} active={status === 'ringing'} onClick={() => pickStatus('ringing')} tone="amber" pulse />
           )}
-          <SummaryChip label="Needs disposition" count={summary.needs_disposition} active={needsDisposition} onClick={pickNeedsDisposition} tone="amber" />
+            <SummaryChip label="Needs disposition" count={summary.needs_disposition} active={needsDisposition} onClick={pickNeedsDisposition} tone="amber" />
+          </div>
+
+          <button
+            onClick={() => fetchCalls()}
+            className="shrink-0 self-start lg:self-auto flex items-center gap-2 px-3 sm:px-4 py-2.5 bg-white border border-[#E0D0BE] hover:bg-[#FFF1E3] text-[#6B5744] rounded-xl text-sm font-medium shadow-sm transition-colors"
+          >
+            <RefreshCw className={`w-4 h-4 ${fetching ? 'animate-spin' : ''}`} /> Refresh
+          </button>
         </div>
 
         {/* Search + filters */}
@@ -1093,29 +1095,30 @@ function SummaryChip({ label, count, active, onClick, icon, tone, pulse }: {
   label: string; count: number; active: boolean; onClick: () => void;
   icon?: ReactNode; tone?: 'green' | 'red' | 'amber'; pulse?: boolean;
 }) {
+  // MINIMAL BY DEFAULT. These sit inline with the H1 now, so an idle chip is
+  // plain text — no border, no fill, no shadow — and only the SELECTED one
+  // carries colour. Six bordered pills beside a page title read as a toolbar
+  // and pull the eye away from the list, which is the thing being filtered.
+  // Tone still differentiates answered/missed/needs-action once chosen.
   const activeCls =
-    tone === 'green' ? 'bg-green-600 text-white border-green-600'
-    : tone === 'red' ? 'bg-red-600 text-white border-red-600'
-    : tone === 'amber' ? 'bg-amber-500 text-white border-amber-500'
-    : 'bg-[#af4408] text-white border-[#af4408]';
+    tone === 'green' ? 'bg-green-600 text-white'
+    : tone === 'red' ? 'bg-red-600 text-white'
+    : tone === 'amber' ? 'bg-amber-500 text-white'
+    : 'bg-[#af4408] text-white';
   const idleCls =
-    tone === 'green' ? 'bg-white text-green-700 border-green-200 hover:bg-green-50'
-    : tone === 'red' ? 'bg-white text-red-700 border-red-200 hover:bg-red-50'
-    : tone === 'amber' ? 'bg-white text-amber-800 border-amber-300 hover:bg-amber-50'
-    : 'bg-white text-[#6B5744] border-[#E0D0BE] hover:bg-[#FFF1E3]';
+    tone === 'green' ? 'text-green-700 hover:bg-green-50'
+    : tone === 'red' ? 'text-red-700 hover:bg-red-50'
+    : tone === 'amber' ? 'text-amber-800 hover:bg-amber-50'
+    : 'text-[#6B5744] hover:bg-[#FFF1E3]';
   return (
-    // w-full inside the grid cell (below lg) so every chip is the SAME width and
-    // the labels line up in columns; xl:w-auto lets them shrink back to content
-    // width once they all fit on one row. justify-between pins the count to the
-    // right edge, so the numbers form a column too instead of floating wherever
-    // the label length leaves them.
+    // Content width, tight padding, no border. The count keeps tabular-nums so
+    // it does not jitter as figures cross 9→10, and sits a shade lighter than
+    // the label when idle so the row scans as labels first, numbers second.
     <button onClick={onClick}
-            className={`w-full xl:w-auto inline-flex items-center justify-between xl:justify-start gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium whitespace-nowrap transition-colors ${active ? activeCls : idleCls} ${pulse && !active ? 'animate-pulse' : ''}`}>
-      <span className="inline-flex items-center gap-1.5 min-w-0">
-        {icon}
-        <span className="truncate">{label}</span>
-      </span>
-      <span className="font-bold tabular-nums">{count}</span>
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap transition-colors ${active ? activeCls : idleCls} ${pulse && !active ? 'animate-pulse' : ''}`}>
+      {icon}
+      {label}
+      <span className={`font-semibold tabular-nums ${active ? '' : 'opacity-60'}`}>{count}</span>
     </button>
   );
 }
