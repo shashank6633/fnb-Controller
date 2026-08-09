@@ -4,7 +4,7 @@
  * CRM — Telephony console (admin only).
  *
  * The owner-facing view of the TeleCMI ACCOUNT itself, as opposed to
- * /crm-calls/settings which configures how this app reacts to calls. Four
+ * /crm-calls/settings which configures how this app reacts to calls. Five
  * things live here because each of them fails silently in production:
  *
  *   1 Account balance — TeleCMI simply stops connecting calls when the wallet
@@ -17,6 +17,13 @@
  *   3 Agents — extensions, working hours and SMS notify, plus whether each one
  *     is mapped to an FNB user (an unmapped GRE cannot click-to-call).
  *   4 Caller ID — which outbound number an agent presents.
+ *   5 Recordings — whether a CDR webhook has EVER arrived, and what TeleCMI
+ *     actually puts in its recording field. Read-only. The player fails with a
+ *     flat "invalid" that cannot distinguish three completely different
+ *     problems: a value that is a filename rather than a URL, an account with
+ *     recording switched off, and a CDR webhook that has never reached us at
+ *     all. The last of those is not a code problem, and only this panel can
+ *     say so.
  *
  * WHY CALLER ID NEEDS A PASSWORD: TeleCMI scopes caller-ID to the USER, not the
  * account, so the app secret cannot read or set it (see src/lib/ct/telecmi-api.ts
@@ -29,13 +36,14 @@
  *   GET  /api/telecmi/analysis?days=N
  *   GET  /api/telecmi/agents      POST /api/telecmi/agents   (add|update|refresh)
  *   POST /api/telecmi/callerid    (login|list|set)
+ *   GET  /api/telecmi/recording-diagnostic
  */
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Phone, Wallet, BarChart3, Users, PhoneOutgoing, Loader2, AlertCircle,
   AlertTriangle, CheckCircle2, RefreshCw, Lock, Plus, Pencil, KeyRound,
-  Link2Off, PlugZap, X, Save, Info,
+  Link2Off, PlugZap, X, Save, Info, FileAudio,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
@@ -103,6 +111,74 @@ const DAY_CHOICES = [1, 7, 30, 90] as const;
 /** Below this the wallet is close enough to empty that calls will start
  *  failing before anyone thinks to check — worth an amber shout. */
 const LOW_BALANCE_INR = 500;
+
+/* ── Recording diagnostic contracts (GET /api/telecmi/recording-diagnostic) ──
+ * Everything is optional because that route answers 200-with-`error` rather
+ * than a 500, exactly as /balance does: a diagnostic that dies silently is
+ * worse than no diagnostic. */
+
+type DiagField = {
+  /** Original spelling as TeleCMI sent it, e.g. filename or data.filename. */
+  path: string;
+  recording_key: boolean;
+  /** The one the mapper actually used (first recognised key wins). */
+  winner: boolean;
+  value: string;
+  redacted: boolean;
+  truncated: boolean;
+  /** Type + length + a coarse hint. Never the value — see the route's leak note. */
+  shape: string;
+};
+
+type DiagCdr = {
+  log_id: string;
+  received_at: string;
+  telecmi_call_id: string;
+  processed: boolean;
+  ingest_error: string;
+  payload_readable: boolean;
+  field_count: number;
+  recording_fields: DiagField[];
+  other_fields: { path: string; shape: string }[];
+  normalized_recording_url: string;
+  /** none | passthrough (already a URL) | joined (filename + base) | dropped. */
+  transform: 'none' | 'passthrough' | 'joined' | 'dropped';
+  applied_base: string;
+  validation: { checked: boolean; ok: boolean; error: string; host: string };
+  /** Plain-language verdict. Owned by the ROUTE so there is one wording, not two. */
+  headline: string;
+};
+
+type RecordingDiagResp = {
+  generated_at: string;
+  error?: string;
+  webhooks?: {
+    cdr_count: number;
+    cdr_newest_at: string;
+    cdr_processed: number;
+    cdr_errored: number;
+    live_count: number;
+    live_newest_at: string;
+    token_configured: boolean;
+    headline: string;
+  };
+  latest_cdr?: DiagCdr | null;
+  recording_scan?: {
+    limit: number;
+    scanned: number;
+    with_recording_value: number;
+    sample: DiagCdr | null;
+    sample_is_latest: boolean;
+  };
+  allowlist?: string[];
+  stored?: {
+    calls_total: number;
+    with_recording_url: number;
+    fixture_recordings: number;
+    real_recordings: number;
+    headline: string;
+  };
+};
 
 /* ── Formatting helpers ───────────────────────────────────────────────────── */
 
@@ -284,6 +360,11 @@ export default function TelephonyPage() {
   const [sessions, setSessions] = useState<Record<string, CallerIdSession>>({});
   const [pwDraft, setPwDraft] = useState<Record<string, string>>({});
 
+  // 5 · Recording diagnostic
+  const [diag, setDiag] = useState<RecordingDiagResp | null>(null);
+  const [diagLoading, setDiagLoading] = useState(true);
+  const [diagError, setDiagError] = useState<string | null>(null);
+
   const loadBalance = useCallback(async () => {
     setBalLoading(true); setBalError(null);
     const r = await getJson<BalanceResp>('/api/telecmi/balance');
@@ -330,6 +411,26 @@ export default function TelephonyPage() {
 
   useEffect(() => { void loadBalance(); void loadAgents(); }, [loadBalance, loadAgents]);
   useEffect(() => { void loadAnalysis(days); }, [days, loadAnalysis]);
+
+  /* ── 5 · Recording diagnostic ─────────────────────────────────────────────
+   * Its own loader and its own effect rather than a line added to the one
+   * above: this is a purely additive panel, and nothing already on this page
+   * should change shape because it exists. Reads local tables only — no
+   * TeleCMI round trip — so it is cheap enough to run on mount. */
+  const loadDiag = useCallback(async () => {
+    setDiagLoading(true); setDiagError(null);
+    const r = await getJson<RecordingDiagResp>('/api/telecmi/recording-diagnostic');
+    if (!r.ok) {
+      if (r.locked) setLocked(true);
+      setDiagError(r.error);
+      setDiag(null);
+    } else {
+      setDiag(r.data);
+    }
+    setDiagLoading(false);
+  }, []);
+
+  useEffect(() => { void loadDiag(); }, [loadDiag]);
 
   /* ── Analysis drift ──────────────────────────────────────────────────────
    * TeleCMI's count is ground truth; ours comes from the CDR webhook. A gap
@@ -986,6 +1087,151 @@ export default function TelephonyPage() {
         </div>
       </SectionCard>
 
+      {/* ── 5 · Recordings ── */}
+      <SectionCard
+        icon={<FileAudio className="w-4 h-4 text-[#af4408]" />}
+        title="Recordings"
+        subtitle="Read-only. Has a CDR ever arrived, and what does TeleCMI actually put in its recording field?"
+        right={
+          <button onClick={() => void loadDiag()} disabled={diagLoading}
+                  className="px-2.5 py-1 bg-white border border-[#E8D5C4] rounded text-xs text-[#6B5744] flex items-center gap-1 hover:bg-[#FFF8F0] disabled:opacity-50">
+            <RefreshCw className={`w-3 h-3 ${diagLoading ? 'animate-spin' : ''}`} /> Refresh
+          </button>
+        }
+      >
+        {diagLoading ? (
+          <Spinner label="Reading the webhook log…" />
+        ) : diagError ? (
+          <ErrorBox msg={diagError} onRetry={() => void loadDiag()} />
+        ) : !diag ? (
+          <ErrorBox msg="No response from the recording diagnostic." onRetry={() => void loadDiag()} />
+        ) : diag.error ? (
+          <ErrorBox msg={diag.error} onRetry={() => void loadDiag()} />
+        ) : !diag.webhooks || !diag.stored ? (
+          <ErrorBox msg="The recording diagnostic answered without any figures." onRetry={() => void loadDiag()} />
+        ) : (
+          <div className="space-y-3">
+            {/* THE HEADLINE. Zero CDRs is the most useful answer this panel can
+                give and the one nobody guesses, so it is stated first, in red,
+                before any field-level detail an owner would otherwise start
+                debugging. The sentence itself comes from the route — one
+                wording, not two that can drift apart. */}
+            {diag.webhooks.cdr_count === 0 ? (
+              <div className="bg-red-50 border border-red-300 text-red-800 rounded-lg p-3 text-xs flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>
+                  <strong className="block mb-1">No call report has ever reached this app.</strong>
+                  {diag.webhooks.headline}{' '}
+                  Fix it in the TeleCMI CHUB dashboard, not here: a webhook of type{' '}
+                  <em>call report</em>, method POST, pointed at this app&rsquo;s CDR URL. The URL is
+                  on{' '}
+                  <a href="/crm-calls/settings" className="text-[#af4408] underline underline-offset-2">CRM Settings</a>.
+                  {!diag.webhooks.token_configured && (
+                    <> No webhook token is configured yet either, so open that page first.</>
+                  )}
+                </span>
+              </div>
+            ) : (
+              <p className="text-[11px] text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1.5 flex items-start gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-px" />
+                <span>{diag.webhooks.headline}</span>
+              </p>
+            )}
+
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+                <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">CDRs received</p>
+                <p className={`text-2xl font-bold mt-0.5 ${diag.webhooks.cdr_count === 0 ? 'text-red-700' : 'text-[#2D1B0E]'}`}>
+                  {count(diag.webhooks.cdr_count)}
+                </p>
+                <p className="text-[11px] text-[#6B5744] mt-1">
+                  {diag.webhooks.cdr_newest_at
+                    ? <>Newest {fmtWhen(diag.webhooks.cdr_newest_at)}</>
+                    : 'Never'}
+                </p>
+              </div>
+
+              {/* Live beside CDR on purpose: the PAIR is the diagnosis. Live
+                  arriving while CDR is zero rules out the token, the network
+                  and the app, and points at one missing URL in TeleCMI. */}
+              <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+                <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Live events</p>
+                <p className="text-2xl font-bold text-[#2D1B0E] mt-0.5">{count(diag.webhooks.live_count)}</p>
+                <p className="text-[11px] text-[#6B5744] mt-1">
+                  Screen-pop feed. Recordings never arrive on these.
+                </p>
+              </div>
+
+              <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+                <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Recording URLs stored</p>
+                <p className="text-2xl font-bold text-[#2D1B0E] mt-0.5">{count(diag.stored.with_recording_url)}</p>
+                <p className="text-[11px] text-[#6B5744] mt-1">
+                  of {count(diag.stored.calls_total)} calls in the log
+                </p>
+              </div>
+
+              <div className={`rounded-lg border p-3 ${diag.stored.real_recordings === 0 && diag.stored.with_recording_url > 0 ? 'bg-amber-50 border-amber-300' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`}>
+                <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Of those, real</p>
+                <p className={`text-2xl font-bold mt-0.5 ${diag.stored.real_recordings === 0 && diag.stored.with_recording_url > 0 ? 'text-amber-800' : 'text-[#2D1B0E]'}`}>
+                  {count(diag.stored.real_recordings)}
+                </p>
+                <p className="text-[11px] text-[#6B5744] mt-1">
+                  {count(diag.stored.fixture_recordings)} demo fixture
+                  {diag.stored.fixture_recordings === 1 ? '' : 's'}
+                </p>
+              </div>
+            </div>
+
+            <p className="text-[11px] text-[#6B5744] border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] px-2.5 py-1.5">
+              {diag.stored.headline}
+            </p>
+
+            {/* Field-level detail. The newest CDR that actually CARRIES a
+                recording is shown first when there is one, because the newest
+                CDR overall is very often a missed call with no recording at
+                all — and reading that as "TeleCMI never sends one" is the
+                wrong conclusion this ordering exists to prevent. */}
+            {diag.recording_scan?.sample && (
+              <CdrDetail
+                cdr={diag.recording_scan.sample}
+                label={
+                  diag.recording_scan.sample_is_latest
+                    ? 'Most recent call report'
+                    : 'Most recent call report that carries a recording'
+                }
+                note={
+                  diag.recording_scan.sample_is_latest
+                    ? undefined
+                    : `Found by looking back through the last ${count(diag.recording_scan.scanned)} report${diag.recording_scan.scanned === 1 ? '' : 's'}; ${count(diag.recording_scan.with_recording_value)} of them carry a recording value.`
+                }
+              />
+            )}
+
+            {diag.latest_cdr && !diag.recording_scan?.sample_is_latest && (
+              <CdrDetail
+                cdr={diag.latest_cdr}
+                label="Most recent call report"
+                note={
+                  diag.recording_scan && diag.recording_scan.with_recording_value === 0
+                    ? `None of the last ${count(diag.recording_scan.scanned)} report${diag.recording_scan.scanned === 1 ? '' : 's'} carried a recording value.`
+                    : undefined
+                }
+              />
+            )}
+
+            {diag.allowlist && diag.allowlist.length > 0 && (
+              <p className="text-[10px] text-[#8B7355]">
+                The player only fetches HTTPS URLs on{' '}
+                <span className="font-mono text-[#6B5744]">{diag.allowlist.join(', ')}</span> — set
+                by the <span className="font-mono">recording_host_allowlist</span> CRM setting.
+                Values are shown here exactly as TeleCMI sent them, with anything that could be a
+                credential masked.
+              </p>
+            )}
+          </div>
+        )}
+      </SectionCard>
+
       {editing && (
         <AgentModal
           mode={editing.mode}
@@ -994,6 +1240,155 @@ export default function TelephonyPage() {
           onSubmit={submitAgent}
         />
       )}
+    </div>
+  );
+}
+
+/* ── One call report, field by field ──────────────────────────────────────────
+ *
+ * The point of this block is to answer, from real data, the question nobody
+ * could answer from the player's flat "Recording URL is invalid": what does
+ * TeleCMI actually put in that field? So it prints the field NAMES it sent
+ * (the spelling matters — the mapper matches on it), the value of any field
+ * the mapper reads as a recording, what the mapper turns that into, and
+ * whether the proxy would accept the result.
+ *
+ * Every other field contributes its name and a SHAPE only, never its value —
+ * a CDR can carry account identifiers, and "string(37) https URL" is enough to
+ * spot a recording hiding under a name the mapper has never heard of.
+ */
+function CdrDetail({ cdr, label, note }: { cdr: DiagCdr; label: string; note?: string }) {
+  const ok = cdr.validation.checked && cdr.validation.ok;
+  const bad = cdr.validation.checked && !cdr.validation.ok;
+  return (
+    <div className="rounded-lg border border-[#E8D5C4] bg-white overflow-hidden">
+      <div className="px-3 py-2 bg-[#FFF8F0] border-b border-[#E8D5C4]">
+        <p className="text-xs font-semibold text-[#2D1B0E]">{label}</p>
+        <p className="text-[10px] text-[#6B5744] mt-0.5">
+          Received {fmtWhen(cdr.received_at)}
+          {cdr.telecmi_call_id && <> · call <span className="font-mono">{cdr.telecmi_call_id}</span></>}
+          {' · '}{cdr.field_count} field{cdr.field_count === 1 ? '' : 's'}
+          {!cdr.processed && <> · <span className="text-amber-800 font-semibold">not ingested</span></>}
+        </p>
+        {note && <p className="text-[10px] text-[#8B7355] mt-0.5">{note}</p>}
+      </div>
+
+      <div className="p-3 space-y-2.5">
+        {cdr.ingest_error && (
+          <p className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1.5 flex items-start gap-1.5">
+            <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-px" />
+            <span>Ingest error on this delivery: {cdr.ingest_error}</span>
+          </p>
+        )}
+
+        <p className={`text-[11px] rounded px-2 py-1.5 flex items-start gap-1.5 border ${
+          ok ? 'text-emerald-800 bg-emerald-50 border-emerald-200'
+             : 'text-amber-900 bg-amber-50 border-amber-300'}`}>
+          {ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-px" />
+              : <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />}
+          <span>{cdr.headline}</span>
+        </p>
+
+        {cdr.recording_fields.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs min-w-[380px]">
+              <thead>
+                <tr className="text-left text-[10px] uppercase tracking-wide text-[#8B7355] border-b border-[#E8D5C4]">
+                  <th className="py-1.5 pr-2 font-medium">Recording field</th>
+                  <th className="py-1.5 pl-2 font-medium">Value as sent</th>
+                </tr>
+              </thead>
+              <tbody className="text-[#2D1B0E]">
+                {cdr.recording_fields.map(f => (
+                  <tr key={f.path} className="border-b border-[#E8D5C4]/60 last:border-0 align-top">
+                    <td className="py-2 pr-2 font-mono text-[11px] whitespace-nowrap">
+                      {f.path}
+                      {f.winner && (
+                        <span className="ml-1.5 px-1 py-px rounded bg-[#FFF1E3] border border-[#E8D5C4] text-[9px] font-sans text-[#6B5744] align-middle">
+                          used
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-2 pl-2 font-mono text-[11px] break-all">
+                      {f.value === '' ? <span className="text-[#8B7355] font-sans italic">empty</span> : f.value}
+                      {f.truncated && <span className="text-[#8B7355]">…</span>}
+                      {f.redacted && (
+                        <span className="ml-1.5 text-[10px] font-sans text-[#8B7355]">
+                          (masked — looked like a credential)
+                        </span>
+                      )}
+                      <span className="block text-[10px] font-sans text-[#8B7355] mt-0.5">{f.shape}</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* What the normalizer produces, and the proxy's own verdict on it —
+            the two halves of the chain the player actually runs. */}
+        <div className="rounded border border-[#E8D5C4] bg-[#FFF8F0] px-2.5 py-2 space-y-1">
+          <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Normalizer result</p>
+          <p className="font-mono text-[11px] text-[#2D1B0E] break-all">
+            {cdr.normalized_recording_url || <span className="font-sans italic text-[#8B7355]">nothing — the mapper stores an empty recording_url</span>}
+          </p>
+          {/* Say what happened to the value, not just what came out. "Joined"
+              is the load-bearing one: it means the URL above was BUILT here,
+              so it is only as right as the base it was built from. */}
+          {cdr.transform === 'joined' && (
+            <p className="text-[10px] text-[#6B5744]">
+              Built by pasting the filename onto{' '}
+              <span className="font-mono text-[#2D1B0E]">{cdr.applied_base || 'the recording base'}</span>
+              {' '}— TeleCMI did not send this URL, we assembled it.
+            </p>
+          )}
+          {cdr.transform === 'passthrough' && (
+            <p className="text-[10px] text-[#6B5744]">Sent by TeleCMI exactly like this; nothing was added.</p>
+          )}
+          {cdr.transform === 'dropped' && (
+            <p className="text-[10px] text-amber-900">
+              A value arrived and was deliberately discarded rather than guessed at
+              {cdr.applied_base && <> (it could not be joined onto <span className="font-mono">{cdr.applied_base}</span>)</>}.
+            </p>
+          )}
+          <p className={`text-[11px] ${bad ? 'text-amber-900' : ok ? 'text-emerald-800' : 'text-[#8B7355]'}`}>
+            {ok
+              ? <>Passes the player&rsquo;s check (host {cdr.validation.host}).</>
+              : bad
+                ? <>The player would reject it: &ldquo;{cdr.validation.error}&rdquo; — this is the exact message the audio proxy returns.</>
+                : <>Nothing to check.</>}
+          </p>
+        </div>
+
+        {cdr.other_fields.length > 0 && (
+          <details className="text-[11px]">
+            <summary className="cursor-pointer text-[#6B5744] hover:text-[#2D1B0E]">
+              Every other field TeleCMI sent ({cdr.other_fields.length}) — names and shapes only
+            </summary>
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {cdr.other_fields.map(f => (
+                <span key={f.path}
+                      className="px-1.5 py-0.5 rounded border border-[#E8D5C4] bg-[#FFF8F0] text-[10px] text-[#6B5744]">
+                  <span className="font-mono text-[#2D1B0E]">{f.path}</span> · {f.shape}
+                </span>
+              ))}
+            </div>
+            <p className="text-[10px] text-[#8B7355] mt-1.5">
+              Values are withheld here on purpose — a report can carry account identifiers. If a
+              recording is hiding under a name the mapper does not know, the name and the shape
+              above are what give it away.
+            </p>
+          </details>
+        )}
+
+        {!cdr.payload_readable && (
+          <p className="text-[11px] text-[#8B7355]">
+            The stored copy of this delivery is not a readable JSON object, so no fields could be
+            listed.
+          </p>
+        )}
+      </div>
     </div>
   );
 }

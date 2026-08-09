@@ -1059,6 +1059,20 @@ export default function ClosingStockByLocationPage() {
           body: { date: closingDate, items: itemsToSubmit, adjust_stock: adjustStockModal, department_id: activeDeptId },
         });
         const json = await res.json();
+        // A REJECTED REQUEST ANSWERS { error: "..." }, NOT { errors: [...] }.
+        // Reading only the plural array meant a 400 pushed nothing, every count
+        // fell to 0, and the banner said "0 saved" with no reason given — the
+        // user cannot tell a refused date from an empty sheet. Surface it.
+        if (!res.ok) {
+          errors.push(String(json?.error || `Save failed (HTTP ${res.status})`));
+          // AND STOP. Semi-finished counts post to a DIFFERENT route with the
+          // SAME closingDate, and that route has no future-date guard — so
+          // carrying on here would refuse the raw half and accept the semi
+          // half, leaving one date half-recorded. Whatever refused the raw
+          // counts refuses the whole submit.
+          setClosingResult({ success: 0, errors, semi: 0, pending: 0, applied: 0 });
+          return;
+        }
         for (const e of json.errors || []) errors.push(e);
         rawSaved = json.success || 0;
         rawPending = json.pending || 0;
@@ -1292,6 +1306,14 @@ export default function ClosingStockByLocationPage() {
           body: { date: closingDate, items, adjust_stock: false, department_id: activeDeptId },
         });
         const json = await res.json();
+        // Same as the modal path: a rejection is { error }, not { errors }, and
+        // the semi route shares this date but not its date guard. Report the
+        // reason and abandon the whole upload rather than half-writing the day.
+        if (!res.ok) {
+          errors.push(String(json?.error || `Upload failed (HTTP ${res.status})`));
+          setClosingResult({ success: 0, errors, semi: 0, pending: 0, applied: 0 });
+          return;
+        }
         for (const e of json.errors || []) errors.push(e);
         rawSaved = json.success || 0;
         rawPending = json.pending || 0;

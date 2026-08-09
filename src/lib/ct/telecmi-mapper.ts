@@ -6,11 +6,14 @@
  * between raw webhook JSON and our normalized shapes — business logic
  * (src/lib/ct/ingest.ts) never touches raw payloads directly.
  *
- * Pure functions: no DB, no imports, no side effects beyond console.warn on
- * unknown shapes. Phone values are returned RAW — ingest normalizes them via
- * normalizePhone() (see src/lib/ct/phone.ts). Timestamps are normalized here
- * to UTC ISO-8601 (accepts epoch seconds, epoch millis, or ISO strings).
+ * Pure functions: no DB, no side effects beyond console.warn on unknown shapes.
+ * The single import is a default STRING constant (the recording base URL) —
+ * nothing here reads or writes the database, and mapCdrPayload() stays callable
+ * with a payload alone. Phone values are returned RAW — ingest normalizes them
+ * via normalizePhone() (see src/lib/ct/phone.ts). Timestamps are normalized
+ * here to UTC ISO-8601 (accepts epoch seconds, epoch millis, or ISO strings).
  */
+import { RECORDING_BASE_URL_DEFAULT } from './settings';
 
 /** Normalized live ("notify") webhook event. */
 export interface MappedLiveEvent {
@@ -188,6 +191,12 @@ const DURATION_KEYS = [
   'callduration', 'talktime', 'talkduration', 'conversationduration',
   'answeredsec', 'answerduration', 'totalduration',
 ];
+// Half of these keys ('filename', 'recordingfile', 'recordingpath',
+// 'monitorfilename') are named for a FILE, not a URL — TeleCMI calls the field
+// "filename" because on some accounts that is exactly what it is. The picked
+// value therefore goes through normalizeRecordingValue() below before it
+// becomes MappedCdr.recordingUrl; storing it raw is what made the recording
+// proxy answer "Recording URL is invalid" on every real call.
 const RECORDING_KEYS = [
   'recordingurl', 'recording', 'recordurl', 'recordingfile', 'filename',
   'fileurl', 'playurl', 'recordingpath', 'monitorfilename',
@@ -374,13 +383,171 @@ export function mapLivePayload(raw: any): MappedLiveEvent | null {
   };
 }
 
+// ---- recording value normalization ------------------------------------------
+
+/**
+ * What normalizeRecordingValue() did with the raw CDR recording field:
+ *   absolute   — it was already an http(s) URL; passed through untouched.
+ *   empty      — the CDR carried no recording field at all.
+ *   joined     — it was a filename/relative path, joined onto the base.
+ *   unresolved — there WAS a value but no URL could honestly be built from it
+ *                (base blank, base unusable, or a non-http scheme). url is ''.
+ */
+export type RecordingShape = 'absolute' | 'empty' | 'joined' | 'unresolved';
+
+export interface NormalizedRecording {
+  /** Fetchable URL, or '' when we refuse to guess one. */
+  url: string;
+  shape: RecordingShape;
+  /** The raw field value we started from, trimmed. */
+  raw: string;
+  /** The base actually applied ('' when none was needed or none was usable). */
+  base: string;
+  /** Plain-English WHY — for the recording diagnostic and the warn log. */
+  note: string;
+}
+
+const ABSOLUTE_HTTP_RE = /^https?:\/\//i;
+// RFC 3986 scheme grammar. Used only to spot a value that is some OTHER kind of
+// URI (s3:, file:, ftp:) so we do not paste it onto an http base.
+const ANY_SCHEME_RE = /^([a-z][a-z0-9+.-]*):/i;
+
+/**
+ * Turn whatever TeleCMI put in the recording field into something the recording
+ * proxy can actually fetch — without hardcoding a guess at their URL scheme.
+ *
+ * We have never seen a real CDR from this account, so the field can be any of
+ * three shapes and all three must be handled:
+ *   (a) a full https URL      → used as-is (this is what the seed rows and the
+ *                               current proxy already expect; must not regress)
+ *   (b) a bare filename or a
+ *       relative path         → joined onto `base` (ct_settings
+ *                               'recording_base_url', see ctRecordingBaseUrl())
+ *   (c) nothing               → stays empty
+ *
+ * We never fabricate a URL out of a call id: a made-up URL that 404s makes "no
+ * recording" indistinguishable from "recording broken", which is worse than an
+ * honest blank. For the same reason, a value we cannot resolve comes back as
+ * 'unresolved' with a note rather than as a plausible-looking wrong URL.
+ *
+ * SECURITY: this only BUILDS a string. Everything still goes through
+ * fetchAllowedRecording() (https + host allowlist + manual redirect
+ * re-validation) — a base pointing at a non-allowlisted host does not smuggle
+ * anything through, the proxy refuses it and says so.
+ *
+ * Pure: no DB, no network. The caller supplies the base.
+ */
+export function normalizeRecordingValue(rawValue: string, base: string): NormalizedRecording {
+  const raw = String(rawValue ?? '').trim();
+  const b = String(base ?? '').trim();
+
+  // (c) nothing to work with.
+  if (!raw) {
+    return { url: '', shape: 'empty', raw: '', base: '', note: 'CDR carried no recording field' };
+  }
+
+  // (a) already absolute. Returned EXACTLY as received, not re-serialized: the
+  // proxy is the one place that decides whether a URL is fetchable, and if this
+  // one is malformed its "Recording URL is invalid" is a better answer than us
+  // blanking the field and reporting "no recording". We still parse it so the
+  // note can say which of those two is about to happen.
+  if (ABSOLUTE_HTTP_RE.test(raw)) {
+    let parses = true;
+    try { new URL(raw); } catch { parses = false; }
+    return {
+      url: raw,
+      shape: 'absolute',
+      raw,
+      base: '',
+      note: parses
+        ? 'absolute http(s) URL — used unchanged'
+        : 'looks absolute but does not parse as a URL — the proxy will refuse it',
+    };
+  }
+
+  // Some other URI scheme (s3:, file:, ftp:, a Windows drive letter …). Pasting
+  // it onto an http base would produce nonsense, so refuse it visibly.
+  const scheme = ANY_SCHEME_RE.exec(raw);
+  if (scheme) {
+    return {
+      url: '', shape: 'unresolved', raw, base: b,
+      note: `value uses the "${scheme[1]}" scheme, not http(s) — refusing to join it onto the recording base`,
+    };
+  }
+
+  // (b) filename / relative path — needs a base.
+  if (!b) {
+    return {
+      url: '', shape: 'unresolved', raw, base: '',
+      note: 'value is a filename or relative path but recording_base_url is blank — refusing to guess a URL',
+    };
+  }
+  let baseUrl: URL;
+  try { baseUrl = new URL(b); } catch {
+    return {
+      url: '', shape: 'unresolved', raw, base: b,
+      note: 'recording_base_url is not a URL — fix it in ct_settings',
+    };
+  }
+
+  try {
+    let built: URL;
+    if (b.endsWith('=')) {
+      // Query-style endpoint (…/play?file=). The base is a literal prefix, so
+      // concatenate and percent-encode — a path join would put the filename in
+      // the wrong place entirely. This repo's own simulator already emits that
+      // shape (scripts/simulate-call.ts), so it is a real possibility, not a
+      // hypothetical.
+      built = new URL(b + encodeURIComponent(raw));
+    } else if (raw.startsWith('/')) {
+      // Root-relative ('/rec/x.mp3') or protocol-relative ('//host/x.mp3'):
+      // resolve against the ORIGIN. The base path is a directory prefix and
+      // must NOT be prepended to a path that already starts at the root.
+      built = new URL(raw, baseUrl.origin);
+      // Keep a token/query the admin put on the base — but never overwrite one
+      // the VALUE brought with it (a pre-signed link is more specific than our
+      // base and must win).
+      if (!built.search) built.search = baseUrl.search;
+    } else {
+      // Directory-style append, with exactly one slash. new URL('x.mp3',
+      // 'https://h/v2/play') would resolve to 'https://h/v2/x.mp3' and silently
+      // LOSE the 'play' segment, so force the trailing slash first.
+      const dir = baseUrl.pathname.endsWith('/') ? baseUrl.pathname : baseUrl.pathname + '/';
+      built = new URL(dir + raw, baseUrl.origin);
+      if (!built.search) built.search = baseUrl.search; // value's own query wins
+    }
+    return { url: built.toString(), shape: 'joined', raw, base: b, note: `joined onto ${b}` };
+  } catch {
+    return {
+      url: '', shape: 'unresolved', raw, base: b,
+      note: 'value could not be joined onto recording_base_url',
+    };
+  }
+}
+
+/** Options for mapCdrPayload(). */
+export interface MapCdrOptions {
+  /**
+   * Base URL for RELATIVE recording values — ct_settings 'recording_base_url',
+   * read with ctRecordingBaseUrl(db) (src/lib/ct/settings.ts).
+   *
+   * OMITTED   → the shipped default (RECORDING_BASE_URL_DEFAULT), so a caller
+   *             that has no DB handle still behaves sanely.
+   * ''        → joining is off; a relative value stays empty (see the
+   *             'unresolved' shape) instead of becoming an unfetchable URL.
+   *
+   * Absolute URLs in the payload ignore this entirely.
+   */
+  recordingBaseUrl?: string;
+}
+
 /**
  * Map a CDR ("call report") webhook payload. Returns null ONLY when the
  * payload carries neither a phone number nor a call id. Missing times are
  * reconstructed conservatively (started ← answered ← ended ± duration) so
  * the contract's non-null startedAt/endedAt always hold.
  */
-export function mapCdrPayload(raw: any): MappedCdr | null {
+export function mapCdrPayload(raw: any, opts: MapCdrOptions = {}): MappedCdr | null {
   const m = collect(raw);
   if (!m) {
     console.warn(`${WARN} CDR payload is not a JSON object — ignoring: ${snippet(raw)}`);
@@ -428,6 +595,21 @@ export function mapCdrPayload(raw: any): MappedCdr | null {
     );
   }
 
+  // The recording field may be a URL, a bare filename, or absent — see
+  // normalizeRecordingValue(). Only 'unresolved' is worth a log line: it is the
+  // one case where a recording EXISTS upstream and we are storing nothing for
+  // it, which would otherwise be indistinguishable from a call with no
+  // recording at all.
+  const recording = normalizeRecordingValue(
+    pickStr(m, RECORDING_KEYS),
+    opts.recordingBaseUrl ?? RECORDING_BASE_URL_DEFAULT,
+  );
+  if (recording.shape === 'unresolved') {
+    console.warn(
+      `${WARN} recording "${recording.raw.slice(0, 80)}" on call ${telecmiCallId || phone} — ${recording.note}`,
+    );
+  }
+
   return {
     telecmiCallId,
     phone,
@@ -439,6 +621,6 @@ export function mapCdrPayload(raw: any): MappedCdr | null {
     answeredAt,
     endedAt,
     durationSec,
-    recordingUrl: pickStr(m, RECORDING_KEYS),
+    recordingUrl: recording.url,
   };
 }

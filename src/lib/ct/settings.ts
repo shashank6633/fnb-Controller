@@ -52,6 +52,59 @@ export function setCtSetting(db: Database.Database, key: string, value: string):
   `).run(key, String(value));
 }
 
+/* ── Recording base URL (plain config, NOT a credential) ───────────────────
+ *
+ * TeleCMI's CDR field is called "filename" because on some accounts it IS a
+ * filename ("REC-2026-08-09-1234.mp3") or a relative path — not a URL.
+ * src/lib/ct/recording-fetch.ts feeds that value straight into new URL(), which
+ * throws on a bare filename, so the recording proxy answers "Recording URL is
+ * invalid" and a recording that exists looks broken. telecmi-mapper.ts joins
+ * such a value onto THIS base (see normalizeRecordingValue there).
+ *
+ * WHY CONFIGURABLE RATHER THAN HARDCODED: no real CDR from this account has
+ * ever been seen — ct_webhook_log has zero cdr rows and every recording_url in
+ * ct_calls is seed data — so the vendor's real play-URL shape is unverified and
+ * we refuse to bake a guess into code. The default below is simply the base the
+ * seeded URLs already imply (https://rest.telecmi.com/v2/play/seed-...), which
+ * makes the shipped default self-consistent and keeps it inside the DEFAULT
+ * host allowlist (telecmi.com) instead of quietly needing a new allowlist entry.
+ *
+ * NO ROW  → the default below.
+ * BLANK   → "do not guess": a relative value stays EMPTY rather than becoming
+ *           an unfetchable URL. That is a deliberate, reportable state.
+ * A VALUE → used as the join base. It does NOT bypass anything: whatever is
+ *           built still has to pass fetchAllowedRecording() (https + host
+ *           allowlist + per-redirect re-validation). Point the base at a host
+ *           that is not allowlisted and the proxy refuses it and says so —
+ *           add the host to 'recording_host_allowlist' deliberately.
+ *
+ * NOT A SECRET: it holds nothing an admin's browser may not see, so it is
+ * deliberately absent from SECRET_KEYS in /api/crm-calls/settings (see the
+ * release-gate comment in that route). It is also deliberately NOT in
+ * CT_SETTING_DEFAULTS: that map feeds the same route's ALLOWED_KEYS, and a key
+ * there with no matching validate() case makes any PUT carrying it fail with
+ * "Unknown setting". Like its sibling 'recording_host_allowlist', this key is
+ * DB-configured today; giving it a Settings field means adding both a
+ * validate() case and a UI input in files this change does not own.
+ */
+export const RECORDING_BASE_URL_DEFAULT = 'https://rest.telecmi.com/v2/play/';
+
+export function ctRecordingBaseUrl(db: Database.Database): string {
+  // Deliberately NOT ctSetting(): that collapses "no row" and "row set to
+  // empty" into the same '' , and those two must differ here — no row means
+  // use the default, an empty row means the admin turned joining off on purpose.
+  try {
+    const row = db
+      .prepare(`SELECT value FROM ct_settings WHERE key = 'recording_base_url'`)
+      .get() as { value?: string } | undefined;
+    if (!row) return RECORDING_BASE_URL_DEFAULT;
+    return String(row.value ?? '').trim();
+  } catch {
+    // Table missing (pre-migration DB) — behave like "no row".
+    return RECORDING_BASE_URL_DEFAULT;
+  }
+}
+
 /** Webhook path token: env wins; else a random token generated once and
  *  persisted so dev works with zero env setup. */
 export function webhookToken(db: Database.Database): string {

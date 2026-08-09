@@ -21,7 +21,7 @@ import type Database from 'better-sqlite3';
 import { getDb, generateId } from '@/lib/db';
 import { mapCdrPayload, mapLivePayload } from './telecmi-mapper';
 import { normalizePhone } from './phone';
-import { ctSetting, setCtSetting, slaDueAt } from './settings';
+import { ctSetting, setCtSetting, slaDueAt, ctRecordingBaseUrl } from './settings';
 import { emitCt, pushRecentCt, type CtEvent } from './bus';
 import { getAgentMap, getUserNamesByEmail, resolveAgentLabel } from './agents';
 
@@ -268,7 +268,13 @@ function createRecovery(
 export function ingestCdr(raw: any): { callId: string | null; created: boolean } {
   try {
     const db = getDb();
-    const m = mapCdrPayload(raw);
+    // Pass the configured recording base through. WITHOUT THIS ARGUMENT THE
+    // SETTING IS DEAD: mapCdrPayload falls back to its hardcoded default, so
+    // `recording_base_url` in ct_settings would have no effect and an admin
+    // correcting a wrong base would see nothing change. This is the only
+    // production ingest path for a CDR, so it is the only place the wiring can
+    // live. See ctRecordingBaseUrl() in ct/settings.ts for what blank means.
+    const m = mapCdrPayload(raw, { recordingBaseUrl: ctRecordingBaseUrl(db) });
     if (!m) return { callId: null, created: false };
 
     const now = new Date().toISOString();
