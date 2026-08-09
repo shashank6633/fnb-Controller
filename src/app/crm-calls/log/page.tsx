@@ -393,7 +393,7 @@ export default function CallLogPage() {
             only when active) so six labels sitting next to an H1 read as a
             filter strip rather than six competing buttons. Counts still ignore
             the active chip, so they stay stable as you switch filters. */}
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 lg:gap-6">
+        <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
           <div className="shrink-0">
             <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">CRM · Call to Table</p>
             <h1 className="text-2xl sm:text-3xl font-bold text-[#2D1B0E] mt-0.5 flex items-center gap-3">
@@ -401,7 +401,22 @@ export default function CallLogPage() {
             </h1>
           </div>
 
-          <div className="flex flex-wrap items-center gap-x-0.5 gap-y-1 lg:flex-1 lg:min-w-0">
+          {/* BESIDE THE TITLE ON EVERY SIZE, including a phone — a two-column
+              block on narrow screens, an inline row from xl once they all fit.
+              flex-1 with a min width is what keeps them on the title's line
+              rather than under it: the title is short and fixed, the chips take
+              the rest, and Refresh wraps to its own line beneath. Stacking them
+              instead (the obvious flex-col-then-row) put a band of pills between
+              the heading and the list on exactly the screen with least room. */}
+          <div className="grid grid-cols-[auto_auto] justify-start gap-x-3 gap-y-0.5 xl:flex xl:flex-1 xl:flex-wrap xl:items-center xl:gap-x-0.5 xl:gap-y-1">
+            {/* grid-cols-[auto_auto], NOT grid-cols-2. Equal halves would force
+                "Needs disposition 36" — the longest label by some way — to
+                overflow its column, because the chips are whitespace-nowrap.
+                Auto columns size to their own content, which also produces the
+                natural split: short labels stack in the left column, long ones
+                in the right. Content-width here is deliberate too: if the block
+                cannot fit beside the title on a very narrow phone, the parent's
+                flex-wrap drops it to its own line instead of squashing it. */}
           <SummaryChip label="All" count={summary.total} active={!direction && !status && !needsDisposition} onClick={pickAll} />
           <SummaryChip label="Inbound" count={summary.inbound} active={direction === 'inbound'} onClick={() => pickDirection('inbound')}
                        icon={<ArrowDownLeft className="w-3.5 h-3.5" />} />
