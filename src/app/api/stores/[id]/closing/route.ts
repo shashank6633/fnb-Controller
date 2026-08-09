@@ -2,6 +2,7 @@ import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { getStoreById, materialStoreId, userStoreAccess, isStoreMappedMaterial, storeCategories } from '@/lib/store-engine';
 import { upsertVarianceApproval } from '@/lib/variance-approval';
+import { checkClosingDate, CLOSING_DATE_RE } from '@/lib/closing-date';
 
 /**
  * /api/stores/[id]/closing — INDEPENDENT store closing stock (Phase C, spec F6).
@@ -30,8 +31,6 @@ import { upsertVarianceApproval } from '@/lib/variance-approval';
  *      system qty & variance as evidence.
  */
 export const dynamic = 'force-dynamic';
-
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Weighted-avg ₹/recipe-unit + system qty as-of end of `date` for one material. */
 function asOfStats(db: any, storeId: string, materialId: string, date: string) {
@@ -99,7 +98,15 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       return Response.json({ store: { id: store.id, name: store.name }, dates });
     }
 
-    if (!DATE_RE.test(date)) {
+    // SHAPE ONLY ON THE READ PATH, DELIBERATELY. CLOSING_DATE_RE is imported
+    // from the shared guard (src/lib/closing-date) purely so this route stops
+    // carrying its own copy of the literal — a copied regex does not prevent
+    // drift, it IS the drift surface. What it is NOT is checkClosingDate():
+    // that belongs to POST alone. This handler only FILTERS by `date`, and its
+    // future/no-such-day refusals would stop an admin from even LOOKING at a
+    // date. A day with nothing counted must keep answering with an empty
+    // result, not a 400. Message and status unchanged.
+    if (!CLOSING_DATE_RE.test(date)) {
       return Response.json({ error: 'date must be YYYY-MM-DD' }, { status: 400 });
     }
 
@@ -163,7 +170,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     }
 
     const b = await request.json();
-    const date = String(b.date || '').trim();
+    // The RAW body date. Trimmed HERE, at the call site, because this field has
+    // always tolerated a padded paste and the shared guard deliberately does
+    // not (see its "no whitespace tolerance" note). Nothing below binds this
+    // value — `date`, below, is what was actually checked.
+    const rawDate = String(b.date || '').trim();
     const note = String(b.note || '').trim();
     // A non-zero variance NEVER moves stock here. It creates a PENDING variance
     // approval; an admin reviews it and only then does stock reconcile to the
@@ -171,13 +182,42 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     // that path is retired in favour of the review queue.)
     const outletId = await getCurrentOutletId();
 
-    if (!DATE_RE.test(date)) {
-      return Response.json({ error: 'date must be YYYY-MM-DD' }, { status: 400 });
-    }
-    const today = new Date().toISOString().slice(0, 10);
-    if (date > today) {
-      return Response.json({ error: 'Cannot record a closing count for a future date' }, { status: 400 });
-    }
+    /* ══════════════════════════════════════════════════════════════════════
+     * THE DATE GUARD — ONCE PER SUBMIT, BEFORE THE TRANSACTION OPENS (2026-08)
+     * ══════════════════════════════════════════════════════════════════════
+     * Shape, real calendar day, then not-in-the-future — in that order, from
+     * the ONE shared validator (src/lib/closing-date.ts) that every writer
+     * into closing_stock / store_closing_counts now runs its date through.
+     * That module carries the full WHY; in short: one fat-fingered 2027-08-09
+     * becomes the newest count for that material and supersedes every real
+     * count of it thereafter (e91c64c), until somebody rejects the phantom
+     * row — and 2026-02-31 used to pass the old shape-only check and SAVE a
+     * count dated to a day that does not exist.
+     *
+     * IST, NOT UTC — A BUG FIX, NOT A LOOSENING. The line this replaces was
+     * `new Date().toISOString().slice(0, 10)`, i.e. UTC. For the whole
+     * 00:00–05:30 IST window that returns YESTERDAY, so a count dated TODAY
+     * was refused as "in the future" — and a bar's closing count is taken
+     * squarely inside that window, which made this a live nightly-close
+     * failure. todayIST() (reached through the shared guard) makes today mean
+     * today. The only refusal that disappears is one that should never have
+     * fired: nothing legitimately blocked before is accepted now.
+     *
+     * BACKDATING IS UNTOUCHED — no lower bound. Late sheets and paper counts
+     * typed up the next morning are ordinary business here. Only future and
+     * invalid dates are refused, and the future test fails OPEN if todayIST()
+     * ever hands back a non-date, so a broken helper cannot reject every count
+     * and take the close down store-wide.
+     *
+     * Response shape is this route's own, unchanged: { error } at 400. Only
+     * the wording comes from the shared module, so every door into a closing
+     * count complains in the same words.
+     * ────────────────────────────────────────────────────────────────────── */
+    const checked = checkClosingDate(rawDate);
+    if (!checked.ok) return Response.json({ error: checked.error }, { status: 400 });
+    // Bind THIS below, never rawDate/b.date — it is the value that was checked.
+    const date = checked.date;
+
     if (!Array.isArray(b.items) || b.items.length === 0) {
       return Response.json({ error: 'items array is required' }, { status: 400 });
     }

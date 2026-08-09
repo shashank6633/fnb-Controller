@@ -35,6 +35,7 @@ import {
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
 import { fmtQtyNum, packFactor, toPurchaseQty } from '@/lib/pack-units';
+import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
@@ -1066,10 +1067,12 @@ export default function ClosingStockByLocationPage() {
         if (!res.ok) {
           errors.push(String(json?.error || `Save failed (HTTP ${res.status})`));
           // AND STOP. Semi-finished counts post to a DIFFERENT route with the
-          // SAME closingDate, and that route has no future-date guard — so
-          // carrying on here would refuse the raw half and accept the semi
-          // half, leaving one date half-recorded. Whatever refused the raw
-          // counts refuses the whole submit.
+          // SAME closingDate. Both now run the one shared date guard
+          // (lib/closing-date), so in practice the semi half would refuse for
+          // the same reason — but stopping here is what GUARANTEES it. Two
+          // routes agreeing today is not the same as two routes that cannot
+          // disagree tomorrow, and the failure mode is a half-recorded day.
+          // Whatever refused the raw counts refuses the whole submit.
           setClosingResult({ success: 0, errors, semi: 0, pending: 0, applied: 0 });
           return;
         }
@@ -1307,8 +1310,9 @@ export default function ClosingStockByLocationPage() {
         });
         const json = await res.json();
         // Same as the modal path: a rejection is { error }, not { errors }, and
-        // the semi route shares this date but not its date guard. Report the
-        // reason and abandon the whole upload rather than half-writing the day.
+        // the semi route shares this date. Report the reason and abandon the
+        // whole upload rather than half-writing the day — see the note there
+        // for why this does not lean on the two routes agreeing.
         if (!res.ok) {
           errors.push(String(json?.error || `Upload failed (HTTP ${res.status})`));
           setClosingResult({ success: 0, errors, semi: 0, pending: 0, applied: 0 });
@@ -1837,7 +1841,16 @@ export default function ClosingStockByLocationPage() {
         </button>
         <label className="text-xs text-[#6B5744] flex flex-col gap-1">
           Date
-          <input type="date" value={date} onChange={e => setDate(e.target.value)}
+          {/* This is a COUNT date, not just a view filter — saveAll() posts it as
+              the closing_stock date (see the POST at ~:1477). Capped at today IST
+              because a future date (a 2027 typo) becomes the NEWEST count for those
+              materials and then silently refuses every real count until someone
+              rejects it — only the newest-dated count per item is approvable.
+              max= is a HINT ONLY: it is bypassed by typing and ignored by some
+              mobile browsers, so /api/closing-stock stays the real guard. Called
+              per render, never hoisted to module scope, so a tab left open
+              overnight does not keep yesterday as the ceiling. */}
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} max={todayIST()}
                  className="px-2 py-1.5 border border-[#D4B896] rounded text-sm" />
         </label>
       </div>
@@ -2233,10 +2246,17 @@ export default function ClosingStockByLocationPage() {
                 <div className="flex flex-wrap gap-4 items-end">
                   <div>
                     <label className="block text-xs font-medium text-[#6B5744] mb-1">Closing Date *</label>
+                    {/* Capped at today IST for the same reason as the grid-header
+                        date above: a future count freezes the baseline and blocks
+                        every later real count for those items. Backdating stays
+                        open — only the future is refused. max= is a hint; the
+                        submit still goes through the server guard (this one date
+                        feeds BOTH /api/closing-stock and …/closing-stock/semi). */}
                     <input
                       type="date"
                       value={closingDate}
                       onChange={e => setClosingDate(e.target.value)}
+                      max={todayIST()}
                       className="px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] [color-scheme:light]"
                     />
                   </div>

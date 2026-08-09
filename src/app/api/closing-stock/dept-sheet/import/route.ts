@@ -6,6 +6,7 @@ import { upsertVarianceApproval } from '@/lib/variance-approval';
 import { rateMap, valueCount, valueSemiCount } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
+import { CLOSING_DATE_RE, checkClosingDate } from '@/lib/closing-date';
 
 /**
  * ALL-DEPARTMENTS CLOSING COUNT — ONE FILE, ONE COLUMN PER DEPARTMENT
@@ -313,7 +314,13 @@ export async function GET(request: Request) {
     if ('error' in scope) return scope.error;
 
     const url = new URL(request.url);
-    const date = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get('date') || '')
+    // SHAPE ONLY, and deliberately not checkClosingDate(). This is the BLANK
+    // template: the date only names the file and scopes which departments count
+    // as active, nothing is written, and an unusable value already falls back to
+    // today rather than being refused. The POST below is where a template dated
+    // in the future gets stopped. CLOSING_DATE_RE is the shared literal so this
+    // copy cannot drift from the one the writers enforce.
+    const date = CLOSING_DATE_RE.test(url.searchParams.get('date') || '')
       ? String(url.searchParams.get('date'))
       : todayIST();
     // WHICH ITEMS GO ON THE SHEET — an admin setting, not a hardcoded rule.
@@ -469,11 +476,27 @@ export async function POST(request: Request) {
     if ('error' in scope) return scope.error;
     const me = scope.me;
 
-    const { date, csv, mode: rawMode } = await readBody(request);
+    const { date: rawDate, csv, mode: rawMode } = await readBody(request);
     const mode = rawMode === 'apply' ? 'apply' : 'preview';
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      return Response.json({ error: 'A valid date (YYYY-MM-DD) is required.' }, { status: 400 });
-    }
+    // ONE date check per UPLOAD — before the CSV is even parsed, and long before
+    // the transaction opens. The file carries one date for up to ~1,025 rows x 8
+    // department columns, so a per-row check would answer 8,000 copies of one
+    // complaint; and PREVIEW is refused on the same terms as APPLY, so a bad
+    // date is caught at the safety step instead of after the owner has approved
+    // the mapping. Backdating is untouched — bulk sheets are typed up a day late
+    // as a matter of routine.
+    //
+    // SHARED GUARD, not the local shape regex that used to live here: that one
+    // passed 2027-08-09 (which then becomes the newest count for every material
+    // in the file and silently refuses every real count after it — e91c64c) and
+    // 2026-02-31 (a day that does not exist, so the counts save and match no GET
+    // date filter afterwards). NO .trim() here, matching what this route has
+    // always accepted; the shared guard has no whitespace tolerance either.
+    const checked = checkClosingDate(rawDate);
+    if (!checked.ok) return Response.json({ error: checked.error }, { status: 400 });
+    // Bind THIS everywhere below — the department lookup, both DELETEs, both
+    // INSERTs and the approval upsert. Never the raw body value.
+    const date = checked.date;
     if (!csv.trim()) {
       return Response.json({ error: 'No CSV content received.' }, { status: 400 });
     }

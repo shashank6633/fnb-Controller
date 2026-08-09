@@ -6,6 +6,7 @@ import { upsertVarianceApproval } from '@/lib/variance-approval';
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
+import { checkClosingDate } from '@/lib/closing-date';
 
 /**
  * DEPARTMENT CLOSING SHEET — one sheet spanning every ACTIVE department, for
@@ -412,11 +413,26 @@ export async function POST(request: Request) {
     const outletId = await getCurrentOutletId();
 
     const body = await request.json();
-    const date = String(body?.date || '').trim();
     const entries: PostEntry[] = Array.isArray(body?.entries) ? body.entries : [];
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      return Response.json({ error: 'A valid date (YYYY-MM-DD) is required.' }, { status: 400 });
-    }
+    // ONE date check for the whole submit, BEFORE the transaction opens. This
+    // sheet posts every department at once, so a per-entry check would answer a
+    // hundred copies of the same complaint; refusing the submit whole also means
+    // not one upsert-delete fires against a bad date.
+    //
+    // SHARED GUARD, not a local regex. The shape test that used to live here
+    // passed 2027-08-09 and 2026-02-31 straight through: a future-dated count
+    // becomes the newest count for those materials and then silently refuses
+    // every real count after it (only the newest-dated count per item is
+    // approvable — e91c64c), and a count dated to a day that does not exist
+    // matches no GET date filter, so it saves and is invisible everywhere.
+    // Backdating is untouched — counting last Tuesday is ordinary business.
+    // The .trim() is kept: it predates the shared guard, which by design has no
+    // whitespace tolerance of its own.
+    const checked = checkClosingDate(String(body?.date || '').trim());
+    if (!checked.ok) return Response.json({ error: checked.error }, { status: 400 });
+    // Bind THIS below, never body.date — the raw value can be an array that
+    // survives String() coercion and then throws at bind time mid-transaction.
+    const date = checked.date;
     if (entries.length === 0) {
       return Response.json({ error: 'entries array is required' }, { status: 400 });
     }

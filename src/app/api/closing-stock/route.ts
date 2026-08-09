@@ -7,7 +7,7 @@ import { materialStoreId, getStoreById } from '@/lib/store-engine';
 import { upsertVarianceApproval, approveVariance } from '@/lib/variance-approval';
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
-import { todayIST } from '@/lib/format-date';
+import { checkClosingDate } from '@/lib/closing-date';
 
 /**
  * VALUATION ON THE CLOSING SHEET (2026-07-30)
@@ -29,13 +29,6 @@ import { todayIST } from '@/lib/format-date';
  */
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
-
-/**
- * The one date shape a closing count may carry. Deliberately the SAME literal
- * the liquor sibling enforces (src/app/api/stores/[id]/closing/route.ts), so
- * the two closing writers cannot drift into accepting different strings.
- */
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Resolved valuation for one closing row: stored when the row carries one. */
 interface RowValuation {
@@ -438,82 +431,31 @@ export async function POST(request: Request) {
     /* ══════════════════════════════════════════════════════════════════════
      * THE DATE GUARD — ONCE FOR THE WHOLE SUBMIT, NEVER PER ITEM (2026-08)
      * ══════════════════════════════════════════════════════════════════════
-     * Until now this route checked only that `date` was TRUTHY: any string at
-     * all went straight into closing_stock.date. The liquor sibling
-     * (src/app/api/stores/[id]/closing/route.ts) has always validated shape +
-     * future; central never did. That gap just became load-bearing.
+     * Shape, real-calendar day and not-in-the-future, in that order, from the
+     * one shared validator: src/lib/closing-date.ts — the single source of
+     * truth EVERY writer into closing_stock must run its date through, so the
+     * regex cannot drift between the several doors into the same table. That
+     * module carries the full WHY; in short, one fat-fingered 2027-08-09
+     * supersedes every later real count of that item until somebody rejects it
+     * (e91c64c), and a malformed date saves a row that matches no GET date
+     * filter and is invisible on every closing surface thereafter.
      *
-     * WHY IT IS LOAD-BEARING NOW. Commit e91c64c ("Variance queue: only the
-     * newest count per item can be approved") made a count SUPERSEDED by any
-     * later-dated row for the same (source, material, store, department) that
-     * is pending or approved — see supersedeWhere() in
-     * src/lib/variance-approval.ts. So one fat-fingered 2027-08-09 becomes the
-     * newest count for that material FOREVER: every genuine count taken
-     * afterwards is reported superseded and approveVariance() refuses it, for
-     * a whole year, until somebody notices and rejects the phantom row. The
-     * sheet for a real day looks normal — nothing on it names the future date
-     * doing the blocking — which is exactly how this would be found late.
-     * A malformed date is the quieter twin: it matches no GET date filter, so
-     * the count saves and is then invisible on every closing surface.
+     * Until dfbf0f0 this route checked only that `date` was TRUTHY — any
+     * string at all went straight into closing_stock.date.
      *
      * BACKDATING MUST KEEP WORKING and is untouched. Counting last Tuesday is
      * ordinary business here — late sheets, paper counts typed up the next
      * morning, the department-ledger cutover — and several flows depend on it.
      * ONLY future and malformed are refused.
      *
-     * IST, NOT UTC. todayIST() (src/lib/format-date) is the shared helper.
-     * `new Date().toISOString().slice(0,10)` returns YESTERDAY for the whole
-     * 00:00-05:30 IST window, so a UTC comparison would reject a perfectly
-     * ordinary early-morning count of the current day — the same off-by-one
-     * already fixed once on the receiving-variance screen.
-     *
      * ONE rejection for the whole request, before the loop. A ~950-line sheet
      * must not come back with 950 copies of the same complaint, and refusing
      * the submit whole means no half-written day: the transaction below never
      * opens, so not one upsert-delete fires against a bad date.
      * ────────────────────────────────────────────────────────────────────── */
-    const dateStr = String(date);
-    if (!DATE_RE.test(dateStr)) {
-      return Response.json(
-        { error: `Invalid closing date "${dateStr}" — a count must be dated YYYY-MM-DD.` },
-        { status: 400 },
-      );
-    }
-    const today = todayIST();
-    // Fail OPEN if the helper ever hands back a non-date: comparing against
-    // garbage would reject EVERY count and take the nightly close down outlet-
-    // wide. The shape check above still stands, so the worst case here is the
-    // behaviour this route already shipped with, not an outage. (Same posture
-    // as the supersede test, which also fails open rather than silently
-    // matching nothing.)
-    // A real calendar date, not just the right SHAPE. DATE_RE passes 2026-13-01
-    // and 2026-02-31: the first is lexically greater than today so it used to be
-    // refused as "in the future", which is not true — it is not a date at all —
-    // and the second is lexically smaller, so it SAVED, dating a count to a day
-    // that does not exist. Round-tripping through Date catches both, and the
-    // user gets the reason that actually applies.
-    const [yy, mm, dd] = dateStr.split('-').map(Number);
-    const asDate = new Date(Date.UTC(yy, mm - 1, dd));
-    if (asDate.getUTCFullYear() !== yy || asDate.getUTCMonth() !== mm - 1 || asDate.getUTCDate() !== dd) {
-      return Response.json(
-        { error: `Invalid closing date "${dateStr}" — there is no such day on the calendar.` },
-        { status: 400 },
-      );
-    }
-    if (DATE_RE.test(today) && dateStr > today) {
-      return Response.json(
-        {
-          error: `Cannot record a closing count dated ${dateStr} — that is in the future (today is ${today} IST). `
-            // "that differs from system stock" is load-bearing: a count matching
-            // system stock has zero variance, and upsertVarianceApproval deletes
-            // the pending row and returns null for those, so it supersedes
-            // nothing. Claiming otherwise overstates the consequence.
-            + 'Counts may be backdated, never forward-dated: a future-dated count supersedes every real count '
-            + 'of that item that differs from system stock, until it is rejected.',
-        },
-        { status: 400 },
-      );
-    }
+    const checked = checkClosingDate(date);
+    if (!checked.ok) return Response.json({ error: checked.error }, { status: 400 });
+    const dateStr = checked.date;
 
     // `pending` = variances left for an admin to clear later; `applied` = variances
     // this submit already posted to stock (adjust_stock, admin, central rows only).
@@ -582,11 +524,11 @@ export async function POST(request: Request) {
         // pointing at it was orphaned. Every per-line rejection above (missing
         // material, store-mapped item, bad quantity) must stay upstream of this
         // line. Same ordering as the sibling writer, ../dept-sheet.
-        // dateStr, not date: `date` is the RAW body value and only dateStr was
-        // validated. `["2026-08-09"]` survives both guards (String() flattens a
-        // one-element array) and then throws at bind time INSIDE the
-        // transaction — a 500 and a full rollback instead of a clean 400. Bind
-        // what was checked.
+        // dateStr, not date: `date` is the RAW body value and only dateStr —
+        // what checkClosingDate() handed back — was validated. `["2026-08-09"]`
+        // passes every check (String() flattens a one-element array) and then
+        // throws at bind time INSIDE the transaction — a 500 and a full
+        // rollback instead of a clean 400. Bind what was checked.
         delOne.run(dateStr, item.material_id, deptId);
 
         const variance = Math.round((physicalStock - systemStock) * 1000) / 1000;

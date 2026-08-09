@@ -653,7 +653,17 @@ export default function ClosingSheetPage() {
         </div>
         <div className="flex items-center gap-1.5">
           <CalendarDays className="w-4 h-4 text-[#8B7355]" />
-          <input type="date" value={date} onChange={e => setDate(e.target.value || todayIST())}
+          {/* The COUNT date for this whole sheet — saveAll() and the CSV upload
+              both post it (…/dept-sheet and …/dept-sheet/import). Capped at today
+              IST: a future date becomes the newest count for those materials and
+              then silently refuses every real count after it, because only the
+              newest-dated count per item is approvable. Backdating is untouched.
+              max= is a HINT ONLY — typing beats it and some mobile browsers drop
+              it — so the routes keep their own future-date guard. Called per
+              render so an overnight tab does not stay pinned to yesterday.
+              (The From/To pair below is a history RANGE filter, deliberately
+              left unbounded — looking at a future window harms nothing.) */}
+          <input type="date" value={date} onChange={e => setDate(e.target.value || todayIST())} max={todayIST()}
                  className="px-2.5 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-white text-[#2D1B0E]" />
         </div>
         {/* This exports what has been COUNTED. The blank sheet to fill in lives

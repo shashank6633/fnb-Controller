@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { valueSemiCount } from '@/lib/closing-valuation';
+import { checkClosingDate } from '@/lib/closing-date';
 
 /**
  * CLOSING COUNTS FOR SEMI-FINISHED ITEMS (sub_recipes)
@@ -28,6 +29,16 @@ import { valueSemiCount } from '@/lib/closing-valuation';
  *
  * Conventions (date, department_id, outlet_id, recorded_by, one row per
  * item-per-department-per-day) deliberately mirror ../route.ts line for line.
+ *
+ * THE COUNT DATE — validated by the SHARED guard (src/lib/closing-date.ts),
+ * which is the same call ../route.ts makes, and it has to be the same CALL
+ * rather than a copied rule: /closing-stock submits ONE sheet as TWO POSTs
+ * under a single date — raw materials to ../route.ts, sub-recipes here. If the
+ * two guards ever disagree, one submit is refused for raw materials and
+ * accepted for semi-finished ones, half-recording the day. Until 2026-08 this
+ * route had NO date validation whatsoever — not even the shape check the liquor
+ * and dept-sheet writers carried — so a typo'd or future date was written here
+ * verbatim, and a non-string threw at bind time inside the transaction.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -238,12 +249,25 @@ export async function POST(request: Request) {
     const outletId = await authMod.getCurrentOutletId();
     const db = getDb();
     const body = await request.json();
-    const { date, items } = body;
+    const { date: rawDate, items } = body;
     const topDeptId = normDept(body.department_id);
 
-    if (!date || !items || !Array.isArray(items) || items.length === 0) {
+    if (!rawDate || !items || !Array.isArray(items) || items.length === 0) {
       return Response.json({ error: 'date and items array are required' }, { status: 400 });
     }
+
+    // ONE date check for the whole submit, BEFORE the transaction opens — a
+    // sheet carrying all 68 sub-recipes must not come back with 68 copies of
+    // the same complaint, and refusing it whole means no half-written day.
+    // Deliberately AFTER the truthiness check above so a missing date keeps its
+    // own message instead of being reported as an invalid one.
+    const checked = checkClosingDate(rawDate);
+    if (!checked.ok) return Response.json({ error: checked.error }, { status: 400 });
+    // Bind THIS at every SQL site below, never body.date: String() coercion
+    // means ["2026-08-09"] passes every check, but binding the ARRAY throws at
+    // bind time inside the write transaction — a 500 and a full rollback where
+    // a clean save was due.
+    const date = checked.date;
 
     const results = { success: 0, errors: [] as string[], total_value: 0 };
 
