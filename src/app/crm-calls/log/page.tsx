@@ -11,7 +11,8 @@
  * Desktop table + mobile cards, paged 50.
  */
 
-import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
@@ -733,29 +734,65 @@ function CallerCell({ call, onQuickCreate }: { call: CallRow; onQuickCreate: () 
 }
 
 /** Disposition chip when set; [Set] button opening the 7-chip inline picker
- *  when not. Fixed-position popover so the table's scroll container never
- *  clips it (same pattern as menu-items' row menu). */
+ *  when not.
+ *
+ *  PORTALED TO <body>, AND THAT IS LOAD-BEARING — DO NOT "SIMPLIFY" IT AWAY.
+ *  This popover is position:fixed, but fixed is only viewport-relative while no
+ *  ancestor establishes a containing block. Any ancestor carrying a transform,
+ *  filter, backdrop-filter, will-change or contain re-roots it to that ancestor,
+ *  and the coordinates below — which come from getBoundingClientRect(), i.e. the
+ *  VIEWPORT — then land somewhere else entirely. That is exactly what happened
+ *  here: clicking Set on the first row opened the picker down in the
+ *  bottom-right corner, nowhere near the button. This file's own comment used to
+ *  claim it followed "the same pattern as menu-items' row menu"; menu-items
+ *  portals (see the note at its RowMenu), and this one did not, which is the one
+ *  part of that pattern that makes it work.
+ *
+ *  Height is MEASURED, never estimated. The old code guessed 160px for a
+ *  header plus seven chips that wrap to three or four rows depending on the
+ *  viewport, so the flip-upward test and the bottom clamp were both computed
+ *  against a height the popover never had. */
+const useIsomorphicLayoutEffect = typeof window !== 'undefined' ? useLayoutEffect : useEffect;
+
 function DispositionCell({ call, saving, onPick }: {
   call: CallRow; saving: boolean; onPick: (d: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
+
+  const WIDTH = 260;
+
+  /** Place the popover under the button, flipping above and clamping only when
+   *  the real measured height says it must. `h` is the estimate on the first
+   *  paint and the measured height on the correction pass below. */
+  const place = (h: number) => {
+    const r = btnRef.current?.getBoundingClientRect();
+    if (!r) return;
+    const left = Math.max(8, Math.min(r.left, window.innerWidth - WIDTH - 8));
+    let top = r.bottom + 6 + h > window.innerHeight ? r.top - h - 6 : r.bottom + 6;
+    top = Math.max(8, Math.min(top, Math.max(8, window.innerHeight - h - 8)));
+    setPos({ top, left });
+  };
 
   const openMenu = () => {
-    const r = btnRef.current?.getBoundingClientRect();
-    if (r) {
-      const width = 260;
-      const estH = 160; // popover header + wrapped disposition chips
-      const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8));
-      // Flip upward when opening below the button would run off the bottom, then
-      // clamp into the viewport so bottom-row pickers stay fully on-screen.
-      let top = r.bottom + 6 + estH > window.innerHeight ? r.top - estH - 6 : r.bottom + 6;
-      top = Math.max(8, Math.min(top, window.innerHeight - estH - 8));
-      setPos({ top, left });
-    }
+    place(160);   // first paint: a guess is fine, the effect below corrects it
     setOpen(true);
   };
+
+  // Re-place once the popover has actually rendered and we can measure it. Runs
+  // before paint, so the corrected position is what the user sees — no visible
+  // jump. Without this the clamp uses a height the element does not have.
+  // useIsomorphicLayoutEffect, not useLayoutEffect: this is a client component
+  // but Next still pre-renders it on the server, where useLayoutEffect logs a
+  // "does nothing on the server" warning on every render.
+  useIsomorphicLayoutEffect(() => {
+    if (!open) return;
+    const h = popRef.current?.offsetHeight;
+    if (h) place(h);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -783,10 +820,10 @@ function DispositionCell({ call, saving, onPick }: {
         {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
         {meta ? meta.label : 'Set'}
       </button>
-      {open && pos && (
+      {open && pos && typeof document !== 'undefined' && createPortal(
         <>
           <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div style={{ top: pos.top, left: pos.left, width: 260 }}
+          <div ref={popRef} style={{ top: pos.top, left: pos.left, width: WIDTH }}
                className="fixed z-50 bg-white border border-[#E8D5C4] rounded-xl shadow-xl p-3">
             <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide mb-2">Disposition</p>
             <div className="flex flex-wrap gap-1.5">
@@ -805,7 +842,8 @@ function DispositionCell({ call, saving, onPick }: {
               ))}
             </div>
           </div>
-        </>
+        </>,
+        document.body,
       )}
     </>
   );
