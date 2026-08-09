@@ -1,6 +1,9 @@
 import { getDb } from '@/lib/db';
 import { requireRole, getCurrentOutletId } from '@/lib/auth';
-import { listVarianceApprovals, pendingVarianceCount, type VarianceOutletScope } from '@/lib/variance-approval';
+import {
+  listVarianceApprovals, pendingVarianceCount, stackedPendingCounts,
+  type VarianceOutletScope,
+} from '@/lib/variance-approval';
 
 /**
  * Variance approvals queue (admin only). Closing counts with a non-zero variance
@@ -16,7 +19,15 @@ import { listVarianceApprovals, pendingVarianceCount, type VarianceOutletScope }
  *      total, returned, truncated, limit, // is `approvals` the whole story?
  *      pending_count_all_outlets,
  *      pending_count_other_outlets,       // > 0 ⇒ rows exist that this read cannot see
+ *      stacked,                           // items with >1 pending count — READ THIS
  *    }
+ *
+ * `stacked` IS THE ONE THAT PREVENTS A SILENT LOSS. Each row's frozen baseline
+ * is only safe to apply once, so an item holding two pending counts double-
+ * corrects if the admin simply works down the queue — and it overstates, i.e.
+ * it hides a shortage. Every such row also carries `approve_blocked` plus
+ * `superseded_by_date` / `superseded_by_status`, so the refusal is visible per
+ * row; `stacked` is the queue-level headline of the same fact, for the banner.
  *
  * `pending_count` DOES NOT MOVE WITH `?outlet`. It is always the current
  * outlet's pending count, exactly as it was before the scope parameter existed,
@@ -70,6 +81,11 @@ export async function GET(request: Request) {
   // superset of "here" (which also includes the outlet-less '' rows).
   const pendingElsewhere = Math.max(0, pendingEverywhere - pendingHere);
 
+  // Same status and outlet scope as the list above, so the banner can never
+  // describe rows the queue below it is not showing. It resolves to an empty
+  // array on the approved/rejected tabs — nothing is pending there to stack.
+  const stacked = stackedPendingCounts(db, { status, outletId, outletScope: scope });
+
   return Response.json({
     approvals: list.rows,
     pending_count: pendingHere,
@@ -82,5 +98,9 @@ export async function GET(request: Request) {
     limit: list.limit,
     pending_count_all_outlets: pendingEverywhere,
     pending_count_other_outlets: pendingElsewhere,
+    // ── Additive (2026-08). [{ material_id, material_name, pending_count,
+    // latest_date }], newest date first. Only the newest count per item is
+    // approvable; the rest are refused and must be rejected deliberately.
+    stacked,
   });
 }

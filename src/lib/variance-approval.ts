@@ -28,6 +28,14 @@
  * A department count must never reach central and a central count must never
  * reach a department. Crossing them is the "department clobber" that
  * varianceApprovalBlock() has guarded since the queue shipped.
+ *
+ * ONE COUNT PER ITEM MAY BE APPROVED — THE LATEST ONE. The delta above is frozen
+ * at count time, which is right for a single count and wrong for two: a second
+ * count on a second DATE freezes the SAME baseline again, so approving both
+ * applies the baseline correction TWICE. The pending-uniqueness index is keyed
+ * per date and cannot see that. supersedeWhere() below is the rule that can, and
+ * approveVariance() refuses anything it flags. See that comment for the measured
+ * case; it is the reason this file grew a second guard.
  */
 import type Database from 'better-sqlite3';
 import { generateId } from '@/lib/db';
@@ -156,6 +164,256 @@ export function pendingVarianceCount(
   return row?.n || 0;
 }
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * SUPERSEDED COUNTS — why an OLDER count may not be approved after a NEWER one.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/** The newest count competing with a given row. */
+export interface SupersedingCount {
+  /** Count date of that newer row (YYYY-MM-DD). */
+  date: string;
+  /** Where it stands. 'rejected' is deliberately not a member — see below. */
+  status: 'pending' | 'approved';
+}
+
+/** The key fields the supersede test reads. A whole variance_approvals row fits. */
+export interface VarianceKeyRow {
+  id?: string | null;
+  source: string;
+  material_id?: string | null;
+  store_id?: string | null;
+  department_id?: string | null;
+  outlet_id?: string | null;
+  date?: string | null;
+  created_at?: string | null;
+}
+
+/**
+ * THE SUPERSEDE PREDICATE. Written ONCE on purpose — read this before touching
+ * either of its two callers.
+ *
+ * A pending row FREEZES system_stock at count time and approveVariance() posts
+ * (physical − that frozen system) on top of LIVE stock. Correct for ONE count.
+ * Wrong the instant two counts on two DATES exist for the same item, because
+ * both froze the SAME baseline and the baseline correction is then applied
+ * TWICE. Measured on the owner's data — Testing Curd 2 (g, pack 1000), live
+ * stock −997 g:
+ *     07-08  system −997  counted    997  → delta  +1,994
+ *     08-08  system −997  counted 11,000  → delta +11,997
+ * Approving 08-08 lands −997 + 11,997 = 11,000 g = 11 kg, which is the shelf.
+ * Approving 07-08 on top of that lands 12,994 g — overstated by exactly the
+ * −997 baseline, a second time. The reverse order is equally wrong. And it
+ * overstates, i.e. it inflates in the direction that HIDES a shortage.
+ *
+ * uq_variance_appr_pending DOES NOT STOP THIS. It is keyed per DATE, so two
+ * dates are two independent pending rows and neither supersedes the other.
+ *
+ * The rule: only the LATEST-dated count per (source, material, store,
+ * department, outlet) may be approved. Older ones are REFUSED and left sitting
+ * in the queue — nothing is auto-decided, because rejecting is a judgement
+ * about a real count a real person made.
+ *
+ * 'pending' AND 'approved' both supersede. 'rejected' does NOT: a rejection
+ * moves no stock, so the older count's frozen baseline is still the live one
+ * and approving it is still exactly right.
+ *
+ * THE SAME-DATE TIE-BREAK IS LOAD-BEARING, not padding. The pending-unique index
+ * covers PENDING rows only, so an APPROVED row and a newer PENDING row can
+ * legitimately share a date — which is precisely what "save with Adjust system
+ * stock, then re-count the same day" produces. created_at decides those, and it
+ * must decide them the right way round or that ordinary flow breaks.
+ *
+ * `self` is the alias of the row being judged, so this ONE text serves both the
+ * correlated subquery in listVarianceApprovals (self = the outer `va`) and the
+ * point lookup in findSupersedingCount (self = a one-row CTE of bound params).
+ * If those two ever drift, the queue offers an Approve button the API refuses —
+ * the most likely way this whole fix fails in practice. Do not inline either.
+ *
+ * COALESCE on the three key columns even though all are NOT NULL DEFAULT '':
+ * a stray NULL would make the key never match itself (NULL = NULL is NULL), and
+ * a supersede test that silently matches nothing fails OPEN.
+ */
+function supersedeWhere(self: string): string {
+  return `
+    nv.id <> ${self}.id
+    AND nv.source      = ${self}.source
+    AND nv.material_id = ${self}.material_id
+    AND COALESCE(nv.store_id, '')      = COALESCE(${self}.store_id, '')
+    AND COALESCE(nv.department_id, '') = COALESCE(${self}.department_id, '')
+    -- OUTLET IS PART OF THE KEY ONLY WHERE THE STOCK RAIL IS ACTUALLY
+    -- OUTLET-SEPARATED, WHICH FOR CENTRAL IT IS NOT.
+    -- raw_materials.current_stock is ONE global pool: the central branch of
+    -- approveVariance writes that single column with no outlet dimension. Keying
+    -- the supersede test on outlet_id therefore reopens the exact double-apply
+    -- this guard exists to stop, one axis over — and it is reachable today, not
+    -- theoretical. variance_approvals is NOT in TABLES_NEEDING_OUTLET (db.ts), so
+    -- rows written before outlet stamping keep outlet_id = '' and sit in the SAME
+    -- admin queue as stamped rows (the scope filter matches the current outlet
+    -- OR the empty one). Two counts
+    -- of one material, one '' and one 'main', would each report "not superseded",
+    -- both be approvable, and both post their frozen delta to the same pool.
+    -- Liquor and department rows are genuinely partitioned — by store_id and
+    -- department_id above, which are already in the key — so they keep the outlet
+    -- term and are unaffected.
+    AND (
+      (COALESCE(${self}.source, '') = 'central' AND COALESCE(${self}.department_id, '') = '')
+      OR COALESCE(nv.outlet_id, '') = COALESCE(${self}.outlet_id, '')
+    )
+    AND nv.status IN ('pending', 'approved')
+    AND (
+          nv.date > ${self}.date
+       OR (nv.date = ${self}.date
+           AND REPLACE(SUBSTR(nv.created_at, 1, 19), 'T', ' ')
+             > REPLACE(SUBSTR(${self}.created_at, 1, 19), 'T', ' '))
+    )
+  `;
+}
+
+/**
+ * Newest competing row first. `nv.id` is the last tie-break so an exact
+ * (date, created_at) collision still resolves to ONE deterministic row — the
+ * date and the status reported for it have to describe the same row.
+ *
+ * The SUBSTR/REPLACE normalisation in the predicate above is mirrored nowhere
+ * here on purpose: every writer of this table is upsertVarianceApproval(), which
+ * stamps datetime('now'), so created_at is uniformly 'YYYY-MM-DD HH:MM:SS' and
+ * plain DESC orders it correctly. The normalisation exists only so a future
+ * import path stamping ISO 'T' timestamps cannot silently shift a whole day
+ * ('T' > ' ') in the comparison, which is the same trap deptMovementsAfter()
+ * below already guards.
+ */
+const SUPERSEDE_ORDER = 'ORDER BY nv.date DESC, nv.created_at DESC, nv.id DESC';
+
+/**
+ * The newest count that supersedes `row`, or null when `row` IS the newest.
+ * One indexed lookup (idx_variance_appr_material carries the material equality).
+ *
+ * A row with no `id` is still safe: the self-exclusion is belt-and-braces, since
+ * a row can never satisfy a STRICT date/created_at inequality against itself.
+ */
+export function findSupersedingCount(
+  db: Database.Database,
+  row: VarianceKeyRow,
+): SupersedingCount | null {
+  const hit = db.prepare(`
+    WITH self AS (
+      SELECT ? AS id, ? AS source, ? AS material_id, ? AS store_id,
+             ? AS department_id, ? AS outlet_id, ? AS date, ? AS created_at
+    )
+    SELECT nv.date AS date, nv.status AS status
+      FROM variance_approvals nv, self
+     WHERE ${supersedeWhere('self')}
+     ${SUPERSEDE_ORDER}
+     LIMIT 1
+  `).get(
+    norm(row.id), norm(row.source), norm(row.material_id), norm(row.store_id),
+    norm(row.department_id), norm(row.outlet_id), norm(row.date), norm(row.created_at),
+  ) as { date: string; status: string } | undefined;
+  if (!hit) return null;
+  return { date: String(hit.date), status: hit.status === 'approved' ? 'approved' : 'pending' };
+}
+
+/**
+ * The refusal, worded in ONE place so the queue's amber notice and the API's
+ * error are the same sentence. It names the date and tells the admin the two
+ * ways out, because "refused" without a next step just moves the confusion.
+ */
+function supersededMessage(s: SupersedingCount): string {
+  return (
+    `A newer count dated ${s.date} was already ${s.status} for this item. ` +
+    `Approve that one instead, or reject it first — approving this older count ` +
+    `applies the same correction a second time.`
+  );
+}
+
+/** `date|status` as packed by the list query, back into a SupersedingCount. */
+function parseSuperseded(packed?: string | null): SupersedingCount | null {
+  const s = String(packed ?? '');
+  const cut = s.indexOf('|');
+  // `< 0`, not `<= 0`: a packed "|pending" (a superseding row whose date is
+  // somehow empty) means SUPERSEDED WITH AN UNKNOWN DATE, not "not superseded".
+  // Reading it as the latter is the one drift this design exists to prevent —
+  // the list would render Approve enabled on a row approveVariance refuses.
+  // Empty dates are not reachable through either writer today; this is about
+  // which way the parse fails if one ever becomes reachable.
+  if (cut < 0) return null;
+  const status = s.slice(cut + 1);
+  if (status !== 'pending' && status !== 'approved') return null;
+  return { date: s.slice(0, cut), status };
+}
+
+/** One material with more than one pending count stacked on a single key. */
+export interface StackedPendingItem {
+  material_id: string;
+  material_name: string;
+  /** How many pending rows are involved in the stack(s) for this material. */
+  pending_count: number;
+  /** Newest count date among them — the one that is actually approvable. */
+  latest_date: string;
+}
+
+/**
+ * Items whose pending queue holds MORE THAN ONE count on the same key, newest
+ * first. This is the queue-level warning: it is what makes 963 pending rows
+ * readable as "these N items will double-apply if you just work down the list".
+ *
+ * GROUPED BY THE SUPERSEDE KEY, NOT BY MATERIAL, then rolled up to the material
+ * for display. Grouping by material_id alone would flag Curd counted in the
+ * kitchen AND Curd counted centrally as a stack — two different rails, two
+ * independent baselines, both legitimately approvable. That is a false alarm on
+ * a banner whose whole job is to be believed. Counting only rows that really
+ * share a key can never miss a real stack and never invents one.
+ *
+ * Scoped exactly like listVarianceApprovals: same INNER JOIN raw_materials (an
+ * orphaned row is unreviewable, so warning about it helps nobody) and the same
+ * outlet filter. `status` is honoured too — the field is called pending_count,
+ * so a queue filtered to approved/rejected has no stack to warn about and gets
+ * an empty array rather than a count of something else.
+ */
+export function stackedPendingCounts(
+  db: Database.Database,
+  opts: { status?: string; outletId?: string | null; outletScope?: VarianceOutletScope } = {},
+): StackedPendingItem[] {
+  const status = opts.status || 'pending';
+  if (status !== 'pending' && status !== 'all') return [];
+
+  const scope: VarianceOutletScope = opts.outletScope === 'all' ? 'all' : 'outlet';
+  const oid = scope === 'all' ? '' : norm(opts.outletId);
+  const params: unknown[] = [];
+  let outletWhere = '';
+  if (oid) { outletWhere = "AND (va.outlet_id = ? OR va.outlet_id = '')"; params.push(oid); }
+
+  return db.prepare(`
+    SELECT g.material_id            AS material_id,
+           rm.name                  AS material_name,
+           SUM(g.n)                 AS pending_count,
+           MAX(g.latest_date)       AS latest_date
+      FROM (
+            SELECT va.material_id   AS material_id,
+                   COUNT(*)         AS n,
+                   MAX(va.date)     AS latest_date
+              FROM variance_approvals va
+              JOIN raw_materials rmk ON rmk.id = va.material_id
+             WHERE va.status = 'pending' ${outletWhere}
+             -- Grouped on the SAME key supersedeWhere() uses, including its
+             -- central carve-out: outlet collapses to '' for central Store/
+             -- Overall rows because that rail is one global pool. Without the
+             -- CASE, a '' row and a 'main' row for one material form two groups
+             -- of one, HAVING COUNT(*) > 1 never fires, and the banner reads
+             -- clean over precisely the pair that double-applies. The banner and
+             -- the guard have to agree or the banner is worse than absent.
+             GROUP BY va.source, va.material_id, COALESCE(va.store_id, ''),
+                      COALESCE(va.department_id, ''),
+                      CASE WHEN va.source = 'central' AND COALESCE(va.department_id, '') = ''
+                           THEN '' ELSE COALESCE(va.outlet_id, '') END
+            HAVING COUNT(*) > 1
+           ) g
+      JOIN raw_materials rm ON rm.id = g.material_id
+     GROUP BY g.material_id
+     ORDER BY latest_date DESC, material_name COLLATE NOCASE
+  `).all(...params) as StackedPendingItem[];
+}
+
 export interface VarianceRow {
   id: string; source: VarianceSource; material_id: string; material_name: string; material_sku: string;
   store_id: string; store_name: string; department_id: string; department_name: string;
@@ -164,6 +422,32 @@ export interface VarianceRow {
   status: string; reviewed_by: string; reviewed_at: string; review_reason: string; created_at: string;
   /** Set only when approval is refused — the reason. See varianceApprovalBlock(). */
   approve_blocked?: string | null;
+  /**
+   * ADDITIVE (2026-08). The newest count competing with this one — see
+   * supersedeWhere(). Non-null ⇒ approveVariance() WILL refuse this row, and
+   * `approve_blocked` already carries the sentence saying so; these two fields
+   * exist so the page can also say WHICH count wins without re-parsing it.
+   */
+  superseded_by_date?: string | null;
+  superseded_by_status?: 'pending' | 'approved' | null;
+  /**
+   * ADDITIVE (2026-08). Live on-hand for THIS ROW'S OWN RAIL, in the SAME unit
+   * basis as system_stock / physical_stock beside it (recipe units) — so the
+   * page can finally show the real projection (live + variance) instead of the
+   * unconditional "only if nothing moved since" caveat.
+   *
+   * null on department rows, and that is the honest answer, not a gap to fill:
+   * a department balance comes from deptOnHand(), which is per-row machinery
+   * (opening + anchor + ledger window) with no set-based form. Dragging it into
+   * this query would be an N+1 over a queue that already runs to 963 rows. Do
+   * NOT substitute rm.current_stock there — that is the CENTRAL pool and would
+   * look authoritative while being wrong on every department row.
+   *
+   * Optional like approve_blocked above, for the same reason: only
+   * listVarianceApprovals() computes these. A raw `SELECT *` row (approveVariance)
+   * has none of them.
+   */
+  live_stock?: number | null;
 }
 
 export interface VarianceListResult {
@@ -227,16 +511,67 @@ export function listVarianceApprovals(
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
   `;
 
-  const rows = db.prepare(`
+  // THE TWO ADDITIONS BELOW ARE SELECT-LIST ONLY. `fromWhere` and `params` are
+  // untouched, so the count still describes exactly these rows and the `?`
+  // binding order is unchanged — both correlated subqueries reference the outer
+  // `va` and bind nothing of their own. Adding a parameter to either would
+  // silently shift every existing bind.
+  const raw = db.prepare(`
     SELECT va.*, rm.name AS material_name, rm.sku AS material_sku,
            COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS material_purchase_unit,
            COALESCE(rm.pack_size, 1) AS material_pack_size,
            COALESCE(sl.name, '')  AS store_name,
-           COALESCE(d.name, '')   AS department_name
+           COALESCE(d.name, '')   AS department_name,
+           -- ONE subquery packing both fields, not two returning one each. Two
+           -- would each resolve the tie independently and could report the date
+           -- of one competing row beside the status of another. '|' separates
+           -- them because neither a YYYY-MM-DD date nor pending/approved can
+           -- contain it. Correlated rather than a per-row findSupersedingCount()
+           -- call: SQLite still evaluates it once per row, but inside the one
+           -- statement and on an index seek, instead of 500 prepared-statement
+           -- round trips out through JS. Measured at 963 pending rows: ~6 ms for
+           -- the whole list, both new columns included.
+           (SELECT nv.date || '|' || nv.status
+              FROM variance_approvals nv
+             WHERE ${supersedeWhere('va')}
+             ${SUPERSEDE_ORDER}
+             LIMIT 1) AS superseded_by,
+           -- LIVE ON-HAND, RESOLVED PER RAIL — the one shortcut that must not be
+           -- taken here is a single materials lookup for all three. See the
+           -- live_stock note on VarianceRow. Liquor with no ledger row at all is
+           -- genuinely 0 on hand, not unknown; department is NULL because there
+           -- is no set-based source for it.
+           CASE
+             WHEN va.source = 'liquor' THEN (
+               SELECT COALESCE(SUM(l.quantity), 0)
+                 FROM store_stock_ledger l
+                WHERE l.store_id = va.store_id AND l.material_id = va.material_id
+             )
+             WHEN COALESCE(va.department_id, '') = '' THEN rm.current_stock
+             ELSE NULL
+           END AS live_stock
     ${fromWhere}
     ORDER BY (va.status = 'pending') DESC, va.date DESC, va.created_at DESC
     LIMIT ${limit}
-  `).all(...params) as VarianceRow[];
+  `).all(...params) as (VarianceRow & { superseded_by?: string | null })[];
+
+  // The packed column is an implementation detail of the query above; it is
+  // destructured OFF the row so the wire shape stays exactly the documented one.
+  const rows: VarianceRow[] = raw.map(r => {
+    const { superseded_by, ...rest } = r;
+    const superseding = parseSuperseded(superseded_by);
+    return {
+      ...rest,
+      superseded_by_date: superseding?.date ?? null,
+      superseded_by_status: superseding?.status ?? null,
+      live_stock: r.live_stock == null ? null : Number(r.live_stock),
+      // Additive: tell the queue up front which rows approveVariance() will
+      // refuse, so the admin sees the reason instead of discovering it on click.
+      // The supersede verdict is HANDED IN rather than looked up again — same
+      // predicate, and one query for the whole page instead of one per row.
+      approve_blocked: varianceApprovalBlock(db, r, r.department_name, { superseding }),
+    };
+  });
 
   // The two LEFT JOINs are kept in the count even though they cannot change its
   // value (both join on a primary key, so no fan-out) — carrying the identical
@@ -246,9 +581,7 @@ export function listVarianceApprovals(
   ) || 0;
 
   return {
-    // Additive: tell the queue up front which rows approveVariance() will refuse,
-    // so the admin sees the reason instead of discovering it on click.
-    rows: rows.map(r => ({ ...r, approve_blocked: varianceApprovalBlock(db, r, r.department_name) })),
+    rows,
     total,
     truncated: total > rows.length,
     limit,
@@ -262,6 +595,17 @@ export interface DecisionResult { ok: boolean; error?: string; applied?: boolean
  * Can this variance safely be APPROVED? Returns null when yes, otherwise the
  * reason to refuse (shown verbatim to the admin, and surfaced on the queue by
  * listVarianceApprovals so the refusal is visible before the click).
+ *
+ * FIRST, AND ON ALL THREE RAILS: IS A NEWER COUNT ALREADY IN PLAY? Approving an
+ * older count after a newer one applies the same frozen baseline correction
+ * twice — see supersedeWhere() for the measured case. That is not a department
+ * problem, it is a delta problem, so this check runs BEFORE the central/liquor
+ * early-out below and not after it. It is also the reason this function gained a
+ * fourth parameter: the queue resolves the verdict for every row in one query
+ * and hands it in, so the page and the API can never disagree about which rows
+ * are approvable.
+ *
+ * The remaining reasons are department-only.
  *
  * A department count is now APPROVABLE — it posts a signed 'adjustment' to that
  * department's own ledger and leaves central alone (see approveVariance). What
@@ -295,9 +639,20 @@ export interface DecisionResult { ok: boolean; error?: string; applied?: boolean
  */
 export function varianceApprovalBlock(
   db: Database.Database,
-  row: { source: string; department_id?: string | null; material_id?: string },
+  row: VarianceKeyRow,
   deptName?: string | null,
+  /**
+   * The supersede verdict, already resolved. Pass it (with an explicit `null`
+   * for "nothing supersedes this") from a caller that has just computed it in
+   * bulk; omit the whole object and this looks it up itself. The property is
+   * REQUIRED inside the object on purpose — an optional one would let a typo'd
+   * or undefined field read as "not superseded" and fail OPEN.
+   */
+  precomputed?: { superseding: SupersedingCount | null },
 ): string | null {
+  const superseding = precomputed ? precomputed.superseding : findSupersedingCount(db, row);
+  if (superseding) return supersededMessage(superseding);
+
   if (String(row.source) !== 'central') return null;
   const deptId = norm(row.department_id);
   if (!deptId) return null;
@@ -402,8 +757,20 @@ export function approveVariance(
   if (!row) return { ok: false, error: 'Variance approval not found' };
   if (row.status !== 'pending') return { ok: false, error: `Already ${row.status}` };
 
-  // Refuse the department-clobber case BEFORE anything is written. See
-  // varianceApprovalBlock().
+  // Refuse the department-clobber case AND the superseded-count case BEFORE
+  // anything is written. See varianceApprovalBlock().
+  //
+  // THE GUARD LIVES HERE, NOT IN THE ROUTE, because the route is not the only
+  // caller: POST /api/closing-stock calls approveVariance() directly for the
+  // admin "Adjust system stock" tick. That path normally passes — the count it
+  // just saved IS the newest, and a same-date row approved earlier today has an
+  // OLDER created_at so it does not supersede. What it now refuses is a
+  // BACKDATED save made after a newer count already corrected the item: there
+  // the count still saves, the approval stays pending, and the admin is told
+  // why. That refusal is the fix working, not a regression — it is exactly the
+  // double-application this guard exists to stop.
+  //
+  // No precomputed verdict is passed, so this does its own one-row lookup.
   let deptName = '';
   if (norm(row.department_id)) {
     try {
@@ -560,7 +927,14 @@ export function approveVariance(
   return { ok: true, applied: true };
 }
 
-/** Reject a pending variance → stock unchanged; variance stands as an open loss. */
+/**
+ * Reject a pending variance → stock unchanged; variance stands as an open loss.
+ *
+ * DELIBERATELY NOT SUPERSEDE-GATED. Rejecting is how a superseded count leaves
+ * the queue, so gating it would strand every stale row permanently — and it
+ * moves no stock, so there is nothing to double-apply. Only approveVariance()
+ * carries that guard.
+ */
 export function rejectVariance(
   db: Database.Database, id: string, reviewer: string, reason: string,
 ): DecisionResult {
