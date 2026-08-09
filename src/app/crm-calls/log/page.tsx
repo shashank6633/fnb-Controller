@@ -399,8 +399,15 @@ export default function CallLogPage() {
           </button>
         </div>
 
-        {/* Summary chips (counts ignore the active chip so they stay stable) */}
-        <div className="flex flex-wrap items-center gap-2">
+        {/* Summary chips (counts ignore the active chip so they stay stable).
+            GRID, not flex-wrap: these are six-to-seven chips of very different
+            label lengths, so wrapping packed them into ragged rows (3 then 2
+            then 1) that read as clutter on a phone. A fixed column count keeps
+            every chip the same width and lines the labels and counts up, and
+            the count is stable per breakpoint instead of reflowing with the
+            longest label. Above xl they all fit on one line, so it falls back
+            to an inline row and the chips shrink to their natural width. */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:flex xl:flex-wrap xl:items-center gap-2">
           <SummaryChip label="All" count={summary.total} active={!direction && !status && !needsDisposition} onClick={pickAll} />
           <SummaryChip label="Inbound" count={summary.inbound} active={direction === 'inbound'} onClick={() => pickDirection('inbound')}
                        icon={<ArrowDownLeft className="w-3.5 h-3.5" />} />
@@ -1097,10 +1104,18 @@ function SummaryChip({ label, count, active, onClick, icon, tone, pulse }: {
     : tone === 'amber' ? 'bg-white text-amber-800 border-amber-300 hover:bg-amber-50'
     : 'bg-white text-[#6B5744] border-[#E0D0BE] hover:bg-[#FFF1E3]';
   return (
+    // w-full inside the grid cell (below lg) so every chip is the SAME width and
+    // the labels line up in columns; xl:w-auto lets them shrink back to content
+    // width once they all fit on one row. justify-between pins the count to the
+    // right edge, so the numbers form a column too instead of floating wherever
+    // the label length leaves them.
     <button onClick={onClick}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium whitespace-nowrap transition-colors ${active ? activeCls : idleCls} ${pulse && !active ? 'animate-pulse' : ''}`}>
-      {icon}
-      {label} <span className="font-bold">{count}</span>
+            className={`w-full xl:w-auto inline-flex items-center justify-between xl:justify-start gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium whitespace-nowrap transition-colors ${active ? activeCls : idleCls} ${pulse && !active ? 'animate-pulse' : ''}`}>
+      <span className="inline-flex items-center gap-1.5 min-w-0">
+        {icon}
+        <span className="truncate">{label}</span>
+      </span>
+      <span className="font-bold tabular-nums">{count}</span>
     </button>
   );
 }
