@@ -333,6 +333,12 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Print Design",   href: "/settings/print-design",  icon: Printer },
       { kind: "link", label: "Store Locations", href: "/settings/stores",       icon: Warehouse },
       { kind: "link", label: "Page Access",    href: "/settings/page-access",   icon: ShieldAlert },
+      // Impact Preview — read-only simulation of the page-access tightening
+      // (who would lose which pages). adminOnly in the page-catalog, so
+      // canAccessPage hides this row for everyone else. It MUST be listed here
+      // as well: this file keeps its own nav tree, and a page registered only in
+      // the catalog is correctly gated and completely invisible.
+      { kind: "link", label: "Page Access — Impact", href: "/admin/page-access-impact", icon: ShieldAlert },
       { kind: "link", label: "Integrations",   href: "/settings/integrations",  icon: ShieldAlert },
       { kind: "link", label: "QR Standees",    href: "/settings/qr-standees",   icon: QrCode },
       { kind: "link", label: "Menu Design",    href: "/settings/customer-menu", icon: LayoutGrid },

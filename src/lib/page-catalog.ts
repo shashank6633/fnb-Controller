@@ -348,6 +348,17 @@ export const PAGE_CATALOG: PageSection[] = [
       // view first, then loosen this.
       { path: '/settings/station-departments', label: 'Settings — Station → Department Map', adminOnly: true },
       { path: '/settings/page-access', label: 'Settings — Page Access' },
+      // Impact Preview — read-only report that answers "if we stop letting a
+      // parent page carry its siblings, who loses which pages?". Simulation
+      // only: it compares canAccessPage() against canAccessPageStrict() (see the
+      // block comment further down this file) and enforces NOTHING.
+      //
+      // adminOnly, and it must stay that way: it prints every role's and every
+      // user's page map side by side — a complete map of who can reach what,
+      // which is exactly the reconnaissance a restricted user should not have.
+      // The route behind it (requireRole('admin')) is the real lock; this entry
+      // is what stops the proxy waving through a legacy null-map user.
+      { path: '/admin/page-access-impact', label: 'Page Access - Impact Preview', adminOnly: true },
       { path: '/settings/integrations', label: 'Settings — Integrations' },
       { path: '/settings/integrations/whatsapp', label: 'Settings — WhatsApp' },
       { path: '/settings/qr-standees', label: 'Settings — QR Standees' },
@@ -527,5 +538,134 @@ export function canAccessPage(
   // Exact match OR prefix match on a controlled page (so /vendors/123 works
   // when /vendors is allowed). To avoid /audit allowing /audit-log we require
   // the next char to be '/' or end-of-string.
+  return allowed.some(p => pathname === p || pathname.startsWith(p + '/'));
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * STRICT PATH MATCHING — MEASURED, **NOT YET ENFORCED**. DO NOT WIRE UP.
+ *
+ * WHY IT EXISTS
+ * The last line of canAccessPage() above matches a grant by PREFIX. That half
+ * of the rule is load-bearing: it is what lets a DETAIL route inherit its list
+ * page, so /vendors/123 opens for someone granted /vendors. Nothing in the
+ * catalog describes detail routes, so without it every record page in the app
+ * would 403.
+ *
+ * The problem is that many catalog parents are ALSO the URL prefix of their
+ * SIBLING catalog pages. /tasks is the Task Dashboard *and* the prefix of the
+ * 14 other Task Management pages, so ticking the dashboard silently hands over
+ * the whole module. Across the catalog 8 parents carry 43 such grants:
+ *   /tasks +14, /crm-calls +10, /inventory +7, /reports +6,
+ *   /kitchen-production +3, /dine-in/kitchen +1, /vendors +1,
+ *   /settings/integrations +1
+ * proxy.ts imports canAccessPage rather than duplicating it, so this is real
+ * server-side reach, not just a sidebar that shows too much.
+ *
+ * WHY IT IS NOT ENFORCED YET
+ * Switching the proxy to this function TIGHTENS access. Any role configured
+ * while the leak was live may have been given a parent instead of the pages
+ * actually intended, and flipping it would strip those pages from staff
+ * mid-service. The owner tops up the missing grants FIRST — informed by
+ * GET /api/admin/page-access-impact, which reports the per-user / per-role
+ * difference between these two functions — and only then do we switch.
+ *
+ * So: canAccessPage() above is untouched and remains the single enforcement
+ * authority. This function is read by the impact report and by nothing else.
+ * If you are here to "finish the fix", the fix is a one-line swap in
+ * canAccessPage — but do not make it until the owner says the top-ups are done.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Every path that is a catalog page in its own right. Built ONCE at module
+ * load (not per call) — canAccessPageStrict is called ~130× per user by the
+ * impact report and would otherwise rebuild this on every check.
+ */
+const CATALOG_PATH_SET: ReadonlySet<string> = new Set(ALL_PAGE_PATHS);
+
+/** True when `pathname` is itself an entry in PAGE_CATALOG (exact match). */
+export function isCatalogPath(pathname: string): boolean {
+  return CATALOG_PATH_SET.has(pathname);
+}
+
+/**
+ * Nearest PROPER catalog ancestor of `pathname`, walking path segments up.
+ *   /vendors/123      → /vendors
+ *   /tasks/board/9    → /tasks/board   (nearest wins, NOT /tasks)
+ *   /foo/bar          → null           (no catalog page above it)
+ *
+ * '/' is deliberately never returned. It is the Dashboard page, not a
+ * namespace root, and the prefix test in canAccessPage cannot match it either
+ * ('/' + '/' = '//', which no real pathname starts with). Treating it as
+ * everyone's ancestor would make a Dashboard grant a grant to every
+ * un-cataloged route in the app.
+ */
+function nearestCatalogAncestor(pathname: string): string | null {
+  let cut = pathname.lastIndexOf('/');
+  while (cut > 0) {
+    const parent = pathname.slice(0, cut);
+    if (CATALOG_PATH_SET.has(parent)) return parent;
+    cut = parent.lastIndexOf('/');
+  }
+  return null;
+}
+
+/**
+ * The strict twin of canAccessPage(). **NOT ENFORCED ANYWHERE** — see the block
+ * comment above before you change that.
+ *
+ * Every gate before the path-list match is IDENTICAL to canAccessPage and is
+ * duplicated here verbatim rather than refactored out of it: null user → false,
+ * admin → true, ALWAYS_ALLOWED → true, hodOnly / mgmtOnly / adminOnly tier
+ * gates, null map → true, unparseable map → true, empty array → true. A little
+ * duplication is the right trade here — canAccessPage gates the whole app and
+ * must not be touched to add a function nothing calls yet.
+ *
+ * ONLY the final match differs:
+ *   1. exact match in the map                        → allowed
+ *   2. pathname is ITSELF a catalog page             → DENIED. This is the fix:
+ *      a distinct page needs its own grant, so /tasks no longer carries
+ *      /tasks/settings.
+ *   3. otherwise it is a detail route → find its nearest catalog ancestor and
+ *      require THAT to be granted. /vendors/123 still opens for /vendors.
+ *   4. no catalog ancestor at all → fall back to the old prefix test, so an
+ *      un-cataloged route can never become unreachable by accident.
+ *
+ * The result is always a SUBSET of canAccessPage: rules 1 and 4 are identical
+ * to it, rule 2 only removes, and rule 3's ancestor is itself a prefix. That is
+ * what makes "lost = now − strict" in the impact report meaningful.
+ */
+export function canAccessPageStrict(
+  pathname: string,
+  user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null,
+): boolean {
+  // ── Gates below are copied verbatim from canAccessPage. Keep them in sync.
+  if (!user) return false;
+  if (user.role === 'admin') return true;
+  if (ALWAYS_ALLOWED.some(p => pathname === p)) return true;
+  if (isHodOnlyPath(pathname) && !user.is_head_chef) return false;
+  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)) return false;
+  if (isAdminOnlyPath(pathname)) return false;
+  if (!user.page_access) return true;
+
+  let allowed: string[];
+  try { allowed = JSON.parse(user.page_access); }
+  catch { return true; }   // garbled value → don't lock out
+  if (!Array.isArray(allowed) || allowed.length === 0) return true;
+  // ── End of the verbatim section. Only what follows differs.
+
+  // 1. Explicitly granted.
+  if (allowed.includes(pathname)) return true;
+
+  // 2. A page that stands on its own in the catalog needs its own grant —
+  //    it does NOT inherit from a parent that merely shares its URL prefix.
+  if (CATALOG_PATH_SET.has(pathname)) return false;
+
+  // 3. Detail route: inherit from the nearest catalog page above it, and only
+  //    that one. /tasks/board/9 asks for /tasks/board, never /tasks.
+  const ancestor = nearestCatalogAncestor(pathname);
+  if (ancestor) return allowed.includes(ancestor);
+
+  // 4. Nothing in the catalog sits above this path. Behave exactly as today
+  //    rather than inventing a denial for a route nobody has classified.
   return allowed.some(p => pathname === p || pathname.startsWith(p + '/'));
 }
