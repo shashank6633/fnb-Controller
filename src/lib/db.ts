@@ -4521,6 +4521,28 @@ function initializeSchema(db: Database.Database) {
     addCtCol('analyzed_by',      `TEXT NOT NULL DEFAULT ''`);   // user email or 'auto'
     db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_calls_analysis_status ON ct_calls(analysis_status)`);
 
+    // ── Answered-call OWNERSHIP (additive; same idempotent addCtCol pattern) ──
+    // WHY: when a GRE answers, that call is THEIRS — the screen-pop and the
+    // disposition write-up belong to one person, and everyone else drops to a
+    // read-only strip naming who is on it. Two people writing up one call was
+    // the reported problem.
+    //
+    // agent_user CANNOT carry this: it is the TELEPHONY agent id (5004_33338614),
+    // and an unmapped id resolves to no app user at all — which is exactly the
+    // first-claim case. So ownership is its own column, holding an app user's
+    // email, set only by the atomic claim in src/lib/ct/call-owner.ts.
+    //
+    // EMPTY STRING = UNOWNED, never NULL: every other ct_ column in this block
+    // uses the empty-string convention and mixing the two makes every ownership
+    // query a NULL trap. NOT NULL DEFAULT '' also back-fills existing rows as
+    // unowned in the ALTER itself, so no data migration is needed.
+    //
+    // NOTHING here expires a lock — expiry is a computation done per request in
+    // call-owner.ts (a browser timer that never fires would strand a call).
+    // owner_claimed_at is read as the expiry anchor only when ended_at is blank.
+    addCtCol('owner_email',      `TEXT NOT NULL DEFAULT ''`);   // app user email who claimed the ANSWERED call; '' = unowned
+    addCtCol('owner_claimed_at', `TEXT NOT NULL DEFAULT ''`);   // UTC ISO of the claim; '' = unowned
+
     // ── Reservation → table seating (Part A) + table party (Part B) ──────────
     // Additive columns; per-column try/catch makes the ALTER idempotent.
     const addBookingCol = (col: string, decl: string) => {

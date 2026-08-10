@@ -9,6 +9,22 @@
  * fallback + /api/crm-calls/dashboard for today's aggregates. Designed to be
  * left open on a counter screen (wallboard), so it is glanceable from far:
  * big numbers, pulsing ring cards, color-coded feed.
+ *
+ * WHO HAS THE CALL. An answered call is owned by one app user, who gets the
+ * screen-pop and the disposition write-up while the lock is in force; everyone
+ * below Admin/Manager/HOD is refused the write (src/lib/ct/call-owner.ts). This
+ * board is a supervisor's view of that: the owner is shown wherever the data
+ * carries one. It rides entirely on feeds the board already reads — the SSE/poll
+ * event's ownerName and owner_name on the live snapshot rows — so there is no
+ * per-row lookup and no new request. NOTE the owner is a different thing from
+ * `agent_user`/agentName: that is the raw TeleCMI agent, which for an unmapped
+ * agent belongs to no app user at all.
+ *
+ * OWNERSHIP MOVING IS ITS OWN FEED LINE. A claim, a management takeover and the
+ * release a saved disposition broadcasts all arrive as CtEvent 'ownership' —
+ * NOT 'answered', which is what they used to be and why a claim four minutes
+ * after the hangup printed "Call answered" underneath "Call ended". They change
+ * neither the ringing list nor the counters; only who is writing the call up.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -100,10 +116,20 @@ function SendMenu({ phone, guestName, docs }: { phone: string; guestName?: strin
 
 interface FeedItem {
   key: string;
-  type: 'incoming_call' | 'call_ended' | 'recovery_update' | 'answered' | 'missed';
+  /**
+   * The FEED's own row kinds, which are not the bus's event types — several bus
+   * events land on one row kind, and 'ownership' is the one that must not.
+   * A claim used to be broadcast as 'answered' and printed "Call answered — Ravi
+   * K" minutes AFTER "Call ended"; it now arrives as its own CtEvent type and
+   * gets its own row. See handleEvent, where the mapping (and the refusal to
+   * guess at an unknown type) lives.
+   */
+  type: 'incoming_call' | 'call_ended' | 'recovery_update' | 'ownership' | 'answered' | 'missed';
   phone?: string;
   guestName?: string;
   agentName?: string;
+  /** App user holding the write-up of this answered call ('' = nobody). */
+  ownerName?: string;
   at: string;
   label: string;
 }
@@ -117,6 +143,10 @@ interface RingingCall {
   started_at?: string;
   agent_user?: string;
   queue?: string;
+  /** Owner of the call, from /api/crm-calls/live. See the ring-card render for
+   *  why these are normally blank on a row in THIS list. */
+  owner_email?: string;
+  owner_name?: string;
 }
 
 /** "11 Jul" — the day an answered call happened, for the sticky-agent line. */
@@ -256,6 +286,16 @@ export default function LiveCallsPage() {
     } catch { /* transient */ }
   }, [applyRoutingFlags]);
 
+  /**
+   * ONE FEED LINE PER EVENT — and only for event types this board actually
+   * understands.
+   *
+   * EVERY BRANCH BELOW IS EXPLICIT, AND AN UNKNOWN TYPE FALLS OFF THE END AND IS
+   * IGNORED. That is deliberate: a new CtEvent type quietly inheriting whichever
+   * branch it happened to land in is how a claim came to be printed as "Call
+   * answered". A row this board cannot label is not news it should invent a
+   * label for — it waits for someone to teach it the type.
+   */
   const handleEvent = useCallback((e: any) => {
     if (!e || !e.type) return;
     const phone = e.phone || '';
@@ -281,12 +321,33 @@ export default function LiveCallsPage() {
         if (e.phone) return (r.phone_e164 || r.phone) !== e.phone;
         return true;
       }));
-      pushFeed({ key, type: 'call_ended', phone, guestName: name, agentName: e.agentName || '', at, label: e.type === 'answered' ? 'Call answered' : 'Call ended' });
+      // ownerName rides along on the same event — this is the moment a
+      // supervisor can see who picked the call up and now owns writing it up.
+      pushFeed({ key, type: 'call_ended', phone, guestName: name, agentName: e.agentName || '', ownerName: e.ownerName || '', at, label: e.type === 'answered' ? 'Call answered' : 'Call ended' });
       refreshStats();
+    } else if (e.type === 'ownership') {
+      // THE OWNER OR THE LOCK CHANGED ON A CALL THAT ALREADY EXISTS — a claim, a
+      // management takeover, or the release the disposition PUT broadcasts.
+      //
+      // DELIBERATELY DOES NOT TOUCH THE RINGING LIST. This lands at CHIP time,
+      // i.e. minutes after the hangup, so re-running the ringing filter for it
+      // would be filtering a call that is long over. Nor does it move the
+      // counters: nobody was answered or missed, the write-up simply moved.
+      //
+      // The name goes in the label rather than into ownerName, because the
+      // generic "· taken by X" suffix below reads as a claim and would be a lie
+      // on the release line.
+      const who = String(e.ownerName || '').trim();
+      const label = e.locked === false
+        ? (who ? `Write-up saved by ${who} — call open to everyone` : 'Write-up saved — call open to everyone')
+        : (who ? `Write-up taken by ${who}` : 'Write-up ownership changed');
+      pushFeed({ key, type: 'ownership', phone, guestName: name, at, label });
     } else if (e.type === 'recovery_update') {
       pushFeed({ key, type: 'recovery_update', phone, at, label: 'Recovery queue updated' });
       refreshStats();
     }
+    // Anything else: a type this board does not know. Ignored on purpose — see
+    // the note above. Never add an `else` that labels it.
   }, [pushFeed, refreshStats]);
 
   // SSE with poll fallback
@@ -415,6 +476,24 @@ export default function LiveCallsPage() {
                       {(r.queue || r.agent_user) && (
                         <p className="text-[11px] text-[#8B7355] mt-0.5 truncate">{[r.queue, r.agent_user].filter(Boolean).join(' · ')}</p>
                       )}
+                      {/* WHO HAS IT. Reads owner_name straight off the snapshot
+                          row — no extra request, and nothing to render when the
+                          row does not name one.
+                          BE HONEST ABOUT TODAY: every row in this list has
+                          status='ringing', a ringing call is by definition not
+                          yet answered, and only an ANSWERED call can be owned —
+                          so this stays blank in production as things stand, and
+                          the board is byte-for-byte what it is today. It is here
+                          so the line is already right if /api/crm-calls/live ever
+                          carries in-progress answered calls, which is the only
+                          way an owned call could reach this list. The surface
+                          that shows ownership TODAY is the Live feed below. */}
+                      {(r.owner_name || r.owner_email) && (
+                        <p className="mt-1 text-[11px] text-[#6B5744] flex items-center gap-1">
+                          <UserCheck className="w-3.5 h-3.5 text-[#af4408] shrink-0" />
+                          <span className="truncate">On this call: <b className="text-[#2D1B0E]">{r.owner_name || r.owner_email}</b></span>
+                        </p>
+                      )}
                       {/* VIP badge — always carries its own evidence, so it is
                           auditable rather than a mysterious star. */}
                       {hint?.vip?.isVip && (
@@ -475,10 +554,18 @@ export default function LiveCallsPage() {
                     ? <ArrowDownLeft className="w-4 h-4 text-green-600 shrink-0" />
                     : f.type === 'call_ended'
                       ? <PhoneCall className="w-4 h-4 text-[#8B7355] shrink-0" />
-                      : <ArrowUpRight className="w-4 h-4 text-amber-500 shrink-0" />}
+                      : f.type === 'ownership'
+                        ? <UserCheck className="w-4 h-4 text-[#af4408] shrink-0" />
+                        : <ArrowUpRight className="w-4 h-4 text-amber-500 shrink-0" />}
                   <span className="flex-1 min-w-0 truncate text-[#3D2614]">
                     <b>{f.guestName || formatPhone(f.phone || '') || 'System'}</b> — {f.label}
                     {f.agentName && <span className="text-[#8B7355]"> · answered by {f.agentName}</span>}
+                    {/* Suppressed when it just repeats the agent: a MAPPED
+                        TeleCMI agent resolves to the same person, and "answered
+                        by Pushpa · taken by Pushpa" reads like two people. */}
+                    {f.ownerName && f.ownerName !== f.agentName && (
+                      <span className="text-[#8B7355]"> · taken by {f.ownerName}</span>
+                    )}
                   </span>
                   {f.phone && <SendMenu phone={f.phone} guestName={f.guestName} docs={docs} />}
                   <span className="text-[11px] text-[#8B7355] tabular-nums shrink-0">{istTime(f.at)}</span>

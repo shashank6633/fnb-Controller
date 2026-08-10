@@ -9,7 +9,10 @@
  *
  * Transport: EventSource('/api/crm-calls/events') primary; on error falls
  * back to polling /api/crm-calls/live?after=<seq> every 5s while retrying
- * SSE every 30s (same pattern as the Live Calls wallboard).
+ * SSE every 30s (same pattern as the Live Calls wallboard). The SAME route,
+ * with &owned=<ids>, is also asked on a slow timer while a card is showing a
+ * lock — because a lock lapses on a clock and a clock fires no event. See THE
+ * LOCK CLOCK below.
  *
  * Behavior contract (CRM_DECISIONS.md §5.1):
  * - incoming_call → slide-in card top-right (below the floating bell).
@@ -19,13 +22,64 @@
  *   disposition mode: 7 one-tap chips → PUT /api/crm-calls/calls/[id].
  *   "Booking Made" opens QuickBookingModal (pre-filled source_call_id) and
  *   dispositions after the booking saves.
- * - Multiple simultaneous calls stack, max 3 cards.
+ * - Multiple simultaneous calls stack, up to MAX_CARDS.
+ *
+ * ── ONE ANSWERED CALL, ONE OWNER ────────────────────────────────────────────
+ * This pop broadcasts to EVERY signed-in CRM browser, so an answered call used
+ * to sit in front of two GREs who both wrote it up — the second disposition
+ * silently overwrote the first. An answered call now has one owner, and every
+ * other browser collapses that card to a slim read-only strip naming them.
+ *
+ * WHAT THIS FILE IS AND IS NOT. It is presentation. The lock is the server
+ * check (callWriteBlock() in src/lib/ct/call-owner.ts) applied by
+ * PUT /api/crm-calls/calls/[id]; hiding a popup stops nothing, since the other
+ * browser can still send the request. So this file never refuses on its own
+ * judgement where the server would allow — every inconclusive answer proceeds
+ * and lets the server decide — and when a 403 does come back it shows the
+ * server's own sentence rather than a generic failure.
+ *
+ * WHO OWNS IT. Ownership arrives on the wire (CtEvent.ownerEmail/ownerName,
+ * and owner_email/owner_name on the /api/crm-calls/live snapshot); this file
+ * never asks per row. A mapped TeleCMI agent is owned the moment the call is
+ * answered. An UNMAPPED agent resolves to no app user at all, so the call
+ * arrives unowned and stays that way until someone ACTS on it — the first
+ * browser to act claims it (POST .../claim), and the losers of that race
+ * collapse to the strip. An unowned call therefore keeps today's behaviour for
+ * everybody, which is exactly what makes first-claim possible.
+ *
+ * OWNED IS NOT LOCKED, AND THIS FILE MUST NEVER CONFUSE THE TWO. owner_email is
+ * the AUDIT RECORD of the claim and deliberately outlives the lock (call-owner.ts
+ * and both server routes say so in writing). Rendering the strip on "has an
+ * owner" is why it never lifted: Pushpa answered at 19:00, the call ended 19:05,
+ * she closed her browser without dispositioning, the server opened the call to
+ * everyone at 19:20 — and every other browser sat on "Pushpa is writing up this
+ * call", with no chips, for the rest of the shift. So the strip renders on
+ * `locked`, which only the server says.
+ *
+ * AND THE DEADLINE IS NEVER RE-DERIVED HERE. A lock lapses with the PASSAGE OF
+ * TIME, and time fires no event, so a browser told "locked" at 19:05 has to ask
+ * again to find out it was opened at 19:20. It asks the way this file already
+ * talks to the server: GET /api/crm-calls/live?owned=<ct_calls ids> — ONE request
+ * for every card on screen, never one per card — which answers, for THIS viewer,
+ * `locked` / `can_write` / `free_at_label`. Copying the 15-minute rule into the
+ * browser would be a second copy of it, and the two would drift.
+ *
+ * WHY can_write AND NOT A LOCAL isManagement(). Admin/Manager/HOD may always
+ * write, including somebody else's call. That tier has exactly one definition
+ * (isManagement in @/lib/auth, server-only), and the ?owned= answer is that
+ * definition already applied to the asking user: management gets locked:true
+ * (so the strip still names the owner) WITH can_write:true (so its chips stay
+ * live), and gets the management-only takeover — POST .../claim {override:true}
+ * — that three server sentences promise.
+ *
+ * MISSED calls are never owned: nobody answered, chasing them is the recovery
+ * queue's whole job, and the claim endpoint refuses them.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
-  PhoneIncoming, PhoneOff, X, UserPlus, CalendarPlus, ExternalLink, Loader2, Star,
+  PhoneIncoming, PhoneOff, X, UserPlus, CalendarPlus, ExternalLink, Loader2, Star, Lock,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
@@ -53,10 +107,47 @@ interface PopCard {
   startedAt: string;
   mode: 'ringing' | 'disposition';
   endedAt?: string;
+  /**
+   * App user (email) holding the write-up of this ANSWERED call; '' = unowned.
+   * NOT card.agent — that is the raw TeleCMI agent id, which for an unmapped
+   * agent belongs to no app user at all.
+   */
+  ownerEmail: string;
+  /** Display name for ownerEmail (falls back to the email); '' when unowned. */
+  ownerName: string;
+  /**
+   * IS A LOCK IN FORCE RIGHT NOW, as the SERVER last told us — never inferred
+   * from ownerEmail (see the header). Viewer-independent: true also for the
+   * manager who may write straight through it.
+   * `undefined` = NOT YET ASKED. Absent is not false: a card whose lock state we
+   * have never been told about keeps the pop, and the write is still gated
+   * server-side.
+   */
+  locked?: boolean;
+  /**
+   * May THIS viewer write this call? The server's own answer for this user, off
+   * GET /api/crm-calls/live?owned=. `undefined` = not yet asked. This is the one
+   * thing that lets a manager keep their chips on a locked call, and it exists
+   * so no browser ever re-implements isManagement().
+   */
+  canWrite?: boolean;
+  /** When the lock lifts, IST-formatted BY THE SERVER (e.g. "7:42 pm"); '' when
+   *  there is no deadline to promise. Never computed here — see the header. */
+  freeAtLabel: string;
+  /**
+   * A refusal the SERVER gave us, verbatim — a lost claim race or a 403 on the
+   * disposition PUT. Shown as-is on the strip: it names the owner and says when
+   * the call frees up, which is more than this browser could work out. '' = none.
+   * Retired the moment the server says the call is writable again, or the strip
+   * it draws would outlive the lock exactly like the owner-based one did.
+   */
+  blocked: string;
   /** New-caller mini-form name input */
   newName: string;
   creating?: boolean;
   saving?: boolean;
+  /** A claim POST is in flight (the action that triggered it is waiting on it). */
+  claiming?: boolean;
   error: string;
 }
 
@@ -68,11 +159,23 @@ interface AnyEvent {
   phone?: string;
   guest?: GuestSnap | null;
   agent?: string;
+  /** Owner of the answered call — see CtEvent.ownerEmail in src/lib/ct/bus.ts. */
+  ownerEmail?: string;
+  ownerName?: string;
+  /** Is a lock in force — CtEvent.locked. Viewer-independent, so it never
+   *  answers "may I write"; only the ?owned= poll can do that. */
+  locked?: boolean;
+  /** CtEvent.freeAtLabel — already IST-formatted by the server. */
+  freeAtLabel?: string;
   queue?: string;
   at?: string;
 }
 
 const MAX_CARDS = 5;
+
+/** How often to re-ask the server whether a lock we are showing is still in
+ *  force. Only runs while a card actually has one — see THE LOCK CLOCK below. */
+const OWNERSHIP_REFRESH_MS = 15000;
 
 const DISPOSITIONS: Array<{ value: string; label: string }> = [
   { value: 'booking_made', label: 'Booking Made' },
@@ -93,8 +196,219 @@ const istDay = (iso?: string | null) => {
 
 const eventKey = (e: AnyEvent): string => String(e.telecmiCallId || e.callId || e.phone || '');
 
+/** Case-insensitive email identity. '' never matches '': an unowned call has
+ *  no owner to be, and a browser that does not yet know its own email is not
+ *  anybody either. */
+const sameEmail = (a: unknown, b: unknown): boolean => {
+  const x = String(a ?? '').trim().toLowerCase();
+  const y = String(b ?? '').trim().toLowerCase();
+  return !!x && x === y;
+};
+
 /**
- * Append a card, enforcing the max-3 stack. When full, drop an already-ended
+ * Ownership carried by a bus event, or null when the event says nothing.
+ *
+ * ABSENT AND EMPTY ARE DIFFERENT THINGS ON THIS WIRE, and getting them the same
+ * way round breaks the feature in one direction or the other:
+ *   field missing  → NO INFORMATION. Leave the owner alone. An older emitter,
+ *                    or any event type that simply does not speak about
+ *                    ownership, must not wipe what `answered` told us.
+ *   ownerEmail: '' → UNOWNED, stated deliberately (see the ownerEmail comments
+ *                    in src/lib/ct/ingest.ts). This is the hand-back: the live
+ *                    'answer' notify is optimistic, and a CDR that reclassifies
+ *                    the call as missed CLEARS the owner, because a missed call
+ *                    belongs to the recovery queue and everyone in it. A browser
+ *                    that ignored this would sit on a read-only strip for a call
+ *                    it is supposed to be chasing.
+ * Both ingest paths read the owner back off the row before emitting, so a ''
+ * on the wire is the row's real state and not an echo of a failed write.
+ *
+ * Either way, a STATED ownership also retires the card's `blocked` message.
+ * That string is a refusal the server gave us about a state this event has just
+ * superseded, and keeping it outlives its truth in both directions: a call
+ * handed back to the recovery queue would stay hidden behind "X is writing it
+ * up" from the very people meant to chase it, and a call handed TO us would
+ * still be showing somebody else's refusal. Nothing is lost — the strip is
+ * re-derived from ownership.
+ */
+function ownerPatch(e: AnyEvent): Partial<Pick<PopCard, 'ownerEmail' | 'ownerName' | 'blocked'>> | null {
+  if (typeof e.ownerEmail !== 'string') return null;   // absent → say nothing
+  const email = e.ownerEmail.trim();
+  if (!email) return { ownerEmail: '', ownerName: '', blocked: '' }; // stated unowned
+  return { ownerEmail: email, ownerName: String(e.ownerName || '').trim() || email, blocked: '' };
+}
+
+/**
+ * Everything an event states about ownership AND about the lock, as one patch.
+ *
+ * The two are separate fields on the wire because they are separate facts: the
+ * claim route sends an owner WITH locked:true, the disposition PUT sends the
+ * SAME owner with locked:false (the owner is the audit record; the release is
+ * the news), and ingest's `answered`/`call_ended` state an owner and say nothing
+ * about the lock at all. Each is therefore applied only when the event actually
+ * carries it — an absent field is no information, never `false`.
+ *
+ * A stated locked:false settles `canWrite` too, and is the only place an event
+ * can: "no lock is in force" is viewer-independent good news, so it is true for
+ * everyone reading it. locked:true is NOT the mirror image — management writes
+ * straight through a lock — so it deliberately leaves canWrite alone for the
+ * ?owned= poll to answer.
+ */
+function lockPatch(e: AnyEvent): Partial<PopCard> {
+  const owner = ownerPatch(e);
+  const patch: Partial<PopCard> = { ...(owner || {}) };
+  // AN EVENT THAT STATES UNOWNED STATES NO LOCK. owner_email '' is the very
+  // first clause of the server's rule (lockFreeSql in call-owner.ts): with no
+  // owner, everyone may write. Deriving it here is not a second copy of the
+  // deadline logic — there is no deadline in it, only the identity "nobody holds
+  // it ⇒ nobody is locked out".
+  // It matters for exactly one flow: the live 'answer' notify is optimistic, and
+  // a CDR that reclassifies the call as MISSED clears the owner. Without this
+  // the strip would survive that hand-back and hide a recovery-queue call from
+  // the very people whose job is to chase it.
+  if (owner && owner.ownerEmail === '') {
+    patch.locked = false;
+    patch.canWrite = true;
+    patch.freeAtLabel = '';
+  }
+  if (typeof e.locked === 'boolean') {
+    patch.locked = e.locked;
+    if (!e.locked) {
+      patch.canWrite = true;
+      patch.blocked = '';        // the refusal is spent; keeping it re-draws a dead strip
+      patch.freeAtLabel = '';    // nothing left to free up
+    } else {
+      // A NEW LOCK INVALIDATES ANY canWrite WE ALREADY HELD — it must go back to
+      // "not yet asked" (undefined), not stay at whatever we last believed.
+      //
+      // canWrite is per-VIEWER and only the ?owned= poll can answer it; this
+      // broadcast cannot. Leaving a stale `true` standing was the one place the
+      // client was LESS restrictive than the server, and it showed:
+      //   · unmapped agent answers -> event carries ownerEmail '' -> the clause
+      //     above sets canWrite true and the card counts as settled-open, so
+      //     polling stops
+      //   · Ravi claims it -> ownership event, locked true, canWrite left true
+      //   · every bystander renders live chips AND the management-only
+      //     "Take over" button on a call locked to Ravi
+      // The same path fired when a manager took over a call you had claimed.
+      // Dropping to undefined makes lockView fall through to the `locked`
+      // branch — the strip — until the poll says otherwise. Wrong for a manager
+      // for one round-trip is the right direction to be wrong in.
+      //
+      // Safe for the OWNER's own browser: lockView short-circuits on
+      // sameEmail(card.ownerEmail, myEmail) before it ever consults canWrite,
+      // so the person who holds the call keeps their pop either way. Only the
+      // people who need the strip are affected.
+      patch.canWrite = undefined;
+    }
+  }
+  if (typeof e.freeAtLabel === 'string' && e.locked !== false) {
+    patch.freeAtLabel = e.freeAtLabel;
+  }
+  return patch;
+}
+
+/**
+ * Which card does a call-level event belong to? telecmi id → ct_calls id →
+ * phone, and the phone fallback only for a still-ringing card and only when the
+ * event carries no id at all (an id-less CDR must never match every card).
+ * Shared by `answered`, `ownership` and `call_ended` so they can never drift
+ * apart.
+ */
+function matchIdx(list: PopCard[], e: AnyEvent): number {
+  return list.findIndex(c =>
+    (!!e.telecmiCallId && c.telecmiCallId === e.telecmiCallId) ||
+    (!!e.callId && c.callId === e.callId) ||
+    (!e.telecmiCallId && !e.callId && !!e.phone && c.phone === e.phone && c.mode === 'ringing'),
+  );
+}
+
+/**
+ * Is somebody else's lock in force on this card, and may I write anyway?
+ *
+ *   null                → no lock to show. Plain pop, exactly as today.
+ *   { canWrite: false } → READ-ONLY STRIP. Not mine, and the server will refuse.
+ *   { canWrite: true }  → the pop stays fully live, with a line naming who holds
+ *                         it and the management takeover. This is the manager
+ *                         case, and it comes from the server's own can_write —
+ *                         isManagement() is never re-implemented here.
+ *
+ * WHAT IT NEVER READS: `ownerEmail` as a lock. An owner outlives the lock by
+ * design, and treating the two as one is what kept the strip up forever.
+ *
+ * ORDER OF AUTHORITY, most authoritative first:
+ *   can_write, per-viewer, from the ?owned= poll — the same answer the write
+ *     itself will give, so it settles the question in both directions.
+ *   locked, viewer-independent, off an event — enough to draw the strip the
+ *     instant a claim lands, which is the whole point of the broadcast. A
+ *     manager who lands here loses their chips only until the next poll, which
+ *     the lock change itself kicks off.
+ *   blocked, a refusal the server already gave us — believed until something
+ *     newer contradicts it, and cleared the moment anything does.
+ *
+ * WHY AN UNKNOWN `myEmail` STILL KEEPS THE POP where we have no server verdict.
+ * Until /api/auth/me answers (or if it never does) this browser cannot tell the
+ * owner apart from everybody else. Showing "someone else has this call" to the
+ * person actually on it is the worse of the two mistakes; the opposite error
+ * just shows a pop whose disposition the server will refuse anyway, with its
+ * refusal surfaced. So inference fails OPEN — but a server verdict is not an
+ * inference, and `locked`/`can_write`/`blocked` are honoured whether or not we
+ * know who we are.
+ */
+interface LockView { title: string; freeAtLabel: string; canWrite: boolean }
+
+function lockView(card: PopCard, myEmail: string): LockView | null {
+  if (sameEmail(card.ownerEmail, myEmail)) return null;   // it's mine — keep the pop
+  const who = card.ownerName || card.ownerEmail;
+  const title = who
+    ? (card.mode === 'ringing' ? `${who} is on this call` : `${who} is writing up this call`)
+    : 'Another user is writing up this call';
+
+  // The server said I may write. If a lock is still in force it belongs to
+  // somebody else and they must be named — but only once we know it is not us.
+  if (card.canWrite === true) {
+    return card.locked && myEmail ? { title, freeAtLabel: card.freeAtLabel, canWrite: true } : null;
+  }
+  if (card.locked === true) return { title, freeAtLabel: card.freeAtLabel, canWrite: false };
+  // A refusal the server actually gave us: it names the owner and already says
+  // when the call frees up, so it is shown verbatim rather than re-worded.
+  if (card.blocked) return { title: card.blocked, freeAtLabel: '', canWrite: false };
+  return null;
+}
+
+/**
+ * Which cards do we need the server's ownership verdict for?
+ *
+ * Only ones with a ct_calls.id — /api/crm-calls/live?owned= keys on the primary
+ * key, and a card holding only a TeleCMI id has nothing to ask with (it keeps
+ * the full pop and the PUT's 403 remains the backstop). And only ones with
+ * something lock-shaped about them: an owner, a lock we were told about, or a
+ * refusal we are still showing. An ordinary unowned ringing call adds nothing to
+ * the query string, so the common case is byte-for-byte the request this
+ * component made before.
+ *
+ * Capped at 20 to match the route's own cap; MAX_CARDS makes that unreachable,
+ * but the two limits should not be able to disagree silently.
+ */
+function ownedIdsOf(list: PopCard[]): string[] {
+  const ids: string[] = [];
+  for (const c of list) {
+    if (!c.callId) continue;
+    if (!c.ownerEmail && c.locked !== true && !c.blocked) continue;
+    // SETTLED OPEN: the server has told us this viewer may write and no lock is
+    // in force. There is nothing further to learn by asking again — a lock can
+    // only come BACK by somebody claiming, and a claim is an event. Stopping
+    // here is what keeps a dispositioned card (which keeps its owner forever, as
+    // the audit record) from polling for the rest of the shift.
+    if (c.canWrite === true && c.locked === false) continue;
+    if (!ids.includes(c.callId)) ids.push(c.callId);
+    if (ids.length >= 20) break;
+  }
+  return ids;
+}
+
+/**
+ * Append a card, enforcing the MAX_CARDS stack. When full, drop an already-ended
  * (disposition-mode) card first — a live ringing call always wins the slot.
  * We permanently suppress (add to `dismissed`) ONLY an ended card; if we're
  * forced to evict a still-ringing card (all slots ringing), we drop it WITHOUT
@@ -121,6 +435,13 @@ export default function CTScreenPop() {
     dispositionAfter: boolean;
   } | null>(null);
   const [nowTick, setNowTick] = useState(Date.now());
+  /**
+   * Who am I? Only used to answer "is this call MINE?" — never "may I write
+   * it", which is the server's `can_write` and nothing this browser derives.
+   * '' until /api/auth/me answers — see lockView() for what that changes and
+   * what it deliberately does not.
+   */
+  const [myEmail, setMyEmail] = useState('');
 
   const cardsRef = useRef<PopCard[]>([]);
   const seqRef = useRef(0);
@@ -130,6 +451,16 @@ export default function CTScreenPop() {
   const dismissedRef = useRef<Set<string>>(new Set());
 
   useEffect(() => { cardsRef.current = cards; }, [cards]);
+
+  // Identify this browser once. A failure is survivable: myEmail stays '' and
+  // every card keeps its full pop, with the server still refusing writes that
+  // are not this user's to make.
+  useEffect(() => {
+    fetch('/api/auth/me')
+      .then(r => r.json())
+      .then(d => setMyEmail(String(d?.user?.email || '')))
+      .catch(() => { /* stays '' — presentation falls back to today's behaviour */ });
+  }, []);
 
   // 1s tick drives the ringing-seconds counter (only while something rings).
   const hasRinging = cards.some(c => c.mode === 'ringing');
@@ -173,6 +504,10 @@ export default function CTScreenPop() {
           queue: e.queue || '',
           startedAt: e.at || new Date().toISOString(),
           mode: 'ringing',
+          ownerEmail: '',   // a ringing call is unanswered, so unownable
+          ownerName: '',
+          freeAtLabel: '',
+          blocked: '',
           newName: '',
           error: '',
         }, dismissedRef.current);
@@ -180,14 +515,36 @@ export default function CTScreenPop() {
       return;
     }
 
+    if (e.type === 'answered' || e.type === 'ownership') {
+      // OWNERSHIP ONLY. The card deliberately keeps its mode, its slot and its
+      // ring timer — answering a call is not a reason to stop showing the
+      // person handling it, and that is the committed behaviour. All this does
+      // is record who holds the write-up and whether a lock is in force.
+      //
+      // 'answered' is telephony: somebody picked up. It states an owner (''
+      // for the unmapped-agent case, which leaves the card open to everyone and
+      // is what makes first-claim possible) and says NOTHING about the lock —
+      // the ?owned= poll settles that, kicked off by this very change.
+      // 'ownership' is the owner or the lock CHANGING on a call that already
+      // exists: a claim (locked:true), a management takeover, or the release
+      // the disposition PUT broadcasts (locked:false) — which is the event that
+      // lifts everyone else's strip the instant the write-up is saved.
+      const patch = lockPatch(e);
+      if (Object.keys(patch).length === 0) return;   // stated nothing
+      setCards(prev => {
+        const idx = matchIdx(prev, e);
+        if (idx === -1) return prev;   // this browser never saw the call ring
+        const next = [...prev];
+        next[idx] = { ...next[idx], ...patch };
+        return next;
+      });
+      return;
+    }
+
     if (e.type === 'call_ended') {
       // Same call → do NOT dismiss; switch the card to disposition mode.
       setCards(prev => {
-        const idx = prev.findIndex(c =>
-          (!!e.telecmiCallId && c.telecmiCallId === e.telecmiCallId) ||
-          (!!e.callId && c.callId === e.callId) ||
-          (!e.telecmiCallId && !e.callId && !!e.phone && c.phone === e.phone && c.mode === 'ringing'),
-        );
+        const idx = matchIdx(prev, e);
         if (idx === -1) return prev;
         const c = prev[idx];
         const next = [...prev];
@@ -197,6 +554,10 @@ export default function CTScreenPop() {
           callId: e.callId || c.callId,
           guest: e.guest || c.guest, // CDR event carries a fresher snapshot
           endedAt: e.at || c.endedAt || new Date().toISOString(),
+          // The write-up window is the whole point of the lock, so an owner
+          // named on the hangup/CDR matters most here. lockPatch ignores an
+          // absent field rather than clearing what `answered` already told us.
+          ...lockPatch(e),
         };
         return next;
       });
@@ -213,7 +574,24 @@ export default function CTScreenPop() {
         if (!r || typeof r !== 'object') continue;
         const key = String(r.telecmi_call_id || r.id || r.phone_e164 || '');
         if (!key || dismissedRef.current.has(key)) continue;
-        if (next.some(c => c.key === key || (!!r.id && c.callId === r.id))) continue;
+
+        // Ownership off the snapshot — the self-heal path when SSE dropped and
+        // this browser never saw the `answered` event. Same rule as the bus: a
+        // row that does not NAME an owner tells us nothing and must not clear
+        // one we already know (an older API simply has no such column).
+        const rowOwner = String(r.owner_email || '').trim();
+        const ownerFields = rowOwner
+          ? { ownerEmail: rowOwner, ownerName: String(r.owner_name || '').trim() || rowOwner }
+          : null;
+
+        const hit = next.findIndex(c => c.key === key || (!!r.id && c.callId === r.id));
+        if (hit !== -1) {
+          if (ownerFields) {
+            next = next === prev ? [...next] : next;   // never mutate state in place
+            next[hit] = { ...next[hit], ...ownerFields };
+          }
+          continue;
+        }
         const guest: GuestSnap | null = r.guest_id
           ? {
               id: String(r.guest_id),
@@ -231,6 +609,14 @@ export default function CTScreenPop() {
           queue: String(r.queue || ''),
           startedAt: String(r.started_at || new Date().toISOString()),
           mode: 'ringing',
+          ownerEmail: ownerFields?.ownerEmail || '',
+          ownerName: ownerFields?.ownerName || '',
+          // The ringing snapshot carries the owner but NOT the lock, so a card
+          // born here starts with the lock unknown and keeps the full pop until
+          // the ?owned= answer arrives. Right by construction: these rows are
+          // status='ringing' and a ringing call is not yet ownable at all.
+          freeAtLabel: '',
+          blocked: '',
           newName: '',
           error: '',
         }, dismissedRef.current);
@@ -239,9 +625,56 @@ export default function CTScreenPop() {
     });
   }, []);
 
+  /**
+   * The SERVER's verdict for THIS viewer on the cards we asked about
+   * (?owned=). Authoritative in a way nothing else here is: it is a direct read
+   * of the row by an authenticated request, so an owner_email of '' really does
+   * mean unowned (unlike the ringing snapshot, which is a partial view), and
+   * can_write is the same answer the disposition PUT will give.
+   */
+  const applyOwned = useCallback((rows: any[]) => {
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    setCards(prev => {
+      let next = prev;
+      for (const r of rows) {
+        if (!r || typeof r !== 'object') continue;
+        const id = String(r.id || '');
+        if (!id) continue;
+        const hit = next.findIndex(c => c.callId === id);
+        if (hit === -1) continue;
+        // A CLAIM IS IN FLIGHT ON THIS CARD — leave it alone. This answer was
+        // read from the row before our POST landed, so applying it would flash
+        // the pre-claim state (and, for a beat, somebody else's strip) over a
+        // call we are in the middle of taking. The claim's own response, and the
+        // next poll, both settle it correctly.
+        if (next[hit].claiming) continue;
+        const owner = String(r.owner_email || '').trim();
+        next = next === prev ? [...next] : next;   // never mutate state in place
+        next[hit] = {
+          ...next[hit],
+          ownerEmail: owner,
+          ownerName: owner ? (String(r.owner_name || '').trim() || owner) : '',
+          ...(typeof r.locked === 'boolean' ? { locked: r.locked } : {}),
+          ...(typeof r.can_write === 'boolean' ? { canWrite: r.can_write } : {}),
+          freeAtLabel: String(r.free_at_label || ''),
+          // A refusal is only true until the server says otherwise, and it just
+          // did. Leaving it would redraw the strip over a call this viewer may
+          // now write — the same "outlived its truth" bug in a second costume.
+          ...(r.can_write === true ? { blocked: '' } : {}),
+        };
+      }
+      return next;
+    });
+  }, []);
+
   const pollLive = useCallback(async (processEvents: boolean) => {
     try {
-      const r = await fetch(`/api/crm-calls/live?after=${seqRef.current}`);
+      // ?owned= rides along on the request this component already makes. ONE
+      // batched question about every card on screen whose lock we need checked —
+      // never a request per card, and none at all when there is nothing to ask.
+      const ids = ownedIdsOf(cardsRef.current);
+      const owned = ids.length ? `&owned=${encodeURIComponent(ids.join(','))}` : '';
+      const r = await fetch(`/api/crm-calls/live?after=${seqRef.current}${owned}`);
       if (!r.ok) return;
       let j: any = null;
       try { j = await r.json(); } catch { return; }
@@ -250,8 +683,40 @@ export default function CTScreenPop() {
       if (processEvents && Array.isArray(j?.events)) {
         for (const e of j.events) handleEvent(e);
       }
+      // LAST: the authoritative per-viewer verdict wins over anything the events
+      // above patched in, because it was read from the row by this same request.
+      applyOwned(Array.isArray(j?.owned) ? j.owned : []);
     } catch { /* transient network error — next tick retries */ }
-  }, [handleEvent, mergeRinging]);
+  }, [applyOwned, handleEvent, mergeRinging]);
+
+  /**
+   * THE LOCK CLOCK. Everything else here is event-driven, and a lapsing lock is
+   * the one thing that fires no event: 15 minutes after the call ends (or 60
+   * after the claim) the server opens the call, and nothing tells anybody. The
+   * SSE stream cannot help — it is healthy, and healthy is exactly when the 5s
+   * fallback poll is switched OFF, so without this the strip would still be up
+   * at 19:21 on a browser nobody has touched.
+   *
+   * Costs nothing when there is nothing to watch: ownedIdsOf() is empty unless a
+   * card on screen actually has an owner / a lock / a refusal, and the fallback
+   * poll (which already carries ?owned= every 5s) suppresses this one entirely.
+   */
+  // Re-armed (and re-asked) whenever this string changes, which is exactly when
+  // the ownership picture moved — a claim, an answer, a takeover, a refusal.
+  // That immediacy is what gets a manager's can_write back within a tick instead
+  // of making them wait out the interval with their chips greyed.
+  const ownedSignature = cards
+    .filter(c => !!c.callId)
+    .map(c => `${c.callId}:${c.ownerEmail.toLowerCase()}:${c.locked === true ? 1 : 0}:${c.blocked ? 1 : 0}`)
+    .join('|');
+  const watching = ownedIdsOf(cards).length > 0;
+  useEffect(() => {
+    if (!watching) return;
+    const tick = () => { if (!pollTimer.current) void pollLive(true); };
+    tick();
+    const t = setInterval(tick, OWNERSHIP_REFRESH_MS);
+    return () => clearInterval(t);
+  }, [watching, ownedSignature, pollLive]);
 
   // ── SSE with poll fallback (mirrors the Live Calls wallboard) ─────────────
   useEffect(() => {
@@ -313,6 +778,179 @@ export default function CTScreenPop() {
     return null;
   }, []);
 
+  /**
+   * FIRST CLAIM WINS — take the call before acting on it.
+   *
+   * `proceed: false` means somebody else got there first. The card has already
+   * been collapsed to the strip naming them, and that IS the losing experience:
+   * two GREs reaching for the same call at the same instant is the normal case,
+   * not an error, so it never becomes a toast or a red box.
+   *
+   * FAILS OPEN ON PURPOSE. Only a refusal that NAMES a different owner stops
+   * anything. No call id yet, a network blip, a 404 because the endpoint is not
+   * deployed, or the claim being refused because the call was never answered
+   * (every missed call, which stays everyone's to chase) — all proceed. The
+   * client is not the lock: PUT /api/crm-calls/calls/[id] re-checks ownership
+   * server-side and its 403 is surfaced verbatim. Refusing here on a guess
+   * would block work the server would have allowed, which is the one failure
+   * the user can neither see through nor get past.
+   *
+   * Returns the resolved ct_calls.id so the caller uses it directly rather than
+   * re-reading card state that React has not re-rendered yet.
+   */
+  const claimBeforeAct = useCallback(async (
+    card: PopCard,
+  ): Promise<{ proceed: boolean; callId?: string }> => {
+    // WHAT WE CLAIM WITH. The claim route accepts EITHER ct_calls.id or the
+    // TeleCMI id, and that matters more than it looks: resolveCallId() finds the
+    // internal id by searching /api/crm-calls/live, whose snapshot is RINGING
+    // rows only — and a claimable call has by definition stopped ringing. So for
+    // the very case first-claim exists for, resolveCallId() usually comes back
+    // empty and the TeleCMI id is the only handle we have.
+    const claimRef = card.callId || card.telecmiCallId || (await resolveCallId(card)) || '';
+    if (!claimRef) return { proceed: true };
+    updateCard(card.key, { claiming: true, error: '' });
+    try {
+      const res = await api(`/api/crm-calls/calls/${encodeURIComponent(claimRef)}/claim`, { method: 'POST' });
+      let j: any = {};
+      try { j = await res.json(); } catch { /* keep {} */ }
+      const owner = String(j?.owner || j?.owner_email || '').trim();
+      const ownerName = String(j?.ownerName || j?.owner_name || '').trim();
+
+      if (res.ok && j?.ok !== false) {
+        // Won it (or already had it — re-claiming your own call succeeds). Record
+        // ourselves as owner so a later echo of our own claim, on the bus or in a
+        // snapshot, can never be mistaken for somebody else holding the call.
+        //
+        // call_id is the route's resolved ct_calls.id. Keep ONLY that: claimRef
+        // may be a TeleCMI id, and the disposition PUT matches on the primary key
+        // alone, so storing the wrong one turns the write-up into a 404.
+        const realId = String(j?.call_id || '').trim() || card.callId || '';
+        updateCard(card.key, {
+          claiming: false,
+          ownerEmail: owner || myEmail,
+          ownerName: ownerName || owner || myEmail,
+          // We hold it, so a lock is in force and it is ours: chips stay live
+          // because canWrite is us, not because nothing is locked.
+          locked: true,
+          canWrite: true,
+          // We hold it now, so any earlier refusal is spent. Not reachable while
+          // the strip has no actions on it, but keeping the invariant here means
+          // "owned by me" and "blocked" can never both be true on one card.
+          blocked: '',
+          ...(realId ? { callId: realId } : {}),
+        });
+        return { proceed: true, callId: realId || undefined };
+      }
+
+      if (owner && !sameEmail(owner, myEmail)) {
+        // MANAGEMENT IS NOT BLOCKED BY A LOST CLAIM. claimCall() refuses anyone
+        // who is not the owner — the management override lives in overrideCall(),
+        // not in the claim — so a manager clicking a chip on somebody else's call
+        // loses this race even though the PUT that follows would be ACCEPTED.
+        // can_write is the server's own answer for this viewer, so when it says
+        // yes we go on and let the write happen; the takeover button is for
+        // deliberately taking the call, not a toll gate on doing the work.
+        if (card.canWrite === true) {
+          updateCard(card.key, {
+            claiming: false,
+            ownerEmail: owner,
+            ownerName: ownerName || owner,
+            locked: true,
+            blocked: '',
+          });
+          return { proceed: true, callId: card.callId || undefined };
+        }
+        updateCard(card.key, {
+          claiming: false,
+          ownerEmail: owner,
+          ownerName: ownerName || owner,
+          // A live lock held by somebody else. `locked` is what draws the strip;
+          // canWrite stays where it is so the next ?owned= answer can still turn
+          // out to be "yes" for a manager whose poll has not landed yet.
+          locked: true,
+          // The server's sentence, which also carries when the call frees up.
+          // Kept so the strip is right even before /api/auth/me has answered.
+          blocked: String(j?.message || j?.error || '')
+            || `${ownerName || owner} answered this call first and is handling it.`,
+        });
+        return { proceed: false };
+      }
+
+      // Inconclusive (not answered yet, no such call, endpoint missing, 401…):
+      // proceed and let the server decide. No callId is reported — claimRef may
+      // be a TeleCMI id, and only the internal id is safe to write back.
+      updateCard(card.key, { claiming: false });
+      return { proceed: true, callId: card.callId || undefined };
+    } catch {
+      updateCard(card.key, { claiming: false });
+      return { proceed: true, callId: card.callId || undefined };
+    }
+  }, [myEmail, resolveCallId, updateCard]);
+
+  /**
+   * MANAGEMENT TAKEOVER — POST .../claim { override: true }.
+   *
+   * Three sentences on the server promise this ("A manager can take it over.",
+   * from refusal() in call-owner.ts, on every refusal a GRE ever reads) and until
+   * now nothing in any .tsx sent override:true, so the promise was unkeepable
+   * from the product. overrideCall() owns the Admin/Manager/HOD check, so this
+   * button is offered ONLY where the server already said can_write on a call that
+   * is locked to somebody else — which is exactly the management case — and a
+   * non-manager who somehow reached it gets a 403 with the lib's own sentence.
+   *
+   * Ordinary chips do NOT come through here: a manager who just wants to write
+   * the call up is let through by claimBeforeAct above. This is for deliberately
+   * moving the call onto themselves, which is what unsticks a bad claim.
+   */
+  const takeOver = useCallback(async (card: PopCard) => {
+    const claimRef = card.callId || card.telecmiCallId || '';
+    if (!claimRef) {
+      updateCard(card.key, { error: 'Call record not found yet — try again in a moment.' });
+      return;
+    }
+    updateCard(card.key, { claiming: true, error: '' });
+    try {
+      const res = await api(`/api/crm-calls/calls/${encodeURIComponent(claimRef)}/claim`, {
+        method: 'POST',
+        body: { override: true },
+      });
+      let j: any = {};
+      try { j = await res.json(); } catch { /* keep {} */ }
+      if (res.ok && j?.ok !== false) {
+        const owner = String(j?.owner || '').trim() || myEmail;
+        const realId = String(j?.call_id || '').trim() || card.callId || '';
+        updateCard(card.key, {
+          claiming: false,
+          ownerEmail: owner,
+          ownerName: String(j?.ownerName || '').trim() || owner,
+          locked: true,
+          canWrite: true,
+          freeAtLabel: '',
+          blocked: '',
+          ...(realId ? { callId: realId } : {}),
+        });
+        return;
+      }
+      // The lib's own sentence, verbatim — it says why, and this is a deliberate
+      // action, so unlike a lost race it deserves to be reported.
+      updateCard(card.key, {
+        claiming: false,
+        error: String(j?.error || '') || `Could not take this call (HTTP ${res.status})`,
+      });
+    } catch (e: any) {
+      updateCard(card.key, { claiming: false, error: e?.message || 'Network error — call not taken over' });
+    }
+  }, [myEmail, updateCard]);
+
+  /**
+   * Create the guest for an unknown caller.
+   *
+   * DELIBERATELY DOES NOT CLAIM THE CALL. This writes guest master data, not
+   * the call write-up: the server does not gate it, it is needed just as much
+   * by whoever is chasing a missed call, and claiming here would let someone
+   * who only typed a name lock out the person actually talking to the caller.
+   */
   const createGuest = useCallback(async (card: PopCard) => {
     if (!card.phone) {
       updateCard(card.key, { error: 'No phone number on this call — cannot create a guest' });
@@ -365,6 +1003,28 @@ export default function CTScreenPop() {
       let j: any = {};
       try { j = await res.json(); } catch { /* keep {} */ }
       if (!res.ok) {
+        // 403 is THE ownership refusal, and the server's own sentence names the
+        // owner and says when the call frees up — far more use than "Failed to
+        // save". Collapse to the strip carrying it: this browser is not writing
+        // this call, so leaving the chips up would just invite a second refusal.
+        if (res.status === 403) {
+          const owner = String(j?.owner || j?.owner_email || '').trim();
+          const ownerName = String(j?.ownerName || j?.owner_name || '').trim();
+          updateCard(card.key, {
+            saving: false,
+            blocked: String(j?.error || j?.block || j?.message || '')
+              || 'Another user is writing up this call.',
+            // The refusal settles can_write for this viewer, right now — and the
+            // 403 states `locked` too. free_at rides along as raw UTC and is
+            // deliberately NOT read: formatting it here would be a second copy of
+            // a deadline the server already renders in IST. The sentence above
+            // carries the time anyway.
+            canWrite: false,
+            ...(typeof j?.locked === 'boolean' ? { locked: j.locked } : {}),
+            ...(owner ? { ownerEmail: owner, ownerName: ownerName || owner } : {}),
+          });
+          return;
+        }
         updateCard(card.key, { saving: false, error: j?.error || `Failed to save (HTTP ${res.status})` });
         return;
       }
@@ -388,27 +1048,71 @@ export default function CTScreenPop() {
     });
   }, [resolveCallId, updateCard]);
 
+  /**
+   * A disposition chip — the gated write. Take the call first: whoever writes
+   * it up owns it, which is exactly the double-write this feature exists to
+   * stop. Losing the race collapses this card to the strip and the PUT never
+   * leaves, so the winner's write-up is the only one.
+   *
+   * `handleBookingSaved` also reaches submitDisposition, but only down the
+   * booking_made path that already claimed here, so the claim sits at the
+   * moments work is actually COMMITTED — a chip, or a booking saved — and never
+   * inside the writer.
+   */
   const onChip = useCallback((card: PopCard, value: string) => {
-    if (value === 'booking_made') void openBookingForDisposition(card);
-    else void submitDisposition(card, value);
-  }, [openBookingForDisposition, submitDisposition]);
+    void (async () => {
+      const gate = await claimBeforeAct(card);
+      if (!gate.proceed) return;
+      const c = gate.callId ? { ...card, callId: gate.callId } : card;
+      if (value === 'booking_made') await openBookingForDisposition(c);
+      else await submitDisposition(c, value);
+    })();
+  }, [claimBeforeAct, openBookingForDisposition, submitDisposition]);
 
-  /** [+ Quick Booking] while ringing / talking. */
-  const openQuickBooking = useCallback((card: PopCard) => {
-    setBooking({
-      cardKey: card.key,
-      guestId: card.guest?.id,
-      guestName: card.guest?.name,
-      sourceCallId: card.callId,
-      dispositionAfter: false,
-    });
-  }, []);
+  /**
+   * [+ Quick Booking] while ringing / talking. OPENING THE MODAL CLAIMS NOTHING.
+   *
+   * It used to, and that is the same hazard createGuest() refuses to take three
+   * functions up: a bystander who mis-clicks would own the call for the rest of
+   * it plus the whole write-up window, the GRE actually on the phone would be
+   * told "<Bystander> is on this call", and cancelling the modal released
+   * nothing because nothing here ever released. Merely LOOKING at a booking form
+   * is not handling a call.
+   *
+   * The claim moves to the save (see handleBookingSaved) — the point at which a
+   * booking carrying source_call_id exists, which really is a write-up of this
+   * call by another name. Cancel now costs nobody anything, because cancel never
+   * claimed.
+   *
+   * The callId is still resolved here so the booking can carry source_call_id.
+   */
+  const onQuickBooking = useCallback((card: PopCard) => {
+    void (async () => {
+      updateCard(card.key, { error: '' });
+      const callId = card.callId || (await resolveCallId(card)) || undefined;
+      if (callId && !card.callId) updateCard(card.key, { callId });
+      setBooking({
+        cardKey: card.key,
+        guestId: card.guest?.id,
+        guestName: card.guest?.name,
+        sourceCallId: callId,
+        dispositionAfter: false,
+      });
+    })();
+  }, [resolveCallId, updateCard]);
 
   const handleBookingSaved = useCallback((b: NonNullable<typeof booking>) => {
-    if (!b.dispositionAfter) return;
     const card = cardsRef.current.find(c => c.key === b.cardKey);
-    if (card) void submitDisposition(card, 'booking_made');
-  }, [submitDisposition]);
+    if (!card) return;
+    // booking_made came through onChip, which already claimed; go straight to
+    // the disposition (which is itself the gated write and 403s if we lost it).
+    if (b.dispositionAfter) { void submitDisposition(card, 'booking_made'); return; }
+    // THE QUICK-BOOKING CLAIM, ON SAVE. A booking now exists against this call,
+    // so the write-up is ours to hold. A lost race just collapses the card to
+    // the strip — the booking is guest/booking data and stands either way, and a
+    // ringing call is refused as not-answered and changes nothing.
+    void claimBeforeAct(card);
+  }, [claimBeforeAct, submitDisposition]);
 
   const ringSeconds = (card: PopCard) => {
     const t = new Date(card.startedAt).getTime();
@@ -424,6 +1128,46 @@ export default function CTScreenPop() {
       <div className="fixed top-24 right-4 md:right-6 z-50 w-[min(92vw,22.5rem)] space-y-3 pointer-events-none">
         <style>{'@keyframes ctPopSlideIn{from{transform:translateX(120%);opacity:0}to{transform:translateX(0);opacity:1}}'}</style>
         {cards.map(card => {
+          /* A LOCK IS IN FORCE ON THIS CALL AND IT IS NOT MINE.
+             Read off the SERVER's locked/can_write, never off "it has an
+             owner" — an owner outlives the lock, which is exactly how this
+             strip used to stay up all evening on a call the server had already
+             opened to everyone. lockView() is where that rule lives. */
+          const lock = lockView(card, myEmail);
+          /* …and I MAY NOT write it → the pop closes down to a slim read-only
+             strip naming them. No chips, no Quick Booking, no disposition —
+             one answered call, one write-up. Only the dismiss stays, because a
+             strip nobody can clear is just clutter on a screen that lives open
+             all shift. No "take over" here either: this branch is precisely
+             the non-management one, and offering an action the server will
+             refuse is worse than not offering it. */
+          if (lock && !lock.canWrite) {
+            return (
+              <div key={card.key} role="status"
+                   style={{ animation: 'ctPopSlideIn .3s ease-out' }}
+                   className="pointer-events-auto w-full bg-white border border-[#E8D5C4] rounded-xl shadow-lg overflow-hidden">
+                <div className="flex items-start gap-2 px-3 py-2.5">
+                  <span className="mt-px shrink-0 w-6 h-6 rounded-full bg-[#FFF1E3] border border-[#E8D5C4] inline-flex items-center justify-center">
+                    <Lock className="w-3.5 h-3.5 text-[#8B7355]" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-semibold text-[#2D1B0E] leading-snug">{lock.title}</p>
+                    <p className="text-[11px] text-[#8B7355] truncate mt-0.5">
+                      {[card.guest?.name, formatPhone(card.phone) || card.phone].filter(Boolean).join(' · ') || '—'}
+                      {/* The server's own IST label — this browser never works
+                          out a deadline of its own. */}
+                      {lock.freeAtLabel ? ` · opens to everyone at ${lock.freeAtLabel}` : ''}
+                    </p>
+                  </div>
+                  <button onClick={() => removeCard(card.key)} aria-label="Dismiss"
+                          className="p-0.5 rounded hover:bg-[#FFF1E3] shrink-0">
+                    <X className="w-4 h-4 text-[#8B7355]" />
+                  </button>
+                </div>
+              </div>
+            );
+          }
+
           const tags = card.guest?.tags || [];
           const isVip = tags.some(t => String(t).toLowerCase() === 'vip');
           const otherTags = tags.filter(t => String(t).toLowerCase() !== 'vip').slice(0, 3);
@@ -503,14 +1247,41 @@ export default function CTScreenPop() {
                   </div>
                 )}
 
+                {/* MANAGEMENT ON SOMEBODY ELSE'S LOCKED CALL. The server said
+                    can_write, so the card stays fully live — chips, Quick
+                    Booking, everything — and this line is the part a manager
+                    actually needs: WHO is on it, until WHEN, and the takeover
+                    three server sentences have been promising. Reachable only
+                    when the SERVER said can_write on a call locked to someone
+                    else — which is the definition of management here, computed
+                    by isManagement inside callOwnerState and never re-derived
+                    in the browser. Everyone else is caught by the read-only
+                    strip above, because a lock arriving on an event resets
+                    canWrite to "not yet asked" rather than leaving a stale
+                    answer standing (see lockPatch) — without that reset this
+                    button did briefly render for bystanders. */}
+                {lock && lock.canWrite && (
+                  <div className="flex items-start gap-2 px-2.5 py-2 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg">
+                    <Lock className="w-3.5 h-3.5 text-[#8B7355] shrink-0 mt-0.5" />
+                    <p className="text-[11px] text-[#6B5744] leading-snug min-w-0 flex-1">
+                      {lock.title}
+                      {lock.freeAtLabel ? ` · opens to everyone at ${lock.freeAtLabel}` : ''}
+                    </p>
+                    <button onClick={() => takeOver(card)} disabled={card.claiming}
+                            className="text-[11px] text-[#af4408] font-semibold hover:underline disabled:opacity-50 shrink-0">
+                      Take over
+                    </button>
+                  </div>
+                )}
+
                 {card.error && (
                   <p className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-2.5 py-1.5">{card.error}</p>
                 )}
 
                 {card.mode === 'ringing' ? (
                   <div className="flex items-center gap-2 pt-0.5">
-                    <button onClick={() => openQuickBooking(card)}
-                            className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-xs font-semibold">
+                    <button onClick={() => onQuickBooking(card)} disabled={card.claiming}
+                            className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-xs font-semibold">
                       <CalendarPlus className="w-3.5 h-3.5" /> Quick Booking
                     </button>
                     {card.guest?.id && (
@@ -524,7 +1295,7 @@ export default function CTScreenPop() {
                   <div className="space-y-1.5">
                     <div className="grid grid-cols-2 gap-1.5">
                       {DISPOSITIONS.map((d, i) => (
-                        <button key={d.value} disabled={card.saving}
+                        <button key={d.value} disabled={card.saving || card.claiming}
                                 onClick={() => onChip(card, d.value)}
                                 className={`px-2 py-1.5 rounded-lg text-xs font-semibold border transition-colors disabled:opacity-50 ${
                                   i === 0
@@ -536,9 +1307,10 @@ export default function CTScreenPop() {
                       ))}
                     </div>
                     <div className="flex items-center justify-between">
-                      {card.saving ? (
+                      {card.saving || card.claiming ? (
                         <span className="text-[11px] text-[#8B7355] inline-flex items-center gap-1">
-                          <Loader2 className="w-3 h-3 animate-spin" /> Saving…
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          {card.claiming ? 'Taking this call…' : 'Saving…'}
                         </span>
                       ) : <span />}
                       {card.guest?.id && (

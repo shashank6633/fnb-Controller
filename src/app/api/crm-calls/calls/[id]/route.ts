@@ -1,11 +1,32 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { emitCt, pushRecentCt, type CtEvent } from '@/lib/ct/bus';
+import { callOwnerColumns, callOwnerState } from '@/lib/ct/call-owner';
 
 /**
  * PUT /api/crm-calls/calls/[id]   { disposition, disposition_note? }
  *
- * Sets the GRE's post-call disposition on a call. Two side-effects:
+ * Sets the GRE's post-call disposition on a call.
+ *
+ * ── THIS ROUTE IS THE LOCK ───────────────────────────────────────────────────
+ * An ANSWERED call belongs to ONE person (src/lib/ct/call-owner.ts). Everything
+ * else in the feature — the pop collapsing to a strip, the claim endpoint — is
+ * presentation and intent. A browser that hides its popup can still send this
+ * request, so if the check is not HERE then two GREs still write up one call and
+ * the second silently overwrites the first. That is the bug the whole feature
+ * exists to kill, and this is the only place it can actually be stopped.
+ *
+ * The check runs AFTER auth and payload validation (a bad disposition still gets
+ * its own 400, not a confusing 403) and BEFORE the UPDATE and both side-effects
+ * below — a refused write must leave the recovery queue and the follow-up list
+ * exactly as it found them. It is evaluated from the row on every request, never
+ * from a timer: a browser that was closed never fires its setTimeout, and the
+ * call would stay locked all evening.
+ *
+ * Management (Admin/Manager/HOD) passes the check by definition, so a bad claim
+ * is never stuck. See call-owner.ts for the full rule.
+ *
+ * Two side-effects, unchanged:
  *
  * 1. RECOVERY CLOSE-OUT — if this call maps to an open recovery (either
  *    ct_recoveries.recovery_call_id = this call, i.e. the auto-matched
@@ -48,15 +69,64 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
   }
 
   const db = getDb();
+  // callOwnerColumns() supplies status/ended_at/disposition/owner_email/
+  // owner_claimed_at — the whole set the lock rule reads. Never hand-type them:
+  // callOwnerState() fails CLOSED on a missing column (which would otherwise
+  // disable the lock for everyone, silently). status and disposition come from
+  // there too, so they are not repeated in the list above.
   const call = db.prepare(`
-    SELECT id, guest_id, phone_e164, direction, status, disposition
+    SELECT id, guest_id, phone_e164, direction, ${callOwnerColumns()}
     FROM ct_calls WHERE id = ?
   `).get(id) as any;
   if (!call) return Response.json({ error: 'Call not found' }, { status: 404 });
 
+  // THE LOCK. ONE evaluation of the rule, before any write. `ownership.block` is
+  // exactly what callWriteBlock() returns — that function is a one-line wrapper
+  // over callOwnerState() — and taking the whole state instead lets the 403 carry
+  // the owner, so the client can draw its strip without a second round-trip.
+  // Asking twice, or re-deriving any of this in the browser, is how the UI ends
+  // up offering an action the server refuses.
+  const ownership = callOwnerState(db, call, user);
+  if (ownership.block) {
+    return Response.json(
+      {
+        error: ownership.block,
+        owner_email: ownership.ownerEmail,
+        owner_name: ownership.ownerName,
+        locked: ownership.locked,
+        free_at: ownership.freeAt,
+      },
+      { status: 403 },
+    );
+  }
+
   const now = new Date().toISOString();
   db.prepare(`UPDATE ct_calls SET disposition = ?, disposition_note = ? WHERE id = ?`)
     .run(disposition, note, id);
+
+  // ── ANNOUNCE THE RELEASE ─────────────────────────────────────────────────
+  // Saving a disposition SPENDS the lock (see lockFreeSql: a call with a
+  // disposition is free to all). Every other browser is holding a strip that
+  // says this call belongs to someone, and nothing else tells them otherwise —
+  // the recovery_update below only fires when a recovery row exists, so an
+  // ordinary answered call announced nothing at all and the strip stayed up
+  // until a hard refresh. That is one of the two release conditions the owner
+  // chose, and it has to be visible on the surface they actually watch.
+  //
+  // ownerEmail is deliberately still populated: it is the audit record of who
+  // handled the call and it outlives the lock. `locked: false` is the news.
+  const releaseEvt: CtEvent = {
+    type: 'ownership',
+    callId: id,
+    phone: call.phone_e164,
+    ownerEmail: ownership.ownerEmail,
+    ownerName: ownership.ownerName,
+    locked: false,
+    freeAtLabel: '',
+    at: now,
+  };
+  emitCt(releaseEvt);
+  pushRecentCt(releaseEvt);
 
   // ── Recovery close-out ───────────────────────────────────────────────────
   // Prefer the explicit callback link (recovery_call_id = this call), else an

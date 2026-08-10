@@ -11,6 +11,9 @@
  *     recoveries for that phone; answered outbound records the callback
  *     attempt; a booking created after a call links + recovers via
  *     attributeBooking().
+ *   - Answered-call OWNERSHIP: stamps ct_calls.owner_email when telephony tells
+ *     us who picked up, so the screen-pop and the write-up belong to ONE person
+ *     (see the ownership block below; the lock itself lives in ./call-owner.ts).
  *   - Safety nets: reconcileLiveEvents (ring seen, CDR never arrived) and
  *     expireOverdueRecoveries (escalate at SLA, expire at 2× SLA).
  *
@@ -31,6 +34,186 @@ function agentDisplayName(db: Database.Database, rawAgent: string | undefined | 
   if (!rawAgent) return '';
   try { return resolveAgentLabel(rawAgent, getAgentMap(db), getUserNamesByEmail(db)); }
   catch { return String(rawAgent || ''); }
+}
+
+// ─── Answered-call OWNERSHIP — the stamping side ────────────────────────────
+//
+// When a call is ANSWERED it belongs to ONE person: they keep the screen-pop and
+// the disposition write-up, and every other browser collapses to a read-only
+// strip naming who has it. THE LOCK RULE AND THE ATOMIC FIRST-CLAIM LIVE IN
+// src/lib/ct/call-owner.ts AND ARE NOT REPEATED HERE. All this file ever does is
+// the one narrow write the telephony side has earned: put an owner on a row that
+// is ANSWERED and still UNOWNED. That precondition is strictly narrower than
+// anything in call-owner.ts, so the two can never disagree about who holds a call.
+//
+// WHY NOT JUST IMPORT claimCall():
+//   1. claimCall() deliberately also succeeds when the lock has LAPSED — the
+//      owner saved a disposition, or the write-up window expired. That is right
+//      for a human clicking "take this call" and WRONG here: a re-delivered CDR
+//      (ingestCdr is idempotent, so re-delivery is normal) or a backfill run
+//      would silently rewrite the owner of a call somebody already wrote up.
+//      Ingest may fill a blank; it may never take one over.
+//   2. call-owner.ts imports @/lib/auth (for isManagement), which pulls
+//      next/headers. Ingest runs from a webhook with NO signed-in user and must
+//      not drag session machinery into that path.
+//
+// MISSED CALLS ARE NEVER OWNED. Nobody picked up, chasing them is the entire job
+// of the recovery queue, and an owner on one would lock it away from the people
+// meant to chase it. The CDR is the source of truth on answered-vs-missed, so it
+// both stamps AND un-stamps — see settleOwnerFromCdr().
+
+/** Set an owner ONLY on an answered, still-unowned row. One conditional UPDATE:
+ *  the precondition is the WHERE, so a browser that claimed the call a moment
+ *  before this webhook landed keeps it — the database picks the winner, not us.
+ *  The answered test matches answeredSql() in call-owner.ts: answered_at is the
+ *  primary signal, status covers a row whose answered_at never arrived. */
+const STAMP_OWNER_SQL = `
+  UPDATE ct_calls
+     SET owner_email = ?, owner_claimed_at = ?
+   WHERE id = ?
+     AND IFNULL(owner_email, '') = ''
+     AND (IFNULL(answered_at, '') <> '' OR IFNULL(status, '') = 'answered')
+`;
+
+/** Hand a call back to everyone. Used only when the CDR reclassifies a call the
+ *  live 'answer' notify had already stamped (see settleOwnerFromCdr). */
+const CLEAR_OWNER_SQL = `
+  UPDATE ct_calls
+     SET owner_email = '', owner_claimed_at = ''
+   WHERE id = ? AND IFNULL(owner_email, '') <> ''
+`;
+
+interface OwnerInfo {
+  /** ct_calls.owner_email — an APP USER's email, '' when unowned. */
+  ownerEmail: string;
+  /** That user's display name (falls back to the email), '' when unowned. */
+  ownerName: string;
+}
+
+const NO_OWNER: OwnerInfo = { ownerEmail: '', ownerName: '' };
+
+/**
+ * Which APP USER should own a call answered by this raw TeleCMI agent id?
+ * Returns null — leave it unowned, first-claim will settle it from the browser —
+ * rather than guessing. owner_email MUST always be a real, active app user: it
+ * is compared against the signed-in user on every write check, so a value that
+ * matches nobody would fail those comparisons silently and lock the call to a
+ * ghost until a manager overrode it.
+ *
+ * The ladder mirrors resolveAgentLabel() in ./agents.ts:
+ *   agent_map has this id  → the mapped email (the admin's explicit intent)
+ *   no mapping at all      → the raw id itself, because device-dialed callbacks
+ *                            store the GRE's own email in agent_user
+ * A mapping that exists but does NOT resolve to an active user returns null: the
+ * admin's map is authoritative, so we must not second-guess a bad entry with the
+ * raw-id fallback. That is the unmapped/mis-mapped case the owner settled as
+ * FIRST CLAIM WINS.
+ */
+function ownerCandidate(
+  db: Database.Database,
+  rawAgent: string | undefined | null,
+): { email: string; name: string } | null {
+  const raw = String(rawAgent || '').trim();
+  if (!raw) return null;
+  try {
+    // getAgentMap returns a NULL-prototype object, so a literal '__proto__'
+    // agent id cannot reach Object.prototype here.
+    const map = getAgentMap(db);
+    const mapped = map[raw] || map[raw.toLowerCase()];
+    const candidate = typeof mapped === 'string' && mapped.trim() ? mapped.trim() : raw;
+    // is_active matters: a mapped agent whose user has since been deactivated
+    // cannot sign in, so owning the call would just lock it for the write-up
+    // window against the GRE who actually handled it.
+    const row = db
+      .prepare(`SELECT email, name FROM users WHERE is_active = 1 AND lower(email) = lower(?) LIMIT 1`)
+      .get(candidate) as { email: string; name: string } | undefined;
+    const email = String(row?.email || '').trim();
+    if (!email) return null; // not one of our users → stays unowned by design
+    return { email, name: String(row?.name || '').trim() || email };
+  } catch (e) {
+    console.error('[ct-ingest] owner candidate lookup failed', e);
+    return null; // never let ownership resolution break ingestion
+  }
+}
+
+/**
+ * Read the row's CURRENT owner for the outgoing CtEvent. Read back rather than
+ * echo what we just tried to write: after a lost race the truthful answer is the
+ * OTHER person, and every browser reacts to this event.
+ *
+ * The name lookup is deliberately local instead of call-owner.ts's
+ * ownerDisplayName() — importing that module would pull @/lib/auth →
+ * next/headers into the webhook path (see the block comment above). There is no
+ * drift risk: this resolves a name, it does not decide anything.
+ */
+function ownerOf(db: Database.Database, callId: string | undefined | null): OwnerInfo {
+  const id = String(callId || '').trim();
+  if (!id) return NO_OWNER;
+  try {
+    const row = db
+      .prepare(`SELECT IFNULL(owner_email, '') AS owner_email FROM ct_calls WHERE id = ?`)
+      .get(id) as { owner_email: string } | undefined;
+    const email = String(row?.owner_email || '').trim();
+    if (!email) return NO_OWNER;
+    const named = db
+      .prepare(`SELECT name FROM users WHERE lower(email) = lower(?) LIMIT 1`)
+      .get(email) as { name?: string } | undefined;
+    return { ownerEmail: email, ownerName: String(named?.name || '').trim() || email };
+  } catch (e) {
+    console.error('[ct-ingest] owner read failed', e);
+    return NO_OWNER;
+  }
+}
+
+/** Stamp the answering agent onto an unowned answered call, then report who
+ *  actually holds it. `claimedAt` is the moment WE recorded the claim (not the
+ *  answer time): it is only ever read as the expiry anchor when ended_at is
+ *  blank, and "when ownership started" is what that anchor means. */
+function stampAnsweredOwner(
+  db: Database.Database,
+  callId: string | undefined | null,
+  rawAgent: string | undefined | null,
+  claimedAt: string,
+): OwnerInfo {
+  const id = String(callId || '').trim();
+  if (!id) return NO_OWNER;
+  try {
+    const cand = ownerCandidate(db, rawAgent);
+    if (cand) db.prepare(STAMP_OWNER_SQL).run(cand.email, claimedAt, id);
+  } catch (e) {
+    console.error('[ct-ingest] owner stamp failed', e);
+  }
+  return ownerOf(db, id);
+}
+
+/**
+ * The CDR is the source of truth on answered-vs-missed, so it settles ownership
+ * both ways and returns the row's owner afterwards:
+ *   answered → stamp the answering agent if the row is still unowned;
+ *   anything else (missed / abandoned / voicemail) → CLEAR any owner. The live
+ *     'answer' notify is optimistic — TeleCMI can announce a bridge that the CDR
+ *     later reports as failed/busy/cancelled — and that same CDR files the call
+ *     into the recovery queue, where it must be visible and writable by everyone.
+ *     Leaving the optimistic stamp behind would lock a missed call for the whole
+ *     write-up window against the very people meant to chase it.
+ *
+ * THE CLEAR IS DELIBERATELY NOT GATED ON THE ROW'S OWN answered_at. It is
+ * tempting to only un-stamp rows that no longer look answered, but that guard
+ * would never fire in the exact case it is meant for: the upsert above keeps a
+ * live-notify answered_at (COALESCE) while flipping status to 'missed', so the
+ * reclassified row still reads as "answered" to call-owner.ts's answeredSql().
+ * The incoming CDR's verdict is the signal here, not the row's leftover flag.
+ */
+function settleOwnerFromCdr(
+  db: Database.Database,
+  callId: string,
+  cdr: { status: string; agent: string },
+  now: string,
+): OwnerInfo {
+  if (cdr.status === 'answered') return stampAnsweredOwner(db, callId, cdr.agent, now);
+  try { db.prepare(CLEAR_OWNER_SQL).run(callId); }
+  catch (e) { console.error('[ct-ingest] owner clear failed', e); }
+  return ownerOf(db, callId);
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
@@ -404,6 +587,12 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
       }
     }
 
+    // OWNERSHIP, settled by the source of truth: an answered call gets the
+    // answering agent (if the row is still unowned), anything else is handed
+    // back to the recovery queue. Must run BEFORE the emit — the event carries
+    // the result to every browser.
+    const owner = settleOwnerFromCdr(db, callId, { status: m.status, agent: m.agent || '' }, now);
+
     emit({
       type: 'call_ended',
       callId,
@@ -414,6 +603,13 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
       // "answered by <name>" only makes sense for answered calls — a missed call
       // was not answered by anyone.
       agentName: m.status === 'answered' ? (agentDisplayName(db, m.agent) || undefined) : undefined,
+      // Sent as '' rather than undefined when unowned — DELIBERATE, and the one
+      // place this file breaks its own `|| undefined` habit. A browser holding a
+      // stale owner has to be able to learn that ownership was cleared (missed
+      // CDR after an optimistic live 'answer'), and an absent field reads as "no
+      // information", not "nobody". '' means UNOWNED, as documented on CtEvent.
+      ownerEmail: owner.ownerEmail,
+      ownerName: owner.ownerName,
       queue: m.queue || undefined,
       at: now,
     });
@@ -530,6 +726,12 @@ export function ingestLive(raw: any): void {
         `).run(m.at || now, telecmiId);
         answeredCallId = (db.prepare(`SELECT id FROM ct_calls WHERE telecmi_call_id = ?`).get(telecmiId) as { id: string } | undefined)?.id;
       }
+      // THE MOMENT OWNERSHIP IS DECIDED for a mapped agent: whoever picked up
+      // owns the write-up from here. Unmapped agent → stays unowned and the
+      // first browser to act claims it. Runs after the status UPDATE above, so
+      // the row already reads 'answered' and STAMP_OWNER_SQL's guard passes. An
+      // id-less answer payload has no row to stamp: first-claim covers it.
+      const owner = stampAnsweredOwner(db, answeredCallId, m.agent, now);
       // Tell the Live wallboard the call left the ringing state in real time
       // (the 12s ringing re-sync is the backstop; this makes it instant).
       emit({
@@ -539,6 +741,11 @@ export function ingestLive(raw: any): void {
         phone: phone || undefined,
         agent: m.agent || undefined,
         agentName: agentDisplayName(db, m.agent) || undefined,
+        // '' = unowned, and every browser needs that fact to decide between
+        // keeping the pop and collapsing to the read-only strip. Presentation
+        // only — the write is gated server-side by callWriteBlock().
+        ownerEmail: owner.ownerEmail,
+        ownerName: owner.ownerName,
         at: m.at || now,
       });
       return;
@@ -591,12 +798,23 @@ export function ingestLive(raw: any): void {
         `).run(m.at || now, phone);
       }
 
+      // Hangup does NOT change ownership — it starts the 15-minute write-up
+      // window that call-owner.ts measures from ended_at. Nothing is stamped or
+      // cleared here: a 'ringing' row can never have had an owner (both the
+      // stamp above and claimCall require an answered row), and an answered one
+      // keeps its owner precisely so the write-up stays theirs. We only READ it,
+      // because this is the browsers' first news that the call ended and they
+      // must not lose track of who holds it while the CDR is still minutes away.
+      const owner = ownerOf(db, row?.id);
+
       emit({
         type: 'call_ended',
         callId: row?.id,
         telecmiCallId: telecmiId || undefined,
         phone: phone || undefined,
         guest: guestSnapshot(db, phone),
+        ownerEmail: owner.ownerEmail,
+        ownerName: owner.ownerName,
         at: m.at || now,
       });
     }
