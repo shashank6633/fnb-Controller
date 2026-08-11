@@ -202,8 +202,14 @@ const AGENT_KEYS = [
 //    aliases for other PBXs, and two of them mean something else entirely (an
 //    IVR node is a menu, not the group that rang). A field we have observed on
 //    this account outranks a guess at another one.
+// 'ivr' was dropped from this list. It used to be harmless: the value was only
+// ever shown as a bare label. The Call Log now renders it as an assertion —
+// "Rang <value>" — and an IVR node is a MENU, not a group of phones, so that
+// sentence would be false. Nothing on this account sends it (a 17-field census
+// of real CDRs found only 'team'), so no payload loses a queue by this removal;
+// one that carried ivr alone now shows no team rather than a wrong one.
 const QUEUE_KEYS = [
-  'queue', 'queuename', 'team', 'group', 'groupname', 'ringgroup', 'department', 'ivr',
+  'queue', 'queuename', 'team', 'group', 'groupname', 'ringgroup', 'department',
 ];
 const START_KEYS = [
   'starttime', 'startedat', 'startstamp', 'starttimestamp', 'start', 'time',
