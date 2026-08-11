@@ -4,6 +4,7 @@ import { normalizePhone } from '@/lib/ct/phone';
 import { guestMetrics, guestMetricsByPhone } from '@/lib/ct/metrics';
 import { getAgentMap, getUserNamesByEmail, resolveAgentLabel } from '@/lib/ct/agents';
 import { norm10, loyaltyDetail, diningDetail } from '@/lib/ct/guest-unify';
+import { recordingRetentionStatus } from '@/lib/ct/retention';
 
 /**
  * GET /api/crm-calls/guests/[id]
@@ -161,7 +162,13 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
         analysis_status: c.analysis_status,
         analysis_score: c.analysis_score,
         analysis_outcome: c.analysis_outcome,
-        has_recording: !!(c.recording_url && String(c.recording_url).trim()),
+        // PLAYABLE, not "a URL exists" — same rule as the Call Log. Past the
+        // retention window the proxy answers 410 and an <audio> element throws
+        // that body away, so offering the control here produced a dead player
+        // with no explanation. Judged by the shared helper rather than a second
+        // copy of the arithmetic; this row already carries both anchors.
+        has_recording: !!(c.recording_url && String(c.recording_url).trim())
+          && !recordingRetentionStatus(db, c as any).expired,
       });
     }
 

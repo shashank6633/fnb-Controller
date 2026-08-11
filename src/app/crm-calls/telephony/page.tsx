@@ -24,6 +24,13 @@
  *     recording switched off, and a CDR webhook that has never reached us at
  *     all. The last of those is not a code problem, and only this panel can
  *     say so.
+ *   6 Recording retention — the one WRITABLE control on this page that is not
+ *     a TeleCMI account setting: how long a recording stays reachable through
+ *     this app (7 / 15 / 30 days). It sits here rather than in CRM Settings
+ *     because it belongs beside the recording diagnostic it constrains, and
+ *     because the panel has to state plainly what it does and does not do —
+ *     no audio is stored on this server, so the window governs playability,
+ *     not files. See src/lib/ct/retention.ts.
  *
  * WHY CALLER ID NEEDS A PASSWORD: TeleCMI scopes caller-ID to the USER, not the
  * account, so the app secret cannot read or set it (see src/lib/ct/telecmi-api.ts
@@ -37,13 +44,14 @@
  *   GET  /api/telecmi/agents      POST /api/telecmi/agents   (add|update|refresh)
  *   POST /api/telecmi/callerid    (login|list|set)
  *   GET  /api/telecmi/recording-diagnostic
+ *   GET  /api/telecmi/recording-retention   PUT /api/telecmi/recording-retention
  */
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Phone, Wallet, BarChart3, Users, PhoneOutgoing, Loader2, AlertCircle,
   AlertTriangle, CheckCircle2, RefreshCw, Lock, Plus, Pencil, KeyRound,
-  Link2Off, PlugZap, X, Save, Info, FileAudio,
+  Link2Off, PlugZap, X, Save, Info, FileAudio, Timer,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
@@ -178,6 +186,24 @@ type RecordingDiagResp = {
     real_recordings: number;
     headline: string;
   };
+};
+
+/* ── Recording retention (GET/PUT /api/telecmi/recording-retention) ────────
+ * `stores_audio` is the one field the copy in this panel hangs off: it is the
+ * server saying whether any recording bytes are kept on this box. It is false
+ * today, and the panel must SAY so rather than imply files are being deleted
+ * on a schedule that never deletes anything. */
+type RetentionResp = {
+  days: number;
+  choices: number[];
+  default_days: number;
+  source: 'db' | 'default';
+  swept_to: string | null;
+  local_store: string;
+  stores_audio: boolean;
+  /** `capped` = the real number is higher; the count stops early on purpose. */
+  expired_recordings: { count: number; capped: boolean };
+  error?: string;
 };
 
 /* ── Formatting helpers ───────────────────────────────────────────────────── */
@@ -365,6 +391,13 @@ export default function TelephonyPage() {
   const [diagLoading, setDiagLoading] = useState(true);
   const [diagError, setDiagError] = useState<string | null>(null);
 
+  // 6 · Recording retention
+  const [ret, setRet] = useState<RetentionResp | null>(null);
+  const [retLoading, setRetLoading] = useState(true);
+  const [retError, setRetError] = useState<string | null>(null);
+  const [retSaving, setRetSaving] = useState<number | null>(null);
+  const [retFlash, setRetFlash] = useState<string | null>(null);
+
   const loadBalance = useCallback(async () => {
     setBalLoading(true); setBalError(null);
     const r = await getJson<BalanceResp>('/api/telecmi/balance');
@@ -431,6 +464,43 @@ export default function TelephonyPage() {
   }, []);
 
   useEffect(() => { void loadDiag(); }, [loadDiag]);
+
+  /* ── 6 · Recording retention ──────────────────────────────────────────────
+   * Its own loader for the same reason as the diagnostic above: additive, and
+   * nothing already on this page changes shape because it exists. Reads
+   * ct_settings plus one capped count — no TeleCMI round trip. */
+  const loadRetention = useCallback(async () => {
+    setRetLoading(true); setRetError(null);
+    const r = await getJson<RetentionResp>('/api/telecmi/recording-retention');
+    if (!r.ok) {
+      if (r.locked) setLocked(true);
+      setRetError(r.error);
+      setRet(null);
+    } else {
+      setRet(r.data);
+    }
+    setRetLoading(false);
+  }, []);
+
+  useEffect(() => { void loadRetention(); }, [loadRetention]);
+
+  const saveRetention = async (days: number) => {
+    if (retSaving != null) return;
+    setRetSaving(days); setRetError(null); setRetFlash(null);
+    try {
+      const r = await api('/api/telecmi/recording-retention', { method: 'PUT', body: { days } });
+      const j = (await r.json().catch(() => ({}))) as Partial<RetentionResp>;
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      // The route answers with the freshly-read state, so the panel shows what
+      // the server actually holds rather than what was clicked.
+      setRet(j as RetentionResp);
+      setRetFlash(`Saved — recordings stay reachable for ${days} days after the call.`);
+    } catch (e) {
+      setRetError(e instanceof Error ? e.message : 'Could not save the retention period');
+    } finally {
+      setRetSaving(null);
+    }
+  };
 
   /* ── Analysis drift ──────────────────────────────────────────────────────
    * TeleCMI's count is ground truth; ours comes from the CDR webhook. A gap
@@ -1228,6 +1298,128 @@ export default function TelephonyPage() {
                 credential masked.
               </p>
             )}
+          </div>
+        )}
+      </SectionCard>
+
+      {/* ── 6 · Recording retention ── */}
+      <SectionCard
+        icon={<Timer className="w-4 h-4 text-[#af4408]" />}
+        title="Recording retention"
+        subtitle="How long a call recording stays reachable through this app."
+        right={
+          <button onClick={() => void loadRetention()} disabled={retLoading}
+                  className="px-2.5 py-1 bg-white border border-[#E8D5C4] rounded text-xs text-[#6B5744] flex items-center gap-1 hover:bg-[#FFF8F0] disabled:opacity-50">
+            <RefreshCw className={`w-3 h-3 ${retLoading ? 'animate-spin' : ''}`} /> Refresh
+          </button>
+        }
+      >
+        {retLoading ? (
+          <Spinner label="Reading the retention policy…" />
+        ) : !ret ? (
+          <ErrorBox msg={retError || 'No response from the retention API.'} onRetry={() => void loadRetention()} />
+        ) : (
+          <div className="space-y-3">
+            {/* WHAT THIS ACTUALLY DOES. Said first, and said plainly, because a
+                retention control that quietly governs nothing is worse than no
+                control: an owner would believe recordings are being deleted
+                here. They are not stored here to begin with. */}
+            <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3 flex items-start gap-2">
+              <Info className="w-4 h-4 text-[#8B7355] shrink-0 mt-0.5" />
+              <div className="text-[11px] text-[#6B5744] space-y-1">
+                {ret.stores_audio ? (
+                  <p>
+                    Recording audio is stored on this server
+                    (<span className="font-mono">{ret.local_store}</span>). Files are deleted
+                    automatically once they pass the window below, and playback is refused from
+                    that moment.
+                  </p>
+                ) : (
+                  <>
+                    <p>
+                      <strong className="text-[#2D1B0E]">No recording audio is kept on this
+                      server.</strong> TeleCMI holds the audio; this app fetches it for each play
+                      through an authenticated proxy and writes nothing to disk — so there is no
+                      file here to delete, and no storage being consumed.
+                    </p>
+                    <p>
+                      What this window controls today is <strong>reachability</strong>: once a call
+                      is older than it, the player refuses the recording for everyone, before any
+                      request goes to TeleCMI, and the refusal is written to the audit trail. If
+                      recordings are ever stored on this server, the same window and the same
+                      expiry job will delete those files — nothing here needs re-configuring.
+                    </p>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {retError && <ErrorBox msg={retError} onRetry={() => void loadRetention()} />}
+            {retFlash && (
+              <p className="text-[11px] text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1.5 flex items-start gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-px" /> <span>{retFlash}</span>
+              </p>
+            )}
+
+            <div>
+              <p className="text-[10px] uppercase tracking-wide text-[#6B5744] mb-1.5">
+                Keep recordings reachable for
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {ret.choices.map(d => {
+                  const active = d === ret.days;
+                  const busy = retSaving === d;
+                  return (
+                    <button
+                      key={d}
+                      onClick={() => void saveRetention(d)}
+                      disabled={retSaving != null || active}
+                      className={`px-3 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 disabled:opacity-60 ${
+                        active
+                          ? 'bg-[#af4408] border-[#af4408] text-white'
+                          : 'bg-white border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF8F0]'
+                      }`}
+                    >
+                      {busy && <Loader2 className="w-3 h-3 animate-spin" />}
+                      {d} days
+                      {d === ret.default_days && !active && (
+                        <span className="text-[9px] font-normal text-[#8B7355]">default</span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] text-[#8B7355] mt-1.5">
+                In force: <strong className="text-[#2D1B0E]">{ret.days} days</strong>
+                {ret.source === 'default'
+                  ? ' — the built-in default; nothing has been saved here yet.'
+                  : ' — saved on this outlet.'}{' '}
+                Shortening the window takes effect immediately, including for calls already logged.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+                <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Past the window</p>
+                <p className="text-2xl font-bold text-[#2D1B0E] mt-0.5">
+                  {count(ret.expired_recordings.count)}{ret.expired_recordings.capped ? '+' : ''}
+                </p>
+                <p className="text-[11px] text-[#6B5744] mt-1">
+                  Stored recording links older than {ret.days} days. These no longer play.
+                  {ret.expired_recordings.capped && ' Counting stops early on purpose — an exact figure is not worth the query at this size.'}
+                </p>
+              </div>
+              <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+                <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Expiry job last walked to</p>
+                <p className="text-sm font-semibold text-[#2D1B0E] mt-1.5">
+                  {ret.swept_to ? fmtWhen(ret.swept_to) : 'Not run yet'}
+                </p>
+                <p className="text-[11px] text-[#6B5744] mt-1">
+                  Calls up to this point have already been through an expiry pass. It runs in the
+                  background off normal traffic, never on a schedule of its own.
+                </p>
+              </div>
+            </div>
           </div>
         )}
       </SectionCard>

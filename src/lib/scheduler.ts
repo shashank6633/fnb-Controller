@@ -15,6 +15,7 @@
 import { refreshUpcomingParties, refreshPartyBookings } from './party-refresh';
 import { checkDeferDueSoon } from './defer-due-check';
 import { checkKitchenExpiry } from './kitchen-expiry-check';
+import { sweepRecordingRetention } from './ct/retention';
 
 /**
  * Adaptive cadence:
@@ -92,6 +93,33 @@ export function startSchedulerOnce(): void {
         if (dd.errors.length) console.warn('[scheduler] defer-due errors:', dd.errors);
       } catch (e: any) {
         console.error('[scheduler] defer-due check failed:', e?.message);
+      }
+
+      // Recording retention — expire recordings past the admin's window
+      // (7/15/30 days, default 30). Same cadence, same best-effort contract.
+      //
+      // THIS IS THE ONLY THING THAT MAKES RETENTION A POLICY RATHER THAN A
+      // SETTING. The sweeper otherwise fires only when somebody plays a
+      // recording or an admin opens the Telephony console — so on a quiet week
+      // nothing expires, which is precisely the week an untouched recording
+      // should have aged out. The refusal path is already time-based and needs
+      // no job; this is for the deletes, and for the watermark an admin reads.
+      // DRAIN, don't single-shot. A pass stops at its batch cap and reports
+      // `more` — a field nothing read before, so a backlog (a shortened window,
+      // or a first run over old data) was left stranded until someone happened
+      // to open the console. Bounded so a huge backlog cannot monopolise a tick.
+      try {
+        let expired = 0, files = 0, passes = 0;
+        for (; passes < 20; passes++) {
+          const rr = sweepRecordingRetention();
+          expired += rr.expired; files += rr.filesDeleted;
+          if (!rr.more) break;
+        }
+        if (expired > 0 || files > 0) {
+          console.log(`[scheduler] recording-retention @ IST ${istHour()}h: ${expired} past window · ${files} files deleted · ${passes + 1} pass(es)`);
+        }
+      } catch (e: any) {
+        console.error('[scheduler] recording-retention sweep failed:', e?.message);
       }
 
       // Kitchen Production — auto-expire past-expiry batches and warn the

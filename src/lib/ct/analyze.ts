@@ -16,6 +16,7 @@ import { analyzeCallRecording, type CallAnalysisStructured } from '@/lib/crm-aud
 import { CrmRateLimitError } from '@/lib/crm-llm';
 import { ctSetting } from './settings';
 import { fetchRecordingBuffer } from './recording-fetch';
+import { recordingRetentionStatus, logRecordingRefusal } from './retention';
 
 const MAX_AUDIO_BYTES = 14 * 1024 * 1024; // Gemini inline_data request limit
 
@@ -40,6 +41,9 @@ export interface CtCallRow {
   recording_url: string;
   analysis_status: string;
   analysis_json: string;
+  /** Retention anchor columns — see the gate in analyzeCall(). */
+  started_at?: string | null;
+  created_at?: string | null;
 }
 
 export interface AnalyzeResult {
@@ -76,8 +80,11 @@ export async function analyzeCtCall(
   // pending/error state) to the DB. `persist(fn)` is a no-op then.
   const ephemeral = isEphemeralRetention(db);
   const persist = (fn: () => void) => { if (!ephemeral) fn(); };
+  // started_at / created_at come back for the RETENTION check below — this
+  // SELECT could not previously answer "how old is this recording?" at all.
   const call = db.prepare(
-    `SELECT id, recording_url, analysis_status, analysis_json FROM ct_calls WHERE id = ?`,
+    `SELECT id, recording_url, analysis_status, analysis_json, started_at, created_at
+       FROM ct_calls WHERE id = ?`,
   ).get(callId) as CtCallRow | undefined;
 
   if (!call) return { ok: false, status: 'error', callId, error: 'Call not found' };
@@ -123,6 +130,28 @@ export async function analyzeCtCall(
     ephemeralInFlight.add(callId);
   }
   try {
+
+  // ── RETENTION: THE ANALYZER IS THE SECOND ROUTE TO THE AUDIO ─────────────
+  // The streaming proxy is not the only path to the bytes, and gating only that
+  // one left the whole policy porous: on day 31 a manager could not press play
+  // (410) but COULD press Enhance — this function then downloaded the same
+  // recording from TeleCMI, sent it to the model, and wrote the transcript into
+  // ct_calls.analysis_json PERMANENTLY. A derived transcript of a recording the
+  // admin asked us to stop keeping outlives the window forever, which defeats
+  // the setting more completely than serving the audio would have.
+  //
+  // Same helper, same reasons, same audit event as the proxy — one rule, two
+  // callers. Refused BEFORE the fetch, so nothing leaves TeleCMI.
+  const retention = recordingRetentionStatus(db, call);
+  if (retention.expired) {
+    const why = retention.reason === 'undated'
+      ? 'Recording cannot be dated, so its age against the retention period cannot be established'
+      : `Recording is past the ${retention.days}-day retention period`;
+    logRecordingRefusal(db, String(call.id), retention, actor || 'system');
+    persist(() => db.prepare(`UPDATE ct_calls SET analysis_status = 'skipped', analysis_error = ?, analyzed_at = ?, analyzed_by = ? WHERE id = ?`)
+      .run(why.slice(0, 500), new Date().toISOString(), actor, callId));
+    return { ok: false, status: 'skipped', callId, error: why };
+  }
 
   let buffer: Buffer, mimeType: string;
   try {

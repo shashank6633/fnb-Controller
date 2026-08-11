@@ -105,6 +105,74 @@ export function ctRecordingBaseUrl(db: Database.Database): string {
   }
 }
 
+/* ── Call-recording retention (plain config, NOT a credential) ─────────────
+ *
+ * How long a call recording stays reachable through this app, in days. An
+ * admin picks one of 7 / 15 / 30 on the Telephony console; 30 is the default
+ * AND the ceiling, because ctRecordingRetentionDays() below only ever returns
+ * a value from that list — a hand-edited row saying 3650 resolves to 30, so no
+ * direct DB edit can quietly switch retention off.
+ *
+ * WHAT IT GOVERNS TODAY: this deployment stores no recording AUDIO. There are
+ * TWO routes to the bytes, and the setting is worth nothing unless BOTH are
+ * gated:
+ *   1. the streaming proxy, src/app/api/telecmi/recording/[callId]/route.ts
+ *   2. the AI analyzer, src/lib/ct/analyze.ts, behind the Enhance button
+ * Both fetch from TeleCMI per use and write no audio to disk. Gating only the
+ * proxy left the policy porous in the worst way: past the window a manager
+ * could not press play but COULD press Enhance, which pulled the same bytes and
+ * wrote a PERMANENT transcript — a derived copy outliving the recording the
+ * admin asked us to stop keeping. So what this setting enforces is
+ * REACHABILITY: past the window neither path will fetch.
+ * The policy, that refusal and the expiry sweeper live in one place —
+ * src/lib/ct/retention.ts — which is also the single place that will delete
+ * local files if this app ever stores them.
+ *
+ * NOT IN CT_SETTING_DEFAULTS — deliberate, for the same reason as
+ * RECORDING_BASE_URL_DEFAULT above: that map feeds ALLOWED_KEYS in
+ * /api/crm-calls/settings, and a key there with no matching validate() case
+ * makes any PUT carrying it fail with "Unknown setting". A key OUTSIDE the map
+ * is skipped by that route instead ("ignore unknown, non-secret keys"), which
+ * would make a save look successful and change nothing — so the write path is
+ * the dedicated admin route /api/telecmi/recording-retention, which validates
+ * against RECORDING_RETENTION_CHOICES and audits the change.
+ *
+ * NOT A SECRET: a number of days. Per the release-gate comment in
+ * /api/crm-calls/settings it is therefore deliberately absent from SECRET_KEYS
+ * there, and this key (plus the sweeper's watermark row, see retention.ts)
+ * reads back to admins through that route's GET. Neither holds anything an
+ * admin's browser may not see.
+ */
+export const RECORDING_RETENTION_KEY = 'recording_retention_days';
+export const RECORDING_RETENTION_CHOICES = [7, 15, 30] as const;
+export const RECORDING_RETENTION_DEFAULT_DAYS = 30;
+
+/**
+ * A stored or posted value → one of the offered choices, or null when it is
+ * not one of them. Callers decide what "not one of them" means: the API route
+ * rejects it, the accessor below falls back to the default.
+ */
+export function normalizeRecordingRetentionDays(value: unknown): number | null {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const days = Math.trunc(n);
+  return RECORDING_RETENTION_CHOICES.find(c => c === days) ?? null;
+}
+
+/** Effective retention window in days. Never throws, never returns more than
+ *  the largest offered choice. */
+export function ctRecordingRetentionDays(db: Database.Database): number {
+  try {
+    const row = db
+      .prepare(`SELECT value FROM ct_settings WHERE key = ?`)
+      .get(RECORDING_RETENTION_KEY) as { value?: string } | undefined;
+    return normalizeRecordingRetentionDays(row?.value) ?? RECORDING_RETENTION_DEFAULT_DAYS;
+  } catch {
+    // Table missing (pre-migration DB) — behave like "no row".
+    return RECORDING_RETENTION_DEFAULT_DAYS;
+  }
+}
+
 /** Webhook path token: env wins; else a random token generated once and
  *  persisted so dev works with zero env setup. */
 export function webhookToken(db: Database.Database): string {

@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { normalizePhone } from '@/lib/ct/phone';
 import { getAgentMap, getUserNamesByEmail, resolveAgentLabel } from '@/lib/ct/agents';
+import { ctRecordingRetentionDays } from '@/lib/ct/settings';
 
 /**
  * GET /api/crm-calls/calls — Call Log list (Call-to-Table CRM).
@@ -54,6 +55,10 @@ export async function GET(req: Request) {
   if (!user) return Response.json({ error: 'Not signed in' }, { status: 401 });
 
   const db = getDb();
+  // Interpolated, not bound: it feeds an arithmetic expression in the SELECT
+  // list, and it is a NUMBER the accessor clamps to the 7/15/30 whitelist, so
+  // no caller-supplied text reaches the SQL.
+  const retentionDays = ctRecordingRetentionDays(db);
   const sp = new URL(req.url).searchParams;
 
   // ── Shared filters (also applied to the summary) ────────────────────────
@@ -126,7 +131,16 @@ export async function GET(req: Request) {
            c.agent_user, c.queue, c.started_at, c.answered_at, c.ended_at,
            c.duration_sec, c.disposition, c.disposition_note, c.created_at,
            c.analysis_status, c.analysis_score, c.analysis_outcome,
-           CASE WHEN NULLIF(c.recording_url, '') IS NULL THEN 0 ELSE 1 END AS has_recording,
+           -- has_recording means PLAYABLE, not "a URL exists". Past the
+           -- retention window the proxy refuses with 410, and a bare <audio>
+           -- element discards that body — so offering the control gave the GRE
+           -- a dead player and no reason. The window is the admin's setting
+           -- (7/15/30, default 30) applied to the same anchor the proxy uses:
+           -- started_at, falling back to created_at.
+           CASE WHEN NULLIF(c.recording_url, '') IS NULL THEN 0
+                WHEN julianday(COALESCE(NULLIF(TRIM(COALESCE(c.started_at,'')),''), c.created_at))
+                     < julianday('now') - ${retentionDays} THEN 0
+                ELSE 1 END AS has_recording,
            COALESCE(NULLIF(c.guest_id, ''), gp.id) AS guest_id,
            COALESCE(NULLIF(g.name, ''), NULLIF(gp.name, ''), '') AS guest_name,
            COALESCE(g.tags, gp.tags, '[]') AS guest_tags
