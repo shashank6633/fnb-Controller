@@ -22,7 +22,20 @@ import {
   type StickerDesign, type StickerLine, type StickerLineSize,
 } from '@/lib/offline-print/kot-sticker';
 import { buildKotStickerRasterB64 } from '@/lib/offline-print/sticker-raster';
-import { bridgePrint, bridgeSupportsRawB64 } from '@/lib/offline-print/bridge-client';
+import { bridgePrint, bridgeSupportsRawB64, probeBridge } from '@/lib/offline-print/bridge-client';
+
+// Bridge release that renders the "Total Items / Total QTY" split and the
+// "Guests: N" KOT line. BOTH numbers are computed inside the bridge, so a
+// counter still running an older build keeps printing the old single
+// "Total items: <qty>" row with no guest count and no error anywhere — which
+// is why this page states the version it actually found instead of assuming.
+const MIN_KOT_TOTALS_BRIDGE = { major: 2, minor: 7, label: '2.7' };
+function bridgeHasKotTotals(version: string | null | undefined): boolean {
+  const m = /^(\d+)\.(\d+)/.exec(String(version || ''));   // numeric compare: 2.10 must outrank 2.7
+  if (!m) return false;
+  const [maj, min] = [Number(m[1]), Number(m[2])];
+  return maj > MIN_KOT_TOTALS_BRIDGE.major || (maj === MIN_KOT_TOTALS_BRIDGE.major && min >= MIN_KOT_TOTALS_BRIDGE.minor);
+}
 
 // Per-item sticker-KOT config (settings key `kot_item_labels`). enabled +
 // granularity are set in KOT & Bill Printers; here we only surface codeType +
@@ -33,7 +46,7 @@ const DEFAULT_STICKER: StickerCfg = { enabled: false, granularity: 'per_unit', c
 
 const SAMPLE_KOT = {
   table: '7', floor: 'Rooftop', kotNumber: 12, station: 'TANDOOR', copyLabel: 'ORIGINAL', foodLiquor: 'FOOD',
-  captain: 'Ramesh', firedBy: 'Suresh', orderRef: '45',
+  captain: 'Ramesh', firedBy: 'Suresh', orderRef: '45', guests: 4,
   items: [{ name: 'Paneer Tikka', qty: 2, notes: 'Less spicy' }, { name: 'Butter Naan', qty: 1 }],
 };
 const SAMPLE_BILL = {
@@ -87,6 +100,9 @@ function KotPreview({ d, businessName }: { d: KotDesign; businessName: string })
       case 'foodLiquor': return <C b cls={z}>*** {s.foodLiquor} ***</C>;
       case 'captain': return cap ? <L cls={z}>Captain: {cap}</L> : null;
       case 'puncher': return (fb && fb.toLowerCase() !== cap.toLowerCase()) ? <L cls={z}>Punched by: {fb}</L> : null;
+      // Suppressed at 0, exactly like the bridge — on a real ticket for an order
+      // whose cover count was never recorded this line simply does not print.
+      case 'guests': return s.guests > 0 ? <L cls={z}>Guests: {s.guests}</L> : null;
       case 'dateTime': return <L cls={z}>{twoCol(nowStamp(), `#${s.orderRef}`)}</L>;
       case 'headerNote': return d.headerNote ? <L cls={z}>* {d.headerNote} *</L> : null;
       case 'items': return (
@@ -101,7 +117,16 @@ function KotPreview({ d, businessName }: { d: KotDesign; businessName: string })
           <Rule />
         </div>
       );
-      case 'totalItems': return <L cls={z}>Total items: {s.items.reduce((a, it) => a + it.qty, 0)}</L>;
+      // Mirrors the bridge's totalItems renderer exactly: dish-LINE count on the
+      // left, PLATE count on the right, sharing one row — stacked onto two rows
+      // when the size/paper leaves too few columns for both.
+      case 'totalItems': {
+        const l = `Total Items: ${s.items.length}`;
+        const r = `Total QTY: ${s.items.reduce((a, it) => a + it.qty, 0)}`;
+        return l.length + r.length + 1 > ITEM_COLS[ln.size]
+          ? <><L cls={z}>{l}</L><L cls={z}>{r}</L></>
+          : <L cls={z}>{twoCol(l, r, ITEM_COLS[ln.size])}</L>;
+      }
       case 'footerNote': return d.footerNote ? <><L>{' '}</L><C cls={z}>{d.footerNote}</C></> : null;  // blank line above, like the bridge
       default: return null;
     }
@@ -351,6 +376,8 @@ export default function PrintDesign() {
   const [overI, setOverI] = useState<number | null>(null);
   const [billDragI, setBillDragI] = useState<number | null>(null);
   const [billOverI, setBillOverI] = useState<number | null>(null);
+  // undefined = still probing, null = bridge unreachable from THIS PC, string = its version
+  const [bridgeVer, setBridgeVer] = useState<string | null | undefined>(undefined);
 
   const load = useCallback(async () => {
     try {
@@ -373,6 +400,13 @@ export default function PrintDesign() {
     } finally { setLoading(false); }
   }, []);
   useEffect(() => { load(); }, [load]);
+  // Ask the local bridge what version it is, so this page can say plainly whether
+  // the layout below will actually print here. Never throws; unreachable → null.
+  useEffect(() => {
+    let alive = true;
+    probeBridge().then((h) => { if (alive) setBridgeVer(h?.version ?? null); });
+    return () => { alive = false; };
+  }, []);
 
   async function save() {
     setSaving(true); setError('');
@@ -482,7 +516,28 @@ export default function PrintDesign() {
           {saved ? 'Saved' : 'Save design'}
         </button>
       </div>
-      <p className="text-sm text-[#8B7355] mb-2">Design how the Food KOT and the Bill print. The preview updates live. After saving, the counter PC must run the latest <b>Print Bridge (v2.2.1+)</b> — re-download it from the <b>KOT &amp; Bill Printers</b> page and restart it — for the new KOT layout to print.</p>
+      <p className="text-sm text-[#8B7355] mb-2">Design how the Food KOT and the Bill print. The preview updates live. After saving, the counter PC must run the latest <b>Print Bridge</b> — re-download it from the <b>KOT &amp; Bill Printers</b> page and restart it — for the new KOT layout to print.</p>
+
+      {/* Live bridge version. "Total Items / Total QTY" and "Guests: N" are both
+          rendered INSIDE the bridge, so an old bridge prints the previous ticket
+          silently — no error, no clue. Say so here rather than let it read as
+          "the fix did not work". */}
+      {bridgeVer === undefined ? null : bridgeHasKotTotals(bridgeVer) ? (
+        <div className="flex items-center gap-2 text-sm text-green-800 bg-green-50 border border-green-200 rounded-lg px-3 py-2 mb-3">
+          <Check className="w-4 h-4 shrink-0" />
+          <span>Print bridge <b>v{bridgeVer}</b> is running on this PC — it prints the <b>Total Items / Total QTY</b> row and the <b>Guests</b> line shown below.</span>
+        </div>
+      ) : bridgeVer === null ? (
+        <div className="flex items-center gap-2 text-sm text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-3 py-2 mb-3">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          <span>No print bridge is reachable from this device, so its version can&apos;t be checked. Every counter PC needs <b>v{MIN_KOT_TOTALS_BRIDGE.label}+</b> for the <b>Total Items / Total QTY</b> row and the <b>Guests</b> line.</span>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 text-sm text-amber-900 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2 mb-3">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          <span>This PC&apos;s print bridge is <b>v{bridgeVer}</b>. It will keep printing the old single <b>“Total items”</b> row and <b>no guest count</b> until you update to <b>v{MIN_KOT_TOTALS_BRIDGE.label}+</b> — open <b>KOT &amp; Bill Printers</b>, download <code>print-bridge.mjs</code> again and restart the bridge on every counter PC.</span>
+        </div>
+      )}
       {error && (
         <div className="flex items-center gap-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3">
           <AlertTriangle className="w-4 h-4 shrink-0" /> {error}

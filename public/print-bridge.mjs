@@ -40,6 +40,8 @@
  *               "payload"; use it for binary-safe payloads like raster images)
  *              (kot docs may carry "paperSaver": { compactCut, pullBackLines } —
  *               minimal feed-before-cut / reverse-feed top margin, v2.6+)
+ *              (kot docs may carry "guests": N — the cover count, printed as the
+ *               'guests' line "Guests: N"; omit it or send 0 to hide the line, v2.7+)
  *   }
  *
  * This file has ZERO dependencies and never touches the app or its database.
@@ -60,7 +62,7 @@ const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.6.0';   // 2.6.0 = raw/tspl jobs may carry doc.payload_b64 (base64) for binary-safe bytes — raster stickers; falls back to doc.payload utf8. KOT paper saver: doc.paperSaver { compactCut: GS V 66 feed-to-cut instead of feed3+cut; pullBackLines: ESC e reverse-feed before printing }. 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
+const VERSION = '2.7.0';   // 2.7.0 = KOT footer line 'totalItems' now prints BOTH counts on one row — left "Total Items: <number of item lines>", right "Total QTY: <sum of quantities>" (it used to print only the qty sum, mislabelled "Total items"). New KOT line key 'guests' → "Guests: N" from doc.guests, suppressed entirely when absent/0; also derived offline from POST /kot's fire.guest.covers. 2.6.0 = raw/tspl jobs may carry doc.payload_b64 (base64) for binary-safe bytes — raster stickers; falls back to doc.payload utf8. KOT paper saver: doc.paperSaver { compactCut: GS V 66 feed-to-cut instead of feed3+cut; pullBackLines: ESC e reverse-feed before printing }. 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -137,6 +139,7 @@ const DEFAULT_KOT_LINES = [
   { key: 'foodLiquor', enabled: true, size: 'large' },
   { key: 'captain', enabled: true, size: 'normal' },
   { key: 'puncher', enabled: true, size: 'normal' },
+  { key: 'guests', enabled: true, size: 'normal' },
   { key: 'dateTime', enabled: true, size: 'normal' },
   { key: 'headerNote', enabled: false, size: 'normal' },
   { key: 'items', enabled: true, size: 'normal' },
@@ -192,6 +195,10 @@ function buildKot(doc, cols, doCut) {
     captain:    (m) => { if (cap) left(`Captain: ${cap}`, m); },
     // Show the puncher ONLY when a DIFFERENT captain punched (case/space-insensitive).
     puncher:    (m) => { if (fb && fb.toLowerCase() !== cap.toLowerCase()) left(`Punched by: ${fb}`, m); },
+    // Cover count. SUPPRESSED at 0/absent on purpose: covers is 0 on every
+    // QR/customer-origin order (22 of the 23 orders in the live DB on
+    // 2026-08-11), and "Guests: 0" on a kitchen ticket reads as a bug.
+    guests:     (m) => { const g = Number(doc.guests) || 0; if (g > 0) left(`Guests: ${g}`, m); },
     dateTime:   (m) => { if (doc.time != null) left(twoCol(fmtTime(doc.time), doc.orderRef ? `#${doc.orderRef}` : '', cols), m); },
     headerNote: (m) => { if (doc.headerNote) left(`* ${doc.headerNote} *`, m); },
     items:      (m) => {
@@ -207,7 +214,31 @@ function buildKot(doc, cols, doCut) {
       }
       rule();
     },
-    totalItems: (m) => left(`Total items: ${(doc.items || []).reduce((s, it) => s + (Number(it.qty) || 1), 0)}`, m),
+    // TWO different counts on ONE row (one design key, so it can never split
+    // across the ticket): how many DISH LINES were printed above, and how many
+    // PLATES those lines add up to. Before v2.7.0 this row printed the qty sum
+    // under the label "Total items" — the Biryani x4 / Coke x3 / Water x2
+    // example printed "Total items: 9" when only 3 lines were ordered.
+    // Each count is exactly what a human re-adding the rows above would get:
+    // Total Items = one per printed row; Total QTY = the sum of the printed
+    // "xN" values, using the SAME `it.qty ?? 1` fallback the row itself uses
+    // (a missing qty prints "x1" and counts 1; a literal 0 prints "x0" and
+    // counts 0). Live data has no such rows — all 35 order_items are 1..4.
+    totalItems: (m) => {
+      const its = doc.items || [];
+      const qty = its.reduce((s, it) => s + (Number(it.qty ?? 1) || 0), 0);
+      // Same column guard as the items table: at multiplier m each glyph is m
+      // times wider, so the usable column count is cols/m (min 8).
+      const tcols = Math.max(8, Math.floor(cols / Math.max(1, m)));
+      const l = `Total Items: ${its.length}`, r = `Total QTY: ${qty}`;
+      // At A+/A++ — and on 58mm paper at any size above A — the two labels are
+      // wider than the row. twoCol would truncate the LEFT one away entirely
+      // (and its '…' is non-ASCII, which line()'s ascii encoding turns into a
+      // stray '&'). Stack them on two rows instead: still ONE design key, both
+      // numbers always legible, never a mangled character.
+      if (l.length + r.length + 1 > tcols) { left(l, m); left(r, m); }
+      else left(twoCol(l, r, tcols), m);
+    },
     footerNote: (m) => { if (doc.footerNote) { line(''); center(doc.footerNote, m, false); } },
   };
 
@@ -771,10 +802,28 @@ const OFFLINE_FALLBACK_HTML =
 // shape buildKot consumes. Groups FIRE.items by station; picks the printer per
 // station (station-matched printer, else the default). Returns
 // { docs:[{station,doc,printer}], missingPrinter:bool }.
+// A cache.json written by an app build older than bridge v2.7.0 has no 'guests'
+// entry in kotDesign.lines — the counter never made a choice about it, so an
+// offline ticket would be the ONLY ticket missing the cover count. Insert the
+// default line (right after 'puncher', matching DEFAULT_KOT_LINES) when the key
+// is absent. Once the Print Agent pushes a fresh cache the app's saved order —
+// including a deliberate enabled:false — is present and wins untouched.
+function withGuestsLine(lines) {
+  if (lines.some((l) => ((l && l.key) || l) === 'guests')) return lines;
+  const out = lines.slice();
+  const after = out.findIndex((l) => ((l && l.key) || l) === 'puncher');
+  out.splice(after >= 0 ? after + 1 : 0, 0, { key: 'guests', enabled: true, size: 'normal' });
+  return out;
+}
+
 function buildOfflineKotDocs(fire, cache, localNumber, nowIso) {
   const kotDesign = (cache && cache.kotDesign) || {};
-  const lines = Array.isArray(kotDesign.lines) && kotDesign.lines.length ? kotDesign.lines : DEFAULT_KOT_LINES;
+  const lines = Array.isArray(kotDesign.lines) && kotDesign.lines.length
+    ? withGuestsLine(kotDesign.lines) : DEFAULT_KOT_LINES;
   const table = fire.table || {};
+  // The offline mini-POS makes "No. of Guests" a REQUIRED field (>= 1), so an
+  // offline ticket normally does carry a cover count; still guarded at 0.
+  const covers = Number(fire.guest && fire.guest.covers) || 0;
   const printers = Array.isArray(cache && cache.printers) ? cache.printers : [];
   const defaultPrinter = cache && cache.defaultPrinter ? cache.defaultPrinter : null;
 
@@ -801,6 +850,7 @@ function buildOfflineKotDocs(fire, cache, localNumber, nowIso) {
       kotNumber: localNumber,
       foodLiquor: anyLiquor ? 'LIQUOR' : 'FOOD',
       captain: fire.captainName,
+      guests: covers > 0 ? covers : undefined,
       orderType: 'DINE-IN',
       orderRef: localNumber,
       time: nowIso,                       // fmtTime() renders this in Asia/Kolkata

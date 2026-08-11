@@ -27,8 +27,12 @@ export async function GET(request: Request) {
     where += secMain.sql; params.push(...secMain.params);
     if (station && station !== 'all') { where += ' AND k.station = ?'; params.push(station); }
 
+    // o.covers rides along because the Print Agent's 9s BACKUP POLL prints from
+    // this very payload whenever SSE is down — without it the "Guests:" line
+    // would silently vanish from exactly the tickets printed during an outage.
+    // (kots has no `covers` column, so k.* cannot shadow it.)
     const kots = db.prepare(`
-      SELECT k.*, o.order_number, o.order_type, o.server_name, t.table_number, t.zone
+      SELECT k.*, o.order_number, o.order_type, o.server_name, o.covers, t.table_number, t.zone
       FROM kots k
       JOIN orders o ON k.order_id = o.id
       LEFT JOIN restaurant_tables t ON o.table_id = t.id

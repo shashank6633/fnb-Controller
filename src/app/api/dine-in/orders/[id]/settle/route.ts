@@ -5,6 +5,7 @@ import { todayIST } from '@/lib/format-date';
 import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
 import { resolveFloorStore } from '@/lib/store-engine';
 import { completeBookingForOrder } from '@/lib/ct/seating';
+import { closeServiceRequestsForOrder } from '@/lib/service-requests';
 
 // Payment methods the cashier can settle with. Split payments record one
 // order_payments row per method; the sales dashboard's payment-category breakup
@@ -223,6 +224,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // seated → completed. Best-effort — the lib swallows errors so a booking
     // hiccup can never fail an already-committed settle.
     completeBookingForOrder(db, id);
+
+    // The table has paid, so its table-assistance bells are over. Close them —
+    // otherwise a "Call waiter" nobody pressed Done on stays pending forever and
+    // the guest-side de-duplicator keeps refusing to raise a NEW one of that type
+    // at that table, silently disabling the button for the next guest. Same
+    // shape as completeBookingForOrder above: after the commit, best-effort, the
+    // lib swallows its own errors so this can never fail a settle that has
+    // already taken the money. Writes only status/outcome/closed_reason/
+    // closed_at — never completed_by — so captain-performance is untouched.
+    closeServiceRequestsForOrder(db, id);
 
     return Response.json({ success: true, order_id: id, total: bill.total, payment_method: primaryMethod, payments, lines: items.length });
   } catch (e: any) {

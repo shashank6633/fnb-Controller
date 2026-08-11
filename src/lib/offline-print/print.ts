@@ -91,7 +91,7 @@ function targetOf(s: PrintStation): PrinterTarget {
 // Fewer lines + smaller sizes = less paper.
 export type KotLineKey =
   | 'table' | 'outlet' | 'floor' | 'kotNo' | 'copyLabel' | 'foodLiquor'
-  | 'captain' | 'puncher' | 'dateTime' | 'headerNote'
+  | 'captain' | 'puncher' | 'guests' | 'dateTime' | 'headerNote'
   | 'items' | 'totalItems' | 'footerNote';
 export type KotLineSize = 'normal' | 'large' | 'xlarge';
 export interface KotLine { key: KotLineKey; enabled: boolean; size: KotLineSize; }
@@ -100,8 +100,10 @@ export const KOT_LINE_LABELS: Record<KotLineKey, string> = {
   table: 'Table number', outlet: 'Outlet name', floor: 'Floor',
   kotNo: 'KOT number + station', copyLabel: 'Original / Duplicate',
   foodLiquor: 'Food / Liquor band', captain: 'Captain',
-  puncher: 'Punched by (only if another captain punches)', dateTime: 'Date & time',
-  headerNote: 'Header note', items: 'Items', totalItems: 'Total items', footerNote: 'Footer note',
+  puncher: 'Punched by (only if another captain punches)',
+  guests: 'Number of guests (hidden when not recorded)', dateTime: 'Date & time',
+  headerNote: 'Header note', items: 'Items',
+  totalItems: 'Total Items + Total QTY', footerNote: 'Footer note',
 };
 
 export const DEFAULT_KOT_LINES: KotLine[] = [
@@ -113,6 +115,7 @@ export const DEFAULT_KOT_LINES: KotLine[] = [
   { key: 'foodLiquor', enabled: true,  size: 'large' },
   { key: 'captain',    enabled: true,  size: 'normal' },
   { key: 'puncher',    enabled: true,  size: 'normal' },
+  { key: 'guests',     enabled: true,  size: 'normal' },
   { key: 'dateTime',   enabled: true,  size: 'normal' },
   { key: 'headerNote', enabled: false, size: 'normal' },
   { key: 'items',      enabled: true,  size: 'normal' },
@@ -163,11 +166,15 @@ function legacyLines(src: any): KotLine[] {
 /**
  * Merge a saved (possibly older/partial/hostile) design over the defaults,
  * GUARANTEEING a complete, valid lines[]: every known key present exactly once,
- * kept in saved order, unknown keys dropped, missing keys (e.g. a newly-added
- * `foodLiquor`) appended. Inherited Object.prototype names ('constructor',
- * '__proto__', …) can't slip through — membership is a Set, not a bracket
- * lookup. Used by both the Settings page and the printer so the preview and the
- * real ticket can never disagree.
+ * kept in saved order, unknown keys dropped, and missing keys (a newly-added
+ * `foodLiquor`, `guests`, …) inserted at their DEFAULT position relative to the
+ * keys that ARE saved — never appended to the end. Appending was wrong: this
+ * venue's saved design lists every pre-`guests` key, so an appended `guests`
+ * would have printed BELOW "Total Items" and the footer note on every ticket.
+ * Inherited Object.prototype names ('constructor', '__proto__', …) can't slip
+ * through — membership is a Set, not a bracket lookup. Used by both the
+ * Settings page and the printer so the preview and the real ticket can never
+ * disagree.
  */
 export function normalizeKotDesign(raw: any): KotDesign {
   const src = raw && typeof raw === 'object' ? raw : {};
@@ -201,7 +208,20 @@ export function normalizeKotDesign(raw: any): KotDesign {
     });
     seen.add(key);
   }
-  for (const def of DEFAULT_KOT_LINES) if (!seen.has(def.key)) ordered.push({ ...def });
+  // Splice each missing key in just AFTER the nearest default-order key that the
+  // saved design already has (front of the list when none of them precede it),
+  // so a key added in a later release lands where the default layout puts it.
+  for (let i = 0; i < DEFAULT_KOT_LINES.length; i++) {
+    const def = DEFAULT_KOT_LINES[i];
+    if (seen.has(def.key)) continue;
+    let at = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      const idx = ordered.findIndex((l) => l.key === DEFAULT_KOT_LINES[j].key);
+      if (idx >= 0) { at = idx + 1; break; }
+    }
+    ordered.splice(at, 0, { ...def });
+    seen.add(def.key);
+  }
   d.lines = ordered;
   return d;
 }
@@ -232,6 +252,7 @@ export interface FiredKot {
   captain?: string | null;        // 1st captain — who opened the table
   fired_by?: string | null;       // captain who punched this KOT
   reprint_count?: number;         // 0 = ORIGINAL, ≥1 = DUPLICATE N
+  covers?: number | null;         // orders.covers — guest count; 0/absent = never recorded, so the KOT line is suppressed
   items: Array<{ id?: string; scan_code?: string; name: string; quantity: number; notes?: string; item_type?: string }>;
 }
 
@@ -310,6 +331,10 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       foodLiquor: kotKind === 'bar' ? 'LIQUOR' : 'FOOD',
       captain: k.captain || undefined,
       firedBy: k.fired_by || undefined,                    // bridge shows "Punched by" only if it differs
+      // Guest count (orders.covers). Sent only when > 0: it is 0 on every
+      // QR/customer-origin order (22 of 23 orders in the live DB on 2026-08-11),
+      // and the bridge suppresses the line entirely rather than print "Guests: 0".
+      guests: Number(k.covers) > 0 ? Number(k.covers) : undefined,
       orderType: k.order_type,
       orderRef: k.order_number != null ? String(k.order_number) : undefined,
       time,
@@ -425,6 +450,9 @@ export async function printFiredKots(firedKots: FiredKot[]): Promise<void> {
       station: m.name || (kind === 'bar' ? 'MAIN BAR' : 'MAIN KITCHEN'),
       kotNumber: k0?.kot_number,
       table: k0?.table_number || undefined,
+      // Every KOT in one fire belongs to the same order, so k0's cover count is
+      // the whole master ticket's. Omitted at 0 (see the per-station doc above).
+      guests: Number(k0?.covers) > 0 ? Number(k0?.covers) : undefined,
       foodLiquor: kind === 'bar' ? 'LIQUOR' : 'FOOD',
       orderType: k0?.order_type,
       orderRef: k0?.order_number != null ? String(k0.order_number) : undefined,

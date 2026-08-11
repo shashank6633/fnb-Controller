@@ -16,7 +16,7 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
     const { id } = await params;
     const db = getDb();
     const kot = db.prepare(`
-      SELECT k.*, o.order_number, o.order_type, o.server_name, t.table_number, t.zone
+      SELECT k.*, o.order_number, o.order_type, o.server_name, o.covers, t.table_number, t.zone
       FROM kots k JOIN orders o ON k.order_id = o.id
       LEFT JOIN restaurant_tables t ON o.table_id = t.id
       WHERE k.id = ?
@@ -38,6 +38,9 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
       order_number: kot.order_number, order_type: kot.order_type,
       table_number: kot.table_number || null, zone: kot.zone || null,
       captain: kot.server_name || null, fired_by: kot.fired_by || null,
+      // Same reason as the reprint route: a resend that drops the guest count
+      // prints a ticket missing a line the original had.
+      covers: kot.covers ?? null,
       reprint_count: reprintCount,                 // ≥1 → DUPLICATE label, fresh outbox id
       reprinted_by: me.name || me.email,
       items: items.map((x) => ({ name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),

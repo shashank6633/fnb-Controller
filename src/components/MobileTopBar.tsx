@@ -45,7 +45,12 @@ export default function MobileTopBar() {
 
   const logout = async () => {
     try { await api('/api/auth/logout', { method: 'POST', body: {} }); } catch {}
-    router.replace('/login');
+    // ?switch=1 unconditionally, because this catch swallows a failed logout.
+    // /login now redirects any cookie-holder to their home, so a bare /login
+    // after a failed POST would bounce the user straight back in with no way
+    // to sign out or hand the tablet over. On a successful logout there is no
+    // cookie and the parameter changes nothing.
+    router.replace('/login?switch=1');
   };
 
   const initial = (user?.name || user?.email || '?').slice(0, 1).toUpperCase();

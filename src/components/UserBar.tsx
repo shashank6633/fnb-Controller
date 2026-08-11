@@ -40,7 +40,10 @@ export default function UserBar() {
   const logout = async () => {
     await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
     setUser(null);
-    router.push('/login');
+    // ?switch=1: /login now redirects any cookie-holder to their home page, so
+    // if this POST failed to clear the cookie a bare /login would bounce the
+    // user straight back in with no way to sign out. Harmless when it worked.
+    router.push('/login?switch=1');
   };
 
   if (pathname === '/login' || pathname.includes('/print')) return null;

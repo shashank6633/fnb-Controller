@@ -61,8 +61,13 @@ export default function PrintAgent() {
     seen.current.add(`kot:${k.id}`);
     persistSeen();
     await printFiredKots([k]).catch(() => {});
+    // Items vs QTY, the same distinction the ticket itself now draws: the log
+    // used to sum quantities and call the total "items", so a 4+3+2 KOT read
+    // "9 items" for 3 dishes. Kept on one line to match the ticket's wording.
+    const lineCount = (k.items || []).length;
+    const qtyTotal = (k.items || []).reduce((s: number, i: any) => s + (Number(i.quantity) || 0), 0);
     pushLog({ id: k.id, kind: 'KOT', label: `KOT #${k.kot_number ?? '—'} · ${k.station || 'kitchen'}`,
-      detail: `${k.table_number ? `Table ${k.table_number}` : k.order_type || ''} · ${(k.items || []).reduce((s: number, i: any) => s + (i.quantity || 0), 0)} items` });
+      detail: `${k.table_number ? `Table ${k.table_number}` : k.order_type || ''} · ${lineCount} item${lineCount === 1 ? '' : 's'} · qty ${qtyTotal}` });
     refreshQueue();
   }, [pushLog, refreshQueue, persistSeen]);
 

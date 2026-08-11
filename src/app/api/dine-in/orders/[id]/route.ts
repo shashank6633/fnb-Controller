@@ -207,6 +207,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
               captain: order.server_name || null,   // captain who opened the table (1st captain)
               fired_by: firedBy,                     // captain who punched this KOT
               reprint_count: 0,                      // 0 = ORIGINAL
+              covers: Number(order.covers) || 0,     // guest count for the KOT's "Guests:" line (0 = never recorded → line suppressed)
               items: its.map((x) => ({ id: x.id, scan_code: x.scan_code, name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),
             });
           }

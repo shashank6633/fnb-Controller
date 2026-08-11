@@ -6,6 +6,11 @@ import { getCurrentUser } from '@/lib/auth';
  * Body: { action: 'accept' | 'complete' }
  *   accept   → pending  → accepted   (a server is on the way)
  *   complete → accepted/pending → completed (drops off the board)
+ *
+ * A human pressing Done is the one close that IS an attend, so it stamps
+ * completed_at / completed_by (captain-performance counts and times these) and
+ * records outcome='attended', closed_reason='captain'. The automatic closes in
+ * src/lib/service-requests.ts deliberately leave completed_at/by alone.
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -29,7 +34,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     } else if (action === 'complete') {
       db.prepare(`
         UPDATE service_requests SET status = 'completed', completed_at = datetime('now'), completed_by = ?,
-          accepted_at = COALESCE(accepted_at, datetime('now')), accepted_by = COALESCE(NULLIF(accepted_by,''), ?)
+          accepted_at = COALESCE(accepted_at, datetime('now')), accepted_by = COALESCE(NULLIF(accepted_by,''), ?),
+          outcome = 'attended', closed_reason = 'captain', closed_at = datetime('now')
         WHERE id = ? AND status IN ('pending','accepted')
       `).run(who, who, id);
     } else {

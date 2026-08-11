@@ -2670,6 +2670,33 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_service_requests_table  ON service_requests(table_id);
     `);
 
+    // Service-request CLOSE TRAIL. A close that nobody typed has to say why, and
+    // it must NOT borrow completed_at / completed_by: /api/dine-in/captain-
+    // performance averages attend time by completed_by and counts a request with
+    // no accepted_at and no completed_at as "unattended". Writing an automatic
+    // close into those columns would credit whoever settled the bill with
+    // attending every open bell at that table. So the automatic paths move only
+    // the status column and these three, and every captain-performance number
+    // keeps meaning exactly what it means today.
+    //   outcome       — '' (still open, or a legacy row) | attended | not_attended | expired
+    //   closed_reason — captain | bill-settled | stale-timeout
+    //   closed_at     — when the close was written. Audit only; no UI reads it,
+    //                   and it is the ONLY timestamp an automatic close leaves.
+    try {
+      const srCols = db.prepare("PRAGMA table_info(service_requests)").all() as any[];
+      const srHas = (n: string) => srCols.some((x: any) => x.name === n);
+      if (!srHas('outcome'))       db.exec("ALTER TABLE service_requests ADD COLUMN outcome TEXT DEFAULT ''");
+      if (!srHas('closed_reason')) db.exec("ALTER TABLE service_requests ADD COLUMN closed_reason TEXT DEFAULT ''");
+      if (!srHas('closed_at'))     db.exec("ALTER TABLE service_requests ADD COLUMN closed_at TEXT");
+    } catch (e) { console.error('service_requests close-trail migration failed:', e); }
+
+    // Safety net for a table that never bills (a walk-out): auto-close a service
+    // request that has sat open this many minutes. 0 = OFF, and OFF is the
+    // default — settling the table's bill already closes its open bells, so the
+    // timeout only has to catch the tables that never reach a bill. Seeded with
+    // INSERT OR IGNORE so an admin's chosen value survives every deploy.
+    db.exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('service_request_auto_close_minutes', '0')");
+
     // Customer QR menu — every table needs a stable, hard-to-guess qr_token that
     // the printed standee encodes (…/menu?t=<token>). Backfill any table that has
     // none. Idempotent: only touches rows still missing a token. NULLs are exempt

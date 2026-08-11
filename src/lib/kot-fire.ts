@@ -51,6 +51,9 @@ export function fireStagingOrder(
     `).get(staging.table_id, orderId) as any;
 
     let targetId: string, targetOutlet: string | null, targetNumber: number, targetServer: string, merged: boolean;
+    // Guest count for the KOT's "Guests:" line. On a merge it is the LIVE bill's
+    // cover count (that's the order the items end up on), not the staging shell's.
+    let targetCovers: number;
     if (live) {
       db.prepare('UPDATE order_items SET order_id = ? WHERE order_id = ?').run(live.id, orderId);
       // Move the table party (order_guests) onto the live bill too, so QR diners
@@ -82,6 +85,7 @@ export function fireStagingOrder(
       `).run(String(staging.guest_name || ''), String(staging.guest_mobile || ''), live.id);
       targetId = live.id; targetOutlet = live.outlet_id;
       targetNumber = live.order_number; targetServer = live.server_name; merged = true;
+      targetCovers = Number(live.covers) || 0;
     } else {
       const seq = db.prepare(`
         SELECT COALESCE(MAX(order_number), 0) + 1 AS n FROM orders
@@ -93,6 +97,7 @@ export function fireStagingOrder(
       `).run(seq.n, serverId, firedBy, orderId);
       targetId = orderId; targetOutlet = staging.outlet_id;
       targetNumber = seq.n; targetServer = firedBy; merged = false;
+      targetCovers = Number(staging.covers) || 0;
     }
 
     const tableRow = staging.table_id
@@ -119,7 +124,7 @@ export function fireStagingOrder(
         id: kotId, outlet_id: targetOutlet, order_id: targetId, kot_number: kseq.n, station, status: 'new',
         order_number: targetNumber, order_type: 'dine-in',
         table_number: tableRow?.table_number || null, zone: tableRow?.zone || null,
-        captain: targetServer || null, fired_by: firedBy, reprint_count: 0,
+        captain: targetServer || null, fired_by: firedBy, reprint_count: 0, covers: targetCovers,
         items: its.map((x) => ({ id: x.id, scan_code: x.scan_code, name: x.name, quantity: x.quantity, notes: x.notes, item_type: x.item_type })),
       });
     }

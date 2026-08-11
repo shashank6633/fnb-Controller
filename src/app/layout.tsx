@@ -4,6 +4,7 @@ import AppShell from "@/components/AppShell";
 import ServiceWorkerRegister from "@/components/ServiceWorkerRegister";
 import BuildVersionWatcher from "@/components/BuildVersionWatcher";
 import GlobalErrorReporter from "@/components/GlobalErrorReporter";
+import BackExitGuard from "@/components/BackExitGuard";
 import "./globals.css";
 
 const inter = Inter({
@@ -59,6 +60,10 @@ export default function RootLayout({
             the "Failed to find Server Action" / Safari "This page couldn't load"
             error class entirely. */}
         <BuildVersionWatcher />
+        {/* Installed-app only: turns Android Back on the first screen into
+            "press back again to exit" instead of closing the app on the first
+            tap. Renders nothing in a browser tab, and nothing until armed. */}
+        <BackExitGuard />
         <AppShell>{children}</AppShell>
       </body>
     </html>

@@ -1,82 +1,70 @@
-'use client';
-import { Suspense, useState } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
-import { Loader2, LogIn, ShieldCheck } from 'lucide-react';
+import { Suspense } from 'react';
+import { redirect } from 'next/navigation';
+import { getCurrentUser } from '@/lib/auth';
+import { homePathFor } from '@/lib/page-catalog';
+import LoginForm from './LoginForm';
 
-// useSearchParams() must be inside a Suspense boundary in Next.js 16 client
-// components, otherwise static prerender fails. We split the form into a
-// child component and wrap it in Suspense at the page root.
-export default function LoginPage() {
-  return (
-    <Suspense fallback={<div className="min-h-screen bg-[#FFF8F0]" />}>
-      <LoginForm />
-    </Suspense>
-  );
+/**
+ * /login — sign-in screen, with an ALREADY-SIGNED-IN guard.
+ *
+ * Why the guard exists. Nothing here ever logged anyone out: destroySession()
+ * is only reached by the POST /api/auth/logout route and by the 30-day expiry
+ * branch inside getCurrentUser — a Back navigation reaches neither, and the
+ * cookie survives it intact. What actually happened is that the form used
+ * router.push after a successful sign-in, so /login stayed parked one entry
+ * below the app for the rest of the session; pressing Back re-rendered a bare
+ * sign-in form to a fully authenticated user, which reads as "it logged me
+ * out". LoginForm now uses router.replace, which stops NEW history from being
+ * poisoned — but every tablet already in the field has a /login entry sitting
+ * in its stack right now. This guard is what heals those without anyone
+ * touching the devices: the stale entry resolves server-side to the user's
+ * role-aware home instead of a login form.
+ *
+ * ACCOUNT SWITCHING. Front-of-house tablets are shared, so the guard must not
+ * become a trap. `/login?switch=1` always renders the form, whoever is signed
+ * in. The normal Logout buttons do not need it — POST /api/auth/logout deletes
+ * the cookie before navigating here, so the guard sees no session and the form
+ * renders as it always did. `?switch=1` is the escape for the case where that
+ * POST failed (all three Logout handlers swallow the error and navigate anyway)
+ * and for a deliberate hand-over without signing out first.
+ *
+ * This page NEVER clears a session. The guard only reads it.
+ */
+export const dynamic = 'force-dynamic';
+
+/** A `next` value we are willing to redirect a signed-in user to: a local
+ *  absolute path only — no cross-origin (`//host`), no backslash trick, and
+ *  never back to /login itself (that would loop against this guard). */
+function safeNext(raw: string | undefined): string | null {
+  if (!raw || !raw.startsWith('/')) return null;
+  if (raw.startsWith('//') || raw.startsWith('/\\')) return null;
+  if (raw === '/login' || raw.startsWith('/login?') || raw.startsWith('/login/')) return null;
+  return raw;
 }
 
-function LoginForm() {
-  const router = useRouter();
-  const params = useSearchParams();
-  // Default to the role-aware launcher so every user lands on their own home
-  // (management → dashboard, GRE → recovery, captain → POS…), not a fixed page.
-  // Restrict `next` to a LOCAL absolute path — reject cross-origin (//host),
-  // backslash tricks, and javascript: URIs so ?next= can't open-redirect.
-  const rawNext = params.get('next');
-  const next = rawNext && rawNext.startsWith('/') && !rawNext.startsWith('//') && !rawNext.startsWith('/\\')
-    ? rawNext
-    : '/launch';
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+export default async function LoginPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+}) {
+  const sp = await searchParams;
+  // Presence is enough — `?switch=1` and a bare `?switch` both mean "let me in".
+  const wantsSwitch = sp.switch !== undefined;
+  const me = await getCurrentUser();
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true); setError(null);
-    try {
-      const r = await fetch('/api/auth/login', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
-      });
-      if (!r.ok) { setError((await r.json()).error || 'Login failed'); return; }
-      router.push(next);
-    } catch (err: any) { setError(err.message); }
-    finally { setBusy(false); }
-  };
+  if (me && !wantsSwitch) {
+    const rawNext = Array.isArray(sp.next) ? sp.next[0] : sp.next;
+    // homePathFor returns '/login' for a signed-in user with no openable page.
+    // Redirecting there would loop, so fall through and show the form instead —
+    // signing in as someone else is the only useful thing left on that account.
+    const home = homePathFor(me);
+    const target = safeNext(rawNext) ?? (home === '/login' ? null : home);
+    if (target) redirect(target);
+  }
 
   return (
-    <div className="min-h-screen bg-[#FFF8F0] flex items-center justify-center p-4">
-      <div className="bg-white border border-[#E8D5C4] rounded-2xl shadow-xl p-8 w-full max-w-sm space-y-5">
-        <div className="text-center">
-          <div className="w-12 h-12 rounded-xl bg-[#af4408] text-white flex items-center justify-center mx-auto mb-3">
-            <ShieldCheck className="w-6 h-6" />
-          </div>
-          <h1 className="text-xl font-bold text-[#2D1B0E]">F&amp;B Controller</h1>
-          <p className="text-xs text-[#8B7355] mt-1">Sign in to continue</p>
-        </div>
-
-        <form onSubmit={submit} className="space-y-3">
-          <label className="block text-xs text-[#6B5744]">
-            Email
-            <input type="email" value={email} onChange={e => setEmail(e.target.value)} required autoFocus
-                   className="w-full mt-1 px-3 py-2 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
-          </label>
-          <label className="block text-xs text-[#6B5744]">
-            Password
-            <input type="password" value={password} onChange={e => setPassword(e.target.value)} required
-                   className="w-full mt-1 px-3 py-2 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
-          </label>
-          {error && <p className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</p>}
-          <button type="submit" disabled={busy}
-                  className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium disabled:opacity-50">
-            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <LogIn className="w-4 h-4" />} Sign in
-          </button>
-        </form>
-
-        <p className="text-center text-[11px] text-[#8B7355] italic tracking-wide pt-1 border-t border-[#F0E2D2]">
-          <span className="block pt-3">From purchase to plate — fully in control.</span>
-        </p>
-      </div>
-    </div>
+    <Suspense fallback={<div className="min-h-screen bg-[#FFF8F0]" />}>
+      <LoginForm switchingFrom={me && wantsSwitch ? (me.name || me.email) : undefined} />
+    </Suspense>
   );
 }

@@ -221,7 +221,10 @@ export default function CaptainShell({ children }: { children: React.ReactNode }
     } catch { alert('Could not start a takeaway — check the connection and try again.'); }
     finally { setTkBusy(false); }
   }
-  async function signOut() { try { await api('/api/auth/logout', { method: 'POST', body: {} }); } catch {} window.location.href = '/login'; }
+  // ?switch=1 unconditionally — the catch above swallows a failed logout, and
+  // /login now sends any cookie-holder back to their home page, so a bare
+  // /login would trap a captain on a shared tablet with no way to hand it over.
+  async function signOut() { try { await api('/api/auth/logout', { method: 'POST', body: {} }); } catch {} window.location.href = '/login?switch=1'; }
   async function installApp() { if (!installEvt) return; installEvt.prompt(); try { await installEvt.userChoice; } catch {} setInstallEvt(null); }
 
   // OFFLINE BANNER — a fixed, prominent strip shown only when the heartbeat says

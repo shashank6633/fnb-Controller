@@ -14,6 +14,12 @@
  *   GET  /api/dine-in/kds/scan-out → { items: [...] } fired-but-not-sent, oldest first.
  *   POST /api/dine-in/kds/scan-out { code } | { item_id } →
  *        { ok, flipped, already, reason, item: { id, name, status, kitchen_sent_at, table_number } }
+ *
+ * TWO different clocks live on this board — label both, they are never the same:
+ *   • the awaiting rows show `fired_at`, the moment the KOT was FIRED to the kitchen;
+ *   • the "Scanned out" strip shows `kitchen_sent_at` from the POST response — the
+ *     scan moment, stamped by the API with datetime('now') on the app server. It is
+ *     never read from this device's clock and never sent up from here.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -57,16 +63,26 @@ interface ScanResult {
   error?: string;
 }
 
+/** One line of the session's "Scanned out" strip. `at` is the SERVER-stamped
+ *  kitchen_sent_at echoed by the POST — not a client clock, not re-derived. */
+interface RecentScan {
+  id: string;
+  name: string;
+  table: string | null;
+  at: string | null;
+}
+
 type ToastKind = 'success' | 'warning' | 'error';
 interface Toast { kind: ToastKind; text: string; at: number; }
 
 const POLL_MS = 3500;
+const RECENT_MAX = 6;      // rows kept in the "Scanned out" strip (this session)
 const DUP_GUARD_MS = 1200;
 const CAM_DUP_MS = 2500;   // camera re-reads the same sticker every frame — wider guard
 const TOAST_MS = 2500;
 
 // ---- Helpers --------------------------------------------------------------
-/** IST time like "07:45 PM". Guards empty / invalid; normalises SQLite
+/** IST time — Chrome's en-IN renders it "07:45 pm". Guards empty / invalid; normalises SQLite
  *  `YYYY-MM-DD HH:MM:SS` (UTC, no tz) into a parseable ISO string first. */
 function istTime(iso?: string | null): string {
   if (!iso) return '';
@@ -83,9 +99,29 @@ function istTime(iso?: string | null): string {
   }
 }
 
+/** Same as istTime but to the second — measured output "07:45:09 pm". Two plates can leave the
+ *  kitchen inside the same minute, so the scan strip needs the seconds to show
+ *  any movement at all. */
+function istTimeSec(iso?: string | null): string {
+  if (!iso) return '';
+  let s = String(iso);
+  if (s.includes(' ') && !s.includes('T')) s = s.replace(' ', 'T') + 'Z';
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return '';
+  try {
+    return d.toLocaleTimeString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true,
+    });
+  } catch {
+    return '';
+  }
+}
+
 // ---- Page -----------------------------------------------------------------
 export default function KitchenScanOutPage() {
   const [awaiting, setAwaiting] = useState<AwaitItem[]>([]);
+  const [recent, setRecent] = useState<RecentScan[]>([]);
   const [value, setValue] = useState('');
   const [toast, setToast] = useState<Toast | null>(null);
   const [sending, setSending] = useState(false);
@@ -214,6 +250,17 @@ export default function KitchenScanOutPage() {
       if (j.flipped) {
         showToast('success', `✓ ${name}${table ? ` · Table ${table}` : ''} — sent`);
         successBuzz();
+        // Keep the scan moment on screen: the row vanishes from "Awaiting" on the
+        // next load, and until now the actual scan time appeared nowhere. `at` is
+        // the server's kitchen_sent_at, echoed straight back by this POST — no
+        // extra query, and never this device's clock.
+        const scannedId = j.item?.id;
+        if (scannedId) {
+          setRecent((prev) => [
+            { id: scannedId, name, table: table ?? null, at: j.item?.kitchen_sent_at ?? null },
+            ...prev.filter((r) => r.id !== scannedId),
+          ].slice(0, RECENT_MAX));
+        }
         load(); // refetch right after a successful flip
         return true;
       } else if (j.already) {
@@ -574,6 +621,35 @@ export default function KitchenScanOutPage() {
           )}
         </div>
 
+        {/* Scanned out (this session) — the only place the real scan moment shows.
+            Hidden until the first successful flip, so the board stays quiet. */}
+        {recent.length > 0 && (
+          <section className="mt-5">
+            <div className="mb-2 flex items-center justify-between px-1">
+              <h2 className="flex items-center gap-1.5 text-sm font-semibold text-[#6B5744]">
+                <CheckCircle2 className="h-4 w-4 text-emerald-600" aria-hidden />
+                Scanned out
+              </h2>
+              <span className="text-xs text-[#8B7355]">scan time</span>
+            </div>
+            <ul className="divide-y divide-[#F3E7DA] overflow-hidden rounded-2xl border border-[#E8D5C4] bg-white shadow-sm">
+              {recent.map((r) => (
+                <li key={r.id} className="flex items-center gap-3 px-3.5 py-2">
+                  <span className="min-w-0 flex-1 truncate text-sm font-semibold text-[#2D1B0E]">
+                    {r.name}
+                    {r.table && (
+                      <span className="ml-1.5 text-xs font-normal text-[#8B7355]">Table {r.table}</span>
+                    )}
+                  </span>
+                  <span className="shrink-0 text-xs font-semibold tabular-nums text-[#6B5744]">
+                    {istTimeSec(r.at) || '—'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
         {/* Awaiting list */}
         <section className="mt-5">
           <div className="mb-2 flex items-center justify-between px-1">
@@ -619,9 +695,11 @@ export default function KitchenScanOutPage() {
                         <span className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-[#8B7355]">
                           {row.kot_number != null && <span>KOT #{row.kot_number}</span>}
                           {t && (
+                            // Labelled: this is fired_at (KOT → kitchen), NOT the
+                            // scan-out time. Unlabelled it reads as "scanned at".
                             <span className="inline-flex items-center gap-1">
                               <Clock className="h-3 w-3" aria-hidden />
-                              {t}
+                              Fired {t}
                             </span>
                           )}
                           {row.station && <span className="truncate">{row.station}</span>}
