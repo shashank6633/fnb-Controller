@@ -63,6 +63,7 @@ import {
   Banknote,
   Phone,
   PhoneMissed,
+  PhoneOff,
   PhoneCall,
   PhoneIncoming,
   Headphones,
@@ -282,6 +283,10 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "What's On (GRE)", href: "/crm-calls/whats-on", icon: CalendarClock },
       { kind: "link", label: "Live Calls",      href: "/crm-calls/live",     icon: PhoneIncoming },
       { kind: "link", label: "Recovery Queue",  href: "/crm-calls/recovery", icon: PhoneMissed },
+      // Management-only (page-catalog mgmtOnly) — canAccessPage hides it for
+      // everyone else. This row must exist: a catalog entry on its own gates
+      // the page correctly and leaves it invisible.
+      { kind: "link", label: "Missed Attribution", href: "/crm-calls/missed-attribution", icon: PhoneOff },
       { kind: "link", label: "Guests",          href: "/crm-calls/guests",   icon: Users },
       { kind: "link", label: "Win-back",        href: "/crm-calls/win-back", icon: HeartHandshake },
       { kind: "link", label: "Call Log",        href: "/crm-calls/log",      icon: PhoneCall },

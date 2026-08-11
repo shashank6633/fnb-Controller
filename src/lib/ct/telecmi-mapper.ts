@@ -45,7 +45,25 @@ export interface MappedCdr {
   endedAt: string;
   durationSec: number;
   recordingUrl: string;
+  /**
+   * Did TeleCMI say this call was recorded? THREE-STATE — see pickRecordFlag().
+   * 'unknown' is not a synonym for 'no': it means the payload never said.
+   */
+  recordFlag: RecordFlag;
 }
+
+/**
+ * TeleCMI's `record` boolean, kept three-state.
+ *
+ *   'yes'     — the payload says the call WAS recorded.
+ *   'no'      — the payload says it was NOT.
+ *   'unknown' — the payload carried no such field, so we have no claim to make.
+ *
+ * The third state is the point. Without it, "TeleCMI never recorded this call"
+ * and "a recording exists but we failed to store its URL" are the same blank,
+ * and only the second is a fault worth chasing.
+ */
+export type RecordFlag = 'yes' | 'no' | 'unknown';
 
 const WARN = '[ct/telecmi-mapper]';
 
@@ -168,7 +186,25 @@ const AGENT_KEYS = [
   'agentuser', 'agentname', 'agent', 'username', 'user', 'userno',
   'answeredby', 'answeredagent', 'agentid', 'extension', 'ext',
 ];
-const QUEUE_KEYS = ['queue', 'queuename', 'group', 'groupname', 'ringgroup', 'department', 'ivr'];
+// 'team' is TeleCMI's own name for the ring group, and it is the field their
+// real CDRs actually carry (observed in the production recording-diagnostic
+// capture; none of the other keys here appeared in those payloads). It matters
+// most on calls NOBODY answered: TeleCMI names an agent only when someone
+// picked up, so on a missed/abandoned CDR the ring group is the ONLY honest
+// answer to "who missed this" — a team, never a person.
+//
+// ORDER: after 'queue'/'queuename', before the rest. pickStr takes the FIRST
+// key present, so position only decides a payload carrying two of these.
+//  · after queue/queuename — those name the destination column's concept
+//    directly and are what every existing payload/mock maps through today;
+//    putting 'team' first would change what such a payload resolves to.
+//  · before group/groupname/ringgroup/department/ivr — those are defensive
+//    aliases for other PBXs, and two of them mean something else entirely (an
+//    IVR node is a menu, not the group that rang). A field we have observed on
+//    this account outranks a guess at another one.
+const QUEUE_KEYS = [
+  'queue', 'queuename', 'team', 'group', 'groupname', 'ringgroup', 'department', 'ivr',
+];
 const START_KEYS = [
   'starttime', 'startedat', 'startstamp', 'starttimestamp', 'start', 'time',
   'calltime', 'calldate', 'datetime', 'date', 'initiatedat', 'createdat',
@@ -333,6 +369,43 @@ function pickAgent(m: Norm): string {
     }
   }
   return '';
+}
+
+// 'record' is the key TeleCMI actually sends (a JSON boolean). The other two
+// are defensive aliases in the style of the lists above — we have not seen them
+// from this account.
+//
+// NOT TO BE CONFUSED with the 'record' in collect()'s envelope-nest list: that
+// one is for a payload shaped { record: { ...the cdr... } }, and collect() only
+// descends into it when the value is an OBJECT. A boolean fails that test, so
+// it stays put as a top-level value here. 'record' is also absent from
+// RECORDING_KEYS, so a boolean can never be mistaken for a recording filename.
+const RECORD_FLAG_KEYS = ['record', 'isrecorded', 'recorded'];
+
+const TRUEY = ['true', '1', 'yes', 'y', 'on'];
+const FALSEY = ['false', '0', 'no', 'n', 'off'];
+
+/**
+ * Read the recording flag WITHOUT inventing one. Booleans and 0/1 numbers map
+ * straight across; a string maps only if it spells a boolean.
+ *
+ * Anything else — an object (the envelope case above), a timestamp, a filename
+ * parked in a `recorded` field — falls through to the next key and finally to
+ * 'unknown'. Guessing here would be worse than not knowing: a wrong 'no' is a
+ * claim that TeleCMI never recorded the call, which we would have no basis for.
+ */
+function pickRecordFlag(m: Norm): RecordFlag {
+  for (const k of RECORD_FLAG_KEYS) {
+    const v = m[k];
+    if (typeof v === 'boolean') return v ? 'yes' : 'no';
+    if (typeof v === 'number' && Number.isFinite(v)) return v !== 0 ? 'yes' : 'no';
+    if (typeof v === 'string') {
+      const s = v.trim().toLowerCase();
+      if (TRUEY.includes(s)) return 'yes';
+      if (FALSEY.includes(s)) return 'no';
+    }
+  }
+  return 'unknown';
 }
 
 function pickLiveEvent(m: Norm): 'ring' | 'answer' | 'hangup' {
@@ -622,5 +695,6 @@ export function mapCdrPayload(raw: any, opts: MapCdrOptions = {}): MappedCdr | n
     endedAt,
     durationSec,
     recordingUrl: recording.url,
+    recordFlag: pickRecordFlag(m),
   };
 }

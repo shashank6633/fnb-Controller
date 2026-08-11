@@ -40,6 +40,33 @@ const MISSED_FAMILY = ['missed', 'abandoned', 'voicemail'];
  *  only have created_at. One expression so filter + sort agree. */
 const STARTED = `COALESCE(NULLIF(c.started_at, ''), c.created_at)`;
 
+/**
+ * What the Call Log can honestly say about a call's recording. THREE states,
+ * because "we can play it" and "there is nothing to play" do not cover the
+ * ground between them:
+ *
+ *   'playable'     — a stored URL, still inside the retention window. This is
+ *                    computed FROM has_recording, so the two cannot drift.
+ *   'not_recorded' — TeleCMI's CDR said record=false AND we hold no URL. Normal
+ *                    operation, not a fault: nothing was ever recorded to lose.
+ *   'unknown'      — no claim available. Covers every row ingested before the
+ *                    flag was captured (they default to 'unknown'), rows created
+ *                    by the live ring/answer path (no CDR flag to read), and a
+ *                    recording that HAS aged past the retention window. The log
+ *                    renders these exactly as it did before this field existed.
+ *
+ * 'not_recorded' deliberately needs BOTH conditions (see the SQL that derives
+ * telecmi_says_not_recorded). A stored URL past its retention window is not
+ * evidence that TeleCMI never recorded the call, so it stays 'unknown' rather
+ * than acquiring a claim the retention work never made.
+ */
+type RecordingState = 'playable' | 'not_recorded' | 'unknown';
+
+function recordingState(playable: boolean, saysNotRecorded: boolean): RecordingState {
+  if (playable) return 'playable';
+  return saysNotRecorded ? 'not_recorded' : 'unknown';
+}
+
 function istDayToUtcIso(v: string, endOfDay: boolean): string | null {
   // YYYY-MM-DD → the IST day boundary as a UTC instant
   if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
@@ -141,6 +168,13 @@ export async function GET(req: Request) {
                 WHEN julianday(COALESCE(NULLIF(TRIM(COALESCE(c.started_at,'')),''), c.created_at))
                      < julianday('now') - ${retentionDays} THEN 0
                 ELSE 1 END AS has_recording,
+           -- Input to recording_state below; stripped from the response. Does
+           -- TeleCMI's own record flag say this call was NOT recorded, with no
+           -- stored URL to contradict it? BOTH halves are required: a URL that
+           -- has aged past the retention window also gives has_recording = 0,
+           -- and expiry is not evidence that nothing was ever recorded.
+           CASE WHEN NULLIF(c.recording_url, '') IS NULL AND c.telecmi_recorded = 'no'
+                THEN 1 ELSE 0 END AS telecmi_says_not_recorded,
            COALESCE(NULLIF(c.guest_id, ''), gp.id) AS guest_id,
            COALESCE(NULLIF(g.name, ''), NULLIF(gp.name, ''), '') AS guest_name,
            COALESCE(g.tags, gp.tags, '[]') AS guest_tags
@@ -160,10 +194,15 @@ export async function GET(req: Request) {
   const calls = rows.map(r => {
     let tags: string[] = [];
     try { const t = JSON.parse(r.guest_tags || '[]'); if (Array.isArray(t)) tags = t; } catch { /* keep [] */ }
-    const { guest_tags: _drop, ...rest } = r;
+    // telecmi_says_not_recorded is an input to recording_state, not a response
+    // field — recording_state is the one thing a caller should read, and it
+    // cannot be misread the way a bare 'no' vs 'unknown' can.
+    const { guest_tags: _drop, telecmi_says_not_recorded: _flag, ...rest } = r;
+    const playable = !!rest.has_recording;
     return {
       ...rest,
-      has_recording: !!rest.has_recording,
+      has_recording: playable,
+      recording_state: recordingState(playable, !!r.telecmi_says_not_recorded),
       guest_tags: tags,
       agent_display: resolveAgentLabel(r.agent_user, agentMap, userNames),
     };

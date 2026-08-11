@@ -255,6 +255,18 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/crm-calls/whats-on', label: "What's On (GRE board)" },
       { path: '/crm-calls/live',     label: 'Live Calls' },
       { path: '/crm-calls/recovery', label: 'Recovery Queue' },
+      // Missed-call attribution — the analytics companion to the Recovery
+      // Queue: misses grouped by the ring group that rang, plus how many were
+      // recovered and how fast. mgmtOnly because it ranks TEAMS on a
+      // performance measure; a screen that grades a shift's work belongs to
+      // whoever runs the shift, not to the shift. The page states in plain
+      // words that telephony data cannot attribute a missed call to an
+      // individual GRE — nobody answered it, so the CDR records the ring group
+      // and no agent — so do NOT "improve" it into a per-person scoreboard.
+      // As with the other report lines in this catalog, the flag is not the
+      // security boundary: /api/crm-calls/missed-attribution answers 403
+      // 'Management only' to anyone outside isManagement() on its own.
+      { path: '/crm-calls/missed-attribution', label: 'Missed-Call Attribution', mgmtOnly: true },
       { path: '/crm-calls/guests',   label: 'Guests (unified 360)' },
       // Win-back: lapsed-guest segment → WhatsApp campaign → attribution.
       // mgmtOnly — it exposes per-guest spend and it is the door that sends

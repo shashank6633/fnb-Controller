@@ -478,11 +478,21 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
       // Upsert: INSERT fresh, or fill only missing/null fields on the existing
       // row (a live-created 'ringing' row gets finalized; a re-delivered CDR
       // becomes a no-op because ended_at is already set).
+      //
+      // telecmi_recorded follows the same never-downgrade discipline, with
+      // 'unknown' playing the part that '' plays for recording_url: a CDR that
+      // omits the flag maps to 'unknown' and must not erase a 'yes' an earlier
+      // CDR established. Both halves of its CASE are deliberate — the first
+      // refuses to write a non-answer over anything, the second keeps the first
+      // known answer. The LIVE path (ingestLive) cannot downgrade it at all: it
+      // never names the column, so a ring/answer/hangup leaves it untouched and
+      // a live-created row simply takes the schema default 'unknown'.
       db.prepare(`
         INSERT INTO ct_calls
           (id, telecmi_call_id, guest_id, phone_e164, direction, status, agent_user, queue,
-           started_at, answered_at, ended_at, duration_sec, recording_url, raw_payload, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           started_at, answered_at, ended_at, duration_sec, recording_url, telecmi_recorded,
+           raw_payload, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(telecmi_call_id) DO UPDATE SET
           guest_id      = COALESCE(ct_calls.guest_id, excluded.guest_id),
           phone_e164    = CASE WHEN ct_calls.phone_e164 = '' THEN excluded.phone_e164 ELSE ct_calls.phone_e164 END,
@@ -495,11 +505,16 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
           ended_at      = COALESCE(NULLIF(ct_calls.ended_at, ''), excluded.ended_at),
           duration_sec  = CASE WHEN IFNULL(ct_calls.duration_sec, 0) = 0 THEN excluded.duration_sec ELSE ct_calls.duration_sec END,
           recording_url = CASE WHEN ct_calls.recording_url = '' THEN excluded.recording_url ELSE ct_calls.recording_url END,
+          telecmi_recorded = CASE
+            WHEN excluded.telecmi_recorded <> 'unknown' AND ct_calls.telecmi_recorded = 'unknown'
+              THEN excluded.telecmi_recorded
+            ELSE ct_calls.telecmi_recorded END,
           raw_payload   = CASE WHEN ct_calls.raw_payload IN ('', '{}') THEN excluded.raw_payload ELSE ct_calls.raw_payload END
       `).run(
         generateId(), telecmiId, guest?.id ?? null, phone, m.direction, m.status,
         m.agent || '', m.queue || '', m.startedAt || now, m.answeredAt,
-        m.endedAt || now, m.durationSec || 0, m.recordingUrl || '', rawJson, now,
+        m.endedAt || now, m.durationSec || 0, m.recordingUrl || '', m.recordFlag,
+        rawJson, now,
       );
       callId = (db.prepare(`SELECT id FROM ct_calls WHERE telecmi_call_id = ?`).get(telecmiId) as { id: string }).id;
     } else {
@@ -510,12 +525,14 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
       db.prepare(`
         INSERT INTO ct_calls
           (id, telecmi_call_id, guest_id, phone_e164, direction, status, agent_user, queue,
-           started_at, answered_at, ended_at, duration_sec, recording_url, raw_payload, created_at)
-        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           started_at, answered_at, ended_at, duration_sec, recording_url, telecmi_recorded,
+           raw_payload, created_at)
+        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         callId, guest?.id ?? null, phone, m.direction, m.status,
         m.agent || '', m.queue || '', m.startedAt || now, m.answeredAt,
-        m.endedAt || now, m.durationSec || 0, m.recordingUrl || '', rawJson, now,
+        m.endedAt || now, m.durationSec || 0, m.recordingUrl || '', m.recordFlag,
+        rawJson, now,
       );
     }
 

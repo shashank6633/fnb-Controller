@@ -110,12 +110,21 @@ interface TimelineEntry {
   type: 'call' | 'booking' | 'follow_up';
   at: string;
   id: string;
-  // call
+  // call — the outcome fields are settled by the API (see its header comment);
+  // this page only chooses words for them, never a different verdict.
   direction?: string;
   status?: string;
+  // Still sent, deliberately NOT rendered on their own: a bare "· rahul.gre"
+  // next to "Not answered" reads as "Rahul missed it", which this data cannot
+  // support. Use answered_by / dialled_by, which say which one it is.
   agent_user?: string;
   agent_display?: string;
   queue?: string;
+  answered?: boolean;      // status is 'answered', nothing else
+  in_progress?: boolean;   // still ringing, not yet ended — no verdict due
+  answered_by?: string;    // person who ANSWERED; '' when naming one would be a guess
+  dialled_by?: string;     // outbound only: the GRE who placed the call
+  rang_team?: string;      // unanswered inbound only: the team that rang
   started_at?: string | null;
   duration_sec?: number;
   disposition?: string;
@@ -172,6 +181,62 @@ function fmtDuration(sec?: number): string {
   if (s === 0) return '0s';
   const m = Math.floor(s / 60);
   return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
+}
+
+/** Call statuses this page has wording for; anything else is shown as-is, with
+ *  underscores spaced out (see the fallback at the end of callOutcome). */
+const KNOWN_CALL_STATUS = new Set(['answered', 'missed', 'abandoned', 'voicemail', 'ringing']);
+
+/**
+ * What a call row says out loud.
+ *
+ * Every call states its outcome plainly, and never names a person we cannot
+ * honestly name:
+ *   inbound, answered  → "Answered by Pushpa"  — the agent who picked up
+ *   outbound, answered → "Answered"            — the GUEST picked up; the GRE
+ *                        who dialled is credited as "called by Pushpa", because
+ *                        crediting them as the answerer would be false
+ *   still ringing      → "Ringing now"         — no verdict is due yet
+ *   anything else      → "Not answered"        — plus the TEAM that rang, which
+ *                        is the only honest answer to "who missed this call":
+ *                        nobody picked up, so the CDR names nobody, and a miss
+ *                        cannot be apportioned to one member of a ring group.
+ *
+ * A missed call and the callback that recovered it are TWO rows and stay two
+ * rows — "Not answered" at 20:00 and "Answered by Pushpa" at 20:30 are two
+ * facts, and merging them into one "recovered" line would erase the miss.
+ *
+ * An unmapped agent id arrives here already resolved to the raw id (the API's
+ * resolveAgentLabel), which is what should be shown — it is never hidden.
+ */
+function callOutcome(t: TimelineEntry): { text: string; tone: string; details: string[] } {
+  const answered = t.answered ?? (t.status === 'answered');
+  const inProgress = !!t.in_progress;
+
+  const text = inProgress
+    ? 'Ringing now'
+    : answered
+      ? (t.answered_by ? `Answered by ${t.answered_by}` : 'Answered')
+      : 'Not answered';
+  const tone = inProgress ? 'text-amber-700' : answered ? 'text-green-700' : 'text-red-600';
+
+  const details: string[] = [];
+  if (answered) details.push(fmtDuration(t.duration_sec));
+  if (t.dialled_by) details.push(`called by ${t.dialled_by}`);
+  if (t.rang_team) details.push(`${inProgress ? 'ringing' : 'rang'} ${t.rang_team}`);
+  // Which team an answered call came through is context, not blame — and it is
+  // labelled for the same reason "rang <team>" is: a bare "reception" sitting
+  // in this list does not say what it is.
+  if (answered && t.queue) details.push(`via ${t.queue}`);
+  if (t.status === 'abandoned') details.push('caller hung up while waiting');
+  // "went to", NOT "left a voicemail". The status is a spelling test on the CDR
+  // status field — it says the call REACHED voicemail. Nothing in this system
+  // records whether the caller actually spoke, and the one voicemail row on file
+  // carries no recording. Promising a message that may not exist sends a GRE
+  // looking for it.
+  if (t.status === 'voicemail') details.push('went to voicemail');
+  if (t.status && !KNOWN_CALL_STATUS.has(t.status)) details.push(String(t.status).replace(/_/g, ' '));
+  return { text, tone, details };
 }
 
 const BADGE_STYLES: Record<string, string> = {
@@ -1160,15 +1225,20 @@ export default function GuestProfilePage() {
                 {t.type === 'call' && (
                   <div className="mt-1">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-sm font-medium text-[#2D1B0E]">
-                        {t.direction === 'outbound' ? 'Outgoing call' : 'Incoming call'}
-                        {t.status && t.status !== 'answered' ? ` — ${String(t.status).replace('_', ' ')}` : ''}
-                      </span>
-                      {t.status === 'answered' && (
-                        <span className="text-xs text-[#8B7355]">{fmtDuration(t.duration_sec)}</span>
-                      )}
-                      {(t.agent_display || t.agent_user) && <span className="text-xs text-[#8B7355]">· {t.agent_display || t.agent_user}</span>}
-                      {t.queue && <span className="text-xs text-[#B9A48C]">· {t.queue}</span>}
+                      {(() => {
+                        const o = callOutcome(t);
+                        return (
+                          <>
+                            <span className="text-sm font-medium text-[#2D1B0E]">
+                              {t.direction === 'outbound' ? 'Outgoing call' : 'Incoming call'} ·{' '}
+                              <span className={o.tone}>{o.text}</span>
+                            </span>
+                            {o.details.length > 0 && (
+                              <span className="text-xs text-[#8B7355]">{o.details.join(' · ')}</span>
+                            )}
+                          </>
+                        );
+                      })()}
                       {t.disposition && (
                         <span className={`badge ${t.disposition === 'booking_made' ? 'badge-success' : t.disposition === 'complaint' ? 'badge-danger' : 'badge-primary'}`}>
                           {DISPOSITION_LABELS[t.disposition] || t.disposition}

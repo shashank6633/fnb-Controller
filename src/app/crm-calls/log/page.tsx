@@ -17,7 +17,7 @@ import Link from 'next/link';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
 import {
-  ArrowDownLeft, ArrowUpRight, ChevronLeft, ChevronRight, Loader2, Phone,
+  ArrowDownLeft, ArrowUpRight, ChevronLeft, ChevronRight, Loader2, MicOff, Phone,
   PhoneMissed, Play, RefreshCw, Search, Square, UserPlus, X, CheckCircle,
   Sparkles, AlertTriangle,
 } from 'lucide-react';
@@ -43,6 +43,11 @@ interface CallRow {
   disposition_note: string;
   created_at: string;
   has_recording: boolean;
+  // Why there is (or isn't) something to play. 'playable' is has_recording;
+  // 'not_recorded' is TeleCMI stating it never recorded the call — normal, not a
+  // fault; 'unknown' is no claim either way (pre-flag rows, live-created rows,
+  // and recordings past the retention window). See the API route for the rules.
+  recording_state: 'playable' | 'not_recorded' | 'unknown';
   // AI call-enhancement state (from the scorecard engine; may be absent on old rows)
   analysis_status?: string;      // '' | pending | done | error | skipped
   analysis_score?: number | null;
@@ -540,8 +545,7 @@ export default function CallLogPage() {
                               <CallerCell call={c} onQuickCreate={() => setQuickGuest({ phone: c.phone_e164 })} />
                             </td>
                             <td className="py-2.5 px-3 text-[13px] text-[#3D2614]">
-                              {c.agent_display || c.agent_user || <span className="text-[#C4B09A]">—</span>}
-                              {c.queue && <p className="text-[11px] text-[#6B5744]">{c.queue}</p>}
+                              <AgentCell call={c} />
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono text-[13px] text-[#3D2614]">
                               {c.status === 'answered' || c.duration_sec > 0 ? mmss(c.duration_sec) : <span className="text-[#C4B09A]">—</span>}
@@ -560,7 +564,7 @@ export default function CallLogPage() {
                                 >
                                   {audioId === c.id ? <Square className="w-4 h-4" /> : <Play className="w-4 h-4" />}
                                 </button>
-                              ) : <span className="text-[#C4B09A]">—</span>}
+                              ) : <NoRecordingCell state={c.recording_state} />}
                             </td>
                             <td className="py-2.5 px-3 text-center">
                               <AiCell
@@ -620,7 +624,7 @@ export default function CallLogPage() {
                     </div>
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[#6B5744]">
                       <span>{when.time} · {when.date}</span>
-                      {(c.agent_display || c.agent_user) && <span>Agent: {c.agent_display || c.agent_user}</span>}
+                      <AgentCell call={c} compact />
                       {(c.status === 'answered' || c.duration_sec > 0) && <span className="font-mono">{mmss(c.duration_sec)}</span>}
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
@@ -730,6 +734,70 @@ function StatusChip({ status }: { status: string }) {
       {m.pulse && <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />}
       {m.label}
     </span>
+  );
+}
+
+/**
+ * The ring group to name when there is no agent to name — '' when the normal
+ * agent rendering applies.
+ *
+ * On an inbound call nobody picked up there is no agent on the CDR, because
+ * there was no one to name; what the CDR does carry is the group that rang.
+ * A bare dash there reads as data we failed to capture. "Rang reception" is
+ * the true and complete answer, and it is deliberately a TEAM: this data
+ * cannot say which member of a ring group let a call go, so nothing here
+ * should be read as a per-person miss.
+ *
+ * ANSWERED IS EXCLUDED, and that exclusion is load-bearing. The live answer
+ * path (ingest.ts) flips a ringing row to status='answered' WITHOUT writing
+ * agent_user — so from the moment someone picks up until the CDR lands at
+ * hangup (and permanently if it never lands), an answered call sits here with
+ * no agent. Saying "Rang reception" on it, under a tooltip that says nobody
+ * answered, would be flatly false: somebody did. Those rows fall through to
+ * the dash instead, which matches Guest 360 — it renders the same row as a
+ * bare "Answered" and invents no name either.
+ *
+ * What DOES qualify: missed, abandoned, voicemail, and a live 'ringing' row.
+ * All of them rang that group; only the Status chip beside this one says how
+ * it ended.
+ *
+ * Outbound is excluded — an outbound call does not ring a queue, so those keep
+ * the existing agent-or-dash plus queue subline. Direction is tested the same
+ * way <DirectionIcon/> tests it: anything that isn't 'outbound' is inbound.
+ */
+function ringGroupOnly(call: CallRow): string {
+  if ((call.agent_display || call.agent_user || '').trim()) return '';
+  if (call.direction === 'outbound') return '';
+  if (call.status === 'answered') return '';
+  return (call.queue || '').trim();
+}
+
+const RANG_TITLE =
+  'TeleCMI names an agent only once someone answers — this is the group the call rang';
+const RINGING_TITLE =
+  'Nobody has picked up yet — this is the group it is ringing';
+
+/** Agent column. `compact` is the mobile card's single-line metadata variant. */
+function AgentCell({ call, compact = false }: { call: CallRow; compact?: boolean }) {
+  const team = ringGroupOnly(call);
+  if (team) {
+    // A call still ringing has not rung — present tense, or the row reads as
+    // finished business while the phone is audibly going in the room.
+    const live = call.status === 'ringing';
+    return (
+      <span title={live ? RINGING_TITLE : RANG_TITLE}
+            className={compact ? undefined : 'text-[12px] text-[#6B5744] whitespace-nowrap'}>
+        {live ? 'Ringing' : 'Rang'} {team}
+      </span>
+    );
+  }
+  const person = call.agent_display || call.agent_user || '';
+  if (compact) return person ? <span>Agent: {person}</span> : null;
+  return (
+    <>
+      {person || <span className="text-[#C4B09A]">—</span>}
+      {call.queue && <p className="text-[11px] text-[#6B5744]">{call.queue}</p>}
+    </>
   );
 }
 
@@ -870,6 +938,32 @@ function DispositionCell({ call, saving, onPick }: {
         document.body,
       )}
     </>
+  );
+}
+
+/**
+ * The Rec column when there is nothing to play. Two different facts used to
+ * share one dash:
+ *
+ *   'not_recorded' — TeleCMI told us it did not record this call. Nothing is
+ *                    missing, so this must not look like an absence. A struck
+ *                    mic says "recording was off", which is the fact.
+ *   anything else  — 'unknown': no claim available (a row from before the flag
+ *                    was captured, a live-created row, or a recording aged past
+ *                    the retention window). Unchanged dash, deliberately — this
+ *                    is every historical row and it should look exactly as it
+ *                    did.
+ *
+ * Same footprint as the dash it replaces: the column stays icon-width.
+ */
+function NoRecordingCell({ state }: { state: CallRow['recording_state'] }) {
+  if (state !== 'not_recorded') return <span className="text-[#C4B09A]">—</span>;
+  return (
+    <span title="TeleCMI did not record this call — nothing is missing"
+          className="inline-flex items-center justify-center text-[#C4B09A]">
+      <MicOff className="w-4 h-4" aria-hidden="true" />
+      <span className="sr-only">Not recorded</span>
+    </span>
   );
 }
 

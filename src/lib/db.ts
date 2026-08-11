@@ -4543,6 +4543,33 @@ function initializeSchema(db: Database.Database) {
     addCtCol('owner_email',      `TEXT NOT NULL DEFAULT ''`);   // app user email who claimed the ANSWERED call; '' = unowned
     addCtCol('owner_claimed_at', `TEXT NOT NULL DEFAULT ''`);   // UTC ISO of the claim; '' = unowned
 
+    // ── Did TeleCMI RECORD this call? (additive; same idempotent addCtCol) ────
+    // TeleCMI's CDR carries a `record` boolean. Until now nothing read it, so a
+    // call TeleCMI never recorded looked identical to a recording that went
+    // missing — one is normal, the other is a fault, and the diagnostic could
+    // not tell them apart.
+    //
+    // THREE-STATE, stored as the three words themselves:
+    //   'yes'     — the CDR said recorded
+    //   'no'      — the CDR said not recorded
+    //   'unknown' — no CDR field to read (every live-created row, and every row
+    //               that already exists today)
+    //
+    // WHY WORDS AND NOT 0/1/NULL. Every falsy shortcut a reader might reach for
+    // has to fail SAFE. With INTEGER 0/1/NULL, `!row.x` is true for both NULL
+    // and 0 — unknown silently collapses into "not recorded", which is exactly
+    // the false claim this column exists to prevent. With '' as the unknown
+    // marker, `if (row.x)` collapses the same way. With 'unknown'/'yes'/'no'
+    // there is no falsy value at all: a reader must spell the word, and
+    // `x === 'no'` cannot accidentally swallow unknown.
+    //
+    // WHY DEFAULT 'unknown' AND NOT ''. NOT NULL DEFAULT back-fills every
+    // existing row inside the ALTER itself — the same trick owner_email uses —
+    // so the entire pre-existing call history lands in UNKNOWN rather than
+    // being relabelled "not recorded". No data migration, and no second blank
+    // state to disambiguate later.
+    addCtCol('telecmi_recorded', `TEXT NOT NULL DEFAULT 'unknown'`); // 'yes' | 'no' | 'unknown'
+
     // ── Reservation → table seating (Part A) + table party (Part B) ──────────
     // Additive columns; per-column try/catch makes the ALTER idempotent.
     const addBookingCol = (col: string, decl: string) => {

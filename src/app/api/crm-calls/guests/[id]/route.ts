@@ -15,6 +15,20 @@ import { recordingRetentionStatus } from '@/lib/ct/retention';
  *     { type:'booking',   at, ... }
  *     { type:'follow_up', at, due_at, status, ... }
  *
+ *   A call row states its OUTCOME as a fact the server has already settled,
+ *   so the page only picks words for it and cannot reach a different verdict:
+ *     answered     — status is 'answered', nothing else
+ *     in_progress  — still ringing and not yet ended; no verdict is due
+ *     answered_by  — the person who ANSWERED, or '' when naming one would be
+ *                    a guess. Never set on an outbound call: there the guest
+ *                    answered and the agent on the row is the GRE who dialled.
+ *     dialled_by   — outbound only: the GRE who placed the call.
+ *     rang_team    — unanswered inbound only: the team the call rang. A call
+ *                    nobody answered names no person, and this data cannot
+ *                    apportion a miss to one member of a ring group.
+ *   A missed call and the callback that recovered it stay TWO rows. They are
+ *   two facts, and collapsing them would erase the miss.
+ *
  * PUT /api/crm-calls/guests/[id]
  *   Field edit: { name?, alt_phone?, email?, tags?[], notes?, dob?, anniversary?, preferences?{}, source? }
  *   OR one action:
@@ -144,6 +158,21 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     for (const c of calls) {
       if (seenCallIds.has(c.id)) continue;
       seenCallIds.add(c.id);
+
+      // ── What happened on this call, settled here rather than in the page ──
+      // Three states and no fourth. A row is ANSWERED only when the status
+      // says so; it is still RINGING while ct_calls holds the live 'ringing'
+      // state with no ended_at (declaring "not answered" on a call that is
+      // still in progress would be a verdict on an unfinished call — the
+      // stale-ring sweeper in ingest.ts is what finally turns an abandoned
+      // ring into 'missed' + ended_at); everything else is NOT ANSWERED.
+      const answered = c.status === 'answered';
+      const inProgress = c.status === 'ringing' && !String(c.ended_at || '').trim();
+      const outbound = c.direction === 'outbound';
+      // One label per row from maps loaded once above — unmapped ids come back
+      // as the raw id, which is the intended display, not a gap to hide.
+      const agentLabel = resolveAgentLabel(c.agent_user, agentMap, userNames);
+
       timeline.push({
         type: 'call',
         at: c.started_at || c.created_at || '',
@@ -151,8 +180,25 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
         direction: c.direction,
         status: c.status,
         agent_user: c.agent_user,
-        agent_display: resolveAgentLabel(c.agent_user, agentMap, userNames),
+        agent_display: agentLabel,
         queue: c.queue,
+        answered,
+        in_progress: inProgress,
+        // WHO ANSWERED — named only where naming one is true. On an inbound
+        // call that is the agent TeleCMI reports. On an OUTBOUND call the
+        // GUEST answered and agent_user is the GRE who dialled (log-callback
+        // writes the caller's own email into that column), so crediting them
+        // as the answerer would be false; they surface as dialled_by instead.
+        answered_by: answered && !outbound ? agentLabel : '',
+        // WHO PLACED IT — outbound only, for the same reason.
+        dialled_by: outbound ? agentLabel : '',
+        // WHO MISSED IT can only be answered as a TEAM. Measured across every
+        // call in this database when this was written: not one inbound call
+        // that went unanswered carries an agent. Nobody picked up, so TeleCMI
+        // names nobody. The queue/team that rang is the honest answer, and
+        // per-agent blame across a ring group is not derivable from these
+        // CDRs. Outbound is excluded — it rings the guest, not a team.
+        rang_team: !answered && !outbound ? String(c.queue || '').trim() : '',
         started_at: c.started_at,
         answered_at: c.answered_at,
         ended_at: c.ended_at,
