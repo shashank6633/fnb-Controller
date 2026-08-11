@@ -18,7 +18,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Settings as SettingsIcon, PlugZap, Webhook, Copy, Check, Clock, UserCheck,
+  Settings as SettingsIcon, PlugZap, Webhook, Copy, Check, Clock, UserCheck, AlertTriangle,
   Loader2, AlertCircle, CheckCircle2, Save, Lock, Database, DownloadCloud,
   MessageCircle, RefreshCw, Sparkles, Zap, Users, Plus, Trash2, MonitorPlay, Crown,
 } from 'lucide-react';
@@ -250,12 +250,45 @@ export default function CtSettingsPage() {
   const [configured, setConfigured] = useState(false);
   const [creds, setCreds] = useState<CredStatus>(EMPTY_CREDS);
   const [paths, setPaths] = useState<{ live: string; cdr: string }>({ live: '', cdr: '' });
+
+  /** Mint a new webhook token and swap the displayed URLs to the new ones.
+   *  The response carries them, so there is no refetch and no window in which
+   *  the screen shows a URL that no longer works. */
+  const rotateToken = async () => {
+    setRotating(true); setRotateErr('');
+    try {
+      const r = await api('/api/crm-calls/settings/rotate-webhook', {
+        method: 'POST', body: { confirm: true },
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok || !j?.ok) {
+        // The 409 for a deployment pinned to TELECMI_WEBHOOK_SECRET lands here,
+        // and its message is the actionable one — show it verbatim.
+        setRotateErr(String(j?.error || `Rotate failed (HTTP ${r.status})`));
+        return;
+      }
+      setPaths(extractWebhookPaths(j));
+      setRotatedAt(new Date().toISOString());
+      setRotateArmed(false);
+    } catch (e: any) {
+      setRotateErr(e?.message || 'Rotate failed');
+    } finally {
+      setRotating(false);
+    }
+  };
   const [origin, setOrigin] = useState('');
 
   const [saving, setSaving] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<'live' | 'cdr' | null>(null);
+  // Rotate is two-step: `rotateArmed` is the confirm, and the server ALSO
+  // requires { confirm: true } — belt and braces, because the cost of an
+  // accidental rotate is a silently dropped evening of calls.
+  const [rotateArmed, setRotateArmed] = useState(false);
+  const [rotating, setRotating] = useState(false);
+  const [rotateErr, setRotateErr] = useState('');
+  const [rotatedAt, setRotatedAt] = useState('');
   const [apkCopyState, setApkCopyState] = useState<'idle' | 'ok' | 'err'>('idle');
 
   // Data tools
@@ -813,6 +846,56 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
             <li>Type <strong>notify</strong>, method <strong>POST</strong> → paste the <strong>Live events</strong> URL.</li>
             <li>Save, then test with a real call (or <code>npm run simulate:call</code> in dev).</li>
           </ol>
+
+          {/* ── Rotate ────────────────────────────────────────────────────────
+              The token IS the credential — it is the whole of the protection on
+              two routes that accept POSTed call data, so a URL that has been
+              pasted into a chat, a ticket or an email cannot be un-pasted. This
+              is the only thing that revokes it.
+              Two-step on purpose. Rotating mid-service silently drops every call
+              until TeleCMI is reconfigured: the old URLs are refused the instant
+              it returns, and calls in that gap are LOST, not queued. A one-click
+              rotate sitting next to a Copy button is a foot-gun. */}
+          <div className="border border-amber-200 bg-amber-50 rounded-lg p-2.5 space-y-2">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-700 shrink-0 mt-0.5" />
+              <div className="text-[11px] text-amber-900">
+                <span className="font-semibold">Rotate the token</span> if these URLs have been
+                shared anywhere they should not be — a chat, a ticket, an email. Anyone holding one
+                can post fabricated calls into the CRM.{' '}
+                <span className="font-semibold">TeleCMI stops reaching this app the moment you
+                rotate</span>, until you paste both new URLs there. Calls in that gap are lost, not
+                queued — so do it outside service hours.
+              </div>
+            </div>
+            {!rotateArmed ? (
+              <button onClick={() => { setRotateArmed(true); setRotateErr(''); }}
+                      className="text-[11px] px-2.5 py-1.5 rounded border border-amber-400 bg-white text-amber-900 hover:bg-amber-100">
+                Rotate webhook token…
+              </button>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] text-amber-900 font-semibold">
+                  Both TeleCMI URLs will stop working until you update them. Continue?
+                </span>
+                <button disabled={rotating} onClick={rotateToken}
+                        className="text-[11px] px-2.5 py-1.5 rounded bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-60 text-white">
+                  {rotating ? 'Rotating…' : 'Yes, rotate now'}
+                </button>
+                <button disabled={rotating} onClick={() => setRotateArmed(false)}
+                        className="text-[11px] px-2.5 py-1.5 rounded border border-[#E0D0BE] bg-white text-[#6B5744]">
+                  Cancel
+                </button>
+              </div>
+            )}
+            {rotateErr && <p className="text-[11px] text-red-700">{rotateErr}</p>}
+            {rotatedAt && !rotateErr && (
+              <p className="text-[11px] text-emerald-800 font-medium">
+                Rotated. The URLs above are the new ones — copy BOTH into TeleCMI now. The old ones
+                are already refused.
+              </p>
+            )}
+          </div>
         </div>
       </section>
 

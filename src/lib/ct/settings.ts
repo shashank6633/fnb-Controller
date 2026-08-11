@@ -175,6 +175,51 @@ export function ctRecordingRetentionDays(db: Database.Database): number {
 
 /** Webhook path token: env wins; else a random token generated once and
  *  persisted so dev works with zero env setup. */
+/**
+ * ROTATE the webhook token — mint a fresh one and forget the old immediately.
+ *
+ * The token IS the credential: both webhook URLs carry it as a path component
+ * and the routes accept a POST on no other basis. So anyone who has ever seen a
+ * URL can post fabricated calls — fake missed calls, fake guest numbers — into
+ * the CRM, quietly poisoning the recovery queue and the call analytics. There is
+ * no read access in it and no way to exfiltrate anything, which is why this is a
+ * real risk rather than an emergency; but a leaked URL cannot be un-leaked, and
+ * rotation is the only thing that actually revokes it.
+ *
+ * NEVER ACCEPTS A CALLER-SUPPLIED VALUE. The new token is generated here with
+ * crypto.randomBytes, the same as the first-run mint. That is deliberate and
+ * matches WRITE_BLOCKED_KEYS in the settings route, which refuses to let
+ * webhook_token be written through the ordinary settings PUT precisely so a
+ * chosen token cannot be smuggled in. A rotate that took a value would reopen
+ * exactly that door.
+ *
+ * REFUSES WHEN THE ENV VAR WINS. webhookToken() prefers
+ * process.env.TELECMI_WEBHOOK_SECRET over the stored row, so on a deployment
+ * that sets it, writing a new row changes NOTHING — the admin would see a fresh
+ * URL, paste it into TeleCMI, and silently break ingestion because the server
+ * still only accepts the env value. Say so instead of pretending to rotate.
+ *
+ * CALL INGESTION STOPS until TeleCMI is reconfigured with the new URLs. Calls in
+ * that gap are lost, not queued — the caller of this function is responsible for
+ * making that plain before anyone clicks.
+ */
+export function rotateWebhookToken(
+  db: Database.Database,
+): { ok: true; token: string } | { ok: false; error: string } {
+  const env = process.env.TELECMI_WEBHOOK_SECRET;
+  if (env && env.length >= 12) {
+    return {
+      ok: false,
+      error: 'This deployment pins the webhook token to the TELECMI_WEBHOOK_SECRET '
+        + 'environment variable, which overrides anything stored here. Rotate it there '
+        + 'and restart, or unset it to manage the token from this screen.',
+    };
+  }
+  const fresh = crypto.randomBytes(24).toString('hex');
+  setCtSetting(db, 'webhook_token', fresh);
+  return { ok: true, token: fresh };
+}
+
 export function webhookToken(db: Database.Database): string {
   const env = process.env.TELECMI_WEBHOOK_SECRET;
   if (env && env.length >= 12) return env;
