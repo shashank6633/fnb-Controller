@@ -1,9 +1,24 @@
 /**
  * Call-to-Table CRM settings + SLA clock.
  *
- * Settings live in ct_settings (key/value TEXT). TeleCMI SECRETS live in env
- * only (TELECMI_APPID / TELECMI_SECRET / TELECMI_WEBHOOK_SECRET) and are never
- * stored in the DB nor returned to the client.
+ * Settings live in ct_settings (key/value TEXT).
+ *
+ * TELECMI CREDENTIALS — READ THIS BEFORE ASSUMING WHERE THE SECRET IS.
+ * credential() below prefers the environment (TELECMI_APPID / TELECMI_SECRET /
+ * TELECMI_WEBHOOK_SECRET) and FALLS BACK TO ct_settings. So the secret CAN and
+ * DOES live in the database — the live DB holds a telecmi_secret row today.
+ * The header used to claim "env only … never stored in the DB", which was the
+ * security map for this credential and was wrong in the one direction that
+ * matters: it told a reader the database was safe to hand around.
+ *
+ * What IS true, and what the code actually enforces:
+ *   - the secret is never RETURNED to a client — reads expose a boolean
+ *     "configured" and at most a short fingerprint, never the value;
+ *   - it is never written into ct_calls.recording_url or any other row;
+ *   - every error message that could carry it goes through scrubCredentials()
+ *     before it is thrown, logged, or persisted (analyze.ts stores throw
+ *     messages in ct_calls.analysis_error, which is displayable).
+ * Treat a database dump as containing this credential. It does.
  */
 import type Database from 'better-sqlite3';
 import crypto from 'crypto';
@@ -61,13 +76,34 @@ export function setCtSetting(db: Database.Database, key: string, value: string):
  * invalid" and a recording that exists looks broken. telecmi-mapper.ts joins
  * such a value onto THIS base (see normalizeRecordingValue there).
  *
- * WHY CONFIGURABLE RATHER THAN HARDCODED: no real CDR from this account has
- * ever been seen — ct_webhook_log has zero cdr rows and every recording_url in
- * ct_calls is seed data — so the vendor's real play-URL shape is unverified and
- * we refuse to bake a guess into code. The default below is simply the base the
- * seeded URLs already imply (https://rest.telecmi.com/v2/play/seed-...), which
- * makes the shipped default self-consistent and keeps it inside the DEFAULT
- * host allowlist (telecmi.com) instead of quietly needing a new allowlist entry.
+ * ── THE SHAPE BELOW IS THE VENDOR'S DOCUMENTED ONE, NOT A GUESS ───────────
+ * https://doc.telecmi.com/chub/docs/play-record documents exactly one playback
+ * endpoint:
+ *     GET https://rest.telecmi.com/v2/play?appid=<appid>&secret=<secret>&file=<filename>
+ * with all three parameters REQUIRED and `file` being the FILENAME of the
+ * recording. Confirmed against the live endpoint on 12 Aug 2026 with junk
+ * credentials, read-only:
+ *     /v2/play?appid=1&secret=xx-xx&file=demo_1111113.wav
+ *          → HTTP 200, application/json, {"code":407,"error":true,"msg":"Authentication Failed"}
+ *     the same request with `file` removed
+ *          → HTTP 200, application/json, {"code":404,"error":true,"msg":"Parameter missing"}
+ * so all three parameters are recognised and credentials really are required.
+ *
+ * WHY IT ENDS IN "?file=" AND CARRIES NO CREDENTIALS. normalizeRecordingValue()
+ * treats a base ending in '=' as a literal prefix and appends the
+ * percent-encoded filename, producing exactly the documented URL minus the two
+ * credential parameters. Those are left out deliberately: whatever this base
+ * builds is STORED in ct_calls.recording_url, and the app secret must never be
+ * written to a row. telecmiPlaybackUrl() in src/lib/ct/recording-fetch.ts adds
+ * appid + secret to the OUTGOING REQUEST instead, per fetch.
+ *
+ * WHAT THIS REPLACED, and why playback has never once worked: the previous
+ * default was 'https://rest.telecmi.com/v2/play/', the path-segment form.
+ * rest.telecmi.com has no such route — /v2/play/<anything> answers 404
+ * text/html "Cannot GET /v2/play/…", identical in form to any unmatched path —
+ * so every URL built from it could only 404. Rows already holding that shape
+ * are repaired on read by telecmiPlaybackUrl(), so changing the default fixes
+ * what is stored NEXT without needing a migration.
  *
  * NO ROW  → the default below.
  * BLANK   → "do not guess": a relative value stays EMPTY rather than becoming
@@ -87,7 +123,7 @@ export function setCtSetting(db: Database.Database, key: string, value: string):
  * DB-configured today; giving it a Settings field means adding both a
  * validate() case and a UI input in files this change does not own.
  */
-export const RECORDING_BASE_URL_DEFAULT = 'https://rest.telecmi.com/v2/play/';
+export const RECORDING_BASE_URL_DEFAULT = 'https://rest.telecmi.com/v2/play?file=';
 
 export function ctRecordingBaseUrl(db: Database.Database): string {
   // Deliberately NOT ctSetting(): that collapses "no row" and "row set to
@@ -250,12 +286,25 @@ export function webhookToken(db: Database.Database): string {
  * telecmiCredentialStatus() instead — a boolean plus a masked tail — so the
  * admin can confirm WHICH secret is stored without it being readable back.
  */
+/** The STORED half only — no env, no fallback. '' when there is no row, no DB
+ *  handle, or no ct_settings table yet. Kept separate from credential() below
+ *  because telling "env wins" from "env wins AND is shadowing something the
+ *  admin typed" needs both halves read independently. */
+function storedCredential(db: Database.Database | null, dbKey: string): string {
+  if (!db) return '';
+  try {
+    const row = db.prepare(`SELECT value FROM ct_settings WHERE key = ?`)
+      .get(dbKey) as { value?: string } | undefined;
+    return String(row?.value || '').trim();
+  } catch {
+    return '';
+  }
+}
+
 function credential(db: Database.Database | null, envKey: string, dbKey: string): string {
   const env = String(process.env[envKey] || '').trim();
   if (env) return env;
-  if (!db) return '';
-  const row = db.prepare(`SELECT value FROM ct_settings WHERE key = ?`).get(dbKey) as any;
-  return String(row?.value || '').trim();
+  return storedCredential(db, dbKey);
 }
 
 export function telecmiAppId(db: Database.Database | null = null): string {
@@ -282,34 +331,73 @@ export function isTelecmiConfigured(db: Database.Database | null = null): boolea
  *  indistinguishable from the save having failed). */
 export type CredentialSource = 'env' | 'db' | 'none';
 
+export interface CredentialField {
+  set: boolean;
+  source: CredentialSource;
+  /** A fingerprint, never the value — see mask(). */
+  masked: string;
+  /**
+   * An environment variable is in force AND a stored row exists that it is
+   * shadowing. `source` alone cannot say this: it reports 'env' whether or not
+   * anything was ever saved here, so an admin who types a credential, saves it
+   * successfully and sees nothing change has no way to tell a silently
+   * overridden value from a failed save. That is the afternoon this flag exists
+   * to give back.
+   */
+  overridden: boolean;
+}
+
 export interface CredentialStatus {
   configured: boolean;
-  appid: { set: boolean; source: CredentialSource; masked: string };
-  secret: { set: boolean; source: CredentialSource; masked: string };
+  appid: CredentialField;
+  secret: CredentialField;
+  /** True when EITHER credential has a stored value the environment ignores. */
+  overridden: boolean;
 }
 
-/** Last 4 characters only, never the value. '' stays ''. */
-function mask(v: string): string {
+/**
+ * A FINGERPRINT, never the value: dots plus at most the last `keep` characters,
+ * and NEVER more than half of what is there — a short value gives up fewer
+ * characters than a long one, and a value of 1 character gives up none.
+ *
+ * `keep` differs by field on purpose. The App ID is an account number that
+ * TeleCMI prints in its own public documentation example, so a few characters
+ * of it identify WHICH account without giving anything away. The app secret is
+ * a live credential: 2 characters are enough to tell "the one I just pasted"
+ * from "the old one" on a settings screen, and every additional character is
+ * one more character of a secret sitting in a screenshot.
+ */
+function mask(v: string, keep: number): string {
   if (!v) return '';
-  return v.length <= 4 ? '••••' : '••••' + v.slice(-4);
+  const show = Math.min(keep, Math.floor(v.length / 2));
+  return show < 1 ? '••••' : '••••' + v.slice(-show);
 }
 
-function sourceOf(db: Database.Database | null, envKey: string, dbKey: string): CredentialSource {
-  if (String(process.env[envKey] || '').trim()) return 'env';
-  if (db) {
-    const row = db.prepare(`SELECT value FROM ct_settings WHERE key = ?`).get(dbKey) as any;
-    if (String(row?.value || '').trim()) return 'db';
-  }
-  return 'none';
+function fieldStatus(
+  db: Database.Database | null,
+  envKey: string,
+  dbKey: string,
+  keep: number,
+): CredentialField {
+  const env = String(process.env[envKey] || '').trim();
+  const stored = storedCredential(db, dbKey);
+  const effective = env || stored;
+  return {
+    set: !!effective,
+    source: env ? 'env' : stored ? 'db' : 'none',
+    masked: mask(effective, keep),
+    overridden: !!env && !!stored,
+  };
 }
 
 export function telecmiCredentialStatus(db: Database.Database | null = null): CredentialStatus {
-  const appid = telecmiAppId(db);
-  const secret = telecmiSecret(db);
+  const appid = fieldStatus(db, 'TELECMI_APPID', 'telecmi_appid', 4);
+  const secret = fieldStatus(db, 'TELECMI_SECRET', 'telecmi_secret', 2);
   return {
-    configured: !!(appid && secret),
-    appid:  { set: !!appid,  source: sourceOf(db, 'TELECMI_APPID', 'telecmi_appid'),   masked: mask(appid) },
-    secret: { set: !!secret, source: sourceOf(db, 'TELECMI_SECRET', 'telecmi_secret'), masked: mask(secret) },
+    configured: appid.set && secret.set,
+    appid,
+    secret,
+    overridden: appid.overridden || secret.overridden,
   };
 }
 

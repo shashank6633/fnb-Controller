@@ -13,17 +13,33 @@ import { getCentralStoreCutoverDate } from '@/lib/central-cutover';
  *
  * Each anomaly returns a severity + headline + detail + fix_url.
  *
- * THE CENTRAL-STORE CUTOVER FLOOR. The two closing-count items below (the
- * per-item "Largest inventory variances" and the ₹ tie-out) read
+ * THE CENTRAL-STORE CUTOVER FLOOR. Three things below read
  * closing_stock.variance_value, a figure FROZEN at count time against
  * raw_materials.current_stock. Before a cutover that book had drifted for
  * months, so a pre-cutover count's variance is missing paperwork, not loss —
- * and this feed is the owner's dashboard. Both are skipped when `yesterday`
- * falls before the cutover date. The window is short by construction (yesterday
- * moves) but it covers cutover morning, which is precisely when a wall of drift
- * presented as red "Variance / high" anomalies would do the damage. Unstamped,
- * getCentralStoreCutoverDate returns null, `preCutover` is false and neither
- * block changes at all.
+ * and this feed is the owner's dashboard. All three are gated on `preCutover`
+ * (`yesterday` earlier than the cutover date):
+ *   1. the per-item "Largest inventory variances" anomalies — not emitted;
+ *   2. the ₹ tie-out ANOMALY — not emitted;
+ *   3. tie_out.variance_value_total in the PAYLOAD — withheld as null, exactly
+ *      as it already is for a non-admin. Gating only the anomaly left the raw
+ *      pre-cutover rupee figure on the wire, and the dashboard prints that
+ *      field verbatim ("⚠ Off by ₹X"), so drift still read as loss on the one
+ *      morning the cutover exists to stop that.
+ *
+ * WHAT IS DELIBERATELY *NOT* GATED, so nobody "completes" it later:
+ * tie_out.balanced. It is a boolean over the same sum, and a boolean has no
+ * honest third state here — true would claim the books tie out across a
+ * boundary nobody can tie out across, and false is what it already says. The
+ * consumer (src/app/page.tsx) already renders the null-₹ case as "Variance
+ * flagged (admin review)" rather than a rupee loss, which is the truthful
+ * reading. `tie_out.pre_cutover` travels beside it so a second dashboard can
+ * tell "withheld because pre-cutover" from "withheld because not an admin".
+ *
+ * The window is short by construction (yesterday moves) but it covers cutover
+ * morning, which is precisely when a wall of drift presented as red "Variance /
+ * high" anomalies would do the damage. Unstamped, getCentralStoreCutoverDate
+ * returns null, `preCutover` is false and nothing here changes at all.
  *
  * The other four detectors are left alone deliberately, for two different
  * reasons — do not "complete the set". Detectors 1, 2 and 4 read purchases,
@@ -221,9 +237,15 @@ export async function GET() {
         received: tieOut.received || 0,
         recipe_consumed: tieOut.consumed || 0,
         wasted: tieOut.wasted || 0,
-        // Variance ₹ total is admin-only; non-admins get just the balanced flag.
-        variance_value_total: isAdmin ? closingValue : null,
+        // Variance ₹ total is admin-only AND cutover-floored — the same two
+        // conditions the tie-out anomaly above is gated on, because this field
+        // is that anomaly's number and a dashboard prints it verbatim.
+        variance_value_total: isAdmin && !preCutover ? closingValue : null,
+        // NOT gated — see the header. Left as the raw signal because a boolean
+        // cannot say "not measurable across the cutover boundary".
         balanced: closingValue < 1000,
+        /** Why the ₹ total may be null: yesterday predates the cutover date. */
+        pre_cutover: preCutover,
       },
       anomaly_count: anomalies.length,
       anomalies: anomalies.slice(0, 12),

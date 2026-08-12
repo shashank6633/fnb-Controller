@@ -27,7 +27,11 @@
  *     TeleCMI: "Try playback now", which fetches a stored recording and reports
  *     the status, content type and error body. Opt-in, never on mount — a URL
  *     can pass every shape check and still point at a path the vendor does not
- *     serve, and nothing but asking can tell those apart.
+ *     serve, and nothing but asking can tell those apart. The panel opens with
+ *     the PRECONDITION (CredentialsStrip): are the App ID and secret set, and
+ *     does TeleCMI accept them? Nothing else in the panel can be true while the
+ *     answer is no, and playback is the only feature that fails silently on it.
+ *     Neither credential is rendered here in any form, masked or otherwise.
  *   6 Recording retention — the one WRITABLE control on this page that is not
  *     a TeleCMI account setting: how long a recording stays reachable through
  *     this app (7 / 15 / 30 days). It sits here rather than in CRM Settings
@@ -163,36 +167,59 @@ type DiagCdr = {
 
 /* One upstream attempt against one stored recording. This is the only part of
  * the diagnostic that leaves the server, and the only part that can tell a
- * SHAPE that validates from a DESTINATION that serves audio. */
+ * SHAPE that validates from a DESTINATION that serves audio.
+ *
+ * EVERY FIELD IS OPTIONAL AND EVERY READ IS GUARDED. This panel and the route
+ * that feeds it are being changed at the same time by different people; a
+ * field that has not landed yet must degrade to "not stated", never to a blank
+ * page. `c.retention.expired` on a payload without a retention block is a
+ * TypeError inside render, which unmounts the whole Telephony console — the
+ * one screen an admin opens BECAUSE something is broken. */
 type DiagProbeCall = {
-  call_id: string;
-  started_at: string;
+  call_id?: string;
+  started_at?: string;
   /** Demo/simulator row rather than a real recording. */
-  fixture: boolean;
+  fixture?: boolean;
   /** Credential-masked, both of them. */
-  stored_url: string;
-  fetched_url: string;
-  rewritten: boolean;
-  rewrite_note: string;
-  credentialed: boolean;
-  retention: { expired: boolean; reason: string; days: number; expires_at: string };
+  stored_url?: string;
+  fetched_url?: string;
+  rewritten?: boolean;
+  rewrite_note?: string;
+  credentialed?: boolean;
+  retention?: { expired?: boolean; reason?: string; days?: number; expires_at?: string };
   /** False when the retention gate refused before any upstream call. */
-  attempted: boolean;
-  upstream_status: number | null;
-  upstream_content_type: string;
+  attempted?: boolean;
+  upstream_status?: number | null;
+  upstream_content_type?: string;
   /** First bytes of a non-audio answer, verbatim. '' when audio came back. */
-  body_preview: string;
-  is_audio: boolean;
-  error: string;
-  headline: string;
+  body_preview?: string;
+  is_audio?: boolean;
+  error?: string;
+  headline?: string;
 };
 
 type DiagProbe = {
-  ran: boolean;
-  limit: number;
-  candidates: number;
-  calls: DiagProbeCall[];
-  headline: string;
+  ran?: boolean;
+  limit?: number;
+  candidates?: number;
+  calls?: DiagProbeCall[];
+  headline?: string;
+};
+
+/**
+ * Whether the TeleCMI App ID and secret are set — NEVER their values.
+ *
+ * Optional because the diagnostic route may not send it yet. When it does not,
+ * the strip falls back to the account check (see credState below), which is a
+ * live use of the very same pair and therefore better evidence than any flag.
+ * `masked` is deliberately NOT read anywhere in this file: a boolean and a
+ * source answer every question an admin has here, and a tail of a secret in a
+ * screenshot answers none of them.
+ */
+type DiagCredentials = {
+  configured?: boolean;
+  appid?: { set?: boolean; source?: string };
+  secret?: { set?: boolean; source?: string };
 };
 
 type RecordingDiagResp = {
@@ -200,6 +227,8 @@ type RecordingDiagResp = {
   error?: string;
   /** Present only on the opt-in probe request; null on a normal panel load. */
   probe?: DiagProbe | null;
+  /** Optional — see DiagCredentials. Booleans only, never a credential. */
+  credentials?: DiagCredentials | null;
   webhooks?: {
     cdr_count: number;
     cdr_newest_at: string;
@@ -393,6 +422,92 @@ function Spinner({ label }: { label: string }) {
     <p className="text-sm text-[#8B7355] flex items-center gap-2 py-2">
       <Loader2 className="w-4 h-4 animate-spin" /> {label}
     </p>
+  );
+}
+
+/**
+ * The precondition for playback, stated in one line above the diagnostic.
+ *
+ * "Set" and "accepted" are separated on purpose — see credState(). A pair that
+ * is saved but refused is the failure that looks most like a working system,
+ * and it is the state this deployment has actually been in: a placeholder
+ * secret, every screen reporting "configured", and not one recording ever
+ * playing.
+ *
+ * IT RENDERS NO CREDENTIAL, MASKED OR OTHERWISE. Six words about whether the
+ * phone system accepts us is the entire useful content; a tail of a secret in
+ * an admin's screenshot is not content, it is exposure. `detail` is the vendor
+ * or transport message from src/lib/ct/telecmi-api.ts, which is documented
+ * never to carry the secret.
+ */
+function CredentialsStrip({
+  state, onRecheck, busy,
+}: {
+  state: { verdict: 'loading' | 'unknown' | 'missing' | 'rejected' | 'unreachable' | 'accepted'; detail: string };
+  onRecheck: () => void;
+  busy: boolean;
+}) {
+  if (state.verdict === 'loading') {
+    return (
+      <p className="text-[11px] text-[#8B7355] flex items-center gap-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] px-2.5 py-1.5">
+        <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+        Checking whether TeleCMI accepts this app&rsquo;s App ID and secret…
+      </p>
+    );
+  }
+
+  const tone =
+    state.verdict === 'accepted' ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
+      : state.verdict === 'missing' || state.verdict === 'rejected' ? 'bg-red-50 border-red-300 text-red-800'
+        : 'bg-amber-50 border-amber-300 text-amber-900';
+
+  const Icon =
+    state.verdict === 'accepted' ? CheckCircle2
+      : state.verdict === 'missing' ? PlugZap
+        : AlertTriangle;
+
+  const title =
+    state.verdict === 'accepted' ? 'TeleCMI accepts this app’s credentials'
+      : state.verdict === 'missing' ? 'TeleCMI App ID and secret are not set'
+        : state.verdict === 'rejected' ? 'TeleCMI rejected this app’s App ID and secret'
+          : state.verdict === 'unreachable' ? 'TeleCMI could not be reached to check the credentials'
+            : 'Whether TeleCMI accepts this app’s credentials is unknown';
+
+  const body =
+    state.verdict === 'accepted'
+      ? 'Credentials are not the reason a recording will not play — read the rest of this panel.'
+      : state.verdict === 'missing'
+        ? 'Recordings cannot be fetched from TeleCMI without them, so every player will refuse with a reason and no audio.'
+        : state.verdict === 'rejected'
+          ? 'Every recording will refuse to play until a pair TeleCMI accepts is saved. Recordings are the only feature that fails silently on this, which is why it is stated here.'
+          : state.verdict === 'unreachable'
+            ? 'A pair is saved. Whether TeleCMI accepts it cannot be established while TeleCMI is unreachable, so treat playback failures as unexplained for now.'
+            : 'The account check did not answer, so this panel cannot say whether the credentials are the problem.';
+
+  return (
+    <div className={`rounded-lg border p-2.5 text-[11px] flex items-start gap-2 ${tone}`}>
+      <Icon className="w-4 h-4 shrink-0 mt-px" />
+      <div className="min-w-0 space-y-1">
+        <p className="font-semibold">{title}</p>
+        <p>{body}</p>
+        {state.detail && <p className="break-words">TeleCMI said: {state.detail}</p>}
+        <p className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-0.5">
+          {state.verdict !== 'accepted' && (
+            <a href="/crm-calls/settings" className="font-semibold underline underline-offset-2">
+              Set the App ID and secret in CRM Settings
+            </a>
+          )}
+          <button
+            type="button"
+            onClick={onRecheck}
+            disabled={busy}
+            className="inline-flex items-center gap-1 font-semibold underline underline-offset-2 disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3 h-3 ${busy ? 'animate-spin' : ''}`} /> Re-check
+          </button>
+        </p>
+      </div>
+    </div>
   );
 }
 
@@ -592,6 +707,67 @@ export default function TelephonyPage() {
     if (!an || t === 0) return null;
     return ((Number(an.local.answered) || 0) / t) * 100;
   }, [an]);
+
+  /* ── Are the TeleCMI credentials set, and does TeleCMI accept them? ───────
+   *
+   * WHY THIS SITS ON THE RECORDINGS PANEL. Playback is the one feature whose
+   * failure mode for a bad credential is completely silent: the GRE gets a
+   * player that will not start, with no error anywhere. Every other consumer
+   * of these credentials (balance, call analysis, agents) already shouts. So
+   * the precondition is stated where the symptom is reported.
+   *
+   * WHERE THE ANSWER COMES FROM, in order:
+   *   1 the diagnostic route, if it grows a `credentials` block — a direct
+   *     statement of whether the pair is stored.
+   *   2 the ACCOUNT CHECK, which is better evidence and already on this page.
+   *     /api/telecmi/balance spends the very same appid + secret against the
+   *     vendor on every load, so its answer is not "are they set" but "does
+   *     TeleCMI accept them" — the question that actually decides playback.
+   *     `configured:false` is the route's word for "nothing is stored".
+   *
+   * "Set" and "accepted" are reported as different things because they fail
+   * differently and are fixed differently, and because the placeholder secret
+   * this deployment shipped with is precisely the case that looks configured
+   * and is not accepted.
+   *
+   * NOTHING HERE READS A CREDENTIAL VALUE. bal.error is built by
+   * src/lib/ct/telecmi-api.ts, which documents that it never contains the
+   * secret; the masked tails the settings API can return are not requested,
+   * not stored and not rendered anywhere on this page.
+   */
+  const credState = useMemo((): {
+    verdict: 'loading' | 'unknown' | 'missing' | 'rejected' | 'unreachable' | 'accepted';
+    detail: string;
+  } => {
+    const declared = diag?.credentials;
+    const configured =
+      typeof declared?.configured === 'boolean' ? declared.configured
+        : typeof bal?.configured === 'boolean' ? bal.configured
+          : null;
+
+    if (configured === false) return { verdict: 'missing', detail: '' };
+
+    // Still waiting on the only live check we have.
+    if (balLoading && !bal) return { verdict: 'loading', detail: '' };
+
+    if (bal?.configured === true) {
+      const err = String(bal.error || '').trim();
+      if (err) {
+        // A refusal and an outage both come back as `error`. Only the first is
+        // a credential problem, so they are not merged: telling an owner their
+        // App ID is wrong when TeleCMI was simply down sends them to re-type a
+        // working secret.
+        return /auth|credential|invalid|forbidden|denied|\b40[137]\b/i.test(err)
+          ? { verdict: 'rejected', detail: err }
+          : { verdict: 'unreachable', detail: err };
+      }
+      if (bal.balance != null) return { verdict: 'accepted', detail: '' };
+    }
+
+    // Stored (or not even that much) but nothing has confirmed it either way —
+    // most often the account check itself failed. Say so rather than guess.
+    return { verdict: 'unknown', detail: balError || '' };
+  }, [diag, bal, balLoading, balError]);
 
   /* ── Agent save (modal submit) ───────────────────────────────────────────── */
   const submitAgent = async (body: Record<string, unknown>): Promise<string | null> => {
@@ -1238,6 +1414,15 @@ export default function TelephonyPage() {
           </button>
         }
       >
+        {/* OUTSIDE the diagnostic's own loading/error chain, deliberately: if
+            the diagnostic cannot answer, "are the credentials even accepted?"
+            is MORE useful, not less, and it is answered from a different
+            request. It is also first because it is the precondition — nothing
+            below it can be true while TeleCMI is refusing us. */}
+        <div className="mb-3">
+          <CredentialsStrip state={credState} onRecheck={() => void loadBalance()} busy={balLoading} />
+        </div>
+
         {diagLoading ? (
           <Spinner label="Reading the webhook log…" />
         ) : diagError ? (
@@ -1385,68 +1570,95 @@ export default function TelephonyPage() {
                 <p className="mt-2 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded p-2">{probeError}</p>
               )}
 
-              {probe && (
-                <div className="mt-3 space-y-2">
-                  <p className={`text-[11px] rounded p-2 border ${
-                    probe.calls.some(c => c.is_audio)
-                      ? 'bg-green-50 border-green-300 text-green-900'
-                      : 'bg-red-50 border-red-300 text-red-800'
-                  }`}>
-                    {probe.headline}
-                  </p>
-
-                  {probe.calls.length === 0 ? (
-                    <p className="text-[11px] text-[#8B7355]">No stored recording URL to try.</p>
-                  ) : probe.calls.map(c => (
-                    <div key={c.call_id} className="rounded border border-[#E8D5C4] bg-white p-2.5 text-[11px] text-[#6B5744] space-y-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className={`px-1.5 py-0.5 rounded font-semibold ${
-                          c.is_audio ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
-                        }`}>
-                          {c.is_audio ? 'Plays' : 'Does not play'}
-                        </span>
-                        {c.fixture && (
-                          <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">Demo fixture</span>
-                        )}
-                        <span className="text-[#8B7355]">{c.started_at || 'undated'}</span>
-                      </div>
-
-                      <p className="text-[#2D1B0E]">{c.headline}</p>
-
-                      {/* The two URLs side by side are the point of the panel: they
-                          are what shows a rewrite happening, and what it produced. */}
-                      <p className="break-all">
-                        <span className="text-[#8B7355]">Stored:</span>{' '}
-                        <span className="font-mono">{c.stored_url}</span>
+              {/* EVERY FIELD BELOW IS READ DEFENSIVELY — see DiagProbeCall.
+                  This panel is the admin's instrument for a broken system; it
+                  has to survive a payload that is itself incomplete. */}
+              {probe && (() => {
+                const calls = Array.isArray(probe.calls) ? probe.calls : [];
+                const anyAudio = calls.some(c => c?.is_audio === true);
+                return (
+                  <div className="mt-3 space-y-2">
+                    {probe.headline && (
+                      <p className={`text-[11px] rounded p-2 border ${
+                        anyAudio
+                          ? 'bg-green-50 border-green-300 text-green-900'
+                          : 'bg-red-50 border-red-300 text-red-800'
+                      }`}>
+                        {probe.headline}
                       </p>
-                      {c.attempted && c.fetched_url && c.fetched_url !== c.stored_url && (
-                        <p className="break-all">
-                          <span className="text-[#8B7355]">Fetched:</span>{' '}
-                          <span className="font-mono">{c.fetched_url}</span>
-                        </p>
-                      )}
-                      {c.rewrite_note && (
-                        <p className="text-[#8B7355]">{c.rewrite_note}</p>
-                      )}
-                      {c.attempted && (
-                        <p className="text-[#8B7355]">
-                          HTTP {c.upstream_status ?? '—'} · {c.upstream_content_type || 'no content type'} ·{' '}
-                          {c.credentialed ? 'sent with credentials' : 'sent WITHOUT credentials'}
-                        </p>
-                      )}
-                      {c.body_preview && (
-                        <p className="font-mono break-all bg-[#FFF8F0] border border-[#E8D5C4] rounded p-1.5">{c.body_preview}</p>
-                      )}
-                      {c.retention.expired && (
-                        <p className="text-amber-800">
-                          Retention: refused after {c.retention.days} days
-                          {c.retention.reason === 'undated' ? ' (this call cannot be dated)' : ''}.
-                        </p>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
+                    )}
+
+                    {calls.length === 0 ? (
+                      <p className="text-[11px] text-[#8B7355]">No stored recording URL to try.</p>
+                    ) : calls.map((c, i) => {
+                      // A probe that neither played nor reported a failure has
+                      // not answered the question; "Does not play" would be a
+                      // verdict nobody gave. Say the truth instead.
+                      const verdict: 'plays' | 'no' | 'unknown' =
+                        c?.is_audio === true ? 'plays'
+                          : c?.is_audio === false ? 'no'
+                            : 'unknown';
+                      const retention = c?.retention;
+                      return (
+                        <div key={c?.call_id || `probe-${i}`} className="rounded border border-[#E8D5C4] bg-white p-2.5 text-[11px] text-[#6B5744] space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className={`px-1.5 py-0.5 rounded font-semibold ${
+                              verdict === 'plays' ? 'bg-green-100 text-green-800'
+                                : verdict === 'no' ? 'bg-red-100 text-red-800'
+                                  : 'bg-[#F0E4D6] text-[#6B5744]'
+                            }`}>
+                              {verdict === 'plays' ? 'Plays' : verdict === 'no' ? 'Does not play' : 'No verdict'}
+                            </span>
+                            {c?.fixture && (
+                              <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">Demo fixture</span>
+                            )}
+                            <span className="text-[#8B7355]">{c?.started_at || 'undated'}</span>
+                          </div>
+
+                          {c?.headline && <p className="text-[#2D1B0E]">{c.headline}</p>}
+                          {!c?.headline && c?.error && <p className="text-[#2D1B0E]">{c.error}</p>}
+
+                          {/* The two URLs side by side are the point of the panel: they
+                              are what shows a rewrite happening, and what it produced.
+                              Both are masked by the route before they leave the server. */}
+                          {c?.stored_url && (
+                            <p className="break-all">
+                              <span className="text-[#8B7355]">Stored:</span>{' '}
+                              <span className="font-mono">{c.stored_url}</span>
+                            </p>
+                          )}
+                          {c?.fetched_url && c.fetched_url !== c.stored_url && (
+                            <p className="break-all">
+                              <span className="text-[#8B7355]">Fetched:</span>{' '}
+                              <span className="font-mono">{c.fetched_url}</span>
+                            </p>
+                          )}
+                          {c?.rewrite_note && (
+                            <p className="text-[#8B7355]">{c.rewrite_note}</p>
+                          )}
+                          {c?.attempted && (
+                            <p className="text-[#8B7355]">
+                              HTTP {c.upstream_status ?? '—'} · {c.upstream_content_type || 'no content type'}
+                              {typeof c.credentialed === 'boolean'
+                                ? ` · ${c.credentialed ? 'sent with credentials' : 'sent WITHOUT credentials'}`
+                                : ''}
+                            </p>
+                          )}
+                          {c?.body_preview && (
+                            <p className="font-mono break-all bg-[#FFF8F0] border border-[#E8D5C4] rounded p-1.5">{c.body_preview}</p>
+                          )}
+                          {retention?.expired && (
+                            <p className="text-amber-800">
+                              Retention: refused after {retention.days ?? '—'} days
+                              {retention.reason === 'undated' ? ' (this call cannot be dated)' : ''}.
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
             </div>
 
             {diag.allowlist && diag.allowlist.length > 0 && (

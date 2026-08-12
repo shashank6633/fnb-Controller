@@ -1335,7 +1335,12 @@ export default function GuestProfilePage() {
                     {/* Shared with the Call Log — see src/components/ct/RecordingPlayer.tsx.
                         A bare <audio> here rendered a dead 0:00/0:00 for a recording the
                         proxy was refusing with a reason, on exactly the same call the Log
-                        was failing on; one player means one explanation on both surfaces. */}
+                        was failing on; one player means one explanation on both surfaces.
+                        It keeps preload="none" precisely for this screen: a busy guest can
+                        have dozens of timeline rows, and preloading would fire one upstream
+                        TeleCMI fetch per row on page open. It also decides for itself
+                        whether the reader is an admin, so nothing has to be threaded down
+                        through the timeline to route a credentials fault. */}
                     {t.has_recording && (
                       <RecordingPlayer callId={t.id} className="mt-2 w-full max-w-sm h-9" />
                     )}

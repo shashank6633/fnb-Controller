@@ -261,7 +261,9 @@ export function guestMetricsByPhone(db: DB, phone: string): GuestMetrics {
 
 export interface AgentStat {
   agent: string;
-  handled: number;            // answered calls handled in the window
+  /** Answered calls handled in the window, EXCLUDING self-logged callbacks the
+   *  server never bounded — see COUNTABLE_CALL below for the exact rule. */
+  handled: number;
   bookings: number;           // bookings attributed to this agent's calls
   recoveries_handled: number; // recoveries assigned to them with ≥1 attempt
   avg_callback_min: number;   // avg missed_at → first_attempt_at (minutes)
@@ -280,7 +282,9 @@ export interface AgentStat {
    *  below: a ring-group call missed by everyone carries NO agent id, so it
    *  lands in nobody's denominator and every agent can sit at 100%. */
   answer_rate: number;
-  /** Outbound (callback) attempts placed by this agent. */
+  /** Outbound (callback) attempts placed by this agent — countable ones only,
+   *  same COUNTABLE_CALL rule as `handled`, so `handled` always equals
+   *  inbound_answered + outbound_answered. */
   outbound_calls: number;
   outbound_answered: number;
   /** 0–100, outbound_answered ÷ outbound_calls — did the guest pick up. */
@@ -533,6 +537,56 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
   `).get(winStart, winEnd) as any;
 
   // ── Agent leaderboard ────────────────────────────────────────────────────
+  //
+  // WHICH ct_calls ROWS THE LEADERBOARD IS ALLOWED TO COUNT.
+  //
+  // Almost every row here is a TeleCMI CDR: the PBX timed it, nobody in the
+  // building can author it, and it carries duration_source = ''. The exception
+  // is the Call Back flow (src/app/api/crm-calls/calls/log-callback/route.ts):
+  // the plan has no outbound package, so a GRE dials from their own handset and
+  // POSTs the app an account of the call. That INSERT is a whole ct_calls row —
+  // direction 'outbound', status 'answered' when connected — written entirely
+  // from a request body. `handled` is the leaderboard's DEFAULT SORT KEY, so
+  // those rows do not merely inflate a number, they reorder a ranking a manager
+  // reads. The route's de-dupe window and per-agent burst cap BOUND how many can
+  // be created; this is the filter that stops the ones that get through from
+  // counting.
+  //
+  // WHAT THIS EXCLUDES — and nothing beyond it:
+  //   duration_source != ''  AND  duration_verified = 0
+  //   i.e. a row the Call Back flow wrote (self-logged) that the server never
+  //   bounded against its own clock (unvouched). See src/lib/ct/call-token.ts
+  //   for what "bounded" means and src/lib/ct/duration-trust.ts for how the same
+  //   two columns are read on screen.
+  //
+  // WHAT IT DELIBERATELY DOES **NOT** DO:
+  //   · It does not touch a PBX CDR. Those carry duration_source = '', so all
+  //     inbound work is counted exactly as before — the filter is a no-op on it.
+  //   · It does not retro-delete history. A callback logged BEFORE the token
+  //     mechanism shipped also carries '' (the ALTER back-filled it) and KEEPS
+  //     counting. Those are real calls by real staff that cannot be verified
+  //     after the fact; silently erasing months of a GRE's recorded work from
+  //     the leaderboard would be a worse wrong than the fabrication risk.
+  //   · It does not punish a verified callback. duration_verified = 1 counts,
+  //     which is the whole point of minting the token.
+  //   · It is NOT fraud detection and proves nothing about any individual row.
+  //     An unvouched row is usually just an iPhone or an offline mint. This only
+  //     says such a row may not MOVE A RANKING.
+  //   · It does not reach outside the leaderboard's CALL COUNTS. `bookings` and
+  //     `recoveries_handled`/`avg_callback_min` are left whole — each carries
+  //     its own note below saying why, and the recovery note also records what
+  //     that leaves open. Every CALL-based figure above this section
+  //     (today.calls/answered/missed, byDay, byHour, byDowHour, unattributed,
+  //     funnel.calls/answered, missed_rate) is already restricted to
+  //     direction = 'inbound', and only the outbound Call Back route ever writes
+  //     duration_source, so the filter would change none of them; the remaining
+  //     figures up there are booking- or recovery-based and are not call counts
+  //     at all. The guest-level metrics at the top of this file also stay whole
+  //     on purpose: total_calls is "how many rows exist for this guest", and it
+  //     has to keep agreeing with the Call Log page, which lists every row and
+  //     MARKS the self-logged ones rather than hiding them.
+  const COUNTABLE_CALL = `NOT (c.duration_source != '' AND c.duration_verified = 0)`;
+
   const agentMap = new Map<string, AgentStat>();
   const ensureAgent = (agent: string): AgentStat => {
     let a = agentMap.get(agent);
@@ -552,12 +606,23 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
     SELECT c.agent_user AS agent, COUNT(*) AS n
     FROM ct_calls c
     WHERE c.status = 'answered' AND c.agent_user != ''
+      AND ${COUNTABLE_CALL}
       AND ${CALL_AT} >= ? AND ${CALL_AT} < ?
     GROUP BY c.agent_user
   `).all(winStart, winEnd) as any[];
   for (const r of handledRows) ensureAgent(r.agent).handled = num(r.n);
 
   // Volume split by direction + average speed of answer, one pass.
+  // COUNTABLE_CALL is applied HERE TOO, and that is not belt-and-braces: these
+  // columns render in the same table row as `handled`, and direction is only
+  // ever 'inbound' or 'outbound', so handled == inbound_answered +
+  // outbound_answered is an identity a manager can see. Filtering one side only
+  // would print a row that does not add up, which is worse than a row that
+  // overcounts. connect_rate needs it for its own sake as well — it is a sort
+  // key too, and a fabricated "connected" callback is a free 100%. On the
+  // inbound columns it is provably a no-op — only the outbound Call Back route
+  // ever writes duration_source, so no inbound row can fail the predicate.
+  //
   // ASA is INBOUND-ONLY on purpose: on an outbound callback the gap between
   // started_at and answered_at is how long the GUEST took to pick up, which
   // says nothing about the agent. Rows missing either timestamp, and rows
@@ -580,7 +645,8 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
                     THEN (julianday(${ANSWERED_AT}) - julianday(${CALL_AT})) * 86400.0
                END)                                                              AS asa_sec
     FROM ct_calls c
-    WHERE c.agent_user != '' AND ${CALL_AT} >= ? AND ${CALL_AT} < ?
+    WHERE c.agent_user != '' AND ${COUNTABLE_CALL}
+      AND ${CALL_AT} >= ? AND ${CALL_AT} < ?
     GROUP BY c.agent_user
   `).all(winStart, winEnd) as any[];
   for (const r of agentVolumeRows) {
@@ -595,6 +661,16 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
     a.asa_sec = a.asa_sample > 0 ? round1(num(r.asa_sec)) : 0;
   }
 
+  // NO COUNTABLE_CALL HERE, on purpose. This counts BOOKINGS, not calls: the
+  // call row is only the attribution key. A booking is a separate artifact with
+  // a guest, a date and a cover count that the floor either honours or does not,
+  // and it is not conjured by a duration claim — faking one is a different and
+  // far louder act than mistyping a talk time. Dropping a real reservation off
+  // an agent's card because the callback it came from was logged from an iPhone
+  // would delete work that actually happened. Consequence to know: an agent can
+  // show bookings > 0 with handled = 0. That reads correctly (we credit the
+  // booking, we do not credit an unvouched call) and it is not a contradiction
+  // the way a mismatched handled/answered pair would be.
   const agentBookingRows = db.prepare(`
     SELECT c.agent_user AS agent, COUNT(*) AS n
     FROM ct_bookings b
@@ -605,6 +681,23 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
   `).all(winStart, winEnd) as any[];
   for (const r of agentBookingRows) ensureAgent(r.agent).bookings = num(r.n);
 
+  // NO COUNTABLE_CALL HERE either — there is nothing here to apply it to. These
+  // read ct_recoveries, which has no duration columns: a recovery is opened by
+  // an inbound MISS the PBX reported (ingest.ts openRecovery), missed_at comes
+  // off that CDR, and first_attempt_at is the SERVER's own clock at the moment
+  // the attempt was recorded. So no claimed talk time enters either figure — a
+  // fabricated DURATION cannot move recoveries_handled or avg_callback_min.
+  //
+  // BE HONEST ABOUT WHAT IS STILL OPEN. Logging a callback against an open
+  // recovery sets first_attempt_at, so a fabricated callback ROW can still mark
+  // a real recovery as attempted — inflating recoveries_handled and pulling
+  // avg_callback_min down. That is a different hole with a different shape and
+  // this filter is the wrong tool for it: a recovery can also be advanced to
+  // 'attempting' straight from /api/crm-calls/recoveries/[id] with no ct_calls
+  // row in existence, so keying the recovery columns off call verification would
+  // punish one honest path and miss the other. Fixing it means gating the
+  // ATTEMPT, not the metric. Noted here so the next reader does not mistake the
+  // leaderboard filter above for cover it never gave.
   const agentRecoveryRows = db.prepare(`
     SELECT assigned_to AS agent,
            COUNT(*)                                                              AS n,

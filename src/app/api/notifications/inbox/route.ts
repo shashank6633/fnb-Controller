@@ -18,6 +18,8 @@ import { canApproveTasks } from '@/lib/tasks';
  *   - kitchen/admin    : open KOT trouble alerts (kot_alerts.resolved_at IS NULL)
  *   - HOD/store/admin  : materials at/below reorder level
  *   - admin            : closing counts parked in the variance-approval queue
+ *   - admin            : committed Central Store cutovers with unreviewed
+ *                        variance records — ONE item per batch, never per line
  *   - plain staff      : their OWN requisitions by stage (with HOD / being
  *                        issued / fulfilled today)
  *
@@ -242,6 +244,42 @@ export async function GET() {
           pendingVarianceCount(db, outletId), '/variance-approvals');
       } catch (vaErr) {
         console.error('[/api/notifications/inbox] variance bucket failed:', vaErr);
+      }
+    }
+
+    // ── Central Store cutover: variance records nobody has reviewed ───────
+    // A committed cutover SETS current_stock for hundreds of materials and
+    // writes one durable record per line whose counted figure differed from the
+    // book ("an alert for every single variance"). Nothing else in the app
+    // surfaced those records, so a cutover could be applied and its variances
+    // never looked at — which is the whole point of taking the count.
+    //
+    // ONE ITEM PER BATCH, NEVER ONE PER LINE. A ~825-material cutover raises
+    // ~600 alert lines; pushing those individually would bury every other
+    // bucket, and the badge sums `count` across items (see
+    // CaptainAlertsProvider), so a per-line count would do the same damage in
+    // one row. count = 1 is therefore the literal truth of this item: one
+    // cutover to review. The numbers live in the engine's own label ("Stock
+    // cutover <date> — N counted, M with a variance, net Rs X"), and the
+    // per-line records are on the review screen this links to.
+    //
+    // ADMIN-ONLY, matching every other surface for these figures: the page is
+    // adminOnly in the page catalog, GET/POST .../central-cutover/alerts are
+    // requireAdmin, and the label quotes a variance count and a rupee total —
+    // exactly what the blind-count rule keeps from non-admins.
+    // NOT outlet-scoped, deliberately: current_stock is a single global pool
+    // with no outlet dimension, so the batch this links to is the same batch
+    // whichever outlet the admin is signed in to (see the db.ts schema note).
+    // Isolated like the other additive buckets so a cutover schema issue can
+    // never break the whole inbox.
+    if (isAdmin) {
+      try {
+        const { unreviewedAlertBatches } = await import('@/lib/central-cutover');
+        for (const b of unreviewedAlertBatches(db)) {
+          push('cutover_alerts:' + b.batch_id, b.label, 1, '/inventory/central-cutover');
+        }
+      } catch (cuErr) {
+        console.error('[/api/notifications/inbox] cutover bucket failed:', cuErr);
       }
     }
 

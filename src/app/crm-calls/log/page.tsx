@@ -704,7 +704,7 @@ export default function CallLogPage() {
                         >
                           <Play className="w-3.5 h-3.5" /> {audioId === c.id ? 'Hide recording' : 'Recording'}
                         </button>
-                      ) : null}
+                      ) : <NoRecordingChip state={c.recording_state} />}
                       <AiCell
                         call={c}
                         analyzing={analyzingIds.has(c.id)}
@@ -1022,15 +1022,54 @@ function DispositionCell({ call, saving, onPick }: {
  *                    is every historical row and it should look exactly as it
  *                    did.
  *
+ * BOTH CARRY THEIR SENTENCE. A bare dash was the other half of the complaint
+ * that produced the player's error states: the owner could see that there was
+ * nothing to press but not why, and the two whys are completely different
+ * (never recorded / aged out of the retention window). The API collapses them
+ * into 'unknown', so the tooltip names both possibilities rather than picking
+ * one — saying "not recorded" about a recording that merely expired would be a
+ * confident lie. Screen readers get the same words, not just the glyph.
+ *
  * Same footprint as the dash it replaces: the column stays icon-width.
  */
+const NOT_RECORDED_WHY = 'TeleCMI did not record this call — nothing is missing.';
+const NO_RECORDING_WHY =
+  'No recording to play — either this call was never recorded, or its recording has passed the retention window.';
+
 function NoRecordingCell({ state }: { state: CallRow['recording_state'] }) {
-  if (state !== 'not_recorded') return <span className="text-[#C4B09A]">—</span>;
+  if (state !== 'not_recorded') {
+    return (
+      <span title={NO_RECORDING_WHY} className="text-[#C4B09A]">
+        <span aria-hidden="true">—</span>
+        <span className="sr-only">{NO_RECORDING_WHY}</span>
+      </span>
+    );
+  }
   return (
-    <span title="TeleCMI did not record this call — nothing is missing"
+    <span title={NOT_RECORDED_WHY}
           className="inline-flex items-center justify-center text-[#C4B09A]">
       <MicOff className="w-4 h-4" aria-hidden="true" />
-      <span className="sr-only">Not recorded</span>
+      <span className="sr-only">{NOT_RECORDED_WHY}</span>
+    </span>
+  );
+}
+
+/**
+ * The mobile card's version of the same fact.
+ *
+ * The card used to render NOTHING when there was nothing to play, which on a
+ * phone is indistinguishable from a recording the page failed to load — the
+ * exact ambiguity the desktop dash at least hinted at. A quiet chip states it
+ * instead. Only for 'not_recorded', where the claim is TeleCMI's own; an
+ * 'unknown' row still shows nothing on mobile, because a chip reading "no
+ * recording" on every historical call would be noise, and the tooltip that
+ * carries the nuance does not exist on a touch screen.
+ */
+function NoRecordingChip({ state }: { state: CallRow['recording_state'] }) {
+  if (state !== 'not_recorded') return null;
+  return (
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-[#E8D5C4] bg-[#FFF8F0] text-xs text-[#8B7355]">
+      <MicOff className="w-3.5 h-3.5" aria-hidden="true" /> Not recorded
     </span>
   );
 }

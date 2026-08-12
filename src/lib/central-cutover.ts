@@ -40,8 +40,11 @@ import { rateMap, materialRate, valueCount } from './closing-valuation';
  * RULING 1b — "we need to have a alert for every single variance". Every line
  *   whose counted figure differs from the book gets its OWN durable record
  *   (alert = 1 on its central_cutover_lines row), listed line by line on the
- *   review screen. The BELL gets ONE notification for the batch — see
- *   unreviewedAlertBatches() — because ~600 bell rows would destroy the bell.
+ *   review screen. The BELL gets ONE notification for the batch — because ~600
+ *   bell rows would destroy the bell. That is unreviewedAlertBatches() below,
+ *   consumed by the admin-gated `cutover_alerts:<batch>` bucket in
+ *   src/app/api/notifications/inbox/route.ts (count = 1 per batch; the numbers
+ *   ride in the label).
  *
  * ── SET, NOT ADD — AND THE GATE THAT MAKES THAT SAFE ───────────────────────
  * src/lib/variance-approval.ts deliberately applies a DELTA rather than
@@ -527,6 +530,9 @@ export interface StageRejection {
     | 'unknown_material'
     | 'unit_required'
     | 'unknown_unit'
+    /** The material declares a pack factor the house rule cannot honour — see
+     *  resolveCountBasis. Refused rather than converted by the wrong factor. */
+    | 'unconvertible_unit'
     | 'store_mapped';
   detail: string;
 }
@@ -554,22 +560,39 @@ export interface PreviewLine {
   counted_basis: 'purchase' | 'recipe';
   pack_factor: number;
   counted_qty_recipe: number;
-  /** LIVE current_stock, recipe units — recomputed on every preview. The value
-   *  actually recorded is snapshotted again inside the commit transaction. */
-  book_qty_recipe: number;
-  variance_recipe: number;
-  /** Both sides in purchase units, for the screen. */
+  /**
+   * LIVE current_stock, recipe units — recomputed on every preview. The value
+   * actually recorded is snapshotted again inside the commit transaction.
+   *
+   * NULL MEANS "THERE IS NO BOOK TO READ" — the counted material has been
+   * deleted since it was staged. Every book-derived field on this interface is
+   * nullable for that one row and for no other reason; see previewBatch. A 0
+   * there would read as a real observation of an empty shelf, which is the one
+   * thing this module refuses to fabricate anywhere else.
+   */
+  book_qty_recipe: number | null;
+  variance_recipe: number | null;
+  /** Both sides in purchase units, for the screen. The COUNTED figure is always
+   *  a real number — it is the human's own measurement, converted through the
+   *  pack factor frozen on the line — even when the material is gone. */
   counted_qty_purchase: number;
-  book_qty_purchase: number;
-  variance_purchase: number;
+  book_qty_purchase: number | null;
+  variance_purchase: number | null;
   unit: string;
   purchase_unit: string;
-  unit_value: number;
+  unit_value: number | null;
   rate_source: string;
   /** Rs — INFORMATION ONLY. */
-  variance_value: number;
+  variance_value: number | null;
   /** This line will raise an alert record at commit. */
   will_alert: boolean;
+  /**
+   * The counted material no longer exists in raw_materials. The line is blocked
+   * and NONE of the book-derived fields above are readable, so the screen must
+   * say "this material is gone, remove the line" rather than offering the
+   * re-count that its blocked sibling flags imply.
+   */
+  material_missing: boolean;
 
   /* Blocking conditions, surfaced BEFORE commit so they are never a surprise.
    * `blocked` is the one to gate the UI on — the three signals below are for
@@ -878,6 +901,36 @@ export function parseCountedQty(v: unknown):
  * Purchase and inventory screens lead with the purchase unit, so a bare number
  * is genuinely ambiguous on exactly those materials, and the wrong guess on a
  * 1,000 g/kg pack is a 1,000x error that lands invisibly.
+ *
+ * ── THE ONE SHAPE THE HOUSE RULE CANNOT HONOUR, AND WHY IT IS REFUSED ──────
+ * packFactor()'s both-halves guard is `pack_size > 1 && recipe unit differs`.
+ * Read literally, that pins the factor to 1 for a material whose two unit
+ * strings differ while pack_size sits strictly BETWEEN 0 and 1 — the inverted
+ * shape, where the purchase unit is SMALLER than the recipe unit (unit 'kg',
+ * purchase_unit 'g', pack_size 0.001). The count sheet still offers the
+ * purchase unit, so a figure typed in grams would be written to current_stock
+ * as kilograms: a 1,000x error, in the one flow that SETS the book rather than
+ * displaying it.
+ *
+ * The rule is not bent for it — bending it is how PICKLED GINGER (kg/kg,
+ * pack_size 1.5) got divided by 1.5, and every other consumer of packFactor
+ * would still disagree with whatever this one function decided. Instead the
+ * line is REFUSED, in the idiom this module already uses for a count it cannot
+ * read honestly (parseCountedQty on a blank, unit_required on an ambiguous
+ * one). Counting in the RECIPE unit is still accepted, because that needs no
+ * conversion at all and is exactly what current_stock holds.
+ *
+ * MEASURED on a copy of the live database (2026-08-12, 952 materials): ZERO
+ * rows have 0 < pack_size < 1, and zero have a NULL/0 pack_size with differing
+ * units. The 14 active rows with differing units and pack_size <= 1 all have
+ * pack_size EXACTLY 1 (e.g. BUDWEISER 330ML, unit 'pcs', purchase_unit 'BTL'),
+ * and for those the x1 conversion is CORRECT, not unhonoured: pack_size 1
+ * means one recipe unit per purchase unit, so 3 BTL genuinely is 3 pcs. All 14
+ * are store-mapped besides, so they are dropped from the count sheet and
+ * refused at staging and at commit. This guard therefore changes nothing on
+ * today's data; it closes the hole one bad pack_size edit would open.
+ * NULL / 0 pack_size is NOT caught here: COALESCE(pack_size, 1) is the house
+ * default everywhere in this codebase, so absent means 1, not "unknown".
  */
 export function resolveCountBasis(
   m: PackMeta & { unit?: string | null; purchase_unit?: string | null },
@@ -885,11 +938,25 @@ export function resolveCountBasis(
   givenUnit?: string | null,
 ):
   | { ok: true; basis: 'purchase' | 'recipe'; unit: string; packFactor: number; recipeQty: number }
-  | { ok: false; reason: 'unit_required' | 'unknown_unit'; detail: string } {
+  | { ok: false; reason: 'unit_required' | 'unknown_unit' | 'unconvertible_unit'; detail: string } {
   const pf = packFactor(m);
   const ru = normUnit(m.unit);
   const pu = normUnit(m.purchase_unit || m.unit);
   const given = normUnit(givenUnit);
+
+  // A declared factor the both-halves guard pins to 1. Refuse anything except
+  // an explicit recipe-unit count, which needs no factor.
+  const declared = Number(m.pack_size);
+  if (ru !== pu && Number.isFinite(declared) && declared > 0 && declared < 1 && given !== ru) {
+    return {
+      ok: false,
+      reason: 'unconvertible_unit',
+      detail: "this material says 1 " + (m.purchase_unit || '') + ' = ' + declared + ' ' + (m.unit || '')
+        + ", and a pack size below 1 is not applied anywhere in this app — a count in '"
+        + (m.purchase_unit || '') + "' would be written to stock unconverted. Fix the pack size on the "
+        + "material (Unit Audit) before counting it, or enter the count in '" + (m.unit || '') + "'",
+    };
+  }
 
   if (!given) {
     if (pf > 1) {
@@ -1285,21 +1352,41 @@ export function previewBatch(db: Database.Database, batchId: string): CutoverPre
 
     // A material deleted after staging: report it as a blocker rather than
     // dropping the line, so the count is not silently lost.
+    //
+    // NOTHING BOOK-DERIVED IS EMITTED AS A NUMBER HERE. There is no
+    // raw_materials row, so the book, the difference and the rupee value are
+    // not zero — they are UNKNOWN, and every one of them ships as null.
+    // Emitting 0 was actively misleading twice over on the review screen: the
+    // page prefers the server's purchase figure whenever it is a number, and 0
+    // is a number, so a line somebody genuinely counted printed 0; and a
+    // variance of 0 satisfied the "counted equals book" test, so a deleted
+    // material was badged "matches".
+    //
+    // The COUNTED figure is not unknown and is not withheld: it is the human's
+    // own measurement. Its purchase-basis form is derived from the units and
+    // pack factor FROZEN on the line at staging — the same three values the
+    // screen would fall back to — so it stays a real number.
     if (!m) {
       blocked++;
       gone++;
+      const frozen: PackMeta = {
+        unit: ln.recipe_unit,
+        purchase_unit: ln.purchase_unit || ln.recipe_unit,
+        pack_size: Number(ln.pack_factor) || 1,
+      };
       out.push({
         material_id: ln.material_id, name: ln.material_name,
         counted_qty: ln.counted_qty, counted_unit: ln.counted_unit,
         counted_basis: ln.counted_basis, pack_factor: ln.pack_factor,
         counted_qty_recipe: ln.counted_qty_recipe,
-        book_qty_recipe: 0, variance_recipe: 0,
-        counted_qty_purchase: 0, book_qty_purchase: 0, variance_purchase: 0,
+        book_qty_recipe: null, variance_recipe: null,
+        counted_qty_purchase: toPurchaseQty(ln.counted_qty_recipe, frozen),
+        book_qty_purchase: null, variance_purchase: null,
         unit: ln.recipe_unit, purchase_unit: ln.purchase_unit,
-        unit_value: 0, rate_source: 'none', variance_value: 0,
+        unit_value: null, rate_source: 'none', variance_value: null,
         will_alert: false, blocked: true, moved_since_stage: 0, stock_changed: false,
         record_edited: false, pack_factor_changed: false,
-        now_store_mapped: false, staged_at: ln.staged_at,
+        now_store_mapped: false, material_missing: true, staged_at: ln.staged_at,
         counted_as_of: ln.staged_at, backdated: false,
       });
       continue;
@@ -1352,6 +1439,7 @@ export function previewBatch(db: Database.Database, batchId: string): CutoverPre
       record_edited: moved.recordTouched,
       pack_factor_changed: pfChanged,
       now_store_mapped: storeMapped,
+      material_missing: false,
       staged_at: ln.staged_at,
       counted_as_of: moved.countedAsOf,
       backdated: moved.backdated,

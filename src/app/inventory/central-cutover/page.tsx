@@ -23,7 +23,8 @@
  *    differs from the book gets its OWN durable record (central_cutover_lines),
  *    listed here line by line with book / counted / difference / rupee value.
  *    Nothing is aggregated away. The bell gets ONE entry per batch; that wiring
- *    lives in the notifications route, not here.
+ *    lives in the notifications route (the admin-only cutover_alerts bucket in
+ *    src/app/api/notifications/inbox/route.ts), not here.
  *
  * THE FOUR JOBS, in the order the operator does them:
  *   1 PREPARE  — read the consequences, pick the count date, open a draft,
@@ -155,7 +156,8 @@ interface SheetSummary {
 
 interface StageRejection {
   row: number; material_id: string; name: string;
-  reason: 'blank' | 'not_a_number' | 'negative' | 'unknown_material' | 'unit_required' | 'unknown_unit' | 'store_mapped';
+  reason: 'blank' | 'not_a_number' | 'negative' | 'unknown_material' | 'unit_required'
+    | 'unknown_unit' | 'unconvertible_unit' | 'store_mapped';
   detail: string;
 }
 interface StageBlocked { row: number; material_id: string; name: string; error: string }
@@ -184,6 +186,10 @@ interface PreviewLine {
   record_edited?: boolean;
   pack_factor_changed?: boolean;
   now_store_mapped?: boolean;
+  /** The counted material has been deleted since it was staged. Every
+   *  book-derived field on this line is null (not 0) — there is no book to
+   *  read — and re-counting cannot help, so the badge must say "remove it". */
+  material_missing?: boolean;
   staged_at?: string;
   /** The instant this line's count SPEAKS FOR — the lower bound the movement
    *  probe measured from. staged_at on a same-day count; the IST start of the
@@ -898,7 +904,9 @@ export default function CentralCutoverPage() {
     return preview.lines
       .filter(l => {
         if (reviewFilter === 'variance' && !varies(l)) return false;
-        if (reviewFilter === 'match' && varies(l)) return false;
+        // A deleted material is neither a variance nor a match — there is no
+        // book left to compare against. It belongs under "blocked" only.
+        if (reviewFilter === 'match' && (varies(l) || l.material_missing)) return false;
         if (reviewFilter === 'blocked' && !l.blocked) return false;
         if (reviewFilter === 'zero' && Math.abs(Number(l.counted_qty_recipe) || 0) > 1e-6) return false;
         if (!q) return true;
@@ -1609,7 +1617,13 @@ export default function CentralCutoverPage() {
                                     <div className="flex flex-wrap gap-1 mt-0.5">
                                       {l.blocked && (
                                         <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-100 border-red-200 text-red-800">
-                                          blocked — {(l.moved_since_stage || 0) > 0
+                                          {/* material_missing FIRST: the material
+                                              is gone, so every other reason is
+                                              unknowable and "recount this one" is
+                                              advice that cannot be followed. */}
+                                          blocked — {l.material_missing
+                                            ? 'this material no longer exists — remove the line'
+                                            : (l.moved_since_stage || 0) > 0
                                             ? `${num(l.moved_since_stage)} movement(s) recorded since the count`
                                             : l.stock_changed ? 'stock changed since the count'
                                             : l.pack_factor_changed ? 'pack size changed since the count'

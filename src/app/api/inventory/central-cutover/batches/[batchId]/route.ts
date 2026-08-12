@@ -73,7 +73,14 @@ export async function GET(
       returned: lines.length,
       truncated,
       alert_lines: access.isAdmin ? alerts : null,
-      alert_count: alerts.length,
+      // ADMIN ONLY, like its sibling above. alert_count IS the variance-line
+      // count: a line raises an alert exactly when its counted figure differed
+      // from the book (commitBatch sets alert = 1 on |variance| > EPS). Shipping
+      // it while blindLine() nulls every variance and blindBatch() nulls
+      // variance_lines told a counter "N of your counts were wrong" — the one
+      // number the blind count exists to withhold, and enough to send them back
+      // to reconcile instead of count.
+      alert_count: access.isAdmin ? alerts.length : null,
       preview: wantPreview ? blindPreview(previewBatch(db, batchId), access.isAdmin) : null,
       blind: !access.isAdmin,
       /** Draft lines carry 0 here until the commit snapshots the replaced

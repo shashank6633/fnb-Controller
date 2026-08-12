@@ -5323,8 +5323,10 @@ function initializeSchema(db: Database.Database) {
         -- alert = 1 at commit and is listed, line by line, on the cutover
         -- review screen — nothing is aggregated away. The BELL gets ONE
         -- notification for the batch, because ~600 bell rows would destroy the
-        -- bell as a tool. reviewed_at = '' is the unreviewed state and is what
-        -- the bell counts.
+        -- bell as a tool. reviewed_at = '' is the unreviewed state, and a batch
+        -- holding any line still in it is what the bell LISTS (one item, count
+        -- 1) -- see unreviewedAlertBatches in src/lib/central-cutover.ts and the
+        -- cutover_alerts bucket in api/notifications/inbox.
         alert              INTEGER NOT NULL DEFAULT 0,
         reviewed_by        TEXT NOT NULL DEFAULT '',
         reviewed_at        TEXT NOT NULL DEFAULT '',

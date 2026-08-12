@@ -5,12 +5,20 @@ import { mapCdrPayload } from '@/lib/ct/telecmi-mapper';
 import {
   assertAllowedRecordingUrl,
   fetchAllowedRecording,
+  hostAllowed,
   peekRecordingBody,
   recordingAllowlist,
+  recordingTarget,
 } from '@/lib/ct/recording-fetch';
 import { recordingRetentionStatus } from '@/lib/ct/retention';
 import { isSecretKey, maskSecretValue } from '@/lib/secret-keys';
-import { telecmiAppId, telecmiSecret } from '@/lib/ct/settings';
+import {
+  RECORDING_BASE_URL_DEFAULT,
+  ctRecordingBaseUrl,
+  telecmiAppId,
+  telecmiCredentialStatus,
+  telecmiSecret,
+} from '@/lib/ct/settings';
 
 /**
  * GET /api/telecmi/recording-diagnostic — admin-only, READ-ONLY.
@@ -36,6 +44,21 @@ import { telecmiAppId, telecmiSecret } from '@/lib/ct/settings';
  * having to read raw JSON out of a table.
  *
  * ── WHAT IT REPORTS ────────────────────────────────────────────────────────
+ *   credentials Whether a TeleCMI App ID and app secret are configured at all,
+ *              and where each comes from — an environment variable or a stored
+ *              row — plus whether an environment variable is SHADOWING a value
+ *              somebody saved in Settings. Nothing can play without these, so
+ *              this is reported on every load, before any probing. BOOLEANS AND
+ *              A SOURCE ONLY: no value, not even a masked tail. (The Settings
+ *              screen shows a short fingerprint so an admin can tell which
+ *              secret is stored; a diagnostic page that gets screenshotted has
+ *              no business repeating even that much.)
+ *   recording_base
+ *              Which base a bare CDR filename is joined onto, and whether it
+ *              is the shipped default or a stored ct_settings row overriding
+ *              it. Called out because a stored row silently beats the default:
+ *              a deployment still carrying the old dead /v2/play/<file> form
+ *              behaves as broken as before any fix, on identical code.
  *   webhooks   Are CDRs arriving at all? Count + newest. ZERO is the single
  *              most useful answer here, so it is called out explicitly, and
  *              the LIVE (screen-pop) count sits beside it: live arriving while
@@ -52,12 +75,14 @@ import { telecmiAppId, telecmiSecret } from '@/lib/ct/settings';
  *   stored     How many ct_calls rows hold a recording_url, and how many of
  *              those are demo fixtures. Today: every one of them is a fixture.
  *   probe      OPT-IN (?probe=1), and the only part that leaves this server:
- *              it actually ASKS TeleCMI for a stored recording and reports the
- *              status, the content type and the first bytes of anything that is
- *              not audio. Everything else here proves the URL's SHAPE; a URL can
- *              be perfectly shaped and still be a path the vendor does not
- *              serve, which is precisely the failure this module hit. Bounded —
- *              see the comment above probeCall().
+ *              it actually ASKS TeleCMI for a REAL stored recording and reports
+ *              which one of a fixed set of outcomes happened — no credentials,
+ *              credentials refused, credentials accepted but no audio for that
+ *              file, audio (it plays), or the transport failed. Everything else
+ *              here proves the URL's SHAPE; a URL can be perfectly shaped and
+ *              still be a path the vendor does not serve, which is precisely
+ *              the failure this module hit. Bounded — see the comment above
+ *              probeCall().
  *
  * ── IT MUST NOT WRITE ──────────────────────────────────────────────────────
  * SELECTs only. Note in particular that this route does NOT call
@@ -80,6 +105,14 @@ import { telecmiAppId, telecmiSecret } from '@/lib/ct/settings';
  * out — the normalized URL, the base, the ingest error. It has to: a recording
  * URL can carry a token in its query string, and the normalized URL was
  * printing the app secret in the clear until that was added.
+ *
+ * THE CREDENTIALS THEMSELVES NEVER APPEAR IN ANY FORM. They are read into
+ * `creds` purely so redactCreds() can recognise them inside other strings, and
+ * the credentials block emits booleans plus the word 'env' / 'db' / 'none' —
+ * no value, no masked tail. The probe's `error` strings are redacted for the
+ * same reason: a transport error is thrown while a URL carrying appid + secret
+ * is in hand, and a fetch implementation that puts the request URL in the
+ * message would otherwise walk one straight out of here.
  *
  * Every OTHER field contributes its NAME and a SHAPE only ("string(37) https
  * URL") — never its value. A name and a length cannot leak a credential, and
@@ -533,13 +566,55 @@ function describeCdr(row: any, allow: string[], creds: string[]): CdrReport {
  * PROBE_MAX_CALLS calls per request, an 8-second timeout each, and a
  * "Range: bytes=0-0" request so a hit costs one byte rather than a whole
  * recording. Expired calls are NOT fetched at all — the retention gate is
- * reported and honoured here exactly as the proxy honours it.
+ * reported and honoured here exactly as the proxy honours it. Neither is a
+ * TeleCMI play request with no credentials to send: that answer is knowable
+ * without asking (see 'no_credentials' below), so it is not asked.
  */
 
 /** Never more than a couple of upstream requests per click. */
 const PROBE_MAX_CALLS = 2;
 /** Shorter than the proxy's 15s: a diagnostic must answer, not hang. */
 const PROBE_TIMEOUT_MS = 8_000;
+/**
+ * How many recent recording rows may be CONSIDERED before picking the ones to
+ * ask about. Retention is decided in JS (recordingRetentionStatus), not in SQL,
+ * so choosing "the newest one still inside the window" means reading a few rows
+ * and filtering them here. Bounded like every other read on this route.
+ */
+const PROBE_CANDIDATE_POOL = 25;
+
+/**
+ * The whole point of the probe: exactly which of these is true.
+ *
+ *   plays                TeleCMI served audio. Playback works for this file.
+ *   no_credentials       No App ID / secret configured, and the request would
+ *                        go to TeleCMI's play route, which requires both. Not
+ *                        sent — the answer is already known.
+ *   credentials_rejected TeleCMI answered its authentication failure (code 407).
+ *                        The App ID or the secret is wrong.
+ *   request_malformed    TeleCMI answered "Parameter missing" (code 404) — OUR
+ *                        request is wrong, not the credentials. That is a bug
+ *                        here, not a configuration fault.
+ *   not_served           TeleCMI did NOT reject the credentials and still sent
+ *                        no audio for this file. On a real recording that reads
+ *                        as "no such file on the account".
+ *   unknown_answer       Something came back that none of the above describes.
+ *                        Quoted verbatim rather than guessed at.
+ *   network_error        Timeout, DNS, TLS, redirect refused — never reached.
+ *   retention_blocked    Past the retention window; refused before any request.
+ *   url_unusable         The stored value is not a URL this app will fetch
+ *                        (not https, or a host that is not allowlisted).
+ */
+type ProbeVerdict =
+  | 'plays'
+  | 'no_credentials'
+  | 'credentials_rejected'
+  | 'request_malformed'
+  | 'not_served'
+  | 'unknown_answer'
+  | 'network_error'
+  | 'retention_blocked'
+  | 'url_unusable';
 
 interface ProbeReport {
   call_id: string;
@@ -550,22 +625,85 @@ interface ProbeReport {
   stored_url: string;
   /** What was actually requested after normalization, credential-masked. */
   fetched_url: string;
+  /**
+   * The recording FILENAME the request asked for — the ?file= parameter, or the
+   * last path segment when the URL has no such parameter. Named in the answer
+   * on purpose: "TeleCMI has no audio for this" is only actionable if you know
+   * WHICH file was asked for, and a filename is not a credential. The
+   * credentials are what stay hidden.
+   */
+  file: string;
   rewritten: boolean;
   rewrite_note: string;
   /** True when the outgoing request carried the TeleCMI appid + secret. */
   credentialed: boolean;
   retention: { expired: boolean; reason: string; days: number; expires_at: string };
-  /** False when the retention gate refused before any upstream call. */
+  /** False when the retention gate, a missing credential or an unusable URL
+   *  settled the answer before any upstream call. */
   attempted: boolean;
   upstream_status: number | null;
   upstream_content_type: string;
   /** First bytes of a NON-audio answer, verbatim and credential-masked. '' for audio. */
   body_preview: string;
-  /** True when the upstream answer is playable audio. This is the whole verdict. */
+  /** The vendor's own error code out of a JSON answer (407 / 404 / …), or null. */
+  vendor_code: number | null;
+  /** The vendor's own message, verbatim and credential-masked. '' when none. */
+  vendor_message: string;
+  /** True when the upstream answer is playable audio. */
   is_audio: boolean;
+  /** Which of the fixed outcomes happened. */
+  verdict: ProbeVerdict;
   /** Transport/guard failure (timeout, host not allowed, invalid URL). */
   error: string;
   headline: string;
+}
+
+/**
+ * The vendor's own { code, msg } out of a textual answer.
+ *
+ * This does NOT reimplement describeTextualUpstream() in recording-fetch.ts —
+ * that builds the one SENTENCE the player shows, and it stays the single place
+ * that wording lives. What the probe needs is the CODE as a value, so it can
+ * say "407, so the credentials are wrong" apart from "404 Parameter missing, so
+ * OUR request is wrong" apart from "something else entirely". A sentence cannot
+ * be branched on; a number can.
+ */
+function readVendorAnswer(text: string): { code: number | null; msg: string } {
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object') {
+      const m = (parsed as any).msg ?? (parsed as any).message;
+      const c = Number((parsed as any).code);
+      return {
+        code: Number.isFinite(c) ? c : null,
+        msg: typeof m === 'string' ? m.trim() : '',
+      };
+    }
+  } catch { /* not JSON — an HTML error page, handled by the caller */ }
+  return { code: null, msg: '' };
+}
+
+/** The filename a playback URL asks for. Not a credential — see ProbeReport. */
+function fileNameOf(u: URL): string {
+  const q = u.searchParams.get('file');
+  if (q) return q.slice(0, VALUE_LIMIT);
+  const seg = u.pathname.split('/').filter(Boolean).pop() || '';
+  try { return decodeURIComponent(seg).slice(0, VALUE_LIMIT); } catch { return seg.slice(0, VALUE_LIMIT); }
+}
+
+/**
+ * Would this request reach TeleCMI's play route with no credentials on it?
+ *
+ * Asked of the PLANNED url (telecmiPlaybackUrl has already added credentials if
+ * there are any), so it is true only when there genuinely are none to add. It
+ * is deliberately narrow: a recording served straight off some other host, or
+ * off a TeleCMI path that is not the play route, needs no appid/secret and must
+ * still be probed for real.
+ */
+function isUncredentialedPlayRequest(u: URL, credentialed: boolean): boolean {
+  if (credentialed) return false;
+  if (!hostAllowed(u.hostname, ['telecmi.com'])) return false;
+  return !!u.searchParams.get('file');
 }
 
 /** Mask credentials in a URL by NAME, not by value match: an appid short enough
@@ -592,6 +730,7 @@ async function probeCall(db: any, row: any, creds: string[]): Promise<ProbeRepor
     fixture: Number(row?.fixture || 0) === 1,
     stored_url: displayUrl(storedRaw, creds),
     fetched_url: '',
+    file: '',
     rewritten: false,
     rewrite_note: '',
     credentialed: false,
@@ -605,16 +744,64 @@ async function probeCall(db: any, row: any, creds: string[]): Promise<ProbeRepor
     upstream_status: null,
     upstream_content_type: '',
     body_preview: '',
+    vendor_code: null,
+    vendor_message: '',
     is_audio: false,
+    verdict: 'unknown_answer',
     error: '',
     headline: '',
   };
 
   if (retention.expired) {
+    base.verdict = 'retention_blocked';
     base.headline =
       retention.reason === 'undated'
         ? 'Not fetched: this call has no readable timestamp, so the proxy refuses it (410) before any request goes out. That is the retention rule working, not a playback fault.'
         : `Not fetched: this recording is past the ${retention.days}-day retention window, so the proxy refuses it (410) before any request goes out.`;
+    return base;
+  }
+
+  // ── Plan the request WITHOUT touching the network ───────────────────────
+  // Exactly what fetchAllowedRecording() is about to do internally. Doing it
+  // here first costs nothing (it is pure) and buys two things a fetch cannot:
+  // the filename to name in the answer, and the chance to settle "there are no
+  // credentials to send" without spending a vendor request on a refusal we can
+  // already predict.
+  let planned: URL;
+  try {
+    // recordingTarget(), NOT assertAllowedRecordingUrl + telecmiPlaybackUrl.
+    // THE PROBE MUST PLAN THE REQUEST EXACTLY AS THE PROXY DOES or it reports
+    // on a different request than the one playback makes — which is worse than
+    // no probe at all, because an admin trusts it. The two had already drifted:
+    // for a stored BARE FILENAME the proxy composes it onto the vendor origin
+    // and the recording plays, while validating the raw string first threw and
+    // the probe announced "DOES NOT PLAY … the player refuses it with this same
+    // message" about a recording that plays perfectly well.
+    const plan = recordingTarget(db, storedRaw, recordingAllowlist(db));
+    planned = plan.url;
+    base.credentialed = plan.credentialed;
+    base.rewrite_note = plan.note;
+    base.rewritten = plan.changed;
+    // A filename is not a credential — but this one is built from a CDR value
+    // and an admin-editable base, so it goes through the same redaction as
+    // every other string that leaves here rather than being trusted by type.
+    base.file = redactCreds(fileNameOf(planned), creds).text;
+    base.fetched_url = displayUrl(planned.toString(), creds);
+  } catch (e: any) {
+    base.verdict = 'url_unusable';
+    // Redacted like every other string that leaves here: these particular
+    // throws are fixed sentences, but an error raised while a credentialed URL
+    // is in hand is exactly the kind of string that quietly carries one.
+    base.error = redactCreds(String(e?.message || 'The stored recording URL cannot be fetched.'), creds).text;
+    base.headline = `DOES NOT PLAY. ${base.error} — the player refuses it with this same message, before any request goes out.`;
+    return base;
+  }
+
+  if (isUncredentialedPlayRequest(planned, base.credentialed)) {
+    base.verdict = 'no_credentials';
+    base.headline =
+      'DOES NOT PLAY, and nothing was asked of TeleCMI. Playback goes to TeleCMI’s /v2/play route, which requires an App ID and an app secret, and neither is configured. '
+      + 'Set them in CRM Settings and probe again; until then no recording can play, whatever the URL looks like.';
     return base;
   }
 
@@ -639,21 +826,80 @@ async function probeCall(db: any, row: any, creds: string[]): Promise<ProbeRepor
     const audio = /^(?:audio|video)\//i.test(r.contentType);
     const ok = (r.status === 200 || r.status === 206) && audio;
     base.is_audio = ok;
+    const named = base.file ? `"${base.file}"` : 'this recording';
+
     if (ok) {
       // Cancel the byte we asked for — nothing needs it.
       try { await r.body?.cancel(); } catch { /* already closed */ }
-      base.headline = `PLAYS. TeleCMI answered ${r.status} with ${r.contentType} — this recording is reachable and the player will work for it.`;
+      base.verdict = 'plays';
+      base.headline = `PLAYS. TeleCMI answered ${r.status} with ${r.contentType} for ${named} — it is reachable and the player will work for it.`;
     } else {
       const preview = await peekRecordingBody(r.body);
-      base.body_preview = redactCreds(preview.replace(/\s+/g, ' ').trim(), creds).text.slice(0, VALUE_LIMIT);
-      base.headline =
-        `DOES NOT PLAY. TeleCMI answered ${r.status} with ${r.contentType || 'no content type'} instead of audio` +
-        (base.body_preview ? `: ${base.body_preview}` : '.');
+      const flat = preview.replace(/\s+/g, ' ').trim();
+      base.body_preview = redactCreds(flat, creds).text.slice(0, VALUE_LIMIT);
+      const vendor = readVendorAnswer(flat);
+      base.vendor_code = vendor.code;
+      base.vendor_message = redactCreds(vendor.msg, creds).text.slice(0, VALUE_LIMIT);
+
+      // ── Classify the refusal ────────────────────────────────────────────
+      // The two codes below are MEASURED against rest.telecmi.com on 12 Aug
+      // 2026 (read-only, junk credentials), and both arrive as HTTP 200 with
+      // application/json — which is the whole reason a status-only check let
+      // JSON into an <audio> element:
+      //     407 "Authentication Failed"  → the appid/secret pair is refused
+      //     404 "Parameter missing"      → one of appid/secret/file was absent
+      // What a VALID credential plus an unknown filename answers has not been
+      // measured — that needs working credentials, which this account does not
+      // yet have. So it is not asserted: anything that is not the 407 is
+      // reported as "the credentials were not rejected and no audio came back",
+      // which is true whatever code the vendor picks for a missing file.
+      const msg = base.vendor_message;
+      if (vendor.code === 407 || /auth/i.test(msg)) {
+        base.verdict = 'credentials_rejected';
+        base.headline =
+          `DOES NOT PLAY. TeleCMI REFUSED THE CREDENTIALS: "${msg || 'Authentication Failed'}" (code ${vendor.code ?? 407}). `
+          + 'The App ID and app secret in CRM Settings are wrong, expired, or belong to another account — nothing will play until they are corrected. '
+          + 'This is the vendor’s own answer, not our reading of it.';
+      } else if (vendor.code === 404 && /parameter/i.test(msg)) {
+        base.verdict = 'request_malformed';
+        base.headline =
+          `DOES NOT PLAY. TeleCMI says "${msg}" (code 404) — that is TeleCMI rejecting OUR request, not the credentials: `
+          + 'its /v2/play route needs appid, secret and file, and one of them did not arrive. This is a fault in this app, not in the settings.';
+      } else if (vendor.code !== null || msg) {
+        base.verdict = 'not_served';
+        base.headline =
+          `DOES NOT PLAY. TeleCMI did not reject the credentials — that answer is code 407 and this is not it — but it served no audio for ${named}: `
+          + `"${msg || base.body_preview}"${vendor.code !== null ? ` (code ${vendor.code})` : ''}. On a real recording that reads as "the account has no such file".`;
+      } else if (r.status === 404 && /cannot\s+get/i.test(base.body_preview)) {
+        // Express's unmatched-route page. Measured: /v2/play/<anything> and
+        // /v2/definitely-not-a-route answer this identically, so it means the
+        // PATH does not exist — not that the file does not.
+        base.verdict = 'request_malformed';
+        base.headline =
+          'DOES NOT PLAY. TeleCMI has no route at the path this URL asks for — "Cannot GET …" is the answer it gives any address that does not exist, and it says nothing about the recording or the credentials. '
+          + 'The fault is the playback URL itself: either this app built it wrongly, or the recording_base_url CRM setting points somewhere the vendor does not serve.';
+      } else if (r.status === 404) {
+        base.verdict = 'not_served';
+        base.headline =
+          `DOES NOT PLAY. TeleCMI answered 404 for ${named} and sent no machine-readable reason`
+          + (base.body_preview ? `: ${base.body_preview}` : '.');
+      } else {
+        base.verdict = 'unknown_answer';
+        base.headline =
+          `DOES NOT PLAY. TeleCMI answered ${r.status} with ${r.contentType || 'no content type'} instead of audio for ${named}`
+          + (base.body_preview ? `: ${base.body_preview}` : '.')
+          + ' Nothing here matches a known TeleCMI answer, so it is quoted rather than interpreted.';
+      }
     }
   } catch (e: any) {
+    base.verdict = 'network_error';
+    // REDACTED, not echoed raw. A transport error is raised while a URL
+    // carrying appid + secret is in hand, and some fetch implementations put
+    // the request URL in the message — the one place a credential could walk
+    // out of this route in plain text.
     base.error = e?.name === 'AbortError'
       ? `The recording source did not answer within ${Math.round(PROBE_TIMEOUT_MS / 1000)} seconds.`
-      : String(e?.message || 'The upstream request failed.');
+      : redactCreds(String(e?.message || 'The upstream request failed.'), creds).text.slice(0, VALUE_LIMIT * 2);
     base.headline = `DOES NOT PLAY. ${base.error}`;
   } finally {
     clearTimeout(timer);
@@ -676,6 +922,78 @@ export async function GET(req: Request) {
     const creds = [telecmiAppId(db), telecmiSecret(db)]
       .map(s => String(s || '').trim())
       .filter(s => s.length >= 6);
+
+    // ── 0 · Are there credentials at all? ─────────────────────────────────
+    // First, because it is first in the causal chain: TeleCMI's playback
+    // endpoint requires appid + secret, so with either missing NOTHING can
+    // play and every other panel here is describing a URL that was never going
+    // to be served. BOOLEANS AND A SOURCE ONLY — see the leak note in the
+    // header. telecmiCredentialStatus() also carries a short masked tail for
+    // the Settings screen; the block below names the fields it copies one by
+    // one precisely so that tail is left behind rather than spread through.
+    const credStatus = telecmiCredentialStatus(db);
+    let credHeadline: string;
+    if (!credStatus.appid.set && !credStatus.secret.set) {
+      credHeadline =
+        'NEITHER the TeleCMI App ID nor the app secret is configured. TeleCMI’s playback endpoint requires both, so no recording can play — this alone is enough to explain a dead play button. Set them in CRM Settings.';
+    } else if (!credStatus.secret.set) {
+      credHeadline = 'The TeleCMI App ID is configured but the app secret is NOT. Playback needs both, so nothing can play.';
+    } else if (!credStatus.appid.set) {
+      credHeadline = 'The TeleCMI app secret is configured but the App ID is NOT. Playback needs both, so nothing can play.';
+    } else if (credStatus.overridden) {
+      credHeadline =
+        'Both credentials are configured — but an ENVIRONMENT VARIABLE is in force and is shadowing a value saved in Settings. Anything typed on the Settings screen is being ignored until that variable is unset and the server restarted. If a freshly-saved credential appears to change nothing, this is why.';
+    } else {
+      credHeadline = `Both credentials are configured (from ${credStatus.appid.source === 'env' ? 'environment variables' : 'CRM Settings'}). Whether TeleCMI ACCEPTS them is a different question — only the playback probe below can answer that.`;
+    }
+    const credentials = {
+      configured: credStatus.configured,
+      appid: { set: credStatus.appid.set, source: credStatus.appid.source, overridden: credStatus.appid.overridden },
+      secret: { set: credStatus.secret.set, source: credStatus.secret.source, overridden: credStatus.secret.overridden },
+      overridden: credStatus.overridden,
+      headline: credHeadline,
+    };
+
+    // ── 0b · Which base is a bare filename joined onto? ───────────────────
+    // A STORED ct_settings row BEATS the shipped default, silently and
+    // permanently. That matters right now: the default was changed from the
+    // path form (https://rest.telecmi.com/v2/play/<file>, a route TeleCMI does
+    // not have) to the documented query form (…/v2/play?file=<file>), and any
+    // deployment carrying a hand-set row still builds the dead shape and will
+    // look exactly as broken as before the fix. This says so out loud instead
+    // of leaving someone to wonder why the same code behaves differently on
+    // two boxes. Not a credential — see the note on the constant in settings.ts.
+    const baseRow = db.prepare(`
+      SELECT value FROM ct_settings WHERE key = 'recording_base_url'
+    `).get() as { value?: string } | undefined;
+    const effectiveBase = ctRecordingBaseUrl(db);
+    // Measured dead: /v2/play/<anything> is Express's unmatched-route 404. A
+    // base with NO query is the one the mapper appends as a path segment, so
+    // "ends at /v2/play and carries no ?" is exactly the broken combination.
+    const deadPathShape = !effectiveBase.includes('?') && /\/v2\/play\/?$/.test(effectiveBase);
+    let baseHeadline: string;
+    if (!baseRow) {
+      baseHeadline = deadPathShape
+        ? 'No recording_base_url row — using the shipped default, and that default is the dead path form. This is a code fault, not a configuration one.'
+        : 'No recording_base_url row — using the shipped default, which is TeleCMI’s documented /v2/play?file=<filename> form.';
+    } else if (!effectiveBase) {
+      baseHeadline = 'recording_base_url is set to BLANK, which deliberately turns joining OFF: a CDR that carries a bare filename is stored with no URL at all and can never play. Delete the row to fall back to the shipped default.';
+    } else if (deadPathShape) {
+      baseHeadline = 'recording_base_url is set to the /v2/play/<file> PATH form, which TeleCMI does not serve — it answers "Cannot GET" to any such address. This stored row OVERRIDES the shipped default, so fixing the default in code changes nothing here: clear this row (or set it to https://rest.telecmi.com/v2/play?file=) and future recordings will be stored with a URL that works.';
+    } else if (effectiveBase !== RECORDING_BASE_URL_DEFAULT) {
+      baseHeadline = 'recording_base_url is set to a custom value, which overrides the shipped default. Anything a CDR filename is joined onto still has to pass the host allowlist below.';
+    } else {
+      baseHeadline = 'recording_base_url is stored, and it matches the shipped default.';
+    }
+    const recordingBase = {
+      // Redacted like every other echoed string: an admin can paste anything
+      // here, including a URL with a token in it.
+      value: redactCreds(effectiveBase, creds).text.slice(0, VALUE_LIMIT * 2),
+      source: !baseRow ? 'default' : effectiveBase ? 'db' : 'blank',
+      matches_default: effectiveBase === RECORDING_BASE_URL_DEFAULT,
+      dead_path_shape: deadPathShape,
+      headline: baseHeadline,
+    };
 
     // ── 1 · Is anything arriving? ─────────────────────────────────────────
     const tally = (kind: string) =>
@@ -787,14 +1105,27 @@ export async function GET(req: Request) {
       ran: boolean;
       limit: number;
       candidates: number;
+      pool: number;
+      /** How many of the pool were skipped for being past retention. */
+      expired_skipped: number;
       calls: ProbeReport[];
+      /** The single outcome the whole probe amounts to. */
+      verdict: ProbeVerdict | 'nothing_to_probe';
       headline: string;
     } | null = null;
     if (new URL(req.url).searchParams.get('probe') === '1') {
-      // Real recordings first, newest first — a fixture answers the endpoint
-      // question too, but only a real row answers the owner's question.
-      const candidates = db.prepare(`
-        SELECT id, recording_url, started_at, created_at,
+      /**
+       * WHICH ROWS TO ASK ABOUT — real before fake, live before expired.
+       *
+       * A synthetic filename cannot tell "the credentials are wrong" from "no
+       * such file", because both refuse. A REAL recording that is still inside
+       * the retention window can, so it is what gets asked about whenever one
+       * exists. Retention is decided by recordingRetentionStatus() in JS, not
+       * in SQL, so the pool is read here (bounded) and filtered below; probing
+       * an expired row would only ever report the 410 the proxy already gives.
+       */
+      const pool = db.prepare(`
+        SELECT id, recording_url, started_at, created_at, telecmi_call_id,
                CASE WHEN recording_url LIKE '%/play/seed-%'
                       OR recording_url LIKE '%file=sim-%'
                       OR COALESCE(telecmi_call_id, '') LIKE 'seed-%'
@@ -803,37 +1134,73 @@ export async function GET(req: Request) {
          WHERE COALESCE(recording_url, '') <> ''
          ORDER BY fixture ASC, COALESCE(NULLIF(started_at, ''), created_at) DESC
          LIMIT ?
-      `).all(PROBE_MAX_CALLS) as any[];
+      `).all(PROBE_CANDIDATE_POOL) as any[];
+
+      const live = pool.filter(r => !recordingRetentionStatus(db, r).expired);
+      const expiredSkipped = pool.length - live.length;
+      // Prefer live rows (already real-first, newest-first from the query). If
+      // EVERY row is expired, still report one so the answer is "retention
+      // refused it" rather than a blank panel.
+      const candidates = (live.length ? live : pool).slice(0, PROBE_MAX_CALLS);
 
       const reports: ProbeReport[] = [];
       for (const row of candidates) reports.push(await probeCall(db, row, creds));
 
+      // ONE verdict for the whole run, in the order that matters to the reader:
+      // the thing they must fix first wins.
+      const has = (v: ProbeVerdict) => reports.some(r => r.verdict === v);
+      let verdict: ProbeVerdict | 'nothing_to_probe';
       let headline: string;
       if (reports.length === 0) {
+        verdict = 'nothing_to_probe';
         headline = 'No call in the log holds a recording URL, so there is nothing to probe. Nothing can be said about playback until a CDR carrying a recording arrives.';
-      } else if (reports.some(r => r.is_audio)) {
+      } else if (has('plays')) {
+        verdict = 'plays';
         headline = 'TeleCMI served audio for at least one stored recording, so the fetch chain works end to end. A recording that still will not play is a fault on that specific call, not on the URL we build.';
-      } else if (reports.every(r => r.retention.expired)) {
-        headline = 'Every recording old enough to probe is past the retention window, so none was fetched. That is the privacy rule working — widen the window above to test playback.';
-      } else if (reports.some(r => r.attempted && !r.credentialed)) {
-        headline = 'TeleCMI refused every attempt and the requests went out WITHOUT credentials — set the TeleCMI App ID and secret in CRM settings, then probe again.';
-      } else if (reports.every(r => r.fixture)) {
-        headline = 'Only demo fixtures were available to probe, so this reports what TeleCMI says about a made-up filename — useful for the endpoint and the credentials, not for a real recording.';
+      } else if (has('no_credentials')) {
+        verdict = 'no_credentials';
+        headline = 'NOTHING CAN PLAY: no TeleCMI App ID and app secret are configured, and the vendor’s playback endpoint requires both. Nothing was asked of TeleCMI — that answer needs no request. Set them in CRM Settings and probe again.';
+      } else if (has('credentials_rejected')) {
+        verdict = 'credentials_rejected';
+        headline = 'NOTHING CAN PLAY: TeleCMI REFUSED THE CREDENTIALS (its code 407). The App ID and app secret in CRM Settings are wrong, expired, or belong to a different account. Everything else in the chain is fine — fix these and probe again.';
+      } else if (has('request_malformed')) {
+        verdict = 'request_malformed';
+        headline = 'TeleCMI rejected the shape of OUR request (its code 404, "Parameter missing"), not the credentials. That is a bug in this app’s playback URL, and it is fixed in code, not in settings.';
+      } else if (reports.every(r => r.verdict === 'retention_blocked')) {
+        verdict = 'retention_blocked';
+        headline = 'Every stored recording is past the retention window, so none was fetched. That is the privacy rule working — widen the window above to test playback.';
+      } else if (has('network_error')) {
+        verdict = 'network_error';
+        headline = 'TeleCMI could not be reached at all. This is a network or timeout fault between this server and the vendor, not a credential or URL problem — the per-call line below has the exact error.';
+      } else if (has('not_served')) {
+        verdict = 'not_served';
+        headline = reports.every(r => r.fixture)
+          ? 'The credentials were not rejected, but TeleCMI served no audio — and every row available to probe is a DEMO FIXTURE, so it asked for a filename that never existed on the account. That is the expected answer for made-up data, and it proves the endpoint and the credentials are reachable, nothing more. It cannot prove a real recording plays until a real one is stored.'
+          : 'The credentials were not rejected, but TeleCMI served no audio for the recording it was asked for. On a real recording that means the account holds no such file — the filename in the call row and the one on the account do not match.';
+      } else if (reports.every(r => r.verdict === 'url_unusable')) {
+        verdict = 'url_unusable';
+        headline = 'Nothing was asked of TeleCMI: the stored recording URLs are not fetchable by this app at all — not HTTPS, or on a host the allowlist does not cover. The per-call line below carries the exact refusal, and it is the same one the player gives.';
       } else {
-        headline = 'TeleCMI did not serve audio for any stored recording. The per-call answer below is the vendor’s own — that is the cause, and it is upstream of the player.';
+        verdict = 'unknown_answer';
+        headline = 'TeleCMI answered with something that matches none of its known replies. The per-call line below quotes it verbatim rather than guessing at it.';
       }
 
       probe = {
         ran: true,
         limit: PROBE_MAX_CALLS,
         candidates: candidates.length,
+        pool: pool.length,
+        expired_skipped: expiredSkipped,
         calls: reports,
+        verdict,
         headline,
       };
     }
 
     return Response.json({
       generated_at: new Date().toISOString(),
+      credentials,
+      recording_base: recordingBase,
       probe,
       webhooks: {
         cdr_count: cdrCount,
