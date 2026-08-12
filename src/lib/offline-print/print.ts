@@ -36,6 +36,23 @@ export async function getStations(force = false): Promise<PrintStation[]> {
 
 function norm(s: string) { return String(s || '').toLowerCase().trim(); }
 
+/**
+ * Short stable fingerprint of a string — FNV-1a, base36.
+ *
+ * Used to make a print job id change when the DOCUMENT changes. Not a hash for
+ * security: it only has to be stable across reloads and different between two
+ * bills that differ, and it runs in the browser, so node crypto is not
+ * available here.
+ */
+function hash32(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
 /** Pick the printer for a KOT station (exact station match → any KOT printer). */
 /**
  * Pick the printer for a fired KOT, FLOOR-AWARE (the table's zone = its floor):
@@ -664,8 +681,29 @@ export async function printBill(order: BillOrder, printedBy?: string, targetFloo
     printedBy: printedBy || order.server_name || undefined,
     date: new Date().toISOString(),
   };
+  // THE ID IS STABLE PER *BILL*, NOT PER ORDER — and the difference is a bug the
+  // owner hit at the counter: remove the service charge, press Print Bill again,
+  // and nothing comes out.
+  //
+  // A bare `bill_<orderId>` is what the bridge's idempotency ledger keys on, and
+  // that ledger remembers a printed job for 72 HOURS (PRINTED_TTL_MS). That
+  // protection is right and must stay — it is what stops a printer or LAN blip
+  // re-printing a ticket the guest already has. But it also meant a CORRECTED
+  // bill was indistinguishable from a duplicate of the old one, so the reprint
+  // was silently dropped and the cashier was left with a bill showing a charge
+  // that had just been removed.
+  //
+  // Folding the money into the id keeps both properties: re-send the SAME bill
+  // and the fingerprint matches, so it is still deduped; change what the guest
+  // owes and it is a different document that genuinely must print.
+  // Every figure computeBill returns, plus the line count and the payment state
+  // — i.e. everything that can make this a materially different document.
+  const billFingerprint = hash32([
+    b.subtotal, b.serviceCharge, b.discount, b.cgst, b.sgst, b.total,
+    doc.items.length, order.payment_method || '',
+  ].join('|'));
   await enqueue({
-    id: `bill_${order.id}`,                     // stable per order → never double-prints
+    id: `bill_${order.id}_${billFingerprint}`,
     printer: targetOf(st), backup: st.backup_target || undefined, doc,
     meta: { stationId: st.id, stationName: st.name, docType: 'bill', source: 'bill', refId: order.id },
   });
