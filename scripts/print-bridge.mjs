@@ -62,7 +62,7 @@ const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.7.0';   // 2.7.0 = KOT footer line 'totalItems' now prints BOTH counts on one row — left "Total Items: <number of item lines>", right "Total QTY: <sum of quantities>" (it used to print only the qty sum, mislabelled "Total items"). New KOT line key 'guests' → "Guests: N" from doc.guests, suppressed entirely when absent/0; also derived offline from POST /kot's fire.guest.covers. 2.6.0 = raw/tspl jobs may carry doc.payload_b64 (base64) for binary-safe bytes — raster stickers; falls back to doc.payload utf8. KOT paper saver: doc.paperSaver { compactCut: GS V 66 feed-to-cut instead of feed3+cut; pullBackLines: ESC e reverse-feed before printing }. 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
+const VERSION = '2.7.1';   // 2.7.1 = Win32 spooler error codes are translated into a sentence naming the fix — err 1801 (no printer of that name) now says so and points at /printers, instead of surfacing a raw PowerShell MethodInvocationException. 2.7.0 = KOT footer line 'totalItems' now prints BOTH counts on one row — left "Total Items: <number of item lines>", right "Total QTY: <sum of quantities>" (it used to print only the qty sum, mislabelled "Total items"). New KOT line key 'guests' → "Guests: N" from doc.guests, suppressed entirely when absent/0; also derived offline from POST /kot's fire.guest.covers. 2.6.0 = raw/tspl jobs may carry doc.payload_b64 (base64) for binary-safe bytes — raster stickers; falls back to doc.payload utf8. KOT paper saver: doc.paperSaver { compactCut: GS V 66 feed-to-cut instead of feed3+cut; pullBackLines: ESC e reverse-feed before printing }. 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -595,6 +595,24 @@ async function printUsb(target, payload) {
         await fs.promises.writeFile(ps1, RAW_PRINT_PS1);
         try {
           await runCmd('powershell', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1, '-Printer', t, '-FilePath', tmp]);
+        } catch (e) {
+          // TRANSLATE THE WIN32 SPOOLER CODES. Raw, these surface as a
+          // PowerShell MethodInvocationException stack trace with a bare
+          // "err=NNNN" buried in it, which reaches the operator as an
+          // unreadable wall of text and tells them nothing about what to do.
+          // 1801 in particular is the single most common setup mistake — the
+          // printer name not matching what Windows has installed — and it is
+          // fully self-inflicted and fully fixable, so it deserves a sentence
+          // rather than a stack trace.
+          const raw = String(e && e.message || e);
+          const code = (raw.match(/err=(\d+)/) || [])[1];
+          const known = {
+            1801: `Windows has no printer named "${t}" (err 1801). The name must match EXACTLY, including spaces and case. Open http://localhost:${PORT}/printers to see the installed names and copy one.`,
+            5:    `Access denied opening "${t}" (err 5). The bridge cannot reach that printer — if it is a shared/network queue, run the bridge as the same user that can print to it.`,
+            1802: `The printer "${t}" exists but its driver is not installed correctly (err 1802). Reinstall it, ideally as Generic / Text Only.`,
+            1796: `"${t}" points at a port that does not exist (err 1796). Re-add the printer in Windows.`,
+          }[Number(code)];
+          throw new Error(known || raw);
         } finally { fs.promises.unlink(ps1).catch(() => {}); }
       }
     } finally { fs.promises.unlink(tmp).catch(() => {}); }
