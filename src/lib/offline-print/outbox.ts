@@ -144,6 +144,37 @@ async function applyResult(job: PrintJob, ok: boolean, error?: string): Promise<
  * outage would be destroyed on every retry and could never print.
  */
 export async function drainOutbox(): Promise<{ printed: number; stillPending: number }> {
+  // ONE DRAIN AT A TIME ACROSS THE WHOLE ORIGIN, not just this tab.
+  //
+  // `draining` below is a module-scoped boolean, so it is per-TAB — but the
+  // queue it protects is IndexedDB, which every tab on this origin shares. On a
+  // counter PC /print/agent, /dine-in/offline-print and any page that has ever
+  // printed each run their own 15s drain loop. A job stays 'pending' until the
+  // bridge acknowledges it, with nothing marking it in-flight, so a second tab
+  // could pick up and re-POST the same jobId while the first was still waiting.
+  // The bridge's ledger does not save us there: it checks alreadyPrinted before
+  // printing but only records the job after printTo resolves, so two overlapping
+  // POSTs both pass the check and both print. The window is a second or two for
+  // a bill and 30-60s for a raster sticker chunk.
+  //
+  // A Web Lock is origin-wide and released automatically if the holding tab is
+  // closed or crashes, which a localStorage flag would not be. ifAvailable:true
+  // makes a losing tab return at once instead of queueing a redundant pass —
+  // matching what the per-tab guard already did. Older or non-secure contexts
+  // (no navigator.locks) fall through to exactly the previous behaviour.
+  const locks: any = (globalThis as any).navigator?.locks;
+  if (locks?.request) {
+    const res = await locks.request(
+      'fnb:print:outbox:drain',
+      { ifAvailable: true },
+      async (lock: unknown) => (lock ? drainOutboxLocked() : null),
+    );
+    return res || { printed: 0, stillPending: 0 };
+  }
+  return drainOutboxLocked();
+}
+
+async function drainOutboxLocked(): Promise<{ printed: number; stillPending: number }> {
   if (draining) return { printed: 0, stillPending: 0 };
   draining = true;
   let printed = 0, stillPending = 0;

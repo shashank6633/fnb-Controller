@@ -56,9 +56,33 @@ export default function PrintAgent() {
       localStorage.setItem('fnb_agent_seen_v1', JSON.stringify(ids.slice(-600)));
     } catch { /* storage full/blocked — outbox + bridge layers still dedup */ }
   }, []);
+  // A KOT's identity for dedup purposes is the ticket PLUS how many times it has
+  // been reprinted — not the ticket alone.
+  //
+  // /api/dine-in/kds/[id]/resend bumps kots.reprint_count and re-emits kot.new
+  // carrying THE SAME kot.id. Keyed on the id alone, the captain's Reprint was
+  // swallowed here before printFiredKots ran and before anything reached the
+  // attempt log, while the captain was told "Re-sent to counter printer ✓".
+  // printFiredKots already builds a reprint-distinct job id (kot_<id>_r<rc>), so
+  // this early return was the only thing standing in the way. It is the same
+  // defect the owner reported for bills, one function above.
+  //
+  // legacyKotKey is the pre-fix format. It is still CONSULTED for an original so
+  // that the reload every deploy triggers cannot resurrect tickets already
+  // printed in the last 20 minutes (the backup poll's window) — those entries
+  // are in localStorage in the old shape. It is deliberately NOT consulted for a
+  // reprint: a bare legacy key must never block one, since blocking reprints is
+  // the bug being fixed. New writes are always the new shape, so the old keys
+  // age out of the 600-entry window on their own.
+  const kotKey = (k: any) => `kot:${k.id}:${Number(k.reprint_count) || 0}`;
+  const legacyKotKey = (k: any) => `kot:${k.id}`;
+  const kotAlreadyPrinted = (k: any) =>
+    seen.current.has(kotKey(k)) ||
+    ((Number(k.reprint_count) || 0) === 0 && seen.current.has(legacyKotKey(k)));
+
   const printKot = useCallback(async (k: any) => {
-    if (!k || seen.current.has(`kot:${k.id}`)) return;
-    seen.current.add(`kot:${k.id}`);
+    if (!k || kotAlreadyPrinted(k)) return;
+    seen.current.add(kotKey(k));
     persistSeen();
     await printFiredKots([k]).catch(() => {});
     // Items vs QTY, the same distinction the ticket itself now draws: the log
@@ -100,12 +124,36 @@ export default function PrintAgent() {
         // Multi-counter: print bills addressed to THIS counter only; unaddressed
         // (auto-print) jobs print on the catch-all/main PC only.
         if (!shouldPrintBillHere(evt.counter)) return;
-        const key = `bill:${bl.id}:${bl.total}`;
+        // THE DEDUP KEY MUST CHANGE WHEN THE CASHIER PRESSES AGAIN. print_seq is
+        // that distinction: print-bill/route.ts stamps one per press.
+        //
+        // Be clear about what protects against a REPEAT of the same intent,
+        // because it is not this line. There is no SSE replay to guard against —
+        // kds-bus is a bare EventEmitter with no history and the stream sends no
+        // `id:` field, so a reconnect, reload or deploy re-delivers nothing. The
+        // real risk is two POSTs from one double-tap, and that is absorbed at
+        // the server by the COALESCE_MS window in print-bill/route.ts, which
+        // hands both presses the same stamp so they collapse to one key here.
+        // Two tabs racing the same job are caught further down, by the outbox's
+        // job-id check and the bridge's 72h ledger.
+        //
+        // The key used to be `bill:<order>:<total>` — order plus amount — so a
+        // second Print Bill on an unchanged bill was swallowed HERE, before
+        // printBill() ran. Neither the money fingerprint in print.ts nor the
+        // bridge's 72h jobId ledger ever got a say, which is why a deliberate
+        // reprint (and therefore the DUPLICATE BILL copy a guest asks for)
+        // produced nothing at all. This return is silent, so it did not even
+        // reach the attempt log — the cashier saw a button that did nothing.
+        //
+        // `total` stays in the key: a payload carrying no print_seq (an older
+        // server during a rolling deploy) then keys exactly as it did before,
+        // so the change cannot make an un-stamped bill print twice.
+        const key = `bill:${bl.id}:${bl.total}:${bl.print_seq || ''}`;
         if (seen.current.has(key)) return;
         seen.current.add(key);
         const target = String(evt.counter || '').trim();
         const res = await printBill(bl, undefined, target || undefined).catch(() => ({ ok: false, reason: 'error' }));
-        pushLog({ id: bl.id, kind: 'BILL', label: `Bill #${bl.order_number ?? '—'}${bl.table_number ? ` · Table ${bl.table_number}` : ''}`,
+        pushLog({ id: bl.id, kind: 'BILL', label: `Bill #${bl.order_number ?? '—'}${bl.table_number ? ` · Table ${bl.table_number}` : ''}${bl.copy_label ? ' · DUPLICATE' : ''}`,
           detail: res.ok ? `₹${Math.round(bl.total || 0)}` : `not printed — ${res.reason || 'no bill printer'}` });
         refreshQueue();
       }
@@ -130,9 +178,12 @@ export default function PrintAgent() {
         for (const k of (j.items || [])) {
           const age = Date.now() - new Date(String(k.created_at).replace(' ', 'T') + 'Z').getTime();
           if (Number.isFinite(age) && age > POLL_MAX_AGE_MS) {
-            // Mark as seen so we log the skip exactly once per ticket.
-            if (!seen.current.has(`kot:${k.id}`)) {
-              seen.current.add(`kot:${k.id}`);
+            // Mark as seen so we log the skip exactly once per ticket. MUST use
+            // the same key shape as printKot above — a bare `kot:<id>` here
+            // would no longer be the key printKot tests, so the 20-minute stale
+            // guard would silently stop matching and old tickets would print.
+            if (!kotAlreadyPrinted(k)) {
+              seen.current.add(kotKey(k));
               stale++;
             }
             continue;

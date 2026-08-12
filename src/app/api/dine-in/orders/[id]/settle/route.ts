@@ -242,6 +242,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           WHERE id = ?
         `).run(primaryMethod, bill.serviceCharge, bill.discount, taxTotal, grand, id);
       }
+      // The desktop POS prints the bill ITSELF, in the browser, the instant this
+      // returns — dine-in/order/[id] settle() calls printBill() against its own
+      // local bridge rather than going through /print-bill. Nothing on that path
+      // ever stamped bill_printed_at, and that column is what decides the
+      // DUPLICATE BILL header. So the guest's request for a copy read NULL and
+      // came off the printer as a second UNMARKED original; only a third press
+      // said DUPLICATE. Declared by the caller rather than assumed, because
+      // /cashier also settles and does not always print.
+      //
+      // COALESCE keeps the stamp a bill already earned (printed before settling,
+      // which is the normal order at a counter) instead of moving it forward.
+      if (b.bill_printed === true) {
+        db.prepare('UPDATE orders SET bill_printed_at = COALESCE(bill_printed_at, ?) WHERE id = ?')
+          .run(new Date().toISOString().slice(0, 19).replace('T', ' '), id);
+      }
       // Record each tender line (clear any prior rows first so a retry can't
       // double-insert). Powers the dashboard's payment-category breakup + split.
       db.prepare('DELETE FROM order_payments WHERE order_id = ?').run(id);

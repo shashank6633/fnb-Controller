@@ -143,7 +143,11 @@ export default function OrderTerminalPage() {
   async function settle(method: string) {
     setSettling(true);
     try {
-      const r = await api(`/api/dine-in/orders/${id}/settle`, { method: 'POST', body: { payment_method: method } });
+      // bill_printed: this page prints the bill on its own local bridge two
+      // lines below, so it is the only thing that can tell the server the guest
+      // now holds one. Without it the next copy prints unmarked instead of
+      // DUPLICATE BILL (see the settle route).
+      const r = await api(`/api/dine-in/orders/${id}/settle`, { method: 'POST', body: { payment_method: method, bill_printed: true } });
       const j = await r.json();
       if (j.error) { alert(j.error); return; }
       // Print the bill via the local bridge (best-effort; never blocks settle).

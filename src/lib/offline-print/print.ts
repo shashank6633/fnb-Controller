@@ -654,7 +654,27 @@ export async function printBill(order: BillOrder, printedBy?: string, targetFloo
   );
   const doc = {
     type: 'bill' as const,
-    lines: design.lines,                                    // ordered, per-line enable + size
+    // ordered, per-line enable + size — PLUS the copy stamp, which has to be
+    // injected here rather than living in the design.
+    //
+    // The bridge renders a bill by walking THIS list and looking each key up in
+    // its SECTIONS map; a key that never appears in the list is never rendered,
+    // whatever else the document carries. 'copyLabel' exists in the bridge's own
+    // DEFAULT_BILL_LINES, but that list is only the fallback for an EMPTY
+    // doc.lines, and design.lines is never empty — normalizeBillDesign drops any
+    // key outside VALID_BILL_KEYS and then backfills all 26 defaults. copyLabel
+    // is not one of them (it is deliberately not a BillLineKey: it is not a line
+    // the owner should be able to reorder, resize, or switch off, because it is
+    // what distinguishes a reprint from an original tax invoice).
+    //
+    // So doc.copyLabel travelled the whole chain and was discarded at the last
+    // step, and the DUPLICATE BILL stamp never reached paper. Prepending the
+    // line only when order.copy_label is set keeps an original byte-identical to
+    // what it prints today, and a bridge older than 2.8.0 skips the unknown key
+    // harmlessly instead of failing.
+    lines: order.copy_label
+      ? ([{ key: 'copyLabel', enabled: true, size: 'large' }, ...design.lines] as unknown as typeof design.lines)
+      : design.lines,
     brandName: design.brandName || shop.name,
     companyName: design.companyName || undefined,
     address: design.address || undefined,
