@@ -87,6 +87,23 @@ export async function probeBridge(timeoutMs = 2500): Promise<BridgeHealth | null
   } catch { return null; }
 }
 
+/**
+ * -1 if a<b, 0 if equal, 1 if a>b. Numeric per segment so 2.10 > 2.9.
+ * A missing/blank version parses as 0.0.0, which sorts below every real bridge —
+ * so callers must establish the bridge is REACHABLE before reading a -1 as
+ * "out of date", since an unreachable probe yields no version at all.
+ */
+export function cmpBridgeVersion(a: string | null | undefined, b: string | null | undefined): number {
+  const segs = (v: string | null | undefined) =>
+    String(v ?? '').trim().replace(/^v/i, '').split('.').map((s) => parseInt(s, 10) || 0);
+  const x = segs(a), y = segs(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] || 0) - (y[i] || 0); // absent segment = 0, so 2.8 === 2.8.0
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
 // ── Raw base64 capability (bridge v2.6.0+) ───────────────────────────────────
 // v2.6.0 decodes `payload_b64` (base64) on raw/tspl docs, so binary bytes
 // (0x80–0xFF, e.g. raster stickers) survive JSON transport. An older bridge

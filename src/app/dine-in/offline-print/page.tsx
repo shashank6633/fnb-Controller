@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
-import { probeBridge, bridgePrint, bridgeStatus, getBridgeUrl, setBridgeUrl, type BridgeHealth, type PrinterStatus } from '@/lib/offline-print/bridge-client';
+import { probeBridge, bridgePrint, bridgeStatus, getBridgeUrl, setBridgeUrl, cmpBridgeVersion, type BridgeHealth, type PrinterStatus } from '@/lib/offline-print/bridge-client';
 import { counts as outboxCounts, retryFailed, drainOutbox, ensureDrainLoop } from '@/lib/offline-print/outbox';
 import { getKotDesign, resolveKotPrinter } from '@/lib/offline-print/print';
 import {
@@ -36,12 +36,37 @@ interface Job {
 const blankForm = { id: '', name: '', role: 'kot' as 'kot' | 'bill', station: '', transport: 'ip' as 'ip' | 'usb', target: '', paper_width: 48, copies: 1, floor: '', backup_target: '', kind: 'food' as 'food' | 'bar', is_master: false, mirror_to_master: true };
 
 // Bridge v2.6+ prints item stickers as raster bytes (label-style, QR beside the
-// details); older bridges fall back to the text layout (QR below). Compare the
-// health version NUMERICALLY — a string compare fails on v2.10.
-function bridgeOlderThan26(version: string): boolean {
-  const parts = String(version || '').split('.').map((n) => parseInt(n, 10) || 0);
-  const maj = parts[0] || 0, min = parts[1] || 0;
-  return maj < 2 || (maj === 2 && min < 6);
+// details); older bridges fall back to the text layout (QR below).
+const STICKER_RASTER_MIN = '2.6';
+
+/**
+ * One line the cashier pastes into an ADMIN PowerShell. Re-running the installer
+ * is an upgrade in place.
+ *
+ * THE TLS 1.2 PREAMBLE IS NOT OPTIONAL. Production negotiates TLS 1.2 only —
+ * measured: `openssl s_client -max_protocol TLSv1` and `TLSv1.1` against
+ * fnb.akanhyd.com are both refused with `tlsv1 alert protocol version`. Windows
+ * PowerShell 5.1 still defaults to Ssl3|Tls, so without this the very first
+ * `iwr` dies on a counter PC. The installer sets Tls12 internally, but that line
+ * runs INSIDE the file — it cannot protect the download that fetches it. Both
+ * other installer one-liners on this codebase already carry the preamble.
+ *
+ * -OutFile + `&` rather than `irm | iex`, and that shape is LOAD-BEARING: the
+ * installer builds its self-elevation arguments from $PSCommandPath, which is
+ * $null when a script is piped into iex — simplify this and it silently does
+ * nothing on any counter where the shell was not already elevated.
+ *
+ * Origin is resolved at call time from window.location, not hardcoded: on the
+ * testing host a hardcoded production URL would install production's bridge and
+ * permanently bake --origin=https://fnb.akanhyd.com into the service, which the
+ * bridge echoes as Access-Control-Allow-Origin — the testing page's next probe
+ * would then be CORS-blocked and this very card would vanish. -AppUrl is passed
+ * explicitly for the same reason.
+ */
+function bridgeUpdateCmd(): string {
+  const origin = typeof window === 'undefined' ? 'https://fnb.akanhyd.com' : window.location.origin;
+  return 'powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; '
+    + `iwr ${origin}/install-bridge-service.ps1 -OutFile $env:TEMP\\ib.ps1; & $env:TEMP\\ib.ps1 -AppUrl ${origin}"`;
 }
 
 export default function OfflinePrintPage() {
@@ -49,6 +74,11 @@ export default function OfflinePrintPage() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [health, setHealth] = useState<BridgeHealth | null>(null);
   const [probing, setProbing] = useState(true);
+  // Version the server currently SHIPS (parsed from public/print-bridge.mjs), to
+  // compare against the bridge running on this PC. null = the server couldn't
+  // tell us — then say nothing rather than accuse an up-to-date counter.
+  const [currentVersion, setCurrentVersion] = useState<string | null>(null);
+  const [cmdCopied, setCmdCopied] = useState(false);
   const [bridgeUrl, setBridgeUrlState] = useState('');
   const [form, setForm] = useState<typeof blankForm>(blankForm);
   const [showForm, setShowForm] = useState(false);
@@ -123,6 +153,15 @@ export default function OfflinePrintPage() {
     const ta = setInterval(loadAgentStatus, 10000);
     return () => { clearInterval(t); clearInterval(ta); };
   }, [loadStations, loadJobs, loadMenuStations, checkBridge, refreshQueue, loadAgentStatus]);
+
+  // The shipped version can't change while the page is open, so fetch it once on
+  // mount — NOT on the 4s bridge-probe tick.
+  useEffect(() => {
+    fetch('/api/dine-in/offline-print/bridge-version')
+      .then((r) => r.json())
+      .then((d) => setCurrentVersion(d?.version || null))
+      .catch(() => {});
+  }, []);
 
   const retryQueue = async () => {
     await retryFailed();
@@ -298,6 +337,14 @@ export default function OfflinePrintPage() {
     setTestingId(null);
   };
 
+  const copyUpdateCmd = async () => {
+    try { await navigator.clipboard.writeText(bridgeUpdateCmd()); setCmdCopied(true); setTimeout(() => setCmdCopied(false), 2000); }
+    catch { flash(false, 'Copy blocked by the browser — select the command and copy it manually.'); }
+  };
+
+  // Only ever true about the bridge on THIS PC — the page can't see the others.
+  const bridgeOutdated = !!health && !!currentVersion && cmpBridgeVersion(health.version, currentVersion) < 0;
+
   const inputCls = 'bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2 text-sm text-[#2D1B0E]';
 
   return (
@@ -335,6 +382,75 @@ export default function OfflinePrintPage() {
           <button onClick={saveBridgeUrl} className="flex items-center gap-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white px-3 py-2 rounded-lg text-sm font-medium"><Save className="w-4 h-4" /> Set</button>
         </div>
       </div>
+
+      {/* Bridge behind the shipped version. Nobody goes looking for this, so it
+          sits right under the status line rather than inside the collapsed
+          troubleshooter — a counter left on an old bridge silently loses whatever
+          the newer one fixed (e.g. the DUPLICATE BILL stamp added in v2.8.0). */}
+      {bridgeOutdated && (
+        <div className="bg-amber-50 border border-amber-300 rounded-xl p-5 text-amber-800">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+            <div className="min-w-0 space-y-3">
+              <div>
+                <p className="font-semibold">Bridge update available — this counter is on v{health!.version}, current is v{currentVersion}</p>
+                <p className="text-xs mt-0.5">Printing keeps working on the old version; it just misses everything fixed since. Updating takes about a minute.</p>
+              </div>
+
+              <div>
+                {/* THIS WARNING IS THE MOST IMPORTANT LINE ON THE CARD. If the
+                    bridge is running from the double-click .bat, its node already
+                    holds port 9920. The installer will happily register and start
+                    the service anyway; the new node then hits server.listen with
+                    no 'error' handler anywhere in print-bridge.mjs, so EADDRINUSE
+                    is fatal and NSSM crash-loops it. The installer's own health
+                    probe is then answered BY THE OLD BRIDGE — which is why its
+                    "port already in use" branch never fires and it prints a green
+                    HEALTHY line naming the OLD version. Reproduced live. Without
+                    this sentence the operator closes a green window believing the
+                    counter was upgraded when nothing changed. */}
+                <p className="text-sm font-medium">Windows</p>
+                <p className="text-xs mt-0.5 mb-1.5 font-medium bg-white/60 rounded px-2 py-1.5">
+                  <b>First close the black <code className="bg-amber-100 px-1 rounded">print-bridge.bat</code> window if one is open</b> (or reboot the PC).
+                  It holds the printing port, and the installer cannot take it over — it would report success while nothing actually changed.
+                </p>
+                <p className="text-xs mb-1">Then run this once in PowerShell (<b>as Administrator</b>):</p>
+                <div className="flex items-start gap-2 mt-1">
+                  <pre className="bg-[#2D1B0E] text-[#F5E9DC] text-[11px] rounded-lg p-2 overflow-x-auto whitespace-pre-wrap flex-1 min-w-0">{bridgeUpdateCmd()}</pre>
+                  <button onClick={copyUpdateCmd} className="shrink-0 flex items-center gap-1.5 border border-amber-400 hover:bg-amber-100 px-3 py-2 rounded-lg text-xs font-medium">
+                    {cmdCopied ? <><CheckCircle2 className="w-3.5 h-3.5" /> Copied</> : 'Copy'}
+                  </button>
+                </div>
+                <p className="text-xs mt-1">Re-running the installer is an <b>upgrade in place</b> — nothing to uninstall, printers stay as they are, and it turns a double-click <code className="bg-white/60 px-1 rounded">print-bridge.bat</code> setup into an always-on Windows service that starts itself at boot.</p>
+                {/* The installer does register an 04:30 task, but it is created
+                    with no /RU, so its principal is the (elevated) account that
+                    ran the install and it fires only while that account is logged
+                    on; schtasks has no StartWhenAvailable, so a 04:30 missed
+                    because the counter was switched off after close is never made
+                    up; and the generated updater runs SilentlyContinue with no
+                    log. Promising hands-free updates here is what leaves a fleet
+                    quietly sitting on old versions, so the card asks for a look
+                    instead. */}
+                <p className="text-xs mt-1"><b>Then come back to this page and refresh</b> — the banner disappears only when the new bridge is actually running. There is a nightly auto-update task, but it only runs if that PC is switched on and signed in, so treat this check as the reliable one.</p>
+              </div>
+
+              {/* The rescue path documented lower down lives inside a block gated
+                  on the bridge being DOWN — and this card only shows when it is
+                  UP, so that block is always collapsed here. Repeat it. */}
+              <p className="text-xs">If PowerShell cannot download the file, open <code className="bg-white/60 px-1 rounded break-all">{typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1</code> in this browser (choose <b>Keep</b> if warned), then run <code className="bg-white/60 px-1 rounded break-all">{'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install-bridge-service.ps1"'}</code> as Administrator.</p>
+
+              <div>
+                <p className="text-sm font-medium">Mac / Linux</p>
+                <p className="text-xs mt-1">Download the current <b>print-bridge.mjs</b>, replace the existing file next to your launcher, and restart the bridge.</p>
+                <a href="/print-bridge.mjs" download className="inline-flex items-center gap-1.5 mt-1.5 border border-amber-400 hover:bg-amber-100 px-3 py-1.5 rounded-lg text-xs font-medium no-underline"><Download className="w-3.5 h-3.5" /> Download bridge v{currentVersion} (.mjs)</a>
+              </div>
+
+              <p className="text-xs border-t border-amber-200 pt-2">This page can only see the bridge on <b>the PC this browser is open on</b>. Open this page on <b>every counter PC</b> — each floor — and repeat the check; a counter you never open it on stays on its old version.</p>
+              <p className="text-xs">To read a counter&rsquo;s version without opening this page, browse to <code className="bg-white/60 px-1 rounded">http://localhost:9920/health</code> <b>on that PC</b>.</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Print Agent (dispatcher) liveness — SEPARATE from the bridge PROCESS
           above. The bridge dot proves the bridge is running; this proves a
@@ -410,11 +526,16 @@ export default function OfflinePrintPage() {
           />
         </div>
 
-        {/* Bridge too old for the label-style raster sticker (QR beside) — nudge an update */}
-        {kotLabels.enabled && health && bridgeOlderThan26(health.version) && (
+        {/* Bridge too old for the label-style raster sticker (QR beside). When the
+            update card at the top is already showing, this only names the
+            sticker-specific consequence — it doesn't repeat the how-to. */}
+        {kotLabels.enabled && health && cmpBridgeVersion(health.version, STICKER_RASTER_MIN) < 0 && (
           <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 text-amber-800 px-3 py-2 text-xs">
             <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-            <span>Bridge v{health.version} — update to v2.6 for label-style stickers (QR beside details). Open “Start / troubleshoot the print bridge” below, download the new print-bridge.mjs and restart the bridge.</span>
+            <span>
+              Bridge v{health.version} on this counter prints the older text-layout sticker (QR below the details) — the label-style sticker with the QR beside the details needs v{STICKER_RASTER_MIN} or newer.
+              {bridgeOutdated ? ' Use the update card at the top of this page.' : ' Open “Start / troubleshoot the print bridge” below, download the new print-bridge.mjs and restart the bridge.'}
+            </span>
           </div>
         )}
 
@@ -560,7 +681,7 @@ export default function OfflinePrintPage() {
             <p className="font-medium text-[#2D1B0E] mt-2">Make it permanent — auto-start on every boot (recommended)</p>
             <p>Run this <b>once</b> in PowerShell <b>(as Administrator)</b>. It installs Node if missing, runs the bridge as an always-on Windows service, and auto-updates daily — the counter never has to launch anything again:</p>
             <pre className="bg-[#2D1B0E] text-[#F5E9DC] text-[11px] rounded-lg p-2 overflow-x-auto whitespace-pre-wrap">{`powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm ${typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`}</pre>
-            <p className="text-xs text-[#8B7355]"><b>If it says “Unable to connect to the remote server”:</b> let the browser download it instead — open <code className="bg-[#FFF1E3] px-1 rounded break-all">{typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1</code> in this browser (choose <b>Keep</b> if warned), then in an <b>admin</b> PowerShell run <code className="bg-[#FFF1E3] px-1 rounded break-all">{'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install-bridge-service.ps1"'}</code>. Wait for <b>HEALTHY — v2.2.1</b>.</p>
+            <p className="text-xs text-[#8B7355]"><b>If it says “Unable to connect to the remote server”:</b> let the browser download it instead — open <code className="bg-[#FFF1E3] px-1 rounded break-all">{typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1</code> in this browser (choose <b>Keep</b> if warned), then in an <b>admin</b> PowerShell run <code className="bg-[#FFF1E3] px-1 rounded break-all">{'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install-bridge-service.ps1"'}</code>. Wait for <b>HEALTHY{currentVersion ? ` — v${currentVersion}` : ''}</b>.</p>
 
             <p className="text-xs text-[#8B7355] mt-1">Add printers below. <b>USB</b>: enter the printer&apos;s name exactly as Windows lists it (see the USB guide card below — sharing is no longer needed). <b>Network</b>: enter <code className="bg-[#FFF1E3] px-1 rounded">192.168.1.50:9100</code>. Everything is on-site, so printing keeps working even if the internet drops.</p>
           </div>

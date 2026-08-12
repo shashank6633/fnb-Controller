@@ -13,7 +13,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { printFiredKots, printBill, copyLabel } from '@/lib/offline-print/print';
 import { api } from '@/lib/api';
-import { probeBridge, getBridgeUrl, setBridgeUrl, getPrintCounter, setPrintCounter, getPrintCatchAll, setPrintCatchAll, getPrintKots, setPrintKots, shouldPrintBillHere, type BridgeHealth } from '@/lib/offline-print/bridge-client';
+import { probeBridge, getBridgeUrl, setBridgeUrl, getPrintCounter, setPrintCounter, getPrintCatchAll, setPrintCatchAll, getPrintKots, setPrintKots, shouldPrintBillHere, cmpBridgeVersion, type BridgeHealth } from '@/lib/offline-print/bridge-client';
 import { ensureDrainLoop, drainOutbox, counts, retryFailed, prunePrinted } from '@/lib/offline-print/outbox';
 import { pushCache, replayOnce } from '@/lib/offline-print/lan-sync';
 import { Printer, Wifi, WifiOff, CheckCircle2, AlertTriangle, RefreshCw, Receipt, ChefHat, Settings, ArrowLeft, Copy } from 'lucide-react';
@@ -23,6 +23,13 @@ interface LogRow { id: string; at: string; kind: 'KOT' | 'BILL'; label: string; 
 export default function PrintAgent() {
   const [live, setLive] = useState(false);
   const [health, setHealth] = useState<BridgeHealth | null>(null);
+  // The version the SITE currently ships, so this tile can say "you are behind"
+  // rather than just naming a number nobody can compare against. THIS is the
+  // page that matters for it: /print/agent is the tab left open on a counter all
+  // day, while the nudge on KOT & Bill Printers only helps someone who thought
+  // to go looking. null = unknown (offline, or the endpoint could not read it)
+  // and then nothing is claimed either way.
+  const [shippedVersion, setShippedVersion] = useState<string | null>(null);
   const [queue, setQueue] = useState({ pending: 0, failed: 0, printed: 0 });
   const [log, setLog] = useState<LogRow[]>([]);
   const [urlInput, setUrlInput] = useState('');
@@ -256,6 +263,17 @@ export default function PrintAgent() {
     return () => { alive = false; clearInterval(t); };
   }, [pushLog]);
 
+  // What the site currently ships, read once. Only a comparison target for the
+  // Bridge tile — a failure leaves it null and the tile says nothing extra.
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/dine-in/offline-print/bridge-version', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => { if (alive && j && typeof j.version === 'string') setShippedVersion(j.version); })
+      .catch(() => { /* offline or unauthenticated — the tile just omits the nudge */ });
+    return () => { alive = false; };
+  }, []);
+
   // (B) REPLAY LOOP — every ~30s, pull the bridge's pending offline KOTs and
   // replay them to the cloud (idempotent by client_ref), then mark them synced.
   useEffect(() => {
@@ -295,6 +313,10 @@ export default function PrintAgent() {
   function saveUrl() { setBridgeUrl(urlInput); setShowCfg(false); probeBridge().then(setHealth); }
 
   const bridgeOk = !!health?.ok;
+  // Both sides must be known before claiming anything: no bridge, or no answer
+  // from the version endpoint, and the tile stays silent rather than guessing.
+  const bridgeOutdated = bridgeOk && !!shippedVersion && !!health?.version
+    && cmpBridgeVersion(health.version, shippedVersion) < 0;
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
   const installerCmd = `powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm ${origin}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`;
 
@@ -348,6 +370,17 @@ export default function PrintAgent() {
               <span className="font-semibold">Bridge</span>
             </div>
             <p className="text-sm mt-1 text-white/70">{bridgeOk ? `Connected · v${health?.version}` : 'Not reachable'}</p>
+            {/* "Connected · v2.7.1" is only useful to someone who knows what the
+                current version is. This tile is on the screen a counter leaves
+                open all day, so it is the right place to say so out loud —
+                otherwise a floor can run months behind and look perfectly green.
+                Amber, never red: an old bridge still prints. */}
+            {bridgeOutdated && (
+              <p className="text-[11px] text-amber-300 mt-1 leading-snug">
+                Update available — v{shippedVersion} is current.{' '}
+                <a href="/dine-in/offline-print" className="underline hover:text-amber-200">How to update</a>
+              </p>
+            )}
             <p className="text-[11px] text-white/40 mt-0.5 truncate">{getBridgeUrl()}</p>
           </div>
           <div className={`rounded-2xl p-4 border ${live ? 'bg-emerald-500/10 border-emerald-500/40' : 'bg-amber-500/10 border-amber-500/40'}`}>
