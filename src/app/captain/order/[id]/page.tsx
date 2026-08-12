@@ -66,6 +66,45 @@ interface DiscReq {
   decided_by?: string | null; decided_note?: string | null;
 }
 
+/**
+ * CAPTAIN → CASHIER BILL REQUEST — the reply shape of
+ * GET / POST /api/dine-in/orders/[id]/request-bill (see src/lib/bill-request.ts).
+ *
+ * `canSettle` is settleAuthority()'s OWN verdict for this caller and this bill,
+ * so the button on screen and the gate on POST /settle cannot disagree. The
+ * captain tablet used to open a full Collect-payment sheet unconditionally;
+ * settle is now gated, so for anyone who is not this floor's cashier that sheet
+ * 403s on the last tap, with the guest watching. This reply is what lets the
+ * tablet offer "Request Bill" instead — before the tap, not after it.
+ */
+interface BillRequestState {
+  status: 'requested' | 'seen';
+  requestedAt: string; requestedBy: string;
+  seenAt: string | null; seenBy: string;
+  floor: string | null; floorName: string | null;
+  tableNumber: string;
+}
+interface BillAuth {
+  request: BillRequestState | null;
+  canSettle: boolean;
+  /** Server verdict: may THIS user withdraw the standing request? True for the
+   *  original requester and for anyone till-capable (managers/admins included)
+   *  — the same test the cancel POST enforces, so the Withdraw button never
+   *  promises what the server would 403. */
+  canCancel: boolean;
+  reason: string;
+  /** settleAuthority's message. Written for the person being REFUSED a settle,
+   *  so it is shown on the cashier console — never to a captain, who is not
+   *  trying to settle and would only be confused by "check in to this floor". */
+  message: string;
+  floor: string | null;
+  floorName: string | null;
+  /** The cashier holding this bill's floor RIGHT NOW — a measured fact the
+   *  server populates on every reply (refusals included), never inferred from
+   *  a reason string. The sheet's "who this goes to" line renders from this. */
+  cashier: { userId: string; userName: string } | null;
+}
+
 // Parse a SQLite/ISO timestamp (space or 'T' separated) as UTC → ms epoch.
 function parseTs(s?: string | null): number {
   if (!s) return NaN;
@@ -115,6 +154,16 @@ export default function CaptainOrder() {
   const [settling, setSettling] = useState(false);
   const [printingBill, setPrintingBill] = useState(false);
 
+  // ── Bill request (captain → cashier) ────────────────────────────────────────
+  // null = not answered yet. While it is null the Bill button keeps its ORIGINAL
+  // behaviour (open the Collect sheet), deliberately: on a tablet that cannot
+  // reach the server the captain cannot settle anyway (the POST would fail too),
+  // and failing the other way would show "Request Bill" to a cashier who can
+  // actually take the money. The stale-verdict race is caught in settle().
+  const [billAuth, setBillAuth] = useState<BillAuth | null>(null);
+  const [reqOpen, setReqOpen] = useState(false);
+  const [reqBusy, setReqBusy] = useState<'request' | 'cancel' | null>(null);
+
   // Signed-in user — drives the cashier-only discount / service-charge controls.
   const [me, setMe] = useState<Me | null>(null);
   const canDiscount = !!(me && (me.can_request_discount === 1 || me.can_request_discount === true));
@@ -154,6 +203,18 @@ export default function CaptainOrder() {
     const r = await api(`/api/dine-in/orders/${id}`);
     const j = await r.json();
     if (j.order) setOrder(j.order);
+  }, [id]);
+
+  // "Can I take this payment, and has anyone been asked?" — one question, one
+  // call. Best-effort: a failed read KEEPS the last known answer rather than
+  // blanking it, so a dropped packet cannot flip the button mid-service.
+  const loadBillAuth = useCallback(async () => {
+    try {
+      const r = await api(`/api/dine-in/orders/${id}/request-bill`);
+      if (!r.ok) return;
+      const j = await r.json();
+      if (j && typeof j.canSettle === 'boolean') setBillAuth(j as BillAuth);
+    } catch { /* offline — keep the last known answer */ }
   }, [id]);
 
   // Table party — every diner at this table (primary first). Best-effort: a
@@ -289,6 +350,17 @@ export default function CaptainOrder() {
   // Load the party list once the order id is known (and whenever it changes).
   useEffect(() => { loadGuests(); }, [loadGuests]);
 
+  // Bill-request state: once on open, then every 15s while the bill is open.
+  // The poll is what turns "Bill requested" into "Cashier has it" on the
+  // captain's screen without them having to ask anyone — and it also picks up a
+  // cashier checking in or out, which changes whether this tablet may settle.
+  useEffect(() => { loadBillAuth(); }, [loadBillAuth]);
+  useEffect(() => {
+    if (order?.status !== 'open') return;
+    const t = setInterval(loadBillAuth, 15000);
+    return () => clearInterval(t);
+  }, [order?.status, loadBillAuth]);
+
   // Instant refresh on a kitchen scan-out: subscribe to the KDS SSE stream and
   // reload the order the moment one of its lines is scanned out of the kitchen.
   useEffect(() => {
@@ -341,6 +413,48 @@ export default function CaptainOrder() {
   const firedItems = useMemo(() => (order?.items || []).filter((i) => !!i.fired_at), [order]);
   const firedIncomplete = useMemo(() => firedItems.filter((i) => !i.completed_at), [firedItems]);
   const canBill = firedIncomplete.length === 0;
+
+  // ── Bill request, derived ───────────────────────────────────────────────────
+  // mayCollect: only once the server has actually said so. Until the first
+  // answer arrives billAuth is null and we keep today's behaviour (see the state
+  // declaration) — the ONE place that decision is made.
+  const mayCollect = billAuth === null || billAuth.canSettle;
+  const billReq = billAuth?.request || null;
+  // Minutes the guest has been waiting. `now` ticks every second while the order
+  // is open, so this stays live without its own timer.
+  const waitedMin = useMemo(() => {
+    const t = parseTs(billReq?.requestedAt);
+    return Number.isFinite(t) ? Math.max(0, Math.floor((now - t) / 60000)) : null;
+  }, [billReq?.requestedAt, now]);
+  /**
+   * WHO THIS REQUEST REACHES, in the captain's words — rendered from the
+   * server's FACTS (billAuth.cashier / floorName, populated on every reply),
+   * never guessed from a refusal reason (D2).
+   *
+   * Mirrors visibleBillRequests() in src/lib/bill-request.ts, which filters
+   * through settleAuthorityForFloor() — the same function that gates settle:
+   *   - a cashier holds the floor  → that cashier, and only them
+   *     ('cashier_on_floor'; a manager COULD override-settle, but the feed
+   *     deliberately does not badge them for a manned floor);
+   *   - the floor is unmanned      → the managers on duty
+   *     ('no_cashier_fallback'), so it is never dropped; a cashier who checks
+   *     in there later inherits it with the floor;
+   *   - the bill has no floor      → everyone till-capable ('no_floor').
+   * Deliberately NOT billAuth.message: that text is written for someone being
+   * refused a settle ("check in to this floor…") and means nothing to a captain.
+   */
+  const requestGoesTo = !billAuth ? ''
+    : billAuth.cashier
+      ? `This goes to ${billAuth.cashier.userName || 'the cashier'} on ${billAuth.floorName || 'Floor'}.`
+      : billAuth.floorName
+        ? `No cashier is checked in on ${billAuth.floorName} — this goes to the managers on duty.`
+        : 'This bill has no table, so it goes to every till.';
+  // Server verdict on Withdraw for THIS user (original requester, or anyone
+  // till-capable — the same test the cancel POST enforces).
+  const canWithdraw = !!billAuth?.canCancel;
+  // "Requested · 0m" reads as broken. Under a minute it is just "Requested".
+  const waitedLabel = waitedMin == null || waitedMin < 1 ? '' : ` · ${waitedMin}m`;
+  const waitedWords = waitedMin == null ? '' : waitedMin < 1 ? ' just now' : ` ${waitedMin} min ago`;
 
   function openSheet(m: MenuItem) { setSheet(m); setMQty(1); setMPortion('Full'); setMMods([]); setMNote(''); }
   const toggleMod = (mod: string) => setMMods((p) => p.includes(mod) ? p.filter((x) => x !== mod) : [...p, mod]);
@@ -430,11 +544,58 @@ export default function CaptainOrder() {
     } finally { setPrintingBill(false); }
   }
 
+  /**
+   * Ask the floor's cashier for the bill.
+   *
+   * IDEMPOTENT AT THE SERVER (bill-request.ts writes one stamp per bill), so the
+   * fourth impatient tap raises no second alert — it replies created:false and
+   * we say so, instead of pretending another cashier was paged.
+   */
+  async function sendBillRequest() {
+    setReqBusy('request');
+    try {
+      const r = await api(`/api/dine-in/orders/${id}/request-bill`, { method: 'POST', body: { action: 'request' } });
+      const j = await r.json();
+      if (j.error) { alert(j.error); await loadBillAuth(); return; }
+      setBillAuth(j as BillAuth);
+      flash(j.created === false ? 'Already sent — the cashier has it' : 'Cashier notified ✓');
+      try { (navigator as any).vibrate?.(60); } catch { /* no haptics */ }
+    } catch { alert('Could not reach the counter. Check the connection and try again.'); }
+    finally { setReqBusy(null); }
+  }
+
+  /** Withdraw a mis-tap. The server allows this for the original requester and
+   *  for anyone till-capable (D14/D15) — the Withdraw button only renders when
+   *  billAuth.canCancel said yes, so a refusal here means the verdict moved
+   *  under us; the alert + re-read below handle that. */
+  async function withdrawBillRequest() {
+    setReqBusy('cancel');
+    try {
+      const r = await api(`/api/dine-in/orders/${id}/request-bill`, { method: 'POST', body: { action: 'cancel' } });
+      const j = await r.json();
+      if (j.error) { alert(j.error); await loadBillAuth(); return; }
+      setBillAuth(j as BillAuth);
+      flash('Request withdrawn');
+    } catch { alert('Could not reach the counter. Check the connection and try again.'); }
+    finally { setReqBusy(null); }
+  }
+
   async function settle(method: string) {
     setSettling(true);
     try {
       const r = await api(`/api/dine-in/orders/${id}/settle`, { method: 'POST', body: { payment_method: method } });
       const j = await r.json();
+      // A 403 here means the answer moved under us — a cashier checked in on this
+      // floor between opening the sheet and tapping pay. Don't leave the captain
+      // on a payment sheet that will keep failing: close it, re-read the verdict
+      // and hand them the request path in the same gesture.
+      if (r.status === 403) {
+        setSettleOpen(false);
+        await loadBillAuth();
+        setReqOpen(true);
+        alert(j.error || 'You can no longer settle this bill — request it from the cashier instead.');
+        return;
+      }
       if (j.error) { alert(j.error); return; }
       const mob = gMobile.trim();
       if (mob) {
@@ -882,11 +1043,32 @@ export default function CaptainOrder() {
               </p>
             )}
             <div className="flex items-center gap-2">
-              <button onClick={() => setSettleOpen(true)} disabled={!canBill}
-                title={canBill ? undefined : `Complete all items to bill (${firedIncomplete.length} left)`}
-                className="flex items-center gap-1.5 border border-[#af4408] text-[#af4408] px-4 py-3 rounded-xl text-sm font-semibold active:scale-95 disabled:opacity-40 disabled:active:scale-100">
-                <Receipt className="w-4 h-4" /> Bill
-              </button>
+              {/* THE BILL BUTTON. Two jobs behind one control, and the LABEL always
+                  says which one the tap does — a captain must never tap "Bill" and
+                  land on a payment sheet that 403s. mayCollect comes from the
+                  server's own settle verdict. The fired-items gate applies to a
+                  REQUEST too: the bill isn't ready either way. */}
+              {mayCollect ? (
+                <button onClick={() => setSettleOpen(true)} disabled={!canBill}
+                  title={canBill ? undefined : `Complete all items to bill (${firedIncomplete.length} left)`}
+                  className="flex items-center gap-1.5 border border-[#af4408] text-[#af4408] px-4 py-3 rounded-xl text-sm font-semibold active:scale-95 disabled:opacity-40 disabled:active:scale-100">
+                  <Receipt className="w-4 h-4" /> Bill
+                </button>
+              ) : (
+                <button onClick={() => setReqOpen(true)} disabled={!canBill}
+                  title={canBill ? undefined : `Complete all items to bill (${firedIncomplete.length} left)`}
+                  className={`flex items-center gap-1.5 border px-4 py-3 rounded-xl text-sm font-semibold active:scale-95 disabled:opacity-40 disabled:active:scale-100 ${
+                    billReq?.status === 'seen' ? 'border-emerald-600 text-emerald-700 bg-emerald-50'
+                    : billReq ? 'border-amber-500 text-amber-700 bg-amber-50'
+                    : 'border-[#af4408] text-[#af4408]'}`}>
+                  {billReq ? <BellRing className="w-4 h-4" /> : <Receipt className="w-4 h-4" />}
+                  {/* 'seen' = somebody who could settle OPENED the bill (D15) —
+                      "has it", not "coming", which the till cannot promise. */}
+                  {billReq?.status === 'seen' ? 'Cashier has it'
+                    : billReq ? `Requested${waitedLabel}`
+                    : 'Request Bill'}
+                </button>
+              )}
               <button onClick={sendKot} disabled={firing || pendingCount === 0}
                 className="flex-1 flex items-center justify-center gap-2 bg-[#af4408] disabled:opacity-40 text-white py-3 rounded-xl text-sm font-bold active:scale-95">
                 {firing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
@@ -1027,6 +1209,87 @@ export default function CaptainOrder() {
               {actionBusy ? <Loader2 className="w-5 h-5 animate-spin" /> : tableAction === 'move' ? <ArrowLeftRight className="w-5 h-5" /> : <GitMerge className="w-5 h-5" />}
               {tableAction === 'move' ? 'Move order here' : 'Merge into this table'}
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── REQUEST-BILL SHEET ───────────────────────────────────────────────
+          Shown INSTEAD of the Collect-payment sheet to anyone the server would
+          refuse a settle. Deliberately a separate sheet rather than a disabled
+          payment sheet: nothing here takes money, so nothing here should look
+          like it might. Two taps to raise a request (open, then the labelled
+          primary button) is on purpose — a stray tap on the footer would
+          otherwise walk a cashier to a table that never asked.
+          "Print bill at counter" is carried across so a captain keeps the one
+          capability this change would otherwise have quietly removed. */}
+      {reqOpen && (
+        <div className="fixed inset-0 z-40 flex items-end" onClick={() => setReqOpen(false)}>
+          <div className="absolute inset-0 bg-black/40" />
+          <div onClick={(e) => e.stopPropagation()} className="relative w-full max-w-3xl mx-auto bg-white rounded-t-3xl p-4 pb-6 max-h-[85vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-1">
+              <p className="font-bold text-lg text-[#2D1B0E]">Bill for {order.table_number || `#${order.order_number}`}</p>
+              <button onClick={() => setReqOpen(false)} className="p-1" aria-label="Close"><X className="w-5 h-5 text-[#8B7355]" /></button>
+            </div>
+            <p className="text-sm text-[#8B7355] mb-3">Total due <b className="text-[#2D1B0E]">₹{Math.round(order.total)}</b>{order.discount > 0 ? <span className="text-green-700"> · disc −₹{Math.round(order.discount)}</span> : null}</p>
+
+            {/* Three states, each with a WORD and not only a colour. */}
+            {billReq?.status === 'seen' ? (
+              <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 mb-3">
+                {/* D15: "seen" is stamped when someone who could settle OPENS the
+                    bill — say exactly that, not "is on the way", which the till
+                    cannot know. And the original requester keeps Withdraw. */}
+                <p className="text-sm font-semibold text-emerald-800 flex items-center gap-1.5">
+                  <CheckCircle2 className="w-4 h-4 shrink-0" /> {billReq.seenBy || 'A cashier'} has opened this bill
+                </p>
+                <p className="text-xs text-emerald-700 mt-1">
+                  Requested{waitedWords}{billReq.requestedBy ? ` by ${billReq.requestedBy}` : ''}.
+                </p>
+                {canWithdraw ? (
+                  <button onClick={withdrawBillRequest} disabled={reqBusy !== null}
+                    className="mt-2 w-full flex items-center justify-center gap-1.5 border border-emerald-300 text-emerald-800 py-2 rounded-lg text-sm font-semibold active:scale-95 disabled:opacity-50">
+                    {reqBusy === 'cancel' ? <Loader2 className="w-4 h-4 animate-spin" /> : <X className="w-4 h-4" />} Withdraw request
+                  </button>
+                ) : (
+                  <p className="text-xs text-emerald-700 mt-1">
+                    Only {billReq.requestedBy || 'the captain who requested it'}, a cashier or a manager can withdraw it.
+                  </p>
+                )}
+              </div>
+            ) : billReq ? (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-3">
+                <p className="text-sm font-semibold text-amber-800 flex items-center gap-1.5">
+                  <BellRing className="w-4 h-4 shrink-0" /> Bill requested{waitedMin != null && waitedMin >= 1 ? ` · ${waitedMin} min ago` : ''}
+                </p>
+                <p className="text-xs text-amber-700 mt-1">
+                  Waiting for a cashier to pick it up. {requestGoesTo}
+                </p>
+                {canWithdraw ? (
+                  <button onClick={withdrawBillRequest} disabled={reqBusy !== null}
+                    className="mt-2 w-full flex items-center justify-center gap-1.5 border border-amber-300 text-amber-800 py-2 rounded-lg text-sm font-semibold active:scale-95 disabled:opacity-50">
+                    {reqBusy === 'cancel' ? <Loader2 className="w-4 h-4 animate-spin" /> : <X className="w-4 h-4" />} Withdraw request
+                  </button>
+                ) : (
+                  <p className="text-xs text-amber-700 mt-1">
+                    Only {billReq.requestedBy || 'the captain who requested it'}, a cashier or a manager can withdraw it.
+                  </p>
+                )}
+              </div>
+            ) : (
+              <>
+                <p className="text-xs text-[#8B7355] mb-2">{requestGoesTo}</p>
+                <button onClick={sendBillRequest} disabled={reqBusy !== null || !canBill}
+                  className="w-full flex items-center justify-center gap-2 bg-[#af4408] text-white py-3.5 rounded-xl text-sm font-bold active:scale-95 disabled:opacity-50 mb-3">
+                  {reqBusy === 'request' ? <Loader2 className="w-5 h-5 animate-spin" /> : <BellRing className="w-5 h-5" />} Request Bill
+                </button>
+                {!canBill && <p className="text-center text-xs text-[#af4408] -mt-1 mb-3">Complete all items to bill ({firedIncomplete.length} left)</p>}
+              </>
+            )}
+
+            <button onClick={printBillNow} disabled={printingBill}
+              className="w-full flex items-center justify-center gap-2 border border-[#af4408] text-[#af4408] py-3 rounded-xl text-sm font-semibold active:scale-95 disabled:opacity-50">
+              {printingBill ? <Loader2 className="w-4 h-4 animate-spin" /> : <Receipt className="w-4 h-4" />} Print bill at counter
+            </button>
+            <p className="text-[11px] text-[#8B7355] text-center mt-2">Payment is collected at the till.</p>
           </div>
         </div>
       )}

@@ -2137,7 +2137,14 @@ function initializeSchema(db: Database.Database) {
       ['Staff',         'staff',   J(['/requisitions']), 0, 0, 1, 2, 'Raises requisitions only'],
       ['Floor Manager', 'manager', J(['/', '/dine-in/floor', '/dine-in/tables', '/dine-in/reservations', '/dine-in/kitchen', '/dine-in/order', '/dine-in/reconciliation', '/captain', '/print/agent', '/reports']), 0, 0, 0, 10, 'Runs the dining floor'],
       ['Captain',       'staff',   J(['/captain']), 0, 0, 0, 11, 'Takes table orders on a tablet'],
-      ['Cashier',       'staff',   J(['/dine-in/floor', '/dine-in/tables', '/dine-in/reservations', '/dine-in/order', '/captain']), 0, 0, 0, 12, 'Takes orders and settles bills'],
+      // '/cashier' was MISSING from this list until 2026-08-11 — the role
+      // described as "settles bills" could not open the cashier console, and
+      // now that settle authority is gated on canAccessPage('/cashier', me)
+      // (src/lib/settle-authority.ts) the omission would refuse a Cashier the
+      // settle itself. Fixed here for FRESH databases; existing ones are
+      // repaired by the one-shot cashier_role_page_grant_v1 migration lower in
+      // this file, whose NOT-LIKE guard makes it a no-op on a fresh install.
+      ['Cashier',       'staff',   J(['/cashier', '/dine-in/floor', '/dine-in/tables', '/dine-in/reservations', '/dine-in/order', '/captain']), 0, 0, 0, 12, 'Takes orders and settles bills'],
       ['Bar Manager',   'manager', J(['/dine-in/floor', '/dine-in/tables', '/dine-in/kitchen', '/dine-in/offline-print', '/print/agent', '/reports']), 0, 0, 0, 13, 'Runs the bar and its printers'],
       ['Head Chef',     'manager', J(['/dine-in/kitchen', '/requisitions', '/menu-items', '/recipes', '/department-consumption']), 1, 0, 0, 14, 'Runs the kitchen; approves requisitions'],
       ['Store Manager', 'manager', J(['/store-dashboard', '/store-requisitions', '/purchases', '/purchase-orders', '/grn', '/inventory', '/closing-stock', '/wastage', '/departments', '/vendors']), 0, 1, 0, 15, 'Runs the store; issues inventory'],
@@ -2567,6 +2574,32 @@ function initializeSchema(db: Database.Database) {
     // When the bill was last printed for this order — highlights the table on the
     // cashier floor as "asked for the bill / about to free up".
     if (!hasOrd('bill_printed_at'))       db.exec(`ALTER TABLE orders ADD COLUMN bill_printed_at TEXT`);
+    // CAPTAIN → CASHIER BILL REQUEST (src/lib/bill-request.ts).
+    //
+    // The captain tablet can no longer take payment: settle and hold are gated
+    // by src/lib/settle-authority.ts, so a captain who is not the floor's
+    // cashier gets a 403. Its Bill button therefore REQUESTS the bill, and the
+    // request surfaces to that floor's cashier as a bell bucket and a marked
+    // table on the cashier board.
+    //
+    // STAMPS ON THE ORDER, NOT A REQUESTS TABLE. Three reasons, all load-bearing:
+    //   IDEMPOTENT BY CONSTRUCTION. A stamp is set or it is not, and the writer
+    //   is COALESCE(bill_requested_at, datetime('now')), so a captain tapping
+    //   Request Bill four times raises exactly one alert. A rows table would
+    //   have needed a de-duplicator that could drift.
+    //   IT RETIRES ITSELF. Every reader joins orders on status = 'open', so
+    //   settling, holding or voiding the bill clears the request with no cleanup
+    //   step that a future change could forget to call.
+    //   IT RIDES ALONG. /api/dine-in/tables already selects the open order's
+    //   columns for the cashier board's "Bill printed" highlight; the marked
+    //   table is the same one-line join, not a second query per tile.
+    // bill_seen_at is the acknowledgement, written only for someone whose
+    // settleAuthority allows that floor — see markBillRequestSeen(). The third
+    // state the owner asked for, "settled", is the order leaving status 'open'.
+    if (!hasOrd('bill_requested_at'))     db.exec(`ALTER TABLE orders ADD COLUMN bill_requested_at TEXT`);
+    if (!hasOrd('bill_requested_by'))     db.exec(`ALTER TABLE orders ADD COLUMN bill_requested_by TEXT DEFAULT ''`);
+    if (!hasOrd('bill_seen_at'))          db.exec(`ALTER TABLE orders ADD COLUMN bill_seen_at TEXT`);
+    if (!hasOrd('bill_seen_by'))          db.exec(`ALTER TABLE orders ADD COLUMN bill_seen_by TEXT DEFAULT ''`);
     // Bill-on-hold: a finalised bill the cashier parked as UNPAID (status
     // 'on_hold'); it frees the table and shows under Outstanding Payment until
     // settled. held_at = when it was parked.
@@ -5051,6 +5084,142 @@ function initializeSchema(db: Database.Database) {
       db.exec(`ALTER TABLE wastages ADD COLUMN return_item_id TEXT`);
     }
   } catch (e) { console.error('material_returns schema failed:', e); }
+
+  // ══ CASHIER FLOOR PRESENCE — who is manning which floor, right now ════════
+  //
+  // WHY A NEW TABLE, when three things in this database already look like they
+  // could carry it. All three were checked and all three are wrong:
+  //
+  //   sessions (token, user_id, created_at, expires_at) has no floor and no
+  //   activity stamp, and a session lives 30 days — so "holds a session" is not
+  //   "is standing at the till".
+  //
+  //   print_agent_heartbeat has a heartbeat, but its PRIMARY KEY is outlet_id
+  //   ALONE, so two counters on two floors overwrite each other; its own
+  //   heartbeat route resolves the user and then throws it away.
+  //
+  //   users.preferred_zones is already spoken for. captainAreaFilter() in
+  //   src/lib/captain-area.ts reads it for ANY staff-tier user, and the seeded
+  //   Cashier role is staff tier — so reusing that column would mean the day
+  //   anyone switches captain_area_lock on, an assigned cashier could no longer
+  //   work tables outside their billing floor. Presence is its own concept and
+  //   gets its own table.
+  //
+  // FLOOR = restaurant_tables.zone, verbatim. An order reaches a floor through
+  // its table_id; a takeaway/delivery order has no table and therefore no
+  // floor at all. An empty zone ('') is a REAL floor — the unzoned tables the
+  // captain UI labels "Floor" — which is why this column is NOT NULL DEFAULT ''
+  // rather than nullable, and why '' must never be treated as "unset".
+  //
+  // ONE CASHIER PER FLOOR: PRIMARY KEY (outlet_id, floor). A replacement
+  // cashier UPSERTs over the row, so a handover is a single write and there is
+  // never an instant where two people both hold Floor 2. The consequence is
+  // deliberate: this is a LIVE REGISTER, not an audit log, and it keeps no
+  // shift history. The record of who actually took money is
+  // order_payments.created_by, written on every settle — that is the row an
+  // auditor reads, and it is unaffected by anything here.
+  //
+  // outlet_id '' = the NULL/default outlet — the same convention
+  // print_agent_heartbeat uses. checked_out_at '' = still on duty, empty string
+  // rather than NULL so no query needs a NULL guard.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cashier_presence (
+        outlet_id      TEXT NOT NULL DEFAULT '',   -- '' = the NULL/default outlet
+        floor          TEXT NOT NULL DEFAULT '',   -- restaurant_tables.zone; '' = the unzoned "Floor"
+        user_id        TEXT NOT NULL,
+        user_name      TEXT NOT NULL DEFAULT '',   -- denormalised so the floor board renders without a join
+        checked_in_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen      TEXT NOT NULL DEFAULT (datetime('now')),
+        checked_out_at TEXT NOT NULL DEFAULT '',   -- '' = still on duty
+        PRIMARY KEY (outlet_id, floor)
+      );
+    `);
+    // A person is in ONE place: checkIn() releases every other floor the user
+    // holds before taking a new one, and the post-login prompt asks "where am I
+    // already checked in?". Both are lookups by user_id. The per-floor read and
+    // the floor board ride the PRIMARY KEY, so this is the only index needed.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_cashier_presence_user ON cashier_presence(user_id)`);
+
+    // STALENESS. Presence MUST expire: a cashier who went home would otherwise
+    // still hold Floor 2 tomorrow — refusing every other STAFF user a settle
+    // there and leaving managers to settle only via recorded overrides
+    // (src/lib/settle-authority.ts, the override model). 720 minutes = 12
+    // hours of INACTIVITY (src/lib/cashier-
+    // presence.ts bumps last_seen on every touch, so this measures silence, not
+    // shift length) — longer than any single service, short enough that every
+    // floor is free again by the next day's open.
+    //
+    // Expiry can only ever WIDEN who may settle, never narrow it: an expired
+    // floor reads as "no cashier on this floor", which is the branch that lets
+    // manager/admin — and the expired cashier themselves — settle. So a wrong
+    // value here cannot strand a payment.
+    //
+    // INSERT OR IGNORE: an admin who tunes this keeps their value across every
+    // future deploy.
+    db.exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('cashier_presence_timeout_min', '720')");
+  } catch (e) { console.error('cashier_presence schema failed:', e); }
+
+  // ══ SEED DEFECT REPAIR — the Cashier role never granted /cashier ═══════════
+  //
+  // THE DEFECT. The seeded Cashier role (the `seeds` array further up this file)
+  // ships page_access
+  //   ["/dine-in/floor","/dine-in/tables","/dine-in/order","/captain",
+  //    "/dine-in/reservations"]
+  // and has never contained "/cashier". Measured against the live database on
+  // 2026-08-11: the row matches that seed exactly (the reservations entry came
+  // from the one-shot nav-continuity grant above). So a user assigned the
+  // Cashier role cannot open the cashier console at all — and now that settle
+  // authority is gated on tillCapable() in src/lib/settle-authority.ts, which
+  // requires staff to hold an EXPLICIT /cashier grant (deliberately NOT
+  // canAccessPage, whose null map grants everything and would pass captains),
+  // that same seed defect would refuse a cashier the right to settle. Shipping
+  // the gate without this repair locks the till.
+  //
+  // WHY ONE-SHOT, NOT A PLAIN UPDATE. A blind UPDATE on every boot is exactly
+  // what scripts/check-boot-migrations.js exists to stop: page access is
+  // admin-owned state, a WHERE clause cannot tell "never granted" from
+  // "deliberately revoked", and a recompute-on-boot silently reverts the admin
+  // on the next deploy. That has already happened once in this file (see the
+  // nav-continuity note). So this runs ONCE, records itself in settings, and
+  // can never run again — if an admin revokes /cashier from the Cashier role
+  // tomorrow, it stays revoked forever, deploy after deploy.
+  //
+  // WHY IT IS SAFE TO WRITE AT ALL. It repairs OUR seed, not the admin's
+  // choice: /cashier has never been in that row for an admin to have formed an
+  // opinion about, because the seed never put it there and the page has never
+  // been reachable for that role. The write is additive (json_insert of one
+  // path), and it deliberately skips:
+  //   - a role that is no longer NAMED 'Cashier' (renamed = the admin owns it),
+  //   - a NULL page_access (= all pages already; nothing to add),
+  //   - a row that somehow already holds the path.
+  // Same shape, same guard, same precedent as the nav-continuity grants.
+  //
+  // WHAT IT DELIBERATELY DOES NOT DO: it does not grant /cashier to Floor
+  // Manager, Bar Manager or any other role. Those maps were written by a human
+  // and adding to them would be inventing intent. And under the override model
+  // (src/lib/settle-authority.ts tillCapable) manager/admin TIER settles
+  // regardless of page maps — this grant is what lets a STAFF user assigned
+  // the Cashier role pass the till capability test, and page maps remain a
+  // configuration decision for /settings/roles.
+  try {
+    const cashierPageGranted = db.prepare("SELECT value FROM settings WHERE key='cashier_role_page_grant_v1'").get() as any;
+    if (!cashierPageGranted) {
+      // '"/cashier"' is quoted on BOTH sides, so the LIKE is an exact JSON
+      // element test — it cannot be satisfied by a longer path that merely
+      // starts with /cashier.
+      db.prepare(
+        `UPDATE roles
+            SET page_access = json_insert(page_access, '$[#]', '/cashier'),
+                updated_at  = datetime('now')
+          WHERE name = 'Cashier'
+            AND page_access IS NOT NULL
+            AND json_valid(page_access)
+            AND page_access NOT LIKE '%"/cashier"%'`,
+      ).run();
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cashier_role_page_grant_v1', '1')").run();
+    }
+  } catch (e) { console.error('cashier_role_page_grant_v1 migration failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

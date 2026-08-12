@@ -74,6 +74,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/dine-in/service-requests', // Captain accept/complete of table service requests
   '/api/dine-in/kds',         // KDS bump (the SSE stream is GET, exempt)
   '/api/dine-in/offline-print', // print-station config + print-job journal
+  '/api/dine-in/cashier-presence', // which cashier holds which floor — holding a floor decides who may settle there
   '/api/tables',              // QR standee token generation (admin)
   '/api/crm',                 // AKAN CRM (chat/training/quiz/settings) — guest-quiz is carved out in isPublic
   '/api/whatsapp',            // WhatsApp Integration (config/templates) — webhook is carved out in isPublic

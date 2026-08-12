@@ -1,6 +1,6 @@
 import { getDb, recordSale } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId, canApproveTableOp } from '@/lib/auth';
-import { canWorkTable } from '@/lib/captain-area';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { settleAuthority, recordSettleOverride } from '@/lib/settle-authority';
 import { todayIST } from '@/lib/format-date';
 import { computeBill, sumItemTax } from '@/lib/bill-calc';
 import { resolveFloorStore } from '@/lib/store-engine';
@@ -12,7 +12,14 @@ import { resolveFloorStore } from '@/lib/store-engine';
  * inventory), stores the authoritative totals and flips the order to 'on_hold'
  * so the table frees and the amount shows under the cashier's Outstanding
  * Payment tab. Payment is collected later via settle (which accepts on_hold).
- * Gated exactly like settle (cashier/manager/admin, or a captain on their table).
+ *
+ * GATED BY THE SAME FUNCTION AS SETTLE, AND THAT IS NOT OPTIONAL. Hold performs
+ * every irreversible half of a settle except taking the money — it writes the
+ * sales rows, deducts the stock and FREEZES the totals, and settle-from-hold
+ * then collects exactly the frozen `orders.total` and skips its own item loop.
+ * So anyone who can hold a bill can decide what that bill will cost. Both routes
+ * call settleAuthority() from src/lib/settle-authority.ts and nothing else; gate
+ * settle alone and hold is the bypass.
  */
 function loadBillDesign(db: ReturnType<typeof getDb>) {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'bill_design'").get() as any;
@@ -37,8 +44,23 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as any;
     if (!order) return Response.json({ error: 'Order not found' }, { status: 404 });
     if (order.status !== 'open') return Response.json({ error: 'Only an open order can be put on hold' }, { status: 409 });
-    if (!canApproveTableOp(me) && !canWorkTable(db, me, order.table_id)) {
-      return Response.json({ error: 'You are not allowed to hold this bill' }, { status: 403 });
+    // Same authority as settle — see the header. Actor from the session cookie,
+    // floor re-derived server-side from the ORDER's table, decided before
+    // req.json() is read, so no body field or header can influence it. The
+    // refusal carries `reason` + the offer flags so the UI can show a check-in
+    // or take-over button instead of a bare 403.
+    const auth = settleAuthority(db, me, order, outletId);
+    if (!auth.allowed) {
+      return Response.json({
+        error: auth.message,
+        reason: auth.reason,
+        floor: auth.floor,
+        floorName: auth.floorName,
+        // Trimmed exactly as settle does — same authority, same payload shape.
+        cashier: auth.cashier ? { userId: auth.cashier.userId, userName: auth.cashier.userName } : null,
+        offerCheckIn: auth.offerCheckIn,
+        offerTakeOver: auth.offerTakeOver,
+      }, { status: auth.status });
     }
 
     const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(id) as any[];
@@ -102,7 +124,27 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     });
     hold();
 
-    return Response.json({ success: true, order_id: id, total: bill.total, status: 'on_hold', lines: items.length });
+    // THE OVERRIDE LEDGER — same as settle: hold freezes the same totals and
+    // writes the same sales rows, so a management hold past a live floor
+    // cashier is recorded identically ('cashier.override_hold'). After the
+    // commit; a no-op unless the authority result was 'manager_override'.
+    recordSettleOverride(db, auth, { actor: me, orderId: id, action: 'hold', outletId });
+
+    return Response.json({
+      success: true, order_id: id, total: bill.total, status: 'on_hold', lines: items.length,
+      // SURFACE THE OVERRIDE — identical to settle's success payload: when
+      // management held past a live floor cashier, the client renders "Held by
+      // <manager> — <cashier> holds this floor" from these recorded facts.
+      // null on every ordinary hold.
+      override: auth.reason === 'manager_override' && auth.override
+        ? {
+            by: String(me.name || me.email || ''),
+            bypassed: auth.override.bypassed.userName || 'the floor cashier',
+            floor: auth.floor,
+            floorName: auth.floorName,
+          }
+        : null,
+    });
   } catch (e: any) {
     console.error('[/api/dine-in/orders/[id]/hold]', e);
     return Response.json({ error: e.message }, { status: 500 });

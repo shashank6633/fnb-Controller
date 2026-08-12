@@ -1,6 +1,6 @@
 import { getDb, recordSale, generateId } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId, canApproveTableOp } from '@/lib/auth';
-import { canWorkTable } from '@/lib/captain-area';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { settleAuthority, recordSettleOverride } from '@/lib/settle-authority';
 import { todayIST } from '@/lib/format-date';
 import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
 import { resolveFloorStore } from '@/lib/store-engine';
@@ -49,14 +49,46 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const fromHold = order.status === 'on_hold';
     if (order.status !== 'open' && !fromHold) return Response.json({ error: 'Order is not open' }, { status: 409 });
 
-    // Authorization — settling closes the bill, writes sales rows + deducts stock,
-    // so it must be gated (it previously only checked sign-in). Allow a
-    // cashier/manager/admin (canApproveTableOp) OR anyone allowed to work this
-    // table (canWorkTable: true for unrestricted operators, and for a captain
-    // only within their assigned area) — preserving every existing settle flow
-    // while stopping an area-restricted captain from closing arbitrary bills.
-    if (!canApproveTableOp(me) && !canWorkTable(db, me, order.table_id)) {
-      return Response.json({ error: 'You are not allowed to settle this bill' }, { status: 403 });
+    // ── AUTHORIZATION ────────────────────────────────────────────────────────
+    // Settling closes the bill, writes the sales rows, deducts stock and takes
+    // the money, so who may do it is the owner's OVERRIDE model: the cashier
+    // checked in on THIS bill's floor settles normally; manager/admin may
+    // ALWAYS settle (recorded as an override below when a cashier held the
+    // floor); other staff must be till-capable and hold the floor.
+    // src/lib/settle-authority.ts is the single place that decides, and
+    // /api/dine-in/orders/[id]/hold calls the identical function — hold freezes
+    // these same totals and routes back through here, so gating one without the
+    // other would leave hold as the bypass.
+    //
+    // WHAT THIS REPLACES: `!canApproveTableOp(me) && !canWorkTable(db, me,
+    // order.table_id)`. canWorkTable() returns true for everyone unless the
+    // setting captain_area_lock === '1', and that key has never existed in this
+    // database and nothing seeds it — so the && was always false and this 403
+    // was unreachable. Settle's real gate was "presents a session cookie".
+    //
+    // NOTHING HERE IS CLIENT-SUPPLIED, deliberately: the actor comes from the
+    // session cookie via getCurrentUser(), the floor is re-derived server-side
+    // from the ORDER's table_id, and this runs before req.json() is even read.
+    // There is no body field, header or query param that can move it.
+    //
+    // The refusal carries `reason` and the offer flags rather than a bare
+    // "Forbidden": a cashier standing at the counter with a guest waiting needs
+    // to be told whose floor it is and that one tap checks them in.
+    const auth = settleAuthority(db, me, order, outletId);
+    if (!auth.allowed) {
+      return Response.json({
+        error: auth.message,
+        reason: auth.reason,
+        floor: auth.floor,
+        floorName: auth.floorName,
+        // Trimmed to the two fields the UI names the holder with, matching
+        // request-bill's state(). The presence row also carries outletId,
+        // checkedInAt and lastSeen — server-side bookkeeping a refused caller
+        // has no use for and should not be handed.
+        cashier: auth.cashier ? { userId: auth.cashier.userId, userName: auth.cashier.userName } : null,
+        offerCheckIn: auth.offerCheckIn,
+        offerTakeOver: auth.offerTakeOver,
+      }, { status: auth.status });
     }
 
     const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(id) as any[];
@@ -220,6 +252,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     });
     settle();
 
+    // THE OVERRIDE LEDGER. If management just settled past a live floor
+    // cashier ('manager_override'), record who settled, when, and who was
+    // bypassed. AFTER the commit, so the ledger holds settles that actually
+    // happened; a no-op for every other reason, so this is unconditional and
+    // cannot get the condition wrong. logAuditEvent never throws.
+    recordSettleOverride(db, auth, { actor: me, orderId: id, action: 'settle', outletId });
+
     // Order is now 'settled': if it came from a reservation, flip that booking
     // seated → completed. Best-effort — the lib swallows errors so a booking
     // hiccup can never fail an already-committed settle.
@@ -235,7 +274,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // closed_at — never completed_by — so captain-performance is untouched.
     closeServiceRequestsForOrder(db, id);
 
-    return Response.json({ success: true, order_id: id, total: bill.total, payment_method: primaryMethod, payments, lines: items.length });
+    return Response.json({
+      success: true, order_id: id, total: bill.total, payment_method: primaryMethod, payments, lines: items.length,
+      // SURFACE THE OVERRIDE. When management settled past a live floor cashier
+      // the client should say so ("Settled by <manager> — <cashier> holds this
+      // floor"), so the success payload carries the same facts the ledger just
+      // recorded — names from the authority result, never a client-side guess.
+      // null on every ordinary settle.
+      override: auth.reason === 'manager_override' && auth.override
+        ? {
+            by: String(me.name || me.email || ''),
+            bypassed: auth.override.bypassed.userName || 'the floor cashier',
+            floor: auth.floor,
+            floorName: auth.floorName,
+          }
+        : null,
+    });
   } catch (e: any) {
     console.error('[/api/dine-in/orders/[id]/settle]', e);
     return Response.json({ error: e.message }, { status: 500 });

@@ -56,6 +56,33 @@ export async function GET() {
 
     const isAdmin = me.role === 'admin';
 
+    // ── Tables waiting for the bill (captain → cashier) ───────────────────
+    // FIRST in the list on purpose: every other bucket is paperwork that can
+    // wait, this one is a guest sitting with a card in their hand.
+    //
+    // Role-targeting is not a new rule here — pendingBillRequestCount() filters
+    // through settleAuthorityForFloor(), the SAME function that gates POST
+    // /settle. So the cashier checked in on a floor is badged for that floor's
+    // requests and no others; a floor with nobody checked in falls through to
+    // manager/admin and to any other cashier, so an unmanned floor's request is
+    // never silently dropped; a takeaway bill has no floor and reaches every
+    // till; and no one is ever badged for work they would be 403'd on.
+    //
+    // Counts UNSEEN requests only. Once a cashier opens the bill the badge
+    // stops nagging, while the table stays marked on the cashier board until
+    // the bill is actually closed — the bell is "nobody has picked this up",
+    // the board is "this table still wants to pay".
+    //
+    // Isolated like the other additive buckets so a bill-request schema issue
+    // can never break the whole inbox.
+    try {
+      const { pendingBillRequestCount } = await import('@/lib/bill-request');
+      push('bill_requests', 'Tables waiting for the bill',
+        pendingBillRequestCount(db, me, outletId), '/cashier');
+    } catch (brErr) {
+      console.error('[/api/notifications/inbox] bill-request bucket failed:', brErr);
+    }
+
     // ── HOD approval inbox ────────────────────────────────────────────────
     if (canApproveAsChef(me)) {
       // Same dept scoping as the /requisitions page: null = see all

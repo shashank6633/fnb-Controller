@@ -31,7 +31,15 @@ export async function GET(request: Request) {
              o.id AS open_order_id, o.order_number AS open_order_number, o.total AS open_order_total,
              o.server_id AS open_order_server_id, o.server_name AS open_order_captain,
              o.guest_name AS open_order_guest, o.booking_id AS open_order_booking_id,
-             o.bill_printed_at AS open_order_bill_printed_at
+             o.bill_printed_at AS open_order_bill_printed_at,
+             -- Captain → cashier bill request (src/lib/bill-request.ts). Two more
+             -- columns on a join the board already runs, so the cashier's marked
+             -- table costs nothing extra per tile. Requested-but-unseen is the
+             -- state that gets the loud colour; seen keeps the table marked but
+             -- quiet. Every consumer of this list is signed in, so exposing the
+             -- flag here is no wider than the totals beside it.
+             o.bill_requested_at AS open_order_bill_requested_at,
+             o.bill_seen_at AS open_order_bill_seen_at
       FROM restaurant_tables t
       LEFT JOIN orders o ON o.table_id = t.id AND o.status = 'open'
       WHERE t.is_active = 1 AND (t.outlet_id = ? OR t.outlet_id IS NULL)${area ? ` AND ${area.sql}` : ''}
