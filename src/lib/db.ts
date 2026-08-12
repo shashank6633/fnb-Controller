@@ -5483,6 +5483,46 @@ function initializeSchema(db: Database.Database) {
       db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cashier_role_page_grant_v1', '1')").run();
     }
   } catch (e) { console.error('cashier_role_page_grant_v1 migration failed:', e); }
+
+  // ── Discount request limits — ONE-SHOT, the owner's stated policy ──────────
+  //
+  // Measured 2026-08-12: EVERY seeded role had can_request_discount = 0 and
+  // max_discount_pct = 0, so nobody could request a discount at all — not even
+  // an Administrator. The owner set the policy: Cashier 10%, Manager 30%,
+  // Administrator 100%. Approval is unchanged and still a live Manager/Admin
+  // login at the till (orders/[id]/discount verifies it on the spot), so this
+  // grants the right to ASK, never the right to approve.
+  //
+  // WHY THIS ALSO UNBLOCKS ADMINS. auth.ts computes can_request_discount = true
+  // for the admin tier unconditionally, but the discount ROUTE does not — it
+  // reads the role row and compares max_discount_pct. With the row at 0 an
+  // admin was refused by their own limit while the session said they were
+  // allowed. Setting Administrator to 100 makes the two agree.
+  //
+  // ONE-SHOT AND NON-CLOBBERING, for the same reason as the grant above: these
+  // are admin-owned decisions and scripts/check-boot-migrations.js exists to
+  // keep deploys out of them. The flag stops it re-running, and each UPDATE is
+  // additionally guarded on can_request_discount = 0 so a limit an admin has
+  // since tuned in Settings -> Roles is never overwritten, even if the flag
+  // were lost.
+  //
+  // DELIBERATELY NOT INCLUDED: Bar Manager, Floor Manager, Head Chef, Store
+  // Manager. The owner named three roles; extending a money permission to roles
+  // he did not name is not mine to do. Any of them can be enabled in
+  // Settings -> Roles.
+  try {
+    const done = db.prepare("SELECT value FROM settings WHERE key='discount_limits_v1'").get() as any;
+    if (!done) {
+      const grant = db.prepare(
+        `UPDATE roles SET can_request_discount = 1, max_discount_pct = ?, updated_at = datetime('now')
+          WHERE name = ? AND can_request_discount = 0`,
+      );
+      for (const [role, pct] of [['Cashier', 10], ['Manager', 30], ['Administrator', 100]] as const) {
+        grant.run(pct, role);
+      }
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('discount_limits_v1', '1')").run();
+    }
+  } catch (e) { console.error('discount_limits_v1 migration failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----
