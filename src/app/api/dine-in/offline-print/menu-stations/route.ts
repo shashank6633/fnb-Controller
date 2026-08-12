@@ -48,9 +48,23 @@ export async function GET() {
 
     // Distinct table zones (= floors) so the printer Floor field can be a
     // dropdown that always matches a real table zone (no typos / mismatches).
+    //
+    // is_active = 1 IS LOAD-BEARING. Deleting a table here is a SOFT delete —
+    // the POST in api/dine-in/tables revives a deactivated row rather than
+    // inserting a new one, so the row survives with is_active = 0. Without this
+    // filter the dropdown kept offering the zone names of tables the owner had
+    // already deleted: after renaming a floor from "1ST FLOOR" to "First Floor"
+    // both appeared, and picking the dead one routes a printer at a floor no
+    // live table belongs to. The tables list itself has always filtered on
+    // is_active (api/dine-in/tables GET); this query was the one that did not.
+    //
+    // A printer already assigned to a now-dead zone does NOT vanish from the
+    // form — the page adds it back as "<zone> (not a table zone)" so the
+    // mis-assignment is visible instead of silently reset.
     const zones = (db.prepare(
       `SELECT DISTINCT TRIM(zone) AS zone FROM restaurant_tables
-       WHERE TRIM(COALESCE(zone, '')) <> '' AND (outlet_id = ? OR outlet_id IS NULL)
+       WHERE is_active = 1 AND TRIM(COALESCE(zone, '')) <> ''
+         AND (outlet_id = ? OR outlet_id IS NULL)
        ORDER BY zone`
     ).all(outletId) as any[]).map((r) => r.zone);
 

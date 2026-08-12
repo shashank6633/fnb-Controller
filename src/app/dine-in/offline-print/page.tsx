@@ -55,6 +55,9 @@ export default function OfflinePrintPage() {
   const [saving, setSaving] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [showHelp, setShowHelp] = useState(false);
+  // Collapsed by default — unlike the bridge troubleshooter it never force-opens,
+  // because a USB printer is a one-time setup, not a fault state.
+  const [showUsbHelp, setShowUsbHelp] = useState(false);
   const [queue, setQueue] = useState({ pending: 0, failed: 0, printed: 0 });
   const [pstatus, setPstatus] = useState<Record<string, PrinterStatus | null>>({});
   const [checkingPrinters, setCheckingPrinters] = useState(false);
@@ -559,7 +562,72 @@ export default function OfflinePrintPage() {
             <pre className="bg-[#2D1B0E] text-[#F5E9DC] text-[11px] rounded-lg p-2 overflow-x-auto whitespace-pre-wrap">{`powershell -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm ${typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1 -OutFile $env:TEMP\\i.ps1; & $env:TEMP\\i.ps1"`}</pre>
             <p className="text-xs text-[#8B7355]"><b>If it says “Unable to connect to the remote server”:</b> let the browser download it instead — open <code className="bg-[#FFF1E3] px-1 rounded break-all">{typeof window !== 'undefined' ? window.location.origin : ''}/install-bridge-service.ps1</code> in this browser (choose <b>Keep</b> if warned), then in an <b>admin</b> PowerShell run <code className="bg-[#FFF1E3] px-1 rounded break-all">{'powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\\Downloads\\install-bridge-service.ps1"'}</code>. Wait for <b>HEALTHY — v2.2.1</b>.</p>
 
-            <p className="text-xs text-[#8B7355] mt-1">Add printers below. <b>USB</b>: share it in Windows, enter <code className="bg-[#FFF1E3] px-1 rounded">\\localhost\POS80</code>. <b>Network</b>: enter <code className="bg-[#FFF1E3] px-1 rounded">192.168.1.50:9100</code>. Everything is on-site, so printing keeps working even if the internet drops.</p>
+            <p className="text-xs text-[#8B7355] mt-1">Add printers below. <b>USB</b>: enter the printer&apos;s name exactly as Windows lists it (see the USB guide card below — sharing is no longer needed). <b>Network</b>: enter <code className="bg-[#FFF1E3] px-1 rounded">192.168.1.50:9100</code>. Everything is on-site, so printing keeps working even if the internet drops.</p>
+          </div>
+        )}
+      </div>
+
+      {/* USB printer guide. Its own card rather than a paragraph inside the bridge
+          troubleshooter: the bridge card auto-opens only when the bridge is DOWN,
+          and someone wiring a USB printer has usually just got it UP. The old
+          one-line hint also told people to share the printer and use
+          \\localhost\NAME — the legacy path. Since bridge v2.5.0 a plain printer
+          NAME is raw-spooled through the Win32 spooler with no sharing at all, so
+          that hint was sending people the long way round. */}
+      <div className="bg-white border border-[#E8D5C4] rounded-xl">
+        <button onClick={() => setShowUsbHelp(!showUsbHelp)} className="w-full flex items-center justify-between p-4 text-left">
+          <span className="font-semibold text-[#2D1B0E]">Adding a USB printer (bill or KOT)</span>
+          {showUsbHelp ? <ChevronDown className="w-5 h-5 text-[#8B7355]" /> : <ChevronRight className="w-5 h-5 text-[#8B7355]" />}
+        </button>
+        {showUsbHelp && (
+          <div className="px-4 pb-4 text-sm text-[#6B5744] space-y-3">
+            <p className="text-xs bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg px-3 py-2">
+              A USB printer is driven by the <b>print bridge on the PC it is plugged into</b> — not over the network.
+              So the bridge must be running on <i>that</i> PC, and the printer must already be installed in the
+              operating system (it prints a Windows test page). If the bridge is down, start it first: nothing below will work.
+            </p>
+
+            <p className="font-medium text-[#2D1B0E]">1. Get the printer&apos;s exact name</p>
+            <p>
+              This is the one step people get wrong. The name must match <b>character for character</b>, including
+              spaces — <code className="bg-[#FFF1E3] px-1 rounded">Rugtek RP80</code> is not the same as
+              <code className="bg-[#FFF1E3] px-1 rounded ml-1">RUGTEK RP80</code>.
+            </p>
+            <ul className="list-disc pl-5 space-y-1 text-xs">
+              <li><b>Windows:</b> Settings → Bluetooth &amp; devices → Printers &amp; scanners. Copy the name shown.</li>
+              <li><b>Mac:</b> System Settings → Printers &amp; Scanners, or run <code className="bg-[#FFF1E3] px-1 rounded">lpstat -p</code> in Terminal.</li>
+              <li><b>Or ask the bridge itself</b> — it lists every installed printer, which avoids typos entirely:
+                <code className="bg-[#FFF1E3] px-1 rounded break-all ml-1">{bridgeUrl || 'http://localhost:9920'}/printers</code>
+              </li>
+            </ul>
+
+            <p className="font-medium text-[#2D1B0E]">2. Add it here</p>
+            <p className="text-xs">
+              <b>Add printer</b> → <b>Prints</b>: <i>Bill (customer receipt)</i> or the KOT station →
+              <b> Connection</b>: <i>USB</i>. The address field relabels itself to
+              <b> &ldquo;OS printer / share name&rdquo;</b> — paste the name from step 1 there.
+              <b> Do not enter an IP for USB.</b> Set the paper width (80mm for most thermal printers), then <b>Save</b>
+              and press <b>Test bill</b> / <b>Test kot</b>.
+            </p>
+
+            <p className="font-medium text-[#2D1B0E]">3. If the test fails</p>
+            <ul className="list-disc pl-5 space-y-1 text-xs">
+              <li><b>&ldquo;Failed to fetch&rdquo;</b> — the browser could not reach the bridge at all. That is the bridge
+                being down or on a different PC, not a printer problem. Fix the bridge first.</li>
+              <li><b>Nothing prints and no error</b> — the name is almost certainly slightly wrong. Compare it against
+                the <code className="bg-[#FFF1E3] px-1 rounded">/printers</code> list above rather than retyping it.</li>
+              <li><b>Garbled characters or pages of symbols</b> — the printer is being driven through a graphics
+                driver. Reinstall it in the OS as <b>Generic / Text Only</b>, or use the vendor&apos;s ESC/POS driver.</li>
+              <li><b>It worked, then stopped</b> — check the bridge window is still open. If it exited, the error
+                printed in that window is the real cause; send it on.</li>
+            </ul>
+
+            <p className="text-xs text-[#8B7355]">
+              <b>Sharing is not required.</b> The bridge raw-spools straight to the installed printer.
+              The older <code className="bg-[#FFF1E3] px-1 rounded">\\localhost\NAME</code> share form still works if
+              it is already set up that way, but it needs a <i>Generic / Text Only</i> driver to pass raw bytes and
+              there is no reason to start there now.
+            </p>
           </div>
         )}
       </div>
