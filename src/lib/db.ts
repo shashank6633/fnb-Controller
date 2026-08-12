@@ -2623,6 +2623,21 @@ function initializeSchema(db: Database.Database) {
     if (!oiCols.some((c: any) => c.name === 'scan_code'))       db.exec(`ALTER TABLE order_items ADD COLUMN scan_code TEXT`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_order_items_kitchen_sent ON order_items(kitchen_sent_at)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_order_items_scan_code ON order_items(scan_code)`);
+    // UNDO A COMPLETED KOT (owner ruling 2026-08-12) — kots.served_at anchors the
+    // window in which the KDS 'Served' bump can still be taken back, and the
+    // recipe consumption is DEFERRED until that window closes rather than posted
+    // at the bump (src/lib/kot-completion.ts explains why deferring beats
+    // reversing). It had to be a new column: kots.updated_at is bumped by the
+    // reprint and resend routes, so a re-sent ticket would silently re-open the
+    // window, and created_at is the FIRE time. NULL means "never served through
+    // the KDS bump" — every historical row, and every ticket the offline replay
+    // writes straight to 'served', so neither is ever swept or undoable.
+    if (!kCols.some((c: any) => c.name === 'served_at')) db.exec(`ALTER TABLE kots ADD COLUMN served_at TEXT`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_kots_served_at ON kots(served_at)`);
+    // The window itself, in seconds. 10 is what the owner asked for; the Kitchen
+    // Display lets a manager change it (0 = no undo, consume inline as before).
+    // OR IGNORE so a tuned value survives every future deploy.
+    db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('kot_undo_window_seconds', '10')`);
     // KOT escalation: a captain flags a KOT that would not print, so the Manager
     // (in-app) and the Kitchen Display both see "not printed — action needed".
     db.exec(`
@@ -4630,6 +4645,103 @@ function initializeSchema(db: Database.Database) {
     // state to disambiguate later.
     addCtCol('telecmi_recorded', `TEXT NOT NULL DEFAULT 'unknown'`); // 'yes' | 'no' | 'unknown'
 
+    // ── WHERE DID THIS DURATION COME FROM, AND CAN WE PROVE IT? ──────────────
+    // (additive; same idempotent addCtCol pattern)
+    //
+    // The Call Back flow logs an OUTBOUND call the GRE placed from their own
+    // handset. On Android the Captain APK reads the exact talk time out of the
+    // device call log; everywhere else the number is a wall-clock estimate or
+    // typed by hand. Until now all four cases landed in the same duration_sec
+    // column and rendered identically, and the only note of provenance was a
+    // duration_source key stringified into the raw_payload JSON blob — which
+    // is not selected by any API and is read by nothing. So there was no way,
+    // in the app or in plain SQL, to tell a measured duration from a typed one.
+    //
+    // TWO COLUMNS, BECAUSE THEY ANSWER TWO DIFFERENT QUESTIONS:
+    //
+    //   duration_source   — what the CLIENT says it is. The callback log path
+    //                       writes one of four words, the set it already
+    //                       whitelists: 'call_log' (Android call log),
+    //                       'approx' (the APK's own wall time, used when
+    //                       READ_CALL_LOG was denied), 'timer' (the web
+    //                       time-away estimate) or 'manual' (typed from zero).
+    //                       '' means no callback ever wrote this row — every
+    //                       CDR/live/seeded call, and the whole history that
+    //                       predates this column. A CLAIM either way: all four
+    //                       words arrive in a request body.
+    //
+    //   duration_verified — 0/1. 1 ONLY when the server itself BOUNDED the
+    //                       number: the client redeemed a single-use
+    //                       ct_call_tokens row minted when the GRE tapped Call
+    //                       Back, and the claim was checked against the wall
+    //                       time elapsed since. BOUNDED, not clamped — the
+    //                       clamp only bites when the claim exceeds that wall
+    //                       time, so an honest 60s call five minutes after
+    //                       dialling is verified and untouched. See
+    //                       src/lib/ct/call-token.ts. This is the column any
+    //                       honesty badge must read.
+    //
+    // WHY DEFAULT '' AND 0. NOT NULL DEFAULT back-fills every existing row
+    // inside the ALTER itself (the trick owner_email and telecmi_recorded both
+    // use), so the whole call history — every seeded row, every CDR row, every
+    // callback logged before this shipped — lands as unknown-source and
+    // UNVERIFIED. That is the truthful state for all of them: nothing in that
+    // history was ever bounded by the server. No data migration, and the fail
+    // state is the safe one, because a reader that forgets the column entirely
+    // still gets "not verified" rather than a false claim of accuracy.
+    addCtCol('duration_source',   `TEXT NOT NULL DEFAULT ''`);    // 'call_log'|'approx'|'timer'|'manual', '' = no callback wrote it — CLAIMED, not proven
+    addCtCol('duration_verified', `INTEGER NOT NULL DEFAULT 0`);  // 1 = server bounded it against a redeemed call token (clamped only if the claim exceeded the wall time)
+
+    // ── ct_call_tokens — the wall-clock receipt for an outbound call back ────
+    //
+    // WHAT IT IS FOR. The GRE taps Call Back; before the dialer opens, the
+    // client asks the server to mint a row here. The server records WHO asked,
+    // WHICH number, and WHEN — on the server clock, which no handset and no
+    // address bar can move. When the log posts back carrying that token id,
+    // the accepted talk time is clamped to (now - issued_at): you cannot have
+    // talked for longer than the wall time since you started dialling. The
+    // token is then marked redeemed, so the same token cannot VOUCH for a
+    // second call. Read "single use" as "a claim can only be vouched for once",
+    // NEVER as "rows cannot be fabricated" — a replay outside the de-dupe
+    // window still inserts a complete ct_calls row; it just lands with
+    // duration_verified = 0. What bounds row CREATION is the de-dupe window and
+    // the per-agent burst cap in log-callback, not this table.
+    //
+    // WHY A TOKEN AND NOT A SIGNATURE. The alternative was signing the APK's
+    // return URL, which needs a shared secret shipped inside an APK — and an
+    // APK is a zip anyone can open. A server-issued, server-timed, single-use
+    // row needs no secret and needs no APK change at all.
+    //
+    // ISSUING MUST NEVER BLOCK THE CALL. If minting fails (offline, server
+    // down) the GRE still dials and the call is still logged — just with
+    // duration_verified = 0. Losing a real guest call to protect a statistic
+    // would be a worse bug than the one this closes.
+    //
+    // EMPTY STRING, NOT NULL, for redeemed_at / redeemed_call_id / recovery_id
+    // — the convention every other ct_ table here uses, so no query needs a
+    // NULL guard. redeemed_at = '' IS the unredeemed state, and it is what the
+    // single-use check tests.
+    //
+    // THIS TABLE IS EPHEMERAL. One row per Call Back tap, and a row is useless
+    // the moment it is redeemed or a day old. issueCallToken() prunes anything
+    // older than 24h on its way past, so the table stays bounded without a
+    // sweeper. Nothing of record lives here — the CALL is the record.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ct_call_tokens (
+        id               TEXT PRIMARY KEY,
+        agent_email      TEXT NOT NULL,
+        phone_e164       TEXT NOT NULL,
+        recovery_id      TEXT NOT NULL DEFAULT '',
+        issued_at        TEXT NOT NULL,
+        redeemed_at      TEXT NOT NULL DEFAULT '',
+        redeemed_call_id TEXT NOT NULL DEFAULT ''
+      );
+    `);
+    // The prune is a range scan on issued_at alone; redemption looks a row up
+    // by its PRIMARY KEY. Those are the only two access paths, so issued_at is
+    // the only index worth carrying.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_call_tokens_issued ON ct_call_tokens(issued_at)`);
+
     // ── Reservation → table seating (Part A) + table party (Part B) ──────────
     // Additive columns; per-column try/catch makes the ALTER idempotent.
     const addBookingCol = (col: string, decl: string) => {
@@ -5084,6 +5196,155 @@ function initializeSchema(db: Database.Database) {
       db.exec(`ALTER TABLE wastages ADD COLUMN return_item_id TEXT`);
     }
   } catch (e) { console.error('material_returns schema failed:', e); }
+
+  // ── CENTRAL STORE CUTOVER — re-base the book on a physical count ──────────
+  //
+  // WHY. raw_materials.current_stock is a RUNNING BALANCE, never an
+  // observation: 39 writers in src/ and every one of them adds to or subtracts
+  // from it. Outflows record themselves (an issue writes a row); inflows need a
+  // human to type a purchase. Cash-market runs and door-drop deliveries arrive
+  // physically and are never typed, so the error is one-directional and
+  // cumulative, and every variance report today measures DRIFT rather than
+  // LOSS. The cutover counts the shelf once, SETS the book to it, and stamps
+  // the date from which a variance means something.
+  //
+  // TWO TABLES, AND WHY NOT THE OBVIOUS ONES:
+  //   NOT closing_stock — that is the table /api/variance-report reads. Writing
+  //     the count there turns every counted material into a variance line on
+  //     cutover day, measured against all-time theoretical history, i.e. a
+  //     fabricated shrinkage report on the exact day the owner is watching.
+  //   NOT variance_approvals — a row there is an actionable admin queue item
+  //     that /api/notifications/inbox counts into the bell, and approving one
+  //     posts a stale count-time delta onto the freshly-corrected book. Several
+  //     hundred of them would destroy the queue and could undo the cutover one
+  //     click at a time.
+  //   NOT inventory_transactions — an 'adjustment' row is NOT report-neutral in
+  //     the negative direction: analytics (top-consumed), inventory/priority
+  //     (consumption frequency) and crm-analyst-data (idle capital) all filter
+  //     on `quantity < 0` with no type predicate, so a downward re-base would
+  //     read as consumption. Ruling 1 says the correction never enters
+  //     consumption, P&L or variance, so the cutover writes NO transaction row
+  //     and central_cutover_lines IS its ledger. The trade-off is real and must
+  //     be said on screen: central stock jumps with no inventory_transactions
+  //     row behind it, and this table is the only record of why.
+  //
+  // NO outlet_id, deliberately. closing_stock and variance_approvals both carry
+  // one, but raw_materials.current_stock is a SINGLE GLOBAL POOL with no outlet
+  // dimension at all. A per-outlet column here would let a screen imply a
+  // per-outlet cutover, which would be a lie. This re-bases the one central
+  // pool, building-wide, whatever outlet the admin is sitting in.
+  //
+  // The stamp (settings.central_store_cutover_at) is NOT seeded or written
+  // here. It is admin-owned state, written once by the explicit commit action
+  // in src/lib/central-cutover.ts — mirroring dept_ledger_cutover_at above and
+  // the rule scripts/check-boot-migrations.js exists to enforce.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS central_cutover_batches (
+        id                 TEXT PRIMARY KEY,
+        -- IST business date the shelf was physically counted. NOT the commit
+        -- time: a sheet counted this morning and typed this evening is dated
+        -- this morning.
+        cutover_date       TEXT NOT NULL,
+        status             TEXT NOT NULL DEFAULT 'draft'
+                           CHECK (status IN ('draft','committed','cancelled')),
+        note               TEXT NOT NULL DEFAULT '',
+        created_by         TEXT NOT NULL DEFAULT '',
+        created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        committed_by       TEXT NOT NULL DEFAULT '',
+        committed_at       TEXT NOT NULL DEFAULT '',
+        cancelled_by       TEXT NOT NULL DEFAULT '',
+        cancelled_at       TEXT NOT NULL DEFAULT '',
+        -- SUMMARY, frozen at commit and never recomputed. These are what the
+        -- single bell notification quotes ("847 counted, 612 with variance,
+        -- net Rs X"). Frozen rather than derived because a line's material can
+        -- later be deleted, and a headline that drifts away from the records
+        -- underneath it is worse than no headline.
+        counted_lines      INTEGER NOT NULL DEFAULT 0,
+        variance_lines     INTEGER NOT NULL DEFAULT 0,
+        -- Rs, INFORMATION ONLY (Ruling 1). Never posted anywhere.
+        net_variance_value REAL NOT NULL DEFAULT 0,
+        shortage_value     REAL NOT NULL DEFAULT 0,   -- absolute Rs of the down lines
+        excess_value       REAL NOT NULL DEFAULT 0,   -- Rs of the up lines
+        -- 1 only for the batch whose commit actually wrote the stamp. A later
+        -- cutover is recorded but does not move the boundary, so it stores 0
+        -- and the screen can say which run set the date.
+        stamped            INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_central_cutover_batches_status
+        ON central_cutover_batches(status, cutover_date);
+
+      CREATE TABLE IF NOT EXISTS central_cutover_lines (
+        id                 TEXT PRIMARY KEY,
+        batch_id           TEXT NOT NULL,
+        material_id        TEXT NOT NULL,
+        -- Frozen label so a committed cutover still reads correctly after a
+        -- material is renamed or deleted. Never join through this.
+        material_name      TEXT NOT NULL DEFAULT '',
+        -- THE EXISTENCE OF THIS ROW MEANS "COUNTED". There is no row for an
+        -- uncounted material and no null quantity: a material with no count is
+        -- left completely untouched by the commit, and a blank cell is refused
+        -- at staging rather than coerced to 0. counted_qty = 0 IS a count —
+        -- "we looked and found none" — and is applied like any other.
+        counted_qty        REAL NOT NULL,             -- AS ENTERED, in counted_unit
+        counted_unit       TEXT NOT NULL DEFAULT '',  -- the unit the human typed
+        counted_basis      TEXT NOT NULL DEFAULT 'recipe'
+                           CHECK (counted_basis IN ('purchase','recipe')),
+        -- packFactor() at staging time, carrying the BOTH-HALVES guard. Stored
+        -- so the commit can refuse a line whose material was re-based by
+        -- /unit-audit after it was staged (that route rescales current_stock by
+        -- fNew/fOld and would otherwise multiply a counted figure).
+        pack_factor        REAL NOT NULL DEFAULT 1,
+        counted_qty_recipe REAL NOT NULL DEFAULT 0,   -- the figure written to current_stock
+        -- current_stock the moment this line was staged. INFORMATIONAL: it is
+        -- what makes the "moved since you counted" refusal quotable. The value
+        -- actually overwritten is book_qty_recipe below.
+        book_qty_at_stage  REAL NOT NULL DEFAULT 0,
+        staged_at          TEXT NOT NULL DEFAULT (datetime('now')),
+        -- SNAPSHOT TAKEN INSIDE THE COMMIT TRANSACTION — the value this line
+        -- actually overwrote. current_stock has no history of its own and is
+        -- not reconstructible from inventory_transactions on this database, so
+        -- these rows are the ONLY record of the pre-cutover book. 0 until the
+        -- batch commits.
+        book_qty_recipe    REAL NOT NULL DEFAULT 0,
+        variance_recipe    REAL NOT NULL DEFAULT 0,   -- counted - book, recipe units
+        recipe_unit        TEXT NOT NULL DEFAULT '',
+        purchase_unit      TEXT NOT NULL DEFAULT '',
+        -- Rs per PURCHASE unit from src/lib/closing-valuation.ts, NOT from
+        -- raw_materials.last_purchase_price (105 rows hold that in a mixed
+        -- basis, up to 5,000x out). rate_source travels with it so a screen can
+        -- say where the money came from.
+        unit_value         REAL NOT NULL DEFAULT 0,
+        rate_source        TEXT NOT NULL DEFAULT 'none',
+        variance_value     REAL NOT NULL DEFAULT 0,   -- Rs, INFORMATION ONLY
+        note               TEXT NOT NULL DEFAULT '',
+        -- THE ALERT RECORD. The owner asked for "an alert for every single
+        -- variance". Every line whose counted figure differs from the book sets
+        -- alert = 1 at commit and is listed, line by line, on the cutover
+        -- review screen — nothing is aggregated away. The BELL gets ONE
+        -- notification for the batch, because ~600 bell rows would destroy the
+        -- bell as a tool. reviewed_at = '' is the unreviewed state and is what
+        -- the bell counts.
+        alert              INTEGER NOT NULL DEFAULT 0,
+        reviewed_by        TEXT NOT NULL DEFAULT '',
+        reviewed_at        TEXT NOT NULL DEFAULT '',
+        review_note        TEXT NOT NULL DEFAULT '',
+        created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (batch_id) REFERENCES central_cutover_batches(id) ON DELETE CASCADE
+      );
+      -- One count per material per batch; re-staging a material UPDATEs its
+      -- line rather than stacking a second quantity on the same shelf.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_central_cutover_line
+        ON central_cutover_lines(batch_id, material_id);
+      CREATE INDEX IF NOT EXISTS idx_central_cutover_lines_batch
+        ON central_cutover_lines(batch_id);
+      CREATE INDEX IF NOT EXISTS idx_central_cutover_lines_material
+        ON central_cutover_lines(material_id);
+      -- The bell + review screen read exactly this: unreviewed alert lines.
+      CREATE INDEX IF NOT EXISTS idx_central_cutover_lines_alert
+        ON central_cutover_lines(alert, reviewed_at);
+    `);
+  } catch (e) { console.error('central_cutover schema failed:', e); }
 
   // ══ CASHIER FLOOR PRESENCE — who is manning which floor, right now ════════
   //

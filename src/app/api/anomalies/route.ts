@@ -1,4 +1,5 @@
 import { getDb } from '@/lib/db';
+import { getCentralStoreCutoverDate } from '@/lib/central-cutover';
 
 /**
  * Daily anomaly detector. Scans yesterday's data and last-30-day baselines
@@ -11,6 +12,27 @@ import { getDb } from '@/lib/db';
  *   - Materials below reorder level
  *
  * Each anomaly returns a severity + headline + detail + fix_url.
+ *
+ * THE CENTRAL-STORE CUTOVER FLOOR. The two closing-count items below (the
+ * per-item "Largest inventory variances" and the ₹ tie-out) read
+ * closing_stock.variance_value, a figure FROZEN at count time against
+ * raw_materials.current_stock. Before a cutover that book had drifted for
+ * months, so a pre-cutover count's variance is missing paperwork, not loss —
+ * and this feed is the owner's dashboard. Both are skipped when `yesterday`
+ * falls before the cutover date. The window is short by construction (yesterday
+ * moves) but it covers cutover morning, which is precisely when a wall of drift
+ * presented as red "Variance / high" anomalies would do the damage. Unstamped,
+ * getCentralStoreCutoverDate returns null, `preCutover` is false and neither
+ * block changes at all.
+ *
+ * The other four detectors are left alone deliberately, for two different
+ * reasons — do not "complete the set". Detectors 1, 2 and 4 read purchases,
+ * sales and receiving, never the book the cutover re-bases. Detector 5
+ * (materials below reorder level) DOES read raw_materials.current_stock, but it
+ * is a reorder alert with no date dimension and no variance figure: a re-based
+ * book makes it MORE accurate, not less, so there is nothing there to gate.
+ * Expect its output to move on cutover day — that is the correction landing,
+ * not a regression.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -38,6 +60,10 @@ export async function GET() {
     const yesterday = yesterdayISO();
     const sevenAgo = daysAgoISO(7);
     const thirtyAgo = daysAgoISO(30);
+    // >= keeps the cutover day itself reportable: the cutover writes no
+    // closing_stock row, so a genuine count dated that day still counts.
+    const cutoverDate = getCentralStoreCutoverDate(db);
+    const preCutover = !!cutoverDate && yesterday < cutoverDate;
     const anomalies: Anomaly[] = [];
 
     // 1. Purchase price spikes (yesterday vs 30-day avg)
@@ -107,8 +133,8 @@ export async function GET() {
       LIMIT 5
     `).all(yesterday) as any[];
     // Variance anomalies reveal the per-item system figure ("off by X vs system
-    // stock") — admin only.
-    if (isAdmin) for (const v of variances) {
+    // stock") — admin only, and suppressed for a pre-cutover count date.
+    if (isAdmin && !preCutover) for (const v of variances) {
       const tone = v.variance_value < 0 ? 'short' : 'over';
       anomalies.push({
         severity: Math.abs(v.variance_value) > 5000 ? 'high' : 'medium',
@@ -173,8 +199,9 @@ export async function GET() {
         (SELECT COALESCE(SUM(ABS(quantity)), 0) FROM inventory_transactions WHERE type='wastage' AND DATE(created_at) = ?) AS wasted
     `).get(yesterday, yesterday, yesterday) as any;
     const closingValue = (db.prepare(`SELECT COALESCE(SUM(ABS(variance_value)), 0) AS v FROM closing_stock WHERE date = ?`).get(yesterday) as any)?.v || 0;
-    // The tie-out ₹ figure is a closing-count variance total — admin only.
-    if (isAdmin && closingValue > 10000) {
+    // The tie-out ₹ figure is a closing-count variance total — admin only, and
+    // suppressed for a pre-cutover count date.
+    if (isAdmin && !preCutover && closingValue > 10000) {
       anomalies.push({
         severity: 'high',
         category: 'Tie-out',

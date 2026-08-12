@@ -83,6 +83,64 @@ export async function GET() {
       console.error('[/api/notifications/inbox] bill-request bucket failed:', brErr);
     }
 
+    // ── Bills parked on hold, unpaid ──────────────────────────────────────
+    // The other half of the cashier's audience. A HELD bill has already written
+    // its sales rows and deducted its stock — the food is gone and the money is
+    // not in the till — so an on_hold order nobody collects is a real loss that
+    // no screen nags about: it sits quietly on the /cashier Outstanding tab
+    // until someone thinks to look.
+    //
+    // TARGETED THE SAME WAY AS THE BILL REQUESTS ABOVE, through
+    // settleAuthorityForFloor(), because collecting one IS a settle: the floor's
+    // checked-in cashier is badged for their floor, an unmanned floor falls
+    // through to management, a floorless (takeaway) bill reaches every till, and
+    // a manned floor does not badge managers whose only route in is the override.
+    // Nobody is badged for a bill they would be 403'd on.
+    //
+    // COUNT ≡ DESTINATION: /cashier's Outstanding tab lists status 'on_hold' for
+    // the current outlet with the same lenient outlet rule (see GET
+    // /api/dine-in/orders), so the badge and the page agree — minus the
+    // authority filter, which can only ever narrow it to this person's own work.
+    //
+    // A standing state, like the reorder bucket: clearing the bell acks it and
+    // it re-surfaces only when the count grows.
+    try {
+      const { settleAuthorityForFloor } = await import('@/lib/settle-authority');
+      const held = db.prepare(`
+        SELECT o.id, o.table_id, rt.id AS rt_id, rt.zone AS rt_zone
+          FROM orders o
+          LEFT JOIN restaurant_tables rt ON rt.id = o.table_id
+         WHERE o.status = 'on_hold' AND (o.outlet_id = ? OR o.outlet_id IS NULL)
+      `).all(outletId) as any[];
+      if (held.length) {
+        const { normalizeFloor } = await import('@/lib/cashier-presence');
+        // Floor resolution must match rowFloor() in bill-request.ts: no table, or
+        // a table row that has since been deleted, means NO floor — reading a
+        // deleted table as the unzoned floor would hand an orphaned bill to
+        // whoever happens to be checked in there.
+        const cache = new Map<string, boolean>();
+        const mayCollect = (floor: string | null): boolean => {
+          const key = floor === null ? ' none' : floor;
+          let hit = cache.get(key);
+          if (hit === undefined) {
+            const a = settleAuthorityForFloor(db, me, floor, outletId);
+            hit = a.allowed && a.reason !== 'manager_override';
+            cache.set(key, hit);
+          }
+          return hit;
+        };
+        const n = held.filter((h) => {
+          const floor = !String(h.table_id ?? '').trim() || h.rt_id == null
+            ? null
+            : normalizeFloor(h.rt_zone);
+          return mayCollect(floor);
+        }).length;
+        push('held_bills', 'Bills on hold awaiting payment', n, '/cashier');
+      }
+    } catch (hbErr) {
+      console.error('[/api/notifications/inbox] held-bill bucket failed:', hbErr);
+    }
+
     // ── HOD approval inbox ────────────────────────────────────────────────
     if (canApproveAsChef(me)) {
       // Same dept scoping as the /requisitions page: null = see all

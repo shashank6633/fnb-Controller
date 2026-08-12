@@ -1,10 +1,10 @@
 'use client';
 
 /**
- * CaptainAlertsProvider — the captain's live alert feed, GLOBAL.
+ * CaptainAlertsProvider — the live alert feed, GLOBAL.
  *
- * Polls the captain's own tables (+ unclaimed) for new QR orders, table service
- * requests and KOT/kitchen issues every 8s and:
+ * Polls three dine-in feeds every 8s for new QR orders, table service requests
+ * and KOT/kitchen issues and:
  *   - raises a toast (+ two-tone chime) the moment a NEW one arrives, and
  *   - shows a FLOATING bell (bottom-right, above all content) with a live badge
  *     and a tap-through list — on EVERY screen, so a captain who has navigated
@@ -14,17 +14,48 @@
  * its "Orders & Requests" tab from the SAME single poll (no duplicate polling).
  *
  * Mounted once in AppShell so it wraps every route (main app + the /captain app).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHO GETS WHICH ALERT IS DECIDED ON THE SERVER (src/lib/alert-audience.ts).
+ * This component used to hold the entire targeting model in one line —
+ * `!owner || owner === meId` — while the three feeds handed every row in the
+ * outlet to any signed-in caller, so a store manager posting a GRN was chimed at
+ * for a table asking for water, and the "filter" was cosmetic besides. Now each
+ * feed returns only the rows this person is an audience for and says so on the
+ * wire, so THERE IS DELIBERATELY NO CLIENT-SIDE OWNER FILTER LEFT: re-filtering
+ * here would silently subtract from a supervisor's firehose, which is the exact
+ * failure this must not cause. What arrives is what belongs to you.
+ *
+ * The audience also decides where a tap LANDS (destFor) — a kitchen-only login
+ * used to be sent to /captain/requests, a page its role cannot open — and, when
+ * a person has no floor duty at all, that the 8s poll simply stops. It restarts
+ * on window focus, so a role change mid-shift is picked up without a reload.
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { Bell, X, CheckCheck } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { AlertAudience } from '@/lib/alert-audience';
 import {
   loadAck, saveAck, ackInboxItem, ackAlertId, ackEverything, refreshInboxAcks, pruneAck,
   isInboxAcked, isAlertAcked, type AckState,
 } from '@/lib/notif-ack';
 
-export interface CaptainAlert { id: string; text: string }
+/** `href` is where tapping this alert should go — see destFor(). */
+export interface CaptainAlert { id: string; text: string; href?: string }
+
+/** Guest-facing wording for a service-request type; the raw code is the fallback. */
+const SERVICE_LABEL: Record<string, string> = {
+  waiter: 'Call waiter',
+  water: 'Refill water',
+  cutlery: 'Extra cutlery',
+  bill: 'Bill requested',
+};
+
+/** The board an alert belongs to, for whoever is looking at it. */
+const REQUESTS_BOARD = '/captain/requests';
+const KITCHEN_BOARD = '/dine-in/kitchen';
+const CASHIER_BOARD = '/cashier';
 /** Action-Inbox bucket (approvals / requisitions / tasks) from /api/notifications/inbox. */
 interface InboxItem { key: string; label: string; count: number; href: string }
 
@@ -52,13 +83,37 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
     window.addEventListener('akan-notif-ack', onLocal);
     return () => { window.removeEventListener('storage', onStorage); window.removeEventListener('akan-notif-ack', onLocal); };
   }, []);
-  const [toast, setToast] = useState<{ key: number; text: string } | null>(null);
+  const [toast, setToast] = useState<{ key: number; text: string; href: string } | null>(null);
   const [flying, setFlying] = useState(false);   // toast animating INTO the bell
   const seen = useRef<Set<string>>(new Set());
   const first = useRef(true);
   const rootRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
   const pathname = usePathname();
+  // What the SERVER says this person is an audience for — see
+  // src/lib/alert-audience.ts. A REF, not state, for two reasons: nothing
+  // renders from it, and if destFor() depended on a state value the poll effect
+  // would restart the moment the audience arrived, re-seeding `seen` and
+  // swallowing the chime for anything that landed in that window.
+  const audRef = useRef<AlertAudience | null>(null);
+  /** True once the server has said this person has no floor duty — poll paused. */
+  const offFloor = useRef(false);
+
+  /**
+   * Where tapping an alert should go.
+   *
+   * Everyone with table duty keeps today's destination, /captain/requests, so
+   * this can only change the landing for people it was already wrong for: a
+   * kitchen-section or cashier login whose role cannot open the captain board at
+   * all and used to be dropped on a blocked page.
+   */
+  const destFor = useCallback((kind: 'order' | 'service' | 'kot'): string => {
+    const a = audRef.current;
+    if (!a || a.captain) return REQUESTS_BOARD;
+    if (a.kitchen && (kind === 'kot' || !a.cashier)) return KITCHEN_BOARD;
+    if (a.cashier) return CASHIER_BOARD;
+    return REQUESTS_BOARD;
+  }, []);
 
   // ── Draggable floating bell ────────────────────────────────────────────────
   // Bell lives at a user-chosen (x,y) — default MIDDLE-RIGHT — draggable
@@ -183,13 +238,15 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
     } catch {}
   }, []);
 
-  // Single poll for the whole app.
+  // Single poll for the whole app. The three feeds are already scoped to this
+  // person server-side, so every row that comes back is theirs to act on.
   useEffect(() => {
-    if (!meId) { setItems([]); return; }
+    if (!meId) { setItems([]); audRef.current = null; return; }
     // New identity (fresh login on the same tab) → seed silently again so we
     // don't replay every pending alert as "new" (a burst of toasts + chimes).
     first.current = true;
     seen.current = new Set();
+    offFloor.current = false;
     let stop = false;
     const poll = async () => {
       try {
@@ -199,26 +256,56 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
           api('/api/dine-in/kot-alerts?open=1').then((x) => x.json()).catch(() => ({})),
         ]);
         if (stop) return;
-        const mine = (owner?: string | null) => !owner || owner === meId;
+        // All three report the same audience; take whichever answered. A feed
+        // that errored returns {} and simply doesn't vote.
+        const next: AlertAudience | undefined = r?.audience || o?.audience || a?.audience;
+        if (next) {
+          audRef.current = next;
+          // No floor duty at all (e.g. the Store Manager role): nothing here will
+          // ever be for them. Stop the 8s poll rather than fetching three empty
+          // lists forever; the focus handler below revives it after a role change.
+          if (!next.live) { offFloor.current = true; setItems([]); return; }
+        }
         const list: CaptainAlert[] = [];
-        for (const ord of (o?.orders || [])) if (mine(ord.table_owner_id)) list.push({ id: 'o:' + ord.id, text: `New order · Table ${ord.table?.number ?? '—'}` });
-        for (const req of (r?.requests || [])) if (mine(req.table_owner_id)) list.push({ id: 's:' + req.id, text: `Table ${req.table_number} · ${req.type}` });
-        for (const al of (a?.alerts || [])) if (mine(al.server_id)) list.push({ id: 'a:' + al.id, text: `⚠ Kitchen issue · Table ${al.table_number || '—'}` });
+        for (const ord of (o?.orders || [])) {
+          list.push({ id: 'o:' + ord.id, text: `New order · Table ${ord.table?.number ?? '—'}`, href: destFor('order') });
+        }
+        for (const req of (r?.requests || [])) {
+          const label = SERVICE_LABEL[String(req.type || '').toLowerCase()] || req.type || 'Request';
+          // '—' where the other two lines use it: a request whose table row is
+          // gone still has to read as a place, not as "Table null".
+          list.push({ id: 's:' + req.id, text: `Table ${req.table_number || '—'} · ${label}`, href: destFor('service') });
+        }
+        for (const al of (a?.alerts || [])) {
+          list.push({ id: 'a:' + al.id, text: `⚠ Kitchen issue · Table ${al.table_number || '—'}`, href: destFor('kot') });
+        }
         setItems(list);
         const fresh = list.filter((it) => !seen.current.has(it.id));
         seen.current = new Set(list.map((it) => it.id)); // seen == present, so a returning id can re-alert
         if (first.current) { first.current = false; return; } // seed silently on first load
-        // Alert on new items — but not while already viewing the requests board.
-        if (fresh.length && !window.location.pathname.endsWith('/captain/requests')) {
-          setToast({ key: Date.now(), text: fresh.length === 1 ? fresh[0].text : `${fresh.length} new orders / requests` });
+        // Alert on new items — but not while already standing on the board that
+        // item would take you to (the captain watching /captain/requests, the
+        // kitchen watching the KDS). Anything landing elsewhere still chimes.
+        const here = window.location.pathname;
+        const elsewhere = fresh.filter((f) => (f.href || REQUESTS_BOARD) !== here);
+        if (elsewhere.length) {
+          setToast({
+            key: Date.now(),
+            text: elsewhere.length === 1 ? elsewhere[0].text : `${elsewhere.length} new orders / requests`,
+            href: elsewhere[0].href || REQUESTS_BOARD,
+          });
           beep();
         }
       } catch { /* offline — keep last state */ }
     };
+    const tick = () => { if (!offFloor.current) poll(); };
+    // A role change mid-shift shouldn't need a reload: focus re-arms the poll.
+    const onFocus = () => { offFloor.current = false; poll(); };
     poll();
-    const t = setInterval(poll, 8000);
-    return () => { stop = true; clearInterval(t); };
-  }, [meId, beep]);
+    const t = setInterval(tick, 8000);
+    window.addEventListener('focus', onFocus);
+    return () => { stop = true; clearInterval(t); window.removeEventListener('focus', onFocus); };
+  }, [meId, beep, destFor]);
 
   // New alert: pop at top-center, DWELL, then FLY into the bell icon, then clear.
   useEffect(() => {
@@ -235,9 +322,12 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
   const unackedAlerts = items.filter((it) => !isAlertAcked(ack, it.id));
   const unackedInbox = inbox.filter((it) => !isInboxAcked(ack, it.key, it.count));
   const totalCount = unackedAlerts.length + unackedInbox.reduce((s, i) => s + (Number(i.count) || 0), 0);
-  const goRequests = (id?: string) => {
+  // Tapping an alert acknowledges it and lands on ITS board (see destFor) —
+  // /captain/requests for anyone with table duty, which is everyone this used to
+  // work for. The bare fallback keeps a caller with no href on the old path.
+  const goRequests = (id?: string, href?: string) => {
     if (id) { const n = ackAlertId(ack, id); setAck(n); saveAck(n); }
-    setOpen(false); setToast(null); router.push('/captain/requests');
+    setOpen(false); setToast(null); router.push(href || REQUESTS_BOARD);
   };
   const goInbox = (item: InboxItem) => {
     const n = ackInboxItem(ack, item.key, item.count); setAck(n); saveAck(n);
@@ -281,7 +371,7 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
           z-40 keeps it below the app's modal layer (z-50); the chime still fires. */}
       {toast && !suppressed && pos && (
         <button
-          onClick={() => goRequests()}
+          onClick={() => goRequests(undefined, toast.href)}
           style={{
             transform: flying
               ? `translate(calc(-50% + ${Math.round(pos.x + BELL / 2 - window.innerWidth / 2)}px), ${Math.round(pos.y + BELL / 2 - 28)}px) scale(0.1)`
@@ -320,7 +410,7 @@ export default function CaptainAlertsProvider({ children }: { children: React.Re
               <div className="max-h-80 overflow-y-auto divide-y divide-[#F0E4D6]">
                 {/* Live table alerts first (time-sensitive), then Action Inbox. */}
                 {items.map((it) => (
-                  <button key={it.id} onClick={() => goRequests(it.id)} className="w-full text-left px-4 py-2.5 text-sm hover:bg-[#FFF1E3]">{it.text}</button>
+                  <button key={it.id} onClick={() => goRequests(it.id, it.href)} className="w-full text-left px-4 py-2.5 text-sm hover:bg-[#FFF1E3]">{it.text}</button>
                 ))}
                 {inbox.map((it) => (
                   <button key={it.key} onClick={() => goInbox(it)}

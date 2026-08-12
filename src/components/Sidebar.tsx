@@ -194,6 +194,15 @@ const navTree: NavEntry[] = [
       // queue was unreachable except by typing the URL, so counts were entered,
       // silently parked, and read back as "stock didn't update".
       { kind: "link", label: "Variance Approvals", href: "/variance-approvals", icon: ClipboardCheck },
+      // Directly under Variance Approvals because it is the same problem one
+      // level up. An approval decides whether ONE count corrects stock; a
+      // cutover counts the whole store on one date and re-bases every counted
+      // material at once, so that from that date a variance means a real loss
+      // instead of months of purchases nobody typed in. It is also the ONLY
+      // place in the app that states when (or whether) that happened, so it must
+      // be reachable without knowing the URL — the catalog gates it adminOnly,
+      // and this list must carry it or it is gated AND invisible.
+      { kind: "link", label: "Central Store Cutover", href: "/inventory/central-cutover", icon: ShieldAlert },
       { kind: "link", label: "Daily Roll-up",      href: "/daily-rollup",       icon: ClipboardCheck },
       { kind: "link", label: "Wastage",            href: "/wastage",            icon: ClipboardCheck },
       { kind: "link", label: "Unit Audit",         href: "/unit-audit",         icon: ShieldAlert },

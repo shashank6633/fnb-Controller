@@ -17,12 +17,14 @@ import Link from 'next/link';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
 import {
-  ArrowDownLeft, ArrowUpRight, ChevronLeft, ChevronRight, Loader2, MicOff, Phone,
+  ArrowDownLeft, ArrowUpRight, BadgeCheck, ChevronLeft, ChevronRight, Loader2, MicOff, Phone,
   PhoneMissed, Play, RefreshCw, Search, Square, UserPlus, X, CheckCircle,
   Sparkles, AlertTriangle,
 } from 'lucide-react';
+import { durationTrust } from '@/lib/ct/duration-trust';
 import CallAnalysisCard, { type CallAnalysisData } from '@/app/crm/assistant/CallAnalysisCard';
 import CollapsibleToolbar from '@/components/ct/CollapsibleToolbar';
+import RecordingPlayer from '@/components/ct/RecordingPlayer';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -42,6 +44,12 @@ interface CallRow {
   disposition: string;
   disposition_note: string;
   created_at: string;
+  // How far duration_sec can be trusted. Written only by the Call Back flow, so
+  // both are '' / 0 on every PBX CDR and on every row that predates it — which
+  // DurationCell renders exactly as this page always did. Optional so a response
+  // from an older build degrades to unmarked rather than to a false claim.
+  duration_source?: string;
+  duration_verified?: number;
   has_recording: boolean;
   // Why there is (or isn't) something to play. 'playable' is has_recording;
   // 'not_recorded' is TeleCMI stating it never recorded the call — normal, not a
@@ -138,6 +146,66 @@ function mmss(sec: number): string {
 }
 
 const startOf = (c: CallRow) => c.started_at || c.created_at;
+
+/**
+ * The talk time — and, only where the number is a CLAIM rather than a
+ * measurement, what kind of claim it is.
+ *
+ * Almost every row here is timed by the PBX and is not in question, so almost
+ * every row renders precisely as it did before this existed: bare mmss, no
+ * glyph, no tooltip. That includes every call logged through the Call Back flow
+ * before the verification mechanism shipped — those carry duration_source = ''
+ * and are left alone on purpose. They were placed by real staff and marking them
+ * would be an accusation the data does not support.
+ *
+ * TWO MARKS, SAYING TWO DIFFERENT THINGS, and a row can carry both:
+ *   '~'       on EVERY self-logged figure, verified or not. The ordinary mark
+ *             for "approximately": this number was not established, it was
+ *             reported. It qualifies the figure without a chip or a colour, and
+ *             no agent name sits next to it. It stays on 00:00 too, because a
+ *             zero-second "connected" callback is the cheapest row anyone can
+ *             fabricate and it must not read like a PBX call.
+ *   a check   ADDITIONALLY, when the SERVER bounded the number against its own
+ *             clock: a call token minted before the dial was redeemed and the
+ *             claimed time fitted inside the wall time that had elapsed. It is
+ *             the only mark that reads as proof, it is a reassurance rather than
+ *             a suspicion, and it proves a LIMIT, not a reading — the tooltip
+ *             says so, and says separately what the phone claimed.
+ * So: bare figure = PBX. '~' = self-logged. '~' + check = self-logged and
+ * server-bounded. There is no state that renders as an exact measurement,
+ * because there is none this server can establish.
+ * Which of those, and why, is decided in src/lib/ct/duration-trust.ts. Nothing
+ * here reads duration_source to decide the MARK: that column is client-supplied,
+ * so letting it promote a row to proof is the hole this closed.
+ *
+ * compact is the mobile card, whose row is a flex-wrap with gap-x-3. It returns
+ * null — NOT an empty wrapper — when there is no duration to show, because an
+ * empty inline element is still a flex item and would leave a phantom gap on
+ * every unanswered call. It therefore carries its own font-mono rather than
+ * being wrapped in one by the caller.
+ */
+function DurationCell({ call, compact = false }: { call: CallRow; compact?: boolean }) {
+  const show = call.status === 'answered' || call.duration_sec > 0;
+  if (!show) return compact ? null : <span className="text-[#C4B09A]">—</span>;
+
+  const trust = durationTrust(call.duration_source, call.duration_verified, call.duration_sec);
+  const text = `${trust.prefix}${mmss(call.duration_sec)}`;
+  const mono = compact ? 'font-mono ' : '';
+  if (trust.kind === 'unmarked') return compact ? <span className="font-mono">{text}</span> : <>{text}</>;
+
+  return (
+    <span title={trust.note} className={`${mono}inline-flex items-center gap-1 cursor-help`}>
+      {text}
+      {trust.kind === 'verified' && (
+        <BadgeCheck className="w-3.5 h-3.5 shrink-0 text-green-600" aria-hidden />
+      )}
+      {/* The tilde and the check are visual shorthand; screen readers get the
+          sentence, since neither a glyph nor a title attribute is announced
+          reliably. */}
+      <span className="sr-only">{trust.note}</span>
+    </span>
+  );
+}
 
 // ─── Page ─────────────────────────────────────────────────────────────────
 
@@ -548,7 +616,7 @@ export default function CallLogPage() {
                               <AgentCell call={c} />
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono text-[13px] text-[#3D2614]">
-                              {c.status === 'answered' || c.duration_sec > 0 ? mmss(c.duration_sec) : <span className="text-[#C4B09A]">—</span>}
+                              <DurationCell call={c} />
                             </td>
                             <td className="py-2.5 px-3"><StatusChip status={c.status} /></td>
                             <td className="py-2.5 px-3">
@@ -625,7 +693,7 @@ export default function CallLogPage() {
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[#6B5744]">
                       <span>{when.time} · {when.date}</span>
                       <AgentCell call={c} compact />
-                      {(c.status === 'answered' || c.duration_sec > 0) && <span className="font-mono">{mmss(c.duration_sec)}</span>}
+                      <DurationCell call={c} compact />
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       <DispositionCell call={c} saving={savingId === c.id} onPick={d => setDisposition(c, d)} />
@@ -967,18 +1035,16 @@ function NoRecordingCell({ state }: { state: CallRow['recording_state'] }) {
   );
 }
 
-/** Auth-proxied playback — the TeleCMI URL never reaches the client. */
+/**
+ * Auth-proxied playback — the TeleCMI URL never reaches the client.
+ *
+ * The element itself lives in src/components/ct/RecordingPlayer.tsx, shared with
+ * Guest 360, because a recording that will not play must say WHY on both
+ * surfaces and there is exactly one set of reasons (the proxy's JSON bodies) to
+ * say it from. A bare <audio> silently swallowed every one of them.
+ */
 function AudioPlayer({ callId }: { callId: string }) {
-  return (
-    <audio
-      controls
-      preload="none"
-      className="w-full max-w-md h-9"
-      src={`/api/telecmi/recording/${encodeURIComponent(callId)}`}
-    >
-      Your browser does not support audio playback.
-    </audio>
-  );
+  return <RecordingPlayer callId={callId} />;
 }
 
 // ─── AI call enhancement (reuses the production scorecard engine) ──────────

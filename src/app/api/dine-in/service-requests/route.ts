@@ -1,6 +1,9 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { expireStaleServiceRequests } from '@/lib/service-requests';
+import {
+  resolveAlertAudience, seesServiceRequest, requestedScope, effectiveScope,
+} from '@/lib/alert-audience';
 
 /**
  * GET /api/dine-in/service-requests   (STAFF)
@@ -13,13 +16,29 @@ import { expireStaleServiceRequests } from '@/lib/service-requests';
  * guest's button dead with nothing on any screen to explain it. Anything that
  * takes a request off this board must actually close the row — which is what the
  * settle hook and the timeout sweep below do.
+ *
+ * ROLE-SCOPED (src/lib/alert-audience.ts), because this feed is what the global
+ * bell chimes on: a captain gets their own tables plus every unclaimed one, a
+ * BILL request additionally reaches every till, management gets the lot. Scoped
+ * on the server, not just in the bell — the old shape handed the whole outlet's
+ * requests to any signed-in caller who typed the URL.
+ *
+ * WHAT SCOPING MUST NOT DO: the sweep below still runs for EVERY caller before
+ * any filtering. It is the walk-out safety net for the guest-side de-duplicator,
+ * and tying it to who is asking would make stale requests expire only while the
+ * right person had a screen open.
+ *
+ * `?scope=all` is the explicit firehose and is honoured only for a caller whose
+ * audience already is one.
  */
-export async function GET() {
+export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const outletId = await getCurrentOutletId();
+    const audience = resolveAlertAudience(me);
+    const scope = effectiveScope(requestedScope(request.url), audience);
 
     // Walk-out safety net, run on the board's own poll (every 5s per open
     // client). No-op unless an admin sets service_request_auto_close_minutes
@@ -38,7 +57,9 @@ export async function GET() {
       ORDER BY sr.created_at ASC
     `).all(outletId) as any[];
 
-    return Response.json({ requests: rows }, { headers: { 'Cache-Control': 'no-store' } });
+    const requests = scope === 'all' ? rows : rows.filter((r) => seesServiceRequest(audience, r));
+
+    return Response.json({ requests, scope, audience }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (e: any) {
     console.error('[/api/dine-in/service-requests GET]', e);
     return Response.json({ error: e.message }, { status: 500 });

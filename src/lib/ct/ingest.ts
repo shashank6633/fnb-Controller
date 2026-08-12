@@ -3,6 +3,9 @@
  *
  * Every TeleCMI payload (live websocket-relay webhook + CDR webhook + backfill)
  * funnels through here. Responsibilities:
+ *   - Declining the INTERNAL LEG of a routed call — the record whose "caller" is
+ *     one of OUR OWN numbers — so our PBX never becomes a guest (see the
+ *     own-numbers block below, and classifyLeg() in ./telecmi-mapper.ts).
  *   - Idempotent CDR upsert into ct_calls (keyed on telecmi_call_id — a CDR
  *     re-delivery or a backfill overlap NEVER duplicates a call).
  *   - Missed-call detection → auto-create ct_recoveries with a business-hours
@@ -34,6 +37,97 @@ function agentDisplayName(db: Database.Database, rawAgent: string | undefined | 
   if (!rawAgent) return '';
   try { return resolveAgentLabel(rawAgent, getAgentMap(db), getUserNamesByEmail(db)); }
   catch { return String(rawAgent || ''); }
+}
+
+// ─── OUR OWN NUMBERS — so an internal leg is never mistaken for a guest ─────
+//
+// TeleCMI reports a routed inbound call as TWO records: the guest dialling our
+// virtual number, and the platform then dialling an agent's handset. Only the
+// first has a caller in it. The second's `from` is OUR number (the one the
+// agents' phones see the call arrive from), and until this existed nothing in
+// the system could tell the two apart — so it was ingested as a call in its own
+// right and appeared on the Live wallboard, screen-pop included, as if a guest
+// had rung. classifyLeg() in ./telecmi-mapper.ts does the deciding; this is
+// where it gets its list of what "ours" means.
+//
+// TWO SOURCES, and NEITHER is a hardcoded number:
+//   own_numbers      — set by an admin. Comma / newline / space separated.
+//   own_numbers_seen — LEARNED, append-only, from the `virtual_number` field
+//                      TeleCMI itself puts on its CDRs.
+// They are separate keys on purpose: learning must never overwrite, reorder or
+// silently drop what a human typed, and a human must be able to clear the
+// learned list on its own if it ever picks up something wrong.
+//
+// AN UNCONFIGURED INSTALL THAT HAS SEEN NO CDR HAS AN EMPTY LIST, and an empty
+// list classifies nothing — behaviour is exactly what it was. That is the
+// deliberate bias throughout: showing an internal number is embarrassing,
+// swallowing a real guest call costs money, so every uncertainty shows the call.
+//
+// NOT A SECRET, so deliberately NOT added to SECRET_KEYS in
+// /api/crm-calls/settings (read its ⚠ RELEASE GATE comment — a new ct_settings
+// key is public to admins by default and must be declared here if it is not).
+// These are the outlet's own published phone numbers; an admin's browser may
+// see them. Neither key is in CT_SETTING_DEFAULTS either, which — exactly like
+// its siblings recording_base_url and recording_host_allowlist — keeps them out
+// of that route's ALLOWED_KEYS, so they are DB/auto-configured and cannot be
+// written through the ordinary settings PUT.
+const OWN_NUMBERS_KEY = 'own_numbers';
+const OWN_NUMBERS_SEEN_KEY = 'own_numbers_seen';
+/** Cap on the learned list. An account has a handful of DIDs; a runaway list
+ *  would be evidence the source field is not what we think it is, and it must
+ *  not be able to grow without bound in a settings row. */
+const MAX_LEARNED_OWN_NUMBERS = 20;
+
+/** Split a stored list ("9198…, 7943446235\n0891…") into trimmed entries. */
+function splitNumbers(raw: string): string[] {
+  return String(raw || '')
+    .split(/[\s,;]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+/** Every number we have reason to believe is OURS. '' / missing rows → []. */
+function ctOwnNumbers(db: Database.Database): string[] {
+  try {
+    return [
+      ...splitNumbers(ctSetting(db, OWN_NUMBERS_KEY)),
+      ...splitNumbers(ctSetting(db, OWN_NUMBERS_SEEN_KEY)),
+    ];
+  } catch (e) {
+    console.error('[ct-ingest] own-number list read failed', e);
+    return []; // fail OPEN — an unreadable list must never suppress a guest
+  }
+}
+
+/**
+ * Remember a number TeleCMI named as `virtual_number`, so LATER payloads — live
+ * events in particular, which need not repeat the field — can be classified
+ * from it. Append-only, deduped on digits, capped, and never throws.
+ *
+ * Only ever called with the value of that one field. It is NOT called with
+ * `to`, `did` or anything else that merely tends to be ours: the whole safety
+ * argument for suppressing on this list is that every entry came from the
+ * vendor's own name for our own DID.
+ */
+function learnOwnNumber(db: Database.Database, value: string): void {
+  const raw = String(value || '').trim();
+  if (!raw) return;
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length < 8) return; // not a dialable number — never learn it
+  try {
+    const known = splitNumbers(ctSetting(db, OWN_NUMBERS_SEEN_KEY));
+    if (known.some(k => k.replace(/\D/g, '') === digits)) return;
+    if (known.length >= MAX_LEARNED_OWN_NUMBERS) {
+      console.warn(
+        `[ct-ingest] not learning own number ${raw} — ${OWN_NUMBERS_SEEN_KEY} already holds ${known.length}`,
+      );
+      return;
+    }
+    setCtSetting(db, OWN_NUMBERS_SEEN_KEY, [...known, raw].join(', '));
+    console.warn(`[ct-ingest] learned own (virtual) number ${raw} from a TeleCMI payload`);
+  } catch (e) {
+    console.error('[ct-ingest] own-number learn failed', e);
+  }
 }
 
 // ─── Answered-call OWNERSHIP — the stamping side ────────────────────────────
@@ -457,8 +551,34 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
     // correcting a wrong base would see nothing change. This is the only
     // production ingest path for a CDR, so it is the only place the wiring can
     // live. See ctRecordingBaseUrl() in ct/settings.ts for what blank means.
-    const m = mapCdrPayload(raw, { recordingBaseUrl: ctRecordingBaseUrl(db) });
+    const m = mapCdrPayload(raw, {
+      recordingBaseUrl: ctRecordingBaseUrl(db),
+      ownNumbers: ctOwnNumbers(db),
+    });
     if (!m) return { callId: null, created: false };
+
+    // Learn BEFORE acting on the classification: this payload's own
+    // virtual_number is what lets the NEXT one (a live ring/answer/hangup that
+    // does not repeat the field) be recognised as the same internal leg.
+    learnOwnNumber(db, m.virtualNumber);
+
+    // ── THE INTERNAL LEG STOPS HERE ──────────────────────────────────────
+    // No ct_calls row, so it never becomes a call, a recovery task pointing a
+    // GRE at our own PBX, or a denominator in the answer rate. Nothing is lost:
+    // the CDR webhook route wrote the RAW payload to ct_webhook_log(kind='cdr')
+    // before calling us, precisely so ingest is free to decline a record.
+    //
+    // WHAT THIS COSTS, stated plainly: the internal leg is the record that
+    // carries the answering agent and the talk time on some accounts. Suppressing
+    // it means "answered by <name>" must come from the GUEST leg's CDR or from
+    // the live `answer` event (which now writes agent_user — see ingestLive).
+    // If a future account turns out to report the agent ONLY on the internal
+    // leg, the fix is to MERGE the two legs on conversation_uuid, not to let
+    // this one back into ct_calls.
+    if (m.leg === 'internal') {
+      console.warn(`[ct-ingest] CDR ignored as an internal leg — ${m.legNote}`);
+      return { callId: null, created: false };
+    }
 
     const now = new Date().toISOString();
     const phone = normalizePhone(m.phone);
@@ -656,11 +776,20 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
  * Ingest a live TeleCMI event (ring / answer / hangup). Logs every payload to
  * ct_webhook_log; a ring on an inbound call upserts a 'ringing' ct_calls row
  * and fires the screen-pop. The CDR remains the source of truth.
+ *
+ * NOTHING IS ANNOUNCED THAT IS NOT A TRACKED CALL. All three branches now
+ * resolve a ct_calls row first and emit only if they found one. Ring inserts, so
+ * it always has one; answer and hangup are UPDATE-only, and before this they
+ * emitted regardless — which is exactly how an internal leg with no row of its
+ * own got "Call answered" and "Call ended" lines on the wallboard while never
+ * appearing in "Ringing now" (it had no ring event, and ring is the only branch
+ * that inserts). A guest-facing feed reports calls this system is tracking; an
+ * event it cannot attach to one is triage material for ct_webhook_log, not news.
  */
 export function ingestLive(raw: any): void {
   try {
     const db = getDb();
-    const m = mapLivePayload(raw);
+    const m = mapLivePayload(raw, { ownNumbers: ctOwnNumbers(db) });
     const now = new Date().toISOString();
     const phone = m ? normalizePhone(m.phone) : '';
 
@@ -673,6 +802,21 @@ export function ingestLive(raw: any): void {
       safeStringify(raw), m ? 1 : 0, m ? '' : 'unrecognized live payload shape',
     );
     if (!m) return;
+
+    // Learn our own DID whenever a live payload happens to name it (they often
+    // do not — the CDR is the reliable source). Cheap, and it makes the check
+    // below self-configuring on accounts whose live events DO carry the field.
+    learnOwnNumber(db, m.virtualNumber);
+
+    // ── THE INTERNAL LEG STOPS HERE ──────────────────────────────────────
+    // Placed AFTER the ct_webhook_log write above, so the payload is still kept
+    // verbatim and stays greppable — we decline to ACT on it, we do not lose it.
+    // No ct_calls row, no bus event, so it reaches neither the wallboard feed,
+    // nor "Ringing now", nor the screen-pop.
+    if (m.leg === 'internal') {
+      console.warn(`[ct-ingest] live ${m.event} ignored as an internal leg — ${m.legNote}`);
+      return;
+    }
 
     const telecmiId = (m.telecmiCallId || '').trim();
 
@@ -732,9 +876,26 @@ export function ingestLive(raw: any): void {
     }
 
     if (m.event === 'answer') {
-      // Not contractually required, but marking the live answer prevents
-      // reconcileLiveEvents from mis-flagging a long in-progress call as
-      // missed while its CDR is still minutes away.
+      // THE ROW MUST LEAVE 'ringing', AND THIS IS THE BRANCH THAT KEPT FAILING
+      // TO MAKE IT.
+      //
+      // The UPDATE used to sit inside `if (telecmiId)` and match on
+      // telecmi_call_id alone, while the emit() below ran unconditionally — the
+      // only one of the three branches with no id-less fallback (ring has one,
+      // hangup has one). So an answer whose id was absent, or simply did not
+      // match the row the ring created, printed "Call answered" on the wallboard
+      // while the DATABASE row stayed 'ringing'. Everything downstream then read
+      // that row and was faithfully wrong: "Ringing now" kept the card (its
+      // snapshot is WHERE status='ringing'), the screen-pop kept counting ring
+      // seconds through a live conversation, today's tiles counted the call in
+      // CALLS TODAY and in NEITHER Answered nor Missed — hence ANSWERED 0 /
+      // ANSWER RATE 0% beside a call the Call Log calls Answered — and five
+      // minutes later reconcileLiveEvents() relabelled the answered call MISSED
+      // and filed a recovery task against a guest who had already been served.
+      //
+      // The fallback mirrors the hangup branch's, and is bounded the same way:
+      // the most recent still-'ringing' row for that phone, and nothing else, so
+      // it can never reach back and rewrite a completed call.
       let answeredCallId: string | undefined;
       if (telecmiId) {
         db.prepare(`
@@ -743,14 +904,58 @@ export function ingestLive(raw: any): void {
         `).run(m.at || now, telecmiId);
         answeredCallId = (db.prepare(`SELECT id FROM ct_calls WHERE telecmi_call_id = ?`).get(telecmiId) as { id: string } | undefined)?.id;
       }
+      if (!answeredCallId && phone) {
+        const open = db.prepare(`
+          SELECT id FROM ct_calls
+           WHERE phone_e164 = ? AND status = 'ringing'
+           ORDER BY COALESCE(NULLIF(started_at, ''), created_at) DESC
+           LIMIT 1
+        `).get(phone) as { id: string } | undefined;
+        if (open) {
+          db.prepare(`
+            UPDATE ct_calls SET status = 'answered', answered_at = COALESCE(answered_at, ?)
+             WHERE id = ? AND status = 'ringing'
+          `).run(m.at || now, open.id);
+          answeredCallId = open.id;
+        }
+      }
+
+      // NOTHING TO ANNOUNCE. No row means this answer belongs to no call this
+      // system is tracking — the internal leg's case, and the reason it used to
+      // print "Call answered · answered by Sh…" on a guest-facing feed. The
+      // payload is already in ct_webhook_log; that is where an unattachable
+      // event belongs.
+      if (!answeredCallId) {
+        console.warn(
+          `[ct-ingest] live answer matched no tracked call (telecmi id "${telecmiId}", phone "${phone}") — not announced`,
+        );
+        return;
+      }
+
+      // NAME THE ANSWERER ON THE ROW, NOW. Until this, agent_user was written
+      // only by the ring INSERT and the CDR upsert, so "Answered by <name>" —
+      // which Guest 360 and the Call Log both derive from agent_user — could not
+      // appear until the CDR landed minutes later. Fills BLANKS ONLY, so it can
+      // never overwrite what an earlier event or a CDR already established.
+      const answeringAgent = String(m.agent || '').trim();
+      if (answeringAgent || m.queue) {
+        db.prepare(`
+          UPDATE ct_calls
+             SET agent_user = CASE WHEN IFNULL(agent_user, '') = '' THEN ? ELSE agent_user END,
+                 queue      = CASE WHEN IFNULL(queue, '')      = '' THEN ? ELSE queue      END
+           WHERE id = ?
+        `).run(answeringAgent, String(m.queue || ''), answeredCallId);
+      }
+
       // THE MOMENT OWNERSHIP IS DECIDED for a mapped agent: whoever picked up
       // owns the write-up from here. Unmapped agent → stays unowned and the
       // first browser to act claims it. Runs after the status UPDATE above, so
-      // the row already reads 'answered' and STAMP_OWNER_SQL's guard passes. An
-      // id-less answer payload has no row to stamp: first-claim covers it.
+      // the row already reads 'answered' and STAMP_OWNER_SQL's guard passes.
       const owner = stampAnsweredOwner(db, answeredCallId, m.agent, now);
-      // Tell the Live wallboard the call left the ringing state in real time
-      // (the 12s ringing re-sync is the backstop; this makes it instant).
+      // Tell the Live wallboard and the screen-pop the call left the ringing
+      // state in real time (the 12s ringing re-sync is the backstop; this makes
+      // it instant), and WHO picked it up — agentName is what the feed prints as
+      // "· answered by X" and what the pop now puts in its header.
       emit({
         type: 'answered',
         callId: answeredCallId,
@@ -769,9 +974,38 @@ export function ingestLive(raw: any): void {
     }
 
     if (m.event === 'hangup') {
-      const row = telecmiId
+      // RESOLVE THE ROW FIRST, BY EITHER HANDLE. The id lookup is the primary;
+      // the phone fallback is the same one the branch already had for its UPDATE,
+      // lifted up here so the resolved id is available to the emit() too — it
+      // used to send callId: undefined down the id-less path, leaving the
+      // screen-pop to match the card on phone alone.
+      //
+      // The fallback now also accepts an 'answered' row, not just a 'ringing'
+      // one. It had to: once the answer branch above reliably flips the row, a
+      // hangup arriving with a non-matching id would find nothing, and the pop
+      // would never leave its "Incoming call" header. Bounded by an EMPTY
+      // ended_at, so it only ever reaches a call still in progress and cannot
+      // rewrite a completed one — which is what the old status='ringing' bound
+      // achieved and must keep achieving.
+      let row = telecmiId
         ? db.prepare(`SELECT id FROM ct_calls WHERE telecmi_call_id = ?`).get(telecmiId) as { id: string } | undefined
         : undefined;
+      if (!row && phone) {
+        row = db.prepare(`
+          SELECT id FROM ct_calls
+           WHERE phone_e164 = ? AND status IN ('ringing', 'answered') AND IFNULL(ended_at, '') = ''
+           ORDER BY COALESCE(NULLIF(started_at, ''), created_at) DESC
+           LIMIT 1
+        `).get(phone) as { id: string } | undefined;
+      }
+
+      // NOTHING TO ANNOUNCE — see the same guard on the answer branch above.
+      if (!row) {
+        console.warn(
+          `[ct-ingest] live hangup matched no tracked call (telecmi id "${telecmiId}", phone "${phone}") — not announced`,
+        );
+        return;
+      }
 
       // LEAVE THE RINGING STATE. This branch used to ONLY emit to the wallboard
       // and never touch ct_calls, so status stayed 'ringing' in the database
@@ -790,30 +1024,16 @@ export function ingestLive(raw: any): void {
       // billed seconds and the recording, and can correct the status. This just
       // stops the board lying for the minutes in between.
       //
-      // Matched on telecmi_call_id, which is why cmiuid had to be added to the
-      // mapper first — without an id this UPDATE could never find its row.
-      if (telecmiId) {
-        db.prepare(`
-          UPDATE ct_calls
-             SET status   = CASE WHEN status = 'ringing' THEN 'missed' ELSE status END,
-                 ended_at = COALESCE(ended_at, ?)
-           WHERE telecmi_call_id = ?
-             AND status IN ('ringing', 'answered')
-        `).run(m.at || now, telecmiId);
-      } else if (phone) {
-        // No id (an older/thinner live payload): fall back to the most recent
-        // still-ringing row for that number. Bounded to ringing only, so it can
-        // never reach back and rewrite a completed call.
-        db.prepare(`
-          UPDATE ct_calls
-             SET status = 'missed', ended_at = COALESCE(ended_at, ?)
-           WHERE id = (
-             SELECT id FROM ct_calls
-              WHERE phone_e164 = ? AND status = 'ringing'
-              ORDER BY started_at DESC LIMIT 1
-           )
-        `).run(m.at || now, phone);
-      }
+      // Keyed on the row id resolved above, so it works down BOTH paths — the
+      // id-less one included, which previously ran a second, separately-written
+      // UPDATE that could drift from this one.
+      db.prepare(`
+        UPDATE ct_calls
+           SET status   = CASE WHEN status = 'ringing' THEN 'missed' ELSE status END,
+               ended_at = COALESCE(ended_at, ?)
+         WHERE id = ?
+           AND status IN ('ringing', 'answered')
+      `).run(m.at || now, row.id);
 
       // Hangup does NOT change ownership — it starts the 15-minute write-up
       // window that call-owner.ts measures from ended_at. Nothing is stamped or
@@ -822,11 +1042,11 @@ export function ingestLive(raw: any): void {
       // keeps its owner precisely so the write-up stays theirs. We only READ it,
       // because this is the browsers' first news that the call ended and they
       // must not lose track of who holds it while the CDR is still minutes away.
-      const owner = ownerOf(db, row?.id);
+      const owner = ownerOf(db, row.id);
 
       emit({
         type: 'call_ended',
-        callId: row?.id,
+        callId: row.id,
         telecmiCallId: telecmiId || undefined,
         phone: phone || undefined,
         guest: guestSnapshot(db, phone),

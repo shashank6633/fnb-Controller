@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { CalendarClock, Download, Filter, Loader2 } from 'lucide-react';
+import { AlertTriangle, CalendarClock, Download, Filter, Loader2 } from 'lucide-react';
 import { packFactor, toPurchaseQty, fmtQtyNum, csvQty, type PackMeta } from '@/lib/pack-units';
 
 const fmt  = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
@@ -58,10 +58,30 @@ interface RollupRow {
   opening: number; received: number;
   consumed_recipe: number; consumed_wastage: number; consumed: number;
   closing: number; counted: number | null; variance: number | null; loss_value: number | null;
+  /** Which opening this material's running balance came from. Present ONLY once
+   *  a cutover is committed: 'cutover' = seeded from the counted figure,
+   *  'all_time' = the material was never counted, so its Opening still carries
+   *  pre-cutover drift and its Variance is not comparable with the rest. */
+  basis?: 'cutover' | 'all_time';
 }
 
 export default function DailyRollupPage() {
-  const [data, setData] = useState<{ rows: RollupRow[]; summary: any; range: any } | null>(null);
+  // `cutover` is present ONLY once a central-store cutover has been committed;
+  // the API omits the key entirely until then.
+  const [data, setData] = useState<{
+    rows: RollupRow[]; summary: any; range: any;
+    cutover?: {
+      date: string;
+      /** The earliest reportable day — the day AFTER the count, because the
+       *  counted figure is the cutover day's closing position. Quote this as
+       *  the floor, never `date`. Optional so a payload from an older build
+       *  still renders (the date inputs then fall back to `date`). */
+      first_day?: string;
+      requested_from: string;
+      materials_opened_from_count?: number;
+      note: string;
+    };
+  } | null>(null);
   const [loading, setLoading] = useState(true);
   const [from, setFrom] = useState(minusDays(7));
   const [to, setTo]     = useState(today());
@@ -101,7 +121,13 @@ export default function DailyRollupPage() {
     const head = ['date','sku','material','unit','opening','received','consumed_recipe','consumed_wastage','consumed','closing','counted','variance','loss_value'];
     const QCOLS = ['opening','received','consumed_recipe','consumed_wastage','consumed','closing','counted','variance'] as const;
     const puHead = ['purchase_unit','pack_factor', ...QCOLS.map(k => `${k}_purchase`)];
-    const lines = [[...head, ...puHead].join(',')];
+    // The floor must travel with the file — a sheet that silently omits every
+    // pre-cutover day reads as "nothing happened then". One quoted preamble
+    // line, and ONLY when a cutover is stamped; otherwise the CSV is
+    // byte-identical to before.
+    const lines = data?.cutover
+      ? ['"' + String(data.cutover.note).replace(/"/g, '""') + '"', [...head, ...puHead].join(',')]
+      : [[...head, ...puHead].join(',')];
     for (const r of rows) {
       const cells = head.map(k => {
         const map: any = { sku: 'material_sku', material: 'material_name' };
@@ -145,15 +171,28 @@ export default function DailyRollupPage() {
         </button>
       </div>
 
+      {/* Cutover floor. Rendered ONLY when a cutover has been committed — the
+          API omits `cutover` entirely otherwise, so this block disappears and
+          the page is unchanged. The wording comes from the payload so the
+          screen can never drift from the clamp that produced the rows. */}
+      {data?.cutover && (
+        <div className="bg-amber-50 border border-amber-300 rounded-xl p-3 text-xs text-amber-900 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          <p className="leading-relaxed">{data.cutover.note}</p>
+        </div>
+      )}
+
       {/* Filters */}
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 flex flex-wrap items-end gap-2 text-xs">
         <div className="inline-flex items-center gap-1 text-[#6B5744]"><Filter className="w-3.5 h-3.5" /> Filter</div>
         <label className="flex flex-col text-[#6B5744]">From
-          <input type="date" value={from} onChange={e => setFrom(e.target.value)}
+          <input type="date" value={from} min={data?.cutover?.first_day || data?.cutover?.date || undefined}
+                 onChange={e => setFrom(e.target.value)}
                  className="px-2 py-1 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
         </label>
         <label className="flex flex-col text-[#6B5744]">To
-          <input type="date" value={to} onChange={e => setTo(e.target.value)}
+          <input type="date" value={to} min={data?.cutover?.first_day || data?.cutover?.date || undefined}
+                 onChange={e => setTo(e.target.value)}
                  className="px-2 py-1 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
         </label>
         <label className="flex flex-col text-[#6B5744]">Material
@@ -228,7 +267,20 @@ export default function DailyRollupPage() {
                     return (
                       <tr key={i} className={`border-t border-[#E8D5C4]/50 ${isLeak ? 'bg-red-50/20' : isOver ? 'bg-indigo-50/20' : ''}`}>
                         <td className="py-1.5 px-3 font-mono text-[10px] text-[#8B7355]">{r.material_sku || '·'}</td>
-                        <td className="py-1.5 px-3">{r.material_name}</td>
+                        <td className="py-1.5 px-3">
+                          {r.material_name}
+                          {/* Only ever rendered after a cutover: the API omits
+                              `basis` entirely until one is committed. A row on
+                              the old opening sitting silently beside re-based
+                              rows is the whole reason the cutover looked like
+                              it had done nothing. */}
+                          {r.basis === 'all_time' && (
+                            <span className="ml-1.5 text-[9px] px-1 py-0.5 rounded border bg-amber-50 border-amber-200 text-amber-900 whitespace-nowrap"
+                                  title="This material was not counted in the cutover, so its Opening is still derived from all-time history and carries pre-cutover drift.">
+                              all-time opening
+                            </span>
+                          )}
+                        </td>
                         <td className="py-1.5 px-3 text-[10px] text-[#6B5744] whitespace-nowrap">
                           {r.purchase_unit || r.unit}
                           {/* State the pack rule outright when the two bases differ, so the

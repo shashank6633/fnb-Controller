@@ -23,7 +23,11 @@
  *     problems: a value that is a filename rather than a URL, an account with
  *     recording switched off, and a CDR webhook that has never reached us at
  *     all. The last of those is not a code problem, and only this panel can
- *     say so.
+ *     say so. It also carries the one control on this page that reaches
+ *     TeleCMI: "Try playback now", which fetches a stored recording and reports
+ *     the status, content type and error body. Opt-in, never on mount — a URL
+ *     can pass every shape check and still point at a path the vendor does not
+ *     serve, and nothing but asking can tell those apart.
  *   6 Recording retention — the one WRITABLE control on this page that is not
  *     a TeleCMI account setting: how long a recording stays reachable through
  *     this app (7 / 15 / 30 days). It sits here rather than in CRM Settings
@@ -43,7 +47,7 @@
  *   GET  /api/telecmi/analysis?days=N
  *   GET  /api/telecmi/agents      POST /api/telecmi/agents   (add|update|refresh)
  *   POST /api/telecmi/callerid    (login|list|set)
- *   GET  /api/telecmi/recording-diagnostic
+ *   GET  /api/telecmi/recording-diagnostic         (+ ?probe=1 for the upstream try)
  *   GET  /api/telecmi/recording-retention   PUT /api/telecmi/recording-retention
  */
 
@@ -157,9 +161,45 @@ type DiagCdr = {
   headline: string;
 };
 
+/* One upstream attempt against one stored recording. This is the only part of
+ * the diagnostic that leaves the server, and the only part that can tell a
+ * SHAPE that validates from a DESTINATION that serves audio. */
+type DiagProbeCall = {
+  call_id: string;
+  started_at: string;
+  /** Demo/simulator row rather than a real recording. */
+  fixture: boolean;
+  /** Credential-masked, both of them. */
+  stored_url: string;
+  fetched_url: string;
+  rewritten: boolean;
+  rewrite_note: string;
+  credentialed: boolean;
+  retention: { expired: boolean; reason: string; days: number; expires_at: string };
+  /** False when the retention gate refused before any upstream call. */
+  attempted: boolean;
+  upstream_status: number | null;
+  upstream_content_type: string;
+  /** First bytes of a non-audio answer, verbatim. '' when audio came back. */
+  body_preview: string;
+  is_audio: boolean;
+  error: string;
+  headline: string;
+};
+
+type DiagProbe = {
+  ran: boolean;
+  limit: number;
+  candidates: number;
+  calls: DiagProbeCall[];
+  headline: string;
+};
+
 type RecordingDiagResp = {
   generated_at: string;
   error?: string;
+  /** Present only on the opt-in probe request; null on a normal panel load. */
+  probe?: DiagProbe | null;
   webhooks?: {
     cdr_count: number;
     cdr_newest_at: string;
@@ -390,6 +430,11 @@ export default function TelephonyPage() {
   const [diag, setDiag] = useState<RecordingDiagResp | null>(null);
   const [diagLoading, setDiagLoading] = useState(true);
   const [diagError, setDiagError] = useState<string | null>(null);
+  // 5b · Upstream playback probe — separate state because it is a separate,
+  // opt-in request that DOES call TeleCMI. It must never load with the panel.
+  const [probe, setProbe] = useState<DiagProbe | null>(null);
+  const [probeLoading, setProbeLoading] = useState(false);
+  const [probeError, setProbeError] = useState<string | null>(null);
 
   // 6 · Recording retention
   const [ret, setRet] = useState<RetentionResp | null>(null);
@@ -449,7 +494,9 @@ export default function TelephonyPage() {
    * Its own loader and its own effect rather than a line added to the one
    * above: this is a purely additive panel, and nothing already on this page
    * should change shape because it exists. Reads local tables only — no
-   * TeleCMI round trip — so it is cheap enough to run on mount. */
+   * TeleCMI round trip — so it is cheap enough to run on mount. The one part
+   * that DOES call TeleCMI is runProbe() below, which is opt-in and never
+   * fires on mount. */
   const loadDiag = useCallback(async () => {
     setDiagLoading(true); setDiagError(null);
     const r = await getJson<RecordingDiagResp>('/api/telecmi/recording-diagnostic');
@@ -464,6 +511,28 @@ export default function TelephonyPage() {
   }, []);
 
   useEffect(() => { void loadDiag(); }, [loadDiag]);
+
+  /* ── 5b · Upstream playback probe ─────────────────────────────────────────
+   * The one control on this page that reaches TeleCMI. It is a BUTTON and not
+   * an effect on purpose: everything else here is free, this costs a real
+   * request, and a diagnostic that fires on every page open is a diagnostic
+   * someone eventually disables. The server bounds it to a couple of calls with
+   * a short timeout and asks for a single byte; see the route. */
+  const runProbe = useCallback(async () => {
+    setProbeLoading(true); setProbeError(null);
+    const r = await getJson<RecordingDiagResp>('/api/telecmi/recording-diagnostic?probe=1');
+    if (!r.ok) {
+      if (r.locked) setLocked(true);
+      setProbeError(r.error);
+      setProbe(null);
+    } else if (r.data?.error) {
+      setProbeError(r.data.error);
+      setProbe(null);
+    } else {
+      setProbe(r.data?.probe ?? null);
+    }
+    setProbeLoading(false);
+  }, []);
 
   /* ── 6 · Recording retention ──────────────────────────────────────────────
    * Its own loader for the same reason as the diagnostic above: additive, and
@@ -1288,6 +1357,97 @@ export default function TelephonyPage() {
                 }
               />
             )}
+
+            {/* ── The upstream probe ──────────────────────────────────────
+                Everything above proves the URL's SHAPE. This is the only thing
+                that proves its DESTINATION, which is the distinction a URL that
+                validated perfectly and 404ed on every play was hiding. */}
+            <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-[#2D1B0E]">Does a stored recording actually play?</p>
+                  <p className="text-[11px] text-[#8B7355] mt-0.5">
+                    Asks TeleCMI for a stored recording and reports what came back. Read-only, at
+                    most two calls, one byte each. Nothing else on this page contacts TeleCMI.
+                  </p>
+                </div>
+                <button
+                  onClick={() => void runProbe()}
+                  disabled={probeLoading}
+                  className="shrink-0 px-2.5 py-1 bg-[#af4408] text-white rounded text-xs font-medium flex items-center gap-1 hover:bg-[#8a3506] disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3 h-3 ${probeLoading ? 'animate-spin' : ''}`} />
+                  {probeLoading ? 'Asking TeleCMI…' : 'Try playback now'}
+                </button>
+              </div>
+
+              {probeError && (
+                <p className="mt-2 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded p-2">{probeError}</p>
+              )}
+
+              {probe && (
+                <div className="mt-3 space-y-2">
+                  <p className={`text-[11px] rounded p-2 border ${
+                    probe.calls.some(c => c.is_audio)
+                      ? 'bg-green-50 border-green-300 text-green-900'
+                      : 'bg-red-50 border-red-300 text-red-800'
+                  }`}>
+                    {probe.headline}
+                  </p>
+
+                  {probe.calls.length === 0 ? (
+                    <p className="text-[11px] text-[#8B7355]">No stored recording URL to try.</p>
+                  ) : probe.calls.map(c => (
+                    <div key={c.call_id} className="rounded border border-[#E8D5C4] bg-white p-2.5 text-[11px] text-[#6B5744] space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className={`px-1.5 py-0.5 rounded font-semibold ${
+                          c.is_audio ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+                        }`}>
+                          {c.is_audio ? 'Plays' : 'Does not play'}
+                        </span>
+                        {c.fixture && (
+                          <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-medium">Demo fixture</span>
+                        )}
+                        <span className="text-[#8B7355]">{c.started_at || 'undated'}</span>
+                      </div>
+
+                      <p className="text-[#2D1B0E]">{c.headline}</p>
+
+                      {/* The two URLs side by side are the point of the panel: they
+                          are what shows a rewrite happening, and what it produced. */}
+                      <p className="break-all">
+                        <span className="text-[#8B7355]">Stored:</span>{' '}
+                        <span className="font-mono">{c.stored_url}</span>
+                      </p>
+                      {c.attempted && c.fetched_url && c.fetched_url !== c.stored_url && (
+                        <p className="break-all">
+                          <span className="text-[#8B7355]">Fetched:</span>{' '}
+                          <span className="font-mono">{c.fetched_url}</span>
+                        </p>
+                      )}
+                      {c.rewrite_note && (
+                        <p className="text-[#8B7355]">{c.rewrite_note}</p>
+                      )}
+                      {c.attempted && (
+                        <p className="text-[#8B7355]">
+                          HTTP {c.upstream_status ?? '—'} · {c.upstream_content_type || 'no content type'} ·{' '}
+                          {c.credentialed ? 'sent with credentials' : 'sent WITHOUT credentials'}
+                        </p>
+                      )}
+                      {c.body_preview && (
+                        <p className="font-mono break-all bg-[#FFF8F0] border border-[#E8D5C4] rounded p-1.5">{c.body_preview}</p>
+                      )}
+                      {c.retention.expired && (
+                        <p className="text-amber-800">
+                          Retention: refused after {c.retention.days} days
+                          {c.retention.reason === 'undated' ? ' (this call cannot be dated)' : ''}.
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
 
             {diag.allowlist && diag.allowlist.length > 0 && (
               <p className="text-[10px] text-[#8B7355]">

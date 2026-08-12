@@ -1,7 +1,7 @@
 import { after } from 'next/server';
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { fetchAllowedRecording } from '@/lib/ct/recording-fetch';
+import { describeUpstreamRefusal, fetchAllowedRecording } from '@/lib/ct/recording-fetch';
 import {
   logRecordingRefusal,
   maybeSweepRecordingRetention,
@@ -20,6 +20,15 @@ import {
  * SSRF guard lives in fetchAllowedRecording (src/lib/ct/recording-fetch.ts):
  * HTTPS only, host allowlist (*.telecmi.com + ct_settings override), manual
  * redirect follow re-validating every hop. Shared with the AI analyze lib.
+ * That helper also normalizes the TeleCMI play URL and attaches credentials for
+ * the outgoing request only — see its header for the measured vendor contract.
+ *
+ * EVERY FAILURE PATH ANSWERS JSON, AND THE PLAYER READS IT. An <audio> element
+ * handed a JSON body renders a silent 0:00/0:00 with a dead play button and
+ * throws the reason away, which is how a broken playback URL survived unnoticed.
+ * The bodies below are therefore written as sentences a GRE can act on, and
+ * src/components/ct/RecordingPlayer.tsx fetches and displays them on error.
+ * Anything added here must keep the { error } key: that is the whole contract.
  *
  * RETENTION. This route is also where the recording-retention window is
  * enforced, and it is the ONLY place that can be: nothing on this deployment
@@ -85,13 +94,19 @@ export async function GET(req: Request, { params }: { params: Promise<{ callId: 
     });
   } catch (e: any) {
     clearTimeout(timer);
-    const msg = e?.name === 'AbortError' ? 'Recording source timed out' : (e?.message || 'Failed to fetch recording');
+    const msg = e?.name === 'AbortError'
+      ? 'The recording source did not answer within 15 seconds.'
+      : (e?.message || 'The recording could not be fetched.');
     return Response.json({ error: msg }, { status: 502 });
   }
   clearTimeout(timer);
 
   if (upstream.status !== 200 && upstream.status !== 206) {
-    return Response.json({ error: `Recording source responded ${upstream.status}` }, { status: 502 });
+    // Read the refusal instead of just its number. TeleCMI's own body names the
+    // fault ("Cannot GET /v2/play/…", "Authentication Failed"), and a bare
+    // "responded 404" has already cost one round of hunting the wrong layer.
+    // The body is being discarded either way, so peeking it costs nothing.
+    return Response.json({ error: await describeUpstreamRefusal(upstream) }, { status: 502 });
   }
 
   const h = new Headers();

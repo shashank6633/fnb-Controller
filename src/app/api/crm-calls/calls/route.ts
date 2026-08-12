@@ -158,6 +158,14 @@ export async function GET(req: Request) {
            c.agent_user, c.queue, c.started_at, c.answered_at, c.ended_at,
            c.duration_sec, c.disposition, c.disposition_note, c.created_at,
            c.analysis_status, c.analysis_score, c.analysis_outcome,
+           -- How far duration_sec can be trusted. Only the Call Back flow writes
+           -- duration_source; a PBX CDR and every row that predates that flow
+           -- carry '', which the client renders exactly as it always did. The
+           -- two travel together because NEITHER decides it alone: 'call_log'
+           -- says the phone read its own call log, duration_verified says the
+           -- server bounded the claim, and only both together mean measured.
+           -- See src/lib/ct/duration-trust.ts for the rule.
+           c.duration_source, c.duration_verified,
            -- has_recording means PLAYABLE, not "a URL exists". Past the
            -- retention window the proxy refuses with 410, and a bare <audio>
            -- element discards that body — so offering the control gave the GRE

@@ -25,8 +25,10 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
+import { durationTrust } from '@/lib/ct/duration-trust';
 import QuickBookingModal from '@/components/ct/QuickBookingModal';
 import CallbackButton from '@/components/ct/CallbackButton';
+import RecordingPlayer from '@/components/ct/RecordingPlayer';
 import CallAnalysisCard, { type CallAnalysisData } from '@/app/crm/assistant/CallAnalysisCard';
 
 // ─── Types (mirror /api/crm-calls/guests/[id]) ──────────────────────────────
@@ -127,6 +129,11 @@ interface TimelineEntry {
   rang_team?: string;      // unanswered inbound only: the team that rang
   started_at?: string | null;
   duration_sec?: number;
+  // How far duration_sec can be trusted. Written only by the Call Back flow, so
+  // both are '' / 0 on every PBX-timed CDR and on every row that predates that
+  // flow — and callOutcome leaves those reading exactly as they always have.
+  duration_source?: string;
+  duration_verified?: number;
   disposition?: string;
   disposition_note?: string;
   has_recording?: boolean;
@@ -208,8 +215,21 @@ const KNOWN_CALL_STATUS = new Set(['answered', 'missed', 'abandoned', 'voicemail
  *
  * An unmapped agent id arrives here already resolved to the raw id (the API's
  * resolveAgentLabel), which is what should be shown — it is never hidden.
+ *
+ * THE DURATION follows the same rule as every other word here: it may not claim
+ * more than is known. A PBX-timed CDR, and every call logged before durations
+ * started being verified, print bare — unchanged, because they are not in doubt
+ * and dressing them up either way would invent a distinction. A duration the
+ * GRE's own handset reported, and that the server could not confirm was measured,
+ * prints with a leading '~' and explains itself on hover.
+ *
+ * Deliberately NOT mirrored from the Call Log: the small check the Call Log puts
+ * on a verified measurement. This is a guest's history, read to answer "what
+ * happened with this guest", not an audit of who typed what — so the good case
+ * stays visually untouched and only an estimate is ever qualified. The Call Log
+ * is the surface where an agent's numbers are compared, and it carries both marks.
  */
-function callOutcome(t: TimelineEntry): { text: string; tone: string; details: string[] } {
+function callOutcome(t: TimelineEntry): { text: string; tone: string; details: string[]; durationNote: string } {
   const answered = t.answered ?? (t.status === 'answered');
   const inProgress = !!t.in_progress;
 
@@ -221,7 +241,8 @@ function callOutcome(t: TimelineEntry): { text: string; tone: string; details: s
   const tone = inProgress ? 'text-amber-700' : answered ? 'text-green-700' : 'text-red-600';
 
   const details: string[] = [];
-  if (answered) details.push(fmtDuration(t.duration_sec));
+  const trust = durationTrust(t.duration_source, t.duration_verified, t.duration_sec);
+  if (answered) details.push(`${trust.prefix}${fmtDuration(t.duration_sec)}`);
   if (t.dialled_by) details.push(`called by ${t.dialled_by}`);
   if (t.rang_team) details.push(`${inProgress ? 'ringing' : 'rang'} ${t.rang_team}`);
   // Which team an answered call came through is context, not blame — and it is
@@ -236,7 +257,9 @@ function callOutcome(t: TimelineEntry): { text: string; tone: string; details: s
   // looking for it.
   if (t.status === 'voicemail') details.push('went to voicemail');
   if (t.status && !KNOWN_CALL_STATUS.has(t.status)) details.push(String(t.status).replace(/_/g, ' '));
-  return { text, tone, details };
+  // Only when a duration is actually in this line — the note explains the figure,
+  // and hanging it on a row that shows no figure would explain nothing.
+  return { text, tone, details, durationNote: answered ? trust.note : '' };
 }
 
 const BADGE_STYLES: Record<string, string> = {
@@ -1234,7 +1257,15 @@ export default function GuestProfilePage() {
                               <span className={o.tone}>{o.text}</span>
                             </span>
                             {o.details.length > 0 && (
-                              <span className="text-xs text-[#8B7355]">{o.details.join(' · ')}</span>
+                              <span
+                                className={`text-xs text-[#8B7355]${o.durationNote ? ' cursor-help' : ''}`}
+                                title={o.durationNote || undefined}
+                              >
+                                {o.details.join(' · ')}
+                                {/* A title attribute is not reliably announced, and
+                                    the '~' is not announced at all. */}
+                                {o.durationNote && <span className="sr-only"> — {o.durationNote}</span>}
+                              </span>
                             )}
                           </>
                         );
@@ -1301,13 +1332,12 @@ export default function GuestProfilePage() {
                     {t.disposition_note && (
                       <p className="text-xs text-[#6B5744] mt-1 break-words">{t.disposition_note}</p>
                     )}
+                    {/* Shared with the Call Log — see src/components/ct/RecordingPlayer.tsx.
+                        A bare <audio> here rendered a dead 0:00/0:00 for a recording the
+                        proxy was refusing with a reason, on exactly the same call the Log
+                        was failing on; one player means one explanation on both surfaces. */}
                     {t.has_recording && (
-                      <audio
-                        controls
-                        preload="none"
-                        src={`/api/telecmi/recording/${t.id}`}
-                        className="mt-2 w-full max-w-sm h-9"
-                      />
+                      <RecordingPlayer callId={t.id} className="mt-2 w-full max-w-sm h-9" />
                     )}
                     {/* Inline AI scorecard (expanded) */}
                     {t.has_recording && aiExpanded[t.id] && (

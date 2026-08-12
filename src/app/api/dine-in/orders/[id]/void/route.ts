@@ -5,9 +5,9 @@ import { getCurrentUser } from '@/lib/auth';
  * Void an open order (manager/admin). No sales are written; the table frees up.
  *
  * A void is a "this never happened" record, so it is only honest while nothing
- * has actually left a shelf. Once the kitchen completes a ticket the recipe
- * consume path has already run for those lines (see kds/[id]/bump), and under
- * department stock that gram has come out of the kitchen that cooked it. Voiding
+ * has actually left a shelf. Once the kitchen marks a ticket SERVED the food is
+ * cooked, and under department stock that gram has come out of the kitchen that
+ * cooked it — whether or not we have posted the deduction yet. Voiding
  * afterwards would leave a permanent department debit with no sale behind it —
  * which reads as theft on the very variance report this rail exists to produce.
  * v1 REFUSES instead. Do NOT "fix" this later by posting a compensating credit
@@ -28,20 +28,32 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     if (!order) return Response.json({ error: 'Order not found' }, { status: 404 });
     if (order.status !== 'open') return Response.json({ error: 'Only an open order can be voided' }, { status: 409 });
 
-    // THE GATE IS recipe_deducted_at, NOT the KOT status. The stamp is written
-    // line-by-line and only on a successful deduct (bump/route.ts stamps inside
-    // the loop; settle and hold backstop anything that threw), so it is the only
-    // field that answers "did the consume path already run for THIS line". A KOT
-    // sitting at 'ready' has cooked nothing on the stock rail and still voids
-    // exactly as it did before this change — do not widen the test to kot.status.
+    // THE GATE IS "WAS IT COOKED", WHICH IS NOW TWO CONDITIONS.
+    //
+    // It used to be recipe_deducted_at alone, because the deduct ran inline in
+    // the KDS bump — served and deducted were the same instant. The KOT undo
+    // window broke that equivalence: the bump now stamps kots.served_at and
+    // DEFERS the consume (src/lib/kot-completion.ts), so for the length of the
+    // window the food is cooked and no line carries a stamp yet. Testing only
+    // the stamp let a void through in exactly that gap, and because the void
+    // takes the order out of the sweep's reach the consumption was then never
+    // posted at all — not deferred, not reversed, silently lost. Two independent
+    // reviewers found it; this is the fix.
+    //
+    // served_at, NOT kot.status generally. A ticket sitting at 'ready' has
+    // cooked nothing on the stock rail and must still void exactly as it always
+    // did — that part of the original reasoning is unchanged and still load-bearing.
     //
     // Note there is no `await` between this read and the UPDATE below.
     // better-sqlite3 is synchronous, so no KDS bump can stamp a line in the gap.
     // Keep it that way: introducing an await here reopens a real TOCTOU.
     const cooked = db.prepare(`
-      SELECT COALESCE(NULLIF(TRIM(station), ''), '') AS station, COUNT(*) AS n
-      FROM order_items
-      WHERE order_id = ? AND recipe_deducted_at IS NOT NULL
+      SELECT COALESCE(NULLIF(TRIM(oi.station), ''), '') AS station, COUNT(*) AS n
+      FROM order_items oi
+      LEFT JOIN kots k ON k.id = oi.kot_id
+      WHERE oi.order_id = ?
+        AND (oi.recipe_deducted_at IS NOT NULL
+             OR NULLIF(TRIM(COALESCE(k.served_at, '')), '') IS NOT NULL)
       GROUP BY 1
     `).all(id) as { station: string; n: number }[];
     const cookedCount = cooked.reduce((s, r) => s + Number(r.n || 0), 0);

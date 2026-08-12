@@ -6,6 +6,10 @@
  * between raw webhook JSON and our normalized shapes — business logic
  * (src/lib/ct/ingest.ts) never touches raw payloads directly.
  *
+ * It also decides, per record, whether there is a GUEST in it at all — a routed
+ * inbound call is reported as two records and only one of them has a caller.
+ * See CallLeg / classifyLeg() below.
+ *
  * Pure functions: no DB, no side effects beyond console.warn on unknown shapes.
  * The single import is a default STRING constant (the recording base URL) —
  * nothing here reads or writes the database, and mapCdrPayload() stays callable
@@ -14,6 +18,25 @@
  * here to UTC ISO-8601 (accepts epoch seconds, epoch millis, or ISO strings).
  */
 import { RECORDING_BASE_URL_DEFAULT } from './settings';
+
+/**
+ * WHICH LEG OF A ROUTED CALL a record describes.
+ *
+ * TeleCMI reports a routed inbound call as TWO records, not one: the guest
+ * dialling our virtual number, and the platform then dialling an agent's
+ * handset. Only the first has a guest in it. The second is internal plumbing —
+ * its `from` is the number our agents' phones see the call arrive from, which
+ * is ours, not the caller's — and putting it in front of a GRE as "a caller" is
+ * how "79434 46235" ended up on the Live wallboard with its own answered/ended
+ * lines. See classifyLeg() for the (deliberately narrow) test.
+ *
+ *   'guest'    — treat as a real call. THE DEFAULT, and what an unconfigured
+ *                install returns for everything, exactly as before this field
+ *                existed.
+ *   'internal' — the number we would report as the customer is demonstrably
+ *                OURS, so there is no guest in this record.
+ */
+export type CallLeg = 'guest' | 'internal';
 
 /** Normalized live ("notify") webhook event. */
 export interface MappedLiveEvent {
@@ -26,6 +49,16 @@ export interface MappedLiveEvent {
   queue: string;
   /** UTC ISO event time (falls back to now). */
   at: string;
+  /** guest vs internal plumbing — see CallLeg. */
+  leg: CallLeg;
+  /** WHY `leg` is 'internal', in one sentence. '' whenever leg is 'guest'. */
+  legNote: string;
+  /**
+   * OUR OWN number exactly as this payload named it (`virtual_number`), '' when
+   * the payload carried no such field. Callers persist it so later payloads —
+   * including live events, which may not repeat it — can be classified too.
+   */
+  virtualNumber: string;
 }
 
 /** Normalized CDR ("call report") webhook record. */
@@ -50,6 +83,12 @@ export interface MappedCdr {
    * 'unknown' is not a synonym for 'no': it means the payload never said.
    */
   recordFlag: RecordFlag;
+  /** guest vs internal plumbing — see CallLeg. */
+  leg: CallLeg;
+  /** WHY `leg` is 'internal', in one sentence. '' whenever leg is 'guest'. */
+  legNote: string;
+  /** OUR OWN number as this payload named it — see MappedLiveEvent.virtualNumber. */
+  virtualNumber: string;
 }
 
 /**
@@ -161,17 +200,39 @@ function pickTime(m: Norm, keys: string[]): string | null {
 
 // ---- candidate key sets (normKey'd: lowercase, punctuation stripped) -------
 
-// 'cmiuid' FIRST — it is TeleCMI's actual unique call id and the only one a real
-// payload carries. Its absence from this list was the whole reason live/CDR
-// correlation did not work: pickStr() returned '', ct_calls.telecmi_call_id went
-// in NULL, and the CDR that arrives at hangup could never find the ringing row it
-// was meant to finalise. Screen-pop matched nothing for the same reason. Every
-// other key here is a defensive alias for mocks and other PBXs — keep them, but
-// cmiuid is the one that fires in production.
+// 'cmiuid' FIRST — it is TeleCMI's unique call id on the LIVE ("notify") events,
+// and its absence from this list was the whole reason live/CDR correlation did
+// not work: pickStr() returned '', ct_calls.telecmi_call_id went in NULL, and the
+// CDR that arrives at hangup could never find the ringing row it was meant to
+// finalise. Screen-pop matched nothing for the same reason.
+//
+// CORRECTION, from a 17-field census of REAL CDRs on this account: a CDR carries
+// NO 'cmiuid' at all. It carries `cmiuuid` (two u's), `call_id` and
+// `conversation_uuid`. normKey() only strips punctuation, so 'cmiuuid' does NOT
+// collapse to 'cmiuid' — the CDR resolves its id from `call_id` (which normalizes
+// to 'callid'), and it always has. An earlier version of this comment claimed
+// cmiuid was "the only one a real payload carries" and "the one that fires in
+// production"; that is true of live events and FALSE of CDRs, and it is corrected
+// here rather than left to mislead the next reader.
+//
+// 'cmiuuid' is therefore listed — but LAST, not next to 'cmiuid'. Position is
+// load-bearing: today's CDRs carry cmiuuid AND call_id, every existing
+// ct_calls.telecmi_call_id was written from call_id, and promoting cmiuuid above
+// 'callid' would silently re-key every future CDR — a re-delivery would insert a
+// DUPLICATE row instead of updating, and the live events would stop matching. At
+// the end it changes nothing for any payload that has one of the other keys, and
+// rescues only the payload that carries cmiuuid ALONE, which today maps to an
+// EMPTY id and can correlate with nothing.
+//
+// `conversation_uuid` is deliberately NOT here. It is shared BY BOTH LEGS of one
+// routed call, so using it as the call id would merge the guest leg and the agent
+// leg into a single ct_calls row — a different behaviour from suppressing the
+// agent leg, and not the one asked for.
 const ID_KEYS = [
   'cmiuid',
   'id', 'callid', 'calluuid', 'uuid', 'sid', 'callsid', 'uniqueid',
   'callrefid', 'refid', 'requestid', 'cdrid',
+  'cmiuuid',
 ];
 const CUSTOMER_KEYS = ['customernumber', 'customerno', 'customerphone', 'custnumber'];
 const FROM_KEYS = [
@@ -182,6 +243,17 @@ const TO_KEYS = [
   'to', 'tonumber', 'dialednumber', 'callednumber', 'destination', 'dest',
   'did', 'didnumber', 'dnis',
 ];
+// OUR OWN number, as TeleCMI itself names it on the record. `virtual_number` is
+// in the measured 17-field CDR census and is the vendor's own word for the DID
+// this account rents — so a payload that reports the SAME number as the customer
+// is, on its own evidence, not describing a guest.
+//
+// DELIBERATELY NARROW. It does NOT include 'did'/'didnumber'/'dnis', even though
+// those also name our side on an inbound call: they are in TO_KEYS, where they
+// are a *guess* at another PBX's spelling of the destination, and a payload that
+// put a guest's number in one of them would then get that guest suppressed. The
+// whole point of this list is that every key on it is unambiguously ours.
+const OWN_NUMBER_KEYS = ['virtualnumber', 'virtualno'];
 const AGENT_KEYS = [
   'agentuser', 'agentname', 'agent', 'username', 'user', 'userno',
   'answeredby', 'answeredagent', 'agentid', 'extension', 'ext',
@@ -359,6 +431,77 @@ function pickPhone(m: Norm, direction: 'inbound' | 'outbound'): string {
   );
 }
 
+/** Digits only, so "+91 79434 46235", "9179434 46235" and 7943446235 compare. */
+function digitsOf(v: unknown): string {
+  return String(v ?? '').replace(/\D/g, '');
+}
+
+/**
+ * Are these two strings the same phone number? Exact digits, or the same last
+ * TEN digits when BOTH sides have at least ten — which is how "7943446235" and
+ * "917943446235" are the one number, and the same rule the rest of this module
+ * already joins guests on.
+ *
+ * The both-sides length floor is the safety catch: without it a 3-digit agent
+ * EXTENSION would "match" by suffix and we would suppress a real call.
+ */
+function sameNumber(a: string, b: string): boolean {
+  const x = digitsOf(a);
+  const y = digitsOf(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (x.length >= 10 && y.length >= 10) return x.slice(-10) === y.slice(-10);
+  return false;
+}
+
+/**
+ * Is this record the guest's leg, or the internal leg the call was routed over?
+ *
+ * ONE TEST, AND IT IS DELIBERATELY THE NARROWEST ONE THAT WORKS: the number we
+ * are about to report as THE CUSTOMER is one of OUR numbers. A guest's call
+ * cannot arrive from our own DID, so when it appears to, we are looking at the
+ * platform→agent leg (or an equally useless call-to-ourselves record).
+ *
+ * "Our numbers" comes from two places, both evidence rather than guesswork:
+ *   1. `virtual_number` ON THIS VERY PAYLOAD — TeleCMI naming its own DID. Needs
+ *      no configuration at all.
+ *   2. `ownNumbers`, passed in by the caller (ct_settings; see ctOwnNumbers() in
+ *      src/lib/ct/ingest.ts). EMPTY on an unconfigured install, which is why
+ *      such an install behaves here exactly as it did before this function
+ *      existed.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO, because both would cost us real guest calls:
+ *   · It does not compare `to` against virtual_number. That would classify by
+ *     where the call was GOING, and a payload that omits or re-spells `to` would
+ *     take a genuine guest with it.
+ *   · It does not group legs by `conversation_uuid`. Whichever leg arrived first
+ *     would win, and if the internal leg won the race the GUEST would be the one
+ *     suppressed. Hiding a real caller costs money; showing an internal number is
+ *     merely embarrassing, so every uncertain case resolves to 'guest'.
+ */
+function classifyLeg(
+  phone: string,
+  virtualNumber: string,
+  ownNumbers: string[] | undefined,
+): { leg: CallLeg; legNote: string } {
+  if (!phone) return { leg: 'guest', legNote: '' };
+  if (virtualNumber && sameNumber(phone, virtualNumber)) {
+    return {
+      leg: 'internal',
+      legNote: `the number reported as the customer (${phone}) is this payload's own virtual_number (${virtualNumber})`,
+    };
+  }
+  for (const own of ownNumbers ?? []) {
+    if (own && sameNumber(phone, own)) {
+      return {
+        leg: 'internal',
+        legNote: `the number reported as the customer (${phone}) is one of our own numbers (${own})`,
+      };
+    }
+  }
+  return { leg: 'guest', legNote: '' };
+}
+
 function pickAgent(m: Norm): string {
   const direct = pickStr(m, AGENT_KEYS);
   if (direct) return direct;
@@ -431,11 +574,26 @@ function pickLiveEvent(m: Norm): 'ring' | 'answer' | 'hangup' {
   return inferred;
 }
 
+/** Options for mapLivePayload(). */
+export interface MapLiveOptions {
+  /**
+   * OUR OWN numbers (DIDs / trunk numbers), read from ct_settings by
+   * ctOwnNumbers(db) in src/lib/ct/ingest.ts and passed in — this module stays
+   * pure and never touches the DB, exactly as MapCdrOptions.recordingBaseUrl
+   * already works.
+   *
+   * OMITTED or [] → nothing is ever classified 'internal' on this evidence, so
+   * an unconfigured install is byte-for-byte what it was. (A payload naming its
+   * own `virtual_number` is still classified from that, which needs no setting.)
+   */
+  ownNumbers?: string[];
+}
+
 /**
  * Map a live ("notify") webhook payload. Returns null ONLY when the payload
  * carries neither a phone number nor a call id (nothing to key on).
  */
-export function mapLivePayload(raw: any): MappedLiveEvent | null {
+export function mapLivePayload(raw: any, opts: MapLiveOptions = {}): MappedLiveEvent | null {
   const m = collect(raw);
   if (!m) {
     console.warn(`${WARN} live payload is not a JSON object — ignoring: ${snippet(raw)}`);
@@ -451,6 +609,8 @@ export function mapLivePayload(raw: any): MappedLiveEvent | null {
   if (!phone) {
     console.warn(`${WARN} live payload has no customer number (call ${telecmiCallId}): ${snippet(raw)}`);
   }
+  const virtualNumber = pickStr(m, OWN_NUMBER_KEYS);
+  const { leg, legNote } = classifyLeg(phone, virtualNumber, opts.ownNumbers);
   return {
     telecmiCallId,
     phone,
@@ -459,6 +619,9 @@ export function mapLivePayload(raw: any): MappedLiveEvent | null {
     agent: pickAgent(m),
     queue: pickStr(m, QUEUE_KEYS),
     at: pickTime(m, LIVE_AT_KEYS) ?? new Date().toISOString(),
+    leg,
+    legNote,
+    virtualNumber,
   };
 }
 
@@ -618,6 +781,8 @@ export interface MapCdrOptions {
    * Absolute URLs in the payload ignore this entirely.
    */
   recordingBaseUrl?: string;
+  /** OUR OWN numbers — see MapLiveOptions.ownNumbers. */
+  ownNumbers?: string[];
 }
 
 /**
@@ -689,6 +854,9 @@ export function mapCdrPayload(raw: any, opts: MapCdrOptions = {}): MappedCdr | n
     );
   }
 
+  const virtualNumber = pickStr(m, OWN_NUMBER_KEYS);
+  const { leg, legNote } = classifyLeg(phone, virtualNumber, opts.ownNumbers);
+
   return {
     telecmiCallId,
     phone,
@@ -702,5 +870,8 @@ export function mapCdrPayload(raw: any, opts: MapCdrOptions = {}): MappedCdr | n
     durationSec,
     recordingUrl: recording.url,
     recordFlag: pickRecordFlag(m),
+    leg,
+    legNote,
+    virtualNumber,
   };
 }

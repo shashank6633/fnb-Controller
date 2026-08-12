@@ -1,14 +1,42 @@
-import { getDb, deductInventoryForSale } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
+import { getDb } from '@/lib/db';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { emitKds } from '@/lib/kds-bus';
-import { resolveFloorStore } from '@/lib/store-engine';
-
-const FLOW = ['new', 'preparing', 'ready', 'served'];
+import { sectionMatchesStation } from '@/lib/kot-section';
+import {
+  applyKotConsumption,
+  commitDueKotConsumption,
+  getUndoWindowSeconds,
+  kotUndoState,
+  markKotServed,
+  nextKotStatus,
+  scheduleDueSweep,
+} from '@/lib/kot-completion';
 
 /**
- * POST — advance a KOT one step along new → preparing → ready → served. Body may
- * pass { to } to set a specific status; otherwise it advances by one. On 'served'
- * the ticket drops off the active board. Broadcasts a kot.bumped event.
+ * POST — advance a KOT exactly ONE step along new → preparing → ready → served.
+ *
+ * THE TARGET IS DERIVED SERVER-SIDE. This route used to take a `to` status from
+ * the request body and set it, which let any signed-in caller drive a ticket
+ * BACKWARDS — including out of 'served', which is the completion that moves
+ * stock. The body may still carry `to`, but only as an assertion: if it does not
+ * match the one step this route was going to take anyway, the request is refused
+ * rather than obeyed. Adding a legitimate transition means adding it here, in
+ * the server's own table, never in a caller's payload.
+ *
+ * WHO MAY BUMP. The board's own visibility rule, mirrored exactly: you may bump
+ * what you can see. That is the outlet scope plus the Parent Role / Section
+ * filter from /api/dine-in/kds (admin, manager and head chef see — and so bump —
+ * every section). This is deliberately NOT the settle authority: closing a bill
+ * and advancing a kitchen ticket are different powers, and importing the till
+ * rules here would refuse the very chefs the board exists for.
+ *
+ * ON 'served' THE CONSUMPTION IS DEFERRED, NOT POSTED. The ticket is stamped
+ * kots.served_at and an undo window opens; only when that window closes does the
+ * recipe consume run (src/lib/kot-completion.ts holds the whole argument, the
+ * exact-complement predicates and the settle/hold backstop). A window of 0
+ * consumes inline, which is exactly the behaviour this route had before.
+ *
+ * Broadcasts a kot.bumped event either way.
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -16,91 +44,70 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const { id } = await params;
     const db = getDb();
+    const outletId = await getCurrentOutletId();
     const kot = db.prepare('SELECT * FROM kots WHERE id = ?').get(id) as any;
     if (!kot) return Response.json({ error: 'KOT not found' }, { status: 404 });
 
-    const b = await req.json().catch(() => ({}));
-    let next: string;
-    if (b.to && FLOW.includes(b.to)) {
-      next = b.to;
-    } else {
-      const i = FLOW.indexOf(kot.status);
-      next = FLOW[Math.min(i + 1, FLOW.length - 1)];
+    // Outlet + section gate — the same two tests /api/dine-in/kds applies when it
+    // decides whether this user may SEE the ticket. A NULL outlet_id is the
+    // shared/default outlet and is visible everywhere, so it is bumpable too.
+    if (kot.outlet_id && outletId && kot.outlet_id !== outletId) {
+      return Response.json({ error: 'This ticket belongs to another outlet' }, { status: 403 });
+    }
+    const privileged = me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef;
+    if (!privileged && me.section && !sectionMatchesStation(me.section, kot.station || '')) {
+      return Response.json(
+        { error: `${kot.station || 'This'} tickets are not in your section (${me.section})` },
+        { status: 403 },
+      );
+    }
+
+    // Land any consumption whose window has already closed. Cheap (one indexed
+    // lookup that normally returns nothing) and it makes a working kitchen the
+    // primary heartbeat for the deferral.
+    commitDueKotConsumption(db);
+
+    const next = nextKotStatus(kot.status);
+
+    const body = await req.json().catch(() => ({} as any));
+    const asserted = body && typeof body.to === 'string' ? String(body.to) : '';
+    if (asserted && asserted !== next) {
+      return Response.json(
+        { error: `This ticket is ${kot.status}; the only move from here is ${next}.`, status: kot.status },
+        { status: 409 },
+      );
     }
     if (next === kot.status) return Response.json({ status: next, kot });
 
+    const windowSec = getUndoWindowSeconds(db);
+
     const apply = db.transaction(() => {
-      db.prepare("UPDATE kots SET status = ?, updated_at = datetime('now') WHERE id = ?").run(next, id);
-      // When the ticket is COMPLETE (served), the food is consumed → deduct each
-      // recipe-linked item's ingredients, exactly once (idempotent via
-      // recipe_deducted_at). This is the "consume on KOT complete" model: settle
-      // later records revenue but skips inventory for these already-deducted items.
-      //   - non-chargeable / complimentary orders STILL consume (deduct runs);
-      //   - a cancelled item never reaches a fired KOT, so it never deducts here;
-      //   - a voided order is skipped (nothing was really cooked/served).
-      // The gram now leaves the DEPARTMENT that cooked it (resolved from the
-      // line's own station, below), not central — central already lost it when
-      // the store issued it on a requisition. The stamp+transaction pairing below
-      // is what keeps STOCK MOVES EXACTLY ONCE true; do not loosen either.
       if (next === 'served') {
-        // Stamp served_at once (item-journey tracking) and advance status. A line
+        // The ticket is COMPLETE. Stamp the serve time on the ticket (the undo
+        // window's only anchor) and on its lines (item-journey tracking). A line
         // already scanned 'kitchen_sent' still moves to 'served' here (terminal).
-        db.prepare("UPDATE order_items SET status = 'served', served_at = COALESCE(served_at, datetime('now')) WHERE kot_id = ?").run(id);
-        const order = db.prepare(`
-          SELECT o.bill_type, o.status, t.zone AS zone
-          FROM orders o
-          LEFT JOIN restaurant_tables t ON t.id = o.table_id
-          WHERE o.id = ?
-        `).get(kot.order_id) as any;
-        if (order && order.status !== 'void') {
-          // FAIL-SAFE floor routing: map this order's table zone → floor bar store
-          // once. Any failure (or an unmapped zone) → undefined → central deduct.
-          // deductInventoryForSale still gates the store path on tm_floor_autodeduct.
-          let floorStoreId: string | undefined;
-          try {
-            floorStoreId = resolveFloorStore(db, order.zone) || undefined;
-          } catch (e) {
-            console.error('[kds bump floor-resolve]', kot.order_id, e);
-            floorStoreId = undefined;
-          }
-          const cook = db.prepare(`
-            SELECT id, recipe_id, quantity, station FROM order_items
-            WHERE kot_id = ? AND recipe_id IS NOT NULL AND recipe_id != '' AND recipe_deducted_at IS NULL
-          `).all(id) as any[];
-          const stamp = db.prepare("UPDATE order_items SET recipe_deducted_at = datetime('now') WHERE id = ?");
-          for (const it of cook) {
-            try {
-              // DEPARTMENT ROUTING READS THE LINE'S station, NEVER kot.station.
-              // kot-fire.ts coerces a blank line station to the literal 'kitchen'
-              // when it groups lines into tickets, and 'Kitchen' is a REAL
-              // department (the main-kitchen roll-up) — so resolving from
-              // kot.station would silently debit the whole main kitchen for every
-              // station-less item. One ticket can also legitimately carry lines
-              // from more than one station, which a per-KOT value cannot express.
-              // Pass it.station through even when it is blank or unmapped
-              // (sushi, terracegrill): applyDeduct records the skip and its reason
-              // and moves nothing, because debiting the WRONG kitchen is worse
-              // than debiting none. Do NOT "simplify" this to kot.station, and do
-              // NOT add a fallback department here.
-              //
-              // opts is now passed unconditionally so station always reaches the
-              // deduct. That is a no-op for floor routing: deductInventoryForSale
-              // normalises a missing/blank opts.storeId to '' and takes the exact
-              // central path, which is what `undefined` did before.
-              deductInventoryForSale(
-                db, it.recipe_id, it.quantity, it.id, order.bill_type || 'normal',
-                { storeId: floorStoreId, station: it.station },
-              );
-              stamp.run(it.id);   // stamp only on success → settle backstops any that threw
-            } catch (e) { console.error('[kds bump recipe-deduct]', it.id, e); }
-          }
-        }
+        // NO STOCK MOVES IN THIS BRANCH unless the window is switched off.
+        markKotServed(db, id);
+        // Window 0 = the undo is switched off, so there is nothing to wait for:
+        // consume in this same transaction, exactly as this route always did.
+        if (windowSec <= 0) applyKotConsumption(db, id);
+      } else {
+        db.prepare("UPDATE kots SET status = ?, updated_at = datetime('now') WHERE id = ?").run(next, id);
       }
     });
     apply();
 
+    // Best-effort: fire one sweep just after this window closes, so a chef who
+    // walks away from the screen still gets the consume on time. Never the
+    // guarantee — see kot-completion.ts.
+    if (next === 'served' && windowSec > 0) scheduleDueSweep(db);
+
     emitKds({ type: 'kot.bumped', outlet_id: kot.outlet_id, station: kot.station, kot: { id, status: next, order_id: kot.order_id } });
-    return Response.json({ status: next });
+    // The undo state rides back on the bump so the board can draw the countdown
+    // without a second round trip. It is the server's own reading of served_at,
+    // so it stays correct across a refresh.
+    const undo = next === 'served' && windowSec > 0 ? kotUndoState(db, id) : null;
+    return Response.json({ status: next, undo });
   } catch (e: any) {
     console.error('[/api/dine-in/kds/[id]/bump]', e);
     return Response.json({ error: e.message }, { status: 500 });

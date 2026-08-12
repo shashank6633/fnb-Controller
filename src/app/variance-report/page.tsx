@@ -51,13 +51,22 @@ export default function VarianceReportPage() {
 
   const exportCsv = () => {
     if (filtered.length === 0) return;
+    // The export mirrors the screen: the SUBTRACTED column (central outflow) is
+    // exported beside the diagnostic recipe figure, never instead of it, and the
+    // cutover opening + per-row basis are appended only once a cutover exists —
+    // a sheet whose rows are on two different bases with nothing saying so is
+    // how one gets averaged into the other in a spreadsheet.
     const headers = ['date','sku','material','category','unit',
-                     'purchases_to_date','recipe_to_date','theoretical_stock',
+                     ...(data?.cutover ? ['cutover_opening','basis'] : []),
+                     'purchases_to_date','central_outflow_to_date','recipe_to_date_excluded','theoretical_stock',
                      'physical_stock','loss','avg_price','loss_value','recorded_by','notes'];
     const lines = [headers.join(',')];
     for (const r of filtered) {
       const v = headers.map(h => {
-        const map: any = { sku: 'material_sku', material: 'material_name', unit: 'material_unit', avg_price: 'average_price' };
+        const map: any = {
+          sku: 'material_sku', material: 'material_name', unit: 'material_unit', avg_price: 'average_price',
+          recipe_to_date_excluded: 'recipe_to_date',
+        };
         const k = map[h] ?? h;
         const x = r[k];
         if (x === null || x === undefined) return '';
@@ -87,26 +96,72 @@ export default function VarianceReportPage() {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
+            {/* TITLE, SUBTITLE AND FORMULA COME FROM THE PAYLOAD. They used to be
+                hard-coded here as "Theoretical = Purchases − Recipe", which has
+                not been this report's formula for a long time: recipe
+                consumption debits the DEPARTMENT and contributes zero, while
+                requisition issues, central wastage, parties, staff meals and
+                vendor returns are what is actually subtracted. A screen that
+                states a formula the server does not use is how a number gets
+                quoted wrongly in a meeting. */}
             <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408] flex items-center gap-2">
-              <ClipboardCheck className="w-6 h-6" /> Closing-Stock Variance
+              <ClipboardCheck className="w-6 h-6" /> {data?.report?.title || 'Central Store variance'}
             </h1>
             <p className="text-[#8B7355] text-sm mt-1">
-              Physical count vs theoretical stock. Internal transfers are excluded — only purchases and recipe consumption move the books.
+              {data?.report?.subtitle
+                || 'Goods issued to departments have left the store — they are counted on the Department Variance report, not here.'}
             </p>
             <div className="mt-2 inline-flex flex-wrap gap-2 text-[11px] font-mono">
               <span className="px-2 py-1 rounded bg-[#FFF1E3] border border-[#D4B896] text-[#6B5744]">
-                <b className="text-[#2D1B0E]">Theoretical</b> = Purchases − Recipe
+                {data?.report?.formula
+                  || 'Theoretical = Purchases − Requisition issues − Central wastage − Party − Staff meals − Vendor returns'}
               </span>
               <span className="px-2 py-1 rounded bg-red-50 border border-red-200 text-red-800">
-                <b>Loss</b> = Purchases − Recipe − Closing Stock
+                <b>Loss</b> = Theoretical − Closing Stock
               </span>
             </div>
+            {Array.isArray(data?.report?.excludes) && data.report.excludes.length > 0 && (
+              <p className="text-[10px] text-[#8B7355] mt-1">
+                Not subtracted: {data.report.excludes.join(' · ')}
+              </p>
+            )}
           </div>
           <button onClick={exportCsv} disabled={filtered.length === 0}
                   className="inline-flex items-center gap-2 px-3 py-2 bg-[#FFF1E3] text-[#6B5744] hover:bg-[#FFE9D4] border border-[#D4B896] rounded-lg text-sm disabled:opacity-50">
             <Download className="w-4 h-4" /> Export CSV
           </button>
         </div>
+
+        {/* THE CUTOVER BASIS. Rendered ONLY once a cutover has been committed —
+            the API omits `cutover` entirely otherwise, so this block disappears
+            and the page is unchanged. The wording comes from the payload so the
+            screen can never drift from the formula that produced the rows. */}
+        {data?.cutover && (
+          <div className="bg-amber-50 border border-amber-300 rounded-xl p-3 text-xs text-amber-900 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+            <div className="leading-relaxed">
+              <p>{data.cutover.note}</p>
+              <p className="mt-1 font-mono text-[10px]">
+                {data.cutover.rows_on_cutover_basis} row(s) opening from the count ·{' '}
+                {data.cutover.rows_pre_cutover} dated before the cutover ·{' '}
+                {data.cutover.rows_without_cutover_count} material(s) never counted
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Server warnings, verbatim. Each one is a real consequence of the
+            formula (an unmodelled movement, a mixed basis) — dropping them
+            leaves a true behaviour looking like a wrong number. */}
+        {Array.isArray(data?.warnings) && data.warnings.length > 0 && (
+          <div className="bg-white border border-amber-200 rounded-xl p-3 text-xs text-[#6B5744] space-y-1">
+            {data.warnings.map((w: string, i: number) => (
+              <p key={i} className="flex items-start gap-2 leading-relaxed">
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0 text-amber-600" />{w}
+              </p>
+            ))}
+          </div>
+        )}
 
         {/* Filter bar */}
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 shadow flex flex-wrap items-center gap-3">
@@ -277,9 +332,19 @@ export default function VarianceReportPage() {
                         the balance would stop reconciling. The basis is therefore stated in
                         every header instead — same precedent as the liquor Movement report's
                         "Unit (recipe)" column. */}
+                    {data?.cutover && (
+                      <th className="text-right py-1.5 px-3 font-medium" title="The cutover count for this material — the opening this row is measured from. Blank on a row that keeps the all-time basis.">Opening <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
+                    )}
                     <th className="text-right py-1.5 px-3 font-medium" title="Σ purchase quantities up to count date, converted into the recipe unit">Purchases <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
-                    <th className="text-right py-1.5 px-3 font-medium" title="Σ recipe-driven consumption up to count date (sales + parties + staff meals)">Recipe <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
-                    <th className="text-right py-1.5 px-3 font-medium" title="Purchases − Recipe">Theoretical <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
+                    {/* THE SUBTRACTED COLUMN. This used to print `recipe_to_date`
+                        under the heading "Recipe", directly between Purchases and
+                        Theoretical — implying Theoretical = Purchases − Recipe.
+                        It is not: recipe consumption debits the department and is
+                        excluded, and what is actually subtracted is the central
+                        outflow (issues + central wastage + party + staff meals +
+                        vendor returns). The three columns now reconcile. */}
+                    <th className="text-right py-1.5 px-3 font-medium" title="Σ central outflow up to count date: requisition issues + central wastage + party + staff meals + vendor returns (net of returns)">Outflow <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
+                    <th className="text-right py-1.5 px-3 font-medium" title="Opening + Purchases − Outflow">Theoretical <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
                     <th className="text-right py-1.5 px-3 font-medium" title="Physical closing-stock count">Closing <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
                     <th className="text-right py-1.5 px-3 font-medium" title="Theoretical − Closing (positive = loss)">Loss <span className="font-normal text-[9px] text-[#8B7355]">(recipe)</span></th>
                     <th className="text-right py-1.5 px-3 font-medium" title="Loss × material avg price">Loss ₹</th>
@@ -299,12 +364,36 @@ export default function VarianceReportPage() {
                       <tr key={r.id} className={`border-t border-[#E8D5C4]/50 ${isLoss ? 'bg-red-50/20' : isSurplus ? 'bg-indigo-50/20' : ''}`}>
                         <td className="py-1.5 px-3">{dateLabel(r.date)}</td>
                         <td className="py-1.5 px-3 font-mono text-[10px] text-[#8B7355]">{r.material_sku || '·'}</td>
-                        <td className="py-1.5 px-3">{r.material_name}</td>
+                        <td className="py-1.5 px-3">
+                          {r.material_name}
+                          {/* Only ever rendered after a cutover: the API omits
+                              `basis` until one is committed. A row still on the
+                              all-time basis sitting unlabelled beside re-based
+                              rows is exactly how the cutover looked like it had
+                              changed nothing. */}
+                          {r.basis === 'pre_cutover' && (
+                            <span className="ml-1.5 text-[9px] px-1 py-0.5 rounded border bg-amber-50 border-amber-200 text-amber-900 whitespace-nowrap"
+                                  title="This count is dated before the cutover, so it keeps the all-time basis. Its variance is pre-cutover drift, not loss.">
+                              pre-cutover
+                            </span>
+                          )}
+                          {r.basis === 'no_cutover_count' && (
+                            <span className="ml-1.5 text-[9px] px-1 py-0.5 rounded border bg-amber-50 border-amber-200 text-amber-900 whitespace-nowrap"
+                                  title="This material was not counted in the cutover, so it has no trusted opening and keeps the all-time basis.">
+                              not in cutover
+                            </span>
+                          )}
+                        </td>
+                        {data?.cutover && (
+                          <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">
+                            {r.basis === 'cutover' ? fmt2(r.cutover_opening) : '—'} <span className="text-[#8B7355]">{r.basis === 'cutover' ? r.material_unit : ''}</span>
+                          </td>
+                        )}
                         <td className="py-1.5 px-3 text-right font-mono text-emerald-700">
                           {r.purchases_to_date != null ? fmt2(r.purchases_to_date) : '—'} <span className="text-[#8B7355]">{r.material_unit}</span>
                         </td>
                         <td className="py-1.5 px-3 text-right font-mono text-blue-700">
-                          {r.recipe_to_date != null ? fmt2(r.recipe_to_date) : '—'} <span className="text-[#8B7355]">{r.material_unit}</span>
+                          {r.central_outflow_to_date != null ? fmt2(r.central_outflow_to_date) : '—'} <span className="text-[#8B7355]">{r.material_unit}</span>
                         </td>
                         <td className="py-1.5 px-3 text-right font-mono text-[#2D1B0E]">
                           {fmt2(r.theoretical_stock ?? r.system_stock)} <span className="text-[#8B7355]">{r.material_unit}</span>

@@ -166,6 +166,18 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/store-requisitions',  label: 'Store Requisitions (Issue)' },
       { path: '/closing-stock',       label: 'Closing Stock' },
       { path: '/variance-approvals',  label: 'Variance Approvals', adminOnly: true },
+      // Sits beside Variance Approvals because it is the same problem one level
+      // up: an approval decides whether ONE count corrects stock, a cutover
+      // re-bases EVERY counted material at once and cannot be undone. adminOnly
+      // for exactly the reason /variance-approvals is — it is a one-way console
+      // that overwrites the central stock figure of hundreds of materials in a
+      // single transaction. It also displays the central-store cutover date,
+      // which a manager has a legitimate reason to know; the manager-facing home
+      // for that date is the label on the variance surfaces, not this console.
+      // Widening it later is a one-word change (adminOnly → mgmtOnly), but the
+      // API behind it must be widened in the same breath or a manager lands on
+      // the page's Admins-only panel.
+      { path: '/inventory/central-cutover', label: 'Central Store Cutover', adminOnly: true },
       { path: '/daily-rollup',        label: 'Daily Roll-up', adminOnly: true },
       { path: '/wastage',             label: 'Wastage' },
       { path: '/unit-audit',          label: 'Unit Audit' },

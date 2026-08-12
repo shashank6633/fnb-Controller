@@ -18,11 +18,35 @@
  * - incoming_call → slide-in card top-right (below the floating bell).
  *   Known guest: name, VIP/tags, badge, calls/bookings counts, last visit
  *   (IST). Unknown: "New caller" + phone + name mini-form → Create Guest.
+ * - answered for the SAME call does NOT dismiss the card either — it moves to
+ *   ON-CALL mode: the header stops saying "Incoming call", the ring counter is
+ *   replaced by talk time counted from the answer, and the card NAMES whoever
+ *   picked up. See THREE CARD STATES below.
  * - call_ended for the SAME call does NOT dismiss the card — it switches to
  *   disposition mode: 7 one-tap chips → PUT /api/crm-calls/calls/[id].
  *   "Booking Made" opens QuickBookingModal (pre-filled source_call_id) and
  *   dispositions after the booking saves.
  * - Multiple simultaneous calls stack, up to MAX_CARDS.
+ *
+ * ── THREE CARD STATES, AND WHY THE MIDDLE ONE HAD TO EXIST ──────────────────
+ * `mode` used to be 'ringing' | 'disposition', with the `answered` event
+ * deliberately applying ownership and nothing else. That is why a GRE could be
+ * two minutes into a conversation while the pop still read "INCOMING CALL 158s"
+ * with the ring counter climbing — the card had no answered state to move to, so
+ * it stayed in the only other one it had. It also had nowhere to put the
+ * answerer's name, which is the thing the person at the desk actually wants to
+ * see, and which Guest 360 has always been able to show from the settled row.
+ *
+ *   ringing      what it says. Ring seconds. Quick Booking available.
+ *   answered     "On call", talk seconds from answeredAt, "Answered by X".
+ *                Quick Booking stays — mid-call is exactly when a GRE books.
+ *   disposition  the call is over: the 7 outcome chips.
+ *
+ * The card is NEVER auto-dismissed on answer or on hangup. A GRE who has just
+ * picked up must not have the guest's history yanked out from under them, and
+ * the write-up is the whole point of the disposition state. What does go away is
+ * the LIE: a card that has heard nothing for RING_STALE_SECONDS stops counting
+ * and says so, instead of implying a phone is still ringing somewhere.
  *
  * ── ONE ANSWERED CALL, ONE OWNER ────────────────────────────────────────────
  * This pop broadcasts to EVERY signed-in CRM browser, so an answered call used
@@ -79,7 +103,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
-  PhoneIncoming, PhoneOff, X, UserPlus, CalendarPlus, ExternalLink, Loader2, Star, Lock,
+  PhoneIncoming, PhoneOff, PhoneCall, X, UserPlus, CalendarPlus, ExternalLink, Loader2, Star,
+  Lock, UserCheck,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
@@ -102,10 +127,25 @@ interface PopCard {
   callId?: string;
   phone: string;
   guest: GuestSnap | null;
+  /** Raw TeleCMI agent id, as first seen on the call. NOT a person's name. */
   agent?: string;
+  /**
+   * WHO PICKED UP, resolved to a staff display name by the server
+   * (agentDisplayName → resolveAgentLabel, src/lib/ct/agents.ts) and carried on
+   * CtEvent.agentName. '' until an event names one.
+   *
+   * An UNMAPPED agent id resolves to the raw id, never to blank — that is
+   * resolveAgentLabel's documented contract, and it is the right one here: a
+   * GRE seeing "Answered by 201_1111112" learns something ("somebody has it,
+   * and the admin has not mapped that extension yet"), where a blank card would
+   * teach them nothing and look like the answer never happened.
+   */
+  agentName: string;
   queue?: string;
   startedAt: string;
-  mode: 'ringing' | 'disposition';
+  mode: 'ringing' | 'answered' | 'disposition';
+  /** When the call was picked up (UTC ISO); talk time counts from here. */
+  answeredAt?: string;
   endedAt?: string;
   /**
    * App user (email) holding the write-up of this ANSWERED call; '' = unowned.
@@ -159,6 +199,9 @@ interface AnyEvent {
   phone?: string;
   guest?: GuestSnap | null;
   agent?: string;
+  /** Staff display name for `agent` — CtEvent.agentName in src/lib/ct/bus.ts.
+   *  Carried by `answered` and by an ANSWERED call's `call_ended`. */
+  agentName?: string;
   /** Owner of the answered call — see CtEvent.ownerEmail in src/lib/ct/bus.ts. */
   ownerEmail?: string;
   ownerName?: string;
@@ -176,6 +219,22 @@ const MAX_CARDS = 5;
 /** How often to re-ask the server whether a lock we are showing is still in
  *  force. Only runs while a card actually has one — see THE LOCK CLOCK below. */
 const OWNERSHIP_REFRESH_MS = 15000;
+
+/**
+ * How long a card may claim to be RINGING with no further news before it stops
+ * counting and says it has lost track.
+ *
+ * 300s deliberately, because that is reconcileLiveEvents()'s own rule
+ * (src/lib/ct/ingest.ts): five minutes after a ring with nothing following, the
+ * SERVER stops believing the call is ringing and marks the row missed. A pop
+ * that kept ticking past that point would be contradicting the database it is a
+ * view of. Not a dismissal — the GRE keeps the card, the guest history and the
+ * actions; only the false "still ringing" goes.
+ *
+ * Applies to 'ringing' ONLY. A real conversation can run half an hour, and there
+ * is nothing stale about an 'answered' card whose talk timer is still climbing.
+ */
+const RING_STALE_SECONDS = 300;
 
 const DISPOSITIONS: Array<{ value: string; label: string }> = [
   { value: 'booking_made', label: 'Booking Made' },
@@ -309,18 +368,33 @@ function lockPatch(e: AnyEvent): Partial<PopCard> {
 }
 
 /**
- * Which card does a call-level event belong to? telecmi id → ct_calls id →
- * phone, and the phone fallback only for a still-ringing card and only when the
- * event carries no id at all (an id-less CDR must never match every card).
- * Shared by `answered`, `ownership` and `call_ended` so they can never drift
- * apart.
+ * Which card does a call-level event belong to? Shared by `answered`,
+ * `ownership` and `call_ended` so they can never drift apart.
+ *
+ * IDS FIRST, ALWAYS — telecmi id, then ct_calls id. Only if NEITHER matches any
+ * card does the phone get a say, and then only for a card the call is not
+ * finished on ('ringing' or 'answered').
+ *
+ * THE PHONE FALLBACK USED TO REQUIRE THE EVENT TO CARRY NO IDS AT ALL, and that
+ * was too strict in the one case that matters most. Ids on this account do not
+ * reliably correlate: the live events and the CDR can arrive keyed differently,
+ * so a card born from the ring holds one id and the CDR's `call_ended` arrives
+ * with another — both present, neither matching. Under the old rule that event
+ * bound to nothing, and the pop sat on "INCOMING CALL" for a call that had ended
+ * minutes ago. It is a two-pass search rather than one predicate precisely so a
+ * mismatching id can never let the phone outrank a card that DID match by id.
+ *
+ * Matching on phone cannot cross-wire two different guests — it is the same
+ * number — and the mode bound keeps it off a card already being written up.
  */
 function matchIdx(list: PopCard[], e: AnyEvent): number {
-  return list.findIndex(c =>
+  const byId = list.findIndex(c =>
     (!!e.telecmiCallId && c.telecmiCallId === e.telecmiCallId) ||
-    (!!e.callId && c.callId === e.callId) ||
-    (!e.telecmiCallId && !e.callId && !!e.phone && c.phone === e.phone && c.mode === 'ringing'),
+    (!!e.callId && c.callId === e.callId),
   );
+  if (byId !== -1) return byId;
+  if (!e.phone) return -1;
+  return list.findIndex(c => c.phone === e.phone && c.mode !== 'disposition');
 }
 
 /**
@@ -360,8 +434,10 @@ interface LockView { title: string; freeAtLabel: string; canWrite: boolean }
 function lockView(card: PopCard, myEmail: string): LockView | null {
   if (sameEmail(card.ownerEmail, myEmail)) return null;   // it's mine — keep the pop
   const who = card.ownerName || card.ownerEmail;
+  // 'answered' reads like 'ringing' here, not like 'disposition': the call is
+  // still up, so the honest sentence is that they are ON it, not writing it up.
   const title = who
-    ? (card.mode === 'ringing' ? `${who} is on this call` : `${who} is writing up this call`)
+    ? (card.mode === 'disposition' ? `${who} is writing up this call` : `${who} is on this call`)
     : 'Another user is writing up this call';
 
   // The server said I may write. If a lock is still in force it belongs to
@@ -409,11 +485,12 @@ function ownedIdsOf(list: PopCard[]): string[] {
 
 /**
  * Append a card, enforcing the MAX_CARDS stack. When full, drop an already-ended
- * (disposition-mode) card first — a live ringing call always wins the slot.
+ * (disposition-mode) card first — a LIVE call, whether still ringing or already
+ * answered, always wins the slot.
  * We permanently suppress (add to `dismissed`) ONLY an ended card; if we're
- * forced to evict a still-ringing card (all slots ringing), we drop it WITHOUT
- * suppressing so it can re-pop from the poll once a slot frees — a live caller
- * must never be hidden forever.
+ * forced to evict a live one (every slot is ringing or on a call), we drop it
+ * WITHOUT suppressing so it can re-pop from the poll once a slot frees — a live
+ * caller must never be hidden forever.
  */
 function pushCard(list: PopCard[], card: PopCard, dismissed: Set<string>): PopCard[] {
   const next = [...list, card];
@@ -462,13 +539,24 @@ export default function CTScreenPop() {
       .catch(() => { /* stays '' — presentation falls back to today's behaviour */ });
   }, []);
 
-  // 1s tick drives the ringing-seconds counter (only while something rings).
-  const hasRinging = cards.some(c => c.mode === 'ringing');
+  // 1s tick drives BOTH counters — ring seconds and, once the call is up, talk
+  // time. It runs only while a card actually has a live counter on it, so a
+  // stack of finished cards costs nothing.
+  //
+  // A ringing card that has gone stale is excluded, which is what stops the
+  // interval on a tab left open on a call nobody ever finished: the display is
+  // frozen at that point anyway, so there is nothing left to re-render. The
+  // dependency is a boolean derived from nowTick, so it settles in one pass
+  // (goes false, interval clears, nothing further updates nowTick).
+  const hasLiveCounter = cards.some(c =>
+    c.mode === 'answered' ||
+    (c.mode === 'ringing' && Math.floor((nowTick - new Date(c.startedAt).getTime()) / 1000) <= RING_STALE_SECONDS),
+  );
   useEffect(() => {
-    if (!hasRinging) return;
+    if (!hasLiveCounter) return;
     const t = setInterval(() => setNowTick(Date.now()), 1000);
     return () => clearInterval(t);
-  }, [hasRinging]);
+  }, [hasLiveCounter]);
 
   const updateCard = useCallback((key: string, patch: Partial<PopCard>) => {
     setCards(prev => prev.map(c => (c.key === key ? { ...c, ...patch } : c)));
@@ -501,6 +589,7 @@ export default function CTScreenPop() {
           phone: String(e.phone || ''),
           guest: e.guest || null,
           agent: e.agent || '',
+          agentName: e.agentName || '',   // a ring names no answerer yet
           queue: e.queue || '',
           startedAt: e.at || new Date().toISOString(),
           mode: 'ringing',
@@ -516,26 +605,44 @@ export default function CTScreenPop() {
     }
 
     if (e.type === 'answered' || e.type === 'ownership') {
-      // OWNERSHIP ONLY. The card deliberately keeps its mode, its slot and its
-      // ring timer — answering a call is not a reason to stop showing the
-      // person handling it, and that is the committed behaviour. All this does
-      // is record who holds the write-up and whether a lock is in force.
+      // The card KEEPS ITS SLOT and is never dismissed by either of these — a
+      // GRE who has just picked up must not have the guest's history pulled out
+      // from under them. What differs is that 'answered' now also moves the card
+      // out of the ringing state, which it did not used to do.
       //
-      // 'answered' is telephony: somebody picked up. It states an owner (''
-      // for the unmapped-agent case, which leaves the card open to everyone and
-      // is what makes first-claim possible) and says NOTHING about the lock —
-      // the ?owned= poll settles that, kicked off by this very change.
+      // 'answered' is TELEPHONY: somebody picked up. It states an owner ('' for
+      // the unmapped-agent case, which leaves the card open to everyone and is
+      // what makes first-claim possible), it names the answerer, and it says
+      // NOTHING about the lock — the ?owned= poll settles that, kicked off by
+      // this very change.
       // 'ownership' is the owner or the lock CHANGING on a call that already
-      // exists: a claim (locked:true), a management takeover, or the release
-      // the disposition PUT broadcasts (locked:false) — which is the event that
-      // lifts everyone else's strip the instant the write-up is saved.
-      const patch = lockPatch(e);
-      if (Object.keys(patch).length === 0) return;   // stated nothing
+      // exists: a claim (locked:true), a management takeover, or the release the
+      // disposition PUT broadcasts (locked:false) — which is the event that
+      // lifts everyone else's strip the instant the write-up is saved. It is NOT
+      // telephony, so it must not touch the mode or the timer: it lands at CHIP
+      // time, i.e. after the call is over, and promoting a card to "On call" on
+      // the strength of it would put a dead call back on the phone.
+      const patch: Partial<PopCard> = lockPatch(e);
+      // Guarded merge: 'ownership' shares this branch and carries no agent, so
+      // an unconditional copy would blank a name 'answered' had established.
+      if (e.agentName) patch.agentName = e.agentName;
+      const answeredAt = e.at || new Date().toISOString();
+      if (Object.keys(patch).length === 0 && e.type !== 'answered') return; // stated nothing
       setCards(prev => {
         const idx = matchIdx(prev, e);
         if (idx === -1) return prev;   // this browser never saw the call ring
+        const c = prev[idx];
         const next = [...prev];
-        next[idx] = { ...next[idx], ...patch };
+        next[idx] = {
+          ...c,
+          ...patch,
+          // ON CALL — but never backwards. A re-delivered 'answered', or one for
+          // another leg of a call that has already hung up, must not drag a card
+          // out of disposition and put a finished call back on the phone.
+          ...(e.type === 'answered' && c.mode !== 'disposition'
+            ? { mode: 'answered' as const, answeredAt: c.answeredAt || answeredAt }
+            : {}),
+        };
         return next;
       });
       return;
@@ -554,6 +661,12 @@ export default function CTScreenPop() {
           callId: e.callId || c.callId,
           guest: e.guest || c.guest, // CDR event carries a fresher snapshot
           endedAt: e.at || c.endedAt || new Date().toISOString(),
+          // An ANSWERED call's CDR names the agent (ingest.ts only sets
+          // agentName when status === 'answered'), so this is the second — and
+          // on a browser that missed the live 'answer', the ONLY — chance to
+          // learn who took it. Guarded for the same reason as above: a missed
+          // call's call_ended carries no agentName and must not erase one.
+          ...(e.agentName ? { agentName: e.agentName } : {}),
           // The write-up window is the whole point of the lock, so an owner
           // named on the hangup/CDR matters most here. lockPatch ignores an
           // absent field rather than clearing what `answered` already told us.
@@ -606,6 +719,12 @@ export default function CTScreenPop() {
           phone: String(r.phone_e164 || ''),
           guest,
           agent: String(r.agent_user || ''),
+          // The ringing snapshot carries the RAW agent id (agent_user), not a
+          // resolved name, and these rows are status='ringing' so nobody has
+          // picked up yet. Left blank on purpose rather than filled with an id
+          // that would render as "Answered by 201_1111112" on a call that has
+          // not been answered — the `answered` event brings the real name.
+          agentName: '',
           queue: String(r.queue || ''),
           startedAt: String(r.started_at || new Date().toISOString()),
           mode: 'ringing',
@@ -1114,11 +1233,15 @@ export default function CTScreenPop() {
     void claimBeforeAct(card);
   }, [claimBeforeAct, submitDisposition]);
 
-  const ringSeconds = (card: PopCard) => {
-    const t = new Date(card.startedAt).getTime();
+  const secondsSince = (iso?: string) => {
+    const t = new Date(String(iso || '')).getTime();
     if (isNaN(t)) return 0;
     return Math.max(0, Math.floor((nowTick - t) / 1000));
   };
+
+  /** "2:31" — talk time reads as a duration, not as a raw second count. */
+  const clock = (secs: number) =>
+    `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
 
   if (cards.length === 0 && !booking) return null;
 
@@ -1171,20 +1294,42 @@ export default function CTScreenPop() {
           const tags = card.guest?.tags || [];
           const isVip = tags.some(t => String(t).toLowerCase() === 'vip');
           const otherTags = tags.filter(t => String(t).toLowerCase() !== 'vip').slice(0, 3);
+          /* THE HEADER MUST NEVER SAY SOMETHING THE CARD DOES NOT KNOW.
+             Three states, plus the one honest admission: a card still claiming
+             to ring RING_STALE_SECONDS after it started has heard nothing since,
+             and by then the server itself has stopped believing it (see the
+             constant). It says so and freezes its counter rather than implying a
+             phone is still ringing somewhere in the building. */
+          const ringStale = card.mode === 'ringing' && secondsSince(card.startedAt) > RING_STALE_SECONDS;
+          const onCall = card.mode === 'answered';
+          const headerBg = ringStale ? 'bg-[#6B5744]' : onCall ? 'bg-[#15803d]' : card.mode === 'ringing' ? 'bg-[#af4408]' : 'bg-[#2D1B0E]';
+          const headerText = ringStale
+            ? 'No update from telephony'
+            : onCall ? 'On call'
+            : card.mode === 'ringing' ? 'Incoming call'
+            : 'Call ended — log outcome';
           return (
             <div key={card.key}
                  style={{ animation: 'ctPopSlideIn .3s ease-out' }}
                  className="pointer-events-auto w-full bg-white border border-[#E8D5C4] rounded-xl shadow-2xl overflow-hidden">
               {/* Header strip */}
-              <div className={`flex items-center gap-2 px-3 py-2 text-white ${card.mode === 'ringing' ? 'bg-[#af4408]' : 'bg-[#2D1B0E]'}`}>
+              <div className={`flex items-center gap-2 px-3 py-2 text-white ${headerBg}`}>
                 {card.mode === 'ringing'
-                  ? <PhoneIncoming className="w-4 h-4 animate-pulse shrink-0" />
-                  : <PhoneOff className="w-4 h-4 shrink-0" />}
+                  ? <PhoneIncoming className={`w-4 h-4 shrink-0 ${ringStale ? '' : 'animate-pulse'}`} />
+                  : onCall
+                    ? <PhoneCall className="w-4 h-4 shrink-0" />
+                    : <PhoneOff className="w-4 h-4 shrink-0" />}
                 <span className="text-xs font-semibold uppercase tracking-wide flex-1 truncate">
-                  {card.mode === 'ringing' ? 'Incoming call' : 'Call ended — log outcome'}
+                  {headerText}
                 </span>
-                {card.mode === 'ringing' && (
-                  <span className="text-[11px] tabular-nums opacity-90 shrink-0">{ringSeconds(card)}s</span>
+                {/* Ring seconds while ringing; TALK TIME once answered, counted
+                    from the answer and formatted as a duration so it reads the
+                    same way the Call Log's "02:31" does. */}
+                {card.mode === 'ringing' && !ringStale && (
+                  <span className="text-[11px] tabular-nums opacity-90 shrink-0">{secondsSince(card.startedAt)}s</span>
+                )}
+                {onCall && (
+                  <span className="text-[11px] tabular-nums opacity-90 shrink-0">{clock(secondsSince(card.answeredAt))}</span>
                 )}
                 <button onClick={() => removeCard(card.key)} aria-label="Dismiss"
                         className="p-0.5 rounded hover:bg-white/20 shrink-0">
@@ -1247,6 +1392,24 @@ export default function CTScreenPop() {
                   </div>
                 )}
 
+                {/* WHO PICKED UP. Rendered for BOTH identity branches, which is
+                    the point — the raw agent id used to appear only inside the
+                    known-guest block, so on the "New caller" card (the exact
+                    case in the owner's screenshot) the pop said nothing at all
+                    about who had answered.
+                    This is the answerer, NOT the owner: the two differ whenever
+                    the TeleCMI agent is unmapped, and the owner already has its
+                    own line inside the lock box below. An unmapped id shows as
+                    the raw id — resolveAgentLabel never hides one. */}
+                {card.agentName && card.mode !== 'ringing' && (
+                  <p className="text-[11px] text-[#6B5744] flex items-center gap-1">
+                    <UserCheck className="w-3.5 h-3.5 text-[#af4408] shrink-0" />
+                    <span className="truncate">
+                      Answered by <b className="text-[#2D1B0E]">{card.agentName}</b>
+                    </span>
+                  </p>
+                )}
+
                 {/* MANAGEMENT ON SOMEBODY ELSE'S LOCKED CALL. The server said
                     can_write, so the card stays fully live — chips, Quick
                     Booking, everything — and this line is the part a manager
@@ -1278,7 +1441,13 @@ export default function CTScreenPop() {
                   <p className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-2.5 py-1.5">{card.error}</p>
                 )}
 
-                {card.mode === 'ringing' ? (
+                {/* ACTIONS. Quick Booking stays available for the whole live
+                    call, ringing AND answered — mid-conversation is exactly when
+                    a GRE takes a booking, and gating it on 'ringing' alone would
+                    have removed it the instant the guest was picked up. The
+                    outcome chips belong to the call being OVER, so they remain
+                    strictly the disposition state's. */}
+                {card.mode !== 'disposition' ? (
                   <div className="flex items-center gap-2 pt-0.5">
                     <button onClick={() => onQuickBooking(card)} disabled={card.claiming}
                             className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-xs font-semibold">

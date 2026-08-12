@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
+import { cutoverReportBasis, cutoverStampedWithoutBatch } from '@/lib/central-cutover';
 
 /**
  * CENTRAL STORE variance report (closing count vs the store's own book).
@@ -13,13 +14,50 @@ import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
  *
  * The authoritative formula (per material, cumulative as-of the count date):
  *
- *   Theoretical Central Stock = Purchases
+ *   Theoretical Central Stock = Opening (see THE CUTOVER BASIS below)
+ *                             + Purchases
  *                             − Requisition issues to departments
  *                             − Central wastage (store's own shelf only)
  *                             − Party issues / consumption (net of returns)
  *                             − Staff-meal issues (net of returns)
  *                             − Vendor returns (goods sent back to the supplier)
  *   Loss (Variance)           = Theoretical − Physical Closing Stock
+ *
+ * ── THE CUTOVER BASIS — the OPENING term, and when it is zero ──────────────
+ * With NO central-store cutover committed (settings.central_store_cutover_at
+ * absent — every install as this shipped, production included) the Opening term
+ * is ZERO and every window below is unbounded below: the statement text, the
+ * bound parameters and the payload are CHARACTER-IDENTICAL to the build before
+ * the cutover module existed. cutoverReportBasis() returns null and every
+ * fragment interpolated into the SQL is the empty string. That is the whole
+ * contract of the null return and it is proven by string-diffing the built
+ * statement, not asserted.
+ *
+ * Once a cutover IS committed, this report was measuring every post-cutover
+ * count against months of pre-cutover drift: it rebuilt the expected figure
+ * from ALL-TIME purchases minus ALL-TIME outflows and never read
+ * raw_materials.current_stock — the one column a cutover re-bases — so a
+ * cutover moved ZERO numbers here. It now opens from the count instead:
+ *
+ *     Theoretical = the cutover's counted figure for this material
+ *                 + purchases dated STRICTLY AFTER the cutover date
+ *                 − outflows  dated STRICTLY AFTER the cutover date
+ *
+ * STRICTLY AFTER, because the counted figure is that day's closing position
+ * (see src/lib/central-cutover.ts, "STRICTLY AFTER, AND WHY THAT IS SAFE").
+ * A count row dated ON the cutover date therefore opens at the counted figure
+ * with both windows empty and reads a variance of zero, which is correct.
+ *
+ * TWO ROWS KEEP THE OLD ALL-TIME BASIS, and both say so in `basis`:
+ *   · a material with NO line in the cutover batch — it was never counted, so
+ *     it has no trustworthy opening. Opening 0 would invent a shortage of its
+ *     entire stock.
+ *   · a count row DATED BEFORE the cutover date — its arithmetic is untouched
+ *     by the cutover (this formula never read current_stock), so it is left
+ *     exactly as it was rather than measured against an opening that is still
+ *     in its future.
+ * Nothing is hidden: no row is dropped, every row carries its basis, and the
+ * mix is counted in the `cutover` block on the payload.
  *
  * WHY RECIPE CONSUMPTION IS NOT IN THIS FORMULA — do not "restore" it.
  * Under department-based inventory a gram leaves central EXACTLY ONCE, at
@@ -148,6 +186,52 @@ export async function GET(request: Request) {
                             AND COALESCE(w.department_id, '') <> '')`
       : '';
 
+    // ── THE CUTOVER BASIS ────────────────────────────────────────────────
+    // null on every unstamped install, and then EVERY fragment below is the
+    // empty string, so the statement text is character-identical to the
+    // pre-cutover build. See the header.
+    const basisRaw = cutoverReportBasis(db);
+    // Belt and braces before either value is inlined as a SQL literal. Both
+    // come from our own tables, but a literal is a literal: anything that is
+    // not an ISO date / an id shape is treated as NO CUTOVER rather than
+    // interpolated. (Bound parameters are not an option here — the report's
+    // `params` array is positional and must stay byte-identical when no
+    // cutover is in force.)
+    const basis = basisRaw
+      && /^\d{4}-\d{2}-\d{2}$/.test(basisRaw.date)
+      && /^[A-Za-z0-9_-]{1,64}$/.test(basisRaw.batchId)
+      ? basisRaw : null;
+    // The per-row floor: the cutover date for a material that WAS counted on a
+    // count row dated on or after the cutover, and '' — a bound every real date
+    // clears — for every other row, which therefore keeps the all-time basis.
+    // A NULL date fails both '> floor' and the pre-existing '<= cs.date', so
+    // the fragment cannot change which NULL-dated rows are counted.
+    const FLOOR = basis
+      ? `CASE WHEN ccl.id IS NOT NULL AND cs.date >= '${basis.date}' THEN '${basis.date}' ELSE '' END`
+      : '';
+    const CUT_P  = basis ? ` AND p.date > ${FLOOR}` : '';
+    const CUT_IT = basis ? ` AND DATE(it.created_at) > ${FLOOR}` : '';
+    const CUT_COLS = basis
+      ? `,
+             -- OPENING TERM. The cutover's counted figure for this material, in
+             -- RECIPE units (counted_qty_recipe is what commitBatch wrote to
+             -- current_stock), and only for a count dated on or after the
+             -- cutover. 0 everywhere else, which is the all-time basis.
+             CASE WHEN ccl.id IS NOT NULL AND cs.date >= '${basis.date}'
+                  THEN COALESCE(ccl.counted_qty_recipe, 0) ELSE 0 END AS cutover_opening,
+             CASE WHEN ccl.id IS NOT NULL AND cs.date >= '${basis.date}'
+                  THEN 1 ELSE 0 END AS on_cutover_basis,
+             CASE WHEN ccl.id IS NULL THEN 1 ELSE 0 END AS cutover_uncounted`
+      : '';
+    // ONE definition of which batch owns the boundary — stampedCutoverBatch(),
+    // through cutoverReportBasis(). A second copy of that query here is exactly
+    // how this report and /api/daily-rollup would open from different counts.
+    const CUT_JOIN = basis
+      ? `
+      LEFT JOIN central_cutover_lines ccl
+             ON ccl.batch_id = '${basis.batchId}' AND ccl.material_id = cs.material_id`
+      : '';
+
     // Per-line variance rows.
     //   theoretical_stock is RECOMPUTED FRESH on every read, so a count taken
     //   before a late-recorded purchase or issue self-corrects — no snapshot lag.
@@ -165,7 +249,7 @@ export async function GET(request: Request) {
              -- 1.5KG (unit = purchase_unit) gets multiplied and reads 1.5x high.
              -- Factor is a per-material constant, so scaling the SUM is exact.
              COALESCE((SELECT SUM(p.quantity) FROM purchases p
-                        WHERE p.material_id = cs.material_id AND p.date <= cs.date), 0)
+                        WHERE p.material_id = cs.material_id AND p.date <= cs.date${CUT_P}), 0)
                * CASE WHEN COALESCE(rm.pack_size, 1) > 1
                            AND LOWER(rm.unit) <> LOWER(COALESCE(rm.purchase_unit, rm.unit))
                       THEN rm.pack_size ELSE 1 END AS purchases_to_date,
@@ -175,14 +259,14 @@ export async function GET(request: Request) {
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type = 'requisition_issue'
-                          AND DATE(it.created_at) <= cs.date), 0) AS issues_to_date,
+                          AND DATE(it.created_at) <= cs.date${CUT_IT}), 0) AS issues_to_date,
              -- Central wastage only. Department wastage debits the department
              -- ledger; counting it here would remove the gram from central a
              -- second time (it already left at issue).
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type = 'wastage'
-                          AND DATE(it.created_at) <= cs.date
+                          AND DATE(it.created_at) <= cs.date${CUT_IT}
                           ${CENTRAL_WASTAGE_ONLY}), 0) AS wastage_to_date,
              -- Parties run on their own rail end-to-end: applyIssueDelta skips
              -- purpose='party' outright, so a party requisition never produces a
@@ -191,13 +275,13 @@ export async function GET(request: Request) {
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type IN ('party_issue', 'party_consumption', 'party_return')
-                          AND DATE(it.created_at) <= cs.date), 0) AS party_to_date,
+                          AND DATE(it.created_at) <= cs.date${CUT_IT}), 0) AS party_to_date,
              -- Staff meals: 'staff_meal_issue' is negative, 'staff_meal_return'
              -- positive, so the net is what the store is actually short.
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type IN ('staff_meal_issue', 'staff_meal_return')
-                          AND DATE(it.created_at) <= cs.date), 0) AS staff_meal_to_date,
+                          AND DATE(it.created_at) <= cs.date${CUT_IT}), 0) AS staff_meal_to_date,
              -- VENDOR RETURNS (req 72-75). Goods physically LEFT THE BUILDING on
              -- an accepted vendor return ticket, so central is legitimately short
              -- by that much. Written NEGATIVE by acceptVendorReturnLine(), so the
@@ -214,25 +298,25 @@ export async function GET(request: Request) {
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type = 'vendor_return'
-                          AND DATE(it.created_at) <= cs.date), 0) AS vendor_return_to_date,
+                          AND DATE(it.created_at) <= cs.date${CUT_IT}), 0) AS vendor_return_to_date,
              -- DIAGNOSTIC ONLY. Not in the formula. Recipe consumption debits the
              -- department, never central. Split so the 'nc' exclusion is visible.
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type = 'sale'
-                          AND DATE(it.created_at) <= cs.date), 0) AS recipe_sale_to_date,
+                          AND DATE(it.created_at) <= cs.date${CUT_IT}), 0) AS recipe_sale_to_date,
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type = 'nc'
-                          AND DATE(it.created_at) <= cs.date), 0) AS recipe_nc_to_date,
+                          AND DATE(it.created_at) <= cs.date${CUT_IT}), 0) AS recipe_nc_to_date,
              -- DIAGNOSTIC ONLY. Real central movements this formula does not yet
              -- model. Zero rows today. Surfaced so the gap is loud, not silent.
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type IN ('transfer', 'butchering_input', 'butchering_output')
-                          AND DATE(it.created_at) <= cs.date), 0) AS unmodelled_outflow_to_date
+                          AND DATE(it.created_at) <= cs.date${CUT_IT}), 0) AS unmodelled_outflow_to_date${CUT_COLS}
       FROM closing_stock cs
-      JOIN raw_materials rm ON rm.id = cs.material_id
+      JOIN raw_materials rm ON rm.id = cs.material_id${CUT_JOIN}
       WHERE ${WHERE}
       ORDER BY cs.date DESC
     `).all(...params) as any[];
@@ -253,16 +337,39 @@ export async function GET(request: Request) {
       r.recipe_to_date = (r.recipe_sale_to_date || 0) + (r.recipe_nc_to_date || 0);
       r.recipe_in_central_formula = false;
 
-      r.theoretical_stock = (r.purchases_to_date || 0) - r.central_outflow_to_date;
+      // THE OPENING TERM. `cutover_opening` is a column only when a cutover is
+      // in force; with none, the property is undefined and `|| 0` makes this
+      // arithmetic character-for-character the old expression.
+      r.theoretical_stock = (r.cutover_opening || 0) + (r.purchases_to_date || 0) - r.central_outflow_to_date;
       r.loss              = r.theoretical_stock - r.physical_stock;
       r.loss_value        = r.loss * (r.average_price || 0);
       // Keep these for back-compat with anything still reading old field names
       r.system_stock      = r.theoretical_stock;
       r.variance          = r.physical_stock - r.theoretical_stock;
       r.variance_value    = r.variance * (r.average_price || 0);
+      // WHICH BASIS PRODUCED THIS ROW. Added only when a cutover is in force,
+      // so an unstamped payload gains no key. A mixed-basis table that does not
+      // label its rows is worse than a single-basis one.
+      if (basis) {
+        r.basis = r.on_cutover_basis
+          ? 'cutover'
+          : (r.cutover_uncounted ? 'no_cutover_count' : 'pre_cutover');
+      }
     }
     // Re-sort by absolute loss after computation
     (rows as any[]).sort((a, b) => Math.abs(b.loss_value) - Math.abs(a.loss_value));
+
+    // How the rows split across the two bases. Counted only when a cutover is
+    // in force; every reader of this object is guarded the same way, so an
+    // unstamped payload is unchanged.
+    const cutoverRows = { cutover: 0, pre_cutover: 0, no_cutover_count: 0 };
+    if (basis) {
+      for (const r of rows as any[]) {
+        if (r.basis === 'cutover') cutoverRows.cutover++;
+        else if (r.basis === 'pre_cutover') cutoverRows.pre_cutover++;
+        else cutoverRows.no_cutover_count++;
+      }
+    }
 
     // Distinct closing dates in this window (for the date picker on the page).
     // Aggregate from the freshly-computed rows so dates summary stays consistent
@@ -367,6 +474,31 @@ export async function GET(request: Request) {
     // A renamed report whose export still says "variance" is how a central
     // number ends up quoted as a whole-building number in a meeting.
     const warnings: string[] = [];
+    // A stamp with no batch behind it (hand-edited settings). The reports keep
+    // the OLD basis in that state — the one case where a cutover is stamped and
+    // nothing here changes — so it is said out loud instead of looking like the
+    // fix silently not working.
+    if (!basis && cutoverStampedWithoutBatch(db)) {
+      warnings.push(
+        'A central-store cutover date is stamped in settings but the batch behind it is missing, so this report '
+        + 'still measures against ALL-TIME purchases and outflows. Nothing here is opening from the count. '
+        + 'Check the Central Store Cutover screen before trusting a variance.',
+      );
+    }
+    if (basis && cutoverRows.pre_cutover > 0) {
+      warnings.push(
+        cutoverRows.pre_cutover + ' count row(s) are dated before the cutover (' + basis.date + ') and keep the '
+        + 'ALL-TIME basis — their variance is months of missing paperwork, not loss. They are labelled '
+        + '"pre_cutover" and are left in rather than hidden.',
+      );
+    }
+    if (basis && cutoverRows.no_cutover_count > 0) {
+      warnings.push(
+        cutoverRows.no_cutover_count + ' count row(s) are for materials that were NOT counted in the cutover, so '
+        + 'they have no trusted opening and keep the ALL-TIME basis (labelled "no_cutover_count"). Count those '
+        + 'materials in a later cutover to clear their history.',
+      );
+    }
     if (Math.abs(unmodelled_outflow_value) > 0.005) {
       warnings.push(
         'Some central movements are not in this formula yet '
@@ -384,7 +516,10 @@ export async function GET(request: Request) {
         subtitle: REPORT_SUBTITLE,
         export_title: REPORT_TITLE,
         export_filename_prefix: 'central-store-variance',
-        formula: 'Theoretical = Purchases − Requisition issues − Central wastage − Party − Staff meals − Vendor returns',
+        formula: basis
+          ? 'Theoretical = Cutover count (' + basis.date + ') + Purchases since − Requisition issues − Central wastage '
+            + '− Party − Staff meals − Vendor returns (all windows STRICTLY AFTER the cutover date)'
+          : 'Theoretical = Purchases − Requisition issues − Central wastage − Party − Staff meals − Vendor returns',
         outflow_column: 'central_outflow_to_date',
         excludes: [
           'Recipe consumption (sales) — debits the department, not the store',
@@ -398,6 +533,23 @@ export async function GET(request: Request) {
       dates,
       by_category: byCategory,
       repeat_offenders: repeat,
+      // Spread, not a null field: with no cutover stamped the payload has no
+      // `cutover` key and is byte-identical to the pre-cutover build.
+      ...(basis ? {
+        cutover: {
+          date: basis.date,
+          batch_id: basis.batchId,
+          rows_on_cutover_basis: cutoverRows.cutover,
+          rows_pre_cutover: cutoverRows.pre_cutover,
+          rows_without_cutover_count: cutoverRows.no_cutover_count,
+          note:
+            'Stock cutover ' + basis.date + '. For a material counted in that cutover, Theoretical now OPENS from '
+            + 'the counted figure and only counts purchases and outflows dated AFTER ' + basis.date + ' — so a '
+            + 'variance on those rows is what has gone missing since the count, not months of pre-cutover drift. '
+            + 'Rows labelled "pre_cutover" (dated before ' + basis.date + ') and "no_cutover_count" (the material '
+            + 'was not counted) still use the ALL-TIME formula and are NOT comparable with the rest.',
+        },
+      } : {}),
     });
   } catch (e: any) {
     console.error('[variance-report]', e);

@@ -2,7 +2,13 @@
 import { getDb } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { mapCdrPayload } from '@/lib/ct/telecmi-mapper';
-import { assertAllowedRecordingUrl, recordingAllowlist } from '@/lib/ct/recording-fetch';
+import {
+  assertAllowedRecordingUrl,
+  fetchAllowedRecording,
+  peekRecordingBody,
+  recordingAllowlist,
+} from '@/lib/ct/recording-fetch';
+import { recordingRetentionStatus } from '@/lib/ct/retention';
 import { isSecretKey, maskSecretValue } from '@/lib/secret-keys';
 import { telecmiAppId, telecmiSecret } from '@/lib/ct/settings';
 
@@ -45,6 +51,13 @@ import { telecmiAppId, telecmiSecret } from '@/lib/ct/settings';
  *              wrong conclusion this prevents.
  *   stored     How many ct_calls rows hold a recording_url, and how many of
  *              those are demo fixtures. Today: every one of them is a fixture.
+ *   probe      OPT-IN (?probe=1), and the only part that leaves this server:
+ *              it actually ASKS TeleCMI for a stored recording and reports the
+ *              status, the content type and the first bytes of anything that is
+ *              not audio. Everything else here proves the URL's SHAPE; a URL can
+ *              be perfectly shaped and still be a path the vendor does not
+ *              serve, which is precisely the failure this module hit. Bounded —
+ *              see the comment above probeCall().
  *
  * ── IT MUST NOT WRITE ──────────────────────────────────────────────────────
  * SELECTs only. Note in particular that this route does NOT call
@@ -476,7 +489,7 @@ function describeCdr(row: any, allow: string[], creds: string[]): CdrReport {
       : 'TeleCMI sent a value the mapper refused to turn into a URL, so nothing was stored to play. It is not an http(s) URL and there is no usable recording base to join it onto.';
   } else if (transform === 'joined' && validation.ok) {
     headline =
-      `TeleCMI sent a FILENAME, not a URL — the shape the field name always hinted at. The mapper built ${shownBase ? `${shownBase}…` : 'a URL'} from it and the result passes the player's check. Whether that URL is the one TeleCMI actually serves the file from can only be settled by pressing play: this panel proves the shape, not the destination.`;
+      `TeleCMI sent a FILENAME, not a URL — the shape the field name always hinted at. The mapper built ${shownBase ? `${shownBase}…` : 'a URL'} from it and the result passes the player's check. That proves the SHAPE, not the destination — run the upstream probe to find out whether TeleCMI actually serves the file from there.`;
   } else if (validation.ok) {
     headline =
       'TeleCMI sent a full HTTPS URL on an allowed host, used unchanged. The player should already work for this call — if it does not, the fault is downstream of the URL.';
@@ -505,7 +518,150 @@ function describeCdr(row: any, allow: string[], creds: string[]): CdrReport {
   };
 }
 
-export async function GET() {
+/* ── The upstream probe (opt-in: ?probe=1) ─────────────────────────────────
+ *
+ * WHY IT EXISTS. Everything above this line proves the SHAPE of a recording URL
+ * and says so out loud ("this panel proves the shape, not the destination").
+ * That honesty was the gap: a URL can be a valid HTTPS link on an allowlisted
+ * host, inside retention, and still be a path the vendor does not serve — which
+ * is exactly what happened. Every check passed and playback 404ed. The only
+ * thing that settles a destination is asking for it, so this does, once, on
+ * demand, and reports what came back.
+ *
+ * IT IS STILL READ-ONLY, and it is bounded so it can never become load on
+ * TeleCMI: opt-in via a query flag (the panel never probes on load), at most
+ * PROBE_MAX_CALLS calls per request, an 8-second timeout each, and a
+ * "Range: bytes=0-0" request so a hit costs one byte rather than a whole
+ * recording. Expired calls are NOT fetched at all — the retention gate is
+ * reported and honoured here exactly as the proxy honours it.
+ */
+
+/** Never more than a couple of upstream requests per click. */
+const PROBE_MAX_CALLS = 2;
+/** Shorter than the proxy's 15s: a diagnostic must answer, not hang. */
+const PROBE_TIMEOUT_MS = 8_000;
+
+interface ProbeReport {
+  call_id: string;
+  started_at: string;
+  /** True when this row is demo/simulator data rather than a real recording. */
+  fixture: boolean;
+  /** As stored on ct_calls, credential-masked. */
+  stored_url: string;
+  /** What was actually requested after normalization, credential-masked. */
+  fetched_url: string;
+  rewritten: boolean;
+  rewrite_note: string;
+  /** True when the outgoing request carried the TeleCMI appid + secret. */
+  credentialed: boolean;
+  retention: { expired: boolean; reason: string; days: number; expires_at: string };
+  /** False when the retention gate refused before any upstream call. */
+  attempted: boolean;
+  upstream_status: number | null;
+  upstream_content_type: string;
+  /** First bytes of a NON-audio answer, verbatim and credential-masked. '' for audio. */
+  body_preview: string;
+  /** True when the upstream answer is playable audio. This is the whole verdict. */
+  is_audio: boolean;
+  /** Transport/guard failure (timeout, host not allowed, invalid URL). */
+  error: string;
+  headline: string;
+}
+
+/** Mask credentials in a URL by NAME, not by value match: an appid short enough
+ *  to fall under the creds-length floor would otherwise print in the clear. */
+function displayUrl(raw: string, creds: string[]): string {
+  let shown = String(raw || '');
+  try {
+    const u = new URL(shown);
+    for (const k of ['secret', 'appid', 'token', 'key', 'auth']) {
+      if (u.searchParams.has(k)) u.searchParams.set(k, 'REDACTED');
+    }
+    shown = u.toString();
+  } catch { /* not a parseable URL — the text redaction below still applies */ }
+  return redactCreds(shown, creds).text.slice(0, VALUE_LIMIT * 2);
+}
+
+/** One bounded upstream attempt for one call row. Never throws. */
+async function probeCall(db: any, row: any, creds: string[]): Promise<ProbeReport> {
+  const storedRaw = String(row?.recording_url || '');
+  const retention = recordingRetentionStatus(db, row);
+  const base: ProbeReport = {
+    call_id: String(row?.id || ''),
+    started_at: String(row?.started_at || row?.created_at || ''),
+    fixture: Number(row?.fixture || 0) === 1,
+    stored_url: displayUrl(storedRaw, creds),
+    fetched_url: '',
+    rewritten: false,
+    rewrite_note: '',
+    credentialed: false,
+    retention: {
+      expired: retention.expired,
+      reason: retention.reason,
+      days: retention.days,
+      expires_at: retention.expiresAt,
+    },
+    attempted: false,
+    upstream_status: null,
+    upstream_content_type: '',
+    body_preview: '',
+    is_audio: false,
+    error: '',
+    headline: '',
+  };
+
+  if (retention.expired) {
+    base.headline =
+      retention.reason === 'undated'
+        ? 'Not fetched: this call has no readable timestamp, so the proxy refuses it (410) before any request goes out. That is the retention rule working, not a playback fault.'
+        : `Not fetched: this recording is past the ${retention.days}-day retention window, so the proxy refuses it (410) before any request goes out.`;
+    return base;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  try {
+    base.attempted = true;
+    const r = await fetchAllowedRecording(db, storedRaw, {
+      // One byte. Enough to learn the verdict, not enough to move audio.
+      rangeHeader: 'bytes=0-0',
+      signal: controller.signal,
+      // The whole point of the probe is to SEE a textual error rather than
+      // have it raised as a sentence, so this is the one caller that sets it.
+      allowTextualBody: true,
+    });
+    base.upstream_status = r.status;
+    base.upstream_content_type = r.contentType;
+    base.fetched_url = displayUrl(r.finalUrl, creds);
+    base.rewrite_note = r.rewriteNote;
+    base.rewritten = r.finalUrl !== storedRaw;
+    base.credentialed = /[?&]secret=/.test(r.finalUrl) && /[?&]appid=/.test(r.finalUrl);
+    const audio = /^(?:audio|video)\//i.test(r.contentType);
+    const ok = (r.status === 200 || r.status === 206) && audio;
+    base.is_audio = ok;
+    if (ok) {
+      // Cancel the byte we asked for — nothing needs it.
+      try { await r.body?.cancel(); } catch { /* already closed */ }
+      base.headline = `PLAYS. TeleCMI answered ${r.status} with ${r.contentType} — this recording is reachable and the player will work for it.`;
+    } else {
+      const preview = await peekRecordingBody(r.body);
+      base.body_preview = redactCreds(preview.replace(/\s+/g, ' ').trim(), creds).text.slice(0, VALUE_LIMIT);
+      base.headline =
+        `DOES NOT PLAY. TeleCMI answered ${r.status} with ${r.contentType || 'no content type'} instead of audio` +
+        (base.body_preview ? `: ${base.body_preview}` : '.');
+    }
+  } catch (e: any) {
+    base.error = e?.name === 'AbortError'
+      ? `The recording source did not answer within ${Math.round(PROBE_TIMEOUT_MS / 1000)} seconds.`
+      : String(e?.message || 'The upstream request failed.');
+    base.headline = `DOES NOT PLAY. ${base.error}`;
+  } finally {
+    clearTimeout(timer);
+  }
+  return base;
+}
+
+export async function GET(req: Request) {
   const gate = await requireRole('admin');
   if (!gate.ok) return Response.json({ error: gate.message }, { status: gate.status });
 
@@ -624,8 +780,61 @@ export async function GET() {
       storedHeadline = `${real} real recording URL${real === 1 ? '' : 's'} stored (plus ${fixtures} demo fixture${fixtures === 1 ? '' : 's'}).`;
     }
 
+    // ── 5 · Upstream probe (opt-in) ───────────────────────────────────────
+    // Off unless asked for, so opening the Telephony page never touches
+    // TeleCMI. See the block comment above probeCall() for the bounds.
+    let probe: {
+      ran: boolean;
+      limit: number;
+      candidates: number;
+      calls: ProbeReport[];
+      headline: string;
+    } | null = null;
+    if (new URL(req.url).searchParams.get('probe') === '1') {
+      // Real recordings first, newest first — a fixture answers the endpoint
+      // question too, but only a real row answers the owner's question.
+      const candidates = db.prepare(`
+        SELECT id, recording_url, started_at, created_at,
+               CASE WHEN recording_url LIKE '%/play/seed-%'
+                      OR recording_url LIKE '%file=sim-%'
+                      OR COALESCE(telecmi_call_id, '') LIKE 'seed-%'
+                    THEN 1 ELSE 0 END AS fixture
+          FROM ct_calls
+         WHERE COALESCE(recording_url, '') <> ''
+         ORDER BY fixture ASC, COALESCE(NULLIF(started_at, ''), created_at) DESC
+         LIMIT ?
+      `).all(PROBE_MAX_CALLS) as any[];
+
+      const reports: ProbeReport[] = [];
+      for (const row of candidates) reports.push(await probeCall(db, row, creds));
+
+      let headline: string;
+      if (reports.length === 0) {
+        headline = 'No call in the log holds a recording URL, so there is nothing to probe. Nothing can be said about playback until a CDR carrying a recording arrives.';
+      } else if (reports.some(r => r.is_audio)) {
+        headline = 'TeleCMI served audio for at least one stored recording, so the fetch chain works end to end. A recording that still will not play is a fault on that specific call, not on the URL we build.';
+      } else if (reports.every(r => r.retention.expired)) {
+        headline = 'Every recording old enough to probe is past the retention window, so none was fetched. That is the privacy rule working — widen the window above to test playback.';
+      } else if (reports.some(r => r.attempted && !r.credentialed)) {
+        headline = 'TeleCMI refused every attempt and the requests went out WITHOUT credentials — set the TeleCMI App ID and secret in CRM settings, then probe again.';
+      } else if (reports.every(r => r.fixture)) {
+        headline = 'Only demo fixtures were available to probe, so this reports what TeleCMI says about a made-up filename — useful for the endpoint and the credentials, not for a real recording.';
+      } else {
+        headline = 'TeleCMI did not serve audio for any stored recording. The per-call answer below is the vendor’s own — that is the cause, and it is upstream of the player.';
+      }
+
+      probe = {
+        ran: true,
+        limit: PROBE_MAX_CALLS,
+        candidates: candidates.length,
+        calls: reports,
+        headline,
+      };
+    }
+
     return Response.json({
       generated_at: new Date().toISOString(),
+      probe,
       webhooks: {
         cdr_count: cdrCount,
         cdr_newest_at: String(cdr?.newest || ''),

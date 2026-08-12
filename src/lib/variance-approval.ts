@@ -41,6 +41,10 @@ import type Database from 'better-sqlite3';
 import { generateId } from '@/lib/db';
 import { postLedger, isStoreMappedMaterial } from '@/lib/store-engine';
 import { deptOnHand, postDeptLedger } from '@/lib/dept-ledger';
+import {
+  getCentralStoreCutoverDate,
+  getCentralStoreCutoverCommittedAt,
+} from '@/lib/central-cutover';
 
 export type VarianceSource = 'central' | 'liquor';
 
@@ -634,9 +638,79 @@ export interface DecisionResult { ok: boolean; error?: string; applied?: boolean
  *     approveVariance is the second line of defence and must stay even after
  *     this one is retired.
  *
- * Central Store/Overall (department_id '') and liquor rows are never blocked:
- * each posts a delta to its own rail.
+ * Central Store/Overall rows (department_id '') are blocked by ONE thing and
+ * only one: the central cutover floor — see centralCutoverBlock() below. Before
+ * a cutover is committed that returns null and they are never blocked, which is
+ * what this comment used to say outright and is no longer the whole truth.
+ * Liquor rows are still never blocked here: they post a delta to the store
+ * ledger, which no central cutover touches.
  */
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║ THE CENTRAL CUTOVER FLOOR — the central twin of the department refusal.  ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ *
+ * A pending central row FREEZES system_stock at count time, and the central
+ * branch of approveVariance() posts (physical − that frozen system) onto LIVE
+ * raw_materials.current_stock. Correct while the book it was frozen against is
+ * still the book. A central-store cutover REPLACES that book: commitBatch SETs
+ * current_stock to the physically counted figure and stamps the date.
+ *
+ * Approving a pre-cutover row after that posts a delta measured against the
+ * OLD, drifted book on top of the freshly corrected one — it re-injects exactly
+ * the drift the cutover just eliminated, ONE CLICK AT A TIME, and 963 pending
+ * rows is 963 chances to undo it silently. Nothing about the row looks wrong on
+ * screen; the arithmetic is simply against a baseline that no longer exists.
+ *
+ * THIS IS THE SAME REFUSAL THE DEPARTMENT BRANCH ALREADY MAKES ("This count is
+ * dated before the department's opening balance, so it cannot be applied — it
+ * would reach back past the cutover"). Central had no equivalent.
+ *
+ * WHICH INSTANT DECIDES. The question is not "which day was counted" but "was
+ * this row's frozen system figure read from the old book or the new one", so
+ * the boundary is central_store_cutover_committed_at — the real UTC instant
+ * current_stock was re-based — and NOT central_store_cutover_at, which is a
+ * business date at midnight and would wave through everything typed on the
+ * cutover day before the commit. The count instant is the same MIN(IST day-end
+ * of the count date, when it was saved) the department branch uses, so a count
+ * dated the 5th and typed on the 12th is judged on the 5th.
+ *
+ * FALLBACKS, BOTH FAIL CLOSED:
+ *   · committed-at missing (a stamp written by hand) → fall back to comparing
+ *     business dates, which still catches every count dated before the cutover.
+ *   · no usable count instant at all → refuse. A row whose age cannot be
+ *     established cannot be proven to post against the current book, and
+ *     Reject is always available.
+ *
+ * Returns the sentence to show, or null when there is nothing to refuse —
+ * including on every install with no cutover committed, where
+ * getCentralStoreCutoverDate() is null and this is a no-op.
+ */
+export function centralCutoverBlock(
+  db: Database.Database,
+  row: VarianceKeyRow,
+): string | null {
+  const cutDate = getCentralStoreCutoverDate(db);
+  if (!cutDate) return null;
+
+  const committedAt = getCentralStoreCutoverCommittedAt(db);
+  const countAt = deptCountInstant(String(row.date ?? '').trim(), String(row.created_at ?? '').trim());
+  const rowDate = String(row.date ?? '').trim().slice(0, 10);
+
+  const stale = committedAt
+    ? (!countAt || countAt < committedAt)
+    : (!rowDate || rowDate < cutDate);
+  if (!stale) return null;
+
+  return (
+    `The central store was cut over on ${cutDate} — its stock was re-based onto a physical count that day. ` +
+    `This count (${rowDate || 'undated'}) was taken against the OLD book, so its difference of ` +
+    `(counted − system-at-count-time) no longer describes anything: approving it would post months of ` +
+    `pre-cutover drift back onto the corrected stock. Reject it. If the shelf is wrong TODAY, count it again ` +
+    `and approve that count instead.`
+  );
+}
+
 export function varianceApprovalBlock(
   db: Database.Database,
   row: VarianceKeyRow,
@@ -655,7 +729,13 @@ export function varianceApprovalBlock(
 
   if (String(row.source) !== 'central') return null;
   const deptId = norm(row.department_id);
-  if (!deptId) return null;
+  if (!deptId) {
+    // CENTRAL STORE (no department): the cutover floor. Placed here, in the
+    // shared block, so the queue disables Approve on exactly the rows the
+    // approval will refuse — a list that renders Approve on a row the server
+    // then rejects is how an admin ends up clicking 963 times.
+    return centralCutoverBlock(db, row);
+  }
 
   const who = norm(deptName) || 'this department';
   const matId = norm(row.material_id);
@@ -901,6 +981,17 @@ export function approveVariance(
       // NO FLOOR AT ZERO. If the delta takes central negative, central goes
       // negative and says so. Clamping would manufacture stock that nobody
       // bought, and hide the very gap a count exists to reveal.
+      // THE CUTOVER FLOOR, a second time. varianceApprovalBlock() above already
+      // refused this row, and this is the belt-and-braces copy for the same
+      // reason the department branch keeps its own windowFrom check: this
+      // function is not only reached through the queue (POST /api/closing-stock
+      // calls it directly for the admin "Adjust system stock" tick), and the
+      // failure mode here is silent — a stale delta posted onto a re-based book
+      // looks like an ordinary correction and undoes the cutover one row at a
+      // time. Throwing rolls the whole approval back.
+      const floorMsg = centralCutoverBlock(db, row as VarianceKeyRow);
+      if (floorMsg) throw new Error(floorMsg);
+
       const cur = db.prepare(`SELECT current_stock FROM raw_materials WHERE id = ?`).get(row.material_id) as { current_stock: number } | undefined;
       const before = r3(Number(cur?.current_stock) || 0);
       const appliedDelta = r3(Number(row.physical_stock) - Number(row.system_stock));

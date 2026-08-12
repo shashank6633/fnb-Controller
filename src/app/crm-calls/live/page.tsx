@@ -117,14 +117,21 @@ function SendMenu({ phone, guestName, docs }: { phone: string; guestName?: strin
 interface FeedItem {
   key: string;
   /**
-   * The FEED's own row kinds, which are not the bus's event types — several bus
-   * events land on one row kind, and 'ownership' is the one that must not.
-   * A claim used to be broadcast as 'answered' and printed "Call answered — Ravi
-   * K" minutes AFTER "Call ended"; it now arrives as its own CtEvent type and
-   * gets its own row. See handleEvent, where the mapping (and the refusal to
-   * guess at an unknown type) lives.
+   * The FEED's own row kinds, which are not the bus's event types — 'ownership'
+   * in particular must never land on the same row kind as an answer. A claim
+   * used to be broadcast as 'answered' and printed "Call answered — Ravi K"
+   * minutes AFTER "Call ended"; it now arrives as its own CtEvent type and gets
+   * its own row. See handleEvent, where the mapping (and the refusal to guess at
+   * an unknown type) lives.
+   *
+   * EVERY MEMBER HERE IS PRODUCED. 'answered' and 'call_ended' were previously
+   * both pushed as 'call_ended' — same grey handset icon for "picked up" and for
+   * "over" — while a 'missed' member was declared and never produced at all. A
+   * union that lists a row kind nothing emits is a claim about this board that
+   * is not true, so the phantom is gone and the answer now uses the member that
+   * was already sitting here unused.
    */
-  type: 'incoming_call' | 'call_ended' | 'recovery_update' | 'ownership' | 'answered' | 'missed';
+  type: 'incoming_call' | 'answered' | 'call_ended' | 'recovery_update' | 'ownership';
   phone?: string;
   guestName?: string;
   agentName?: string;
@@ -310,20 +317,39 @@ export default function LiveCallsPage() {
       });
       pushFeed({ key, type: 'incoming_call', phone, guestName: name, at, label: 'Incoming call ringing' });
     } else if (e.type === 'call_ended' || e.type === 'answered') {
-      // Remove ONLY the matching card, cascading id → callId → phone. A
-      // call_ended can arrive with no telecmi id (CDR with no call id, or a
-      // live hangup that never carried one) — in that case fall back to phone,
-      // and if there's no identifier at all keep every card (never nuke the
-      // whole board off one id-less event).
-      setRinging(prev => prev.filter(r => {
-        if (e.telecmiCallId) return (r.telecmi_call_id || r.id) !== e.telecmiCallId;
-        if (e.callId) return r.id !== e.callId;
-        if (e.phone) return (r.phone_e164 || r.phone) !== e.phone;
-        return true;
-      }));
+      // THE CARD FOR THIS CALL COMES OFF THE BOARD. Two passes, ids then phone,
+      // deliberately — the same shape matchIdx() uses in the screen-pop, and for
+      // the same reason.
+      //
+      // It used to be a single cascade that consulted ONLY the first identifier
+      // the event happened to carry: an event with a telecmi id that matched no
+      // card stopped there, even when its callId matched one perfectly. Ids on
+      // this account do not reliably correlate — the ring, the live answer and
+      // the CDR can arrive keyed differently — so that was precisely the case
+      // that left an answered call sitting in "Ringing now".
+      //
+      // Phone gets a say only when NEITHER id matched anything. It is a blunter
+      // instrument: it would also drop a second, genuinely-ringing card for the
+      // same number. That is bounded to at most one 12s syncRinging cycle (the
+      // server snapshot puts back anything still ringing), where a stuck card is
+      // bounded by nothing.
+      setRinging(prev => {
+        const idHit = (r: RingingCall) =>
+          (!!e.telecmiCallId && (r.telecmi_call_id === e.telecmiCallId || r.id === e.telecmiCallId)) ||
+          (!!e.callId && (r.id === e.callId || r.telecmi_call_id === e.callId));
+        if (prev.some(idHit)) return prev.filter(r => !idHit(r));
+        if (!e.phone) return prev;   // no identifier at all → never nuke the board
+        return prev.filter(r => (r.phone_e164 || r.phone) !== e.phone);
+      });
       // ownerName rides along on the same event — this is the moment a
       // supervisor can see who picked the call up and now owns writing it up.
-      pushFeed({ key, type: 'call_ended', phone, guestName: name, agentName: e.agentName || '', ownerName: e.ownerName || '', at, label: e.type === 'answered' ? 'Call answered' : 'Call ended' });
+      pushFeed({
+        key,
+        type: e.type === 'answered' ? 'answered' : 'call_ended',
+        phone, guestName: name,
+        agentName: e.agentName || '', ownerName: e.ownerName || '', at,
+        label: e.type === 'answered' ? 'Call answered' : 'Call ended',
+      });
       refreshStats();
     } else if (e.type === 'ownership') {
       // THE OWNER OR THE LOCK CHANGED ON A CALL THAT ALREADY EXISTS — a claim, a
@@ -550,13 +576,19 @@ export default function LiveCallsPage() {
             <ul className="divide-y divide-[#F0E4D6] max-h-[420px] overflow-y-auto">
               {feed.map(f => (
                 <li key={f.key} className="py-2 flex items-center gap-3 text-sm">
+                  {/* One icon per row kind. 'answered' is green and its own
+                      glyph — it used to share the grey handset with 'call_ended',
+                      so at a glance "picked up" and "over" were the same row. The
+                      final arm is 'recovery_update', the only kind left. */}
                   {f.type === 'incoming_call'
                     ? <ArrowDownLeft className="w-4 h-4 text-green-600 shrink-0" />
-                    : f.type === 'call_ended'
-                      ? <PhoneCall className="w-4 h-4 text-[#8B7355] shrink-0" />
-                      : f.type === 'ownership'
-                        ? <UserCheck className="w-4 h-4 text-[#af4408] shrink-0" />
-                        : <ArrowUpRight className="w-4 h-4 text-amber-500 shrink-0" />}
+                    : f.type === 'answered'
+                      ? <PhoneIncoming className="w-4 h-4 text-green-700 shrink-0" />
+                      : f.type === 'call_ended'
+                        ? <PhoneCall className="w-4 h-4 text-[#8B7355] shrink-0" />
+                        : f.type === 'ownership'
+                          ? <UserCheck className="w-4 h-4 text-[#af4408] shrink-0" />
+                          : <ArrowUpRight className="w-4 h-4 text-amber-500 shrink-0" />}
                   <span className="flex-1 min-w-0 truncate text-[#3D2614]">
                     <b>{f.guestName || formatPhone(f.phone || '') || 'System'}</b> — {f.label}
                     {f.agentName && <span className="text-[#8B7355]"> · answered by {f.agentName}</span>}

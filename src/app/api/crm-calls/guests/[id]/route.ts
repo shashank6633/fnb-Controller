@@ -150,7 +150,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       `SELECT id, telecmi_call_id, direction, status, agent_user, queue,
               started_at, answered_at, ended_at, duration_sec, recording_url,
               disposition, disposition_note, created_at,
-              analysis_status, analysis_score, analysis_outcome
+              analysis_status, analysis_score, analysis_outcome,
+              duration_source, duration_verified
        FROM ct_calls
        WHERE (guest_id = @gid AND @gid <> '') OR (phone_e164 = @phone AND @phone <> '')`,
     ).all({ gid: guestKey, phone }) as any[];
@@ -203,6 +204,13 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
         answered_at: c.answered_at,
         ended_at: c.ended_at,
         duration_sec: c.duration_sec,
+        // HOW FAR duration_sec CAN BE TRUSTED. Only the Call Back flow (a GRE
+        // dialling from their own handset) writes duration_source; a PBX-timed
+        // CDR and every row predating that flow carry '', and the page leaves
+        // those looking exactly as they always have. Both fields travel because
+        // neither settles it alone — see src/lib/ct/duration-trust.ts.
+        duration_source: c.duration_source || '',
+        duration_verified: c.duration_verified || 0,
         disposition: c.disposition,
         disposition_note: c.disposition_note,
         analysis_status: c.analysis_status,
