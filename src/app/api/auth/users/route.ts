@@ -37,6 +37,22 @@ function normSection(v: any): string | null {
 }
 
 /**
+ * Normalize a JSON-array column (page_access, visible_department_ids,
+ * preferred_zones, preferred_table_ids) for storage.
+ *   undefined / null / []  → null  (column NULL = "the default applies")
+ *   ['/a','/b']            → '["/a","/b"]'
+ * An EMPTY array deliberately stores NULL, never '[]': on the wire an empty
+ * page_access means "follow the role" (canAccessPage + proxy both treat an
+ * empty array as no restriction), so persisting '[]' would read as a grant,
+ * not a lockout. PUT has always done this — POST now matches it.
+ */
+function jsonArrOrNull(input: unknown): string | null {
+  if (!Array.isArray(input)) return null;
+  const vals = input.filter((v) => typeof v === 'string' && v !== '');
+  return vals.length ? JSON.stringify(vals) : null;
+}
+
+/**
  * Resolve the effective privilege tier + flags for a user save. When a named
  * role_id is given, its base_role + flags win (the named role is the source of
  * truth); otherwise fall back to the explicitly-passed role + flags (legacy).
@@ -53,7 +69,8 @@ function resolveRole(db: any, role_id: any, explicitRole: any, explicitChef: any
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
-  const { email, name, role, role_id, password, position, department_id, is_head_chef, is_store_manager, can_approve_requisitions, section } = await req.json();
+  const { email, name, role, role_id, password, position, department_id, is_head_chef, is_store_manager, can_approve_requisitions, section,
+          page_access, visible_department_ids, preferred_zones, preferred_table_ids, is_active } = await req.json();
   if (!email || !password) return Response.json({ error: 'email + password required' }, { status: 400 });
   const sec = normSection(section);
   if (sec === null) return Response.json({ error: `section must be one of ${VALID_SECTIONS.join(', ')}` }, { status: 400 });
@@ -65,9 +82,19 @@ export async function POST(req: Request) {
   const exists = db.prepare('SELECT id FROM users WHERE email = ?').get(String(email).toLowerCase());
   if (exists) return Response.json({ error: 'Email already in use' }, { status: 409 });
   const hash = await hashPassword(password);
+  // page_access is stored NULL unless the creator ticked an explicit override.
+  // NULL is what makes a new user INHERIT their assigned role's pages —
+  // getCurrentUser (src/lib/auth.ts) and proxy.ts both resolve a user's pages
+  // as "the user's own map if it is not NULL, else the assigned role's" — so a
+  // role-based user is correctly gated the moment they are created, with no
+  // second save needed.
+  // The other three JSON columns default to NULL the same way (own dept only /
+  // all areas). Before this, the create form rendered these controls and then
+  // silently dropped them, which left a no-role user at FULL access.
   db.prepare(`
-    INSERT INTO users (id, email, password_hash, name, role, role_id, position, department_id, is_head_chef, is_store_manager, can_approve_requisitions, section)
-    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO users (id, email, password_hash, name, role, role_id, position, department_id, is_head_chef, is_store_manager, can_approve_requisitions, section,
+                       page_access, visible_department_ids, preferred_zones, preferred_table_ids, is_active)
+    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     String(email).toLowerCase(), hash, name || '', eff.role, eff.role_id,
     position || '',
@@ -76,6 +103,11 @@ export async function POST(req: Request) {
     eff.is_store_manager ? 1 : 0,
     eff.can_approve_requisitions ? 1 : 0,
     sec,
+    jsonArrOrNull(page_access),
+    jsonArrOrNull(visible_department_ids),
+    jsonArrOrNull(preferred_zones),
+    jsonArrOrNull(preferred_table_ids),
+    (is_active === 0 || is_active === false) ? 0 : 1,
   );
   return Response.json({ success: true }, { status: 201 });
 }

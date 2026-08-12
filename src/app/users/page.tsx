@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Users, Plus, Edit, X, Save, Loader2, ShieldCheck, Shield, ChefHat, Warehouse, Building, ChevronDown, ChevronRight, ShieldAlert, MapPin, CheckSquare } from 'lucide-react';
 import { api } from '@/lib/api';
@@ -33,7 +33,37 @@ interface AppUser {
 interface Department { id: string; name: string; code?: string; is_active: number; }
 /** Dine-in table (subset of restaurant_tables) — used for the captain-area picker. */
 interface RestTable { id: string; table_number: string; zone?: string | null; seats?: number; }
-interface Role { id: string; name: string; base_role: UserRole; is_head_chef: number; is_store_manager: number; can_approve_requisitions?: number; description?: string; }
+interface Role {
+  id: string; name: string; base_role: UserRole;
+  is_head_chef: number; is_store_manager: number; can_approve_requisitions?: number; description?: string;
+  /** JSON-stringified array of the role's pages. NULL = the role grants every page. */
+  page_access?: string | null;
+  /** A DEACTIVATED role still governs the users assigned to it (getCurrentUser
+   *  joins roles without an is_active filter), so we load and resolve those too. */
+  is_active?: number;
+}
+
+/** The pages a user EFFECTIVELY sees — mirrors getCurrentUser()/proxy.ts:
+ *  a personal override wins; else the assigned role's pages (a role with no
+ *  restriction = every page); no role at all = every page.
+ *  The checkbox grid is seeded from THIS so a follows-role user shows their
+ *  role's pages ticked instead of an empty grid that reads as "no access".
+ *  Same helper as Settings → Page Access; keep the two in step. */
+function effectivePages(u: { page_access?: string | null; role_id?: string | null }, rolesArr: Role[]): Set<string> {
+  const own = parseArr(u.page_access);
+  if (own.size > 0) return own;
+  if (u.role_id) {
+    const r = rolesArr.find(x => x.id === u.role_id);
+    if (r) {
+      const rp = parseArr(r.page_access);
+      return rp.size > 0 ? rp : new Set(ALL_PAGE_PATHS);
+    }
+    // Role assigned but not resolvable (roles fetch failed): FAIL CLOSED —
+    // an empty grid is safer than a full-access grid a Save could persist.
+    return new Set();
+  }
+  return new Set(ALL_PAGE_PATHS);
+}
 
 /**
  * Position templates — picking one auto-suggests the approval flags.
@@ -97,6 +127,10 @@ export default function UsersPage() {
   const [editing, setEditing] = useState<Partial<AppUser> & { password?: string } | null>(null);
   const [me, setMe] = useState<AppUser | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // False when the roles list failed to load. The page-access grid then can't
+  // know what a role-based user actually inherits, so page edits are blocked
+  // (fail closed) rather than saved from a grid that may be showing nothing.
+  const [rolesReady, setRolesReady] = useState(true);
 
   const load = async () => {
     setLoading(true);
@@ -110,7 +144,10 @@ export default function UsersPage() {
     const [r, dRes, roleRes, tRes] = await Promise.all([
       fetch('/api/auth/users'),
       fetch('/api/departments').then(r => r.json()).catch(() => ({ departments: [] })),
-      fetch('/api/auth/roles').then(r => r.ok ? r.json() : { roles: [] }).catch(() => ({ roles: [] })),
+      // include_inactive: a deactivated role STILL governs its users' tier and
+      // pages, so we need it here to resolve them honestly (and to name it in
+      // the Role picker). null = the fetch failed → page editing is blocked.
+      fetch('/api/auth/roles?include_inactive=1').then(r => r.ok ? r.json() : null).catch(() => null),
       fetch('/api/dine-in/tables').then(r => r.ok ? r.json() : { items: [] }).catch(() => ({ items: [] })),
     ]);
     if (r.ok) {
@@ -121,7 +158,8 @@ export default function UsersPage() {
     }
     setDepartments((dRes.departments || []).filter((d: Department) => d.is_active));
     setTables(tRes.items || []);
-    setRoles(roleRes.roles || []);
+    setRoles(roleRes?.roles || []);
+    setRolesReady(!!roleRes);
     setLoading(false);
   };
   useEffect(() => { load(); }, []);
@@ -131,12 +169,32 @@ export default function UsersPage() {
     const isNew = !editing.id;
     if (isNew && !editing.password) { alert('Password required for new users'); return; }
 
-    // Convert stringified arrays → real arrays for the API. Sending null clears
-    // the map; an empty array means "explicitly nothing".
+    // Fail closed while the roles list is unavailable: the page grid was seeded
+    // from an unresolvable role, so saving it could strip or over-grant pages.
+    if (!rolesReady) { alert('Roles could not be loaded — reload the page before saving access changes.'); return; }
+    if (editing.role_id && !roles.some(r => r.id === editing.role_id)) {
+      alert("This user's role couldn't be resolved — reload the page before saving."); return;
+    }
+
+    // Convert stringified arrays → real arrays for the API. Sending null leaves
+    // the user following their role (or full access if they have no role).
     const body: any = { ...editing };
     if (typeof body.page_access === 'string') {
       try { body.page_access = JSON.parse(body.page_access); }
       catch { body.page_access = null; }
+    }
+    // An empty page list can NOT be saved: on the wire [] is stored as NULL,
+    // which means FOLLOW ROLE / full access — so "untick everything + Save"
+    // would silently GRANT access instead of revoking it. Make the admin pick.
+    if (Array.isArray(body.page_access) && body.page_access.length === 0) {
+      alert(
+        'No pages are ticked, and that cannot be saved as "no access".\n\n' +
+        'An empty page list means "follow the assigned role" (or full access when there is no role).\n\n' +
+        '• To restrict this user: tick the pages they should have.\n' +
+        '• To hand them back to their role: use "Follow role".\n' +
+        '• To block them entirely: untick Active.'
+      );
+      return;
     }
     if (typeof body.visible_department_ids === 'string') {
       try { body.visible_department_ids = JSON.parse(body.visible_department_ids); }
@@ -282,7 +340,10 @@ export default function UsersPage() {
                                 is_head_chef: u.is_head_chef ?? 0,
                                 is_store_manager: u.is_store_manager ?? 0,
                                 can_approve_requisitions: u.can_approve_requisitions ?? 0,
-                                page_access: u.page_access ?? null,
+                                // Normalize a stored empty array to null: '[]' already
+                                // resolves as "follow role" everywhere, so carrying it
+                                // into the modal would misread as a real override.
+                                page_access: parseArr(u.page_access).size > 0 ? u.page_access! : null,
                                 visible_department_ids: u.visible_department_ids ?? null,
                                 preferred_zones: u.preferred_zones ?? null,
                                 preferred_table_ids: u.preferred_table_ids ?? null,
@@ -364,7 +425,16 @@ export default function UsersPage() {
                           }}
                           className="w-full mt-1 px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm font-medium">
                     <option value="">— Custom (set tier + pages manually) —</option>
-                    {roles.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+                    {/* Only ACTIVE roles are offered, plus this user's own role if it
+                        has since been deactivated — that role still governs them, so
+                        hiding it would make the picker read as "Custom" and lie. */}
+                    {roles
+                      .filter(r => r.is_active !== 0 || r.id === editing.role_id)
+                      .map(r => (
+                        <option key={r.id} value={r.id}>
+                          {r.name}{r.is_active === 0 ? ' (deactivated)' : ''}
+                        </option>
+                      ))}
                   </select>
                   <span className="block text-[10px] text-[#8B7355] mt-0.5">
                     {editing.role_id
@@ -489,6 +559,8 @@ export default function UsersPage() {
                   editing={editing}
                   setEditing={setEditing}
                   departments={departments}
+                  roles={roles}
+                  rolesReady={rolesReady}
                 />
 
                 {/* Captain Area — restrict this captain to specific floors + tables.
@@ -517,38 +589,83 @@ export default function UsersPage() {
    Lets admin grant/revoke specific pages + department visibility per user, inline.
    Same data model as /settings/page-access — they edit the same DB columns. */
 
-function PageAccessSection({ editing, setEditing, departments }: {
+function PageAccessSection({ editing, setEditing, departments, roles, rolesReady }: {
   editing: any;
   setEditing: (e: any) => void;
   departments: Array<{ id: string; name: string; code?: string }>;
+  roles: Role[];
+  rolesReady: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [sectionOpen, setSectionOpen] = useState<Set<string>>(new Set());
 
   const isAdmin = editing.role === 'admin';
-  const currentPages = parseArr(editing.page_access);
+  const assignedRole = editing.role_id ? roles.find(r => r.id === editing.role_id) : undefined;
+  // A PERSONAL override exists only while users.page_access is a non-empty set.
+  // null (and the empty set, which stores as NULL) both mean "follow the role".
+  const hasOverride = parseArr(editing.page_access).size > 0;
+  const roleUnresolved = !!editing.role_id && !assignedRole;
+  // A role whose own page_access is empty/NULL restricts nothing = every page.
+  const rolePageCount = assignedRole ? parseArr(assignedRole.page_access).size : 0;
+  const roleGrantsEveryPage = !!assignedRole && rolePageCount === 0;
+  // The admin emptied the grid (Clear, or unticking the last page). This is a
+  // real, distinct state: it is NOT "follow role" and it is NOT saveable —
+  // an empty list stores as NULL, which grants rather than revokes. save()
+  // refuses it; here we just have to stop calling it something it isn't.
+  const touchedEmpty = typeof editing.page_access === 'string' && parseArr(editing.page_access).size === 0;
+
+  // The TICKED set. Seeded from EFFECTIVE pages (override, else the role's
+  // pages, else all) — not from the raw users.page_access column. That is the
+  // whole fix: a follows-role user used to render an all-empty grid, so ticking
+  // one extra page saved just that page and silently dropped the role's set.
+  const [draft, setDraft] = useState<Set<string>>(() => effectivePages(editing, roles));
   const currentDepts = parseArr(editing.visible_department_ids);
 
-  const togglePage = (path: string) => {
-    const next = new Set(currentPages);
-    if (next.has(path)) next.delete(path); else next.add(path);
+  // Reseed when the modal switches to a different user, or when the assigned
+  // role changes (picking a role clears the override, so the grid must show
+  // the new role's pages). Keyed so ordinary keystrokes never reseed.
+  const seedKey = `${editing.id ?? 'new'}|${editing.role_id ?? ''}`;
+  const seededFor = useRef(seedKey);
+  useEffect(() => {
+    if (seededFor.current === seedKey) return;
+    seededFor.current = seedKey;
+    setDraft(effectivePages({ page_access: editing.page_access, role_id: editing.role_id }, roles));
+  }, [seedKey, editing.page_access, editing.role_id, roles]);
+
+  // Any grid edit writes the WHOLE ticked set as a personal override, so
+  // whatever the user already had is carried along instead of being dropped.
+  const commit = (next: Set<string>) => {
+    setDraft(next);
     setEditing({ ...editing, page_access: JSON.stringify(Array.from(next)) });
   };
+  const togglePage = (path: string) => {
+    const next = new Set(draft);
+    if (next.has(path)) next.delete(path); else next.add(path);
+    commit(next);
+  };
   const toggleSectionPaths = (paths: string[]) => {
-    const next = new Set(currentPages);
+    const next = new Set(draft);
     const allOn = paths.every(p => next.has(p));
     if (allOn) { for (const p of paths) next.delete(p); }
     else { for (const p of paths) next.add(p); }
-    setEditing({ ...editing, page_access: JSON.stringify(Array.from(next)) });
+    commit(next);
   };
   const toggleDept = (id: string) => {
     const next = new Set(currentDepts);
     if (next.has(id)) next.delete(id); else next.add(id);
     setEditing({ ...editing, visible_department_ids: JSON.stringify(Array.from(next)) });
   };
-  const grantAll = () => setEditing({ ...editing, page_access: JSON.stringify(ALL_PAGE_PATHS) });
-  const grantNone = () => setEditing({ ...editing, page_access: JSON.stringify([]) });
-  const grantFullAccess = () => setEditing({ ...editing, page_access: null });
+  const grantAll = () => commit(new Set(ALL_PAGE_PATHS));
+  // Unticks everything so a fresh set can be picked. Saving with nothing ticked
+  // is refused in save() — an empty list stores as NULL, which GRANTS (follow
+  // role / full access) rather than revoking.
+  const clearTicks = () => commit(new Set());
+  // Drop the personal override: back to whatever the role says, and keep
+  // following it as the role is edited later.
+  const followRole = () => {
+    setDraft(effectivePages({ page_access: null, role_id: editing.role_id }, roles));
+    setEditing({ ...editing, page_access: null });
+  };
   const toggleSection = (label: string) =>
     setSectionOpen(prev => {
       const n = new Set(prev);
@@ -558,34 +675,104 @@ function PageAccessSection({ editing, setEditing, departments }: {
 
   const summary = isAdmin
     ? 'Admin — always has full access (cannot be restricted)'
-    : editing.page_access == null
-      ? (editing.role_id
-          ? "Inherits this role's pages (add an override here to customize)"
-          : 'Full access (no map set — sees every page)')
-      : currentPages.size === 0
-        ? 'No pages granted — user will be locked out except /login'
-        : `${currentPages.size} page${currentPages.size === 1 ? '' : 's'} granted (overrides the role)`;
+    : roleUnresolved
+      ? "⚠ This user's role could not be loaded — reload before editing access"
+      : touchedEmpty
+        ? '⚠ Nothing ticked — this cannot be saved as “no access”'
+        : hasOverride
+          ? `Custom override — ${draft.size} page${draft.size === 1 ? '' : 's'}${assignedRole ? ` (ignores the ${assignedRole.name} role)` : ''}`
+          : assignedRole
+            ? `Following the ${assignedRole.name} role — ${roleGrantsEveryPage ? 'every page' : `${rolePageCount} page${rolePageCount === 1 ? '' : 's'}`}`
+            : 'No role assigned — full access to every page';
 
   return (
     <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF8F0]">
-      <button type="button"
-              onClick={() => setOpen(o => !o)}
-              className="w-full px-3 py-2 flex items-center gap-2 text-left text-xs text-[#6B5744] hover:bg-[#FFF1E3] rounded-t-lg">
-        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        <ShieldAlert size={14} className="text-[#af4408]" />
-        <span className="font-semibold">Page Access &amp; Department Visibility</span>
-        <span className="ml-2 text-[10px] text-[#8B7355] italic flex-1">{summary}</span>
+      {/* Header row is a DIV, not a button: the All / Clear / Follow-role
+          controls are real buttons and a button may not nest inside a button
+          (React logs a hydration error and the inner clicks are unreliable).
+          The disclosure toggle is its own button beside them. */}
+      <div className="w-full px-3 py-2 flex items-center gap-2 text-xs text-[#6B5744] rounded-t-lg">
+        <button type="button"
+                onClick={() => setOpen(o => !o)}
+                aria-expanded={open}
+                className="flex items-center gap-2 text-left flex-1 min-w-0 hover:text-[#af4408]">
+          {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          <ShieldAlert size={14} className="text-[#af4408] shrink-0" />
+          <span className="font-semibold whitespace-nowrap">Page Access &amp; Dept Visibility</span>
+          <span className={`ml-2 text-[10px] italic flex-1 ${hasOverride && !isAdmin ? 'text-amber-700 not-italic font-medium' : 'text-[#8B7355]'}`}>{summary}</span>
+        </button>
         {!isAdmin && open && (
-          <span className="text-[10px] flex gap-2" onClick={e => e.stopPropagation()}>
-            <button type="button" onClick={grantAll} className="text-[#af4408] hover:underline">All</button>
-            <button type="button" onClick={grantNone} className="text-[#af4408] hover:underline">None</button>
-            <button type="button" onClick={grantFullAccess} className="text-[#af4408] hover:underline" title="Clear the map — user gets full access by default">Reset</button>
+          <span className="text-[10px] flex gap-2 shrink-0">
+            <button type="button" onClick={grantAll} className="text-[#af4408] hover:underline"
+                    title="Tick every page — saves as a personal override">All</button>
+            <button type="button" onClick={clearTicks} className="text-[#af4408] hover:underline"
+                    title="Untick everything so you can pick a fresh set. An empty list cannot be saved — it would mean “follow role”, not “no access”.">Clear</button>
+            {/* ALWAYS RENDERED. Both branches clear the personal override to
+                NULL; only the CONSEQUENCE differs, which is why the label does.
+                With a role, NULL means "follow the role". Without one, NULL is
+                the legacy full-access map. Gating this on role_id (as it was
+                briefly) left a user who has NO role and a personal override
+                with no way back to NULL from this screen at all — the only
+                control that used to do it was the old Reset button, which this
+                replaced. */}
+            <button type="button" onClick={followRole} className="text-[#af4408] hover:underline"
+                    title={editing.role_id
+                      ? 'Remove the personal override so this user follows their role again (and keeps following it as the role is edited)'
+                      : 'Remove the personal override. This user has no role, so clearing it restores full access — assign a role if you want them to follow one.'}>
+              {editing.role_id ? 'Follow role' : 'Full access'}
+            </button>
           </span>
         )}
-      </button>
+      </div>
 
       {open && !isAdmin && (
         <div className="px-3 py-2 space-y-3 border-t border-[#E8D5C4]">
+          {/* INHERITANCE STATE — the screen must say plainly whether this user
+              follows their role, because the boxes below look identical either
+              way once they are seeded from the role's pages. */}
+          {roleUnresolved ? (
+            <div className="text-[11px] bg-red-50 border border-red-200 text-red-800 rounded p-2">
+              This user&apos;s role could not be loaded, so their real pages can&apos;t be shown.
+              Reload the page before changing access — saving now could grant or strip the wrong pages.
+            </div>
+          ) : touchedEmpty ? (
+            <div className="text-[11px] bg-amber-50 border border-amber-300 text-amber-900 rounded p-2">
+              <span className="font-semibold">Nothing is ticked — Save will refuse this.</span>{' '}
+              An empty page list is stored as “no restriction”, so it would{' '}
+              {assignedRole ? <>hand this user back to the <b>{assignedRole.name}</b> role</> : <>grant every page</>},
+              not block them. Tick the pages they should have
+              {assignedRole ? <>, or use <b>Follow role</b> to do that deliberately</> : null}.
+              To block someone entirely, untick <b>Active</b> above.
+            </div>
+          ) : hasOverride ? (
+            <div className="text-[11px] bg-amber-50 border border-amber-200 text-amber-900 rounded p-2">
+              <span className="font-semibold">Personal override.</span>{' '}
+              {assignedRole
+                ? <>These ticks beat the <b>{assignedRole.name}</b> role — editing that role will no longer change what this
+                    user sees. Use <b>Follow role</b> above to hand them back.</>
+                : <>These ticks are this user&apos;s own page list.</>}
+            </div>
+          ) : assignedRole ? (
+            <div className="text-[11px] bg-green-50 border border-green-200 text-green-900 rounded p-2">
+              <span className="font-semibold">Following the {assignedRole.name} role.</span>{' '}
+              {roleGrantsEveryPage
+                ? <>That role restricts nothing, so this user sees every page.</>
+                : <>The {rolePageCount} ticked page{rolePageCount === 1 ? '' : 's'} below {rolePageCount === 1 ? 'is' : 'are'}{' '}
+                    the role&apos;s — applied automatically, nothing to save here.
+                    Change them for everyone in Settings → Roles.</>}
+              {' '}Ticking anything here creates a personal override for this user only.
+            </div>
+          ) : (
+            <div className="text-[11px] bg-blue-50 border border-blue-200 text-blue-900 rounded p-2">
+              <span className="font-semibold">No role assigned</span> — this user gets <b>every page</b>.
+              Assign a role above, or tick only the pages they should have.
+            </div>
+          )}
+          {!rolesReady && (
+            <div className="text-[11px] bg-red-50 border border-red-200 text-red-800 rounded p-2">
+              Roles could not be loaded — page access cannot be saved. Reload the page.
+            </div>
+          )}
           {/* DEPARTMENT VISIBILITY */}
           <div className="bg-blue-50/40 border border-blue-200 rounded p-2">
             <div className="text-[11px] font-semibold text-[#2D1B0E] mb-1">
@@ -608,7 +795,7 @@ function PageAccessSection({ editing, setEditing, departments }: {
           {/* PAGE ACCESS */}
           {PAGE_CATALOG.map(section => {
             const paths = section.pages.map(p => p.path);
-            const checkedCount = paths.filter(p => currentPages.has(p)).length;
+            const checkedCount = paths.filter(p => draft.has(p)).length;
             const allChecked = checkedCount === paths.length;
             const someChecked = checkedCount > 0 && !allChecked;
             const isExpanded = sectionOpen.has(section.label);
@@ -628,7 +815,7 @@ function PageAccessSection({ editing, setEditing, departments }: {
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-1 px-3 py-1.5 text-xs bg-white">
                     {section.pages.map(p => (
                       <label key={p.path} className="flex items-center gap-1.5 cursor-pointer hover:bg-[#FFF8F0] px-1 rounded">
-                        <input type="checkbox" checked={currentPages.has(p.path)} onChange={() => togglePage(p.path)} />
+                        <input type="checkbox" checked={draft.has(p.path)} onChange={() => togglePage(p.path)} />
                         <span className="text-[#2D1B0E]">{p.label}</span>
                         <span className="text-[9px] font-mono text-[#8B7355] ml-auto">{p.path}</span>
                       </label>
@@ -639,8 +826,9 @@ function PageAccessSection({ editing, setEditing, departments }: {
             );
           })}
           <div className="text-[10px] text-[#8B7355] italic">
-            Empty page list = locked out. Reset (above) clears the map → user gets full access by default.
-            Changes apply when you click Save below.
+            Ticking any page here creates a personal override that beats the role. An empty list cannot be
+            saved — it means “follow role” (or full access with no role), not “no access”; to block someone
+            entirely, untick <b>Active</b> above. Changes apply when you click Save below.
           </div>
         </div>
       )}

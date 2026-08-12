@@ -470,14 +470,68 @@ export function homePathFor(user: { role?: string; page_access?: string | null; 
   const prefs: string[] = [];
   // Management wants the whole-outlet dashboard first.
   if (isMgmt) prefs.push('/');
+
+  // ── A CASHIER OUTRANKS A CAPTAIN ─────────────────────────────────────────
+  // The owner's rule: "For Cashier Login Home Page Should be Cashier page."
+  //
+  // The two roles cannot be told apart by TIER — Captain and Cashier are both
+  // base_role 'staff' — and the seeded Cashier bundle CONTAINS '/captain'
+  // (measured on this database: ["/dine-in/floor","/dine-in/tables",
+  // "/dine-in/order","/captain","/dine-in/reservations","/cashier"]), so with
+  // '/captain' first in the list below every cashier matched it and landed on
+  // the tablet POS instead of the till.
+  //
+  // What DOES separate them is the '/cashier' grant itself: the Captain bundle
+  // is ["/captain"] and holds no cashier page, and '/cashier' is the app's
+  // existing definition of a till operator (tillCapable() in
+  // src/lib/settle-authority.ts gates settle on exactly this grant). So a
+  // cashier is homed at the till and a captain — who has no such grant — is
+  // untouched and still lands on /captain.
+  //
+  // The grant is read STRICTLY: an explicit, parseable, non-empty array that
+  // lists the page. canAccessPage() deliberately answers "yes" for a null /
+  // empty / garbled map (its documented backward compat), and under that
+  // forgiving reading every legacy full-access user would look like a cashier
+  // and be pulled off their current home. Path matching mirrors the last line
+  // of canAccessPage (exact, or a prefix ending at a '/' boundary) so a map
+  // that opens the cashier PAGE is what opens this home, never one without the
+  // other. This repeats tillCapable() rather than importing it: that module
+  // pulls in db.ts/better-sqlite3, and page-catalog is bundled into client
+  // components (Sidebar, /customers, /settings/page-access), so importing it
+  // here would drag the database into the browser bundle.
+  //
+  // Management keeps the dashboard ONLY when they can actually open it. '/' is
+  // pushed above for management, but prefs are resolved through canAccessPage,
+  // so that entry wins only if '/' is genuinely reachable. An admin always is.
+  // A manager or HOD whose EXPLICIT map omits '/' but includes '/cashier' now
+  // homes to the till instead — correct for someone whose map says they work a
+  // till, but it is a behaviour change, not the no-op the old comment claimed.
+  let grantsCashierPage = false;
+  if (user.page_access) {
+    try {
+      const map: unknown = JSON.parse(user.page_access);
+      grantsCashierPage =
+        Array.isArray(map) &&
+        map.some(p => typeof p === 'string' && ('/cashier' === p || '/cashier'.startsWith(p + '/')));
+    } catch { grantsCashierPage = false; }   // garbled map → not an explicit grant
+  }
+  if (grantsCashierPage) prefs.push('/cashier');
+
   // Then role homes, most-specific first. A GRE has CRM but not Captain access
-  // (and vice-versa), so each lands correctly; someone with both is POS-primary.
+  // (and vice-versa), so each lands correctly; someone with both of THOSE two
+  // is POS-primary (a cashier already jumped the queue above).
   prefs.push(
     '/captain',              // captains → tablet POS
     '/crm-calls/recovery',   // GREs → missed-call recovery home base
     '/crm-calls',            // (CRM without recovery grant)
     '/dine-in/kitchen',      // kitchen → KDS
     '/dine-in/floor',        // floor staff → order floor
+    // SHADOWED, and kept deliberately. An explicit '/cashier' grant is pushed
+    // ahead of '/captain' above, and any map loose enough to reach this entry
+    // (null, '[]', garbled) also passes canAccessPage('/captain'), which sits
+    // first. So no input reaches it today. It stays as the floor: if the strict
+    // grant test above is ever narrowed, a till user still lands somewhere sane
+    // rather than on the POS.
     '/cashier',
     '/requisitions',
     '/tasks/my',
