@@ -62,7 +62,7 @@ const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.8.0';   // 2.8.0 = BILL line key 'copyLabel' — prints doc.copyLabel (e.g. DUPLICATE BILL) centred and bold ABOVE the outlet name; absent on an original so a first bill is unchanged. 2.7.1 = Win32 spooler error codes are translated into a sentence naming the fix — err 1801 (no printer of that name) now says so and points at /printers, instead of surfacing a raw PowerShell MethodInvocationException. 2.7.0 = KOT footer line 'totalItems' now prints BOTH counts on one row — left "Total Items: <number of item lines>", right "Total QTY: <sum of quantities>" (it used to print only the qty sum, mislabelled "Total items"). New KOT line key 'guests' → "Guests: N" from doc.guests, suppressed entirely when absent/0; also derived offline from POST /kot's fire.guest.covers. 2.6.0 = raw/tspl jobs may carry doc.payload_b64 (base64) for binary-safe bytes — raster stickers; falls back to doc.payload utf8. KOT paper saver: doc.paperSaver { compactCut: GS V 66 feed-to-cut instead of feed3+cut; pullBackLines: ESC e reverse-feed before printing }. 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
+const VERSION = '2.8.1';   // 2.8.1 = macOS/Linux USB failures name the real cause — an unknown CUPS destination now lists the installed queues and suggests the underscored form, instead of surfacing bare 'lp: No such file or directory'. 2.8.0 = BILL line key 'copyLabel' — prints doc.copyLabel (e.g. DUPLICATE BILL) centred and bold ABOVE the outlet name; absent on an original so a first bill is unchanged. 2.7.1 = Win32 spooler error codes are translated into a sentence naming the fix — err 1801 (no printer of that name) now says so and points at /printers, instead of surfacing a raw PowerShell MethodInvocationException. 2.7.0 = KOT footer line 'totalItems' now prints BOTH counts on one row — left "Total Items: <number of item lines>", right "Total QTY: <sum of quantities>" (it used to print only the qty sum, mislabelled "Total items"). New KOT line key 'guests' → "Guests: N" from doc.guests, suppressed entirely when absent/0; also derived offline from POST /kot's fire.guest.covers. 2.6.0 = raw/tspl jobs may carry doc.payload_b64 (base64) for binary-safe bytes — raster stickers; falls back to doc.payload utf8. KOT paper saver: doc.paperSaver { compactCut: GS V 66 feed-to-cut instead of feed3+cut; pullBackLines: ESC e reverse-feed before printing }. 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -629,7 +629,31 @@ async function printUsb(target, payload) {
     const p = spawn('lp', ['-d', t, '-o', 'raw'], { stdio: ['pipe', 'ignore', 'pipe'] });
     let err = '';
     p.stderr.on('data', (d) => (err += d));
-    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`lp -d ${t} failed (${code}) ${err.trim()}`))));
+    p.on('close', async (code) => {
+      if (code === 0) return resolve();
+      // TRANSLATE THE CUPS FAILURE, for the same reason the Win32 codes are
+      // translated above: "lp: No such file or directory" tells an operator
+      // nothing, and it is the message they get for the commonest mistake here.
+      //
+      // A CUPS DESTINATION NAME CANNOT CONTAIN SPACES. macOS shows a friendly
+      // description ("Canon G3070 series") while the actual queue is
+      // "Canon_G3070_series", so a name copied off the Printers pane never
+      // matches. Measured on a real Mac: every queue underscored, none spaced.
+      let msg = `lp -d ${t} failed (${code}) ${err.trim()}`;
+      try {
+        const queues = (await listPrinters()).map((p2) => p2.name).filter(Boolean);
+        const known = queues.some((q) => q === t);
+        if (!known) {
+          const guess = queues.find((q) => q.toLowerCase() === t.toLowerCase().replace(/\s+/g, '_'));
+          msg = `No print queue named "${t}" on this computer.`
+            + (guess ? ` Did you mean "${guess}"? A CUPS queue name has NO SPACES — the Printers pane shows a friendly description, the queue itself uses underscores.` : '')
+            + (queues.length
+              ? ` Installed queues: ${queues.join(', ')}.`
+              : ' No printers are installed here at all — the bridge must run on the computer the printer is plugged into.');
+        }
+      } catch { /* fall back to the raw lp message */ }
+      reject(new Error(msg));
+    });
     p.on('error', (e) => reject(new Error(`lp not available — ${e.message}`)));
     p.stdin.write(payload);
     p.stdin.end();
