@@ -293,9 +293,25 @@ export function getSalesDashboard(
   }
 
   // Cancel breakup — order cancel = voided orders in range (by IST void day).
+  //
+  // HUMAN CANCELLATIONS ONLY, via auto_close_reason IS NULL. That column is
+  // NULL for every void a person wrote and non-NULL for one written by the
+  // idle-table sweep (src/lib/stale-tables.ts), which closes ABANDONED EMPTY
+  // tables — no items, no KOT, no payment. Counting those here would report a
+  // cancellation to the owner that no guest and no cashier ever made.
+  //
+  // The amount matters as much as the count: an empty open order keeps whatever
+  // stale total it was left with rather than 0 (the sweep deliberately does not
+  // rewrite money columns), so on the live data today that is 945 of revenue
+  // that would appear cancelled without ever having been ordered.
+  //
+  // No-op on ship: 0 rows currently carry a non-NULL auto_close_reason and the
+  // sweep is seeded OFF, so every void counted before this line is still
+  // counted after it.
   const orderCancel = db.prepare(`
     SELECT COUNT(*) AS count, COALESCE(SUM(total), 0) AS amount
-    FROM orders WHERE status = 'void' AND (outlet_id = ? OR outlet_id IS NULL)
+    FROM orders WHERE status = 'void' AND auto_close_reason IS NULL
+      AND (outlet_id = ? OR outlet_id IS NULL)
       AND date(COALESCE(voided_at, updated_at), ${IST}) BETWEEN ? AND ?
   `).get(outletId, from, to) as any;
 

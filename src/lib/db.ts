@@ -2604,6 +2604,30 @@ function initializeSchema(db: Database.Database) {
     // 'on_hold'); it frees the table and shows under Outstanding Payment until
     // settled. held_at = when it was parked.
     if (!hasOrd('held_at'))               db.exec(`ALTER TABLE orders ADD COLUMN held_at TEXT`);
+    // IDLE-TABLE SWEEP — why a void happened (src/lib/stale-tables.ts).
+    //
+    // Open orders accumulate forever: nothing in this app has ever closed one.
+    // Measured on the live database 2026-08-12, eleven orders sat 'open' — two
+    // of them 765h and 527h old (32 and 22 days), the rest ~17h.
+    //
+    // The sweep closes only the EMPTY ones (zero order_items): no bill, no
+    // money, nothing consumed, so 'void' — "this never happened" — is literally
+    // true, and it is the existing status every reader already understands. A
+    // table that HAS items is never closed by a timer under any setting; it is
+    // only flagged for a human. See the header of stale-tables.ts.
+    //
+    // NULL for every void a human wrote (including every row that pre-dates
+    // this column); 'idle_empty' for one the sweep wrote. That distinction is
+    // the whole point of the column: /api/dine-in/kot-analytics and
+    // src/lib/sales-dashboard.ts both COUNT and SUM(total) over
+    // status = 'void', so without it an automatic close would be
+    // indistinguishable from a cashier cancelling a real bill.
+    if (!hasOrd('auto_close_reason'))     db.exec(`ALTER TABLE orders ADD COLUMN auto_close_reason TEXT`);
+    // How many hours an EMPTY open order may idle before the sweep closes it.
+    // 0 = OFF, and OFF is the seeded default: nothing starts closing tables the
+    // moment this deploys — the owner turns it on after looking at the list.
+    // INSERT OR IGNORE so his chosen value survives every future deploy.
+    db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('stale_table_auto_close_hours', '0')`);
     // Per-item prep timer + completion: prep_minutes snapshot from the menu item,
     // fired_at when it went to the kitchen (timer start), completed_at when the
     // captain marks it received. Bill is gated until every fired item completes.

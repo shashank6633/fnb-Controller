@@ -57,6 +57,15 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/dine-in/floor',       label: 'Order Floor' },
       { path: '/cashier',             label: 'Cashier' },
+      // Idle Tables — open orders nobody closed, split into the empty ones a
+      // timer may close and the ones with items that only a person may.
+      // mgmtOnly because it lists what EVERY open table is worth across the
+      // outlet and its buttons settle or write off a bill; that is management
+      // work, not a floor surface like Order Floor or Tables. As with every
+      // flag here this is not the security boundary — /api/dine-in/stale-tables
+      // refuses a non-management caller with its own 403, and settle/void keep
+      // their own gates on top.
+      { path: '/dine-in/stale-tables', label: 'Idle Tables', mgmtOnly: true },
       { path: '/dine-in/requests',    label: 'Customer Orders & Requests' },
       { path: '/dine-in/discount-approvals', label: 'Discount Approvals' },
       { path: '/dine-in/kitchen',     label: 'Kitchen Display' },

@@ -95,6 +95,10 @@ const navTree: NavEntry[] = [
     items: [
       { kind: "link", label: "Order Floor",        href: "/dine-in/floor",             icon: ShoppingCart },
       { kind: "link", label: "Cashier",            href: "/cashier",                   icon: Wallet },
+      // Management-only (page-catalog mgmtOnly) — canAccessPage hides it for
+      // everyone else. Sits beside Cashier because it is the same job: closing
+      // bills that were never closed.
+      { kind: "link", label: "Idle Tables",        href: "/dine-in/stale-tables",      icon: Timer },
       { kind: "link", label: "Customer Orders & Requests", href: "/dine-in/requests",  icon: Bell },
       { kind: "link", label: "Discount Approvals", href: "/dine-in/discount-approvals", icon: BadgePercent },
       { kind: "link", label: "Kitchen Display",    href: "/dine-in/kitchen",           icon: ChefHat },

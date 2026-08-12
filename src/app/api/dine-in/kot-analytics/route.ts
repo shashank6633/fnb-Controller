@@ -92,10 +92,26 @@ export async function GET(req: Request) {
       ORDER BY k.reprint_count DESC, k.created_at DESC LIMIT 8`).all(p);
 
     // Voids — orders voided within the range (by void time, IST)
+    //
+    // A HUMAN CANCELLATION ONLY. auto_close_reason is NULL for every void a
+    // person wrote and non-NULL for one the idle-table sweep wrote
+    // (src/lib/stale-tables.ts), so this tile keeps meaning "someone cancelled
+    // a bill" — the discipline signal it is read for — instead of quietly
+    // absorbing abandoned empty tables aging out on a timer.
+    //
+    // It is not cosmetic: those empty orders carry a STALE total with no items
+    // behind them (measured 2026-08-12 — 9 of them at 105 each, 945 in all,
+    // against a real void base of 28,102), so without this they would post
+    // phantom cancelled revenue, not merely an inflated count.
+    //
+    // A provable no-op the day it ships: auto_close_reason was added in this
+    // same batch, every existing row is NULL (verified: 0 non-NULL), and the
+    // sweep is seeded OFF. All 19 existing voids keep counting.
     const voids = db.prepare(`
       SELECT COUNT(*) count, COALESCE(SUM(total),0) value
       FROM orders o
       WHERE (o.outlet_id = :outlet OR o.outlet_id IS NULL) AND o.status = 'void'
+            AND o.auto_close_reason IS NULL
             AND o.voided_at IS NOT NULL
             AND date(o.voided_at,${IST}) BETWEEN :from AND :to`).get(p) as any;
 

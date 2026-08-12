@@ -5,8 +5,13 @@
  * Guards against double-start via globalThis so HMR / multi-route imports
  * don't spawn parallel intervals.
  *
- * Currently runs:
- *   - refreshUpcomingParties() every POLL_MINUTES minutes
+ * Every tick, in this order (each after the first is best-effort and wrapped so
+ * it cannot break the loop):
+ *   - refreshUpcomingParties() + refreshPartyBookings()
+ *   - checkDeferDueSoon()          — deferred requisition items coming due
+ *   - sweepRecordingRetention()    — call recordings past the admin's window
+ *   - sweepStaleTables()           — EMPTY idle open orders (never ones with items)
+ *   - checkKitchenExpiry()         — production batches at/near expiry
  *
  * Production-only by default. Set ENABLE_SCHEDULER=1 to force in dev for
  * local testing.
@@ -16,6 +21,7 @@ import { refreshUpcomingParties, refreshPartyBookings } from './party-refresh';
 import { checkDeferDueSoon } from './defer-due-check';
 import { checkKitchenExpiry } from './kitchen-expiry-check';
 import { sweepRecordingRetention } from './ct/retention';
+import { sweepStaleTables } from './stale-tables';
 
 /**
  * Adaptive cadence:
@@ -120,6 +126,30 @@ export function startSchedulerOnce(): void {
         }
       } catch (e: any) {
         console.error('[scheduler] recording-retention sweep failed:', e?.message);
+      }
+
+      // Idle tables — close open orders that are EMPTY (zero order_items) and
+      // have sat past the admin's window, so an abandoned table frees itself on
+      // the cashier floor. OFF until the owner sets
+      // settings['stale_table_auto_close_hours'], and structurally incapable of
+      // closing an order that has items — the guard is in the UPDATE itself
+      // (src/lib/stale-tables.ts). A timer must never decide the fate of a
+      // table with money on it; those are only ever FLAGGED for a human.
+      //
+      // THE JOB IS WHAT MAKES THIS A POLICY RATHER THAN A SETTING, exactly as
+      // with recording retention above: the same sweep can ride along on a
+      // screen that lists idle tables, but on a quiet day nobody opens that
+      // screen — and a quiet day is precisely when yesterday's ghost table
+      // should age out. Best-effort by contract (sweepStaleTables swallows its
+      // own errors), and wrapped anyway so it can NEVER break the refresh loop.
+      try {
+        const st = sweepStaleTables({ throttleMs: 0 });
+        if (st.closed > 0) {
+          console.log(`[scheduler] idle-tables @ IST ${istHour()}h: ${st.closed} empty order(s) closed after ${st.window_hours}h idle${st.freed_tables.length ? ' · tables freed: ' + st.freed_tables.join(', ') : ''}`);
+        }
+        if (st.skipped === 'error') console.warn('[scheduler] idle-tables sweep reported an error (see above)');
+      } catch (e: any) {
+        console.error('[scheduler] idle-tables sweep failed:', e?.message);
       }
 
       // Kitchen Production — auto-expire past-expiry batches and warn the
