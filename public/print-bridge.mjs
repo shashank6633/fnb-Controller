@@ -62,7 +62,7 @@ const OUTBOX_FILE = path.join(SCRIPT_DIR, 'kot-outbox.json');
 const OFFLINE_HTML_FILE = path.join(SCRIPT_DIR, 'offline-pos.html');
 const PRINTED_FILE = path.join(SCRIPT_DIR, 'printed-jobs.json');  // jobId → ts (idempotency)
 
-const VERSION = '2.7.1';   // 2.7.1 = Win32 spooler error codes are translated into a sentence naming the fix — err 1801 (no printer of that name) now says so and points at /printers, instead of surfacing a raw PowerShell MethodInvocationException. 2.7.0 = KOT footer line 'totalItems' now prints BOTH counts on one row — left "Total Items: <number of item lines>", right "Total QTY: <sum of quantities>" (it used to print only the qty sum, mislabelled "Total items"). New KOT line key 'guests' → "Guests: N" from doc.guests, suppressed entirely when absent/0; also derived offline from POST /kot's fire.guest.covers. 2.6.0 = raw/tspl jobs may carry doc.payload_b64 (base64) for binary-safe bytes — raster stickers; falls back to doc.payload utf8. KOT paper saver: doc.paperSaver { compactCut: GS V 66 feed-to-cut instead of feed3+cut; pullBackLines: ESC e reverse-feed before printing }. 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
+const VERSION = '2.8.0';   // 2.8.0 = BILL line key 'copyLabel' — prints doc.copyLabel (e.g. DUPLICATE BILL) centred and bold ABOVE the outlet name; absent on an original so a first bill is unchanged. 2.7.1 = Win32 spooler error codes are translated into a sentence naming the fix — err 1801 (no printer of that name) now says so and points at /printers, instead of surfacing a raw PowerShell MethodInvocationException. 2.7.0 = KOT footer line 'totalItems' now prints BOTH counts on one row — left "Total Items: <number of item lines>", right "Total QTY: <sum of quantities>" (it used to print only the qty sum, mislabelled "Total items"). New KOT line key 'guests' → "Guests: N" from doc.guests, suppressed entirely when absent/0; also derived offline from POST /kot's fire.guest.covers. 2.6.0 = raw/tspl jobs may carry doc.payload_b64 (base64) for binary-safe bytes — raster stickers; falls back to doc.payload utf8. KOT paper saver: doc.paperSaver { compactCut: GS V 66 feed-to-cut instead of feed3+cut; pullBackLines: ESC e reverse-feed before printing }. 2.5.0 = GET /printers lists installed printers; USB target can be a printer NAME (raw-spooled to the Win32 spooler, no sharing) as well as a \\host\share; /printer-status is USB-aware. 2.4.0 = raw passthrough: doc.type 'tspl'|'raw' sends doc.payload bytes verbatim (TSPL2 labels for the TSC TE210 label printer) — no ESC/POS wrapping. 2.3.2 = bill item Rate/Amt columns are plain numbers (Rs only on the totals). 2.3.1 = bill item columns realigned. 2.3.0 = idempotent by jobId. 2.2.1 = offline LAN KOT + audit hardening.
 const startedAt = Date.now();
 
 const args = process.argv.slice(2);
@@ -299,6 +299,9 @@ function billItemRow(name, qty, rate, amt, cols, w) {
 // Default BILL line order (mirrors DEFAULT_BILL_LINES in print.ts) — used when a
 // doc carries no `lines` (backward compat / non-designed bills).
 const DEFAULT_BILL_LINES = [
+  // FIRST, deliberately — a duplicate must be identifiable before the reader's
+  // eye reaches the outlet name, or two copies of one bill look interchangeable.
+  { key: 'copyLabel', enabled: true, size: 'large' },
   { key: 'brand', enabled: true, size: 'xlarge' }, { key: 'company', enabled: true, size: 'normal' },
   { key: 'address', enabled: true, size: 'normal' }, { key: 'contact', enabled: true, size: 'normal' },
   { key: 'email', enabled: true, size: 'normal' }, { key: 'fssai', enabled: true, size: 'normal' },
@@ -346,6 +349,9 @@ function buildBill(doc, cols, doCut) {
 
   // One renderer per bill line key; conditional lines no-op when absent.
   const SECTIONS = {
+    // Absent on an original — the line simply renders nothing, so a first bill
+    // is byte-identical to what it printed before this key existed.
+    copyLabel:   (m) => { if (doc.copyLabel) centerS(String(doc.copyLabel).toUpperCase(), m, true); },
     brand:       (m) => centerS(String(doc.brandName || 'RESTAURANT').toUpperCase(), m, true),
     company:     (m) => { if (doc.companyName) centerS(String(doc.companyName), m); },
     address:     (m) => { if (doc.address) centerS(String(doc.address), m); },

@@ -40,9 +40,27 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const b = await req.json().catch(() => ({}));
     const counter = String(b?.counter || '').trim();
 
+    // DUPLICATE DETECTION HAPPENS HERE, and only here. The server is the one
+    // place that knows whether this bill has been printed before —
+    // bill_printed_at is stamped further down, so reading it now, BEFORE that
+    // update, is what distinguishes press 1 from press 2. The print agent and
+    // the bridge cannot work this out for themselves: an agent may have been
+    // restarted, and the bridge sees only the document it is handed.
+    const alreadyPrinted = !!String(order.bill_printed_at || '').trim();
+    // Distinct per press. This rides through to the print job id, so a repeat
+    // press is a NEW job that genuinely prints, while a re-delivery of THIS
+    // event (an SSE reconnect, an agent replay) carries the same value and is
+    // still deduped by the bridge's 72h ledger. That is the whole reason it is
+    // a stamp rather than a boolean.
+    const printSeq = new Date().toISOString();
+
     const bill = {
       id: order.id,
       order_number: order.order_number,
+      // Rendered above the outlet name by the bill printer. Undefined on an
+      // original, so a first bill is unchanged.
+      copy_label: alreadyPrinted ? 'DUPLICATE BILL' : undefined,
+      print_seq: printSeq,
       table_number: order.table_number || null,
       table_id: order.table_id || null,          // present => DINE-IN, absent => PARCEL
       zone: order.zone || null,
@@ -57,11 +75,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       payment_method: order.payment_method || undefined,
       items,
     };
-    // Mark that a bill was printed for this (still-open) table so the cashier
-    // floor can highlight it as "asked for the bill / about to free up".
-    if (order.status === 'open') {
-      db.prepare("UPDATE orders SET bill_printed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").run(id);
-    }
+    // Mark that a bill was printed. Two readers now depend on this:
+    //  1. the cashier floor highlights "asked for the bill / about to free up";
+    //  2. the NEXT press reads it to decide whether to stamp DUPLICATE BILL.
+    //
+    // Reader 2 is why the old `if (order.status === 'open')` guard had to go. A
+    // settled order never got stamped, so every reprint after payment looked
+    // like an original — and that is precisely when a guest asks for another
+    // copy. Unconditional now.
+    //
+    // This cannot disturb reader 1: the floor highlight comes from
+    // api/dine-in/tables, which joins orders ON o.status = 'open', so a settled
+    // order's stamp is invisible to it by construction.
+    db.prepare("UPDATE orders SET bill_printed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").run(id);
 
     emitKds({ type: 'bill.print', outlet_id: order.outlet_id, station: 'bill', counter, bill });
     return Response.json({ success: true, counter: counter || null });

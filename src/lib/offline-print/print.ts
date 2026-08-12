@@ -498,6 +498,14 @@ export interface BillOrder {
   discount_pct?: number | null;          // % discount (drives computeBill)
   server_name?: string; subtotal: number; tax_total: number; discount: number; total: number;
   payment_method?: string;
+  /** 'DUPLICATE BILL' when the server saw this order already had a bill printed.
+   *  Decided server-side in the print-bill route — an agent may have restarted
+   *  and cannot know the history. Absent on an original. */
+  copy_label?: string;
+  /** A per-press stamp from the same route. Folded into the job id so a repeat
+   *  press is a NEW job that prints, while a re-delivered event (SSE reconnect,
+   *  agent replay) repeats this value and stays deduped. */
+  print_seq?: string;
   items: Array<{ name: string; quantity: number; unit_price: number; line_total: number }>;
 }
 
@@ -679,6 +687,9 @@ export async function printBill(order: BillOrder, printedBy?: string, targetFloo
     balance: order.payment_method ? 0 : undefined,
     footer: design.footerNote || undefined,
     printedBy: printedBy || order.server_name || undefined,
+    // Printed above the outlet name by the bridge. Undefined on an original, so
+    // a first bill renders exactly as it always has.
+    copyLabel: order.copy_label || undefined,
     date: new Date().toISOString(),
   };
   // THE ID IS STABLE PER *BILL*, NOT PER ORDER — and the difference is a bug the
@@ -698,9 +709,13 @@ export async function printBill(order: BillOrder, printedBy?: string, targetFloo
   // owes and it is a different document that genuinely must print.
   // Every figure computeBill returns, plus the line count and the payment state
   // — i.e. everything that can make this a materially different document.
+  // print_seq makes every deliberate press a distinct job, which is what lets a
+  // DUPLICATE actually print. The money figures stay in the fingerprint anyway:
+  // they cover the offline/agent paths that carry no print_seq, so a corrected
+  // bill still reprints there.
   const billFingerprint = hash32([
     b.subtotal, b.serviceCharge, b.discount, b.cgst, b.sgst, b.total,
-    doc.items.length, order.payment_method || '',
+    doc.items.length, order.payment_method || '', order.print_seq || '',
   ].join('|'));
   await enqueue({
     id: `bill_${order.id}_${billFingerprint}`,
