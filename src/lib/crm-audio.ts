@@ -182,7 +182,14 @@ async function callGeminiAudio(base64: string, mimeType: string, textPrompt: str
   const keys = getGeminiKeys();
   if (!keys.length) throw new Error('No Gemini API key configured. Add one in CRM Settings.');
 
-  const models = [getCrmSetting('crm_gemini_model', 'gemini-2.5-flash'), 'gemini-2.0-flash'];
+  // Same retirement trap as the text chain (see the note on GEMINI_MODELS in
+  // src/lib/crm-llm.ts): 'gemini-2.0-flash' was withdrawn by Google and 404s, so
+  // it was not a fallback at all — it was a guaranteed second failure whose
+  // message replaced the real one. gemini-flash-latest is an alias Google keeps
+  // current, which is the property that matters for a fallback: it cannot be
+  // retired out from under us. Audio here is sent as inline_data, which the
+  // flash line supports.
+  const models = [getCrmSetting('crm_gemini_model', 'gemini-2.5-flash'), 'gemini-flash-latest'];
   const body = JSON.stringify({
     contents: [{
       role: 'user',

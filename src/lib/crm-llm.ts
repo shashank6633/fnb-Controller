@@ -63,10 +63,39 @@ export function getClaudeKey(): string {
   return getCrmSetting('crm_claude_key', process.env.ANTHROPIC_API_KEY || '');
 }
 
+/**
+ * The model chain: the configured one first, then live fallbacks.
+ *
+ * EVERY ENTRY HERE IS PROBED, NOT ASSUMED. Google retires model ids, and a
+ * retired one in this list does real damage: the loop below overwrites lastErr
+ * on each pass, so the LAST model's failure is the message the user sees. With
+ * two dead ids parked at the end, every Gemini failure — a quota block, a bad
+ * key, anything — surfaced to the owner as "This model models/gemini-2.0-flash
+ * is no longer available", which points at the wrong problem entirely. That is
+ * exactly what he reported on the Calls list.
+ *
+ * Measured against his own key on 2026-08-12 with a real generateContent call
+ * (ListModels is NOT sufficient — gemini-2.5-flash-lite is still LISTED and
+ * still 404s "no longer available to new..."):
+ *     gemini-2.5-flash      200 OK   1487ms
+ *     gemini-flash-latest   200 OK   2283ms
+ *     gemini-3.5-flash      200 OK   1575ms
+ *     gemini-3.6-flash      200 OK   2759ms
+ *     gemini-2.5-flash-lite 404      GONE
+ *     gemini-2.0-flash      404      GONE
+ *
+ * gemini-flash-latest sits second on purpose: it is an alias Google keeps
+ * pointed at the current flash model, so it cannot be retired out from under
+ * this list the way the 2.0 pair was. The concrete pins on either side of it
+ * mean a bad alias day still has a known-good model to fall to.
+ *
+ * The first entry is settings-driven (crm_gemini_model), so moving to a newer
+ * model is a Settings change, not a deploy.
+ */
 const GEMINI_MODELS = () => [
   getCrmSetting('crm_gemini_model', 'gemini-2.5-flash'),
-  'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
+  'gemini-flash-latest',
+  'gemini-3.5-flash',
 ];
 const CLAUDE_MODEL = () => getCrmSetting('crm_claude_model', 'claude-sonnet-5');
 
@@ -129,7 +158,15 @@ async function callGemini(messages: CrmMessage[], system: string, maxTokens: num
             lastErr = new CrmRateLimitError(msg, 30);
             continue;
           }
-          lastErr = new Error(msg);
+          // A RETIRED MODEL MUST NOT BURY THE REAL REASON. This branch is the
+          // last writer before the next model is tried, so without the guard the
+          // final entry in the chain always owns the message the owner reads —
+          // and "no longer available" is the least actionable sentence Google
+          // emits, because it describes OUR list, not his call. Keep the first
+          // substantive error instead; only claim the model is gone when that is
+          // genuinely all we have.
+          const modelGone = res.status === 404 || /no longer available|is not found|not supported/i.test(msg);
+          if (!modelGone || !lastErr) lastErr = new Error(msg);
           break; // model-level problem (bad model id etc.) → try next model
         }
         const cand = j?.candidates?.[0];

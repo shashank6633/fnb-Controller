@@ -114,6 +114,63 @@ const REASON_FAULT: Record<RecordingFailureReason, string> = {
 };
 
 /**
+ * Content type → file extension, for the download filename.
+ *
+ * Keyed on the ESSENCE only (the bit before any ';charset='), because vendors
+ * and CDNs decorate these freely. Deliberately a small closed list of the audio
+ * types a call recording can actually arrive as: an unknown type falls through
+ * to the vendor's own filename rather than being labelled with a guess, because
+ * a file named .mp3 that is not an mp3 is worse than one named honestly.
+ */
+const AUDIO_EXT: Record<string, string> = {
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/wav': 'wav',
+  'audio/wave': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/vnd.wave': 'wav',
+  'audio/ogg': 'ogg',
+  'audio/opus': 'opus',
+  'audio/webm': 'webm',
+  'audio/aac': 'aac',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'audio/flac': 'flac',
+  'audio/x-flac': 'flac',
+};
+
+/**
+ * The name the browser saves a recording under.
+ *
+ * Two things it has to get right, both of which it previously got wrong:
+ *
+ *  1. AN EXTENSION, or the file is unopenable. The old header emitted
+ *     `recording-<uuid>` bare, so a download landed as an unrecognised document.
+ *  2. A NAME THAT TELLS TWO RECORDINGS APART. Downloading a second call gave
+ *     `recording-<uuid>` and `recording-<uuid> (1)` — two identical-looking
+ *     files with no way to know which call either belonged to. Leading with the
+ *     call DATE makes them sort and identify on sight.
+ *
+ * Everything is passed through a conservative character filter: the call id is
+ * ours, but the vendor filename is not, and a quote or a path separator in a
+ * Content-Disposition is a header-injection primitive.
+ */
+function recordingFilename(
+  row: { id: string; recording_url: string | null; started_at: string | null; created_at: string | null },
+  contentType: string,
+): string {
+  const essence = String(contentType || '').split(';')[0].trim().toLowerCase();
+  const fromVendor = /\.([a-z0-9]{2,5})(?:$|\?)/i.exec(String(row.recording_url || ''))?.[1]?.toLowerCase();
+  const ext = AUDIO_EXT[essence]
+    || (fromVendor && Object.values(AUDIO_EXT).includes(fromVendor) ? fromVendor : '')
+    || 'mp3';
+  const day = String(row.started_at || row.created_at || '').slice(0, 10);   // YYYY-MM-DD
+  const safe = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, '');
+  const stamp = /^\d{4}-\d{2}-\d{2}$/.test(day) ? `${day}-` : '';
+  return `call-${stamp}${safe(String(row.id)).slice(0, 20)}.${safe(ext)}`;
+}
+
+/**
  * The error body. `error` is the sentence and is the load-bearing contract;
  * `fault` is the machine class; `credentialed` answers the one question the
  * player cannot answer for itself — did the outgoing request actually carry an
@@ -211,7 +268,19 @@ export async function GET(req: Request, { params }: { params: Promise<{ callId: 
     if (v) h.set(k, v);
   }
   h.set('Cache-Control', 'private, no-store');
-  h.set('Content-Disposition', `inline; filename="recording-${row.id}"`);
+  // A DOWNLOADED RECORDING MUST BE OPENABLE. The browser's own audio control has
+  // a Download item, and it names the file from this header — which said
+  // `recording-<uuid>` with NO EXTENSION. The bytes were fine; the operating
+  // system had nothing to identify them by, so the file landed with a blank
+  // "?" icon and would not open in any player. That is what the owner hit.
+  //
+  // The extension is derived from what the recording actually IS, in this order:
+  // the content-type we are about to serve (authoritative — the body has already
+  // been proven to be audio by fetchAllowedRecording, which rejects TeleCMI's
+  // 200-with-JSON errors), then the extension on the vendor's own filename, and
+  // only then mp3, which is what TeleCMI serves. Naming an unknown body .mp3 is
+  // a guess, so it is the last resort rather than the first.
+  h.set('Content-Disposition', `inline; filename="${recordingFilename(row, upstream.contentType)}"`);
 
   // Stream the body through (200 for full, 206 for range responses).
   return new Response(upstream.body, { status: upstream.status, headers: h });
