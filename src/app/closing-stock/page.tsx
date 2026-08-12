@@ -34,7 +34,7 @@ import {
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
-import { fmtQtyNum, packFactor, toPurchaseQty } from '@/lib/pack-units';
+import { csvQty, fmtQtyNum, packFactor, toPurchaseQty } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 
@@ -977,6 +977,85 @@ export default function ClosingStockByLocationPage() {
       }
     } catch (_) {}
     setHistoryLoading(false);
+  };
+
+  /**
+   * Download the counted sheet for the ONE date currently open in History.
+   *
+   * BLIND COUNTS APPLY TO THE FILE, NOT JUST THE SCREEN. System Stock, Variance
+   * and Variance (₹) are admin-only in the table above; a CSV that carried them
+   * for everyone would hand a counter the very figure a blind count exists to
+   * withhold, and in the most durable, most shareable form there is. So the
+   * columns are BUILT from the same isAdmin flag the table branches on rather
+   * than assembled and filtered afterwards — a column cannot survive here by
+   * being forgotten in one place.
+   *
+   * Quantities lead with the PURCHASE unit, and the recipe figure travels in its
+   * own column so the sheet stays arithmetic-checkable — but only where the two
+   * actually differ (packFactor > 1), which is exactly when the table prints its
+   * "= N g" hint. csvQty keeps every number ungrouped: toLocaleString's commas
+   * would make Excel read 1,250 as text.
+   *
+   * Sub-recipes are counted in their own yield unit and have no purchase unit,
+   * no pack factor and no system figure — their system/variance cells are the
+   * same honest blank the table draws as a dash, never a 0 that would read as
+   * "counted and matched".
+   */
+  const downloadHistoryCsv = () => {
+    if (!historyDate) return;
+    const rows: Record<string, string | number>[] = [];
+
+    for (const item of historyItems) {
+      const hm = { unit: item.unit, purchase_unit: item.purchase_unit, pack_size: item.pack_size };
+      const converts = packFactor(hm) > 1;
+      const r: Record<string, string | number> = {
+        Type: 'Raw material',
+        Material: item.material_name ?? '',
+        Category: categoryLabel(item.category),
+      };
+      if (isAdmin) r['System Stock'] = csvQty(toPurchaseQty(Number(item.system_stock) || 0, hm));
+      r['Physical Stock'] = csvQty(toPurchaseQty(Number(item.physical_stock) || 0, hm));
+      r['Unit'] = item.purchase_unit || item.unit || '';
+      r['Physical (recipe)'] = converts ? csvQty(Number(item.physical_stock) || 0) : '';
+      r['Recipe Unit'] = converts ? (item.unit || '') : '';
+      r['Last Purchase Price'] = item.rate_per_purchase_unit == null ? '' : Number(item.rate_per_purchase_unit);
+      r['Total Value'] = item.total_value == null ? '' : Number(item.total_value);
+      if (isAdmin) r['Variance'] = csvQty(toPurchaseQty(Number(item.variance) || 0, hm));
+      if (isAdmin) r['Variance (Rs)'] = item.variance_value == null ? '' : Number(item.variance_value);
+      r['Notes'] = item.notes || '';
+      rows.push(r);
+    }
+
+    for (const s of historySemi) {
+      const r: Record<string, string | number> = {
+        Type: 'Semi-finished',
+        Material: s.name ?? '',
+        Category: categoryLabel(s.category || 'sub-recipe'),
+      };
+      if (isAdmin) r['System Stock'] = '';
+      r['Physical Stock'] = csvQty(Number(s.physical_stock) || 0);
+      r['Unit'] = s.unit || s.yield_unit || '';
+      r['Physical (recipe)'] = '';
+      r['Recipe Unit'] = '';
+      r['Last Purchase Price'] = s.rate_per_unit == null ? '' : Number(s.rate_per_unit);
+      r['Total Value'] = s.total_value == null ? '' : Number(s.total_value);
+      if (isAdmin) r['Variance'] = '';
+      if (isAdmin) r['Variance (Rs)'] = '';
+      r['Notes'] = s.notes || '';
+      rows.push(r);
+    }
+
+    if (!rows.length) return;
+    // Papa.unparse (already a dependency of this page) handles quoting for
+    // material names that contain a comma or a quote — hand-joining would
+    // corrupt those rows silently.
+    const blob = new Blob([Papa.unparse(rows)], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `closing-stock-${historyDate}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const updateClosingItem = (materialId: string, field: 'physical_stock' | 'notes', value: string) => {
@@ -2071,6 +2150,21 @@ export default function ClosingStockByLocationPage() {
                         <h3 className="text-sm font-semibold text-[#2D1B0E]">
                           Closing Stock — {new Date(historyDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' })}
                         </h3>
+                        {/* Download the sheet exactly as recorded on this date.
+                            Sits under the heading it belongs to, so it can only
+                            ever mean "this date" — the date list behind it has
+                            no download, because a count is read one day at a
+                            time. Carries the same admin gating as the table:
+                            a non-admin's file has no System Stock or Variance
+                            column at all. */}
+                        <button
+                          onClick={downloadHistoryCsv}
+                          disabled={!historyItems.length && !historySemi.length}
+                          title={`Download the ${historyItems.length + historySemi.length} recorded row(s) for this date as CSV`}
+                          className="mt-1.5 inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4] disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <Download className="w-3.5 h-3.5" /> Download CSV
+                        </button>
                       </div>
                       {historySummary && (
                         <div className="flex gap-4 text-xs">
