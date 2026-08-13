@@ -486,6 +486,15 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                     value={l.material_id}
                     onPick={(id: string) => { const mat = materials.find(x => x.id === id); update(i, { material_id: id, unit: entryUnit(mat as any) }); }}
                     excludeIds={lines.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
+                    // purchaseBasis: the picked chip must name the unit this
+                    // form actually costs in. Without it the chip read
+                    // "GREYGOOSE (750ML) (ml)" beside a Qty box that is in
+                    // BOTTLES — the same recipe-vs-purchase mislabel as the Unit
+                    // caption below, in the one other place the eye lands first.
+                    // The materials list here already carries purchase_unit and
+                    // pack_size (packFactor above depends on them), which is
+                    // what this flag requires.
+                    purchaseBasis
                   />
                   {l.material_id && recordedMaterialIds.has(l.material_id) && (
                     <div className="text-[10px] text-amber-700 mt-0.5">⚠ Already recorded above — saving will add to it.</div>
@@ -503,7 +512,30 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                     {opts.map(u => <option key={u} value={u}>{u}</option>)}
                   </select>
                 ) : (
-                  <span className="col-span-1 text-xs text-[#8B7355] py-2">{m?.unit || ''}</span>
+                  // dispUnit, NOT m.unit — the caption must name the unit the
+                  // quantity is actually costed in.
+                  //
+                  // unitOptions() returns exactly ONE option for a packed
+                  // material (the purchase unit, by the owner's 2026-08-06 call
+                  // above), so this branch is the one that always renders for
+                  // liquor — and it was printing the RECIPE unit. Grey Goose
+                  // therefore read "Qty 1 · ml · ₹3,350": the arithmetic was
+                  // right (1 BTL = 750 ml x ₹4.4669 = ₹3,350) and only the
+                  // caption was wrong, which is worse than it sounds. Reading it
+                  // as millilitres, ₹3,350 looks like a 750x conversion fault —
+                  // and the mirror case is the real hazard: type 750 meaning
+                  // millilitres and you book 750 BOTTLES, about ₹2.5 million,
+                  // with nothing on screen to contradict you.
+                  //
+                  // The comment above dispUnit already stated this rule ("so
+                  // what is displayed is what toBaseQty converts"); this line
+                  // simply did not follow it.
+                  <span className="col-span-1 text-xs text-[#8B7355] py-2"
+                        title={`Quantity is entered and costed in ${dispUnit}${
+                          m && packFactor(m) > 1 ? ` — 1 ${dispUnit} = ${packFactor(m)} ${m.unit}` : ''
+                        }`}>
+                    {dispUnit || m?.unit || ''}
+                  </span>
                 )}
                 <div className="col-span-2 flex items-center justify-end gap-1">
                   <span className="text-xs font-mono text-[#6B5744]"
