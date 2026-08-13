@@ -777,9 +777,9 @@ export default function PurchasesPage() {
       (parseFloat(line.quantity) || 0) > 0 && (parseFloat(line.unit_price) || 0) > 0;
 
     const groups: Array<{
-      materialId: string; name: string; unit: string;
+      materialId: string; name: string;
       lineNos: number[];
-      mergeable: Array<{ key: string; lineNos: number[]; parts: number[]; total: number; rate: number; bookable: number }>;
+      mergeable: Array<{ key: string; lineNos: number[]; parts: number[]; total: number; rate: number; bookable: number; unit: string }>;
       differs: string[]; bookable: number;
     }> = [];
     const flagged = new Set<number>();
@@ -798,7 +798,9 @@ export default function PurchasesPage() {
       // warning surface and a half-typed repeat is still worth seeing.
       rows.forEach((r) => flagged.add(r.idx));
       const mat = materials.find((m) => String(m.id) === mid) as any;
-      const unit = matUnits(mid).pu || String(mat?.unit || '') || 'unit';
+      // The BTL-basis label only. A CASE row is captioned per sub-group below,
+      // because the basis — not the material — decides what its numbers mean.
+      const purchaseUnit = matUnits(mid).pu || String(mat?.unit || '') || 'unit';
       const bySub = new Map<string, typeof rows>();
       for (const r of rows) {
         const a = bySub.get(r.key);
@@ -816,12 +818,21 @@ export default function PurchasesPage() {
           total: Math.round(rs.reduce((s, r) => s + (parseFloat(r.line.quantity) || 0), 0) * 10000) / 10000,
           rate: r2(parseFloat(rs[0].line.unit_price) || 0),
           bookable: rs.filter((r) => r.bookable).length,
+          /**
+           * The caption for THIS sub-group's quantities and rate. mergeSafeKey
+           * folds the BTL/CASE basis into the key, so every row here shares one
+           * basis and rs[0] speaks for all of them. On the CASE basis the typed
+           * quantity is CASES and the typed rate is ₹/CASE (billSubmit expands
+           * qty × case_size and divides the rate by case_size before POSTing),
+           * so printing the material's purchase unit read "₹1,200/BTL … 5 + 3 =
+           * 8 BTL" over eight CASES — a 12× misread of both numbers.
+           */
+          unit: caseBasis(mid, rs[0].line.entry_mode).on ? 'CASE' : purchaseUnit,
         }));
       const keys = [...bySub.keys()];
       groups.push({
         materialId: mid,
         name: mat?.name || mid,
-        unit,
         lineNos: grp.lineNos,
         mergeable,
         differs: keys.length > 1 ? keyDiffLabels(keys) : [],
@@ -1225,9 +1236,9 @@ export default function PurchasesPage() {
       setBillError(
         m
           ? `${g.name} is on line ${m.lineNos.join(' and line ')} twice at the same rate ` +
-            `(₹${m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/${g.unit}). ` +
+            `(₹${m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/${m.unit}). ` +
             `Each line books its own purchase row, so stock would be credited twice. ` +
-            `Use "Merge into one line" above — ${m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = ${fmtQtyNum(m.total)} ${g.unit}.`
+            `Use "Merge into one line" above — ${m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = ${fmtQtyNum(m.total)} ${m.unit}.`
           : `${g.name} is on line ${g.lineNos.join(' and line ')}` +
             `${g.differs.length > 0 ? ` (${g.differs.join(' and ')})` : ''}. ` +
             `One item = one line on a bill, so this bill cannot be saved as it stands. ` +
@@ -2813,9 +2824,9 @@ export default function PurchasesPage() {
                           <div key={m.key} className="flex flex-wrap items-center justify-between gap-2">
                             <span className="text-[11px] text-[#6B5744]">
                               Lines {m.lineNos.join(' + ')} are identical at{' '}
-                              ₹{m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/{g.unit} —{' '}
+                              ₹{m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/{m.unit} —{' '}
                               <strong className="text-[#2D1B0E]">
-                                {m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = {fmtQtyNum(m.total)} {g.unit}
+                                {m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = {fmtQtyNum(m.total)} {m.unit}
                               </strong>
                             </span>
                             <button

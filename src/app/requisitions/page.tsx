@@ -1478,8 +1478,16 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                 // 1 of it = pack_size recipe units — so convert for the on-hand /
                 // buffer warnings (which are shown in recipe units).
                 const packSize = Number(mat?.pack_size || 1);
-                const inPurchaseUnit = !!mat && !!mat.purchase_unit && it.unit === mat.purchase_unit && packSize > 1;
-                const reqRecipe = it.quantity_requested * (inPurchaseUnit ? packSize : 1);
+                // packFactor() rather than a local `packSize > 1`: the shared helper
+                // carries BOTH halves of the guard (pack_size > 1 AND recipe unit ≠
+                // purchase unit). The short test converted PICKLED GINGER 1.5KG
+                // (kg/kg, pack 1.5, current_stock 6 kg — the ONLY live row with
+                // pack_size > 1 and identical units, checked on a copy of the db), so
+                // a 5 kg ask became 7.5 kg of recipe demand and falsely read short
+                // against 6 kg on hand.
+                const packConv = mat ? packFactor(mat) : 1;
+                const inPurchaseUnit = !!mat && !!mat.purchase_unit && it.unit === mat.purchase_unit && packConv > 1;
+                const reqRecipe = it.quantity_requested * (inPurchaseUnit ? packConv : 1);
                 const short    = mat ? mat.current_stock < reqRecipe : false;
                 const buffer   = Number(mat?.reorder_level || 0);
                 const postReq  = mat ? (mat.current_stock - reqRecipe) : 0;

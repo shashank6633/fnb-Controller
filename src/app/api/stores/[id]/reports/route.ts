@@ -77,13 +77,26 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     /** Enriched current stock (engine rows + sku/pack/case/reorder meta). */
     const stockRows = () => {
       const base = storeStock(db, storeId);
+      // Pack meta is keyed off the material ids ACTUALLY IN the result set, the
+      // same way /api/stores/[id]/stock builds it. It used to come from an INNER
+      // JOIN on store_category_map, a DIFFERENT admission rule than the one that
+      // produced these rows: storeStock admits any material with a ledger row
+      // here, so every material a store HOLDS whose category isn't mapped to it
+      // fell out and got m = {} → pack 1, purchase_unit = recipe unit. Measured
+      // on a floor bar (owns zero categories) holding 12 BTL of 100 PIPERS
+      // (ml/BTL/750): avg_cost_purchase printed ₹2.54 under the client's
+      // "₹/purchase unit" heading — the ₹/recipe-unit figure verbatim, 750× low
+      // vs the correct ₹1,905.30/BTL — and Low Stock lost reorder_level (0 ⇒
+      // filtered out), so the report came back empty instead of listing the item.
       const meta = new Map<string, any>();
-      for (const m of db.prepare(`
-        SELECT rm.id, rm.sku, rm.purchase_unit, rm.pack_size, rm.case_size, rm.reorder_level
-        FROM raw_materials rm
-        JOIN store_category_map scm
-          ON scm.store_id = ? AND REPLACE(REPLACE(REPLACE(LOWER(TRIM(scm.category)),' ',''),'-',''),'_','') = REPLACE(REPLACE(REPLACE(LOWER(TRIM(rm.category)),' ',''),'-',''),'_','')
-      `).all(storeId) as any[]) meta.set(m.id, m);
+      const ids = base.map(r => r.material_id);
+      if (ids.length) {
+        const ph = ids.map(() => '?').join(',');
+        for (const m of db.prepare(`
+          SELECT rm.id, rm.sku, rm.purchase_unit, rm.pack_size, rm.case_size, rm.reorder_level
+          FROM raw_materials rm WHERE rm.id IN (${ph})
+        `).all(...ids) as any[]) meta.set(m.id, m);
+      }
       return base.map(r => {
         const m = meta.get(r.material_id) || {};
         const pack = n(m.pack_size) || 1;

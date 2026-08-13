@@ -25,6 +25,12 @@ import MaterialTypeahead from '@/components/MaterialTypeahead';
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const fmtNum = (v: number, d = 2) => (v ?? 0).toLocaleString('en-IN', { maximumFractionDigits: d });
 
+/** The unit this row's numbers are actually in. Both quantities (purchases.quantity)
+ *  and rates (purchases.unit_price) on this screen are per the material's own
+ *  PURCHASE unit, so Total Qty and Last ₹ must name the same thing — one spelling,
+ *  used by both cells, so the two captions cannot drift apart. */
+const unitOf = (m: MaterialStat) => m.purchase_unit || m.recipe_unit || 'unit';
+
 interface MaterialStat {
   material_id: string;
   material_name: string;
@@ -400,6 +406,15 @@ export default function VendorMaterialsPage() {
                   && (String(m.name || '').toLowerCase().includes(bulkQ) || String(m.sku || '').toLowerCase().includes(bulkQ))).slice(0, 60)
               : [];
             const picked = bulkPicked[v.vendor_id] || new Set<string>();
+            /* Every rate below is ₹ per that item's OWN purchase unit, and 15 of the
+               59 active vendors supply in several units at once (HYPERPURE: kg, BTL,
+               CAN, l, pcs across 155 items — 35 of them not kg). The header used to
+               print the unit of whichever row the sort surfaced first and stamp it
+               over all of them, so ₹182.76 per BTL of sunflower oil read as ₹182.76
+               per kg. Name a unit here only when every row on screen really is in it;
+               each rate cell carries its own either way, as Total Qty already does. */
+            const rateUnits = new Set(rows.map(unitOf));
+            const rateUnit = rateUnits.size === 1 ? [...rateUnits][0] : null;
             return (
               <div key={v.vendor_id}
                    ref={el => { rowRefs.current[v.vendor_id] = el; }}
@@ -537,7 +552,16 @@ export default function VendorMaterialsPage() {
                           <th className="text-center py-2 px-3 font-medium" title="Is this item mapped to this vendor? Purchase Orders only accept mapped pairs.">Mapped?</th>
                           <th className="text-right py-2 px-3 font-medium" title="Negotiated contract price (separate from mapping). Edit on /contracts.">Contract ₹</th>
                           <th className="text-right py-2 px-3 font-medium">Total Qty</th>
-                          <th className="text-right py-2 px-3 font-medium">Last ₹/{v.materials[0]?.purchase_unit || 'unit'}</th>
+                          <th className="text-right py-2 px-3 font-medium"
+                              /* Scoped to "shown here", not "this vendor": the item filter
+                                 above can narrow 155 mixed rows down to one BTL row, and a
+                                 tooltip claiming the vendor buys only in BTL would be the
+                                 same over-claim in a smaller box. */
+                              title={rateUnit
+                                ? `Last purchase price — ₹ per ${rateUnit}. Every item shown here is bought in ${rateUnit}.`
+                                : 'Last purchase price, in ₹ per the purchase unit named on each row. The items shown here are bought in several different units, so the column has no single rate basis.'}>
+                            Last ₹{rateUnit ? `/${rateUnit}` : ''}
+                          </th>
                           <th className="text-right py-2 px-3 font-medium">90d Avg</th>
                           <th className="text-left  py-2 px-3 font-medium">Last Buy</th>
                           <th className="text-center py-2 px-3 font-medium"># Buys</th>
@@ -582,8 +606,10 @@ export default function VendorMaterialsPage() {
                                 <span className="text-[10px] text-[#8B7355]">—</span>
                               )}
                             </td>
-                            <td className="py-1.5 px-3 text-right font-mono">{fmtNum(m.total_qty)} {m.purchase_unit || m.recipe_unit}</td>
-                            <td className="py-1.5 px-3 text-right font-mono">{fmt(m.last_unit_price)}</td>
+                            <td className="py-1.5 px-3 text-right font-mono">{fmtNum(m.total_qty)} {unitOf(m)}</td>
+                            <td className="py-1.5 px-3 text-right font-mono whitespace-nowrap">
+                              {fmt(m.last_unit_price)}<span className="text-[10px] text-[#8B7355]">/{unitOf(m)}</span>
+                            </td>
                             <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{m.avg_unit_price_90d ? fmt(m.avg_unit_price_90d) : '—'}</td>
                             <td className="py-1.5 px-3 text-[10px] font-mono text-[#8B7355]">{m.last_purchase_date}</td>
                             <td className="py-1.5 px-3 text-center text-[10px] text-[#6B5744]">{m.purchase_count}</td>

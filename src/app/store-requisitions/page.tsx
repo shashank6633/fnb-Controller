@@ -1065,16 +1065,36 @@ function effectiveQty(line: ReqLine): number {
  * threshold to cross — so it reads green whenever it covers the line. Saying
  * amber there would be inventing a judgement nobody configured.
  *
- * All quantities are RECIPE units, the basis current_stock is stored in.
+ * TWO BASES MEET HERE, so the need is lifted onto the shelf's basis BEFORE any
+ * comparison. current_stock and reorder_level are material-level columns on
+ * raw_materials — RECIPE units (g / ml), same as every other reader of them
+ * (page.tsx low-stock, eod). The outstanding qty is in the LINE's own unit
+ * (option B), which is the PURCHASE unit on 16,346 of the 16,353 live
+ * requisition_items rows. Compared raw, a 1 kg need read as the number 1
+ * against a 1,000 g shelf, so `qty < need` was false for a store holding a
+ * FIFTH of the ask and the dot went GREEN — measured on the live db, 24 lines
+ * flip GREEN→RED once both sides agree (JAVITRI 50 GMS: 1,000 g on the shelf
+ * against a 2 kg line; STAR ANISE: 954 g against 1 kg).
+ *
+ * U.toRecipe is the page's own line-basis resolver, so the three legacy lines
+ * with a blank unit (read as recipe) and every packFactor-1 material (kg/kg
+ * PICKLED GINGER included) pass through unchanged — no special case here.
+ *
+ * `qty` is RETURNED in recipe units on purpose: the caller prints it through
+ * U.stockPU for the purchase figure the column tooltip promises, and prints it
+ * raw as the small "= N g" hint. Converting it here would divide it twice.
  */
 function stockLevel(line: ReqLine): {
   qty: number | null; dot: string; text: string; title: string;
 } {
   const raw = (line as any).current_stock;
   if (raw == null) return { qty: null, dot: '', text: '', title: '' };
-  const qty = Number(raw) || 0;
-  const need = Math.max(0, effectiveQty(line) - (Number(line.quantity_issued) || 0));
-  const reorder = Number(line.reorder_level) || 0;
+  const qty = Number(raw) || 0;                       // recipe units (rm.current_stock)
+  const U = lineUnits(line);
+  const need = U.toRecipe(                            // line basis → recipe basis
+    Math.max(0, effectiveQty(line) - (Number(line.quantity_issued) || 0)),
+  );
+  const reorder = Number(line.reorder_level) || 0;    // recipe units (rm.reorder_level)
 
   if (qty <= 0 || qty < need) {
     return {

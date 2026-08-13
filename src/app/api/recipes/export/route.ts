@@ -1,6 +1,6 @@
 import { getDb, convertToMaterialUnit } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { toPurchaseQty, purchasePrice } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty, purchasePrice } from '@/lib/pack-units';
 import * as XLSX from 'xlsx';
 
 /**
@@ -28,6 +28,35 @@ function engineLineCost(ing: any): number {
  *   - Recipes        : main recipes + ingredient lines + sub-recipe references
  *   - Sub-Recipes    : sub-recipes + their own ingredient lines
  *   - Direct Items   : menu items linked directly to a raw material
+ *
+ * ── DIRECT ITEMS: WHY SOME "Cost / sale" CELLS ARE BLANK ────────────────────
+ * average_price is ₹ per RECIPE unit (₹/ml, ₹/g) — never ₹ per item sold. Only
+ * direct_item_links.qty_per_unit (recipe units per item sold: 30 for a peg, 700
+ * for a bottle) converts the one into the other. This sheet used to multiply by
+ * `qty_per_unit || 1`, so a measured material with NO configured pour size
+ * printed its ₹/ml under the header "Cost / sale (₹)" and a margin computed
+ * from it: SINGLETON 12 Y.O BOTTLE (sell ₹16,499, material 700 ML @ ₹9.01/ml)
+ * read Cost ₹9.01 / Margin 99.95%, against a real bottle cost of ₹6,307 (~62%).
+ *
+ * THE CHOICE MADE HERE: leave the cost blank and name the reason — do NOT
+ * derive the sale from the pack. The sheet cannot tell a peg from a bottle:
+ * 259 live rows are in this state and both readings sit on the SAME material
+ * with the SAME unset qty_per_unit ("SINGLETON 12 Y.O 30 ML" ₹769 and
+ * "SINGLETON 12 Y.O BOTTLE" ₹16,499 both link to SINGLETON 12YRS (700ML)).
+ * Pricing every such sale as one pack would fix the 73 bottle-ish rows and
+ * replace the +99.95% artefact with a −720% one on the 63 peg-ish rows
+ * (−1,547% for BUDWEISER DRAUGHT 330 ML off a 30 L keg). A guess that is wrong
+ * in the other direction is not an improvement; a blank is honest and points at
+ * the one field that would fix it. This mirrors the two surfaces that already
+ * refuse this number — /api/menu-items (its CASE returns NULL so the UI shows
+ * "—") and /api/sales-import (books ₹0 and reports the line as uncosted).
+ *
+ * Piece-counted materials (pcs / btl / nos) are untouched: for them 1 sold = 1
+ * piece IS the portion, so their cost stays exactly as it was.
+ *
+ * Every quantity/rate header on that sheet also names its basis now, because
+ * "1 sold uses" and the rate sat unlabelled beside Purchase Unit / Pack Size
+ * and read as purchase units when both are in the material's RECIPE unit.
  *
  * Query params:
  *   ?format=csv                  → legacy CSV (Recipes only, no sub/direct)
@@ -220,24 +249,60 @@ export async function GET(request: Request) {
       ORDER BY item_name
     `).all() as any[];
 
+    // Recipe units that are a MEASURE, not a count. Same list, same order as
+    // /api/sales-import (MEASURED_RECIPE_UNITS) and the /api/menu-items CASE
+    // expression — if one is edited, all three must be.
+    const MEASURED_RECIPE_UNITS = new Set(['ml', 'l', 'g', 'kg']);
+    let uncostedDirect = 0;
+
     const directRows = directItems.map((d: any) => {
-      const costPerSale = (Number(d.average_price) || 0) * (Number(d.qty_per_unit) || 1);
-      const margin = d.selling_price > 0
+      const recipeUnit = String(d.material_unit || '').trim();
+      // qty_per_unit is RECIPE units per ITEM SOLD; absent/≤0 → 1, matching
+      // normalizeQtyPerUnit in direct-items/_lib/link-writer.ts.
+      const qtyPerSale = Number(d.qty_per_unit) > 0 ? Number(d.qty_per_unit) : 1;
+      const isMeasured = MEASURED_RECIPE_UNITS.has(recipeUnit.toLowerCase());
+      // "1 ml per sale" is nobody's pour size — it is the unset default showing
+      // through, so the sale quantity is genuinely unknown for this row.
+      const noPortionSize = isMeasured && qtyPerSale === 1;
+
+      // packFactor carries the both-halves guard, so a kg/kg material like
+      // PICKLED GINGER 1.5KG reports no pack hint rather than a bogus one.
+      const pf = packFactor({
+        unit: d.material_unit, purchase_unit: d.purchase_unit, pack_size: d.pack_size,
+      });
+      const packHint = pf > 1
+        ? ` (pack: 1 ${d.purchase_unit || 'purchase unit'} = ${Math.round(pf * 1000) / 1000} ${recipeUnit})`
+        : '';
+
+      const costPerSale = noPortionSize
+        ? null
+        : (Number(d.average_price) || 0) * qtyPerSale;
+      const margin = costPerSale != null && d.selling_price > 0
         ? Math.round(((d.selling_price - costPerSale) / d.selling_price) * 10000) / 100
         : null;
+      if (noPortionSize) uncostedDirect++;
+
       return {
         'Sold As': d.item_name,
         Category: d.category || '',
         Station:  d.station || '',
         'Selling Price (₹)': Math.round(d.selling_price || 0),
         'Matched Material':  d.material_name || '',
-        'Material Unit':     d.material_unit || '',
+        // Renamed from 'Material Unit' / '1 sold uses' / 'Avg Price / unit (₹)':
+        // all three are the RECIPE basis, and unlabelled they read as the
+        // purchase basis they are printed next to.
+        'Material Unit (recipe)': recipeUnit,
         'Purchase Unit':     d.purchase_unit || '',
-        'Pack Size':         d.pack_size || 1,
-        '1 sold uses':       d.qty_per_unit || 1,
-        'Avg Price / unit (₹)': Math.round((d.average_price || 0) * 10000) / 10000,
-        'Cost / sale (₹)':   Math.round(costPerSale * 100) / 100,
+        'Pack Size (recipe units per purchase unit)': d.pack_size || 1,
+        '1 sold uses (qty in Material Unit)': qtyPerSale,
+        'Avg Price (₹ per Material Unit)': Math.round((d.average_price || 0) * 10000) / 10000,
+        'Cost / sale (₹)':   costPerSale != null ? Math.round(costPerSale * 100) / 100 : '',
         'Margin %':          margin != null ? margin : '',
+        // Says which basis produced the cost, or why there isn't one. Blank
+        // cells that do not explain themselves get read as zero.
+        'Cost basis': noPortionSize
+          ? `not costed — no portion size. Set "1 sold uses" to the ${recipeUnit} in one sale${packHint}`
+          : `${Math.round(qtyPerSale * 1000) / 1000} ${recipeUnit} × ₹/${recipeUnit}`.trim(),
         Dismissed:           d.dismissed ? 'yes' : '',
       };
     });
@@ -256,12 +321,17 @@ export async function GET(request: Request) {
       ['Sub-Recipes',         subRecipes.length],
       ['  Ingredient lines',  totalSubIngredients],
       ['Direct Items',        directItems.length],
+      ['  Uncosted (no portion size)', uncostedDirect],
       [],
       ['Notes'],
       ['Main Recipes — every recipe with its ingredient lines + any [SUB] references it uses.'],
       ['Sub-Recipes — every sub-recipe (Mint Chutney, GG Paste, etc.) with its own ingredient lines.'],
       ['Direct Items — menu items sold AS-IS from a raw material (beers, whiskies, water bottles).'],
       ['Costs use the rolling 90-day weighted-average price normalised by pack_size.'],
+      ['Direct Items: a blank "Cost / sale" means the pour size is not configured, NOT zero cost.'],
+      ['  Avg Price is ₹ per RECIPE unit (₹/ml, ₹/g) — it only becomes a cost per sale once'],
+      ['  "1 sold uses" says how many recipe units one sale is. Each such row names its reason'],
+      ['  in "Cost basis"; set the portion on the Menu Items page and re-export.'],
     ];
 
     const wb = XLSX.utils.book_new();
@@ -286,9 +356,12 @@ export async function GET(request: Request) {
     XLSX.utils.book_append_sheet(wb, wsSub, 'Sub-Recipes');
 
     const wsDir = XLSX.utils.json_to_sheet(directRows.length ? directRows : [{ 'Sold As': '(no direct items)' }]);
+    // 14 widths for 14 keys — the trailing 'Cost basis' carries a sentence, so
+    // it gets the wide column; Dismissed stays last.
     wsDir['!cols'] = [
       { wch: 30 }, { wch: 20 }, { wch: 14 }, { wch: 14 }, { wch: 28 },
-      { wch: 10 }, { wch: 12 }, { wch: 10 }, { wch: 12 }, { wch: 16 }, { wch: 14 }, { wch: 10 }, { wch: 10 },
+      { wch: 16 }, { wch: 12 }, { wch: 18 }, { wch: 20 }, { wch: 18 }, { wch: 14 }, { wch: 10 },
+      { wch: 64 }, { wch: 10 },
     ];
     XLSX.utils.book_append_sheet(wb, wsDir, 'Direct Items');
 
