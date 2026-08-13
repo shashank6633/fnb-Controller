@@ -307,6 +307,20 @@ export default function ReturnsPage() {
   const [kindFilter, setKindFilter] = useState<'' | 'internal' | 'vendor'>('');
   const [search, setSearch] = useState('');
   const [composer, setComposer] = useState<null | 'vendor' | 'internal'>(null);
+  // What this viewer may RAISE, decided by the server (GET /api/returns) from
+  // the same predicates POST enforces.
+  //
+  // NULL MEANS NOT YET KNOWN, and both doors stay shut while it is. Defaulting
+  // to {true,true} was the obvious choice and the wrong one: the flags are only
+  // written on the success path, so every page load enabled both above-the-fold
+  // buttons until the fetch returned, and a failed first load left them enabled
+  // for the life of the page. Either window hands back exactly the
+  // offer-then-reject this change exists to remove. A shut door for one fetch is
+  // the cheaper mistake, and it is honest — we genuinely do not know yet.
+  //
+  // An older server that does not send these fields still reads as permitted
+  // (`!== false`), so a rolling deploy never hides a door someone really has.
+  const [canRaise, setCanRaise] = useState<{ vendor: boolean; internal: boolean } | null>(null);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -316,6 +330,16 @@ export default function ReturnsPage() {
       if (!r.ok) { setErr(j.error || 'Could not load returns'); setRows([]); return; }
       setErr('');
       setRows(j.returns || []);
+      const raise = {
+        vendor: j.viewer_can_raise_vendor !== false,
+        internal: j.viewer_can_raise_internal !== false,
+      };
+      setCanRaise(raise);
+      // Re-gate a composer that is ALREADY OPEN. The flags can arrive after the
+      // sheet does (a slow first load, or a background refresh), and a sheet
+      // left open on a kind the viewer may not raise would still let them fill
+      // it in and be refused on save.
+      setComposer((c) => (c && !raise[c] ? null : c));
     } catch (e) {
       setErr(errText(e) || 'Could not load returns');
     } finally {
@@ -372,28 +396,47 @@ export default function ReturnsPage() {
           not by a dropdown inside a form, because the two do opposite things to
           central stock and a mis-set dropdown on an otherwise-complete ticket is
           how inventory gets invented. */}
+      {/* DISABLED, NOT HIDDEN, when this viewer may not raise that kind. A door
+          that vanishes reads as a bug and becomes a phone call ("where did
+          Return to Store go?"); a door that is visibly shut and says why is
+          answerable on the spot. The server refuses either way — this only
+          stops the page inviting work it will then reject at the last click. */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <button onClick={() => setComposer('vendor')}
-                className="text-left bg-white border border-[#E8D5C4] hover:border-rose-300 hover:bg-rose-50/40 rounded-xl p-4 transition">
+                disabled={canRaise?.vendor !== true}
+                title={canRaise == null ? 'Checking your permissions…' : canRaise.vendor ? undefined : 'Only the store or an admin can raise a vendor return'}
+                className="text-left bg-white border border-[#E8D5C4] rounded-xl p-4 transition enabled:hover:border-rose-300 enabled:hover:bg-rose-50/40 disabled:opacity-60 disabled:cursor-not-allowed">
           <div className="flex items-center gap-2 text-[#2D1B0E] font-semibold text-sm">
             <Truck className="w-4 h-4 text-rose-600" /> Return to Vendor
-            <Plus className="w-3.5 h-3.5 ml-auto text-[#8B7355]" />
+            {canRaise?.vendor === true && <Plus className="w-3.5 h-3.5 ml-auto text-[#8B7355]" />}
           </div>
           <p className="text-[11px] text-[#6B5744] mt-1">
             Goods go back to the supplier. Pick the <b>GRN line</b> they arrived on — PO No., GRN No.,
             vendor and rate come from that line. On Store Accept, <b>central stock goes DOWN</b>.
           </p>
+          {canRaise?.vendor === false && (
+            <p className="text-[11px] text-[#8B7355] mt-1.5 italic">
+              Raised at the receiving counter — the store or an admin.
+            </p>
+          )}
         </button>
         <button onClick={() => setComposer('internal')}
-                className="text-left bg-white border border-[#E8D5C4] hover:border-indigo-300 hover:bg-indigo-50/40 rounded-xl p-4 transition">
+                disabled={canRaise?.internal !== true}
+                title={canRaise == null ? 'Checking your permissions…' : canRaise.internal ? undefined : 'Your user has no department assigned'}
+                className="text-left bg-white border border-[#E8D5C4] rounded-xl p-4 transition enabled:hover:border-indigo-300 enabled:hover:bg-indigo-50/40 disabled:opacity-60 disabled:cursor-not-allowed">
           <div className="flex items-center gap-2 text-[#2D1B0E] font-semibold text-sm">
             <Store className="w-4 h-4 text-indigo-600" /> Return to Store
-            <Plus className="w-3.5 h-3.5 ml-auto text-[#8B7355]" />
+            {canRaise?.internal === true && <Plus className="w-3.5 h-3.5 ml-auto text-[#8B7355]" />}
           </div>
           <p className="text-[11px] text-[#6B5744] mt-1">
             A department gives issued items back. Pick the department, then items from what it
             actually holds. On Store Accept, <b>department stock goes DOWN and central stock goes UP</b>.
           </p>
+          {canRaise?.internal === false && (
+            <p className="text-[11px] text-[#8B7355] mt-1.5 italic">
+              Raised by the department returning the goods. Ask an admin to set your department.
+            </p>
+          )}
         </button>
       </div>
 
@@ -1072,9 +1115,19 @@ function InternalComposer({ onClose, onSaved }: { onClose: () => void; onSaved: 
         fetch('/api/auth/me').then(r => r.json()).catch(() => ({ user: null })),
       ]);
       const list: DeptRow[] = (d.departments || []).filter((x: DeptRow) => x.is_active);
-      setDepts(list);
       const mine = me?.user?.department_id;
-      if (mine && list.some(x => x.id === mine)) setDeptId(mine);
+      // OFFER ONLY WHAT THE SERVER WILL ACCEPT. POST /api/returns lets a
+      // non-admin raise for their OWN department only, so listing every
+      // department here just invites a full cart to be built against another
+      // kitchen and refused at the final click. An admin still picks freely,
+      // which is the exemption the owner kept.
+      //
+      // A non-admin with no department gets an empty list, which is correct and
+      // matches the server: they cannot raise an internal return at all, and the
+      // button that opens this composer is already disabled for them.
+      const offer = me?.user?.role === 'admin' ? list : list.filter(x => x.id === mine);
+      setDepts(offer);
+      if (mine && offer.some(x => x.id === mine)) setDeptId(mine);
     })();
   }, []);
 

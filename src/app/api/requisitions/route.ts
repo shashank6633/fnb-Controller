@@ -363,11 +363,29 @@ export async function POST(request: Request) {
     // Non-admin/non-privileged users can only raise for their own department.
     // With per-line depts, every item must belong to their dept.
     if (me.role !== 'admin' && !me.is_head_chef && !me.is_store_manager) {
-      if (me.department_id) {
-        const offender = validItems.find((it: any) => it.department_id !== me.department_id);
-        if (offender) {
-          return Response.json({ error: 'You can only raise requisitions for your own department' }, { status: 403 });
-        }
+      // FAILS CLOSED WHEN THE USER HAS NO DEPARTMENT. The guard used to be a
+      // bare `if (me.department_id)`, so an unassigned user skipped the
+      // comparison and could raise for any department — the check silently
+      // switched itself off for exactly the accounts least likely to be
+      // deliberately scoped. Fixed here in lockstep with the identical hole in
+      // src/app/api/returns/route.ts, because the two were copies of each other
+      // and fixing one alone is how they drift.
+      //
+      // A no-op on today's data: every active non-privileged user has a
+      // department, so nobody currently reaches this branch. It is a trap being
+      // closed before someone creates the user that springs it.
+      //
+      // NOTE the exemption list is UNCHANGED here. Requisitions are a separate
+      // flow from returns and the owner's decision was about returns; widening
+      // or narrowing who may raise a requisition is not part of this change.
+      if (!me.department_id) {
+        return Response.json({
+          error: 'Your user has no department assigned, so it cannot raise a requisition. Ask an admin to set your department.',
+        }, { status: 403 });
+      }
+      const offender = validItems.find((it: any) => it.department_id !== me.department_id);
+      if (offender) {
+        return Response.json({ error: 'You can only raise requisitions for your own department' }, { status: 403 });
       }
     }
 

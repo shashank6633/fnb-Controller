@@ -1,5 +1,5 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canIssueAsStore } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canIssueAsStore, canProcessAsStore } from '@/lib/auth';
 import { requisitionVisibility } from '@/lib/dept-hierarchy';
 import {
   RETURN_KINDS, RETURN_DISPOSITIONS, isReturnKind, isReturnDisposition,
@@ -57,6 +57,47 @@ import {
 
 const EPS = 1e-9;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * WHO MAY RAISE, DEFINED ONCE.
+ *
+ * POST enforces these and GET reports them to the page, so the buttons the user
+ * is offered and the rules the server applies come from the same two functions.
+ * That identity is the point: the page previously rendered both composers
+ * unconditionally, so a plain manager could build an entire cart against another
+ * department and be refused only on the final click. Duplicating the predicate
+ * in the UI would just move that lie one layer up — the next edit to one copy
+ * re-opens the gap.
+ *
+ * Neither of these grants anything. Raising a ticket moves no stock; the only
+ * stock write is the store's accept, gated separately on canIssueAsStore with no
+ * admin bypass.
+ */
+type Raiser = { role?: string; department_id?: string | null };
+
+/**
+ * Vendor returns leave the building against a GRN — a receiving-counter act, so
+ * the raiser is the store or an admin. That is exactly canProcessAsStore
+ * (auth.ts), which is imported and called rather than re-spelled here: a local
+ * copy would be invisible to anyone grepping that helper's callers after an
+ * incident, and this repo's standing traps are all paired definitions drifting
+ * apart.
+ *
+ * NOT canIssueAsStore, which is the narrower `is_store_manager` with no admin
+ * bypass and guards the ACCEPT step further down. The two are deliberately
+ * different: raising asks for a return, accepting physically takes the goods
+ * back over the counter and is the only step that writes stock.
+ */
+
+/**
+ * Internal returns are raised by the department losing the stock. True here
+ * means "may raise for SOME department" — POST still checks it is their own.
+ * An admin qualifies without a department; anyone else needs one, which is what
+ * makes the department rule enforceable rather than skippable.
+ */
+function canRaiseInternalReturn(me: Raiser): boolean {
+  return me.role === 'admin' || !!me.department_id;
+}
 
 /**
  * WHO SEES a ticket — never who may act on one.
@@ -154,6 +195,10 @@ export async function GET(request: Request) {
       viewer_role: me?.role || 'guest',
       viewer_can_approve_hod: me ? canApproveAsChef(me) : false,
       viewer_can_verify_store: me ? canIssueAsStore(me) : false,
+      // What the two composer buttons should offer. Same functions POST gates
+      // on, so the page cannot offer a door the server will shut.
+      viewer_can_raise_vendor: me ? canProcessAsStore(me) : false,
+      viewer_can_raise_internal: me ? canRaiseInternalReturn(me) : false,
     });
   } catch (e: any) {
     console.error('[/api/returns GET]', e);
@@ -414,13 +459,48 @@ export async function POST(request: Request) {
     }
 
     // ── 3. Who may raise what ───────────────────────────────────────────────
-    // Same rule the requisition composer enforces: a plain department user
-    // raises for their own department only. Store and admin are cross-cutting;
-    // a vendor return is a store-side act and carries no department at all.
-    if (kind === 'internal' && me.role !== 'admin' && !me.is_head_chef && !me.is_store_manager) {
-      if (me.department_id && departmentId !== me.department_id) {
+    // THE TWO KINDS HAVE OPPOSITE RIGHTFUL AUTHORS, because they move goods in
+    // opposite directions. An INTERNAL return sends stock from a kitchen back to
+    // the store, so the kitchen losing it is the side that asks. A VENDOR return
+    // sends stock that arrived on a GRN back out of the building, so it is
+    // raised at the receiving counter and has no department at all.
+    //
+    // This block used to gate only the internal half, and even there it exempted
+    // the store — which is how a store user could file a kitchen's return with
+    // the kitchen never involved, and how any signed-in user could raise a
+    // vendor return by POSTing directly.
+
+    // INTERNAL — the owning department, or an admin. Owner's decision
+    // (2026-08-12): a store user may no longer raise a department's return on
+    // its behalf. is_store_manager and is_head_chef were exemptions here and are
+    // deliberately gone; admin stays so a mistake can still be corrected
+    // centrally.
+    if (kind === 'internal') {
+      // FAILS CLOSED ON A MISSING DEPARTMENT. The old test was
+      // `if (me.department_id && …)`, so a user with no department skipped the
+      // comparison entirely and could name any kitchen — which would have made
+      // the rule above cosmetic for exactly the account it was written for (a
+      // store manager typically carries no department). Refusing with a
+      // fixable reason beats silently granting everything.
+      if (!canRaiseInternalReturn(me)) {
+        return Response.json({
+          error: 'Your user has no department assigned, so it cannot raise a department return. Ask an admin to set your department.',
+        }, { status: 403 });
+      }
+      if (me.role !== 'admin' && departmentId !== me.department_id) {
         return Response.json({ error: 'You can only raise returns for your own department' }, { status: 403 });
       }
+    }
+
+    // VENDOR — the store, or an admin. canIssueAsStore is the same helper that
+    // guards the accept step, so "who hands goods over the counter" has one
+    // definition rather than two that can drift. The GRN picker
+    // (returns/sources) already refuses everyone else, so this is the write-side
+    // half of a rule the read side has always enforced.
+    if (kind === 'vendor' && !canProcessAsStore(me)) {
+      return Response.json({
+        error: 'A vendor return is raised at the receiving counter — only the store or an admin can raise one.',
+      }, { status: 403 });
     }
 
     if (kind === 'internal') {

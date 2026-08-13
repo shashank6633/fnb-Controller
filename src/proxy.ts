@@ -35,6 +35,13 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/departments',         // department master
   '/api/requisitions',        // internal department requisitions + workflow actions
   '/api/requisitions-import', // bulk import past transfers from Recaho
+  // Returns — the sibling of /api/requisitions and, like it, a workflow whose
+  // last step writes raw_materials.current_stock (store-verify). It was the only
+  // stock-moving family missing from this list. Safe to add: every write on the
+  // returns pages goes through src/lib/api.ts, which injects X-CSRF-Token on
+  // state-changing methods; the bare fetch() calls there are all GETs, which
+  // isStateChanging() never checks.
+  '/api/returns',             // vendor + internal returns, and the accept that moves stock
   '/api/unit-audit',          // bulk update of material units
   '/api/sales-import',        // bulk import Recaho item-wise sales report
   '/api/units',               // unit registry CRUD (admin)
