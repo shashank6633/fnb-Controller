@@ -16,7 +16,7 @@ import { useEffect, useState } from 'react';
 import { Wine, Loader2, RefreshCw, AlertTriangle, Plus, X, Trash2 } from 'lucide-react';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import { api } from '@/lib/api';
-import { packFactor, purchasePrice, type PackMeta } from '@/lib/pack-units';
+import { fmtQtyNum, packFactor, purchasePrice, type PackMeta } from '@/lib/pack-units';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 // Rates need paise: a sub-rupee ₹/recipe-unit rate rounds to "₹0" under fmt(),
@@ -27,13 +27,15 @@ const rate2 = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { 
 // recipe unit (and its average_price) stay canonical; these helpers just let
 // the bar manager enter/read in a friendlier unit (e.g. L instead of 17820 ml).
 //
-// PURCHASE-UNIT ENTRY (additive, 2026-08-06)
-// -----------------------------------------
-// The copy on this page tells the bar manager to "Enter bottle / unit counts
-// consumed", but the picker only ever offered the metric ladder — for a ml/BTL
-// material there was no way to say "3 bottles", so "3" was silently booked as
-// 3 ml. This adds the material's PURCHASE unit as an entry option and teaches
-// toBaseQty to multiply it by pack_size.
+// ENTRY UNIT — RECIPE UNIT (2026-08-13). See unitOptions() below for the whole
+// reasoning; the short version is that entry is in ml/g, a 750 ml bottle is
+// typed as 750, and the bottle equivalent is rendered live under each line so a
+// bottle-count typo is visible while it is being made.
+//
+// This SUPERSEDES the purchase-unit entry added on 2026-08-06. That earlier note
+// used to live here describing bottle-count entry as current; it is kept only in
+// unitOptions()'s history section now, so there is one place to read for what
+// the entry unit is and why.
 //
 // THE BASES, so the next reader cannot get the multiplication wrong:
 //   raw_materials.unit           RECIPE unit   (ml, g)  <- what we STORE
@@ -46,26 +48,37 @@ const rate2 = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { 
 // wrong by pack_size (750×) in the other direction.
 //
 function unitOptions(base?: string, m?: PackMeta): string[] {
-  // PURCHASE UNIT ONLY — the owner's call, 2026-08-06: "Keep it as Purchase
-  // unit only because 3ml is wrong thing."
+  // RECIPE UNIT ONLY — the owner's call, 2026-08-13: "In Party for Consumption
+  // Keep the Recipe unit to enter, accordingly conversion and calculations will
+  // be done."
   //
-  // A bar manager counts BOTTLES off a shelf. Offering the metric ladder beside
-  // the purchase unit meant a stray pick booked "3" as 3 ml of ABSOLUT —
-  // Rs 8.70 instead of the Rs 6,522 that three 750 ml bottles are worth. Making
-  // the purchase unit the ONLY option removes the mis-pick rather than relying
-  // on the person to notice it. DO NOT "restore" ml / L / g / kg here.
+  // ── THIS REPLACES THE 2026-08-06 PURCHASE-UNIT-ONLY RULE. READ WHY BEFORE
+  //    CHANGING IT BACK. ─────────────────────────────────────────────────────
+  // On 06-08 this form offered BOTH units in a dropdown, someone picked ml and
+  // typed 3 meaning three bottles of ABSOLUT, and the P&L took 3 ml — Rs 8.70
+  // against the Rs 6,522 those bottles were worth. The response was to delete ml
+  // and leave only the purchase unit.
+  //
+  // The owner has since asked for the opposite, and it is NOT a re-run of that
+  // mistake: the hazard was having TWO selectable units and mis-picking between
+  // them, not which one won. Exactly one unit is still offered — so there is
+  // still nothing to mis-pick — and it is now the material's own recipe unit,
+  // which is the basis every stored quantity and average_price is already in.
+  // The trade is ergonomic: a bottle is typed as 750, not 1.
+  //
+  // What guards the new shape is the conversion hint rendered under the field
+  // (the "= N BTL" line): a bottle count typed into an ml box shows an absurd
+  // bottle equivalent immediately, at the moment of entry, instead of surfacing
+  // weeks later as an unexplainable party cost.
   //
   // packFactor() carries the BOTH-HALVES guard (pack_size > 1 AND recipe unit
-  // !== purchase unit). When it returns 1 there is no distinct purchase unit to
-  // offer — PICKLED GINGER 1.5KG (kg/kg, pack 1.5) and BUDWEISER 330ML
-  // (pcs/BTL, pack 1) both fall here — so the material's own unit IS the
-  // purchase unit and entry stays in it. Either way exactly one option is
-  // offered, and toBaseQty converts it to the stored RECIPE unit.
-  if (m && packFactor(m) > 1) {
-    const pu = String(m.purchase_unit || '').trim();
-    if (pu) return [pu];
-  }
-  return [base || 'pcs'];
+  // !== purchase unit), and it no longer decides the entry unit at all — the
+  // recipe unit is the entry unit either way. PICKLED GINGER 1.5KG (kg/kg,
+  // pack 1.5) and BUDWEISER 330ML (pcs/BTL, pack 1) already entered in their own
+  // unit and are unaffected. toBaseQty() is then a no-op for these lines
+  // (display === base), which is the point: nothing is scaled, so nothing can be
+  // scaled wrongly.
+  return [base || m?.unit || 'pcs'];
 }
 
 /** The unit a NEW line must be seeded with — always the single option
@@ -448,8 +461,9 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
           </div>
 
           <div className="text-xs text-[#6B5744] bg-amber-50 border border-amber-200 rounded p-2">
-            Enter bottle / unit counts consumed at this event. Cost auto-pulls from each material's average purchase price.
-            Save to lock in liquor cost on the P&amp;L.
+            Enter each material in its own recipe unit — <b>ml for spirits, g for solids</b>, so a 750 ml bottle
+            is <b>750</b>, not 1. The bottle equivalent is shown under every line as you type. Cost auto-pulls from
+            each material&apos;s average purchase price. Save to lock in liquor cost on the P&amp;L.
           </div>
 
           <div className="grid grid-cols-12 gap-2 text-[10px] font-medium text-[#8B7355] uppercase tracking-wide px-1">
@@ -513,26 +527,16 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                   </select>
                 ) : (
                   // dispUnit, NOT m.unit — the caption must name the unit the
-                  // quantity is actually costed in.
-                  //
-                  // unitOptions() returns exactly ONE option for a packed
-                  // material (the purchase unit, by the owner's 2026-08-06 call
-                  // above), so this branch is the one that always renders for
-                  // liquor — and it was printing the RECIPE unit. Grey Goose
-                  // therefore read "Qty 1 · ml · ₹3,350": the arithmetic was
-                  // right (1 BTL = 750 ml x ₹4.4669 = ₹3,350) and only the
-                  // caption was wrong, which is worse than it sounds. Reading it
-                  // as millilitres, ₹3,350 looks like a 750x conversion fault —
-                  // and the mirror case is the real hazard: type 750 meaning
-                  // millilitres and you book 750 BOTTLES, about ₹2.5 million,
-                  // with nothing on screen to contradict you.
-                  //
-                  // The comment above dispUnit already stated this rule ("so
-                  // what is displayed is what toBaseQty converts"); this line
-                  // simply did not follow it.
+                  // quantity is actually costed in. Since 2026-08-13 those are
+                  // the same thing here (entry is in the recipe unit), but the
+                  // rule stands on its own: this line printed m.unit while the
+                  // cost above converted from dispUnit, and when the two units
+                  // differed it read "Qty 1 · ml · ₹3,350" for one whole bottle.
+                  // Bind the caption to the value it describes and the class of
+                  // bug cannot come back if the entry unit ever changes again.
                   <span className="col-span-1 text-xs text-[#8B7355] py-2"
                         title={`Quantity is entered and costed in ${dispUnit}${
-                          m && packFactor(m) > 1 ? ` — 1 ${dispUnit} = ${packFactor(m)} ${m.unit}` : ''
+                          m && packFactor(m) > 1 ? ` — ${packFactor(m)} ${dispUnit} = 1 ${m.purchase_unit}` : ''
                         }`}>
                     {dispUnit || m?.unit || ''}
                   </span>
@@ -572,6 +576,36 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                     {' '}· stored as ₹{m.average_price}/{m.unit}
                   </div>
                 )}
+                {/*
+                  THE LIVE CONVERSION — the guard that replaces purchase-unit-only
+                  entry (owner's call 2026-08-13: enter in the recipe unit).
+
+                  Entry in millilitres means one bottle is typed as 750, so the
+                  failure mode is someone typing a BOTTLE COUNT into an ml box: 3
+                  meaning three bottles books 3 ml of ABSOLUT, Rs 8.70 against the
+                  Rs 6,522 it should be. That is the 06-08 incident, and removing
+                  the unit dropdown does not by itself prevent it.
+
+                  What prevents it is showing the bottle equivalent of whatever
+                  was just typed, next to the box, while the person is still
+                  looking at it. "3 ml = 0.004 BTL" is self-evidently not three
+                  bottles; the same error discovered in a month-end P&L is not
+                  traceable to anything. Under a tenth of a purchase unit is
+                  called out explicitly, because that is the shape a bottle-count
+                  typo takes and it is the only case worth interrupting for.
+                */}
+                {m && packFactor(m) > 1 && Number(l.qty) > 0 && (() => {
+                  const inPurchase = (Number(l.qty) || 0) / packFactor(m);
+                  const looksLikeBottleCount = inPurchase < 0.1;
+                  return (
+                    <div className={`col-span-12 -mt-1 text-[9px] ${looksLikeBottleCount ? 'text-amber-700 font-medium' : 'text-[#B8A590]'}`}>
+                      {fmtQtyNum(Number(l.qty))} {m.unit} = {fmtQtyNum(Math.round(inPurchase * 1000) / 1000)} {m.purchase_unit}
+                      {looksLikeBottleCount && (
+                        <> — that is under a tenth of a {m.purchase_unit}. Did you mean {fmtQtyNum(Number(l.qty) * packFactor(m))} {m.unit} ({fmtQtyNum(Number(l.qty))} {m.purchase_unit})?</>
+                      )}
+                    </div>
+                  );
+                })()}
                 <input value={l.notes} onChange={e => update(i, { notes: e.target.value })}
                        placeholder="Line notes (optional)"
                        className="col-span-12 px-2 py-1 border border-[#E8D5C4] rounded text-[11px] text-[#6B5744] -mt-1" />
