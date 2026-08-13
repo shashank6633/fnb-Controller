@@ -14,6 +14,7 @@
  */
 import { norm10 } from '@/lib/ct/guest-unify';
 import { autoSaveCrmGuest } from '@/lib/ct/guest-autosave';
+import { refreshGuestMetrics } from '@/lib/ct/guest-metrics';
 
 /** Add / update one diner in a table's party. Idempotent per (order, phone).
  *  Also mirrors the diner into the CRM (guest + dining visit). Best-effort. */
@@ -124,6 +125,17 @@ export function seatBooking(
     db.prepare("UPDATE ct_bookings SET status = 'seated', table_id = ?, seated_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")
       .run(tableId, bookingId);
 
+    // Seating IS an arrival, so the guest's stored lifetime metrics move with
+    // it. isArrived() counts status 'seated' (and the seated_at stamp this line
+    // writes) as a visit, but ct_guests holds those figures denormalised and
+    // only the Reservego importer used to refresh them — a guest seated from
+    // the Seat board therefore kept the arrival_rate of an hour ago while the
+    // guest 360, which aggregates live, already counted the visit. Inside the
+    // same transaction as the status write: a seat that committed without its
+    // metric would leave the Customers list wrong until the next import, which
+    // may be never for a phone booking.
+    if (booking.guest_id) refreshGuestMetrics(db, String(booking.guest_id));
+
     // The booking's guest becomes the party primary.
     addOrderGuest(db, { orderId, mobile: guestMobile, name: guestName, isPrimary: true, source: 'reservation' });
 
@@ -135,12 +147,30 @@ export function seatBooking(
 }
 
 /** On settle: if the order came from a reservation, flip that booking
- *  seated → completed. Best-effort. */
+ *  seated → completed, and move the guest's stored lifetime metrics with it.
+ *  Best-effort. */
 export function completeBookingForOrder(db: any, orderId: string): void {
   try {
     const row = db.prepare("SELECT booking_id FROM orders WHERE id = ?").get(String(orderId || '')) as any;
     const bid = row && String(row.booking_id || '');
     if (!bid) return;
-    db.prepare("UPDATE ct_bookings SET status = 'completed', updated_at = datetime('now') WHERE id = ? AND status = 'seated'").run(bid);
+    const guest = db.prepare('SELECT guest_id FROM ct_bookings WHERE id = ?').get(bid) as any;
+    const guestId = guest ? String(guest.guest_id || '') : '';
+    // The status flip and the guest's metric refresh are one transaction even
+    // though this whole function is best-effort, and for that exact reason:
+    // the caller (the settle route) runs it AFTER the money is committed and
+    // swallows every failure, so if the pair could half-happen the failure mode
+    // would be a booking marked completed whose guest still reads as never
+    // having come — silent, permanent, and invisible to the settle that caused
+    // it. Either both land or neither does and the booking stays 'seated',
+    // which is recoverable.
+    //
+    // The guarded status ('seated' only) means a retried settle changes nothing
+    // and skips the refresh; a refresh on an unchanged row would be a no-op
+    // write anyway, but not doing it keeps the retry genuinely free.
+    db.transaction(() => {
+      const res = db.prepare("UPDATE ct_bookings SET status = 'completed', updated_at = datetime('now') WHERE id = ? AND status = 'seated'").run(bid);
+      if (res.changes > 0 && guestId) refreshGuestMetrics(db, guestId);
+    })();
   } catch (e: any) { console.warn('[completeBookingForOrder]', e?.message || e); }
 }

@@ -210,8 +210,10 @@ function timeRange(start: string, end: string): string {
 
 // ─── Entertainment type meta ─────────────────────────────────────────────────
 
+// Display labels only — the stored `value` is what the API and the rest of the
+// codebase read, so 'band' keeps its name on the wire while reading "Live Band".
 const ENT_TYPES: { value: EntType; label: string }[] = [
-  { value: 'band', label: 'Band' },
+  { value: 'band', label: 'Live Band' },
   { value: 'dj', label: 'DJ' },
   { value: 'live_music', label: 'Live Music' },
   { value: 'event', label: 'Event' },
@@ -267,6 +269,11 @@ interface EntForm {
   description: string;
 }
 const EMPTY_FORM: EntForm = { type: 'band', name: '', start_time: '', end_time: '', area: '', description: '' };
+
+/** A row of the band master (/api/crm-calls/bands). */
+interface BandRow { id: string; name: string }
+/** Sentinel option value for "add a band that isn't on the list yet". */
+const NEW_BAND_OPT = '__new_band__';
 
 // ─── Special/offer form state ────────────────────────────────────────────────
 
@@ -325,6 +332,12 @@ export default function WhatsOnPage() {
   const [editForm, setEditForm] = useState<EntForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState('');
+
+  // Band master for the Live Band name picker. `bandsReady` stays false if the
+  // list can't be read — the editor then falls back to a free-text name rather
+  // than trapping the manager behind an empty dropdown.
+  const [bands, setBands] = useState<BandRow[]>([]);
+  const [bandsReady, setBandsReady] = useState(false);
 
   // Specials & offers editor (management)
   const [showAddSpecial, setShowAddSpecial] = useState(false);
@@ -425,6 +438,43 @@ export default function WhatsOnPage() {
   }, [callCtxOn]);
 
   const next7 = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(todayIST(), i)), []);
+
+  // ── Band master (Live Band name picker) ──
+  const loadBands = useCallback(async () => {
+    try {
+      const res = await fetch('/api/crm-calls/bands');
+      if (!res.ok) return;
+      const j = (await res.json()) as { bands?: BandRow[] };
+      setBands(Array.isArray(j.bands) ? j.bands : []);
+      setBandsReady(true);
+    } catch { /* leave the editor on free text */ }
+  }, []);
+
+  // Only managers see the editor, so only they need the list.
+  useEffect(() => { if (isManagement) loadBands(); }, [isManagement, loadBands]);
+
+  const createBand = useCallback(async (raw: string): Promise<{ ok: true; name: string } | { ok: false; error: string }> => {
+    const clean = raw.trim().replace(/\s+/g, ' ');
+    if (!clean) return { ok: false, error: 'Band name is required.' };
+    try {
+      const res = await api('/api/crm-calls/bands', { method: 'POST', body: { name: clean } });
+      let j: { band?: BandRow; error?: string } = {};
+      try { j = await res.json(); } catch { /* keep defaults */ }
+      if (!res.ok) return { ok: false, error: j.error || 'Could not add the band.' };
+      const row = j.band;
+      if (!row) return { ok: false, error: 'Could not add the band.' };
+      setBands(prev => (
+        prev.some(b => b.id === row.id)
+          ? prev
+          : [...prev, row].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+      ));
+      // Return the STORED name — the server may have revived a retired row
+      // whose casing differs from what was just typed.
+      return { ok: true, name: row.name };
+    } catch {
+      return { ok: false, error: 'Network error — please try again.' };
+    }
+  }, []);
 
   // ── Entertainment CRUD ──
   function resetEditor() {
@@ -814,6 +864,9 @@ export default function WhatsOnPage() {
               <EntEditor
                 form={form}
                 setForm={setForm}
+                bands={bands}
+                bandsReady={bandsReady}
+                onCreateBand={createBand}
                 onSave={createEvent}
                 onCancel={() => { setShowAdd(false); setFormError(''); }}
                 saving={saving}
@@ -832,6 +885,9 @@ export default function WhatsOnPage() {
                       key={row.id}
                       form={editForm}
                       setForm={setEditForm}
+                      bands={bands}
+                      bandsReady={bandsReady}
+                      onCreateBand={createBand}
                       onSave={() => saveEdit(row.id)}
                       onCancel={() => { setEditingId(null); setFormError(''); }}
                       saving={saving}
@@ -1247,9 +1303,12 @@ function CapacityGauge({ cap }: { cap: CapacityBlock }) {
 }
 
 /** Shared add/edit form for a calendar entertainment row. */
-function EntEditor({ form, setForm, onSave, onCancel, saving, error, submitLabel }: {
+function EntEditor({ form, setForm, bands, bandsReady, onCreateBand, onSave, onCancel, saving, error, submitLabel }: {
   form: EntForm;
   setForm: (updater: (f: EntForm) => EntForm) => void;
+  bands: BandRow[];
+  bandsReady: boolean;
+  onCreateBand: (name: string) => Promise<{ ok: true; name: string } | { ok: false; error: string }>;
   onSave: () => void;
   onCancel: () => void;
   saving: boolean;
@@ -1257,6 +1316,37 @@ function EntEditor({ form, setForm, onSave, onCancel, saving, error, submitLabel
   submitLabel: string;
 }) {
   const inputCls = 'w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm text-[#2D1B0E] outline-none focus:border-[#af4408]';
+
+  // Live Band picks its name off the band master; every other type stays free
+  // text. If the list couldn't load we keep free text so the board is never
+  // un-editable because of one failed read.
+  const bandMode = form.type === 'band' && bandsReady;
+  const [addingBand, setAddingBand] = useState(false);
+  const [newBand, setNewBand] = useState('');
+  const [bandError, setBandError] = useState('');
+  const [addingBusy, setAddingBusy] = useState(false);
+
+  // A row saved before the master existed (or created elsewhere) keeps its name
+  // selectable, otherwise opening it to edit would silently blank the band.
+  // Match case-insensitively but SHOW the master's spelling, so a name that
+  // differs only in case still reads as selected instead of blank.
+  const matched = form.name ? bands.find(b => b.name.toLowerCase() === form.name.toLowerCase()) : undefined;
+  const selectValue = matched ? matched.name : form.name;
+
+  async function submitNewBand() {
+    setAddingBusy(true);
+    setBandError('');
+    const res = await onCreateBand(newBand);
+    if (res.ok) {
+      setForm(f => ({ ...f, name: res.name }));
+      setNewBand('');
+      setAddingBand(false);
+    } else {
+      setBandError(res.error);
+    }
+    setAddingBusy(false);
+  }
+
   return (
     <div className="mb-3 p-3 sm:p-4 rounded-xl border border-[#E8D5C4] bg-[#FFFBF5]">
       <div className="grid sm:grid-cols-2 gap-2.5">
@@ -1271,14 +1361,66 @@ function EntEditor({ form, setForm, onSave, onCancel, saving, error, submitLabel
           </select>
         </label>
         <label className="block">
-          <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">Name</span>
-          <input
-            value={form.name}
-            onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
-            maxLength={120}
-            placeholder="e.g. The Local Collective"
-            className={inputCls + ' mt-1'}
-          />
+          <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">
+            {bandMode ? 'Band' : 'Name'}
+          </span>
+          {bandMode ? (
+            addingBand ? (
+              <div className="mt-1">
+                <div className="flex gap-1.5">
+                  <input
+                    value={newBand}
+                    onChange={e => { setNewBand(e.target.value); setBandError(''); }}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); if (!addingBusy) submitNewBand(); } }}
+                    maxLength={120}
+                    autoFocus
+                    placeholder="New band name"
+                    className={inputCls}
+                  />
+                  <button
+                    type="button"
+                    onClick={submitNewBand}
+                    disabled={addingBusy || !newBand.trim()}
+                    className="px-3 py-2 rounded-lg text-sm font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white transition-colors disabled:opacity-50 whitespace-nowrap"
+                  >
+                    {addingBusy ? 'Adding…' : 'Add'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setAddingBand(false); setNewBand(''); setBandError(''); }}
+                    disabled={addingBusy}
+                    className="px-3 py-2 rounded-lg text-sm font-medium text-[#6B5744] hover:bg-[#FFF1E3] transition-colors disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                </div>
+                {bandError && <p className="mt-1 text-xs font-medium text-red-500">{bandError}</p>}
+              </div>
+            ) : (
+              <select
+                value={selectValue}
+                onChange={e => {
+                  const v = e.target.value;
+                  if (v === NEW_BAND_OPT) { setNewBand(''); setBandError(''); setAddingBand(true); return; }
+                  setForm(f => ({ ...f, name: v }));
+                }}
+                className={inputCls + ' mt-1'}
+              >
+                <option value="">Select a band…</option>
+                {form.name && !matched && <option value={form.name}>{form.name} (not in list)</option>}
+                {bands.map(b => <option key={b.id} value={b.name}>{b.name}</option>)}
+                <option value={NEW_BAND_OPT}>+ Add new band…</option>
+              </select>
+            )
+          ) : (
+            <input
+              value={form.name}
+              onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+              maxLength={120}
+              placeholder="e.g. The Local Collective"
+              className={inputCls + ' mt-1'}
+            />
+          )}
         </label>
         <label className="block">
           <span className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">Start time</span>

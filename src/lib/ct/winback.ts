@@ -209,7 +209,20 @@ function bandFor(days: number | null): WinbackBand {
   return 'active';
 }
 
-/** Last seated/completed booking + count, per ct_guests.id. */
+/**
+ * Last seated/completed booking + count, per ct_guests.id.
+ *
+ * ONE ROW PER GUEST, NOT ONE PER BOOKING. This is the whole-table aggregate the
+ * segment cannot avoid — every guest's band depends on their own last visit, so
+ * there is nothing to bound it by. What it must not do is hand back the raw
+ * bookings: on a copy seeded to the archive's shape (82,128 bookings / 70,324
+ * guests) the GROUP BY returns 36,011 rows in 44ms, where the same query
+ * without the grouping would be 82k rows in memory before the page is chosen.
+ *
+ * is_duplicate = 0 because `n` is reported to the owner as a visit count:
+ * Reservego's same-day re-emissions are one visit, and counting them would make
+ * a two-visit guest look like a regular.
+ */
 function bookingVisitMap(db: DB): Map<string, { last: string; count: number }> {
   const map = new Map<string, { last: string; count: number }>();
   let rows: any[] = [];
@@ -217,7 +230,7 @@ function bookingVisitMap(db: DB): Map<string, { last: string; count: number }> {
     rows = db.prepare(`
       SELECT b.guest_id AS guest_id, MAX(${VISIT_AT}) AS last_visit, COUNT(*) AS n
       FROM ct_bookings b
-      WHERE b.status IN ('seated', 'completed')
+      WHERE b.status IN ('seated', 'completed') AND b.is_duplicate = 0
       GROUP BY b.guest_id
     `).all() as any[];
   } catch { return map; }

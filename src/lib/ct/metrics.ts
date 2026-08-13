@@ -26,6 +26,13 @@ const BOOKED_AT = `REPLACE(b.created_at, ' ', 'T')`;
  *  booking row was last touched (status flips to seated/completed bump it). */
 const VISIT_AT = `COALESCE(NULLIF(b.booking_date, ''), substr(REPLACE(COALESCE(b.updated_at, b.created_at), ' ', 'T'), 1, 10))`;
 const MISSED_FAMILY = `('missed','abandoned','voicemail')`;
+/** Reservego re-emits a row when a guest is re-booked or moved on the same
+ *  evening; markDuplicateGroups() marks the losers is_duplicate = 1 instead of
+ *  deleting them (db.ts § A2). Counting them would overstate bookings and
+ *  understate the arrival rate, so every count/aggregate here excludes them.
+ *  Phone bookings are always 0 (NOT NULL DEFAULT 0), so this changes nothing
+ *  for the 40 rows that predate the import. */
+const LIVE_ONLY = `b.is_duplicate = 0`;
 
 // ─── IST clock helpers ─────────────────────────────────────────────────────
 const IST_OFFSET_MIN = 330;
@@ -186,7 +193,7 @@ export function listMetricsForGuests(db: DB, guestIds: string[]): Record<string,
              SUM(CASE WHEN b.status IN ('seated','completed') THEN 1 ELSE 0 END)      AS converted_count,
              MAX(CASE WHEN b.status IN ('seated','completed') THEN ${VISIT_AT} END)   AS last_visit_at
       FROM ct_bookings b
-      WHERE b.guest_id IN (${ph})
+      WHERE b.guest_id IN (${ph}) AND ${LIVE_ONLY}
       GROUP BY b.guest_id
     `).all(...chunk) as any[];
 
@@ -384,6 +391,12 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
     SELECT COUNT(*) AS n FROM ct_recoveries WHERE status IN ('pending','attempting')
   `).get() as any;
 
+  // SAFE AT 82k WITHOUT A CHANGE, and worth saying why: BOOKED_AT is an
+  // expression and cannot use an index, but `source_call_id IS NOT NULL` can —
+  // SQLite seeks idx_ct_bookings_src and never touches the imported rows, which
+  // all carry a NULL source_call_id (reservego-import.ts inserts no call link).
+  // Measured on the 82,128-row copy: 0.01ms. That same fact is why no
+  // is_duplicate filter is needed here — a Reservego row cannot reach this count.
   const bookingsFromCallsToday = db.prepare(`
     SELECT COUNT(*) AS n
     FROM ct_bookings b
@@ -497,6 +510,8 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
     WHERE c.direction = 'inbound' AND ${CALL_AT} >= ? AND ${CALL_AT} < ?
   `).get(winStart, winEnd) as any;
 
+  // Index-backed on source_call_id like bookings_from_calls above (0.01ms at
+  // 82,128 rows) and, for the same reason, structurally free of Reservego rows.
   const fb = db.prepare(`
     SELECT COUNT(*)                                                            AS booked,
            SUM(CASE WHEN b.status IN ('seated','completed') THEN 1 ELSE 0 END) AS seated
@@ -671,11 +686,18 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
   // show bookings > 0 with handled = 0. That reads correctly (we credit the
   // booking, we do not credit an unvouched call) and it is not a contradiction
   // the way a mismatched handled/answered pair would be.
+  //
+  // The `source_call_id IS NOT NULL` half is redundant to the JOIN and is here
+  // for the planner: without it SQLite drove the join from a full SCAN of
+  // ct_bookings — 15.8ms on the 82,128-row copy, all of it spent on imported
+  // rows that can never match a call — and with it the same query seeks
+  // idx_ct_bookings_src and returns in 0.01ms.
   const agentBookingRows = db.prepare(`
     SELECT c.agent_user AS agent, COUNT(*) AS n
     FROM ct_bookings b
     JOIN ct_calls c ON c.id = b.source_call_id
-    WHERE c.agent_user != ''
+    WHERE b.source_call_id IS NOT NULL AND b.source_call_id != ''
+      AND c.agent_user != ''
       AND ${BOOKED_AT} >= ? AND ${BOOKED_AT} < ?
     GROUP BY c.agent_user
   `).all(winStart, winEnd) as any[];
@@ -719,15 +741,25 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
 
   // ── Lapsed guests (win-back list) ────────────────────────────────────────
   const lapsedCutoff = istDateStr(nowMs - LAPSED_DAYS * DAY_MS);
+  // AGGREGATE THE BOOKINGS FIRST, THEN NAME THE 20 GUESTS. Grouping by g.id
+  // made ct_guests the driving table, so the plan was "scan all 70,324 guests,
+  // probe the bookings index once each" — 52.4ms on the copy, of which 70,304
+  // guests were only ever going to be thrown away by the LIMIT. Grouping
+  // ct_bookings by guest_id and joining ct_guests to the surviving 20 is 30.6ms
+  // and, more to the point, stops growing with the guest table.
   const lapsedRows = db.prepare(`
-    SELECT g.id AS guest_id, g.name, g.phone_e164, MAX(${VISIT_AT}) AS last_visit_at
-    FROM ct_bookings b
-    JOIN ct_guests g ON g.id = b.guest_id
-    WHERE b.status IN ('seated','completed')
-    GROUP BY g.id
-    HAVING MAX(${VISIT_AT}) < ?
-    ORDER BY last_visit_at DESC
-    LIMIT 20
+    SELECT g.id AS guest_id, g.name, g.phone_e164, x.last_visit_at
+    FROM (
+      SELECT b.guest_id AS gid, MAX(${VISIT_AT}) AS last_visit_at
+      FROM ct_bookings b
+      WHERE b.status IN ('seated','completed') AND ${LIVE_ONLY}
+      GROUP BY b.guest_id
+      HAVING MAX(${VISIT_AT}) < ?
+      ORDER BY last_visit_at DESC
+      LIMIT 20
+    ) x
+    JOIN ct_guests g ON g.id = x.gid
+    ORDER BY x.last_visit_at DESC
   `).all(lapsedCutoff) as any[];
 
   const lapsed: LapsedGuest[] = lapsedRows.map((r) => ({

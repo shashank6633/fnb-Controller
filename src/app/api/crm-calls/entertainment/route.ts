@@ -19,6 +19,39 @@ export const revalidate = 0;
 const ENT_TYPES = ['band', 'dj', 'live_music', 'event', 'offer', 'other'] as const;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+/**
+ * Re-attribute bookings already held for `date` to whatever now plays that night.
+ *
+ * The back-link lives in the Reservego importer (relinkBands) because the
+ * importer owns ct_bookings. It is resolved at call time rather than imported
+ * statically so this route keeps compiling — and simply skips the relink —
+ * until that helper is merged. Assumed shape: relinkBands(db, 'YYYY-MM-DD').
+ */
+async function relinkBandsForDates(dates: string[]) {
+  const uniq = [...new Set(dates.filter(Boolean))];
+  if (!uniq.length) return;
+  try {
+    const mod = (await import('@/lib/reservego-import')) as unknown as Record<string, unknown>;
+    const fn = mod.relinkBands;
+    if (typeof fn !== 'function') return;
+    const db = getDb();
+    // { from, to } — NOT a bare date string. relinkBands takes a RANGE, and a
+    // string argument silently became `range.from === undefined`, which its
+    // boundDate() widens to 0000-01-01..9999-12-31: every calendar edit
+    // re-linked all ~85,000 bookings instead of the one night that changed.
+    // Results were still right, which is why nothing looked wrong; the cost was
+    // a full-table pass per keystroke-save. The `as` cast on a dynamic import is
+    // what hid the mismatch from tsc, so the cast now states the real shape.
+    for (const d of uniq) {
+      (fn as (db: unknown, range: { from?: string; to?: string }) => unknown)(db, { from: d, to: d });
+    }
+  } catch (err) {
+    // A relink is a follow-up, never a precondition: the calendar write the
+    // user just made must stand even if attribution fails.
+    console.error('[crm-calls/entertainment] relinkBands failed', err);
+  }
+}
+
 export async function GET(req: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Not authenticated' }, { status: 401 });
@@ -111,6 +144,8 @@ export async function POST(req: Request) {
     id, outletId, eventDate, type, name, startTime, endTime,
     area, description, me.email, now, now,
   );
+
+  await relinkBandsForDates([eventDate]);
 
   const row = db.prepare('SELECT * FROM ct_entertainment WHERE id = ?').get(id);
   return Response.json({ success: true, entertainment: row }, { status: 201 });

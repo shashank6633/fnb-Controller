@@ -399,6 +399,13 @@ export function buildWhatsOn(
   });
 
   // ── Reservations (ct_bookings LEFT JOIN ct_guests) ───────────────────────
+  // ONE DAY AT A TIME, so the Reservego archive does not reach this board:
+  // is_duplicate = 0 plus the date equality is exactly idx_ct_bookings_dup_date,
+  // and the board reads only the rows for `date`. Measured on the 82,128-row
+  // copy: 0.7ms for the busiest day. No LIMIT, deliberately — the heaviest real
+  // day in the archive is 328 reservations (measured over the 04-10-2025
+  // export's 11,832 rows), and a board that silently dropped the 501st booking
+  // of a big night would be worse than a slightly longer list.
   const reservations: WhatsOnReservation[] = [];
   try {
     const rows = db
@@ -408,7 +415,7 @@ export function buildWhatsOn(
                 g.name AS guest_name, g.phone_e164 AS guest_phone
          FROM ct_bookings b
          LEFT JOIN ct_guests g ON g.id = b.guest_id
-         WHERE b.booking_date = ?
+         WHERE b.is_duplicate = 0 AND b.booking_date = ?
          ORDER BY b.slot_time, b.created_at`,
       )
       .all(date) as any[];

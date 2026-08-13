@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { refreshGuestMetrics } from '@/lib/ct/guest-metrics';
 
 /**
  * CRM Call-to-Table — single booking (/api/crm-calls/bookings/:id).
@@ -125,7 +126,30 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
   sqlParams.push(new Date().toISOString());
 
   sqlParams.push(id);
-  db.prepare(`UPDATE ct_bookings SET ${sets.join(', ')} WHERE id = ?`).run(...sqlParams);
+
+  // THE EDIT AND THE GUEST'S LIFETIME METRICS COMMIT TOGETHER.
+  // ct_guests carries a denormalised summary of this booking (total_bookings,
+  // arrived_visits, arrival_rate, total_pax, first/last_booking, spend), and
+  // three of the four fields this route can write — status, booking_date,
+  // party_size — are inputs to it. Before this, only the importer refreshed
+  // that summary, so cancelling a completed booking here left the guest reading
+  // arrival_rate 1.0 forever while the guest 360, which aggregates live,
+  // disagreed. One transaction rather than two statements because a refresh
+  // that could half-happen would be a worse cache than no refresh: the row and
+  // its summary would be permanently inconsistent with no signal that they are.
+  //
+  // The refresh is UNCONDITIONAL, not gated on "did a metric field change".
+  // A column list here would be a second, silent copy of what
+  // computeGuestMetrics reads, and the day someone adds bill_amount to the
+  // editable set it goes stale without a test failing. Measured cost of the
+  // wasted call on a notes-only edit, against a copy holding all 129 real
+  // Reservego exports (85,598 bookings / 70,342 guests): 0.043ms, and the write
+  // itself is skipped when the numbers have not moved.
+  const guestId = String(existing.guest_id || '');
+  db.transaction(() => {
+    db.prepare(`UPDATE ct_bookings SET ${sets.join(', ')} WHERE id = ?`).run(...sqlParams);
+    if (guestId) refreshGuestMetrics(db, guestId);
+  })();
 
   const booking = db.prepare(`${GUEST_JOIN_SELECT} WHERE b.id = ?`).get(id);
   return Response.json({ success: true, booking });

@@ -4820,6 +4820,388 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('ct (call-to-table CRM) schema failed:', e); }
 
+  // ══ RESERVEGO RESERVATION IMPORT — SCHEMA ONLY (2026-08) ══════════════════
+  //
+  // The owner exports Reservego's reservation history as CSV and wants it to
+  // build ONE accurate guest database. It lands in the tables the phone CRM
+  // already uses — ct_guests as the customer master, ct_bookings as the booking
+  // history — and NOT in a parallel "imported reservations" island that every
+  // CRM page, plus the /dine-in/reservations seat board, would then have to
+  // UNION forever.
+  //
+  // Everything here is additive and PRAGMA-guarded. The 40 ct_bookings and 27
+  // ct_guests rows already in production are real bookings taken over the
+  // phone: no column is dropped or renamed and nothing is backfilled, so those
+  // rows come out of this migration byte-identical, just wider.
+  //
+  // WHY A SESSION TABLE AND NOT A ONE-SHOT UPLOAD. Production is ~106,000 rows
+  // / ~30MB. Measured on this machine with better-sqlite3: 106k upserts in one
+  // batched transaction = 1.1s, an idempotent re-import = 0.4s, a full metric
+  // rollup = 12ms. SQLite is nowhere near the bottleneck — the HTTP body is. So
+  // the browser parses the CSV with papaparse and posts batches of 2,000 rows,
+  // and reservation_imports is the row those batches accumulate into: it is
+  // what gives the upload a progress bar, a duplicate/collapse report, and the
+  // ability to survive a dropped connection.
+  //
+  // Column semantics are fixed by src/lib/reservego.ts (mapRow / MappedBooking
+  // / dedupeKeyFor / computeGuestMetrics). That module is the agreed contract —
+  // this block stores what it produces and re-spells none of its rules.
+  try {
+    // ── A) ct_bookings gains the Reservego record ────────────────────────────
+    // These are nullable on purpose. A NULL here reads as "this booking did not
+    // come from Reservego", which is the literal truth for all 40 existing rows
+    // and for every future booking typed in during a phone call — and it is
+    // also what makes the partial unique index below legal (see WHY, there).
+    const rbCols = db.prepare(`PRAGMA table_info(ct_bookings)`).all() as any[];
+    const hasRB = (n: string) => rbCols.some((c: any) => c.name === n);
+    const addRB = (col: string, decl: string) => {
+      if (!hasRB(col)) db.exec(`ALTER TABLE ct_bookings ADD COLUMN ${col} ${decl}`);
+    };
+    addRB('reservego_key',          `TEXT`);     // dedupeKeyFor(outlet, guestKey, bookingTime) — THE idempotency key
+    addRB('reservego_status',       `TEXT`);     // the RAW status string, kept verbatim: mapStatus() returns null for
+                                                 // anything it does not recognise, and a status we cannot map is exactly
+                                                 // the one worth being able to read back later.
+    addRB('booking_time',           `TEXT`);     // when the booking was CREATED — the owner's unique-record field.
+                                                 // Distinct from created_at, which is when WE inserted the row.
+    addRB('reserved_time',          `TEXT`);     // the slot the table was booked FOR
+    addRB('booking_type',           `TEXT`);     // Reservation | Walkin | …
+    addRB('outlet_name',            `TEXT`);
+    addRB('pax_breakdown',          `TEXT`);     // JSON of the 10 pax columns (adult/child/veg/non-veg/male/female/
+                                                 // infant/couple/male-stag/female-stag) — one column, not ten, because
+                                                 // nothing queries them individually; they are read back as a whole.
+    addRB('reserved_by',            `TEXT`);
+    addRB('sections',               `TEXT`);
+    addRB('tables_csv',             `TEXT`);     // Reservego's "Table(s)" — free text, may list several
+    addRB('source',                 `TEXT`);     // Source of Booking. Separate from the existing `channel`, which is
+                                                 // OUR taxonomy ('call'); this one is Reservego's, unedited.
+    addRB('preferences',            `TEXT`);
+    addRB('tags',                   `TEXT`);
+    addRB('guest_comments',         `TEXT`);
+    addRB('outlet_comments',        `TEXT`);
+    addRB('deletion_type',          `TEXT`);
+    addRB('deletion_reason',        `TEXT`);
+    addRB('bill_amount',            `REAL`);     // NULL ≠ 0: "no bill recorded" is not "spent nothing", and
+                                                 // computeGuestMetrics' total/avg spend depends on that distinction.
+    addRB('bill_number',            `TEXT`);
+    addRB('booking_amount',         `REAL`);     // advance taken at booking, per Reservego (the existing
+                                                 // advance_amount column stays OUR field, written by the phone CRM)
+    addRB('booking_txn_id',         `TEXT`);
+    addRB('booking_payment_status', `TEXT`);
+    addRB('booking_payment_date',   `TEXT`);
+    addRB('arrived',                `INTEGER DEFAULT 0`);  // isArrived(status, seatedAt) — denormalised because every
+                                                           // metric and every "who actually came" filter reads it
+    addRB('import_id',              `TEXT`);     // which reservation_imports run wrote/last-touched this row
+    addRB('source_exported_at',     `TEXT`);     // THE RECENCY GUARD. Reservego stamps its export in the file name
+                                                 // (exportStampFromFileName / normalizeExportStamp in reservego.ts);
+                                                 // the engine refuses a field-level overwrite whose stamp is older
+                                                 // than the one stored here. Without the column the guard has nowhere
+                                                 // to read from, so re-uploading a stale export from the owner's 129
+                                                 // files would quietly revert bookings the newer export had corrected.
+                                                 // NULL = the 40 phone rows and any row written before the guard.
+                                                 // No index: it is only ever read on a row already found through
+                                                 // idx_ct_bookings_resv_key, so an index would pay write cost on
+                                                 // 85,558 rows to serve no query.
+    addRB('reservego_visit_count',  `INTEGER`);  // Reservego's own "Vist Count" column — misspelt at source, kept
+                                                 // under a readable name. Stored as a CROSS-CHECK against the
+                                                 // arrived_visits we compute in computeGuestMetrics, not as an input
+                                                 // to it: their count is per-export and per-outlet, ours is over
+                                                 // every row we hold. A gap between the two is a signal worth
+                                                 // reading, which it cannot be if we overwrite one with the other.
+                                                 // NULL ≠ 0 — a blank cell means "not reported", not "never came".
+
+    // ── A2) is_duplicate — the same-day verdict, STORED not computed ─────────
+    // markDuplicateGroups() (src/lib/reservego.ts) decides, per (outlet, mobile,
+    // date), which stored row IS the visit and which are its duplicates. That
+    // verdict is written here after each import; 0 = the visit, 1 = a duplicate
+    // of it. Nothing is deleted, so the row stays auditable and the verdict can
+    // be recomputed if the rule ever changes.
+    //
+    // WHY STORED. Three reasons, in order of how much they hurt.
+    //  1. ONE ANSWER. The bookings list, the CSV export and the guest metrics
+    //     must agree on the count or the feature is worthless — the owner will
+    //     see 82,088 on screen and a different number in the file he opens in
+    //     Excel. Computed per query, the rule would exist three more times, once
+    //     per SQL statement, alongside the TS function that is supposed to be
+    //     the only copy. A stored column makes them all read the same byte.
+    //  2. IT IS NOT CLEANLY EXPRESSIBLE IN SQL ANYWAY. The tiebreak is a total
+    //     ordering over (arrived, bill_amount, booking_time, id) where a missing
+    //     bill sorts as -1 — not as SQL NULL, which orders differently and would
+    //     silently pick a different primary. A window function that "looks the
+    //     same" is a second implementation of a rule already proven subtle
+    //     enough to have shipped wrong once (the per-batch collapse).
+    //  3. COST. Measured shape of the real archive: ~129 Reservego exports,
+    //     217,805 CSV rows → 82,088 bookings over 70,297 guests. Computing the
+    //     verdict per query means partitioning 82k rows on every list render,
+    //     every sort and every keystroke of the search box; stored, it is one
+    //     pass per import.
+    addRB('is_duplicate', `INTEGER NOT NULL DEFAULT 0`);
+    // NOT NULL, unlike `arrived` above, and deliberately. Every consumer filters
+    // `is_duplicate = 0`, and in SQL `NULL = 0` is not false but NULL — one row
+    // written with an explicit NULL would vanish from the list, the export AND
+    // the metrics at once, silently. The default fills the 40 existing phone
+    // rows with 0, which is the truth: a phone booking is never a Reservego
+    // duplicate (markDuplicateGroups is only ever handed import_id IS NOT NULL
+    // rows), and the importer's INSERT omits the column so new rows also land
+    // at 0 until the post-import sweep judges them.
+
+    // ── A3) derived reservation fields — written once, at import ─────────────
+    // Everything here is a function of the row Reservego already gave us, so
+    // none of it is new information. It is stored because the questions the
+    // owner asks of this archive are all GROUP BY questions — which weekday
+    // fills, lunch vs dinner, which band pulls a crowd — and derived per query
+    // they would be `strftime()` and `CASE` expressions over 85,558 bookings,
+    // unindexable by definition: SQLite cannot seek on an expression, so every
+    // one of those screens would be a full table scan plus a sort.
+    //
+    // Nullable, and nothing is backfilled: NULL reads as "not derived", which
+    // is the truth for all 40 existing phone bookings. The two live-band
+    // columns are the deliberate exception — see the note above them.
+    addRB('reserved_date',  `TEXT`);     // YYYY-MM-DD the table was booked FOR, split out of reserved_time.
+                                         // booking_date is OUR field and reserved_time is a timestamp; this is the
+                                         // date half, so a month filter is a range scan and not a substr().
+    addRB('day_of_week',    `TEXT`);     // 'Saturday' — the label, for display and CSV export
+    addRB('dow',            `INTEGER`);  // 0=Sunday…6=Saturday, matching strftime('%w'). Kept BESIDE the label
+                                         // rather than derived from it because sorting a weekday report by name
+                                         // yields Friday, Monday, Saturday — and because ordering by the label
+                                         // cannot use an index on the label.
+    addRB('slot_time',      `TEXT`);     // already on the base table (CREATE TABLE ct_bookings above), so this
+                                         // addRB is a guarded no-op. Listed anyway so the derived set reads as
+                                         // one group here instead of one column silently living elsewhere.
+    addRB('meal_period',    `TEXT`);     // 'lunch' | 'dinner', split at the reservation_meal_cutoff setting seeded
+                                         // below. A setting and not a constant: the cutoff is a house rule the
+                                         // owner may move, and 17:00 is only today's answer.
+    // The two live-band columns are NOT NULL DEFAULT '' while the rest of this
+    // group is nullable, and the difference is not cosmetic. '' is the sentinel
+    // src/lib/ct/live-band.ts declared for them, and the relink backfill
+    // (/api/crm/reservations/relink-bands) selects its work with
+    // `WHERE live_band_id = ''` and counts it with `SUM(CASE WHEN live_band_id
+    // = '' …)`. In SQL a NULL row answers neither that equality nor its
+    // negation, so nullable columns would hand the backfill an empty work set
+    // over all 85,558 imported bookings — the feature would run, report 0, and
+    // look like it had nothing to do. '' also matches the neighbouring
+    // occasion / section_pref columns on the base table.
+    addRB('live_band',      `TEXT NOT NULL DEFAULT ''`);  // the band name AS IT WAS on the night, frozen onto the
+                                         // booking. Renaming a band in ct_bands must not rewrite what last year's
+                                         // report says played.
+    addRB('live_band_id',   `TEXT NOT NULL DEFAULT ''`);  // → ct_bands.id. The join key, so 'Agnee' and 'AGNEE'
+                                         // aggregate as one band even though live_band above keeps them spelt as
+                                         // typed. '' = no band that night.
+    // A database that already carries these columns in a NULLABLE form predates
+    // this declaration, and the PRAGMA guard above cannot correct it — changing
+    // nullability needs a table rewrite, which is not this block's job. Say so
+    // once at boot rather than let the relink backfill quietly find no rows.
+    if (db.prepare(`PRAGMA table_info(ct_bookings)`).all()
+          .some((c: any) => c.name === 'live_band_id' && Number(c.notnull) === 0)) {
+      console.warn(`[db] ct_bookings.live_band_id is nullable; relink-bands matches on '' and will skip NULL rows`);
+    }
+
+    // WHY THIS UNIQUE INDEX IS PARTIAL.
+    // One table now holds two kinds of booking. Reservego rows carry a
+    // dedupeKey and must be unique on it — that is what makes re-uploading the
+    // same file (or an overlapping month) an idempotent no-op instead of
+    // 106,000 duplicates. Phone bookings have no such key and never will.
+    // SQLite treats NULLs as distinct in a UNIQUE index, so a plain UNIQUE
+    // index would already tolerate many NULL rows — but WHERE reservego_key IS
+    // NOT NULL states that intent instead of relying on it, and keeps the index
+    // holding only the ~106k rows that are actually looked up through it rather
+    // than every row in the table. Both kinds of booking therefore live in one
+    // table, and the seat board's queries are unaffected.
+    //
+    // UPSERT TRAP, measured against a copy of production: a PARTIAL index does
+    // NOT match a bare conflict target. `ON CONFLICT(reservego_key) DO UPDATE`
+    // fails to even PREPARE with "ON CONFLICT clause does not match any PRIMARY
+    // KEY or UNIQUE constraint". The importer must repeat the predicate:
+    //   ON CONFLICT(reservego_key) WHERE reservego_key IS NOT NULL DO UPDATE …
+    // (INSERT OR IGNORE / OR REPLACE need no target and are unaffected.)
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ct_bookings_resv_key
+             ON ct_bookings(reservego_key) WHERE reservego_key IS NOT NULL`);
+    // booking_date is already indexed as idx_ct_bookings_date (created with the
+    // table above); re-declaring it under the same name is a no-op rather than
+    // a second, redundant B-tree paying write cost on all 106k inserts.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_date      ON ct_bookings(booking_date)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_arrived   ON ct_bookings(arrived)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_import    ON ct_bookings(import_id)`);
+    // The one filter every Reservego surface applies: hide duplicates, then bound
+    // or order by date. is_duplicate FIRST because it is the equality half —
+    // SQLite can seek on a leading equality and then range-scan booking_date
+    // inside it, so this one index serves both the WHERE and the ORDER BY. The
+    // reverse order would seek on the date and re-test is_duplicate per row,
+    // which over 82k bookings is the whole table minus the month.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_dup_date ON ct_bookings(is_duplicate, booking_date)`);
+    // The A3 columns exist to be grouped and filtered on; these are what make
+    // that cheap. Single-column and not composite because the reports pick one
+    // of them at a time (a weekday breakdown, a lunch/dinner split, a band's
+    // history) and a composite would only serve the one prefix order it was
+    // built in.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_dow       ON ct_bookings(dow)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_meal      ON ct_bookings(meal_period)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_resv_date ON ct_bookings(reserved_date)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_band      ON ct_bookings(live_band_id)`);
+    // The reserved_date twin of idx_ct_bookings_dup_date, for the same reason
+    // and in the same column order: every Reservego surface hides duplicates
+    // first, and the ones that report on the night the guest was booked FOR
+    // bound by reserved_date rather than by our booking_date.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_bookings_dup_resv_date ON ct_bookings(is_duplicate, reserved_date)`);
+
+    // ── B) ct_guests gains denormalised lifetime metrics ─────────────────────
+    // Refreshed once at the end of an import, NOT computed per page view. A
+    // Customers list that aggregated 106k bookings on every render would be
+    // paying 12ms of rollup for one screen of 50 rows, and paying it again on
+    // every sort and every keystroke of the search box. Written by
+    // computeGuestMetrics() so the list, the guest 360 and the CSV export can
+    // never disagree about what "arrival rate" means.
+    const gCols = db.prepare(`PRAGMA table_info(ct_guests)`).all() as any[];
+    const hasG = (n: string) => gCols.some((c: any) => c.name === n);
+    const addG = (col: string, decl: string) => {
+      if (!hasG(col)) db.exec(`ALTER TABLE ct_guests ADD COLUMN ${col} ${decl}`);
+    };
+    addG('phone10',              `TEXT`);            // phone10() last-10-digit key: 919392966858 and 9392966858 are
+                                                     // one guest. phone_e164 keeps the stored form; this is the JOIN key.
+    addG('total_bookings',       `INTEGER DEFAULT 0`);
+    addG('arrived_visits',       `INTEGER DEFAULT 0`);
+    addG('cancelled_bookings',   `INTEGER DEFAULT 0`);
+    addG('no_shows',             `INTEGER DEFAULT 0`);
+    addG('arrival_rate',         `REAL DEFAULT 0`);  // 0..1, arrived / total
+    addG('total_pax',            `INTEGER DEFAULT 0`);
+    addG('total_spend',          `REAL DEFAULT 0`);
+    addG('avg_spend',            `REAL DEFAULT 0`);  // per ARRIVED visit, not per booking — see computeGuestMetrics
+    addG('first_booking',        `TEXT`);
+    addG('last_booking',         `TEXT`);
+    addG('booking_sources',      `TEXT`);            // JSON array of the distinct Source of Booking values
+    addG('visit_frequency_days', `INTEGER`);         // mean gap between arrived visits; NULL = fewer than two visits,
+                                                     // which is not the same as "comes every 0 days"
+    addG('metrics_updated_at',   `TEXT`);            // NULL = never rolled up (the state all 27 existing rows are in)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_guests_phone10 ON ct_guests(phone10)`);
+
+    // ── C) reservation_imports — one row per upload session ──────────────────
+    // The counters are NOT NULL DEFAULT 0 because import/batch increments them
+    // in place (`SET rows_processed = rows_processed + ?`) and in SQL
+    // NULL + n = NULL: a single NULL counter would silently blank the progress
+    // bar and the final summary. Defaulting to 0 means a start row can be
+    // inserted with just its identity and every batch can safely add to it.
+    // errors_json is capped by the writer, not here — the point of the column
+    // is the first few hundred rejected rows, not a second copy of the file.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS reservation_imports (
+        id                TEXT PRIMARY KEY,
+        file_name         TEXT NOT NULL DEFAULT '',
+        started_at        TEXT,
+        finished_at       TEXT,
+        status            TEXT NOT NULL DEFAULT 'running',   -- running | completed | failed
+        rows_total        INTEGER NOT NULL DEFAULT 0,        -- as counted by the browser parse, known up front
+        rows_processed    INTEGER NOT NULL DEFAULT 0,
+        new_bookings      INTEGER NOT NULL DEFAULT 0,
+        updated_bookings  INTEGER NOT NULL DEFAULT 0,
+        duplicate_rows    INTEGER NOT NULL DEFAULT 0,        -- same reservego_key seen again — the re-import case
+        collapsed_rows    INTEGER NOT NULL DEFAULT 0,        -- same date + same mobile, collapsed to the checked-in
+                                                             -- copy. REPORTED, never silently dropped.
+        new_customers     INTEGER NOT NULL DEFAULT 0,
+        updated_customers INTEGER NOT NULL DEFAULT 0,
+        failed_rows       INTEGER NOT NULL DEFAULT 0,
+        errors_json       TEXT DEFAULT '[]',
+        imported_by       TEXT DEFAULT '',
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+
+    // ── D) ct_bands — the band master behind ct_bookings.live_band_id ─────────
+    //
+    // WHY A TABLE AND NOT FREE TEXT ON THE BOOKING. Typed per night, "Agnee",
+    // "AGNEE" and "Agnee Band" are three different strings, so GROUP BY
+    // live_band reports three bands with a third of the covers each and no
+    // query can put them back together — the one thing the owner wants this
+    // column for (which act actually fills the room) is exactly the thing free
+    // text cannot answer. UNIQUE COLLATE NOCASE is therefore the point of the
+    // table, not decoration on it: it makes the second spelling of a name
+    // impossible to insert rather than merely discouraged. Case-INSENSITIVE
+    // and not case-preserving-unique because the collation is what catches
+    // 'AGNEE'; the name stays stored as first typed, and ct_bookings.live_band
+    // keeps the per-night spelling anyway.
+    //
+    // is_active retires a band without deleting it: the id is referenced by
+    // every booking it ever played, so a delete would orphan history. Inactive
+    // means "do not offer this in the picker", not "never happened".
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ct_bands (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        is_active  INTEGER DEFAULT 1,
+        created_by TEXT,
+        created_at TEXT,
+        updated_at TEXT
+      );
+    `);
+
+    // ── E) settings seeds ────────────────────────────────────────────────────
+    // INSERT OR IGNORE, so a value the owner has already changed survives every
+    // subsequent boot. Seeded rather than left absent because meal_period and
+    // the band lead-in are derived AT IMPORT: a missing key would make the
+    // derivation fall back to a hardcoded default that then disagrees with what
+    // /settings shows, for the whole archive, silently.
+    db.exec(`
+      -- Lunch/dinner boundary for ct_bookings.meal_period. 17:00 is AKAN's
+      -- current changeover, not a law — hence a setting.
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('reservation_meal_cutoff', '17:00');
+      -- How long before a band's start time a booking still counts as "came for
+      -- that band". Guests booked at 19:00 are there for the 21:00 act; without
+      -- a lead-in window, attributing on exact overlap would credit the band
+      -- with only the late arrivals.
+      INSERT OR IGNORE INTO settings (key, value) VALUES ('reservation_band_lead_in_minutes', '120');
+    `);
+  } catch (e) { console.error('reservego reservation-import schema failed:', e); }
+
+  // ── ct_bookings.arrived — one-shot backfill for the pre-import rows ────────
+  //
+  // `arrived` was added above for the importer, so it defaulted to 0 on the 40
+  // bookings the phone CRM had already taken. Measured on a copy of production
+  // (2026-08-13): 9 rows sit at status 'seated' and 14 at 'completed' — 23 rows
+  // that describe a guest who sat at a table and are rendered "Arrived: No" by
+  // every surface that reads the column. The remaining 17 (8 confirmed, 5
+  // no_show, 2 cancelled, 2 pending) are correctly 0 and must stay 0.
+  //
+  // The derivation is isArrived(status, seatedAt) from src/lib/reservego.ts,
+  // transcribed — not reinvented — so an imported row and a phone row mean the
+  // same thing by the same rule: cancelled and no_show are never arrivals
+  // whatever a seated stamp says, and otherwise 'seated'/'completed' or the
+  // presence of a stamp is an arrival. All 40 rows have seated_at NULL today,
+  // so the stamp clause changes nothing right now; it is here because the seat
+  // board (src/lib/ct/seating.ts) writes seated_at and this migration must not
+  // encode a narrower rule than the one the app uses.
+  //
+  // ONE-DIRECTIONAL, 0 → 1 ONLY. Clearing a 1 back to 0 would make this a
+  // repair job competing with the importer for ownership of the column on every
+  // boot; the flag below is what makes it a migration instead.
+  try {
+    const arrivedFlag = db.prepare("SELECT value FROM settings WHERE key = 'ct_bookings_arrived_backfill_v1'").get() as { value?: string } | undefined;
+    if (!arrivedFlag) {
+      const run = db.transaction(() => {
+        // The import guard is the point of the WHERE clause. import_id and
+        // reservego_key are both NULL only on rows the CRM typed itself; a
+        // Reservego row already carries the importer's own isArrived() verdict,
+        // computed from the CSV, and a boot migration second-guessing it from
+        // our mapped status would overwrite the more informed answer. Both
+        // columns are checked rather than one because they are written by the
+        // same statement and disagreeing would mean a half-written row.
+        const info = db.prepare(`
+          UPDATE ct_bookings
+             SET arrived = 1
+           WHERE (arrived IS NULL OR arrived = 0)
+             AND import_id IS NULL
+             AND reservego_key IS NULL
+             AND status NOT IN ('cancelled', 'no_show')
+             AND (status IN ('seated', 'completed')
+                  OR (seated_at IS NOT NULL AND TRIM(seated_at) <> ''))
+        `).run();
+        // Flag written inside the same transaction: if the process dies between
+        // the two statements, neither happened and the next boot retries.
+        db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('ct_bookings_arrived_backfill_v1', '1')").run();
+        return info.changes;
+      });
+      const changed = run();
+      console.log(`[db] ct_bookings_arrived_backfill_v1: marked ${changed} pre-import booking(s) as arrived`);
+    }
+  } catch (e) { console.error('[db] ct_bookings_arrived_backfill_v1 failed (rolled back):', e); }
+
   // ══ DEPARTMENT-BASED INVENTORY — CUTOVER SCHEMA (2026-08) ═════════════════
   //
   // ONE RAIL: Central Store --requisition issue--> Department --recipe

@@ -20,9 +20,10 @@
  */
 
 import { useEffect, useState } from 'react';
-import { X, Search, UserPlus, Loader2, CheckCircle, CalendarCheck, Phone } from 'lucide-react';
+import { X, Search, UserPlus, Loader2, CheckCircle, CalendarCheck, Phone, Music, AlertTriangle } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
+import { BOOKING_PREFERENCES, PREF_LIVE_BAND } from '@/lib/ct/live-band';
 import PhoneField from '@/components/PhoneField';
 
 interface GuestLite {
@@ -48,6 +49,21 @@ const SECTIONS = ['Any', 'Rooftop', 'Indoor'];
 /** Today's date in IST as YYYY-MM-DD (bookings are restaurant-local). */
 const istToday = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
+/** YYYY-MM-DD → "12 Aug", for warning copy a GRE reads mid-call. */
+const shortDate = (d: string) => {
+  const t = Date.parse(`${d}T00:00:00`);
+  return isNaN(t) ? d : new Date(t).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+};
+
+interface BandLite { id: string; name: string; start_time?: string; area?: string; outlet_id?: string }
+
+/**
+ * The band lookup's outcome, kept as a state machine rather than "band or null"
+ * because `none` (checked, nothing scheduled) and `error` (could not check) owe
+ * the GRE different sentences, and neither may be silently shown as "no band".
+ */
+type BandState = 'idle' | 'loading' | 'found' | 'none' | 'error';
+
 export default function QuickBookingModal({
   open, onClose, onSaved, guestId, guestName, sourceCallId,
 }: QuickBookingModalProps) {
@@ -67,7 +83,14 @@ export default function QuickBookingModal({
   const [partySize, setPartySize] = useState(2);
   const [occasion, setOccasion] = useState('Casual');
   const [sectionPref, setSectionPref] = useState('Any');
+  const [preference, setPreference] = useState('');
   const [notes, setNotes] = useState('');
+
+  // ── Live Band for the chosen date ──
+  const [band, setBand] = useState<BandLite | null>(null);
+  const [bandState, setBandState] = useState<BandState>('idle');
+  /** The GRE has seen the "no band scheduled" warning and clicked Save again. */
+  const [ackNoBand, setAckNoBand] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -86,10 +109,64 @@ export default function QuickBookingModal({
     setPartySize(2);
     setOccasion('Casual');
     setSectionPref('Any');
+    setPreference('');
     setNotes('');
+    setBand(null);
+    setBandState('idle');
+    setAckNoBand(false);
     setSaving(false);
     setError('');
   }, [open, guestId, guestName]);
+
+  /**
+   * Look the date's Live Band up as soon as the preference is set, so the
+   * answer is on screen while the guest is still on the line.
+   *
+   * The ordering below mirrors resolveLiveBand() in src/lib/ct/live-band.ts
+   * exactly — the server is what actually stamps the booking, and a modal that
+   * named a different band than the one stored would be worse than no modal.
+   * The API already filters to (current outlet OR legacy blank), so the only
+   * non-blank outlet_id that can come back IS the current outlet; preferring it
+   * here reproduces the server's first tiebreak without knowing the outlet id.
+   */
+  useEffect(() => {
+    if (!open || preference !== PREF_LIVE_BAND || !date) { setBand(null); setBandState('idle'); return; }
+    let stale = false;
+    setBandState('loading');
+    (async () => {
+      try {
+        const r = await fetch(`/api/crm-calls/entertainment?date=${encodeURIComponent(date)}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const j = await r.json();
+        const raw: unknown[] = Array.isArray(j?.entertainment) ? j.entertainment : [];
+        const field = (e: unknown, k: string) => String((e as Record<string, unknown>)?.[k] ?? '');
+        const bands: BandLite[] = raw
+          .filter(e => field(e, 'type') === 'band' && field(e, 'name').trim() !== '')
+          .map(e => ({
+            id: field(e, 'id'), name: field(e, 'name'), start_time: field(e, 'start_time'),
+            area: field(e, 'area'), outlet_id: field(e, 'outlet_id'),
+          }))
+          .sort((a, b) => {
+            const rank = (e: BandLite) => (e.outlet_id === '' ? 1 : 0);
+            const timed = (e: BandLite) => ((e.start_time || '').trim() === '' ? 1 : 0);
+            return rank(a) - rank(b)
+              || timed(a) - timed(b)
+              || (a.start_time || '').localeCompare(b.start_time || '')
+              || a.name.localeCompare(b.name);
+          });
+        if (stale) return;
+        if (bands.length) { setBand(bands[0]); setBandState('found'); }
+        else { setBand(null); setBandState('none'); }
+      } catch {
+        if (!stale) { setBand(null); setBandState('error'); }
+      }
+    })();
+    return () => { stale = true; };
+  }, [open, preference, date]);
+
+  // A new date or preference is a new question — the previous "save anyway"
+  // must not carry over and silently book a second blank band night.
+  useEffect(() => { setAckNoBand(false); }, [preference, date]);
 
   // Debounced guest search (only when no guest is selected).
   useEffect(() => {
@@ -151,6 +228,14 @@ export default function QuickBookingModal({
   const save = async () => {
     if (!guest?.id) { setError('Pick or create a guest first'); return; }
     if (!date) { setError('Booking date is required'); return; }
+    // A Live Band booking on a date with no band is a promise nobody has made
+    // yet. It still saves — refusing it would lose the table — but not on the
+    // click that discovers it, so the GRE cannot hang up unaware.
+    if (preference === PREF_LIVE_BAND && bandState === 'none' && !ackNoBand) {
+      setAckNoBand(true);
+      setError(`No Live Band is on the calendar for ${shortDate(date)}. Tell the guest you will confirm, then click Save Booking again to take it anyway.`);
+      return;
+    }
     setSaving(true);
     setError('');
     try {
@@ -163,6 +248,7 @@ export default function QuickBookingModal({
           party_size: partySize,
           occasion,
           section_pref: sectionPref,
+          preference,
           notes,
           channel: 'call',
           ...(sourceCallId ? { source_call_id: sourceCallId } : {}),
@@ -293,7 +379,7 @@ export default function QuickBookingModal({
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <div>
               <label className="block text-xs font-medium text-[#6B5744] mb-1">Party size</label>
               <input type="number" min={1} max={500} step={1} value={partySize}
@@ -312,7 +398,57 @@ export default function QuickBookingModal({
                 {SECTIONS.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
+            {/* Preference = what they are coming FOR. Its own field, not a
+                flavour of Occasion (what they celebrate) or Section (where they
+                sit). Defaults to unset: guessing "Dining" for every caller
+                would make the field useless the day someone reports on it. */}
+            <div>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">Preference</label>
+              <select value={preference} onChange={e => setPreference(e.target.value)} className={inputCls}>
+                <option value="">Not stated</option>
+                {BOOKING_PREFERENCES.map(p => <option key={p} value={p}>{p}</option>)}
+              </select>
+            </div>
           </div>
+
+          {/* Live Band answer for the chosen date — the question the phone is
+              actually ringing about. Never left blank-and-silent: `none` says
+              so in as many words, because that is a callback the GRE owes. */}
+          {preference === PREF_LIVE_BAND && (
+            <>
+              {bandState === 'loading' && (
+                <p className="text-xs text-[#8B7355] flex items-center gap-1.5">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Checking the entertainment calendar…
+                </p>
+              )}
+              {bandState === 'found' && band && (
+                <p className="text-xs text-[#2D1B0E] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-3 py-2 flex items-start gap-1.5">
+                  <Music className="w-3.5 h-3.5 text-[#af4408] mt-px shrink-0" />
+                  <span>
+                    <span className="font-semibold">{band.name}</span> plays on {shortDate(date)}
+                    {band.start_time ? ` from ${band.start_time}` : ''}{band.area ? ` · ${band.area}` : ''}.
+                    <span className="text-[#8B7355]"> Saved with the booking.</span>
+                  </span>
+                </p>
+              )}
+              {bandState === 'none' && (
+                <p className="text-xs text-[#8a3506] bg-[#FFF1E3] border border-[#af4408]/40 rounded-lg px-3 py-2 flex items-start gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
+                  <span>
+                    <span className="font-semibold">No Live Band is on the calendar for {shortDate(date)}.</span>{' '}
+                    Do not promise one — the booking will save with no band recorded.
+                    Ask the manager to add it, then follow up with the guest.
+                  </span>
+                </p>
+              )}
+              {bandState === 'error' && (
+                <p className="text-xs text-[#8B7355] bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg px-3 py-2 flex items-start gap-1.5">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
+                  <span>Could not read the entertainment calendar just now, so the band for {shortDate(date)} is unconfirmed. The preference will still be saved.</span>
+                </p>
+              )}
+            </>
+          )}
 
           <div>
             <label className="block text-xs font-medium text-[#6B5744] mb-1">Notes</label>
@@ -330,7 +466,9 @@ export default function QuickBookingModal({
           <button onClick={save} disabled={saving || !guest?.id || !date}
                   className="flex items-center gap-2 px-5 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-sm font-medium">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
-            {saving ? 'Saving…' : 'Save Booking'}
+            {saving ? 'Saving…'
+              : ackNoBand && preference === PREF_LIVE_BAND && bandState === 'none' ? 'Save without a band'
+              : 'Save Booking'}
           </button>
         </div>
       </div>

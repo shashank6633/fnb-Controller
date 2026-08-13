@@ -226,10 +226,22 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       });
     }
 
+    // Index-backed on guest_id, and bounded so one guest can never page the
+    // whole archive into a timeline. is_duplicate = 0 keeps Reservego's same-day
+    // re-emissions out of the 360 — they are the same visit, and showing three
+    // of them is how the guest's history stops matching their metrics (which
+    // computeGuestMetrics derives from the deduped rows).
+    //
+    // WHY 500 IS NOT A REAL LIMIT: the heaviest guest in the 04-10-2025 export
+    // (11,832 rows, 3.4 months) has 8 bookings, so 500 is ~50 years of that
+    // guest. It is a fuse against a mis-keyed import, not a paging rule — and
+    // the newest are kept, because that is what the timeline shows first.
     const bookings = guestKey ? db.prepare(
       `SELECT id, source_call_id, booking_date, slot_time, party_size, occasion, section_pref,
               status, created_by, channel, advance_amount, notes, created_at, updated_at
-       FROM ct_bookings WHERE guest_id = ?`,
+       FROM ct_bookings WHERE guest_id = ? AND is_duplicate = 0
+       ORDER BY COALESCE(NULLIF(booking_date, ''), created_at) DESC
+       LIMIT 500`,
     ).all(guestKey) as any[] : [];
     for (const b of bookings) {
       timeline.push({

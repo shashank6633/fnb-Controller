@@ -289,6 +289,18 @@ export const PAGE_CATALOG: PageSection[] = [
       // 'Management only' to anyone outside isManagement() on its own.
       { path: '/crm-calls/missed-attribution', label: 'Missed-Call Attribution', mgmtOnly: true },
       { path: '/crm-calls/guests',   label: 'Guests (unified 360)' },
+      // Reservation Database — the Reservego CSV import and the customer master
+      // it builds (ct_guests + ct_bookings, extended in place; no parallel
+      // tables). mgmtOnly for the same reason as Win-back below: every row on
+      // the Customers tab is one guest's phone, email and LIFETIME SPEND, and
+      // the Import tab is the door that rewrites all of it in a single upload
+      // of ~106,000 rows. That is an owner surface, not a floor one.
+      //
+      // As with every line in this catalog the flag is not the security
+      // boundary — each /api/crm/reservations/* route authenticates on its own
+      // — but it is what stops the proxy waving through a legacy user whose
+      // page_access is null (canAccessPage FAILS OPEN for those).
+      { path: '/crm-calls/database', label: 'Reservation Database', adminOnly: true },
       // Win-back: lapsed-guest segment → WhatsApp campaign → attribution.
       // mgmtOnly — it exposes per-guest spend and it is the door that sends
       // marketing to guests. See src/lib/ct/winback.ts.

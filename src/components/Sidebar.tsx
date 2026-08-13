@@ -301,6 +301,10 @@ const navTree: NavEntry[] = [
       // the page correctly and leaves it invisible.
       { kind: "link", label: "Missed Attribution", href: "/crm-calls/missed-attribution", icon: PhoneOff },
       { kind: "link", label: "Guests",          href: "/crm-calls/guests",   icon: Users },
+      // Management-only (page-catalog mgmtOnly) — canAccessPage hides it for
+      // everyone else. This row must exist: the catalog entry alone gates the
+      // page correctly and leaves it unreachable by anything but a typed URL.
+      { kind: "link", label: "Reservation DB",  href: "/crm-calls/database", icon: Database },
       { kind: "link", label: "Win-back",        href: "/crm-calls/win-back", icon: HeartHandshake },
       { kind: "link", label: "Call Log",        href: "/crm-calls/log",      icon: PhoneCall },
       { kind: "link", label: "Topic Alerts",    href: "/crm-calls/topics",   icon: Radar },

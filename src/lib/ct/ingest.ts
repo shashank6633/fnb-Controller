@@ -404,19 +404,25 @@ function guestSnapshot(db: Database.Database, phone: string): CtEvent['guest'] {
   const totalCalls = (db
     .prepare(`SELECT COUNT(*) AS n FROM ct_calls WHERE guest_id = ? OR phone_e164 = ?`)
     .get(g.id, phone) as { n: number }).n;
+  // All four are single index seeks on guest_id (COUNT is covered by
+  // idx_ct_bookings_guest — 0.01ms against the 82,128-row copy) and stay that
+  // way as the archive grows. is_duplicate = 0 because these counts decide the
+  // badge the GRE sees mid-call: metrics.ts computes REPEAT GUEST from deduped
+  // rows, and a screen-pop that counted Reservego's same-day re-emissions would
+  // promote a two-visit guest that the CRM page then calls a one-visit guest.
   const totalBookings = (db
-    .prepare(`SELECT COUNT(*) AS n FROM ct_bookings WHERE guest_id = ?`)
+    .prepare(`SELECT COUNT(*) AS n FROM ct_bookings WHERE guest_id = ? AND is_duplicate = 0`)
     .get(g.id) as { n: number }).n;
   const converted = (db
-    .prepare(`SELECT COUNT(*) AS n FROM ct_bookings WHERE guest_id = ? AND status IN ('seated','completed')`)
+    .prepare(`SELECT COUNT(*) AS n FROM ct_bookings WHERE guest_id = ? AND is_duplicate = 0 AND status IN ('seated','completed')`)
     .get(g.id) as { n: number }).n;
   const completed = (db
-    .prepare(`SELECT COUNT(*) AS n FROM ct_bookings WHERE guest_id = ? AND status = 'completed'`)
+    .prepare(`SELECT COUNT(*) AS n FROM ct_bookings WHERE guest_id = ? AND is_duplicate = 0 AND status = 'completed'`)
     .get(g.id) as { n: number }).n;
   const lastVisit = (db
     .prepare(`
       SELECT MAX(COALESCE(NULLIF(booking_date, ''), updated_at)) AS at
-      FROM ct_bookings WHERE guest_id = ? AND status IN ('seated','completed')
+      FROM ct_bookings WHERE guest_id = ? AND is_duplicate = 0 AND status IN ('seated','completed')
     `)
     .get(g.id) as { at: string | null }).at;
 
