@@ -151,6 +151,11 @@ interface ReturnHeaderRow {
   department_id: string | null;
   grn_id: string | null;
   outlet_id: string | null;
+  /** Email of whoever raised the ticket. Read by the separation-of-duties check
+   *  below — the raiser may not also be the one who accepts the goods. The row
+   *  is fetched with SELECT *, so the column was always present; only this
+   *  declaration was missing. */
+  drafted_by: string | null;
 }
 
 /** The request as it arrives — every field `unknown` until it is checked, so a
@@ -190,6 +195,39 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         { error: 'Only the store manager can verify a return — accepting goods at the counter is a physical handover.' },
         { status: 403 },
       );
+    }
+
+    // SEPARATION OF DUTIES: THE PERSON WHO RAISED IT CANNOT BE THE ONE WHO
+    // ACCEPTS IT. This is the single step that writes stock, and until now
+    // nothing anywhere compared the actor to any earlier actor — so one account
+    // holding admin + is_head_chef + is_store_manager could raise, approve and
+    // accept a cross-department stock movement alone, with no second pair of
+    // eyes at any point. Two live accounts hold exactly that combination.
+    //
+    // NO ADMIN BYPASS, deliberately, and this is the whole reason the control
+    // works: both of those accounts ARE admins, so an admin override would
+    // excuse precisely the two people it exists to check and leave the rule
+    // decorative. It also matches canIssueAsStore itself, which already refuses
+    // admins-without-the-flag on the same reasoning — accepting goods is a
+    // physical act, not a desk permission.
+    //
+    // The cost is real and accepted: if you raised it, someone else must accept
+    // it. Returns are not time-critical the way a bill is — the goods sit on the
+    // counter until the next store person is on — so the error names who can,
+    // rather than leaving a dead end.
+    if (String(r.drafted_by || '').trim().toLowerCase() === String(me.email || '').trim().toLowerCase()) {
+      const others = db.prepare(
+        `SELECT name FROM users
+          WHERE is_active = 1 AND is_store_manager = 1 AND lower(email) <> lower(?)
+          ORDER BY name`,
+      ).all(String(me.email || '')) as { name: string }[];
+      const who = others.length
+        ? others.map((u) => u.name).join(', ')
+        : 'nobody else currently holds the store role — ask an admin to assign it';
+      return Response.json({
+        error: `You raised this return, so you cannot also accept it. Accepting is the step that moves stock, and it needs a second person: ${who}.`,
+        needs_second_person: true,
+      }, { status: 403 });
     }
 
     // Friendly pre-check. NOT the guard: the authoritative one is the

@@ -260,8 +260,16 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       submit:       ret.status === 'draft' && (isAuthor || isAdmin),
       hod_approve:  ret.status === 'submitted' && canApproveAsChef(me),
       hod_reject:   ret.status === 'submitted' && canApproveAsChef(me),
-      // The ONLY gate behind which stock moves.
-      store_verify: ret.status === 'hod_approved' && canIssueAsStore(me),
+      // The ONLY gate behind which stock moves — and the one step whose actor
+      // must differ from the raiser. `&& !isAuthor` mirrors the refusal in
+      // store-verify/route.ts so the Accept button is simply absent for whoever
+      // raised the ticket, rather than present and then 403-ing at the counter
+      // with the goods already handed over. THIS is the copy that matters: the
+      // ticket page reads its permissions from here, not from the list route,
+      // so gating only the list would have left the real Accept button open.
+      // No admin bypass on either side, because the accounts that can raise,
+      // approve and accept alone are themselves admins.
+      store_verify: ret.status === 'hod_approved' && canIssueAsStore(me) && !isAuthor,
       cancel:       ['draft', 'submitted', 'hod_approved'].includes(ret.status) && (isAuthor || isAdmin),
     };
 

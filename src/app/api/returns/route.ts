@@ -184,7 +184,12 @@ export async function GET(request: Request) {
         // The only stage that moves stock, and deliberately no admin bypass:
         // accepting goods over the counter is a physical act (see the reasoning
         // recorded on canIssueAsStore in src/lib/auth.ts).
-        can_store_verify:  !!me && r.status === 'hod_approved' && canIssueAsStore(me),
+        // `&& !mine` is separation of duties, mirrored from the store-verify
+        // route so the Accept button never appears to the person who raised the
+        // ticket. Without it the control still holds — the server refuses — but
+        // it refuses at the click, after the storekeeper has the goods on the
+        // counter, which is the worst possible moment to discover a rule.
+        can_store_verify:  !!me && r.status === 'hod_approved' && canIssueAsStore(me) && !mine,
         can_cancel:        !!me && (r.status === 'draft' || r.status === 'submitted') && (mine || admin),
       };
     });
