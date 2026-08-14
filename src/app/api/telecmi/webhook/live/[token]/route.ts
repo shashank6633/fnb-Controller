@@ -28,6 +28,34 @@ export async function POST(
   const { token } = await params;
   const db = getDb();
   if (!token || token !== webhookToken(db)) {
+    // RECORD THE REFUSAL. This used to return 403 and write nothing, which made
+    // "TeleCMI is posting with a stale token" and "TeleCMI is not posting at
+    // all" look identical from inside the app — both are simply silence. That
+    // cost two days once: the notify webhook stopped on 12 Aug and the only
+    // evidence anywhere was an absence of rows.
+    //
+    // NEVER LOG THE TOKEN ITSELF. It is the only thing protecting this endpoint
+    // (TeleCMI sends no signature and no shared secret), and ct_webhook_log is
+    // readable from the admin database screen. A short prefix plus the length is
+    // enough to tell "they are sending an OLD token" from "they are sending
+    // something malformed", and useless to anyone who reads it.
+    try {
+      const seen = String(token || '');
+      const fingerprint = seen ? `${seen.slice(0, 6)}… (${seen.length} chars)` : '(empty)';
+      // Every text column here is NOT NULL with a '' default — passing NULL
+      // throws a constraint error that the catch below would swallow, making
+      // this whole record a silent no-op. Empty strings, not NULL.
+      db.prepare(
+        `INSERT INTO ct_webhook_log
+           (id, kind, telecmi_call_id, phone_e164, event, received_at, payload, processed, error)
+         VALUES (?, 'live', '', '', 'rejected', ?, '{}', 0, ?)`,
+      ).run(
+        generateId(),
+        new Date().toISOString(),
+        `Rejected: webhook token did not match. Sent ${fingerprint}. `
+        + `Re-copy the live URL from CRM Settings -> Webhook URLs into TeleCMI -> Settings -> Webhooks (type "notify").`,
+      );
+    } catch { /* a logging failure must never change the response TeleCMI sees */ }
     return Response.json({ error: 'Invalid webhook token' }, { status: 403 });
   }
 

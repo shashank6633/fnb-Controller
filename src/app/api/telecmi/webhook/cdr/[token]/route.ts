@@ -32,6 +32,28 @@ export async function POST(
   const { token } = await params;
   const db = getDb();
   if (!token || token !== webhookToken(db)) {
+    // Same refusal record the live route keeps, and for the same reason: a 403
+    // that writes nothing makes a stale token indistinguishable from silence.
+    // The token is NEVER logged — only a short prefix and its length, which
+    // separates "an old token" from "something malformed" and is useless to a
+    // reader of the admin database screen.
+    try {
+      const seen = String(token || '');
+      const fingerprint = seen ? `${seen.slice(0, 6)}… (${seen.length} chars)` : '(empty)';
+      // Every text column here is NOT NULL with a '' default — passing NULL
+      // throws a constraint error that the catch below would swallow, making
+      // this whole record a silent no-op. Empty strings, not NULL.
+      db.prepare(
+        `INSERT INTO ct_webhook_log
+           (id, kind, telecmi_call_id, phone_e164, event, received_at, payload, processed, error)
+         VALUES (?, 'cdr', '', '', 'rejected', ?, '{}', 0, ?)`,
+      ).run(
+        generateId(),
+        new Date().toISOString(),
+        `Rejected: webhook token did not match. Sent ${fingerprint}. `
+        + `Re-copy the CDR URL from CRM Settings -> Webhook URLs into TeleCMI -> Settings -> Webhooks.`,
+      );
+    } catch { /* logging must never change the response TeleCMI sees */ }
     return Response.json({ error: 'Invalid webhook token' }, { status: 403 });
   }
 
