@@ -2,6 +2,7 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, isManagement } from '@/lib/auth';
 import { normalizePhone } from '@/lib/ct/phone';
 import { listMetricsForGuests } from '@/lib/ct/metrics';
+import { csvConversion } from '@/lib/ct/conversion-display';
 import { norm10, buildLoyaltyMap, buildDiningMap, syntheticGuests } from '@/lib/ct/guest-unify';
 
 /**
@@ -14,6 +15,10 @@ import { norm10, buildLoyaltyMap, buildDiningMap, syntheticGuests } from '@/lib/
  *     converted     — 1/0 → guest has (not) ≥1 seated/completed booking (badge-derived)
  *     last_call_from / last_call_to — IST date range (YYYY-MM-DD) on last call
  *     sort          — name|last_call|total_calls|calls_30d|missed_calls|total_bookings|last_visit|conversion|created
+ *                     ('conversion' sorts on the VISIT conversion — visit_conversion_rate,
+ *                      converted_count ÷ total_bookings — not on the call→booking rate.
+ *                      Guests with no bookings carry null and sink to the bottom in BOTH
+ *                      directions, which is the point: they have no conversion to rank.)
  *     dir           — asc|desc (default: desc, except name → asc)
  *     page/pageSize — pagination (default 1 / 25, pageSize ≤ 200)
  *     format=csv    — stream the FULL filtered set as a CSV download (no pagination)
@@ -26,23 +31,30 @@ import { norm10, buildLoyaltyMap, buildDiningMap, syntheticGuests } from '@/lib/
 export const dynamic = 'force-dynamic';
 
 // Shape per CRM_DECISIONS.md — guestMetrics/listMetricsForGuests (fleet-built lib).
+// MIRROR of GuestMetrics in src/lib/ct/metrics.ts. metricsFor() casts, so tsc
+// will NOT catch a stale copy here — keep the two field-for-field identical.
 interface GuestMetrics {
   total_calls: number;
   calls_30d: number;
   missed_calls: number;
+  answered_inbound: number;
   last_call_at: string | null;
   total_bookings: number;
   completed_visits: number;
   no_shows: number;
+  converted_count: number;
   last_visit_at: string | null;
-  conversion_rate: number;
+  /** converted_count ÷ total_bookings. null = no bookings yet (render '—'). */
+  visit_conversion_rate: number | null;
+  /** bookings ÷ answered inbound. null = no answered call (hide the tile). */
+  call_booking_rate: number | null;
   badge: string;
 }
 
 const EMPTY_METRICS: GuestMetrics = {
-  total_calls: 0, calls_30d: 0, missed_calls: 0, last_call_at: null,
-  total_bookings: 0, completed_visits: 0, no_shows: 0, last_visit_at: null,
-  conversion_rate: 0, badge: 'NEW CALLER',
+  total_calls: 0, calls_30d: 0, missed_calls: 0, answered_inbound: 0, last_call_at: null,
+  total_bookings: 0, completed_visits: 0, no_shows: 0, converted_count: 0, last_visit_at: null,
+  visit_conversion_rate: null, call_booking_rate: null, badge: 'NEW CALLER',
 };
 
 function parseJson<T>(text: unknown, fallback: T): T {
@@ -239,7 +251,10 @@ export async function GET(request: Request) {
         case 'missed_calls': return g.metrics.missed_calls;
         case 'total_bookings': return g.metrics.total_bookings;
         case 'last_visit': return g.metrics.last_visit_at;
-        case 'conversion': return g.metrics.conversion_rate;
+        // The VISIT conversion (converted_count ÷ total_bookings), which is what
+        // the badge reads. null for a guest with no bookings — the comparator
+        // below sinks it in both directions rather than ranking a fabricated 0%.
+        case 'conversion': return g.metrics.visit_conversion_rate;
         case 'created': return g.created_at;
         // Unified loyalty / dining sorts
         case 'points': return g.loyalty ? g.loyalty.points : null;
@@ -268,9 +283,11 @@ export async function GET(request: Request) {
     if (sp.get('format') === 'csv') {
       const header = [
         'Name', 'Phone', 'Alt Phone', 'Email', 'Tags', 'Badge', 'Source',
-        'Total Calls', 'Calls 30d', 'Missed Calls', 'Last Call (IST)',
+        'Total Calls', 'Calls 30d', 'Missed Calls', 'Answered Inbound', 'Last Call (IST)',
         'Bookings', 'Completed Visits', 'No Shows', 'Last Visit (IST)',
-        'Conversion %',
+        // 'Call to Booking %' is deliberately ASCII (no arrow) — a CSV header is
+        // read by Excel, not by a designer.
+        'Conversion %', 'Call to Booking %',
         'Loyalty Points', 'Loyalty Tier', 'Loyalty Visits', 'Loyalty Spend',
         'Dining Orders', 'Dining Visits', 'Dining Spend', 'QR Orders', 'Last Seen (IST)',
         'DOB', 'Anniversary', 'Notes', 'Created (IST)',
@@ -284,9 +301,14 @@ export async function GET(request: Request) {
           g.name, g.phone_e164, g.alt_phone, g.email,
           Array.isArray(g.tags) ? g.tags.join('; ') : '',
           m.badge, g.source,
-          m.total_calls, m.calls_30d, m.missed_calls, istDisplay(m.last_call_at),
+          m.total_calls, m.calls_30d, m.missed_calls, m.answered_inbound, istDisplay(m.last_call_at),
           m.total_bookings, m.completed_visits, m.no_shows, istDisplay(m.last_visit_at),
-          Math.round((Number(m.conversion_rate) || 0) * 100) / 100,
+          // Whole percents, matching the '%' in the header. The old cell wrote the
+          // raw ratio (0.67) under a header that said '%' — a 100× lie in a file
+          // people paste straight into a deck. '' (never 0) when the rate is null,
+          // so Excel shows an empty cell instead of a confident zero.
+          csvConversion(m.visit_conversion_rate),
+          csvConversion(m.call_booking_rate),
           loy ? Math.round(loy.points) : '', loy ? loy.tier : '',
           loy ? loy.visit_count : '', loy ? Math.round(loy.total_spend) : '',
           din.orders || 0, din.visits || 0, din.total_spent || 0, din.qr_orders || 0,

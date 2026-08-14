@@ -33,6 +33,7 @@ import {
   CalendarDays,
 } from 'lucide-react';
 import CollapsibleToolbar from '@/components/ct/CollapsibleToolbar';
+import { fmtConversion, NO_CONVERSION, CONVERSION_HELP } from '@/lib/ct/conversion-display';
 
 const PAGE_SIZE = 25;
 
@@ -40,12 +41,17 @@ interface GuestMetrics {
   total_calls: number;
   calls_30d: number;
   missed_calls: number;
+  answered_inbound: number;
   last_call_at: string | null;
   total_bookings: number;
   completed_visits: number;
   no_shows: number;
+  converted_count: number;
   last_visit_at: string | null;
-  conversion_rate: number; // ratio (bookings ÷ answered inbound)
+  /** converted_count ÷ total_bookings. null = no bookings yet (render '—'). */
+  visit_conversion_rate: number | null;
+  /** bookings ÷ answered inbound. null = no answered call (hide the tile). */
+  call_booking_rate: number | null;
   badge: string;
 }
 
@@ -127,10 +133,6 @@ function istDate(iso: string | null): string {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return '';
   return d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
-}
-
-function convPct(rate: number): string {
-  return `${Math.round((Number(rate) || 0) * 100)}%`;
 }
 
 const TIER_CHIP: Record<string, string> = {
@@ -437,7 +439,7 @@ export default function CtGuestsPage() {
                       <SortTh label="Last Call" sortKey="last_call" sort={sort} dir={dir} onSort={onSort} className="text-left py-3 px-3" />
                       <SortTh label="Bookings" sortKey="total_bookings" sort={sort} dir={dir} onSort={onSort} className="text-right py-3 px-3" align="right" />
                       <SortTh label="Last Visit" sortKey="last_visit" sort={sort} dir={dir} onSort={onSort} className="text-left py-3 px-3" />
-                      <SortTh label="Conv %" sortKey="conversion" sort={sort} dir={dir} onSort={onSort} className="text-right py-3 px-3" align="right" />
+                      <SortTh label="Conversion" sortKey="conversion" sort={sort} dir={dir} onSort={onSort} className="text-right py-3 px-3" align="right" title={CONVERSION_HELP} />
                       <SortTh label="Loyalty" sortKey="points" sort={sort} dir={dir} onSort={onSort} className="text-right py-3 px-3" align="right" />
                       <SortTh label="Dining" sortKey="spend" sort={sort} dir={dir} onSort={onSort} className="text-right py-3 px-3" align="right" />
                     </tr>
@@ -481,7 +483,11 @@ export default function CtGuestsPage() {
                         <td className="py-2.5 px-3 text-[13px] text-[#3D2614] whitespace-nowrap">
                           {istDate(g.metrics.last_visit_at) || <span className="text-[#C4B09A]">—</span>}
                         </td>
-                        <td className="py-2.5 px-3 text-right font-medium text-[#2D1B0E]">{convPct(g.metrics.conversion_rate)}</td>
+                        <td className="py-2.5 px-3 text-right font-medium text-[#2D1B0E]">
+                          {g.metrics.visit_conversion_rate == null
+                            ? <span className="text-[#C4B09A]">{NO_CONVERSION}</span>
+                            : fmtConversion(g.metrics.visit_conversion_rate)}
+                        </td>
                         <td className="py-2.5 px-3 text-right whitespace-nowrap">
                           {g.loyalty ? (
                             <span className="inline-flex items-center justify-end gap-1.5">
@@ -530,8 +536,8 @@ export default function CtGuestsPage() {
                           <p className="text-sm font-bold text-[#2D1B0E]">{g.metrics.total_bookings}</p>
                         </div>
                         <div>
-                          <p className="text-[10px] text-[#6B5744] uppercase tracking-wide">Conv</p>
-                          <p className="text-sm font-bold text-[#2D1B0E]">{convPct(g.metrics.conversion_rate)}</p>
+                          <p className="text-[10px] text-[#6B5744] uppercase tracking-wide">Conversion</p>
+                          <p className="text-sm font-bold text-[#2D1B0E]">{fmtConversion(g.metrics.visit_conversion_rate)}</p>
                         </div>
                       </div>
                       <div className="flex items-center justify-between gap-2 mt-2 pt-2 border-t border-[#F0E4D6] text-[11px] text-[#6B5744]">
@@ -616,13 +622,13 @@ function GuestAvatar({ name, phone }: { name: string; phone: string }) {
   );
 }
 
-function SortTh({ label, sortKey, sort, dir, onSort, className, align }: {
+function SortTh({ label, sortKey, sort, dir, onSort, className, align, title }: {
   label: string; sortKey: string; sort: string; dir: 'asc' | 'desc';
-  onSort: (key: string) => void; className?: string; align?: 'right';
+  onSort: (key: string) => void; className?: string; align?: 'right'; title?: string;
 }) {
   const active = sort === sortKey;
   return (
-    <th className={`font-semibold ${className || ''}`} aria-sort={active ? (dir === 'asc' ? 'ascending' : 'descending') : undefined}>
+    <th className={`font-semibold ${className || ''}`} title={title} aria-sort={active ? (dir === 'asc' ? 'ascending' : 'descending') : undefined}>
       <button onClick={() => onSort(sortKey)}
               className={`inline-flex items-center gap-1 uppercase tracking-wide hover:text-[#af4408] transition-colors ${active ? 'text-[#af4408]' : ''} ${align === 'right' ? 'flex-row-reverse' : ''}`}>
         {label}

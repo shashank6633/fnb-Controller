@@ -39,23 +39,32 @@ import { recordingRetentionStatus } from '@/lib/ct/retention';
 export const dynamic = 'force-dynamic';
 
 // Shape per CRM_DECISIONS.md — guestMetrics (fleet-built lib).
+// MIRROR of GuestMetrics in src/lib/ct/metrics.ts — keep field-for-field identical.
 interface GuestMetrics {
   total_calls: number;
   calls_30d: number;
   missed_calls: number;
+  answered_inbound: number;
   last_call_at: string | null;
   total_bookings: number;
   completed_visits: number;
   no_shows: number;
+  converted_count: number;
   last_visit_at: string | null;
-  conversion_rate: number;
+  /** converted_count ÷ total_bookings. null = no bookings yet (render '—'). */
+  visit_conversion_rate: number | null;
+  /** bookings ÷ answered inbound. null = no answered call (hide the tile). */
+  call_booking_rate: number | null;
   badge: string;
 }
 
+// A synthetic (loyalty/dining-only) guest and a metrics failure both land here.
+// Both rates are null, NOT 0: neither guest has a denominator, and a confident
+// '0%' for someone with no bookings is the defect this change removed.
 const EMPTY_METRICS: GuestMetrics = {
-  total_calls: 0, calls_30d: 0, missed_calls: 0, last_call_at: null,
-  total_bookings: 0, completed_visits: 0, no_shows: 0, last_visit_at: null,
-  conversion_rate: 0, badge: 'NEW CALLER',
+  total_calls: 0, calls_30d: 0, missed_calls: 0, answered_inbound: 0, last_call_at: null,
+  total_bookings: 0, completed_visits: 0, no_shows: 0, converted_count: 0, last_visit_at: null,
+  visit_conversion_rate: null, call_booking_rate: null, badge: 'NEW CALLER',
 };
 
 function parseJson<T>(text: unknown, fallback: T): T {

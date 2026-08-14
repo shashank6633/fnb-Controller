@@ -9,7 +9,9 @@
  *     pending-recoveries chip (links to the Recovery Queue, 🔴 when any
  *     open recovery has breached its SLA — computed from the recoveries
  *     queue's sla_state).
- *   · Conversion funnel  Calls → Answered → Booking → Seated
+ *   · Call → Booking funnel  Calls → Answered → Booked from call → Seated
+ *     (call-centre view; the outlet's guest conversion — bookings that reached
+ *     the table — is the footnote under it, from stats.visit_conversion)
  *   · Recovery funnel    Missed → Attempted → Recovered → Booked
  *   · Call volume by IST day (stacked CSS bars, no chart lib) + hour heat strip
  *   · GRE leaderboard (calls handled, bookings, recoveries, avg callback)
@@ -89,7 +91,18 @@ interface DashboardStats {
   byDowHour?: DowHourCell[];       // 7×24 dense grid (older API builds omit it)
   weekdayOccurrences?: number[];   // index 0 = Sunday
   unattributed?: { calls: number; missed: number };
+  /** Call-centre funnel: inbound calls → call-linked bookings → seated. */
   funnel: FunnelStats;
+  /**
+   * Outlet conversion, bookings → visits — a RATIO OF TOTALS computed in SQL
+   * (SUM(seated|completed) ÷ COUNT(*) over every live booking MADE in the
+   * window), NOT the mean of per-guest ratios. The two are different numbers:
+   * on the 90-day production window it is 23/40 = 57.5% against a per-guest
+   * mean of 55.8%. Never recompute this client-side from anything but the two
+   * counts below. `pct` is 0–100 with 1 decimal, and null — never 0 — when the
+   * window holds no bookings, so the footnote renders an em dash.
+   */
+  visit_conversion: { bookings: number; visited: number; pct: number | null };
   recoveryFunnel: RecoveryFunnelStats;
   agents: AgentStat[];
   avg_time_to_first_callback_min: number;
@@ -423,18 +436,30 @@ export default function CrmDashboardPage() {
 
         {/* Funnels */}
         <div className="grid lg:grid-cols-2 gap-4">
-          <Card icon={<TrendingUp className="w-4 h-4" />} title="Conversion Funnel" subtitle={`Inbound · last ${days} days`}>
+          <Card icon={<TrendingUp className="w-4 h-4" />} title="Call → Booking Funnel" subtitle={`Inbound · last ${days} days`}>
             <FunnelChart
               stages={[
                 { label: 'Calls', value: funnel.calls },
                 { label: 'Answered', value: funnel.answered },
-                { label: 'Booking', value: funnel.booked },
+                { label: 'Booked from call', value: funnel.booked },
                 { label: 'Seated', value: funnel.seated },
               ]}
               barClasses={['bg-[#E8D5C4]', 'bg-[#d98e5f]', 'bg-[#c4682b]', 'bg-[#af4408]']}
             />
             <p className="mt-3 pt-3 border-t border-[#F0E4D6] text-xs text-[#8B7355]">
               Missed-call rate <span className="font-semibold text-[#2D1B0E]">{stats.missed_rate}%</span> of inbound calls
+            </p>
+            {/* The outlet's guest conversion. Deliberately a wider population
+                than the funnel above: every live booking in the window, not
+                just the ones a call produced. Rendered from the two server
+                counts — never averaged, never recomputed here. */}
+            <p className="mt-1 text-xs text-[#8B7355]">
+              Conversion (bookings → visits){' '}
+              <span className="font-semibold text-[#2D1B0E]">
+                {stats.visit_conversion.pct == null ? '—' : `${stats.visit_conversion.pct}%`}
+              </span>
+              {' '}— {stats.visit_conversion.visited} of {stats.visit_conversion.bookings} bookings made in
+              the last {days} days were seated or completed
             </p>
           </Card>
 

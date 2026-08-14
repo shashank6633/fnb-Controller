@@ -7,8 +7,36 @@
  * timezone of the venue — callers pass nothing timezone-related.
  *
  * Percentage fields (`answered_pct`, `missed_rate`, `recovery_rate`) are
- * 0–100 numbers rounded to 1 decimal. `conversion_rate` is a RATIO
- * (bookings ÷ answered inbound calls, 2 decimals, 0-safe, may exceed 1).
+ * 0–100 numbers rounded to 1 decimal.
+ *
+ * TWO guest rates live here, named apart on purpose so neither can pass for
+ * the other:
+ *
+ *   · `visit_conversion_rate` — THE guest conversion. converted_count ÷
+ *     total_bookings: bookings that reached the table (status seated OR
+ *     completed) over EVERY live booking, including cancelled, no-show and
+ *     still-upcoming ones. A RATIO in [0,1] to 2 decimals, never clamped.
+ *     It shares its numerator with computeBadge() below, so the badge and the
+ *     number next to it are one fact and cannot contradict each other. No call
+ *     is involved: a guest who booked and dined without ever ringing us is
+ *     converted.
+ *
+ *   · `call_booking_rate` — the CALL-CENTRE metric, unchanged arithmetic:
+ *     total_bookings ÷ answered inbound calls, a RATIO to 2 decimals capped at
+ *     1.0. This is the number that used to be exported under the bare name
+ *     "conversion rate", and the rename IS the bug fix: under that name it was
+ *     printed beside a visit-anchored badge, so guests who booked and visited
+ *     but never called read 0%, while guests who called, booked and then
+ *     no-showed read 100%.
+ *
+ * Both are `null`, never 0, when their denominator is 0. 0/0 is "no rate yet",
+ * and a confident 0% for a guest who never booked (or never called) is exactly
+ * the defect this replaced. Surfaces render null as an em dash via the one
+ * shared renderer, src/lib/ct/conversion-display.ts.
+ *
+ * The dashboard's outlet-level equivalent is `visit_conversion` on
+ * DashboardStats: the same rule aggregated as a RATIO OF TOTALS, not as the
+ * mean of per-guest ratios (see the block that computes it).
  */
 import type Database from 'better-sqlite3';
 import { normalizePhone } from './phone';
@@ -53,11 +81,42 @@ function istDateStr(msUtc: number): string {
 const round1 = (n: number) => Math.round(n * 10) / 10;
 /** 0–100 percentage, 1 decimal, 0-safe. */
 const pct = (num: number, den: number) => (den > 0 ? round1((num / den) * 100) : 0);
-/** Conversion ratio, 2 decimals, 0-safe, capped at 1.0 (100%). A guest can book
- *  more than once per answered call (repeat bookings, multi-channel), but a
- *  "conversion rate" over 100% reads as broken — the repeat signal lives in the
- *  bookings count and the REPEAT badge instead. */
-const ratio = (num: number, den: number) => (den > 0 ? Math.min(1, Math.round((num / den) * 100) / 100) : 0);
+/**
+ * THE guest conversion: bookings that reached the table ÷ live bookings.
+ * Same numerator as computeBadge(), so the badge and this number are one fact.
+ * null (not 0) when there are no bookings: 0/0 is "no conversion yet", and a
+ * confident 0% for someone who never booked is the defect this replaced.
+ * Not clamped — converted_count ≤ total_bookings by construction, so a clamp
+ * could only ever hide a data bug instead of exposing it.
+ *
+ * NOT the same thing as the stored ct_guests.arrival_rate, and deliberately not
+ * merged with it: that one is written by the Reservego rollup under a different
+ * rule (isArrived() in src/lib/reservego.ts also counts a bare seated_at on a
+ * row whose status is neither seated nor completed).
+ *
+ * DO NOT EXPECT THE TWO TO MATCH, AND DO NOT "RECONCILE" THEM. They are computed
+ * over DIFFERENT POPULATIONS: ct_guests.arrival_rate is written only by the
+ * Reservego import rollup, so it is 0 for every guest who has no Reservego
+ * bookings. Measured on the live data today that is EVERY guest — 27 of 27 carry
+ * arrival_rate 0.0 while their visit_conversion_rate is non-zero, because none of
+ * them came from a Reservego import. An earlier version of this comment claimed
+ * the two were "numerically identical on today's data", which was simply wrong and
+ * would lead the next reader to backfill one from the other and merge two
+ * unrelated populations into one confidently incorrect number.
+ */
+const visitRatio = (converted: number, bookings: number): number | null =>
+  (bookings > 0 ? Math.round((converted / bookings) * 100) / 100 : null);
+
+/**
+ * Call-centre metric: bookings ÷ answered inbound calls. null (not 0) when the
+ * guest has no answered inbound call — no call, no call-to-booking rate, and
+ * printing 0% for those guests was half of the bug this file just fixed.
+ * Still capped at 1.0: a guest can book twice off one answered call, and a
+ * >100% "rate" reads as broken; the repeat signal lives in total_bookings.
+ */
+const callBookingRatio = (bookings: number, answeredInbound: number): number | null =>
+  (answeredInbound > 0 ? Math.min(1, Math.round((bookings / answeredInbound) * 100) / 100) : null);
+
 const num = (v: unknown) => Number(v) || 0;
 
 // ─── Guest metrics ─────────────────────────────────────────────────────────
@@ -73,13 +132,23 @@ export interface GuestMetrics {
   total_calls: number;
   calls_30d: number;
   missed_calls: number;
+  /** Answered INBOUND calls — the denominator of call_booking_rate. */
+  answered_inbound: number;
   last_call_at: string | null;
   total_bookings: number;
   completed_visits: number;
   no_shows: number;
+  /** Bookings that reached the table: status seated OR completed. The badge
+   *  reads this same number — visit_conversion_rate cannot contradict it. */
+  converted_count: number;
   last_visit_at: string | null;
-  /** bookings ÷ answered inbound calls (ratio, 0-safe, 2 decimals). */
-  conversion_rate: number;
+  /** THE guest conversion: converted_count ÷ total_bookings (ratio, 2dp).
+   *  null when the guest has no bookings — 0/0 is not 0%. Never clamped. */
+  visit_conversion_rate: number | null;
+  /** Call-centre metric: total_bookings ÷ answered_inbound (ratio, 2dp, capped
+   *  at 1.0). null when the guest has no answered inbound call — they have no
+   *  call-to-booking rate at all, and printing 0% for them was the bug. */
+  call_booking_rate: number | null;
   badge: CtBadge;
 }
 
@@ -106,12 +175,17 @@ function emptyMetrics(): GuestMetrics {
     total_calls: 0,
     calls_30d: 0,
     missed_calls: 0,
+    answered_inbound: 0,
     last_call_at: null,
     total_bookings: 0,
     completed_visits: 0,
     no_shows: 0,
+    converted_count: 0,
     last_visit_at: null,
-    conversion_rate: 0,
+    // null, NOT 0 — a guest with no bookings and no answered call has no rate.
+    // Every zero here would print a confident "0%" on four surfaces.
+    visit_conversion_rate: null,
+    call_booking_rate: null,
     badge: 'NEW CALLER',
   };
 }
@@ -142,12 +216,15 @@ function buildMetrics(c: CallAgg | undefined, b: BookAgg | undefined, nowMs: num
     total_calls: ca.total_calls,
     calls_30d: ca.calls_30d,
     missed_calls: ca.missed_calls,
+    answered_inbound: ca.answered_inbound,
     last_call_at: ca.last_call_at,
     total_bookings: ba.total_bookings,
     completed_visits: ba.completed_visits,
     no_shows: ba.no_shows,
+    converted_count: ba.converted_count,
     last_visit_at: ba.last_visit_at,
-    conversion_rate: ratio(ba.total_bookings, ca.answered_inbound),
+    visit_conversion_rate: visitRatio(ba.converted_count, ba.total_bookings),
+    call_booking_rate: callBookingRatio(ba.total_bookings, ca.answered_inbound),
     badge: computeBadge(ca, ba, nowMs),
   };
 }
@@ -233,6 +310,11 @@ export function guestMetrics(db: DB, guestId: string): GuestMetrics {
  * Metrics keyed by phone — used by the screen-pop for unknown callers who
  * have call history but no ct_guests row yet. When a guest exists for the
  * normalized phone this delegates to guestMetrics().
+ *
+ * The no-guest path below passes no BookAgg, so total_bookings is 0 and
+ * visit_conversion_rate comes back null → the screen-pop shows the em dash.
+ * That is correct and intended: a caller with no ct_guests row has no bookings
+ * to convert. Do not substitute 0 here.
  */
 export function guestMetricsByPhone(db: DB, phone: string): GuestMetrics {
   const e164 = normalizePhone(phone);
@@ -353,8 +435,18 @@ export interface DashboardStats {
    * answer rates is a lie by omission.
    */
   unattributed: { calls: number; missed: number };
-  /** Inbound-only conversion funnel over the window. */
+  /** Inbound-only CALL → BOOKING funnel over the window (call-linked bookings
+   *  only). This is the call-centre view; the guest-facing conversion is
+   *  `visit_conversion` below. */
   funnel: { calls: number; answered: number; booked: number; seated: number };
+  /**
+   * Outlet conversion, bookings → visits: the same rule as the per-guest
+   * `visit_conversion_rate`, aggregated over every live booking MADE in the
+   * window. `pct` is 0–100 with 1 decimal, and `null` — never 0 — when the
+   * window holds no bookings, so the panel can render an em dash instead of a
+   * confident zero. Always publish the two counts beside the percentage.
+   */
+  visit_conversion: { bookings: number; visited: number; pct: number | null };
   recoveryFunnel: { missed: number; attempted: number; recovered: number; booked: number };
   agents: AgentStat[];
   avg_time_to_first_callback_min: number;
@@ -525,6 +617,37 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
     answered: num(f?.answered),
     booked: num(fb?.booked),
     seated: num(fb?.seated),
+  };
+
+  // ── Outlet conversion: bookings → visits (RATIO OF TOTALS) ────────────────
+  // Same population and same rule as the per-guest visit_conversion_rate
+  // (status seated|completed over every live booking), aggregated by summing
+  // the two integers — NOT by averaging per-guest ratios, which would weight a
+  // one-booking guest like a forty-booking guest and answer a different
+  // question ("the average guest's hit rate" instead of "of the bookings we
+  // took, how many turned up"). The two are not the same number: measured on
+  // the production copy, ratio of totals 23/40 = 57.5% against a mean of
+  // per-guest ratios of 55.8%. It is computed HERE, in SQL, as two integers,
+  // precisely so there is no array of per-guest ratios in this code path for a
+  // later edit to average by mistake — dashboardStats must never load
+  // per-guest metrics.
+  //
+  // Cohort anchor is BOOKED_AT (when the booking was MADE), matching
+  // funnel.booked above so both panels bound the same rows the same way.
+  // Unlike the funnel this counts ALL live bookings, not just call-linked ones
+  // — which is the whole point: a guest who booked and dined without ever
+  // ringing us belongs in the outlet's conversion.
+  const vc = db.prepare(`
+    SELECT COUNT(*)                                                            AS bookings,
+           SUM(CASE WHEN b.status IN ('seated','completed') THEN 1 ELSE 0 END) AS visited
+    FROM ct_bookings b
+    WHERE ${BOOKED_AT} >= ? AND ${BOOKED_AT} < ? AND ${LIVE_ONLY}
+  `).get(winStart, winEnd) as any;
+
+  const visitConversion = {
+    bookings: num(vc?.bookings),
+    visited: num(vc?.visited),
+    pct: num(vc?.bookings) > 0 ? pct(num(vc?.visited), num(vc?.bookings)) : null,
   };
 
   // ── Recovery funnel + headline KPIs ──────────────────────────────────────
@@ -777,6 +900,7 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
     weekdayOccurrences,
     unattributed,
     funnel,
+    visit_conversion: visitConversion,
     recoveryFunnel,
     agents,
     avg_time_to_first_callback_min: round1(num(cb?.m)),

@@ -52,10 +52,26 @@
  *
  * ── WHY A NEW FILE AND NOT src/lib/ct/metrics.ts ───────────────────────────
  * metrics.ts owns a DIFFERENT and unrelated GuestMetrics: the call-CRM's live
- * aggregates (calls, conversion_rate, badge) computed per request and never
- * stored. Adding the stored-lifetime writer there would put two exported types
- * of the same name and two meanings of "guest metrics" in one module. These are
- * the reservation lifetime metrics; they live next door.
+ * aggregates (calls, visit_conversion_rate, call_booking_rate, badge) computed
+ * per request and never stored. Adding the stored-lifetime writer there would
+ * put two exported types of the same name and two meanings of "guest metrics"
+ * in one module. These are the reservation lifetime metrics; they live next
+ * door.
+ *
+ * The two DO now compute a numerically similar figure, and they are still not
+ * the same number, so do not collapse them: arrival_rate here is arrived_visits
+ * ÷ total_bookings with `arrived` from isArrived(status, seated_at), which also
+ * counts a bare seated_at on a row that is neither seated nor completed;
+ * metrics.ts's visit_conversion_rate is converted_count ÷ total_bookings off
+ * status alone, because it must share its numerator with the CRM badge.
+ *
+ * THEY DO NOT AGREE, AND MUST NOT BE RECONCILED. arrival_rate is written ONLY by
+ * the Reservego import rollup, so it stays 0 for any guest with no Reservego
+ * bookings. Measured today: 27 of 27 guests carry arrival_rate 0.0 (none came from
+ * a Reservego import) while their visit_conversion_rate is non-zero. A previous
+ * version of this comment said they "agree on today's data" — false, and dangerous,
+ * because it invites backfilling one from the other and fusing two unrelated
+ * populations into a single wrong figure.
  *
  * ── SCHEMA ASSUMPTION ──────────────────────────────────────────────────────
  * The columns written here and the is_duplicate column filtered on are created

@@ -6,7 +6,12 @@
  * One scroll = the whole "call-to-table" story for a guest:
  *   Header   — name, phone + device-dialed callback, editable tag chips, status badge,
  *              inline edit mode (prefs / dob / anniversary / notes).
- *   Metrics  — calls / bookings / visits / no-shows / conversion %.
+ *   Metrics  — calls / bookings / visits / no-shows / Conversion, plus a
+ *              Call → Booking tile shown only to guests who have an answered
+ *              inbound call. Conversion is visit-anchored (seated|completed ÷
+ *              all live bookings) — the same fact the header badge reads, so
+ *              the two can never contradict each other; '—', never 0%, when
+ *              the guest has no bookings to convert.
  *   Timeline — unified reverse-chron: calls (with inline recording player),
  *              bookings (with quick status-advance), follow-ups (with Done).
  *
@@ -26,6 +31,7 @@ import {
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
 import { durationTrust } from '@/lib/ct/duration-trust';
+import { fmtConversion, NO_CONVERSION_SUB, CONVERSION_HELP } from '@/lib/ct/conversion-display';
 import QuickBookingModal from '@/components/ct/QuickBookingModal';
 import CallbackButton from '@/components/ct/CallbackButton';
 import RecordingPlayer from '@/components/ct/RecordingPlayer';
@@ -99,13 +105,37 @@ interface Metrics {
   total_calls: number;
   calls_30d: number;
   missed_calls: number;
+  answered_inbound: number;
   last_call_at: string | null;
   total_bookings: number;
   completed_visits: number;
   no_shows: number;
+  converted_count: number;
   last_visit_at: string | null;
-  conversion_rate: number;
+  /** converted_count ÷ total_bookings. null = no bookings yet (render '—'). */
+  visit_conversion_rate: number | null;
+  /** bookings ÷ answered inbound. null = no answered call (hide the tile). */
+  call_booking_rate: number | null;
   badge: string;
+}
+
+/** One tile in the metrics strip. `help` is the hover text and is set on the
+ *  Conversion tile only — the array is annotated (not inferred) because the
+ *  conditional Call → Booking tile is spread in, and a spread's element type
+ *  does not pick up a sibling literal's optional field.
+ *
+ *  `wrapSub` opts a tile out of the shared `truncate` on the sub-line. The two
+ *  rate tiles set it because their sub-line IS the denominator — "23 of 40
+ *  bookings visited" measures 132px against a 123px tile at lg:grid-cols-6, and
+ *  a rate whose denominator is clipped to "23 of 40 booking…" is the kind of
+ *  half-fact this whole change exists to remove. Tiles 1-4 keep truncate, so
+ *  their rendering is unchanged. */
+interface MetricTile {
+  label: string;
+  value: string | number;
+  sub: string;
+  help?: string;
+  wrapSub?: boolean;
 }
 
 interface TimelineEntry {
@@ -1078,18 +1108,46 @@ export default function GuestProfilePage() {
       </div>
 
       {/* ── Metrics strip ── */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3 sm:gap-4 mb-6">
-        {[
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 sm:gap-4 mb-6">
+        {([
           { label: 'Calls', value: metrics?.total_calls ?? 0, sub: metrics?.last_call_at ? `${metrics?.missed_calls ?? 0} missed · last call ${fmtIst(metrics.last_call_at).split(',')[0]}` : `${metrics?.missed_calls ?? 0} missed` },
           { label: 'Bookings', value: metrics?.total_bookings ?? 0, sub: '' },
-          { label: 'Visits', value: metrics?.completed_visits ?? 0, sub: metrics?.last_visit_at ? `last ${fmtIst(metrics.last_visit_at)}` : '' },
+          // ONE MEANING OF "VISIT" ON THIS PAGE. This tile counted completed_visits
+          // (status 'completed' only) while the Conversion tile beside it says
+          // "N of M bookings visited" from converted_count (seated OR completed) —
+          // the same expression computeBadge uses. A guest whose booking is still
+          // 'seated' therefore read "Visits 0" next to "Conversion 100% — 1 of 1
+          // bookings visited". Eight of the twenty booked guests showed that pair.
+          // Both now count seated+completed: they turned up, which is what a reader
+          // means by a visit, and it is the basis the badge and the rate already use.
+          { label: 'Visits', value: metrics?.converted_count ?? 0, sub: metrics?.last_visit_at ? `last ${fmtIst(metrics.last_visit_at)}` : '' },
           { label: 'No-shows', value: metrics?.no_shows ?? 0, sub: '' },
-          { label: 'Conversion', value: `${Math.round((metrics?.conversion_rate ?? 0) * 100)}%`, sub: 'answered → booked' },
-        ].map((m) => (
-          <div key={m.label} className="bg-white border border-[#E8D5C4] rounded-xl p-3 sm:p-4">
+          {
+            label: 'Conversion',
+            value: fmtConversion(metrics?.visit_conversion_rate),
+            sub: (metrics?.total_bookings ?? 0) > 0
+              ? `${metrics?.converted_count ?? 0} of ${metrics?.total_bookings ?? 0} bookings visited`
+              : NO_CONVERSION_SUB,
+            help: CONVERSION_HELP,
+            wrapSub: true,
+          },
+          ...((metrics?.answered_inbound ?? 0) > 0
+            ? [{
+                label: 'Call → Booking',
+                value: fmtConversion(metrics?.call_booking_rate),
+                sub: `${metrics?.total_bookings ?? 0} booking${(metrics?.total_bookings ?? 0) === 1 ? '' : 's'} from ${metrics?.answered_inbound} answered call${(metrics?.answered_inbound ?? 0) === 1 ? '' : 's'}`,
+                wrapSub: true,
+              }]
+            : []),
+        ] as MetricTile[]).map((m) => (
+          <div key={m.label} title={m.help} className="bg-white border border-[#E8D5C4] rounded-xl p-3 sm:p-4">
             <p className="text-xs text-[#8B7355] uppercase tracking-wide">{m.label}</p>
             <p className="text-xl font-bold text-[#2D1B0E] mt-1">{m.value}</p>
-            {m.sub && <p className="text-[11px] text-[#8B7355] mt-0.5 truncate">{m.sub}</p>}
+            {m.sub && (
+              <p className={`text-[11px] text-[#8B7355] mt-0.5 ${m.wrapSub ? 'leading-snug' : 'truncate'}`}>
+                {m.sub}
+              </p>
+            )}
           </div>
         ))}
       </div>
