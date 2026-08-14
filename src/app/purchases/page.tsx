@@ -210,6 +210,24 @@ const emptyBill: BillFormData = {
   items: [emptyBillLine(), emptyBillLine()],
 };
 
+/**
+ * Pull the PO number out of a purchase's notes.
+ *
+ * THERE IS NO FOREIGN KEY. `purchases` carries no po_id — when a PO is received
+ * the receive route records the link as a SENTENCE in notes:
+ *   "Received against PO-2026-0001 (GRN GRN-2026-0001)"
+ * so reading it back means matching that text. That is fragile by nature: change
+ * the wording in the receive route and this quietly finds nothing. It therefore
+ * fails CLOSED — no match renders no link, never a broken one. The durable fix
+ * is a real po_id column plus a backfill, which is a schema change and its own
+ * decision.
+ */
+const PO_IN_NOTES = /\bPO-[^\s)(,;]+/;
+function poNumberFromNotes(notes: string | null | undefined): string | null {
+  const m = String(notes || '').match(PO_IN_NOTES);
+  return m ? m[0] : null;
+}
+
 export default function PurchasesPage() {
   const [purchases, setPurchases] = useState<Purchase[]>([]);
   const [materials, setMaterials] = useState<RawMaterial[]>([]);
@@ -277,7 +295,13 @@ export default function PurchasesPage() {
   const [searchTerm, setSearchTerm] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
-  const [appliedFilters, setAppliedFilters] = useState({ search: '', from: '', to: '' });
+  /** Vendor picked in the Vendor filter. '' = every vendor. Exact match on the
+   *  name, unlike the free-text box which matches material/vendor/brand loosely
+   *  — a buyer reconciling one supplier's bills needs "this vendor and nothing
+   *  else", which a substring search cannot promise (searching "SRI" also
+   *  returns SRI SAI and SRINIVAS). */
+  const [vendorFilter, setVendorFilter] = useState('');
+  const [appliedFilters, setAppliedFilters] = useState({ search: '', from: '', to: '', vendor: '' });
 
   // Sort
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
@@ -569,7 +593,7 @@ export default function PurchasesPage() {
   };
 
   const applyFilters = () => {
-    const filters = { search: searchTerm, from: dateFrom, to: dateTo };
+    const filters = { search: searchTerm, from: dateFrom, to: dateTo, vendor: vendorFilter };
     setAppliedFilters(filters);
     setPage(1);
     fetchPurchases(filters);
@@ -577,6 +601,15 @@ export default function PurchasesPage() {
 
   // Filter purchases by search term client-side (API doesn't support text search)
   const filteredPurchases = purchases.filter((p) => {
+    // Vendor first, and it is an EXACT name match, not a substring: the point of
+    // this filter is "this supplier's bills and no one else's". Compared
+    // case- and space-insensitively because the same vendor reaches these rows
+    // from three places — the bill modal's picker, the CSV importer and the
+    // Recaho inward import — and they do not agree on trailing spaces or case.
+    if (appliedFilters.vendor) {
+      const want = appliedFilters.vendor.trim().toLowerCase();
+      if ((p.vendor || '').trim().toLowerCase() !== want) return false;
+    }
     if (!appliedFilters.search) return true;
     const term = appliedFilters.search.toLowerCase();
     return (
@@ -585,6 +618,15 @@ export default function PurchasesPage() {
       p.brand.toLowerCase().includes(term)
     );
   });
+
+  /* Options come from the vendors actually PRESENT in the loaded rows, not from
+   * the vendor master. The master would offer suppliers with nothing to show in
+   * this window, and would silently omit any vendor that has been deactivated
+   * since — or that arrived as free text through an import and was never in the
+   * master at all. Every option here is guaranteed to return rows. */
+  const vendorOptions = Array.from(
+    new Set(purchases.map((p) => (p.vendor || '').trim()).filter(Boolean)),
+  ).sort((x, y) => x.localeCompare(y));
 
   // Sort
   const sortedPurchases = [...filteredPurchases].sort((a, b) => {
@@ -1998,6 +2040,22 @@ export default function PurchasesPage() {
                 />
               </div>
             </div>
+            {/* Vendor — exact match, options drawn from the rows on screen so
+                every choice returns something. Sits before the dates because
+                "whose bills" is the question asked first when reconciling. */}
+            <div className="w-full sm:w-52">
+              <label className="block text-xs text-[#8B7355] mb-1">Vendor</label>
+              <select
+                value={vendorFilter}
+                onChange={(e) => setVendorFilter(e.target.value)}
+                className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] focus:border-transparent"
+              >
+                <option value="">All vendors</option>
+                {vendorOptions.map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+            </div>
             <div className="w-full sm:w-40">
               <label className="block text-xs text-[#8B7355] mb-1">From Date</label>
               <input
@@ -2027,7 +2085,7 @@ export default function PurchasesPage() {
               onClick={exportPurchases}
               disabled={sortedPurchases.length === 0}
               className="flex items-center gap-2 px-4 py-2 border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors whitespace-nowrap"
-              title="Download all purchases below as Excel (matches your current search / date filters)"
+              title="Download all purchases below as Excel (matches your current vendor / search / date filters)"
             >
               <Download className="w-4 h-4" />
               Export ({sortedPurchases.length})
@@ -2063,6 +2121,7 @@ export default function PurchasesPage() {
                   <th className="text-right py-3 px-4 font-medium">Unit Price</th>
                   <th className="text-right py-3 px-4 font-medium">Total</th>
                   <th className="text-right py-3 px-4 font-medium">Total Inward</th>
+                  <th className="text-left py-3 px-4 font-medium" title="The purchase order this bill was received against, when it came from one">PO No</th>
                   <th className="text-left py-3 px-4 font-medium">Notes</th>
                 </tr>
               </thead>
@@ -2160,6 +2219,24 @@ export default function PurchasesPage() {
                         return anyCharge
                           ? <span className="text-[#af4408] font-medium">{formatCurrency(val)}</span>
                           : <span className="text-[#8B7355]" title="No inward charges recorded — same as Total">{formatCurrency(val)}</span>;
+                      })()}
+                    </td>
+                    <td className="py-3 px-4">
+                      {(() => {
+                        const po = poNumberFromNotes(p.notes);
+                        if (!po) return <span className="text-[#8B7355]">-</span>;
+                        // Deep-links into the PO list's existing "PO number or
+                        // vendor" search, because there is no
+                        // /purchase-orders/[id] detail page to open.
+                        return (
+                          <a
+                            href={`/purchase-orders?q=${encodeURIComponent(po)}`}
+                            title={`Open ${po} on Purchase Orders`}
+                            className="text-[#af4408] hover:underline font-mono text-xs whitespace-nowrap"
+                          >
+                            {po}
+                          </a>
+                        );
                       })()}
                     </td>
                     <td className="py-3 px-4 text-[#8B7355] max-w-[200px] truncate">

@@ -284,8 +284,19 @@ export default function PurchaseOrdersPage() {
   // (It also stops a manager's first paint claiming "signed in as ADMIN".)
   const [role, setRole] = useState<'admin' | 'manager'>('manager');
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'all' | 'draft' | 'pending' | 'approved' | 'received' | 'rejected'>('pending');
-  const [search, setSearch] = useState('');
+  /* Landing from a PO link on Purchases (/purchase-orders?q=PO-2026-0001) seeds
+   * the search box AND widens the tab to 'all'. Both matter: the default tab is
+   * 'pending', so a received PO — which is exactly the kind a purchase row links
+   * to — would be filtered out and the link would look broken while working
+   * perfectly. Read once at mount from window.location, deliberately not
+   * useSearchParams, so this needs no Suspense boundary around the page. */
+  const initialQ = typeof window !== 'undefined'
+    ? (new URLSearchParams(window.location.search).get('q') || '')
+    : '';
+  const [tab, setTab] = useState<'all' | 'draft' | 'pending' | 'approved' | 'received' | 'rejected'>(
+    initialQ ? 'all' : 'pending',
+  );
+  const [search, setSearch] = useState(initialQ);
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [savingId, setSavingId] = useState<string | null>(null);
