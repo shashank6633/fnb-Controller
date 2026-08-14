@@ -70,11 +70,33 @@ import {
 const PAGE_SIZE = 25;
 
 /**
- * 2,000 rows per POST ≈ 600KB of JSON — comfortably inside any proxy body
- * limit, and ~53 requests for the 106k-row production file, which is a
- * progress bar that actually moves rather than one that jumps 0 → 100.
+ * 500 rows per POST.
+ *
+ * THE 2,000 THAT WAS HERE MADE EVERY UPLOAD FAIL WITH HTTP 413, and the comment
+ * that justified it was simply wrong: it claimed "≈ 600KB … comfortably inside
+ * any proxy body limit". Measured on the owner's real export, a Reservego row is
+ * ~901 bytes of JSON (38 columns, every value a string), so 2,000 rows is
+ * ~1.76 MB.
+ *
+ * And the ceiling is 1 MB, not 25. Probed against production directly: a 900 KB
+ * body reaches the app (401), 1,100 KB is refused by the proxy (413). The
+ * repo's deploy/nginx.conf does say client_max_body_size 25M — the live box is
+ * not running it, which is consistent with those AWS deploy scripts being stale.
+ * So the app must fit the limit that EXISTS, not the one that is checked in.
+ *
+ * 500 x 901 B ≈ 440 KB, less than half the ceiling, which leaves room for rows
+ * fatter than the sample (long guest comments, many tags) without going over.
+ * A 40 MB file is ~44,000 rows ≈ 88 requests; the 110k-row file ~220. That costs
+ * nothing that matters: the database side was measured at 1.1 s for 106,000
+ * rows, so this upload is entirely wire-bound either way, and more, smaller
+ * requests also make the progress bar honest.
  */
-const BATCH_ROWS = 2000;
+const BATCH_ROWS = 500;
+
+/** How many times a 413 may halve a batch before we admit defeat. 500 -> 250 ->
+ *  125 -> 62 -> 31 -> 15; if 15 rows still will not fit, the limit is not a
+ *  body-size problem and retrying smaller is just a slower failure. */
+const MAX_SPLIT_DEPTH = 5;
 
 /** 2MB read slices. Papa's own default is 10MB; smaller slices make the
  *  progress bar update several times per second instead of once per 10MB. */
@@ -987,7 +1009,11 @@ export default function ReservationDatabasePage() {
    * A 4xx is NOT retried — a payload the server rejected on its merits will be
    * rejected identically the second time.
    */
-  const postBatch = async (importId: string, rows: ReservegoRow[]): Promise<Counters> => {
+  const postBatch = async (
+    importId: string,
+    rows: ReservegoRow[],
+    splitDepth = 0,
+  ): Promise<Counters> => {
     let last = '';
     for (let attempt = 1; attempt <= 3; attempt++) {
       if (cancelRef.current) throw new Error('cancelled');
@@ -998,6 +1024,29 @@ export default function ReservationDatabasePage() {
         });
         if (res.ok) return (await res.json()) as Counters;
         last = await errorText(res);
+
+        // 413 IS THE ONE 4xx THAT IS NOT ABOUT THE PAYLOAD'S MERITS. The rows
+        // are fine; there are merely too many bytes of them for whatever sits
+        // in front of the app. So halve and retry instead of giving up — the
+        // blanket `4xx -> break` below treated it as unfixable, which is why a
+        // single oversized batch killed an entire upload rather than costing
+        // one extra round trip.
+        //
+        // This also means the client stops depending on knowing the proxy's
+        // limit. BATCH_ROWS is sized for the 1 MB measured today; if that ever
+        // tightens, or a row turns out to be far fatter than the sample, the
+        // upload adapts by itself rather than failing at 3am.
+        //
+        // Splitting cannot double-write: the importer keys every row on
+        // reservego_key behind a unique index, so the two halves are the same
+        // upsert the whole batch would have been. The server's counters are
+        // cumulative per import, so the SECOND half's response is the running
+        // total and is what the caller wants.
+        if (res.status === 413 && rows.length > 1 && splitDepth < MAX_SPLIT_DEPTH) {
+          const mid = Math.ceil(rows.length / 2);
+          await postBatch(importId, rows.slice(0, mid), splitDepth + 1);
+          return await postBatch(importId, rows.slice(mid), splitDepth + 1);
+        }
         if (res.status >= 400 && res.status < 500) break;
       } catch (e: any) {
         last = e?.message || 'network error';
