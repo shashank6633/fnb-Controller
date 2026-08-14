@@ -1222,16 +1222,26 @@ export default function ClosingSheetPage() {
                           <th className="text-left font-semibold px-2 py-1.5">Item</th>
                           <th className="text-left font-semibold px-2 py-1.5">Department</th>
                           <th className="text-right font-semibold px-2 py-1.5">Entered</th>
-                          {/* PURCHASE, not recipe — stale caption from before the
-                              purchase-unit rollout. The cell below prints
-                              s.stored_purchase_qty with s.stored_unit, which the route
-                              builds by converting the stored recipe figure BACK through
-                              toPurchaseQty and sending the material's purchase_unit
-                              (api/closing-stock/dept-sheet/import/route.ts:846-851, owner
-                              rule at :44-48: entered and stored are BOTH purchase units).
+                          {/* Header says just "Stored" — no unit-basis claim — on
+                              purpose. "(purchase units)" was tried here and was right
+                              for ordinary raw-material rows but WRONG for the ~69
+                              sub-recipe / semi-finished rows this same sheet carries,
+                              which are not stored on a purchase-unit basis. Owner
+                              decision: drop the parenthetical rather than caption a
+                              mixed column with one basis. Do NOT re-add "(purchase
+                              units)" here — the cell already carries its own per-row
+                              unit via s.stored_unit, so nothing is lost by leaving the
+                              header generic.
+                              The cell prints s.stored_purchase_qty with s.stored_unit,
+                              which the route builds by converting the stored recipe
+                              figure BACK through toPurchaseQty and sending the
+                              material's purchase_unit
+                              (api/closing-stock/dept-sheet/import/route.ts:846-851,
+                              owner rule at :44-48: entered and stored are BOTH purchase
+                              units for rows where a purchase-unit basis applies).
                               DIJON MUSTARD SAUCE 370 GM (g/kg, pack 1000): a 4 kg cell
                               stores 4,000 g and this column reads "4 kg" — purchase. */}
-                          <th className="text-right font-semibold px-2 py-1.5">Stored (purchase units)</th>
+                          <th className="text-right font-semibold px-2 py-1.5">Stored</th>
                         </tr>
                       </thead>
                       <tbody>

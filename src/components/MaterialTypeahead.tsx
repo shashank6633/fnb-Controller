@@ -9,7 +9,15 @@
  *   materials  — full list (no pagination needed; we cap displayed results)
  *   value      — current material_id, or '' for unselected
  *   onPick     — called with the chosen id (or '' when cleared)
- *   excludeIds — material ids to grey out (e.g. already added on other rows)
+ *   excludeIds — material ids already used elsewhere (e.g. on other rows)
+ *   excludeMode — what excludeIds DOES. 'hide' (default) drops them from the
+ *                 list entirely, which is what every existing caller has always
+ *                 got. 'disable' keeps them visible but greyed and unpickable,
+ *                 tagged "Already added" — chosen for Enter Full Bill, where a
+ *                 vanishing row read as "the dropdown lost my item" rather than
+ *                 "you already added it". Opt-in so no other screen shifts.
+ *   onExcludedPick — called when the user tries to pick a greyed row, so the
+ *                 caller can say WHERE it was already added. 'disable' only.
  *   placeholder — input placeholder when no selection
  *   compact    — render at xs size (for embedded grids); else sm
  *
@@ -41,6 +49,8 @@ export default function MaterialTypeahead({
   value,
   onPick,
   excludeIds = [],
+  excludeMode = 'hide',
+  onExcludedPick,
   placeholder = 'Type material name, SKU or category…',
   compact = true,
   showStock = true,
@@ -50,6 +60,13 @@ export default function MaterialTypeahead({
   value: string;
   onPick: (id: string) => void;
   excludeIds?: string[];
+  /** DEFAULT 'hide' — the behaviour every existing caller was written against
+   *  (excluded rows are filtered out of the list). 'disable' is opt-in: the row
+   *  stays visible, greyed, tagged and unpickable. */
+  excludeMode?: 'hide' | 'disable';
+  /** 'disable' only: the user clicked a greyed row. Lets the caller name the
+   *  line it is already on, instead of the click just doing nothing. */
+  onExcludedPick?: (m: MaterialLite) => void;
   placeholder?: string;
   compact?: boolean;
   showStock?: boolean;
@@ -131,10 +148,20 @@ export default function MaterialTypeahead({
 
   const picked = useMemo(() => materials.find(m => m.id === value) || null, [materials, value]);
 
+  /** Ids that are present-but-unpickable. Empty unless excludeMode='disable',
+   *  so the 'hide' path below is byte-for-byte what it always was. */
+  const blockedIds = useMemo(
+    () => (excludeMode === 'disable' ? new Set(excludeIds) : new Set<string>()),
+    [excludeIds, excludeMode],
+  );
+  const isBlocked = (m: MaterialLite) => blockedIds.has(m.id);
+
   const results = useMemo(() => {
     const raw = query.trim().toLowerCase();
     const excluded = new Set(excludeIds);
-    let list = materials.filter(m => !excluded.has(m.id));
+    // 'disable' keeps excluded rows IN the list (greyed at render); 'hide'
+    // drops them, which is the long-standing default.
+    let list = excludeMode === 'disable' ? materials.slice() : materials.filter(m => !excluded.has(m.id));
     if (raw) {
       // Tokenized substring match — split query on whitespace, every token
       // must appear somewhere in the searchable haystack. So:
@@ -180,11 +207,15 @@ export default function MaterialTypeahead({
     // pathological catalogues from mounting tens of thousands of nodes at once;
     // beyond it, typing to filter is the intended path.
     return list.slice(0, 1000);
-  }, [materials, query, excludeIds]);
+  }, [materials, query, excludeIds, excludeMode]);
 
   useEffect(() => { setActive(0); }, [query]);
 
   const choose = (m: MaterialLite) => {
+    // A greyed row is not a selection. Tell the caller so it can say WHERE the
+    // material already sits, and leave the dropdown open so the user can pick
+    // something else without reopening it.
+    if (isBlocked(m)) { onExcludedPick?.(m); return; }
     onPick(m.id);
     setOpen(false);
     setQuery('');
@@ -196,8 +227,17 @@ export default function MaterialTypeahead({
       setOpen(true); e.preventDefault(); return;
     }
     if (!open) return;
-    if (e.key === 'ArrowDown') { e.preventDefault(); setActive(i => Math.min(i + 1, results.length - 1)); }
-    else if (e.key === 'ArrowUp')   { e.preventDefault(); setActive(i => Math.max(i - 1, 0)); }
+    // Arrows step OVER greyed rows, so the highlight never rests on something
+    // Enter cannot take. With excludeMode='hide' nothing is blocked and this
+    // walks exactly one row, as before.
+    const step = (dir: 1 | -1) => setActive(i => {
+      for (let n = i + dir; n >= 0 && n < results.length; n += dir) {
+        if (!isBlocked(results[n])) return n;
+      }
+      return i;
+    });
+    if (e.key === 'ArrowDown') { e.preventDefault(); step(1); }
+    else if (e.key === 'ArrowUp')   { e.preventDefault(); step(-1); }
     else if (e.key === 'Enter')     { if (results[active]) { e.preventDefault(); choose(results[active]); } }
     else if (e.key === 'Escape')    { setOpen(false); }
   };
@@ -253,19 +293,29 @@ export default function MaterialTypeahead({
               </li>
               {results.map((m, i) => {
                 const isActive = i === active;
+                const blocked = isBlocked(m);
                 const lowStock = !!(m.reorder_level && m.current_stock != null && m.current_stock < m.reorder_level);
                 return (
                   <li key={m.id}
                       onMouseDown={(e) => { e.preventDefault(); choose(m); }}
-                      onMouseEnter={() => setActive(i)}
-                      title={`${m.sku ? m.sku + ' — ' : ''}${m.name}`}
-                      className={`px-2 ${itemSize} cursor-pointer flex items-start justify-between gap-2 ${
-                        isActive ? 'bg-[#FFF1E3]' : 'hover:bg-[#FFF8F0]'}`}>
+                      onMouseEnter={() => { if (!blocked) setActive(i); }}
+                      title={blocked
+                        ? `${m.name} is already on this bill — one material, one line`
+                        : `${m.sku ? m.sku + ' — ' : ''}${m.name}`}
+                      className={`px-2 ${itemSize} flex items-start justify-between gap-2 ${
+                        blocked
+                          ? 'cursor-not-allowed bg-[#F5F2EE] opacity-60'
+                          : `cursor-pointer ${isActive ? 'bg-[#FFF1E3]' : 'hover:bg-[#FFF8F0]'}`}`}>
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
-                        {m.sku && <span className="text-[10px] font-mono text-[#8B7355]">{m.sku}</span>}
+                        {m.sku && <span className={`text-[10px] font-mono ${blocked ? 'text-[#A9A29B]' : 'text-[#8B7355]'}`}>{m.sku}</span>}
                         {/* break-words = the full name is always visible, wrapping if needed */}
-                        <span className="text-[#2D1B0E] break-words leading-snug">{m.name}</span>
+                        <span className={`break-words leading-snug ${blocked ? 'text-[#8A8178] line-through' : 'text-[#2D1B0E]'}`}>{m.name}</span>
+                        {blocked && (
+                          <span className="text-[9px] font-semibold uppercase tracking-wide text-amber-800 bg-amber-100 border border-amber-300 rounded px-1 py-px">
+                            Already added
+                          </span>
+                        )}
                       </div>
                       <div className="text-[9px] text-[#8B7355] flex gap-2 flex-wrap mt-0.5">
                         {m.category && <span>{m.category}</span>}

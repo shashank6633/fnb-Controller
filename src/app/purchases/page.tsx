@@ -619,9 +619,11 @@ export default function PurchasesPage() {
     billLineIdCounter = 1;
     setBillData({ ...emptyBill, date: todayString(), items: [emptyBillLine(), emptyBillLine()] });
     setBillError(null);
-    // Nothing to reset for duplicates any more: a repeat is refused outright,
-    // so there is no per-bill acknowledgement that could leak into the next
-    // bill. Only the mapping panel's transient note/expansion needs clearing.
+    // The "already added" note MUST be cleared here. billLineIdCounter resets to
+    // 1 on every open, so a note left behind by a bill that was closed without
+    // saving would reappear attached to a brand-new, unrelated line that merely
+    // happens to reuse the same id.
+    setDupPickNote(null);
     setBillMapNote(null);
     setVendorItemsOpen(false);
     setBillModalOpen(true);
@@ -637,10 +639,18 @@ export default function PurchasesPage() {
   };
 
   const removeBillLine = (id: number) => {
-    setBillData((prev) => ({
-      ...prev,
-      items: prev.items.filter((item) => item.id !== id),
-    }));
+    // Dropping a line frees its material, so any "already added on line N"
+    // note is now stale — and N itself may have shifted.
+    setDupPickNote(null);
+    setBillData((prev) => {
+      // A chosen material is LOCKED, so this trash is the ONLY way to correct a
+      // wrong pick. On the last remaining line there is nothing to fall back
+      // to, so reset it to a blank line rather than removing it — otherwise a
+      // one-line bill with the wrong material has no way out except closing the
+      // modal and re-typing the whole header.
+      if (prev.items.length <= 1) return { ...prev, items: [emptyBillLine()] };
+      return { ...prev, items: prev.items.filter((item) => item.id !== id) };
+    });
   };
 
   const updateBillLine = (id: number, field: keyof BillLineItem, value: string) => {
@@ -873,6 +883,8 @@ export default function PurchasesPage() {
    * a keystroke between render and click cannot merge the wrong pair.
    */
   const mergeBillLines = (materialId: string, key: string) => {
+    // Merging removes rows, which moves every line number below them.
+    setDupPickNote(null);
     setBillData((prev) => {
       const billRate = parseFloat(prev.gst_rate) || 0;
       const idxs = prev.items
@@ -940,6 +952,17 @@ export default function PurchasesPage() {
   const [vendorMapBusy, setVendorMapBusy] = useState(false);
   const [vendorItemsOpen, setVendorItemsOpen] = useState(false);
   const [billMapNote, setBillMapNote] = useState<string | null>(null);
+  /* "Already added" feedback for the material picker. One material = one line
+   * on a bill, so the picker greys a material that is already on another row;
+   * this names the row it is on, per line, so the message lands where the user
+   * is actually looking rather than at the top of the modal. */
+  /* Stores the MATERIAL, never a rendered sentence. An earlier version baked the
+   * line number into the text at click time, which then went stale the moment a
+   * line above it was deleted or merged away — the note kept naming line 1 after
+   * line 1 was gone. The position is now recomputed at render from the live
+   * items array, so it cannot drift, and the note self-dismisses if the material
+   * stops being a duplicate. */
+  const [dupPickNote, setDupPickNote] = useState<{ lineId: number; materialId: string; name: string } | null>(null);
 
   useEffect(() => {
     if (!billModalOpen || !billVendorId) { setVendorMap(null); return; }
@@ -995,6 +1018,11 @@ export default function PurchasesPage() {
    *  an item the bill already carries — this panel must not create the very
    *  duplicate the block above exists to catch. */
   const placeMaterialOnLine = (materialId: string, name: string) => {
+    // The vendor quick-pick chips fill a line without going through the picker,
+    // so they bypass onPick's clear. Without this, a row still showing "already
+    // added" could be filled with a different, perfectly valid material and keep
+    // the stale duplicate warning underneath it.
+    setDupPickNote(null);
     // Read the decision off current state and act OUTSIDE the updater — a
     // setState call inside another setState's updater is not safe (React may
     // re-run the updater).
@@ -1388,6 +1416,7 @@ export default function PurchasesPage() {
 
       setBillModalOpen(false);
       setBillData({ ...emptyBill });
+      setDupPickNote(null);
       setBillNotices(notices);
       await fetchPurchases(appliedFilters);
       // One line in = one purchases row out. The server no longer folds a line
@@ -2901,13 +2930,63 @@ export default function PurchasesPage() {
                           <td className="py-2 px-2 block md:table-cell">
                             <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
                             {/* billPickerMaterials = the same full catalogue with
-                                this vendor's mapped items marked ★. Nothing is
-                                filtered out — every material stays pickable. */}
-                            <MaterialTypeahead
-                              materials={billPickerMaterials as any} purchaseBasis
-                              value={item.material_id}
-                              onPick={(id) => updateBillLine(item.id, 'material_id', id)}
-                            />
+                                this vendor's mapped items marked ★. A material
+                                already on ANOTHER line is greyed and unpickable
+                                (excludeMode='disable'), so one material = one line
+                                is enforced at the moment of choosing — not only at
+                                Save, where the refusal used to arrive after the
+                                whole bill had been typed. Greyed rather than
+                                hidden: a row that vanishes reads as "the dropdown
+                                lost my item". This row's OWN material is never
+                                excluded, so re-picking on this line still works. */}
+                            {item.material_id ? (() => {
+                              // LOCKED once chosen — read-only text, no dropdown, no clear ×.
+                              // To swap it, delete the line (trash) and add a new one, so a
+                              // line's material can never quietly become a different material
+                              // after its qty, rate, GST and cess were typed against the first
+                              // one. Identical rule and styling to the requisition composer's
+                              // locked chip, so the two screens behave the same way.
+                              const mat = materials.find((m) => String(m.id) === String(item.material_id)) as any;
+                              // Same basis as the picker's own displayUnit(): purchase_unit
+                              // first, recipe unit only as a fallback. Printing mat.unit here
+                              // would make the locked chip read "(g)" where the freshly-picked
+                              // chip read "(kg)".
+                              const pu = String(mat?.purchase_unit || mat?.unit || '');
+                              return (
+                                <div title="To change the material, delete this line and add a new one"
+                                     className="w-full text-left px-2 py-1 text-xs border border-[#E8D5C4] rounded bg-[#F5EDE3] text-[#2D1B0E] break-words leading-snug cursor-not-allowed">
+                                  {mat?.sku && <span className="text-[#8B7355] font-mono">{mat.sku} — </span>}
+                                  <span>{mat?.name || '(material removed)'}</span>
+                                  {pu && <span className="text-[#8B7355]"> ({pu})</span>}
+                                </div>
+                              );
+                            })() : (
+                              <MaterialTypeahead
+                                materials={billPickerMaterials as any} purchaseBasis
+                                value={item.material_id}
+                                onPick={(id) => { setDupPickNote(null); updateBillLine(item.id, 'material_id', id); }}
+                                excludeMode="disable"
+                                excludeIds={billData.items
+                                  .filter((x) => x.id !== item.id && x.material_id)
+                                  .map((x) => x.material_id)}
+                                onExcludedPick={(m) => setDupPickNote({ lineId: item.id, materialId: m.id, name: m.name })}
+                              />
+                            )}
+                            {(() => {
+                              // Recomputed every render from the LIVE items array, so deleting
+                              // or merging a line above this one can never leave the note
+                              // naming a position that has moved or gone. If the material has
+                              // left the bill entirely, the note stops rendering by itself.
+                              if (!dupPickNote || dupPickNote.lineId !== item.id) return null;
+                              const at = billData.items.findIndex((x) => x.material_id === dupPickNote.materialId);
+                              if (at < 0) return null;
+                              return (
+                                <div className="mt-1 text-[9px] leading-tight font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 py-1">
+                                  {dupPickNote.name} is already added on line {at + 1}. One material, one
+                                  line — change the quantity on line {at + 1} instead.
+                                </div>
+                              );
+                            })()}
                             {/* A bill is a fact: an unmapped pair is a NOTE with a
                                 one-click fix, never a block on saving. */}
                             {vendorMapIds && vendorMapIds.size > 0 && item.material_id
@@ -3107,9 +3186,16 @@ export default function PurchasesPage() {
                             {formatCurrency(item.final_unit_price)}
                           </td>
                           <td className="py-2 px-1 block md:table-cell">
-                            {billCalc.items.length > 1 && (
+                            {/* Always offered, including on the last line. The material is
+                                locked once chosen, so this is the ONLY way to correct a wrong
+                                pick — hiding it at one line left a one-line bill unfixable.
+                                On the last line it clears the row instead of removing it. */}
+                            {(
                               <button
                                 type="button"
+                                title={billCalc.items.length > 1
+                                  ? 'Remove this line'
+                                  : 'Clear this line (last line — the row stays, the material is cleared)'}
                                 onClick={() => removeBillLine(item.id)}
                                 className="p-1 text-red-400 hover:text-red-600 transition-colors"
                               >

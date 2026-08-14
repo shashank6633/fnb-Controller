@@ -334,7 +334,15 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
   }, []);
 
   const addLine = () => setLines(p => [...p, { material_id: '', qty: '', notes: '', unit: '' }]);
-  const removeLine = (i: number) => setLines(p => p.filter((_, idx) => idx !== i));
+  // A chosen material is now LOCKED (see the read-only chip in the row below),
+  // so this X is the ONLY way to correct a wrong pick. On the last remaining
+  // line there is nothing to fall back to — filtering it out would leave zero
+  // rows, the same dead end src/app/purchases/page.tsx removeBillLine was
+  // already fixed for (read it). Reset to one blank line instead of removing it.
+  const removeLine = (i: number) => setLines(p => {
+    if (p.length <= 1) return [{ material_id: '', qty: '', notes: '', unit: '' }];
+    return p.filter((_, idx) => idx !== i);
+  });
   const update = (i: number, patch: any) => setLines(p => p.map((it, idx) => idx === i ? { ...it, ...patch } : it));
 
   const totalCost = lines.reduce((acc, l) => {
@@ -495,21 +503,50 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
             return (
               <div key={i} className="grid grid-cols-12 gap-2 items-start">
                 <div className="col-span-6">
-                  <MaterialTypeahead
-                    materials={materials as any}
-                    value={l.material_id}
-                    onPick={(id: string) => { const mat = materials.find(x => x.id === id); update(i, { material_id: id, unit: entryUnit(mat as any) }); }}
-                    excludeIds={lines.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
-                    // purchaseBasis: the picked chip must name the unit this
-                    // form actually costs in. Without it the chip read
-                    // "GREYGOOSE (750ML) (ml)" beside a Qty box that is in
-                    // BOTTLES — the same recipe-vs-purchase mislabel as the Unit
-                    // caption below, in the one other place the eye lands first.
-                    // The materials list here already carries purchase_unit and
-                    // pack_size (packFactor above depends on them), which is
-                    // what this flag requires.
-                    purchaseBasis
-                  />
+                  {l.material_id ? (
+                    // LOCKED once chosen — read-only text, no dropdown, no clear
+                    // x. To swap it, delete the line (X button below) and add a
+                    // new one. Same rule and styling as the requisition
+                    // composer's locked chip (src/app/requisitions/page.tsx
+                    // ~1538-1552) and the "Enter Full Bill" locked chip
+                    // (src/app/purchases/page.tsx ~2927-2947), so a line's
+                    // material can never quietly change after its qty was typed
+                    // against it, and the lock behaves identically everywhere.
+                    //
+                    // Basis: dispUnit (computed above, same variable the Unit
+                    // caption box one column to the right renders) — NOT
+                    // purchase_unit. Every OTHER locked chip in the app matches
+                    // purchase_unit because those screens enter quantities in
+                    // purchase units; THIS screen enters in the material's
+                    // RECIPE unit by owner decision (2026-08-13, see
+                    // unitOptions() above), and dispUnit is that recipe unit.
+                    // Printing purchase_unit here would read "(BTL)" next to a
+                    // Qty box captioned "(ml)" — the exact mismatch this
+                    // basis choice exists to avoid. purchaseBasis on the
+                    // MaterialTypeahead below is unaffected by this: it only
+                    // drives the stock column in the search results, and that
+                    // component's own picked-state chip never renders here
+                    // because a chosen material switches this slot to this div.
+                    <div title="To change the material, delete this line and add a new one"
+                         className="w-full text-left px-2 py-1 text-xs border border-[#E8D5C4] rounded bg-[#F5EDE3] text-[#2D1B0E] break-words leading-snug cursor-not-allowed">
+                      {m?.sku && <span className="text-[#8B7355] font-mono">{m.sku} — </span>}
+                      <span>{m?.name || '(material removed)'}</span>
+                      {dispUnit && <span className="text-[#8B7355]"> ({dispUnit})</span>}
+                    </div>
+                  ) : (
+                    <MaterialTypeahead
+                      materials={materials as any}
+                      value={l.material_id}
+                      onPick={(id: string) => { const mat = materials.find(x => x.id === id); update(i, { material_id: id, unit: entryUnit(mat as any) }); }}
+                      excludeIds={lines.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
+                      // purchaseBasis here only feeds the stock column in the
+                      // search-results list while typing. Its picked-state chip
+                      // does not matter — the instant a material is picked,
+                      // material_id becomes truthy and this slot switches to
+                      // the locked div above (recipe-unit basis) instead.
+                      purchaseBasis
+                    />
+                  )}
                   {l.material_id && recordedMaterialIds.has(l.material_id) && (
                     <div className="text-[10px] text-amber-700 mt-0.5">⚠ Already recorded above — saving will add to it.</div>
                   )}
@@ -547,6 +584,7 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                     {fmt(cost)}
                   </span>
                   <button type="button" onClick={() => removeLine(i)}
+                          title={lines.length > 1 ? 'Remove this line' : 'Clear this line (last line — the row stays, the material is cleared)'}
                           className="text-red-600 hover:text-red-700"><X size={12} /></button>
                 </div>
                 {/*
