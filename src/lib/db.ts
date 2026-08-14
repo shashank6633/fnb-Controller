@@ -17,6 +17,35 @@ export function getDb(): Database.Database {
     db = new Database(DB_PATH);
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
+
+    /* ── Sized for the box this actually runs on: 1 GB RAM, 2 vCPU ────────────
+     *
+     * These three were never set, so the app ran on SQLite's defaults, and the
+     * defaults are wrong here in a way that only shows up once the database
+     * outgrows them.
+     *
+     * cache_size: the default is 2,000 PAGES — about 8 MB at a 4 KB page. The
+     * database was 32 MB before the Reservego import and lands near 120-150 MB
+     * with ~110k reservations and their indexes, so the working set stopped
+     * fitting and ordinary reads started going to the SSD. That matters far more
+     * here than in a typical app: better-sqlite3 is SYNCHRONOUS, so a query that
+     * waits on disk blocks the ONE Node thread, and billing, KOT and the captain
+     * app all queue behind it. That is what a venue experiences as a 504.
+     * Negative means KiB, so -32000 is a 32 MB cache — affordable next to Node's
+     * ~300-400 MB resident set on a 1 GB box, and enough to hold the hot pages.
+     *
+     * busy_timeout: the default is 0 ms. A reader or writer that finds the lock
+     * held FAILS INSTANTLY rather than waiting for it, which turns a 20 ms
+     * checkpoint into an error for whoever asked at the wrong moment. Five
+     * seconds is far longer than any legitimate contention here.
+     *
+     * temp_store = MEMORY: keeps ORDER BY / GROUP BY spill files off the disk.
+     * The reports sort large result sets, and this box has the RAM for it.
+     *
+     * If the box is ever resized, cache_size is the one to revisit. */
+    db.pragma('cache_size = -32000');
+    db.pragma('busy_timeout = 5000');
+    db.pragma('temp_store = MEMORY');
     initializeSchema(db);
     // After schema is built + seeded, push the units table into the in-memory
     // registry so convert() uses user-edited values immediately.

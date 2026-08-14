@@ -98,6 +98,23 @@ const BATCH_ROWS = 500;
  *  body-size problem and retrying smaller is just a slower failure. */
 const MAX_SPLIT_DEPTH = 5;
 
+/**
+ * Pause between batches, in milliseconds.
+ *
+ * WHY AN UPLOAD HAS TO BE POLITE HERE. The server is ONE Node thread and
+ * better-sqlite3 is SYNCHRONOUS, so while a batch is being written nothing else
+ * on the box is served — not billing, not a KOT, not a captain's order. Firing
+ * ~220 batches back to back for a 110k-row file therefore does not merely load
+ * the server, it holds the restaurant's till closed for the duration, and nginx
+ * starts answering 504 to whoever was waiting.
+ *
+ * 150 ms is long enough for the queued requests of a busy service to drain
+ * between writes, and costs the upload about 33 seconds across 220 batches —
+ * nothing against an import that is measured in minutes, and the difference
+ * between a slow upload and a frozen venue.
+ */
+const BATCH_PAUSE_MS = 150;
+
 /** 2MB read slices. Papa's own default is 10MB; smaller slices make the
  *  progress bar update several times per second instead of once per 10MB. */
 const CHUNK_BYTES = 2 * 1024 * 1024;
@@ -1085,6 +1102,10 @@ export default function ReservationDatabasePage() {
         const processed = Number(c?.rows_processed);
         sentRef.current = Number.isFinite(processed) ? processed : sentRef.current + batch.length;
         setRowsSent(sentRef.current);
+        // Let the server breathe before the next write — see BATCH_PAUSE_MS.
+        // Only BETWEEN batches, never after the last one, so a small file that
+        // fits in a single batch pays nothing at all.
+        if (buffer.length > 0) await sleep(BATCH_PAUSE_MS);
       }
     };
 
