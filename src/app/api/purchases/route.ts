@@ -209,6 +209,7 @@ export async function GET(request: Request) {
     let query = `
       SELECT p.*, rm.name as material_name,
              grn.grn_number AS grn_number,
+             grn.po_id      AS grn_po_id,
              rm.unit          AS material_unit,
              rm.purchase_unit AS material_purchase_unit,
              COALESCE(rm.pack_size, 1) AS material_pack_size,
@@ -249,6 +250,39 @@ export async function GET(request: Request) {
     query += ' ORDER BY p.date DESC, p.created_at DESC';
 
     const purchases = db.prepare(query).all(...params) as any[];
+
+    /* RESOLVE po_id FROM THE GRN, because the stored column is usually empty.
+     *
+     * NOTHING WRITES purchases.po_id. All seven INSERT INTO purchases statements
+     * in this codebase — PO receive, ad-hoc GRN, full bill, bulk, opening stock,
+     * inward import, seed — omit the column. It is populated only by the boot
+     * migration in db.ts, so a bill received since the last restart carries
+     * po_id = NULL, the snapshot lookup below is never attempted, and the
+     * "Stock when PO raised" cell falls to its em-dash branch. That is exactly
+     * what shipped: the column read blank in production on a row whose PO No and
+     * GRN No both rendered, because those two come from elsewhere — PO No is
+     * parsed out of the notes text, GRN No from the grn_id foreign key.
+     *
+     * purchases.grn_id -> goods_receipt_notes.po_id is the honest structural
+     * link and it is complete the instant a receipt is written: the receive route
+     * stamps po_id onto the GRN row in the same transaction. The join is ALREADY
+     * here for grn_number, so this costs one more column and no extra query.
+     *
+     * Resolved in JS, not as a second `AS po_id` after `p.*`: that would rely on
+     * better-sqlite3 letting a later duplicate column silently overwrite an
+     * earlier one, which is true today and is not a rule worth betting a stock
+     * figure on.
+     *
+     * The stored column still wins when it is set — the boot migration's own
+     * two-pass backfill (including the notes-text pass, which the GRN join
+     * cannot reproduce) stays authoritative for the direct-bill rows it links.
+     * This only fills in where nothing was stored.
+     */
+    for (const r of purchases) {
+      if (!String(r?.po_id ?? '').trim() && String(r?.grn_po_id ?? '').trim()) {
+        r.po_id = String(r.grn_po_id).trim();
+      }
+    }
 
     /* ATTACH THE STOCK-AT-RAISE SNAPSHOT.
      *
