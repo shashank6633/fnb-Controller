@@ -38,6 +38,14 @@ import { api } from '@/lib/api';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import Combobox from '@/components/Combobox';
 import { packFactor, fmtQtyNum } from '@/lib/pack-units';
+// THE ONLY renderer of an in-hand Store/Dept figure (CONTRACT §5). This page
+// converts nothing and formats nothing: it hands the snapshot to the shared
+// component, which owns toPurchaseQty() and every "not a number" wording. A
+// second hand-rolled copy here is exactly how this column and the two pickers
+// would come to disagree about the same material on the same afternoon.
+import StockOnHandNote from '@/components/StockOnHandNote';
+import type { StockOnHand, StockLeg } from '@/components/StockOnHandNote';
+import { useStockOnHand } from '@/lib/use-stock-on-hand';
 
 function formatCurrency(value: number): string {
   return '₹' + value.toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -213,19 +221,151 @@ const emptyBill: BillFormData = {
 /**
  * Pull the PO number out of a purchase's notes.
  *
- * THERE IS NO FOREIGN KEY. `purchases` carries no po_id — when a PO is received
- * the receive route records the link as a SENTENCE in notes:
+ * THIS IS A DISPLAY FALLBACK AND NOTHING ELSE. When a PO is received the receive
+ * route also records the link as a SENTENCE in notes:
  *   "Received against PO-2026-0001 (GRN GRN-2026-0001)"
- * so reading it back means matching that text. That is fragile by nature: change
- * the wording in the receive route and this quietly finds nothing. It therefore
- * fails CLOSED — no match renders no link, never a broken one. The durable fix
- * is a real po_id column plus a backfill, which is a schema change and its own
- * decision.
+ * and for rows written before `purchases.po_id` existed that sentence is the only
+ * trace left. Matching it is fragile by nature — reword the receive route and this
+ * quietly finds nothing — so it fails CLOSED: no match renders no link, never a
+ * broken one.
+ *
+ * IT MUST NEVER KEY AN AUDIT FIGURE (CONTRACT §0). The "Stock when PO raised"
+ * column joins on the stored `purchases.po_id` alone. A regex mismatch there would
+ * put a confidently wrong stock number beside a purchase, which is the exact defect
+ * that column exists to prevent.
  */
 const PO_IN_NOTES = /\bPO-[^\s)(,;]+/;
 function poNumberFromNotes(notes: string | null | undefined): string | null {
   const m = String(notes || '').match(PO_IN_NOTES);
   return m ? m[0] : null;
+}
+
+/* ══ RECORDED IN-HAND STOCK — reading the snapshot (CONTRACT §5.4 / §6) ═══════
+ *
+ * `/api/purchases` returns, per row:
+ *   po_id        the real link (NULL for 2,145 of 2,165 rows — direct bill,
+ *                opening stock, bulk import, ad-hoc GRN. NULL means "no PO".)
+ *   po_number    the PO's own number, joined through po_id. Exact, not parsed.
+ *   stock_at_po  the frozen `po_line_stock_snapshots` row for (po_id, material_id),
+ *                or absent when that PO was raised before snapshots existed.
+ *
+ * FOUR STATES, and none of them may look like a number:
+ *   no po_id                    → "—"            (no purchase order)
+ *   po_id, no stock_at_po       → "not recorded" (rendered by StockOnHandNote)
+ *   stock_at_po, dept redacted  → "Dept restricted"
+ *   a recorded zero             → "Store 0 kg"   — WITH its unit, normal weight
+ *
+ * There is NO `?? 0` below and there must never be one. `dept_counted_qty` arrives
+ * as JS null when no department ever anchored a count and stays null to the screen.
+ * Quantities stay in RECIPE units the whole way here; StockOnHandNote converts once
+ * through toPurchaseQty(), using the pack meta STORED IN THE SNAPSHOT — so a later
+ * pack correction cannot restate what a historical audit row says.
+ */
+
+/** Strict number read. '' / null / undefined / NaN are all "we do not have it". */
+const snapNum = (v: unknown): number | null => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * `stores_json` / `dept_json` → legs. Accepts either the stored JSON TEXT or an
+ * already-parsed array, because the column is TEXT in SQLite and a route may hand
+ * back either. Returns null if ANY leg is malformed: a breakdown that does not add
+ * up to its own total reads as a stock discrepancy that does not exist, and
+ * StockOnHandNote drops the breakdown and prints the total alone.
+ */
+function snapLegs(raw: unknown): StockLeg[] | null {
+  let arr: unknown = raw;
+  if (typeof raw === 'string') {
+    try { arr = JSON.parse(raw); } catch { return null; }
+  }
+  if (!Array.isArray(arr)) return null;
+  const out: StockLeg[] = [];
+  for (const r of arr) {
+    const q = snapNum((r as any)?.qty);
+    if (q === null) return null;
+    const id = (r as any)?.id;
+    out.push({
+      id: id === null || id === undefined ? null : String(id),
+      name: String((r as any)?.name ?? '').trim(),
+      qty: q,
+      inactive: (r as any)?.inactive === true,
+    });
+  }
+  return out;
+}
+
+interface SnapshotCell {
+  /** null = a snapshot IS recorded but its payload could not be read whole. */
+  data: StockOnHand | null;
+  takenAt: string | null;
+  /** Server stripped the department rail for this viewer (CONTRACT §4.3). */
+  restricted: boolean;
+}
+
+/**
+ * The purchase row → the cell's state, or null when NO snapshot is recorded.
+ *
+ * STRICT, deliberately. `central_qty` and `store_total_qty` are the two figures an
+ * auditor acts on; if either is missing or unparseable the whole entry is refused
+ * (data: null → "unavailable") rather than repaired with a zero. Repairing it would
+ * print a quantity nobody ever measured next to a purchase order.
+ */
+function snapshotFromRow(p: any): SnapshotCell | null {
+  const raw = p?.stock_at_po;
+  if (!raw || typeof raw !== 'object') return null;      // no snapshot → "not recorded"
+
+  const takenAt = raw.taken_at ? String(raw.taken_at) : null;
+  // Absence of the dept keys is NOT evidence of restriction — only the explicit
+  // server flag is. Guessing either way mislabels a real figure.
+  const restricted = raw.dept_restricted === true;
+
+  const central = snapNum(raw.central_qty);
+  const storeTotal = snapNum(raw.store_total_qty);
+  if (central === null || storeTotal === null) return { data: null, takenAt, restricted };
+
+  // Pack meta AS IT WAS when the PO was raised — never today's catalogue row, or a
+  // pack correction next year would restate what this audit record says.
+  const unit = String(raw.unit ?? '').trim();
+  const purchaseUnit = String(raw.purchase_unit ?? '').trim();
+  const packSize = snapNum(raw.pack_size);
+  // A pack factor we cannot read is a 1000× error waiting to happen: defaulting it
+  // to 1 would print 6,000 g under a "kg" label. Defaulting is only safe when the
+  // two units are the same word — packFactor's both-halves guard forces 1 there
+  // anyway (PICKLED GINGER, kg/kg pack 1.5, must render 6 kg and never 4).
+  const unitsDiffer = purchaseUnit !== '' && purchaseUnit.toLowerCase() !== unit.toLowerCase();
+  if (packSize === null && unitsDiffer) return { data: null, takenAt, restricted };
+
+  const countedCount = restricted ? 0 : Math.max(0, Math.trunc(snapNum(raw.dept_counted_count) ?? 0));
+  const uncountedCount = restricted ? 0 : Math.max(0, Math.trunc(snapNum(raw.dept_uncounted_count) ?? 0));
+  // No anchored department = NO total. null, never 0. And a payload carrying a
+  // total without a count is not trusted to mean zero either — the count is what
+  // decides whether the figure exists at all.
+  const countedQty = countedCount > 0 ? snapNum(raw.dept_counted_qty) : null;
+
+  return {
+    takenAt,
+    restricted,
+    data: {
+      material_id: String(p.material_id ?? ''),
+      unit,
+      purchase_unit: purchaseUnit,
+      pack_size: packSize ?? 1,
+      case_size: snapNum(raw.case_size) ?? 1,
+      central_qty: central,
+      // stores_json already carries the Grocery leg; StockOnHandNote adds one only
+      // when it is absent, so nothing is counted twice.
+      stores: snapLegs(raw.stores_json ?? raw.stores) ?? [],
+      store_total_qty: storeTotal,
+      store_mapped: raw.store_mapped === true || raw.store_mapped === 1,
+      depts: restricted ? [] : (snapLegs(raw.dept_json ?? raw.depts) ?? []),
+      dept_counted_qty: countedQty,
+      dept_counted_count: countedCount,
+      dept_uncounted_count: uncountedCount,
+    },
+  };
 }
 
 export default function PurchasesPage() {
@@ -637,6 +777,41 @@ export default function PurchasesPage() {
   // Paginate
   const totalPages = Math.max(1, Math.ceil(sortedPurchases.length / pageSize));
   const paginatedPurchases = sortedPurchases.slice((page - 1) * pageSize, page * pageSize);
+
+  /* ── "Stock when PO raised": why the Dept half can read "not counted" ───────
+   *
+   * A department figure is only ever "not counted" for one reason worth putting a
+   * banner up for: the department ledger cutover has never been run, so NO pair
+   * has an opening balance and every department balance in the building is
+   * legitimately unknown. CONTRACT §5.4 wants that said once, above the table,
+   * rather than left to read as a bug in this column.
+   *
+   * The cutover stamp lives on GET /api/stock-on-hand, which returns the whole
+   * catalogue. Downloading it to learn ONE scalar is waste, so the fetch is gated:
+   * it fires only once a snapshot with an uncounted department rail is actually on
+   * screen — i.e. only when there is something for the banner to explain. On
+   * today's data (no snapshots yet) it never fires at all.
+   *
+   * Cheap test, no parsing: the explicit dept_restricted rows are excluded because
+   * those read "Dept restricted", which the banner does not explain.
+   */
+  const cutoverBannerRelevant = useMemo(
+    () =>
+      purchases.some((p: any) => {
+        const s = p?.stock_at_po;
+        return (
+          !!p?.po_id && !!s && typeof s === 'object' && s.dept_restricted !== true &&
+          Math.trunc(Number(s.dept_counted_count) || 0) === 0
+        );
+      }),
+    [purchases],
+  );
+  const liveStock = useStockOnHand(cutoverBannerRelevant);
+  // cutoverKnown gates the claim: an endpoint that 404s or errors leaves cutoverAt
+  // null too, and asserting "cutover has never been run" off a failed fetch would
+  // be a guess. No banner is the honest render when we do not know.
+  const showCutoverBanner =
+    cutoverBannerRelevant && liveStock.cutoverKnown && liveStock.cutoverAt === null;
 
   // Summary calculations
   const today = todayString();
@@ -2093,6 +2268,20 @@ export default function PurchasesPage() {
           </div>
         </div>
 
+        {/* CONTRACT §5.4 — said once, above the table, not per row. Without it a
+            whole column of "Dept not counted" reads as a broken feature instead of
+            an unopened ledger. */}
+        {showCutoverBanner && (
+          <div className="flex items-start gap-2 rounded-xl border border-[#E8D5C4] bg-[#FFF1E3] px-4 py-3 text-xs text-[#6B5744]">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-[#af4408]" />
+            <p>
+              Department stock has never been opened (no cutover run), so every department
+              figure reads &quot;not counted&quot;. Run Inventory → Department Ledger → Cutover
+              to start recording it.
+            </p>
+          </div>
+        )}
+
         {/* Purchases Table */}
         <div className="bg-white border border-[#E8D5C4] rounded-xl shadow overflow-hidden">
           <div className="overflow-x-auto">
@@ -2122,6 +2311,13 @@ export default function PurchasesPage() {
                   <th className="text-right py-3 px-4 font-medium">Total</th>
                   <th className="text-right py-3 px-4 font-medium">Total Inward</th>
                   <th className="text-left py-3 px-4 font-medium" title="The purchase order this bill was received against, when it came from one">PO No</th>
+                  <th className="text-left py-3 px-4 font-medium" title="The goods receipt this bill came in on. Read from the real grn_id link, not from notes text. Blank for purchases that never went through a GRN — imports and direct bills.">GRN No</th>
+                  <th
+                    className="text-left py-3 px-4 font-medium whitespace-nowrap"
+                    title="The Store and Department stock recorded at the moment this purchase order was raised. Blank or 'not recorded' means no figure was stored for this line; the reason is not something this column can know."
+                  >
+                    Stock when PO raised
+                  </th>
                   <th className="text-left py-3 px-4 font-medium">Notes</th>
                 </tr>
               </thead>
@@ -2223,7 +2419,14 @@ export default function PurchasesPage() {
                     </td>
                     <td className="py-3 px-4">
                       {(() => {
-                        const po = poNumberFromNotes(p.notes);
+                        // The STORED link wins. `po_number` reaches this row through
+                        // purchases.po_id -> purchase_orders, so it is the PO this
+                        // bill was actually received against — not a number scraped
+                        // out of a sentence. The notes parse stays only as the
+                        // fallback for rows written before po_id existed, and it
+                        // still fails closed.
+                        const linked = String((p as any).po_number || '').trim();
+                        const po = linked || poNumberFromNotes(p.notes);
                         if (!po) return <span className="text-[#8B7355]">-</span>;
                         // Deep-links into the PO list's existing "PO number or
                         // vendor" search, because there is no
@@ -2231,11 +2434,70 @@ export default function PurchasesPage() {
                         return (
                           <a
                             href={`/purchase-orders?q=${encodeURIComponent(po)}`}
-                            title={`Open ${po} on Purchase Orders`}
-                            className="text-[#af4408] hover:underline font-mono text-xs whitespace-nowrap"
+                            title={
+                              linked
+                                ? `Open ${po} on Purchase Orders — linked by purchase order id`
+                                : `Open ${po} on Purchase Orders — read from this bill's notes, not a stored link`
+                            }
+                            className={`hover:underline font-mono text-xs whitespace-nowrap ${
+                              linked ? 'text-[#af4408]' : 'text-[#af4408]/80 decoration-dotted underline-offset-2 underline'
+                            }`}
                           >
                             {po}
                           </a>
+                        );
+                      })()}
+                    </td>
+                    <td className="py-3 px-4">
+                      {/* The one identifier a received row always has. Invoice ID is
+                          blank on GRN rows and Bill No is blank on the ad-hoc ones,
+                          so this is what gets you back to the paperwork. A real FK,
+                          so unlike PO No it cannot be broken by a wording change. */}
+                      {(p as any).grn_number
+                        ? <span className="font-mono text-xs whitespace-nowrap text-[#2D1B0E]">{(p as any).grn_number}</span>
+                        : <span className="text-[#8B7355]">-</span>}
+                    </td>
+                    {/* ── Recorded In-Hand Stock (CONTRACT §5.4 / §6) ──────────
+                        Keyed ONLY on the stored po_id. Never on the notes parse:
+                        a text mismatch would put a confidently wrong stock figure
+                        beside a purchase, and a wrong audit number is worse than
+                        no column at all. */}
+                    <td className="py-3 px-4 align-top">
+                      {(() => {
+                        if (!(p as any).po_id) {
+                          return (
+                            <span className="text-[#8B7355]" title="No stock record for this bill. purchases.po_id is written by the boot migration, not at receive time, so a bill received since the last restart has no link yet even when the PO No column beside this one shows a number - that number is read from the notes text on the row itself.">
+                              —
+                            </span>
+                          );
+                        }
+                        const snap = snapshotFromRow(p);
+                        // No snapshot row: this PO was raised before the record
+                        // existed. StockOnHandNote prints "not recorded" — grey,
+                        // italic, wordy, so it cannot read as a quantity.
+                        if (!snap) return <StockOnHandNote variant="cell" />;
+                        if (!snap.data) {
+                          // A snapshot IS on file but its payload could not be read
+                          // whole. Saying "not recorded" here would be a false claim
+                          // about the past, and printing a repaired zero would be a
+                          // false claim about the stock. Say neither.
+                          return (
+                            <span
+                              className="text-[11px] italic text-[#B8A590]"
+                              title="A stock snapshot is recorded for this PO line but could not be read. Nothing is shown rather than a repaired figure."
+                            >
+                              unavailable
+                            </span>
+                          );
+                        }
+                        return (
+                          <StockOnHandNote
+                            variant="cell"
+                            data={snap.data}
+                            deptScope={snap.restricted ? 'none' : 'all'}
+                            asOf={snap.takenAt}
+                            poNumber={String((p as any).po_number || '').trim() || null}
+                          />
                         );
                       })()}
                     </td>
@@ -2246,7 +2508,7 @@ export default function PurchasesPage() {
                 ))}
                 {paginatedPurchases.length === 0 && (
                   <tr>
-                    <td colSpan={11} className="py-12 text-center text-[#8B7355]">
+                    <td colSpan={13} className="py-12 text-center text-[#8B7355]">
                       <ShoppingCart className="w-10 h-10 mx-auto mb-3 opacity-40" />
                       <p>No purchases found.</p>
                       <p className="text-xs mt-1">Add your first purchase to get started.</p>

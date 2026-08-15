@@ -2488,6 +2488,158 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('GRN schema failed:', e); }
 
+  // ── PURCHASES → PURCHASE ORDER, as a real column ─────────────────────────
+  // The cost row still cannot NAME its purchase order in one hop. grn_id reaches
+  // the delivery and goods_receipt_notes.po_id reaches the order, but nothing on
+  // `purchases` answers "which PO was this bought against?" — so readers re-parse
+  // a sentence in notes with a regex (src/app/purchases/page.tsx:225). A regex is
+  // not a join: reword the receive route and it quietly finds nothing, and an
+  // audit column that silently empties is worse than no column at all.
+  //
+  // Soft link, deliberately no FK — the same trade as grn_id above: SQLite cannot
+  // ADD one by ALTER, and rebuilding `purchases` on a live restaurant system to
+  // gain a constraint nothing enforces today is not worth it.
+  //
+  // NULL is an honest value here and MOST rows keep it (2,145 of 2,165 today):
+  // direct purchase, opening stock, bulk/inward import, ad-hoc GRN with no PO,
+  // seed. Readers MUST render a missing po_id as "not recorded" — never as zero,
+  // never by falling back to a guess.
+  //
+  // Placed AFTER the goods_receipt_notes CREATE above on purpose. The `purchases`
+  // column block sits at ~line 2321, BEFORE that table exists, so a backfill put
+  // there would find no GRN on a brand-new database and only link on the SECOND
+  // boot — the exact hazard already documented on the req_item_id migration.
+  try {
+    const cols = db.prepare("PRAGMA table_info(purchases)").all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    if (!has('po_id')) db.exec(`ALTER TABLE purchases ADD COLUMN po_id TEXT`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_purchases_po ON purchases(po_id)`);
+
+    // Backfill in two passes, strongest evidence first. Both are guarded by
+    // `po_id IS NULL`, which is what makes them idempotent — a row that already
+    // carries a link is never rewritten. Deliberately NOT settings-flag-guarded:
+    // a flag freezes the backfill after one run, whereas the NULL guard lets a
+    // row written by an older build heal on the next restart. Measured cost once
+    // there is nothing left to do: ~0.2 ms per pass over 2,165 rows.
+
+    // PASS 1 — STRUCTURAL. purchases.grn_id -> goods_receipt_notes.po_id. Both
+    // hops are stored ids written in the SAME transaction as the purchase. No
+    // text is consulted anywhere in this path. Measured: 20/20 exact, 0 orphan,
+    // 0 material mismatch, max 1 purchases row per PO.
+    db.exec(`
+      UPDATE purchases SET po_id = (
+        SELECT g.po_id FROM goods_receipt_notes g
+         WHERE g.id = purchases.grn_id
+           AND g.po_id IS NOT NULL AND g.po_id <> ''
+           AND EXISTS (SELECT 1 FROM purchase_orders o WHERE o.id = g.po_id))
+      WHERE po_id IS NULL
+        AND grn_id IS NOT NULL AND grn_id <> ''
+        AND EXISTS (SELECT 1 FROM goods_receipt_notes g2
+                     WHERE g2.id = purchases.grn_id
+                       AND g2.po_id IS NOT NULL AND g2.po_id <> ''
+                       AND EXISTS (SELECT 1 FROM purchase_orders o2
+                                    WHERE o2.id = g2.po_id))
+    `);
+
+    // PASS 2 — TEXT FALLBACK, for receives that predate purchases.grn_id (that
+    // column shipped un-backfilled by design, so an older database has only the
+    // notes sentence). Anchored at the START of notes and matched against the
+    // WHOLE po_number, so a prefix can never eat a longer number. The COUNT(*) = 1
+    // guard means an ambiguous sentence writes NOTHING rather than guessing, and
+    // a notes line naming a deleted PO is a no-op instead of a wrong link.
+    // purchase_orders.po_number is UNIQUE at the schema level, so two POs can
+    // never match — the guard is belt-and-braces.
+    //
+    // DO NOT DELETE THIS PASS because it scores 0 locally. Production is an older
+    // database and is expected to hold PO receives with the note and no grn_id.
+    //
+    // BUT IT MUST NOT MATCH ON TEXT ALONE. po_number is not stable over time.
+    // /admin/reset offers "Purchase Orders" as a checkbox INDEPENDENT of
+    // "Purchases": it deletes the POs and their GRNs while keeping every
+    // purchases row and its notes text. That rewinds nextPoNumber (MAX+1 per
+    // year), so a brand-new PO is minted carrying a number an OLD note still
+    // names — and it destroys pass 1's structural evidence at the same time,
+    // leaving only this text to match on. Measured on a replay of the reset
+    // route's own statements: 7 of 20 historical purchases were attached to
+    // new, unrelated POs, one putting a 07 Aug purchase under a PO raised
+    // 14 Aug by a different vendor. The block re-runs on every boot, so that
+    // is not a migration window — it is permanent.
+    //
+    // THE GUARD IS ON created_at, NOT date(). A day-granular comparison let a
+    // recycled PO through whenever it was raised on or before the same DAY as
+    // the old purchase — which is precisely the common case: wipe the POs, raise
+    // fresh ones this morning, and this afternoon's backfill cheerfully attaches
+    // a purchase from earlier today. Row creation timestamps are strictly
+    // ordered and cannot collide that way. Measured: all 20 legitimate links
+    // still form under the stricter comparison.
+    //
+    // The principle is unchanged: goods cannot be received against a PO that did
+    // exist yet, so the PO's own date must not be AFTER the purchase date. A
+    // recycled number always fails it (the new PO is younger than the old
+    // purchase), while every genuine link passes. Verified on the live data:
+    // 20 links today, 20 survive, 0 rejected. Cheap, and it makes the pass
+    // self-correcting rather than something that must be watched.
+    db.exec(`
+      UPDATE purchases SET po_id = (
+        SELECT o.id FROM purchase_orders o
+         WHERE (purchases.notes LIKE 'Received against ' || o.po_number || ' %'
+             OR purchases.notes =    'Received against ' || o.po_number)
+           AND o.created_at <= purchases.created_at)
+      WHERE po_id IS NULL
+        AND notes LIKE 'Received against PO-%'
+        AND (SELECT COUNT(*) FROM purchase_orders o
+              WHERE (purchases.notes LIKE 'Received against ' || o.po_number || ' %'
+                  OR purchases.notes =    'Received against ' || o.po_number)
+                AND o.created_at <= purchases.created_at) = 1
+    `);
+  } catch (e) { console.error('purchases.po_id migration failed:', e); }
+
+  // ── STOCK AS IT WAS WHEN THE PO LINE WAS RAISED ──────────────────────────
+  // A SIDE TABLE, not columns on purchase_order_items, and this is the reason:
+  // PUT /api/purchase-orders and [id]/edit-approved both DELETE every line of the
+  // PO and re-INSERT it with a fresh id. A snapshot column would be destroyed and
+  // silently re-taken on every edit — the approval-time figure the owner
+  // explicitly rejected. Keyed on material_id because line ids are not stable;
+  // one material = one PO line is already enforced by duplicateLineError on the
+  // human paths and mergeDuplicateLines on the machine paths.
+  //
+  // WRITE-ONCE. Nothing in this codebase may ever UPDATE a row of this table.
+  // Approval, receipt, GRN, price edits and pack corrections must all leave it
+  // exactly as written. There is NO backfill: a PO raised before this shipped
+  // has no snapshot and must read "not recorded", never 0.
+  //
+  // UNITS: every *_qty column is in RECIPE units (the basis `current_stock` and
+  // the department ledger are stored in), and `basis` says so on every row. The
+  // pack meta is frozen alongside them so a later pack correction cannot restate
+  // a historical quantity when the figure is rendered in purchase units.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS po_line_stock_snapshots (
+        po_id                TEXT    NOT NULL,
+        material_id          TEXT    NOT NULL,
+        taken_at             TEXT    NOT NULL,
+        taken_by             TEXT    NOT NULL DEFAULT '',
+        source               TEXT    NOT NULL,
+        basis                TEXT    NOT NULL DEFAULT 'recipe',
+        unit                 TEXT    NOT NULL DEFAULT '',
+        purchase_unit        TEXT    NOT NULL DEFAULT '',
+        pack_size            REAL    NOT NULL DEFAULT 1,
+        case_size            REAL    NOT NULL DEFAULT 1,
+        central_qty          REAL    NOT NULL,
+        stores_json          TEXT    NOT NULL DEFAULT '[]',
+        store_total_qty      REAL    NOT NULL,
+        store_mapped         INTEGER NOT NULL DEFAULT 0,
+        dept_json            TEXT    NOT NULL DEFAULT '[]',
+        dept_counted_qty     REAL,
+        dept_counted_count   INTEGER NOT NULL DEFAULT 0,
+        dept_uncounted_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (po_id, material_id),
+        FOREIGN KEY (po_id) REFERENCES purchase_orders(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_po_stock_snap_material ON po_line_stock_snapshots(material_id);
+    `);
+  } catch (e) { console.error('po_line_stock_snapshots schema failed:', e); }
+
   // POS Phase 1 — front-of-house order backbone: tables → order → settle → sale.
   // An order is opened on a table, items are added (priced from menu_items), and
   // settling writes one `sales` row per line + deducts inventory (see recordSale).

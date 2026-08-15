@@ -1,5 +1,14 @@
 import type Database from 'better-sqlite3';
 import type { SessionUser } from './auth';
+// The two rails of stockOnHandBulk() at the foot of this file. Imported for
+// REUSE, never re-derived: deptOnHandBulk is the one department-balance
+// arithmetic and consolidatedStock is the one store roll-up. A second copy of
+// either would be free to disagree with the screen it is supposed to explain.
+// No cycle: store-engine -> db.ts -> dept-ledger, and none of the three imports
+// this file (db.ts reaches store-engine through a deferred require).
+import { deptKey, deptOnHandBulk } from './dept-ledger';
+import type { DeptOnHandResult } from './dept-ledger';
+import { consolidatedStock, listStores } from './store-engine';
 
 /**
  * Department Stock — LEDGER-BACKED, anchored on a physical count.
@@ -610,4 +619,293 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
       anchored_mixed: mixed,
     },
   };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * PER-MATERIAL STOCK ON HAND — the Stores rail and the Departments rail,
+ * for MANY materials, in ONE batched pass.
+ *
+ * WHY THIS EXISTS. computeDeptStock() above answers "what does ONE department
+ * hold, across all of its materials". A store person raising a PO or a GRN
+ * needs the transpose: "for THIS material, what is sitting in the stores and
+ * what is sitting in the departments" — and needs it for every material in a
+ * picker at once. There was no per-MATERIAL roll-up across departments before
+ * this function.
+ *
+ * ONE CALL, WHOLE CATALOGUE. This box is a single-threaded better-sqlite3
+ * process that has already served a 504 under load. A per-material request, or
+ * a loop over /api/department-stock?department_id=X, is an N+1 that stalls
+ * billing and the captain app behind it. Everything below is bounded:
+ *   · one raw_materials read for pack meta,
+ *   · one consolidatedStock() pass for the stores rail,
+ *   · one departments read + one deptOnHandBulk() (four queries) for the
+ *     departments rail.
+ * That is a fixed six-ish queries whether you ask for 1 material or all 952.
+ *
+ * TWO SEPARATE FIGURES, NEVER MERGED. A store person needs to know 3 kg is
+ * sitting in the kitchen, not merely that 4 kg exists in the building. Stores
+ * and Departments are returned as distinct rails and must be rendered as two
+ * numbers.
+ *
+ * UNITS. Every quantity here is in RECIPE units, the stored basis — the same
+ * basis raw_materials.current_stock, store_stock_ledger.quantity and
+ * department_material_transactions.quantity are written in. Nothing is
+ * converted on this side. The pack meta (unit / purchase_unit / pack_size /
+ * case_size) rides along so the renderer converts ONCE, through
+ * toPurchaseQty() in src/lib/pack-units.ts, whose both-halves guard is what
+ * keeps PICKLED GINGER 1.5KG (kg/kg, pack 1.5, stock 6) reading 6 kg and not
+ * 4. Never divide by pack_size here or anywhere downstream.
+ *
+ * NO ZERO-AS-UNKNOWN, ANYWHERE ON THIS PATH.
+ *   · A material absent from the returned Map is UNKNOWN — the renderer says
+ *     "unavailable". It is not stock of 0.
+ *   · dept_counted_qty is NULL — never 0 — when no department in scope has an
+ *     anchored figure. Do not `?? 0` it.
+ *   · A counted zero is real, keeps its leg (qty: 0) and renders with its unit.
+ *   · There is deliberately no COALESCE(<qty>, 0) in the SQL below.
+ *
+ * NOT A CACHE, NOT A SNAPSHOT. This is the LIVE figure, recomputed per call.
+ * The frozen PO-time record is a separate concern (po_line_stock_snapshots);
+ * whoever writes that table must call THIS function for its numbers rather
+ * than defining a second one, or the audit trail and the picker will disagree.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/** One place stock is sitting: a store location, or a department. */
+export interface StockLeg {
+  /** store_locations.id / departments.id. Null is reserved for a synthetic leg
+   *  (the renderer's "Grocery" line, built from central_qty). */
+  id: string | null;
+  /** The name AS IT IS NOW. A snapshot writer must copy it, not re-join it —
+   *  departments get renamed and a re-join would restate a historic record. */
+  name: string;
+  /** RECIPE units. Present means MEASURED: a 0 here is a counted zero. */
+  qty: number;
+  /** Set only on a deactivated department that still holds a counted balance.
+   *  Real stock is never hidden just because the department was switched off. */
+  inactive?: boolean;
+}
+
+/** Stores + Departments for ONE material. Every qty is in RECIPE units. */
+export interface StockOnHand {
+  material_id: string;
+  /** Pack meta as it stands right now — feed it straight to toPurchaseQty(). */
+  unit: string;
+  /** Falls back to `unit` when the material has no purchase unit, which is what
+   *  packFactor() does internally, so the guard behaves identically either way. */
+  purchase_unit: string;
+  pack_size: number;
+  case_size: number;
+
+  // ── STORES RAIL ──
+  /** raw_materials.current_stock — the central grocery backstock. */
+  central_qty: number;
+  /** One leg per ACTIVE store_location, zeros included, for a store-mapped
+   *  material. EMPTY for a material no store owns — not "0 everywhere". */
+  stores: StockLeg[];
+  /** central_qty + SUM(stores[].qty). The single number a "Store" label shows. */
+  store_total_qty: number;
+  /** The material is in consolidatedStock()'s universe (category-mapped to an
+   *  active store, or holding a store ledger row) — i.e. it lives on the TGBCL
+   *  rail. Such materials never write a department ledger row, so their
+   *  department rail is structurally "not counted", never zero. */
+  store_mapped: boolean;
+
+  // ── DEPARTMENTS RAIL ──
+  /** ONLY departments with a real anchored balance. A department that has never
+   *  been counted contributes NOTHING here — it is counted in
+   *  dept_uncounted_count instead, because 19 null legs per material is payload
+   *  carrying no information. */
+  depts: StockLeg[];
+  /** SUM(depts[].qty), or NULL when depts is empty. NEVER 0 for "unknown". */
+  dept_counted_qty: number | null;
+  /** depts.length — how many departments the total above actually covers. */
+  dept_counted_count: number;
+  /** ACTIVE departments in scope with no anchor for this material. A
+   *  data-quality signal about live departments, which is why a deactivated
+   *  department is not counted in it. */
+  dept_uncounted_count: number;
+}
+
+export interface StockOnHandOptions {
+  /** Departments to measure.
+   *    omitted   → EVERY department row (active and inactive).
+   *    []        → NONE. The "restricted viewer" case: every material comes
+   *                back with depts: [], dept_counted_qty: null and
+   *                dept_uncounted_count: 0, so the UI can say "restricted"
+   *                rather than inventing "not counted" or "0".
+   *    [ids...]  → exactly those, for a partially-scoped viewer. Departments
+   *                outside the list are omitted entirely and are NEVER folded
+   *                into dept_counted_qty — a roll-up the viewer cannot
+   *                decompose is a wrong number. */
+  deptIds?: string[];
+}
+
+/** 4 dp, the rounding every other quantity surface in this app uses. */
+function r4Soh(n: number): number {
+  return Math.round((Number(n) || 0) * 10000) / 10000;
+}
+
+/**
+ * Stores + Departments on hand, per material, batched.
+ *
+ * @param materialIds  omitted → the whole raw_materials catalogue.
+ *                     [] → an empty Map (an explicit request for nothing).
+ * @param opts.deptIds see StockOnHandOptions.
+ *
+ * A material id that does not exist is simply absent from the Map. Callers MUST
+ * treat "absent" as unknown and print "unavailable" — never 0.
+ *
+ * THROWS rather than degrading if the stores rail cannot be read. A liquor
+ * material silently reported as grocery-only is a confidently wrong number, and
+ * the whole point of this path is that no displayed figure may be wrong. The
+ * DEPARTMENT rail is the half a caller may legitimately fail closed on (pass
+ * deptIds: []) — see /api/stock-on-hand.
+ */
+export function stockOnHandBulk(
+  db: Database.Database,
+  materialIds?: string[],
+  opts?: StockOnHandOptions,
+): Map<string, StockOnHand> {
+  const out = new Map<string, StockOnHand>();
+
+  // ── 1. THE MATERIAL UNIVERSE + its pack meta ──────────────────────────────
+  // No COALESCE: current_stock / pack_size / case_size are NOT NULL columns, so
+  // a coalesce there would be dead code that still reads like a zero-fill on a
+  // path where zero-fills are banned. The text columns are normalised in JS.
+  const scopedMats = Array.isArray(materialIds);
+  const wantIds = scopedMats
+    ? [...new Set((materialIds as string[]).map((m) => String(m ?? '').trim()).filter(Boolean))]
+    : [];
+  if (scopedMats && wantIds.length === 0) return out;
+
+  const metaSelect = `
+    SELECT id, unit, purchase_unit, pack_size, case_size, current_stock
+      FROM raw_materials`;
+  const metaRows = (scopedMats
+    ? db.prepare(`${metaSelect} WHERE id IN (SELECT value FROM json_each(?))`).all(JSON.stringify(wantIds))
+    : db.prepare(metaSelect).all()
+  ) as Array<{
+    id: string; unit: string | null; purchase_unit: string | null;
+    pack_size: number | null; case_size: number | null; current_stock: number | null;
+  }>;
+  if (metaRows.length === 0) return out;
+
+  // ── 2. STORES RAIL ────────────────────────────────────────────────────────
+  // consolidatedStock() already answers this for the whole catalogue in one
+  // pass: grocery_qty (= raw_materials.current_stock), by_store for every ACTIVE
+  // store (0 included) and the material universe that defines store_mapped
+  // (category-mapped to an active store ∪ holds a store ledger row). Its cost is
+  // flat, so it is called once here regardless of how many materials were asked
+  // for. Deliberately NOT wrapped in a try/catch — see the doc comment.
+  const activeStores = listStores(db)
+    .filter((s) => !!s.is_active)
+    .map((s) => ({ id: s.id, name: s.name }));
+  const byMaterial = new Map<string, Record<string, number>>();
+  for (const row of consolidatedStock(db)) byMaterial.set(row.material_id, row.by_store);
+
+  // ── 3. DEPARTMENTS RAIL ───────────────────────────────────────────────────
+  // Every department row, or exactly the scoped ones. INACTIVE departments are
+  // read too: a department can be switched off while still holding counted
+  // stock, and hiding it would hide real stock. They are filtered at leg level
+  // below, not here.
+  const scopedDepts = !!opts && Array.isArray(opts.deptIds);
+  const deptFilterIds = scopedDepts
+    ? [...new Set((opts!.deptIds as string[]).map((d) => String(d ?? '').trim()).filter(Boolean))]
+    : [];
+  const deptRows = (scopedDepts
+    ? (deptFilterIds.length === 0
+      ? []
+      : db.prepare(`SELECT id, name, is_active FROM departments WHERE id IN (SELECT value FROM json_each(?))`)
+        .all(JSON.stringify(deptFilterIds)))
+    : db.prepare(`SELECT id, name, is_active FROM departments`).all()
+  ) as Array<{ id: string; name: string; is_active: number }>;
+
+  // deptOnHandBulk is the ONE department-balance derivation (anchor = later of
+  // the newest closing count and the cutover opening row, MAX'd against the
+  // cutover floor, with the same-second rowid tie-break). Four queries for the
+  // whole dept x material matrix. NEVER loop computeDeptStock() for this: it is
+  // ~75x slower on a loaded ledger and it discards the per-(dept, material)
+  // split that this whole feature exists to show.
+  //
+  // materialIds is forwarded ONLY when the caller scoped it. On a whole-
+  // catalogue call, passing 952 ids into `material_id IN (SELECT value FROM
+  // json_each(?))` buys nothing — the predicate matches every row anyway — so
+  // the filter is left off.
+  const balances: Map<string, DeptOnHandResult> = deptRows.length > 0
+    ? deptOnHandBulk(db, deptRows.map((d) => d.id), scopedMats ? wantIds : undefined)
+    : new Map();
+
+  // ── 4. COMPOSE ────────────────────────────────────────────────────────────
+  for (const m of metaRows) {
+    const central = Number(m.current_stock);
+    // Not finite = we do not know this material's central stock. Leaving it out
+    // of the Map makes the renderer say "unavailable"; writing 0 would state a
+    // fact we do not have.
+    if (!Number.isFinite(central)) continue;
+
+    const recipeUnit = String(m.unit ?? '').trim();
+    const purchaseUnit = String(m.purchase_unit ?? '').trim() || recipeUnit;
+
+    const perStore = byMaterial.get(m.id);
+    const stores: StockLeg[] = [];
+    let storeTotal = central;
+    if (perStore) {
+      for (const s of activeStores) {
+        const q = r4Soh(Number(perStore[s.id]) || 0);
+        stores.push({ id: s.id, name: s.name, qty: q });
+        storeTotal += q;
+      }
+    }
+
+    const depts: StockLeg[] = [];
+    let deptQty = 0;
+    let uncounted = 0;
+    for (const d of deptRows) {
+      const b = balances.get(deptKey(d.id, m.id));
+      // ABSENT KEY and neverCounted are the SAME state: nobody ever counted this
+      // pair. deptOnHandBulk returns no key at all for a pair with no anchor and
+      // no movement, and {onHand: null, neverCounted: true} for one with movement
+      // but no anchor. Neither may be rendered as 0.
+      const counted = !!b && !b.neverCounted && b.onHand !== null && Number.isFinite(b.onHand);
+      const isActive = !!d.is_active;
+      if (counted) {
+        const q = r4Soh(b!.onHand as number);
+        // A deactivated department only earns a leg when it is actually holding
+        // something. A deactivated department counted at zero is noise.
+        if (isActive) {
+          depts.push({ id: d.id, name: d.name, qty: q });
+        } else if (q !== 0) {
+          depts.push({ id: d.id, name: d.name, qty: q, inactive: true });
+        } else {
+          continue;
+        }
+        deptQty += q;
+      } else if (isActive) {
+        uncounted++;
+      }
+    }
+    // Biggest holding first, so a renderer showing "top 3 + N more" shows the
+    // three that matter. Name breaks the tie for a stable order.
+    depts.sort((a, b2) => b2.qty - a.qty || a.name.localeCompare(b2.name));
+
+    out.set(m.id, {
+      material_id: m.id,
+      unit: recipeUnit,
+      purchase_unit: purchaseUnit,
+      pack_size: Number(m.pack_size) || 1,
+      case_size: Number(m.case_size) || 1,
+      central_qty: r4Soh(central),
+      stores,
+      store_total_qty: r4Soh(storeTotal),
+      store_mapped: !!perStore,
+      depts,
+      // NULL, not 0: no department in scope has an anchored figure for this
+      // material, so its department holding is unknown, not empty.
+      dept_counted_qty: depts.length > 0 ? r4Soh(deptQty) : null,
+      dept_counted_count: depts.length,
+      dept_uncounted_count: uncounted,
+    });
+  }
+
+  return out;
 }

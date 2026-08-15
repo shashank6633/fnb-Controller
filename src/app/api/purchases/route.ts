@@ -1,6 +1,8 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
+import { readPoSnapshots, snapshotKey } from '@/lib/po-stock-snapshot';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { canSeeAllDeptStock } from '@/lib/dept-stock';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { resolveVendorRef, isPairMapped } from '@/lib/vendor-mapping';
 // THE DUPLICATE RULE LIVES IN ONE MODULE NOW — src/lib/line-dedupe.ts — and is
@@ -206,6 +208,7 @@ export async function GET(request: Request) {
     // the secondary "= 20,000 g" hint. total_price is the invoice amount.
     let query = `
       SELECT p.*, rm.name as material_name,
+             grn.grn_number AS grn_number,
              rm.unit          AS material_unit,
              rm.purchase_unit AS material_purchase_unit,
              COALESCE(rm.pack_size, 1) AS material_pack_size,
@@ -218,6 +221,14 @@ export async function GET(request: Request) {
              END AS recipe_qty
       FROM purchases p
       JOIN raw_materials rm ON p.material_id = rm.id
+      -- GRN number by the REAL foreign key, not by scraping notes. purchases
+      -- carries grn_id and it is populated for every row that arrived through a
+      -- goods receipt — both the PO-receive path and ad-hoc GRNs — which makes
+      -- it the one identifier those rows always have. Invoice ID is blank on
+      -- them and Bill No is blank on the ad-hoc ones. LEFT JOIN because most
+      -- purchases (imports, direct bills) never touch a GRN at all and must
+      -- come back with NULL rather than vanish from the list.
+      LEFT JOIN goods_receipt_notes grn ON grn.id = p.grn_id
       WHERE 1=1
     `;
     const params: any[] = [];
@@ -237,7 +248,66 @@ export async function GET(request: Request) {
 
     query += ' ORDER BY p.date DESC, p.created_at DESC';
 
-    const purchases = db.prepare(query).all(...params);
+    const purchases = db.prepare(query).all(...params) as any[];
+
+    /* ATTACH THE STOCK-AT-RAISE SNAPSHOT.
+     *
+     * Without this the whole feature is invisible: po_line_stock_snapshots was
+     * being written correctly and read by nobody, so every row on the Purchases
+     * screen said "not recorded" — including POs raised minutes earlier with
+     * their rows sitting on disk. readPoSnapshots was written and never called.
+     *
+     * ONE query for the whole page, not one per row. readPoSnapshots dedupes by
+     * po_id, fetches once and filters to the exact (po_id, material_id) pairs.
+     * better-sqlite3 is synchronous and this box is single-threaded, so a query
+     * per row would block billing and KOT behind the report.
+     *
+     * A row with no po_id, or a pair with no snapshot, gets NOTHING — not a
+     * zero-filled object. snapshotFromRow() on the page treats a missing
+     * stock_at_po as "not recorded", which is the honest reading: we do not know
+     * what the stock was, and that is different from knowing it was nil.
+     */
+    const snapKeys = purchases
+      .filter((r) => r?.po_id && r?.material_id)
+      .map((r) => ({ po_id: String(r.po_id), material_id: String(r.material_id) }));
+    if (snapKeys.length > 0) {
+      const snaps = readPoSnapshots(db, snapKeys);
+
+      /* DEPARTMENT SCOPE. The stored snapshot carries a per-department breakdown,
+       * and this endpoint served it to anyone: a user restricted to their own
+       * department could read every other department's stock straight out of the
+       * Purchases table. The live pickers honour the scope; this read did not.
+       *
+       * A restricted viewer gets the STORE half — which is not department data —
+       * and no department figures at all, flagged dept_restricted so the page says
+       * "some departments are hidden from you" rather than inventing a zero. That
+       * flag already exists and snapshotFromRow() already reads it; nothing here
+       * needs to guess.
+       *
+       * Suppressing the TOTAL as well as the per-department legs is deliberate:
+       * dept_counted_qty is the sum across departments, so handing it over would
+       * leak the very number the scope exists to withhold. */
+      const viewer = await getCurrentUser();
+      const seesAllDepts = !!viewer && canSeeAllDeptStock(viewer);
+
+      for (const r of purchases) {
+        if (!r?.po_id || !r?.material_id) continue;
+        // snapshotKey(), not a hand-written template — the two must never drift.
+        const hit = snaps.get(snapshotKey(String(r.po_id), String(r.material_id)));
+        if (!hit) continue;
+        r.stock_at_po = seesAllDepts
+          ? hit
+          : {
+              ...hit,
+              depts: [],
+              dept_counted_qty: null,
+              dept_counted_count: 0,
+              dept_uncounted_count: 0,
+              dept_restricted: true,
+            };
+      }
+    }
+
     return Response.json({ purchases });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });

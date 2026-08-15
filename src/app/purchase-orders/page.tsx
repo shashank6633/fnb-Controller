@@ -9,6 +9,8 @@ import {
 import { api } from '@/lib/api';
 import { allocateBillCharges, resolveCharge, r2, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT } from '@/lib/po-charges';
 import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
+import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
+import { useStockOnHand, type StockOnHandState } from '@/lib/use-stock-on-hand';
 
 // Always 2 dp: at 0 dp the paise were dropped per row, so the item column
 // visibly failed to add up to the footer/list total (₹235.50 + ₹118.50 showed
@@ -1908,7 +1910,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
               </p>
               <div className="flex flex-col sm:flex-row gap-2">
                 <input value={billNo} onChange={e => setBillNo(e.target.value)}
-                       placeholder="Vendor bill no. (optional)"
+                       placeholder="Vendor bill no. (required)" required
                        className="sm:w-48 px-2 py-1 border border-[#E8D5C4] rounded text-[11px] bg-white" />
                 {alloc.discount_applied > 0 && (
                   <input value={chargesNote} onChange={e => setChargesNote(e.target.value)}
@@ -2569,6 +2571,10 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   const [vendorLoadError, setVendorLoadError] = useState('');
   const [mapBusy, setMapBusy] = useState(false);
   const vm = useVendorItemIndex();
+  /* LIVE in-hand stock, ONE batched call for the whole catalogue, made once when
+     this modal mounts and held for its life (CONTRACT §4). Not per material, not
+     per department, and never refreshed under the buyer mid-order. */
+  const stock = useStockOnHand(true);
 
   // This list feeds BOTH the header dropdown and every line dropdown, and a line
   // vendor is required to save. A silently failed fetch would therefore leave the
@@ -2927,6 +2933,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                         ) : (
                           <SimpleMaterialPicker value={it.material_id} materials={picks.mapped}
                                               takenIds={takenIds} onPickTaken={goToTakenLine}
+                                              stock={stock}
                                               disabled={!vm.ready}
                                               scopeNote={vm.ready
                                                 ? (lineVendorId
@@ -2989,6 +2996,20 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                             )}
                             <span className="ml-1 text-[#B8A590]">· 🗑 remove the line to change the item</span>
                           </div>
+                        )}
+                        {/* IN HAND, WHILE THE QUANTITY IS BEING DECIDED. Sits
+                            directly above the Qty box on purpose: this is the
+                            moment the buyer commits a number, and "3 kg is
+                            already in the kitchen" belongs here, not on another
+                            screen. Store and Dept stay two figures — a merged
+                            total would hide the very split that answers the
+                            question. Note the LIVE figure is what the buyer
+                            reasons with; what the system will remember is the
+                            snapshot taken the instant this PO is raised. */}
+                        {mat && (
+                          <StockOnHandNote data={stock.map.get(mat.id)} loading={stock.loading}
+                                           variant="line" deptScope={stock.scope} visibleDepts={stock.visible}
+                                           className="mt-1" />
                         )}
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
@@ -3212,9 +3233,16 @@ function CreatePOModal({ materials, onClose, onCreated }: {
 function SimpleMaterialPicker({
   value, materials, onChange, takenIds, onPickTaken,
   disabled, scopeNote, unmapped = [], unmappedLabel, unmappedHint, onMapAndPick, mapBusy,
+  stock,
 }: {
   value: string; materials: Material[]; onChange: (id: string, mat?: Material) => void;
   takenIds?: Map<string, number>; onPickTaken?: (lineNo: number) => void;
+  /** LIVE in-hand stock for every material — Store and Departments, separately
+   *  (CONTRACT §5.2). Optional and defaulted to undefined: when it is absent the
+   *  dropdown renders exactly what it always has. The figure is read from the
+   *  ONE batched /api/stock-on-hand call the parent modal makes at mount, never
+   *  from a per-material or per-department fetch. */
+  stock?: StockOnHandState;
   /** STRICT VENDOR ↔ ITEM MAPPING (all optional — callers that pass none get
    *  exactly the previous behaviour):
    *   disabled     — mapping not loaded yet; do not offer an unfiltered list
@@ -3288,6 +3316,10 @@ function SimpleMaterialPicker({
              className="z-[100] max-w-[calc(100vw-1rem)] bg-white border border-[#D4B896] rounded shadow-lg p-2 max-h-[55vh] overflow-y-auto overscroll-contain">
           <input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="Search SKU or name…"
                  className="w-full px-2 py-1 text-xs border border-[#E8D5C4] rounded mb-1 sticky top-0" />
+          {/* The legend is pinned here, always, whenever the figure is shown:
+              "Dept 3 kg*" is a different claim from "Dept 3 kg" and the reader
+              must never have to guess which caveat a marker carries. */}
+          {stock && <StockOnHandLegend className="px-1 pb-1" />}
           <div className="space-y-0.5">
             {list.length === 0 && (
               <div className="px-2 py-1 text-[11px] text-[#8B7355]">
@@ -3305,21 +3337,34 @@ function SimpleMaterialPicker({
                         onChange(m.id, m);
                       }}
                       title={takenLine ? `Already on line ${takenLine} — add the extra quantity there` : undefined}
-                      className={`w-full text-left px-2 py-1 rounded text-xs flex items-center gap-2 ${
+                      className={`w-full text-left px-2 py-1 rounded text-xs flex flex-col items-stretch gap-0.5 ${
                         takenLine ? 'bg-[#FFF8F0] text-[#A08B76] cursor-default' : 'hover:bg-[#FFF1E3]'}`}>
-                <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0">{m.sku || '·'}</span>
-                <span className="flex-1 truncate">{m.name}</span>
-                {takenLine ? (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#F0E4D6] text-[#8B7355] shrink-0">
-                    already on line {takenLine}
-                  </span>
-                ) : (<>
-                  <span className="text-[10px] text-[#6B5744]">{poUnitOf(m)}</span>
-                  {/* Rate carries its own basis: a bare "₹86.00" next to a list
-                      of kitchen materials reads as ₹/g. poRateOf is already
-                      ₹/purchase-unit — say which unit that is. */}
-                  <span className="text-[10px] font-mono text-[#6B5744]">₹{poRateOf(m).toFixed(2)}/{poUnitOf(m)}</span>
-                </>)}
+                <span className="flex items-center gap-2 w-full">
+                  <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0">{m.sku || '·'}</span>
+                  <span className="flex-1 min-w-0 truncate">{m.name}</span>
+                  {takenLine ? (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#F0E4D6] text-[#8B7355] shrink-0">
+                      already on line {takenLine}
+                    </span>
+                  ) : (<>
+                    <span className="text-[10px] text-[#6B5744]">{poUnitOf(m)}</span>
+                    {/* Rate carries its own basis: a bare "₹86.00" next to a list
+                        of kitchen materials reads as ₹/g. poRateOf is already
+                        ₹/purchase-unit — say which unit that is. */}
+                    <span className="text-[10px] font-mono text-[#6B5744]">₹{poRateOf(m).toFixed(2)}/{poUnitOf(m)}</span>
+                  </>)}
+                </span>
+                {/* IN HAND, BEFORE THE PICK (owner's ask #1). Store and Dept as
+                    two figures on the pick list itself, so "do we already have
+                    this?" is answered before the line exists — not after, on a
+                    screen the buyer has to go and find. Shown on a taken row
+                    too: that row is precisely where someone is deciding whether
+                    to add MORE. */}
+                {stock && (
+                  <StockOnHandNote data={stock.map.get(m.id)} loading={stock.loading}
+                                   variant="row" deptScope={stock.scope} visibleDepts={stock.visible}
+                                   className="pl-[4.5rem] block" />
+                )}
               </button>
               );
             })}
@@ -3395,6 +3440,10 @@ function EditPOItems({ poId, initialDate, initialDeliveryDate, initialVendor, in
   // single payload. A draft is edited here and created there; a rule that
   // applied on only one of the two would just move the problem.
   const vm = useVendorItemIndex();
+  /* Same ONE batched in-hand call as the composer, for the same reason: a line
+     ADDED during an edit is a line being raised now, so the buyer needs the
+     same two figures here that they would have had there. */
+  const stock = useStockOnHand(true);
 
   // is_active filter matches the new-PO composer: a retired vendor must not be
   // offered for a fresh line. One already saved on this draft stays visible via
@@ -3598,12 +3647,19 @@ function EditPOItems({ poId, initialDate, initialDeliveryDate, initialVendor, in
                     order unit {poUnitOf(mat)} · ₹{poRateOf(mat).toFixed(2)}/{poUnitOf(mat)}
                     {packNote(packMetaOfMat(mat)) && <span className="ml-1 text-[#B8A590]">· {packNote(packMetaOfMat(mat))}</span>}
                   </div>
+                  {/* Live Store + Dept, same renderer and same wording as the
+                      new-PO composer — the two screens must never describe the
+                      same material differently. */}
+                  <StockOnHandNote data={stock.map.get(mat.id)} loading={stock.loading}
+                                   variant="line" deptScope={stock.scope} visibleDepts={stock.visible}
+                                   className="mt-1" />
                 </div>
               ) : vendorHasNoItems ? (
                 <NoItemsForVendor compact vendorId={lineVendorId} vendorName={lineVendorName || 'This vendor'} />
               ) : (
                 <SimpleMaterialPicker value={it.material_id} materials={picks.mapped}
                                       takenIds={takenIds} onPickTaken={goToTakenLine}
+                                      stock={stock}
                                       disabled={!vm.ready}
                                       scopeNote={vm.ready
                                         ? (lineVendorId

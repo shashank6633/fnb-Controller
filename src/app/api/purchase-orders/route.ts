@@ -1,8 +1,17 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
+import { snapshotPoLines } from '@/lib/po-stock-snapshot';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { effectiveRole, effectiveActor, recalcTotal, poWriteGate, duplicateLineError } from '@/lib/po-helpers';
 import { vendorMappingError, vendorResolver, resolveVendorRef } from '@/lib/vendor-mapping';
+// THE definition of the figure, and THE writer of the frozen copy. Both are
+// imported, never restated here: if this route computed "in-hand stock" itself
+// there would be two definitions of it — the one the picker shows while you
+// order and the one the audit column shows afterwards — and they would drift.
+// stockOnHandBulk lives in dept-stock beside the department arithmetic it is
+// built from; /api/stock-on-hand (the live picker feed) calls the SAME function,
+// which is what guarantees the snapshot and the picker can never disagree.
+import { stockOnHandBulk, type StockOnHand } from '@/lib/dept-stock';
 
 /** Phase B store guard for PO composition (create/edit are interactive, so we
  *  reject the request with a clear message instead of silently dropping lines).
@@ -516,6 +525,28 @@ export async function POST(request: Request) {
     const actor = await effectiveActor();
     const outletId = await getCurrentOutletId();
 
+    // ── STOCK AS IT WAS THE MOMENT THIS PO WAS RAISED ────────────────────────
+    // The business question this answers is "did we order this when we already
+    // had stock?", so the figure has to be the one that was true AT RAISE TIME.
+    // It is never recomputed afterwards — see the write inside the transaction.
+    //
+    // READ HERE, OUTSIDE db.transaction(). better-sqlite3 is synchronous, so
+    // every millisecond spent computing inside the txn is a millisecond the whole
+    // app — billing included — waits on the SQLite write lock, and the department
+    // half of this figure is the expensive part. Reading microseconds before the
+    // INSERT is still honestly "when the PO was raised".
+    //
+    // NOT wrapped in try/catch on purpose. If the figure cannot be taken, the PO
+    // must not be created: there is no backfill for this table, so a line written
+    // without its snapshot is a permanent hole that can only ever be filled by a
+    // later recomputed guess — the exact thing the owner ruled out.
+    //
+    // Safe to call with these ids: lineSanityError() above has already proved
+    // every material_id is present and exists, and duplicateLineError() has
+    // proved no material appears twice.
+
+    const stockAtRaise = stockOnHandBulk(db, items.map((it: any) => String(it?.material_id || '').trim()));
+
     const txn = db.transaction(() => {
       db.prepare(`
         INSERT INTO purchase_orders (id, po_number, date, delivery_date, vendor_id, vendor, status, notes, drafted_by, outlet_id, created_at, updated_at)
@@ -547,6 +578,17 @@ export async function POST(request: Request) {
                     Math.round(qty * px * 100) / 100,
                     lineVendor, lineVendorId, it.notes || '');
       }
+      // ── FROZEN FROM HERE ───────────────────────────────────────────────────
+      // INSIDE the transaction, immediately after the lines it describes, so the
+      // snapshot and the lines commit together or not at all — a purchase_order_items
+      // row can never exist without the stock figure that was true when it was raised.
+      //
+      // WRITE-ONCE. Nothing may ever UPDATE po_line_stock_snapshots: not this
+      // route's own edit path, not submit, not approve, not receive, not a price
+      // or pack correction. The helper inserts ON CONFLICT (po_id, material_id)
+      // DO NOTHING, which is what makes that physically true rather than a
+      // convention someone can forget.
+      snapshotPoLines(db, id, { takenBy: actor, source: 'po_create', precomputed: stockAtRaise });
       recalcTotal(db, id);
       deriveHeaderVendor(db, id);
     });
@@ -647,6 +689,25 @@ export async function PUT(request: Request) {
     const resolvedVendorName = hdr.status === 'known' && headerGiven ? hdr.name : vendor;
     const resolvedVendorId   = hdr.status === 'known' && headerGiven ? hdr.id   : (vendor_id ?? null);
 
+    // ── STOCK AS IT WAS WHEN A LINE WAS ADDED TO THIS PO ─────────────────────
+    // Same read-outside / write-inside split as POST, and the same no-try/catch
+    // rule: a line must not be written if its figure cannot be taken.
+    //
+    // Only lines that are NEW to this PO end up with a row — the helper inserts
+    // ON CONFLICT (po_id, material_id) DO NOTHING, so a material that was already
+    // on the order keeps the figure taken when IT was raised. That is what makes
+    // this safe despite the DELETE-then-re-INSERT below: an edit that only moves
+    // a rate re-writes every line row with a fresh id and must still not restate
+    // a single stored stock number.
+    //
+    // A header-only edit (no `items` array) adds no line, so it takes no figure.
+    let stockAtRaise: Map<string, StockOnHand> | null = null;
+    let lineActor = '';
+    if (Array.isArray(items)) {
+      lineActor = await effectiveActor();
+      stockAtRaise = stockOnHandBulk(db, items.map((it: any) => String(it?.material_id || '').trim()));
+    }
+
     const txn = db.transaction(() => {
       db.prepare(`
         UPDATE purchase_orders SET
@@ -681,6 +742,22 @@ export async function PUT(request: Request) {
                   Math.round(qty * px * 100) / 100,
                   lineVendor, lineVendorId, it.notes || '');
         }
+        // FROZEN — see the POST handler. Inside the same transaction as the lines
+        // it describes, and write-once: this is the ADD path, never a re-take.
+        // Snapshots for a material dropped from the PO are deliberately left in
+        // place: the reader joins on (po_id, material_id), so an orphan simply
+        // never renders, and a line removed and re-added later keeps the figure
+        // from when it was first raised.
+        //
+        // `?? undefined` is unreachable (this branch runs only when `items` is an
+        // array, which is exactly when stockAtRaise was computed) and cannot
+        // produce a wrong number if it ever were reached — the helper would just
+        // take the same figure itself, inside the lock instead of before it.
+          snapshotPoLines(db, id, {
+            takenBy: lineActor,
+            source: 'po_edit_add',
+            precomputed: stockAtRaise ?? undefined,
+          });
         recalcTotal(db, id);
         deriveHeaderVendor(db, id);
       }
