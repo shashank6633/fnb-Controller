@@ -9,6 +9,11 @@ build agent gets pointed here. It was produced by a 10-agent read-only inspectio
 the live codebase (2026-08-16); every claim below is grounded in a file the fleet
 actually read.
 
+**OWNER RULINGS 2026-08-16 (see §8 — these override anything below that conflicts):**
+D1 approved · D2 approved with the split-shift/business-day rules in §8.2 ·
+D3 self-service DEFERRED (admin `/hr` only for now) · D4 approved ·
+**go-live is gated on biometric integration, not GPS.**
+
 ---
 
 ## 0. Stack facts (verified, do not re-derive)
@@ -301,3 +306,79 @@ guards) → adversarial verify (≤10 agents) → on-screen check on :3001 → c
   work) belong to ANOTHER task — HR commits must never include them; stage
   explicitly, never `git add -A`.
 - Never say "Done" — report the verification checklist.
+
+---
+
+## 8. OWNER RULINGS — 2026-08-16 (decisions taken; contract text above yields to this)
+
+The owner reviewed the four architecture decisions with worked scenarios and ruled:
+
+### 8.1 D1 (employees ≠ logins): APPROVED — and go-live is biometric-gated
+
+Kitchen helpers and similar staff will not operate the webapp and will not have
+logins. Their attendance comes through **biometric only**. Consequence, in the
+owner's words: *"We go live when the Biometrics are integrated only."*
+
+Engineering consequences:
+- The **module go-live milestone = biometric integration**, not GPS. GPS remains a
+  fully supported `source` (the spec's §8 stands; login-holding staff can use it
+  when enabled), but nothing is declared live for staff attendance until a real
+  device feeds the engine.
+- Since the device make/model is still not finalized, what CAN be built now and is
+  now **promoted in priority**: the intake chokepoint, the punch-pairing engine
+  (§8.2), `hr_biometric_map`, the **CSV-import provider** (works with any device's
+  export from day one), and a webhook stub. The vendor-specific connector is the
+  only piece that waits for the device.
+- Non-webapp staff are `hr_employees` rows with `user_id = NULL`, exactly per D1.
+
+### 8.2 D2 (event log + summary): APPROVED — with the split-shift / single-gate rules
+
+The venue runs **one entry/exit gate** (one device at one door) and **split
+shifts**: roughly 9/10 AM to ~3 PM, break, ~6 PM to ~1 AM the NEXT calendar
+morning. Both sessions belong to ONE attendance day. Binding rules:
+
+1. **Business day, not calendar day.** An attendance day runs to a configurable
+   cutoff, default **04:00 IST** (`hr_day_cutoff` setting). Any punch between
+   midnight and the cutoff attaches to the PREVIOUS business day. A 1:00 AM
+   checkout lands on yesterday's row — never on a new day.
+2. **Worked example (the owner's own):** IN 9:30 → OUT 15:00 → IN 18:30 →
+   OUT 01:00(+1 cal-day) = ONE `hr_attendance` row: worked 12h00m, break 3h30m,
+   two sessions, day = the morning's IST date.
+3. **Single-gate pairing.** One device records both directions. Unless the future
+   device reports direction explicitly (if it does, that wins), punches alternate:
+   first punch of the business day = IN, next = OUT, and so on. Multiple IN/OUT
+   pairs per day are NORMAL (that is the break shift), never an error.
+4. **Debounce.** Consecutive punches from the same employee within a configurable
+   window (default 3 min, `hr_punch_debounce_min`) are duplicates — keep the
+   first, log the rest as ignored events (append-only: recorded, marked ignored,
+   never deleted).
+5. **Odd punch count at day close** (forgot to punch out) → summary flagged
+   `MISSING_CHECKOUT`, surfaced for a correction request. The engine NEVER invents
+   a checkout time.
+6. Overtime/late/early compute against the assigned shift template, which must
+   support both **overnight spans** (end < start ⇒ +1 day) and **split
+   definitions** (two windows in one shift).
+
+### 8.3 D3 (/my-hr split): DEFERRED — admin-only module for now
+
+Ruling: *"At HR Access only will take that decision later."*
+- Build the **`/hr` admin module only**. NO `/my-hr` pages, no staff self-service,
+  no GPS self-check-in UI in the initial build.
+- The `/my-hr` root stays **reserved** (no other feature may claim the path) so
+  the self-service split can be added later without rework; the API layer keeps
+  the `/api/hr/me/*` shape unused-but-possible.
+- All sensitive-page tier flags from §2.2 still apply to `/hr` pages — the
+  deferral removes the staff surface, not the locks.
+
+### 8.4 D4 (payslips): APPROVED — protected PDF endpoint
+
+Ruling: *"make it protected."* Authenticated pdfkit endpoint, no 'print' path,
+per §2.5. Applies to every future HR letter (offer, experience, relieving).
+
+### 8.5 Effect on phase order (§6)
+
+Phase 2 becomes **"Attendance engine + biometric readiness"**: geofence admin +
+engine + pairing + business-day summary + corrections + `hr_biometric_map` +
+CSV-import provider + import UI. The GPS *capture UI* moves out of Phase 2 into
+the deferred self-service scope (§8.3); the GPS source stays supported in the
+engine. Phase 8 shrinks to: vendor connector for the finalized device.
