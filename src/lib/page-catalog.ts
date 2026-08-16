@@ -341,6 +341,30 @@ export const PAGE_CATALOG: PageSection[] = [
     ],
   },
   {
+    // HR — HRMS module (contract: docs/HRMS_DECISIONS.md). Entries are added
+    // phase by phase: registering a path whose page.tsx does not exist yet gives
+    // granted users a 404 (the proxy happily lets them through), so this list
+    // must only ever name pages that are BUILT. Phase 1: dashboard, employees,
+    // settings.
+    //
+    // Every entry here is tier-flagged on purpose: canAccessPage fails OPEN for
+    // legacy NULL page_access users (8 of 9 on the reference DB), so an
+    // unflagged HR page would be visible to nearly everyone the day it ships.
+    // Employee records are PII (phone, address, DOB) — mgmtOnly per
+    // docs/HRMS_DECISIONS.md §2.2. Settings is adminOnly. Future salary/payroll/bank/
+    // disciplinary pages MUST be adminOnly (tier flags run BEFORE grants, so
+    // the documented '/hr' prefix-grant leak cannot open them).
+    //
+    // Owner ruling 2026-08-16 (§8.3): staff self-service is DEFERRED and will
+    // live under the RESERVED root /my-hr — never register other features there.
+    label: 'HR',
+    pages: [
+      { path: '/hr',           label: 'HR Dashboard', mgmtOnly: true },
+      { path: '/hr/employees', label: 'Employees',    mgmtOnly: true },
+      { path: '/hr/settings',  label: 'HR Settings',  adminOnly: true },
+    ],
+  },
+  {
     label: 'Admin',
     pages: [
       { path: '/departments',         label: 'Departments' },
