@@ -4370,7 +4370,8 @@ function EditApprovedPOModal({ po, materials, onClose, onSaved }: {
       <div className="bg-white rounded-xl w-full max-w-2xl flex flex-col" style={{ maxHeight: 'calc(100vh - 1.5rem)' }}>
         <div className="px-5 py-3 border-b border-[#E8D5C4]">
           <h3 className="font-bold text-[#2D1B0E]">Edit items — {po.po_number}</h3>
-          <p className="text-[11px] text-[#8B7355] mt-0.5">
+          <p className="text-[11px] text-[#6B5744] mt-0.5">
+            {po.vendor ? <>Vendor: <span className="font-medium">{po.vendor}</span> · </> : null}
             Add items or change quantities. Saving sends this PO back for a fresh admin approval —
             nothing can be received until it is re-approved. Rates are corrected at Receive, not here.
           </p>
@@ -4386,18 +4387,36 @@ function EditApprovedPOModal({ po, materials, onClose, onSaved }: {
                     <SimpleMaterialPicker value={l.material_id} materials={materials}
                                           takenIds={takenIds}
                                           onPickTaken={() => setError('That item is already on the PO — change its quantity instead.')}
-                                          onChange={(id, m) => setLines(ls => ls.map((x, xi) => xi === i ? {
-                                            ...x, material_id: id,
-                                            material_name: m?.name || id,
-                                            purchase_unit: m ? poUnitOf(m) : '',
-                                            unit_price: m ? poRateOf(m) : 0,
-                                          } : x))} />
+                                          onChange={(id, m) => setLines(ls => ls.map((x, xi) => {
+                                            if (xi !== i) return x;
+                                            /* VENDOR SEED, primary-first. The header vendor may not be
+                                               MAPPED to supply this item — the route's strict pairing
+                                               check refuses that with a 400 — so the material's own
+                                               primary vendor wins when it has one, and the header is
+                                               the fallback. vendor_id stays null for a primary-seeded
+                                               name: the route's vendorResolver resolves names against
+                                               the master ID-first-then-name, so a bare name is valid. */
+                                            const primary = String((m as any)?.primary_vendor || '').trim();
+                                            return {
+                                              ...x, material_id: id,
+                                              material_name: m?.name || id,
+                                              purchase_unit: m ? poUnitOf(m) : '',
+                                              unit_price: m ? poRateOf(m) : 0,
+                                              vendor: primary || x.vendor,
+                                              vendor_id: primary ? null : x.vendor_id,
+                                            };
+                                          }))} />
                   ) : (
                     <div className="flex items-center justify-between gap-2">
                       <div className="min-w-0">
                         <span className="text-sm font-medium text-[#2D1B0E]">{l.material_name}</span>
                         {l.isNew && <span className="ml-1.5 text-[9px] px-1 py-0.5 rounded bg-green-100 text-green-700 align-middle">ADDED</span>}
-                        {l.vendor && <span className="ml-1.5 text-[10px] text-[#8B7355]">{l.vendor}</span>}
+                        {/* The vendor ALWAYS shows: a line with a blank vendor is
+                            received under the PO's header vendor, and hiding that
+                            read as "no vendor" (owner report, 2026-08-16). */}
+                        <span className="ml-1.5 text-[10px] text-[#8B7355]">
+                          {l.vendor || (po.vendor ? `${po.vendor} (PO vendor)` : '— no vendor —')}
+                        </span>
                       </div>
                       <button onClick={() => setLines(ls => ls.filter((_, xi) => xi !== i))}
                               className="p-1 rounded text-red-500 hover:bg-red-50 shrink-0" title="Remove this line">
@@ -4416,17 +4435,26 @@ function EditApprovedPOModal({ po, materials, onClose, onSaved }: {
                       <span className="text-[#8B7355] font-mono">₹{l.unit_price.toFixed(2)}{l.purchase_unit ? `/${l.purchase_unit}` : ''}</span>
                       {/* purchase qty x Rs/purchase-unit — same basis on both sides */}
                       <span className="ml-auto font-mono text-[#2D1B0E]">₹{((Number(l.quantity) || 0) * l.unit_price).toLocaleString('en-IN', { maximumFractionDigits: 0 })}</span> {/* rate-basis: purchase */}
-                      {l.isNew && vendorChoices.length > 1 && (
-                        <select value={l.vendor}
-                                onChange={e => {
-                                  const v = vendorChoices.find(c => c.name === e.target.value);
-                                  setLines(ls => ls.map((x, xi) => xi === i ? { ...x, vendor: v?.name || '', vendor_id: v?.id ?? null } : x));
-                                }}
-                                className="border border-[#E8D5C4] rounded px-1.5 py-1 text-[11px]">
-                          {po.vendor ? null : <option value="">— vendor —</option>}
-                          {vendorChoices.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
-                        </select>
-                      )}
+                      {l.isNew && (() => {
+                        /* Options = this line's current vendor (covers the
+                           primary-vendor seed, which may not be on the PO yet)
+                           ∪ the vendors already on the PO. Rendered even with a
+                           single option so the vendor is always VISIBLE on an
+                           added line (owner report: "vendor is not showing"). */
+                        const names = [...new Set([l.vendor, ...vendorChoices.map(c => c.name)].filter(Boolean))];
+                        return (
+                          <select value={l.vendor}
+                                  onChange={e => {
+                                    const name = e.target.value;
+                                    const v = vendorChoices.find(c => c.name === name);
+                                    setLines(ls => ls.map((x, xi) => xi === i ? { ...x, vendor: name, vendor_id: v?.id ?? null } : x));
+                                  }}
+                                  className="border border-[#E8D5C4] rounded px-1.5 py-1 text-[11px]">
+                            {po.vendor && !l.vendor ? null : (l.vendor ? null : <option value="">— vendor —</option>)}
+                            {names.map(n => <option key={n} value={n}>{n}</option>)}
+                          </select>
+                        );
+                      })()}
                     </div>
                   )}
                 </div>
