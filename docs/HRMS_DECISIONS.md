@@ -375,6 +375,27 @@ Ruling: *"At HR Access only will take that decision later."*
 Ruling: *"make it protected."* Authenticated pdfkit endpoint, no 'print' path,
 per §2.5. Applies to every future HR letter (offer, experience, relieving).
 
+### 8.4a Phase 1 verify rulings (2026-08-16, recorded during the fix pass)
+
+- **hr_designations is a GLOBAL master** — deliberately no `outlet_id`, deviating
+  from the blanket "outlet_id on every hr_ table" rule. Job titles are shared
+  across outlets the way `roles` and `departments` are. (Flagged to the owner;
+  standing unless overruled.)
+- **Designation deactivation always succeeds** (soft, `is_active=0`): holders
+  keep the label (LEFT JOIN renders it), pickers hide it. No in-use guard.
+- **/hr/settings is adminOnly** — the catalog flag is the truth; page copy says so.
+- **Gender vocabulary**: lowercase keys `male|female|other|''`; server lowercases.
+- **Phones**: `+`-prefixed values stored verbatim (non-India E.164); only bare or
+  91-prefixed digits are normalised to last-10 (the PhoneField contract).
+- **Photos**: server caps data-URI length at 400k chars on POST/PUT; the LIST
+  projection excludes `photo` (ships `has_photo` 0/1 instead) — full photo only
+  on the single-employee GET. Lists render initials in Phase 1.
+- **Routes gate through `canManageHr`/`canAdminHr` from src/lib/hr.ts** — one
+  predicate source, per §2.6, verified wired (they were briefly dead code).
+- Still deferred to their phases: §3 item 5 (secret-keys mask) before Phase 4
+  payroll columns exist; §3 item 7 (settings KEY_POLICY `hr_` prefix) before the
+  first `hr_*` settings key (Phase 2 `hr_day_cutoff`).
+
 ### 8.5 Effect on phase order (§6)
 
 Phase 2 becomes **"Attendance engine + biometric readiness"**: geofence admin +

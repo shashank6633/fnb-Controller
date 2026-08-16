@@ -6110,6 +6110,94 @@ function initializeSchema(db: Database.Database) {
       db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('discount_limits_v1', '1')").run();
     }
   } catch (e) { console.error('discount_limits_v1 migration failed:', e); }
+
+  // ── HRMS module (hr_ namespace) ──────────────────────────────────────────
+  // Contract: docs/HRMS_DECISIONS.md (read it before touching anything here).
+  // Phase 1 tables only; later phases append INSIDE this one block.
+  //
+  // The load-bearing choices, so nobody "fixes" them:
+  //  - hr_employees stands ALONE. users rows are LOGIN ACCOUNTS (email+password
+  //    NOT NULL, some shared per station) — a kitchen helper without a login is
+  //    an employee with user_id NULL, never a fabricated credential. The
+  //    nullable user_id is the ONLY declared FK in the namespace; child tables
+  //    reference hr_employees.id as plain TEXT + index (the task_*/ct_* house
+  //    style — foreign_keys=ON makes a DEFAULT '' insert against an FK column
+  //    throw).
+  //  - The partial UNIQUE index on user_id allows unlimited NULLs while
+  //    forbidding two employees claiming one login.
+  //  - This block NEVER writes users/roles/departments/page_access — the
+  //    boot-migration lock (scripts/check-boot-migrations.js) fails `npm test`
+  //    on any unguarded write, and an earlier violation silently re-granted
+  //    revoked pages on every deploy.
+  //  - No seeds. Designations are created by the owner in the UI; a seed here
+  //    would resurrect deleted rows on every deploy (INSERT OR IGNORE is only
+  //    deploy-safe for things the admin cannot delete).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS hr_employees (
+        id               TEXT PRIMARY KEY,
+        employee_code    TEXT NOT NULL UNIQUE,      -- HR-issued, human-facing (EMP-0001)
+        full_name        TEXT NOT NULL,
+        photo            TEXT NOT NULL DEFAULT '',  -- base64 data URI (~250KB, ImageUpload-compressed)
+        dob              TEXT NOT NULL DEFAULT '',  -- YYYY-MM-DD
+        gender           TEXT NOT NULL DEFAULT '',
+        phone10          TEXT NOT NULL DEFAULT '',  -- PhoneField contract: +91 = bare 10 digits
+        alt_phone10      TEXT NOT NULL DEFAULT '',
+        email            TEXT NOT NULL DEFAULT '',  -- contact only; NOT an identity
+        current_address  TEXT NOT NULL DEFAULT '',
+        permanent_address TEXT NOT NULL DEFAULT '',
+        emergency_name   TEXT NOT NULL DEFAULT '',
+        emergency_relation TEXT NOT NULL DEFAULT '',
+        emergency_phone10 TEXT NOT NULL DEFAULT '',
+        department_id    TEXT NOT NULL DEFAULT '',  -- departments.id (the real 3-main/16-sub tree)
+        sub_department_id TEXT NOT NULL DEFAULT '', -- departments.id (a child row)
+        designation_id   TEXT NOT NULL DEFAULT '',  -- hr_designations.id
+        grade            TEXT NOT NULL DEFAULT '',
+        reporting_manager_id TEXT NOT NULL DEFAULT '', -- hr_employees.id
+        employment_type  TEXT NOT NULL DEFAULT 'permanent',
+        employee_category TEXT NOT NULL DEFAULT '',
+        cost_centre      TEXT NOT NULL DEFAULT '',
+        work_location    TEXT NOT NULL DEFAULT '',
+        home_outlet_id   TEXT NOT NULL DEFAULT '',  -- employment assignment; users.current_outlet_id is a VIEW preference, never this
+        joining_date     TEXT NOT NULL DEFAULT '',  -- YYYY-MM-DD
+        probation_months INTEGER NOT NULL DEFAULT 0,
+        confirmation_date TEXT NOT NULL DEFAULT '',
+        notice_period_days INTEGER NOT NULL DEFAULT 0,
+        status           TEXT NOT NULL DEFAULT 'active',
+        exit_date        TEXT NOT NULL DEFAULT '',
+        user_id          TEXT REFERENCES users(id),
+        notes            TEXT NOT NULL DEFAULT '',
+        created_by       TEXT NOT NULL DEFAULT '',  -- me.email (house actor convention)
+        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_emp_user
+        ON hr_employees(user_id) WHERE user_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_hr_emp_dept    ON hr_employees(department_id);
+      CREATE INDEX IF NOT EXISTS idx_hr_emp_status  ON hr_employees(status);
+      CREATE INDEX IF NOT EXISTS idx_hr_emp_outlet  ON hr_employees(home_outlet_id);
+      CREATE INDEX IF NOT EXISTS idx_hr_emp_phone   ON hr_employees(phone10);
+
+      CREATE TABLE IF NOT EXISTS hr_designations (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        department_id TEXT NOT NULL DEFAULT '',   -- hint only, not a constraint
+        grade       TEXT NOT NULL DEFAULT '',
+        is_active   INTEGER NOT NULL DEFAULT 1,   -- soft delete; rows are never removed
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_employee_outlets (
+        id          TEXT PRIMARY KEY,
+        employee_id TEXT NOT NULL,                -- hr_employees.id (no FK by design)
+        outlet_id   TEXT NOT NULL,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (employee_id, outlet_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_emp_outlets_emp ON hr_employee_outlets(employee_id);
+    `);
+  } catch (e) { console.error('hrms schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

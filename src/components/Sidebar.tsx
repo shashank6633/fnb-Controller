@@ -336,6 +336,23 @@ const navTree: NavEntry[] = [
     ],
   },
 
+  // HR — HRMS module (contract: docs/HRMS_DECISIONS.md). Every entry here must
+  // ALSO be registered in src/lib/page-catalog.ts (and vice versa) — this file
+  // keeps its own nav tree, and a catalog-only page is correctly gated but
+  // completely invisible. Rows are added phase by phase, only for pages that
+  // exist. canAccessPage() filters per user, so mgmtOnly/adminOnly visibility
+  // is automatic once the row is here.
+  {
+    kind: "section",
+    label: "HR",
+    icon: Users,
+    items: [
+      { kind: "link", label: "HR Dashboard", href: "/hr",           icon: LayoutDashboard },
+      { kind: "link", label: "Employees",    href: "/hr/employees", icon: Users },
+      { kind: "link", label: "HR Settings",  href: "/hr/settings",  icon: Settings2 },
+    ],
+  },
+
   {
     kind: "section",
     label: "Settings",

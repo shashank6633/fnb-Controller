@@ -90,6 +90,7 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/crm-calls',           // CRM Call-to-Table: guests/calls/bookings/recoveries/settings/seed mutations
   '/api/crm-calls/entertainment', // GRE "What's On" entertainment calendar CRUD (management-gated writes)
   '/api/telecmi',             // TeleCMI actions (click-to-call, backfill) — webhooks are carved out in isPublic (matched there first)
+  '/api/hr',                  // HRMS module (docs/HRMS_DECISIONS.md) — one prefix covers every present and future HR mutation; HR client writes must use src/lib/api.ts or they 403 here
 ];
 
 function isPublic(pathname: string): boolean {
