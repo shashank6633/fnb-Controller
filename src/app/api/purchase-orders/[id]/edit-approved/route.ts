@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { duplicateLineError } from '@/lib/po-helpers';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
+import { snapshotPoLines } from '@/lib/po-stock-snapshot';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * GOODS ALREADY TAKEN IN CLOSE THIS DOOR.
@@ -280,6 +281,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
                 lineVendor, lineVendorId, it.notes || '');
         afterItems.push({ material_id: materialId, quantity: qty, unit_price: px, total_price: lineTotal });
       }
+
+      // Freeze stock for materials NEW to this PO, at this moment. The owner's
+      // rule verbatim: originals keep the figure from the 1st raise, "for extra
+      // added items also usually take Actual stock at [add] time". ON CONFLICT
+      // (po_id, material_id) DO NOTHING inside snapshotPoLines makes both
+      // halves true in one call: every material already snapshotted is left
+      // untouched, and only the additions get a row, taken now. Inside this
+      // txn per the lib's own header — a purchase_order_items row must never
+      // exist without the stock figure that was true when it was raised. The
+      // 'po_edit_approved_add' source was declared in SnapshotSource for
+      // exactly this path and had no caller until here.
+      snapshotPoLines(db, id, { takenBy: me.email, source: 'po_edit_approved_add' });
 
       // Money + note follow the claim (status/approved_at/approved_by were
       // already cleared there): newTotal is only known after the re-insert.

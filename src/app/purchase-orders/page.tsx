@@ -305,6 +305,13 @@ export default function PurchaseOrdersPage() {
   const [openDetailId, setOpenDetailId] = useState<string | null>(null);
   const [reviewId, setReviewId] = useState<string | null>(null);   // approval-context drawer
   const [receivingId, setReceivingId] = useState<string | null>(null);
+  // Approved-PO line edit (add items / change quantities, same PO). Backend:
+  // [id]/edit-approved — replaces the line set and drops the PO to
+  // pending_reapproval, forcing a fresh admin approval. Refused once ANY goods
+  // are received (lines are frozen after receipt so a delivery cannot be
+  // received twice); the button greys out on part-received rows for the same
+  // reason the server refuses.
+  const [editApprovedPo, setEditApprovedPo] = useState<PO | null>(null);
   const [rejectingPo, setRejectingPo] = useState<PO | null>(null);
   const [approvingPo, setApprovingPo] = useState<PO | null>(null);
   const [poFlagCount, setPoFlagCount] = useState<Record<string, number>>({});  // poId → flag total
@@ -599,6 +606,23 @@ export default function PurchaseOrdersPage() {
                                   <PackageCheck className="w-3 h-3" /> Receive
                                 </button>
                               )}
+                              {/* Edit an APPROVED PO's lines (add items / change
+                                  quantities — one PO, re-approval forced). Shown
+                                  wherever Receive is: same status, and the route
+                                  gates admin|manager on the REAL tier itself.
+                                  Disabled once anything is received — the server
+                                  hard-refuses that with the GRN list, so a live
+                                  button would only 409; grey + why is honest. */}
+                              {canReceive && (
+                                <button onClick={() => setEditApprovedPo(p)}
+                                        disabled={isSaving || partReceived}
+                                        title={partReceived
+                                          ? 'Goods already received against this PO — lines are frozen. Missing goods are left un-received; a wrong rate is corrected on Receive.'
+                                          : 'Add items or change quantities — the PO goes back for re-approval'}
+                                        className="px-2 py-1 rounded text-[10px] bg-amber-100 text-amber-800 hover:bg-amber-200 inline-flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed">
+                                  <ClipboardList className="w-3 h-3" /> Edit items
+                                </button>
+                              )}
                               {/* Gated on the status itself, NOT the canCancel
                                   array or the tab — the Rejected/Cancelled tab
                                   also holds cancelled POs, which cannot be
@@ -664,6 +688,13 @@ export default function PurchaseOrdersPage() {
                         role={role}
                         onClose={() => setReceivingId(null)}
                         onReceived={() => { setReceivingId(null); fetchAll(); }} />
+        )}
+
+        {editApprovedPo && (
+          <EditApprovedPOModal po={editApprovedPo}
+                               materials={materials}
+                               onClose={() => setEditApprovedPo(null)}
+                               onSaved={() => { setEditApprovedPo(null); fetchAll(); setTab('pending'); }} />
         )}
 
         {rejectingPo && (
@@ -4227,6 +4258,204 @@ function ApprovePOModal({ po, onClose, onApproved }: {
             {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ShieldCheck className="w-4 h-4" />}
             {requiresNote ? 'Approve with override' : 'Approve'}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================ */
+/* Edit an APPROVED PO's lines — add items / change quantities,
+ * same PO, forced re-approval.
+ *
+ * Backend: POST /api/purchase-orders/[id]/edit-approved. It REPLACES the whole
+ * line set, drops the PO to 'pending_reapproval' (clearing the old approval),
+ * and hard-refuses (409, naming the GRNs) once ANY goods are received — the
+ * button that opens this modal is already disabled on part-received rows for
+ * that reason. The route also snapshots stock for materials NEW to the PO at
+ * this moment; originals keep their raise-time figure (first-write-wins), which
+ * is the owner's rule for the "Stock when PO raised" column.
+ *
+ * Deliberately SIMPLER than the Create/Draft composers: rates are read-only
+ * here (a wrong rate on undelivered goods is corrected at Receive, which takes
+ * an override with a reason — the route's own header says so), and new lines
+ * take their vendor from a small select over the vendors already on this PO
+ * (header vendor first). The full vendor↔item mapping machinery stays on the
+ * composer paths where vendors are actually being chosen. */
+function EditApprovedPOModal({ po, materials, onClose, onSaved }: {
+  po: PO; materials: Material[]; onClose: () => void; onSaved: () => void;
+}) {
+  type EditLine = {
+    id?: string; material_id: string; material_name: string; purchase_unit: string;
+    quantity: string;          // raw keystrokes — committed on save (the rate-draft lesson)
+    unit_price: number; vendor: string; vendor_id: string | null; notes: string;
+    isNew: boolean;
+  };
+  const [lines, setLines] = useState<EditLine[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    fetch(`/api/purchase-orders?id=${po.id}`).then(r => r.json()).then(d => {
+      const items: POItem[] = d.purchase_order?.items || [];
+      setLines(items.map(it => ({
+        id: it.id, material_id: it.material_id,
+        material_name: it.material_name || it.material_id,
+        purchase_unit: it.material_purchase_unit || '',
+        quantity: String(it.quantity),
+        unit_price: it.unit_price,
+        vendor: it.vendor || '', vendor_id: it.vendor_id ?? null,
+        notes: it.notes || '', isNew: false,
+      })));
+      setLoading(false);
+    }).catch(() => { setError('Failed to load the PO lines. Close and retry.'); setLoading(false); });
+  }, [po.id]);
+
+  /* Vendor choices for NEW lines: the header vendor plus every vendor already
+   * on a line. A blank choice is allowed only when the PO has a header vendor —
+   * the route resolves a blank line vendor to the header at receive time. */
+  const vendorChoices = useMemo(() => {
+    const seen = new Map<string, { id: string | null; name: string }>();
+    if (po.vendor) seen.set(po.vendor, { id: (po as any).vendor_id ?? null, name: po.vendor });
+    for (const l of lines) if (l.vendor) seen.set(l.vendor, { id: l.vendor_id, name: l.vendor });
+    return [...seen.values()];
+  }, [po, lines]);
+
+  const takenIds = useMemo(() => {
+    const m = new Map<string, number>();
+    lines.forEach((l, i) => { if (l.material_id) m.set(l.material_id, i + 1); });
+    return m;
+  }, [lines]);
+
+  const addLine = () => setLines(ls => [...ls, {
+    material_id: '', material_name: '', purchase_unit: '',
+    quantity: '1', unit_price: 0,
+    vendor: vendorChoices.length === 1 ? vendorChoices[0].name : (po.vendor || ''),
+    vendor_id: vendorChoices.length === 1 ? vendorChoices[0].id : ((po as any).vendor_id ?? null),
+    notes: '', isNew: true,
+  }]);
+
+  // Both factors are PURCHASE basis: POItem.quantity and unit_price are declared
+  // purchase-unit on the interface, and new lines seed from poRateOf (Rs/purchase
+  // unit) with a qty typed against the purchase unit shown beside the box.
+  const total = lines.reduce((s, l) => s + (Number(l.quantity) || 0) * (l.unit_price || 0), 0); // rate-basis: purchase
+  const invalid = lines.some(l => !l.material_id || !(Number(l.quantity) > 0) || !(l.unit_price > 0));
+  const changed = lines.some(l => l.isNew) || true; // qty edits are cheap to allow through; server refuses no-ops harmlessly
+
+  const submit = async () => {
+    setBusy(true); setError('');
+    try {
+      const r = await api(`/api/purchase-orders/${po.id}/edit-approved`, {
+        method: 'POST',
+        body: {
+          reason,
+          items: lines.map(l => ({
+            id: l.id, material_id: l.material_id,
+            quantity: Number(l.quantity) || 0, unit_price: l.unit_price,
+            vendor: l.vendor, vendor_id: l.vendor_id, notes: l.notes,
+          })),
+        },
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(d.error || 'Failed to save the edit.'); return; }
+      alert(`${po.po_number} updated — it is back in Pending Approval and needs a fresh admin approval before it can be received.`);
+      onSaved();
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-3">
+      <div className="bg-white rounded-xl w-full max-w-2xl flex flex-col" style={{ maxHeight: 'calc(100vh - 1.5rem)' }}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4]">
+          <h3 className="font-bold text-[#2D1B0E]">Edit items — {po.po_number}</h3>
+          <p className="text-[11px] text-[#8B7355] mt-0.5">
+            Add items or change quantities. Saving sends this PO back for a fresh admin approval —
+            nothing can be received until it is re-approved. Rates are corrected at Receive, not here.
+          </p>
+        </div>
+        <div className="px-5 py-3 overflow-y-auto flex-1 space-y-2">
+          {loading ? (
+            <div className="text-sm text-[#8B7355] flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Loading lines…</div>
+          ) : (
+            <>
+              {lines.map((l, i) => (
+                <div key={l.id || `new-${i}`} className="border border-[#E8D5C4] rounded-lg p-2.5 space-y-1.5">
+                  {l.isNew && !l.material_id ? (
+                    <SimpleMaterialPicker value={l.material_id} materials={materials}
+                                          takenIds={takenIds}
+                                          onPickTaken={() => setError('That item is already on the PO — change its quantity instead.')}
+                                          onChange={(id, m) => setLines(ls => ls.map((x, xi) => xi === i ? {
+                                            ...x, material_id: id,
+                                            material_name: m?.name || id,
+                                            purchase_unit: m ? poUnitOf(m) : '',
+                                            unit_price: m ? poRateOf(m) : 0,
+                                          } : x))} />
+                  ) : (
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <span className="text-sm font-medium text-[#2D1B0E]">{l.material_name}</span>
+                        {l.isNew && <span className="ml-1.5 text-[9px] px-1 py-0.5 rounded bg-green-100 text-green-700 align-middle">ADDED</span>}
+                        {l.vendor && <span className="ml-1.5 text-[10px] text-[#8B7355]">{l.vendor}</span>}
+                      </div>
+                      <button onClick={() => setLines(ls => ls.filter((_, xi) => xi !== i))}
+                              className="p-1 rounded text-red-500 hover:bg-red-50 shrink-0" title="Remove this line">
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+                  {l.material_id && (
+                    <div className="flex items-center gap-3 text-xs">
+                      <label className="text-[#6B5744]">Qty
+                        <input type="number" min="0.01" step="any" value={l.quantity}
+                               onChange={e => setLines(ls => ls.map((x, xi) => xi === i ? { ...x, quantity: e.target.value } : x))}
+                               className="ml-1.5 w-24 border border-[#E8D5C4] rounded px-2 py-1 font-mono" />
+                        {l.purchase_unit && <span className="ml-1 text-[#8B7355]">{l.purchase_unit}</span>}
+                      </label>
+                      <span className="text-[#8B7355] font-mono">₹{l.unit_price.toFixed(2)}{l.purchase_unit ? `/${l.purchase_unit}` : ''}</span>
+                      {/* purchase qty x Rs/purchase-unit — same basis on both sides */}
+                      <span className="ml-auto font-mono text-[#2D1B0E]">₹{((Number(l.quantity) || 0) * l.unit_price).toLocaleString('en-IN', { maximumFractionDigits: 0 })}</span> {/* rate-basis: purchase */}
+                      {l.isNew && vendorChoices.length > 1 && (
+                        <select value={l.vendor}
+                                onChange={e => {
+                                  const v = vendorChoices.find(c => c.name === e.target.value);
+                                  setLines(ls => ls.map((x, xi) => xi === i ? { ...x, vendor: v?.name || '', vendor_id: v?.id ?? null } : x));
+                                }}
+                                className="border border-[#E8D5C4] rounded px-1.5 py-1 text-[11px]">
+                          {po.vendor ? null : <option value="">— vendor —</option>}
+                          {vendorChoices.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
+                        </select>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+              <button onClick={addLine}
+                      className="w-full border border-dashed border-[#D4B896] rounded-lg py-2 text-xs text-[#6B5744] hover:bg-[#FFF1E3] inline-flex items-center justify-center gap-1">
+                <Plus className="w-3.5 h-3.5" /> Add item
+              </button>
+              <div>
+                <label className="block text-xs text-[#6B5744] mb-1">Reason for the change (required — goes in the approval note)</label>
+                <textarea value={reason} onChange={e => setReason(e.target.value)} rows={2}
+                          placeholder="e.g. Vendor confirmed 5 more cases available / quantity corrected after stock check"
+                          className="w-full border border-[#E8D5C4] rounded-lg px-2.5 py-1.5 text-sm" />
+              </div>
+              {error && <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-2.5 py-1.5">{error}</div>}
+            </>
+          )}
+        </div>
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-between gap-2">
+          <span className="text-xs text-[#6B5744]">New total <span className="font-mono font-semibold">₹{total.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</span></span>
+          <div className="flex gap-2">
+            <button onClick={onClose} disabled={busy} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
+            <button onClick={submit}
+                    disabled={busy || loading || invalid || lines.length === 0 || !reason.trim() || !changed}
+                    className="px-3 py-2 text-sm bg-amber-500 hover:bg-amber-600 text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+              Save &amp; send for re-approval
+            </button>
+          </div>
         </div>
       </div>
     </div>
