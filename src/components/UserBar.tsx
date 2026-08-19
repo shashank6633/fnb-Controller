@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { LogOut, ShieldCheck, User as UserIcon, Store } from 'lucide-react';
+import HardRefreshButton from '@/components/HardRefreshButton';
 import { usePathname, useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 
@@ -79,6 +80,9 @@ export default function UserBar() {
       <span className={`text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded ${user.role === 'admin' ? 'bg-[#af4408] text-white' : 'bg-gray-200 text-[#6B5744]'}`}>
         {user.role}
       </span>
+      {/* Hard refresh beside the profile identity (owner request 2026-08-17) —
+          clears SW caches + reloads; see HardRefreshButton for the full story. */}
+      <HardRefreshButton />
       <button onClick={logout} title="Sign out"
               className="p-1.5 rounded-full text-[#6B5744] hover:text-red-600 hover:bg-red-50">
         <LogOut className="w-3.5 h-3.5" />

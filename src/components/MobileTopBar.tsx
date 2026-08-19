@@ -20,6 +20,7 @@ import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { Menu, LogOut, UtensilsCrossed } from 'lucide-react';
 import { api } from '@/lib/api';
+import HardRefreshButton from '@/components/HardRefreshButton';
 
 interface SessionUser { email: string; name: string; role: string; }
 
@@ -76,6 +77,10 @@ export default function MobileTopBar() {
           floating bell (CaptainAlertsProvider). */}
       {user && (
         <div className="flex items-center gap-1">
+        {/* Hard refresh beside the profile circle (owner request 2026-08-17) —
+            clears SW caches + reloads. Same button on the desktop UserBar; the
+            dark variant matches this bar's near-black brown. */}
+        <HardRefreshButton dark />
         <div className="relative">
           <button
             onClick={() => setMenuOpen(o => !o)}
