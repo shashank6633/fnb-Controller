@@ -375,6 +375,49 @@ Ruling: *"At HR Access only will take that decision later."*
 Ruling: *"make it protected."* Authenticated pdfkit endpoint, no 'print' path,
 per §2.5. Applies to every future HR letter (offer, experience, relieving).
 
+### 8.4b Attendance rulings (2026-08-16, during the all-phases build)
+
+- **Suspended staff CANNOT punch** — owner verbatim: "Suspended Staff Cannot
+  Punch untill HR Releases the suspension." The engine's blocked set is
+  resigned/terminated/former/**suspended**, with a distinct refusal message.
+  Release = HR sets the employee's status back on the profile (audited);
+  punching resumes automatically.
+- Missing-checkout timing stands as built: an odd punch count flags
+  MISSING_CHECKOUT only after the business day CLOSES (04:00 cutoff); on the
+  open day a dangling IN reads PRESENT, and attendance reads sweep stale open
+  days so yesterday can never render PRESENT. (Explained to the owner with
+  worked examples; change only on a new ruling.)
+
+### 8.4c All-phases build + SmartOffice + verify-fix rulings (2026-08-16/17)
+
+- **The biometric device is SmartOffice v1.0.1** (vendor PDF in the owner's
+  Downloads). Connector: src/lib/smartoffice.ts (all 10 endpoints, query-string
+  auth, tolerant parsing, 15s timeouts) + /api/hr/biometric/smartoffice
+  (save_config/test/sync/push_user/block/unblock/set_expiration/devices) +
+  the biometric page card. Punches flow through syncSmartOfficePunches →
+  recordAttendanceEvent (source 'biometric', device direction wins when
+  reported). Config keys hr_smartoffice_* in settings KV (api_key auto-masked).
+  BlockUser encoding is the VENDOR's inverted 0=block/1=unblock — never "fix".
+  Suspension mirrors to the device (block on suspend, unblock on release),
+  fire-and-forget. TOPOLOGY: cloud→LAN reachability (port-forward/VPN) is the
+  owner's open item; CSV import is the guaranteed path meanwhile.
+- **Payroll**: roster scoped to the run's outlet (home/'' /hr_employee_outlets);
+  mid-month revisions pay per-day segments; paid-leave never double-pays a
+  punched day; cross-month leave clamps to remaining days; only DISBURSED
+  advances recover; statutory v1 applies state='' configs only.
+- **Engine**: LATE + overtime_minutes computed on CHECKED_OUT days from the
+  rostered shift (late_after/overtime_after minutes); ABSENT/HALF_DAY stay
+  unmodelled (register derives absent = rostered day with no summary row).
+- **Gates follow the catalog**: advances GET + all of exits/disciplinary are
+  canAdminHr (POST advance request stays canManageHr).
+- **hr_notifications is live**: producers at leave/correction/advance decisions
+  and SOP publish via src/lib/hr-notify.ts (login-linked employees only) + push.
+- Exit clearance resets to pending on each hr_approve; resignations refused for
+  already-exited employees. Documents PATCH verify/reject exists; filenames
+  download RFC-5987-encoded. SECRET_KEY_RE's uan/esic are segment-anchored
+  (bare 'uan' matched 'quantity' and masked 32 operational columns — verify
+  fleet catch).
+
 ### 8.4a Phase 1 verify rulings (2026-08-16, recorded during the fix pass)
 
 - **hr_designations is a GLOBAL master** — deliberately no `outlet_id`, deviating

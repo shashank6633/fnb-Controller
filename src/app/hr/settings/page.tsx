@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * HR Settings — Phase 1 = Designations management ONLY
+ * HR Settings — Designations master + Attendance engine knobs
  * (contract: docs/HRMS_DECISIONS.md).
  *
  * Designations are a soft-delete master (hr_designations.is_active) — rows are
@@ -9,8 +9,13 @@
  * management-tier; MUTATIONS ARE ADMIN-ONLY server-side, so this page surfaces
  * the 403 as friendly copy instead of pretending the buttons will work.
  *
- * Attendance rules / Shift templates / Leave types are dashed Phase 2/3
- * placeholders on purpose — nothing behind them exists yet.
+ * Attendance engine card → GET/PUT /api/hr/settings (§8.2): business-day
+ * cutoff (hr_day_cutoff, HH:MM IST — a punch before the cutoff belongs to the
+ * PREVIOUS attendance day) and punch debounce minutes
+ * (hr_punch_debounce_min). GET is management-tier, PUT is admin-only.
+ *
+ * Shift templates and Leave types are managed on their own live pages
+ * (/hr/shifts, /hr/leave) — this page just links there.
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -195,7 +200,7 @@ export default function HrSettingsPage() {
               <Settings2 className="w-6 h-6" /> HR Settings
             </h1>
             <p className="text-[#8B7355] text-sm mt-1">
-              Phase 1 covers the designations master. Attendance rules, shifts and leave types arrive with their phases.
+              Designations master and the attendance engine rules. Shifts and leave types live on their own pages.
             </p>
           </div>
           <button
@@ -338,30 +343,35 @@ export default function HrSettingsPage() {
           </p>
         </div>
 
-        {/*
-          ── NOT BUILT YET — Phase 2/3 placeholders only ─────────────────────
-          Nothing behind these cards exists. They are here so the owner sees
-          where each configuration will land; do not wire buttons into them.
-        */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <PlaceholderCard
-            icon={<Clock3 className="w-5 h-5" />}
-            title="Attendance rules"
-            phase="Phase 2"
-            note="Day cutoff, punch debounce and geofences — lands with the biometric-gated attendance engine."
-          />
-          <PlaceholderCard
-            icon={<CalendarRange className="w-5 h-5" />}
-            title="Shift templates"
-            phase="Phase 3"
-            note="Split and overnight shift definitions the roster and overtime compute against."
-          />
-          <PlaceholderCard
-            icon={<Palmtree className="w-5 h-5" />}
-            title="Leave types"
-            phase="Phase 3"
-            note="Leave vocabularies, balances and accrual rules for the leave request flow."
-          />
+        {/* Attendance engine knobs — GET/PUT /api/hr/settings (§8.2). */}
+        <AttendanceEngineCard />
+
+        {/* Shifts and leave types are LIVE on their own pages — link there. */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <a
+            href="/hr/shifts"
+            className="border border-[#E8D5C4] bg-white rounded-xl p-5 shadow hover:border-[#af4408] hover:bg-[#FFF1E3] transition-colors block"
+          >
+            <div className="flex items-center gap-2 mb-1.5 text-[#af4408]">
+              <CalendarRange className="w-5 h-5" />
+              <span className="text-sm font-medium text-[#2D1B0E]">Shift templates</span>
+            </div>
+            <p className="text-xs text-[#8B7355]">
+              Split and overnight shift definitions the roster computes against — managed on the Shifts page.
+            </p>
+          </a>
+          <a
+            href="/hr/leave"
+            className="border border-[#E8D5C4] bg-white rounded-xl p-5 shadow hover:border-[#af4408] hover:bg-[#FFF1E3] transition-colors block"
+          >
+            <div className="flex items-center gap-2 mb-1.5 text-[#af4408]">
+              <Palmtree className="w-5 h-5" />
+              <span className="text-sm font-medium text-[#2D1B0E]">Leave types</span>
+            </div>
+            <p className="text-xs text-[#8B7355]">
+              Leave vocabularies, balances and the request/approval flow — managed on the Leave page.
+            </p>
+          </a>
         </div>
 
         {/* Add / edit modal */}
@@ -444,27 +454,131 @@ export default function HrSettingsPage() {
 
 /* ── page-local helpers ─────────────────────────────────────────────────── */
 
-function PlaceholderCard({
-  icon,
-  title,
-  phase,
-  note,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  phase: string;
-  note: string;
-}) {
+/**
+ * Attendance engine settings — the two §8.2 knobs, wired to /api/hr/settings.
+ * GET is management-tier (values shown are the EFFECTIVE ones the pairing
+ * engine reads); PUT is admin-only server-side, so a manager's Save gets the
+ * friendly 403 copy — same pattern as the designations mutations above.
+ */
+function AttendanceEngineCard() {
+  const [cutoff, setCutoff] = useState('');
+  const [debounce, setDebounce] = useState('');
+  const [loaded, setLoaded] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        // Bare fetch is fine for GETs (CSRF header is only for mutations).
+        const r = await fetch('/api/hr/settings');
+        const j = await r.json().catch(() => null);
+        if (!r.ok || !j?.settings) {
+          setLoadFailed(true);
+          return;
+        }
+        setCutoff(String(j.settings.hr_day_cutoff || '04:00'));
+        setDebounce(String(j.settings.hr_punch_debounce_min ?? 3));
+        setLoaded(true);
+      } catch {
+        setLoadFailed(true);
+      }
+    })();
+  }, []);
+
+  const save = async () => {
+    setSaving(true);
+    setSaved(false);
+    setErr(null);
+    try {
+      const r = await api('/api/hr/settings', {
+        method: 'PUT',
+        body: { hr_day_cutoff: cutoff, hr_punch_debounce_min: debounce },
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok) {
+        setErr(
+          r.status === 403
+            ? 'Only admins can change the attendance engine settings — ask an admin to make this change.'
+            : j?.error || 'Could not save the settings. Try again.',
+        );
+        return;
+      }
+      if (j?.settings) {
+        setCutoff(String(j.settings.hr_day_cutoff));
+        setDebounce(String(j.settings.hr_punch_debounce_min));
+      }
+      setSaved(true);
+    } catch {
+      setErr('Could not save the settings. Check your connection and try again.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
-    <div className="border-2 border-dashed border-[#E8D5C4] rounded-xl p-5">
-      <div className="flex items-center gap-2 mb-1.5 text-[#8B7355]">
-        {icon}
-        <span className="text-sm font-medium text-[#6B5744]">{title}</span>
-        <span className="ml-auto text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-[#FFF1E3] text-[#8B7355] border-[#E8D5C4]">
-          {phase}
-        </span>
-      </div>
-      <p className="text-xs text-[#8B7355]">{note}</p>
+    <div className="bg-white border border-[#E8D5C4] rounded-xl shadow p-5">
+      <h3 className="font-semibold text-[#2D1B0E] flex items-center gap-2 mb-1">
+        <Clock3 className="w-5 h-5 text-[#af4408]" /> Attendance engine
+        <span className="text-xs font-normal text-[#8B7355]">changes are admin-only</span>
+      </h3>
+      <p className="text-xs text-[#8B7355] mb-4">
+        The business-day cutoff decides which attendance day a punch belongs to: anything BEFORE the cutoff counts as
+        the previous day — so with an 04:00 cutoff, a 1 AM checkout belongs to yesterday&apos;s shift. The debounce
+        window treats repeat punches within it as duplicates (kept, marked ignored).
+      </p>
+      {loadFailed ? (
+        <p className="text-sm text-[#8B7355]">The attendance settings could not be loaded — reload the page to retry.</p>
+      ) : !loaded ? (
+        <p className="text-sm text-[#8B7355]">
+          <Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Loading...
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-xl">
+            <div>
+              <label className="text-xs text-[#6B5744]">Business-day cutoff (IST)</label>
+              <input
+                type="time"
+                value={cutoff}
+                onChange={(e) => setCutoff(e.target.value)}
+                className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm"
+              />
+              <p className="text-[10px] text-[#8B7355] mt-1">Punches before this time belong to the previous day.</p>
+            </div>
+            <div>
+              <label className="text-xs text-[#6B5744]">Punch debounce (minutes)</label>
+              <input
+                type="number"
+                min={1}
+                max={60}
+                step={1}
+                value={debounce}
+                onChange={(e) => setDebounce(e.target.value)}
+                className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm"
+              />
+              <p className="text-[10px] text-[#8B7355] mt-1">Repeat punches inside this window are duplicates.</p>
+            </div>
+          </div>
+          {err && (
+            <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-800 flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" /> {err}
+            </div>
+          )}
+          <div className="mt-3 flex items-center gap-3">
+            <button
+              onClick={save}
+              disabled={saving}
+              className="px-3 py-2 text-sm bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50"
+            >
+              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
+            </button>
+            {saved && <span className="text-xs text-green-700">Saved — future punches use the new values.</span>}
+          </div>
+        </>
+      )}
     </div>
   );
 }

@@ -170,6 +170,28 @@ export async function POST(request: Request) {
       }
     }
 
+    // Referenced-row validation at CREATE (named 400s — the backend mapping
+    // rule every Phase 2-7 route follows): a non-empty reference must be a
+    // real row. Empty stays allowed — these links are all optional.
+    const department_id = s(body?.department_id);
+    if (department_id && !db.prepare('SELECT id FROM departments WHERE id = ?').get(department_id)) {
+      return Response.json({ error: 'Selected department was not found' }, { status: 400 });
+    }
+    const sub_department_id = s(body?.sub_department_id);
+    if (sub_department_id && !db.prepare('SELECT id FROM departments WHERE id = ?').get(sub_department_id)) {
+      return Response.json({ error: 'Selected sub-department was not found' }, { status: 400 });
+    }
+    const designation_id = s(body?.designation_id);
+    if (designation_id && !db.prepare('SELECT id FROM hr_designations WHERE id = ?').get(designation_id)) {
+      return Response.json({ error: 'Selected designation was not found' }, { status: 400 });
+    }
+    // A brand-new employee cannot equal their own manager (fresh id), so only
+    // existence is checked here; the self-report guard lives on PUT.
+    const reporting_manager_id = s(body?.reporting_manager_id);
+    if (reporting_manager_id && !db.prepare('SELECT id FROM hr_employees WHERE id = ?').get(reporting_manager_id)) {
+      return Response.json({ error: 'Selected reporting manager was not found' }, { status: 400 });
+    }
+
     // Stamp the caller's outlet ONLY when the KEY is absent from the body —
     // an explicit '' is a deliberate "no outlet" and is stored as ''.
     // getCurrentOutletId is async — resolve it BEFORE db.transaction(); an
@@ -194,11 +216,11 @@ export async function POST(request: Request) {
       emergency_name: s(body?.emergency_name),
       emergency_relation: s(body?.emergency_relation),
       emergency_phone10: normPhone(body?.emergency_phone10),
-      department_id: s(body?.department_id),
-      sub_department_id: s(body?.sub_department_id),
-      designation_id: s(body?.designation_id),
+      department_id,
+      sub_department_id,
+      designation_id,
       grade: s(body?.grade),
-      reporting_manager_id: s(body?.reporting_manager_id),
+      reporting_manager_id,
       employment_type,
       employee_category: s(body?.employee_category),
       cost_centre: s(body?.cost_centre),

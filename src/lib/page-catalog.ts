@@ -361,6 +361,28 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/hr',           label: 'HR Dashboard', mgmtOnly: true },
       { path: '/hr/employees', label: 'Employees',    mgmtOnly: true },
+      // Phase 2 — attendance engine. Register + timeline + corrections queue
+      // live on one page; geofences and the biometric mapping/import are the
+      // config surfaces behind attendance and stay adminOnly like /hr/settings.
+      { path: '/hr/attendance', label: 'Attendance',           mgmtOnly: true },
+      { path: '/hr/geofences',  label: 'Geofences',            adminOnly: true },
+      { path: '/hr/biometric',  label: 'Biometric & Import',   adminOnly: true },
+      // Phases 3-7 (owner ordered all phases 2026-08-16). Money, identity and
+      // disciplinary surfaces are adminOnly — the only flag that holds against
+      // the NULL-page_access fail-open; team-facing operations are mgmtOnly.
+      { path: '/hr/shifts',      label: 'Shifts',               mgmtOnly: true },
+      { path: '/hr/roster',      label: 'Roster',               mgmtOnly: true },
+      { path: '/hr/leave',       label: 'Leave',                mgmtOnly: true },
+      { path: '/hr/payroll',     label: 'Payroll & Advances',   adminOnly: true },
+      { path: '/hr/documents',   label: 'Employee Documents',   adminOnly: true },
+      { path: '/hr/sops',        label: 'SOP Library',          mgmtOnly: true },
+      { path: '/hr/training',    label: 'Training',             mgmtOnly: true },
+      { path: '/hr/tests',       label: 'Knowledge Tests',      mgmtOnly: true },
+      { path: '/hr/performance', label: 'Performance',          mgmtOnly: true },
+      { path: '/hr/assets',      label: 'Employee Assets',      mgmtOnly: true },
+      { path: '/hr/recruitment', label: 'Recruitment',          mgmtOnly: true },
+      { path: '/hr/exits',       label: 'Disciplinary & Exits', adminOnly: true },
+      { path: '/hr/reports',     label: 'HR Reports',           mgmtOnly: true },
       { path: '/hr/settings',  label: 'HR Settings',  adminOnly: true },
     ],
   },

@@ -89,6 +89,11 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
  */
 const OWNED_PREFIXES: Array<{ re: RegExp; route: string }> = [
   { re: /^wa_/i, route: '/api/whatsapp/config' },
+  // HRMS keys (hr_day_cutoff, hr_punch_debounce_min, ...) are owned by the HR
+  // settings route so the manager-writable generic PUT here cannot touch them,
+  // per docs/HRMS_DECISIONS.md §2.7. Registered BEFORE the first hr_* key
+  // exists — the gate being decorative-until-registered is the trap.
+  { re: /^hr_/i, route: '/api/hr/settings' },
 ];
 
 /** The dedicated route that owns this key, or null when this endpoint owns it. */
