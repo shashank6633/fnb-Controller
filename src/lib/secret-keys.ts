@@ -46,7 +46,19 @@
  * change: prove the key it stops matching is not a credential before you do it.
  */
 export const SECRET_KEY_RE =
-  /(token|api[_-]?key|_keys|secret|password|passwd|webhook|credential|sa_json|private)/i;
+  /(token|api[_-]?key|_keys|secret|password|passwd|webhook|credential|sa_json|private|aadhaar|account_number|ifsc|doc_number|salary|(^|_)uan(_|$)|(^|_)esic(_|$))/i;
+// uan/esic are SEGMENT-anchored: bare 'uan' substring-matches 'quantity' and
+// masked 32 operational columns across purchases/sales/recipes in the admin
+// SQL console (found by the verify fleet). (^|_)uan(_|$) matches uan, uan_no,
+// employee_uan — never q-uan-tity.
+// The second half of the pattern (aadhaar onward) exists for the HRMS module
+// (docs/HRMS_DECISIONS.md §2.9): hr_bank_accounts.account_number/ifsc and
+// hr_documents.doc_number (PAN/Aadhaar numbers land there) must not render in
+// the /admin/database SQL console, and any settings key naming salary becomes
+// admin-only by shape. Deliberately NOT matched: bare 'basic'/'gross' — they
+// would mask legitimate operational columns (butchering's gross_weight), and
+// the salary AMOUNT columns are visible to the admin console's admin-only
+// audience anyway; identity numbers are the boundary here, not figures.
 
 /**
  * Keys that are admin-read-only but whose NAME does not give them away, so the

@@ -395,6 +395,81 @@ export async function GET() {
       }
     }
 
+    // ── HRMS buckets (additive; docs/HRMS_DECISIONS.md §3 item 6). Each bucket
+    //    sits in its OWN try/catch with a dynamic import so an hr-schema issue
+    //    can never darken the whole bell, and each is ONE row per QUEUE with
+    //    count = queue size — the badge SUMS counts across items, so per-item
+    //    rows would bury every other bucket. Every bucket carries the SAME
+    //    predicate as the page it deep-links to (canManageHr for the mgmt
+    //    pages, canAdminHr for the admin ones): a narrower gate would hide
+    //    real work, a wider one would deep-link people into a 403. ──────────
+
+    // Leave requests awaiting a decision → /hr/leave (mgmt page, canManageHr).
+    try {
+      const { canManageHr } = await import('@/lib/hr');
+      if (canManageHr(me)) {
+        const n = one(
+          `SELECT COUNT(*) AS n FROM hr_leave_requests WHERE status = 'pending'`,
+          [],
+        );
+        push('hr_leave_pending', 'Leave requests awaiting decision', n, '/hr/leave');
+      }
+    } catch (hrLeaveErr) {
+      console.error('[/api/notifications/inbox] hr-leave bucket failed:', hrLeaveErr);
+    }
+
+    // Attendance corrections awaiting review → /hr/attendance (mgmt page,
+    // canManageHr — decisions are admin acts, but the QUEUE lives on the
+    // register page every HR manager works from).
+    try {
+      const { canManageHr } = await import('@/lib/hr');
+      if (canManageHr(me)) {
+        const n = one(
+          `SELECT COUNT(*) AS n FROM hr_attendance_corrections WHERE status = 'pending'`,
+          [],
+        );
+        push('hr_corrections_pending', 'Attendance corrections awaiting review', n, '/hr/attendance');
+      }
+    } catch (hrCorrErr) {
+      console.error('[/api/notifications/inbox] hr-corrections bucket failed:', hrCorrErr);
+    }
+
+    // Salary advances awaiting a decision → /hr/payroll (admin page,
+    // canAdminHr — advance decisions and everything money-shaped are admin-only).
+    try {
+      const { canAdminHr } = await import('@/lib/hr');
+      if (canAdminHr(me)) {
+        const n = one(
+          `SELECT COUNT(*) AS n FROM hr_advances WHERE status = 'pending'`,
+          [],
+        );
+        push('hr_advances_pending', 'Salary advances awaiting decision', n, '/hr/payroll');
+      }
+    } catch (hrAdvErr) {
+      console.error('[/api/notifications/inbox] hr-advances bucket failed:', hrAdvErr);
+    }
+
+    // Employee documents expiring within 60 days → /hr/documents (admin page,
+    // canAdminHr). Threshold math mirrors GET /api/hr/documents?expiring_days=60
+    // exactly (todayIST + 60d, '' = no expiry and never counted) so the badge
+    // and the page it links to always agree.
+    try {
+      const { canAdminHr } = await import('@/lib/hr');
+      if (canAdminHr(me)) {
+        const { todayIST } = await import('@/lib/format-date');
+        const base = new Date(`${todayIST()}T00:00:00Z`);
+        base.setUTCDate(base.getUTCDate() + 60);
+        const threshold = base.toISOString().slice(0, 10);
+        const n = one(
+          `SELECT COUNT(*) AS n FROM hr_documents WHERE expiry_date != '' AND expiry_date <= ?`,
+          [threshold],
+        );
+        push('hr_docs_expiring', 'Employee documents expiring within 60 days', n, '/hr/documents');
+      }
+    } catch (hrDocsErr) {
+      console.error('[/api/notifications/inbox] hr-docs bucket failed:', hrDocsErr);
+    }
+
     const total = items.reduce((s, i) => s + i.count, 0);
     return Response.json({ total, items });
   } catch (e: any) {

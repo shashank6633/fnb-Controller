@@ -6196,6 +6196,609 @@ function initializeSchema(db: Database.Database) {
         UNIQUE (employee_id, outlet_id)
       );
       CREATE INDEX IF NOT EXISTS idx_hr_emp_outlets_emp ON hr_employee_outlets(employee_id);
+
+      -- ── Phase 2: attendance engine + biometric readiness (contract §8.2/§8.5) ──
+      -- The venue's shape, written into the schema:
+      --  · ONE entry/exit gate, so punches carry no direction — the pairing
+      --    engine in src/lib/hr-attendance.ts alternates IN/OUT per business day
+      --    (a device that reports direction later simply overrides pairing).
+      --  · SPLIT SHIFTS crossing midnight: 9:30-15:00 + 18:30-01:00 is ONE
+      --    attendance day. business_date is the IST day AFTER the configurable
+      --    cutoff (settings hr_day_cutoff, default '04:00') — a 1 AM checkout
+      --    belongs to yesterday. It is stamped AT WRITE TIME and indexed, never
+      --    derived by range-scanning UTC timestamps through the shift.
+      --  · hr_attendance_events is APPEND-ONLY: debounced duplicates are KEPT
+      --    and marked ignored, never deleted; corrections never rewrite events.
+      --  · hr_attendance is ONE computed summary row per employee per business
+      --    day. MISSING_CHECKOUT is flagged, a checkout time is never invented.
+      CREATE TABLE IF NOT EXISTS hr_geofences (
+        id                   TEXT PRIMARY KEY,
+        outlet_id            TEXT NOT NULL DEFAULT '',
+        name                 TEXT NOT NULL,
+        lat                  REAL NOT NULL,
+        lng                  REAL NOT NULL,
+        radius_m             REAL NOT NULL DEFAULT 100,   -- configurable, never hard-coded
+        accuracy_threshold_m REAL NOT NULL DEFAULT 50,
+        grace_seconds        INTEGER NOT NULL DEFAULT 300,
+        is_active            INTEGER NOT NULL DEFAULT 1,
+        created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_attendance_events (
+        id             TEXT PRIMARY KEY,
+        employee_id    TEXT NOT NULL,               -- hr_employees.id (no FK by design)
+        outlet_id      TEXT NOT NULL DEFAULT '',
+        event_type     TEXT NOT NULL,
+          -- check_in|check_out|break_start|break_end|outside_detected|outside_confirmed|returned
+        source         TEXT NOT NULL DEFAULT 'manual',  -- gps|biometric|manual|import (vocab in src/lib/hr.ts)
+        at             TEXT NOT NULL DEFAULT (datetime('now')),  -- UTC, render via fmtIST
+        business_date  TEXT NOT NULL DEFAULT '',    -- IST day after hr_day_cutoff; stamped at write
+        lat            REAL,
+        lng            REAL,
+        accuracy_m     REAL,
+        geofence_id    TEXT NOT NULL DEFAULT '',
+        geofence_status TEXT NOT NULL DEFAULT '',   -- inside|outside|unknown
+        reason         TEXT NOT NULL DEFAULT '',    -- outside-geofence classification, correction note
+        device_info    TEXT NOT NULL DEFAULT '',
+        ignored        INTEGER NOT NULL DEFAULT 0,  -- debounce dupes: kept + marked, never deleted
+        ignored_reason TEXT NOT NULL DEFAULT '',
+        created_by     TEXT NOT NULL DEFAULT '',    -- me.email; '' for machine sources
+        created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_att_ev_emp_day ON hr_attendance_events(employee_id, business_date);
+      CREATE INDEX IF NOT EXISTS idx_hr_att_ev_day     ON hr_attendance_events(business_date);
+
+      CREATE TABLE IF NOT EXISTS hr_attendance (
+        id               TEXT PRIMARY KEY,
+        employee_id      TEXT NOT NULL,
+        outlet_id        TEXT NOT NULL DEFAULT '',
+        date             TEXT NOT NULL,             -- IST business date (YYYY-MM-DD), the register key
+        status           TEXT NOT NULL DEFAULT 'NOT_CHECKED_IN',
+          -- NOT_CHECKED_IN|PRESENT|LATE|ON_BREAK|OUTSIDE_GEOFENCE|EARLY_CHECKOUT|
+          -- CHECKED_OUT|ABSENT|ON_LEAVE|HALF_DAY|OVERTIME|MISSING_CHECKOUT (vocab in src/lib/hr.ts)
+        first_in         TEXT NOT NULL DEFAULT '',  -- UTC datetimes; '' = none
+        last_out         TEXT NOT NULL DEFAULT '',
+        sessions         INTEGER NOT NULL DEFAULT 0, -- IN/OUT pairs; 2 on a split-shift day
+        worked_minutes   INTEGER NOT NULL DEFAULT 0,
+        break_minutes    INTEGER NOT NULL DEFAULT 0,
+        outside_minutes  INTEGER NOT NULL DEFAULT 0,
+        overtime_minutes INTEGER NOT NULL DEFAULT 0,
+        shift_id         TEXT NOT NULL DEFAULT '',  -- Phase 3 fills this
+        missing_checkout INTEGER NOT NULL DEFAULT 0,
+        corrected        INTEGER NOT NULL DEFAULT 0, -- an approved correction touched this day
+        computed_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (employee_id, date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_att_date ON hr_attendance(date);
+      -- (status, date) serves sweepStaleOpenDays' WHERE status='PRESENT' AND
+      -- date < ? — without it the sweep range-scans the whole summary history
+      -- on every register read (verify-fleet EXPLAIN finding).
+      CREATE INDEX IF NOT EXISTS idx_hr_att_status_date ON hr_attendance(status, date);
+
+      -- Corrections follow the variance_approvals pattern: frozen original +
+      -- requested + approved JSON, decision metadata, and a partial UNIQUE over
+      -- pending so one employee-day can hold only one open request. The
+      -- original events are NEVER rewritten — an approved correction appends
+      -- source='manual' events and recomputes the summary.
+      CREATE TABLE IF NOT EXISTS hr_attendance_corrections (
+        id             TEXT PRIMARY KEY,
+        employee_id    TEXT NOT NULL,
+        date           TEXT NOT NULL,               -- IST business date being corrected
+        original_json  TEXT NOT NULL DEFAULT '{}',
+        requested_json TEXT NOT NULL DEFAULT '{}',
+        reason         TEXT NOT NULL DEFAULT '',
+        requested_by   TEXT NOT NULL DEFAULT '',
+        status         TEXT NOT NULL DEFAULT 'pending', -- pending|approved|rejected
+        reviewed_by    TEXT NOT NULL DEFAULT '',
+        reviewed_at    TEXT NOT NULL DEFAULT '',
+        review_reason  TEXT NOT NULL DEFAULT '',
+        approved_json  TEXT NOT NULL DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_att_corr_pending
+        ON hr_attendance_corrections(employee_id, date) WHERE status = 'pending';
+
+      -- Future biometric device: employee <-> device identity mapping. The
+      -- vendor connector (whatever it turns out to be — API/webhook/SDK/CSV)
+      -- resolves its punches through this table and calls the SAME
+      -- recordAttendanceEvent() chokepoint GPS and manual entry use.
+      CREATE TABLE IF NOT EXISTS hr_biometric_map (
+        id                    TEXT PRIMARY KEY,
+        employee_id           TEXT NOT NULL,
+        biometric_employee_id TEXT NOT NULL,        -- the id the DEVICE knows
+        device_id             TEXT NOT NULL DEFAULT '',
+        outlet_id             TEXT NOT NULL DEFAULT '',
+        is_active             INTEGER NOT NULL DEFAULT 1,
+        created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at            TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (biometric_employee_id, device_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_bio_emp ON hr_biometric_map(employee_id);
+
+      -- ── Phases 3-7: shifts/roster/leave, pay, SOPs/training/tests, people
+      --    lifecycle, notifications (contract §5/§6; owner ordered all phases
+      --    2026-08-16). Backend-mapping rules that hold across every table:
+      --     · employee_id is ALWAYS hr_employees.id (never users.id, never an
+      --       email) — actor columns (*_by) are ALWAYS me.email. The two must
+      --       not be mixed: employees may have no login at all.
+      --     · department/designation references are ids into departments /
+      --       hr_designations; joins are LEFT so dangling ids degrade to blank,
+      --       never to dropped rows.
+      --     · money history is EFFECTIVE-DATED and append-only (salary
+      --       structures, statutory configs) — nothing overwrites an old rate.
+      --     · ledgers (advances, payroll items, asset history) are append-only;
+      --       state lives in small status columns, not in row deletion.
+      CREATE TABLE IF NOT EXISTS hr_shifts (
+        id             TEXT PRIMARY KEY,
+        name           TEXT NOT NULL,
+        start_hhmm     TEXT NOT NULL DEFAULT '09:00',  -- IST clock times
+        end_hhmm       TEXT NOT NULL DEFAULT '18:00',  -- end < start = overnight (+1 day)
+        split_json     TEXT NOT NULL DEFAULT '[]',     -- optional extra windows for split shifts
+        break_minutes  INTEGER NOT NULL DEFAULT 0,
+        grace_minutes  INTEGER NOT NULL DEFAULT 10,
+        late_after_minutes INTEGER NOT NULL DEFAULT 15,
+        early_out_before_minutes INTEGER NOT NULL DEFAULT 15,
+        overtime_after_minutes INTEGER NOT NULL DEFAULT 30,
+        department_id  TEXT NOT NULL DEFAULT '',
+        is_active      INTEGER NOT NULL DEFAULT 1,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_rosters (
+        id          TEXT PRIMARY KEY,
+        employee_id TEXT NOT NULL,
+        date        TEXT NOT NULL,                 -- IST business date
+        shift_id    TEXT NOT NULL,
+        note        TEXT NOT NULL DEFAULT '',
+        created_by  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (employee_id, date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_roster_date ON hr_rosters(date);
+
+      CREATE TABLE IF NOT EXISTS hr_shift_requests (
+        id           TEXT PRIMARY KEY,
+        employee_id  TEXT NOT NULL,
+        date         TEXT NOT NULL,
+        requested_shift_id TEXT NOT NULL,
+        swap_with_employee_id TEXT NOT NULL DEFAULT '',
+        reason       TEXT NOT NULL DEFAULT '',
+        status       TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected
+        requested_by TEXT NOT NULL DEFAULT '',
+        reviewed_by  TEXT NOT NULL DEFAULT '',
+        reviewed_at  TEXT NOT NULL DEFAULT '',
+        review_reason TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_leave_types (
+        id             TEXT PRIMARY KEY,
+        name           TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        annual_entitlement REAL NOT NULL DEFAULT 0,
+        carry_forward_max  REAL NOT NULL DEFAULT 0,
+        encashable     INTEGER NOT NULL DEFAULT 0,
+        max_consecutive_days INTEGER NOT NULL DEFAULT 0, -- 0 = no cap
+        is_paid        INTEGER NOT NULL DEFAULT 1,
+        is_active      INTEGER NOT NULL DEFAULT 1,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_leave_balances (
+        id            TEXT PRIMARY KEY,
+        employee_id   TEXT NOT NULL,
+        leave_type_id TEXT NOT NULL,
+        year          TEXT NOT NULL,               -- '2026'
+        entitled      REAL NOT NULL DEFAULT 0,
+        taken         REAL NOT NULL DEFAULT 0,
+        adjusted      REAL NOT NULL DEFAULT 0,     -- manual +/- with audit
+        UNIQUE (employee_id, leave_type_id, year)
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_leave_requests (
+        id            TEXT PRIMARY KEY,
+        employee_id   TEXT NOT NULL,
+        leave_type_id TEXT NOT NULL,
+        from_date     TEXT NOT NULL,
+        to_date       TEXT NOT NULL,
+        days          REAL NOT NULL DEFAULT 1,     -- 0.5 supported
+        reason        TEXT NOT NULL DEFAULT '',
+        status        TEXT NOT NULL DEFAULT 'pending', -- pending|approved|rejected|cancelled
+        requested_by  TEXT NOT NULL DEFAULT '',
+        reviewed_by   TEXT NOT NULL DEFAULT '',
+        reviewed_at   TEXT NOT NULL DEFAULT '',
+        review_reason TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_leave_req_emp ON hr_leave_requests(employee_id, from_date);
+
+      -- Salary structures: NEVER overwritten. A revision INSERTs a new row with
+      -- effective_from; the previous row's effective_to is closed in the same
+      -- transaction. Both remain forever (owner spec §18).
+      CREATE TABLE IF NOT EXISTS hr_salary_structures (
+        id             TEXT PRIMARY KEY,
+        employee_id    TEXT NOT NULL,
+        effective_from TEXT NOT NULL,              -- YYYY-MM-DD
+        effective_to   TEXT NOT NULL DEFAULT '',   -- '' = current
+        basic          REAL NOT NULL DEFAULT 0,
+        hra            REAL NOT NULL DEFAULT 0,
+        allowances_json TEXT NOT NULL DEFAULT '[]', -- [{label, amount}]
+        gross          REAL NOT NULL DEFAULT 0,
+        deductions_json TEXT NOT NULL DEFAULT '[]',
+        net            REAL NOT NULL DEFAULT 0,
+        note           TEXT NOT NULL DEFAULT '',
+        created_by     TEXT NOT NULL DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_sal_emp ON hr_salary_structures(employee_id, effective_from);
+
+      -- Statutory rates are CONFIG ROWS, never constants in code and never
+      -- columns on the employee (owner spec §19/§20): scoped by state/category,
+      -- effective-dated, applied at payroll compute time.
+      CREATE TABLE IF NOT EXISTS hr_statutory_configs (
+        id             TEXT PRIMARY KEY,
+        kind           TEXT NOT NULL,              -- pf|esi|professional_tax|tds|bonus|gratuity|min_wage
+        state          TEXT NOT NULL DEFAULT '',   -- '' = all-India
+        employee_category TEXT NOT NULL DEFAULT '',
+        effective_from TEXT NOT NULL,
+        effective_to   TEXT NOT NULL DEFAULT '',
+        config_json    TEXT NOT NULL DEFAULT '{}', -- rates/slabs, shape per kind
+        is_active      INTEGER NOT NULL DEFAULT 1,
+        created_by     TEXT NOT NULL DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      -- Bank details: readable in FULL only by canViewSalary callers; every
+      -- other surface gets a masked account number. account_number is in the
+      -- secret-keys mask list for /admin/database.
+      CREATE TABLE IF NOT EXISTS hr_bank_accounts (
+        id              TEXT PRIMARY KEY,
+        employee_id     TEXT NOT NULL,
+        bank_name       TEXT NOT NULL DEFAULT '',
+        account_holder  TEXT NOT NULL DEFAULT '',
+        account_number  TEXT NOT NULL DEFAULT '',
+        ifsc            TEXT NOT NULL DEFAULT '',
+        branch          TEXT NOT NULL DEFAULT '',
+        account_type    TEXT NOT NULL DEFAULT 'savings',
+        verify_status   TEXT NOT NULL DEFAULT 'unverified', -- unverified|verified|rejected
+        verified_by     TEXT NOT NULL DEFAULT '',
+        verified_at     TEXT NOT NULL DEFAULT '',
+        is_active       INTEGER NOT NULL DEFAULT 1,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_bank_emp ON hr_bank_accounts(employee_id);
+
+      -- Document vault: bytes as BLOBs in THIS file (contract D4) behind an
+      -- HR-gated route with Cache-Control private/no-store. 400k client cap
+      -- upstream; scripts/backup-db.sh switched off .dump|gzip in the same
+      -- change that shipped this table.
+      CREATE TABLE IF NOT EXISTS hr_documents (
+        id            TEXT PRIMARY KEY,
+        employee_id   TEXT NOT NULL,
+        doc_type      TEXT NOT NULL DEFAULT '',    -- aadhaar|pan|address_proof|... (vocab in hr.ts)
+        doc_number    TEXT NOT NULL DEFAULT '',    -- masked outside canViewHrDocs
+        issue_date    TEXT NOT NULL DEFAULT '',
+        expiry_date   TEXT NOT NULL DEFAULT '',    -- expiry alerts key on this
+        filename      TEXT NOT NULL DEFAULT '',
+        mime          TEXT NOT NULL DEFAULT '',
+        size_bytes    INTEGER NOT NULL DEFAULT 0,
+        data          BLOB,
+        verify_status TEXT NOT NULL DEFAULT 'unverified',
+        verified_by   TEXT NOT NULL DEFAULT '',
+        uploaded_by   TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_docs_emp ON hr_documents(employee_id);
+      CREATE INDEX IF NOT EXISTS idx_hr_docs_expiry ON hr_documents(expiry_date);
+
+      CREATE TABLE IF NOT EXISTS hr_advances (
+        id               TEXT PRIMARY KEY,
+        employee_id      TEXT NOT NULL,
+        requested_amount REAL NOT NULL DEFAULT 0,
+        approved_amount  REAL NOT NULL DEFAULT 0,
+        installment_amount REAL NOT NULL DEFAULT 0,
+        recovered_amount REAL NOT NULL DEFAULT 0,
+        reason           TEXT NOT NULL DEFAULT '',
+        status           TEXT NOT NULL DEFAULT 'pending', -- pending|approved|rejected|disbursed|closed
+        requested_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        reviewed_by      TEXT NOT NULL DEFAULT '',
+        reviewed_at      TEXT NOT NULL DEFAULT '',
+        disbursed_at     TEXT NOT NULL DEFAULT '',
+        created_by       TEXT NOT NULL DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_adv_emp ON hr_advances(employee_id);
+
+      CREATE TABLE IF NOT EXISTS hr_advance_installments (
+        id          TEXT PRIMARY KEY,
+        advance_id  TEXT NOT NULL,
+        period      TEXT NOT NULL,                 -- '2026-09' payroll period
+        amount      REAL NOT NULL DEFAULT 0,
+        status      TEXT NOT NULL DEFAULT 'due',   -- due|recovered|waived
+        recovered_at TEXT NOT NULL DEFAULT '',
+        payroll_item_id TEXT NOT NULL DEFAULT '',  -- set when a payroll run recovers it
+        UNIQUE (advance_id, period)
+      );
+
+      -- Payroll ARCHITECTURE (owner spec §19): a run consumes attendance +
+      -- leave + structures + statutory configs + advances into frozen items.
+      -- Runs are drafts until finalized; a finalized run is immutable.
+      CREATE TABLE IF NOT EXISTS hr_payroll_runs (
+        id          TEXT PRIMARY KEY,
+        period      TEXT NOT NULL,                 -- '2026-09'
+        outlet_id   TEXT NOT NULL DEFAULT '',
+        status      TEXT NOT NULL DEFAULT 'draft', -- draft|finalized
+        note        TEXT NOT NULL DEFAULT '',
+        created_by  TEXT NOT NULL DEFAULT '',
+        finalized_by TEXT NOT NULL DEFAULT '',
+        finalized_at TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (period, outlet_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_payroll_items (
+        id            TEXT PRIMARY KEY,
+        run_id        TEXT NOT NULL,
+        employee_id   TEXT NOT NULL,
+        paid_days     REAL NOT NULL DEFAULT 0,
+        lop_days      REAL NOT NULL DEFAULT 0,
+        overtime_minutes INTEGER NOT NULL DEFAULT 0,
+        earnings_json TEXT NOT NULL DEFAULT '[]',
+        deductions_json TEXT NOT NULL DEFAULT '[]',
+        gross         REAL NOT NULL DEFAULT 0,
+        net           REAL NOT NULL DEFAULT 0,
+        detail_json   TEXT NOT NULL DEFAULT '{}',  -- the full compute trace, frozen
+        UNIQUE (run_id, employee_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_pay_items_emp ON hr_payroll_items(employee_id);
+
+      -- SOPs: versioned; publishing a version assigns it and archives the old
+      -- one (owner spec §24). Assignments track viewed/acknowledged per person.
+      CREATE TABLE IF NOT EXISTS hr_sops (
+        id           TEXT PRIMARY KEY,
+        title        TEXT NOT NULL,
+        category     TEXT NOT NULL DEFAULT '',
+        department_id TEXT NOT NULL DEFAULT '',
+        designation_id TEXT NOT NULL DEFAULT '',
+        is_active    INTEGER NOT NULL DEFAULT 1,
+        created_by   TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_sop_versions (
+        id          TEXT PRIMARY KEY,
+        sop_id      TEXT NOT NULL,
+        version     INTEGER NOT NULL DEFAULT 1,
+        body        TEXT NOT NULL DEFAULT '',      -- the SOP content (rich text/markdown)
+        status      TEXT NOT NULL DEFAULT 'draft', -- draft|published|archived
+        require_ack INTEGER NOT NULL DEFAULT 1,
+        published_by TEXT NOT NULL DEFAULT '',
+        published_at TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (sop_id, version)
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_sop_assignments (
+        id             TEXT PRIMARY KEY,
+        sop_version_id TEXT NOT NULL,
+        employee_id    TEXT NOT NULL,
+        viewed_at      TEXT NOT NULL DEFAULT '',
+        acknowledged_at TEXT NOT NULL DEFAULT '',
+        quiz_score     REAL,
+        assigned_by    TEXT NOT NULL DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (sop_version_id, employee_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_sopass_emp ON hr_sop_assignments(employee_id);
+
+      CREATE TABLE IF NOT EXISTS hr_trainings (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        trainer     TEXT NOT NULL DEFAULT '',
+        sop_id      TEXT NOT NULL DEFAULT '',
+        department_id TEXT NOT NULL DEFAULT '',
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        created_by  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_training_assignments (
+        id            TEXT PRIMARY KEY,
+        training_id   TEXT NOT NULL,
+        employee_id   TEXT NOT NULL,
+        assigned_date TEXT NOT NULL DEFAULT '',
+        due_date      TEXT NOT NULL DEFAULT '',
+        completed_date TEXT NOT NULL DEFAULT '',
+        score         REAL,
+        remarks       TEXT NOT NULL DEFAULT '',
+        status        TEXT NOT NULL DEFAULT 'assigned', -- assigned|in_progress|completed|failed|expired
+        assigned_by   TEXT NOT NULL DEFAULT '',
+        UNIQUE (training_id, employee_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_trainass_emp ON hr_training_assignments(employee_id);
+
+      CREATE TABLE IF NOT EXISTS hr_tests (
+        id            TEXT PRIMARY KEY,
+        name          TEXT NOT NULL,
+        department_id TEXT NOT NULL DEFAULT '',
+        designation_id TEXT NOT NULL DEFAULT '',
+        pass_score    REAL NOT NULL DEFAULT 60,
+        max_attempts  INTEGER NOT NULL DEFAULT 3,
+        time_limit_minutes INTEGER NOT NULL DEFAULT 0, -- 0 = untimed
+        shuffle       INTEGER NOT NULL DEFAULT 1,
+        version       INTEGER NOT NULL DEFAULT 1,
+        is_active     INTEGER NOT NULL DEFAULT 1,
+        created_by    TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_test_questions (
+        id         TEXT PRIMARY KEY,
+        test_id    TEXT NOT NULL,
+        kind       TEXT NOT NULL DEFAULT 'mcq',    -- mcq|true_false
+        question   TEXT NOT NULL,
+        options_json TEXT NOT NULL DEFAULT '[]',
+        correct    TEXT NOT NULL DEFAULT '',       -- option key; NEVER sent to takers
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        is_active  INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_testq_test ON hr_test_questions(test_id);
+
+      CREATE TABLE IF NOT EXISTS hr_test_attempts (
+        id           TEXT PRIMARY KEY,
+        test_id      TEXT NOT NULL,
+        test_version INTEGER NOT NULL DEFAULT 1,
+        employee_id  TEXT NOT NULL,
+        attempt_no   INTEGER NOT NULL DEFAULT 1,
+        answers_json TEXT NOT NULL DEFAULT '{}',
+        score        REAL NOT NULL DEFAULT 0,
+        passed       INTEGER NOT NULL DEFAULT 0,
+        started_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        finished_at  TEXT NOT NULL DEFAULT '',
+        UNIQUE (test_id, employee_id, attempt_no)
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_kpis (
+        id        TEXT PRIMARY KEY,
+        name      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        weight    REAL NOT NULL DEFAULT 1,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_performance_reviews (
+        id          TEXT PRIMARY KEY,
+        employee_id TEXT NOT NULL,
+        period      TEXT NOT NULL,                 -- '2026-09' | '2026-Q3' | '2026'
+        kind        TEXT NOT NULL DEFAULT 'monthly', -- monthly|quarterly|annual
+        scores_json TEXT NOT NULL DEFAULT '[]',    -- [{kpi_id, score, note}]
+        overall     REAL NOT NULL DEFAULT 0,
+        remarks     TEXT NOT NULL DEFAULT '',
+        reviewed_by TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (employee_id, period, kind)
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_assets (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        kind        TEXT NOT NULL DEFAULT '',      -- uniform|id_card|device|... (vocab in hr.ts)
+        tag         TEXT NOT NULL DEFAULT '',      -- asset tag / serial
+        employee_id TEXT NOT NULL DEFAULT '',      -- '' = in store, unissued
+        status      TEXT NOT NULL DEFAULT 'in_store', -- in_store|issued|returned|damaged|lost
+        note        TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_assets_emp ON hr_assets(employee_id);
+
+      CREATE TABLE IF NOT EXISTS hr_asset_history (
+        id         TEXT PRIMARY KEY,
+        asset_id   TEXT NOT NULL,
+        employee_id TEXT NOT NULL DEFAULT '',
+        action     TEXT NOT NULL,                  -- issued|returned|damaged|lost|repaired
+        note       TEXT NOT NULL DEFAULT '',
+        acted_by   TEXT NOT NULL DEFAULT '',
+        at         TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_assethist_asset ON hr_asset_history(asset_id);
+
+      CREATE TABLE IF NOT EXISTS hr_candidates (
+        id             TEXT PRIMARY KEY,
+        name           TEXT NOT NULL,
+        phone10        TEXT NOT NULL DEFAULT '',
+        email          TEXT NOT NULL DEFAULT '',
+        position       TEXT NOT NULL DEFAULT '',
+        department_id  TEXT NOT NULL DEFAULT '',
+        resume_note    TEXT NOT NULL DEFAULT '',
+        interview_score REAL,
+        expected_salary REAL,
+        offered_salary  REAL,
+        joining_date   TEXT NOT NULL DEFAULT '',
+        stage          TEXT NOT NULL DEFAULT 'applied',
+          -- applied|shortlisted|interview|selected|offer|joined|rejected (vocab in hr.ts)
+        employee_id    TEXT NOT NULL DEFAULT '',   -- set when converted on join
+        note           TEXT NOT NULL DEFAULT '',
+        created_by     TEXT NOT NULL DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_onboarding_items (
+        id          TEXT PRIMARY KEY,
+        employee_id TEXT NOT NULL,
+        item        TEXT NOT NULL,                 -- kyc|bank|documents|uniform|... free label
+        done        INTEGER NOT NULL DEFAULT 0,
+        done_by     TEXT NOT NULL DEFAULT '',
+        done_at     TEXT NOT NULL DEFAULT '',
+        sort_order  INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_onb_emp ON hr_onboarding_items(employee_id);
+
+      -- Disciplinary is the most restricted surface in the module: adminOnly
+      -- page + canAdminHr on every verb, and doc_number-style masking rules do
+      -- not apply because NOTHING here is ever served to non-admins.
+      CREATE TABLE IF NOT EXISTS hr_disciplinary_records (
+        id          TEXT PRIMARY KEY,
+        employee_id TEXT NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'incident', -- incident|warning|show_cause
+        subject     TEXT NOT NULL DEFAULT '',
+        detail      TEXT NOT NULL DEFAULT '',
+        employee_response TEXT NOT NULL DEFAULT '',
+        manager_comment   TEXT NOT NULL DEFAULT '',
+        final_decision    TEXT NOT NULL DEFAULT '',
+        status      TEXT NOT NULL DEFAULT 'open',  -- open|closed
+        created_by  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_disc_emp ON hr_disciplinary_records(employee_id);
+
+      CREATE TABLE IF NOT EXISTS hr_resignations (
+        id               TEXT PRIMARY KEY,
+        employee_id      TEXT NOT NULL,
+        resignation_date TEXT NOT NULL DEFAULT '',
+        notice_days      INTEGER NOT NULL DEFAULT 0,
+        last_working_date TEXT NOT NULL DEFAULT '',
+        reason           TEXT NOT NULL DEFAULT '',
+        status           TEXT NOT NULL DEFAULT 'submitted',
+          -- submitted|manager_approved|hr_approved|withdrawn|completed
+        manager_by       TEXT NOT NULL DEFAULT '',
+        manager_at       TEXT NOT NULL DEFAULT '',
+        hr_by            TEXT NOT NULL DEFAULT '',
+        hr_at            TEXT NOT NULL DEFAULT '',
+        created_by       TEXT NOT NULL DEFAULT '',
+        created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS hr_exit_clearance (
+        id          TEXT PRIMARY KEY,
+        employee_id TEXT NOT NULL,
+        item        TEXT NOT NULL,                 -- assets|advances|leave_encash|fnf|experience_letter|...
+        status      TEXT NOT NULL DEFAULT 'pending', -- pending|cleared|waived
+        note        TEXT NOT NULL DEFAULT '',
+        cleared_by  TEXT NOT NULL DEFAULT '',
+        cleared_at  TEXT NOT NULL DEFAULT '',
+        UNIQUE (employee_id, item)
+      );
+
+      -- Durable per-user HR notifications (task_notifications shape) - the
+      -- bell buckets in /api/notifications/inbox stay live COUNTs; these are
+      -- the addressed, persistent rows behind them.
+      CREATE TABLE IF NOT EXISTS hr_notifications (
+        id              TEXT PRIMARY KEY,
+        recipient_email TEXT NOT NULL,
+        kind            TEXT NOT NULL DEFAULT '',
+        title           TEXT NOT NULL DEFAULT '',
+        body            TEXT NOT NULL DEFAULT '',
+        href            TEXT NOT NULL DEFAULT '',
+        is_read         INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_hr_notif_rcpt ON hr_notifications(recipient_email, is_read);
     `);
   } catch (e) { console.error('hrms schema failed:', e); }
 }

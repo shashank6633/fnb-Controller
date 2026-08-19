@@ -9,6 +9,8 @@ import {
   employeeOutletIds,
   replaceEmployeeOutlets,
 } from '@/lib/hr-server';
+import { getSmartOfficeConfig, soBlockUser } from '@/lib/smartoffice';
+import { reportServerError } from '@/lib/error-alerts';
 
 /**
  * Single employee (/api/hr/employees/:id) — HRMS Phase 1.
@@ -171,8 +173,24 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
         );
       }
       if (f === 'gender') v = v.toLowerCase();
+      // Referenced-row validation (named 400s, same rule as the create
+      // route): a non-empty reference must be a real row; '' clears the link.
+      if ((f === 'department_id' || f === 'sub_department_id') && v) {
+        if (!db.prepare('SELECT id FROM departments WHERE id = ?').get(v)) {
+          return Response.json(
+            { error: f === 'department_id' ? 'Selected department was not found' : 'Selected sub-department was not found' },
+            { status: 400 },
+          );
+        }
+      }
+      if (f === 'designation_id' && v && !db.prepare('SELECT id FROM hr_designations WHERE id = ?').get(v)) {
+        return Response.json({ error: 'Selected designation was not found' }, { status: 400 });
+      }
       if (f === 'reporting_manager_id' && v && v === id) {
         return Response.json({ error: 'An employee cannot report to themselves' }, { status: 400 });
+      }
+      if (f === 'reporting_manager_id' && v && !db.prepare('SELECT id FROM hr_employees WHERE id = ?').get(v)) {
+        return Response.json({ error: 'Selected reporting manager was not found' }, { status: 400 });
       }
       // '+'-prefixed = non-India E.164, stored verbatim; otherwise norm to last-10.
       if (PHONE_FIELDS.has(f) && v && !v.startsWith('+')) {
@@ -325,7 +343,56 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     // deactivate it as an explicit admin action.
     const suggest_deactivate_login = EXIT_STATUSES.has(status) && !!existing.user_id;
 
-    return Response.json({ employee: loadEmployee(db, id), suggest_deactivate_login });
+    // ── SmartOffice suspension mirror — owner ruling §8.4b ("Suspended Staff
+    // Cannot Punch untill HR Releases the suspension"): the attendance engine
+    // already refuses suspended punches; this ALSO blocks/unblocks the person
+    // on the biometric device itself so the gate turns them away. Best-effort
+    // BY DESIGN: the status change above is already committed, and a device
+    // hiccup must NEVER fail it — failures are logged/reported only, and the
+    // outcome rides the response as device_block. The vendor's inverted
+    // 0-blocks/1-unblocks wire encoding is owned by soBlockUser (verbatim PDF
+    // quote there) — this caller passes a plain boolean.
+    let device_block: 'sent' | 'failed' | 'skipped' = 'skipped';
+    try {
+      const toSuspended = status === 'suspended' && existing.status !== 'suspended';
+      const releasedFromSuspension =
+        existing.status === 'suspended' && status !== 'suspended' && !EXIT_STATUSES.has(status);
+      if (toSuspended || releasedFromSuspension) {
+        const cfg = getSmartOfficeConfig(db);
+        if (cfg.baseUrl && cfg.apiKey) {
+          const mapping = db
+            .prepare(
+              `SELECT biometric_employee_id, device_id FROM hr_biometric_map
+               WHERE employee_id = ? AND is_active = 1
+               ORDER BY (device_id = '') DESC, created_at
+               LIMIT 1`,
+            )
+            .get(id) as { biometric_employee_id: string; device_id: string } | undefined;
+          if (mapping) {
+            // Serial '0' = all devices (vendor convention) unless pinned.
+            const r = await soBlockUser(
+              cfg,
+              mapping.biometric_employee_id,
+              mapping.device_id || '0',
+              toSuspended, // true = block on suspension; false = unblock on release
+            );
+            device_block = r.ok ? 'sent' : 'failed';
+            if (!r.ok) {
+              console.error('SmartOffice suspension block/unblock failed:', r.message);
+              reportServerError(new Error(`SmartOffice block/unblock failed: ${r.message}`), {
+                url: request.url,
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {
+      device_block = 'failed';
+      console.error('SmartOffice suspension mirror failed:', e);
+      reportServerError(e, { url: request.url });
+    }
+
+    return Response.json({ employee: loadEmployee(db, id), suggest_deactivate_login, device_block });
   } catch (e) {
     console.error('PATCH /api/hr/employees/[id] failed:', e);
     return Response.json({ error: 'Failed to update employee status' }, { status: 500 });
