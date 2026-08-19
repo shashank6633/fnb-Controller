@@ -22,10 +22,18 @@
  *   ON-CALL mode: the header stops saying "Incoming call", the ring counter is
  *   replaced by talk time counted from the answer, and the card NAMES whoever
  *   picked up. See THREE CARD STATES below.
- * - call_ended for the SAME call does NOT dismiss the card — it switches to
- *   disposition mode: 7 one-tap chips → PUT /api/crm-calls/calls/[id].
- *   "Booking Made" opens QuickBookingModal (pre-filled source_call_id) and
- *   dispositions after the booking saves.
+ * - call_ended for the SAME call: OWNER-ONLY DISPOSITION (owner ruling
+ *   2026-08-17). When the ended call has a known owner (a mapped agent
+ *   answered it), every OTHER browser's card is auto-dismissed on hangup —
+ *   the answerer alone keeps the card, switched to disposition mode: 7
+ *   one-tap chips → PUT /api/crm-calls/calls/[id]. "Booking Made" opens
+ *   QuickBookingModal (pre-filled source_call_id) and dispositions after the
+ *   booking saves. The card is kept on EVERY screen when there is no owner to
+ *   hand it to: a MISSED call (nobody answered — the whole floor should see
+ *   it needs chasing) or an UNMAPPED agent's answer (ownerEmail '', so
+ *   first-claim decides who writes it up), and on a browser whose own
+ *   identity is unknown (/api/auth/me failed — we cannot prove it is not the
+ *   owner's screen, so we must not take the write-up card away).
  * - Multiple simultaneous calls stack, up to MAX_CARDS.
  *
  * ── THREE CARD STATES, AND WHY THE MIDDLE ONE HAD TO EXIST ──────────────────
@@ -42,11 +50,14 @@
  *                Quick Booking stays — mid-call is exactly when a GRE books.
  *   disposition  the call is over: the 7 outcome chips.
  *
- * The card is NEVER auto-dismissed on answer or on hangup. A GRE who has just
- * picked up must not have the guest's history yanked out from under them, and
- * the write-up is the whole point of the disposition state. What does go away is
- * the LIE: a card that has heard nothing for RING_STALE_SECONDS stops counting
- * and says so, instead of implying a phone is still ringing somewhere.
+ * The card is never auto-dismissed on ANSWER — a GRE who has just picked up
+ * must not have the guest's history yanked out from under them, and everyone
+ * else's card flipping to "Answered by X" is how the floor learns the call is
+ * handled. On HANGUP the owner-only rule above applies: the answerer keeps the
+ * disposition card (the write-up is its whole point); other screens let go.
+ * What also goes away is the LIE: a card that has heard nothing for
+ * RING_STALE_SECONDS stops counting and says so, instead of implying a phone
+ * is still ringing somewhere.
  *
  * ── ONE ANSWERED CALL, ONE OWNER ────────────────────────────────────────────
  * This pop broadcasts to EVERY signed-in CRM browser, so an answered call used
@@ -521,6 +532,11 @@ export default function CTScreenPop() {
   const [myEmail, setMyEmail] = useState('');
 
   const cardsRef = useRef<PopCard[]>([]);
+  /** Mirror of myEmail for handlers created with empty deps (handleEvent) —
+   *  same pattern as cardsRef. '' means identity unknown, which the owner-only
+   *  hangup rule treats as "keep the card" (never yank a write-up we cannot
+   *  prove belongs to someone else). */
+  const myEmailRef = useRef('');
   const seqRef = useRef(0);
   const esRef = useRef<EventSource | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -528,6 +544,7 @@ export default function CTScreenPop() {
   const dismissedRef = useRef<Set<string>>(new Set());
 
   useEffect(() => { cardsRef.current = cards; }, [cards]);
+  useEffect(() => { myEmailRef.current = myEmail; }, [myEmail]);
 
   // Identify this browser once. A failure is survivable: myEmail stays '' and
   // every card keeps its full pop, with the server still refusing writes that
@@ -649,11 +666,28 @@ export default function CTScreenPop() {
     }
 
     if (e.type === 'call_ended') {
-      // Same call → do NOT dismiss; switch the card to disposition mode.
+      // OWNER-ONLY DISPOSITION (owner ruling 2026-08-17, header §call_ended):
+      // when the ended call has a KNOWN owner, every browser that is not the
+      // owner's drops the card on hangup — Agent B saw "Answered by A" while
+      // the call ran; once it ends, the write-up belongs to A alone and a
+      // dead card on B's screen is clutter. Three deliberate keep-cases:
+      //   · owner unknown/'' (missed call, or an unmapped agent answered) —
+      //     the card stays EVERYWHERE, because either the whole floor should
+      //     see the miss, or first-claim decides who writes it up;
+      //   · myEmail '' (identity fetch failed) — we cannot prove this is not
+      //     the owner's screen, so we must not take the write-up card away;
+      //   · the owner's own screen — the whole point of disposition mode.
+      // The key lands in dismissedRef so the ?owned= poll cannot resurrect it.
       setCards(prev => {
         const idx = matchIdx(prev, e);
         if (idx === -1) return prev;
         const c = prev[idx];
+        const owner = String((e as { ownerEmail?: unknown }).ownerEmail ?? '').trim() || String(c.ownerEmail || '').trim();
+        const me = myEmailRef.current;
+        if (owner && me && !sameEmail(owner, me)) {
+          dismissedRef.current.add(c.key);
+          return prev.filter(x => x.key !== c.key);
+        }
         const next = [...prev];
         next[idx] = {
           ...c,
