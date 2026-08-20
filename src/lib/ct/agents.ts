@@ -99,6 +99,85 @@ export function resolveAgentLabel(
   return raw; // unmapped → show the raw id, never hide it
 }
 
+/**
+ * WHO A RINGING CALL IS RINGING FOR — a PERSON or a GROUP, and which of the two.
+ *
+ *   'agent' — the telephony payload NAMED an extension, and `label` is that
+ *             agent resolved through resolveAgentLabel (the raw id when it is
+ *             unmapped, which is that function's contract — never blank).
+ *   'group' — the payload named no person, but it DID name the ring group /
+ *             team the call is hunting through (TeleCMI calls this `team`).
+ *             A GROUP IS NOT A PERSON: a renderer must word it as a group and
+ *             must never print it where it would read as an individual's name.
+ */
+export type RingingFor = { kind: 'agent' | 'group'; label: string };
+
+/**
+ * THE RINGING LADDER, in ONE place so no two surfaces can answer it differently.
+ * The screen-pop (from the bus event), the Live wallboard and the /live snapshot
+ * all resolve "who is it ringing for" through this function.
+ *
+ *   1. named extension  → { kind: 'agent' }
+ *   2. ring group/team  → { kind: 'group' }
+ *   3. neither          → null. THE CALLER MUST SAY NOTHING, or say what it
+ *      already says while it does not know ("trying the next agent").
+ *
+ * THERE IS NO FOURTH RUNG, and in particular "whoever missed the previous leg"
+ * is NOT one. That is a different fact about a different extension — the phone
+ * that has ALREADY STOPPED ringing — and naming it here would tell a GRE their
+ * handset is ringing when it is not. A blank degrades to honest wording; it
+ * never degrades to a guess.
+ *
+ * Pure: pass pre-loaded maps (getAgentMap / getUserNamesByEmail), exactly as
+ * resolveAgentLabel above, so a list of rows costs one load and not N.
+ */
+export function ringingForLabel(
+  rawAgent: string | null | undefined,
+  queue: string | null | undefined,
+  agentMap: Record<string, string>,
+  userNames: Record<string, string>,
+): RingingFor | null {
+  const named = resolveAgentLabel(rawAgent, agentMap, userNames);
+  if (named) return { kind: 'agent', label: named };
+  const group = String(queue || '').trim();
+  if (group) return { kind: 'group', label: group };
+  return null;
+}
+
+/**
+ * WHICH TELEPHONY IDS BELONG TO THIS APP USER — the caller's OWN agent_map keys
+ * and nothing else, so a client can be told "this ringing call is for you"
+ * without ever being handed anybody else's mapping.
+ *
+ * Reads the map by VALUE (the mapped email), the reverse of every other use of
+ * agent_map here. Deduped case-insensitively because getAgentMap deliberately
+ * publishes a lowercased alias for each key — those two entries are one mapping,
+ * not two ids — and the original spelling wins because it is inserted first.
+ *
+ * An EMPTY result means "no TeleCMI id is mapped to you", which is the ordinary
+ * state for a manager who never takes calls. It must never be read as "this
+ * user has no calls": ownership (ct_calls.owner_email) is the authority on that,
+ * and a device-dialed callback stores the user's own email as agent_user with no
+ * mapping involved at all.
+ */
+export function agentIdsForEmail(
+  agentMap: Record<string, string>,
+  email: string | null | undefined,
+): string[] {
+  const want = String(email || '').trim().toLowerCase();
+  if (!want) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const [id, mapped] of Object.entries(agentMap)) {
+    if (String(mapped || '').trim().toLowerCase() !== want) continue;
+    const lower = id.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    out.push(id);
+  }
+  return out;
+}
+
 /** What kind of identity a raw ct_calls.agent_user value is. See the header:
  *  'telecmi'   — an id the PBX reported; mappable in Settings → Agent mapping.
  *  'app_login' — the GRE's own app login email, written by the device-callback

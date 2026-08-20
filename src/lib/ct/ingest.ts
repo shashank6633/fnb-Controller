@@ -29,7 +29,9 @@ import { mapCdrPayload, mapLivePayload } from './telecmi-mapper';
 import { normalizePhone } from './phone';
 import { ctSetting, setCtSetting, slaDueAt, ctRecordingBaseUrl } from './settings';
 import { emitCt, pushRecentCt, type CtEvent } from './bus';
-import { getAgentMap, getUserNamesByEmail, resolveAgentLabel } from './agents';
+import {
+  getAgentMap, getUserNamesByEmail, resolveAgentLabel, ringingForLabel, type RingingFor,
+} from './agents';
 
 /** Resolve a raw TeleCMI agent id to a staff display name for the live feed
  *  (via agent_map). Cheap enough for the low frequency of live/CDR events. */
@@ -37,6 +39,28 @@ function agentDisplayName(db: Database.Database, rawAgent: string | undefined | 
   if (!rawAgent) return '';
   try { return resolveAgentLabel(rawAgent, getAgentMap(db), getUserNamesByEmail(db)); }
   catch { return String(rawAgent || ''); }
+}
+
+/**
+ * WHO IS THIS RING FOR — named extension, else the ring group, else nothing.
+ * The ladder itself lives in ringingForLabel() (./agents.ts) so this file, the
+ * /api/crm-calls/live snapshot and every renderer share ONE implementation.
+ *
+ * On a map-read failure both maps come through empty, and resolveAgentLabel's
+ * documented fallback then shows the RAW agent id — the same degradation
+ * agentDisplayName() above already makes, so a settings/user read that fails
+ * costs a nice name, never the fact that somebody's phone is ringing.
+ */
+function ringingForOf(
+  db: Database.Database,
+  rawAgent: string | undefined | null,
+  queue: string | undefined | null,
+): RingingFor | undefined {
+  let map: Record<string, string> = {};
+  let names: Record<string, string> = {};
+  try { map = getAgentMap(db); names = getUserNamesByEmail(db); }
+  catch (e) { console.error('[ct-ingest] agent map read failed for a ring', e); }
+  return ringingForLabel(rawAgent, queue, map, names) ?? undefined;
 }
 
 // ─── OUR OWN NUMBERS — so an internal leg is never mistaken for a guest ─────
@@ -512,7 +536,17 @@ function ackMissedCall(callId: string, phone: string): void {
 /** INSERT OR IGNORE a recovery for a missed call (call_id UNIQUE = the dedupe). */
 function createRecovery(
   db: Database.Database,
-  opts: { callId: string; phone: string; missedAt: string; detectedVia: 'cdr' | 'live_event' | 'backfill' },
+  opts: {
+    callId: string; phone: string; missedAt: string;
+    detectedVia: 'cdr' | 'live_event' | 'backfill';
+    /** This leg's conversation_id, '' when the payload named none. See
+     *  absorbIntoOpenRecovery() — '' is UNGROUPABLE and falls to the window. */
+    conversationId?: string;
+    /** This leg's direction. Only a GUEST's unanswered ring may be merged into
+     *  an existing chase — see absorbIntoOpenRecovery(). Defaults to inbound,
+     *  which is what the mapper falls back to for an unreadable payload. */
+    direction?: 'inbound' | 'outbound';
+  },
 ): boolean {
   if (!opts.phone) {
     // No dialable number → nothing to call back. Tracked in ct_calls only.
@@ -523,6 +557,27 @@ function createRecovery(
   // advance the round-robin cursor for a recovery we won't actually create.
   const dupe = db.prepare(`SELECT 1 FROM ct_recoveries WHERE call_id = ? LIMIT 1`).get(opts.callId);
   if (dupe) return false;
+
+  // ...and the same guard for a leg that was ABSORBED into somebody else's row
+  // rather than creating its own. ct_recoveries.call_id only ever names the ONE
+  // leg that won the INSERT, so without this ledger check a re-delivered
+  // webhook, a backfill re-run, or the ordinary late-CDR sequence would absorb
+  // the same ring a second time and add +1 to a count the guest never dialled.
+  if (alreadyAbsorbedLeg(db, opts.callId)) return false;
+
+  // ALREADY SPOKEN TO? If another leg of THIS routed call was answered, the
+  // guest reached us and there is no callback debt to file — even though this
+  // leg's own CDR says 'missed'. Without this an answered leg delivered before
+  // its missed siblings opens a pending task for a call somebody picked up,
+  // and fires a "sorry we missed you" WhatsApp at a guest we just spoke to.
+  if (conversationWasAnswered(db, opts)) return false;
+
+  // ONE RECOVERY PER CALL. A hunt group rings agent after agent and files a
+  // missed CDR for each, so this is reached once per LEG. If this miss belongs
+  // to a call we are already chasing, count it there and file nothing new —
+  // which also means ackMissedCall() does not fire again, so the guest is not
+  // WhatsApped once per extension that failed to pick up.
+  if (absorbIntoOpenRecovery(db, opts)) return false;
 
   const now = new Date().toISOString();
   const guest = guestByPhone(db, opts.phone);
@@ -539,6 +594,249 @@ function createRecovery(
       opts.missedAt, opts.detectedVia, slaDueAt(opts.missedAt, db), assignee, now, now,
     );
   return info.changes > 0;
+}
+
+/** How far apart two rings may be and still be treated as ONE call.
+ *  Owner's rule, 2026-08-20: "if guest has called 3 times or more in less than
+ *  15 min keep it as 1 call; if the duration between 2 calls is more than
+ *  15 min keep as 2 different calls and different recovery queues."
+ *  The window SLIDES — it is measured from the PREVIOUS ring in the chain, not
+ *  from the first — so a guest still trying at minute 30 in ten-minute bursts
+ *  is one unanswered problem, which is what he confirmed he wanted. */
+const RECOVERY_MERGE_WINDOW_MS = 15 * 60 * 1000;
+
+/** How far apart two legs of ONE routed call may be STAMPED before we refuse to
+ *  believe they are the same call. A hunt group's legs are seconds apart (25s
+ *  ring each), so hours is already absurdly generous — its whole job is to stop
+ *  a conversation_id that is REUSED (or degenerate: TeleCMI's looser aliases
+ *  `sessionid`/`sessionuuid` may mean session, and a numeric field stringifies
+ *  to "0") from silently swallowing an unrelated call weeks later. Delivery may
+ *  be arbitrarily late — this bounds the CLOCK on the ring, not its arrival. */
+const CONVERSATION_SPAN_MS = 6 * 60 * 60 * 1000;
+
+/** A recovery whose loop is closed. Everything else — including 'expired' and
+ *  'unreachable' — is still a task the queue offers Attempt/WhatsApp on, so it
+ *  is still the row a fresh ring belongs to. */
+const RESOLVED_RECOVERY = `('recovered', 'auto_resolved')`;
+
+/** Was this exact leg already counted into some other recovery? */
+function alreadyAbsorbedLeg(db: Database.Database, callId: string): boolean {
+  try {
+    return !!db.prepare(`SELECT 1 FROM ct_recovery_legs WHERE call_id = ? LIMIT 1`).get(callId);
+  } catch {
+    return false; // ledger unavailable → fall through and file/merge as before
+  }
+}
+
+/**
+ * Did another leg of this same routed call get ANSWERED? Then the guest was
+ * spoken to and this 'missed' leg carries no callback debt.
+ *
+ * Bounded exactly like the conversation rung below — same phone, same
+ * conversation, same 6-hour stamp span — because an unbounded or phone-free
+ * conversation match is how a degenerate id silently mutes the queue.
+ * Dormant until TeleCMI actually sends conversation ids on this account.
+ */
+function conversationWasAnswered(
+  db: Database.Database,
+  opts: { phone: string; missedAt: string; conversationId?: string },
+): boolean {
+  try {
+    const conversationId = String(opts.conversationId || '').trim();
+    if (!conversationId) return false;
+    const missedMs = Date.parse(opts.missedAt);
+    if (isNaN(missedMs)) return false;
+    return !!db.prepare(`
+      SELECT 1 FROM ct_calls
+       WHERE conversation_id = ?
+         AND phone_e164 = ?
+         AND status = 'answered'
+         AND COALESCE(NULLIF(started_at, ''), created_at) BETWEEN ? AND ?
+       LIMIT 1
+    `).get(
+      conversationId, opts.phone,
+      new Date(missedMs - CONVERSATION_SPAN_MS).toISOString(),
+      new Date(missedMs + CONVERSATION_SPAN_MS).toISOString(),
+    );
+  } catch {
+    return false; // never suppress a task because a lookup failed
+  }
+}
+
+/**
+ * Is this miss part of a call we are ALREADY chasing? Returns true when it was
+ * counted into an existing recovery (so the caller must not file a new one).
+ *
+ * ONLY A GUEST'S RING MERGES. MISSED_FAMILY is direction-blind and the mapper
+ * turns an unanswered OUTBOUND leg into status 'missed' too, so without this a
+ * GRE tapping Call Back and getting no answer would land on the guest's own
+ * chain: the badge would claim the guest rang again, and — worse — our own
+ * dialling would slide the 15-minute window forward and merge two guest rings
+ * genuinely 20 minutes apart, in flat violation of the owner's rule.
+ *
+ * Two rungs, strongest evidence first:
+ *
+ *  (a) SAME conversation_id — literally the same routed call, so this absorbs
+ *      REGARDLESS of the recovery's status: a late-arriving leg CDR must never
+ *      open a second task for a call another leg already closed. It is still
+ *      bounded by PHONE and by CONVERSATION_SPAN_MS, because "same id" is only
+ *      as trustworthy as the PBX field behind it — an id shared by a transfer
+ *      leg on a different number, or a constant/degenerate value, would
+ *      otherwise suppress the callback task for every other guest. '' is
+ *      UNGROUPABLE per the column's contract and never reaches this query.
+ *
+ *  (b) SAME phone within the sliding window, into any recovery that is not
+ *      already resolved. If the loop was closed — we called them back — a fresh
+ *      miss is a fresh debt and deserves its own row, so a resolved recovery is
+ *      never silently reopened. 'expired' and 'unreachable' DO absorb: the queue
+ *      still shows and still works those rows, and a guest ringing again two
+ *      minutes after a GRE marked them unreachable is the owner's original
+ *      complaint (two rows, two WhatsApps), not a new debt.
+ *
+ * THE WINDOW IS SYMMETRIC. The test is "this ring is within 15 minutes of the
+ * chain", not merely "the chain is recent enough for this ring": the chain's
+ * LAST ring must not be older than missedAt - 15min AND its FIRST ring must not
+ * be newer than missedAt + 15min. A one-sided lower bound reads as "not more
+ * than 15 minutes NEWER than me", which lets any older miss delivered late —
+ * webhook retry, or the backfill route replaying up to 5,000 CDRs / 90 days —
+ * fold into today's chain and lose its own task, SLA and acknowledgement
+ * entirely. It also lets one future-dated stamp keep a row swallowing that
+ * number's calls forever.
+ *
+ * missed_at anchors the SLA to when the guest FIRST tried, so absorbing a later
+ * ring never advances it. It IS pulled BACKWARDS (with sla_due_at recomputed)
+ * when an out-of-order delivery reveals an earlier ring than the one that
+ * happened to arrive first — otherwise "anchored to the first ring" would only
+ * hold when the CDRs arrive in order, and the guest would be handed slack they
+ * never earned.
+ *
+ * On ANY failure: false — file the recovery. A duplicate task is a nuisance; a
+ * missed guest with no task at all is the thing this module exists to prevent.
+ */
+function absorbIntoOpenRecovery(
+  db: Database.Database,
+  opts: {
+    callId: string; phone: string; missedAt: string;
+    conversationId?: string; direction?: 'inbound' | 'outbound';
+  },
+): boolean {
+  try {
+    if (opts.direction === 'outbound') return false;   // our dial, not their ring
+
+    const missedMs = Date.parse(opts.missedAt);
+    if (isNaN(missedMs)) return false;                 // unreadable clock → file it
+    const conversationId = String(opts.conversationId || '').trim();
+
+    type Target = {
+      id: string; missed_at: string; last_missed_at: string | null;
+      missed_count: number; sla_due_at: string; guest_id: string | null;
+    };
+    const COLS = `r.id, r.missed_at, r.last_missed_at, r.missed_count, r.sla_due_at, r.guest_id`;
+    // A recovery filed FOR one of our own unanswered callbacks is not a chain
+    // of guest rings, so it is not a merge target either. '<> outbound' rather
+    // than '= inbound' so a blank/unknown direction still merges — the owner's
+    // duplicate-rows complaint matters more than excluding an ambiguous row.
+    const NOT_OURS = `c.direction <> 'outbound'`;
+    let row: Target | undefined;
+
+    if (conversationId) {
+      row = db.prepare(`
+        SELECT ${COLS} FROM ct_recoveries r
+          JOIN ct_calls c ON c.id = r.call_id
+         WHERE c.conversation_id = ?
+           AND r.call_id <> ?
+           AND r.phone_e164 = ?
+           AND ${NOT_OURS}
+           AND r.missed_at BETWEEN ? AND ?
+      ORDER BY r.missed_at DESC
+         LIMIT 1
+      `).get(
+        conversationId, opts.callId, opts.phone,
+        new Date(missedMs - CONVERSATION_SPAN_MS).toISOString(),
+        new Date(missedMs + CONVERSATION_SPAN_MS).toISOString(),
+      ) as Target | undefined;
+    }
+
+    if (!row) {
+      row = db.prepare(`
+        SELECT ${COLS} FROM ct_recoveries r
+          JOIN ct_calls c ON c.id = r.call_id
+         WHERE r.phone_e164 = ?
+           AND r.call_id <> ?
+           AND r.status NOT IN ${RESOLVED_RECOVERY}
+           AND ${NOT_OURS}
+           AND COALESCE(NULLIF(r.last_missed_at, ''), r.missed_at) >= ?
+           AND r.missed_at <= ?
+      ORDER BY COALESCE(NULLIF(r.last_missed_at, ''), r.missed_at) DESC
+         LIMIT 1
+      `).get(
+        opts.phone, opts.callId,
+        new Date(missedMs - RECOVERY_MERGE_WINDOW_MS).toISOString(),
+        new Date(missedMs + RECOVERY_MERGE_WINDOW_MS).toISOString(),
+      ) as Target | undefined;
+    }
+
+    if (!row) return false;
+
+    const now = new Date().toISOString();
+
+    // RECORD THE LEG, THEN COUNT FROM THE LEDGER. Recomputing beats +1: the
+    // same ring re-delivered is an INSERT OR IGNORE no-op, so the count cannot
+    // drift, and a count that already drifted repairs itself on the next merge.
+    // If the ledger table is missing we still merge (the owner's rule is what
+    // matters) and fall back to the blind increment.
+    let legs: number | null = null;
+    try {
+      db.prepare(`
+        INSERT OR IGNORE INTO ct_recovery_legs (call_id, recovery_id, missed_at, absorbed_at)
+        VALUES (?, ?, ?, ?)
+      `).run(opts.callId, row.id, opts.missedAt, now);
+      legs = (db
+        .prepare(`SELECT COUNT(*) AS n FROM ct_recovery_legs WHERE recovery_id = ?`)
+        .get(row.id) as { n: number }).n;
+    } catch (e) {
+      console.error('[ct-ingest] recovery leg ledger unavailable — counting blind', e);
+    }
+
+    // The chain's newest ring: GREATEST-style, so an out-of-order leg cannot
+    // drag the sliding window backwards.
+    const chainLast = (row.last_missed_at || '').trim() || row.missed_at;
+    const chainLastMs = Date.parse(chainLast);
+    const newLast = (isNaN(chainLastMs) || missedMs > chainLastMs) ? opts.missedAt : chainLast;
+
+    // The chain's oldest ring: LEAST-style, and the SLA follows it.
+    const chainFirstMs = Date.parse(row.missed_at);
+    const pullBack = !isNaN(chainFirstMs) && missedMs < chainFirstMs;
+
+    db.prepare(`
+      UPDATE ct_recoveries
+         SET missed_count   = ?,
+             last_missed_at = ?,
+             missed_at      = ?,
+             sla_due_at     = ?,
+             guest_id       = COALESCE(guest_id, ?),
+             updated_at     = ?
+       WHERE id = ?
+    `).run(
+      legs === null ? (Number(row.missed_count) || 1) + 1 : 1 + legs,
+      newLast,
+      pullBack ? opts.missedAt : row.missed_at,
+      pullBack ? slaDueAt(opts.missedAt, db) : row.sla_due_at,
+      // A leg that arrived before the guest record existed left guest_id NULL
+      // and the row reading "Unknown caller"; the merge removed the second
+      // chance a later leg used to provide, so take it here.
+      row.guest_id ? null : (guestByPhone(db, opts.phone)?.id ?? null),
+      now,
+      row.id,
+    );
+    // The board's ×N badge and "last rang" only move on a re-fetch otherwise —
+    // an absorbed ring emits no call-level event of its own.
+    emitRecoveryUpdate(db, opts.phone);
+    return true;
+  } catch (e) {
+    console.error('[ct-ingest] recovery merge check failed — filing separately', e);
+    return false;
+  }
 }
 
 // ─── IS THIS ENDED LEG THE END OF THE CALL? ─────────────────────────────────
@@ -767,6 +1065,12 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
         phone,
         missedAt: m.endedAt || m.startedAt || now,
         detectedVia: 'cdr',
+        // The leg's own conversation — how a hunt group's three missed CDRs
+        // become one callback task instead of three.
+        conversationId: m.conversationId || '',
+        // Only a guest's ring may merge; our own unanswered callback is also
+        // status 'missed' and must not inflate their chain.
+        direction: m.direction,
       });
       if (madeNew) {
         emitRecoveryUpdate(db, phone);
@@ -779,6 +1083,14 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
     // AT OR BEFORE it. Without this, a re-delivered/backfilled OLDER answered
     // call would silently close a NEWER open recovery. Timestamps are UTC ISO,
     // so the string comparison is chronological.
+    //
+    // THE BOUND IS THE CHAIN'S LAST RING, NOT missed_at. missed_at is frozen at
+    // the FIRST ring so the SLA keeps counting from it, so a merged row is
+    // OLDER than rings it legitimately contains. Testing missed_at alone was
+    // only safe while one row meant one ring: an answered call that happened
+    // BETWEEN two rings — delivered late by a webhook retry or by the backfill
+    // route, which this code already anticipates — would otherwise close rings
+    // it never answered and empty the queue behind the guest's back.
     if (m.status === 'answered' && m.direction === 'inbound' && phone) {
       const answeredAt = m.answeredAt || m.endedAt || now;
       const res = db
@@ -787,7 +1099,8 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
           SET status = 'auto_resolved',
               resolution_note = 'Guest called back and was answered',
               updated_at = ?
-          WHERE phone_e164 = ? AND status IN ${OPEN_RECOVERY} AND missed_at <= ?
+          WHERE phone_e164 = ? AND status IN ${OPEN_RECOVERY}
+            AND COALESCE(NULLIF(last_missed_at, ''), missed_at) <= ?
         `)
         .run(now, phone, answeredAt);
       if (res.changes > 0) emitRecoveryUpdate(db, phone);
@@ -958,6 +1271,24 @@ export function ingestLive(raw: any): void {
             guest_id   = COALESCE(ct_calls.guest_id, excluded.guest_id),
             phone_e164 = CASE WHEN ct_calls.phone_e164 = '' THEN excluded.phone_e164 ELSE ct_calls.phone_e164 END,
             started_at = COALESCE(NULLIF(ct_calls.started_at, ''), excluded.started_at),
+            -- THE RING GROUP, FILL-BLANK ONLY. It is the second rung of "who is
+            -- this ringing for" (see ringingForOf above), and the /live snapshot
+            -- reads it off THIS ROW — so a pop that mounts mid-ring can only
+            -- show the group if the row has it. A re-delivered or repeated ring
+            -- for the same leg that carries a team when the first one did not
+            -- now fills it in. Fill-blank, so it can never move a leg into a
+            -- different group.
+            queue = CASE WHEN IFNULL(ct_calls.queue, '') = '' THEN excluded.queue ELSE ct_calls.queue END,
+            -- agent_user IS DELIBERATELY NOT REFRESHED HERE, and the asymmetry
+            -- with queue above is the point. On a RINGING row that column holds
+            -- the extension being RUNG; from the answer onward every reader
+            -- (Call Log, Guest 360, agent_display on /live) treats it as the
+            -- extension that ANSWERED. Those are different agents on a hunt
+            -- group. The INSERT above already writes whatever the first ring
+            -- named — widening that to later rings would only widen the window
+            -- in which a ringing extension can be left sitting in the column and
+            -- then be printed as "answered by". A group is safe to fill because
+            -- it means the same thing on every path.
             conversation_id = CASE WHEN IFNULL(ct_calls.conversation_id, '') = '' THEN excluded.conversation_id ELSE ct_calls.conversation_id END
         `).run(
           generateId(), telecmiId, guest?.id ?? null, phone,
@@ -988,6 +1319,47 @@ export function ingestLive(raw: any): void {
           );
         }
       }
+      // WHO IS IT RINGING FOR — resolved ONCE, for both fields below, off one
+      // agent_map + user-name load (it used to be one load for the name field
+      // alone, so this costs nothing extra).
+      const ringFor = ringingForOf(db, m.agent, m.queue);
+
+      // WHY THE POP SAYS "trying the next agent" AND NOT A NAME, recorded where
+      // whoever asks next will find it. The mapper reads no agent off this live
+      // ring — so we log the payload's own KEY NAMES (names only: a value could
+      // be a guest's number, and a key name cannot). If TeleCMI does name the
+      // ringing extension under a spelling AGENT_KEYS has never heard of, it is
+      // in this line, and adding that one spelling turns the group rung into a
+      // real name. If the line only ever shows keys that are plainly not an
+      // agent, then this account's live ring genuinely does not say who it is
+      // ringing, and the group is the most honest answer there is.
+      //
+      // Bounded by its own condition: it stops the moment a ring names an agent.
+      if (!String(m.agent || '').trim()) {
+        // ONE LEVEL OF ENVELOPE TOO, exactly the six the mapper's own collect()
+        // flattens. A log that printed only the top level would read
+        // "Payload keys: event, data" on precisely the WRAPPED payloads that
+        // made this question hard, and would name none of the fields the
+        // shortlist has to come from — the one mechanism for settling this would
+        // fail on the only cases where it matters. Nested keys are prefixed
+        // (`data.agent_no`) so the reader can see where to add the spelling.
+        const keysOf = (o: unknown, prefix: string): string[] =>
+          (o && typeof o === 'object' && !Array.isArray(o))
+            ? Object.keys(o as Record<string, unknown>).map(k => prefix + k)
+            : [];
+        const top = raw as Record<string, unknown> | null | undefined;
+        const all = [
+          ...keysOf(raw, ''),
+          ...['data', 'cdr', 'call', 'payload', 'body', 'record']
+            .flatMap(nest => keysOf(top?.[nest], `${nest}.`)),
+        ];
+        console.warn(
+          `[ct-ingest] live ring named NO agent — "ringing for" falls back to `
+          + `${ringFor ? `the group "${ringFor.label}"` : 'nothing at all'}. `
+          + `Payload keys: ${all.length ? all.join(', ') : '(payload is not an object)'}`,
+        );
+      }
+
       emit({
         type: 'incoming_call',
         callId,
@@ -1001,7 +1373,18 @@ export function ingestLive(raw: any): void {
         // unmapped id shows as the raw id rather than as a blank. STRICTLY FROM
         // THE PAYLOAD: a ring that names no agent sends nothing here — the pop
         // must not invent an extension.
-        ringingAgentName: agentDisplayName(db, m.agent) || undefined,
+        //
+        // UNCHANGED IN MEANING AND IN VALUE: ringingForLabel's 'agent' rung is
+        // resolveAgentLabel, which returns a name for every non-blank id and ''
+        // for a blank one — exactly what agentDisplayName() returned here before.
+        ringingAgentName: ringFor?.kind === 'agent' ? ringFor.label : undefined,
+        // THE SECOND RUNG, and set ONLY when the first one is empty. `queue`
+        // below still carries the group verbatim for anything that wants the raw
+        // fact; this field is the ANSWER to "who is it ringing for" when no
+        // person was named, which is why it disappears the moment one is. A
+        // renderer reading these two in order cannot print a group beside a
+        // named agent, and cannot print a group as if it were a person.
+        ringingGroupName: ringFor?.kind === 'group' ? ringFor.label : undefined,
         queue: m.queue || undefined,
         at: m.at || now,
       });
@@ -1215,12 +1598,15 @@ export function reconcileLiveEvents(): number {
     const cutoff = new Date(Date.now() - 5 * 60_000).toISOString();
     const stuck = db
       .prepare(`
-        SELECT id, phone_e164, started_at, created_at FROM ct_calls
+        SELECT id, phone_e164, started_at, created_at, conversation_id, direction FROM ct_calls
         WHERE status = 'ringing'
           AND IFNULL(ended_at, '') = ''
           AND COALESCE(NULLIF(started_at, ''), created_at) < ?
       `)
-      .all(cutoff) as Array<{ id: string; phone_e164: string; started_at: string | null; created_at: string }>;
+      .all(cutoff) as Array<{
+        id: string; phone_e164: string; started_at: string | null;
+        created_at: string; conversation_id: string | null; direction: string | null;
+      }>;
 
     let n = 0;
     for (const call of stuck) {
@@ -1230,6 +1616,10 @@ export function reconcileLiveEvents(): number {
         phone: call.phone_e164,
         missedAt: call.started_at || call.created_at || now,
         detectedVia: 'live_event',
+        // Same merge rule on the safety-net path: a ring the CDR never arrived
+        // for is still one leg of its conversation, not a separate call.
+        conversationId: call.conversation_id || '',
+        direction: call.direction === 'outbound' ? 'outbound' : 'inbound',
       });
       // Same missed call, other detection path — acknowledge it here too, and
       // only on a genuinely new recovery. If the CDR later arrives for this

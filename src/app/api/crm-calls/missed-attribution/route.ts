@@ -240,7 +240,40 @@ export async function GET(req: Request) {
   // their own difference from it in their own SQL).
   const WINDOW = `${CALL_AT} >= ? AND ${CALL_AT} <= ?`;
   const BASE_WHERE = `c.direction = 'inbound' AND c.status IN ${MISSED_FAMILY_SQL} AND ${WINDOW}`;
-  const BASE_FROM = `FROM ct_calls c LEFT JOIN ct_recoveries r ON r.call_id = c.id WHERE ${BASE_WHERE}`;
+  // A LEG THAT WAS ABSORBED IS STILL TRACKED — it just does not OWN the row.
+  //
+  // ct_recoveries.call_id names only the ONE ring that created the callback
+  // task. Since one call that rings a hunt group files ONE task instead of one
+  // per ring (see absorbIntoOpenRecovery in src/lib/ct/ingest.ts), a plain
+  // `r.call_id = c.id` join leaves rings 2..N with no recovery — and this
+  // report counts exactly that as `untracked`. Left alone it would cap
+  // recovered_pct at 1/N for every hunt-group call, and fire the warn banner
+  // that tells the manager to "check the CDR webhook" — sending him to debug a
+  // healthy webhook, every day, because the queue is working as designed.
+  //
+  // ct_recovery_legs is the ledger of absorbed rings, so resolve each call's
+  // task by ownership FIRST and through the ledger second. Written as two
+  // scalar subqueries inside COALESCE rather than an OR-join precisely because
+  // it must yield exactly one recovery per call: an OR could match two rows and
+  // silently double every SUM in this file.
+  //
+  // The ledger lives in the ct block of initializeSchema(), whose errors are
+  // SWALLOWED. If it is somehow absent this must degrade to the old join and
+  // still render, never 500 a management report over a missing optimisation.
+  let legsLedger = false;
+  try {
+    legsLedger = !!db.prepare(
+      `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ct_recovery_legs' LIMIT 1`,
+    ).get();
+  } catch { legsLedger = false; }
+
+  const RECOVERY_FOR_CALL = legsLedger
+    ? `r.id = COALESCE(
+         (SELECT r2.id FROM ct_recoveries r2 WHERE r2.call_id = c.id),
+         (SELECT l.recovery_id FROM ct_recovery_legs l WHERE l.call_id = c.id)
+       )`
+    : `r.call_id = c.id`;
+  const BASE_FROM = `FROM ct_calls c LEFT JOIN ct_recoveries r ON ${RECOVERY_FOR_CALL} WHERE ${BASE_WHERE}`;
   const range = [lo, hi];
 
   // 1 — headline counts (one row).

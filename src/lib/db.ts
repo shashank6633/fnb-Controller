@@ -4931,6 +4931,81 @@ function initializeSchema(db: Database.Database) {
     }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_calls_conversation ON ct_calls(conversation_id)`);
 
+    // ── ONE RECOVERY PER CALL, NOT PER RING (additive; PRAGMA-guarded) ───────
+    // The same hunt group that broke the screen-pop also inflated the recovery
+    // queue: ct_recoveries.call_id is UNIQUE per LEG, so ONE call that rang
+    // Pushpa -> Nisha -> Bharath and was missed by all three filed THREE
+    // callback tasks for one guest. The owner saw five rows for one caller
+    // inside sixty seconds, and each new row also fired its own "sorry we
+    // missed you" WhatsApp at that guest (ackMissedCall runs on `madeNew`).
+    //
+    // These two columns let a later miss be ABSORBED into the recovery already
+    // open for the same call instead of filing another one:
+    //   missed_count   — how many times the guest actually rang. Collapsing
+    //                    five rows into one must not destroy the fact that they
+    //                    tried five times; that count is exactly what tells a
+    //                    GRE who to call first. DEFAULT 1, because every row
+    //                    that already exists represents one miss.
+    //   last_missed_at — the most recent miss in this chain, which is what the
+    //                    15-minute window is measured from (owner's rule,
+    //                    2026-08-20: rings less than 15 min apart are one call;
+    //                    a gap longer than that is a new call and a new row).
+    //                    It is deliberately NOT missed_at: missed_at stays the
+    //                    FIRST miss so the SLA clock keeps counting from when
+    //                    the guest first tried. Absorbing a new ring must never
+    //                    reset that timer and make an old debt look fresh.
+    // '' means "never absorbed anything" and the window falls back to
+    // missed_at — true for every pre-existing row, which is why blank is the
+    // right default rather than a back-filled copy.
+    //
+    // EACH ALTER IS INDIVIDUALLY TRY/CAUGHT, like every other additive column
+    // in this file. These sit ~350 lines inside the single ct try whose catch
+    // only console.errors, so an unguarded throw here would silently skip
+    // EVERY remaining statement in the ct block (ct_call_tokens, the
+    // ct_bookings columns, orders.booking_id, the guests backfill) for that
+    // boot. Swallow per-statement so one failure cannot cascade.
+    try {
+      const ctRecovCols = db.prepare(`PRAGMA table_info(ct_recoveries)`).all() as any[];
+      if (!ctRecovCols.some((c: any) => c.name === 'missed_count')) {
+        db.exec(`ALTER TABLE ct_recoveries ADD COLUMN missed_count INTEGER NOT NULL DEFAULT 1`);
+      }
+      if (!ctRecovCols.some((c: any) => c.name === 'last_missed_at')) {
+        db.exec(`ALTER TABLE ct_recoveries ADD COLUMN last_missed_at TEXT NOT NULL DEFAULT ''`);
+      }
+    } catch (e) { console.error('[db] ct_recoveries merge columns failed', e); }
+
+    // ── ct_recovery_legs — WHICH rings a merged callback task absorbed ───────
+    //
+    // WHY THIS EXISTS. missed_count alone is not safe to keep as a bare
+    // counter. The dedupe that protects the recovery workflow is
+    // ct_recoveries.call_id UNIQUE, and that only ever names the ONE leg that
+    // created the row — an ABSORBED leg leaves no trace keyed to its call_id.
+    // So a re-delivered webhook, a backfill re-run (up to 5,000 CDRs / 90 days
+    // through the same ingestCdr), or the ordinary late-CDR sequence (the
+    // reconcileLiveEvents safety net files the task, then the real CDRs land)
+    // would sail past that guard and absorb the SAME ring again, adding +1 to
+    // the count every time. The badge would then tell a GRE the guest rang a
+    // number of times they never dialled.
+    //
+    // One row per absorbed leg, call_id as the PRIMARY KEY, so:
+    //   · re-ingesting an absorbed leg is a no-op (INSERT OR IGNORE), and
+    //   · missed_count is RECOMPUTED from this ledger rather than incremented,
+    //     which makes the count idempotent by construction and self-repairing.
+    // It is also the only audit trail of a merge: without it a merged chain
+    // cannot be recounted or unpicked, because the phone-window rung leaves no
+    // join back to the rings it swallowed.
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS ct_recovery_legs (
+          call_id     TEXT PRIMARY KEY,
+          recovery_id TEXT NOT NULL,
+          missed_at   TEXT NOT NULL DEFAULT '',
+          absorbed_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_ct_recov_legs_rec ON ct_recovery_legs(recovery_id);
+      `);
+    } catch (e) { console.error('[db] ct_recovery_legs failed', e); }
+
     // ── ct_call_tokens — the wall-clock receipt for an outbound call back ────
     //
     // WHAT IT IS FOR. The GRE taps Call Back; before the dialer opens, the

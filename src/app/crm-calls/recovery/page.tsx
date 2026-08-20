@@ -86,6 +86,13 @@ interface Recovery {
   resolution_note: string;
   created_at: string;
   updated_at: string;
+  /** How many rings this one task absorbed (hunt-group legs + repeat calls
+   *  inside the 15-minute window). 1 for an ordinary single miss, and for every
+   *  row created before the merge existed. */
+  missed_count?: number;
+  /** The most recent ring in this chain; '' when nothing was ever absorbed.
+   *  The SLA still runs from missed_at — the FIRST ring — on purpose. */
+  last_missed_at?: string;
   guest_name: string | null;
   guest_tags: string[];
   is_vip: boolean;
@@ -636,7 +643,10 @@ function RowGroup(props: RowActions & { showStatusCol: boolean }) {
         <td className="py-2.5 px-2">
           <CallerCell r={r} />
         </td>
-        <td className="py-2.5 px-3 text-[13px] text-[#3D2614] whitespace-nowrap">{istDateTime(r.missed_at)}</td>
+        <td className="py-2.5 px-3 text-[13px] text-[#3D2614] whitespace-nowrap">
+          <div>{istDateTime(r.missed_at)}</div>
+          <LastRang r={r} />
+        </td>
         <td className="py-2.5 px-3"><SlaChip r={r} nowMs={nowMs} /></td>
         <td className="py-2.5 px-3 text-center">
           <AttemptsBadge count={r.attempts.length} />
@@ -701,6 +711,7 @@ function MobileCard(props: RowActions) {
         </div>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-[11px] text-[#6B5744]">
           <span className="inline-flex items-center gap-1"><Clock className="w-3 h-3" />Missed {istDateTime(r.missed_at)}</span>
+          <LastRang r={r} />
           <span>{r.attempts.length} attempt{r.attempts.length === 1 ? '' : 's'}</span>
           <span className="truncate">{r.assigned_to ? `→ ${r.assigned_to}` : 'Unassigned'}</span>
           <StatusBadge status={r.status} />
@@ -912,6 +923,7 @@ function CallerCell({ r }: { r: Recovery }) {
         <p className="font-semibold text-[13px] text-[#2D1B0E] truncate flex items-center gap-1.5">
           <span className="truncate">{known ? (r.guest_name || '').trim() : formatPhone(r.phone_e164)}</span>
           {r.is_vip && <VipBadge />}
+          <TriedBadge r={r} />
         </p>
         <p className="text-[11px] text-[#6B5744] font-mono truncate">
           {known ? formatPhone(r.phone_e164) : 'Unknown caller'}
@@ -919,6 +931,56 @@ function CallerCell({ r }: { r: Recovery }) {
       </div>
     </div>
   );
+}
+
+/**
+ * How many unanswered RINGS this one callback task absorbed.
+ *
+ * A hunt group rings agent after agent, and each ring that goes unanswered used
+ * to file its own row — one caller could fill five lines of this queue inside a
+ * minute. Those rings are now merged into a single task, and this is the fact
+ * that merge must not throw away: a chain of rings is exactly what tells a GRE
+ * who to ring back first.
+ *
+ * IT COUNTS RINGS, NOT CALLS, AND THE WORDING MUST SAY SO. One call that rings
+ * three extensions is three unanswered rings; so is one guest redialling three
+ * times. The two are only distinguishable when TeleCMI sends a per-call
+ * conversation id, and on this account that field is empty on every call so
+ * far. Claiming "rang 3 times" would have a GRE telling a guest who dialled
+ * once that they called three times.
+ *
+ * Hidden at 1, which is every ordinary miss and every row that predates the
+ * merge (the column defaults to 1) — a badge on every line would say nothing.
+ */
+function TriedBadge({ r }: { r: Recovery }) {
+  const rings = Number(r.missed_count) || 1;
+  if (rings < 2) return null;
+  const last = (r.last_missed_at || '').trim();
+  const span = last && last !== r.missed_at
+    ? ` First ${istDateTime(r.missed_at)}, last ${istDateTime(last)}.`
+    : '';
+  return (
+    <span
+      title={`${rings} unanswered rings merged into this one callback task.${span} A hunt group rings several extensions, so a single call can ring more than once.`}
+      className="inline-flex items-center px-1.5 py-0.5 rounded-full bg-[#FFF1E3] border border-[#E8D5C4] text-[#af4408] text-[10px] font-bold shrink-0"
+    >
+      ×{rings}
+    </span>
+  );
+}
+
+/**
+ * The chain's most recent ring.
+ *
+ * The Missed column shows the FIRST ring, because that is what the SLA runs
+ * from. On a merged row that can be a long way behind the last time the guest
+ * actually tried, and "Missed 10:00 ×4" with no sight of the 10:45 ring reads
+ * as a stale task. Hidden unless something was absorbed.
+ */
+function LastRang({ r }: { r: Recovery }) {
+  const last = (r.last_missed_at || '').trim();
+  if (!last || last === r.missed_at) return null;
+  return <span className="text-[11px] text-[#8B7355]">last rang {istDateTime(last)}</span>;
 }
 
 function VipBadge() {

@@ -73,6 +73,15 @@
  * and lets the server decide — and when a 403 does come back it shows the
  * server's own sentence rather than a generic failure.
  *
+ * THAT RULE HAS EXACTLY ONE DELIBERATE EXCEPTION, and it is named so the rest of
+ * the discipline stays true: ADMIN MONITOR MODE (below) hides the write actions
+ * on a call that is not the admin's own, even though the server's can_write says
+ * an admin MAY write it. It is an owner ruling, not an inference — the admin was
+ * offered "read-only plus Quick Booking" and chose the stricter shape — and it
+ * removes ACTIONS, never DATA: the guest history stays, and "Take over" (the
+ * deliberate, server-checked escalation) stays with it, so an admin who wants
+ * the call is one click from having it. Nothing else in this file refuses.
+ *
  * WHO OWNS IT. Ownership arrives on the wire (CtEvent.ownerEmail/ownerName,
  * and owner_email/owner_name on the /api/crm-calls/live snapshot); this file
  * never asks per row. A mapped TeleCMI agent is owned the moment the call is
@@ -144,13 +153,75 @@
  * and the card names both, each in its own state. Neither is ever blanked for
  * being unmapped: an unmapped id arrives as the raw id by design
  * (resolveAgentLabel, src/lib/ct/agents.ts) and is shown as-is.
+ *
+ * ── "RINGING FOR" IS A LADDER, AND THE CARD NEVER INVENTS A RUNG ────────────
+ * Reported 2026-08-20 with screenshots: the pop said "Ringing — trying the next
+ * agent" and never named anybody. It was not a rendering bug — the live ring
+ * payload on this account carries no agent field at all, so the server had no
+ * name to send (see the ring branch of ingestLive in src/lib/ct/ingest.ts, which
+ * now logs the payload's key names every time that happens). The wire therefore
+ * answers in two fields, produced by ONE function (ringingForLabel in
+ * src/lib/ct/agents.ts) so no surface can ladder it differently:
+ *
+ *   1 ringingAgentName / ringing_agent_name — A PERSON. The payload named an
+ *     extension. Shown in the HEADER: "Ringing — Pushpa B".
+ *   2 ringingGroupName / ringing_group_name — A GROUP (TeleCMI's `team`), and
+ *     set by the server ONLY when rung 1 is empty. Shown in the BODY, worded as
+ *     a group ("Ringing the Front Desk team") because a group is not a person
+ *     and must never sit in the slot where a name goes.
+ *   3 neither — today's honest wording ("Ringing — trying the next agent" while
+ *     a hunt group is walking, otherwise "Incoming call"). NOT a guess: "whoever
+ *     is probably next" is supported by nothing on the wire and is forbidden.
+ *
+ * The two rungs are read IN ORDER at render, never merged, so the card cannot
+ * print a group beside a named agent even if a later leg fills rung 1 while an
+ * earlier one had filled rung 2. `queue` is deliberately NOT a rung: it carries
+ * the group VERBATIM whether or not a person was named, so rendering it as
+ * "ringing for" would do exactly that.
+ *
+ * AND THE CONTRADICTION THIS CARD MUST NEVER PRINT: "Ringing — Pushpa" directly
+ * above "Pushpa did not pick up". The missed-leg branch clears rung 1 when the
+ * agent it named is the one reported as missing the leg; rung 2 survives that
+ * (a group is still ringing after one of its members gave up) and takes over.
+ *
+ * ── ADMIN MONITOR MODE (owner ruling 2026-08-20) ────────────────────────────
+ * An ADMIN sees every live call in the venue, each labelled with who it is
+ * ringing for and who answered, so he can judge how the GREs are working. Two
+ * rules, and the second is the one with teeth:
+ *
+ *   HIS OWN CALLS behave exactly as they do for any GRE — full disposition
+ *     rights, Quick Booking, everything. "His own" is the SERVER's answer
+ *     (is_mine on the /api/crm-calls/live rows, computed from the session and
+ *     the agent map), with the email comparison as the fallback, never the
+ *     authority.
+ *   EVERYONE ELSE'S CALLS ARE WATCH-ONLY — no disposition chips, no Quick
+ *     Booking. He was offered "read-only plus Quick Booking" and chose this. The
+ *     card says so where the button used to be ("Watching · Pushpa B"), because
+ *     a missing control with no explanation reads as a bug and a disabled one
+ *     reads as a dare.
+ *
+ * A NON-ADMIN GRE IS UNAFFECTED, by construction: every branch this mode adds is
+ * guarded by `isAdmin &&`, and no existing expression was rewritten — so for
+ * role !== 'admin' every path evaluates exactly as it did before. THE TEST FAILS
+ * CLOSED: isAdmin comes from the tier the SERVER resolved (/api/auth/me →
+ * user.role, an exact === 'admin' compare, never canAccessPage, never
+ * isManagement — that set is every Manager and HOD, a far wider audience than
+ * the one the owner named). A failed fetch, no session, or any other tier leaves
+ * it false, which is today's behaviour.
+ *
+ * WHAT MONITOR MODE DELIBERATELY DOES NOT CHANGE: the hangup dismissal. An
+ * ENDED call is not a live call, the Call Log holds it, and keeping every
+ * finished call of the shift on the admin's screen — each one a card whose
+ * "log outcome" header he is not allowed to act on — would be clutter that
+ * contradicts itself. So on hangup an admin lets go of somebody else's card
+ * exactly like everybody else does, and keeps his own.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   PhoneIncoming, PhoneOff, PhoneCall, X, UserPlus, CalendarPlus, ExternalLink, Loader2, Star,
-  Lock, UserCheck,
+  Lock, UserCheck, Eye,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { formatPhone } from '@/lib/ct/phone';
@@ -209,6 +280,26 @@ interface PopCard {
    * the reason spelled out on agentName above.
    */
   ringingFor: string;
+  /**
+   * RUNG 2 OF "RINGING FOR" — the ring GROUP (TeleCMI's `team`) this call is
+   * hunting through, off CtEvent.ringingGroupName / ringing_group_name. '' when
+   * the wire named no group.
+   *
+   * A GROUP IS NOT A PERSON. It is worded as a group in the body and never
+   * placed in the header slot where `ringingFor` renders a name, and it is read
+   * only AFTER `ringingFor` is found empty — that ordering is what stops the
+   * card printing a group beside an agent it has just named.
+   *
+   * NOT card.queue, which carries the group verbatim on every call including the
+   * ones that DID name a person. The server sets this field only when it named
+   * nobody, which is precisely what makes it an answer to "who is it ringing
+   * for" rather than just a fact about the call.
+   *
+   * SURVIVES A MISSED LEG on purpose: one member of a hunt group giving up does
+   * not stop the group ringing, so when the missed leg clears `ringingFor` this
+   * is the honest thing left to say.
+   */
+  ringingGroup: string;
   /** Staff display name of the last agent whose leg went unanswered, off
    *  CtEvent.missedByName. '' when no leg has been missed, or when the server
    *  could not name one (which is why `hunting` is a separate flag). */
@@ -244,6 +335,23 @@ interface PopCard {
   ownerEmail: string;
   /** Display name for ownerEmail (falls back to the email); '' when unowned. */
   ownerName: string;
+  /**
+   * IS THIS CALL MINE — the SERVER's answer for this viewer (is_mine on the
+   * /api/crm-calls/live rows), which is the only place the question can honestly
+   * be answered: it is computed from the session AND the agent map, and the
+   * agent map is admin-only and never reaches a browser.
+   *
+   * `undefined` = NOT YET ASKED (no snapshot row for this card yet), which reads
+   * as "not established as mine" — the same thing the server means by false.
+   * FALSE IS NOT "SOMEBODY ELSE'S": an unowned call naming no agent is false for
+   * everyone and must stay first-claim for everyone. It is used for exactly one
+   * thing, ADMIN MONITOR MODE, where "not established as mine" plus a KNOWN
+   * OWNER is what makes a call somebody else's.
+   *
+   * The email comparison (sameEmail against ownerEmail) remains the fallback for
+   * a card no snapshot has covered yet — never the authority.
+   */
+  isMine?: boolean;
   /**
    * IS A LOCK IN FORCE RIGHT NOW, as the SERVER last told us — never inferred
    * from ownerEmail (see the header). Viewer-independent: true also for the
@@ -304,10 +412,27 @@ interface AnyEvent {
   /** Staff display name of the agent who let a 'missed_leg' ring out —
    *  CtEvent.missedByName. Unmapped ids arrive as the raw id, never blank. */
   missedByName?: string;
-  /** Staff display name of the agent the call is ringing for NOW —
-   *  CtEvent.ringingAgentName, on `incoming_call` (and on a 'missed_leg' when
-   *  the server already knows who it moved on to). */
+  /**
+   * RUNG 1 — the staff display name of the agent the call is ringing for NOW,
+   * CtEvent.ringingAgentName, on `incoming_call`. Unmapped ids arrive as the raw
+   * id, never blank.
+   *
+   * IT IS ALSO READ ON A 'missed_leg', AND THE SERVER HAS NEVER SENT IT THERE.
+   * That read is kept because it costs nothing and is right the day the server
+   * can answer — but the comment that used to promise "the server already knows
+   * who it moved on to" was describing a value that does not exist: the NEXT
+   * extension mid-cascade appears in no TeleCMI payload and in no emitted field,
+   * so filling it would be the guess this whole ladder exists to forbid. Until
+   * then a missed leg falls to rung 2 (the group, which survives the leg) and
+   * then to "trying the next agent".
+   */
   ringingAgentName?: string;
+  /**
+   * RUNG 2 — CtEvent.ringingGroupName on `incoming_call`: the ring group /
+   * `team` the call is hunting through, set by the server ONLY when it named no
+   * person. See PopCard.ringingGroup for why this is not `queue`.
+   */
+  ringingGroupName?: string;
   /** Owner of the answered call — see CtEvent.ownerEmail in src/lib/ct/bus.ts. */
   ownerEmail?: string;
   ownerName?: string;
@@ -384,6 +509,21 @@ const sameLabel = (a: unknown, b: unknown): boolean => {
   const x = String(a ?? '').trim().toLowerCase();
   const y = String(b ?? '').trim().toLowerCase();
   return !!x && x === y;
+};
+
+/**
+ * Word a RING GROUP as a group — "Front Desk" → "Front Desk team" — so rung 2 of
+ * the ringing ladder can never be mistaken for a person's name (see the header).
+ *
+ * The suffix is dropped when the group already names itself one, because
+ * "Sales Team team" is the kind of sentence that makes a GRE distrust the whole
+ * card. Nothing else is done to the label: it is the telephony system's own
+ * `team` value and is otherwise printed exactly as it arrived.
+ */
+const groupPhrase = (g: string): string => {
+  const s = String(g || '').trim();
+  if (!s) return '';
+  return /\b(team|group|queue)$/i.test(s) ? s : `${s} team`;
 };
 
 /**
@@ -669,6 +809,27 @@ export default function CTScreenPop() {
    * what it deliberately does not.
    */
   const [myEmail, setMyEmail] = useState('');
+  /**
+   * AM I AN ADMIN — the one gate on monitor mode, and it FAILS CLOSED.
+   *
+   * `user.role` is the base tier the SERVER already resolved (an assigned role's
+   * base_role wins over the legacy users.role, see src/lib/auth.ts), compared
+   * exactly against 'admin'. Every other tier, a failed fetch, an expired
+   * session and any unreadable answer all leave this false — which is today's
+   * behaviour for everybody.
+   *
+   * NOT isManagement (admin + manager + every HOD — a far wider audience than
+   * the owner named) and NOT canAccessPage, which fails OPEN four ways and is
+   * therefore never an "is this user an admin" test.
+   *
+   * IT COMES FROM THE SAME FETCH AS myEmail, DELIBERATELY. /api/crm-calls/live
+   * also reports `me.is_admin`, and OR-ing that in would decouple the two: a
+   * browser could know it is an admin while still not knowing its own email, and
+   * every owned card would then look like somebody else's — putting an admin
+   * into watch-only on calls that are his. One source, both facts, settled
+   * together.
+   */
+  const [isAdmin, setIsAdmin] = useState(false);
 
   const cardsRef = useRef<PopCard[]>([]);
   /** Mirror of myEmail for handlers created with empty deps (handleEvent) —
@@ -676,6 +837,11 @@ export default function CTScreenPop() {
    *  hangup rule treats as "keep the card" (never yank a write-up we cannot
    *  prove belongs to someone else). */
   const myEmailRef = useRef('');
+  /** Mirror of isAdmin for callbacks created with stable deps (pollLive), so
+   *  choosing which snapshot list to merge never re-creates the callback — and
+   *  therefore never tears down and rebuilds the SSE connection, which depends
+   *  on pollLive's identity. false until proven otherwise, as above. */
+  const isAdminRef = useRef(false);
   const seqRef = useRef(0);
   const esRef = useRef<EventSource | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -684,15 +850,24 @@ export default function CTScreenPop() {
 
   useEffect(() => { cardsRef.current = cards; }, [cards]);
   useEffect(() => { myEmailRef.current = myEmail; }, [myEmail]);
+  useEffect(() => { isAdminRef.current = isAdmin; }, [isAdmin]);
 
   // Identify this browser once. A failure is survivable: myEmail stays '' and
   // every card keeps its full pop, with the server still refusing writes that
   // are not this user's to make.
+  //
+  // The SAME answer carries the tier, so monitor mode costs no second request:
+  // /api/auth/me returns the whole SessionUser and role is already on it. The
+  // compare is exact and everything else — including a role we do not recognise
+  // — is not an admin.
   useEffect(() => {
     fetch('/api/auth/me')
       .then(r => r.json())
-      .then(d => setMyEmail(String(d?.user?.email || '')))
-      .catch(() => { /* stays '' — presentation falls back to today's behaviour */ });
+      .then(d => {
+        setMyEmail(String(d?.user?.email || ''));
+        setIsAdmin(String(d?.user?.role || '') === 'admin');
+      })
+      .catch(() => { /* stays '' / false — presentation falls back to today's behaviour */ });
   }, []);
 
   // 1s tick drives BOTH counters — ring seconds and, once the call is up, talk
@@ -737,6 +912,12 @@ export default function CTScreenPop() {
       const key = eventKey(e);
       if (!key || dismissedRef.current.has(key)) return;
       const ringingFor = String(e.ringingAgentName || '').trim();
+      // RUNG 2, carried alongside rung 1 and never merged with it. The server
+      // sets exactly one of the two per event, so on a single ring they cannot
+      // both be filled; across SEVERAL rings of one hunt group they can, which is
+      // why the render reads them in order rather than trusting them to stay
+      // exclusive here.
+      const ringingGroup = String(e.ringingGroupName || '').trim();
       setCards(prev => {
         const existing = prev.find(c => c.key === key);
         if (existing) {
@@ -756,6 +937,10 @@ export default function CTScreenPop() {
               callId: c.callId || e.callId,
               guest: c.guest || e.guest || null,
               ...(ringingFor ? { ringingFor } : {}),
+              // Same "only when the event states one" rule as rung 1: a ring
+              // that names no group must not wipe the group an earlier ring of
+              // the same conversation established.
+              ...(ringingGroup ? { ringingGroup } : {}),
               ...(moved && c.mode === 'ringing'
                 ? { lastSignalAt: laterIso(c.lastSignalAt, e.at || new Date().toISOString()) }
                 : {}),
@@ -771,8 +956,11 @@ export default function CTScreenPop() {
           agent: e.agent || '',
           agentName: e.agentName || '',   // a ring names no answerer yet
           // …but a ring DOES name who it is ringing for, which is the question
-          // the GRE staring at the card actually has.
+          // the GRE staring at the card actually has. Rung 1 when the payload
+          // named a person, rung 2 (the group) when it named only the team —
+          // on this account today that is the rung that fires.
           ringingFor,
+          ringingGroup,
           missedByName: '',
           hunting: false,
           queue: e.queue || '',
@@ -870,8 +1058,16 @@ export default function CTScreenPop() {
             // Who it rings for now: the server's next agent when it named one,
             // otherwise nobody — the agent we were showing is the one that just
             // rang out, and keeping his name up would contradict the very line
-            // underneath it. A blank simply drops back to "Incoming call".
+            // underneath it. A blank drops to rung 2 (the GROUP, deliberately
+            // left untouched below: one member giving up does not stop the group
+            // ringing) and then to "trying the next agent".
+            //
+            // `nextRinger` is a read the server has never satisfied — the next
+            // extension mid-cascade is in no payload — and it stays a read
+            // rather than becoming a guess. See AnyEvent.ringingAgentName.
             ringingFor: nextRinger || (sameLabel(c.ringingFor, missedBy) ? '' : c.ringingFor),
+            // ringingGroup IS NOT TOUCHED HERE. It is still true, and it is the
+            // most specific thing left to say once the name above is cleared.
             // EVIDENCE OF LIFE — the staleness clock restarts. Without this a
             // six-extension hunt would cross RING_STALE_SECONDS and the card
             // would announce it had lost track of a call it can hear ringing.
@@ -935,8 +1131,39 @@ export default function CTScreenPop() {
     // recovery_update is not a pop concern.
   }, []);
 
-  /** Merge currently-ringing calls (poll payload) into the stack. */
-  const mergeRinging = useCallback((rows: any[]) => {
+  /**
+   * Merge LIVE calls off the poll snapshot into the stack.
+   *
+   * IT TAKES BOTH LISTS THE ROUTE OFFERS, and reads `status` to tell them apart:
+   *   `ringing` — status='ringing' by construction, which is why an ABSENT
+   *               status here means ringing and nothing else (that query IS the
+   *               WHERE clause; the route says so in writing).
+   *   `active`  — every call still in progress, ringing AND answered. THE
+   *               SERVER sends this one to an admin and to nobody else, and
+   *               omits the key entirely otherwise (see the route header), so a
+   *               non-admin browser is never handed the rows at all. The test in
+   *               pollLive is what a client does with a list it has; it is not
+   *               what decides whether it gets one.
+   * The two never both arrive: `active` is a superset, so merging both would
+   * be the same call twice — the route's own instruction is to render one.
+   *
+   * THE SNAPSHOT NOW CARRIES RESOLVED LABELS, and that is what fixes the second
+   * half of the 2026-08-20 report. It used to hand over only the RAW agent id,
+   * so this function deliberately dropped every name on the floor — a pop that
+   * reloaded mid-ring lost who it was ringing for permanently, and a card that
+   * mounted mid-call never learned who was on it. ringing_agent_name,
+   * ringing_group_name and agent_display are resolved server-side through the
+   * same helpers the bus events use, so filling them in here cannot disagree
+   * with what an event would have said.
+   *
+   * EVERY PATCH ONTO AN EXISTING CARD FILLS A BLANK ONLY, under the file's
+   * standing rule: events know things a row does not (which leg is ringing now,
+   * that a leg was missed), and a snapshot must never undo them. And nothing
+   * here touches `mode` — learning who is on a call says nothing about whether
+   * it is still up, and promoting a card on the strength of a row is how a
+   * finished call would get put back on the phone.
+   */
+  const mergeLiveRows = useCallback((rows: any[]) => {
     if (!Array.isArray(rows) || rows.length === 0) return;
     setCards(prev => {
       let next = prev;
@@ -954,11 +1181,58 @@ export default function CTScreenPop() {
           ? { ownerEmail: rowOwner, ownerName: String(r.owner_name || '').trim() || rowOwner }
           : null;
 
+        // STILL RINGING? Absent status = the `ringing` list = ringing. This is
+        // the one thing that decides whether agent_display names the extension
+        // being RUNG or the person who ANSWERED, and getting it wrong would put
+        // "Answered by Pushpa" on a call Pushpa has not picked up.
+        const rowRinging = String(r.status || 'ringing') === 'ringing';
+        const agentDisplay = String(r.agent_display || '').trim();
+        // Rungs 1 and 2, already resolved and already mutually exclusive on the
+        // wire. Asked only of a ringing row: once a call is answered "who is it
+        // ringing for" has no live answer, and the route does not send one.
+        const rowRingingFor = rowRinging ? String(r.ringing_agent_name || '').trim() : '';
+        const rowRingingGroup = rowRinging ? String(r.ringing_group_name || '').trim() : '';
+        // The server's own "is this mine", used by monitor mode alone.
+        const rowIsMine: boolean | undefined = typeof r.is_mine === 'boolean' ? r.is_mine : undefined;
+
         const hit = next.findIndex(c => c.key === key || (!!r.id && c.callId === r.id));
         if (hit !== -1) {
-          if (ownerFields) {
+          const c = next[hit];
+          const patch: Partial<PopCard> = {
+            ...(ownerFields || {}),
+            // Only when it actually CHANGES. Every poll carries is_mine, so
+            // copying it unconditionally would hand back a new card object (and
+            // a new array) every five seconds for a stack that has not moved.
+            ...(rowIsMine !== undefined && rowIsMine !== c.isMine ? { isMine: rowIsMine } : {}),
+            // FILL A BLANK ONLY, all three — and rung 1 has one more test to
+            // pass before it may be refilled.
+            //
+            // THE CONTRADICTION THIS SECOND CLAUSE EXISTS FOR. The missed-leg
+            // branch above CLEARS ringingFor in exactly one case: when it named
+            // the agent the CDR has just told us let the call pass. A blank is
+            // precisely what "fill a blank" treats as free to write, and
+            // ct_calls.agent_user is NOT cleared by a missed-leg CDR — so the
+            // very next 5s poll would hand the same name straight back, and the
+            // card would print "Ringing — Pushpa B" in the header directly above
+            // "Pushpa B did not pick up" in the body. That is the one sentence
+            // this file's header says it must never print, and it would be
+            // permanent, because every poll re-asserts it.
+            //
+            // Dormant while live rings on this account name nobody — and left
+            // dormant would be worse than useless, since the whole point of the
+            // ingest log is to make naming the ringing extension possible. The
+            // Live wallboard closes the same hole at its own merge, from the
+            // same two fields side by side.
+            ...(rowRingingFor && !c.ringingFor && !sameLabel(rowRingingFor, c.missedByName)
+              ? { ringingFor: rowRingingFor }
+              : {}),
+            ...(rowRingingGroup && !c.ringingGroup ? { ringingGroup: rowRingingGroup } : {}),
+            // …and the answerer only off a row that says somebody answered.
+            ...(!rowRinging && agentDisplay && !c.agentName ? { agentName: agentDisplay } : {}),
+          };
+          if (Object.keys(patch).length) {
             next = next === prev ? [...next] : next;   // never mutate state in place
-            next[hit] = { ...next[hit], ...ownerFields };
+            next[hit] = { ...c, ...patch };
           }
           continue;
         }
@@ -969,6 +1243,7 @@ export default function CTScreenPop() {
               tags: Array.isArray(r.guest_tags) ? r.guest_tags.map((t: unknown) => String(t)) : [],
             }
           : null;
+        const startedAt = String(r.started_at || new Date().toISOString());
         next = pushCard(next, {
           key,
           telecmiCallId: r.telecmi_call_id ? String(r.telecmi_call_id) : undefined,
@@ -976,29 +1251,33 @@ export default function CTScreenPop() {
           phone: String(r.phone_e164 || ''),
           guest,
           agent: String(r.agent_user || ''),
-          // The ringing snapshot carries the RAW agent id (agent_user), not a
-          // resolved name, and these rows are status='ringing' so nobody has
-          // picked up yet. Left blank on purpose rather than filled with an id
-          // that would render as "Answered by 201_1111112" on a call that has
-          // not been answered — the `answered` event brings the real name.
-          agentName: '',
-          // Same reasoning for "ringing for": agent_user here is the RAW id and
-          // this snapshot does not resolve it, so filling it would print an
-          // extension number for an agent who IS mapped — the one case
-          // resolveAgentLabel exists to avoid. The ring event brings the name.
-          ringingFor: '',
+          // WHO ANSWERED — and ONLY off a row that has been answered. On a
+          // ringing row agent_display resolves the extension the PBX is ringing,
+          // not the person holding the call, so copying it here would render
+          // "Answered by Pushpa B" on a phone still ringing on her desk.
+          agentName: rowRinging ? '' : agentDisplay,
+          // WHO IT IS RINGING FOR, both rungs, resolved by the server. This is
+          // what a card born from the snapshot used to have to leave blank.
+          ringingFor: rowRingingFor,
+          ringingGroup: rowRingingGroup,
           missedByName: '',
           hunting: false,
           queue: String(r.queue || ''),
-          startedAt: String(r.started_at || new Date().toISOString()),
-          lastSignalAt: String(r.started_at || new Date().toISOString()),
-          mode: 'ringing',
+          startedAt,
+          lastSignalAt: startedAt,
+          mode: rowRinging ? 'ringing' : 'answered',
+          // Talk time counts from the answer. answered_at should always be set
+          // on an answered row; falling back to started_at when it is not
+          // over-counts by the ring (~25s), which is a smaller lie than a talk
+          // timer frozen at 0:00 on a conversation that is demonstrably running.
+          ...(rowRinging ? {} : { answeredAt: String(r.answered_at || '') || startedAt }),
           ownerEmail: ownerFields?.ownerEmail || '',
           ownerName: ownerFields?.ownerName || '',
-          // The ringing snapshot carries the owner but NOT the lock, so a card
-          // born here starts with the lock unknown and keeps the full pop until
-          // the ?owned= answer arrives. Right by construction: these rows are
-          // status='ringing' and a ringing call is not yet ownable at all.
+          ...(rowIsMine !== undefined ? { isMine: rowIsMine } : {}),
+          // The snapshot carries the owner but NOT the lock, so a card born here
+          // starts with the lock unknown and keeps the full pop until the
+          // ?owned= answer arrives — which it asks for on the very next tick,
+          // because having an owner is one of the things that makes a card ask.
           freeAtLabel: '',
           blocked: '',
           newName: '',
@@ -1080,7 +1359,30 @@ export default function CTScreenPop() {
       let j: any = null;
       try { j = await r.json(); } catch { return; }
       if (typeof j?.seq === 'number') seqRef.current = Math.max(seqRef.current, j.seq);
-      mergeRinging(Array.isArray(j?.ringing) ? j.ringing : []);
+      // WHICH LIST — and this single line is the whole of "an admin sees every
+      // live call". `active` is `ringing` plus the calls that have already been
+      // ANSWERED and not yet ended, i.e. exactly the ones a browser can learn
+      // about no other way: a card is normally born from the `incoming_call`
+      // event, so a tab opened (or reloaded) while a conversation is running
+      // knows nothing about it at all — no guest, no agent, no owner — until the
+      // next event, which on a five-minute call is never.
+      //
+      // ADMIN ONLY, on purpose. Labelling calls is for everybody (that is the
+      // other half of this change), but WHICH CALLS a GRE's pop shows is monitor
+      // mode, and a non-admin must keep exactly the stack they have today.
+      //
+      // THE ENFORCEMENT IS THE SERVER'S. It does not send `active` to a
+      // non-admin at all, so this line is belt-and-braces rather than the gate —
+      // which is the right way round: a client-side `if` beside a wire that
+      // carried the rows anyway was a hidden control, not a permission. The
+      // `Array.isArray` arm also covers a server older than `active`, and both
+      // fall through to `ringing`.
+      //
+      // Read off the ref so this callback keeps a stable identity — it is a
+      // dependency of the SSE effect, and re-creating it would reconnect the
+      // stream.
+      const live = isAdminRef.current && Array.isArray(j?.active) ? j.active : j?.ringing;
+      mergeLiveRows(Array.isArray(live) ? live : []);
       if (processEvents && Array.isArray(j?.events)) {
         for (const e of j.events) handleEvent(e);
       }
@@ -1088,7 +1390,7 @@ export default function CTScreenPop() {
       // above patched in, because it was read from the row by this same request.
       applyOwned(Array.isArray(j?.owned) ? j.owned : []);
     } catch { /* transient network error — next tick retries */ }
-  }, [applyOwned, handleEvent, mergeRinging]);
+  }, [applyOwned, handleEvent, mergeLiveRows]);
 
   /**
    * THE LOCK CLOCK. Everything else here is event-driven, and a lapsing lock is
@@ -1543,6 +1845,33 @@ export default function CTScreenPop() {
              strip used to stay up all evening on a call the server had already
              opened to everyone. lockView() is where that rule lives. */
           const lock = lockView(card, myEmail);
+          /* ADMIN MONITOR MODE — is this somebody ELSE'S call that I am only
+             watching? (See the header for the ruling and its one exception to
+             this file's "never refuse where the server would allow".)
+
+             Three properties make this the right predicate rather than a
+             near-miss:
+               · THE SERVER ANSWERS FIRST. is_mine is computed from the session
+                 AND the agent map — the map is admin-only and never reaches a
+                 browser, so a mapped admin's own call is recognised without
+                 anything being exposed. sameEmail is the fallback for a card no
+                 snapshot has covered yet, and it returns false for two blanks,
+                 so an unknown identity is never "mine".
+               · A KNOWN OWNER IS REQUIRED. An UNOWNED card — every missed call,
+                 and every call an unmapped agent answered — stays first-claim
+                 for the admin exactly as it does for everyone: the server would
+                 accept the write, chasing it is the recovery queue's whole job,
+                 and hiding it would take a call away from someone who can work
+                 it. So watch-only is only ever "this belongs to a named person
+                 who is not me".
+               · isAdmin FAILS CLOSED, so for every GRE this is false and every
+                 branch below it is dead code. */
+          const isMine = card.isMine === true || sameEmail(card.ownerEmail, myEmail);
+          const watchOnly = isAdmin && !!card.ownerEmail && !isMine;
+          /* Who I am watching. The answerer when telephony named one, else the
+             owner — and never blank, because watchOnly requires an owner and the
+             server falls owner_name back to the email rather than to nothing. */
+          const watchingWho = card.agentName || card.ownerName || card.ownerEmail;
           /* …and I MAY NOT write it → the pop closes down to a slim read-only
              strip naming them. No chips, no Quick Booking, no disposition —
              one answered call, one write-up. Only the dismiss stays, because a
@@ -1596,6 +1925,23 @@ export default function CTScreenPop() {
              !ringStale because once the window has expired we no longer know
              that, and the honest admission below outranks it. */
           const hunting = card.mode === 'ringing' && card.hunting && !ringStale;
+          /* RUNG 2 OF "RINGING FOR" — the GROUP, read ONLY once rung 1 (the
+             person, which the header prints) has come up empty. That ordering is
+             the whole guarantee that the card cannot say "Ringing — Pushpa B" in
+             the header and "Ringing the Front Desk team" underneath it: two
+             answers to one question, one of them stale.
+
+             Gated on a card that is RINGING and not stale, for the same reason
+             `hunting` is: once the window has expired we no longer know the
+             phones are ringing, and claiming a group is being rung would be the
+             very lie the stale header exists to stop telling. It is also the
+             rung that survives a missed leg — one member giving up does not stop
+             the group ringing — which is what the card falls back to when the
+             name it was showing is cleared for contradicting "X did not pick
+             up". */
+          const ringGroup = card.mode === 'ringing' && !ringStale && !card.ringingFor
+            ? groupPhrase(card.ringingGroup)
+            : '';
           /* …AND THE ONE CASE WHERE IT NEVER CAME BACK. A missed leg was the last
              thing we ever heard: nothing says the call is still up, and a call
              that rang out is a real missed call somebody has to write up. The
@@ -1642,22 +1988,35 @@ export default function CTScreenPop() {
               </div>
 
               <div className="p-3 space-y-2.5">
-                {/* THE HUNT GROUP, SAID OUT LOUD. Directly under the header,
-                    because it is the sentence that stops a GRE believing the
-                    call is over: one extension gave up, the phone is still
-                    ringing on the next one. The name is kept when the window
-                    has expired too — "X did not pick up" stays true whatever
-                    happened afterwards — but the claim that it is still
-                    ringing is dropped with it. */}
-                {(hunting || (strandedMiss && !!card.missedByName)) && (
+                {/* WHO IT IS RINGING, SAID OUT LOUD. Directly under the header,
+                    because these are the sentences that stop a GRE believing
+                    the call is over or that it is not their problem: the ring
+                    GROUP when the header could not name a person (rung 2), and
+                    the hunt itself — one extension gave up, the phone is still
+                    ringing on the next one. The missed name is kept when the
+                    window has expired too — "X did not pick up" stays true
+                    whatever happened afterwards — but the claim that anything
+                    is still ringing is dropped with it, which is why `ringGroup`
+                    and `hunting` are both gated on !ringStale and the icon falls
+                    back to the hung-up phone. */}
+                {(hunting || !!ringGroup || (strandedMiss && !!card.missedByName)) && (
                   <div className="flex items-start gap-2 px-2.5 py-2 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg">
-                    {hunting
+                    {(hunting || ringGroup)
                       ? <PhoneIncoming className="w-3.5 h-3.5 text-[#af4408] shrink-0 mt-0.5 animate-pulse" />
                       : <PhoneOff className="w-3.5 h-3.5 text-[#8B7355] shrink-0 mt-0.5" />}
                     <div className="min-w-0 flex-1">
-                      {hunting && (
+                      {/* WHO IT IS RINGING FOR, when the header could not say.
+                          One sentence, never two: the group and the hunt are
+                          the same fact seen from two sides ("it is ringing the
+                          Front Desk team" / "one of them just gave up"), and
+                          printing them as separate lines reads like two
+                          different calls. When the wire named no group at all
+                          this is exactly today's wording, unchanged. */}
+                      {(hunting || ringGroup) && (
                         <p className="text-[11px] font-semibold text-[#af4408] leading-snug">
-                          Ringing — trying the next agent
+                          {ringGroup
+                            ? <>Ringing the <b className="text-[#2D1B0E]">{ringGroup}</b>{hunting ? ' — trying the next agent' : ''}</>
+                            : 'Ringing — trying the next agent'}
                         </p>
                       )}
                       {!!card.missedByName && (
@@ -1742,10 +2101,16 @@ export default function CTScreenPop() {
                 )}
 
                 {/* MANAGEMENT ON SOMEBODY ELSE'S LOCKED CALL. The server said
-                    can_write, so the card stays fully live — chips, Quick
-                    Booking, everything — and this line is the part a manager
-                    actually needs: WHO is on it, until WHEN, and the takeover
-                    three server sentences have been promising. Reachable only
+                    can_write, so for a MANAGER or an HOD the card stays fully
+                    live — chips, Quick Booking, everything — and this line is
+                    the part they actually need: WHO is on it, until WHEN, and
+                    the takeover three server sentences have been promising.
+                    AN ADMIN IS THE ONE EXCEPTION, by the owner's ruling: monitor
+                    mode has already removed his chips and Quick Booking on a
+                    call that is not his, and this box is what makes that
+                    survivable — the takeover below is his one-click route from
+                    watching to holding, and it is checked on the server, so
+                    nothing here is a promise the API will not keep. Reachable only
                     when the SERVER said can_write on a call locked to someone
                     else — which is the definition of management here, computed
                     by isManagement inside callOwnerState and never re-derived
@@ -1784,7 +2149,38 @@ export default function CTScreenPop() {
                     off the screen was to throw the write-up away. Quick Booking
                     is not lost with it: the "Booking Made" chip opens the same
                     modal. */}
-                {!showChips ? (
+                {/* ADMIN MONITOR MODE, and the one place it actually bites.
+                    Somebody else's call: NO disposition chips and NO Quick
+                    Booking — the owner was offered "read-only plus Quick
+                    Booking" and chose this shape. It is checked FIRST so there
+                    is exactly one gate rather than one on each branch, which is
+                    how a control eventually gets added to the wrong side.
+
+                    A LABEL, NOT A DEAD BUTTON. It sits precisely where the
+                    button was, because a control that silently vanishes reads as
+                    a bug and a greyed-out one reads as a dare. The Profile link
+                    stays — watching is the point, and reading a guest's history
+                    is not writing anything. The takeover, when the server has
+                    said this call is locked to them, is in the box above: that
+                    is the honest way for an admin to go from watching to
+                    handling, and it is server-checked.
+
+                    For a non-admin `watchOnly` is false and this whole branch is
+                    unreachable, so the two below are byte-for-byte today's. */}
+                {watchOnly ? (
+                  <div className="flex items-center gap-2 pt-0.5">
+                    <span className="flex-1 min-w-0 inline-flex items-center gap-1.5 px-3 py-2 bg-[#FFF8F0] border border-[#E8D5C4] text-[#6B5744] rounded-lg text-xs font-semibold">
+                      <Eye className="w-3.5 h-3.5 shrink-0 text-[#8B7355]" />
+                      <span className="truncate">Watching · {watchingWho}</span>
+                    </span>
+                    {card.guest?.id && (
+                      <Link href={`/crm-calls/guests/${card.guest.id}`}
+                            className="inline-flex items-center gap-1 px-3 py-2 bg-[#FFF1E3] hover:bg-[#E8D5C4] text-[#6B5744] rounded-lg text-xs font-semibold shrink-0">
+                        <ExternalLink className="w-3.5 h-3.5" /> Profile
+                      </Link>
+                    )}
+                  </div>
+                ) : !showChips ? (
                   <div className="flex items-center gap-2 pt-0.5">
                     <button onClick={() => onQuickBooking(card)} disabled={card.claiming}
                             className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-xs font-semibold">

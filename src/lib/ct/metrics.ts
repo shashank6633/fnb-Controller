@@ -651,6 +651,20 @@ export function dashboardStats(db: DB, opts: { days?: number } = {}): DashboardS
   };
 
   // ── Recovery funnel + headline KPIs ──────────────────────────────────────
+  //
+  // `missed` HERE COUNTS CALLBACK TASKS, NOT RINGS — and that is deliberate.
+  // Since one call that rings a hunt group files ONE task rather than one per
+  // ring (absorbIntoOpenRecovery in ./ingest.ts), this number is no longer the
+  // same as the missed-call count on /crm-calls/missed-attribution, which
+  // counts ct_calls rows. They measure different things: this is a funnel about
+  // WORK — a task is attempted, recovered, booked — and a ring cannot be
+  // attempted, only a task can. Every stage below is per-row, so counting rings
+  // at the top would make the funnel's own percentages wrong.
+  //
+  // Expect a one-off step DOWN in this figure on the day the merge shipped:
+  // fewer duplicate tasks, not fewer missed guests. Rows created before that
+  // day are per-ring and are deliberately left alone (owner's instruction), so
+  // history is not restated.
   const rf = db.prepare(`
     SELECT COUNT(*)                                                                 AS missed,
            SUM(CASE WHEN first_attempt_at IS NOT NULL THEN 1 ELSE 0 END)            AS attempted,

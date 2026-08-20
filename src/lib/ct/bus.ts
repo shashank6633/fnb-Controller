@@ -77,8 +77,44 @@ export interface CtEvent {
    * WHICH AGENT AN INCOMING CALL IS RINGING FOR, on `incoming_call` — same
    * resolution, raw id when unmapped. Absent when the live payload named no
    * agent: the ringing extension is reported, never guessed.
+   *
+   * A PERSON, ALWAYS. When it is absent the call may still be ringing a GROUP —
+   * see ringingGroupName below, which is the SECOND rung of the same ladder.
    */
   ringingAgentName?: string;
+  /**
+   * THE RING GROUP an incoming call is hunting through, on `incoming_call` —
+   * TeleCMI's own `team`. THE SECOND RUNG of "who is it ringing for", and SET
+   * ONLY WHEN ringingAgentName IS NOT: the two together are the whole answer, in
+   * that order, and they are produced by one function (ringingForLabel() in
+   * ./agents.ts) so the pop, the wallboard and the /api/crm-calls/live snapshot
+   * cannot ladder it differently.
+   *
+   *   ringingAgentName set → the payload NAMED an extension. Say the person.
+   *   ringingGroupName set → it named no person but DID name the group. A GROUP
+   *                          IS NOT A PERSON: word it as one ("ringing the Front
+   *                          Desk team"), never as an individual's name. This is
+   *                          why it is a field of its own and not a fallback
+   *                          poured into ringingAgentName.
+   *   NEITHER set          → the payload named neither. Say nothing, or keep the
+   *                          wording already used while it is unknown ("trying
+   *                          the next agent").
+   *
+   * NOT the same field as `queue` below, which still carries the group VERBATIM
+   * whether or not a person was named. Rendering `queue` as "ringing for" would
+   * print a group beside a named agent on the very calls the name came through.
+   *
+   * NEVER FILLED FROM missedByName. Who let the PREVIOUS leg pass is a fact
+   * about a phone that has ALREADY STOPPED ringing; printing it here would tell
+   * a GRE their handset is ringing when it is not. A blank degrades to honest
+   * wording, never to a guess — including "probably whoever is next in the
+   * group", which nothing in any payload supports.
+   *
+   * WHY THIS RUNG NORMALLY FIRES: on this account the live ring has not been
+   * observed carrying an agent field at all (see the ring branch of ingestLive
+   * in ./ingest.ts, which logs the payload's key names whenever that happens).
+   */
+  ringingGroupName?: string;
   /**
    * OWNERSHIP of an answered call — the app user (email) who holds the write-up,
    * '' / undefined when nobody does. Distinct from `agent`: that is the TELEPHONY
@@ -89,6 +125,12 @@ export interface CtEvent {
    * presentation only — the lock that actually matters is the server check in
    * callWriteBlock(). Never treat "ownerEmail is set" as "locked": the lock
    * lapses on disposition/expiry while the owner is kept as the audit trail.
+   *
+   * "IS THIS CALL MINE?" IS NOT ANSWERED HERE, and cannot be: a broadcast has no
+   * viewer. GET /api/crm-calls/live answers it per-viewer and server-side —
+   * `is_mine` on each row, computed from the session, not from anything the
+   * client asserts. Comparing this email against one the browser holds is the
+   * fallback, not the authority.
    */
   ownerEmail?: string;
   /** Resolved display name for `ownerEmail`, so the strip names a person and
