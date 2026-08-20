@@ -23,7 +23,7 @@ import {
   Settings as SettingsIcon, PlugZap, Webhook, Copy, Check, Clock, UserCheck, AlertTriangle,
   Loader2, AlertCircle, CheckCircle2, Save, Lock, Database, DownloadCloud,
   MessageCircle, RefreshCw, Sparkles, Zap, Users, Plus, Trash2, MonitorPlay, Crown,
-  Eraser, Eye, EyeOff,
+  Eraser, Eye, EyeOff, ScanSearch, UserPlus,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
@@ -147,6 +147,82 @@ function parseHiddenIds(v: unknown): string[] {
  */
 function isAppLoginId(v: string): boolean {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(v || '').trim());
+}
+
+/** One agent as TeleCMI knows it: the raw id plus the NAME on the PBX. */
+interface TelecmiAgentLite { id: string; name: string }
+
+/**
+ * Rows out of /api/telecmi/agents (GET) or a scan's `found` list.
+ *
+ * Returns null when the payload carries no list at all — "we were not given a
+ * roster" and "the roster is empty" are different facts and the callers below
+ * must be able to tell them apart. `agents[]` holds row objects and the older
+ * `agent_ids[]` bare strings; both are accepted, ids are de-duplicated in
+ * canonical form, and a missing name is simply '' (an id TeleCMI does not name
+ * keeps today's presentation rather than inventing one).
+ */
+function parseRosterAgents(j: any): TelecmiAgentLite[] | null {
+  const raw = Array.isArray(j?.agents) ? j.agents
+    : Array.isArray(j?.agent_ids) ? j.agent_ids
+    : null;
+  if (!raw) return null;
+  const out: TelecmiAgentLite[] = [];
+  const used = new Set<string>();
+  for (const v of raw as unknown[]) {
+    const obj = v && typeof v === 'object' ? (v as Record<string, unknown>) : null;
+    const id = String((obj ? obj.agent_id : v) ?? '').trim();
+    if (!id) continue;
+    const key = canonAgentId(id);
+    if (used.has(key)) continue;
+    used.add(key);
+    out.push({ id, name: obj ? String(obj.name ?? '').trim() : '' });
+  }
+  return out;
+}
+
+/** Comparable form of a person's name: trimmed, lowercased, inner runs of
+ *  whitespace collapsed. Used ONLY to suggest a match, never to store one. */
+function normPersonName(v: unknown): string {
+  return String(v ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function firstNameWord(v: unknown): string {
+  return normPersonName(v).split(' ')[0] || '';
+}
+
+/**
+ * A CONFIDENT staff match for a TeleCMI agent name, or null.
+ *
+ * The rule, deliberately conservative — this only ever fills a dropdown that
+ * the admin still has to Save, but a wrong guess that looks authoritative is
+ * worse than no guess at all:
+ *   1. exact full-name match wins, and only when EXACTLY ONE staff member has
+ *      that name (two "Ravi"s is an ambiguity, not a suggestion);
+ *   2. otherwise a both-ways startsWith on the FIRST word ("Bharath" vs
+ *      "Bharath D"), again only when it singles out one staff member;
+ *   3. anything shorter than 3 characters on either side is not evidence.
+ * Everything else returns null and the row renders exactly as it does today.
+ */
+function suggestStaffForName(
+  telecmiName: string,
+  staff: Array<{ email: string; name: string }>,
+): { email: string; name: string } | null {
+  const n = normPersonName(telecmiName);
+  if (n.length < 3 || !staff.length) return null;
+
+  const exact = staff.filter(s => normPersonName(s.name) === n);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) return null; // ambiguous — say nothing
+
+  const f = firstNameWord(telecmiName);
+  if (f.length < 3) return null;
+  const near = staff.filter(s => {
+    const sf = firstNameWord(s.name);
+    if (sf.length < 3) return false;
+    return sf === f || sf.startsWith(f) || f.startsWith(sf);
+  });
+  return near.length === 1 ? near[0] : null;
 }
 
 /** Per-agent usage from the API's additive `agents_detail`. Absent on an older
@@ -453,6 +529,54 @@ export default function CtSettingsPage() {
    */
   const [rosterIds, setRosterIds] = useState<string[] | null>(null);
 
+  /**
+   * TeleCMI's own NAME for an agent id, canonical id → name.
+   *
+   * WHY. A raw id says nothing about who it is: mapping "5008_33338614" means
+   * remembering that 5008 is Bharath D. This is a DISPLAY HINT ONLY — it is
+   * never stored, never sent back, and an id TeleCMI does not name simply
+   * renders as it does today. Filled from the roster GET below and topped up by
+   * a scan; merged, never replaced, so one failed refresh cannot blank names
+   * that were already on screen.
+   */
+  const [telecmiNames, setTelecmiNames] = useState<Record<string, string>>({});
+  /**
+   * Whether asking TeleCMI for agents is possible at all.
+   *   'unknown'     — not answered yet: render nothing, promise nothing.
+   *   'ready'       — the roster GET worked; the fetch controls are shown.
+   *   'unavailable' — not configured / not permitted / could not be read. The
+   *                   editor stays EXACTLY as it is today plus a one-line note;
+   *                   no button is offered that would only 403 or 400.
+   */
+  const [agentSource, setAgentSource] = useState<{ status: 'unknown' | 'ready' | 'unavailable'; note: string }>(
+    { status: 'unknown', note: '' },
+  );
+  // "Get agents from TeleCMI" / "Scan TeleCMI for more". Nothing here runs on
+  // load, on a timer, or as a side effect of anything else: every request to
+  // TeleCMI below is one deliberate press.
+  const [pullingAgents, setPullingAgents] = useState(false);
+  const [scanningAgents, setScanningAgents] = useState(false);
+  const [pulledOnce, setPulledOnce] = useState(false);
+  const [fetchNote, setFetchNote] = useState<string | null>(null);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [scanNote, setScanNote] = useState<string | null>(null);
+  /** Agents a scan found that are on TeleCMI but not on this list — the admin
+   *  picks which to add. null = no scan has run in this session. */
+  const [scanFound, setScanFound] = useState<TelecmiAgentLite[] | null>(null);
+  const [addingAgentId, setAddingAgentId] = useState<string | null>(null);
+  const [addingAllAgents, setAddingAllAgents] = useState(false);
+  /**
+   * Ids we know are KEYS in the stored agent_map right now — including the ones
+   * stored with no staff member ("in the roster, not yet assigned").
+   *
+   * Needed because "Save mapping" PUTs the map as a whole and the settings route
+   * keeps only entries that have BOTH an id and a value, so an unassigned id
+   * silently drops out of the roster on the next save. That is pre-existing
+   * behaviour; this set is what lets the card SAY so before the press instead of
+   * letting the owner discover it afterwards.
+   */
+  const [knownMapIds, setKnownMapIds] = useState<string[]>([]);
+
   useEffect(() => {
     if (typeof window !== 'undefined') setOrigin(window.location.origin);
   }, []);
@@ -463,28 +587,67 @@ export default function CtSettingsPage() {
   useEffect(() => {
     let cancelled = false;
     setRosterIds(null);
+    setAgentSource({ status: 'unknown', note: '' });
+    // Both this effect and the settings load below merge into knownMapIds; the
+    // reset lives here, in the effect body, so it always lands before either
+    // fetch resolves rather than racing one of them.
+    setKnownMapIds([]);
+    setScanFound(null);
+    setPulledOnce(false);
+    setFetchNote(null);
+    setFetchError(null);
+    setScanNote(null);
     api('/api/telecmi/agents')
       .then(async r => {
         if (cancelled) return;
         // 401/403 (not admin) or any other non-OK answer → roster UNKNOWN.
-        if (!r.ok) return;
+        if (!r.ok) {
+          // A control that can only 403 must not be offered at all. Same for a
+          // provider that is simply not answering: the editor below is fully
+          // usable without it, so this costs a note, never a banner.
+          setAgentSource({
+            status: 'unavailable',
+            note: r.status === 401 || r.status === 403
+              ? 'Fetching agents from TeleCMI is not available for this login.'
+              : `TeleCMI could not be reached (HTTP ${r.status}), so agents cannot be fetched right now. The list below is unaffected.`,
+          });
+          return;
+        }
         const j = await r.json().catch(() => null);
-        if (cancelled || !j) return;
+        if (cancelled || !j) {
+          setAgentSource({ status: 'unavailable', note: 'TeleCMI did not return a readable answer, so agents cannot be fetched right now. The list below is unaffected.' });
+          return;
+        }
+        if (j.configured === false) {
+          setAgentSource({ status: 'unavailable', note: 'TeleCMI is not configured, so there are no agents to fetch. The list below is unaffected.' });
+          return;
+        }
         // `error` means the roster could not be read (mock mode, unparseable
         // agent_map, every lookup failed). agents:[] alongside it is a failure,
         // not the fact that this venue has no agents — never group on it.
-        if (j.error) return;
-        const raw = Array.isArray(j.agent_ids) ? j.agent_ids
-          : Array.isArray(j.agents) ? j.agents
-          : null;
-        if (!raw) return;
-        const ids = (raw as unknown[])
-          .map(v => {
-            // agents[] carries row objects, agent_ids[] bare strings — accept both.
-            const id = v && typeof v === 'object' ? (v as Record<string, unknown>).agent_id : v;
-            return String(id ?? '').trim();
-          })
-          .filter(Boolean);
+        if (j.error) {
+          setAgentSource({ status: 'unavailable', note: `Agents could not be read from TeleCMI: ${String(j.error)}` });
+          return;
+        }
+        const rows = parseRosterAgents(j);
+        if (!rows) {
+          setAgentSource({ status: 'unavailable', note: 'TeleCMI returned no agent list, so agents cannot be fetched right now. The list below is unaffected.' });
+          return;
+        }
+        setAgentSource({ status: 'ready', note: '' });
+        // Names are a display hint and are recorded even when every id here is
+        // already listed — that is precisely the case this feature exists for.
+        const named: Record<string, string> = {};
+        for (const a of rows) if (a.name) named[canonAgentId(a.id)] = a.name;
+        if (Object.keys(named).length) setTelecmiNames(prev => ({ ...prev, ...named }));
+        // The roster IS the agent_map key set (that route has no other source),
+        // so these ids are known to be stored — including the unassigned ones.
+        setKnownMapIds(prev => {
+          const set = new Set(prev);
+          for (const a of rows) { const k = canonAgentId(a.id); if (k) set.add(k); }
+          return Array.from(set);
+        });
+        const ids = rows.map(a => a.id);
         // AN EMPTY ROSTER IS NOT A ROSTER. TeleCMI has no list-users endpoint, so
         // that route builds the roster out of agent_map — an empty one means
         // "nobody has been added here yet", NOT "TeleCMI has no agents". Grouping
@@ -493,7 +656,12 @@ export default function CtSettingsPage() {
         if (!ids.length) return;
         setRosterIds(ids);
       })
-      .catch(() => { /* unknown roster → flat list, never a broken page */ });
+      .catch(() => {
+        // unknown roster → flat list, never a broken page
+        if (!cancelled) {
+          setAgentSource({ status: 'unavailable', note: 'TeleCMI could not be reached, so agents cannot be fetched right now. The list below is unaffected.' });
+        }
+      });
     return () => { cancelled = true; };
   }, [refreshKey]);
 
@@ -538,6 +706,12 @@ export default function CtSettingsPage() {
         setAgentsSeen(seen);
         setAgentDetails(parseAgentDetails(j?.agents_detail));
         setSavedAgentMap(mapObj);
+        // Every key stored in agent_map, assigned or not — see knownMapIds.
+        setKnownMapIds(prev => {
+          const set = new Set(prev);
+          for (const k of Object.keys(mapObj)) { const c = canonAgentId(k); if (c) set.add(c); }
+          return Array.from(set);
+        });
         setAgentRows(buildAgentRows(mapObj, seen));
         // The dismiss list. agents_seen above is ALREADY filtered by it
         // server-side, so a hidden id simply does not arrive as a row — the
@@ -780,12 +954,33 @@ export default function CtSettingsPage() {
     }
     return out;
   }, [agentRows]);
+  /**
+   * The saved map as it can be COMPARED to the draft: canonical keys, and only
+   * the entries that actually carry a staff member.
+   *
+   * WHY THE FILTER. parseAgentMap deliberately keeps an unassigned id (`id` →
+   * ''), because that is how an agent added on the Telephony page — or by "Get
+   * agents from TeleCMI" below — sits in the roster. The draft, by design, only
+   * ever contains assigned rows. Comparing the two raw therefore reported
+   * "unsaved changes" the moment the page loaded with any unassigned agent in
+   * the map, arming a Save the admin never asked for. Comparing like with like
+   * keeps Save armed by real edits only.
+   */
+  const savedAssignedMap = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(savedAgentMap)) {
+      const key = canonAgentId(k);
+      const val = String(v ?? '').trim();
+      if (key && val) out[key] = val;
+    }
+    return out;
+  }, [savedAgentMap]);
   const agentDirty = useMemo(() => {
-    const a = agentMapDraft, b = savedAgentMap;
+    const a = agentMapDraft, b = savedAssignedMap;
     const ak = Object.keys(a), bk = Object.keys(b);
     if (ak.length !== bk.length) return true;
     return ak.some(k => a[k] !== b[k]);
-  }, [agentMapDraft, savedAgentMap]);
+  }, [agentMapDraft, savedAssignedMap]);
   const hiddenSet = useMemo(() => new Set(hiddenIds), [hiddenIds]);
   /** A row is DERIVED when its id came from real calls — either it is in
    *  agents_seen, or it is on the dismiss list (the server filters hidden ids
@@ -929,6 +1124,12 @@ export default function CtSettingsPage() {
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setAgentError(j?.error || `HTTP ${r.status}`); return; }
       setSavedAgentMap(agent_map);
+      // The PUT stores a canonical REPLACEMENT that keeps only assigned entries,
+      // so after this the stored map holds exactly these keys — anything that
+      // was in the roster unassigned is no longer there. Say that in state too,
+      // or the "will drop out of the roster" note would keep naming ids that
+      // already have.
+      setKnownMapIds(Object.keys(agent_map).map(canonAgentId).filter(Boolean));
       // Prefer the server's echo (canonical + de-duped) so the screen shows what
       // was actually stored — including a normalization we did not predict.
       // Only an older server that echoes nothing falls back to the draft.
@@ -946,6 +1147,224 @@ export default function CtSettingsPage() {
     } finally {
       setSavingAgents(false);
     }
+  };
+
+  /* ── Get agents FROM TeleCMI ──────────────────────────────────────────────
+   *
+   * The owner's problem, in his words: an agent who has never taken a call is
+   * not listed at all, so there is nothing to map until they do — and even when
+   * listed, a raw id ("5008_33338614") does not say who it is.
+   *
+   * Two steps, both explicit, cheapest first:
+   *   1. "Get agents from TeleCMI" — a GET of /api/telecmi/agents. That is the
+   *      ROSTER, i.e. the ids already stored in agent_map, enriched with the
+   *      TeleCMI name. It costs no discovery traffic, so it is the first press,
+   *      and every id it returns that has no row here gets one immediately.
+   *   2. "Scan TeleCMI for more" — POST { action:'scan' }. TeleCMI has NO
+   *      list-users endpoint, so this PROBES a bounded extension range, one
+   *      request per candidate. Read-only: it writes nothing. Whatever it finds
+   *      that is not in the roster is listed, and only the ones the admin picks
+   *      are added, via POST { action:'map', id }.
+   *
+   * Nothing here runs by itself. Adding rows locally is not a write — a roster
+   * id is ALREADY a key in agent_map — so no press below silently changes the
+   * stored mapping except 'map', which is the admin choosing a named agent.
+   */
+
+  /** Record TeleCMI's names for later rows. Merge only: a name already on
+   *  screen must not be blanked because one later answer omitted it. */
+  const mergeTelecmiNames = (rows: TelecmiAgentLite[]) => {
+    const named: Record<string, string> = {};
+    for (const a of rows) {
+      const key = canonAgentId(a.id);
+      if (key && a.name) named[key] = a.name;
+    }
+    if (Object.keys(named).length) setTelecmiNames(prev => ({ ...prev, ...named }));
+  };
+
+  /** Give these ids a row if they have none. Returns what it actually did, so
+   *  the report can be honest rather than optimistic. */
+  const addRosterRows = (rows: TelecmiAgentLite[]): { added: number; skippedHidden: number } => {
+    const have = new Set(agentRows.map(r => canonAgentId(r.id)));
+    const hiddenNow = new Set(hiddenIds);
+    const fresh: Array<{ id: string; email: string }> = [];
+    let skippedHidden = 0;
+    for (const a of rows) {
+      const key = canonAgentId(a.id);
+      if (!key || have.has(key)) continue;
+      // An app login is not a TeleCMI agent and can never be mapped to one.
+      if (isAppLoginId(key)) continue;
+      // The admin dismissed this id explicitly. Bringing it back silently would
+      // undo that decision on their behalf — report it instead; "Show hidden"
+      // below is one click and un-hides it deliberately.
+      if (hiddenNow.has(key)) { skippedHidden++; continue; }
+      have.add(key);
+      // Canonical (lowercased) id — the same form the server stores, so this row
+      // can never save as a second copy of an id already in the map.
+      fresh.push({ id: key, email: '' });
+    }
+    if (fresh.length) setAgentRows(prev => [...prev, ...fresh]);
+    return { added: fresh.length, skippedHidden };
+  };
+
+  const getAgentsFromTelecmi = async () => {
+    if (pullingAgents || scanningAgents || addingAllAgents || addingAgentId) return;
+    setPullingAgents(true);
+    setFetchError(null); setFetchNote(null); setScanNote(null);
+    try {
+      // House convention: bare fetch for GETs, api() for mutations.
+      const r = await fetch('/api/telecmi/agents');
+      if (!r.ok) {
+        setFetchError(r.status === 401 || r.status === 403
+          ? 'Not permitted to read TeleCMI agents. Nothing was changed.'
+          : `TeleCMI agents could not be read (HTTP ${r.status}). Nothing was changed.`);
+        return;
+      }
+      const j = await r.json().catch(() => null);
+      if (!j) { setFetchError('TeleCMI did not return a readable answer. Nothing was changed.'); return; }
+      if (j.configured === false) {
+        setFetchError(String(j.error || 'TeleCMI is not configured, so there are no agents to fetch.'));
+        return;
+      }
+      const rows = parseRosterAgents(j);
+      if (!rows) {
+        setFetchError(String(j.error || 'TeleCMI returned no agent list. Nothing was changed.'));
+        return;
+      }
+      mergeTelecmiNames(rows);
+      setKnownMapIds(prev => {
+        const set = new Set(prev);
+        for (const a of rows) { const k = canonAgentId(a.id); if (k) set.add(k); }
+        return Array.from(set);
+      });
+      const { added, skippedHidden } = addRosterRows(rows);
+      setPulledOnce(true);
+      const named = rows.filter(a => a.name).length;
+      const parts = [
+        added > 0
+          ? `Added ${added} agent${added === 1 ? '' : 's'} from the roster`
+          : (rows.length === 0
+            ? 'The TeleCMI roster is empty — nothing to add'
+            : `Added nothing new — all ${rows.length} roster agent${rows.length === 1 ? '' : 's'} already listed`),
+        named ? `${named} named by TeleCMI` : '',
+        skippedHidden ? `${skippedHidden} left hidden (use “Show hidden” to bring one back)` : '',
+      ].filter(Boolean);
+      // A partial failure upstream (some ids could not be enriched) must not
+      // read as a clean result.
+      setFetchNote(parts.join(' · ') + (j.error ? ` — ${String(j.error)}` : ''));
+    } catch (e: any) {
+      setFetchError(e?.message || 'TeleCMI could not be reached. Nothing was changed.');
+    } finally {
+      setPullingAgents(false);
+    }
+  };
+
+  const scanTelecmiForMore = async () => {
+    if (pullingAgents || scanningAgents || addingAllAgents || addingAgentId) return;
+    setScanningAgents(true);
+    setFetchError(null); setScanNote(null);
+    try {
+      // No range is sent: the route derives one from the extensions it already
+      // knows about, so "the usual extensions" has ONE definition, not two that
+      // can drift apart. The advanced range picker lives on the Telephony page.
+      const r = await api('/api/telecmi/agents', { method: 'POST', body: { action: 'scan' } });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setFetchError(String(j?.error || `The scan failed (HTTP ${r.status}). Nothing was changed.`));
+        return;
+      }
+      if (j?.configured === false) {
+        setFetchError(String(j?.error || 'TeleCMI is not configured, so there is nothing to scan.'));
+        return;
+      }
+      const found = parseRosterAgents({ agents: Array.isArray(j?.found) ? j.found : [] }) ?? [];
+      mergeTelecmiNames(found);
+
+      const have = new Set(agentRows.map(r2 => canonAgentId(r2.id)));
+      const hiddenNow = new Set(hiddenIds);
+      // Offer only what this list does not already carry, and never an id the
+      // admin has dismissed — adding that one would write to the roster and
+      // still show nothing, because a hidden unassigned row is filtered out.
+      const more = found.filter(a => {
+        const k = canonAgentId(a.id);
+        return k && !have.has(k) && !hiddenNow.has(k) && !isAppLoginId(k);
+      });
+      setScanFound(more);
+
+      const scanned = Number.isFinite(Number(j?.scanned)) ? Number(j.scanned) : null;
+      const from = j?.range?.from, to = j?.range?.to;
+      const unreachable = Array.isArray(j?.unreachable) ? j.unreachable.length : 0;
+      const parts = [
+        `Scan found ${more.length} more agent${more.length === 1 ? '' : 's'}`,
+        scanned != null ? `${scanned} extension${scanned === 1 ? '' : 's'} asked${from != null && to != null ? ` (${from}–${to})` : ''}` : '',
+        // A truncated scan is a FLOOR, never a roster: "nothing found" after an
+        // early stop is not evidence that there is nothing there.
+        j?.timed_out ? `stopped early at ${j?.last_ext ?? 'an unstated point'} — there may be more beyond it` : '',
+        unreachable ? `${unreachable} did not answer` : '',
+      ].filter(Boolean);
+      setScanNote(parts.join(' · '));
+      if (j?.error) setFetchError(String(j.error));
+    } catch (e: any) {
+      setFetchError(e?.message || 'The scan could not be run. Nothing was changed.');
+    } finally {
+      setScanningAgents(false);
+    }
+  };
+
+  /**
+   * Put ONE discovered agent into the roster.
+   *
+   * Deliberately NOT through the CRM-settings PUT: that route stores a canonical
+   * replacement of agent_map and keeps only entries that have a staff member, so
+   * a freshly discovered agent (no staff member yet) would be dropped on the way
+   * in and every other unassigned id deleted on the way past. The agents route
+   * merges one id into the stored map instead. Returns an error string, or null.
+   */
+  const addDiscoveredAgent = async (id: string): Promise<string | null> => {
+    const key = canonAgentId(id);
+    if (!key) return 'That agent id is empty.';
+    try {
+      const r = await api('/api/telecmi/agents', { method: 'POST', body: { action: 'map', id: key } });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        return String(j?.error || `${id} could not be added to the roster (HTTP ${r.status}).`);
+      }
+      setAgentRows(prev => (prev.some(x => canonAgentId(x.id) === key) ? prev : [...prev, { id: key, email: '' }]));
+      setKnownMapIds(prev => (prev.includes(key) ? prev : [...prev, key]));
+      setScanFound(prev => (prev ? prev.filter(a => canonAgentId(a.id) !== key) : prev));
+      return null;
+    } catch (e: any) {
+      return e?.message || `${id} could not be added to the roster.`;
+    }
+  };
+
+  const addOneDiscovered = async (id: string) => {
+    if (addingAgentId || addingAllAgents || pullingAgents || scanningAgents) return;
+    setAddingAgentId(id); setFetchError(null);
+    const err = await addDiscoveredAgent(id);
+    if (err) setFetchError(err);
+    else setFetchNote(`✓ ${id} added to the roster — pick a staff member below, then press “Save mapping”.`);
+    setAddingAgentId(null);
+  };
+
+  /** Sequential, and it STOPS at the first failure: these are writes to one
+   *  settings row, and racing them would have the merges overwrite each other. */
+  const addAllDiscovered = async () => {
+    if (addingAgentId || addingAllAgents || pullingAgents || scanningAgents) return;
+    const list = scanFound ?? [];
+    if (!list.length) return;
+    setAddingAllAgents(true); setFetchError(null);
+    let ok = 0;
+    for (const a of list) {
+      const err = await addDiscoveredAgent(a.id);
+      if (err) {
+        setFetchError(`${err} ${ok} of ${list.length} were added before this.`);
+        break;
+      }
+      ok++;
+    }
+    if (ok) setFetchNote(`✓ ${ok} agent${ok === 1 ? '' : 's'} added to the roster — pick staff members below, then press “Save mapping”.`);
+    setAddingAllAgents(false);
   };
 
   // ── Locked (non-admin) ────────────────────────────────────────────────────
@@ -1031,12 +1450,27 @@ export default function CtSettingsPage() {
     const stale = isLoginId ? null : staleInfo(row.id);
     const emailKnown = row.email
       && staff.some(s => s.email.toLowerCase() === row.email.toLowerCase());
+    // WHO THIS ID IS. TeleCMI's own name for the agent, when we have been told
+    // it. Display only — nothing about the stored map changes — and an id
+    // TeleCMI does not know simply renders exactly as it did before.
+    const telecmiName = isLoginId ? '' : (telecmiNames[canonAgentId(row.id)] || '');
+    // Confirm-only suggestion: never applied on its own, and never shown at all
+    // without a confident, unambiguous match.
+    const suggestion = !row.email.trim() && telecmiName
+      ? suggestStaffForName(telecmiName, staff)
+      : null;
     return (
       <div key={idx} className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
         <div className="flex-1 min-w-[8rem] w-full sm:w-auto">
           <input value={row.id} onChange={e => setAgentRow(idx, { id: e.target.value })}
                  placeholder="e.g. 101 or gre.ravi" aria-label="TeleCMI agent id"
                  className={`${inputCls} ${isUnmappedSeen ? 'border-amber-300' : ''}`} />
+          {telecmiName && (
+            <div className="text-[10px] text-[#6B5744] mt-0.5 truncate"
+                 title={`TeleCMI calls ${row.id} “${telecmiName}”`}>
+              · {telecmiName} <span className="text-[#C9A98A]">on TeleCMI</span>
+            </div>
+          )}
         </div>
         <span className="text-[#C9A98A] shrink-0 text-sm hidden sm:inline">→</span>
         <div className="flex-1 min-w-[10rem] w-full sm:w-auto">
@@ -1053,6 +1487,17 @@ export default function CtSettingsPage() {
             )}
           </select>
         </div>
+        {suggestion && (
+          /* One click FILLS the dropdown — it saves nothing. Getting it wrong
+             costs one click back to "— Unmapped —", and the admin still has to
+             press "Save mapping" for anything to be stored. */
+          <button type="button"
+                  onClick={() => { setAgentFlash(null); setAgentError(null); setAgentRow(idx, { email: suggestion.email }); }}
+                  title={`TeleCMI calls this agent “${telecmiName}”. This only fills the box — press “Save mapping” to store it.`}
+                  className="text-[10px] px-1.5 py-0.5 rounded border border-[#E8D5C4] bg-[#FFF1E3] text-[#af4408] hover:bg-[#FFE4CC] shrink-0 flex items-center gap-1">
+            <Sparkles className="w-3 h-3" /> Map to {suggestion.name}?
+          </button>
+        )}
         {isUnmappedSeen && (
           <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 shrink-0">
             unmapped
@@ -1714,6 +2159,18 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
         <div className="px-3 sm:px-4 py-2.5 bg-[#FFF1E3] border-b border-[#E8D5C4] flex flex-wrap items-center gap-2">
           <Users className="w-4 h-4 text-[#af4408]" />
           <h2 className="text-sm font-semibold text-[#2D1B0E]">Agent mapping</h2>
+          {/* Offered ONLY when the roster GET actually worked. Not configured,
+              not permitted, or unreachable → no button at all (one that could
+              only 403 is worse than none) and a one-line note in the body. */}
+          {agentSource.status === 'ready' && (
+            <button type="button" onClick={() => void getAgentsFromTelecmi()}
+                    disabled={pullingAgents || scanningAgents || addingAllAgents || Boolean(addingAgentId)}
+                    title="Ask TeleCMI which agents exist and list any that are missing here. Nothing is saved until you press “Save mapping”."
+                    className="ml-auto px-2.5 py-1 rounded text-[11px] font-medium border border-[#E8D5C4] bg-white text-[#af4408] hover:bg-[#FFF1E3] flex items-center gap-1.5 disabled:opacity-50">
+              {pullingAgents ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <UserPlus className="w-3.5 h-3.5" />}
+              {pullingAgents ? 'Asking TeleCMI…' : 'Get agents from TeleCMI'}
+            </button>
+          )}
           {unmappedSeenCount > 0 && (
             <span className="ml-auto px-2 py-0.5 rounded-full text-[10px] font-medium border bg-amber-50 border-amber-300 text-amber-800">
               {unmappedSeenCount} unmapped
@@ -1729,8 +2186,9 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
             its raw id.
           </p>
           <p className="text-xs text-[#6B5744]">
-            The ids below come from calls actually seen — an agent who has not taken a call yet
-            will not be listed, so use <strong>Add agent id</strong> to name them in advance.
+            The ids below come from calls actually seen — an agent who has not taken a call yet is
+            not listed by call history, so fetch them with <strong>Get agents from TeleCMI</strong>{' '}
+            (top right) or type one in with <strong>Add agent id</strong> to name them in advance.
             Callbacks a GRE logs from their own phone are recorded against their app login, not a
             TeleCMI id; those are attributed by name already and are not shown here.
           </p>
@@ -1743,6 +2201,95 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
             this list only (it is listed under <em>hidden</em> below and can be brought back);
             nothing about the calls themselves changes.
           </p>
+
+          {/* ── Get agents from TeleCMI ──────────────────────────────────────
+              Degrading gracefully is the whole point of this block: when the
+              provider cannot be asked, the editor above and below is EXACTLY
+              what it is today plus this one line. Never a banner over a page
+              that works. */}
+          {agentSource.status === 'unavailable' && agentSource.note && (
+            <p className="text-[11px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-2 py-1.5">
+              {agentSource.note}
+            </p>
+          )}
+
+          {agentSource.status === 'ready' && (
+            <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] p-2.5 space-y-2">
+              <p className="text-[11px] text-[#6B5744]">
+                <strong className="text-[#2D1B0E]">Get agents from TeleCMI</strong> (top right) lists the agents
+                TeleCMI already knows about — with their names — so an agent who has never taken a call can still
+                be mapped. TeleCMI cannot list its own users, so anything beyond that roster has to be found by
+                asking about candidate extensions one at a time: that is the scan. Nothing on TeleCMI is changed
+                either way. <strong>Add</strong> puts a found id into the roster straight away; the staff member
+                you pick for it is stored when you press <strong>Save mapping</strong>.
+              </p>
+
+              {(fetchNote || scanNote) && (
+                <div className="bg-white border border-[#E8D5C4] rounded px-2 py-1.5 text-[11px] text-[#2D1B0E] space-y-0.5">
+                  {fetchNote && <div>{fetchNote}</div>}
+                  {scanNote && <div className="text-[#6B5744]">{scanNote}</div>}
+                </div>
+              )}
+              {fetchError && (
+                <div className="bg-red-50 border border-red-200 text-red-700 rounded px-2 py-1.5 text-[11px] flex items-start gap-1.5">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-px" /> {fetchError}
+                </div>
+              )}
+
+              {/* The scan is offered only AFTER the cheap roster pull — it is a
+                  request to TeleCMI per candidate extension, so it should never
+                  be the first thing anyone presses. */}
+              {pulledOnce && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <button type="button" onClick={() => void scanTelecmiForMore()}
+                          disabled={pullingAgents || scanningAgents || addingAllAgents || Boolean(addingAgentId)}
+                          className="px-2.5 py-1 rounded text-[11px] font-medium border border-[#E8D5C4] bg-white text-[#6B5744] hover:bg-[#FFF1E3] flex items-center gap-1.5 disabled:opacity-50">
+                    {scanningAgents ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
+                    {scanningAgents ? 'Scanning TeleCMI…' : 'Scan TeleCMI for more'}
+                  </button>
+                  <span className="text-[10px] text-[#6B5744]">
+                    finds agents that are on TeleCMI but not in the roster yet — a few seconds, and it changes nothing
+                  </span>
+                </div>
+              )}
+
+              {scanFound !== null && !scanningAgents && (
+                scanFound.length === 0 ? (
+                  <p className="text-[11px] text-[#6B5744] italic">
+                    The scan found no agent that is not already on this list.
+                  </p>
+                ) : (
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[11px] font-medium text-[#2D1B0E]">
+                        {scanFound.length} on TeleCMI, not on this list
+                      </span>
+                      <button type="button" onClick={() => void addAllDiscovered()}
+                              disabled={addingAllAgents || Boolean(addingAgentId) || pullingAgents || scanningAgents}
+                              className="text-[11px] px-2 py-1 rounded border border-[#E8D5C4] bg-white text-[#af4408] hover:bg-[#FFF1E3] flex items-center gap-1 disabled:opacity-50">
+                        {addingAllAgents ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
+                        Add all
+                      </button>
+                    </div>
+                    {scanFound.map(a => (
+                      <div key={canonAgentId(a.id)} className="flex flex-wrap items-center gap-2">
+                        <code className="flex-1 min-w-[8rem] text-[11px] text-[#2D1B0E] bg-white border border-[#E8D5C4] rounded px-2 py-1 overflow-x-auto whitespace-nowrap">
+                          {a.id}{a.name ? <span className="text-[#6B5744]"> · {a.name}</span> : null}
+                        </code>
+                        <button type="button" onClick={() => void addOneDiscovered(a.id)}
+                                disabled={addingAllAgents || Boolean(addingAgentId) || pullingAgents || scanningAgents}
+                                title="Add this agent to the roster so it can be mapped to a staff member"
+                                className="text-[11px] px-2 py-1 rounded border border-[#E8D5C4] bg-white text-[#6B5744] hover:bg-[#FFF1E3] flex items-center gap-1 shrink-0 disabled:opacity-50">
+                          {addingAgentId === a.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
+                          Add
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )
+              )}
+            </div>
+          )}
 
           {visibleAgentRows.length === 0 ? (
             <p className="text-xs text-[#6B5744] italic">
@@ -1847,6 +2394,14 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
               <span className="text-[10px] text-[#6B5744]">unsaved changes</span>
             )}
           </div>
+
+          {/* A warning used to stand here saying an unassigned id would drop out
+              of the roster on save. That was true, and it is not any more: the
+              settings PUT now preserves a key whose value is empty (see the
+              'agent_map' case in src/app/api/crm-calls/settings/route.ts), which
+              is what "in the roster, not yet assigned" is stored as. Saving is
+              no longer destructive to a discovered agent, so there is nothing
+              left to admit before the press. */}
 
           {agentFlash && (
             <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-lg p-2.5 text-xs flex items-center gap-1.5">

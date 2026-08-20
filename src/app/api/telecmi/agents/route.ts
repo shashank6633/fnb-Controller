@@ -535,14 +535,19 @@ export async function POST(req: Request) {
    * a staff member), exactly as the `add` branch does after creating an agent.
    *
    * WHY NOT DO THIS THROUGH THE CRM SETTINGS PUT (/api/crm-calls/settings,
-   * key agent_map). Because that validator builds a canonical REPLACEMENT of
-   * the whole object and keeps only entries that have BOTH a key and a value
-   * (`if (key && val) clean[key] = val`). A freshly discovered agent has no
-   * staff member yet, so it would be dropped on the way in — and every other
-   * already-discovered-but-unassigned id would be deleted on the way past. In
-   * the worst case the map stores '{}' and the roster is wiped. Merge here, on
-   * the route that owns the roster, and never route an unassigned id through
-   * that PUT.
+   * key agent_map). That PUT builds a canonical REPLACEMENT of the whole
+   * object, so it is the wrong shape for "add one id": this route would have to
+   * send the entire map back and would clobber any edit made between its read
+   * and its write. Adding here — on the route that owns the roster — is a
+   * merge into one key and cannot lose a concurrent change.
+   *
+   * It used to be worse than a shape mismatch. That validator kept only entries
+   * with BOTH a key and a value (`if (key && val)`), so an unassigned id was
+   * dropped on the way in AND every other unassigned id was deleted on the way
+   * past — one Save mapping could empty the roster. That is fixed: the PUT now
+   * preserves a key whose value is empty (an empty value still never overwrites
+   * an assignment). Saving from CRM Settings is no longer destructive to the
+   * agents this route discovers.
    *
    * TeleCMI is NOT contacted: scan already proved the agent exists, and a
    * second lookup would double the provider traffic for no new fact. The row

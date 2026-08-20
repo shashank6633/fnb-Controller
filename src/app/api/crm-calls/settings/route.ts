@@ -357,11 +357,24 @@ function validate(key: string, value: any): { ok: true; value: string } | { ok: 
       // Canonical storage: keys lowercased + trimmed so a mixed-case TeleCMI
       // agent id ("Gre.Ravi" vs "gre.ravi") can never split into two rows or
       // fail to resolve. Last non-empty value wins on a case-collision.
+      //
+      // AN UNASSIGNED AGENT IS KEPT. This used to require a value
+      // (`if (key && val)`), which made agent_map "ids that have a staff
+      // member" — but the map is ALSO the roster: /api/telecmi/agents lists
+      // its keys, and both `add` (a new agent created on TeleCMI) and `map`
+      // (an agent found by a scan) deliberately write id -> '' meaning "in
+      // the roster, not yet assigned". So one press of Save mapping silently
+      // deleted every agent nobody had assigned yet — including the ones just
+      // discovered — and the roster shrank each time it was saved. An empty
+      // value is a real state and is now preserved; an empty value still never
+      // OVERWRITES an assignment on a case-collision, which is what keeps the
+      // "last non-empty wins" rule above true.
       const clean: Record<string, string> = {};
       for (const [k, v] of Object.entries(obj)) {
         const key = String(k).trim().toLowerCase().slice(0, 100);
         const val = String(v ?? '').trim().slice(0, 200);
-        if (key && val) clean[key] = val;
+        if (!key) continue;
+        if (val || !(key in clean)) clean[key] = val;
       }
       return { ok: true, value: JSON.stringify(clean) };
     }
