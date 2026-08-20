@@ -10,8 +10,10 @@
  * paste into the TeleCMI dashboard (SETTINGS → WEBHOOKS: type "call report" for
  * the CDR URL, "notify" for the Live URL).
  *
- * GET /api/crm-calls/settings  → { settings, webhook urls/token, configured }
- * PUT /api/crm-calls/settings  → changed keys only
+ * GET /api/crm-calls/settings  → { settings, webhook urls/token, configured,
+ *                                  agents_seen/_detail, agent_hidden, staff }
+ * PUT /api/crm-calls/settings  → changed keys only (the Agent-mapping editor
+ *                                sends agent_map + agent_hidden together)
  * POST /api/crm-calls/seed     → demo data (confirm first, show counts)
  * POST /api/telecmi/backfill   → historical CDR pull ({ days })
  */
@@ -21,6 +23,7 @@ import {
   Settings as SettingsIcon, PlugZap, Webhook, Copy, Check, Clock, UserCheck, AlertTriangle,
   Loader2, AlertCircle, CheckCircle2, Save, Lock, Database, DownloadCloud,
   MessageCircle, RefreshCw, Sparkles, Zap, Users, Plus, Trash2, MonitorPlay, Crown,
+  Eraser, Eye, EyeOff,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
@@ -85,6 +88,37 @@ function parseAgentMap(v: any): Record<string, string> {
     const key = String(k).trim();
     const email = String(val ?? '').trim();
     if (key && email) out[key] = email;
+  }
+  return out;
+}
+
+/** Canonical form of a TeleCMI agent id — trimmed + lowercased. This is exactly
+ *  how the server stores agent_map KEYS and agent_hidden entries, so every
+ *  membership test on this page goes through it rather than re-lowercasing
+ *  inline and drifting. */
+function canonAgentId(v: unknown): string {
+  return String(v ?? '').trim().toLowerCase();
+}
+
+/**
+ * Parse the admin's dismiss list → canonical ids, de-duplicated, order kept.
+ *
+ * The current server sends it top-level as a real array (`agent_hidden`); an
+ * older/echoed payload can carry it as the raw ct_settings JSON string, so both
+ * shapes are accepted and a malformed blob simply reads as "nothing hidden"
+ * rather than throwing the whole settings load away.
+ */
+function parseHiddenIds(v: unknown): string[] {
+  let arr: unknown = v;
+  if (typeof v === 'string') { try { arr = JSON.parse(v || '[]'); } catch { return []; } }
+  if (!Array.isArray(arr)) return [];
+  const out: string[] = [];
+  const used = new Set<string>();
+  for (const raw of arr) {
+    const id = canonAgentId(raw);
+    if (!id || used.has(id)) continue;
+    used.add(id);
+    out.push(id);
   }
   return out;
 }
@@ -371,6 +405,26 @@ export default function CtSettingsPage() {
   const [agentDetails, setAgentDetails] = useState<Record<string, AgentDetail>>({});
   const [agentRows, setAgentRows] = useState<Array<{ id: string; email: string }>>([]);
   const [savedAgentMap, setSavedAgentMap] = useState<Record<string, string>>({});
+  // The admin's dismiss list (ct_settings 'agent_hidden').
+  //
+  // WHY IT EXISTS. Rows here have two different origins: ids TYPED into this
+  // editor (they live only in agent_map, so removing one is a real delete) and
+  // ids DERIVED from real calls (agents_seen). A derived id cannot be deleted —
+  // it is on ct_calls rows, so the next GET derives it again — which is exactly
+  // what read as "delete did not save". Hiding is the only thing that takes one
+  // off this list, and it is presentation only: the calls, their agent_user
+  // values and resolveAgentLabel() are untouched.
+  // Draft + saved are kept apart because Save must arm when ONLY the hidden set
+  // changed; watching agent_map alone was the direct cause of the bug.
+  const [hiddenIds, setHiddenIds] = useState<string[]>([]);
+  const [savedHidden, setSavedHidden] = useState<string[]>([]);
+  const [showHidden, setShowHidden] = useState(false);
+  // Ids proven DERIVED this session, even once they leave the dismiss list.
+  // Only a derived id can be hidden, so an id that has been on that list must
+  // never fall back to being treated as a typed row — after an un-hide is saved
+  // it is gone from agent_hidden but not yet back in agents_seen (that needs a
+  // reload), and a trash button there would promise a delete that cannot stick.
+  const [everHidden, setEverHidden] = useState<string[]>([]);
   const [savingAgents, setSavingAgents] = useState(false);
   const [agentFlash, setAgentFlash] = useState<string | null>(null);
   const [agentError, setAgentError] = useState<string | null>(null);
@@ -421,6 +475,14 @@ export default function CtSettingsPage() {
         setAgentDetails(parseAgentDetails(j?.agents_detail));
         setSavedAgentMap(mapObj);
         setAgentRows(buildAgentRows(mapObj, seen));
+        // The dismiss list. agents_seen above is ALREADY filtered by it
+        // server-side, so a hidden id simply does not arrive as a row — the
+        // hidden block below is rendered from this list, not from the rows.
+        const hidden = parseHiddenIds(j?.agent_hidden ?? src?.agent_hidden);
+        setHiddenIds(hidden);
+        setSavedHidden(hidden);
+        setEverHidden(hidden);
+        setShowHidden(false);
       })
       .catch(e => { if (!cancelled) setLoadError(e?.message || 'Failed to load settings'); })
       .finally(() => { if (!cancelled) setLoading(false); });
@@ -660,13 +722,40 @@ export default function CtSettingsPage() {
     if (ak.length !== bk.length) return true;
     return ak.some(k => a[k] !== b[k]);
   }, [agentMapDraft, savedAgentMap]);
+  const hiddenSet = useMemo(() => new Set(hiddenIds), [hiddenIds]);
+  /** A row is DERIVED when its id came from real calls — either it is in
+   *  agents_seen, or it is on the dismiss list (the server filters hidden ids
+   *  OUT of agents_seen, and only a derived id can ever get onto that list).
+   *  Everything else is MANUAL: it exists only in the saved map. */
+  const derivedSet = useMemo(
+    () => new Set<string>([...seenSet, ...hiddenIds, ...savedHidden, ...everHidden]),
+    [seenSet, hiddenIds, savedHidden, everHidden],
+  );
+  // Hiding/un-hiding must arm Save on its own. Without this the whole point is
+  // lost: the trash on an unmapped derived row changed nothing savable, the
+  // dirty-check stayed false, and the id came back on the next load.
+  const hiddenDirty = useMemo(() => {
+    const a = [...hiddenIds].sort(), b = [...savedHidden].sort();
+    return a.length !== b.length || a.some((v, i) => v !== b[i]);
+  }, [hiddenIds, savedHidden]);
+  const agentsChanged = agentDirty || hiddenDirty;
+  /** Rows on screen. A hidden id drops out — but ONLY while it is unmapped, so
+   *  a mapping can never disappear silently behind the dismiss list. */
+  const visibleAgentRows = useMemo(
+    () => agentRows
+      .map((row, idx) => ({ row, idx }))
+      .filter(({ row }) => !(hiddenSet.has(canonAgentId(row.id)) && !row.email.trim())),
+    [agentRows, hiddenSet],
+  );
   // Honest count: only TeleCMI ids that appeared on a call and still have no
-  // staff member. An app-login email can never be mapped, so it is never a gap.
+  // staff member. An app-login email can never be mapped, so it is never a gap —
+  // and neither is an id the admin has just hidden, so the chip counts what is
+  // actually on screen rather than something the owner can no longer see.
   const unmappedSeenCount = useMemo(
-    () => agentRows.filter(
-      r => !r.email.trim() && !isAppLoginId(r.id) && seenSet.has(r.id.trim().toLowerCase()),
+    () => visibleAgentRows.filter(
+      ({ row }) => !row.email.trim() && !isAppLoginId(row.id) && seenSet.has(row.id.trim().toLowerCase()),
     ).length,
-    [agentRows, seenSet],
+    [visibleAgentRows, seenSet],
   );
 
   const setAgentRow = (idx: number, patch: Partial<{ id: string; email: string }>) =>
@@ -674,17 +763,58 @@ export default function CtSettingsPage() {
   const addAgentRow = () => setAgentRows(prev => [...prev, { id: '', email: '' }]);
   const removeAgentRow = (idx: number) => setAgentRows(prev => prev.filter((_, i) => i !== idx));
 
+  /** DERIVED row that has a name: drop the NAME only. The id stays on screen
+   *  because it stays on real calls; Save removes it from agent_map. */
+  const clearAgentName = (idx: number) => {
+    setAgentFlash(null); setAgentError(null);
+    setAgentRow(idx, { email: '' });
+  };
+  /** DERIVED row with no name: take it off this list. Presentation only. */
+  const hideAgentRow = (id: string) => {
+    const key = canonAgentId(id);
+    if (!key) return;
+    setAgentFlash(null); setAgentError(null);
+    setHiddenIds(prev => (prev.includes(key) ? prev : [...prev, key]));
+    setEverHidden(prev => (prev.includes(key) ? prev : [...prev, key]));
+  };
+  /** Put a hidden id back on the list. It may have no row left (the server
+   *  filters hidden ids out of agents_seen), so re-create one rather than let
+   *  "Unhide" appear to do nothing until the next reload. */
+  const unhideAgentId = (id: string) => {
+    const key = canonAgentId(id);
+    if (!key) return;
+    setAgentFlash(null); setAgentError(null);
+    setHiddenIds(prev => prev.filter(h => h !== key));
+    setAgentRows(prev => (
+      prev.some(r => canonAgentId(r.id) === key) ? prev : [...prev, { id: key, email: '' }]
+    ));
+  };
+
   const saveAgentMap = async () => {
     if (savingAgents) return;
     setSavingAgents(true); setAgentError(null); setAgentFlash(null);
     try {
       const agent_map = agentMapDraft; // already omits blank / unmapped rows
-      const r = await api('/api/crm-calls/settings', { method: 'PUT', body: { agent_map } });
+      // The dismiss list rides along on every save — the two are one editor
+      // state, and the PUT ignores an unknown non-secret key, so an older
+      // server just stores the map exactly as it does today.
+      const agent_hidden = hiddenIds;
+      const r = await api('/api/crm-calls/settings', { method: 'PUT', body: { agent_map, agent_hidden } });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setAgentError(j?.error || `HTTP ${r.status}`); return; }
       setSavedAgentMap(agent_map);
+      // Prefer the server's echo (canonical + de-duped) so the screen shows what
+      // was actually stored — including a normalization we did not predict.
+      // Only an older server that echoes nothing falls back to the draft.
+      const storedHidden = j?.agent_hidden === undefined ? agent_hidden : parseHiddenIds(j.agent_hidden);
+      setHiddenIds(storedHidden);
+      setSavedHidden(storedHidden);
       const n = Object.keys(agent_map).length;
-      setAgentFlash(`✓ Saved — ${n} agent${n === 1 ? '' : 's'} mapped to staff`);
+      const h = storedHidden.length;
+      setAgentFlash(
+        `✓ Saved — ${n} agent${n === 1 ? '' : 's'} mapped to staff`
+        + (h ? ` · ${h} id${h === 1 ? '' : 's'} hidden from this list` : ''),
+      );
     } catch (e: any) {
       setAgentError(e?.message || 'Save failed');
     } finally {
@@ -1363,11 +1493,20 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
             Callbacks a GRE logs from their own phone are recorded against their app login, not a
             TeleCMI id; those are attributed by name already and are not shown here.
           </p>
+          {/* The one thing that was never said on screen — and the reason the
+              trash button looked broken. */}
+          <p className="text-xs text-[#6B5744]">
+            The ids on this list are the ones <strong>seen on real calls</strong> plus the ones{' '}
+            <strong>you typed</strong>. Clearing a name leaves the id here — it is still in call
+            history and cannot be deleted from it — and <strong>hiding</strong> takes an id off
+            this list only; nothing about the calls themselves changes.
+          </p>
 
-          {agentRows.length === 0 ? (
+          {visibleAgentRows.length === 0 ? (
             <p className="text-xs text-[#6B5744] italic">
-              No TeleCMI agents have appeared on a call yet. Add ids manually below, or run a
-              backfill / take a call first, then refresh.
+              {hiddenIds.length > 0
+                ? 'Every agent id is hidden — use “Show hidden” below to bring one back.'
+                : 'No TeleCMI agents have appeared on a call yet. Add ids manually below, or run a backfill / take a call first, then refresh.'}
             </p>
           ) : (
             <div className="space-y-2">
@@ -1378,13 +1517,19 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
                 <span className={`${labelCls} flex-1 min-w-[10rem]`}>Staff member</span>
                 <span className="w-7 shrink-0" />
               </div>
-              {agentRows.map((row, idx) => {
+              {visibleAgentRows.map(({ row, idx }) => {
                 // A legacy app-login email still sitting in the SAVED map: keep
                 // the row visible so it can be removed, but say what it is
                 // rather than badging it as a mapping gap.
                 const isLoginId = isAppLoginId(row.id);
                 const isUnmappedSeen = !row.email.trim() && !isLoginId
                   && seenSet.has(row.id.trim().toLowerCase());
+                // Which "delete" this row can actually honour. MANUAL rows live
+                // only in agent_map, so the trash is real. A DERIVED id is on
+                // real calls: the most that can be removed is the NAME, and the
+                // id itself can only be hidden.
+                const isDerived = derivedSet.has(canonAgentId(row.id));
+                const hasName = Boolean(row.email.trim());
                 const stale = isLoginId ? null : staleInfo(row.id);
                 const emailKnown = row.email
                   && staff.some(s => s.email.toLowerCase() === row.email.toLowerCase());
@@ -1426,13 +1571,66 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
                         no calls in {AGENT_STALE_DAYS} days — likely a removed extension
                       </span>
                     )}
-                    <button type="button" onClick={() => removeAgentRow(idx)} title="Remove row"
-                            className="p-1.5 text-[#8B7355] hover:text-red-600 hover:bg-red-50 rounded shrink-0">
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                    {!isDerived ? (
+                      <button type="button" onClick={() => removeAgentRow(idx)}
+                              title="Remove this row" aria-label="Remove this row"
+                              className="p-1.5 text-[#8B7355] hover:text-red-600 hover:bg-red-50 rounded shrink-0">
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    ) : hasName ? (
+                      <button type="button" onClick={() => clearAgentName(idx)}
+                              title="Clear the mapped name — the id stays, it is on real calls"
+                              aria-label="Clear the mapped name"
+                              className="p-1.5 text-[#8B7355] hover:text-[#af4408] hover:bg-[#FFF1E3] rounded shrink-0">
+                        <Eraser className="w-3.5 h-3.5" />
+                      </button>
+                    ) : (
+                      <button type="button" onClick={() => hideAgentRow(row.id)}
+                              title="Hide this id from the list — it stays in call history"
+                              aria-label="Hide this id from the list"
+                              className="p-1.5 text-[#8B7355] hover:text-[#af4408] hover:bg-[#FFF1E3] rounded shrink-0">
+                        <EyeOff className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {/* Nothing is ever lost silently: whatever was hidden stays one click
+              from coming back, and says so even while collapsed. */}
+          {hiddenIds.length > 0 && (
+            <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] p-2.5 space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] font-medium text-[#2D1B0E]">{hiddenIds.length} hidden</span>
+                <span className="text-[11px] text-[#C9A98A]">·</span>
+                <button type="button" onClick={() => setShowHidden(v => !v)}
+                        className="text-[11px] px-2 py-1 rounded border border-[#E8D5C4] bg-white text-[#6B5744] hover:bg-[#FFF1E3] flex items-center gap-1">
+                  {showHidden
+                    ? <><EyeOff className="w-3 h-3" /> Hide again</>
+                    : <><Eye className="w-3 h-3" /> Show hidden</>}
+                </button>
+                <span className="text-[10px] text-[#6B5744]">
+                  off this list only — their calls are untouched and still show as before
+                </span>
+              </div>
+              {showHidden && (
+                <div className="space-y-1">
+                  {hiddenIds.map(id => (
+                    <div key={id} className="flex flex-wrap items-center gap-2 opacity-60">
+                      <code className="flex-1 min-w-[8rem] text-[11px] text-[#2D1B0E] bg-white border border-[#E8D5C4] rounded px-2 py-1 overflow-x-auto whitespace-nowrap">
+                        {id}
+                      </code>
+                      <button type="button" onClick={() => unhideAgentId(id)}
+                              title="Put this id back on the list"
+                              className="text-[11px] px-2 py-1 rounded border border-[#E8D5C4] bg-white text-[#6B5744] hover:bg-[#FFF1E3] flex items-center gap-1 shrink-0">
+                        <Eye className="w-3 h-3" /> Unhide
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -1441,12 +1639,12 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
                     className="px-2.5 py-1.5 border border-[#E8D5C4] rounded text-xs text-[#6B5744] hover:bg-[#FFF8F0] flex items-center gap-1.5">
               <Plus className="w-3.5 h-3.5" /> Add agent id
             </button>
-            <button onClick={saveAgentMap} disabled={!agentDirty || savingAgents}
+            <button onClick={saveAgentMap} disabled={!agentsChanged || savingAgents}
                     className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded text-sm flex items-center gap-1.5 disabled:opacity-50">
               {savingAgents ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
               Save mapping
             </button>
-            {agentDirty && !savingAgents && (
+            {agentsChanged && !savingAgents && (
               <span className="text-[10px] text-[#6B5744]">unsaved changes</span>
             )}
           </div>

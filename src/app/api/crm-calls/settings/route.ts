@@ -3,6 +3,7 @@ import type Database from 'better-sqlite3';
 import { getDb } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import {
+  ctSetting,
   ctSettings,
   setCtSetting,
   webhookToken,
@@ -21,13 +22,33 @@ import { describeCallAgents, isAppLoginAgent } from '@/lib/ct/agents';
  *       telecmi_configured, and telecmi_credentials (booleans + a masked tail,
  *       never the values), plus the Agent-mapping editor's inputs: agents_seen /
  *       agents_detail (TeleCMI ids only — app login emails are excluded, see the
- *       GET) and the staff picker.
+ *       GET), agent_hidden, and the staff picker.
  * PUT → { key: value, ... } partial update. Allowlist = CT_SETTING_DEFAULTS
- *       keys + 'telecmi_base_url' + the two TeleCMI credentials.
+ *       keys + 'telecmi_base_url' + 'agent_hidden' + the two TeleCMI credentials.
  *
  * The credentials are WRITE-ONLY: an admin can save or clear them here so the
  * owner can configure their own telephony from the UI, but no read path ever
  * returns them. Everything else in SECRET_KEYS stays blocked both ways.
+ *
+ * ── WHERE THE AGENT-MAPPING ROWS COME FROM, AND WHY HIDING EXISTS ───────────
+ * The ids in that editor arrive from TWO different places, and only one of them
+ * is ours to delete:
+ *   1. THE SAVED MAP — the 'agent_map' setting: rows an admin typed here. The
+ *      PUT stores a canonical REPLACEMENT of the whole object, so removing an
+ *      entry from it does persist.
+ *   2. CALL HISTORY (derived) — describeCallAgents() reads the distinct
+ *      ct_calls.agent_user values. These are not a setting at all; they are a
+ *      projection of real calls that really were answered by that id.
+ * So "delete" cannot mean the same thing for both. Un-mapping a derived id (say
+ * the retired extension "5004_33338614") saves nothing to change — the id is
+ * still on those calls, so the next GET derives it again and it comes back as
+ * "— Unmapped —". That is not a lost write; there is nothing about a derived id
+ * that a settings write could remove. HIDING is the only way to take one off
+ * the list: 'agent_hidden' is an admin's explicit "stop listing this id", and
+ * the GET below filters hidden ids out of agents_seen / agents_detail while
+ * returning the hidden list separately so the editor can offer "show hidden".
+ * Nothing is deleted anywhere: ct_calls, log-callback, and resolveAgentLabel()
+ * are untouched, so a hidden agent's calls still display exactly as before.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -45,6 +66,21 @@ const ROUTING_HINT_KEYS: readonly string[] = ['sticky_agent', 'vip_routing', 'vi
 const MISSED_ACK_KEYS: readonly string[] = ['missed_call_whatsapp', 'missed_call_wa_text'];
 
 /**
+ * The Agent-mapping editor's dismiss list — a JSON array of TeleCMI agent ids an
+ * admin has taken off that list (see the header). Like the routing hints it is
+ * deliberately NOT in CT_SETTING_DEFAULTS (that lib is shared/owned elsewhere),
+ * so it is allow-listed here and given its own validate() case below.
+ *
+ * NOT A SECRET (per the release-gate comment on SECRET_KEYS): it holds nothing
+ * but TeleCMI agent ids the same admin is already looking at in this editor, so
+ * it stays OFF SECRET_KEYS on purpose and reads back through this GET.
+ */
+const AGENT_HIDDEN_KEY = 'agent_hidden';
+/** Cap per id (matches the agent_map key cap) and on the whole list. */
+const AGENT_ID_MAX = 100;
+const AGENT_HIDDEN_MAX = 500;
+
+/**
  * TeleCMI app credentials. WRITE-ONLY through this route: an admin may save or
  * clear them (otherwise configuring telephony needs an SSH session and a
  * restart), but they are stripped from every read — the GET reports
@@ -52,7 +88,7 @@ const MISSED_ACK_KEYS: readonly string[] = ['missed_call_whatsapp', 'missed_call
  */
 const CREDENTIAL_KEYS: readonly string[] = ['telecmi_appid', 'telecmi_secret'];
 
-const ALLOWED_KEYS: readonly string[] = [...Object.keys(CT_SETTING_DEFAULTS), 'telecmi_base_url', 'auto_analyze', 'analysis_retention', ...ROUTING_HINT_KEYS, ...MISSED_ACK_KEYS, ...CREDENTIAL_KEYS];
+const ALLOWED_KEYS: readonly string[] = [...Object.keys(CT_SETTING_DEFAULTS), 'telecmi_base_url', 'auto_analyze', 'analysis_retention', AGENT_HIDDEN_KEY, ...ROUTING_HINT_KEYS, ...MISSED_ACK_KEYS, ...CREDENTIAL_KEYS];
 
 /**
  * ⚠ RELEASE GATE — read this before adding ANY key to ct_settings.
@@ -91,6 +127,40 @@ const SECRET_KEYS: readonly string[] = [
 const WRITE_BLOCKED_KEYS: readonly string[] = SECRET_KEYS.filter(k => !CREDENTIAL_KEYS.includes(k));
 
 const HM_RE = /^([01]?\d|2[0-3]):[0-5]\d$/;
+
+/**
+ * Canonical form of one TeleCMI agent id for hiding and for matching: trimmed,
+ * lowercased, capped. Deliberately the SAME normalization agent_map keys get
+ * (see the 'agent_map' case), so hiding "GRE.Ravi" also hides the row derived
+ * from a call that reported "gre.ravi" — one id, one row, either way.
+ */
+function canonAgentId(value: unknown): string {
+  return String(value ?? '').trim().toLowerCase().slice(0, AGENT_ID_MAX);
+}
+
+/**
+ * The stored dismiss list as canonical ids. Returns [] for a missing row, an
+ * empty row, or anything unparseable — a hand-edited ct_settings value must
+ * never 500 the settings GET, and "can't read it" has to mean "hide nothing"
+ * (failing the other way would make agents vanish from the editor with no way
+ * to get them back).
+ */
+function hiddenAgentIds(db: Database.Database): string[] {
+  try {
+    const parsed = JSON.parse(ctSetting(db, AGENT_HIDDEN_KEY) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const it of parsed) {
+      const id = canonAgentId(it);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+      if (out.length >= AGENT_HIDDEN_MAX) break;
+    }
+    return out;
+  } catch { return []; }
+}
 
 function publicSettings(db: Database.Database): Record<string, string> {
   const s = ctSettings(db);
@@ -138,8 +208,19 @@ export async function GET() {
   // name everywhere they appear — so they are dropped from the pre-list only, and
   // the SAVED agent_map is left exactly as stored: if an admin mapped an email
   // once, that entry stays theirs to keep or remove.
+  //
+  // Then the admin's own dismiss list is applied. A derived id cannot be deleted
+  // (it is still on real calls — see the header), so hiding is what actually
+  // takes a row off this editor: hidden ids are filtered OUT of both agents_seen
+  // and agents_detail, and returned separately as agent_hidden so the page can
+  // offer "show hidden (N)" and un-hide. This is presentation only — the calls,
+  // their agent_user values and resolveAgentLabel() are untouched, so a hidden
+  // agent still shows normally everywhere else in the CRM.
+  const hidden = hiddenAgentIds(db);
+  const hiddenSet = new Set(hidden);
   const seenAgents = describeCallAgents(db)
-    .filter(a => a.kind !== 'app_login' && !isAppLoginAgent(a.id));
+    .filter(a => a.kind !== 'app_login' && !isAppLoginAgent(a.id))
+    .filter(a => !hiddenSet.has(canonAgentId(a.id)));
   let staff: Array<{ email: string; name: string }> = [];
   try {
     staff = (db.prepare(
@@ -167,6 +248,10 @@ export async function GET() {
     // live agent) instead of showing it identically to a working extension.
     // last_seen is the stored ct_calls timestamp text, '' when the row has none.
     agents_detail: seenAgents.map(a => ({ id: a.id, calls: a.calls, last_seen: a.last_seen })),
+    // The ids the two lists above were filtered BY — canonical (trimmed +
+    // lowercased), de-duplicated, [] when nothing is hidden. The editor needs it
+    // to say "show hidden (N)" and to PUT the list back one id shorter to un-hide.
+    agent_hidden: hidden,
     staff,
   });
 }
@@ -277,6 +362,34 @@ function validate(key: string, value: any): { ok: true; value: string } | { ok: 
         const key = String(k).trim().toLowerCase().slice(0, 100);
         const val = String(v ?? '').trim().slice(0, 200);
         if (key && val) clean[key] = val;
+      }
+      return { ok: true, value: JSON.stringify(clean) };
+    }
+    case AGENT_HIDDEN_KEY: {
+      // Accept an array or a JSON string of one; store canonical JSON text.
+      // AN EMPTY ARRAY IS VALID and means "nothing hidden" — it MUST be storable,
+      // because [] is exactly what un-hiding the last id sends. (Unlike the
+      // credentials, an empty value here is not a "clear the row" case: the row
+      // is the list, and an empty list is a real state.)
+      let arr: any = value;
+      if (typeof value === 'string') {
+        try { arr = JSON.parse(value || '[]'); } catch { return { ok: false, error: 'agent_hidden must be a JSON array of TeleCMI agent ids' }; }
+      }
+      if (!Array.isArray(arr)) {
+        return { ok: false, error: 'agent_hidden must be a JSON array of TeleCMI agent ids' };
+      }
+      // Same canonical key form as agent_map (trim + lowercase + 100 chars), so a
+      // hidden id matches its mapped/derived row whatever case TeleCMI reported.
+      // De-duplicated, blanks dropped, whole list capped — the editor never sends
+      // more than a screenful, so the cap only bounds a hand-crafted request.
+      const clean: string[] = [];
+      const seen = new Set<string>();
+      for (const it of arr) {
+        const id = canonAgentId(it);
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        clean.push(id);
+        if (clean.length >= AGENT_HIDDEN_MAX) break;
       }
       return { ok: true, value: JSON.stringify(clean) };
     }
@@ -464,6 +577,11 @@ export async function PUT(req: Request) {
     updated: Object.keys(updates),
     ...(updates.analysis_retention === 'ephemeral' ? { scorecards_purged: purged } : {}),
     settings: publicSettings(db),
+    // Additive, same name and shape as the GET's: the canonical dismiss list as
+    // actually stored. Hiding/un-hiding is a one-key PUT, so echoing it lets the
+    // editor settle on the stored truth (de-duplicated, lowercased) without a
+    // second round trip.
+    agent_hidden: hiddenAgentIds(db),
     // Fresh status after the write. This is how the client learns that an env
     // var still wins (source stays 'env' even though the save succeeded) and
     // which secret is now stored — the masked tail is the only echo it gets.
