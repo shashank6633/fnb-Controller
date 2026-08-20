@@ -1,7 +1,8 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canManageHr, isHrEmploymentType } from '@/lib/hr';
+import { canAdminHr, canManageHr, isHrEmploymentType } from '@/lib/hr';
 import { nextEmployeeCode } from '@/lib/hr-server';
+import { mainDeptOf } from '@/lib/dept-hierarchy';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -27,7 +28,12 @@ import { reportServerError } from '@/lib/error-alerts';
  *   FILE line number); WARNINGS import anyway (shared phones, unknown
  *   columns). Rows are never silently dropped.
  *   → { ok, total_rows, valid, errors: [{line, message}],
- *       warnings: [{line?, message}], sample: first 10 normalised rows }
+ *       warnings: [{line?, message}], sample: first 10 normalised rows,
+ *       unknown_designations: [{name, rows: [line], department_id,
+ *                               department_name}] }
+ *       department_id/department_name say WHERE each new designation would
+ *       land: the MAIN department resolved from the first row that named it
+ *       ('' / 'any department' when that row carried no department).
  *
  * POST ?commit=1
  *   Same body, parsed and validated ONCE (the commit inserts exactly the rows
@@ -40,7 +46,32 @@ import { reportServerError } from '@/lib/error-alerts';
  *   Valid rows import even when other rows errored — forgiving, per the house
  *   liquor-CSV precedent. ONE hr.employee.import audit event, not per row.
  *   → { ok, imported, skipped: [{line, message}],
- *       codes: [{line, employee_code, full_name}] }
+ *       codes: [{line, employee_code, full_name}],
+ *       created_designations: [{id, name}] }
+ *
+ * MISSING MASTERS — deliberately asymmetric (owner ruling 2026-08-17, after a
+ * bulk upload dead-ended on the designation "Commis I"):
+ *   • DESIGNATIONS may be created on the fly, but only on an explicit human
+ *     confirmation — `create_designations=1` (query param, JSON body flag or
+ *     multipart field). Never silent. They are HR-local: a wrong one is
+ *     cosmetic and deactivatable. Without the flag an unknown designation is
+ *     the same hard row error as before (only the copy changed), so a plain
+ *     preview/commit behaves exactly as it did. A created designation is
+ *     ATTACHED to the MAIN department of the FIRST row that named it (the
+ *     row's sub_department wins over its department, and a sub-department
+ *     resolves to its main via departments.parent_id) so the designation
+ *     immediately behaves like one an admin had pinned on HR Settings: offered
+ *     first to employees of that main department and its sub-departments. A
+ *     first row with no department mints a GENERIC designation (department_id
+ *     ''), which stays pickable everywhere.
+ *   • DEPARTMENTS are NOT auto-creatable and keep the hard error. The
+ *     department tree is shared with requisitions, closing stock, variance and
+ *     dept-stock — a typo there pollutes load-bearing operational data.
+ *   Whenever the flag is set the CALLER must additionally satisfy canAdminHr:
+ *   POST /api/hr/designations is admin-only, so a manager may import (the
+ *   import itself stays canManageHr) but may not mint masters. The gate runs
+ *   BEFORE any write, and on preview too — a manager must never be shown a
+ *   preview that promises rows the commit would refuse.
  *
  * Guards: Content-Length pre-check + byte-length backstop at 1MB, row cap
  * 2000 — the DB is synchronous better-sqlite3 on the shared POS box.
@@ -168,23 +199,38 @@ function parseCsv(text: string): ParsedCsv {
   return { headers, rows };
 }
 
+/** Checkbox-shaped flag: '1' / 'true' / 'yes' / 'on' (and a JSON boolean
+ *  true, which stringifies to 'true'). Anything else is OFF — a
+ *  master-creating confirmation must never be inferred from noise. */
+function truthyFlag(v: unknown): boolean {
+  const s = String(v ?? '').trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
 /**
  * Read the CSV text out of the request, whichever way the client sent it:
- * multipart `file`, a JSON `{ csv }` body, or a raw text/csv body.
+ * multipart `file`, a JSON `{ csv }` body, or a raw text/csv body. The
+ * `create_designations` confirmation rides the SAME single body read (a
+ * Request body can only be consumed once) — the query param is OR-ed in by
+ * the caller.
  */
-async function readCsvBody(req: Request): Promise<string> {
+async function readCsvBody(req: Request): Promise<{ csv: string; createDesignations: boolean }> {
   const ct = req.headers.get('content-type') || '';
   if (ct.includes('multipart/form-data')) {
     const fd = await req.formData();
+    const createDesignations = truthyFlag(fd.get('create_designations'));
     const file = fd.get('file');
-    if (!file || !(file instanceof Blob)) return '';
-    return await file.text();
+    if (!file || !(file instanceof Blob)) return { csv: '', createDesignations };
+    return { csv: await file.text(), createDesignations };
   }
   if (ct.includes('application/json')) {
-    const body = await req.json().catch(() => ({}));
-    return String((body as Record<string, unknown>)?.csv || '');
+    const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+    return {
+      csv: String(body?.csv || ''),
+      createDesignations: truthyFlag(body?.create_designations),
+    };
   }
-  return await req.text();
+  return { csv: await req.text(), createDesignations: false };
 }
 
 /* ------------------------------------------------------------------ *
@@ -237,6 +283,20 @@ function parseDateCell(raw: string): string | null {
 interface RowIssue { line: number; message: string }
 interface Warning { line?: number; message: string }
 
+/** One designation name typed in the file that no hr_designations row matches.
+ *  `name` is the EXACT first spelling seen (deduped case-insensitively);
+ *  `rows` are the 1-based FILE line numbers that asked for it.
+ *  `department_id` / `department_name` are the MAIN department the designation
+ *  would be attached to if it is created — resolved from the FIRST row that
+ *  named it ('' / 'any department' when that row had no department, i.e. a
+ *  GENERIC designation that stays pickable for every employee). */
+interface UnknownDesignation {
+  name: string;
+  rows: number[];
+  department_id: string;
+  department_name: string;
+}
+
 /** One fully-normalised, insert-ready row (the SAME object feeds both the
  *  preview sample and the commit — parse once per request). */
 interface ValidRow {
@@ -255,6 +315,10 @@ interface ValidRow {
   sub_department_name: string;
   designation_id: string;
   designation_name: string;
+  /** Non-empty ONLY when create_designations was confirmed and this row's
+   *  designation does not exist yet: designation_id is resolved from the row
+   *  minted inside the commit transaction. '' on every other row. */
+  pending_designation_name: string;
   grade: string;
   employment_type: string;
   employee_category: string;
@@ -289,9 +353,25 @@ export async function POST(request: Request) {
       );
     }
 
-    const commit = new URL(request.url).searchParams.get('commit') === '1';
+    const qs = new URL(request.url).searchParams;
+    const commit = qs.get('commit') === '1';
 
-    const csv = await readCsvBody(request);
+    const { csv, createDesignations: bodyCreateDesignations } = await readCsvBody(request);
+    // The confirmation may arrive as ?create_designations=1 or as a body flag.
+    const createDesignations =
+      truthyFlag(qs.get('create_designations')) || bodyCreateDesignations;
+
+    // Re-gate BEFORE anything else runs: creating masters is admin-only
+    // (POST /api/hr/designations is canAdminHr) even though the import itself
+    // is canManageHr. Checked on preview too, so a manager is never shown a
+    // preview whose commit would 403.
+    if (createDesignations && !canAdminHr(me)) {
+      return Response.json(
+        { error: 'Only an admin can add new designations. Ask an admin, or remove those rows.' },
+        { status: 403 },
+      );
+    }
+
     if (!csv.trim()) {
       return Response.json({ error: 'No CSV content received' }, { status: 400 });
     }
@@ -355,6 +435,10 @@ export async function POST(request: Request) {
 
     const seenCodes = new Set<string>(); // in-file employee_code dedupe (case-insensitive)
     const valid: ValidRow[] = [];
+    // Designation names typed in the file that no hr_designations row matches,
+    // keyed lower-case so "Commis I" and "commis i" are ONE entry (the first
+    // spelling seen wins — it is what the confirmation prompt shows).
+    const unknownDesignations = new Map<string, UnknownDesignation>();
 
     for (const row of rows) {
       const cells = row.cells;
@@ -420,13 +504,16 @@ export async function POST(request: Request) {
       }
 
       // department / sub_department / designation — matched BY NAME.
+      // DEPARTMENTS are never auto-created: the department tree is shared with
+      // requisitions, closing stock, variance and dept-stock, so a typo here
+      // pollutes load-bearing operational data. Hard error, always.
       let department_id = '';
       let department_name = '';
       const deptRaw = cell('department');
       if (deptRaw) {
         const hit = deptByName.get(deptRaw) as { id: string; name: string } | undefined;
         if (!hit) {
-          rowErrors.push(`Department "${deptRaw}" was not found - create it on the Departments page (/departments) first`);
+          rowErrors.push(`Department "${deptRaw}" was not found - create it on the Departments page (/departments) first. Departments are shared with store operations, so they are never created automatically.`);
         } else {
           department_id = hit.id;
           department_name = hit.name;
@@ -438,22 +525,54 @@ export async function POST(request: Request) {
       if (subRaw) {
         const hit = deptByName.get(subRaw) as { id: string; name: string } | undefined;
         if (!hit) {
-          rowErrors.push(`Sub-department "${subRaw}" was not found - create it on the Departments page (/departments) first`);
+          rowErrors.push(`Sub-department "${subRaw}" was not found - create it on the Departments page (/departments) first. Departments are shared with store operations, so they are never created automatically.`);
         } else {
           sub_department_id = hit.id;
           sub_department_name = hit.name;
         }
       }
+      // DESIGNATIONS are HR-local, so an unknown one is an OFFER, not a
+      // dead end — but only ever on an explicit confirmation.
       let designation_id = '';
       let designation_name = '';
+      let pending_designation_name = '';
       const desigRaw = cell('designation');
       if (desigRaw) {
         const hit = desigByName.get(desigRaw) as { id: string; name: string } | undefined;
-        if (!hit) {
-          rowErrors.push(`Designation "${desigRaw}" was not found - create it on the HR Settings page (/hr/settings) first`);
-        } else {
+        if (hit) {
           designation_id = hit.id;
           designation_name = hit.name;
+        } else {
+          // Collect it whatever else is wrong with the row — the prompt lists
+          // every name the file asked for.
+          const key = desigRaw.toLowerCase();
+          const seen = unknownDesignations.get(key);
+          if (seen) seen.rows.push(row.line);
+          else {
+            // WHERE it lands: the MAIN department of THIS (the first) row —
+            // sub_department wins over department, and a sub-department walks
+            // up to its main via parent_id (mainDeptOf). A row with no
+            // department (or one whose department name did not resolve, which
+            // is already a row error) mints a GENERIC designation: department
+            // '' stays pickable for every employee.
+            const rowDeptId = sub_department_id || department_id;
+            const main = rowDeptId ? mainDeptOf(db, rowDeptId) : null;
+            unknownDesignations.set(key, {
+              name: desigRaw,
+              rows: [row.line],
+              department_id: main ? main.id : '',
+              department_name: main ? main.name : 'any department',
+            });
+          }
+
+          if (createDesignations) {
+            // Confirmed by an admin: the row imports, and its designation is
+            // minted inside the commit transaction (first spelling wins).
+            pending_designation_name = seen ? seen.name : desigRaw;
+            designation_name = pending_designation_name;
+          } else {
+            rowErrors.push(`Designation "${desigRaw}" does not exist yet — tick "create missing designations" below to add it, or create it on HR Settings first.`);
+          }
         }
       }
 
@@ -513,6 +632,7 @@ export async function POST(request: Request) {
         sub_department_name,
         designation_id,
         designation_name,
+        pending_designation_name,
         grade: cell('grade'),
         employment_type,
         employee_category: cell('employee_category'),
@@ -529,6 +649,10 @@ export async function POST(request: Request) {
       });
     }
 
+    // Stable order: the line the name first appeared on.
+    const unknown_designations: UnknownDesignation[] = [...unknownDesignations.values()]
+      .sort((a, b) => a.rows[0] - b.rows[0]);
+
     if (!commit) {
       return Response.json({
         ok: true,
@@ -537,6 +661,7 @@ export async function POST(request: Request) {
         errors,
         warnings,
         sample: valid.slice(0, 10),
+        unknown_designations,
       });
     }
 
@@ -558,6 +683,22 @@ export async function POST(request: Request) {
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
+    // Confirmed-only designation mint (same shape as POST /api/hr/designations:
+    // name as typed and trimmed, is_active 1, no grade). department_id is the
+    // MAIN department resolved from the first row that named the designation —
+    // '' when that row had none, which is the GENERIC "any department" case.
+    const desigInsert = db.prepare(
+      `INSERT INTO hr_designations (id, name, department_id, grade, is_active)
+       VALUES (?, ?, ?, '', 1)`,
+    );
+    const created_designations: Array<{
+      id: string;
+      name: string;
+      department_id: string;
+      department_name: string;
+    }> = [];
+    const designationIdByKey = new Map<string, string>(); // lower name → id
+
     let imported = 0;
     // Rows a validation error excluded are reported as skipped; a rare
     // insert-time refusal (e.g. a code race) joins them without rolling the
@@ -567,17 +708,71 @@ export async function POST(request: Request) {
     const batchId = generateId();
 
     const run = db.transaction(() => {
+      // Masters first, in the SAME transaction as the employee inserts — a
+      // rolled-back import must not leave orphan designations behind. EVERY
+      // name the preview listed is created, including one whose only row also
+      // failed on something else: the confirmation showed that list, and a
+      // designation is deactivatable if it turns out to be a typo.
+      if (createDesignations) {
+        for (const [key, info] of unknownDesignations) {
+          // Re-check by NOCASE name: the designation may have been created on
+          // HR Settings between the preview and this commit. Never duplicate.
+          const again = desigByName.get(info.name) as { id: string; name: string } | undefined;
+          if (again) { designationIdByKey.set(key, again.id); continue; }
+          const desigId = generateId();
+          try {
+            desigInsert.run(desigId, info.name, info.department_id);
+            designationIdByKey.set(key, desigId);
+            created_designations.push({
+              id: desigId,
+              name: info.name,
+              department_id: info.department_id,
+              department_name: info.department_name,
+            });
+          } catch (desigErr) {
+            // A UNIQUE(name COLLATE NOCASE) refusal rolls back this statement
+            // only; re-read rather than losing the whole batch.
+            console.error('employee import: designation create refused', info.name, desigErr);
+            const raced = desigByName.get(info.name) as { id: string } | undefined;
+            if (!raced) throw desigErr;
+            designationIdByKey.set(key, raced.id);
+          }
+        }
+
+        // ONE audit event for the whole confirmed batch, beside (not instead
+        // of) the hr.employee.import event below.
+        if (created_designations.length > 0) {
+          logAuditEvent(db, {
+            event_type: 'hr.designation.import_create',
+            entity_type: 'hr_designation',
+            entity_id: batchId,
+            actor_email: me.email,
+            outlet_id: home_outlet_id || null,
+            after: {
+              created: created_designations,
+              names: created_designations.map(d => d.name),
+              import_batch: batchId,
+            },
+            note: 'Created from the employee CSV import (confirmed by the uploader)',
+          });
+        }
+      }
+
       for (const row of valid) {
         // Sequential mint INSIDE the txn: nextEmployeeCode reads
         // MAX(employee_code), so each insert advances the next mint.
         const employee_code = row.employee_code || nextEmployeeCode(db);
+        // A pending row takes the id of the designation just minted above.
+        const designation_id = row.pending_designation_name
+          ? (designationIdByKey.get(row.pending_designation_name.toLowerCase()) ?? '')
+          : row.designation_id;
         try {
           insert.run(
             generateId(), employee_code, row.full_name, /* photo */ '',
             row.dob, row.gender, row.phone10, row.alt_phone10, row.email,
             row.current_address, row.permanent_address, row.emergency_name,
             row.emergency_relation, row.emergency_phone10, row.department_id,
-            row.sub_department_id, row.designation_id, row.grade,
+            row.sub_department_id, designation_id, row.grade,
             /* reporting_manager_id */ '', row.employment_type,
             row.employee_category, row.cost_centre, row.work_location,
             home_outlet_id, row.joining_date, row.probation_months,
@@ -600,12 +795,17 @@ export async function POST(request: Request) {
         entity_id: batchId,
         actor_email: me.email,
         outlet_id: home_outlet_id || null,
-        after: { imported, skipped: skipped.length, total_rows: rows.length },
+        after: {
+          imported,
+          skipped: skipped.length,
+          total_rows: rows.length,
+          created_designations: created_designations.length,
+        },
       });
     });
     run();
 
-    return Response.json({ ok: true, imported, skipped, codes });
+    return Response.json({ ok: true, imported, skipped, codes, created_designations });
   } catch (e) {
     console.error('POST /api/hr/employees/import failed:', e);
     reportServerError(e, { url: request.url });

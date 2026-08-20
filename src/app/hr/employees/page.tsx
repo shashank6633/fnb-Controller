@@ -19,6 +19,39 @@
  * preview (?commit=0) → import (?commit=1) discipline from the biometric CSV
  * import. Row errors exclude only their row; clean rows still import
  * (forgiving, per the liquor-CSV precedent).
+ *
+ * UNKNOWN DESIGNATIONS ARE A PROMPT, NOT A DEAD END (owner, 2026-08-17).
+ * A preview that reports `unknown_designations` renders an amber question
+ * card ("shall I add them?") with an OFF-by-default checkbox that re-arms
+ * Import as `?commit=1&create_designations=1`. Designations are HR-local —
+ * a wrong one is cosmetic and deactivatable on /hr/settings.
+ * DEPARTMENTS ARE DELIBERATELY NOT AUTO-CREATABLE: the department tree is
+ * shared with requisitions, closing stock, variance and dept-stock, so a
+ * typo there pollutes load-bearing operational data. Those rows keep the
+ * strict error and must be fixed on /departments first.
+ * GATE REALITY: POST /api/hr/designations is canAdminHr (admin) while this
+ * page is canManageHr (management). A manager still imports — they just do
+ * not get the checkbox (a button that would 403 is never rendered); they get
+ * the same list as a note ending "ask an admin to add them on HR Settings".
+ *
+ * DESIGNATION ↔ DEPARTMENT LINK (owner, 2026-08-17: "link designation and
+ * department"). hr_designations.department_id is set on HR Settings; here it
+ * finally does something — the designation picker defaults to the ones that
+ * belong to the department being chosen. The rule, identical everywhere:
+ *  - department_id '' = GENERIC (Manager, Trainee) → pickable everywhere.
+ *  - otherwise it shows when the employee's department matches, TREE-AWARE:
+ *    the tree is 3 mains with sub-departments (src/lib/dept-hierarchy.ts), so
+ *    a designation pinned to "Kitchen" also offers under a Kitchen SUB-dept
+ *    and vice-versa. The employee's sub_department_id wins when set.
+ *  - a designation the employee ALREADY holds is NEVER hidden — hiding it
+ *    would blank a real assignment on save; it stays, flagged, amber-noted.
+ *  - no department chosen yet = no filter (everything shows).
+ *  - the filter is a DEFAULT, not a cage: "Show all designations" lifts it in
+ *    one click, so an unusual assignment is never blocked.
+ * The same link drives the inline create (a new designation is minted under
+ * the MAIN department on the form — designations live at main-dept level) and
+ * the bulk-upload card's "→ Kitchen" labels (presentational; the import route
+ * does the actual attaching).
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -36,16 +69,19 @@ import TabScroller from '@/components/TabScroller';
 import {
   HR_EMPLOYEE_STATUSES,
   HR_EMPLOYMENT_TYPES,
+  canAdminHr,
   employeeStatusMeta,
   employmentTypeMeta,
   isHrEmploymentType,
   type HrEmployeeListRow,
 } from '@/lib/hr';
+import type { SessionUser } from '@/lib/auth';
 
 const PAGE_SIZE = 25;
 
 interface DeptRow { id: string; name: string; parent_id: string | null; is_active: number }
-interface DesigRow { id: string; name: string; grade?: string; is_active?: number }
+/** `department_id` is the HR-Settings link: '' = generic (any department). */
+interface DesigRow { id: string; name: string; department_id?: string; grade?: string; is_active?: number }
 interface OutletRow { id: string; name: string; is_active?: number }
 
 interface CreateForm {
@@ -101,19 +137,75 @@ function csvCell(v: string): string {
   return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
 
+/** One parsed CSV record plus the 1-based FILE line it starts on (a quoted
+ *  cell may span lines, so the record index is not the line number). */
+interface CsvRecord { line: number; cells: string[] }
+
+/**
+ * Minimal RFC-4180 reader — used ONLY to label the bulk-upload prompt ("which
+ * department will this new designation be created under?"). The server remains
+ * the parser of record: nothing here changes what is uploaded or imported.
+ */
+function parseCsvRecords(text: string): CsvRecord[] {
+  const out: CsvRecord[] = [];
+  let cells: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  let line = 1;
+  let recLine = 1;
+  let started = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (!started) { recLine = line; started = true; }
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; }
+      } else {
+        if (ch === '\n') line++;
+        cur += ch;
+      }
+      continue;
+    }
+    if (ch === '"') { inQuotes = true; continue; }
+    if (ch === ',') { cells.push(cur); cur = ''; continue; }
+    if (ch === '\r') continue;
+    if (ch === '\n') {
+      cells.push(cur);
+      out.push({ line: recLine, cells });
+      cells = []; cur = ''; line++; started = false;
+      continue;
+    }
+    cur += ch;
+  }
+  if (started) { cells.push(cur); out.push({ line: recLine, cells }); }
+  // Blank lines carry no row — drop them, but the surviving line numbers stay true.
+  return out.filter(r => r.cells.some(c => c.trim() !== ''));
+}
+
+/** Header cell → the import contract's column key (tolerant of case/spacing). */
+function headerKey(h: string): string {
+  return h.trim().toLowerCase().replace(/[\s-]+/g, '_');
+}
+
 interface ImportRowError { line: number; message: string }
 interface ImportWarning { line: number | null; message: string }
+/** One designation named in the file that the master does not have yet. */
+interface UnknownDesignation { name: string; lines: number[] }
 interface ImportPreview {
   total_rows: number;
   valid: number;
   errors: ImportRowError[];
   warnings: ImportWarning[];
   sample: any[];
+  unknown_designations: UnknownDesignation[];
+  /** Server's own "valid if the designations are created" count, when it sends one. */
+  valid_with_designations: number | null;
 }
 interface ImportCommit {
   imported: number;
   skipped: ImportRowError[];
   codes: { line: number; employee_code: string; full_name: string }[];
+  created_designations: string[];
 }
 
 /** Trimmed string from any echoed value ('' for null/undefined). */
@@ -135,19 +227,90 @@ function toCount(v: unknown): number {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
 }
 
+/**
+ * Is this row error the "designation not found" one? Ticking the create box
+ * clears exactly these — a department/sub-department miss reads similarly but
+ * must NOT be treated as recoverable (departments are never auto-created).
+ */
+function isDesignationNotFound(message: string): boolean {
+  return /designation/i.test(message)
+    && !/sub[-\s_]?department|^\s*department/i.test(message)
+    && /not\s*found|does\s*not\s*exist|doesn'?t\s*exist|unknown|unrecognis|unrecogniz/i.test(message);
+}
+
+/** Lines whose designation error names this designation — the fallback when
+ *  the API sends names without line numbers. */
+function linesForDesignation(name: string, errors: ImportRowError[]): number[] {
+  const needle = name.toLowerCase();
+  const lines = errors
+    .filter(e => isDesignationNotFound(e.message) && e.message.toLowerCase().includes(needle))
+    .map(e => e.line)
+    .filter(n => n > 0);
+  return [...new Set(lines)].sort((a, b) => a - b);
+}
+
+/**
+ * Normalise `unknown_designations` without assuming a shape: an array of
+ * names, or of objects carrying name + line/lines. Names are de-duplicated
+ * case-insensitively (the first spelling wins — it is what the file said).
+ */
+function normalizeUnknownDesignations(raw: any, errors: ImportRowError[]): UnknownDesignation[] {
+  if (!Array.isArray(raw)) return [];
+  const out: UnknownDesignation[] = [];
+  const byKey = new Map<string, UnknownDesignation>();
+  for (const item of raw) {
+    const name = typeof item === 'string'
+      ? strv(item)
+      : rowField(item, 'name', 'designation', 'designation_name', 'value');
+    if (!name) continue;
+    const rawLines: unknown[] = Array.isArray(item?.lines)
+      ? item.lines
+      : (item?.line === undefined || item?.line === null ? [] : [item.line]);
+    const lines = rawLines.map(toCount).filter(n => n > 0);
+    const key = name.toLowerCase();
+    const seen = byKey.get(key);
+    if (seen) {
+      for (const l of lines) if (!seen.lines.includes(l)) seen.lines.push(l);
+    } else {
+      const entry: UnknownDesignation = { name, lines: [...new Set(lines)] };
+      byKey.set(key, entry);
+      out.push(entry);
+    }
+  }
+  for (const e of out) {
+    if (e.lines.length === 0) e.lines = linesForDesignation(e.name, errors);
+    e.lines.sort((a, b) => a - b);
+  }
+  return out;
+}
+
 /** Normalise the preview response without assuming exact key names. */
 function normalizeImportPreview(json: any): ImportPreview {
   const errs = Array.isArray(json?.errors) ? json.errors : [];
   const warns = Array.isArray(json?.warnings) ? json.warnings : [];
+  const errors: ImportRowError[] = errs.map((e: any) => ({
+    line: toCount(e?.line),
+    message: strv(e?.message) || 'Row error',
+  }));
+  const hinted = Number(
+    json?.valid_with_designations
+    ?? json?.valid_with_new_designations
+    ?? json?.valid_if_designations_created,
+  );
   return {
     total_rows: toCount(json?.total_rows ?? json?.total),
     valid: toCount(json?.valid),
-    errors: errs.map((e: any) => ({ line: toCount(e?.line), message: strv(e?.message) || 'Row error' })),
+    errors,
     warnings: warns.map((w: any) => ({
       line: w?.line === null || w?.line === undefined ? null : toCount(w.line),
       message: strv(w?.message) || 'Warning',
     })),
     sample: Array.isArray(json?.sample) ? json.sample : [],
+    unknown_designations: normalizeUnknownDesignations(
+      json?.unknown_designations ?? json?.unknown_designation_names,
+      errors,
+    ),
+    valid_with_designations: Number.isFinite(hinted) ? Math.floor(hinted) : null,
   };
 }
 
@@ -155,7 +318,16 @@ function normalizeImportPreview(json: any): ImportPreview {
 function normalizeImportCommit(json: any): ImportCommit {
   const skipped = Array.isArray(json?.skipped) ? json.skipped : [];
   const codes = Array.isArray(json?.codes) ? json.codes : [];
+  const createdRaw = Array.isArray(json?.created_designations)
+    ? json.created_designations
+    : (Array.isArray(json?.designations_created) ? json.designations_created : []);
+  const created: string[] = [];
+  for (const c of createdRaw) {
+    const name = typeof c === 'string' ? strv(c) : rowField(c, 'name', 'designation', 'designation_name');
+    if (name && !created.some(x => x.toLowerCase() === name.toLowerCase())) created.push(name);
+  }
   return {
+    created_designations: created,
     imported: toCount(json?.imported),
     skipped: skipped.map((e: any) => ({ line: toCount(e?.line), message: strv(e?.message) || 'Row skipped' })),
     codes: codes.map((c: any) => ({
@@ -188,11 +360,26 @@ export default function HrEmployeesPage() {
   const [designations, setDesignations] = useState<DesigRow[]>([]);
   const [outlets, setOutlets] = useState<OutletRow[]>([]);
 
+  // ── Who am I ────────────────────────────────────────────────────────────
+  // Creating a designation is admin-only (POST /api/hr/designations is
+  // canAdminHr) while this page is management-wide. Hiding the affordance is
+  // UX only — the API re-checks; we simply never render a button that 403s.
+  const [me, setMe] = useState<SessionUser | null>(null);
+  const isAdmin = canAdminHr(me);
+
   // ── Create modal ────────────────────────────────────────────────────────
   const [showCreate, setShowCreate] = useState(false);
   const [form, setForm] = useState<CreateForm>(emptyForm());
   const [saving, setSaving] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  /** Designation box display text — the Combobox is allowCustom, so the typed
+   *  text and the picked id are separate pieces of state. */
+  const [desigText, setDesigText] = useState('');
+  const [desigCreating, setDesigCreating] = useState(false);
+  const [desigCreateError, setDesigCreateError] = useState<string | null>(null);
+  /** "Show all designations" — lifts the department filter. The filter is a
+   *  helpful default, never a cage; this is the one-click escape hatch. */
+  const [showAllDesigs, setShowAllDesigs] = useState(false);
 
   // ── Bulk upload modal ───────────────────────────────────────────────────
   const [showBulk, setShowBulk] = useState(false);
@@ -205,6 +392,9 @@ export default function HrEmployeesPage() {
   const [bulkImporting, setBulkImporting] = useState(false);
   const [bulkError, setBulkError] = useState<string | null>(null);
   const [bulkResult, setBulkResult] = useState<ImportCommit | null>(null);
+  /** "Create these designations and import" — default OFF, admin-only, and
+   *  reset by every preview so it is always a fresh, deliberate answer. */
+  const [bulkCreateDesig, setBulkCreateDesig] = useState(false);
   const bulkFileRef = useRef<HTMLInputElement>(null);
 
   // Race guard: a stale response must never overwrite a newer one
@@ -257,6 +447,15 @@ export default function HrEmployeesPage() {
 
   useEffect(() => { fetchEmployees(); }, [fetchEmployees]);
 
+  // Who am I — decides whether the "create the missing designations"
+  // affordances render at all (a non-admin would only get a 403).
+  useEffect(() => {
+    fetch('/api/auth/me')
+      .then(r => (r.ok ? r.json() : Promise.reject()))
+      .then(j => setMe(j?.user || null))
+      .catch(() => {}); // unknown viewer = not an admin = no create affordance
+  }, []);
+
   // Picker data — one fetch each on mount (bare fetch is fine for GETs)
   useEffect(() => {
     fetch('/api/departments')
@@ -306,14 +505,85 @@ export default function HrEmployeesPage() {
     if (!form.department_id) return [];
     return [{ value: '', label: '(none)' }, ...subsOf(form.department_id).map(s => ({ value: s.id, label: s.name }))];
   }, [form.department_id, subsOf]);
+  /* ── Designation ↔ department link ──────────────────────────────────────
+   * Client-side twin of mainDeptOf (src/lib/dept-hierarchy.ts): the tree is
+   * 3 mains + sub-departments, so "belongs to Kitchen" must also mean every
+   * Kitchen sub-department and vice-versa. */
+
+  /** The MAIN department id for any department id ('' stays ''). An id the
+   *  picker hasn't loaded is treated as its own main — never as a match. */
+  const mainIdOf = useCallback((id: string): string => {
+    const raw = (id || '').trim();
+    if (!raw) return '';
+    const d = deptById.get(raw);
+    if (!d) return raw;
+    return d.parent_id || d.id;
+  }, [deptById]);
+
+  /** Human label for a designation's department_id: '' = generic. */
+  const deptLabelFor = useCallback((id: string): string => {
+    const raw = (id || '').trim();
+    if (!raw) return 'Any department';
+    return deptById.get(raw)?.name || 'Unknown department';
+  }, [deptById]);
+
+  /** The department the filter compares against: the sub-department when one
+   *  is chosen, else the main department. '' = nothing chosen yet. */
+  const effDeptId = form.sub_department_id || form.department_id;
+
+  /**
+   * THE RULE. A generic designation (department_id '') fits everywhere; with
+   * no department chosen nothing is filtered; otherwise it fits when the ids
+   * are equal, or when they share a main department (which covers "one is the
+   * other's parent" in both directions).
+   */
+  const designationFits = useCallback((designationDeptId: string): boolean => {
+    const dd = (designationDeptId || '').trim();
+    if (!dd) return true;         // generic — pickable everywhere
+    if (!effDeptId) return true;  // nothing chosen — nothing to filter by
+    if (dd === effDeptId) return true;
+    const a = mainIdOf(dd);
+    const b = mainIdOf(effDeptId);
+    return !!a && a === b;
+  }, [effDeptId, mainIdOf]);
+
+  const activeDesigs = useMemo(() => designations.filter(d => d.is_active !== 0), [designations]);
+
+  /** The designation the form currently holds (may pre-date the department). */
+  const heldDesig = useMemo(
+    () => (form.designation_id ? designations.find(d => d.id === form.designation_id) || null : null),
+    [designations, form.designation_id],
+  );
+
+  /** Held, department-pinned, and it does NOT fit the department now chosen —
+   *  we keep it selected (never silently blank a real assignment) and say so. */
+  const heldDesigMismatch =
+    !!heldDesig && !!(heldDesig.department_id || '').trim() && !designationFits(heldDesig.department_id || '');
+
+  /** What the picker offers: the fitting ones + whatever is already held. */
+  const desigVisible = useMemo(() => {
+    if (showAllDesigs) return activeDesigs;
+    return activeDesigs.filter(d => designationFits(d.department_id || '') || d.id === form.designation_id);
+  }, [activeDesigs, showAllDesigs, designationFits, form.designation_id]);
+
+  /** How many the department filter is currently keeping out of the list. */
+  const desigHiddenCount = Math.max(0, activeDesigs.length - desigVisible.length);
+
   const desigOptions = useMemo<ComboOption[]>(
     () => [
       { value: '', label: '(none)' },
-      ...designations
-        .filter(d => d.is_active !== 0)
-        .map(d => ({ value: d.id, label: d.name, hint: d.grade || undefined })),
+      ...desigVisible.map(d => {
+        // Hint carries the ORIGIN (department) so the link is visible, plus
+        // the grade when there is one, plus a flag on a kept-but-foreign pick.
+        const parts = [deptLabelFor(d.department_id || '')];
+        if (d.grade) parts.push(d.grade);
+        if (!showAllDesigs && (d.department_id || '').trim() && !designationFits(d.department_id || '')) {
+          parts.push('other department');
+        }
+        return { value: d.id, label: d.name, hint: parts.join(' · ') };
+      }),
     ],
-    [designations],
+    [desigVisible, deptLabelFor, designationFits, showAllDesigs],
   );
   const outletOptions = useMemo<ComboOption[]>(
     () => [{ value: '', label: '(none)' }, ...outlets.map(o => ({ value: o.id, label: o.name }))],
@@ -321,10 +591,80 @@ export default function HrEmployeesPage() {
   );
 
   // ── Create ──────────────────────────────────────────────────────────────
-  const openCreate = () => { setForm(emptyForm()); setCreateError(null); setShowCreate(true); };
+  const openCreate = () => {
+    setForm(emptyForm());
+    setCreateError(null);
+    setDesigText('');
+    setDesigCreateError(null);
+    setDesigCreating(false);
+    setShowAllDesigs(false); // every open starts from the helpful default
+    setShowCreate(true);
+  };
+
+  /** The designation box is allowCustom: a picked option carries its id, a
+   *  typed-but-unmatched name carries none (and offers "＋ Create" below). */
+  const onDesignationChange = (v: string, opt: ComboOption | null) => {
+    setDesigCreateError(null);
+    if (opt) {
+      setDesigText(opt.value ? opt.label : '');   // the '(none)' option clears the box
+      setForm(f => ({ ...f, designation_id: opt.value }));
+      return;
+    }
+    setDesigText(v);
+    setForm(f => ({ ...f, designation_id: '' }));
+  };
+
+  /** Typed a name the master doesn't have (and it isn't just an empty box). */
+  const pendingDesigName = !form.designation_id ? desigText.trim() : '';
+
+  /** A new designation is minted at MAIN-department level — a sub-department
+   *  on the form resolves to its main. '' = a generic (any-department) one. */
+  const newDesigDeptId = mainIdOf(effDeptId);
+  const newDesigDeptName = newDesigDeptId ? (deptById.get(newDesigDeptId)?.name || '') : '';
+
+  /** Admin-only: mint the typed designation, then select it. 409/403 render
+   *  verbatim — the API's own words are the honest answer. */
+  const createTypedDesignation = async () => {
+    const name = pendingDesigName;
+    if (!name || desigCreating) return;
+    setDesigCreating(true);
+    setDesigCreateError(null);
+    try {
+      const res = await apiJson<{ designation: DesigRow }>('/api/hr/designations', {
+        method: 'POST',
+        // The link, written at birth: the department chosen on THIS form
+        // (sub → main). No department chosen = a generic designation.
+        body: { name, department_id: newDesigDeptId },
+      });
+      const created = res?.designation;
+      if (!created?.id) {
+        setDesigCreateError('The designation was not returned — reopen this form and pick it from the list.');
+        return;
+      }
+      // Defensive: keep the department we asked for if the echo omits it, so
+      // the picker doesn't immediately filter out what was just created.
+      const row: DesigRow = { ...created, department_id: created.department_id ?? newDesigDeptId };
+      setDesignations(prev => (prev.some(d => d.id === row.id) ? prev : [...prev, row]));
+      setForm(f => ({ ...f, designation_id: created.id }));
+      setDesigText(created.name || name);
+    } catch (e: any) {
+      setDesigCreateError(e?.message || 'Could not create that designation');
+    } finally {
+      setDesigCreating(false);
+    }
+  };
 
   const save = async () => {
     if (!form.full_name.trim()) { setCreateError('Full name is required.'); return; }
+    // Never silently drop a typed designation that was never created.
+    if (pendingDesigName) {
+      setCreateError(
+        isAdmin
+          ? `No designation named "${pendingDesigName}" exists yet — press ＋ Create under the box, pick another, or clear it.`
+          : `No designation named "${pendingDesigName}" exists yet — pick one from the list, or clear the box and ask an admin to add it on HR Settings.`,
+      );
+      return;
+    }
     setSaving(true);
     setCreateError(null);
     try {
@@ -354,6 +694,7 @@ export default function HrEmployeesPage() {
     setBulkPreviewedCsv(null);
     setBulkError(null);
     setBulkResult(null);
+    setBulkCreateDesig(false);
     setShowBulk(true);
   };
 
@@ -426,6 +767,7 @@ export default function HrEmployeesPage() {
       setBulkPreviewedCsv(null);
       setBulkError(null);
       setBulkResult(null);
+      setBulkCreateDesig(false);
     } catch {
       setBulkError('Could not read that file — try pasting the rows instead.');
     }
@@ -435,6 +777,7 @@ export default function HrEmployeesPage() {
     setBulkCsv(v);
     setBulkFileName(null);
     setBulkError(null);
+    setBulkCreateDesig(false); // a different file = a fresh answer to the question
     // Staleness (bulkPreviewedCsv !== bulkCsv) disarms Import on its own.
   };
 
@@ -449,6 +792,7 @@ export default function HrEmployeesPage() {
     }
     setBulkPreviewing(true);
     setBulkError(null);
+    setBulkCreateDesig(false); // every preview asks the question again, unticked
     try {
       const res = await api('/api/hr/employees/import?commit=0', {
         method: 'POST',
@@ -479,12 +823,107 @@ export default function HrEmployeesPage() {
     }
   };
 
+  /* ── Unknown-designation prompt (owner ask, 2026-08-17) ───────────────
+   * Declared before the import handler so the arming maths is one source of
+   * truth for the counts strip, the button copy and the request itself. */
+  const bulkStale = !!bulkPreview && bulkPreviewedCsv !== bulkCsv;
+
+  /** Designations this file names that the master doesn't have yet. */
+  const unknownDesigs = useMemo<UnknownDesignation[]>(
+    () => (bulkPreview && !bulkStale ? bulkPreview.unknown_designations : []),
+    [bulkPreview, bulkStale],
+  );
+
+  /**
+   * Which department each new designation would be created under — taken from
+   * the FIRST row in the file that used it (department, else sub-department,
+   * resolved up to its MAIN department because designations live at main level).
+   * PRESENTATIONAL ONLY: the import route does the actual attaching; this just
+   * stops the amber card from asking a question it won't answer. '' = the row
+   * named no department, so it becomes a generic (any-department) designation.
+   */
+  const unknownDesigDeptLabel = useMemo<Map<string, string>>(() => {
+    const out = new Map<string, string>();
+    if (unknownDesigs.length === 0 || !bulkCsv.trim()) return out;
+    const recs = parseCsvRecords(bulkCsv);
+    if (recs.length < 2) return out;
+    const header = recs[0].cells.map(headerKey);
+    const iDesig = header.indexOf('designation');
+    const iDept = header.indexOf('department');
+    const iSub = header.indexOf('sub_department');
+    if (iDesig < 0) return out;
+    // departments.name → its MAIN department's name (case-insensitive).
+    const mainNameByName = new Map<string, string>();
+    for (const d of departments) {
+      const main = d.parent_id ? departments.find(p => p.id === d.parent_id) : d;
+      mainNameByName.set(d.name.trim().toLowerCase(), (main || d).name);
+    }
+    for (const d of unknownDesigs) {
+      const needle = d.name.trim().toLowerCase();
+      for (let i = 1; i < recs.length; i++) {
+        const cells = recs[i].cells;
+        if ((cells[iDesig] ?? '').trim().toLowerCase() !== needle) continue;
+        const raw = (iDept >= 0 ? (cells[iDept] ?? '').trim() : '')
+          || (iSub >= 0 ? (cells[iSub] ?? '').trim() : '');
+        // An unmatched name is shown as typed — the import will reject that
+        // row anyway (departments are never auto-created).
+        out.set(d.name, raw ? (mainNameByName.get(raw.toLowerCase()) || raw) : '');
+        break;
+      }
+    }
+    return out;
+  }, [unknownDesigs, bulkCsv, departments]);
+
+  /**
+   * Rows that ONLY a missing designation is blocking — creating the
+   * designations makes exactly these importable. A row that ALSO has a bad
+   * date, a duplicate code or an unknown DEPARTMENT stays blocked, so the
+   * "will import" number never over-promises.
+   */
+  const desigRecoverableLines = useMemo<number[]>(() => {
+    if (!bulkPreview || unknownDesigs.length === 0) return [];
+    const candidates = new Set<number>();
+    for (const d of unknownDesigs) for (const l of d.lines) candidates.add(l);
+    const out: number[] = [];
+    for (const line of candidates) {
+      const onLine = bulkPreview.errors.filter(e => e.line === line);
+      if (onLine.length === 0) continue; // can't attribute it — leave it counted as an error
+      if (onLine.every(e => isDesignationNotFound(e.message))) out.push(line);
+    }
+    return out.sort((a, b) => a - b);
+  }, [bulkPreview, unknownDesigs]);
+
+  /** Creating designations is admin-only — a manager never sees the checkbox. */
+  const canCreateDesigs = isAdmin && unknownDesigs.length > 0;
+  const desigArmed = canCreateDesigs && bulkCreateDesig;
+
+  /** What WILL import once the box is ticked: the server's own count when it
+   *  sends one, else valid + the rows only the missing designation blocked. */
+  const validWithNewDesigs = useMemo(() => {
+    if (!bulkPreview) return 0;
+    const hint = bulkPreview.valid_with_designations;
+    if (hint !== null && hint >= bulkPreview.valid && hint <= bulkPreview.total_rows) return hint;
+    return bulkPreview.valid + desigRecoverableLines.length;
+  }, [bulkPreview, desigRecoverableLines]);
+
+  const effectiveValid = bulkPreview ? (desigArmed ? validWithNewDesigs : bulkPreview.valid) : 0;
+
+  /** Error MESSAGES the tick clears — the errors chip and table say so. */
+  const resolvedErrorCount = useMemo(
+    () => (desigArmed && bulkPreview
+      ? bulkPreview.errors.filter(e => isDesignationNotFound(e.message)).length
+      : 0),
+    [desigArmed, bulkPreview],
+  );
+
   const runBulkImport = async () => {
-    if (!bulkPreview || bulkPreview.valid <= 0 || bulkPreviewedCsv !== bulkCsv) return;
+    if (!bulkPreview || effectiveValid <= 0 || bulkPreviewedCsv !== bulkCsv) return;
     setBulkImporting(true);
     setBulkError(null);
     try {
-      const res = await api('/api/hr/employees/import?commit=1', {
+      // create_designations=1 is sent ONLY on an admin's explicit tick; the
+      // API re-checks the admin gate, this is just the honest request.
+      const res = await api(`/api/hr/employees/import?commit=1${desigArmed ? '&create_designations=1' : ''}`, {
         method: 'POST',
         headers: { 'Content-Type': 'text/csv' },
         body: bulkCsv,
@@ -499,10 +938,20 @@ export default function HrEmployeesPage() {
         );
         return;
       }
-      setBulkResult(normalizeImportCommit(json));
+      const commitResult = normalizeImportCommit(json);
+      setBulkResult(commitResult);
+      // New designations are now in the master — refresh the picker so the
+      // create modal and the template example see them without a reload.
+      if (commitResult.created_designations.length > 0) {
+        fetch('/api/hr/designations')
+          .then(r => (r.ok ? r.json() : Promise.reject()))
+          .then(j => setDesignations(Array.isArray(j?.designations) ? j.designations : []))
+          .catch(() => {});
+      }
       // Disarm — the same text must not be importable twice from this modal.
       setBulkPreview(null);
       setBulkPreviewedCsv(null);
+      setBulkCreateDesig(false);
     } catch {
       setBulkError('Could not reach the server — check the employee list before retrying.');
     } finally {
@@ -510,9 +959,8 @@ export default function HrEmployeesPage() {
     }
   };
 
-  const bulkStale = !!bulkPreview && bulkPreviewedCsv !== bulkCsv;
   const canBulkImport =
-    !!bulkPreview && bulkPreview.valid > 0 && !bulkStale && !bulkImporting && !bulkPreviewing;
+    !!bulkPreview && effectiveValid > 0 && !bulkStale && !bulkImporting && !bulkPreviewing;
 
   // ── Pagination derived ──────────────────────────────────────────────────
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -767,12 +1215,95 @@ export default function HrEmployeesPage() {
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                       <label className="text-xs text-[#6B5744]">Designation</label>
+                      {/* allowCustom: an unknown designation is a PROMPT, not a
+                          dead end. Admins get "＋ Create"; everyone else gets
+                          the honest ask-an-admin note (POST is canAdminHr).
+                          The list defaults to the chosen department's
+                          designations (tree-aware) + the generic ones. */}
                       <Combobox
                         options={desigOptions}
-                        value={form.designation_id ? (designations.find(d => d.id === form.designation_id)?.name || '') : ''}
-                        onChange={(v) => setForm({ ...form, designation_id: v })}
-                        placeholder="Pick designation"
+                        value={desigText}
+                        onChange={onDesignationChange}
+                        allowCustom
+                        placeholder="Pick or type a designation"
                       />
+
+                      {/* The filter is a default, not a cage — one click lifts it. */}
+                      {(desigHiddenCount > 0 || showAllDesigs) && (
+                        <div className="mt-1 text-[11px] text-[#8B7355]">
+                          {showAllDesigs ? (
+                            <>
+                              Showing all {activeDesigs.length} designations.{' '}
+                              <button type="button" onClick={() => setShowAllDesigs(false)}
+                                      className="text-[#af4408] hover:underline font-medium">
+                                {effDeptId
+                                  ? `Only ${deptById.get(effDeptId)?.name || 'this department'}’s`
+                                  : 'Back to the matching ones'}
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              {desigHiddenCount} designation{desigHiddenCount === 1 ? '' : 's'} from other
+                              departments {desigHiddenCount === 1 ? 'is' : 'are'} hidden.{' '}
+                              <button type="button" onClick={() => setShowAllDesigs(true)}
+                                      className="text-[#af4408] hover:underline font-medium">
+                                Show all designations
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Department changed under a held designation: keep the
+                          pick (blanking a real assignment silently is worse),
+                          flag it, let a human decide. */}
+                      {heldDesigMismatch && heldDesig && (
+                        <div className="mt-1.5 rounded-lg border border-amber-200 bg-amber-50 text-amber-900 px-2 py-1 text-[11px] flex items-start gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
+                          <span>
+                            {heldDesig.name} belongs to {deptLabelFor(heldDesig.department_id || '')} — change it if
+                            this is wrong.
+                          </span>
+                        </div>
+                      )}
+
+                      {pendingDesigName && (
+                        isAdmin ? (
+                          <div className="mt-1.5 space-y-1">
+                            <button
+                              type="button"
+                              onClick={createTypedDesignation}
+                              disabled={desigCreating || saving}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] text-xs font-medium disabled:opacity-50"
+                            >
+                              {desigCreating
+                                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                : <Plus className="w-3.5 h-3.5" />}
+                              {/* Says exactly which department it lands under. */}
+                              Create &quot;{pendingDesigName}&quot;{newDesigDeptName
+                                ? ` under ${newDesigDeptName}`
+                                : ' (any department)'}
+                            </button>
+                            <div className="text-[11px] text-[#8B7355]">
+                              {newDesigDeptName
+                                ? <>Designations sit at main-department level, so this one is linked to <span className="font-medium">{newDesigDeptName}</span> and will be offered for every department under it. </>
+                                : <>No department chosen, so it is created as a generic designation offered everywhere. </>}
+                              Change or deactivate it on HR Settings.
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="mt-1.5 text-[11px] text-[#8B7355]">
+                            No designation named &quot;{pendingDesigName}&quot; yet — pick one from the list, or
+                            ask an admin to add it on HR Settings.
+                          </div>
+                        )
+                      )}
+                      {desigCreateError && (
+                        <div className="mt-1.5 rounded-lg border border-red-200 bg-red-50 text-red-700 px-2 py-1 text-[11px] flex items-start gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
+                          <span>{desigCreateError}</span>
+                        </div>
+                      )}
                     </div>
                     <div>
                       <label className="text-xs text-[#6B5744]">Employment type</label>
@@ -861,6 +1392,25 @@ export default function HrEmployeesPage() {
                       </span>
                     </div>
 
+                    {/* What was created on the way in — designations are named
+                        explicitly so a typo can be deactivated on HR Settings. */}
+                    {bulkResult.created_designations.length > 0 && (
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 text-amber-900 px-4 py-3 text-sm">
+                        <div className="font-medium">
+                          Created {bulkResult.created_designations.length} designation
+                          {bulkResult.created_designations.length === 1 ? '' : 's'}:
+                        </div>
+                        <ul className="mt-1 space-y-0.5">
+                          {bulkResult.created_designations.map(n => (
+                            <li key={n} className="text-[13px] break-words">· {n}</li>
+                          ))}
+                        </ul>
+                        <div className="mt-1 text-[11px] text-amber-800">
+                          Edit or deactivate them on HR Settings (/hr/settings).
+                        </div>
+                      </div>
+                    )}
+
                     {bulkResult.codes.length > 0 && (
                       <div className="rounded-xl border border-[#E8D5C4] overflow-hidden">
                         <div className="bg-[#FFF1E3] text-[#6B5744] px-3 py-2 text-xs font-semibold">
@@ -935,7 +1485,10 @@ export default function HrEmployeesPage() {
                           <div className="text-xs text-[#8B7355]">
                             Department, sub-department and designation are matched by NAME against what exists in
                             this app. Rows with problems are reported with their line number and skipped — the
-                            clean rows still import.
+                            clean rows still import. A designation the file names but the master doesn&apos;t have is
+                            offered for creation after the preview{isAdmin ? '' : ' (admins only)'}; a missing
+                            department must be created on the Departments page first — that tree is shared with
+                            store operations.
                           </div>
                           <button onClick={downloadTemplate}
                                   className="inline-flex items-center gap-1.5 text-xs font-medium text-[#af4408] hover:underline">
@@ -1001,15 +1554,21 @@ export default function HrEmployeesPage() {
                           <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border bg-[#FFF1E3] text-[#6B5744] border-[#E8D5C4]">
                             {bulkPreview.total_rows} row{bulkPreview.total_rows === 1 ? '' : 's'}
                           </span>
+                          {/* Recomputed live: ticking "create these designations"
+                              must never leave "0 will import" beside an enabled
+                              Import button. Un-ticking restores these numbers. */}
                           <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border bg-green-100 text-green-700 border-green-200">
-                            <CheckCircle2 className="w-3.5 h-3.5" /> {bulkPreview.valid} will import
+                            <CheckCircle2 className="w-3.5 h-3.5" /> {effectiveValid} will import
+                            {desigArmed && (
+                              <> (with the {unknownDesigs.length} new designation{unknownDesigs.length === 1 ? '' : 's'})</>
+                            )}
                           </span>
                           <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border ${
-                            bulkPreview.errors.length > 0
+                            bulkPreview.errors.length - resolvedErrorCount > 0
                               ? 'bg-red-100 text-red-700 border-red-200'
                               : 'bg-gray-100 text-gray-600 border-gray-200'
                           }`}>
-                            <AlertTriangle className="w-3.5 h-3.5" /> {bulkPreview.errors.length} error{bulkPreview.errors.length === 1 ? '' : 's'}
+                            <AlertTriangle className="w-3.5 h-3.5" /> {bulkPreview.errors.length - resolvedErrorCount} error{bulkPreview.errors.length - resolvedErrorCount === 1 ? '' : 's'}
                           </span>
                           <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border ${
                             bulkPreview.warnings.length > 0
@@ -1020,9 +1579,82 @@ export default function HrEmployeesPage() {
                           </span>
                         </div>
 
-                        {bulkPreview.valid <= 0 && (
+                        {effectiveValid <= 0 && (
                           <div className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-3 text-sm">
-                            No importable rows — fix the errors below (line numbers refer to the file), then preview again.
+                            No importable rows — {canCreateDesigs
+                              ? 'answer the designation question below, or fix the errors (line numbers refer to the file) and preview again.'
+                              : 'fix the errors below (line numbers refer to the file), then preview again.'}
+                          </div>
+                        )}
+
+                        {/* ── The unknown-designation PROMPT (never a dead end) ──
+                            Designations are HR-local: a wrong one is cosmetic and
+                            deactivatable. Departments stay strict — their tree is
+                            shared with store operations. */}
+                        {unknownDesigs.length > 0 && (
+                          <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                            <div className="flex items-start gap-2">
+                              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                              <div className="min-w-0 space-y-2">
+                                <div className="font-medium">
+                                  {unknownDesigs.length} designation{unknownDesigs.length === 1 ? '' : 's'} in this file
+                                  {unknownDesigs.length === 1 ? " doesn't" : " don't"} exist yet — shall I add
+                                  {unknownDesigs.length === 1 ? ' it' : ' them'}?
+                                </div>
+                                {/* Each one names the department it will be created
+                                    under — from the first row that used it. */}
+                                <ul className="space-y-0.5">
+                                  {unknownDesigs.map(d => {
+                                    const deptLabel = unknownDesigDeptLabel.get(d.name) || '';
+                                    return (
+                                      <li key={d.name} className="text-[13px] break-words">
+                                        · <span className="font-medium">{d.name}</span>
+                                        <span className="text-amber-800">
+                                          {' → '}
+                                          {deptLabel
+                                            ? <span className="font-medium">{deptLabel}</span>
+                                            : '(any department)'}
+                                        </span>
+                                        {d.lines.length > 0 && (
+                                          <span className="text-amber-800">
+                                            {'  '}(line{d.lines.length === 1 ? '' : 's'} {d.lines.join(', ')})
+                                          </span>
+                                        )}
+                                      </li>
+                                    );
+                                  })}
+                                </ul>
+                                {isAdmin ? (
+                                  <>
+                                    <label className="flex items-start gap-2 cursor-pointer select-none">
+                                      <input
+                                        type="checkbox"
+                                        checked={bulkCreateDesig}
+                                        onChange={e => setBulkCreateDesig(e.target.checked)}
+                                        disabled={bulkImporting || bulkPreviewing}
+                                        className="mt-0.5 w-4 h-4 accent-[#af4408]"
+                                      />
+                                      <span className="text-[13px] font-medium">
+                                        Create these designations and import
+                                      </span>
+                                    </label>
+                                    <div className="text-[11px] text-amber-800">
+                                      Each is linked to the department shown beside it (its main department), so it
+                                      is offered on that department&apos;s employee forms — re-link any of them on
+                                      HR Settings. They are added to the designation master when you press Import —
+                                      deactivate any typo later on HR Settings. Departments are never created this way: fix
+                                      those on the Departments page first (that tree is shared with store operations).
+                                    </div>
+                                  </>
+                                ) : (
+                                  <div className="text-[12px] text-amber-800">
+                                    Rows using {unknownDesigs.length === 1 ? 'it' : 'them'} are listed as errors below and
+                                    will NOT import — the rest still will. Creating a designation is an admin action:
+                                    ask an admin to add {unknownDesigs.length === 1 ? 'it' : 'them'} on HR Settings.
+                                  </div>
+                                )}
+                              </div>
+                            </div>
                           </div>
                         )}
 
@@ -1030,6 +1662,11 @@ export default function HrEmployeesPage() {
                           <div className="rounded-xl border border-red-200 overflow-hidden">
                             <div className="bg-red-50 text-red-700 px-3 py-2 text-xs font-semibold">
                               Errors — these rows will NOT be imported.
+                              {desigArmed && resolvedErrorCount > 0 && (
+                                <span className="font-normal text-amber-800">
+                                  {' '}The amber ones are cleared by creating the designations.
+                                </span>
+                              )}
                             </div>
                             <div className="overflow-x-auto">
                               <table className="w-full text-sm">
@@ -1040,12 +1677,26 @@ export default function HrEmployeesPage() {
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {bulkPreview.errors.map((e, i) => (
-                                    <tr key={i} className="border-t border-red-100 bg-red-50/40">
-                                      <td className="py-1.5 px-3 text-xs font-mono">{e.line || '—'}</td>
-                                      <td className="py-1.5 px-3 text-xs text-red-700">{e.message}</td>
-                                    </tr>
-                                  ))}
+                                  {bulkPreview.errors.map((e, i) => {
+                                    // With the box ticked these stop being errors —
+                                    // say so on the row instead of contradicting the
+                                    // counts strip above.
+                                    const resolved = desigArmed && isDesignationNotFound(e.message);
+                                    return (
+                                      <tr key={i}
+                                          className={`border-t ${resolved ? 'border-amber-100 bg-amber-50/50' : 'border-red-100 bg-red-50/40'}`}>
+                                        <td className="py-1.5 px-3 text-xs font-mono">{e.line || '—'}</td>
+                                        <td className={`py-1.5 px-3 text-xs ${resolved ? 'text-amber-800' : 'text-red-700'}`}>
+                                          {e.message}
+                                          {resolved && (
+                                            <span className="block text-[11px] text-amber-700">
+                                              Resolved — this designation will be created on import.
+                                            </span>
+                                          )}
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
                                 </tbody>
                               </table>
                             </div>
@@ -1144,11 +1795,19 @@ export default function HrEmployeesPage() {
                     <button onClick={runBulkImport} disabled={!canBulkImport}
                             title={!bulkPreview ? 'Run a preview first'
                               : bulkStale ? 'The rows changed — preview again'
-                              : bulkPreview.valid <= 0 ? 'No importable rows — fix the errors first'
-                              : undefined}
+                              : effectiveValid <= 0
+                                ? (canCreateDesigs
+                                  ? 'No importable rows — tick "Create these designations and import", or fix the errors first'
+                                  : 'No importable rows — fix the errors first')
+                                : undefined}
                             className="px-3 py-2 text-sm bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-40">
                       {bulkImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                      Import {bulkPreview && !bulkStale ? bulkPreview.valid : ''} employee{bulkPreview && !bulkStale && bulkPreview.valid === 1 ? '' : 's'}
+                      {/* Copy flips with the tick so the button states exactly what it will do. */}
+                      {desigArmed && (
+                        <>Create {unknownDesigs.length} designation{unknownDesigs.length === 1 ? '' : 's'} &amp; </>
+                      )}
+                      {desigArmed ? 'import ' : 'Import '}
+                      {bulkPreview && !bulkStale ? effectiveValid : ''} employee{bulkPreview && !bulkStale && effectiveValid === 1 ? '' : 's'}
                     </button>
                   </>
                 )}

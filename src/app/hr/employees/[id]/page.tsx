@@ -16,6 +16,22 @@
  *    only SHOW an amber pointer to /users — deactivation stays an explicit
  *    admin action there.
  *  - Personal / Employment: each tab saves ONLY its own fields via one PUT.
+ *    Employment's Designation picker accepts free text: an unknown designation
+ *    is a PROMPT ('＋ Create "X"'), never a dead end — designations are
+ *    HR-local, so a wrong one is cosmetic and deactivatable on HR Settings.
+ *    Creating is ADMIN-only (POST /api/hr/designations is canAdminHr) while
+ *    this page is canManageHr, so managers see a pointer to HR Settings
+ *    instead of a button that would 403. The picker is FILTERED by the chosen
+ *    department (owner rule 2026-08-17 — "link designation and department"):
+ *    generic designations (department_id '') always show, pinned ones show for
+ *    their whole main-department tree, the designation the employee already
+ *    holds is never hidden (an amber note names its department instead), and
+ *    'Show all designations' lifts the filter for the unusual case. A created
+ *    designation is pinned to the MAIN department currently selected.
+ *    Departments are deliberately NOT
+ *    auto-creatable anywhere: that tree is shared with requisitions, closing
+ *    stock, variance and dept-stock, where a typo pollutes load-bearing
+ *    operational data — create those on the Departments page first.
  *  - Salary / Documents / Disciplinary are admin-only surfaces: gated
  *    client-side via /api/auth/me + canAdminHr with a plain lock card for
  *    everyone else — and every backing API re-checks canAdminHr server-side
@@ -110,7 +126,11 @@ interface EmployeeDetail extends HrEmployeeListRow {
 
 interface DeptRow { id: string; name: string; parent_id: string | null; is_active: number }
 interface OutletRow { id: string; name: string }
-interface DesigRow { id: string; name: string; grade: string; is_active: number }
+/** hr_designations row as the picker needs it. `department_id` is the
+ *  DESIGNATION→DEPARTMENT link curated on HR Settings: '' means GENERIC
+ *  (belongs to no department — Manager, Trainee — and stays pickable
+ *  everywhere), any other value pins it to that department's tree. */
+interface DesigRow { id: string; name: string; department_id: string; grade: string; is_active: number }
 interface UserRow { id: string; name: string; email: string }
 interface EmpPickRow { id: string; full_name: string; employee_code: string }
 
@@ -417,6 +437,18 @@ export default function EmployeeProfilePage() {
   const [employmentErr, setEmploymentErr] = useState<string | null>(null);
   const [employmentOk, setEmploymentOk] = useState(false);
 
+  // Employment tab — inline "create designation" affordance. `desigTyped` holds
+  // free text the viewer typed into the designation Combobox; null means "show
+  // the selected option's label instead". Creation is always an EXPLICIT click,
+  // never a side effect of saving.
+  const [desigTyped, setDesigTyped] = useState<string | null>(null);
+  const [desigCreating, setDesigCreating] = useState(false);
+  const [desigCreateErr, setDesigCreateErr] = useState<string | null>(null);
+  // The designation list is filtered to the chosen department by DEFAULT, never
+  // caged: this lifts the filter for one unusual assignment (see the
+  // 'Show all designations' link under the picker).
+  const [desigShowAll, setDesigShowAll] = useState(false);
+
   /* ---- Phase 4/6 tabs: session tier + lazy per-tab state ---- */
 
   // Who am I — Salary / Documents / Disciplinary are admin-only surfaces; the
@@ -545,7 +577,15 @@ export default function EmployeeProfilePage() {
       ]);
       if (dj?.departments) setDepts((dj.departments as DeptRow[]).filter((d) => d.is_active));
       if (oj?.outlets) setOutlets(oj.outlets as OutletRow[]);
-      if (gj?.designations) setDesignations((gj.designations as DesigRow[]).filter((d) => d.is_active));
+      if (gj?.designations) {
+        setDesignations(
+          (gj.designations as DesigRow[])
+            .filter((d) => d.is_active)
+            // '' is the GENERIC marker the picker filter keys off — normalise a
+            // NULL column to it so a legacy row never reads as "pinned to null".
+            .map((d) => ({ ...d, department_id: d.department_id || '' })),
+        );
+      }
       if (uj?.users) setUsers(uj.users as UserRow[]);
       if (ej?.rows) setEmployees(ej.rows as EmpPickRow[]);
     })();
@@ -573,10 +613,125 @@ export default function EmployeeProfilePage() {
     ];
   }, [depts, employmentDraft?.department_id, NONE]);
 
-  const designationOptions = useMemo<ComboOption[]>(
-    () => [NONE, ...designations.map((d) => ({ value: d.id, label: d.name, hint: d.grade || undefined }))],
-    [designations, NONE],
+  /* ---- designation ⇄ department link (owner rule, 2026-08-17) ------------- *
+   * A designation with department_id = '' is GENERIC and stays pickable
+   * everywhere. A pinned one shows when the employee's department matches it,
+   * TREE-AWARE: same id, or the same MAIN department (a designation pinned to
+   * "Kitchen" offers under every Kitchen sub-department and vice-versa) — the
+   * client mirror of mainDeptOf() in src/lib/dept-hierarchy.ts. With no
+   * department chosen there is nothing to filter by, so everything shows. The
+   * filter is a helpful default, not a cage: 'Show all designations' lifts it,
+   * and the designation the employee ALREADY holds is never hidden.
+   * ------------------------------------------------------------------------ */
+
+  const deptById = useMemo(() => {
+    const m = new Map<string, DeptRow>();
+    for (const d of depts) m.set(d.id, d);
+    return m;
+  }, [depts]);
+
+  /** Main (top-level) department id for any dept id — a sub resolves to its
+   *  parent, a main (or an unknown id) resolves to itself. */
+  const mainDeptIdOf = useCallback(
+    (deptId: string): string => {
+      if (!deptId) return '';
+      const d = deptById.get(deptId);
+      return d ? d.parent_id || d.id : deptId;
+    },
+    [deptById],
   );
+
+  const deptNameOf = useCallback(
+    (deptId: string): string => (deptId ? deptById.get(deptId)?.name || '' : ''),
+    [deptById],
+  );
+
+  /** The department the Employment tab currently means: the sub-department when
+   *  one is set, else the main department. '' = nothing chosen yet. */
+  const empDeptId = employmentDraft
+    ? employmentDraft.sub_department_id || employmentDraft.department_id
+    : '';
+
+  /** MAIN department a newly created designation gets pinned to ('' = generic). */
+  const createUnderDeptId = useMemo(() => mainDeptIdOf(empDeptId), [mainDeptIdOf, empDeptId]);
+  const createUnderDeptName = useMemo(
+    () => deptNameOf(createUnderDeptId),
+    [deptNameOf, createUnderDeptId],
+  );
+
+  /** True when a designation may be offered for the chosen department. */
+  const desigFitsDept = useCallback(
+    (desigDeptId: string): boolean => {
+      if (!desigDeptId) return true;   // generic — pickable everywhere
+      if (!empDeptId) return true;     // no department chosen — nothing to filter by
+      if (desigDeptId === empDeptId) return true;
+      return mainDeptIdOf(desigDeptId) === mainDeptIdOf(empDeptId);
+    },
+    [empDeptId, mainDeptIdOf],
+  );
+
+  /** The designation this employee holds right now — the unsaved draft pick
+   *  first, else the saved one. It is ALWAYS offered, whatever department it
+   *  belongs to: hiding it would let a save silently blank a real assignment. */
+  const heldDesigId = employmentDraft?.designation_id || emp?.designation_id || '';
+
+  const designationOptions = useMemo<ComboOption[]>(() => {
+    const optOf = (d: DesigRow): ComboOption => {
+      const bits = [deptNameOf(d.department_id) || (d.department_id ? 'Other department' : 'Any department')];
+      if (d.grade) bits.push(d.grade);
+      return { value: d.id, label: d.name, hint: bits.join(' · ') };
+    };
+    const rows = desigShowAll
+      ? designations
+      : designations.filter((d) => d.id === heldDesigId || desigFitsDept(d.department_id));
+    const opts = rows.map(optOf);
+    // A held designation that is missing from the loaded list (deactivated on HR
+    // Settings, or outside this fetch) still needs an option, or clearing the
+    // field would make it unrecoverable without a reload.
+    if (heldDesigId && !opts.some((o) => o.value === heldDesigId)) {
+      const name = (emp?.designation_id === heldDesigId && emp?.designation_name) || '';
+      if (name) opts.push({ value: heldDesigId, label: name, hint: 'currently assigned' });
+    }
+    opts.sort((a, b) => a.label.localeCompare(b.label));
+    return [NONE, ...opts];
+  }, [designations, desigShowAll, desigFitsDept, heldDesigId, deptNameOf, emp, NONE]);
+
+  /** How many active designations the department filter is hiding right now
+   *  (0 when nothing is filtered — the 'Show all' link only earns its place
+   *  when it would actually reveal something). */
+  const desigHiddenCount = useMemo(
+    () =>
+      designations.filter((d) => d.id !== heldDesigId && !desigFitsDept(d.department_id)).length,
+    [designations, heldDesigId, desigFitsDept],
+  );
+
+  /** The held designation when it belongs to ANOTHER department than the one
+   *  chosen — kept in the list, but flagged so a human decides. */
+  const heldDesigMismatch = useMemo(() => {
+    // Only the DRAFT pick is flagged — that is what a Save would write. (The
+    // option list is wider: it also keeps the saved designation available so
+    // clearing the field stays reversible.)
+    const draftId = employmentDraft?.designation_id || '';
+    if (!draftId || !empDeptId) return null;
+    const row = designations.find((d) => d.id === draftId);
+    if (!row || !row.department_id) return null;      // unknown or generic — nothing to flag
+    if (desigFitsDept(row.department_id)) return null;
+    return {
+      name: row.name,
+      dept: deptNameOf(row.department_id) || 'another department',
+    };
+  }, [employmentDraft?.designation_id, empDeptId, designations, desigFitsDept, deptNameOf]);
+
+  /** Free-typed designation text that matches no loaded designation ('' when
+   *  the field holds a real pick, is blank, or the text names an existing row).
+   *  Drives both the create affordance and the save guard — a typed label must
+   *  never be silently dropped by the PUT. */
+  const desigUnmatched = useMemo<string>(() => {
+    const typed = (desigTyped || '').trim();
+    if (!typed) return '';
+    const hit = designations.some((d) => (d.name || '').trim().toLowerCase() === typed.toLowerCase());
+    return hit ? '' : typed;
+  }, [desigTyped, designations]);
 
   const outletOptions = useMemo<ComboOption[]>(
     () => [NONE, ...outlets.map((o) => ({ value: o.id, label: o.name }))],
@@ -760,8 +915,65 @@ export default function EmployeeProfilePage() {
     }
   };
 
+  /**
+   * Create the free-typed designation, then select it — the explicit half of
+   * the "unknown designation is a prompt" rule. Only rendered for admins
+   * (POST /api/hr/designations is canAdminHr); the server re-checks, and a 403
+   * or the 409 'already exists' body is surfaced VERBATIM rather than swallowed.
+   *
+   * The new row is pinned to the MAIN department of whatever the Employment tab
+   * has selected (a sub-department resolves to its main, so "Commis I" typed
+   * under Kitchen → Hot Kitchen lands on Kitchen and offers across the whole
+   * Kitchen tree). Nothing chosen → department_id '' = generic, pickable
+   * everywhere. Grade stays curated on HR Settings.
+   */
+  const createDesignation = async () => {
+    const name = desigUnmatched;
+    if (!name) return;
+    setDesigCreating(true); setDesigCreateErr(null);
+    try {
+      const res = await api('/api/hr/designations', {
+        method: 'POST',
+        body: { name, department_id: createUnderDeptId },
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { setDesigCreateErr(j?.error || 'Could not create the designation.'); return; }
+      const raw = j?.designation as DesigRow | undefined;
+      if (!raw?.id) { setDesigCreateErr('Could not create the designation.'); return; }
+      // Trust the server's stored department_id (it is the row that will come
+      // back on the next GET), defaulting to generic if the column is absent.
+      const row: DesigRow = { ...raw, department_id: raw.department_id || '' };
+      // Append (name-sorted, like the GET) + select. Nothing is written to the
+      // employee yet — the Employment tab still saves on its own Save.
+      setDesignations((prev) =>
+        prev.some((d) => d.id === row.id)
+          ? prev
+          : [...prev, row].sort((a, b) => (a.name || '').localeCompare(b.name || '')),
+      );
+      setEmploymentDraft((d) => (d ? { ...d, designation_id: row.id } : d));
+      setDesigTyped(null);
+      setEmploymentErr(null);
+    } catch {
+      setDesigCreateErr('Could not create the designation. Check your connection.');
+    } finally {
+      setDesigCreating(false);
+    }
+  };
+
   const saveEmployment = async () => {
     if (!employmentDraft) return;
+    // A typed-but-unsaved designation would be silently dropped by the PUT
+    // (designation_id is blank while the text matches nothing) — refuse, and
+    // say which way out this viewer actually has.
+    if (desigUnmatched) {
+      setEmploymentErr(
+        isAdmin
+          ? `"${desigUnmatched}" is not a saved designation — use the Create button under the Designation field, or pick one from the list.`
+          : `"${desigUnmatched}" is not a saved designation — pick one from the list, or ask an admin to add it on HR Settings.`,
+      );
+      setEmploymentOk(false);
+      return;
+    }
     setEmploymentSaving(true); setEmploymentErr(null); setEmploymentOk(false);
     try {
       const res = await api(apiUrl, { method: 'PUT', body: { ...employmentDraft } });
@@ -769,6 +981,9 @@ export default function EmployeeProfilePage() {
       if (!res.ok) { setEmploymentErr(j?.error || 'Could not save employment details.'); return; }
       const fresh = await load();
       if (fresh) setEmploymentDraft(employmentFromEmp(fresh));
+      // Drop any leftover typed text so the picker reads back off the saved id.
+      setDesigTyped(null);
+      setDesigCreateErr(null);
       setEmploymentOk(true);
       setTimeout(() => setEmploymentOk(false), 2500);
     } catch {
@@ -1535,10 +1750,131 @@ export default function EmployeeProfilePage() {
                     <FieldLabel>Designation</FieldLabel>
                     <Combobox
                       options={designationOptions}
-                      value={labelFor(designationOptions, employmentDraft.designation_id, emp.designation_name || '')}
-                      onChange={(v) => setEmploymentDraft({ ...employmentDraft, designation_id: v })}
+                      value={
+                        desigTyped ??
+                        labelFor(designationOptions, employmentDraft.designation_id, emp.designation_name || '')
+                      }
+                      onChange={(v, opt) => {
+                        setDesigCreateErr(null);
+                        if (opt) {
+                          // A real pick (including "— None —"): the id is the truth
+                          // again, so the typed-text overlay goes away.
+                          setDesigTyped(null);
+                          setEmploymentDraft((d) => (d ? { ...d, designation_id: opt.value } : d));
+                          return;
+                        }
+                        // Typing the exact name of a designation the DEPARTMENT
+                        // FILTER is hiding must not read as "unknown" — that
+                        // would blank the field on save. Resolve it against the
+                        // full master and select it, lifting the filter so the
+                        // pick is visible in the list too.
+                        const typed = v.trim().toLowerCase();
+                        const hidden = typed
+                          ? designations.find((d) => (d.name || '').trim().toLowerCase() === typed)
+                          : undefined;
+                        if (hidden) {
+                          setDesigTyped(null);
+                          setDesigShowAll(true);
+                          setEmploymentDraft((d) => (d ? { ...d, designation_id: hidden.id } : d));
+                          return;
+                        }
+                        // Free text matching nothing: hold it locally and drop the
+                        // id, so a stale pick can never ride along under a label
+                        // that no longer describes it. Save is guarded until this
+                        // is resolved (created, picked, or cleared).
+                        setDesigTyped(v);
+                        setEmploymentDraft((d) => (d ? { ...d, designation_id: '' } : d));
+                      }}
+                      allowCustom
                       placeholder="Pick a designation…"
                     />
+
+                    {/* The department filter, stated plainly with the way out.
+                        Only rendered when it is actually hiding something — a
+                        toggle that reveals nothing is noise. */}
+                    {empDeptId && (desigHiddenCount > 0 || desigShowAll) && (
+                      <p className="mt-1 text-[11px] text-[#8B7355]">
+                        {desigShowAll ? (
+                          <>
+                            Showing all designations.{' '}
+                            <button
+                              type="button"
+                              onClick={() => setDesigShowAll(false)}
+                              className="underline text-[#af4408] hover:text-[#8a3506]"
+                            >
+                              Filter by {deptNameOf(empDeptId) || 'department'}
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            Showing designations for {deptNameOf(empDeptId) || 'this department'} plus generic
+                            ones · {desigHiddenCount} hidden.{' '}
+                            <button
+                              type="button"
+                              onClick={() => setDesigShowAll(true)}
+                              className="underline text-[#af4408] hover:text-[#8a3506]"
+                            >
+                              Show all designations
+                            </button>
+                          </>
+                        )}
+                      </p>
+                    )}
+
+                    {/* The held designation belongs elsewhere: it stays in the
+                        list (hiding it would blank a real assignment on save) —
+                        flagged so a human decides, never auto-cleared. */}
+                    {heldDesigMismatch && (
+                      <p className="mt-1 flex items-start gap-1 text-[11px] text-amber-700">
+                        <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                        <span>
+                          &quot;{heldDesigMismatch.name}&quot; belongs to {heldDesigMismatch.dept}, not{' '}
+                          {deptNameOf(empDeptId) || 'the chosen department'}. It is kept as-is — change it only
+                          if it is wrong.
+                        </span>
+                      </p>
+                    )}
+
+                    {/* Unknown designation → a prompt, not an error. Admin-only,
+                        because POST /api/hr/designations is canAdminHr; managers
+                        get the pointer instead of a button that would 403. */}
+                    {!!desigUnmatched && meLoaded && (
+                      isAdmin ? (
+                        <div className="mt-1.5 space-y-1">
+                          <button
+                            type="button"
+                            onClick={createDesignation}
+                            disabled={desigCreating}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-[#af4408] bg-white text-[#af4408] hover:bg-[#FFF1E3] text-xs font-medium disabled:opacity-50"
+                          >
+                            {desigCreating
+                              ? <Loader2 className="w-3 h-3 animate-spin" />
+                              : <Plus className="w-3 h-3" />}
+                            Create &quot;{desigUnmatched}&quot;{' '}
+                            {createUnderDeptName ? `under ${createUnderDeptName}` : '(any department)'}
+                          </button>
+                          <p className="text-[11px] text-[#8B7355]">
+                            {createUnderDeptName
+                              ? `Adds it to the designations master under ${createUnderDeptName}, so it offers across that department — deactivate or re-link it later on HR Settings.`
+                              : 'No department chosen, so it is added as generic — pickable for every department. Link it to one later on HR Settings.'}
+                          </p>
+                          {desigCreateErr && (
+                            <div className="rounded-lg border border-red-200 bg-red-50 px-2 py-1 text-[11px] text-red-700">
+                              {desigCreateErr}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="mt-1.5 text-[11px] text-[#8B7355]">
+                          &quot;{desigUnmatched}&quot; is not a saved designation. Pick one from the list, or ask an
+                          admin to add it on{' '}
+                          <Link href="/hr/settings" className="underline text-[#af4408] hover:text-[#8a3506]">
+                            HR Settings
+                          </Link>
+                          .
+                        </p>
+                      )
+                    )}
                   </div>
                   <div>
                     <FieldLabel>Grade</FieldLabel>

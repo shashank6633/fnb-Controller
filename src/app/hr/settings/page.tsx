@@ -9,6 +9,11 @@
  * management-tier; MUTATIONS ARE ADMIN-ONLY server-side, so this page surfaces
  * the 403 as friendly copy instead of pretending the buttons will work.
  *
+ * The list is GROUPED BY MAIN DEPARTMENT (a designation pinned to a
+ * sub-department is shown under that sub-department's main, matching how the
+ * employee pickers filter), mains A-Z with 'Any department' last, so an admin
+ * can see at a glance which department each job title belongs to.
+ *
  * Attendance engine card → GET/PUT /api/hr/settings (§8.2): business-day
  * cutoff (hr_day_cutoff, HH:MM IST — a punch before the cutoff belongs to the
  * PREVIOUS attendance day) and punch debounce minutes
@@ -49,6 +54,16 @@ interface Dept {
   parent_id: string | null;
   parent_name: string | null;
   is_active: number;
+}
+
+/** One rendered block of the designations table: every designation that belongs
+ *  to one MAIN department (or the trailing 'Any department' block). */
+interface DesignationGroup {
+  key: string;
+  label: string;
+  /** The 'Any department' (generic) block — always sorted last. */
+  isAny: boolean;
+  rows: DesignationRow[];
 }
 
 const emptyDesignation = (): Partial<DesignationRow> => ({ name: '', department_id: '', grade: '', is_active: 1 });
@@ -127,6 +142,52 @@ export default function HrSettingsPage() {
 
   /** Column shows only when the API actually computed counts. */
   const hasCounts = useMemo(() => (designations || []).some((d) => d.employee_count != null), [designations]);
+
+  /**
+   * Group the visible designations by MAIN department — the same tree rule the
+   * employee pickers use: a designation pinned to a sub-department belongs to
+   * that sub-department's main (departments.parent_id), so "Kitchen" and
+   * "Hot Kitchen" designations sit in one block. Order: mains A-Z, then any
+   * dangling department, then 'Any department' (generic) last. Row order
+   * INSIDE a group is untouched (the API's is_active DESC, name ASC).
+   */
+  const groups = useMemo<DesignationGroup[]>(() => {
+    const byId = new Map(departments.map((d) => [d.id, d]));
+    const map = new Map<string, DesignationGroup>();
+    for (const d of visible) {
+      let key = '';
+      let label = 'Any department';
+      if (d.department_id) {
+        const dept = byId.get(d.department_id);
+        const main = dept ? (dept.parent_id ? byId.get(dept.parent_id) || dept : dept) : null;
+        if (main) {
+          key = main.id;
+          label = main.name;
+        } else {
+          // Departments failed to load, or the department was removed — never
+          // hide the designation, just park it in its own block.
+          key = 'unknown';
+          label = 'Unknown department';
+        }
+      }
+      let g = map.get(key);
+      if (!g) {
+        g = { key, label, isAny: key === '', rows: [] };
+        map.set(key, g);
+      }
+      g.rows.push(d);
+    }
+    return [...map.values()].sort((a, b) => {
+      if (a.isAny !== b.isAny) return a.isAny ? 1 : -1;
+      const aUnknown = a.key === 'unknown';
+      const bUnknown = b.key === 'unknown';
+      if (aUnknown !== bUnknown) return aUnknown ? 1 : -1;
+      return a.label.localeCompare(b.label);
+    });
+  }, [visible, departments]);
+
+  /** colSpan for the group heading rows — keep in step with the header cells. */
+  const columnCount = hasCounts ? 6 : 5;
 
   const friendly = (status: number, serverMsg: string | undefined, fallback: string): string => {
     if (status === 403) return 'Only admins can change designations — ask an admin to make this change.';
@@ -241,14 +302,22 @@ export default function HrSettingsPage() {
 
         {/* Designations */}
         <div className="bg-white border border-[#E8D5C4] rounded-xl shadow overflow-hidden">
-          <div className="px-5 py-4 border-b border-[#E8D5C4] flex flex-wrap items-center justify-between gap-3">
-            <h2 className="font-semibold text-[#2D1B0E] flex items-center gap-2">
-              <BadgeCheck className="w-5 h-5 text-[#af4408]" /> Designations
-              <span className="text-xs font-normal text-[#8B7355]">
-                job titles for the employee master — mutations are admin-only
-              </span>
-            </h2>
-            <label className="flex items-center gap-1.5 text-xs text-[#6B5744]">
+          <div className="px-5 py-4 border-b border-[#E8D5C4] flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+                <BadgeCheck className="w-5 h-5 text-[#af4408]" /> Designations
+                <span className="text-xs font-normal text-[#8B7355]">
+                  job titles for the employee master — mutations are admin-only
+                </span>
+              </h2>
+              {/* The rule the employee pickers now follow — stated once, here. */}
+              <p className="text-xs text-[#8B7355] mt-1 max-w-3xl">
+                A designation attached to a department is offered first for employees in that department (including its
+                sub-departments); &ldquo;Any department&rdquo; designations are offered everywhere. Pickers keep a
+                &ldquo;Show all designations&rdquo; link, so an unusual assignment is never blocked.
+              </p>
+            </div>
+            <label className="flex items-center gap-1.5 text-xs text-[#6B5744] shrink-0">
               <input type="checkbox" checked={showInactive} onChange={(e) => setShowInactive(e.target.checked)} />
               Show inactive
             </label>
@@ -272,59 +341,79 @@ export default function HrSettingsPage() {
                 <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
                   <tr>
                     <th className="text-left py-2 px-3 font-medium">Name</th>
-                    <th className="text-left py-2 px-3 font-medium">Department hint</th>
+                    {/* The exact department pinned on the row — the group heading
+                        above it names the MAIN department that row falls under. */}
+                    <th className="text-left py-2 px-3 font-medium">Department</th>
                     <th className="text-left py-2 px-3 font-medium">Grade</th>
                     {hasCounts && <th className="text-right py-2 px-3 font-medium">Employees</th>}
                     <th className="text-left py-2 px-3 font-medium">Active</th>
                     <th className="text-right py-2 px-3 font-medium">Actions</th>
                   </tr>
                 </thead>
-                <tbody>
-                  {visible.map((d) => (
-                    <tr
-                      key={d.id}
-                      className={`border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3] ${!d.is_active ? 'opacity-50' : ''}`}
-                    >
-                      <td className="py-2 px-3 font-medium text-[#2D1B0E]">{d.name}</td>
-                      <td className="py-2 px-3 text-xs text-[#6B5744]">
-                        {d.department_id ? (
-                          deptNameById.get(d.department_id) || <span className="text-[#8B7355]">Unknown department</span>
-                        ) : (
-                          <span className="text-[#8B7355]">—</span>
+                {groups.map((g) => (
+                  <tbody key={g.key || 'any'}>
+                    {/* Group heading — which department these job titles serve. */}
+                    <tr className="bg-[#FFF1E3]/70 border-t border-[#E8D5C4]">
+                      <td colSpan={columnCount} className="py-1.5 px-3">
+                        <span className="text-[11px] font-semibold uppercase tracking-wide text-[#8B7355]">
+                          {g.label}
+                        </span>
+                        <span className="ml-2 text-[11px] text-[#8B7355]">
+                          {g.rows.length} {g.rows.length === 1 ? 'designation' : 'designations'}
+                        </span>
+                        {g.isAny && (
+                          <span className="ml-2 text-[11px] text-[#8B7355]">— offered to every employee</span>
                         )}
                       </td>
-                      <td className="py-2 px-3 text-xs text-[#6B5744]">
-                        {d.grade || <span className="text-[#8B7355]">—</span>}
-                      </td>
-                      {hasCounts && (
-                        <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744]">
-                          {d.employee_count != null ? d.employee_count : '—'}
-                        </td>
-                      )}
-                      <td className="py-2 px-3">
-                        <Toggle
-                          size="sm"
-                          checked={!!d.is_active}
-                          disabled={togglingId === d.id}
-                          onChange={(next) => setActive(d, next)}
-                          label={d.is_active ? `Deactivate ${d.name}` : `Reactivate ${d.name}`}
-                        />
-                      </td>
-                      <td className="py-2 px-3 text-right">
-                        <button
-                          onClick={() => {
-                            setModalError(null);
-                            setEditing({ ...d });
-                          }}
-                          className="p-1 text-[#6B5744] hover:text-[#af4408]"
-                          title="Edit"
-                        >
-                          <Edit className="w-3.5 h-3.5" />
-                        </button>
-                      </td>
                     </tr>
-                  ))}
-                </tbody>
+                    {g.rows.map((d) => (
+                      <tr
+                        key={d.id}
+                        className={`border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3] ${!d.is_active ? 'opacity-50' : ''}`}
+                      >
+                        <td className="py-2 px-3 font-medium text-[#2D1B0E]">{d.name}</td>
+                        <td className="py-2 px-3 text-xs text-[#6B5744]">
+                          {d.department_id ? (
+                            deptNameById.get(d.department_id) || (
+                              <span className="text-[#8B7355]">Unknown department</span>
+                            )
+                          ) : (
+                            <span className="text-[#8B7355]">—</span>
+                          )}
+                        </td>
+                        <td className="py-2 px-3 text-xs text-[#6B5744]">
+                          {d.grade || <span className="text-[#8B7355]">—</span>}
+                        </td>
+                        {hasCounts && (
+                          <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744]">
+                            {d.employee_count != null ? d.employee_count : '—'}
+                          </td>
+                        )}
+                        <td className="py-2 px-3">
+                          <Toggle
+                            size="sm"
+                            checked={!!d.is_active}
+                            disabled={togglingId === d.id}
+                            onChange={(next) => setActive(d, next)}
+                            label={d.is_active ? `Deactivate ${d.name}` : `Reactivate ${d.name}`}
+                          />
+                        </td>
+                        <td className="py-2 px-3 text-right">
+                          <button
+                            onClick={() => {
+                              setModalError(null);
+                              setEditing({ ...d });
+                            }}
+                            className="p-1 text-[#6B5744] hover:text-[#af4408]"
+                            title="Edit"
+                          >
+                            <Edit className="w-3.5 h-3.5" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                ))}
               </table>
             </div>
           )}
@@ -399,7 +488,7 @@ export default function HrSettingsPage() {
                   />
                 </div>
                 <div>
-                  <label className="text-xs text-[#6B5744]">Department hint</label>
+                  <label className="text-xs text-[#6B5744]">Department</label>
                   {/* Portaled Combobox — a plain absolute dropdown would clip inside this modal. */}
                   <Combobox
                     options={deptOptions}
@@ -414,7 +503,10 @@ export default function HrSettingsPage() {
                     placeholder="Pick a department..."
                   />
                   <p className="text-[10px] text-[#8B7355] mt-1">
-                    A hint for pickers only — it does not restrict which employees can hold the designation.
+                    Employee pickers offer this designation first to that department and its sub-departments. It is a
+                    default, not a restriction — &ldquo;Show all designations&rdquo; still lists it for anyone, and an
+                    employee who already holds it never loses it. Leave it on &ldquo;None (any department)&rdquo; for
+                    titles like Manager or Trainee that belong everywhere.
                   </p>
                 </div>
                 <div>
