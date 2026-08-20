@@ -1,11 +1,13 @@
 import { getDb } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { ctSetting, isTelecmiConfigured, setCtSetting, telecmiAppId } from '@/lib/ct/settings';
-import { addAgent, fetchAgent, updateAgent, type AgentWrite, type TelecmiAgent } from '@/lib/ct/telecmi-api';
+import { describeCallAgents } from '@/lib/ct/agents';
+import { reportServerError } from '@/lib/error-alerts';
+import { addAgent, fetchAgent, updateAgent, type AgentWrite, type TelecmiAgent, type TelecmiResult } from '@/lib/ct/telecmi-api';
 
 /**
  * /api/telecmi/agents — admin-only TeleCMI agent roster (GET) and
- * add / update / refresh (POST).
+ * add / update / refresh / scan / verify (POST).
  *
  * ── WHY THE ROSTER COMES FROM OUR SIDE ─────────────────────────────────────
  * TeleCMI has NO list-users endpoint — /user/add, /user/update and /user/get
@@ -16,11 +18,45 @@ import { addAgent, fetchAgent, updateAgent, type AgentWrite, type TelecmiAgent }
  * /user/get. One dead id must not blank the page, so a failed lookup still
  * yields a row carrying what we know plus an `error`.
  *
+ * ── DISCOVERY IS AN EXTENSION PROBE, NOT A LIST (action 'scan') ─────────────
+ * The consequence of "no list endpoint" is the owner's actual bug: an agent who
+ * exists on TeleCMI but was never typed into agent_map is INVISIBLE here
+ * forever. There is exactly one lever the provider leaves us — TeleCMI derives
+ * an agent id as `<extension>_<appid>` (see addAgent in lib/ct/telecmi-api.ts),
+ * the appid is ours, and extensions are small consecutive numbers. So 'scan'
+ * enumerates the roster by PROBING a bounded range of extensions, one
+ * /user/get per candidate: a hit means that agent exists.
+ *
+ * That is a third-party API being hit N times, so it is fenced:
+ *   · admin-only and ONLY on an explicit button press — never on page load,
+ *     never on a timer, never as a side effect of add/update/refresh;
+ *   · at most MAX_SCAN_EXTENSIONS (200) candidates per scan, a wider range is
+ *     refused with the number to narrow to;
+ *   · the same ENRICH_CONCURRENCY pool the GET uses, under a wall-clock budget;
+ *     past the deadline the scan returns what it found plus `timed_out` and
+ *     `last_ext` — the last extension it actually reached — so the admin
+ *     resumes from there instead of the scan silently under-reporting;
+ *   · a "not found" is the NORMAL answer for most candidates: it costs one
+ *     request, logs nothing, and is never surfaced as an error.
+ *
+ * ── 'verify' — THE OTHER HALF: an id that lingers after being removed ───────
+ * /user/get each id already in agent_map and report live / missing. The rule
+ * that matters: a TRANSPORT failure (timeout, network, 5xx, rate limit, bad
+ * credentials) is reported as `unknown`, NEVER as missing. Calling a working
+ * agent dead because the network hiccuped is how a real GRE gets deleted from
+ * the roster.
+ *
+ * BOTH SCAN AND VERIFY ARE READ-ONLY. Neither writes agent_map or any setting;
+ * discovery is a read, and adding a found agent to the roster stays the
+ * admin's explicit next step.
+ *
  * ── SECRETS ────────────────────────────────────────────────────────────────
  * /user/get returns the agent's PASSWORD. Rows are therefore built by an
  * explicit whitelist (toRow) rather than by spreading the upstream object —
  * spreading would ship that password to the browser the day TeleCMI adds a
- * field, and nobody would notice. Nothing here logs a request body either.
+ * field, and nobody would notice. Scan returns rows through that same toRow, so
+ * a probe cannot leak what the roster does not. Nothing here logs a request
+ * body either.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -32,8 +68,32 @@ const ENRICH_CONCURRENCY = 5;
 
 /** Whole-GET budget for enrichment. Each lookup can burn the client's 8s
  *  timeout; with a large map that multiplies into minutes of a held-open page.
- *  Past the deadline the remaining ids return unenriched rather than hanging. */
+ *  Past the deadline the remaining ids return unenriched rather than hanging.
+ *  'verify' reuses it — it is the same workload as the GET's enrichment pass. */
 const ENRICH_BUDGET_MS = 20_000;
+
+/** Hard cap on candidates in ONE scan. 200 extensions at ENRICH_CONCURRENCY is
+ *  ~40 sequential round trips against a shared provider — enough to cover two
+ *  whole 100-blocks, small enough that a fat-fingered 1..99999 is refused
+ *  rather than fired. */
+const MAX_SCAN_EXTENSIONS = 200;
+
+/** Sibling of ENRICH_BUDGET_MS for the scan, which probes up to 200 candidates
+ *  instead of a roster's worth. Past it the scan reports `timed_out` and the
+ *  last extension reached; it never keeps a request open indefinitely. */
+const SCAN_BUDGET_MS = 30_000;
+
+/** Extensions are dialled numbers, not ids — reject anything that isn't one. */
+const MAX_EXTENSION = 99_999_999;
+
+/** Extensions are handed out in hundreds ("the 5000s"), which is what makes a
+ *  bounded probe viable at all. Used to widen a derived range to a whole block. */
+const SCAN_BLOCK = 100;
+
+/** Last-resort range when NOTHING is known — no mapping, no call history. The
+ *  owner's handsets are 5002..5007, and TeleCMI's own onboarding hands out the
+ *  5000s, so this is the block worth guessing before asking for a range. */
+const DEFAULT_SCAN_FROM = 5000;
 
 interface AgentRow {
   agent_id: string;
@@ -269,6 +329,143 @@ function checkPassword(raw: unknown): { error: string } | { password: string } {
   return { password };
 }
 
+/* ── DISCOVERY (scan) + ROSTER HEALTH (verify) ────────────────────────────── */
+
+/**
+ * The three answers a /user/get can give, and the ONLY place the difference is
+ * decided — scan and verify must not each invent their own rule.
+ *
+ *   'exists'  — TeleCMI returned an agent record with something identifying in
+ *               it. This extension is taken; for scan, that IS the discovery.
+ *   'absent'  — TeleCMI answered, understood us, and has no such agent. The
+ *               normal answer for most probed candidates.
+ *   'unknown' — WE DO NOT KNOW. Reported, never conflated with 'absent'.
+ */
+type LookupVerdict = 'exists' | 'absent' | 'unknown';
+
+/**
+ * Errors that say nothing about whether the agent exists. Matched on the
+ * provider's message because TeleCMI answers HTTP 200 with a non-200 `code` for
+ * most failures (see post() in lib/ct/telecmi-api.ts), so status alone would
+ * read an "Authentication Failed" as "this agent is gone" — and verify would
+ * then hand an admin a list of live GREs to delete.
+ */
+const AMBIGUOUS_ERROR = /auth|credential|secret|appid|token|forbid|denied|permission|parameter missing|rate|too many|timed? ?out|did not respond|request failed|internal|server error|unavailable|try again/i;
+
+/** Did TeleCMI hand back an actual agent, or a 200 with nothing in it? */
+function hasAgentIdentity(a: TelecmiAgent | null): boolean {
+  if (!a) return false;
+  return !!(strOrNull(a.name) || strOrNull(a.agent_id) || strOrNull(a.phone) || numOrNull(a.extension) != null);
+}
+
+function classifyLookup(res: TelecmiResult<{ agent: TelecmiAgent }>): { verdict: LookupVerdict; agent: TelecmiAgent | null } {
+  if (res.ok) {
+    const agent = pickAgent(res.data);
+    // A 200 carrying no agent record is NOT proof of absence — the GET treats
+    // the same shape as a failed row rather than an empty agent, and so must
+    // this. If a provider change ever makes that the miss response, a scan
+    // reports the candidates as unreachable, which is visible; claiming the
+    // extensions are free would not be.
+    return hasAgentIdentity(agent) ? { verdict: 'exists', agent } : { verdict: 'unknown', agent: null };
+  }
+  // status 0 = the request never completed (network / 8s abort). 429 / 5xx are
+  // the provider refusing to answer. None of them are evidence about the agent.
+  if (res.status === 0 || res.status >= 500 || res.status === 429 || res.status === 401 || res.status === 403) {
+    return { verdict: 'unknown', agent: null };
+  }
+  if (AMBIGUOUS_ERROR.test(String(res.error || ''))) return { verdict: 'unknown', agent: null };
+  return { verdict: 'absent', agent: null };
+}
+
+/**
+ * Leading extension of a TeleCMI identity: '5004_33338614' → 5004, '101' → 101,
+ * 'gre.ravi' → null. Anchored and terminated so '5002abc' is not read as 5002.
+ */
+function leadingExtension(id: string): number | null {
+  const m = /^(\d{1,8})(?:_|$)/.exec(String(id || '').trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n > 0 && n <= MAX_EXTENSION ? n : null;
+}
+
+/**
+ * Every extension we already have a reason to believe in: the agent_map keys an
+ * admin typed, PLUS the TeleCMI ids that have actually appeared on calls
+ * (describeCallAgents) — an agent can be answering calls while absent from the
+ * map, which is precisely the case this feature exists for. App-login values
+ * are excluded there by `kind`, so an email never becomes an extension.
+ * Call history is a HINT: if it cannot be read the scan still works.
+ */
+function knownExtensions(db: ReturnType<typeof getDb>, map: Record<string, string>): number[] {
+  const out = new Set<number>();
+  for (const key of Object.keys(map)) {
+    const e = leadingExtension(key);
+    if (e) out.add(e);
+  }
+  try {
+    for (const a of describeCallAgents(db)) {
+      if (a.kind !== 'telecmi') continue;
+      const e = leadingExtension(a.id);
+      if (e) out.add(e);
+    }
+  } catch { /* history is a hint, never a hard dependency */ }
+  return Array.from(out).sort((a, b) => a - b);
+}
+
+/**
+ * The range to probe when the caller names none.
+ *
+ * DERIVATION: take the lowest extension we know of and widen DOWN to its
+ * hundred-block — floor(min/100)*100 .. +99 — because that block is where the
+ * neighbours of a known handset live (know 5002, and 5007 is worth probing).
+ * When the known extensions straddle more than one block the top is widened to
+ * cover the highest known one too, so a default scan can never fail to reach an
+ * extension we already knew about; that widening is clamped to
+ * MAX_SCAN_EXTENSIONS, and anything beyond it needs an explicit range.
+ * Knowing nothing at all falls back to DEFAULT_SCAN_FROM's block.
+ */
+function defaultScanRange(known: number[]): { from: number; to: number } {
+  if (!known.length) return { from: DEFAULT_SCAN_FROM, to: DEFAULT_SCAN_FROM + SCAN_BLOCK - 1 };
+  const min = known[0];
+  const max = known[known.length - 1];
+  const from = Math.max(1, Math.floor(min / SCAN_BLOCK) * SCAN_BLOCK);
+  let to = from + SCAN_BLOCK - 1;
+  if (max > to) {
+    to = Math.min(Math.floor(max / SCAN_BLOCK) * SCAN_BLOCK + SCAN_BLOCK - 1, from + MAX_SCAN_EXTENSIONS - 1);
+  }
+  return { from, to };
+}
+
+/** null = the caller named no range (derive one). Otherwise a validated range
+ *  or the reason it was refused — including the cap, which says what to do. */
+function parseScanRange(body: any): { error: string } | { from: number; to: number } | null {
+  const rawFrom = body?.from;
+  const rawTo = body?.to;
+  const hasFrom = rawFrom != null && rawFrom !== '';
+  const hasTo = rawTo != null && rawTo !== '';
+  if (!hasFrom && !hasTo) return null;
+  if (!hasFrom || !hasTo) {
+    return { error: 'Give both from and to, or neither — with neither, the range is derived from the extensions already known.' };
+  }
+  const from = Number(rawFrom);
+  const to = Number(rawTo);
+  if (!Number.isInteger(from) || from < 1 || from > MAX_EXTENSION) {
+    return { error: `from must be a whole extension number between 1 and ${MAX_EXTENSION}.` };
+  }
+  if (!Number.isInteger(to) || to < 1 || to > MAX_EXTENSION) {
+    return { error: `to must be a whole extension number between 1 and ${MAX_EXTENSION}.` };
+  }
+  if (to < from) return { error: 'to must not be lower than from.' };
+  const span = to - from + 1;
+  if (span > MAX_SCAN_EXTENSIONS) {
+    return {
+      error: `A scan checks at most ${MAX_SCAN_EXTENSIONS} extensions at a time, and ${from}–${to} is ${span}. `
+        + `Narrow it (e.g. ${from}–${from + MAX_SCAN_EXTENSIONS - 1}) and scan the rest afterwards.`,
+    };
+  }
+  return { from, to };
+}
+
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
@@ -281,6 +478,9 @@ export async function POST(req: Request) {
   if (!isTelecmiConfigured(db)) {
     // Writes spend real money and change real telephony config — there is no
     // sane mock. Refuse clearly instead of pretending an agent was created.
+    // This also gates the read-only scan/verify below, correctly: with no
+    // credentials there is no account to discover agents in, and a mocked
+    // "found nothing" would be indistinguishable from a genuinely empty PBX.
     return Response.json(
       { configured: false, error: 'TeleCMI is not configured. Add the App ID and Secret in CRM Settings first.' },
       { status: 400 },
@@ -326,6 +526,47 @@ export async function POST(req: Request) {
     setCtSetting(db, 'agent_map', JSON.stringify(map));
 
     return Response.json({ ok: true, agent: toRow(key, map[key], created) });
+  }
+
+  /* ── MAP: put a DISCOVERED agent into the roster ──────────────────────────
+   * The other half of `scan`. Scan is read-only and returns agents that exist
+   * on TeleCMI; this is the explicit "yes, add that one" — it puts the id in
+   * agent_map with an EMPTY value (present in the roster, not yet assigned to
+   * a staff member), exactly as the `add` branch does after creating an agent.
+   *
+   * WHY NOT DO THIS THROUGH THE CRM SETTINGS PUT (/api/crm-calls/settings,
+   * key agent_map). Because that validator builds a canonical REPLACEMENT of
+   * the whole object and keeps only entries that have BOTH a key and a value
+   * (`if (key && val) clean[key] = val`). A freshly discovered agent has no
+   * staff member yet, so it would be dropped on the way in — and every other
+   * already-discovered-but-unassigned id would be deleted on the way past. In
+   * the worst case the map stores '{}' and the roster is wiped. Merge here, on
+   * the route that owns the roster, and never route an unassigned id through
+   * that PUT.
+   *
+   * TeleCMI is NOT contacted: scan already proved the agent exists, and a
+   * second lookup would double the provider traffic for no new fact. The row
+   * comes back unenriched; the next GET enriches it like any other. */
+  if (action === 'map') {
+    const rawId = String(body?.id ?? '').trim();
+    if (!rawId) return Response.json({ error: 'Agent id is required.' }, { status: 400 });
+    if (rawId.length > 100) return Response.json({ error: 'Agent id is too long.' }, { status: 400 });
+
+    const { map, error: mapError } = readAgentMap(db);
+    if (mapError) {
+      return Response.json({
+        error: `The roster mapping could not be read, so nothing was changed. ${mapError}`,
+      }, { status: 409 });
+    }
+    const key = mapKey(rawId);
+    const already = key in map;
+    if (!already) {
+      map[key] = '';                 // unassigned until an admin picks a user
+      setCtSetting(db, 'agent_map', JSON.stringify(map));
+    }
+    // Idempotent: adding an id twice (double click, "Add all" re-run) is a
+    // no-op that still reports success, so the client never has to special-case it.
+    return Response.json({ ok: true, already, agent: toRow(key, map[key], null) });
   }
 
   if (action === 'update') {
@@ -385,5 +626,130 @@ export async function POST(req: Request) {
     return Response.json({ ok: true, agent: toRow(id, map[key] ?? map[id] ?? '', pickAgent(res.data)) });
   }
 
-  return Response.json({ error: "action must be 'add', 'update' or 'refresh'." }, { status: 400 });
+  // ── DISCOVERY — READ-ONLY, EXPLICIT, BOUNDED. See the header docblock. ────
+  // Nothing below writes agent_map or any other setting: the admin decides what
+  // to do with what is found. Both are one-button admin actions; neither is
+  // reachable from a page load or a timer.
+  if (action === 'scan') {
+    try {
+      const appid = telecmiAppId(db);
+      if (!appid) {
+        // isTelecmiConfigured above already requires it; this is the guard that
+        // stops a blank appid turning every probe into a lookup for "5002_".
+        return Response.json({ error: 'The TeleCMI App ID is missing, so agent ids cannot be built. Add it in CRM Settings.' }, { status: 400 });
+      }
+
+      // A roster we cannot read makes `new_ids` a lie — every found agent would
+      // be reported as new, and the admin would re-add agents they already have.
+      // Refuse rather than mislead, the same way GET does.
+      const { map, error: mapError } = readAgentMap(db);
+      if (mapError) return Response.json({ error: mapError }, { status: 400 });
+
+      const asked = parseScanRange(body);
+      if (asked && 'error' in asked) return Response.json({ error: asked.error }, { status: 400 });
+      const { from, to } = asked ?? defaultScanRange(knownExtensions(db, map));
+
+      const exts: number[] = [];
+      for (let e = from; e <= to; e++) exts.push(e);
+
+      const deadline = Date.now() + SCAN_BUDGET_MS;
+      // The LOWEST extension the budget stopped us reaching. Everything below it
+      // was probed, so `last_ext` below is a resume point that cannot skip a
+      // candidate — a pool finishes out of order, so "the highest one probed"
+      // would not be safe to resume from.
+      let firstSkipped = Number.POSITIVE_INFINITY;
+
+      const probes = await mapWithLimit(exts, ENRICH_CONCURRENCY, async (ext) => {
+        const id = `${ext}_${appid}`;
+        if (Date.now() > deadline) {
+          if (ext < firstSkipped) firstSkipped = ext;
+          return { ext, id, verdict: 'skipped' as const, agent: null as TelecmiAgent | null };
+        }
+        try {
+          const res = await fetchAgent(db, id);
+          const c = classifyLookup(res);
+          return { ext, id, verdict: c.verdict as LookupVerdict | 'skipped', agent: c.agent };
+        } catch {
+          // fetchAgent already swallows transport errors; an unexpected throw is
+          // "we do not know", never "this extension is free".
+          return { ext, id, verdict: 'unknown' as const, agent: null as TelecmiAgent | null };
+        }
+      });
+
+      const found = sortRows(
+        probes
+          .filter(p => p.verdict === 'exists')
+          .map(p => toRow(p.id, map[p.id] ?? map[mapKey(p.id)] ?? '', p.agent)),
+      );
+
+      const mapped = new Set(Object.keys(map).map(mapKey));
+      const new_ids = found.map(r => r.agent_id).filter(id => !mapped.has(mapKey(id)));
+
+      // Probes that answered nothing usable. Reported for the same reason
+      // `timed_out` is: "found 3" after 40 refused requests is under-reporting,
+      // and an admin who cannot see that has no reason to scan again.
+      const unreachable = probes.filter(p => p.verdict === 'unknown').map(p => p.id);
+
+      const timed_out = Number.isFinite(firstSkipped);
+      return Response.json({
+        ok: true,
+        scanned: probes.filter(p => p.verdict !== 'skipped').length,
+        found,
+        new_ids,
+        unreachable,
+        timed_out,
+        // Everything up to and including last_ext was actually probed, so
+        // "scan again from last_ext + 1" cannot miss a candidate.
+        last_ext: timed_out ? firstSkipped - 1 : to,
+        range: { from, to },
+      });
+    } catch (e) {
+      reportServerError(e, { url: '/api/telecmi/agents (scan)' });
+      return Response.json({ error: 'The agent scan failed unexpectedly. Nothing was changed.' }, { status: 500 });
+    }
+  }
+
+  if (action === 'verify') {
+    try {
+      const { map, error: mapError } = readAgentMap(db);
+      if (mapError) return Response.json({ error: mapError }, { status: 400 });
+
+      const ids = Object.keys(map);
+      if (ids.length === 0) {
+        return Response.json({ ok: true, checked: 0, live: [], missing: [], unknown: [], timed_out: false });
+      }
+
+      const deadline = Date.now() + ENRICH_BUDGET_MS;
+      const results = await mapWithLimit(ids, ENRICH_CONCURRENCY, async (id) => {
+        if (Date.now() > deadline) return { id, verdict: 'skipped' as const };
+        try {
+          return { id, verdict: classifyLookup(await fetchAgent(db, id)).verdict as LookupVerdict | 'skipped' };
+        } catch {
+          return { id, verdict: 'unknown' as const };
+        }
+      });
+
+      // THE RULE: only a definite "TeleCMI answered and has no such agent" is
+      // `missing`. Transport failures AND ids the budget never reached are
+      // `unknown` — an id we did not manage to check must never be offered up
+      // for removal.
+      const live = results.filter(r => r.verdict === 'exists').map(r => r.id);
+      const missing = results.filter(r => r.verdict === 'absent').map(r => r.id);
+      const unknown = results.filter(r => r.verdict === 'unknown' || r.verdict === 'skipped').map(r => r.id);
+
+      return Response.json({
+        ok: true,
+        checked: results.filter(r => r.verdict !== 'skipped').length,
+        live,
+        missing,
+        unknown,
+        timed_out: results.some(r => r.verdict === 'skipped'),
+      });
+    } catch (e) {
+      reportServerError(e, { url: '/api/telecmi/agents (verify)' });
+      return Response.json({ error: 'The roster check failed unexpectedly. Nothing was changed.' }, { status: 500 });
+    }
+  }
+
+  return Response.json({ error: "action must be 'add', 'update', 'map', 'refresh', 'scan' or 'verify'." }, { status: 400 });
 }

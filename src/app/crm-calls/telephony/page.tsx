@@ -15,7 +15,14 @@
  *     and every downstream feature (recovery queue, attribution, win-back) is
  *     quietly working off half the calls.
  *   3 Agents — extensions, working hours and SMS notify, plus whether each one
- *     is mapped to an FNB user (an unmapped GRE cannot click-to-call).
+ *     is mapped to an FNB user (an unmapped GRE cannot click-to-call). TeleCMI
+ *     publishes NO list-users endpoint, so this roster can only ever be the
+ *     agents someone added here. That is a silent failure mode of its own: an
+ *     extension that exists on TeleCMI but was never added is invisible on this
+ *     page forever. Two controls close that gap and neither runs on its own —
+ *     "Scan TeleCMI for agents" probes a bounded range of candidate extensions
+ *     to find agents we are missing, and "Check roster against TeleCMI" asks the
+ *     reverse question, which of our ids TeleCMI no longer recognises.
  *   4 Caller ID — which outbound number an agent presents.
  *   5 Recordings — whether a CDR webhook has EVER arrived, and what TeleCMI
  *     actually puts in its recording field. Read-only. The player fails with a
@@ -49,7 +56,7 @@
  * APIs (all admin-gated, all POSTs CSRF-protected via @/lib/api):
  *   GET  /api/telecmi/balance
  *   GET  /api/telecmi/analysis?days=N
- *   GET  /api/telecmi/agents      POST /api/telecmi/agents   (add|update|refresh)
+ *   GET  /api/telecmi/agents      POST /api/telecmi/agents   (add|update|refresh|scan|verify|map)
  *   POST /api/telecmi/callerid    (login|list|set)
  *   GET  /api/telecmi/recording-diagnostic         (+ ?probe=1 for the upstream try)
  *   GET  /api/telecmi/recording-retention   PUT /api/telecmi/recording-retention
@@ -60,6 +67,7 @@ import {
   Phone, Wallet, BarChart3, Users, PhoneOutgoing, Loader2, AlertCircle,
   AlertTriangle, CheckCircle2, RefreshCw, Lock, Plus, Pencil, KeyRound,
   Link2Off, PlugZap, X, Save, Info, FileAudio, Timer,
+  ScanSearch, ListChecks, UserPlus, ChevronDown, ChevronRight,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
@@ -108,6 +116,77 @@ type AgentRow = {
 };
 
 type AgentsResp = { configured: boolean; agents: AgentRow[]; error?: string };
+
+/* ── Discovery: POST { action: 'scan' } ───────────────────────────────────────
+ *
+ * WHY A SCAN HAS TO EXIST. TeleCMI publishes no list-users endpoint — /user/add,
+ * /user/update and /user/get are the whole API, and /user/get needs an id you
+ * already know. So the roster is not "the agents on this account", it is "the
+ * agents somebody typed into agent_map", and an extension that exists upstream
+ * but was never added here can never appear. The one lever the provider leaves
+ * us is that an agent id is `<extension>_<appid>` and extensions are small
+ * consecutive numbers, so the SERVER probes a bounded range of candidates, one
+ * /user/get each, and reports which ones answer. A "not found" is the normal
+ * answer for most candidates and is not an error anywhere in this flow.
+ *
+ * EVERY FIELD IS OPTIONAL AND EVERY READ GOES THROUGH A NORMALIZER. This page
+ * and the route behind it are written at the same time by different people; a
+ * field that has not landed yet must degrade to "not stated", never to a
+ * TypeError inside render on the one screen an admin opens BECAUSE the phone
+ * system is misbehaving.
+ */
+type ScanFound = {
+  extension: number | null;
+  agent_id: string;
+  /** TeleCMI's own name for this agent — the whole point of showing the row. */
+  name: string;
+  phone: string;
+  /** The route's verdict on whether this id is already mapped; null = not stated. */
+  in_roster: boolean | null;
+};
+
+type ScanState = {
+  /** Candidate extensions actually probed. */
+  scanned: number | null;
+  from: number | null;
+  to: number | null;
+  found: ScanFound[];
+  /**
+   * The scan hit its time budget. Everything past `last_extension` was NOT
+   * looked at, so the result is a floor and not a roster — rendered as such,
+   * because a truncated scan presented as complete would "prove" an agent does
+   * not exist on TeleCMI when nobody ever asked about them.
+   */
+  timed_out: boolean;
+  last_extension: number | null;
+};
+
+/* ── Roster verification: POST { action: 'verify' } ───────────────────────────
+ * The reverse question: of the ids WE hold, which does TeleCMI still recognise?
+ * "Not recognised" and "could not be checked" are kept apart all the way to the
+ * screen — the first is a removed extension, the second is a transport failure
+ * that says nothing at all about the id, and merging them would invite an admin
+ * to clear a live agent because the network hiccuped. */
+type VerifyRow = {
+  agent_id: string;
+  extension: number | null;
+  name: string;
+  mapped_email: string | null;
+  /** Why it could not be checked; only meaningful on the `unchecked` list. */
+  reason: string;
+};
+
+type VerifyState = {
+  checked: number | null;
+  live: number | null;
+  missing: VerifyRow[];
+  unchecked: VerifyRow[];
+};
+
+/** Hard client-side cap on one scan, mirroring the route's own. One candidate
+ *  is one request to a third party, so a fat-fingered range is refused here
+ *  rather than fired at the provider and refused there. */
+const SCAN_MAX_CANDIDATES = 200;
 
 type CallerIdEntry = { pstn: number; price: number; capacity: number; profile: string };
 
@@ -347,6 +426,76 @@ function normalizeAgent(a: any): AgentRow {
   };
 }
 
+/** The one key form for comparing agent ids anywhere on this page. It matches
+ *  the canonical agent_map key the server stores (trim + lowercase), so a
+ *  discovered "5007_APPID" and a mapped "5007_appid" are one agent, not two. */
+const canonAgentId = (id: unknown): string => String(id ?? '').trim().toLowerCase();
+
+const numOrNull = (v: unknown): number | null =>
+  (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+
+/** First value that is actually stated. Used to accept a couple of spellings
+ *  from a route being written in parallel without pretending a missing field
+ *  is a false/zero. */
+const firstDefined = (...vals: unknown[]): unknown => vals.find(v => v != null);
+
+function normalizeScanRow(f: any): ScanFound {
+  const inRoster = firstDefined(f?.in_roster, f?.in_map, f?.mapped);
+  return {
+    extension: numOrNull(f?.extension),
+    agent_id: String(f?.agent_id ?? f?.id ?? '').trim(),
+    name: String(f?.name ?? ''),
+    phone: String(f?.phone ?? ''),
+    in_roster: typeof inRoster === 'boolean' ? inRoster : null,
+  };
+}
+
+function normalizeScan(j: any): ScanState {
+  const rows = Array.isArray(j?.found) ? j.found : Array.isArray(j?.agents) ? j.agents : [];
+  return {
+    scanned: numOrNull(firstDefined(j?.scanned, j?.candidates)),
+    from: numOrNull(j?.from),
+    to: numOrNull(j?.to),
+    found: rows.map(normalizeScanRow),
+    // Strictly true-only: an absent flag means "the route did not say", which
+    // must read as a complete scan, not as a truncated one.
+    timed_out: j?.timed_out === true,
+    last_extension: numOrNull(firstDefined(j?.last_extension, j?.reached_extension, j?.last_reached)),
+  };
+}
+
+/** A row may arrive as a bare id string — that is still a usable answer. */
+function normalizeVerifyRow(r: any): VerifyRow {
+  if (typeof r === 'string') {
+    return { agent_id: r.trim(), extension: null, name: '', mapped_email: null, reason: '' };
+  }
+  return {
+    agent_id: String(r?.agent_id ?? r?.id ?? '').trim(),
+    extension: numOrNull(r?.extension),
+    name: String(r?.name ?? ''),
+    mapped_email: r?.mapped_email ? String(r.mapped_email) : null,
+    reason: String(firstDefined(r?.reason, r?.error) ?? ''),
+  };
+}
+
+function normalizeVerify(j: any): VerifyState {
+  const arr = (v: unknown): VerifyRow[] => (Array.isArray(v) ? v.map(normalizeVerifyRow) : []);
+  const missing = arr(firstDefined(j?.missing, j?.unrecognised, j?.not_found));
+  const unchecked = arr(firstDefined(j?.unchecked, j?.could_not_check, j?.failed));
+  const checked = numOrNull(firstDefined(j?.checked, j?.total));
+  // live is derived only when the route did not state it: every checked id is
+  // exactly one of live / not-recognised / not-checked, so the subtraction is
+  // an identity rather than a guess. Still null when there is no total to
+  // subtract from — an invented count is worse than a dash.
+  const stated = numOrNull(firstDefined(j?.live, j?.recognised, j?.ok_count));
+  return {
+    checked,
+    live: stated ?? (checked == null ? null : Math.max(0, checked - missing.length - unchecked.length)),
+    missing,
+    unchecked,
+  };
+}
+
 type GetResult<T> = { ok: true; data: T } | { ok: false; error: string; locked?: boolean };
 
 /** One GET path for every section: a failed load must never fall through and
@@ -536,6 +685,23 @@ export default function TelephonyPage() {
   const [editing, setEditing] = useState<{ mode: 'add' } | { mode: 'edit'; agent: AgentRow } | null>(null);
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [agentFlash, setAgentFlash] = useState<string | null>(null);
+
+  // 3b · Discovery + verification. Separate state from the roster on purpose:
+  // both are opt-in, both cost real TeleCMI requests, and neither may change
+  // what the roster shows unless the admin actually maps something.
+  const [scan, setScan] = useState<ScanState | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [rangeOpen, setRangeOpen] = useState(false);
+  const [rangeFrom, setRangeFrom] = useState('');
+  const [rangeTo, setRangeTo] = useState('');
+  /** The id currently being written into agent_map (also the busy marker). */
+  const [mappingId, setMappingId] = useState<string | null>(null);
+  const [mappingAll, setMappingAll] = useState(false);
+  const [mapError, setMapError] = useState<string | null>(null);
+  const [verify, setVerify] = useState<VerifyState | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
 
   // 4 · Caller ID
   const [sessions, setSessions] = useState<Record<string, CallerIdSession>>({});
@@ -808,6 +974,196 @@ export default function TelephonyPage() {
       setRefreshingId(null);
     }
   };
+
+  /* ── 3b · Discovery, mapping and verification ─────────────────────────────
+   *
+   * All three below are BUTTON-ONLY. Nothing here runs on mount, on a timer, or
+   * as a side effect of anything else on this page: a scan is up to a couple of
+   * hundred requests at a third party, and a diagnostic that fires on every page
+   * open is a diagnostic somebody eventually rips out.
+   */
+
+  /** Ids the roster already holds, in canonical form. */
+  const rosterIds = useMemo(
+    () => new Set(agents.map(a => canonAgentId(a.agent_id))),
+    [agents],
+  );
+
+  /** One POST path for the three new actions, so 401/403 locks the page exactly
+   *  as every GET on it does rather than surfacing as a puzzling error string. */
+  const postAgents = async (
+    body: Record<string, unknown>,
+  ): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string }> => {
+    try {
+      const r = await api('/api/telecmi/agents', { method: 'POST', body });
+      if (r.status === 401 || r.status === 403) {
+        setLocked(true);
+        return { ok: false, error: 'Admin only' };
+      }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) return { ok: false, error: String(j?.error || `HTTP ${r.status}`) };
+      return { ok: true, data: j };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'Network error' };
+    }
+  };
+
+  /**
+   * Scan a bounded range of candidate extensions.
+   *
+   * The range is validated HERE as well as on the server because the cost of a
+   * wide range is paid at TeleCMI, not by us: 5000–9999 is five thousand
+   * requests to somebody else's account, and it should never leave the browser.
+   * With no range typed, nothing is sent and the route's own default governs —
+   * one definition of "the usual extensions", not two that can drift apart.
+   */
+  const runScan = async (override?: { from: number; to: number }) => {
+    if (scanning) return;
+    setScanError(null); setMapError(null);
+
+    const body: Record<string, unknown> = { action: 'scan' };
+    if (override) {
+      body.from = override.from;
+      body.to = override.to;
+    } else {
+      const rawFrom = rangeFrom.trim();
+      const rawTo = rangeTo.trim();
+      if (rawFrom || rawTo) {
+        const f = Number(rawFrom);
+        const t = Number(rawTo);
+        if (!Number.isInteger(f) || f <= 0 || !Number.isInteger(t) || t <= 0) {
+          setScanError('Give both a from and a to extension as whole numbers — for example 5000 and 5010.');
+          return;
+        }
+        if (t < f) {
+          setScanError('The “to” extension must not be lower than the “from” extension.');
+          return;
+        }
+        if (t - f + 1 > SCAN_MAX_CANDIDATES) {
+          setScanError(
+            `That range is ${count(t - f + 1)} extensions. A scan asks TeleCMI once per extension, so it is capped at ${SCAN_MAX_CANDIDATES} — narrow the range and scan again for the rest.`,
+          );
+          return;
+        }
+        body.from = f;
+        body.to = t;
+      }
+    }
+
+    setScanning(true);
+    const r = await postAgents(body);
+    if (!r.ok) {
+      setScanError(r.error);
+      setScan(null);
+    } else if (r.data?.configured === false) {
+      setScanError(String(r.data?.error || 'TeleCMI is not configured, so there is nothing to scan.'));
+      setScan(null);
+    } else if (r.data?.error && !Array.isArray(r.data?.found) && !Array.isArray(r.data?.agents)) {
+      // A 200 carrying an error and no list is a failure wearing a success code.
+      setScanError(String(r.data.error));
+      setScan(null);
+    } else {
+      setScan(normalizeScan(r.data));
+      // A 200 that DID list agents but also carried an error is a partial scan;
+      // show both rather than choosing one.
+      setScanError(r.data?.error ? String(r.data.error) : null);
+    }
+    setScanning(false);
+  };
+
+  /**
+   * Map one discovered id into agent_map so it joins the roster.
+   *
+   * WHY THIS DOES NOT PUT agent_map THROUGH THE CRM SETTINGS ROUTE. That route
+   * stores a canonical REPLACEMENT of the whole object and drops every entry
+   * whose value is empty — and a freshly discovered agent has no FNB user yet,
+   * so it would be dropped on the way in while every other unassigned agent
+   * already in the map would be deleted on the way past. The agents route
+   * merges a single id into the stored map exactly as `add` already does.
+   */
+  const addToRoster = async (id: string): Promise<string | null> => {
+    const r = await postAgents({ action: 'map', id });
+    if (!r.ok) {
+      return /action must be/i.test(r.error)
+        ? `${id} could not be added to the roster mapping — this app's agent API does not accept a mapping write. Nothing was changed on TeleCMI or here.`
+        : r.error;
+    }
+    const saved = r.data?.agent ? normalizeAgent(r.data.agent) : null;
+    if (saved) {
+      setAgents(prev => (prev.some(a => canonAgentId(a.agent_id) === canonAgentId(saved.agent_id))
+        ? prev.map(a => (canonAgentId(a.agent_id) === canonAgentId(saved.agent_id) ? saved : a))
+        : [...prev, saved]));
+    } else {
+      // The route said yes but did not echo the row — re-pull rather than paint
+      // a roster entry we were never actually given.
+      await loadAgents();
+    }
+    return null;
+  };
+
+  const mapOne = async (id: string) => {
+    if (mappingId || mappingAll) return;
+    setMappingId(id); setMapError(null);
+    const err = await addToRoster(id);
+    if (err) setMapError(err);
+    else {
+      setAgentFlash(`✓ ${id} added to the roster`);
+      setTimeout(() => setAgentFlash(null), 4000);
+    }
+    setMappingId(null);
+  };
+
+  /** Sequential, and it STOPS at the first failure. Racing a dozen writes at one
+   *  ct_settings row would have them overwrite each other's merges, and carrying
+   *  on past an error would bury the one message that explains the gap. */
+  const mapAllNew = async (ids: string[]) => {
+    if (mappingId || mappingAll) return;
+    setMappingAll(true); setMapError(null);
+    let done = 0;
+    for (const id of ids) {
+      setMappingId(id);
+      const err = await addToRoster(id);
+      if (err) {
+        setMapError(done > 0 ? `Added ${count(done)} of ${count(ids.length)}, then stopped: ${err}` : err);
+        break;
+      }
+      done += 1;
+    }
+    setMappingId(null);
+    setMappingAll(false);
+    if (done > 0) {
+      setAgentFlash(`✓ ${count(done)} agent${done === 1 ? '' : 's'} added to the roster`);
+      setTimeout(() => setAgentFlash(null), 4000);
+    }
+  };
+
+  /** Ask TeleCMI about every id we already hold. */
+  const runVerify = async () => {
+    if (verifying) return;
+    setVerifying(true); setVerifyError(null);
+    const r = await postAgents({ action: 'verify' });
+    if (!r.ok) {
+      setVerifyError(r.error);
+      setVerify(null);
+    } else if (r.data?.configured === false) {
+      setVerifyError(String(r.data?.error || 'TeleCMI is not configured, so the roster could not be checked.'));
+      setVerify(null);
+    } else {
+      setVerify(normalizeVerify(r.data));
+      setVerifyError(r.data?.error ? String(r.data.error) : null);
+    }
+    setVerifying(false);
+  };
+
+  /* Found rows, each answered against the roster we are actually rendering.
+   * The route's own `in_roster` is trusted when it states one, but the local
+   * check is ORed in so a row flips to "In roster" the instant it is mapped —
+   * without it the chip would still read "New" after a successful add. */
+  const scanRows = (scan?.found ?? []).map(f => ({
+    ...f,
+    inRoster: f.in_roster === true || rosterIds.has(canonAgentId(f.agent_id)),
+  }));
+  const newRows = scanRows.filter(r => !r.inRoster && r.agent_id);
 
   /* ── Caller ID ───────────────────────────────────────────────────────────── */
   // Hoisted rather than written inline: as object-literal keys sitting BEFORE
@@ -1140,6 +1496,20 @@ export default function TelephonyPage() {
                     className="px-2.5 py-1 bg-white border border-[#E8D5C4] rounded text-xs text-[#6B5744] flex items-center gap-1 hover:bg-[#FFF8F0] disabled:opacity-50">
               <RefreshCw className={`w-3 h-3 ${agentsLoading ? 'animate-spin' : ''}`} /> Refresh
             </button>
+            {/* The two discovery controls. Both reach TeleCMI, so both are
+                presses and never effects — see the handlers. */}
+            <button onClick={() => void runScan()} disabled={scanning || !agentsConfigured}
+                    title="Ask TeleCMI about a bounded range of extensions to find agents that are not in this roster"
+                    className="px-2.5 py-1 bg-white border border-[#E8D5C4] rounded text-xs text-[#6B5744] flex items-center gap-1 hover:bg-[#FFF8F0] disabled:opacity-50">
+              {scanning ? <Loader2 className="w-3 h-3 animate-spin" /> : <ScanSearch className="w-3 h-3" />}
+              {scanning ? 'Scanning TeleCMI…' : 'Scan TeleCMI for agents'}
+            </button>
+            <button onClick={() => void runVerify()} disabled={verifying || !agentsConfigured}
+                    title="Ask TeleCMI whether it still recognises every id in this roster"
+                    className="px-2.5 py-1 bg-white border border-[#E8D5C4] rounded text-xs text-[#6B5744] flex items-center gap-1 hover:bg-[#FFF8F0] disabled:opacity-50">
+              {verifying ? <Loader2 className="w-3 h-3 animate-spin" /> : <ListChecks className="w-3 h-3" />}
+              {verifying ? 'Checking roster…' : 'Check roster against TeleCMI'}
+            </button>
             <button onClick={() => setEditing({ mode: 'add' })} disabled={!agentsConfigured}
                     className="px-2.5 py-1 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-40 text-white rounded text-xs flex items-center gap-1">
               <Plus className="w-3 h-3" /> Add agent
@@ -1147,9 +1517,314 @@ export default function TelephonyPage() {
           </>
         }
       >
+        {/* THE MODEL, in one line. Everything confusing about this page starts
+            with an owner assuming the roster is "the agents on my TeleCMI
+            account". It is not, it cannot be, and saying so here is the
+            difference between "the app is broken" and "press Scan". */}
+        <p className="text-[11px] text-[#6B5744] mb-3">
+          TeleCMI provides no list of agents, so this roster is the agents you have added — use{' '}
+          <strong className="text-[#2D1B0E]">Scan TeleCMI for agents</strong> to discover any that
+          are in TeleCMI but not here yet.
+        </p>
+
         {agentFlash && (
           <div className="mb-3 bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-lg p-2.5 text-xs flex items-center gap-2">
             <CheckCircle2 className="w-4 h-4 shrink-0" /> {agentFlash}
+          </div>
+        )}
+
+        {/* ── Discovery panel ────────────────────────────────────────────────
+            OUTSIDE the roster's own loading/error branch below, deliberately:
+            when the roster fails to load, scanning is MORE useful, not less,
+            and it is a different request against a different failure mode. */}
+        <div className="mb-3 rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3 space-y-2">
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-[#2D1B0E] flex items-center gap-1.5">
+                <ScanSearch className="w-3.5 h-3.5 text-[#af4408]" /> Discover agents on TeleCMI
+              </p>
+              <p className="text-[11px] text-[#8B7355] mt-0.5">
+                TeleCMI cannot list its own users, so a scan asks about candidate extensions one at
+                a time. Most candidates do not exist and simply do not answer — that is the normal
+                result, not a failure. Nothing is changed on TeleCMI by scanning.
+              </p>
+            </div>
+            {scan && !scanning && (
+              <button onClick={() => { setScan(null); setScanError(null); setMapError(null); }}
+                      className="shrink-0 px-2 py-1 bg-white border border-[#E8D5C4] rounded text-[11px] text-[#6B5744] hover:bg-[#FFF8F0]">
+                Clear
+              </button>
+            )}
+          </div>
+
+          {scanning && <Spinner label="Asking TeleCMI about each extension — this can take a few seconds…" />}
+
+          {/* No Retry here on purpose: a retry button on a control that spends
+              third-party requests invites a double-press. The Scan button is a
+              few pixels away and says exactly what it will do. */}
+          {scanError && !scanning && <ErrorBox msg={scanError} />}
+
+          {scan && !scanning && (
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-xs text-[#2D1B0E]">
+                  Scanned{' '}
+                  <strong>{scan.scanned == null ? '—' : count(scan.scanned)}</strong> extension
+                  {scan.scanned === 1 ? '' : 's'}
+                  {scan.from != null && scan.to != null && (
+                    <span className="text-[#8B7355]"> ({scan.from}–{scan.to})</span>
+                  )}
+                  {' · found '}<strong>{count(scanRows.length)}</strong> agent{scanRows.length === 1 ? '' : 's'}
+                  {' · '}
+                  <strong className={newRows.length > 0 ? 'text-amber-800' : 'text-[#6B5744]'}>
+                    {count(newRows.length)} not in your roster yet
+                  </strong>
+                </p>
+                {newRows.length > 1 && (
+                  <button onClick={() => void mapAllNew(newRows.map(r => r.agent_id))}
+                          disabled={mappingAll || mappingId != null}
+                          className="ml-auto px-2.5 py-1 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-40 text-white rounded text-xs font-semibold inline-flex items-center gap-1.5">
+                    {mappingAll ? <Loader2 className="w-3 h-3 animate-spin" /> : <UserPlus className="w-3 h-3" />}
+                    Add all {count(newRows.length)} new
+                  </button>
+                )}
+              </div>
+
+              {mapError && <ErrorBox msg={mapError} />}
+
+              {/* A truncated scan is a FLOOR, never a roster. Said before the
+                  table, because "not found" on a scan that stopped early is
+                  the one reading that would be flatly wrong. */}
+              {scan.timed_out && (() => {
+                const from = scan.last_extension != null ? scan.last_extension + 1 : null;
+                const to = scan.to ?? numOrNull(rangeTo);
+                const canContinue = from != null && to != null && from <= to;
+                return (
+                  <div className="bg-amber-50 border border-amber-300 text-amber-900 rounded-lg p-2.5 text-[11px] flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 mt-px" />
+                    <span>
+                      <strong>This scan stopped early.</strong> It reached extension{' '}
+                      <strong>{scan.last_extension ?? 'an unstated point'}</strong> before running out
+                      of time, so anything past that was never asked about. The list below is what was
+                      found so far — it is not proof that nothing else exists.{' '}
+                      {canContinue ? (
+                        <button
+                          onClick={() => {
+                            setRangeOpen(true);
+                            setRangeFrom(String(from));
+                            setRangeTo(String(to));
+                            void runScan({ from, to });
+                          }}
+                          disabled={scanning}
+                          className="font-semibold underline underline-offset-2 disabled:opacity-50"
+                        >
+                          Continue from {from}
+                        </button>
+                      ) : (
+                        <>Set a range below to carry on from where it stopped.</>
+                      )}
+                    </span>
+                  </div>
+                );
+              })()}
+
+              {scanRows.length === 0 ? (
+                <p className="text-[11px] text-[#8B7355]">
+                  No agent answered in that range. If an extension you expect is missing, widen the
+                  range below and scan again.
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm min-w-[560px] bg-white border border-[#E8D5C4] rounded-lg">
+                    <thead>
+                      <tr className="text-left text-[10px] uppercase tracking-wide text-[#8B7355] border-b border-[#E8D5C4]">
+                        <th className="py-1.5 px-2 font-medium">Ext</th>
+                        <th className="py-1.5 px-2 font-medium">Name on TeleCMI</th>
+                        <th className="py-1.5 px-2 font-medium">Agent id</th>
+                        <th className="py-1.5 px-2 font-medium">State</th>
+                        <th className="py-1.5 px-2 font-medium text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-[#2D1B0E]">
+                      {scanRows.map((r, i) => (
+                        <tr key={r.agent_id || `scan-${r.extension ?? i}`} className="border-b border-[#E8D5C4]/60 last:border-0">
+                          <td className="py-2 px-2 font-semibold tabular-nums">{r.extension ?? '—'}</td>
+                          <td className="py-2 px-2">
+                            {r.name || <span className="text-[#8B7355]">—</span>}
+                            {r.phone && <span className="block text-[10px] text-[#8B7355] tabular-nums">{r.phone}</span>}
+                          </td>
+                          <td className="py-2 px-2 font-mono text-[10px] break-all">
+                            {r.agent_id || <span className="font-sans text-[#8B7355]">not returned</span>}
+                          </td>
+                          <td className="py-2 px-2">
+                            {r.inRoster ? (
+                              <span className="text-[11px] text-emerald-800 bg-emerald-50 border border-emerald-200 rounded px-1.5 py-0.5 inline-flex items-center gap-1">
+                                <CheckCircle2 className="w-3 h-3" /> In roster
+                              </span>
+                            ) : (
+                              <span className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 inline-flex items-center gap-1">
+                                <AlertTriangle className="w-3 h-3" /> New
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-2 text-right">
+                            {r.inRoster ? (
+                              <span className="text-[11px] text-[#8B7355]">—</span>
+                            ) : !r.agent_id ? (
+                              // Nothing to write into agent_map. The appid half
+                              // of the id is a server-side value, so this page
+                              // must not invent one.
+                              <span className="text-[11px] text-[#8B7355]"
+                                    title="TeleCMI did not return an id for this extension, so there is nothing to map.">
+                                No id returned
+                              </span>
+                            ) : (
+                              <button onClick={() => void mapOne(r.agent_id)}
+                                      disabled={mappingAll || mappingId != null}
+                                      className="px-2 py-1 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-40 text-white rounded text-xs font-semibold inline-flex items-center gap-1.5">
+                                {mappingId === r.agent_id ? <Loader2 className="w-3 h-3 animate-spin" /> : <UserPlus className="w-3 h-3" />}
+                                Add to roster
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {newRows.length > 0 && (
+                <p className="text-[10px] text-[#8B7355]">
+                  Adding puts the agent in this roster with no FNB user assigned yet — they can take
+                  calls immediately, but click-to-call needs the mapping finished in{' '}
+                  <a href="/crm-calls/settings" className="text-[#af4408] underline underline-offset-2">CRM Settings</a>.
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Advanced range. Collapsed by default and worded so nobody feels
+              they are missing a step by ignoring it. */}
+          <div>
+            <button onClick={() => setRangeOpen(o => !o)}
+                    className="text-[11px] text-[#6B5744] hover:text-[#2D1B0E] inline-flex items-center gap-1">
+              {rangeOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+              Advanced: scan a specific extension range
+            </button>
+            {rangeOpen && (
+              <div className="mt-1.5 border border-[#E8D5C4] rounded-lg bg-white p-2.5 flex flex-wrap items-end gap-2">
+                <label className="block">
+                  <span className="text-[10px] uppercase tracking-wide text-[#6B5744]">From extension</span>
+                  <input type="number" inputMode="numeric" value={rangeFrom}
+                         onChange={e => setRangeFrom(e.target.value)} placeholder="5000"
+                         className="w-28 mt-0.5 px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]" />
+                </label>
+                <label className="block">
+                  <span className="text-[10px] uppercase tracking-wide text-[#6B5744]">To extension</span>
+                  <input type="number" inputMode="numeric" value={rangeTo}
+                         onChange={e => setRangeTo(e.target.value)} placeholder="5020"
+                         className="w-28 mt-0.5 px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]" />
+                </label>
+                <button onClick={() => void runScan()} disabled={scanning || !agentsConfigured}
+                        className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-40 text-white rounded text-xs font-semibold inline-flex items-center gap-1.5">
+                  {scanning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ScanSearch className="w-3.5 h-3.5" />}
+                  Scan this range
+                </button>
+                <button onClick={() => { setRangeFrom(''); setRangeTo(''); }}
+                        disabled={scanning || (!rangeFrom && !rangeTo)}
+                        className="px-2.5 py-1.5 bg-white border border-[#E8D5C4] rounded text-xs text-[#6B5744] hover:bg-[#FFF8F0] disabled:opacity-40">
+                  Use default range
+                </button>
+                <p className="w-full text-[10px] text-[#8B7355]">
+                  Most venues never need this — the default range covers your existing extensions.
+                  Leave both boxes empty to use it. At most {SCAN_MAX_CANDIDATES} extensions per
+                  scan, because each one is a separate request to TeleCMI.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ── Roster verification panel ─────────────────────────────────────── */}
+        {(verifying || verifyError || verify) && (
+          <div className="mb-3 rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3 space-y-2">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <p className="text-xs font-semibold text-[#2D1B0E] flex items-center gap-1.5">
+                <ListChecks className="w-3.5 h-3.5 text-[#af4408]" /> Roster checked against TeleCMI
+              </p>
+              {verify && !verifying && (
+                <button onClick={() => { setVerify(null); setVerifyError(null); }}
+                        className="shrink-0 px-2 py-1 bg-white border border-[#E8D5C4] rounded text-[11px] text-[#6B5744] hover:bg-[#FFF8F0]">
+                  Clear
+                </button>
+              )}
+            </div>
+
+            {verifying && <Spinner label="Asking TeleCMI about each id in this roster…" />}
+            {verifyError && !verifying && <ErrorBox msg={verifyError} />}
+
+            {verify && !verifying && (
+              <div className="space-y-2">
+                <p className="text-xs text-[#2D1B0E]">
+                  TeleCMI recognises <strong>{verify.live == null ? '—' : count(verify.live)}</strong>
+                  {verify.checked != null && <> of <strong>{count(verify.checked)}</strong></>} id
+                  {verify.checked === 1 ? '' : 's'} in this roster.
+                </p>
+
+                {/* KEPT APART FROM THE LIST BELOW. A transport failure says
+                    nothing whatsoever about the id, and listing it beside real
+                    removals would invite an admin to clear a live agent. */}
+                {verify.unchecked.length > 0 && (
+                  <div className="rounded-lg border border-[#E8D5C4] bg-white p-2.5 space-y-1.5">
+                    <p className="text-[11px] font-semibold text-[#2D1B0E]">
+                      Could not check — try again ({count(verify.unchecked.length)})
+                    </p>
+                    <p className="text-[10px] text-[#8B7355]">
+                      TeleCMI did not answer for these. That is a failed lookup, not a verdict — the
+                      agents may be perfectly fine. Nothing should be changed on the strength of it.
+                    </p>
+                    {verify.unchecked.map((r, i) => (
+                      <p key={r.agent_id || `unchecked-${i}`} className="text-[11px] text-[#6B5744] break-all">
+                        <span className="font-mono text-[#2D1B0E]">{r.agent_id || '—'}</span>
+                        {r.extension != null && <> · ext {r.extension}</>}
+                        {r.name && <> · {r.name}</>}
+                        {r.reason && <span className="block text-[10px] text-[#8B7355]">{r.reason}</span>}
+                      </p>
+                    ))}
+                  </div>
+                )}
+
+                {verify.missing.length > 0 ? (
+                  <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 space-y-1.5">
+                    <p className="text-[11px] font-semibold text-amber-900 flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                      Not recognised by TeleCMI ({count(verify.missing.length)})
+                    </p>
+                    {verify.missing.map((r, i) => (
+                      <p key={r.agent_id || `missing-${i}`} className="text-[11px] text-amber-900 break-all">
+                        <span className="font-mono">{r.agent_id || '—'}</span>
+                        {r.extension != null && <> · ext {r.extension}</>}
+                        {r.mapped_email && <> · mapped to {r.mapped_email}</>}
+                        <span className="block text-[10px]">
+                          TeleCMI does not recognise this id — likely a removed extension.
+                        </span>
+                      </p>
+                    ))}
+                    <p className="text-[10px] text-amber-900">
+                      Nothing is removed automatically. Hide or clear these under Agent mapping in{' '}
+                      <a href="/crm-calls/settings" className="font-semibold underline underline-offset-2">CRM Settings</a>
+                      {' '}— their past calls keep displaying exactly as they do now.
+                    </p>
+                  </div>
+                ) : verify.unchecked.length === 0 ? (
+                  <p className="text-[11px] text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2.5 py-1.5 flex items-start gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-px" />
+                    Every id in this roster is one TeleCMI still recognises.
+                  </p>
+                ) : null}
+              </div>
+            )}
           </div>
         )}
         {agentsLoading ? (
