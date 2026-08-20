@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
-import { mapCdrPayload } from '@/lib/ct/telecmi-mapper';
+import { mapCdrPayload, mapLivePayload } from '@/lib/ct/telecmi-mapper';
 import {
   assertAllowedRecordingUrl,
   fetchAllowedRecording,
@@ -74,6 +74,7 @@ import {
  *              wrong conclusion this prevents.
  *   stored     How many ct_calls rows hold a recording_url, and how many of
  *              those are demo fixtures. Today: every one of them is a fixture.
+ *   live_agent WHO ANSWERED, on the LIVE events — see the block below.
  *   probe      OPT-IN (?probe=1), and the only part that leaves this server:
  *              it actually ASKS TeleCMI for a REAL stored recording and reports
  *              which one of a fixed set of outcomes happened — no credentials,
@@ -83,6 +84,31 @@ import {
  *              still be a path the vendor does not serve, which is precisely
  *              the failure this module hit. Bounded — see the comment above
  *              probeCall().
+ *
+ * ── WHO ANSWERED, ON THE LIVE EVENTS (the live_agent panel) ────────────────
+ * A second question lands on the same table, and it is answered the same way:
+ * FROM THE CAPTURED PAYLOADS, not from a guess.
+ *
+ * The screen-pop shows "Answered by X" only when the live 'answered' event named
+ * an agent it could resolve. On this account it often names nobody, so the card
+ * reads "ON CALL 0:33" with no name for the whole conversation — and the CDR,
+ * which does name the agent, arrives after the hangup and is therefore too late
+ * to be any use to the person on the phone.
+ *
+ * THERE ARE TWO COMPLETELY DIFFERENT CAUSES and they need opposite fixes:
+ *   (a) TeleCMI sends the answerer under a key the mapper has never heard of.
+ *       AGENT_KEYS in src/lib/ct/telecmi-mapper.ts gains one spelling and the
+ *       whole thing starts working, retroactively, for free.
+ *   (b) TeleCMI's live answer event genuinely carries no agent at all. Then no
+ *       key list will ever help and the answer has to come from somewhere else.
+ * Nobody can tell those apart by reading code. This panel settles it by printing
+ * the ACTUAL KEYS of the last LIVE_AGENT_LIMIT answered live payloads, the values
+ * of the agent-shaped ones, and — asked of the mapper itself, never assumed —
+ * whether the mapper reads each of them as the agent.
+ *
+ * Bounded and read-only like everything else here: one indexed SELECT with a
+ * LIMIT, and the key probes are pure calls into the mapper with a synthetic
+ * payload. It touches no network and nothing outside ct_webhook_log.
  *
  * ── IT MUST NOT WRITE ──────────────────────────────────────────────────────
  * SELECTs only. Note in particular that this route does NOT call
@@ -547,6 +573,203 @@ function describeCdr(row: any, allow: string[], creds: string[]): CdrReport {
     transform,
     applied_base: shownBase,
     validation,
+    headline,
+  };
+}
+
+/* ── WHO ANSWERED: the live-event agent-key evidence ───────────────────────
+ *
+ * See "WHO ANSWERED, ON THE LIVE EVENTS" in the file header for why this exists.
+ * Everything below is SELECT + pure mapper calls; nothing here leaves the box.
+ */
+
+/** How many recent ANSWERED live deliveries the panel reports on. */
+const LIVE_AGENT_LIMIT = 20;
+
+/**
+ * Sentinel for mapperReadsAsAgent(), spelled on the same two principles as
+ * PROBE_VALUE above: it contains "answered" so a probe key that lands on the
+ * EVENT field still classifies as an answer instead of logging an
+ * "unknown live event" warning, and it reads as what it is so anyone who does
+ * see it in a log knows it came from this diagnostic and is not a real payload.
+ */
+const LIVE_AGENT_PROBE = 'answered-agent-key-probe';
+
+/**
+ * Does the MAPPER read THIS key, at THIS nesting, as the answering agent?
+ *
+ * Asked of the mapper, exactly as mapperReadsAsRecording() asks about recording
+ * keys and for exactly the same reason: AGENT_KEYS is not exported from
+ * src/lib/ct/telecmi-mapper.ts, and a copy of that list here would be a second
+ * truth that falls out of step without ever failing — this panel would then say
+ * "the mapper does not read this key" about a key somebody had just added to it,
+ * which is precisely the sentence an admin would act on.
+ *
+ * The scaffold fields exist only to get past mapLivePayload's "no id AND no
+ * phone" rejection quietly; `status: 'answered'` keeps the event classification
+ * silent. An agent-shaped key cannot collide with any of them.
+ *
+ * CONTAINS, NOT EQUALS — the mapper trims what it reads, and a future normaliser
+ * could do more, so an equality test would start answering "no" about keys that
+ * work perfectly well.
+ */
+function mapperReadsAsAgent(parent: string | null, key: string): boolean {
+  const probe: Record<string, unknown> = {
+    cmiuid: 'agent-key-probe',
+    customer_number: '910000000000',
+    status: 'answered',
+  };
+  if (parent) probe[parent] = { [key]: LIVE_AGENT_PROBE };
+  else probe[key] = LIVE_AGENT_PROBE;
+  try {
+    return String(mapLivePayload(probe)?.agent || '').includes(LIVE_AGENT_PROBE);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Is this field name one whose VALUE the panel prints?
+ *
+ * Two families, and nothing else on the payload gets a value at all (every other
+ * field contributes a name and a shape, the same rule the CDR panel follows):
+ *   agent-like  agent / user / ext — the candidates for "who picked up". Their
+ *               values ARE the evidence: seeing `ans_by: "5002"` beside
+ *               "the mapper read no agent" is the whole point of the panel.
+ *   event-like  event / status / state — so the reader can see the vendor's own
+ *               word for the event next to the mapper's classification of it.
+ * An extension number is not a credential; anything that IS one is masked by
+ * echoValue() on its name, exactly as everywhere else on this route.
+ *
+ * IT IS A NAME TEST, NOT A CLAIM ABOUT WHAT IS THERE. A key TeleCMI spells
+ * ans_by or handled_by matches neither family and so shows only its NAME AND
+ * SHAPE, like every other field — which is still the answer ("string(4) digits"
+ * next to a plausible name is an extension), and the headlines are written to
+ * send the reader to that list rather than to conclude past it. Widening these
+ * fragments to guess at more spellings would trade that honesty for printing
+ * more values, which is the wrong direction on a page that gets screenshotted.
+ */
+function isAgentLikeKey(key: string): boolean {
+  const b = bareKey(key);
+  return b.includes('agent') || b.includes('user') || b.includes('ext');
+}
+function isEventLikeKey(key: string): boolean {
+  const b = bareKey(key);
+  return b.includes('event') || b.includes('status') || b.includes('state');
+}
+
+interface LiveAgentField {
+  /** Original spelling as TeleCMI sent it, e.g. agent or data.agent. */
+  path: string;
+  shape: string;
+  /** Name marks it as a candidate for "who answered". */
+  agent_like: boolean;
+  /** Set for agent-like and event-like names only; redacted and truncated. */
+  value: string;
+  redacted: boolean;
+  truncated: boolean;
+  /** Asked of the mapper, not assumed. False for non-agent-shaped names. */
+  mapper_reads_as_agent: boolean;
+}
+
+interface LiveAnswerReport {
+  log_id: string;
+  received_at: string;
+  telecmi_call_id: string;
+  /** ct_webhook_log.event — the mapper's classification AT INGEST TIME. */
+  event_at_ingest: string;
+  /** The same payload re-run through today's mapper. A difference is drift. */
+  event_now: string;
+  payload_readable: boolean;
+  /** Every top-level key name, verbatim. The list IS the answer when the mapper
+   *  reads no agent: one of these is what TeleCMI calls the answerer, or none is. */
+  top_level_keys: string[];
+  /** What the mapper actually extracts as the agent. '' is the finding. */
+  mapper_agent: string;
+  fields: LiveAgentField[];
+  headline: string;
+}
+
+/** Field-by-field agent report for ONE live-answer ct_webhook_log row. */
+function describeLiveAnswer(row: any, creds: string[]): LiveAnswerReport {
+  let payload: unknown = null;
+  let payloadReadable = false;
+  try {
+    payload = JSON.parse(String(row?.payload ?? ''));
+    payloadReadable = isPlainObject(payload);
+  } catch {
+    payloadReadable = false;
+  }
+
+  let mapped: ReturnType<typeof mapLivePayload> = null;
+  try {
+    mapped = isPlainObject(payload) ? mapLivePayload(payload) : null;
+  } catch {
+    mapped = null;
+  }
+
+  const fields: LiveAgentField[] = [];
+  const topKeys: string[] = [];
+  const visit = (parent: string | null, key: string, value: unknown) => {
+    const agentLike = isAgentLikeKey(key);
+    const echoed = agentLike || isEventLikeKey(key) ? echoValue(key, value, creds) : null;
+    fields.push({
+      path: parent ? `${parent}.${key}` : key,
+      shape: shapeOf(value),
+      agent_like: agentLike,
+      value: echoed?.value ?? '',
+      redacted: echoed?.redacted ?? false,
+      truncated: echoed?.truncated ?? false,
+      mapper_reads_as_agent: agentLike ? mapperReadsAsAgent(parent, key) : false,
+    });
+  };
+  if (isPlainObject(payload)) {
+    for (const [k, v] of Object.entries(payload)) {
+      topKeys.push(k);
+      visit(null, k, v);
+      // One level down, mirroring how a live event can arrive wrapped in an
+      // envelope — and probed AT ITS OWN NESTING, so a key the mapper would only
+      // find at the top level is not reported as readable where it is buried.
+      if (isPlainObject(v)) for (const [ck, cv] of Object.entries(v)) visit(k, ck, cv);
+    }
+  }
+
+  const agentRaw = String(mapped?.agent || '');
+  const agentEcho = echoValue('agent', agentRaw, creds);
+  const namedCandidates = fields
+    .filter(f => f.agent_like && !f.mapper_reads_as_agent && f.value)
+    .map(f => f.path);
+
+  let headline: string;
+  if (!payloadReadable) {
+    headline = 'The stored payload for this delivery is not a readable JSON object, so nothing can be read out of it.';
+  } else if (agentRaw) {
+    headline =
+      `The mapper DOES read an agent off this payload: "${agentEcho.value}". A screen-pop that showed no name for this call did not lose it here — either that id is unmapped in Agent mapping (it would then display as the raw id, not as a blank), or the pop never received this event.`;
+  } else if (namedCandidates.length) {
+    headline =
+      `The mapper read NO agent, but this payload DOES carry agent-shaped field${namedCandidates.length === 1 ? '' : 's'} with a value: ${namedCandidates.join(', ')}. If one of those names the answerer, add its spelling to AGENT_KEYS in src/lib/ct/telecmi-mapper.ts and every future answered event names a person. Nothing else needs changing.`;
+  } else {
+    // DELIBERATELY NOT "so no key list would help". A field named nothing like
+    // agent/user/ext — ans_by, handled_by, a bare extension column — can still
+    // be the answerer, and only a human reading the real key names can say. So
+    // this points AT the list rather than concluding past it. Every key there
+    // carries its shape, and "string(4) digits" beside a name is usually enough
+    // to recognise an extension without the value ever being printed.
+    headline =
+      'The mapper read no agent, and no field whose NAME looks like an agent/user/extension carries a value. Read the key list beside this: if one of those keys is TeleCMI’s own word for the answerer under some other spelling, adding it to AGENT_KEYS in src/lib/ct/telecmi-mapper.ts is the fix. If none of them is, this live answer genuinely does not say who picked up and the CDR (after the call) is the only source of the name.';
+  }
+
+  return {
+    log_id: String(row?.id ?? ''),
+    received_at: String(row?.received_at ?? ''),
+    telecmi_call_id: String(row?.telecmi_call_id ?? ''),
+    event_at_ingest: String(row?.event ?? ''),
+    event_now: String(mapped?.event || ''),
+    payload_readable: payloadReadable,
+    top_level_keys: topKeys,
+    mapper_agent: agentEcho.value,
+    fields,
     headline,
   };
 }
@@ -1098,6 +1321,57 @@ export async function GET(req: Request) {
       storedHeadline = `${real} real recording URL${real === 1 ? '' : 's'} stored (plus ${fixtures} demo fixture${fixtures === 1 ? '' : 's'}).`;
     }
 
+    // ── 4b · WHO ANSWERED, on the live events ─────────────────────────────
+    // Filtered on the STORED event column, which is the mapper's OWN
+    // classification written at ingest (ingestLive() in src/lib/ct/ingest.ts
+    // stores m.event) — so "event = 'answer'" IS "this payload parses to an
+    // answered event", read back rather than recomputed over the whole table.
+    // Each selected row is then re-run through today's mapper anyway, and
+    // event_now beside event_at_ingest exposes any drift since it was stored.
+    const liveAnswerRows = db.prepare(`
+      SELECT id, received_at, telecmi_call_id, event, payload
+        FROM ct_webhook_log
+       WHERE kind = 'live' AND event = 'answer'
+       ORDER BY received_at DESC, rowid DESC
+       LIMIT ?
+    `).all(LIVE_AGENT_LIMIT) as any[];
+    const liveAnswers = liveAnswerRows.map(r => describeLiveAnswer(r, creds));
+    const withAgent = liveAnswers.filter(r => !!r.mapper_agent).length;
+    const anonymous = liveAnswers.length - withAgent;
+    const candidateKeys = Array.from(new Set(
+      liveAnswers.flatMap(r => r.fields.filter(f => f.agent_like && !f.mapper_reads_as_agent && f.value).map(f => f.path)),
+    ));
+
+    let liveAgentHeadline: string;
+    if (liveCount === 0) {
+      liveAgentHeadline =
+        'No live (screen-pop) event has ever reached this server, so there is nothing to say about who answered. Until live events arrive the pop cannot name anybody, whatever the mapper does.';
+    } else if (liveAnswers.length === 0) {
+      liveAgentHeadline =
+        `${liveCount} live event${liveCount === 1 ? ' has' : 's have'} been logged but NOT ONE of them parsed as an ANSWER. The pop therefore never had an answered event to take a name from — the gap is upstream of the agent key entirely: TeleCMI is not sending an answer event, or it is arriving in a shape the mapper classifies as something else.`;
+    } else if (anonymous === 0) {
+      liveAgentHeadline =
+        `Every one of the last ${liveAnswers.length} answered live event${liveAnswers.length === 1 ? '' : 's'} named an agent the mapper could read. A pop showing no name is therefore NOT a mapping-key fault — look at whether the pop received the event at all.`;
+    } else if (candidateKeys.length) {
+      liveAgentHeadline =
+        `${anonymous} of the last ${liveAnswers.length} answered live events named NO agent the mapper reads — but those payloads DO carry agent-shaped fields the mapper ignores: ${candidateKeys.join(', ')}. If one of those is the answerer, adding its spelling to AGENT_KEYS in src/lib/ct/telecmi-mapper.ts is the entire fix.`;
+    } else {
+      liveAgentHeadline =
+        `${anonymous} of the last ${liveAnswers.length} answered live events named no agent, and none of them carries a field whose NAME looks like an agent/user/extension. Read the per-event key lists below before concluding TeleCMI never sends it: a key called something else entirely (ans_by, handled_by, a bare extension column) would look exactly like this, and adding its spelling to AGENT_KEYS in src/lib/ct/telecmi-mapper.ts would fix every future call. If no key there is the answerer, the live answer genuinely does not carry it and the name can only come from the CDR after the call.`;
+    }
+
+    const liveAgent = {
+      limit: LIVE_AGENT_LIMIT,
+      answered_events: liveAnswers.length,
+      with_agent: withAgent,
+      without_agent: anonymous,
+      /** Agent-shaped keys seen carrying a value that the mapper does NOT read.
+       *  This is the shortlist a fix would be chosen from. */
+      unread_agent_keys: candidateKeys,
+      events: liveAnswers,
+      headline: liveAgentHeadline,
+    };
+
     // ── 5 · Upstream probe (opt-in) ───────────────────────────────────────
     // Off unless asked for, so opening the Telephony page never touches
     // TeleCMI. See the block comment above probeCall() for the bounds.
@@ -1213,6 +1487,8 @@ export async function GET(req: Request) {
         headline: webhookHeadline,
       },
       latest_cdr: latest,
+      // ADDITIVE: who answered, off the LIVE events. Nothing above it changes.
+      live_agent: liveAgent,
       recording_scan: {
         limit: SCAN_LIMIT,
         scanned,

@@ -10,7 +10,7 @@ import {
   telecmiCredentialStatus,
   CT_SETTING_DEFAULTS,
 } from '@/lib/ct/settings';
-import { distinctCallAgents } from '@/lib/ct/agents';
+import { describeCallAgents, isAppLoginAgent } from '@/lib/ct/agents';
 
 /**
  * CRM Call-to-Table — Settings (/api/crm-calls/settings). Admin-only.
@@ -19,7 +19,9 @@ import { distinctCallAgents } from '@/lib/ct/agents';
  *       TeleCMI credentials, plus computed webhook URLs (RELATIVE paths — the
  *       client prepends window.location.origin for the copy button),
  *       telecmi_configured, and telecmi_credentials (booleans + a masked tail,
- *       never the values).
+ *       never the values), plus the Agent-mapping editor's inputs: agents_seen /
+ *       agents_detail (TeleCMI ids only — app login emails are excluded, see the
+ *       GET) and the staff picker.
  * PUT → { key: value, ... } partial update. Allowlist = CT_SETTING_DEFAULTS
  *       keys + 'telecmi_base_url' + the two TeleCMI credentials.
  *
@@ -123,8 +125,21 @@ export async function GET() {
 
   const db = getDb();
   const token = webhookToken(db);
-  // For the Agent Mapping editor: every raw agent id seen on a call (so the
+  // For the Agent Mapping editor: the TeleCMI agent ids seen on calls (so the
   // admin can map the ones that actually appear) + the staff list to map them to.
+  //
+  // ct_calls.agent_user legitimately holds TWO kinds of value (see
+  // src/lib/ct/agents.ts): a TeleCMI id, and — for callbacks a GRE made from
+  // their own phone — that GRE's app login email. Only the first kind belongs in
+  // this editor: an email can never be mapped to a TeleCMI id, so pre-listing one
+  // just parks a permanent phantom "unmapped" row (that is what put
+  // bidigapushpa06@gmail.com / shashank@akanhyd.com in the list and badged them).
+  // Those rows are NOT broken — resolveAgentLabel() already shows the person's
+  // name everywhere they appear — so they are dropped from the pre-list only, and
+  // the SAVED agent_map is left exactly as stored: if an admin mapped an email
+  // once, that entry stays theirs to keep or remove.
+  const seenAgents = describeCallAgents(db)
+    .filter(a => a.kind !== 'app_login' && !isAppLoginAgent(a.id));
   let staff: Array<{ email: string; name: string }> = [];
   try {
     staff = (db.prepare(
@@ -143,7 +158,15 @@ export async function GET() {
     // typed — without it, "saved but nothing changed" is indistinguishable from
     // a failed save.
     telecmi_credentials: telecmiCredentialStatus(db),
-    agents_seen: distinctCallAgents(db),
+    // Unchanged key, unchanged shape (a flat list of raw ids, in the same
+    // order) — an older client keeps working; it now simply carries TeleCMI ids
+    // only. Kept alongside agents_detail so nothing has to read the richer form.
+    agents_seen: seenAgents.map(a => a.id),
+    // Additive: the same ids with usage, so the editor can mark a stale one
+    // (e.g. the removed extension "5004_33338614" — real history, no longer a
+    // live agent) instead of showing it identically to a working extension.
+    // last_seen is the stored ct_calls timestamp text, '' when the row has none.
+    agents_detail: seenAgents.map(a => ({ id: a.id, calls: a.calls, last_seen: a.last_seen })),
     staff,
   });
 }

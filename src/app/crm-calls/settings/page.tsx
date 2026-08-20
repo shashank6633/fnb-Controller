@@ -89,16 +89,78 @@ function parseAgentMap(v: any): Record<string, string> {
   return out;
 }
 
+/**
+ * Is this agent id an app LOGIN EMAIL rather than a TeleCMI id?
+ *
+ * ct_calls.agent_user legitimately holds two kinds of value: a TeleCMI agent id
+ * (from the PBX) and — when a GRE logs a callback dialled from their own phone
+ * — that GRE's app login email. Attribution handles both (the email resolves to
+ * the user's name), but an email can never be *mapped* to a TeleCMI id, so it
+ * has no business sitting in this editor as a phantom "unmapped" row.
+ *
+ * The server now filters those out of agents_seen (src/lib/ct/agents.ts
+ * isAppLoginAgent — same pragmatic `local@domain.tld` shape, kept in step here
+ * so this page behaves identically against an older server that still sends
+ * them, and so a legacy email key already in the SAVED map can be labelled for
+ * what it is instead of being badged "unmapped").
+ */
+function isAppLoginId(v: string): boolean {
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(v || '').trim());
+}
+
+/** Per-agent usage from the API's additive `agents_detail`. Absent on an older
+ *  server → no stats, and the editor simply renders no stale chip. */
+interface AgentDetail { calls: number; lastSeenMs: number | null }
+
+/** Parse a stored ct_calls timestamp. These are ISO strings today; tolerate the
+ *  bare-SQLite 'YYYY-MM-DD HH:MM:SS' form (read as UTC) rather than treating an
+ *  unparseable value as "ancient" and mislabelling a live extension. */
+function parseAgentTs(v: string): number | null {
+  const s = String(v || '').trim();
+  if (!s) return null;
+  let d = new Date(s);
+  if (isNaN(d.getTime()) && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(s)) d = new Date(`${s.replace(' ', 'T')}Z`);
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
+
+/** agents_detail → { idLower: { calls, lastSeenMs } }. Tolerates a missing /
+ *  malformed block (older server) by returning {}. */
+function parseAgentDetails(v: unknown): Record<string, AgentDetail> {
+  const out: Record<string, AgentDetail> = {};
+  if (!Array.isArray(v)) return out;
+  for (const raw of v as unknown[]) {
+    if (!raw || typeof raw !== 'object') continue;
+    const it = raw as Record<string, unknown>;
+    const id = String(it.id ?? '').trim();
+    if (!id) continue;
+    const n = Number(it.calls);
+    out[id.toLowerCase()] = {
+      calls: Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0,
+      lastSeenMs: parseAgentTs(String(it.last_seen ?? '')),
+    };
+  }
+  return out;
+}
+
+/** An id with no call in this many days is history (a removed extension), not a
+ *  mapping gap the admin still has to close. */
+const AGENT_STALE_DAYS = 90;
+
 /** One editor row per agent id: the union of (agents seen on calls) and
- *  (existing map keys), seen ones first & in the order the API returned them. */
+ *  (existing map keys), seen ones first & in the order the API returned them.
+ *  A seen id that is an app login email is skipped — it is not mappable — but a
+ *  legacy email key already SAVED in the map is still listed, so the admin can
+ *  see it and remove it. */
 function buildAgentRows(mapObj: Record<string, string>, seen: string[]): Array<{ id: string; email: string }> {
   const rows: Array<{ id: string; email: string }> = [];
   const used = new Set<string>();
   for (const a of seen) {
     const key = String(a || '').trim();
     if (!key || used.has(key.toLowerCase())) continue;
+    const mapped = mapObj[key] ?? mapObj[key.toLowerCase()] ?? '';
+    if (isAppLoginId(key) && !mapped) continue; // login email, never mappable
     used.add(key.toLowerCase());
-    rows.push({ id: key, email: mapObj[key] ?? mapObj[key.toLowerCase()] ?? '' });
+    rows.push({ id: key, email: mapped });
   }
   for (const [k, v] of Object.entries(mapObj)) {
     const key = String(k).trim();
@@ -306,6 +368,7 @@ export default function CtSettingsPage() {
   // sticky-bar; agent_map is a JSON blob, not a flat EDITABLE_KEY).
   const [staff, setStaff] = useState<Array<{ email: string; name: string }>>([]);
   const [agentsSeen, setAgentsSeen] = useState<string[]>([]);
+  const [agentDetails, setAgentDetails] = useState<Record<string, AgentDetail>>({});
   const [agentRows, setAgentRows] = useState<Array<{ id: string; email: string }>>([]);
   const [savedAgentMap, setSavedAgentMap] = useState<Record<string, string>>({});
   const [savingAgents, setSavingAgents] = useState(false);
@@ -346,12 +409,16 @@ export default function CtSettingsPage() {
               .map(s => ({ email: String(s?.email || '').trim(), name: String(s?.name || s?.email || '').trim() }))
               .filter(s => s.email)
           : [];
+        // agents_seen = TeleCMI ids seen on calls (the server keeps app-login
+        // emails out); agents_detail is additive usage for the same ids and is
+        // simply absent on an older server.
         const seen = Array.isArray(j?.agents_seen)
           ? (j.agents_seen as any[]).map(a => String(a || '').trim()).filter(Boolean)
           : [];
         const mapObj = parseAgentMap(src?.agent_map);
         setStaff(staffList);
         setAgentsSeen(seen);
+        setAgentDetails(parseAgentDetails(j?.agents_detail));
         setSavedAgentMap(mapObj);
         setAgentRows(buildAgentRows(mapObj, seen));
       })
@@ -561,6 +628,19 @@ export default function CtSettingsPage() {
     () => new Set(agentsSeen.map(a => a.trim().toLowerCase())),
     [agentsSeen],
   );
+  // "Stale" = seen on calls, but the last one is older than AGENT_STALE_DAYS →
+  // a removed extension living on in history, not a gap to fill. Returns null
+  // when the server sent no usage (older build) so nothing extra is rendered.
+  const staleInfo = useMemo(() => {
+    const cutoff = Date.now() - AGENT_STALE_DAYS * 86_400_000;
+    return (id: string): { lastSeenMs: number; calls: number } | null => {
+      const d = agentDetails[id.trim().toLowerCase()];
+      if (!d || d.lastSeenMs === null) return null;
+      return d.lastSeenMs < cutoff ? { lastSeenMs: d.lastSeenMs, calls: d.calls } : null;
+    };
+  }, [agentDetails]);
+  const lastSeenLabel = (ms: number) =>
+    new Date(ms).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' });
   // The map we would PUT: only rows with both an id and a staff email.
   const agentMapDraft = useMemo(() => {
     const out: Record<string, string> = {};
@@ -580,8 +660,12 @@ export default function CtSettingsPage() {
     if (ak.length !== bk.length) return true;
     return ak.some(k => a[k] !== b[k]);
   }, [agentMapDraft, savedAgentMap]);
+  // Honest count: only TeleCMI ids that appeared on a call and still have no
+  // staff member. An app-login email can never be mapped, so it is never a gap.
   const unmappedSeenCount = useMemo(
-    () => agentRows.filter(r => !r.email.trim() && seenSet.has(r.id.trim().toLowerCase())).length,
+    () => agentRows.filter(
+      r => !r.email.trim() && !isAppLoginId(r.id) && seenSet.has(r.id.trim().toLowerCase()),
+    ).length,
     [agentRows, seenSet],
   );
 
@@ -1270,8 +1354,14 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
             Map each TeleCMI agent id / extension to a staff member so the{' '}
             <strong>Call Log</strong>, <strong>Guest 360</strong> and the{' '}
             <strong>leaderboard</strong> show their name instead of a raw id — this also feeds
-            round-robin recovery assignment. Ids seen on real calls are pre-listed below; unmapped
-            ones are flagged. Leave a row on <em>— Unmapped —</em> to keep showing its raw id.
+            round-robin recovery assignment. Leave a row on <em>— Unmapped —</em> to keep showing
+            its raw id.
+          </p>
+          <p className="text-xs text-[#6B5744]">
+            The ids below come from calls actually seen — an agent who has not taken a call yet
+            will not be listed, so use <strong>Add agent id</strong> to name them in advance.
+            Callbacks a GRE logs from their own phone are recorded against their app login, not a
+            TeleCMI id; those are attributed by name already and are not shown here.
           </p>
 
           {agentRows.length === 0 ? (
@@ -1289,7 +1379,13 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
                 <span className="w-7 shrink-0" />
               </div>
               {agentRows.map((row, idx) => {
-                const isUnmappedSeen = !row.email.trim() && seenSet.has(row.id.trim().toLowerCase());
+                // A legacy app-login email still sitting in the SAVED map: keep
+                // the row visible so it can be removed, but say what it is
+                // rather than badging it as a mapping gap.
+                const isLoginId = isAppLoginId(row.id);
+                const isUnmappedSeen = !row.email.trim() && !isLoginId
+                  && seenSet.has(row.id.trim().toLowerCase());
+                const stale = isLoginId ? null : staleInfo(row.id);
                 const emailKnown = row.email
                   && staff.some(s => s.email.toLowerCase() === row.email.toLowerCase());
                 return (
@@ -1317,6 +1413,17 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
                     {isUnmappedSeen && (
                       <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 shrink-0">
                         unmapped
+                      </span>
+                    )}
+                    {isLoginId && (
+                      <span className="text-[10px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1.5 py-0.5 shrink-0">
+                        logged from the app, not TeleCMI
+                      </span>
+                    )}
+                    {stale && (
+                      <span title={`Last call ${lastSeenLabel(stale.lastSeenMs)} · ${stale.calls} call${stale.calls === 1 ? '' : 's'} on record`}
+                            className="text-[10px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1.5 py-0.5 shrink-0">
+                        no calls in {AGENT_STALE_DAYS} days — likely a removed extension
                       </span>
                     )}
                     <button type="button" onClick={() => removeAgentRow(idx)} title="Remove row"

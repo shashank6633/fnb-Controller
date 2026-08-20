@@ -150,6 +150,14 @@ interface PopCard {
    * GRE seeing "Answered by 201_1111112" learns something ("somebody has it,
    * and the admin has not mapped that extension yet"), where a blank card would
    * teach them nothing and look like the answer never happened.
+   *
+   * IT IS ALSO LEARNED FROM THE POLL. A live 'answered' webhook that carries no
+   * agent id at all leaves this '' — and used to leave it '' for the WHOLE call,
+   * because the only other thing that names the answerer is the CDR, which
+   * arrives after the hangup and so is useless to the person still holding the
+   * phone. The ?owned= snapshot now carries agent_display, so the moment the
+   * server learns who has the call (a later live event, the CDR, or an admin
+   * mapping the extension) the next poll fills this in. See applyOwned().
    */
   agentName: string;
   queue?: string;
@@ -476,18 +484,31 @@ function lockView(card: PopCard, myEmail: string): LockView | null {
  *
  * Capped at 20 to match the route's own cap; MAX_CARDS makes that unreachable,
  * but the two limits should not be able to disagree silently.
+ *
+ * ONE CARD ASKS FOR A SECOND REASON: a call that is UP RIGHT NOW and still does
+ * not name who answered it. The same snapshot carries agent_display, so a card
+ * left anonymous by an agent-less 'answered' webhook has somewhere to learn the
+ * name from while the conversation is still happening — which is the only time
+ * it is worth anything. It is deliberately NOT enough to be lock-shaped: the
+ * reported case is an UNMAPPED (or absent) agent, which resolves to no app user,
+ * so the card arrives unowned and every lock test below skips it. Bounded by
+ * construction — the card stops asking the moment a name arrives, and 'answered'
+ * mode ends at the hangup, so it can never poll for the rest of a shift.
  */
 function ownedIdsOf(list: PopCard[]): string[] {
   const ids: string[] = [];
   for (const c of list) {
     if (!c.callId) continue;
-    if (!c.ownerEmail && c.locked !== true && !c.blocked) continue;
-    // SETTLED OPEN: the server has told us this viewer may write and no lock is
-    // in force. There is nothing further to learn by asking again — a lock can
-    // only come BACK by somebody claiming, and a claim is an event. Stopping
-    // here is what keeps a dispositioned card (which keeps its owner forever, as
-    // the audit record) from polling for the rest of the shift.
-    if (c.canWrite === true && c.locked === false) continue;
+    const needsAnswerer = c.mode === 'answered' && !c.agentName;
+    if (!needsAnswerer) {
+      if (!c.ownerEmail && c.locked !== true && !c.blocked) continue;
+      // SETTLED OPEN: the server has told us this viewer may write and no lock is
+      // in force. There is nothing further to learn by asking again — a lock can
+      // only come BACK by somebody claiming, and a claim is an event. Stopping
+      // here is what keeps a dispositioned card (which keeps its owner forever, as
+      // the audit record) from polling for the rest of the shift.
+      if (c.canWrite === true && c.locked === false) continue;
+    }
     if (!ids.includes(c.callId)) ids.push(c.callId);
     if (ids.length >= 20) break;
   }
@@ -784,6 +805,17 @@ export default function CTScreenPop() {
    * of the row by an authenticated request, so an owner_email of '' really does
    * mean unowned (unlike the ringing snapshot, which is a partial view), and
    * can_write is the same answer the disposition PUT will give.
+   *
+   * IT ALSO CARRIES WHO ANSWERED (agent_display, resolved server-side by the
+   * same resolveAgentLabel() the Call Log uses). That is a strictly ADDITIVE
+   * read here and it is applied under the file's existing guarded-merge rule:
+   * it may only FILL A BLANK. It never overwrites a name an event already
+   * established — the events know things a row does not, and a snapshot must not
+   * be able to undo them — never blanks one, and never touches `mode`: learning
+   * who is on a call says nothing about whether the call is still up, and
+   * promoting a card on the strength of it would put a finished call back on the
+   * phone (the same mistake the 'ownership' event is explicitly forbidden from
+   * making).
    */
   const applyOwned = useCallback((rows: any[]) => {
     if (!Array.isArray(rows) || rows.length === 0) return;
@@ -802,9 +834,15 @@ export default function CTScreenPop() {
         // next poll, both settle it correctly.
         if (next[hit].claiming) continue;
         const owner = String(r.owner_email || '').trim();
+        // FILL A BLANK ONLY. An unmapped id resolves to the raw id, never to
+        // blank, so a non-empty agent_display is always something worth showing;
+        // an empty one is "the server does not know either" and must leave a
+        // name we already have alone.
+        const agentDisplay = String(r.agent_display || '').trim();
         next = next === prev ? [...next] : next;   // never mutate state in place
         next[hit] = {
           ...next[hit],
+          ...(agentDisplay && !next[hit].agentName ? { agentName: agentDisplay } : {}),
           ownerEmail: owner,
           ownerName: owner ? (String(r.owner_name || '').trim() || owner) : '',
           ...(typeof r.locked === 'boolean' ? { locked: r.locked } : {}),
@@ -858,9 +896,13 @@ export default function CTScreenPop() {
   // the ownership picture moved — a claim, an answer, a takeover, a refusal.
   // That immediacy is what gets a manager's can_write back within a tick instead
   // of making them wait out the interval with their chips greyed.
+  // The last segment is "this card is up and still nameless" — the second reason
+  // a card asks (see ownedIdsOf). Included so the ask happens on the tick the
+  // call is answered rather than up to OWNERSHIP_REFRESH_MS later: a name that
+  // lands after the conversation is over is the very problem being fixed.
   const ownedSignature = cards
     .filter(c => !!c.callId)
-    .map(c => `${c.callId}:${c.ownerEmail.toLowerCase()}:${c.locked === true ? 1 : 0}:${c.blocked ? 1 : 0}`)
+    .map(c => `${c.callId}:${c.ownerEmail.toLowerCase()}:${c.locked === true ? 1 : 0}:${c.blocked ? 1 : 0}:${c.mode === 'answered' && !c.agentName ? 1 : 0}`)
     .join('|');
   const watching = ownedIdsOf(cards).length > 0;
   useEffect(() => {

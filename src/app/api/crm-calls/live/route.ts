@@ -1,7 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { latestCtSeq, recentCtSince } from '@/lib/ct/bus';
-import { getUserNamesByEmail } from '@/lib/ct/agents';
+import { getAgentMap, getUserNamesByEmail, resolveAgentLabel } from '@/lib/ct/agents';
 import { callOwnerColumns, callOwnerState } from '@/lib/ct/call-owner';
 import { isStickyAgentOn, isVipRoutingOn } from '@/lib/ct/routing';
 
@@ -106,21 +106,54 @@ export async function GET(req: Request) {
   // locked=true (so the strip still names the owner) together with canWrite=true
   // (so their chips stay live) — which is exactly the owner's rule, and it comes
   // from isManagement inside callOwnerState rather than any second definition.
+  //
+  // WHO ANSWERED RIDES ALONG (agent_user + agent_display). ADDITIVE — every key
+  // above keeps its name and its meaning; these two are new.
+  //
+  // WHY THEY ARE HERE AND NOT ONLY ON THE BUS. The pop learns the answerer from
+  // the live 'answered' event, which carries whatever agentDisplayName() could
+  // make of the agent id the LIVE webhook happened to send. When that payload
+  // names no agent at all the card stays anonymous — "ON CALL 0:33" with nobody
+  // on it — for the whole call, because the only other chance to learn the name
+  // is the CDR, which lands after the call is over and is therefore too late to
+  // be of any use to the person holding the phone.
+  //
+  // The pop already asks this route about these very cards every few seconds, so
+  // this is the SELF-HEAL path: the moment the server learns who has the call —
+  // a later live event that does carry the id, the CDR, or an admin mapping the
+  // extension in CRM Settings — the next poll carries the name and the card
+  // fills it in. No new request, no request per card.
+  //
+  // agent_display is resolved EXACTLY as /api/crm-calls/calls resolves it
+  // (resolveAgentLabel with the agent_map + user names), so the pop, the Call
+  // Log and Guest 360 can never disagree about what to call the same person. An
+  // unmapped id resolves to the raw id rather than to blank — that is
+  // resolveAgentLabel's documented contract and the right one here: "Answered by
+  // 5002" tells a GRE somebody has it and the extension is unmapped, where a
+  // blank teaches them nothing.
   const ownedIds = String(new URL(req.url).searchParams.get('owned') || '')
     .split(',').map(s => s.trim()).filter(Boolean).slice(0, 20);
   let owned: Array<{ id: string; owner_email: string; owner_name: string;
-                     locked: boolean; can_write: boolean; free_at_label: string }> = [];
+                     locked: boolean; can_write: boolean; free_at_label: string;
+                     agent_user: string; agent_display: string }> = [];
   if (ownedIds.length) {
     const ph = ownedIds.map(() => '?').join(',');
     const oRows = db.prepare(
-      `SELECT c.id, ${callOwnerColumns('c')} FROM ct_calls c WHERE c.id IN (${ph})`,
+      `SELECT c.id, c.agent_user, ${callOwnerColumns('c')} FROM ct_calls c WHERE c.id IN (${ph})`,
     ).all(...ownedIds) as any[];
-    // One name map for the whole batch, never one query per row.
-    const names = oRows.some(r => String(r.owner_email || '').trim())
+    // One name map for the whole batch, never one query per row. Now also
+    // needed by an agent id (a mapped agent resolves THROUGH an email to a
+    // user's name), so the "is it worth loading" test covers both — and a batch
+    // with neither an owner nor an agent still costs zero extra queries.
+    const anyAgent = oRows.some(r => String(r.agent_user || '').trim());
+    const names = anyAgent || oRows.some(r => String(r.owner_email || '').trim())
       ? getUserNamesByEmail(db)
       : undefined;
+    // The agent_map is one ct_settings read, and only an agent id can use it.
+    const agentMap = anyAgent ? getAgentMap(db) : null;
     owned = oRows.map(r => {
       const st = callOwnerState(db, r, user, names);
+      const agentUser = String(r.agent_user || '').trim();
       return {
         id: String(r.id),
         owner_email: st.ownerEmail,
@@ -128,6 +161,10 @@ export async function GET(req: Request) {
         locked: st.locked,
         can_write: st.canWrite,
         free_at_label: st.freeAtLabel,
+        agent_user: agentUser,
+        agent_display: agentUser && agentMap
+          ? resolveAgentLabel(agentUser, agentMap, names || {})
+          : '',
       };
     });
   }
