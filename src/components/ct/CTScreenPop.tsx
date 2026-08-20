@@ -109,6 +109,41 @@
  *
  * MISSED calls are never owned: nobody answered, chasing them is the recovery
  * queue's whole job, and the claim endpoint refuses them.
+ *
+ * ── ONE CONVERSATION, SEVERAL RINGING LEGS (hunt group) ─────────────────────
+ * The venue rings agents IN SEQUENCE: one inbound call tries PUSHPA for 25s,
+ * then Nisha for 25s, then Bharath, who picks up. TeleCMI writes a CDR for EVERY
+ * leg, so the FIRST thing the pop hears about a call that is very much alive is
+ * "missed". Reported 2026-08-17 with the call log attached: the card flipped to
+ * "CALL ENDED — LOG OUTCOME", on every screen, while the phone was still ringing
+ * on the next extension.
+ *
+ * The wire now says which kind of ending it is, and this file acts on it:
+ *   leg 'missed_leg'  ONE EXTENSION gave up. The conversation continues. The
+ *                     card STAYS in its ringing state, says so ("Ringing —
+ *                     trying the next agent", and who did not pick up), and the
+ *                     ring timer keeps running because the call is still ringing.
+ *   leg 'final'       the conversation itself ended → disposition, exactly as
+ *                     before.
+ *   leg absent        an older server, and today's behaviour: disposition.
+ * Anything else unrecognised also dispositions, deliberately. The two failure
+ * directions are not equal: dispositioning early is a card the GRE can still
+ * close, while holding a card open on a value we failed to recognise strands it
+ * with no write-up — a new bug on top of the old one.
+ *
+ * A missed leg is also EVIDENCE OF LIFE, which is why RING_STALE_SECONDS is
+ * measured from `lastSignalAt` and not from the first ring: a hunt group that
+ * walks six extensions would otherwise have the card announce it had lost track
+ * while it was demonstrably still ringing. And the safety net that is the whole
+ * point of that constant is kept: if a missed leg is the LAST thing that ever
+ * arrives (the next leg's events are lost), the window still expires, the card
+ * still stops claiming to ring — and it then offers the OUTCOME CHIPS, because a
+ * call that rang out really is a missed call somebody has to write up.
+ *
+ * WHO IT IS RINGING FOR / WHO ANSWERED are two different people on a hunt group
+ * and the card names both, each in its own state. Neither is ever blanked for
+ * being unmapped: an unmapped id arrives as the raw id by design
+ * (resolveAgentLabel, src/lib/ct/agents.ts) and is shown as-is.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -160,8 +195,43 @@ interface PopCard {
    * mapping the extension) the next poll fills this in. See applyOwned().
    */
   agentName: string;
+  /**
+   * WHO THE PHONE IS RINGING FOR RIGHT NOW — a staff display name resolved by
+   * the server (CtEvent.ringingAgentName), '' when the event named nobody.
+   *
+   * NOT agentName: on a hunt group the person it is ringing for and the person
+   * who eventually answers are different people, and the card is in a different
+   * state for each. Cleared when the agent it named is the one reported as
+   * missing the leg — "Ringing — Pushpa" directly above "Pushpa did not pick up"
+   * is a contradiction the card must not print.
+   *
+   * An UNMAPPED agent id arrives as the raw id and is shown as the raw id, for
+   * the reason spelled out on agentName above.
+   */
+  ringingFor: string;
+  /** Staff display name of the last agent whose leg went unanswered, off
+   *  CtEvent.missedByName. '' when no leg has been missed, or when the server
+   *  could not name one (which is why `hunting` is a separate flag). */
+  missedByName: string;
+  /**
+   * Has a MISSED LEG landed on this card — i.e. one extension gave up and the
+   * hunt group moved on? Presentation only ('Ringing — trying the next agent'),
+   * and the one thing that earns a rung-out card its outcome chips if the rest
+   * of the conversation's events never arrive. Set only while the card is
+   * ringing; a late leg CDR can never set it on an answered or finished call.
+   */
+  hunting: boolean;
   queue?: string;
   startedAt: string;
+  /**
+   * The last time this call gave ANY evidence of being alive — the first ring,
+   * or a missed leg saying the hunt group moved on. RING_STALE_SECONDS is
+   * measured from HERE, while the ring counter on the header still counts from
+   * startedAt: "how long has this guest been ringing" and "how long since we
+   * last heard anything" are different questions, and only the second one is
+   * about whether we have lost track.
+   */
+  lastSignalAt: string;
   mode: 'ringing' | 'answered' | 'disposition';
   /** When the call was picked up (UTC ISO); talk time counts from here. */
   answeredAt?: string;
@@ -221,6 +291,23 @@ interface AnyEvent {
   /** Staff display name for `agent` — CtEvent.agentName in src/lib/ct/bus.ts.
    *  Carried by `answered` and by an ANSWERED call's `call_ended`. */
   agentName?: string;
+  /**
+   * WHICH ENDING IS THIS — CtEvent.leg, on `call_ended` only.
+   *   'missed_leg'  one extension of a hunt group stopped ringing; the
+   *                 conversation carries on to the next agent.
+   *   'final'       the conversation ended.
+   * Absent on an older server, which is today's behaviour: treat as final.
+   * Typed loosely (string) for the same reason as everything else on AnyEvent —
+   * this is untrusted JSON off the wire, not a compile-time guarantee.
+   */
+  leg?: string;
+  /** Staff display name of the agent who let a 'missed_leg' ring out —
+   *  CtEvent.missedByName. Unmapped ids arrive as the raw id, never blank. */
+  missedByName?: string;
+  /** Staff display name of the agent the call is ringing for NOW —
+   *  CtEvent.ringingAgentName, on `incoming_call` (and on a 'missed_leg' when
+   *  the server already knows who it moved on to). */
+  ringingAgentName?: string;
   /** Owner of the answered call — see CtEvent.ownerEmail in src/lib/ct/bus.ts. */
   ownerEmail?: string;
   ownerName?: string;
@@ -252,6 +339,13 @@ const OWNERSHIP_REFRESH_MS = 15000;
  *
  * Applies to 'ringing' ONLY. A real conversation can run half an hour, and there
  * is nothing stale about an 'answered' card whose talk timer is still climbing.
+ *
+ * MEASURED FROM THE LAST SIGNAL, NOT THE FIRST RING (see PopCard.lastSignalAt).
+ * On a hunt group the news arrives leg by leg, and each missed leg is proof the
+ * call is alive; counting from the first ring would let a long hunt trip this
+ * window and print "No update from telephony" about a phone that is audibly
+ * ringing. The window itself is unchanged, and so is the thing it protects: a
+ * call that really does go quiet still stops counting five minutes later.
  */
 const RING_STALE_SECONDS = 300;
 
@@ -281,6 +375,30 @@ const sameEmail = (a: unknown, b: unknown): boolean => {
   const x = String(a ?? '').trim().toLowerCase();
   const y = String(b ?? '').trim().toLowerCase();
   return !!x && x === y;
+};
+
+/** Do two display labels name the same person? Used only to stop the card
+ *  saying "Ringing — Pushpa" and "Pushpa did not pick up" at the same time. Two
+ *  blanks are not a match, exactly as in sameEmail. */
+const sameLabel = (a: unknown, b: unknown): boolean => {
+  const x = String(a ?? '').trim().toLowerCase();
+  const y = String(b ?? '').trim().toLowerCase();
+  return !!x && x === y;
+};
+
+/**
+ * The later of two ISO timestamps, preferring whichever is parseable.
+ *
+ * The staleness clock only ever moves FORWARD. A leg CDR can be delivered late
+ * and carries the moment that leg ended, not the moment we heard about it, so an
+ * older `at` must never shorten the window a newer event already opened.
+ */
+const laterIso = (a: string, b: string): string => {
+  const ta = new Date(a).getTime();
+  const tb = new Date(b).getTime();
+  if (isNaN(ta)) return b;
+  if (isNaN(tb)) return a;
+  return tb > ta ? b : a;
 };
 
 /**
@@ -586,9 +704,15 @@ export default function CTScreenPop() {
   // frozen at that point anyway, so there is nothing left to re-render. The
   // dependency is a boolean derived from nowTick, so it settles in one pass
   // (goes false, interval clears, nothing further updates nowTick).
+  // Measured from lastSignalAt, NOT startedAt — a missed leg re-dates it, and
+  // the counter has to come back with it: a hunt group that walks three
+  // extensions is a call whose timer must keep running. Re-arming after a freeze
+  // is safe because a fresher lastSignalAt against the (stopped) nowTick reads
+  // as 0 seconds, so the boolean flips back to true on the very next render.
   const hasLiveCounter = cards.some(c =>
     c.mode === 'answered' ||
-    (c.mode === 'ringing' && Math.floor((nowTick - new Date(c.startedAt).getTime()) / 1000) <= RING_STALE_SECONDS),
+    (c.mode === 'ringing'
+      && Math.floor((nowTick - new Date(c.lastSignalAt || c.startedAt).getTime()) / 1000) <= RING_STALE_SECONDS),
   );
   useEffect(() => {
     if (!hasLiveCounter) return;
@@ -612,13 +736,31 @@ export default function CTScreenPop() {
     if (e.type === 'incoming_call') {
       const key = eventKey(e);
       if (!key || dismissedRef.current.has(key)) return;
+      const ringingFor = String(e.ringingAgentName || '').trim();
       setCards(prev => {
         const existing = prev.find(c => c.key === key);
         if (existing) {
           // Ring repeat / richer payload — merge ids and guest, never duplicate.
-          return prev.map(c => c.key === key
-            ? { ...c, callId: c.callId || e.callId, guest: c.guest || e.guest || null }
-            : c);
+          // A hunt group re-rings the SAME conversation at the next extension, so
+          // a ring that names an agent we were not already ringing for is real
+          // news: it re-dates the staleness clock (the call is demonstrably still
+          // ringing) and re-labels the header. A re-delivery of the ring we
+          // already have names the same agent, changes nothing, and deliberately
+          // does NOT reset the clock — otherwise a repeating event could hold a
+          // dead card open for ever.
+          return prev.map(c => {
+            if (c.key !== key) return c;
+            const moved = !!ringingFor && !sameLabel(c.ringingFor, ringingFor);
+            return {
+              ...c,
+              callId: c.callId || e.callId,
+              guest: c.guest || e.guest || null,
+              ...(ringingFor ? { ringingFor } : {}),
+              ...(moved && c.mode === 'ringing'
+                ? { lastSignalAt: laterIso(c.lastSignalAt, e.at || new Date().toISOString()) }
+                : {}),
+            };
+          });
         }
         return pushCard(prev, {
           key,
@@ -628,8 +770,14 @@ export default function CTScreenPop() {
           guest: e.guest || null,
           agent: e.agent || '',
           agentName: e.agentName || '',   // a ring names no answerer yet
+          // …but a ring DOES name who it is ringing for, which is the question
+          // the GRE staring at the card actually has.
+          ringingFor,
+          missedByName: '',
+          hunting: false,
           queue: e.queue || '',
           startedAt: e.at || new Date().toISOString(),
+          lastSignalAt: e.at || new Date().toISOString(),
           mode: 'ringing',
           ownerEmail: '',   // a ringing call is unanswered, so unownable
           ownerName: '',
@@ -687,6 +835,57 @@ export default function CTScreenPop() {
     }
 
     if (e.type === 'call_ended') {
+      // ── ONE LEG GAVE UP, THE CALL DID NOT ─────────────────────────────────
+      // A hunt group rings agent after agent and TeleCMI writes a CDR per leg,
+      // so a 'missed' ending is routinely the FIRST news about a call that is
+      // still ringing somewhere else in the building. This branch is the whole
+      // fix for the 2026-08-17 report: it must run BEFORE anything below, since
+      // the owner-only rule would otherwise DISMISS the card outright on other
+      // screens — which is precisely what happened, on a live call.
+      //
+      // Everything unrecognised falls through to the disposition path below —
+      // see the header for why that direction is the safe one.
+      if (String(e.leg || '').trim() === 'missed_leg') {
+        const at = e.at || new Date().toISOString();
+        const nextRinger = String(e.ringingAgentName || '').trim();
+        const missedBy = String(e.missedByName || '').trim();
+        setCards(prev => {
+          const idx = matchIdx(prev, e);
+          if (idx === -1) return prev;    // this browser never saw the call ring
+          const c = prev[idx];
+          // ONLY A RINGING CARD. Leg CDRs arrive minutes late and out of order,
+          // so Pushpa's missed leg can land AFTER Bharath has already answered
+          // (or after the conversation ended and the card went to chips).
+          // Putting a live or finished call back on "trying the next agent"
+          // would be this same bug pointing the other way, so a missed leg for
+          // anything that is no longer ringing is simply not news.
+          if (c.mode !== 'ringing') return prev;
+          const next = [...prev];
+          next[idx] = {
+            ...c,
+            callId: c.callId || e.callId,
+            guest: e.guest || c.guest,   // the CDR carries a fresher snapshot
+            hunting: true,
+            ...(missedBy ? { missedByName: missedBy } : {}),
+            // Who it rings for now: the server's next agent when it named one,
+            // otherwise nobody — the agent we were showing is the one that just
+            // rang out, and keeping his name up would contradict the very line
+            // underneath it. A blank simply drops back to "Incoming call".
+            ringingFor: nextRinger || (sameLabel(c.ringingFor, missedBy) ? '' : c.ringingFor),
+            // EVIDENCE OF LIFE — the staleness clock restarts. Without this a
+            // six-extension hunt would cross RING_STALE_SECONDS and the card
+            // would announce it had lost track of a call it can hear ringing.
+            lastSignalAt: laterIso(c.lastSignalAt, at),
+            // OWNERSHIP IS DELIBERATELY UNTOUCHED. A leg that nobody answered
+            // says nothing about who will own the conversation, and applying an
+            // ownerEmail of '' off a late-delivered leg could hand a settled
+            // call back to the queue. `answered`/`final` state the owner.
+          };
+          return next;
+        });
+        return;
+      }
+
       // OWNER-ONLY DISPOSITION (owner ruling 2026-08-17, header §call_ended):
       // when the ended call has a KNOWN owner, every browser that is not the
       // owner's drops the card on hangup — Agent B saw "Answered by A" while
@@ -721,6 +920,9 @@ export default function CTScreenPop() {
           // on a browser that missed the live 'answer', the ONLY — chance to
           // learn who took it. Guarded for the same reason as above: a missed
           // call's call_ended carries no agentName and must not erase one.
+          // On a hunt group this is the FINAL leg — the one that was actually
+          // picked up — so it names the answerer and not any of the extensions
+          // that rang out first; those never reach here (they return above).
           ...(e.agentName ? { agentName: e.agentName } : {}),
           // The write-up window is the whole point of the lock, so an owner
           // named on the hangup/CDR matters most here. lockPatch ignores an
@@ -780,8 +982,16 @@ export default function CTScreenPop() {
           // that would render as "Answered by 201_1111112" on a call that has
           // not been answered — the `answered` event brings the real name.
           agentName: '',
+          // Same reasoning for "ringing for": agent_user here is the RAW id and
+          // this snapshot does not resolve it, so filling it would print an
+          // extension number for an agent who IS mapped — the one case
+          // resolveAgentLabel exists to avoid. The ring event brings the name.
+          ringingFor: '',
+          missedByName: '',
+          hunting: false,
           queue: String(r.queue || ''),
           startedAt: String(r.started_at || new Date().toISOString()),
+          lastSignalAt: String(r.started_at || new Date().toISOString()),
           mode: 'ringing',
           ownerEmail: ownerFields?.ownerEmail || '',
           ownerName: ownerFields?.ownerName || '',
@@ -1372,17 +1582,35 @@ export default function CTScreenPop() {
           const otherTags = tags.filter(t => String(t).toLowerCase() !== 'vip').slice(0, 3);
           /* THE HEADER MUST NEVER SAY SOMETHING THE CARD DOES NOT KNOW.
              Three states, plus the one honest admission: a card still claiming
-             to ring RING_STALE_SECONDS after it started has heard nothing since,
-             and by then the server itself has stopped believing it (see the
-             constant). It says so and freezes its counter rather than implying a
-             phone is still ringing somewhere in the building. */
-          const ringStale = card.mode === 'ringing' && secondsSince(card.startedAt) > RING_STALE_SECONDS;
+             to ring RING_STALE_SECONDS after its LAST NEWS (the first ring, or
+             the last leg that rang out — see PopCard.lastSignalAt) has heard
+             nothing since, and by then the server itself has stopped believing
+             it (see the constant). It says so and freezes its counter rather
+             than implying a phone is still ringing somewhere in the building. */
+          const ringStale = card.mode === 'ringing'
+            && secondsSince(card.lastSignalAt || card.startedAt) > RING_STALE_SECONDS;
           const onCall = card.mode === 'answered';
+          /* THE HUNT GROUP IS STILL WALKING EXTENSIONS. One leg rang out and the
+             call moved on, which is news the card must show rather than act on:
+             it is still a RINGING card in every other respect. Gated on
+             !ringStale because once the window has expired we no longer know
+             that, and the honest admission below outranks it. */
+          const hunting = card.mode === 'ringing' && card.hunting && !ringStale;
+          /* …AND THE ONE CASE WHERE IT NEVER CAME BACK. A missed leg was the last
+             thing we ever heard: nothing says the call is still up, and a call
+             that rang out is a real missed call somebody has to write up. The
+             card drops to the stale presentation AND offers the outcome chips,
+             so it is never left with a dismiss as the only way out. */
+          const strandedMiss = ringStale && card.hunting;
+          const showChips = card.mode === 'disposition' || strandedMiss;
           const headerBg = ringStale ? 'bg-[#6B5744]' : onCall ? 'bg-[#15803d]' : card.mode === 'ringing' ? 'bg-[#af4408]' : 'bg-[#2D1B0E]';
           const headerText = ringStale
             ? 'No update from telephony'
             : onCall ? 'On call'
-            : card.mode === 'ringing' ? 'Incoming call'
+            // WHO IT IS RINGING FOR, in the header, while it rings. An unmapped
+            // extension resolves to the raw id and is printed as the raw id —
+            // "Ringing — 201_1111112" tells the GRE something; a blank does not.
+            : card.mode === 'ringing' ? (card.ringingFor ? `Ringing — ${card.ringingFor}` : 'Incoming call')
             : 'Call ended — log outcome';
           return (
             <div key={card.key}
@@ -1414,6 +1642,33 @@ export default function CTScreenPop() {
               </div>
 
               <div className="p-3 space-y-2.5">
+                {/* THE HUNT GROUP, SAID OUT LOUD. Directly under the header,
+                    because it is the sentence that stops a GRE believing the
+                    call is over: one extension gave up, the phone is still
+                    ringing on the next one. The name is kept when the window
+                    has expired too — "X did not pick up" stays true whatever
+                    happened afterwards — but the claim that it is still
+                    ringing is dropped with it. */}
+                {(hunting || (strandedMiss && !!card.missedByName)) && (
+                  <div className="flex items-start gap-2 px-2.5 py-2 bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg">
+                    {hunting
+                      ? <PhoneIncoming className="w-3.5 h-3.5 text-[#af4408] shrink-0 mt-0.5 animate-pulse" />
+                      : <PhoneOff className="w-3.5 h-3.5 text-[#8B7355] shrink-0 mt-0.5" />}
+                    <div className="min-w-0 flex-1">
+                      {hunting && (
+                        <p className="text-[11px] font-semibold text-[#af4408] leading-snug">
+                          Ringing — trying the next agent
+                        </p>
+                      )}
+                      {!!card.missedByName && (
+                        <p className="text-[11px] text-[#8B7355] leading-snug truncate">
+                          <b className="text-[#2D1B0E] font-semibold">{card.missedByName}</b> did not pick up
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {/* Identity */}
                 {card.guest ? (
                   <div>
@@ -1521,9 +1776,15 @@ export default function CTScreenPop() {
                     call, ringing AND answered — mid-conversation is exactly when
                     a GRE takes a booking, and gating it on 'ringing' alone would
                     have removed it the instant the guest was picked up. The
-                    outcome chips belong to the call being OVER, so they remain
-                    strictly the disposition state's. */}
-                {card.mode !== 'disposition' ? (
+                    outcome chips belong to the call being OVER — which is the
+                    disposition state, plus the one ringing card we have positive
+                    evidence rang out and then went silent (strandedMiss). That
+                    card is a missed call in everything but the event that never
+                    arrived, and leaving it with no chips would mean the only way
+                    off the screen was to throw the write-up away. Quick Booking
+                    is not lost with it: the "Booking Made" chip opens the same
+                    modal. */}
+                {!showChips ? (
                   <div className="flex items-center gap-2 pt-0.5">
                     <button onClick={() => onQuickBooking(card)} disabled={card.claiming}
                             className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-xs font-semibold">

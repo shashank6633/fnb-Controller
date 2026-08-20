@@ -47,6 +47,39 @@ export interface CtEvent {
   /** Resolved staff display name for `agent` (via agent_map), for the live feed. */
   agentName?: string;
   /**
+   * DID THIS `call_ended` END THE CALL, or only one leg of it?
+   *
+   * The venue rings a HUNT GROUP: one inbound call rings agent after agent and
+   * TeleCMI files EVERY leg as its own CDR, so a missed CDR normally means the
+   * call moved to the next extension — not that it is over. Ingest used to emit
+   * `call_ended` for all of them and every screen flipped to "CALL ENDED — LOG
+   * OUTCOME" while the call was still ringing elsewhere.
+   *
+   *   'missed_leg' — a leg stopped ringing and the call MAY STILL BE ALIVE
+   *                  (evidence: another leg of the same conversation_id is up).
+   *                  A consumer must NOT announce the end or ask for a
+   *                  disposition on this; wait for a 'final'.
+   *   'final'      — the call is over. Today's behaviour.
+   *
+   * Only set on a `call_ended` raised from a CDR (see missedLegFinality() in
+   * ./ingest.ts). ABSENT MEANS 'final': every pre-existing emitter and every
+   * buffered event from before this field must keep behaving exactly as it did.
+   */
+  leg?: 'missed_leg' | 'final';
+  /**
+   * WHICH AGENT LET IT PASS on a missed leg ("Missed by Agent PUSHPA B" in
+   * TeleCMI's own log). Deliberately NOT agentName: that field means "answered
+   * by", and a missed call was answered by nobody. Resolved through
+   * resolveAgentLabel, so an UNMAPPED id renders as the raw id — never blank.
+   */
+  missedByName?: string;
+  /**
+   * WHICH AGENT AN INCOMING CALL IS RINGING FOR, on `incoming_call` — same
+   * resolution, raw id when unmapped. Absent when the live payload named no
+   * agent: the ringing extension is reported, never guessed.
+   */
+  ringingAgentName?: string;
+  /**
    * OWNERSHIP of an answered call — the app user (email) who holds the write-up,
    * '' / undefined when nobody does. Distinct from `agent`: that is the TELEPHONY
    * agent id, which for an unmapped agent resolves to no app user at all, so the

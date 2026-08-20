@@ -4897,6 +4897,40 @@ function initializeSchema(db: Database.Database) {
     addCtCol('duration_source',   `TEXT NOT NULL DEFAULT ''`);    // 'call_log'|'approx'|'timer'|'manual', '' = no callback wrote it — CLAIMED, not proven
     addCtCol('duration_verified', `INTEGER NOT NULL DEFAULT 0`);  // 1 = server bounded it against a redeemed call token (clamped only if the claim exceeded the wall time)
 
+    // ── WHICH ROUTED CALL IS THIS LEG PART OF? (additive; PRAGMA-guarded) ─────
+    // The venue rings a HUNT GROUP: ONE inbound call rings agent after agent,
+    // 25s each, and TeleCMI reports every leg as its own CDR — two "missed" and
+    // then one "picked", same caller, seconds apart. So a CDR arriving does NOT
+    // mean the call is over; it means it stopped ringing THAT extension.
+    //
+    // TeleCMI's `conversation_uuid` is shared by every leg of that one call, and
+    // it is what this column stores (see CONVERSATION_KEYS in
+    // src/lib/ct/telecmi-mapper.ts, where it is read into the mapped shapes).
+    // It exists so a reader can ask the one question a single leg cannot answer:
+    // IS ANY OTHER LEG OF THIS CONVERSATION STILL LIVE? — and stay silent about
+    // "call ended" until none is. The owner watched his screen-pop flip to
+    // "CALL ENDED — LOG OUTCOME" while the call was still ringing the next GRE.
+    //
+    // IT IS NOT A CALL ID AND MUST NEVER BE UNIQUE. One row per LEG is the
+    // storage rule — telecmi_call_id (UNIQUE) still keys the row; several rows
+    // legitimately share one conversation_id. The index is therefore a plain
+    // one, and it is the whole point of the column: the liveness question is a
+    // lookup by conversation_id on every leg-ended event.
+    //
+    // NOT NULL DEFAULT '' back-fills every existing row inside the ALTER itself
+    // (the trick owner_email and telecmi_recorded both use), and '' is the
+    // ct_ block's own unknown marker. '' MEANS "this payload named no
+    // conversation" — never "the same conversation as the other blanks": all
+    // pre-existing rows, every live-created row whose payload omitted it, and
+    // any PBX that spells it differently land here together, so a reader must
+    // treat '' as UNGROUPABLE and fall back to today's per-leg behaviour rather
+    // than joining a whole history into one imaginary call.
+    const ctCallCols = db.prepare(`PRAGMA table_info(ct_calls)`).all() as any[];
+    if (!ctCallCols.some((c: any) => c.name === 'conversation_id')) {
+      db.exec(`ALTER TABLE ct_calls ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''`);
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_ct_calls_conversation ON ct_calls(conversation_id)`);
+
     // ── ct_call_tokens — the wall-clock receipt for an outbound call back ────
     //
     // WHAT IT IS FOR. The GRE taps Call Back; before the dialer opens, the

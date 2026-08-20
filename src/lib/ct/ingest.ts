@@ -541,6 +541,98 @@ function createRecovery(
   return info.changes > 0;
 }
 
+// ─── IS THIS ENDED LEG THE END OF THE CALL? ─────────────────────────────────
+//
+// THE BUG THIS EXISTS FOR (owner, 2026-08-17, with TeleCMI's own log as
+// evidence): the venue rings a HUNT GROUP, so ONE inbound call rings agent
+// after agent and TeleCMI files EVERY leg as its own CDR —
+//   07:13:56 Missed by PUSHPA B (ring 25s) · 07:14:21 Missed by Nisha Sharma
+//   (ring 25s) · 07:14:46 Picked by Bharath D — one caller, one conversation.
+// Ingest emitted `call_ended` for every one of those CDRs, and the screen-pop
+// turns any `call_ended` into "CALL ENDED — LOG OUTCOME". So the instant the
+// call stopped ringing ONE extension every browser was told the call was over
+// and asked to write it up, while it was still ringing the next GRE.
+//
+// A MISSED CDR MEANS "IT STOPPED RINGING THAT EXTENSION", NOT "THE CALL ENDED".
+// This decides which of the two it was, from evidence only, in the order the
+// evidence deserves:
+//   (a) conversation_id — TeleCMI's `conversation_uuid`, shared by every leg of
+//       the one routed call (see CONVERSATION_KEYS in ./telecmi-mapper.ts, and
+//       the ct_calls.conversation_id migration in db.ts). Another leg of THIS
+//       conversation still up ⇒ 'missed_leg'. When we HAVE this key it is the
+//       whole answer, so (b) is not consulted: a conversation with no other live
+//       leg genuinely has ended.
+//   (b) only when no conversation id is available at all ('' = UNGROUPABLE, per
+//       the column's contract — never "same conversation as the other blanks"):
+//       a live call from the SAME phone that started in the last 90 seconds is,
+//       on a hunt group whose legs ring 25s apart, the next leg of this call.
+//   (c) otherwise 'final' — today's behaviour, unchanged.
+//
+// "STILL UP" IS status IN ('ringing','answered') AND A BLANK ended_at, the same
+// bound the live-hangup fallback uses. The status test alone would be wrong in
+// the direction that matters: an ANSWERED row keeps status='answered' forever
+// after it completes, so yesterday's answered call would make every missed CDR
+// from that number look like a live sibling and the pop would never settle.
+//
+// The current leg is excluded by id — it was just upserted (missed, ended_at
+// set), but a row must never be its own evidence.
+const LIVE_SIBLING_BY_CONVERSATION_SQL = `
+  SELECT 1 FROM ct_calls
+   WHERE conversation_id = ?
+     AND id <> ?
+     AND status IN ('ringing', 'answered')
+     AND IFNULL(ended_at, '') = ''
+   LIMIT 1
+`;
+
+const LIVE_SIBLING_BY_PHONE_SQL = `
+  SELECT 1 FROM ct_calls
+   WHERE phone_e164 = ?
+     AND id <> ?
+     AND status IN ('ringing', 'answered')
+     AND IFNULL(ended_at, '') = ''
+     AND COALESCE(NULLIF(started_at, ''), created_at) >= ?
+   LIMIT 1
+`;
+
+/** How far back the phone fallback looks. The measured hunt group hands the
+ *  call on every 25s; 90s covers three such hops and still cannot reach a
+ *  separate call from the same guest minutes later. */
+const HUNT_GROUP_PHONE_WINDOW_MS = 90_000;
+
+/**
+ * 'missed_leg' when this ended leg may not be the end of the call, 'final' when
+ * it is. Only ever asked about a MISSED-family CDR — an answered CDR is always
+ * final (somebody picked up; that IS the conversation).
+ *
+ * ON ANY FAILURE, 'final': the missed-call RECOVERY QUEUE is the safety net for
+ * a call wrongly called over, and a pop wrongly left open has none — nothing
+ * later retracts a 'missed_leg', so it must be claimed on evidence or not at all.
+ */
+function missedLegFinality(
+  db: Database.Database,
+  opts: { callId: string; conversationId: string; phone: string; now: string },
+): 'missed_leg' | 'final' {
+  try {
+    const conversationId = String(opts.conversationId || '').trim();
+    if (conversationId) {
+      const sibling = db.prepare(LIVE_SIBLING_BY_CONVERSATION_SQL).get(conversationId, opts.callId);
+      return sibling ? 'missed_leg' : 'final';
+    }
+    if (opts.phone) {
+      const anchorMs = Date.parse(opts.now);
+      const baseMs = isNaN(anchorMs) ? Date.now() : anchorMs;
+      const cutoff = new Date(baseMs - HUNT_GROUP_PHONE_WINDOW_MS).toISOString();
+      const sibling = db.prepare(LIVE_SIBLING_BY_PHONE_SQL).get(opts.phone, opts.callId, cutoff);
+      return sibling ? 'missed_leg' : 'final';
+    }
+    return 'final';
+  } catch (e) {
+    console.error('[ct-ingest] leg finality check failed', e);
+    return 'final';
+  }
+}
+
 // ─── CDR ingestion (source of truth) ────────────────────────────────────────
 
 /**
@@ -617,8 +709,8 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
         INSERT INTO ct_calls
           (id, telecmi_call_id, guest_id, phone_e164, direction, status, agent_user, queue,
            started_at, answered_at, ended_at, duration_sec, recording_url, telecmi_recorded,
-           raw_payload, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           conversation_id, raw_payload, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(telecmi_call_id) DO UPDATE SET
           guest_id      = COALESCE(ct_calls.guest_id, excluded.guest_id),
           phone_e164    = CASE WHEN ct_calls.phone_e164 = '' THEN excluded.phone_e164 ELSE ct_calls.phone_e164 END,
@@ -635,12 +727,18 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
             WHEN excluded.telecmi_recorded <> 'unknown' AND ct_calls.telecmi_recorded = 'unknown'
               THEN excluded.telecmi_recorded
             ELSE ct_calls.telecmi_recorded END,
+          -- FILL-BLANK ONLY, exactly like agent_user/queue above. A leg's
+          -- conversation belongs to it for good: the ring that created this row
+          -- may have named it, and a later CDR (or a re-delivery) must not be
+          -- able to move a leg into a different conversation. '' stays
+          -- UNGROUPABLE, never "the same conversation as the other blanks".
+          conversation_id = CASE WHEN IFNULL(ct_calls.conversation_id, '') = '' THEN excluded.conversation_id ELSE ct_calls.conversation_id END,
           raw_payload   = CASE WHEN ct_calls.raw_payload IN ('', '{}') THEN excluded.raw_payload ELSE ct_calls.raw_payload END
       `).run(
         generateId(), telecmiId, guest?.id ?? null, phone, m.direction, m.status,
         m.agent || '', m.queue || '', m.startedAt || now, m.answeredAt,
         m.endedAt || now, m.durationSec || 0, m.recordingUrl || '', m.recordFlag,
-        rawJson, now,
+        m.conversationId || '', rawJson, now,
       );
       callId = (db.prepare(`SELECT id FROM ct_calls WHERE telecmi_call_id = ?`).get(telecmiId) as { id: string }).id;
     } else {
@@ -652,13 +750,13 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
         INSERT INTO ct_calls
           (id, telecmi_call_id, guest_id, phone_e164, direction, status, agent_user, queue,
            started_at, answered_at, ended_at, duration_sec, recording_url, telecmi_recorded,
-           raw_payload, created_at)
-        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           conversation_id, raw_payload, created_at)
+        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         callId, guest?.id ?? null, phone, m.direction, m.status,
         m.agent || '', m.queue || '', m.startedAt || now, m.answeredAt,
         m.endedAt || now, m.durationSec || 0, m.recordingUrl || '', m.recordFlag,
-        rawJson, now,
+        m.conversationId || '', rawJson, now,
       );
     }
 
@@ -736,6 +834,16 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
     // the result to every browser.
     const owner = settleOwnerFromCdr(db, callId, { status: m.status, agent: m.agent || '' }, now);
 
+    // IS THE CALL ACTUALLY OVER? An ANSWERED CDR always is — somebody picked up,
+    // and that is the conversation. A MISSED one is only the end of the call if
+    // no other leg of it is still up: on this venue's hunt group a missed CDR
+    // usually means the call has simply moved to the next extension. See
+    // missedLegFinality() above for the evidence ladder and why it fails 'final'.
+    const missed = MISSED_FAMILY.has(m.status);
+    const leg: 'missed_leg' | 'final' = missed
+      ? missedLegFinality(db, { callId, conversationId: m.conversationId || '', phone, now })
+      : 'final';
+
     emit({
       type: 'call_ended',
       callId,
@@ -746,6 +854,17 @@ export function ingestCdr(raw: any): { callId: string | null; created: boolean }
       // "answered by <name>" only makes sense for answered calls — a missed call
       // was not answered by anyone.
       agentName: m.status === 'answered' ? (agentDisplayName(db, m.agent) || undefined) : undefined,
+      // WHICH AGENT JUST LET IT PASS — the other half of the owner's request, and
+      // the same CDR supplies it: TeleCMI names the ringing extension on a missed
+      // leg ("Missed by Agent PUSHPA B"). Kept in a field of its OWN rather than
+      // agentName so no consumer can read "missed by" as "answered by".
+      // resolveAgentLabel shows the RAW id when the agent is unmapped — mapping is
+      // not done for these ids yet, and a blank would name nobody at all.
+      missedByName: missed ? (agentDisplayName(db, m.agent) || undefined) : undefined,
+      // 'missed_leg' = DO NOT tell the GRE the call is over (it is still ringing
+      // somewhere); 'final' = today's behaviour. Always sent on a call_ended from
+      // a CDR so no consumer has to infer it from the status.
+      leg,
       // Sent as '' rather than undefined when unowned — DELIBERATE, and the one
       // place this file breaks its own `|| undefined` habit. A browser holding a
       // stale owner has to be able to learn that ownership was cleared (missed
@@ -833,15 +952,16 @@ export function ingestLive(raw: any): void {
         db.prepare(`
           INSERT INTO ct_calls
             (id, telecmi_call_id, guest_id, phone_e164, direction, status, agent_user, queue,
-             started_at, raw_payload, created_at)
-          VALUES (?, ?, ?, ?, 'inbound', 'ringing', ?, ?, ?, ?, ?)
+             started_at, conversation_id, raw_payload, created_at)
+          VALUES (?, ?, ?, ?, 'inbound', 'ringing', ?, ?, ?, ?, ?, ?)
           ON CONFLICT(telecmi_call_id) DO UPDATE SET
             guest_id   = COALESCE(ct_calls.guest_id, excluded.guest_id),
             phone_e164 = CASE WHEN ct_calls.phone_e164 = '' THEN excluded.phone_e164 ELSE ct_calls.phone_e164 END,
-            started_at = COALESCE(NULLIF(ct_calls.started_at, ''), excluded.started_at)
+            started_at = COALESCE(NULLIF(ct_calls.started_at, ''), excluded.started_at),
+            conversation_id = CASE WHEN IFNULL(ct_calls.conversation_id, '') = '' THEN excluded.conversation_id ELSE ct_calls.conversation_id END
         `).run(
           generateId(), telecmiId, guest?.id ?? null, phone,
-          m.agent || '', m.queue || '', m.at || now, safeStringify(raw), now,
+          m.agent || '', m.queue || '', m.at || now, m.conversationId || '', safeStringify(raw), now,
         );
         callId = (db.prepare(`SELECT id FROM ct_calls WHERE telecmi_call_id = ?`).get(telecmiId) as { id: string } | undefined)?.id;
       } else if (phone) {
@@ -860,11 +980,11 @@ export function ingestLive(raw: any): void {
           db.prepare(`
             INSERT INTO ct_calls
               (id, telecmi_call_id, guest_id, phone_e164, direction, status, agent_user, queue,
-               started_at, raw_payload, created_at)
-            VALUES (?, NULL, ?, ?, 'inbound', 'ringing', ?, ?, ?, ?, ?)
+               started_at, conversation_id, raw_payload, created_at)
+            VALUES (?, NULL, ?, ?, 'inbound', 'ringing', ?, ?, ?, ?, ?, ?)
           `).run(
             callId, guest?.id ?? null, phone,
-            m.agent || '', m.queue || '', m.at || now, safeStringify(raw), now,
+            m.agent || '', m.queue || '', m.at || now, m.conversationId || '', safeStringify(raw), now,
           );
         }
       }
@@ -875,6 +995,13 @@ export function ingestLive(raw: any): void {
         phone: phone || undefined,
         guest: guestSnapshot(db, phone),
         agent: m.agent || undefined,
+        // WHO IS IT RINGING FOR — asked for alongside the leg fix, because on a
+        // hunt group "ringing" without a name tells a GRE nothing about whether
+        // it is their phone. Resolved the same way as everywhere else, so an
+        // unmapped id shows as the raw id rather than as a blank. STRICTLY FROM
+        // THE PAYLOAD: a ring that names no agent sends nothing here — the pop
+        // must not invent an extension.
+        ringingAgentName: agentDisplayName(db, m.agent) || undefined,
         queue: m.queue || undefined,
         at: m.at || now,
       });
@@ -943,14 +1070,20 @@ export function ingestLive(raw: any): void {
       // which Guest 360 and the Call Log both derive from agent_user — could not
       // appear until the CDR landed minutes later. Fills BLANKS ONLY, so it can
       // never overwrite what an earlier event or a CDR already established.
+      //
+      // conversation_id rides along on the SAME blank-fill terms: an answer is
+      // often the first payload of the routed call to name it, and the next
+      // leg's ended-CDR asks its liveness question by that value.
       const answeringAgent = String(m.agent || '').trim();
-      if (answeringAgent || m.queue) {
+      const answerConversation = String(m.conversationId || '').trim();
+      if (answeringAgent || m.queue || answerConversation) {
         db.prepare(`
           UPDATE ct_calls
              SET agent_user = CASE WHEN IFNULL(agent_user, '') = '' THEN ? ELSE agent_user END,
-                 queue      = CASE WHEN IFNULL(queue, '')      = '' THEN ? ELSE queue      END
+                 queue      = CASE WHEN IFNULL(queue, '')      = '' THEN ? ELSE queue      END,
+                 conversation_id = CASE WHEN IFNULL(conversation_id, '') = '' THEN ? ELSE conversation_id END
            WHERE id = ?
-        `).run(answeringAgent, String(m.queue || ''), answeredCallId);
+        `).run(answeringAgent, String(m.queue || ''), answerConversation, answeredCallId);
       }
 
       // THE MOMENT OWNERSHIP IS DECIDED for a mapped agent: whoever picked up
@@ -1036,10 +1169,11 @@ export function ingestLive(raw: any): void {
       db.prepare(`
         UPDATE ct_calls
            SET status   = CASE WHEN status = 'ringing' THEN 'missed' ELSE status END,
-               ended_at = COALESCE(ended_at, ?)
+               ended_at = COALESCE(ended_at, ?),
+               conversation_id = CASE WHEN IFNULL(conversation_id, '') = '' THEN ? ELSE conversation_id END
          WHERE id = ?
            AND status IN ('ringing', 'answered')
-      `).run(m.at || now, row.id);
+      `).run(m.at || now, String(m.conversationId || ''), row.id);
 
       // Hangup does NOT change ownership — it starts the 15-minute write-up
       // window that call-owner.ts measures from ended_at. Nothing is stamped or

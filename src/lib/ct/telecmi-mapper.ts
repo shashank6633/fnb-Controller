@@ -59,6 +59,12 @@ export interface MappedLiveEvent {
    * including live events, which may not repeat it — can be classified too.
    */
   virtualNumber: string;
+  /**
+   * THE ONE ROUTED CALL this record is a leg of (`conversation_uuid`), '' when
+   * the payload carried no such field. See CONVERSATION_KEYS — it is NOT the
+   * call id, and legs deliberately stay separate rows.
+   */
+  conversationId: string;
 }
 
 /** Normalized CDR ("call report") webhook record. */
@@ -89,6 +95,8 @@ export interface MappedCdr {
   legNote: string;
   /** OUR OWN number as this payload named it — see MappedLiveEvent.virtualNumber. */
   virtualNumber: string;
+  /** The one routed call this CDR is a leg of — see MappedLiveEvent.conversationId. */
+  conversationId: string;
 }
 
 /**
@@ -228,11 +236,33 @@ function pickTime(m: Norm, keys: string[]): string | null {
 // routed call, so using it as the call id would merge the guest leg and the agent
 // leg into a single ct_calls row — a different behaviour from suppressing the
 // agent leg, and not the one asked for.
+//
+// THAT EXCLUSION STAYS, and the value is no longer thrown away: it now rides its
+// OWN field (`conversationId` on both mapped shapes, read via CONVERSATION_KEYS
+// below). One leg per row remains the storage rule; the conversation id is only
+// how a reader asks "is another leg of this same call still live?" — which is the
+// question a hunt group makes unanswerable from a single leg. A ring group hands
+// one inbound call to agent after agent, each leg its own CDR, so a leg ending is
+// NOT the call ending.
 const ID_KEYS = [
   'cmiuid',
   'id', 'callid', 'calluuid', 'uuid', 'sid', 'callsid', 'uniqueid',
   'callrefid', 'refid', 'requestid', 'cdrid',
   'cmiuuid',
+];
+// THE CORRELATION KEY, and ONLY that — never an id candidate (see the ID_KEYS
+// note directly above; adding any of these there would merge the legs into one
+// row). `conversation_uuid` is the spelling in the measured 17-field CDR census
+// of this account; the rest are defensive aliases in the style of the lists here,
+// unobserved on this account.
+//
+// 'conversation' is last of the conversation-* spellings on purpose: a payload
+// that nests the record under a `conversation` OBJECT gets nothing from it
+// (pickStr only takes strings/numbers), and a payload carrying a scalar
+// `conversation_uuid` must resolve from that, not from a looser sibling.
+const CONVERSATION_KEYS = [
+  'conversationuuid', 'conversationid', 'convuuid', 'conversation',
+  'sessionuuid', 'sessionid',
 ];
 const CUSTOMER_KEYS = ['customernumber', 'customerno', 'customerphone', 'custnumber'];
 const FROM_KEYS = [
@@ -478,6 +508,10 @@ function sameNumber(a: string, b: string): boolean {
  *     would win, and if the internal leg won the race the GUEST would be the one
  *     suppressed. Hiding a real caller costs money; showing an internal number is
  *     merely embarrassing, so every uncertain case resolves to 'guest'.
+ *     STILL TRUE now that the value is carried as `conversationId`: this function
+ *     never reads it. Correlating legs to answer "is another one still live?" is
+ *     a different question from "is there a guest in THIS record", and only the
+ *     second one may suppress anything.
  */
 function classifyLeg(
   phone: string,
@@ -622,6 +656,7 @@ export function mapLivePayload(raw: any, opts: MapLiveOptions = {}): MappedLiveE
     leg,
     legNote,
     virtualNumber,
+    conversationId: pickStr(m, CONVERSATION_KEYS),
   };
 }
 
@@ -873,5 +908,6 @@ export function mapCdrPayload(raw: any, opts: MapCdrOptions = {}): MappedCdr | n
     leg,
     legNote,
     virtualNumber,
+    conversationId: pickStr(m, CONVERSATION_KEYS),
   };
 }
