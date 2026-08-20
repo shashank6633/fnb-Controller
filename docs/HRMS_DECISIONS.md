@@ -424,6 +424,42 @@ per §2.5. Applies to every future HR letter (offer, experience, relieving).
   from the blanket "outlet_id on every hr_ table" rule. Job titles are shared
   across outlets the way `roles` and `departments` are. (Flagged to the owner;
   standing unless overruled.)
+- **DESIGNATIONS LIVE ON HR SETTINGS — NEVER MERGED INTO ROLES.** Owner ruling
+  2026-08-17 ("Keep Designations in HR Settings"), after weighing the
+  alternative. They answer different questions and must not be conflated:
+  a DESIGNATION is the job title (Commis I, Captain) — HR data that reaches
+  payslips, letters and reports, and that a person can hold with NO login at
+  all; a ROLE is the access grant (tier + page set) and requires a `users` row
+  by definition. Merging them would force one role per job title even when
+  Commis I/II/III need identical access, and would couple two unrelated change
+  cycles — HR adding a title vs an admin changing page access. The only
+  sanctioned bridge is the department link (§8.4d), never a shared table.
+  `users.position` (free text, POSITION_TEMPLATES) stays untouched as legacy;
+  the duality is accepted, documented, and NOT migrated.
+
+### 8.4d Designation rulings (2026-08-17)
+
+- **An unknown designation is a QUESTION, not a dead end.** Bulk import offers
+  "shall I add them?" with the department each will land under; the
+  create-employee modal and the profile Employment tab offer `＋ Create "X"`.
+  Creation is always an explicit human confirmation, never silent, and is
+  admin-only (the designations API is canAdminHr while the employee pages are
+  canManageHr) — a manager sees the list plus "ask an admin", never a button
+  that would 403, and their import still runs for every other row.
+- **DEPARTMENTS are never auto-created.** That tree is shared with
+  requisitions, closing stock, variance and dept-stock, where a typo is
+  operational damage rather than a cosmetic label. The error names the
+  Departments page and says why.
+- **The designation → department link is a helpful DEFAULT, not a constraint**:
+  pickers filter to the chosen department's titles plus generic ('' =
+  any-department) ones, tree-aware in both directions via `mainDeptOf`; a
+  designation the employee ALREADY holds is never hidden (flagged instead, so
+  a save can never silently blank it); every picker keeps a "Show all
+  designations" escape naming the hidden count. Quick-create attaches the
+  chosen department resolved to its MAIN, while HR Settings still allows
+  deliberate pinning to a sub-department — the convenience path defaults
+  sensibly, the precise path stays available. Deliberately NOT enforced
+  server-side (`department_id` remains a hint on the row).
 - **Designation deactivation always succeeds** (soft, `is_active=0`): holders
   keep the label (LEFT JOIN renders it), pickers hide it. No in-use guard.
 - **/hr/settings is adminOnly** — the catalog flag is the truth; page copy says so.
