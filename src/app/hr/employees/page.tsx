@@ -1,5 +1,7 @@
 'use client';
 
+/* eslint-disable @typescript-eslint/no-explicit-any -- tolerant readers for the bulk-import API's echoed rows (biometric page convention) */
+
 /**
  * HR — Employee Master list (Phase 1).
  *
@@ -12,13 +14,21 @@
  * The create modal is deliberately MINIMAL (Personal + Employment essentials)
  * — everything else is edited on the profile page (/hr/employees/[id]), which
  * the save navigates straight into.
+ *
+ * Bulk upload modal: CSV → POST /api/hr/employees/import with the mandatory
+ * preview (?commit=0) → import (?commit=1) discipline from the biometric CSV
+ * import. Row errors exclude only their row; clean rows still import
+ * (forgiving, per the liquor-CSV precedent).
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { Users, Plus, Search, X, Loader2, Save, ChevronLeft, ChevronRight } from 'lucide-react';
-import { apiJson } from '@/lib/api';
+import {
+  Users, Plus, Search, X, Loader2, Save, ChevronLeft, ChevronRight,
+  Upload, Download, Eye, FileText, Info, AlertTriangle, CheckCircle2,
+} from 'lucide-react';
+import { api, apiJson } from '@/lib/api';
 import { fmtISTDate } from '@/lib/format-date';
 import Combobox, { type ComboOption } from '@/components/Combobox';
 import PhoneField from '@/components/PhoneField';
@@ -27,6 +37,8 @@ import {
   HR_EMPLOYEE_STATUSES,
   HR_EMPLOYMENT_TYPES,
   employeeStatusMeta,
+  employmentTypeMeta,
+  isHrEmploymentType,
   type HrEmployeeListRow,
 } from '@/lib/hr';
 
@@ -62,6 +74,98 @@ function initialsOf(name: string): string {
   );
 }
 
+/* ------------------------------------------------------------------ *
+ * Bulk CSV upload (POST /api/hr/employees/import ?commit=0|1)
+ *
+ * Preview/commit discipline copied from the biometric CSV import
+ * (src/app/hr/biometric/page.tsx): preview is mandatory, editing the
+ * CSV after a preview disarms Import until the next preview, and API
+ * error copy renders verbatim.
+ * ------------------------------------------------------------------ */
+
+/** The import contract's columns, in template order (only full_name is required). */
+const IMPORT_COLUMNS = [
+  'full_name', 'employee_code', 'phone', 'alt_phone', 'email', 'gender', 'dob',
+  'joining_date', 'department', 'sub_department', 'designation', 'grade',
+  'employment_type', 'employee_category', 'cost_centre', 'work_location',
+  'probation_months', 'notice_period_days', 'emergency_name',
+  'emergency_relation', 'emergency_phone', 'current_address',
+  'permanent_address', 'notes',
+] as const;
+
+/** Mirrors the API's 1MB body precheck — a courtesy stop before the upload. */
+const MAX_IMPORT_CHARS = 1_000_000;
+
+/** RFC-4180 cell quoting for the client-generated template. */
+function csvCell(v: string): string {
+  return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+interface ImportRowError { line: number; message: string }
+interface ImportWarning { line: number | null; message: string }
+interface ImportPreview {
+  total_rows: number;
+  valid: number;
+  errors: ImportRowError[];
+  warnings: ImportWarning[];
+  sample: any[];
+}
+interface ImportCommit {
+  imported: number;
+  skipped: ImportRowError[];
+  codes: { line: number; employee_code: string; full_name: string }[];
+}
+
+/** Trimmed string from any echoed value ('' for null/undefined). */
+function strv(v: unknown): string {
+  return String(v ?? '').trim();
+}
+
+/** First non-empty of the row's candidate keys — tolerant of naming drift. */
+function rowField(r: any, ...keys: string[]): string {
+  for (const k of keys) {
+    const v = strv(r?.[k]);
+    if (v) return v;
+  }
+  return '';
+}
+
+function toCount(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+}
+
+/** Normalise the preview response without assuming exact key names. */
+function normalizeImportPreview(json: any): ImportPreview {
+  const errs = Array.isArray(json?.errors) ? json.errors : [];
+  const warns = Array.isArray(json?.warnings) ? json.warnings : [];
+  return {
+    total_rows: toCount(json?.total_rows ?? json?.total),
+    valid: toCount(json?.valid),
+    errors: errs.map((e: any) => ({ line: toCount(e?.line), message: strv(e?.message) || 'Row error' })),
+    warnings: warns.map((w: any) => ({
+      line: w?.line === null || w?.line === undefined ? null : toCount(w.line),
+      message: strv(w?.message) || 'Warning',
+    })),
+    sample: Array.isArray(json?.sample) ? json.sample : [],
+  };
+}
+
+/** Normalise the commit response without assuming exact key names. */
+function normalizeImportCommit(json: any): ImportCommit {
+  const skipped = Array.isArray(json?.skipped) ? json.skipped : [];
+  const codes = Array.isArray(json?.codes) ? json.codes : [];
+  return {
+    imported: toCount(json?.imported),
+    skipped: skipped.map((e: any) => ({ line: toCount(e?.line), message: strv(e?.message) || 'Row skipped' })),
+    codes: codes.map((c: any) => ({
+      line: toCount(c?.line),
+      employee_code: strv(c?.employee_code),
+      full_name: strv(c?.full_name),
+    })),
+  };
+}
+
 export default function HrEmployeesPage() {
   const router = useRouter();
 
@@ -89,6 +193,19 @@ export default function HrEmployeesPage() {
   const [form, setForm] = useState<CreateForm>(emptyForm());
   const [saving, setSaving] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+
+  // ── Bulk upload modal ───────────────────────────────────────────────────
+  const [showBulk, setShowBulk] = useState(false);
+  const [bulkCsv, setBulkCsv] = useState('');
+  const [bulkFileName, setBulkFileName] = useState<string | null>(null);
+  const [bulkPreview, setBulkPreview] = useState<ImportPreview | null>(null);
+  /** The exact text the current preview was computed from — edits disarm Import. */
+  const [bulkPreviewedCsv, setBulkPreviewedCsv] = useState<string | null>(null);
+  const [bulkPreviewing, setBulkPreviewing] = useState(false);
+  const [bulkImporting, setBulkImporting] = useState(false);
+  const [bulkError, setBulkError] = useState<string | null>(null);
+  const [bulkResult, setBulkResult] = useState<ImportCommit | null>(null);
+  const bulkFileRef = useRef<HTMLInputElement>(null);
 
   // Race guard: a stale response must never overwrite a newer one
   // (pattern copied from src/app/crm-calls/log/page.tsx).
@@ -229,6 +346,174 @@ export default function HrEmployeesPage() {
     // Keep `saving` true through a successful navigation so the button can't double-fire.
   };
 
+  // ── Bulk upload ─────────────────────────────────────────────────────────
+  const openBulk = () => {
+    setBulkCsv('');
+    setBulkFileName(null);
+    setBulkPreview(null);
+    setBulkPreviewedCsv(null);
+    setBulkError(null);
+    setBulkResult(null);
+    setShowBulk(true);
+  };
+
+  const closeBulk = () => {
+    if (bulkPreviewing || bulkImporting) return;
+    setShowBulk(false);
+    // Contract: refresh the employee list on close after a successful import.
+    if (bulkResult && bulkResult.imported > 0) fetchEmployees();
+  };
+
+  /** Client-generated blob CSV: the full header row + one realistic example.
+   *  The example borrows a REAL department/designation name when the pickers
+   *  have loaded, so it previews clean out of the box. */
+  const downloadTemplate = () => {
+    const exampleDept = mains[0]?.name || 'Kitchen';
+    const exampleDesig = designations.find(d => d.is_active !== 0)?.name || 'Commis I';
+    const example: Record<(typeof IMPORT_COLUMNS)[number], string> = {
+      full_name: 'Anjali Reddy',
+      employee_code: '',                       // blank = auto EMP-####
+      phone: '9848012345',
+      alt_phone: '',
+      email: 'anjali.reddy@example.com',
+      gender: 'female',
+      dob: '1996-04-18',
+      joining_date: '2026-09-01',
+      department: exampleDept,
+      sub_department: '',
+      designation: exampleDesig,
+      grade: '',
+      employment_type: 'permanent',
+      employee_category: '',
+      cost_centre: '',
+      work_location: 'Main Kitchen',
+      probation_months: '3',
+      notice_period_days: '30',
+      emergency_name: 'Srinivas Reddy',
+      emergency_relation: 'Father',
+      emergency_phone: '9848054321',
+      current_address: 'H.No 8-3-214, Yousufguda, Hyderabad',
+      permanent_address: '',
+      notes: '',
+    };
+    const text =
+      IMPORT_COLUMNS.join(',') + '\n' +
+      IMPORT_COLUMNS.map(c => csvCell(example[c])).join(',') + '\n';
+    const blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'employee-import-template.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const onBulkPickFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = ''; // allow re-picking the same file
+    if (!f) return;
+    try {
+      const text = await f.text();
+      if (text.length > MAX_IMPORT_CHARS) {
+        setBulkError('That file is bigger than 1MB — split it and import in parts.');
+        return;
+      }
+      setBulkCsv(text);
+      setBulkFileName(f.name);
+      setBulkPreview(null);
+      setBulkPreviewedCsv(null);
+      setBulkError(null);
+      setBulkResult(null);
+    } catch {
+      setBulkError('Could not read that file — try pasting the rows instead.');
+    }
+  };
+
+  const onBulkTyped = (v: string) => {
+    setBulkCsv(v);
+    setBulkFileName(null);
+    setBulkError(null);
+    // Staleness (bulkPreviewedCsv !== bulkCsv) disarms Import on its own.
+  };
+
+  const runBulkPreview = async () => {
+    if (!bulkCsv.trim()) {
+      setBulkError('Choose a CSV file or paste the rows first.');
+      return;
+    }
+    if (bulkCsv.length > MAX_IMPORT_CHARS) {
+      setBulkError('That CSV is bigger than 1MB — split it and import in parts.');
+      return;
+    }
+    setBulkPreviewing(true);
+    setBulkError(null);
+    try {
+      const res = await api('/api/hr/employees/import?commit=0', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/csv' },
+        body: bulkCsv,
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        setBulkPreview(null);
+        setBulkPreviewedCsv(null);
+        // API errors render verbatim (file too big / no header / bad columns).
+        setBulkError(
+          json?.error
+            || (res.status === 401 || res.status === 403
+              ? 'You need management access to import employees.'
+              : 'Preview failed — nothing was imported.'),
+        );
+        return;
+      }
+      setBulkPreview(normalizeImportPreview(json));
+      setBulkPreviewedCsv(bulkCsv);
+    } catch {
+      setBulkPreview(null);
+      setBulkPreviewedCsv(null);
+      setBulkError('Could not reach the server — nothing was imported.');
+    } finally {
+      setBulkPreviewing(false);
+    }
+  };
+
+  const runBulkImport = async () => {
+    if (!bulkPreview || bulkPreview.valid <= 0 || bulkPreviewedCsv !== bulkCsv) return;
+    setBulkImporting(true);
+    setBulkError(null);
+    try {
+      const res = await api('/api/hr/employees/import?commit=1', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/csv' },
+        body: bulkCsv,
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        setBulkError(
+          json?.error
+            || (res.status === 401 || res.status === 403
+              ? 'You need management access to import employees.'
+              : 'Import failed — check the employee list before retrying, no rows should have been created.'),
+        );
+        return;
+      }
+      setBulkResult(normalizeImportCommit(json));
+      // Disarm — the same text must not be importable twice from this modal.
+      setBulkPreview(null);
+      setBulkPreviewedCsv(null);
+    } catch {
+      setBulkError('Could not reach the server — check the employee list before retrying.');
+    } finally {
+      setBulkImporting(false);
+    }
+  };
+
+  const bulkStale = !!bulkPreview && bulkPreviewedCsv !== bulkCsv;
+  const canBulkImport =
+    !!bulkPreview && bulkPreview.valid > 0 && !bulkStale && !bulkImporting && !bulkPreviewing;
+
   // ── Pagination derived ──────────────────────────────────────────────────
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const fromN = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
@@ -250,10 +535,16 @@ export default function HrEmployeesPage() {
               Employee master{loading ? '' : ` — ${total} employee${total === 1 ? '' : 's'}`}. Profiles, departments and designations.
             </p>
           </div>
-          <button onClick={openCreate}
-                  className="inline-flex items-center gap-2 px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
-            <Plus className="w-4 h-4" /> Add Employee
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={openBulk}
+                    className="inline-flex items-center gap-2 px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm font-medium">
+              <Upload className="w-4 h-4" /> Bulk upload
+            </button>
+            <button onClick={openCreate}
+                    className="inline-flex items-center gap-2 px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium">
+              <Plus className="w-4 h-4" /> Add Employee
+            </button>
+          </div>
         </div>
 
         {/* Filters */}
@@ -527,6 +818,340 @@ export default function HrEmployeesPage() {
                         className="px-3 py-2 text-sm bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
                 </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Bulk upload modal — house safe-modal shell */}
+        {showBulk && (
+          <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
+            <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+                 className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl shadow-xl flex flex-col overflow-hidden">
+              <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+                <h2 className="font-bold text-[#2D1B0E] flex items-center gap-2">
+                  <Upload className="w-4 h-4 text-[#af4408]" /> Bulk upload employees
+                </h2>
+                <button onClick={closeBulk} disabled={bulkPreviewing || bulkImporting}
+                        className="text-[#8B7355] disabled:opacity-50">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
+                {/* API errors render verbatim (file too big / no header / …) */}
+                {bulkError && (
+                  <div className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-3 text-sm flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                    <span>{bulkError}</span>
+                  </div>
+                )}
+
+                {bulkResult ? (
+                  /* ── Success state ──────────────────────────────────── */
+                  <div className="space-y-3">
+                    <div className="rounded-xl border border-green-200 bg-green-50 text-green-800 px-4 py-3 text-sm flex items-start gap-2">
+                      <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+                      <span>
+                        Imported {bulkResult.imported} employee{bulkResult.imported === 1 ? '' : 's'}.
+                        {bulkResult.skipped.length > 0 && (
+                          <> Skipped {bulkResult.skipped.length} row{bulkResult.skipped.length === 1 ? '' : 's'} — listed below, they were NOT imported.</>
+                        )}
+                        {' '}The list refreshes when you close this window.
+                      </span>
+                    </div>
+
+                    {bulkResult.codes.length > 0 && (
+                      <div className="rounded-xl border border-[#E8D5C4] overflow-hidden">
+                        <div className="bg-[#FFF1E3] text-[#6B5744] px-3 py-2 text-xs font-semibold">
+                          Minted employee codes
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
+                              <tr>
+                                <th className="text-left py-2 px-3 font-medium">Line</th>
+                                <th className="text-left py-2 px-3 font-medium">Code</th>
+                                <th className="text-left py-2 px-3 font-medium">Name</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {bulkResult.codes.slice(0, 20).map((c, i) => (
+                                <tr key={i} className="border-t border-[#E8D5C4]/50">
+                                  <td className="py-1.5 px-3 text-xs font-mono">{c.line || '—'}</td>
+                                  <td className="py-1.5 px-3 text-xs font-mono whitespace-nowrap">{c.employee_code || '—'}</td>
+                                  <td className="py-1.5 px-3 text-xs">{c.full_name || '—'}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        {bulkResult.codes.length > 20 && (
+                          <div className="px-3 py-2 border-t border-[#E8D5C4] text-[11px] text-[#8B7355]">
+                            …and {bulkResult.codes.length - 20} more imported — open the employee list for the full set.
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {bulkResult.skipped.length > 0 && (
+                      <div className="rounded-xl border border-red-200 overflow-hidden">
+                        <div className="bg-red-50 text-red-700 px-3 py-2 text-xs font-semibold">
+                          Skipped rows — fix these in the CSV and upload just them again.
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
+                              <tr>
+                                <th className="text-left py-2 px-3 font-medium">Line</th>
+                                <th className="text-left py-2 px-3 font-medium">Problem</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {bulkResult.skipped.map((e, i) => (
+                                <tr key={i} className="border-t border-red-100 bg-red-50/40">
+                                  <td className="py-1.5 px-3 text-xs font-mono">{e.line || '—'}</td>
+                                  <td className="py-1.5 px-3 text-xs text-red-700">{e.message}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    {/* ── Step 1: template + file/paste + preview ─────── */}
+                    <div className="rounded-xl border border-[#E8D5C4] bg-[#FFF1E3] px-4 py-3 text-sm">
+                      <div className="flex items-start gap-2">
+                        <Info className="w-4 h-4 text-[#af4408] mt-0.5 shrink-0" />
+                        <div className="space-y-1">
+                          <div>
+                            Only <code className="font-mono text-xs bg-white border border-[#E8D5C4] rounded px-1 py-0.5">full_name</code> is
+                            required. A blank <code className="font-mono text-xs bg-white border border-[#E8D5C4] rounded px-1 py-0.5">employee_code</code> is
+                            auto-assigned (EMP-####). Dates accept YYYY-MM-DD or DD-MM-YYYY.
+                          </div>
+                          <div className="text-xs text-[#8B7355]">
+                            Department, sub-department and designation are matched by NAME against what exists in
+                            this app. Rows with problems are reported with their line number and skipped — the
+                            clean rows still import.
+                          </div>
+                          <button onClick={downloadTemplate}
+                                  className="inline-flex items-center gap-1.5 text-xs font-medium text-[#af4408] hover:underline">
+                            <Download className="w-3.5 h-3.5" /> Download template (headers + one example row)
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <label className="text-xs text-[#6B5744] font-medium">CSV file</label>
+                        <input ref={bulkFileRef} type="file" accept=".csv,text/csv,text/plain"
+                               onChange={onBulkPickFile} className="hidden" />
+                        <button onClick={() => bulkFileRef.current?.click()}
+                                disabled={bulkPreviewing || bulkImporting}
+                                className="w-full flex flex-col items-center justify-center gap-2 px-4 py-6 border-2 border-dashed border-[#E8D5C4] hover:border-[#af4408] hover:bg-[#FFF1E3] rounded-xl text-sm text-[#6B5744] disabled:opacity-50">
+                          <FileText className="w-6 h-6 text-[#8B7355]" />
+                          {bulkFileName
+                            ? <span className="font-medium text-[#2D1B0E]">{bulkFileName}</span>
+                            : <span>Choose a CSV file…</span>}
+                          <span className="text-[11px] text-[#8B7355]">Loads into the text box for review</span>
+                        </button>
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-xs text-[#6B5744] font-medium">…or paste rows</label>
+                        <textarea
+                          value={bulkCsv}
+                          onChange={e => onBulkTyped(e.target.value)}
+                          rows={7}
+                          spellCheck={false}
+                          disabled={bulkPreviewing || bulkImporting}
+                          placeholder={'full_name,phone,department,designation,joining_date\nAnjali Reddy,9848012345,Kitchen,Commis I,2026-09-01'}
+                          className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-xs font-mono disabled:opacity-50"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button onClick={runBulkPreview}
+                              disabled={bulkPreviewing || bulkImporting || !bulkCsv.trim()}
+                              className="inline-flex items-center gap-2 px-3 py-2 border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm font-medium disabled:opacity-40">
+                        {bulkPreviewing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
+                        Preview
+                      </button>
+                      <span className="text-[11px] text-[#8B7355]">
+                        Nothing is written until you press Import.
+                      </span>
+                    </div>
+
+                    {/* Stale-preview warning — edits disarm Import */}
+                    {bulkStale && !bulkError && (
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 text-amber-800 px-4 py-3 text-sm flex items-start gap-2">
+                        <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                        <span>The rows changed since the last preview — run Preview again before importing.</span>
+                      </div>
+                    )}
+
+                    {/* ── Step 2: preview results ─────────────────────── */}
+                    {bulkPreview && !bulkStale && (
+                      <div className="space-y-3">
+                        <div className="flex flex-wrap gap-2">
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border bg-[#FFF1E3] text-[#6B5744] border-[#E8D5C4]">
+                            {bulkPreview.total_rows} row{bulkPreview.total_rows === 1 ? '' : 's'}
+                          </span>
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border bg-green-100 text-green-700 border-green-200">
+                            <CheckCircle2 className="w-3.5 h-3.5" /> {bulkPreview.valid} will import
+                          </span>
+                          <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border ${
+                            bulkPreview.errors.length > 0
+                              ? 'bg-red-100 text-red-700 border-red-200'
+                              : 'bg-gray-100 text-gray-600 border-gray-200'
+                          }`}>
+                            <AlertTriangle className="w-3.5 h-3.5" /> {bulkPreview.errors.length} error{bulkPreview.errors.length === 1 ? '' : 's'}
+                          </span>
+                          <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border ${
+                            bulkPreview.warnings.length > 0
+                              ? 'bg-amber-100 text-amber-800 border-amber-200'
+                              : 'bg-gray-100 text-gray-600 border-gray-200'
+                          }`}>
+                            <Info className="w-3.5 h-3.5" /> {bulkPreview.warnings.length} warning{bulkPreview.warnings.length === 1 ? '' : 's'}
+                          </span>
+                        </div>
+
+                        {bulkPreview.valid <= 0 && (
+                          <div className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-3 text-sm">
+                            No importable rows — fix the errors below (line numbers refer to the file), then preview again.
+                          </div>
+                        )}
+
+                        {bulkPreview.errors.length > 0 && (
+                          <div className="rounded-xl border border-red-200 overflow-hidden">
+                            <div className="bg-red-50 text-red-700 px-3 py-2 text-xs font-semibold">
+                              Errors — these rows will NOT be imported.
+                            </div>
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-sm">
+                                <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
+                                  <tr>
+                                    <th className="text-left py-2 px-3 font-medium">Line</th>
+                                    <th className="text-left py-2 px-3 font-medium">Problem</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {bulkPreview.errors.map((e, i) => (
+                                    <tr key={i} className="border-t border-red-100 bg-red-50/40">
+                                      <td className="py-1.5 px-3 text-xs font-mono">{e.line || '—'}</td>
+                                      <td className="py-1.5 px-3 text-xs text-red-700">{e.message}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
+
+                        {bulkPreview.warnings.length > 0 && (
+                          <div className="rounded-xl border border-amber-200 overflow-hidden">
+                            <div className="bg-amber-50 text-amber-800 px-3 py-2 text-xs font-semibold">
+                              Warnings — these rows still import.
+                            </div>
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-sm">
+                                <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
+                                  <tr>
+                                    <th className="text-left py-2 px-3 font-medium">Line</th>
+                                    <th className="text-left py-2 px-3 font-medium">Note</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {bulkPreview.warnings.map((w, i) => (
+                                    <tr key={i} className="border-t border-amber-100 bg-amber-50/40">
+                                      <td className="py-1.5 px-3 text-xs font-mono">{w.line ?? '—'}</td>
+                                      <td className="py-1.5 px-3 text-xs text-amber-800">{w.message}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
+
+                        {bulkPreview.sample.length > 0 && (
+                          <div className="rounded-xl border border-[#E8D5C4] overflow-hidden">
+                            <div className="bg-[#FFF1E3] text-[#6B5744] px-3 py-2 text-xs font-semibold">
+                              Sample — first {bulkPreview.sample.length} parsed row{bulkPreview.sample.length === 1 ? '' : 's'}
+                            </div>
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-sm">
+                                <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
+                                  <tr>
+                                    <th className="text-left py-2 px-3 font-medium">Code</th>
+                                    <th className="text-left py-2 px-3 font-medium">Name</th>
+                                    <th className="text-left py-2 px-3 font-medium">Department</th>
+                                    <th className="text-left py-2 px-3 font-medium">Designation</th>
+                                    <th className="text-left py-2 px-3 font-medium">Type</th>
+                                    <th className="text-left py-2 px-3 font-medium">Joined</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {bulkPreview.sample.map((r, i) => {
+                                    const code = rowField(r, 'employee_code');
+                                    const typeKey = rowField(r, 'employment_type');
+                                    const sub = rowField(r, 'sub_department_name', 'sub_department');
+                                    return (
+                                      <tr key={i} className="border-t border-[#E8D5C4]/50">
+                                        <td className="py-1.5 px-3 text-xs font-mono whitespace-nowrap">
+                                          {code || <span className="italic text-[#8B7355]">auto</span>}
+                                        </td>
+                                        <td className="py-1.5 px-3 text-xs font-bold">{rowField(r, 'full_name') || '—'}</td>
+                                        <td className="py-1.5 px-3 text-xs">
+                                          {rowField(r, 'department_name', 'department') || <span className="text-[#8B7355]">—</span>}
+                                          {sub && <div className="text-[10px] text-[#8B7355]">{sub}</div>}
+                                        </td>
+                                        <td className="py-1.5 px-3 text-xs">{rowField(r, 'designation_name', 'designation') || <span className="text-[#8B7355]">—</span>}</td>
+                                        <td className="py-1.5 px-3 text-xs">
+                                          {isHrEmploymentType(typeKey) ? employmentTypeMeta(typeKey).label : (typeKey || '—')}
+                                        </td>
+                                        <td className="py-1.5 px-3 text-xs font-mono whitespace-nowrap">{rowField(r, 'joining_date') || '—'}</td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
+              <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
+                {bulkResult ? (
+                  <button onClick={closeBulk}
+                          className="px-3 py-2 text-sm bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg inline-flex items-center gap-1">
+                    <CheckCircle2 className="w-4 h-4" /> Done
+                  </button>
+                ) : (
+                  <>
+                    <button onClick={closeBulk} disabled={bulkPreviewing || bulkImporting}
+                            className="px-3 py-2 text-sm text-[#6B5744] disabled:opacity-50">
+                      Cancel
+                    </button>
+                    <button onClick={runBulkImport} disabled={!canBulkImport}
+                            title={!bulkPreview ? 'Run a preview first'
+                              : bulkStale ? 'The rows changed — preview again'
+                              : bulkPreview.valid <= 0 ? 'No importable rows — fix the errors first'
+                              : undefined}
+                            className="px-3 py-2 text-sm bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-40">
+                      {bulkImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                      Import {bulkPreview && !bulkStale ? bulkPreview.valid : ''} employee{bulkPreview && !bulkStale && bulkPreview.valid === 1 ? '' : 's'}
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           </div>
