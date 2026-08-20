@@ -40,10 +40,30 @@ import { agentLogin, listCallerIds, setCallerId, type TelecmiResult } from '@/li
  * it is absent, past its deadline, or rejected by TeleCMI we say so plainly and
  * drop it, instead of quietly retrying with a credential that cannot work.
  *
+ * ── A LOGIN THAT JUST SUCCEEDED IS PROOF THE CREDENTIALS WORK ──────────────
+ * The page signs an agent in and then immediately lists their caller IDs. When
+ * that list call came back auth-shaped we deleted the token and told the admin
+ * the sign-in was no longer accepted — seconds after telling them it had
+ * succeeded. One card showed "Signed in · expires <date>", "Signed in — this
+ * token lasts 30 days" and "sign this agent in again" all at once, and the
+ * stored credential really was gone, so the next attempt failed too.
+ *
+ * TeleCMI answers get_callerid/set_callerid with an auth-shaped status when the
+ * caller-ID feature simply is not provisioned for that agent or account — the
+ * same 404 a dead token gets (see isAuthFailure: it deliberately leans towards
+ * forgetting, which is right for an OLD token and wrong for a new one). So a
+ * token minted moments ago gets a grace window: an auth-shaped failure inside
+ * it is reported as "caller IDs are unavailable for this agent", the token is
+ * KEPT, and only an older token is treated as stale and dropped.
+ *
+ * Every failure body therefore carries a `reason` discriminator so the page can
+ * render the right thing instead of matching on our prose.
+ *
  * Body shapes:
  *   { action:'login', id, password }  -> { ok, agent_id, expires_at }
  *   { action:'list',  id }            -> { ok, callerid:[{pstn,price,capacity,profile}] }
  *   { action:'set',   id, callerid }  -> { ok, callerid }
+ *   any failure                       -> { ok:false, error, reason }
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -57,6 +77,26 @@ const TOKENS_KEY = 'telecmi_user_tokens';
  *  bound: the real expiry is whatever TeleCMI enforces, which is why a rejected
  *  token is also purged on the spot (see isAuthFailure). */
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** How long after issue a token is still treated as PROVEN GOOD.
+ *
+ *  Inside this window an auth-shaped rejection cannot plausibly mean "your
+ *  password changed" — TeleCMI accepted that password seconds ago — so it is
+ *  read as the feature being unavailable, and the token survives. Two minutes
+ *  is generous for the login → list round trip the page makes back to back and
+ *  short enough that a genuinely revoked token is still cleared on the next
+ *  attempt a minute later. */
+const TOKEN_GRACE_MS = 2 * 60 * 1000;
+
+/** Machine-readable failure kinds, so the page never string-matches our prose.
+ *   not_signed_in         — no token stored for this agent at all.
+ *   token_stale           — the stored sign-in is gone or rejected; re-login.
+ *                           The token has been forgotten by the time we say it.
+ *   callerid_unavailable  — the sign-in is fine (proven moments ago); TeleCMI
+ *                           refused the caller-ID call itself. Token KEPT.
+ *   transport             — TeleCMI errored or was unreachable for other
+ *                           reasons; nothing is known about the token. */
+type FailureReason = 'not_signed_in' | 'token_stale' | 'callerid_unavailable' | 'transport';
 
 interface StoredToken { token: string; expires_at: string }
 
@@ -103,18 +143,55 @@ function forgetToken(db: Database.Database, agentId: string): void {
 
 const SIGN_IN_AGAIN = 'Sign this agent in again (their TeleCMI password) to continue.';
 
-/** The live token for an agent, or the exact reason an admin cannot proceed. */
-function liveToken(db: Database.Database, agentId: string): { token: string } | { error: string } {
+/** The live token for an agent, or the exact reason an admin cannot proceed.
+ *  `issued_at` is derived, not stored: saveToken always writes now + TTL, so the
+ *  expiry it recorded is the issue time one TTL later. That is enough to know
+ *  whether a rejection is landing on a token we minted seconds ago. */
+function liveToken(
+  db: Database.Database,
+  agentId: string,
+): { token: string; issued_at: number } | { error: string; reason: FailureReason } {
   const stored = readTokens(db)[agentId];
   if (!stored?.token) {
-    return { error: `Agent ${agentId} has not been signed in to TeleCMI yet. Use "Sign in" on this agent (their TeleCMI password) before reading or changing caller ID.` };
+    return {
+      error: `Agent ${agentId} has not been signed in to TeleCMI yet. Use "Sign in" on this agent (their TeleCMI password) before reading or changing caller ID.`,
+      reason: 'not_signed_in',
+    };
   }
   const expiry = Date.parse(stored.expires_at || '');
   if (!Number.isFinite(expiry) || expiry <= Date.now()) {
     forgetToken(db, agentId);
-    return { error: `The TeleCMI sign-in for agent ${agentId} has expired (tokens last about 30 days). ${SIGN_IN_AGAIN}` };
+    return {
+      error: `The TeleCMI sign-in for agent ${agentId} has expired (tokens last about 30 days). ${SIGN_IN_AGAIN}`,
+      reason: 'token_stale',
+    };
   }
-  return { token: stored.token };
+  return { token: stored.token, issued_at: expiry - TOKEN_TTL_MS };
+}
+
+/**
+ * Was this token minted moments ago — i.e. has TeleCMI itself vouched for the
+ * agent's password since the page loaded?
+ *
+ * Bounded on BOTH sides on purpose. Ahead of `now` is the login we are still
+ * finishing plus a little clock drift; a wildly future-dated expiry (a
+ * hand-edited row, a machine whose clock jumped) is NOT treated as fresh,
+ * because an unbounded past would make a dead token unforgettable for a month.
+ */
+function withinGrace(issuedAt: number): boolean {
+  const age = Date.now() - issuedAt;
+  return age < TOKEN_GRACE_MS && age > -TOKEN_GRACE_MS;
+}
+
+/** The "your sign-in is fine, the feature is not" message. Deliberately says
+ *  what is NOT broken too: an admin reading "TeleCMI refused" next to a green
+ *  "Signed in" chip needs telling that both are true and that calling still
+ *  works, or they will re-enter the password until they give up. */
+function callerIdUnavailable(agentId: string, action: 'list' | 'set'): string {
+  const what = action === 'list'
+    ? 'would not list caller IDs for this agent'
+    : 'refused the caller-ID change, so the caller ID was NOT changed';
+  return `The TeleCMI sign-in for agent ${agentId} is valid — it was accepted moments ago — but TeleCMI ${what}. Caller IDs may not be enabled for this agent or account; ask TeleCMI to enable them. Click-to-call is unaffected.`;
 }
 
 /**
@@ -201,19 +278,27 @@ export async function POST(req: Request) {
 
   if (action === 'list') {
     const t = liveToken(db, id);
-    if ('error' in t) return Response.json({ ok: false, error: t.error }, { status: 400 });
+    if ('error' in t) return Response.json({ ok: false, error: t.error, reason: t.reason }, { status: 400 });
 
     const res = await listCallerIds(db, t.token);
     if (!res.ok) {
       if (isAuthFailure(res)) {
+        // The grace window is what stops a successful sign-in being undone by
+        // the very lookup that follows it. Keep the token; blame the feature.
+        if (withinGrace(t.issued_at)) {
+          return Response.json(
+            { ok: false, error: callerIdUnavailable(id, 'list'), reason: 'callerid_unavailable' },
+            { status: 502 },
+          );
+        }
         forgetToken(db, id);
         return Response.json(
-          { ok: false, error: `TeleCMI no longer accepts the stored sign-in for agent ${id}. ${SIGN_IN_AGAIN}` },
+          { ok: false, error: `TeleCMI no longer accepts the stored sign-in for agent ${id}. ${SIGN_IN_AGAIN}`, reason: 'token_stale' },
           { status: 400 },
         );
       }
       return Response.json(
-        { ok: false, error: scrub(res.error || 'TeleCMI could not list caller IDs', t.token) },
+        { ok: false, error: scrub(res.error || 'TeleCMI could not list caller IDs', t.token), reason: 'transport' },
         { status: 502 },
       );
     }
@@ -241,19 +326,28 @@ export async function POST(req: Request) {
     }
 
     const t = liveToken(db, id);
-    if ('error' in t) return Response.json({ ok: false, error: t.error }, { status: 400 });
+    if ('error' in t) return Response.json({ ok: false, error: t.error, reason: t.reason }, { status: 400 });
 
     const res = await setCallerId(db, t.token, callerid);
     if (!res.ok) {
       if (isAuthFailure(res)) {
+        // Same grace rule as 'list': an agent who signed in moments ago has not
+        // had their password revoked in between, so do not throw the token away
+        // and do not tell them their sign-in is dead.
+        if (withinGrace(t.issued_at)) {
+          return Response.json(
+            { ok: false, error: callerIdUnavailable(id, 'set'), reason: 'callerid_unavailable' },
+            { status: 502 },
+          );
+        }
         forgetToken(db, id);
         return Response.json(
-          { ok: false, error: `TeleCMI no longer accepts the stored sign-in for agent ${id}. ${SIGN_IN_AGAIN} The caller ID was NOT changed.` },
+          { ok: false, error: `TeleCMI no longer accepts the stored sign-in for agent ${id}. ${SIGN_IN_AGAIN} The caller ID was NOT changed.`, reason: 'token_stale' },
           { status: 400 },
         );
       }
       return Response.json(
-        { ok: false, error: scrub(res.error || 'TeleCMI could not set the caller ID', t.token) },
+        { ok: false, error: scrub(res.error || 'TeleCMI could not set the caller ID', t.token), reason: 'transport' },
         { status: 502 },
       );
     }

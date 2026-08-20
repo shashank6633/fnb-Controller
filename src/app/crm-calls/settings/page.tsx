@@ -86,8 +86,15 @@ function parseAgentMap(v: any): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, val] of Object.entries(obj)) {
     const key = String(k).trim();
-    const email = String(val ?? '').trim();
-    if (key && email) out[key] = email;
+    // KEEP AN UNASSIGNED AGENT. This used to require an email
+    // (`if (key && email)`), which silently dropped every roster agent that
+    // had no staff member yet — and an agent added on the Telephony page
+    // lands in agent_map with EXACTLY that shape (id -> ''). The owner's
+    // recreated extensions 5008..5012 were all in the saved map and none of
+    // them reached this editor, so the page showed only the old ids derived
+    // from call history and the two screens disagreed. An empty value is
+    // meaningful: "in the roster, not yet mapped".
+    if (key) out[key] = String(val ?? '').trim();
   }
   return out;
 }
@@ -428,10 +435,67 @@ export default function CtSettingsPage() {
   const [savingAgents, setSavingAgents] = useState(false);
   const [agentFlash, setAgentFlash] = useState<string | null>(null);
   const [agentError, setAgentError] = useState<string | null>(null);
+  /**
+   * The CURRENT TeleCMI roster — the ids that exist on the PBX right now.
+   *
+   * WHY THIS PAGE NEEDS IT. The Telephony screen lists the roster; this editor
+   * lists ids seen on real ct_calls rows. Those are different things and neither
+   * screen said so, which is exactly the owner's question: recreate the venue's
+   * extensions and the old ones (5002..5006) live on in call history forever
+   * while the new ones (5008..5012) are on TeleCMI and nowhere in that history.
+   * Knowing the roster is what lets this list separate "current agent" from
+   * "id that only exists in old calls".
+   *
+   * null = WE DO NOT KNOW — not loaded yet, not permitted, or the roster could
+   * not be read. Grouping is then skipped and the flat list renders exactly as
+   * before; a guessed grouping would file a live agent under "From past calls",
+   * which is worse than no grouping at all.
+   */
+  const [rosterIds, setRosterIds] = useState<string[] | null>(null);
 
   useEffect(() => {
     if (typeof window !== 'undefined') setOrigin(window.location.origin);
   }, []);
+
+  // Roster lookup, deliberately SEPARATE from the settings load below: it talks
+  // to TeleCMI, so it is slower and far likelier to fail, and a failure here
+  // must cost nothing but the grouping.
+  useEffect(() => {
+    let cancelled = false;
+    setRosterIds(null);
+    api('/api/telecmi/agents')
+      .then(async r => {
+        if (cancelled) return;
+        // 401/403 (not admin) or any other non-OK answer → roster UNKNOWN.
+        if (!r.ok) return;
+        const j = await r.json().catch(() => null);
+        if (cancelled || !j) return;
+        // `error` means the roster could not be read (mock mode, unparseable
+        // agent_map, every lookup failed). agents:[] alongside it is a failure,
+        // not the fact that this venue has no agents — never group on it.
+        if (j.error) return;
+        const raw = Array.isArray(j.agent_ids) ? j.agent_ids
+          : Array.isArray(j.agents) ? j.agents
+          : null;
+        if (!raw) return;
+        const ids = (raw as unknown[])
+          .map(v => {
+            // agents[] carries row objects, agent_ids[] bare strings — accept both.
+            const id = v && typeof v === 'object' ? (v as Record<string, unknown>).agent_id : v;
+            return String(id ?? '').trim();
+          })
+          .filter(Boolean);
+        // AN EMPTY ROSTER IS NOT A ROSTER. TeleCMI has no list-users endpoint, so
+        // that route builds the roster out of agent_map — an empty one means
+        // "nobody has been added here yet", NOT "TeleCMI has no agents". Grouping
+        // on it would file every id on this page under "From past calls" and
+        // declare live extensions dead. Stay unknown; render the flat list.
+        if (!ids.length) return;
+        setRosterIds(ids);
+      })
+      .catch(() => { /* unknown roster → flat list, never a broken page */ });
+    return () => { cancelled = true; };
+  }, [refreshKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -758,13 +822,56 @@ export default function CtSettingsPage() {
     [visibleAgentRows, seenSet],
   );
 
+  /** Roster ids in canonical form, or null when the roster is unknown. An app
+   *  login email can never be a TeleCMI agent, so a legacy one sitting in
+   *  agent_map is not allowed to count as roster membership. */
+  const rosterSet = useMemo(() => {
+    if (rosterIds === null) return null;
+    const ids = rosterIds.map(canonAgentId).filter(id => id && !isAppLoginId(id));
+    // Same rule as the fetch: nothing left to compare against is UNKNOWN, never
+    // "no agent on this page is current".
+    return ids.length ? new Set(ids) : null;
+  }, [rosterIds]);
+
+  /**
+   * The two labelled groups. null = roster unknown → render the flat list.
+   *
+   *   past    — DERIVED from real calls and NOT on TeleCMI now. Precisely the
+   *             recreated-extension case the owner is asking about.
+   *   current — everything else: ids that really are on the roster, plus a row
+   *             just typed here (unsaved, so it cannot be in the roster yet —
+   *             and calling something the admin is adding "from past calls"
+   *             would simply be false).
+   */
+  const agentGroups = useMemo(() => {
+    if (!rosterSet) return null;
+    const current: Array<{ row: { id: string; email: string }; idx: number }> = [];
+    const past: Array<{ row: { id: string; email: string }; idx: number }> = [];
+    for (const entry of visibleAgentRows) {
+      const id = canonAgentId(entry.row.id);
+      const isPast = !rosterSet.has(id) && derivedSet.has(id) && !isAppLoginId(entry.row.id);
+      (isPast ? past : current).push(entry);
+    }
+    return { current, past };
+  }, [rosterSet, visibleAgentRows, derivedSet]);
+
+  /** Roster ids with no row on this list at all — the concrete half of the
+   *  answer to "how can Telephony and Agent mapping show different ids". */
+  const rosterOnlyIds = useMemo(() => {
+    if (!rosterSet) return [] as string[];
+    const onList = new Set(agentRows.map(r => canonAgentId(r.id)));
+    return [...rosterSet].filter(id => !onList.has(id));
+  }, [rosterSet, agentRows]);
+
   const setAgentRow = (idx: number, patch: Partial<{ id: string; email: string }>) =>
     setAgentRows(prev => prev.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
   const addAgentRow = () => setAgentRows(prev => [...prev, { id: '', email: '' }]);
   const removeAgentRow = (idx: number) => setAgentRows(prev => prev.filter((_, i) => i !== idx));
 
   /** DERIVED row that has a name: drop the NAME only. The id stays on screen
-   *  because it stays on real calls; Save removes it from agent_map. */
+   *  because it stays on real calls; Save removes it from agent_map. Removal is
+   *  then available on the next render — that two-step is the truth, not a
+   *  hoop: a mapping must never vanish behind a removal. */
   const clearAgentName = (idx: number) => {
     setAgentFlash(null); setAgentError(null);
     setAgentRow(idx, { email: '' });
@@ -776,6 +883,25 @@ export default function CtSettingsPage() {
     setAgentFlash(null); setAgentError(null);
     setHiddenIds(prev => (prev.includes(key) ? prev : [...prev, key]));
     setEverHidden(prev => (prev.includes(key) ? prev : [...prev, key]));
+  };
+  /**
+   * THE REMOVAL THE OWNER WAS LOOKING FOR.
+   *
+   * Same mechanism as before (the agent_hidden dismiss list — a derived id is on
+   * real ct_calls rows and the next load derives it again, so there is nothing
+   * else a removal could mean here). What changed is that it now READS as a
+   * removal: a trash control, and a confirm that states exactly what survives it.
+   */
+  const removeDerivedRow = (id: string) => {
+    const key = canonAgentId(id);
+    if (!key) return;
+    const ok = window.confirm(
+      `Remove ${id} from this list — the id stays in call history and past calls are unchanged.\n\n`
+      + 'It is listed under "hidden" below and can be brought back at any time. '
+      + 'Press "Save mapping" afterwards to keep it off the list.',
+    );
+    if (!ok) return;
+    hideAgentRow(id);
   };
   /** Put a hidden id back on the list. It may have no row left (the server
    *  filters hidden ids out of agents_seen), so re-create one rather than let
@@ -870,6 +996,121 @@ export default function CtSettingsPage() {
   const vipOn = form.vip_routing === '1';
   const autoAnalyzeOn = form.auto_analyze === '1';
   const ephemeral = form.analysis_retention === 'ephemeral';
+
+  // ── Agent-mapping renderers ───────────────────────────────────────────────
+  // Pulled out so the two grouped sections and the ungrouped fallback render
+  // identical rows. The grouping is presentation only — every control, every
+  // badge and every save path is the same in all three places.
+
+  /** Right-hand controls share one shape so no row's actions read as a mystery
+   *  icon; only the colour and the words differ. */
+  const rowActionCls = 'px-2 py-1.5 rounded shrink-0 flex items-center gap-1.5 text-[11px] font-medium border border-[#E8D5C4] bg-white';
+
+  const agentColumnHeader = (
+    <div className="hidden sm:flex items-center gap-2 px-0.5">
+      <span className={`${labelCls} flex-1 min-w-[8rem]`}>TeleCMI agent id</span>
+      <span className="w-4 shrink-0" />
+      <span className={`${labelCls} flex-1 min-w-[10rem]`}>Staff member</span>
+      <span className="w-[6.5rem] shrink-0" />
+    </div>
+  );
+
+  const renderAgentRow = ({ row, idx }: { row: { id: string; email: string }; idx: number }) => {
+    // A legacy app-login email still sitting in the SAVED map: keep the row
+    // visible so it can be removed, but say what it is rather than badging it
+    // as a mapping gap.
+    const isLoginId = isAppLoginId(row.id);
+    const isUnmappedSeen = !row.email.trim() && !isLoginId
+      && seenSet.has(row.id.trim().toLowerCase());
+    // Which removal this row can actually honour. MANUAL rows live only in
+    // agent_map, so deleting one is a real delete. A DERIVED id is on real
+    // calls: the name can go, and the id can come off THIS LIST — nothing can
+    // take it out of history, which is what the wording below has to admit.
+    const isDerived = derivedSet.has(canonAgentId(row.id));
+    const hasName = Boolean(row.email.trim());
+    const stale = isLoginId ? null : staleInfo(row.id);
+    const emailKnown = row.email
+      && staff.some(s => s.email.toLowerCase() === row.email.toLowerCase());
+    return (
+      <div key={idx} className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+        <div className="flex-1 min-w-[8rem] w-full sm:w-auto">
+          <input value={row.id} onChange={e => setAgentRow(idx, { id: e.target.value })}
+                 placeholder="e.g. 101 or gre.ravi" aria-label="TeleCMI agent id"
+                 className={`${inputCls} ${isUnmappedSeen ? 'border-amber-300' : ''}`} />
+        </div>
+        <span className="text-[#C9A98A] shrink-0 text-sm hidden sm:inline">→</span>
+        <div className="flex-1 min-w-[10rem] w-full sm:w-auto">
+          <select value={row.email} onChange={e => setAgentRow(idx, { email: e.target.value })}
+                  aria-label="Staff member"
+                  className={`${inputCls} ${isUnmappedSeen ? 'border-amber-300 bg-amber-50/50' : ''}`}>
+            <option value="">— Unmapped —</option>
+            {staff.map(s => (
+              <option key={s.email} value={s.email}>{s.name} · {s.email}</option>
+            ))}
+            {/* a previously-mapped email that isn't in the active staff list — keep it selectable */}
+            {row.email && !emailKnown && (
+              <option value={row.email}>{row.email} (inactive)</option>
+            )}
+          </select>
+        </div>
+        {isUnmappedSeen && (
+          <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 shrink-0">
+            unmapped
+          </span>
+        )}
+        {isLoginId && (
+          <span className="text-[10px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1.5 py-0.5 shrink-0">
+            logged from the app, not TeleCMI
+          </span>
+        )}
+        {stale && (
+          <span title={`Last call ${lastSeenLabel(stale.lastSeenMs)} · ${stale.calls} call${stale.calls === 1 ? '' : 's'} on record`}
+                className="text-[10px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1.5 py-0.5 shrink-0">
+            no calls in {AGENT_STALE_DAYS} days — likely a removed extension
+          </span>
+        )}
+        {!isDerived ? (
+          <button type="button" onClick={() => removeAgentRow(idx)}
+                  title="Remove this row — you typed this id, so nothing else refers to it"
+                  aria-label="Remove this row"
+                  className={`${rowActionCls} text-[#8B7355] hover:text-red-600 hover:border-red-200 hover:bg-red-50`}>
+            <Trash2 className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Remove</span>
+          </button>
+        ) : hasName ? (
+          <button type="button" onClick={() => clearAgentName(idx)}
+                  title="Clear the mapped name. The id itself stays — it is on real calls — and can be removed from this list once it has no name."
+                  aria-label="Clear the mapped name"
+                  className={`${rowActionCls} text-[#8B7355] hover:text-[#af4408] hover:bg-[#FFF1E3]`}>
+            <Eraser className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Clear name</span>
+          </button>
+        ) : (
+          <button type="button" onClick={() => removeDerivedRow(row.id)}
+                  title="Remove from this list — the id stays in call history and past calls are unchanged"
+                  aria-label="Remove from this list"
+                  className={`${rowActionCls} text-[#8B7355] hover:text-red-600 hover:border-red-200 hover:bg-red-50`}>
+            <Trash2 className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Remove</span>
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const renderAgentRows = (entries: Array<{ row: { id: string; email: string }; idx: number }>) => (
+    <div className="space-y-2">
+      {agentColumnHeader}
+      {entries.map(entry => renderAgentRow(entry))}
+    </div>
+  );
+
+  const groupHeading = (title: string, note: string) => (
+    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+      <h3 className="text-[11px] font-semibold uppercase tracking-wide text-[#2D1B0E]">{title}</h3>
+      <span className="text-[10px] text-[#6B5744] normal-case">{note}</span>
+    </div>
+  );
 
   return (
     <div className="p-4 sm:p-6 max-w-4xl mx-auto space-y-4 pb-24">
@@ -1498,8 +1739,9 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
           <p className="text-xs text-[#6B5744]">
             The ids on this list are the ones <strong>seen on real calls</strong> plus the ones{' '}
             <strong>you typed</strong>. Clearing a name leaves the id here — it is still in call
-            history and cannot be deleted from it — and <strong>hiding</strong> takes an id off
-            this list only; nothing about the calls themselves changes.
+            history and cannot be deleted from it — and <strong>Remove</strong> takes an id off
+            this list only (it is listed under <em>hidden</em> below and can be brought back);
+            nothing about the calls themselves changes.
           </p>
 
           {visibleAgentRows.length === 0 ? (
@@ -1508,94 +1750,51 @@ TELECMI_WEBHOOK_SECRET=<optional>`}
                 ? 'Every agent id is hidden — use “Show hidden” below to bring one back.'
                 : 'No TeleCMI agents have appeared on a call yet. Add ids manually below, or run a backfill / take a call first, then refresh.'}
             </p>
-          ) : (
-            <div className="space-y-2">
-              {/* header row (hidden on narrow screens) */}
-              <div className="hidden sm:flex items-center gap-2 px-0.5">
-                <span className={`${labelCls} flex-1 min-w-[8rem]`}>TeleCMI agent id</span>
-                <span className="w-4 shrink-0" />
-                <span className={`${labelCls} flex-1 min-w-[10rem]`}>Staff member</span>
-                <span className="w-7 shrink-0" />
+          ) : agentGroups ? (
+            /* GROUPED. Only rendered when the CURRENT TeleCMI roster is known —
+               this is the whole answer to "how can Telephony and Agent mapping
+               show the same ids": it names which ids the two screens share and
+               which exist only inside old calls. */
+            <div className="space-y-4">
+              <div className="space-y-2">
+                {groupHeading(
+                  'Current TeleCMI agents',
+                  'on the TeleCMI roster right now — the same ids the Telephony page lists',
+                )}
+                {agentGroups.current.length > 0 ? renderAgentRows(agentGroups.current) : (
+                  <p className="text-[11px] text-[#6B5744] italic">
+                    None of the current agents is on this list yet.
+                  </p>
+                )}
+                {rosterOnlyIds.length > 0 && (
+                  <p className="text-[10px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-2 py-1.5">
+                    On TeleCMI but not on this list yet: <strong>{rosterOnlyIds.join(', ')}</strong> — they have
+                    not answered a call through this system, so no call history names them. Use{' '}
+                    <strong>Add agent id</strong> below to map one in advance.
+                  </p>
+                )}
               </div>
-              {visibleAgentRows.map(({ row, idx }) => {
-                // A legacy app-login email still sitting in the SAVED map: keep
-                // the row visible so it can be removed, but say what it is
-                // rather than badging it as a mapping gap.
-                const isLoginId = isAppLoginId(row.id);
-                const isUnmappedSeen = !row.email.trim() && !isLoginId
-                  && seenSet.has(row.id.trim().toLowerCase());
-                // Which "delete" this row can actually honour. MANUAL rows live
-                // only in agent_map, so the trash is real. A DERIVED id is on
-                // real calls: the most that can be removed is the NAME, and the
-                // id itself can only be hidden.
-                const isDerived = derivedSet.has(canonAgentId(row.id));
-                const hasName = Boolean(row.email.trim());
-                const stale = isLoginId ? null : staleInfo(row.id);
-                const emailKnown = row.email
-                  && staff.some(s => s.email.toLowerCase() === row.email.toLowerCase());
-                return (
-                  <div key={idx} className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
-                    <div className="flex-1 min-w-[8rem] w-full sm:w-auto">
-                      <input value={row.id} onChange={e => setAgentRow(idx, { id: e.target.value })}
-                             placeholder="e.g. 101 or gre.ravi" aria-label="TeleCMI agent id"
-                             className={`${inputCls} ${isUnmappedSeen ? 'border-amber-300' : ''}`} />
-                    </div>
-                    <span className="text-[#C9A98A] shrink-0 text-sm hidden sm:inline">→</span>
-                    <div className="flex-1 min-w-[10rem] w-full sm:w-auto">
-                      <select value={row.email} onChange={e => setAgentRow(idx, { email: e.target.value })}
-                              aria-label="Staff member"
-                              className={`${inputCls} ${isUnmappedSeen ? 'border-amber-300 bg-amber-50/50' : ''}`}>
-                        <option value="">— Unmapped —</option>
-                        {staff.map(s => (
-                          <option key={s.email} value={s.email}>{s.name} · {s.email}</option>
-                        ))}
-                        {/* a previously-mapped email that isn't in the active staff list — keep it selectable */}
-                        {row.email && !emailKnown && (
-                          <option value={row.email}>{row.email} (inactive)</option>
-                        )}
-                      </select>
-                    </div>
-                    {isUnmappedSeen && (
-                      <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 shrink-0">
-                        unmapped
-                      </span>
-                    )}
-                    {isLoginId && (
-                      <span className="text-[10px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1.5 py-0.5 shrink-0">
-                        logged from the app, not TeleCMI
-                      </span>
-                    )}
-                    {stale && (
-                      <span title={`Last call ${lastSeenLabel(stale.lastSeenMs)} · ${stale.calls} call${stale.calls === 1 ? '' : 's'} on record`}
-                            className="text-[10px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-1.5 py-0.5 shrink-0">
-                        no calls in {AGENT_STALE_DAYS} days — likely a removed extension
-                      </span>
-                    )}
-                    {!isDerived ? (
-                      <button type="button" onClick={() => removeAgentRow(idx)}
-                              title="Remove this row" aria-label="Remove this row"
-                              className="p-1.5 text-[#8B7355] hover:text-red-600 hover:bg-red-50 rounded shrink-0">
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    ) : hasName ? (
-                      <button type="button" onClick={() => clearAgentName(idx)}
-                              title="Clear the mapped name — the id stays, it is on real calls"
-                              aria-label="Clear the mapped name"
-                              className="p-1.5 text-[#8B7355] hover:text-[#af4408] hover:bg-[#FFF1E3] rounded shrink-0">
-                        <Eraser className="w-3.5 h-3.5" />
-                      </button>
-                    ) : (
-                      <button type="button" onClick={() => hideAgentRow(row.id)}
-                              title="Hide this id from the list — it stays in call history"
-                              aria-label="Hide this id from the list"
-                              className="p-1.5 text-[#8B7355] hover:text-[#af4408] hover:bg-[#FFF1E3] rounded shrink-0">
-                        <EyeOff className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
+
+              {agentGroups.past.length > 0 && (
+                <div className="space-y-2">
+                  {groupHeading(
+                    'From past calls',
+                    `${agentGroups.past.length} id${agentGroups.past.length === 1 ? '' : 's'} not on TeleCMI now`,
+                  )}
+                  <p className="text-[11px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-2 py-1.5">
+                    These extensions answered calls in the past but are not agents on TeleCMI now —
+                    recreating extensions does this. Map them to keep old calls named, or remove them
+                    from this list.
+                  </p>
+                  {renderAgentRows(agentGroups.past)}
+                </div>
+              )}
             </div>
+          ) : (
+            /* Roster unknown (not loaded, not permitted, or TeleCMI could not be
+               read) — today's flat list, rather than a guessed grouping that
+               could file a live agent under "From past calls". */
+            renderAgentRows(visibleAgentRows)
           )}
 
           {/* Nothing is ever lost silently: whatever was hidden stays one click

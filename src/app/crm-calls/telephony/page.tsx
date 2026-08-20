@@ -60,6 +60,11 @@
  *   POST /api/telecmi/callerid    (login|list|set)
  *   GET  /api/telecmi/recording-diagnostic         (+ ?probe=1 for the upstream try)
  *   GET  /api/telecmi/recording-retention   PUT /api/telecmi/recording-retention
+ *   GET  /api/crm-calls/settings  — READ ONLY, and only for the reconciliation
+ *     line under the roster (agent_map + agents_seen). This page never writes
+ *     that route: agent mapping is edited in CRM Settings, and the one write
+ *     this page makes to agent_map goes through the agents route's `map` action
+ *     for the reason documented on addToRoster().
  */
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
@@ -188,7 +193,27 @@ type VerifyState = {
  *  rather than fired at the provider and refused there. */
 const SCAN_MAX_CANDIDATES = 200;
 
+/** How many mapping-only ids are named in full before the line says "and N
+ *  more". Naming them is the whole point — a count alone sends the owner back
+ *  to the other screen to work out WHICH ids — but a wall of eighty is a wall. */
+const MAPPING_ONLY_NAMED = 12;
+
 type CallerIdEntry = { pstn: number; price: number; capacity: number; profile: string };
+
+/**
+ * The machine-readable failure kind from /api/telecmi/callerid.
+ *
+ * It exists so this page never has to match on the route's prose to tell three
+ * completely different things apart, and above all so it can tell a DEAD
+ * SIGN-IN from a caller-ID feature that is simply not provisioned. TeleCMI
+ * answers both with the same auth-shaped status, which is how a sign-in that
+ * had just succeeded came to be reported as no longer accepted on the very same
+ * card. Absent on an older server — every read below falls back to the
+ * behaviour this page had before the discriminator existed.
+ */
+type CallerIdReason = 'not_signed_in' | 'token_stale' | 'callerid_unavailable' | 'transport';
+
+const CALLERID_REASONS: readonly string[] = ['not_signed_in', 'token_stale', 'callerid_unavailable', 'transport'];
 
 /** Per-agent caller-ID session. The password is deliberately NOT in here — it
  *  lives in a field-local state that is wiped the moment the login returns. */
@@ -197,7 +222,20 @@ type CallerIdSession = {
   callerids: CallerIdEntry[] | null;
   selected: number | null;
   busy: 'login' | 'list' | 'set' | null;
+  /**
+   * The card's primary failure: an action the admin asked for that did not
+   * happen. Red, and mutually exclusive with `flash` — every write of one
+   * clears the other, because a card that shows "Signed in" and "sign this
+   * agent in again" at once is not two facts, it is a bug the owner has to
+   * guess his way out of.
+   */
   error: string | null;
+  /**
+   * A failure of the CALLER-ID LOOKUP, which says nothing at all about the
+   * sign-in. Neutral, secondary, and allowed to sit under a green "Signed in"
+   * chip — because after a successful login that combination is the truth.
+   */
+  callerid_note: string | null;
   flash: string | null;
 };
 
@@ -512,6 +550,64 @@ async function getJson<T>(url: string): Promise<GetResult<T>> {
   }
 }
 
+/* ── Caller-ID failures: which of the two states is being reported ──────────
+ *
+ * The whole point of this pair of helpers is that "the sign-in is dead" and
+ * "TeleCMI would not hand over caller IDs" are DIFFERENT sentences with
+ * different remedies, and were previously the same red box. See the note on
+ * CallerIdSession.error / .callerid_note.
+ */
+
+/** The route's `reason`, or null when it did not state one (older server). */
+function readReason(j: unknown): CallerIdReason | null {
+  const r = String((j as { reason?: unknown } | null | undefined)?.reason ?? '').trim();
+  return CALLERID_REASONS.includes(r) ? (r as CallerIdReason) : null;
+}
+
+/** callerIdPost() hangs the reason off the Error it throws, so every catch on
+ *  this page can read it without a second return channel. */
+type CallerIdFailure = Error & { reason?: CallerIdReason | null };
+
+const reasonOf = (e: unknown): CallerIdReason | null => {
+  const r = (e as CallerIdFailure)?.reason;
+  return r == null ? null : r;
+};
+
+/**
+ * The wording for the secondary, caller-ID-only line.
+ *
+ * `afterSignIn` is not cosmetic: a login that JUST succeeded is evidence the
+ * credentials work, so the sentence has to LEAD with that. Anything that reads
+ * "sign this agent in again" printed a second after "Signed in" sends an owner
+ * to re-type a password that was never wrong.
+ */
+function callerIdNoteFor(reason: CallerIdReason | null, detail: string, afterSignIn: boolean): string {
+  const lead = afterSignIn ? 'Signed in. ' : '';
+  switch (reason) {
+    case 'callerid_unavailable':
+      return `${lead}TeleCMI did not return caller IDs for this agent — they may not be enabled on this account. Click-to-call is unaffected.`;
+    case 'transport':
+      return `${lead}TeleCMI could not be asked for this agent’s caller IDs just now, so the list below is not their real one. Try Reload in a moment. TeleCMI said: ${detail}`;
+    case 'token_stale':
+      // Only reachable straight after a login — outside that window a stale
+      // token is a sign-in failure and is reported as one. Here it would
+      // contradict the sign-in TeleCMI accepted seconds ago.
+      return `${lead}TeleCMI would not accept that sign-in when reading caller IDs. The sign-in itself was accepted, so try Reload before signing in again.`;
+    default:
+      // No reason stated: say the one thing that is certainly true and carry
+      // the server's own message rather than inventing a diagnosis.
+      return `${lead}TeleCMI did not return caller IDs for this agent (click-to-call is unaffected). TeleCMI said: ${detail}`;
+  }
+}
+
+/** What to call a mapping-only agent id on screen: the extension when the id is
+ *  the usual `<extension>_<appid>`, otherwise the id itself. The full id is kept
+ *  in a title so the row can still be matched in CRM Settings. */
+function agentIdLabel(id: string): string {
+  const m = /^(\d+)_/.exec(String(id).trim());
+  return m ? m[1] : String(id).trim();
+}
+
 /* ── Small presentational pieces ──────────────────────────────────────────── */
 
 function SectionCard({
@@ -703,6 +799,20 @@ export default function TelephonyPage() {
   const [verifying, setVerifying] = useState(false);
   const [verifyError, setVerifyError] = useState<string | null>(null);
 
+  // 3c · The CRM agent-mapping id list, read ONLY to reconcile it with this
+  // roster. Nothing on this page writes it.
+  //
+  // WHY THIS IS HERE AT ALL. The two screens list two different things and
+  // neither said so. This roster is agent_map — the agents TeleCMI has now.
+  // CRM Settings lists that map UNIONED with every agent id seen on a real
+  // call, so when a venue's extensions are deleted and re-created upstream the
+  // old ones live on there forever, on ct_calls rows that really happened. An
+  // owner comparing the two screens can only conclude that one of them is
+  // wrong, so this page says out loud which ids are history and where to
+  // manage them.
+  const [mapIds, setMapIds] = useState<string[] | null>(null);
+  const [mapIdsError, setMapIdsError] = useState<string | null>(null);
+
   // 4 · Caller ID
   const [sessions, setSessions] = useState<Record<string, CallerIdSession>>({});
   const [pwDraft, setPwDraft] = useState<Record<string, string>>({});
@@ -768,7 +878,49 @@ export default function TelephonyPage() {
     setAgentsLoading(false);
   }, []);
 
-  useEffect(() => { void loadBalance(); void loadAgents(); }, [loadBalance, loadAgents]);
+  /* ── The CRM mapping's ids, for the reconciliation line only ──────────────
+   * Read-only, and it must never take the page over: a footnote that cannot
+   * load is a missing footnote, not a broken console. So a 401/403 here does
+   * NOT call setLocked() the way every other loader on this page does — the
+   * page's own admin gate is already answered by the telephony routes. */
+  const loadMappingIds = useCallback(async () => {
+    setMapIdsError(null);
+    const r = await getJson<Record<string, unknown>>('/api/crm-calls/settings');
+    if (!r.ok) {
+      setMapIds(null);
+      setMapIdsError(r.error);
+      return;
+    }
+    const data = r.data ?? {};
+    // The route nests the settings object; older shapes put the keys at the top
+    // level. Accept both rather than render a silent empty reconciliation.
+    const nested = data.settings;
+    const src = (nested && typeof nested === 'object' ? nested : data) as Record<string, unknown>;
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const push = (v: unknown) => {
+      const id = String(v ?? '').trim();
+      const key = canonAgentId(id);
+      if (!id || seen.has(key)) return;
+      seen.add(key);
+      out.push(id);
+    };
+    // agent_map KEYS, not entries: a key whose FNB user is still blank is a row
+    // in that editor all the same, and it is exactly the kind being asked about.
+    let map: unknown = src.agent_map;
+    if (typeof map === 'string') { try { map = JSON.parse(map || '{}'); } catch { map = null; } }
+    if (map && typeof map === 'object' && !Array.isArray(map)) {
+      Object.keys(map as Record<string, unknown>).forEach(push);
+    }
+    // agents_seen = ids on real ct_calls rows. The server has already filtered
+    // this by the admin's own hide list, so an id he has dismissed over there is
+    // not named again over here.
+    const seenIds = data.agents_seen;
+    if (Array.isArray(seenIds)) seenIds.forEach(push);
+    setMapIds(out);
+  }, []);
+
+  useEffect(() => { void loadBalance(); void loadAgents(); void loadMappingIds(); }, [loadBalance, loadAgents, loadMappingIds]);
   useEffect(() => { void loadAnalysis(days); }, [days, loadAnalysis]);
 
   /* ── 5 · Recording diagnostic ─────────────────────────────────────────────
@@ -989,6 +1141,26 @@ export default function TelephonyPage() {
     [agents],
   );
 
+  /**
+   * Ids the CRM agent mapping holds that are NOT agents on TeleCMI.
+   *
+   * Almost always historical extensions: the venue's TeleCMI users were
+   * re-created, so 5002–5006 exist on real past calls and nowhere else. This is
+   * a statement about the two LISTS, never an instruction — nothing here
+   * deletes, hides or maps anything, because a derived id cannot be deleted at
+   * all (it is on ct_calls rows) and hiding it is CRM Settings' own decision.
+   *
+   * Only meaningful once the roster has actually loaded: with `agents` empty
+   * every mapped id looks unknown, which is why the block that renders this is
+   * gated on a non-empty roster.
+   */
+  const mappingOnlyIds = useMemo(
+    () => (mapIds ?? []).filter(id => !rosterIds.has(canonAgentId(id))),
+    [mapIds, rosterIds],
+  );
+  const mappingOnlyShown = mappingOnlyIds.slice(0, MAPPING_ONLY_NAMED);
+  const mappingOnlyRest = mappingOnlyIds.length - mappingOnlyShown.length;
+
   /** One POST path for the three new actions, so 401/403 locks the page exactly
    *  as every GET on it does rather than surfacing as a puzzling error string. */
   const postAgents = async (
@@ -1171,7 +1343,8 @@ export default function TelephonyPage() {
   // (TS2783). Same precedence either way — defaults, then whatever the session
   // already holds, then the patch — but expressed so the compiler agrees.
   const BLANK_SESSION: CallerIdSession = {
-    expires_at: null, callerids: null, selected: null, busy: null, error: null, flash: null,
+    expires_at: null, callerids: null, selected: null, busy: null,
+    error: null, callerid_note: null, flash: null,
   };
   const patchSession = (id: string, patch: Partial<CallerIdSession>) =>
     setSessions(prev => ({
@@ -1187,14 +1360,37 @@ export default function TelephonyPage() {
     // configured". Checking only r.ok reads that as a successful sign-in, then
     // reports the resulting empty caller-ID list as fact and lets "Set caller
     // ID" claim success for a call that never left the building. Both flags.
-    if (!r.ok || j?.ok === false) throw new Error(j?.error || `HTTP ${r.status}`);
+    if (!r.ok || j?.ok === false) {
+      const err: CallerIdFailure = new Error(j?.error || `HTTP ${r.status}`);
+      // Carried on the Error rather than returned separately so every existing
+      // catch on this page keeps working and can ask what kind of failure it was.
+      err.reason = readReason(j);
+      throw err;
+    }
     return j;
   };
 
+  /** The one shape a red caller-ID failure takes: no flash beside it, and —
+   *  when the server has told us there is no usable token any more — the card
+   *  goes back to the password box, because a green "Signed in" chip above a red
+   *  "sign this agent in again" is the exact contradiction being fixed here.
+   *  Only those two verdicts retire the sign-in; on anything else this browser
+   *  has learned nothing about the token and must not throw the session away. */
+  const failSession = (id: string, message: string, reason: CallerIdReason | null) =>
+    patchSession(id, {
+      busy: null,
+      error: message,
+      flash: null,
+      callerid_note: null,
+      ...(reason === 'token_stale' || reason === 'not_signed_in'
+        ? { expires_at: null, callerids: null, selected: null }
+        : {}),
+    });
+
   const signIn = async (id: string) => {
     const password = (pwDraft[id] || '').trim();
-    if (!password) { patchSession(id, { error: 'Enter this agent’s TeleCMI password.' }); return; }
-    patchSession(id, { busy: 'login', error: null, flash: null });
+    if (!password) { patchSession(id, { error: 'Enter this agent’s TeleCMI password.', flash: null }); return; }
+    patchSession(id, { busy: 'login', error: null, callerid_note: null, flash: null });
     try {
       const j = await callerIdPost({ action: 'login', id, password });
       // Wipe the typed password the instant it has been used — it is never
@@ -1203,16 +1399,38 @@ export default function TelephonyPage() {
       patchSession(id, {
         busy: null,
         expires_at: j?.expires_at ?? null,
+        // A sign-in that succeeded RETIRES whatever the last attempt left on
+        // this card. Without these two the old red line survives beside the new
+        // green one and the owner is looking at both verdicts at once.
+        error: null,
+        callerid_note: null,
         flash: 'Signed in — this token lasts 30 days.',
       });
-      await listCallerIds(id);
+      // The caller-ID lookup that follows is a DIFFERENT call. Whatever it does
+      // next, it may not touch the sign-in verdict above — see listCallerIds.
+      await listCallerIds(id, { afterSignIn: true });
     } catch (e: any) {
-      patchSession(id, { busy: null, error: e?.message || 'Sign-in failed' });
+      failSession(id, e?.message || 'Sign-in failed', reasonOf(e));
     }
   };
 
-  const listCallerIds = async (id: string) => {
-    patchSession(id, { busy: 'list', error: null });
+  /**
+   * Read this agent's caller IDs.
+   *
+   * `afterSignIn` marks the call the sign-in makes on its own behalf, and it
+   * changes exactly one thing: a failure is reported as a caller-ID note, never
+   * as a sign-in error. A login that has just returned a token is evidence the
+   * credentials work; a later, different call failing is not evidence that they
+   * do not, and rendering it as one is what put "Signed in", "expires 19 Sept
+   * 2026" and "sign this agent in again" on one card.
+   */
+  const listCallerIds = async (id: string, opts?: { afterSignIn?: boolean }) => {
+    const afterSignIn = opts?.afterSignIn === true;
+    // After a sign-in, `flash` and `expires_at` are the truth about the SIGN-IN
+    // and this call has no business clearing either.
+    patchSession(id, afterSignIn
+      ? { busy: 'list', callerid_note: null }
+      : { busy: 'list', error: null, flash: null, callerid_note: null });
     try {
       const j = await callerIdPost({ action: 'list', id });
       const list: CallerIdEntry[] = Array.isArray(j?.callerid)
@@ -1223,25 +1441,44 @@ export default function TelephonyPage() {
             profile: String(c?.profile ?? ''),
           }))
         : [];
-      patchSession(id, { busy: null, callerids: list, selected: list[0]?.pstn ?? null });
+      patchSession(id, {
+        busy: null, callerids: list, selected: list[0]?.pstn ?? null,
+        error: null, callerid_note: null,
+      });
     } catch (e: any) {
-      patchSession(id, { busy: null, error: e?.message || 'Could not list caller IDs' });
+      const reason = reasonOf(e);
+      const detail = e?.message || 'Could not list caller IDs';
+      // `callerid_unavailable` is the server saying in so many words that the
+      // sign-in is fine and the FEATURE is not, so it can never be dressed as a
+      // sign-in failure either. Everything else keeps this page's previous
+      // behaviour, which is what an older server without `reason` gets.
+      if (afterSignIn || reason === 'callerid_unavailable') {
+        patchSession(id, { busy: null, callerid_note: callerIdNoteFor(reason, detail, afterSignIn) });
+        return;
+      }
+      failSession(id, detail, reason);
     }
   };
 
   const applyCallerId = async (id: string) => {
     const s = sessions[id];
     const callerid = s?.selected;
-    if (callerid == null) { patchSession(id, { error: 'Pick a caller ID first.' }); return; }
-    patchSession(id, { busy: 'set', error: null, flash: null });
+    if (callerid == null) { patchSession(id, { error: 'Pick a caller ID first.', flash: null }); return; }
+    patchSession(id, { busy: 'set', error: null, callerid_note: null, flash: null });
     try {
       const j = await callerIdPost({ action: 'set', id, callerid });
       patchSession(id, {
         busy: null,
+        error: null,
         flash: `Caller ID set to ${j?.callerid ?? callerid} for outbound calls.`,
       });
     } catch (e: any) {
-      patchSession(id, { busy: null, error: e?.message || 'Could not set the caller ID' });
+      // A set that did not happen stays a red failure — it was an explicit
+      // request and the number was not changed. What matters is that only a
+      // `token_stale` verdict retires the sign-in: on `callerid_unavailable`
+      // the route's own message says the sign-in is valid, so the green chip
+      // above it is not a contradiction, it is the other half of the sentence.
+      failSession(id, e?.message || 'Could not set the caller ID', reasonOf(e));
     }
   };
 
@@ -1940,6 +2177,53 @@ export default function TelephonyPage() {
               <a href="/crm-calls/settings" className="text-[#af4408] underline underline-offset-2">CRM Settings</a>.
               An unmapped agent still takes calls, but click-to-call cannot dial for them.
             </p>
+
+            {/* ── This roster vs the CRM agent mapping ────────────────────────
+                SILENT WHEN THE TWO AGREE. It exists for the one case that reads
+                as a bug and is not: extensions recreated on TeleCMI, so the ids
+                that answered last month's calls are still in the mapping editor
+                and are no longer agents anywhere. Naming them is the point —
+                "the lists differ" without saying WHICH ids just moves the
+                puzzle to the other screen. Informational only: this page holds
+                no control that could act on them, and a derived id cannot be
+                deleted at all (it sits on real ct_calls rows), which is why the
+                only thing offered is a link to where it can be dismissed. */}
+            {agents.length > 0 && mappingOnlyIds.length > 0 && (
+              <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] p-2.5 flex items-start gap-2">
+                <Info className="w-4 h-4 text-[#8B7355] shrink-0 mt-0.5" />
+                <div className="text-[11px] text-[#6B5744] space-y-1 min-w-0">
+                  <p>
+                    <strong className="text-[#2D1B0E]">
+                      {mappingOnlyIds.length === 1
+                        ? '1 id appears in CRM agent mapping but is not an agent on TeleCMI:'
+                        : `${count(mappingOnlyIds.length)} ids appear in CRM agent mapping but are not agents on TeleCMI:`}
+                    </strong>{' '}
+                    {mappingOnlyShown.map((id, i) => (
+                      <span key={id} title={id} className="font-mono text-[#2D1B0E]">
+                        {agentIdLabel(id)}{i < mappingOnlyShown.length - 1 ? ', ' : ''}
+                      </span>
+                    ))}
+                    {mappingOnlyRest > 0 && <> and {count(mappingOnlyRest)} more</>}
+                    {' '}— these are historical extensions from past calls.
+                  </p>
+                  <p>
+                    The two screens are not meant to match. This roster is the agents this app holds
+                    on TeleCMI; CRM Settings lists the same mapping <em>plus</em> every agent id that
+                    appears on a real call, so an extension deleted and re-created upstream stays
+                    there as history. Nothing is broken and nothing here can change them —{' '}
+                    <a href="/crm-calls/settings" className="text-[#af4408] underline underline-offset-2">
+                      manage them in CRM Settings
+                    </a>.
+                  </p>
+                </div>
+              </div>
+            )}
+            {mapIdsError && (
+              <p className="text-[10px] text-[#8B7355]">
+                The CRM agent mapping could not be read ({mapIdsError}), so this page cannot say
+                whether it holds ids that are no longer agents on TeleCMI.
+              </p>
+            )}
           </div>
         )}
       </SectionCard>
@@ -2038,7 +2322,13 @@ export default function TelephonyPage() {
                             disabled={!s?.callerids?.length || busy === 'set'}
                             className="w-full mt-0.5 px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]"
                           >
-                            {!s?.callerids?.length && <option value="">— none returned —</option>}
+                            {/* Two different empties. "none returned" is an
+                                answer from TeleCMI; "not available" is the
+                                absence of one, and calling that "none" would
+                                state a fact nobody has. */}
+                            {!s?.callerids?.length && (
+                              <option value="">{s?.callerid_note ? '— not available —' : '— none returned —'}</option>
+                            )}
                             {(s?.callerids ?? []).map(c => (
                               <option key={c.pstn} value={c.pstn}>
                                 {c.pstn}{c.profile ? ` · ${c.profile}` : ''}{c.capacity ? ` · capacity ${c.capacity}` : ''}
@@ -2059,6 +2349,16 @@ export default function TelephonyPage() {
                       </div>
                     )}
 
+                    {/* The caller-ID line, kept deliberately apart from the red
+                        box below. A caller-ID lookup that fails says nothing
+                        about the sign-in, so it is neutral, secondary, and
+                        allowed to sit under the green "Signed in" chip — which
+                        after a successful login is simply the truth. */}
+                    {s?.callerid_note && (
+                      <p className="text-[11px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded px-2 py-1.5 flex items-start gap-1.5">
+                        <Info className="w-3.5 h-3.5 shrink-0 mt-px text-[#8B7355]" /> {s.callerid_note}
+                      </p>
+                    )}
                     {s?.error && (
                       <p className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1.5 flex items-start gap-1.5">
                         <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-px" /> {s.error}
@@ -2072,6 +2372,17 @@ export default function TelephonyPage() {
                   </div>
                 );
               })}
+
+              {/* Said ONCE, under the whole list, rather than implied on every
+                  card. An account with no per-agent caller IDs is a normal
+                  account, and a dozen cards each reading "— none returned —"
+                  looks like a dozen faults. */}
+              <p className="text-[10px] text-[#6B5744]">
+                <strong className="text-[#2D1B0E]">&ldquo;— none returned —&rdquo; is a normal answer.</strong>{' '}
+                Many TeleCMI accounts publish no per-agent caller IDs at all; those agents simply dial
+                out on the account&rsquo;s own number. It is not a failed sign-in and it does not affect
+                click-to-call — the only thing it stops is choosing a different outbound number here.
+              </p>
             </div>
           )}
         </div>
