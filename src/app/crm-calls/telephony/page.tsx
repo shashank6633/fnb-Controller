@@ -71,7 +71,7 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Phone, Wallet, BarChart3, Users, PhoneOutgoing, Loader2, AlertCircle,
   AlertTriangle, CheckCircle2, RefreshCw, Lock, Plus, Pencil, KeyRound,
-  Link2Off, PlugZap, X, Save, Info, FileAudio, Timer,
+  Link2Off, PlugZap, X, Save, Info, FileAudio, Timer, PhoneIncoming,
   ScanSearch, ListChecks, UserPlus, ChevronDown, ChevronRight,
 } from 'lucide-react';
 import { api } from '@/lib/api';
@@ -339,6 +339,77 @@ type DiagCredentials = {
   secret?: { set?: boolean; source?: string };
 };
 
+/* ── "Ringing — for whom?" (the live_ring block of the same diagnostic) ────
+ *
+ * The owner's question is "Didn't Pickup shows correctly, but I need to see FOR
+ * WHOM it is ringing." The name on "did not pick up" comes from the per-leg
+ * MISSED CDR and works; the RING event yields no agent, so the live card can
+ * only ever show the ring group. Whether that is a missing key spelling or a
+ * payload that genuinely does not say can only be settled by looking at the
+ * captured ring payloads, and this block is that look.
+ *
+ * EVERY FIELD IS OPTIONAL AND EVERY READ IS GUARDED, for the same reason
+ * DiagProbeCall is: the route and this panel move independently, and a field
+ * that has not landed must degrade to "not stated", never to a page that
+ * unmounts on a TypeError. */
+type DiagRingField = {
+  path?: string;
+  shape?: string;
+  /** False when the mapper's collect() cannot reach this nesting at all. */
+  in_mapper_reach?: boolean;
+  matched_agent_key?: boolean;
+  matched_queue_key?: boolean;
+  matched_id_key?: boolean;
+  /** Credential-masked AND digit-masked by the route. '' when withheld. */
+  value?: string;
+  /** Why no value is printed — caller-side field, or an object shown by name. */
+  withheld?: string;
+  redacted?: boolean;
+  /** A run of 6+ digits was replaced by '#' — i.e. a phone number was hidden. */
+  digits_masked?: boolean;
+  truncated?: boolean;
+  candidate?: boolean;
+  candidate_score?: number;
+  candidate_why?: string[];
+};
+
+type DiagRingEvent = {
+  log_id?: string;
+  received_at?: string;
+  telecmi_call_id?: string;
+  event_at_ingest?: string;
+  payload_readable?: boolean;
+  field_count?: number;
+  caller_side_withheld?: number;
+  /** What the mapper extracts from this payload — the "we read that" half. */
+  mapper?: { agent?: string; queue?: string; event?: string; direction?: string };
+  fields?: DiagRingField[];
+  candidates?: { path?: string; score?: number; why?: string[] }[];
+  headline?: string;
+};
+
+type DiagLiveRing = {
+  limit?: number;
+  /** Every live row by classification — so "no rings" reads as a stated fact
+   *  about the feed rather than as an empty panel. */
+  live_event_breakdown?: { event?: string; n?: number }[];
+  ring_events_total?: number;
+  examined?: number;
+  oldest_at?: string;
+  newest_at?: string;
+  with_agent?: number;
+  without_agent?: number;
+  with_queue?: number;
+  caller_side_withheld?: number;
+  /** Values the route declined to print because they were shaped like a person
+   *  or an email under a field name that attributes them to nobody. */
+  identity_withheld?: number;
+  /** THE SHORTLIST, pooled across the examined rings and ranked. */
+  candidate_keys?: { path?: string; score?: number; seen_on?: number; in_mapper_reach?: boolean; why?: string[] }[];
+  events?: DiagRingEvent[];
+  headline?: string;
+};
+
 type RecordingDiagResp = {
   generated_at: string;
   error?: string;
@@ -357,6 +428,8 @@ type RecordingDiagResp = {
     headline: string;
   };
   latest_cdr?: DiagCdr | null;
+  /** Optional — the ring evidence. Absent on a server that predates it. */
+  live_ring?: DiagLiveRing | null;
   recording_scan?: {
     limit: number;
     scanned: number;
@@ -2660,6 +2733,38 @@ export default function TelephonyPage() {
         )}
       </SectionCard>
 
+      {/* ── 5b · Ringing — for whom? ──
+          Fed by the SAME diagnostic request as the Recordings card above (one
+          fetch, two questions), but given its own card because it answers a
+          completely different one and an owner looking for it should not have
+          to know it lives under "Recordings". */}
+      <SectionCard
+        icon={<PhoneIncoming className="w-4 h-4 text-[#af4408]" />}
+        title="Ringing — for whom?"
+        subtitle="Read-only. Does TeleCMI's ring event say which phone is being rung, under a field name we do not read?"
+        right={
+          <button onClick={() => void loadDiag()} disabled={diagLoading}
+                  className="px-2.5 py-1 bg-white border border-[#E8D5C4] rounded text-xs text-[#6B5744] flex items-center gap-1 hover:bg-[#FFF8F0] disabled:opacity-50">
+            <RefreshCw className={`w-3 h-3 ${diagLoading ? 'animate-spin' : ''}`} /> Refresh
+          </button>
+        }
+      >
+        {diagLoading ? (
+          <Spinner label="Reading the ring payloads…" />
+        ) : diagError ? (
+          <ErrorBox msg={diagError} onRetry={() => void loadDiag()} />
+        ) : diag?.error ? (
+          <ErrorBox msg={diag.error} onRetry={() => void loadDiag()} />
+        ) : !diag?.live_ring ? (
+          <p className="text-[11px] text-[#8B7355] border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] px-2.5 py-2">
+            This diagnostic did not report on ring payloads. Refresh; if it stays empty, the server
+            is running a build from before this panel existed.
+          </p>
+        ) : (
+          <RingEvidence ring={diag.live_ring} />
+        )}
+      </SectionCard>
+
       {/* ── 6 · Recording retention ── */}
       <SectionCard
         icon={<Timer className="w-4 h-4 text-[#af4408]" />}
@@ -2939,6 +3044,298 @@ function CdrDetail({ cdr, label, note }: { cdr: DiagCdr; label: string; note?: s
           </p>
         )}
       </div>
+    </div>
+  );
+}
+
+/* ── "Ringing — for whom?" evidence ───────────────────────────────────────
+ *
+ * HOW TO READ THIS PANEL, in the order it is laid out:
+ *
+ *   1 THE VERDICT, in one sentence, written by the route so there is one
+ *     wording and not two that drift.
+ *   2 HOW MUCH EVIDENCE IT RESTS ON — how many rings were read and over what
+ *     period. A shortlist drawn from two rings last March is not the same claim
+ *     as one drawn from twenty this morning, and "no rings at all" is a
+ *     completely different answer from "rings that say nothing".
+ *   3 THE SHORTLIST: field names TeleCMI sends that this app does not read,
+ *     whose value looks like an extension or an agent identity, best first.
+ *     This is the only actionable thing on the panel.
+ *   4 The per-ring detail, collapsed, for whoever wants to check the shortlist
+ *     against the raw field list rather than take it on trust.
+ *
+ * A SHORTLIST ENTRY IS A LEAD, NOT A FIX, and the panel says so where it is
+ * hardest to miss. The function that reads the agent is shared by ring, answer
+ * and CDR, so a spelling adopted here also decides who an ANSWERED call is
+ * attributed to — the wrong one would mis-credit a pickup, which is worse than
+ * the missing label this exists to fix.
+ *
+ * Values shown here are already credential-masked AND digit-masked by the
+ * route; a guest phone number arrives as ########## and never as itself. This
+ * component adds no unmasking of any kind — it renders what it is given. */
+function RingEvidence({ ring }: { ring: DiagLiveRing }) {
+  const examined = Number(ring.examined ?? 0);
+  const total = Number(ring.ring_events_total ?? 0);
+  const named = Number(ring.with_agent ?? 0);
+  const unnamed = Number(ring.without_agent ?? 0);
+  const withQueue = Number(ring.with_queue ?? 0);
+  const breakdown = Array.isArray(ring.live_event_breakdown) ? ring.live_event_breakdown : [];
+  const events = Array.isArray(ring.events) ? ring.events : [];
+  const allCandidates = Array.isArray(ring.candidate_keys) ? ring.candidate_keys : [];
+  // A lead the mapper could never reach is still shown, greyed and labelled —
+  // but it is NOT what makes the panel "actionable", because no key spelling
+  // would pick it up.
+  const actionable = allCandidates.filter(c => c.in_mapper_reach !== false);
+
+  const tone: 'good' | 'lead' | 'flat' =
+    examined > 0 && unnamed === 0 ? 'good' : actionable.length > 0 ? 'lead' : 'flat';
+
+  return (
+    <div className="space-y-3">
+      <p className={`text-[11px] rounded-lg border px-2.5 py-2 flex items-start gap-1.5 ${
+        tone === 'good' ? 'text-emerald-800 bg-emerald-50 border-emerald-200'
+          : tone === 'lead' ? 'text-amber-900 bg-amber-50 border-amber-300'
+            : 'text-[#6B5744] bg-[#FFF8F0] border-[#E8D5C4]'}`}>
+        {tone === 'good' ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-px" />
+          : tone === 'lead' ? <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+            : <Info className="w-3.5 h-3.5 shrink-0 mt-px" />}
+        <span>{ring.headline || 'The diagnostic returned no verdict about ring payloads.'}</span>
+      </p>
+
+      {/* HOW MUCH EVIDENCE. Stated before anything is concluded from it. */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+          <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Ring events read</p>
+          <p className={`text-2xl font-bold mt-0.5 ${examined === 0 ? 'text-amber-800' : 'text-[#2D1B0E]'}`}>
+            {count(examined)}
+          </p>
+          <p className="text-[11px] text-[#6B5744] mt-1">
+            {total > examined ? <>of {count(total)} logged (newest {count(ring.limit ?? examined)})</> : <>of {count(total)} logged</>}
+          </p>
+        </div>
+
+        <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+          <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Period read</p>
+          <p className="text-[11px] text-[#2D1B0E] mt-1 leading-relaxed">
+            {examined === 0
+              ? <span className="text-[#8B7355]">Nothing to read</span>
+              : <>{fmtWhen(ring.oldest_at)}<br />→ {fmtWhen(ring.newest_at)}</>}
+          </p>
+        </div>
+
+        <div className={`rounded-lg border p-3 ${named === 0 && examined > 0 ? 'bg-amber-50 border-amber-300' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`}>
+          <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Named an agent</p>
+          <p className={`text-2xl font-bold mt-0.5 ${named === 0 && examined > 0 ? 'text-amber-800' : 'text-[#2D1B0E]'}`}>
+            {count(named)}
+          </p>
+          <p className="text-[11px] text-[#6B5744] mt-1">
+            {examined === 0 ? 'No ring to judge' : `${count(unnamed)} named nobody the app reads`}
+          </p>
+        </div>
+
+        <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+          <p className="text-[10px] uppercase tracking-wide text-[#6B5744]">Carried a ring group</p>
+          <p className="text-2xl font-bold text-[#2D1B0E] mt-0.5">{count(withQueue)}</p>
+          <p className="text-[11px] text-[#6B5744] mt-1">
+            The group is the fallback answer when no person is named.
+          </p>
+        </div>
+      </div>
+
+      {/* WHEN THERE ARE NO RINGS AT ALL, this is the whole answer — so the live
+          feed's own event mix is shown rather than an empty field list, which
+          would read as "the payload has no fields". */}
+      {examined === 0 && breakdown.length > 0 && (
+        <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-2.5 py-2">
+          <p className="text-[10px] uppercase tracking-wide text-[#6B5744] mb-1.5">
+            Every live event this app has logged, by type
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {breakdown.map((b, i) => (
+              <span key={`${b.event || 'x'}-${i}`}
+                    className="px-1.5 py-0.5 rounded border border-[#E8D5C4] bg-white text-[10px] text-[#6B5744]">
+                <span className="font-mono text-[#2D1B0E]">{b.event || '(blank)'}</span> · {count(b.n ?? 0)}
+              </span>
+            ))}
+          </div>
+          <p className="text-[10px] text-[#8B7355] mt-1.5">
+            No ring among them means none has been captured — it does <strong>not</strong> mean a
+            ring payload carries no extension. Nothing can be concluded about the ring until one
+            arrives.
+          </p>
+        </div>
+      )}
+
+      {/* THE SHORTLIST — the only actionable thing on the panel. */}
+      {allCandidates.length > 0 && (
+        <div className="rounded-lg border border-[#E8D5C4] bg-white overflow-hidden">
+          <div className="px-3 py-2 bg-[#FFF8F0] border-b border-[#E8D5C4]">
+            <p className="text-xs font-semibold text-[#2D1B0E]">
+              Fields TeleCMI sends that this app does not read, ranked
+            </p>
+            <p className="text-[10px] text-[#6B5744] mt-0.5">
+              Each of these holds something shaped like an extension or an agent identity, and the
+              mapper ignores it. Best first.
+            </p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs min-w-[420px]">
+              <thead>
+                <tr className="text-left text-[10px] uppercase tracking-wide text-[#8B7355] border-b border-[#E8D5C4]">
+                  <th className="py-1.5 px-3 font-medium">Field</th>
+                  <th className="py-1.5 pr-3 font-medium whitespace-nowrap">Seen on</th>
+                  <th className="py-1.5 pr-3 font-medium">Why it is a candidate</th>
+                </tr>
+              </thead>
+              <tbody className="text-[#2D1B0E]">
+                {allCandidates.map((c, i) => {
+                  const reachable = c.in_mapper_reach !== false;
+                  return (
+                    <tr key={`${c.path || 'c'}-${i}`} className="border-b border-[#E8D5C4]/60 last:border-0 align-top">
+                      <td className="py-2 px-3 font-mono text-[11px] whitespace-nowrap">
+                        {c.path || '—'}
+                        {!reachable && (
+                          <span className="ml-1.5 px-1 py-px rounded bg-[#F0E4D6] text-[9px] font-sans text-[#6B5744] align-middle">
+                            out of reach
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2 pr-3 text-[11px] text-[#6B5744] whitespace-nowrap">
+                        {count(c.seen_on ?? 0)} of {count(examined)}
+                        <span className="block text-[10px] text-[#8B7355]">rank {count(c.score ?? 0)}</span>
+                      </td>
+                      <td className="py-2 pr-3 text-[11px] text-[#6B5744]">
+                        {(c.why || []).join('; ') || 'not stated'}
+                        {!reachable && (
+                          <span className="block text-[10px] text-[#8B7355] mt-0.5">
+                            Nested where the mapper never looks — no key spelling would reach it;
+                            that would take a change to how envelopes are unwrapped.
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-[10px] text-amber-900 bg-amber-50 border-t border-amber-200 px-3 py-2">
+            <strong>A lead, not a fix.</strong> The same function reads the agent for ringing, for
+            answering and for the call report, so a spelling adopted from this list also decides who
+            an <em>answered</em> call is credited to. Before adding one, someone has to check what
+            that same field holds on an <em>answered</em> call — a wrong guess would silently
+            mis-credit pickups, which is worse than the missing label. That answered-call evidence
+            is collected by the same diagnostic request but is not drawn on this page yet, so it is
+            a developer step, not something to act on from this table alone.
+          </p>
+        </div>
+      )}
+
+      {/* THE RAW EVIDENCE, collapsed. Names always; values only where they are
+          the evidence, and already masked by the route. */}
+      {events.length > 0 && (
+        <details className="text-[11px]">
+          <summary className="cursor-pointer text-[#6B5744] hover:text-[#2D1B0E]">
+            Field-by-field, ring by ring ({count(events.length)})
+          </summary>
+          <div className="mt-2 space-y-2">
+            {events.map((ev, i) => (
+              <div key={ev.log_id || `ring-${i}`} className="rounded-lg border border-[#E8D5C4] bg-white overflow-hidden">
+                <div className="px-3 py-2 bg-[#FFF8F0] border-b border-[#E8D5C4]">
+                  <p className="text-[10px] text-[#6B5744]">
+                    {fmtWhen(ev.received_at)}
+                    {ev.telecmi_call_id && <> · call <span className="font-mono">{ev.telecmi_call_id}</span></>}
+                    {' · '}{count(ev.field_count ?? 0)} field{(ev.field_count ?? 0) === 1 ? '' : 's'}
+                  </p>
+                  {/* THE GAP, on one line: what the payload holds vs what we read. */}
+                  <p className="text-[10px] text-[#2D1B0E] mt-1">
+                    <span className="text-[#8B7355]">The app read:</span>{' '}
+                    agent <span className="font-mono">{ev.mapper?.agent || '—'}</span>
+                    {' · '}group <span className="font-mono">{ev.mapper?.queue || '—'}</span>
+                    {' · '}event <span className="font-mono">{ev.mapper?.event || '—'}</span>
+                    {' · '}direction <span className="font-mono">{ev.mapper?.direction || '—'}</span>
+                  </p>
+                  {ev.headline && <p className="text-[10px] text-[#6B5744] mt-1">{ev.headline}</p>}
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs min-w-[420px]">
+                    <thead>
+                      <tr className="text-left text-[10px] uppercase tracking-wide text-[#8B7355] border-b border-[#E8D5C4]">
+                        <th className="py-1.5 px-3 font-medium">Field name</th>
+                        <th className="py-1.5 pr-3 font-medium">Shape</th>
+                        <th className="py-1.5 pr-3 font-medium">Value</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-[#2D1B0E]">
+                      {(ev.fields || []).map((f, j) => (
+                        // Index in the key, not the path alone: paths are
+                        // digit-masked by the route, so two keys of a per-leg
+                        // map keyed by phone number arrive as the same string.
+                        <tr key={`${f.path || 'f'}-${j}`} className="border-b border-[#E8D5C4]/60 last:border-0 align-top">
+                          <td className="py-1.5 px-3 font-mono text-[11px] whitespace-nowrap">
+                            {f.path || '—'}
+                            {f.matched_agent_key && (
+                              <span className="ml-1.5 px-1 py-px rounded bg-emerald-100 text-emerald-800 text-[9px] font-sans align-middle">read as agent</span>
+                            )}
+                            {f.matched_queue_key && (
+                              <span className="ml-1.5 px-1 py-px rounded bg-[#FFF1E3] border border-[#E8D5C4] text-[9px] font-sans text-[#6B5744] align-middle">read as group</span>
+                            )}
+                            {f.matched_id_key && (
+                              <span className="ml-1.5 px-1 py-px rounded bg-[#F0E4D6] text-[9px] font-sans text-[#6B5744] align-middle">read as call id</span>
+                            )}
+                            {f.candidate && (
+                              <span className="ml-1.5 px-1 py-px rounded bg-amber-100 text-amber-800 text-[9px] font-sans align-middle">candidate</span>
+                            )}
+                          </td>
+                          <td className="py-1.5 pr-3 text-[10px] text-[#8B7355] whitespace-nowrap">{f.shape || '—'}</td>
+                          <td className="py-1.5 pr-3 font-mono text-[11px] break-all">
+                            {f.withheld
+                              ? <span className="font-sans italic text-[#8B7355]">{f.withheld}</span>
+                              : f.value === '' || f.value === undefined
+                                ? <span className="font-sans text-[#8B7355]">—</span>
+                                : <>{f.value}{f.truncated && <span className="text-[#8B7355]">…</span>}</>}
+                            {f.redacted && (
+                              <span className="ml-1.5 text-[10px] font-sans text-[#8B7355]">(masked — looked like a credential)</span>
+                            )}
+                            {f.digits_masked && (
+                              <span className="ml-1.5 text-[10px] font-sans text-[#8B7355]">(# — a long number, hidden)</span>
+                            )}
+                            {f.candidate && (f.candidate_why || []).length > 0 && (
+                              <span className="block text-[10px] font-sans text-amber-900 mt-0.5">{(f.candidate_why || []).join('; ')}</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {!ev.payload_readable && (
+                  <p className="px-3 py-2 text-[10px] text-[#8B7355]">
+                    The stored copy of this delivery is not a readable JSON object, so no fields
+                    could be listed.
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+          <p className="text-[10px] text-[#8B7355] mt-2">
+            A value is shown only where it is the evidence — a field the app already reads, or a
+            candidate. Everything else contributes its name and its shape. Anything that looked
+            like a credential is masked, any run of six or more digits is replaced by
+            <span className="font-mono"> # </span>so a guest&rsquo;s number cannot appear — in a
+            field NAME as well as in a value, because a payload can key a list by the number it is
+            dialling — caller-side fields print no value at all, and a value shaped like a
+            person&rsquo;s name or an email prints only where the field NAME says staff or ring
+            group; elsewhere the name and the shape are the lead and the person is withheld.
+            {(ring.caller_side_withheld ?? 0) > 0 && (
+              <> {count(ring.caller_side_withheld ?? 0)} field value{(ring.caller_side_withheld ?? 0) === 1 ? ' was' : 's were'} withheld as caller-side.</>
+            )}
+            {(ring.identity_withheld ?? 0) > 0 && (
+              <> {count(ring.identity_withheld ?? 0)} more {(ring.identity_withheld ?? 0) === 1 ? 'was' : 'were'} withheld as an unattributed name or email.</>
+            )}
+          </p>
+        </details>
+      )}
     </div>
   );
 }

@@ -75,6 +75,9 @@ import {
  *   stored     How many ct_calls rows hold a recording_url, and how many of
  *              those are demo fixtures. Today: every one of them is a fixture.
  *   live_agent WHO ANSWERED, on the LIVE events — see the block below.
+ *   live_ring  WHO IT IS RINGING, on the LIVE ring events. The same evidence
+ *              method pointed at the payload the answer panel has never read —
+ *              see the block comment above describeLiveRing().
  *   probe      OPT-IN (?probe=1), and the only part that leaves this server:
  *              it actually ASKS TeleCMI for a REAL stored recording and reports
  *              which one of a fixed set of outcomes happened — no credentials,
@@ -774,6 +777,1297 @@ function describeLiveAnswer(row: any, creds: string[]): LiveAnswerReport {
   };
 }
 
+/* ── RINGING — FOR WHOM: the live-RING agent evidence ──────────────────────
+ *
+ * ── THE QUESTION ──────────────────────────────────────────────────────────
+ * "Didn't Pickup is showing correctly after a call has not been answered by a
+ * GRE, but I need FOR WHOM it is ringing as well, which makes better analysis.
+ * The agents are already mapped."
+ *
+ * ── WHAT IS ALREADY SETTLED, SO NOBODY RE-LITIGATES IT HERE ───────────────
+ *   · "Pushpa did not pick up" WORKS. That name comes from the PER-LEG MISSED
+ *     CDR, resolved through the owner's agent mapping. THE MAPPING IS HEALTHY;
+ *     it is not the blocker and this panel says nothing about it.
+ *   · "Ringing — for whom" renders "Extension not reported" because the LIVE
+ *     RING payload yields no agent: pickAgent() (src/lib/ct/telecmi-mapper.ts)
+ *     finds no scalar under any AGENT_KEYS spelling and no agent/user object,
+ *     so the name is simply absent and the UI falls back to the ring group.
+ *   · There is ONE "incoming call ringing" live event for the whole call, then
+ *     missed CDRs as the hunt group hands the call on. So there is no per-leg
+ *     RING event to read either.
+ *
+ * ── WHY WE DID NOT JUST ADD A SPELLING TO AGENT_KEYS ──────────────────────
+ * pickAgent() IS EVENT-BLIND. The same function answers for ring, for answer
+ * and for the CDR, and its result also drives ownerCandidate(). A speculative
+ * spelling added to AGENT_KEYS on a guess would therefore not merely improve a
+ * ring label — it would become agentName on ANSWERED calls too and could
+ * silently MIS-ATTRIBUTE WHO PICKED UP. That is a worse bug than the missing
+ * label, and it is unacceptable. A spelling may only be added ON EVIDENCE.
+ *
+ * ── SO THIS PANEL PRODUCES THE EVIDENCE ───────────────────────────────────
+ * Every live webhook body is stored verbatim in ct_webhook_log (kind='live',
+ * event = the mapper's own classification, written by ingestLive()). The ring
+ * payloads from this account are already sitting there. The live_agent panel
+ * above does a field-by-field report over the ANSWER rows; it has never looked
+ * at a RING row, and that blind spot is the entire reason the question is open.
+ *
+ * This panel reports, over the recent RING rows:
+ *   1 HOW MANY were examined and over WHAT PERIOD — and when there are none it
+ *     says so in words, because an empty panel reads as "the payload has no
+ *     fields", and absence of data is not evidence of absence.
+ *   2 THE FIELD NAMES each ring carries, top level AND one level down, each
+ *     nested one prefixed (data.agent_no) so the reader can see where it lives.
+ *     A field cannot be missed here merely because it arrived wrapped.
+ *   3 FOR EACH FIELD whether AGENT_KEYS already matches it, whether QUEUE_KEYS
+ *     matches it, and — the point of the exercise — a ranked UNMATCHED
+ *     CANDIDATES list: fields we do NOT read whose VALUE is shaped like an
+ *     extension or an agent identity, each with the reason it qualified.
+ *   4 WHAT THE MAPPER ACTUALLY EXTRACTED from that same payload (agent, queue,
+ *     event, direction), so the gap between "the payload holds this" and "we
+ *     read that" is visible on one line.
+ *
+ * READ THE RESULT LIKE THIS. A ranked candidate is a LEAD, not a verdict: it
+ * says a field we ignore holds something extension-shaped, not that the field
+ * means "the phone that is ringing". Whoever acts on it still has to check that
+ * the same key on an ANSWER payload names the answerer, because of the
+ * event-blindness above. If the shortlist comes back EMPTY across a decent
+ * number of rings, that is the answer too, and the honest thing then is to stop
+ * promising a name and let the ring GROUP stand as the best available answer.
+ *
+ * ── SAFETY: THIS ECHOES A RAW PROVIDER PAYLOAD ────────────────────────────
+ * A ring payload carries the GUEST'S PHONE NUMBER. Field names are MOSTLY safe
+ * to print and values are not, so:
+ *   · field NAMES go through safeName() — credentials blanked and 6+ digit runs
+ *     masked, and nothing more. "Names are safe" holds for a record and fails
+ *     for a MAP: `legs: { "919876543210": {…} }` puts the guest's number in the
+ *     Field-name column and inside the parent's key list, and neither of those
+ *     is a value, so neither was covered by any rule below.
+ *   · credentials — the SAME scheme as the answer panel, echoValue() plus
+ *     redactCreds(). No second scheme is invented here.
+ *   · phone numbers and anything else long and numeric — every run of 6 or more
+ *     digits in ANY echoed value is replaced by '#' of the same length by
+ *     maskLongDigits(). A 10-digit guest number prints as ##########, which is
+ *     its shape and nothing else, while a 3- or 4-digit extension — the thing
+ *     we are hunting — survives intact. Six is the floor because no Indian
+ *     mobile or STD landline is that short and no SIP extension on this account
+ *     is that long.
+ *   · caller-side fields (caller / from / cli / ani / cnam / customer …) print
+ *     NO value at all, only a name and a shape. A caller-name field is guest
+ *     identity, it is not going to be the answering agent, and it is not worth
+ *     the risk. They are counted so their absence from the shortlist is stated
+ *     rather than silent.
+ *   · a value shaped like a PERSON'S NAME or an EMAIL prints only where the
+ *     field NAME attributes it to staff or to a ring group (isAttributedKey).
+ *     The caller-side list can only name the guest spellings somebody thought
+ *     of, and the premise here is that the spellings are unknown — `party`,
+ *     `whatsapp`, `subscriber`, `a_party` and a bare `email` all walked past it.
+ *     Inverting the test closes that by construction; the field is still listed
+ *     and still shortlisted, so what is withheld is the person, not the finding.
+ *   · a value that turns out to contain one of THIS account's credentials is
+ *     masked by the scheme above AND dropped from the shortlist — we know what
+ *     that field holds and it is not an agent.
+ *   · everything else prints only when it is a MATCHED key or a CANDIDATE, and
+ *     any other field contributes a name and a shape, exactly as the CDR and
+ *     answer panels already do.
+ *
+ * Bounded and read-only like everything else on this route: one indexed SELECT
+ * with a LIMIT, one small GROUP BY, and pure calls into the mapper with
+ * synthetic payloads. No network, no writes, nothing outside ct_webhook_log.
+ */
+
+/** How many recent RING deliveries the panel reports on. */
+const LIVE_RING_LIMIT = 20;
+
+/**
+ * Sentinel for mapperReadsAsQueue() and mapperFlattensEnvelope().
+ *
+ * It reads as what it is, for the same reason PROBE_VALUE does: if a probe key
+ * happens to land on the payload's EVENT field the mapper logs one
+ * "unknown live event" warning, and whoever reads that log line must be able to
+ * see instantly that it came from this diagnostic rather than from a real
+ * malformed payload. (pickLiveEvent() matches its vocabularies EXACTLY, not by
+ * substring, so no spelling of a sentinel can suppress that warning on the live
+ * path — it can only be made recognisable.)
+ */
+const LIVE_RING_PROBE = 'ringing-key-probe';
+
+/**
+ * Does the MAPPER read THIS key, at THIS nesting, as the QUEUE (the ring group)?
+ *
+ * Asked of the mapper for the same reason mapperReadsAsAgent() asks about agent
+ * keys: QUEUE_KEYS is not exported from src/lib/ct/telecmi-mapper.ts, and a copy
+ * of it here would be a second truth that drifts silently. It matters on this
+ * panel specifically because the ring group IS the fallback answer — a field
+ * reported as "unread" that the mapper is in fact already reading as the queue
+ * would send someone to add a spelling that changes nothing.
+ */
+function mapperReadsAsQueue(parent: string | null, key: string): boolean {
+  const probe: Record<string, unknown> = {
+    cmiuid: 'queue-key-probe',
+    customer_number: '910000000000',
+    status: 'ringing',
+  };
+  if (parent) probe[parent] = { [key]: LIVE_RING_PROBE };
+  else probe[key] = LIVE_RING_PROBE;
+  try {
+    return String(mapLivePayload(probe)?.queue || '').includes(LIVE_RING_PROBE);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Does the MAPPER read THIS key, at THIS nesting, as the CALL ID?
+ *
+ * Not printed as a finding — used to keep the shortlist honest. TeleCMI's own
+ * call id can be a short token, and a short token is exactly what an extension
+ * looks like, so without this the id would rank as the strongest "unread agent
+ * field" on every single ring. It is not unread and it is not an agent.
+ *
+ * Note there is deliberately NO cmiuid scaffold in this probe: the sentinel has
+ * to be the only id candidate in the payload for the test to mean anything. The
+ * phone keeps mapLivePayload from rejecting it.
+ */
+function mapperReadsAsCallId(parent: string | null, key: string): boolean {
+  const probe: Record<string, unknown> = { customer_number: '910000000000', status: 'ringing' };
+  if (parent) probe[parent] = { [key]: LIVE_RING_PROBE };
+  else probe[key] = LIVE_RING_PROBE;
+  try {
+    return String(mapLivePayload(probe)?.telecmiCallId || '') === LIVE_RING_PROBE;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Does the mapper's collect() FLATTEN this envelope — i.e. can any key nested
+ * under `parent` be reached by the mapper at all?
+ *
+ * WHY THIS IS ASKED AND NOT LISTED: collect() descends into a fixed set of
+ * wrapper names (data / cdr / call / payload / body / record) and that list is
+ * private to the mapper. Copying it here would drift. So instead: put a key the
+ * mapper unquestionably reads — the call id — INSIDE the envelope, and see
+ * whether the mapper comes back with it. If it does, the mapper descends into
+ * that wrapper; if it does not, nothing nested there is reachable no matter what
+ * spelling is added to AGENT_KEYS, and this panel must say so instead of
+ * offering a lead that could never work.
+ *
+ * The top-level scaffold exists only to get past mapLivePayload's "no id AND no
+ * phone" rejection quietly, and is skipped if the envelope name collides with it.
+ */
+const LIVE_RING_ENVELOPE_PROBE = 'ringing-envelope-probe';
+function mapperFlattensEnvelope(parent: string): boolean {
+  const probe: Record<string, unknown> = { [parent]: { cmiuid: LIVE_RING_ENVELOPE_PROBE } };
+  if (parent !== 'customer_number') probe.customer_number = '910000000000';
+  if (parent !== 'status') probe.status = 'ringing';
+  try {
+    return String(mapLivePayload(probe)?.telecmiCallId || '') === LIVE_RING_ENVELOPE_PROBE;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Field names whose VALUE is never printed on this panel because it describes
+ * the CALLER, not the answerer. See the safety block in the header: a caller
+ * name or number is guest identity and is not a lead worth any risk.
+ *
+ * SOFT list. Applied only when the name carries no agent hint, so `agent_number`
+ * and `agent_phone` — which contain "number"/"phone" and are exactly the sort of
+ * spelling this panel exists to find — are NOT swallowed by it.
+ *
+ * `name` is on it because it has to be: cnam / caller_name / contact_name were
+ * withheld while a bare `name`, `display_name` or `party_name` holding the very
+ * same guest printed in full. Three spellings protected and two not is not a
+ * rule, it is an accident. Staff-side spellings keep printing through the agent
+ * hint (agent_name, member_name, callee_name), and routing containers through
+ * ROUTING_NAME_HINTS below.
+ */
+const CALLER_SIDE_HINTS = [
+  'caller', 'from', 'cli', 'ani', 'cnam', 'customer', 'guest', 'contact',
+  'msisdn', 'mobile', 'phone', 'number', 'name', 'did', 'dnis', 'virtual', 'source', 'src',
+];
+
+/**
+ * Guest markers that BEAT an agent hint instead of yielding to it.
+ *
+ * `isAgentLikeKey` matches the bare substrings agent / user / ext, so a field
+ * spelled `guest_user_name` or `customer_ext` carried an "agent hint", escaped
+ * the caller-side rule, and printed. Where a name says guest THIS plainly, the
+ * guest reading wins and no agent fragment inside it changes that.
+ *
+ * Kept to four unambiguous words on purpose. Every other caller-side hint stays
+ * soft, because `agent_number` / `agent_phone` must keep printing.
+ */
+const GUEST_ABSOLUTE_HINTS = ['caller', 'cnam', 'customer', 'guest'];
+
+/**
+ * Routing containers — a ring GROUP is not a person and is the panel's own
+ * fallback answer, so `queue_name` / `group_name` must not disappear behind the
+ * `name` entry added to CALLER_SIDE_HINTS above.
+ */
+const ROUTING_NAME_HINTS = ['queue', 'group', 'team', 'dept', 'hunt', 'skill'];
+function isRoutingNameKey(key: string): boolean {
+  const b = bareKey(key);
+  return ROUTING_NAME_HINTS.some(h => b.includes(h));
+}
+
+/**
+ * Field names whose value is a secret even though SECRET_KEY_RE does not say so.
+ *
+ * SEGMENT-ANCHORED, not substring: bare `pin` matches "mapping" and bare `pass`
+ * matches "bypass". Anchoring on a non-letter boundary makes agent_pin, sip_key,
+ * otp and x-passcode match while ordinary words do not.
+ *
+ * This is a ring-panel-local widening and deliberately NOT an edit to
+ * TELEPHONY_IDENTITY_KEYS: that Set is read by the CDR and answer panels too,
+ * and this change has no business altering what they print. secret-keys.ts
+ * remains the single rule for settings keys — see its own header.
+ */
+const RING_SECRET_RE = /(^|[^a-z])(pin|otp|pass|passcode|password|key|secret|token|credential)([^a-z]|$)/i;
+function isRingSecretName(key: string): boolean {
+  return RING_SECRET_RE.test(String(key)) || isSecretKey(key) || TELEPHONY_IDENTITY_KEYS.has(bareKey(key));
+}
+
+/**
+ * Name fragments that make a field a plausible "who is this ringing" field even
+ * though AGENT_KEYS does not match it. Reuses isAgentLikeKey() (agent / user /
+ * ext, the answer panel's test) and widens it with the vocabulary other PBXs and
+ * TeleCMI's own click-to-call use.
+ *
+ * THIS IS A DISPLAY HEURISTIC, NOT A CLAIM. It only decides ranking and whether
+ * a value is printed; it never decides what the mapper reads (that is always
+ * asked of the mapper). Being incomplete costs a rank, not a truth — a field
+ * with no hint at all is still listed, and still becomes a candidate on the
+ * strength of its VALUE alone.
+ */
+const RING_AGENT_HINTS = [
+  'member', 'staff', 'employee', 'emp', 'operator', 'answer', 'ansby', 'pick',
+  'handle', 'assign', 'peer', 'endpoint', 'device', 'sip', 'desk', 'callee',
+  'attendant', 'executive', 'telecaller', 'ringto', 'destuser', 'follow',
+];
+function hasAgentNameHint(key: string): boolean {
+  const b = bareKey(key);
+  return isAgentLikeKey(key) || RING_AGENT_HINTS.some(h => b.includes(h));
+}
+function isCallerSideKey(key: string): boolean {
+  const b = bareKey(key);
+  // A plain guest word beats everything, including an agent fragment sitting
+  // inside it (guest_user_name, customer_ext).
+  if (GUEST_ABSOLUTE_HINTS.some(h => b.includes(h))) return true;
+  if (hasAgentNameHint(key) || isRoutingNameKey(key)) return false;
+  return CALLER_SIDE_HINTS.some(h => b.includes(h));
+}
+
+/**
+ * Does the field's NAME attribute it to STAFF or to ROUTING?
+ *
+ * The question the caller-side denylist cannot answer. That list can only name
+ * the guest spellings somebody thought of, and the whole premise of this panel
+ * is that the payload's spellings are UNKNOWN — so `party`, `whatsapp`,
+ * `subscriber`, `originator`, `a_party` and a bare `email` all sailed past it
+ * and printed "Ravi Kumar" / "ravi.kumar@gmail.com" in full.
+ *
+ * Inverting the test closes that by construction: an identity-shaped VALUE is
+ * printed only where the NAME says the field belongs to an agent or to a ring
+ * group, and everywhere else the shape and the field name are reported without
+ * the value. A guest field cannot escape by being spelled in a way nobody
+ * predicted, and `agent_name` / `callee_name` / `queue_name` — the fields this
+ * panel exists to surface — are unaffected.
+ */
+function isAttributedKey(key: string): boolean {
+  return hasAgentNameHint(key) || isRoutingNameKey(key);
+}
+
+/**
+ * The same question asked about a field's WHOLE PATH, not just its leaf.
+ *
+ * THIS IS THE FIX FOR THE HOLE THAT MATTERED MOST. The walk in describeLiveRing
+ * descends one level into every nested object, and it passed only the LEAF name
+ * to the guard. So `caller.number` was withheld (the leaf spells a hint) while
+ * `caller.name` and `customer.email` — the same guest, one key along — printed
+ * in full, and the panel's top-ranked "lead" became the guest's name. The
+ * envelope is exactly where a vendor puts guest identity, so it is exactly where
+ * the guard has to hold.
+ *
+ * A wrapper that says guest makes the whole subtree guest-side, LEAF HINT AND
+ * ALL: `caller.agent_ext` is withheld, because a vendor that nests under
+ * `caller` is describing the caller and an `agent` fragment inside that subtree
+ * is not enough to bet a guest's identity on. The soft/absolute split above is
+ * what decides which wrappers are that final — a SOFT wrapper does yield to a
+ * leaf hint, so `phone_info.agent_ext` prints, and so does anything under a
+ * neutral wrapper such as `data.agent_ext`.
+ */
+function isCallerSidePath(parent: string | null, key: string): boolean {
+  if (isCallerSideKey(key)) return true;
+  if (!parent) return false;
+  const pb = bareKey(parent);
+  if (GUEST_ABSOLUTE_HINTS.some(h => pb.includes(h))) return true;
+  return isCallerSideKey(parent) && !hasAgentNameHint(key);
+}
+
+/**
+ * Replace every run of 6+ digits with '#', COUNTING ACROSS the punctuation a
+ * phone number is normally written with.
+ *
+ * THE ONE RULE THAT MAKES THIS PANEL SAFE TO PRINT. A guest's 10-digit number
+ * becomes ##########  — its shape, and nothing else. An extension (2–5 digits)
+ * survives verbatim, which is the whole evidence we are after, and a mixed id
+ * like 201_1111112 prints as 201_####### , which still shows the form AND the
+ * extension half. Six is the floor because nothing shorter can be an Indian
+ * mobile or an STD landline and nothing on this account uses an extension that
+ * long.
+ *
+ * IT USED TO COUNT ONE CONTIGUOUS RUN, and that was a hole with a name:
+ * "9876543210" was masked but "+91 98765 43210", "98765-43210" and
+ * "(040) 2345-6789" all printed the guest's number verbatim, because no single
+ * run reached six. The scan now walks a run THROUGH spaces, dots, brackets,
+ * plus and hyphens and totals the digits inside it, so the separator a vendor
+ * happens to use stops deciding whether a number is hidden.
+ *
+ * SEPARATORS SURVIVE, DIGITS DO NOT. Masking in place rather than collapsing to
+ * one blob is what keeps the panel useful: "### ### ###" is visibly three short
+ * groups (a member list) and "+## ##### #####" is visibly a phone, and neither
+ * tells you a single digit. That distinction matters because an extension list
+ * written "201 202 203" totals nine digits and is masked by this rule — it stays
+ * legible as a shape, and judgeCandidate() still shortlists it on its name.
+ */
+function maskLongDigits(s: string): { text: string; masked: boolean } {
+  let masked = false;
+  const text = s.replace(/[0-9](?:[0-9\s().+-]*[0-9])?/g, run => {
+    if (run.replace(/\D/g, '').length < 6) return run;
+    masked = true;
+    return run.replace(/[0-9]/g, '#');
+  });
+  return { text, masked };
+}
+
+/**
+ * A field NAME, made safe to print.
+ *
+ * THE HEADER OF THIS PANEL SAYS "FIELD NAMES ARE SAFE TO PRINT", AND THAT IS
+ * ONLY TRUE OF A RECORD. It is false of a MAP, and a per-leg map keyed by the
+ * number being dialled — `legs: { "919876543210": { status: "ringing" } }` — is
+ * an entirely ordinary shape for exactly the payload this panel is hunting.
+ * Every key of such an object reaches the screen twice, as the row's `path` and
+ * inside the parent's `{ … }` key list, and neither went through the digit mask
+ * that guards every VALUE. A guest's number printed in full in the Field-name
+ * column, on the one panel whose footnote promises it cannot.
+ *
+ * So a name gets the same two passes a value gets — this account's credentials
+ * blanked, then every run of 6+ digits masked — and nothing else. Names are not
+ * put through the identity rules: an ordinary field spelling like `agent name`
+ * is shaped exactly like a person's name, and masking those would blank the
+ * column the whole panel is read from. Digits are the objective part of the
+ * rule and the part a phone number cannot avoid.
+ */
+function safeName(name: string, creds: string[]): string {
+  return maskLongDigits(redactCreds(String(name), creds).text).text;
+}
+
+/** Plainly a telephone number rather than an extension: 7+ digits once
+ *  punctuation is stripped, and nothing in it but dialling characters. */
+function looksLikePhoneValue(s: string): boolean {
+  const t = s.trim();
+  if (!t) return false;
+  if (!/^[+0-9][0-9\s()+-]*$/.test(t)) return false;
+  return t.replace(/\D/g, '').length >= 7;
+}
+
+/**
+ * Words a value can be that are NOT an identity, so a short token spelling one
+ * of them is not offered as an agent candidate. Deliberately a small display
+ * list and NOT a copy of the mapper's vocabularies: being incomplete only ever
+ * costs a spurious low-ranked lead, never a missed one, so there is nothing here
+ * that can drift into a wrong answer.
+ */
+const NON_IDENTITY_WORDS = new Set([
+  'inbound', 'outbound', 'incoming', 'outgoing', 'internal', 'external',
+  'ring', 'ringing', 'answer', 'answered', 'missed', 'noanswer', 'busy',
+  'hangup', 'ended', 'end', 'start', 'started', 'new', 'call', 'voice', 'sms',
+  'true', 'false', 'yes', 'no', 'null', 'none', 'unknown', 'na', 'india', 'in',
+  'queue', 'group', 'team', 'ivr', 'did', 'trunk', 'pstn', 'sip', 'webrtc',
+]);
+
+/**
+ * Inner key names that make a nested container look like it holds an identity.
+ *
+ * ONE list for both the array branch and the object branch of judgeCandidate().
+ * They were two lists and they had drifted by exactly one word — the object
+ * branch was missing 'agent' — so `{ target: { ext: '201' } }` ranked 45 and
+ * `{ target: { agent: '201' } }` ranked 0. Same nesting, same value, one key
+ * name apart. Two lists for one question is how that happens.
+ */
+const IDENTITY_INNER_KEYS = ['name', 'username', 'user', 'email', 'id', 'ext', 'extension', 'agent'];
+
+/**
+ * The two shapes that are BOTH strong agent evidence AND, on a ring payload,
+ * the likeliest form of guest identity. Named once and shared by judgeCandidate
+ * (which ranks them) and echoRingValue (which decides whether the value may be
+ * printed), because the two must agree about what they are looking at — a shape
+ * one of them recognises and the other does not is exactly how a guest name
+ * ends up ranked as a lead with its value on screen.
+ */
+const IDENTITY_NAME_RE = /^[A-Za-z][A-Za-z.'’-]*( [A-Za-z.'’-]+){0,3}$/;
+const IDENTITY_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+/** A value shaped like a person's name, and not a word that plainly is not one. */
+function looksLikePersonName(s: string): boolean {
+  return s.length >= 3 && s.length <= 40 && IDENTITY_NAME_RE.test(s) && !NON_IDENTITY_WORDS.has(bareKey(s));
+}
+
+/**
+ * How many extensions are in this value if it is a member list written as ONE
+ * STRING — 0 if it is not one.
+ *
+ * ONLY THE UNAMBIGUOUS SPELLINGS ARE CLAIMED, because the alternative reading
+ * of a run of short numbers is a telephone number and getting that backwards is
+ * the expensive mistake:
+ *   · a comma, semicolon, pipe or slash is never used to write a phone number,
+ *     so 2-to-5-digit groups joined by one of those are a list. "201,202,203",
+ *     "201/202", "201;202;203".
+ *   · whitespace is ambiguous — "98765 43210" is a mobile — so it counts only
+ *     when there are THREE OR MORE groups and every one of them is 2–3 digits.
+ *     That admits "201 202 203" and refuses "040 2345 6789" (a 4-digit group)
+ *     and "98765 43210" (two groups).
+ * A value this misreads is still digit-masked before it is printed, so the cost
+ * of the remaining ambiguity is a wrong label and a rank, never a leaked number.
+ */
+function extensionListSize(s: string): number {
+  if (/^\d{2,5}(\s*[,;|/]\s*\d{2,5})+$/.test(s)) return s.split(/[,;|/]/).length;
+  if (/^\d{2,3}(\s+\d{2,3}){2,}$/.test(s)) return s.split(/\s+/).length;
+  return 0;
+}
+
+/** One field's claim to being the extension the mapper is not reading. */
+interface Candidacy {
+  /** Why it qualified, in words the panel prints verbatim. */
+  why: string[];
+  /** Higher sorts first. 0 means "not a candidate". */
+  score: number;
+}
+
+/**
+ * Is this field's VALUE shaped like an extension or an agent identity?
+ *
+ * SHAPE-BASED ON PURPOSE. The whole reason the question is open is that the
+ * NAME we are looking for is unknown, so a name-only test would find nothing by
+ * construction. The value decides candidacy; the name only adds rank.
+ *
+ * A LIST OF SHORT NUMBERS SCORES HIGHEST, and that is not an accident: the owner
+ * asked "for whom ALSO is it ringing", a hunt group rings several phones at
+ * once, and an array of extensions is the single field that would answer him
+ * completely. Nothing on this account has been observed to send one — which is
+ * exactly why it must be looked for rather than assumed absent.
+ *
+ * AN UNRECOGNISED SHAPE UNDER AN AGENT-SOUNDING NAME IS STILL A LEAD. This
+ * function used to return early — on an empty value, and on a phone-shaped one —
+ * and to gate the name bonus behind `score > 0`. Between them those three exits
+ * meant a field literally called `ring_members` holding "201,202,203" scored
+ * ZERO: no value printed, not on the shortlist, and — worst of all — the panel
+ * then announced "not one field holds a value shaped like an extension" with a
+ * comma-separated list of extensions sitting in the table underneath. Six
+ * plausible spellings of a hunt-group member list failed the same way
+ * (ringing_member "SIP/201", agent_ext "Ext 201", answered_by_ext "201/202",
+ * member_extensions, staff "Pushpa (201)"), and so did agent_number holding a
+ * follow-me mobile. An unrecognised shape must DOWNGRADE a lead, never erase it,
+ * so the name bonus is now unconditional and every path falls through to it.
+ */
+function judgeCandidate(key: string, value: unknown): Candidacy {
+  const why: string[] = [];
+  let score = 0;
+  /** The value is a phone number. Tracked rather than returned on, so the name
+   *  bonus below still sees it — an agent's own mobile is a real ring target. */
+  let isPhone = false;
+
+  if (Array.isArray(value)) {
+    const scalars = value.filter(v => typeof v === 'string' || typeof v === 'number').map(v => String(v).trim());
+    const allShortNumeric = scalars.length > 0 && scalars.length === value.length
+      && scalars.every(s => /^\d{2,5}$/.test(s));
+    // A MIXED list still counts. The first version demanded that EVERY element
+    // be a bare extension, so a perfectly ordinary hunt-group list holding
+    // ["201", "919876543210", { name: … }] scored as generic noise and dropped
+    // off the shortlist — the exact field the owner's question is about. Now one
+    // extension-shaped element, or one entry carrying a name/id, is enough.
+    const someIdentityish = value.some(v => (
+      ((typeof v === 'string' || typeof v === 'number') && /^\d{2,5}$/.test(String(v).trim()))
+      || (isPlainObject(v) && Object.keys(v).map(bareKey).some(k => IDENTITY_INNER_KEYS.includes(k)))
+    ));
+    if (allShortNumeric) {
+      why.push(`a list of ${scalars.length} short numeric value${scalars.length === 1 ? '' : 's'} — the shape of a ring group's member list, which is exactly "for whom is it ringing"`);
+      score += 80;
+    } else if (someIdentityish) {
+      why.push(`a list of ${value.length} item${value.length === 1 ? '' : 's'}, at least one of which is extension-shaped or carries a name/id — the shape of a ring group's member list`);
+      score += 55;
+    } else if (value.length > 0) {
+      why.push(`a list of ${value.length} item${value.length === 1 ? '' : 's'} — the mapper reads no list as an agent, so anything in here is invisible to it`);
+      score += 20;
+    }
+  } else if (isPlainObject(value)) {
+    const inner = Object.keys(value).map(bareKey);
+    if (inner.some(k => IDENTITY_INNER_KEYS.includes(k))) {
+      why.push('an object carrying name/id fields — pickAgent() only ever descends into objects literally named agent or user, so under any other name this is unread');
+      score += 45;
+    }
+  } else {
+    const s = value === null || value === undefined ? '' : String(value).trim();
+    const attributed = isAttributedKey(key);
+    if (!s) {
+      // Nothing to judge — but fall through: an EMPTY value under an
+      // agent-sounding name is itself a finding (it is what shadows a nested
+      // one out of the mapper's collect()), so the name bonus must still see it.
+    } else if (s.length > VALUE_LIMIT) {
+      // Longer than anything this panel will print. Recognising a shape here
+      // would be a claim about a value the reader is only ever shown the first
+      // VALUE_LIMIT characters of — and echoValue truncates BEFORE the digit
+      // mask sees the string, so a 211-character "email address" printed as
+      // "…98765": the tail of a masked 10-digit number, cut down to five digits
+      // and therefore no longer long enough to mask. Nothing is characterised
+      // at this length; the name bonus below still applies, and the truncation
+      // boundary is masked in echoRingValue as a second line of defence.
+      why.push(`a ${s.length}-character value — too long for this panel to characterise or to print in full`);
+    } else if (extensionListSize(s)) {
+      // THE OWNER'S QUESTION IS "FOR WHOM **ALSO**", i.e. a LIST, and a hunt
+      // group's member list does not always arrive as a JSON array — the plain
+      // string "201,202,203" is at least as likely. It matched no shape at all
+      // before this branch existed, so it scored on its NAME alone (40) and
+      // ranked BELOW an ordinary `city: "Hyderabad"` (55). The single most
+      // on-point field the payload could carry sorted under a place name.
+      //
+      // TESTED BEFORE looksLikePhoneValue ON PURPOSE: "201 202 203" totals nine
+      // digits, so the phone test claimed it and the panel labelled a member
+      // list "a telephone number — normally the caller". See extensionListSize
+      // for why only unambiguous spellings are claimed here.
+      why.push(`${extensionListSize(s)} short numbers written as one delimited string — a ring group's member list, which is exactly "for whom is it ringing"`);
+      score += 75;
+    } else if (looksLikePhoneValue(s)) {
+      isPhone = true;
+      why.push('a telephone number — on a ring payload that is normally the caller, not the phone being rung');
+    } else if (/^\d{2,5}$/.test(s)) {
+      why.push(`a ${s.length}-digit number — the shape of a SIP extension`);
+      score += 70;
+    } else if (/^\d{2,6}[_-]\d{4,}$/.test(s)) {
+      why.push('an id in the click-to-call form <extension>_<number>, whose first half is an extension');
+      score += 65;
+    } else if (IDENTITY_EMAIL_RE.test(s)) {
+      why.push(attributed
+        ? 'an email address — an agent identity, and the form the FNB agent mapping is keyed on'
+        : 'an email address — the form the FNB agent mapping is keyed on, but nothing in the field NAME says staff or routing, so only its domain is printed and the local part is treated as possible guest identity');
+      score += attributed ? 50 : 45;
+    } else if (looksLikePersonName(s)) {
+      // SPLIT ON ATTRIBUTION, and both halves matter. Unqualified, "a human
+      // name" was a false claim printed as a headline: `city: "Hyderabad"`
+      // scored 55 and came back as "the strongest is city (a human name)". This
+      // panel cannot tell a person from a place, so where the field name does
+      // not say staff it no longer pretends to — and the value is withheld in
+      // echoRingValue, because the same shape is how a guest's name arrives.
+      why.push(attributed
+        ? 'a human name, under a field name that reads as staff or routing'
+        : 'a value shaped like a person\'s name, though nothing in the field NAME says staff or routing — it could equally be a place, a label or the GUEST, so the value is not printed and the field NAME is the lead');
+      score += attributed ? 55 : 45;
+    } else if (/^[A-Za-z0-9_.-]{2,16}$/.test(s) && !NON_IDENTITY_WORDS.has(bareKey(s))) {
+      why.push('a short identifier');
+      score += 25;
+    }
+  }
+
+  // THE NAME BONUS IS APPLIED TO EVERY SHAPE AND EVERY SCORE, lists, objects and
+  // shapes nothing here recognised. `score > 0` used to guard it, which quietly
+  // reintroduced the same class of bug the "every shape" note was written about:
+  // the bonus was reachable by a list, but not by a value whose shape scored
+  // nothing — and the field the owner is actually asking about, a hunt-group
+  // member list, is precisely a value with an unrecognised shape.
+  //
+  // 40 is CANDIDATE_FLOOR exactly, so a name hint alone is the weakest thing that
+  // still earns a place on the shortlist. It cannot outrank real evidence, and
+  // the reason is printed beside it so nobody reads it as more than it is.
+  if (hasAgentNameHint(key)) {
+    if (score > 0) {
+      why.push('and its NAME reads like an agent/extension field');
+    } else if (isPhone) {
+      why.push('its NAME reads like an agent/extension field and it holds a telephone number — on a follow-me or mobile-app ring that is the agent\'s own phone, so it is listed; the number itself is masked here');
+    } else {
+      why.push('its NAME reads like an agent/extension field, though its value is not a shape this panel recognises — the value is printed beside it, read it and judge for yourself');
+    }
+    score += 40;
+  }
+  return { why, score };
+}
+
+/**
+ * Score at or above which a field is offered as a lead.
+ *
+ * SET ABOVE A BARE "short identifier" (25) ON PURPOSE. At 25 every opaque token
+ * on the payload — the call id, a session key, a locale — qualified, and the
+ * shortlist the owner is meant to read at a glance was mostly noise. A short
+ * token now earns a place only when its NAME also reads like an agent field
+ * (25 + 40), while the things that actually look like an extension — a 2-to-5
+ * digit number, a name, an email, a list of extensions — clear it on the value
+ * alone and keep their place with no name hint at all.
+ */
+const CANDIDATE_FLOOR = 40;
+
+interface LiveRingField {
+  /** Original spelling as TeleCMI sent it, e.g. agent_no or data.agent_no. */
+  path: string;
+  shape: string;
+  /** False when the mapper's collect() cannot reach this nesting at all —
+   *  a lead here could not be fixed by adding a spelling to AGENT_KEYS. */
+  in_mapper_reach: boolean;
+  /** Asked of the mapper, never assumed. */
+  matched_agent_key: boolean;
+  matched_queue_key: boolean;
+  /** The mapper reads this key as the CALL ID. Reported so a short id is not
+   *  read as an extension the panel forgot to shortlist. */
+  matched_id_key: boolean;
+  /** '' whenever `withheld` is set. Credential-masked and digit-masked. */
+  value: string;
+  /** Why no value is printed. '' when one is. */
+  withheld: string;
+  redacted: boolean;
+  digits_masked: boolean;
+  truncated: boolean;
+  /** An UNMATCHED field whose value looks like an extension or an identity. */
+  candidate: boolean;
+  candidate_score: number;
+  candidate_why: string[];
+}
+
+interface LiveRingReport {
+  log_id: string;
+  received_at: string;
+  telecmi_call_id: string;
+  /** ct_webhook_log.event — the mapper's classification AT INGEST TIME. */
+  event_at_ingest: string;
+  payload_readable: boolean;
+  field_count: number;
+  /**
+   * How many fields this panel refused to read because the PATH is caller-side.
+   * Reported so "nothing was found" can be read honestly: a few withheld fields
+   * means a few places this panel deliberately did not look. Counted over EVERY
+   * field, not only the ones that would otherwise have printed — it used to be
+   * the latter, which quietly excluded every phone-shaped caller field and made
+   * the hedge understate itself.
+   */
+  caller_side_withheld: number;
+  /** How many values were declined because they were identity-shaped under a
+   *  field name that attributes them to nobody. The field is still listed and
+   *  still a lead — see isAttributedKey(). */
+  identity_withheld: number;
+  /** Fields nested one level BELOW where the walk stops. The other half of the
+   *  honesty hedge: their contents were never examined. */
+  deeper_nesting: number;
+  /** Paths the mapper reads as the agent whose value pickStr WOULD read here.
+   *  Non-empty while mapper.agent is '' means an earlier spelling is shadowing
+   *  one — see mapperCanReadValue() for why "readable" and not "non-empty". */
+  shadowed_agent_paths: string[];
+  /** The shadowERS: paths the mapper reads as the agent that hold something
+   *  pickStr cannot read (blank, object, list, boolean). They occupy the slot in
+   *  collect() and stop the search, which is a mapper fix, not a key-list one. */
+  blocking_agent_paths: string[];
+  /** Non-caller-side paths NAMED like an agent field that carry NOTHING — no
+   *  text, no members, no keys. This is the set, and the ONLY set, that "the
+   *  vendor sends the key and leaves it blank" may be said about. */
+  agent_named_empty_paths: string[];
+  /** Non-caller-side paths NAMED like an agent field that DO carry something —
+   *  text, list members or object keys — and still did not become a lead.
+   *
+   *  SPLIT OUT BECAUSE THE HEADLINE WAS LYING ABOUT THEM. Both sets used to be
+   *  one list, and the branch that reads it says "TeleCMI is sending the key and
+   *  leaving it empty at ring time". On a payload carrying
+   *  `agent_list: ["201", "<app id>"]` that sentence was printed with
+   *  `[ 201, •••• ]` sitting in the row directly underneath it. "It holds
+   *  something we are not offering as a lead" and "it is not there" are
+   *  different answers with different next steps. */
+  agent_named_filled_paths: string[];
+  /** What the mapper extracts from THIS payload today — the other half of the
+   *  gap the panel exists to show. */
+  mapper: { agent: string; queue: string; event: string; direction: string };
+  fields: LiveRingField[];
+  /** The unmatched leads on this one payload, best first. */
+  candidates: { path: string; score: number; why: string[] }[];
+  headline: string;
+}
+
+/**
+ * Print a ring-payload value, or refuse to.
+ *
+ * Order matters and each step is load-bearing:
+ *   1 caller-side PATH — the leaf name OR the envelope it arrived in → nothing
+ *     is printed at all. The envelope half is not decoration: the walk descends
+ *     one level, and testing only the leaf let `caller.name` and
+ *     `customer.email` print in full while `caller.number` was withheld.
+ *   2 a secret-sounding name → the whole value is masked, before any branch
+ *     below can render part of it. RING_SECRET_RE catches the short telephony
+ *     credentials (agent_pin, otp, sip_key) that SECRET_KEY_RE does not.
+ *   3 an OBJECT prints its inner KEY NAMES and no values. A nested object is
+ *     offered as a lead because it holds a name/id, and the reader needs to see
+ *     which — but String() on it says "[object Object]", which is useless, and
+ *     printing its contents would echo values that never went through any of
+ *     the tests below. Names only is both more useful and strictly safer.
+ *   4 an ARRAY is rendered element by element, each one through the SAME rules
+ *     as a scalar, so a phone number inside a list is masked exactly as one
+ *     sitting on its own would be. (String() on an array quietly comma-joins
+ *     it, which would have slipped a whole list past the per-value guard.)
+ *   5 an IDENTITY-SHAPED value under a field name that says NOTHING about staff
+ *     or routing → name withheld, email reduced to its domain. See
+ *     isAttributedKey(): the caller-side denylist can only catch the guest
+ *     spellings somebody thought of, and this panel's whole premise is that the
+ *     spellings are unknown.
+ *   6 echoValue() → the EXISTING credential scheme, unchanged: a credential
+ *     NAME masks the whole value, a credential found inside an innocent value is
+ *     blanked in place, and the result is truncated at VALUE_LIMIT.
+ *   7 maskLongDigits() → the phone guard, applied AFTER the credential pass so
+ *     it cannot reveal anything the credential pass hid, plus a mask of the
+ *     truncation boundary itself (step 6 cuts before step 7 can see the whole
+ *     string, so a long run sliced down to five digits would otherwise print).
+ */
+function echoRingValue(
+  parent: string | null,
+  key: string,
+  v: unknown,
+  creds: string[],
+  /** The field's NAME attributes it to staff or to routing, so an identity-
+   *  shaped value in it is evidence rather than possible guest identity. */
+  attributed: boolean,
+): {
+  value: string;
+  withheld: string;
+  /** Withheld specifically because the NAME is caller-side. Separate from
+   *  `withheld` because only this one disqualifies a field as a lead — an
+   *  object still IS a lead, it just shows its key names instead of a value. */
+  caller_side: boolean;
+  /** Withheld under step 5 — identity-shaped, but the field name does not
+   *  attribute it. Still a lead; counted so the footnote can say how many
+   *  values were declined on that rule rather than leaving it unstated. */
+  identity_withheld: boolean;
+  redacted: boolean;
+  digits_masked: boolean;
+  truncated: boolean;
+} {
+  const nothing = { caller_side: false, identity_withheld: false, redacted: false, digits_masked: false, truncated: false };
+  if (isCallerSidePath(parent, key)) {
+    return {
+      value: '',
+      withheld: 'caller-side field — the value is guest identity and is not printed',
+      ...nothing,
+      caller_side: true,
+    };
+  }
+  // Before ANY branch below, so a secret in a list or an object is masked too.
+  if (isRingSecretName(key)) {
+    return {
+      value: maskSecretValue(v === null || v === undefined ? '' : String(v)),
+      withheld: '',
+      ...nothing,
+      redacted: true,
+    };
+  }
+  if (isPlainObject(v)) {
+    // safeName, NOT the raw key: an object can be a MAP keyed by the number
+    // being dialled, and its keys are then guest identity. See safeName().
+    const names = Object.keys(v).map(n => safeName(n, creds));
+    return {
+      value: names.length ? `{ ${names.join(', ')} }` : '{ }',
+      withheld: 'an object — its field NAMES are shown, its values are not',
+      ...nothing,
+    };
+  }
+  if (Array.isArray(v)) {
+    let redacted = false;
+    let digitsMasked = false;
+    let identityWithheld = false;
+    let truncated = v.length > 12;
+    const parts = v.slice(0, 12).map(item => {
+      if (isPlainObject(item)) return `{ ${Object.keys(item).map(n => safeName(n, creds)).join(', ')} }`;
+      if (Array.isArray(item)) return `[…]`;
+      const one = echoRingValue(parent, key, item, creds, attributed);
+      redacted = redacted || one.redacted;
+      digitsMasked = digitsMasked || one.digits_masked;
+      truncated = truncated || one.truncated;
+      identityWithheld = identityWithheld || one.identity_withheld;
+      return one.withheld ? '‹withheld›' : one.value;
+    });
+    const joined = `[ ${parts.join(', ')}${v.length > 12 ? ', …' : ''} ]`;
+    return {
+      value: joined.length > VALUE_LIMIT ? joined.slice(0, VALUE_LIMIT) : joined,
+      withheld: '',
+      caller_side: false,
+      identity_withheld: identityWithheld,
+      redacted,
+      digits_masked: digitsMasked,
+      truncated: truncated || joined.length > VALUE_LIMIT,
+    };
+  }
+  // IDENTITY SHAPE UNDER AN UNATTRIBUTED NAME. The caller-side list above knows
+  // caller / cnam / customer / contact / name; it did not know `party`,
+  // `whatsapp`, `profile`, `subscriber`, `originator`, `a_party` or a bare
+  // `email`, and every one of those printed "Ravi Kumar" and
+  // "ravi.kumar@gmail.com" in full. Enumerating guest spellings is the losing
+  // side of that game — the payload's spellings are exactly what is unknown —
+  // so the test is inverted here: an identity-shaped value prints only where the
+  // NAME says agent or ring group. The field is STILL a lead either way; what is
+  // withheld is the person, not the finding.
+  if (!attributed) {
+    const s = v === null || v === undefined ? '' : String(v).trim();
+    if (s.length <= VALUE_LIMIT && IDENTITY_EMAIL_RE.test(s)) {
+      // The DOMAIN is the whole discriminator — @a-pbx-host is an agent SIP
+      // identity, @gmail.com is a guest — and it names no person, so it is the
+      // one part worth printing.
+      //
+      // IT IS STILL A PIECE OF THE PAYLOAD, so it goes through the same two
+      // passes every other echoed string does. It used to be interpolated raw,
+      // and that was the one hole in this file that defeated BOTH guards at
+      // once: `a_party: "ravi@919876543210.example"` printed the guest's twelve
+      // digits in full, and `"ravi@<appid>.io"` printed this account's live App
+      // ID in full — inside the very sentence explaining that the value was
+      // being withheld for safety. A SIP host that is a bare IP is masked along
+      // with them; losing an octet is the right side of that trade.
+      const rawDomain = s.slice(s.lastIndexOf('@'));
+      const domainCreds = redactCreds(rawDomain, creds);
+      const domain = maskLongDigits(domainCreds.text);
+      return {
+        value: '',
+        withheld: `an email address under a field name that says nothing about staff or routing — the local part could be the guest, so only the domain is shown: ${domain.text}`,
+        ...nothing,
+        identity_withheld: true,
+        redacted: domainCreds.redacted,
+        digits_masked: domain.masked,
+      };
+    }
+    if (looksLikePersonName(s)) {
+      return {
+        value: '',
+        withheld: 'a value shaped like a person\'s name, under a field name that says nothing about staff or routing — it could be the guest, so it is not printed. The field NAME and the shape are the lead.',
+        ...nothing,
+        identity_withheld: true,
+      };
+    }
+  }
+  const echoed = echoValue(key, v, creds);
+  const digits = maskLongDigits(echoed.value);
+  let text = digits.text;
+  let digitsMaskedOut = digits.masked;
+  if (echoed.truncated) {
+    // echoValue TRUNCATES BEFORE maskLongDigits ever sees the string, so a run
+    // that was long enough to hide can be cut down to a few digits and print.
+    // Demonstrated: a 211-character value ending "…9876543210@a.com" came back
+    // as "…98765" — five digits of a guest number, and digits_masked false, so
+    // the row did not even carry the "(# — a long number, hidden)" marker.
+    // Anything still touching the cut is masked whatever its length.
+    const cut = text.replace(/[0-9][0-9\s().+-]*$/, run => run.replace(/[0-9]/g, '#'));
+    if (cut !== text) {
+      text = cut;
+      digitsMaskedOut = true;
+    }
+  }
+  return {
+    value: text,
+    withheld: '',
+    caller_side: false,
+    identity_withheld: false,
+    redacted: echoed.redacted,
+    digits_masked: digitsMaskedOut,
+    truncated: echoed.truncated,
+  };
+}
+
+/**
+ * One request's memory of what the mapper said about a (nesting, key) pair, and
+ * about an envelope name.
+ *
+ * WHY IT IS HERE AT ALL. Each probe is a real call into the mapper, and the same
+ * twenty-odd key names repeat on every ring in the batch. Without this the panel
+ * runs the mapper thousands of times per page load and — the part that actually
+ * matters — a probe key that lands on a time or direction field makes the mapper
+ * log a warning EVERY time, so a single admin page view would bury the server
+ * log in hundreds of identical lines about a payload that does not exist.
+ *
+ * PER REQUEST, not module-level. The answers cannot change inside one request,
+ * and a cache with no lifetime is a question nobody should have to answer later.
+ */
+interface RingProbeMemo {
+  keys: Map<string, { agent: boolean; queue: boolean; id: boolean }>;
+  envelopes: Map<string, boolean>;
+}
+function newRingProbeMemo(): RingProbeMemo {
+  return { keys: new Map(), envelopes: new Map() };
+}
+function probeKey(memo: RingProbeMemo, parent: string | null, key: string) {
+  const at = `${parent ?? ''}\u0000${key}`;
+  let hit = memo.keys.get(at);
+  if (!hit) {
+    const agent = mapperReadsAsAgent(parent, key);
+    hit = {
+      agent,
+      // Short-circuited: a key the mapper already reads as the agent cannot also
+      // be its queue, and skipping the probe skips its log warnings too.
+      queue: agent ? false : mapperReadsAsQueue(parent, key),
+      id: agent ? false : mapperReadsAsCallId(parent, key),
+    };
+    memo.keys.set(at, hit);
+  }
+  return hit;
+}
+function probeEnvelope(memo: RingProbeMemo, parent: string): boolean {
+  let hit = memo.envelopes.get(parent);
+  if (hit === undefined) {
+    hit = mapperFlattensEnvelope(parent);
+    memo.envelopes.set(parent, hit);
+  }
+  return hit;
+}
+
+/**
+ * Would the mapper's pickStr() read this raw value as text?
+ *
+ * MIRRORS pickStr IN src/lib/ct/telecmi-mapper.ts EXACTLY — a non-empty trimmed
+ * string, a finite number, a bigint, and nothing else. It cannot be replaced by
+ * an "is it empty" test, and that distinction is the whole point:
+ *
+ *   collect() stores ANY value that is not null (`if (nk && v != null && ...)`),
+ *   so an object, a list, a boolean or an empty string sitting on an AGENT_KEYS
+ *   spelling OCCUPIES the slot and blocks a filled one nested below — while
+ *   pickStr reads none of them and returns ''.
+ *
+ * So a field like that is the SHADOWER, not something being shadowed, and the
+ * two must not be reported as one thing. `String(value).trim() !== ''` was doing
+ * exactly that: it called {zzz:1} "carries a value" (String() on an object is
+ * "[object Object]") and then explained the payload with "an EMPTY earlier
+ * spelling … skip a blank and keep looking" — the wrong instruction for a value
+ * that is not blank. It also called [] empty, so an array shadow went unreported
+ * altogether. Asking the mapper's own question removes both mistakes.
+ */
+function mapperCanReadValue(v: unknown): boolean {
+  if (typeof v === 'string') return v.trim() !== '';
+  if (typeof v === 'number') return Number.isFinite(v);
+  return typeof v === 'bigint';
+}
+
+/** Field-by-field ring report for ONE live-ring ct_webhook_log row. */
+function describeLiveRing(row: any, creds: string[], memo: RingProbeMemo): LiveRingReport {
+  let payload: unknown = null;
+  let payloadReadable = false;
+  try {
+    payload = JSON.parse(String(row?.payload ?? ''));
+    payloadReadable = isPlainObject(payload);
+  } catch {
+    payloadReadable = false;
+  }
+
+  let mapped: ReturnType<typeof mapLivePayload> = null;
+  try {
+    mapped = isPlainObject(payload) ? mapLivePayload(payload) : null;
+  } catch {
+    mapped = null;
+  }
+
+  const fields: LiveRingField[] = [];
+  let fieldCount = 0;
+  let callerSideSkipped = 0;
+  /** Values declined under the identity rule in echoRingValue — counted only
+   *  where a value WOULD have printed, which is exactly the set the rule bites
+   *  on, so this cannot understate the way the caller-side count once did. */
+  let identityWithheldCount = 0;
+  let deeperNesting = 0;
+  /** Paths the mapper READS as the agent whose value pickStr WOULD read. If the
+   *  mapper still came back empty, one of these is being shadowed by another —
+   *  and the "nothing here" headline would be a lie told over the evidence. */
+  const matchedAgentReadable: string[] = [];
+  /** Paths the mapper reads as the agent that hold something pickStr CANNOT
+   *  read — a blank, an object, a list, a boolean. These are the shadowERS: they
+   *  occupy the slot in collect() and stop the mapper looking any further. */
+  const matchedAgentBlocking: string[] = [];
+  /**
+   * Paths named like an agent field, NOT caller-side, and carrying NOTHING.
+   *
+   * EXISTS TO STOP ONE FALSE SENTENCE. The last headline branch used to say "no
+   * field on this ring is named like an agent field" whenever nothing scored,
+   * and a payload carrying a literal `agent: ""` reached exactly that branch —
+   * the field is MATCHED, so judgeCandidate is short-circuited to 0 and the
+   * field vanishes from the reasoning. "TeleCMI sends the key and leaves it
+   * blank on a ring" and "TeleCMI has no such key" are different answers with
+   * different fixes, and the panel was printing the second for the first.
+   */
+  const agentNamedEmptyPaths: string[] = [];
+  /**
+   * Paths named like an agent field, NOT caller-side, that DO carry something —
+   * and so cannot be described as empty.
+   *
+   * THE SECOND HALF OF THE SAME FALSE SENTENCE. The list above used to hold
+   * these too, and the branch that reads it announces "TeleCMI is sending the
+   * key and leaving it empty at ring time … no addition to AGENT_KEYS would fill
+   * it". Run against `{ agent_pin: "9137", sip_key: "abc123", agent_list:
+   * ["201", "<app id>"] }` the panel named all three as empty keys — with
+   * `[ 201, •••• ]` printed in the table underneath. Every one of them holds a
+   * value; the panel is what is not offering it.
+   */
+  const agentNamedFilledPaths: string[] = [];
+  /** Does the field carry ANYTHING at all? The honest test behind "empty" —
+   *  wider than mapperCanReadValue (which asks the narrower question "would
+   *  pickStr read this", and answers no for a populated object or list). */
+  const hasContent = (v: unknown): boolean => {
+    if (v === null || v === undefined) return false;
+    if (typeof v === 'string') return v.trim() !== '';
+    if (Array.isArray(v)) return v.length > 0;
+    if (isPlainObject(v)) return Object.keys(v).length > 0;
+    return true;
+  };
+
+  const visit = (parent: string | null, key: string, value: unknown) => {
+    fieldCount++;
+    const probed = probeKey(memo, parent, key);
+    const matchedAgent = probed.agent;
+    const matchedQueue = probed.queue;
+    const matchedId = probed.id;
+    const inReach = parent === null ? true : probeEnvelope(memo, parent);
+    // safeName, NOT the raw spelling: on a per-leg MAP the "field name" is the
+    // number being dialled, and this string is printed on screen unmasked in
+    // the Field-name column and repeated in every headline that names a path.
+    // See safeName(). The probes above are given the RAW key — what the mapper
+    // reads must never depend on what the panel is willing to display.
+    const path = safeName(parent ? `${parent}.${key}` : key, creds);
+    const callerSide = isCallerSidePath(parent, key);
+    // COUNTED HERE, not from echoRingValue's answer, because that only ran for
+    // fields that already wanted a value. Every phone-shaped caller field scores
+    // zero and so was never counted, and the "N caller-side fields were not read"
+    // hedge in the headline systematically understated what had been skipped.
+    if (callerSide) callerSideSkipped++;
+    // The walk stops one level down. An object sitting AT that level has
+    // contents nobody looked at, so "nothing was found" has to be qualified.
+    if (parent !== null && isPlainObject(value)) deeperNesting++;
+    if (matchedAgent) {
+      if (mapperCanReadValue(value)) matchedAgentReadable.push(path);
+      else if (value !== null && value !== undefined) matchedAgentBlocking.push(path);
+    }
+    // EMPTY vs MERELY HIDDEN. Only a field that carries nothing may be reported
+    // as one the vendor left blank; anything holding a value the panel declines
+    // to print belongs in the other list, with the reason said out loud.
+    if (!callerSide && (matchedAgent || hasAgentNameHint(key))) {
+      if (hasContent(value)) agentNamedFilledPaths.push(path);
+      else agentNamedEmptyPaths.push(path);
+    }
+
+    // A key the mapper ALREADY reads is not a lead — it is the answer, and its
+    // value is printed so the reader can see what the mapper had to work with.
+    // The CALL ID is excluded for a different reason: it is read, it is not an
+    // agent, and its value is often short enough to look exactly like one.
+    const judged = matchedAgent || matchedQueue || matchedId
+      ? { why: [], score: 0 }
+      : judgeCandidate(key, value);
+    // A SECRET-NAMED FIELD IS NEVER A LEAD, however well its value scores. Its
+    // value is masked before anything can be read off it, so offering it as
+    // something to act on offers evidence nobody can see — and it outranked real
+    // leads while doing so: `agent_pin: "9137"` scored 110 and became the
+    // headline's top recommendation ("the shape of a SIP extension"), one step
+    // away from a live PIN being added to AGENT_KEYS. The field is still listed
+    // with its name and shape, which is all a masked value was ever worth.
+    const isCandidate = judged.score >= CANDIDATE_FLOOR && !isRingSecretName(key);
+
+    // VALUES ONLY WHERE THEY ARE EVIDENCE: a matched key (what the mapper used)
+    // or a candidate (what it is ignoring). Everything else contributes a name
+    // and a shape, the same rule the CDR and answer panels follow.
+    const wantsValue = matchedAgent || matchedQueue || isCandidate;
+    // A key the MAPPER reads as the agent or the ring group is attributed by
+    // that fact alone, whatever it is spelled — that is the mapper's own answer,
+    // not a guess about the name.
+    const attributed = matchedAgent || matchedQueue || isAttributedKey(key);
+    const echoed = wantsValue
+      ? echoRingValue(parent, key, value, creds, attributed)
+      // A caller-side field says so even when no value was wanted anyway. It
+      // used to render as a bare "—", indistinguishable from a field this panel
+      // simply had no interest in, so the row contradicted the count in the
+      // footnote below it: `customer.number` was one of the "N withheld" and
+      // showed nothing to say so.
+      : {
+        value: '',
+        withheld: callerSide
+          ? 'caller-side field — the value is guest identity and is not printed'
+          // AND A SECRET-NAMED ONE SAYS SO TOO. It is skipped by isCandidate
+          // above, so nothing called echoRingValue for it and the row rendered a
+          // bare "—" — a field literally named agent_pin showing nothing, with no
+          // word anywhere about why, while the headline listed it as a key the
+          // vendor sends empty. Two silences reading as one wrong fact.
+          : isRingSecretName(key)
+            ? 'the field NAME says credential — the value is not printed and the field is not offered as a lead'
+            : '',
+        caller_side: callerSide,
+        identity_withheld: false,
+        redacted: false,
+        digits_masked: false,
+        truncated: false,
+      };
+    if (echoed.identity_withheld) identityWithheldCount++;
+
+    fields.push({
+      path,
+      shape: shapeOf(value),
+      in_mapper_reach: inReach,
+      matched_agent_key: matchedAgent,
+      matched_queue_key: matchedQueue,
+      matched_id_key: matchedId,
+      value: echoed.value,
+      withheld: echoed.withheld,
+      redacted: echoed.redacted,
+      digits_masked: echoed.digits_masked,
+      truncated: echoed.truncated,
+      // A caller-side field never becomes a lead: its value is not printed, so
+      // offering it as a shortlist entry would be a lead nobody could read. An
+      // OBJECT still is one — it shows its key names, which is the readable part.
+      // An IDENTITY-WITHHELD field still is one too: what it lost is the person,
+      // not the finding, and its name and shape are the lead.
+      //
+      // A CREDENTIAL-VALUED FIELD IS NOT. `redacted` here means echoValue found
+      // one of THIS account's configured credentials inside the value, so we
+      // know exactly what the field holds and it is not an agent. It was ranking
+      // top: `agent_tag` carrying the App ID printed "••••" and the headline read
+      // "the strongest is agent_tag (a short identifier; and its NAME reads like
+      // an agent/extension field)" — a recommendation to wire the App ID in as
+      // the agent name, with no readable evidence beside it. Same reasoning as
+      // the secret-NAMED exclusion above; the row still shows the name, the shape
+      // and the "(masked — looked like a credential)" marker.
+      //
+      // A LIST IS THE EXCEPTION, and it has to be. `redacted` on an array means
+      // ONE ELEMENT contained a credential, not that the field is one — so
+      // `agent_list: ["201", "<app id>"]` printed `[ 201, •••• ]`, was struck off
+      // the shortlist by a rule written for scalars, and the panel then reported
+      // "not one field holds a value shaped like an extension". A hunt-group
+      // member list is the exact shape the owner's question is about; it is not
+      // allowed to disappear because of what sits beside the extension in it.
+      // The masked element stays masked either way — this decides ranking only.
+      candidate: isCandidate && !echoed.caller_side && !(echoed.redacted && !Array.isArray(value)),
+      candidate_score: judged.score,
+      candidate_why: judged.why,
+    });
+  };
+
+  if (isPlainObject(payload)) {
+    for (const [k, v] of Object.entries(payload)) {
+      visit(null, k, v);
+      // ONE LEVEL DOWN — every nested object, not only the wrappers collect()
+      // knows. A field must not be missed here precisely because it arrived
+      // wrapped; whether the mapper could ever reach it is reported separately
+      // as in_mapper_reach rather than being used to hide it.
+      if (isPlainObject(v)) for (const [ck, cv] of Object.entries(v)) visit(k, ck, cv);
+    }
+  }
+
+  const candidates = fields
+    .filter(f => f.candidate)
+    .sort((a, b) => b.candidate_score - a.candidate_score || a.path.localeCompare(b.path))
+    .map(f => ({ path: f.path, score: f.candidate_score, why: f.candidate_why }));
+
+  // attributed: TRUE — these two are not payload fields, they are what the
+  // mapper concluded. The agent name and the ring group are the answer this
+  // panel exists to print; withholding them as "possible guest identity" would
+  // blank the one line the reader came for.
+  const agentEcho = echoRingValue(null, 'agent', String(mapped?.agent || ''), creds, true);
+  const queueEcho = echoRingValue(null, 'queue', String(mapped?.queue || ''), creds, true);
+  const rawAgent = String(mapped?.agent || '').trim();
+
+  // "Nothing was found here" is the one sentence on this panel that ENDS an
+  // investigation, so it is the one that has to be hedged with everything this
+  // walk did not look at. Both hedges below are facts about the walk, not
+  // guesses about the payload.
+  const unlooked = deeperNesting
+    ? ` (${deeperNesting} field${deeperNesting === 1 ? ' nests' : 's nest'} deeper than this panel walks, and ${deeperNesting === 1 ? 'its contents were' : 'their contents were'} not examined)`
+    : '';
+  const notRead = callerSideSkipped
+    ? ` (${callerSideSkipped} caller-side field${callerSideSkipped === 1 ? ' was' : 's were'} deliberately not read — those describe the guest)`
+    : '';
+
+  let headline: string;
+  if (!payloadReadable) {
+    headline = 'The stored payload for this delivery is not a readable JSON object, so nothing can be read out of it.';
+  } else if (agentEcho.value && looksLikePhoneValue(rawAgent)) {
+    // The mapper found SOMETHING, but what it found is a phone number. Saying
+    // "this works today" here would send the reader away from a real bug:
+    // AGENT_KEYS is ordered, and an earlier spelling holding the caller's or the
+    // agent's number wins over a later one holding the extension.
+    headline =
+      `The mapper reads an agent off this RING payload, but what it reads is a TELEPHONE NUMBER (${agentEcho.value}), not an extension or a name. That is very likely the wrong field winning: AGENT_KEYS is consulted in order, so an earlier spelling holding a number beats a later one holding the extension. Check the field list for a shorter, extension-shaped value the mapper is walking past.`;
+  } else if (agentEcho.value) {
+    headline =
+      `The mapper DOES read an agent off this RING payload: "${agentEcho.value}". "Ringing — <name>" can be shown for a call like this one today; if it was not, the fault is downstream of the mapper, not in the key list.`;
+  } else if (matchedAgentReadable.length) {
+    // The contradiction case, and it must never be reported as "nothing here":
+    // collect() keeps the FIRST spelling it meets, so a value the mapper cannot
+    // read as text at the top blocks a populated `data.agent` underneath. The
+    // value is sitting in the table below with a "read as agent" badge on it.
+    //
+    // ONLY pickStr-READABLE PATHS ARE NAMED HERE. The test used to be
+    // String(value).trim() !== '', which called an object "a value" and put the
+    // BLOCKER in the same breath as the thing it blocks — and then explained the
+    // payload as "an EMPTY earlier spelling … skip a blank", which is the wrong
+    // instruction whenever the blocker is an object or a list.
+    headline =
+      `CONTRADICTION, and it is the finding. The mapper read NO agent — yet ${matchedAgentReadable.length === 1 ? 'a field it does read as the agent carries' : `${matchedAgentReadable.length} fields it does read as the agent carry`} a readable value on this very payload (${matchedAgentReadable.join(', ')}). `
+      + (matchedAgentBlocking.length
+        ? `The blocker is ${matchedAgentBlocking.join(', ')}: the mapper keeps the FIRST key of a given name it meets, and ${matchedAgentBlocking.length === 1 ? 'that one holds' : 'those hold'} something it cannot read as text — a blank, an object or a list — so it stops there. `
+        : 'That is the signature of an earlier spelling the mapper cannot read as text — a blank, an object or a list. It keeps the first key of a given name it meets, so that one shadows the filled one below it. ')
+      + 'No new spelling in AGENT_KEYS would fix this. The fix is to make the mapper skip a value it cannot read and keep looking, and it belongs to whoever owns src/lib/ct/telecmi-mapper.ts.';
+  } else if (candidates.length) {
+    const lead = candidates[0];
+    headline =
+      `The mapper read NO agent here, but this ring carries ${candidates.length} unread field${candidates.length === 1 ? '' : 's'} whose value or name points at an extension or an identity — the strongest is ${lead.path} (${lead.why.join('; ')}). `
+      + 'That is a LEAD, not a verdict: before any spelling goes into AGENT_KEYS, check what the same key holds on an ANSWERED payload, because pickAgent() is event-blind and a wrong spelling would mis-attribute who picked up.';
+  } else if (agentNamedFilledPaths.length) {
+    // THE PAYLOAD HAS THE KEY AND IT IS NOT EMPTY — it just did not become a
+    // lead, because the panel masked it (a credential name, a credential inside
+    // the value) or because the mapper already reads it. This branch comes
+    // FIRST, above the empty one, because saying "the vendor sends it blank"
+    // over a field that holds something is the more damaging of the two errors:
+    // it closes the question. Send the reader to the row instead.
+    headline =
+      `The mapper read no agent and nothing here became a lead — but ${agentNamedFilledPaths.length === 1 ? 'a field named like an agent field DOES carry a value' : `${agentNamedFilledPaths.length} fields named like an agent field DO carry values`} on this ring (${agentNamedFilledPaths.join(', ')})${queueEcho.value ? `, alongside a ring group "${queueEcho.value}"` : ''}${notRead}${unlooked}. `
+      + `${agentNamedFilledPaths.length === 1 ? 'It is' : 'They are'} not offered as ${agentNamedFilledPaths.length === 1 ? 'a lead' : 'leads'} because the panel will not act on ${agentNamedFilledPaths.length === 1 ? 'it' : 'them'} — a name that reads as a credential, a value carrying one of this account's credentials, or a key the mapper already reads. READ THE ROW: the reason is printed beside each one. This is NOT "TeleCMI sends nothing".`;
+  } else if (agentNamedEmptyPaths.length) {
+    // THE PAYLOAD HAS THE KEY AND LEAVES IT BLANK. Reported apart from "no such
+    // field exists" because the two answers point at different places: this one
+    // is a fact about TeleCMI's ring event, and no spelling added to AGENT_KEYS
+    // can fill a field the vendor sends empty.
+    headline =
+      `The mapper read no agent, and no field here holds a value shaped like an extension, an email or a person's name — but this ring DOES carry ${agentNamedEmptyPaths.length === 1 ? 'a field named like an agent field' : `${agentNamedEmptyPaths.length} fields named like an agent field`} (${agentNamedEmptyPaths.join(', ')}) with nothing in ${agentNamedEmptyPaths.length === 1 ? 'it at all' : 'them at all'}${queueEcho.value ? `, and a ring group "${queueEcho.value}"` : ''}${notRead}${unlooked}. `
+      + 'That is TeleCMI sending the key and leaving it empty at ring time, not a spelling we are missing — no addition to AGENT_KEYS would fill it. Compare the same key on an ANSWERED payload before concluding anything about the account.';
+  } else {
+    headline =
+      `The mapper read no agent, and no field on this ring is named like an agent field or holds a value shaped like an extension or an agent identity${queueEcho.value ? ` — the only routing fact it carries is the ring group "${queueEcho.value}"` : ''}${notRead}${unlooked}. `
+      + 'Read the field list beside this before concluding: every name is printed, and a name nobody recognised is still worth a human eye.';
+  }
+
+  return {
+    log_id: String(row?.id ?? ''),
+    received_at: String(row?.received_at ?? ''),
+    // safeName here too. This one is printed in the header of every ring in the
+    // collapsed evidence list, and it is the LAST string on the panel derived
+    // from the provider that no rule covered. On this account it is a token
+    // (ZZHANGUP-1) and masking costs nothing; on a PBX that builds a call id out
+    // of the number dialled it is the guest's number, printed beside a footnote
+    // promising that cannot happen.
+    telecmi_call_id: safeName(String(row?.telecmi_call_id ?? ''), creds),
+    event_at_ingest: String(row?.event ?? ''),
+    payload_readable: payloadReadable,
+    field_count: fieldCount,
+    caller_side_withheld: callerSideSkipped,
+    identity_withheld: identityWithheldCount,
+    deeper_nesting: deeperNesting,
+    shadowed_agent_paths: rawAgent ? [] : matchedAgentReadable,
+    blocking_agent_paths: rawAgent ? [] : matchedAgentBlocking,
+    agent_named_empty_paths: agentNamedEmptyPaths,
+    agent_named_filled_paths: agentNamedFilledPaths,
+    mapper: {
+      agent: agentEcho.value,
+      queue: queueEcho.value,
+      // Re-run through TODAY's mapper, beside event_at_ingest: a difference
+      // between the two is drift in the classifier since the row was stored.
+      event: String(mapped?.event || ''),
+      direction: String(mapped?.direction || ''),
+    },
+    fields,
+    candidates,
+    headline,
+  };
+}
+
 /* ── The upstream probe (opt-in: ?probe=1) ─────────────────────────────────
  *
  * WHY IT EXISTS. Everything above this line proves the SHAPE of a recording URL
@@ -1372,6 +2666,213 @@ export async function GET(req: Request) {
       headline: liveAgentHeadline,
     };
 
+    // ── 4c · RINGING — FOR WHOM, on the live RING events ──────────────────
+    // Same table, same filter style as 4b, same read-only bounds — only the
+    // classification differs: event = 'ring' rather than 'answer'. See the big
+    // block comment above describeLiveRing() for why this panel exists and how
+    // its answer is meant to be read.
+    //
+    // The breakdown is taken FIRST and over every live row, because the most
+    // likely answer on this account is "there are no ring rows", and that must
+    // be reported as a fact about the feed rather than as an empty panel. It is
+    // one grouped count over an already-filtered kind, not a scan of anything.
+    const liveEventBreakdown = (db.prepare(`
+      SELECT COALESCE(NULLIF(event, ''), '(unclassified)') AS event, COUNT(*) AS n
+        FROM ct_webhook_log
+       WHERE kind = 'live'
+       GROUP BY 1
+       ORDER BY n DESC
+    `).all() as any[]).map(r => ({ event: String(r?.event || ''), n: Number(r?.n || 0) }));
+    const ringTotal = Number((db.prepare(`
+      SELECT COUNT(*) AS n FROM ct_webhook_log WHERE kind = 'live' AND event = 'ring'
+    `).get() as any)?.n || 0);
+
+    const liveRingRows = ringTotal
+      ? db.prepare(`
+          SELECT id, received_at, telecmi_call_id, event, payload
+            FROM ct_webhook_log
+           WHERE kind = 'live' AND event = 'ring'
+           ORDER BY received_at DESC, rowid DESC
+           LIMIT ?
+        `).all(LIVE_RING_LIMIT) as any[]
+      : [];
+    // ONE memo for the whole batch — see RingProbeMemo. The same key names
+    // repeat on every ring, and re-asking the mapper about each of them once per
+    // row is both wasted work and a wall of duplicate warnings in the log.
+    const ringMemo = newRingProbeMemo();
+    const liveRings = liveRingRows.map(r => describeLiveRing(r, creds, ringMemo));
+    const ringWithAgent = liveRings.filter(r => !!r.mapper.agent).length;
+    const ringWithoutAgent = liveRings.length - ringWithAgent;
+    const ringWithQueue = liveRings.filter(r => !!r.mapper.queue).length;
+    const ringWithheld = liveRings.reduce((n, r) => n + r.caller_side_withheld, 0);
+    const ringIdentityWithheld = liveRings.reduce((n, r) => n + r.identity_withheld, 0);
+    const ringDeeper = liveRings.reduce((n, r) => n + r.deeper_nesting, 0);
+    // Rings where the mapper read nothing while a key it DOES read carried a
+    // value — an empty earlier spelling shadowing a filled nested one. It is a
+    // different fault from "no spelling matches" and points at a different fix,
+    // so it gets its own branch rather than being folded into "nothing found".
+    const ringShadowed = liveRings.filter(r => r.shadowed_agent_paths.length > 0);
+    const ringShadowPaths = Array.from(new Set(ringShadowed.flatMap(r => r.shadowed_agent_paths)));
+    const ringBlockPaths = Array.from(new Set(ringShadowed.flatMap(r => r.blocking_agent_paths)));
+    // Agent-NAMED fields across the examined rings, split the same way the
+    // per-ring report splits them. Kept apart from the shortlist: these are
+    // fields the payload DOES carry under an agent-sounding name, and the last
+    // headline branch must not say they do not exist.
+    //
+    // BOTH OF THESE WERE COMPUTED AND THEN NEVER READ. Every branch below went
+    // straight from "no candidates" to "NOT ONE field on any of them holds a
+    // value shaped like an extension … Stop promising more than that until a
+    // ring payload proves otherwise" — the one sentence on this panel written to
+    // END the investigation — while `agent: ""` on every ring said something
+    // quite different, and the per-ring headline underneath said it correctly.
+    // The headline the owner reads first was the only one that did not know.
+    const ringAgentNamedEmpty = Array.from(new Set(liveRings.flatMap(r => r.agent_named_empty_paths)));
+    const ringAgentNamedFilled = Array.from(new Set(liveRings.flatMap(r => r.agent_named_filled_paths)));
+    // Oldest/newest of the rows ACTUALLY EXAMINED — "over what period", so a
+    // shortlist drawn from three rings last March is not read as current.
+    const ringDates = liveRings.map(r => r.received_at).filter(Boolean).sort();
+    const ringOldest = ringDates[0] || '';
+    const ringNewest = ringDates[ringDates.length - 1] || '';
+
+    /**
+     * THE SHORTLIST, pooled across every examined ring and ranked.
+     *
+     * Pooled because one payload is an anecdote: a field that turns up on every
+     * ring with an extension-shaped value is a far stronger lead than one that
+     * appeared once, and `seen_on` is what lets the reader tell those apart. The
+     * score is the best any single row gave it; ties break on how often it was
+     * seen, then on the name, so the order is stable between loads.
+     */
+    const ringCandidatePool = new Map<string, { path: string; score: number; why: Set<string>; seen_on: number; in_mapper_reach: boolean }>();
+    for (const ev of liveRings) {
+      // seen_on IS RENDERED AS "n of N rings", so it has to count RINGS. Paths
+      // are digit-masked (safeName), so two keys of a per-leg map keyed by phone
+      // number now share one path — and a per-field += 1 would have printed
+      // "seen on 3 of 1". Counted once per ring per path instead.
+      const seenThisRing = new Set<string>();
+      for (const f of ev.fields) {
+        if (!f.candidate) continue;
+        const firstHereForPath = !seenThisRing.has(f.path);
+        seenThisRing.add(f.path);
+        const cur = ringCandidatePool.get(f.path);
+        if (cur) {
+          cur.score = Math.max(cur.score, f.candidate_score);
+          if (firstHereForPath) cur.seen_on += 1;
+          for (const w of f.candidate_why) cur.why.add(w);
+          cur.in_mapper_reach = cur.in_mapper_reach || f.in_mapper_reach;
+        } else {
+          ringCandidatePool.set(f.path, {
+            path: f.path,
+            score: f.candidate_score,
+            why: new Set(f.candidate_why),
+            seen_on: 1,
+            in_mapper_reach: f.in_mapper_reach,
+          });
+        }
+      }
+    }
+    const ringCandidates = Array.from(ringCandidatePool.values())
+      .sort((a, b) => b.score - a.score || b.seen_on - a.seen_on || a.path.localeCompare(b.path))
+      .map(c => ({
+        path: c.path,
+        score: c.score,
+        seen_on: c.seen_on,
+        in_mapper_reach: c.in_mapper_reach,
+        why: Array.from(c.why),
+      }));
+    // A lead the mapper's collect() could never reach is still shown — but it is
+    // NOT the one to act on, because no AGENT_KEYS spelling would pick it up.
+    const actionableRingCandidates = ringCandidates.filter(c => c.in_mapper_reach);
+
+    let liveRingHeadline: string;
+    if (liveCount === 0) {
+      liveRingHeadline =
+        'No live (screen-pop) event of any kind has ever reached this server, so there is no ring payload to examine and nothing can be said about who a call is ringing. This is a webhook question, not a mapper question.';
+    } else if (ringTotal === 0) {
+      liveRingHeadline =
+        `${liveCount} live event${liveCount === 1 ? ' has' : 's have'} been logged but NOT ONE is classified as a RING (${liveEventBreakdown.map(b => `${b.event}: ${b.n}`).join(', ') || 'no events'}). `
+        + 'THIS IS NOT EVIDENCE THAT A RING PAYLOAD CARRIES NO AGENT — it means none has ever been captured here, so there is nothing to read. Until a ring event arrives, the ring group is the only honest answer to "for whom is it ringing".';
+    } else if (liveRings.length === 0) {
+      liveRingHeadline =
+        `${ringTotal} ring event${ringTotal === 1 ? ' is' : 's are'} logged but none could be read back. That is a fault in this diagnostic or in the stored rows, not an answer about the payload.`;
+    } else if (ringWithoutAgent === 0) {
+      liveRingHeadline =
+        `Every one of the last ${liveRings.length} ring${liveRings.length === 1 ? '' : 's'} DOES name an agent the mapper reads. "Ringing — <name>" is therefore already available on this account: if the screen still says "Extension not reported", the gap is between the mapper and the screen, not in the payload.`;
+    } else if (ringShadowed.length) {
+      liveRingHeadline =
+        `${ringShadowed.length} of the last ${liveRings.length} ring${liveRings.length === 1 ? '' : 's'} CONTRADICT themselves: the mapper read no agent, yet a field it does read as the agent carries a READABLE value on that same payload (${ringShadowPaths.slice(0, 4).join(', ')}${ringShadowPaths.length > 4 ? ', …' : ''}). `
+        + (ringBlockPaths.length
+          ? `The blocker is ${ringBlockPaths.slice(0, 4).join(', ')}${ringBlockPaths.length > 4 ? ', …' : ''} — ${ringBlockPaths.length === 1 ? 'that key holds' : 'those keys hold'} something the mapper cannot read as text (a blank, an object or a list). `
+          : '')
+        + 'The mapper keeps the FIRST key of a given name it meets, so an unreadable one at the top of the payload shadows a filled one nested below it, and no spelling added to AGENT_KEYS would change that. The fix is in how the mapper collects keys — skip a value it cannot read and keep looking — and it belongs to whoever owns src/lib/ct/telecmi-mapper.ts.';
+    } else if (actionableRingCandidates.length) {
+      const top = actionableRingCandidates.slice(0, 3).map(c => `${c.path} (seen on ${c.seen_on} of ${liveRings.length})`).join(', ');
+      liveRingHeadline =
+        `${ringWithoutAgent} of the last ${liveRings.length} ring${liveRings.length === 1 ? '' : 's'} named NO agent the mapper reads — but the payloads DO carry unread fields whose values are shaped like an extension or an identity. Best first: ${top}. `
+        + 'THIS IS A LEAD, NOT A FIX. pickAgent() in src/lib/ct/telecmi-mapper.ts is event-blind — the same function answers for ring, for answer and for the CDR, and its result drives who a call is attributed to. Before any of these spellings goes into AGENT_KEYS, check what that same key holds on an ANSWERED payload (the live_agent block of this same response reports them field by field); a wrong spelling would silently mis-attribute who picked up, which is worse than the missing label.';
+    } else if (ringCandidates.length) {
+      liveRingHeadline =
+        `${ringWithoutAgent} of the last ${liveRings.length} ring${liveRings.length === 1 ? '' : 's'} named no agent. Fields with extension-shaped values DO exist on these payloads, but every one of them is nested somewhere the mapper's collect() never descends into, so NO spelling added to AGENT_KEYS would reach them. Reading them would take a change to the mapper's envelope handling, not to its key list.`;
+    } else if (ringAgentNamedFilled.length) {
+      // MIRRORS THE PER-RING CHAIN, and it has to. These two branches did not
+      // exist here at all: the pooled headline dropped straight from "no
+      // candidates" to the closing verdict below, so the card's top line said
+      // "not one field holds a value shaped like an extension" while the
+      // per-ring headline in the collapsed section underneath said "this ring
+      // DOES carry a field named like an agent field". The summary contradicting
+      // its own evidence, with the summary read first and believed.
+      liveRingHeadline =
+        `${ringWithoutAgent} of the last ${liveRings.length} ring${liveRings.length === 1 ? '' : 's'} named no agent and nothing became a lead — but ${ringAgentNamedFilled.length === 1 ? 'a field named like an agent field DOES carry a value' : `${ringAgentNamedFilled.length} fields named like an agent field DO carry values`} on these payloads (${ringAgentNamedFilled.slice(0, 4).join(', ')}${ringAgentNamedFilled.length > 4 ? ', …' : ''}). `
+        + `${ringAgentNamedFilled.length === 1 ? 'It was' : 'They were'} left off the shortlist because this panel will not act on ${ringAgentNamedFilled.length === 1 ? 'it' : 'them'} — a name that reads as a credential, a value carrying one of this account's credentials, or a key the mapper already reads. Open "Field-by-field, ring by ring" below: the reason is printed on the row. Do not read this as "TeleCMI sends nothing".`;
+    } else if (ringAgentNamedEmpty.length) {
+      liveRingHeadline =
+        `${ringWithoutAgent} of the last ${liveRings.length} ring${liveRings.length === 1 ? '' : 's'} named no agent, and no field on them holds a value shaped like an extension, an email or a person's name — but the payloads DO carry ${ringAgentNamedEmpty.length === 1 ? 'a field named like an agent field' : `${ringAgentNamedEmpty.length} fields named like an agent field`} (${ringAgentNamedEmpty.slice(0, 4).join(', ')}${ringAgentNamedEmpty.length > 4 ? ', …' : ''}) with nothing in ${ringAgentNamedEmpty.length === 1 ? 'it' : 'them'} at all. `
+        + 'That is TeleCMI sending the key and leaving it EMPTY at ring time — a different answer from "we are missing a spelling", and one no addition to AGENT_KEYS could fix. It is worth asking TeleCMI to populate it before anything is changed here.';
+    } else {
+      liveRingHeadline =
+        `${ringWithoutAgent} of the last ${liveRings.length} ring${liveRings.length === 1 ? '' : 's'} named no agent, and NOT ONE field on any of them holds a value shaped like an extension, an email or a person's name`
+        + (ringWithheld ? ` (${ringWithheld} caller-side field${ringWithheld === 1 ? ' was' : 's were'} deliberately not read — those describe the guest)` : '')
+        // THE SECOND HEDGE, and it was missing here while the per-ring headline
+        // carried it. This sentence ends the investigation; every part of the
+        // payload the walk did not open has to be named in it.
+        + (ringDeeper ? ` (${ringDeeper} field${ringDeeper === 1 ? ' nests' : 's nest'} deeper than this panel walks, and ${ringDeeper === 1 ? 'its contents were' : 'their contents were'} never examined)` : '')
+        + `. On this evidence the live ring payload on this account genuinely does not say which phone it is ringing`
+        + (ringWithQueue ? `, and the ring GROUP — which ${ringWithQueue} of these rings does carry — is the best answer that exists.` : '. Not even a ring group is carried, so the ring event says nothing about routing at all.')
+        + ' The names on "did not pick up" come from the per-leg MISSED CDR after the fact, and that remains the only source of a person\'s name for an unanswered call. Stop promising more than that until a ring payload proves otherwise.';
+    }
+
+    const liveRing = {
+      limit: LIVE_RING_LIMIT,
+      /** Every live row by classification — so "no rings" is a stated fact. */
+      live_event_breakdown: liveEventBreakdown,
+      ring_events_total: ringTotal,
+      examined: liveRings.length,
+      /** The period the examined rings span. '' when none were examined. */
+      oldest_at: ringOldest,
+      newest_at: ringNewest,
+      with_agent: ringWithAgent,
+      without_agent: ringWithoutAgent,
+      with_queue: ringWithQueue,
+      caller_side_withheld: ringWithheld,
+      /** Values declined because they were identity-shaped under a field name
+       *  that attributes them to neither staff nor a ring group. */
+      identity_withheld: ringIdentityWithheld,
+      /** Fields nested deeper than this panel walks. The second half of the
+       *  honesty hedge on "nothing was found". */
+      deeper_nesting: ringDeeper,
+      /** Agent-NAMED fields the vendor sends with nothing in them, pooled. Named
+       *  in the response and not only inside a sentence, because "the key is
+       *  there and blank" is the finding somebody has to take to TeleCMI. */
+      agent_named_empty: ringAgentNamedEmpty,
+      /** Agent-NAMED fields that DO carry something and still are not leads. */
+      agent_named_filled: ringAgentNamedFilled,
+      /** THE SHORTLIST: unread fields whose value looks like an extension or an
+       *  agent identity, pooled across the examined rings and ranked. */
+      candidate_keys: ringCandidates,
+      events: liveRings,
+      headline: liveRingHeadline,
+    };
+
     // ── 5 · Upstream probe (opt-in) ───────────────────────────────────────
     // Off unless asked for, so opening the Telephony page never touches
     // TeleCMI. See the block comment above probeCall() for the bounds.
@@ -1489,6 +2990,9 @@ export async function GET(req: Request) {
       latest_cdr: latest,
       // ADDITIVE: who answered, off the LIVE events. Nothing above it changes.
       live_agent: liveAgent,
+      // ADDITIVE: who a call is RINGING, off the LIVE ring events. Same table,
+      // same bounds, nothing above it changes.
+      live_ring: liveRing,
       recording_scan: {
         limit: SCAN_LIMIT,
         scanned,
