@@ -10,7 +10,7 @@
  * Action buttons appear contextually based on (status, viewer permissions).
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ClipboardList, Plus, Trash2, Send, CheckCircle2, XCircle, Package,
@@ -40,6 +40,13 @@ interface Department { id: string; name: string; code?: string; }
 interface ReqItem {
   id: string; req_id: string; material_id: string;
   material_name: string; material_sku?: string; material_unit: string;
+  /** raw_materials.category, shipped by the ?id= detail SELECT
+   *  (api/requisitions/route.ts:88) and used to group the store's line table by
+   *  shelf. The column is `TEXT NOT NULL DEFAULT 'other'`, so on live data it is
+   *  never NULL and never blank — 'other' is a REAL shelf with 141 materials on
+   *  it, not a stand-in for "unset". Optional here only because an older payload
+   *  (or a caller that hand-builds a ReqItem) may omit it. */
+  material_category?: string;
   /** Unit the department REQUESTED in (recipe unit or purchase unit, e.g. 'BTL').
    *  quantity_requested / chef_approved_qty / quantity_issued are all in THIS unit. */
   unit?: string;
@@ -194,6 +201,102 @@ function deptLeadQty(it: ReqItem, storeHasIssued: boolean): number {
   if (it.is_rejected) return 0;
   return storeHasIssued ? (Number(it.quantity_issued) || 0) : effectiveQty(it);
 }
+
+/**
+ * Group a requisition's lines BY SHELF so a store person walks one aisle at a
+ * time instead of criss-crossing the room down a flat, name-ordered list.
+ *
+ * This is the SAME RULE as /store-requisitions (page.tsx:1508-1532), copied
+ * deliberately rather than approximated: the two screens render the same
+ * requisition to the same picker, and a hand-over sheet that reads one way here
+ * and another way there is worse than no grouping at all.
+ *   · categories A-Z, case-insensitive
+ *   · 'Uncategorised' pinned LAST, so a blank never sorts above a real shelf
+ *   · items A-Z by name INSIDE each group
+ *
+ * WHAT COUNTS AS BLANK. Only a genuinely empty/whitespace value collapses into
+ * the no-category bucket. The literal 'other' is left alone as its own group
+ * because on this database it is a REAL category carrying 141 materials / 3,222
+ * requisition lines — folding it into "no category" would tell the picker that a
+ * fifth of the sheet is unfiled when it is not. raw_materials.category is
+ * `TEXT NOT NULL DEFAULT 'other'` and today holds 0 NULLs and 0 empty strings,
+ * so that bucket is the compatibility floor, not a live case.
+ *
+ * TWO SHELVES MUST NEVER PRINT THE SAME NAME. Both of these are latent today
+ * (checked on a copy of the live db: 0 case-variant categories, 0 blank, 0 rows
+ * literally named 'Uncategorised') and both mislead the one person this grouping
+ * exists for — a picker counting items off a shelf:
+ *   · The bucket key is CASE-FOLDED. Keying on the raw string while sorting
+ *     case-INSENSITIVELY put 'Veg' and 'veg' in two buckets that then rendered
+ *     as two adjacent header rows both reading VEG (the header is
+ *     CSS-uppercased), e.g. 'VEG (117 items)' followed by 'VEG (1 item)'. The
+ *     first spelling seen is kept for display, so nothing renders differently on
+ *     data that has no variants.
+ *   · The no-category bucket is keyed on a SENTINEL that no category string can
+ *     equal, and prints 'No category' rather than 'Uncategorised' — a material
+ *     genuinely filed under "Uncategorised" is a real shelf and now keeps its own
+ *     group instead of being merged into the unfiled pile and sorted below every
+ *     real shelf. This is the one deliberate divergence from
+ *     /store-requisitions' wording; it applies only to a bucket that is empty on
+ *     this database, and the alternative is two shelves sharing a label.
+ *
+ * PRESENTATION ONLY. Callers keep reading `detail.items` for totals, costing and
+ * every action — this returns the same rows in a different order and nothing
+ * else. The server still sends them ORDER BY department, material
+ * (api/requisitions/route.ts:130); re-ordering here is a display decision on
+ * this screen and does not touch that query (which /store-requisitions shares).
+ */
+/** Key for the "this material has no category" bucket. The LEADING SPACE is what
+ *  makes it safe: a real key is `category.trim().toLowerCase()` and non-empty, so
+ *  no real category can ever produce a key that starts with a space. */
+const NO_CATEGORY_KEY = ' no-category';
+const NO_CATEGORY_LABEL = 'No category';
+
+function groupLinesByCategory<T extends { material_category?: string; material_name?: string }>(
+  items: readonly T[],
+): Array<{ name: string; lines: T[] }> {
+  // key (case-folded, or the sentinel) → the spelling to print + its rows.
+  const groups = new Map<string, { name: string; lines: T[] }>();
+  for (const line of items) {
+    const raw = String(line.material_category || '').trim();
+    const key = raw ? raw.toLowerCase() : NO_CATEGORY_KEY;
+    const bucket = groups.get(key);
+    if (bucket) bucket.lines.push(line);
+    else groups.set(key, { name: raw || NO_CATEGORY_LABEL, lines: [line] });
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => {
+      if (a === NO_CATEGORY_KEY) return 1;
+      if (b === NO_CATEGORY_KEY) return -1;
+      return a.localeCompare(b, undefined, { sensitivity: 'base' });
+    })
+    .map(([, g]) => ({
+      name: g.name,
+      lines: g.lines.slice().sort((x, y) =>
+        String(x.material_name || '').localeCompare(String(y.material_name || ''), undefined, { sensitivity: 'base' })),
+    }));
+}
+
+/**
+ * Purchase units that are a MEASURE rather than a countable pack.
+ *
+ * Rounding a shortfall UP to a whole purchase unit is right for a bottle, a
+ * packet or a case — no vendor sells 0.4 of a bottle. It is wrong for a unit
+ * that is itself a measurement: a 0.01 kg shortfall of KAFFIRLIME LEAF became a
+ * pre-priced 1 kg order, +9,900%, and 100 g of BASIL / LEMON GRASS / ROSEMERRY
+ * each became 1 kg, +900%. Measured on a copy of the live db: with Issue Now
+ * cleared across every requisition, 281 auto-filled Buy quantities order more
+ * than the line is short, and EVERY ONE of them is on a `kg` purchase unit.
+ *
+ * The six purchase units with a real pack conversion on this database are
+ * btl (2,536 requisition lines), kg (4,000), pkt (350), l (338), can (20) and
+ * case (4) — so only kg and l need the relaxation, and the set is deliberately
+ * a MEASURE list rather than a count list: anything unrecognised keeps today's
+ * ceil, which is the safe direction for a unit nobody has seen yet.
+ */
+const MEASURE_PURCHASE_UNITS = new Set(['g', 'gm', 'gms', 'gram', 'grams', 'kg', 'kgs', 'kilogram',
+                                        'ml', 'l', 'ltr', 'ltrs', 'lt', 'litre', 'liter', 'litres', 'liters']);
+const isMeasurePurchaseUnit = (u?: string) => MEASURE_PURCHASE_UNITS.has(String(u || '').toLowerCase().trim());
 
 const STATUS_BADGE: Record<string, string> = {
   draft:           'bg-[#E8D5C4] text-[#6B5744]',
@@ -1160,7 +1263,47 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
               </tr>
             </thead>
             <tbody>
-              {(detail.items || []).map(it => {
+              {/* CATEGORY-WISE, so the store person walks one shelf at a time.
+                  Full-width header rows rather than a per-row Category column:
+                  that is how /store-requisitions already prints the same
+                  requisition (page.tsx:1508-1552), it costs the table ZERO
+                  horizontal width — which is what keeps this readable on a
+                  tablet inside the existing overflow-x-auto — and a bare column
+                  would not have helped anyway, because the rows arrive ordered
+                  by department + material name, so the categories would still be
+                  scattered down the list. Deliberately NOT collapsible: a
+                  collapsed group on a hand-over sheet is a line quietly not
+                  issued. Grouping is presentation only — reqTotal and every
+                  action still read detail.items. */}
+              {groupLinesByCategory(detail.items || []).map(group => (
+              <Fragment key={`cat-${group.name}`}>
+                <tr className="bg-[#FFF1E3] border-t border-[#E8D5C4]">
+                  {/* colSpan tracks the header row above: 7 columns normally,
+                      9 once Issued / To Purchase appear (same storeHasIssued
+                      const the <thead> uses, so the two can never drift). */}
+                  <td colSpan={storeHasIssued ? 9 : 7}
+                      className="py-1 px-2 text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">
+                    {group.name}
+                    {/* THE COUNT IS WHAT THE PICKER HANDS OVER. detail.items
+                        includes chef-rejected lines (they render struck-through
+                        below), while the Issue modal's identical header counts a
+                        list those are already filtered out of — so one shelf
+                        printed "5 items" here and "4 items" there, on the two
+                        surfaces this grouping exists to reconcile. Count the
+                        pickable rows and name the rejected ones separately
+                        rather than folding them into the same number. */}
+                    {(() => {
+                      const pick = group.lines.filter(l => !l.is_rejected).length;
+                      const rej  = group.lines.length - pick;
+                      return (
+                        <span className="ml-1.5 font-normal normal-case">
+                          ({pick} item{pick === 1 ? '' : 's'}{rej > 0 ? ` + ${rej} rejected` : ''})
+                        </span>
+                      );
+                    })()}
+                  </td>
+                </tr>
+                {group.lines.map(it => {
                 const rejected = !!it.is_rejected;
                 // Stock is in recipe units; the request may be in the purchase
                 // unit (e.g. BTL) — convert before comparing.
@@ -1239,7 +1382,9 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                     </td>
                   </tr>
                 );
-              })}
+                })}
+              </Fragment>
+              ))}
             </tbody>
           </table>
           </div>
@@ -1971,7 +2116,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   // Default: pure issuance — record what was handed to the department, no
   // vendor side-effect. Store managers raise POs on /purchase-orders.
   //
-  // Opt-in: store manager ticks "Also raise vendor PO for the shortfall" →
+  // Opt-in: store manager ticks "Also raise a vendor PO" →
   // backend `auto_create_po: true` flag is sent → for any line with
   // quantity_to_purchase > 0, a single vendor PO is auto-created in `pending`
   // and goes to the admin's PO approval queue. Vendor + unit price fields
@@ -2025,7 +2170,8 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // than one pack (300 ml against a 750 ml BTL ask) must keep floor()'s 0 and
       // behave exactly as it did before this change. Only <= 0 relaxes.
       const issuable  = bookStock > 0 ? Math.min(effective, stockInReqUnits) : effective;
-      const shortfall = Math.max(0, effective - issuable);
+      // (There used to be a `const shortfall = effective - issuable` here, frozen
+      //  into the Buy box below. See the note above buyInPurchaseUnit.)
       // Purchase-unit metadata so the PO math can switch between recipe-unit
       // (kg / ml / pcs) and purchase-unit (BTL / PKT / CASE) entry. pack_size
       // is recipe-units per purchase-unit (e.g. 750 ml in 1 BTL).
@@ -2042,13 +2188,17 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // there is a real pack conversion; otherwise the recipe-unit IS the
       // purchase-unit and the distinction doesn't matter.
       const buyInPurchaseUnit = packConv > 1;
-      // Convert shortfall to purchase-unit qty for the PO line. If the request
-      // was ALREADY in the purchase unit (reqFactor>1) the shortfall is in
-      // purchase units — use it as-is; else it's recipe units → divide by pack.
-      // Ceil so the order covers the demand — vendors don't sell fractional bottles.
-      const buyQty = buyInPurchaseUnit
-        ? (reqFactor > 1 ? Math.ceil(shortfall) : Math.ceil(shortfall / packConv))
-        : shortfall;
+      // NOTE: the Buy qty is NOT frozen here any more — see autoBuyQty() below.
+      // `effective − issuable` is still the figure the box opens on (autoBuyQty
+      // returns exactly that while Issue Now is untouched), but it is now
+      // RE-DERIVED on every render from `requested − Issue Now`, which is the
+      // same subtraction the Shortfall COLUMN has always printed. Frozen, it
+      // disagreed with the column standing next to it the moment the storekeeper
+      // typed a smaller Issue Now: the column said "16 kg short", the Buy box
+      // stayed blank, and the submit button greyed out. Measured over all 16,353
+      // live requisition lines, the frozen seed filled the box on 137 of them
+      // (0.8%) — it is 0 both when the store has enough AND (via the
+      // deliberate relaxation above) when the book balance is at or below zero.
       // PRICE BASES (canon): last_purchase_price is ₹ per PURCHASE unit
       // (PO-receive + db backfill write it that way); average_price is ₹ per
       // RECIPE unit. The old code asserted the opposite and multiplied lpp by
@@ -2081,11 +2231,24 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         id: it.id,
         material_id: it.material_id,         // needed to look up mapped vendors
         material_name: it.material_name,
+        /** Shelf this item lives on. Carried onto the line ONLY so this grid can
+         *  be grouped the same way the read-only Store Inbox table and
+         *  /store-requisitions are — the store person picks off this grid, and
+         *  three renderings of one requisition in three different orders is the
+         *  thing the grouping was asked for to stop. Presentation only: nothing
+         *  in the PO math, the POST body or any total reads it. */
+        material_category: it.material_category,
         material_unit: it.material_unit,     // recipe unit (canonical)
         req_unit: reqUnit(it),               // unit the dept requested in — requested/issued qtys are STORED in THIS unit
         U,                                   // purchase-unit view of req_unit (display only — see lineUnits)
         purchase_unit: purchaseUnit,         // vendor-facing unit
         pack_size: packConv,                 // recipe-units per purchase-unit, canon-guarded (1 = no real conversion, so every `pack_size > 1` test below is the full guard)
+        /** Recipe-units per REQUESTED unit (pack when the dept asked in BTL, else
+         *  1). Kept on the line so autoBuyQty() can reproduce the seed's own
+         *  conversion expression verbatim instead of re-deriving it from U — the
+         *  two agree on every live row, but a Buy qty is money and it must be
+         *  the SAME arithmetic, not an equivalent one. */
+        req_factor: reqFactor,
         current_stock: it.current_stock,     // keep raw value for the warning render
         requested: effective,                // chef-approved demand, not raw request
         /** STORED-basis seed. Posted VERBATIM while the box still reads its own
@@ -2099,7 +2262,14 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         // PO-only fields, hidden until raisePo is ticked. These are ALREADY on
         // the purchase basis (po_entry_unit names it) — raw strings for the same
         // typing reason, but no basis change: the PO side is not re-converted.
-        quantity_to_purchase: buyQty > 0 ? String(buyQty) : '',
+        /** The storekeeper's OVERRIDE of the Buy qty. Empty + buy_touched false
+         *  means "follow the shortfall" (autoBuyQty). Read it through buyStr(),
+         *  never directly, or the box goes back to being a frozen snapshot. */
+        quantity_to_purchase: '',
+        /** True once the Buy box has been typed in — including CLEARED to blank,
+         *  which is how a storekeeper says "do not order this line". Without the
+         *  flag a cleared box would silently refill itself from the shortfall. */
+        buy_touched: false,
         unit_price: buyUnitPrice > 0 ? String(buyUnitPrice) : '',
         /** Unit the user is entering qty + price in. Drives both the column
          *  labels and the on-submit conversion, which normalises a recipe-unit
@@ -2117,6 +2287,16 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [raisePo, setRaisePo] = useState(false);
+  /* The server's own answer to the last submit. Set on a 200 and rendered as a
+     result panel INSTEAD of the form — the modal no longer closes itself, so a
+     report about lines that were not ordered cannot be swept away by the same
+     click that submitted them. onDone() (close + reload) is on the Done button. */
+  const [result, setResult] = useState<any | null>(null);
+  /* A refused submit (400). Nothing was written, so the form stays exactly as it
+     is and the named rows are outlined — every 400 from store-process carries a
+     `code` plus the req_item_id(s) it is about. */
+  const [errorText, setErrorText] = useState('');
+  const [errorRows, setErrorRows] = useState<Set<string>>(new Set());
   const [poDate, setPoDate] = useState(new Date().toISOString().slice(0, 10));
   // Deliberately BLANK, unlike poDate. Defaulting this to today would put an
   // invented delivery promise on the vendor PO that nobody agreed to, and the
@@ -2125,11 +2305,28 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
 
   // Vendor lookup state — only fetched when the PO checkbox is ticked, so the
   // modal stays light when the store user is just issuing items.
-  //   allVendors             : every active vendor (fallback dropdown options)
-  //   vendorsByMaterial[mid] : vendors mapped to that specific material via
-  //                            /api/vendor-materials (the curated list)
+  //   allVendors : every active vendor (fallback dropdown options)
+  //   vmIdx      : the WHOLE vendor↔item map, one payload
+  //
+  // WHY THE WHOLE MAP AND NOT ONE FETCH PER LINE. The previous version asked
+  // /api/vendor-materials?material_id= only for lines whose Buy qty was ALREADY
+  // seeded above 0, with deps [raisePo] so it never re-ran when the storekeeper
+  // typed one afterwards. On 99.2% of live requisitions no line seeds a Buy qty
+  // (see autoBuyQty), so `vendorsByMaterial` stayed permanently empty and every
+  // Vendor dropdown fell through to "All active vendors" while its tooltip
+  // asserted "No mapped vendors yet" — false for BANGLORE TOMATO, which is
+  // mapped to TARKARI. The one control that steers the storekeeper to a vendor
+  // the SERVER will accept was switched off and then denied existing.
+  // ?index=1 answers every line in a single request (same endpoint and same
+  // rows the /purchase-orders composer reads, so the two screens agree), and it
+  // also names the vendors that carry no item list at all.
   const [allVendors, setAllVendors] = useState<{ id: string; name: string }[]>([]);
-  const [vendorsByMaterial, setVendorsByMaterial] = useState<Record<string, { id: string; name: string }[]>>({});
+  const [vmIdx, setVmIdx] = useState<{
+    by_vendor?: Record<string, string[]>;
+    vendor_names?: Record<string, string>;
+    vendors_no_items?: Array<{ id: string; name: string }>;
+  } | null>(null);
+  const [vmError, setVmError] = useState('');
   useEffect(() => {
     if (!raisePo) return;
     // Active vendors — always fetched once when the box is ticked.
@@ -2138,29 +2335,50 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         setAllVendors((j.vendors || []).filter((v: any) => v.is_active).map((v: any) => ({ id: v.id, name: v.name })));
       }).catch(() => {});
     }
-    // Per-material mappings — fetched in parallel for each line that has a
-    // purchase qty > 0 and isn't yet cached.
-    const toFetch = lines
-      .filter(ln => (Number(ln.quantity_to_purchase) || 0) > 0 && ln.material_id && !vendorsByMaterial[ln.material_id])
-      .map(ln => ln.material_id);
-    if (toFetch.length === 0) return;
-    const unique = Array.from(new Set(toFetch));
-    Promise.all(unique.map(mid =>
-      fetch(`/api/vendor-materials?material_id=${encodeURIComponent(mid)}`)
-        .then(r => r.json())
-        .then(j => ({ mid, vendors: (j.mappings || []).map((m: any) => ({ id: m.vendor_id, name: m.vendor_name })) }))
-        .catch(() => ({ mid, vendors: [] }))
-    )).then(results => {
-      setVendorsByMaterial(prev => {
-        const next = { ...prev };
-        for (const r of results) next[r.mid] = r.vendors;
-        return next;
-      });
-    });
+    if (vmIdx) return;
+    fetch('/api/vendor-materials?index=1')
+      .then(async r => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(j => { setVmIdx(j || {}); setVmError(''); })
+      // FAILS OPEN, unlike the /purchase-orders composer. There the server 400s
+      // an unmapped pair, so hiding the list until it loads costs nothing; HERE
+      // the server DROPS the line and records the issue anyway, so refusing to
+      // show vendors would strand a storekeeper mid-hand-over over a lookup that
+      // is only ever advisory. The warnings below all test `vmReady` first and
+      // simply go quiet when it is false.
+      .catch(e => { setVmIdx(null); setVmError(e?.message || 'Could not load the vendor → item mapping.'); });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [raisePo]);
 
-  const update = (i: number, patch: any) => setLines(p => p.map((ln, j) => j === i ? { ...ln, ...patch } : ln));
+  /** Vendors mapped to each material, inverted out of the one index payload.
+   *  Same rows /api/vendor-materials?material_id= returns (both read
+   *  vendor_materials joined to vendors), so no vendor appears or disappears
+   *  relative to the previous per-material fetch — only the coverage changes. */
+  const vendorsByMaterial = useMemo(() => {
+    const m: Record<string, { id: string; name: string }[]> = {};
+    const names = vmIdx?.vendor_names || {};
+    for (const [vid, mids] of Object.entries(vmIdx?.by_vendor || {})) {
+      for (const mid of mids) (m[mid] ||= []).push({ id: vid, name: names[vid] || vid });
+    }
+    for (const list of Object.values(m)) list.sort((a, b) => a.name.localeCompare(b.name));
+    return m;
+  }, [vmIdx]);
+  /** Active vendors with NO item list at all — 20 of 59 on this database. Every
+   *  PO line naming one of them is refused by the server, whatever the item. */
+  const vendorsNoItems = useMemo(
+    () => new Set((vmIdx?.vendors_no_items || []).map(v => v.id)),
+    [vmIdx]);
+  const vmReady = !!vmIdx;
+
+  const update = (i: number, patch: any) => {
+    // Any edit invalidates the last refusal: the sentence named a row and a
+    // value that no longer describe the form, and a stale red banner over a
+    // corrected grid is how a storekeeper stops reading red banners.
+    if (errorText) { setErrorText(''); setErrorRows(new Set()); }
+    setLines(p => p.map((ln, j) => j === i ? { ...ln, ...patch } : ln));
+  };
 
   type Line = (typeof lines)[number];
   /**
@@ -2178,10 +2396,124 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     const vPU = Math.max(0, Number(ln.issued_pu) || 0);
     return vPU === ln.U.toPU(ln.issued_seed) ? ln.issued_seed : ln.U.fromPU(vPU);
   };
+  /** What is still short on this line, in the line's STORED unit — the exact
+   *  subtraction the Shortfall column prints (`requested − Issue Now`). */
+  const shortOf = (ln: Line) => Math.max(0, ln.requested - issuedOf(ln));
+  /**
+   * The Buy qty a line offers while nobody has overridden it: the LIVE shortfall,
+   * expressed in whatever unit the Buy box is currently entering in.
+   *
+   * This is the seed's own expression, unchanged, with the frozen `shortfall`
+   * swapped for the live one — `req_factor` and `pack_size` are the very values
+   * the seed computed, so a line that opens untouched shows the identical number
+   * it showed before this change. What is new is only that it KEEPS UP: lower
+   * Issue Now to what you can actually hand over and the shortfall appears in
+   * both the column and the box, instead of the column alone.
+   *
+   * Rounded UP on the purchase basis because vendors do not sell fractional
+   * bottles — but only for a purchase unit that is actually a countable pack.
+   * For a unit that is itself a measurement (kg / L) the shortfall is kept, to
+   * 3 dp; see isMeasurePurchaseUnit above for the numbers.
+   */
+  const autoBuyQty = (ln: Line) => {
+    const short = shortOf(ln);
+    if (short <= 0) return 0;
+    // Entering in the PURCHASE unit (the default whenever the two units differ).
+    if (ln.pack_size > 1 && ln.po_entry_unit === ln.purchase_unit) {
+      // A whole pack for btl / pkt / can / case; the real figure for kg / L.
+      const upToOrderable = (v: number) =>
+        isMeasurePurchaseUnit(ln.purchase_unit) ? Math.ceil(v * 1000) / 1000 : Math.ceil(v);
+      // requested-unit IS the purchase unit → already there; else recipe → ÷ pack.
+      return ln.req_factor > 1 ? upToOrderable(short) : upToOrderable(short / ln.pack_size);
+    }
+    // 6 dp, the same precision lineUnits.fromPU() rounds an entered figure to.
+    // `short` is a subtraction of two floats, so without it a 4 kg shortfall can
+    // reach the box as "4.000000000000001" and get POSTed as the PO quantity.
+    const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
+    // Entering in the RECIPE unit → the shortfall has to be expressed there too.
+    if (ln.pack_size > 1) return round6(short * ln.req_factor);
+    // No real pack conversion: recipe unit IS the purchase unit, nothing to do.
+    return round6(short);
+  };
+  /** The vendor this line would be ordered from, as the server will read it.
+   *  Declared ABOVE buyStr because the Buy box reads it — see the note there. */
+  const vendorIdOf   = (ln: Line) => String(ln.vendor_id || '').trim();
+  const vendorNameOf = (ln: Line) => String(ln.vendor || '').trim();
+  const hasVendor    = (ln: Line) => !!(vendorIdOf(ln) || vendorNameOf(ln));
+  /**
+   * The string the Buy box shows: the storekeeper's own text once he has typed
+   * in it (blank included — that is how a line is taken off the PO), otherwise
+   * the live shortfall — BUT ONLY ONCE THE LINE HAS A VENDOR. EVERY reader goes
+   * through here, so the box, the line total, the footer total and the POST body
+   * can never disagree.
+   *
+   * WHY THE VENDOR GATES THE AUTO-FILL. The submit button is disabled while any
+   * line with a Buy qty is missing its vendor or its rate, because the server
+   * 400s that request and a 400 throws the ISSUE away too. Auto-filling the Buy
+   * box from the shortfall alone turned that gate inside out: the seed never
+   * fills a vendor, so every short line became a "Buy line" with no vendor and
+   * the button locked. Measured on a copy of the live db with Issue Now cleared:
+   * 12,964 of 16,359 requisition lines auto-filled a Buy qty and ALL 12,964 had
+   * no vendor — including both requisitions sitting in the Store Inbox today,
+   * where ticking the box and lowering Issue Now disabled the hand-over
+   * outright. That is the same "the ticked box blocks the issue" defect the
+   * checkbox copy below says was fixed, arriving through the other door.
+   *
+   * A vendor is the ONLY reliable signal that a human means to buy this line —
+   * the server's own words (store-process/route.ts, vendorRefOf). So: the
+   * shortfall is shown as the box's PLACEHOLDER (grey, visible, not a value)
+   * until a vendor is picked, and fills in as a real value the moment one is.
+   * Nothing is hidden and nothing is silently dropped — an empty Buy box orders
+   * nothing, which is exactly what it looks like, and the Shortfall column next
+   * to it prints the same figure regardless. Typing in the box still wins over
+   * everything (buy_touched), so a line can be ordered with no shortfall at all.
+   */
+  const buyStr = (ln: Line) =>
+    ln.buy_touched ? ln.quantity_to_purchase
+                   : (hasVendor(ln) && autoBuyQty(ln) > 0 ? String(autoBuyQty(ln)) : '');
+  /** What the Buy box OFFERS while it is still empty — the same figure buyStr
+   *  will fill in the moment a vendor is picked, shown as a placeholder so the
+   *  storekeeper can see the suggestion without it counting as an order. */
+  const buyHint = (ln: Line) =>
+    (!ln.buy_touched && !hasVendor(ln) && autoBuyQty(ln) > 0) ? String(autoBuyQty(ln)) : '';
   /** Buy qty / unit price as numbers — the boxes hold raw strings (see seed).
    *  NO basis change: both stay in ln.po_entry_unit, exactly as before. */
-  const buyOf   = (ln: Line) => Math.max(0, Number(ln.quantity_to_purchase) || 0);
+  const buyOf   = (ln: Line) => Math.max(0, Number(buyStr(ln)) || 0);
   const priceOf = (ln: Line) => Math.max(0, Number(ln.unit_price) || 0);
+  /**
+   * The client's copy of the SERVER's mapping rule (src/lib/vendor-mapping.ts
+   * vendorMappingError), so the storekeeper is told BEFORE the round trip
+   * instead of after — and "after" here is unrecoverable: the issue commits,
+   * the requisition flips to store_processed, and the Issue button that opens
+   * this modal disappears, so the purchase intent cannot be retried from this
+   * screen at all. Returns null when there is nothing to say, including while
+   * the index has not loaded (advisory only — the server still has the last
+   * word, and its wording is what a 200 response prints).
+   *
+   * Scale, measured on live data: 308 of the 737 materials that appear on
+   * requisitions (42%) have NO vendor mapped, and 20 of 59 active vendors have
+   * no item list at all.
+   */
+  const mappingWarning = (ln: Line): string | null => {
+    if (!vmReady) return null;
+    const mapped = vendorsByMaterial[ln.material_id] || [];
+    const vid = vendorIdOf(ln);
+    if (!hasVendor(ln)) {
+      return mapped.length === 0
+        ? `No vendor is mapped to supply ${ln.material_name}. Map one on Vendor Items first — any vendor picked here will be refused and the line dropped from the PO.`
+        : null;
+    }
+    if (!vid) {
+      return `"${vendorNameOf(ln)}" was not picked from the vendor list, so its item list cannot be checked.`;
+    }
+    if (vendorsNoItems.has(vid)) {
+      return `${vendorNameOf(ln) || 'This vendor'} has no items mapped at all, so nothing can be ordered from them. This line will be DROPPED from the PO — add their item list on Vendor Items first.`;
+    }
+    if (!mapped.some(v => v.id === vid)) {
+      return `${vendorNameOf(ln) || 'This vendor'} is not mapped to supply ${ln.material_name}. This line will be DROPPED from the PO — pick a mapped vendor${mapped.length ? ` (${mapped.map(v => v.name).join(', ')})` : ''}, or map the pair on Vendor Items.`;
+    }
+    return null;
+  };
 
   // A cross-line SUM of shortfalls mixes units (kg + BTL + pcs) and is
   // meaningless as a number — count the lines that are short instead.
@@ -2194,23 +2526,53 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // PO-mode validations — fire before any DB write so the store user gets
       // a clear, line-specific error instead of a half-created PO.
       //
-      // 1. At least one line must actually contribute to the PO (qty > 0).
+      // "NO LINE HAS A BUY QTY" IS NO LONGER REFUSED. It is a legitimate
+      // outcome — the store had everything on the shelf — and refusing it left
+      // the storekeeper unable to record the hand-over at all until he unticked
+      // a box he had ticked on purpose. The server's own answer to it is
+      // "No vendor PO was raised — no line had a Buy quantity", which the
+      // result panel prints; the footer says the same thing BEFORE the click.
       const buyLines = lines.filter(ln => buyOf(ln) > 0);
-      if (buyLines.length === 0) {
-        alert('You ticked "Also raise vendor PO" but no line has a Buy quantity. Enter a positive Buy qty on at least one line, or untick the box to issue without a PO.');
-        return;
-      }
-      // 2. Every Buy-qty line must have a positive unit price.
+      // 1. Every Buy-qty line must have a positive unit price. Mirrors the
+      //    server's po_price_required 400, which refuses the WHOLE gesture
+      //    (issue included) — so it is worth stopping here.
       const noPrice = buyLines.find(ln => !(priceOf(ln) > 0));
       if (noPrice) {
         alert(`Enter a unit price (> 0) for "${noPrice.material_name}" before raising the PO. POs cannot be raised at ₹0.`);
         return;
       }
-      // 3. Every Buy-qty line must have a vendor picked.
-      const noVendor = buyLines.find(ln => !ln.vendor_id && !ln.vendor.trim());
+      // 2. Every Buy-qty line must have a vendor picked (server: po_vendor_required).
+      const noVendor = buyLines.find(ln => !hasVendor(ln));
       if (noVendor) {
         alert(`Pick a vendor for "${noVendor.material_name}" before raising the PO.`);
         return;
+      }
+      // 3. LINES THE SERVER WILL DROP. Unlike the two above, an unmapped
+      //    vendor/item pair does NOT get a 400 — the server records the issue,
+      //    reports the drop, and moves on. That is the right call there (it
+      //    refuses to strand a hand-over over a mapping it cannot fix), but it
+      //    is also a one-way door on this screen: once the requisition is
+      //    store_processed the Issue button vanishes and the purchase intent
+      //    cannot be re-submitted here. So ASK first, and let him back out and
+      //    fix the mapping instead. Advisory — `mappingWarning` is silent while
+      //    the index has not loaded, and the storekeeper can always continue.
+      // hasVendor() first: mappingWarning also speaks up on a line with NO
+      // vendor yet (to say the item has no mapped supplier at all), and that
+      // case is already refused by the price/vendor gate above — it must not be
+      // relabelled here as "the vendor you picked will be rejected".
+      const willDrop = buyLines
+        .filter(ln => hasVendor(ln))
+        .map(ln => ({ ln, why: mappingWarning(ln) }))
+        .filter(x => !!x.why);
+      if (willDrop.length > 0) {
+        const ok = confirm(
+          `${willDrop.length} purchase line${willDrop.length === 1 ? '' : 's'} will be DROPPED from the vendor PO:\n\n` +
+          willDrop.map(x => `• ${x.ln.material_name} — ${x.why}`).join('\n\n') +
+          `\n\nThe issue itself WILL be recorded either way, and this requisition cannot be issued again from this screen afterwards — ` +
+          `so the dropped quantity would have to be ordered by hand on Purchase Orders.\n\n` +
+          `Continue anyway?`,
+        );
+        if (!ok) return;
       }
     }
     setBusy(true);
@@ -2227,12 +2589,19 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         const enteredInPurchaseUnit = raisePo && ln.po_entry_unit === ln.purchase_unit && ln.pack_size > 1;
         const enteredInRecipeUnit = raisePo && !enteredInPurchaseUnit
           && ln.pack_size > 1 && ln.po_entry_unit === ln.material_unit;
-        const poQty = enteredInRecipeUnit
+        // round6 on BOTH halves. These are the numbers that land in
+        // purchase_order_items.quantity / .unit_price and get multiplied into
+        // total_price, and a recipe→purchase conversion is a float multiply:
+        // ₹0.10164/g × 1000 is 101.64000000000001, not 101.64. 6 dp is far below
+        // any real rate or quantity and removes exactly that artefact. A value
+        // entered directly in the purchase unit passes through unchanged.
+        const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
+        const poQty = round6(enteredInRecipeUnit
           ? buyOf(ln) / ln.pack_size
-          : buyOf(ln);
-        const poPrice = enteredInRecipeUnit
+          : buyOf(ln));
+        const poPrice = round6(enteredInRecipeUnit
           ? priceOf(ln) * ln.pack_size
-          : priceOf(ln);
+          : priceOf(ln));
         return {
           id: ln.id,
           // Purchase-unit box → the line's own stored unit, converted ONCE here
@@ -2260,19 +2629,187 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     }
     const r = await api(`/api/requisitions/${req.id}/store-process`, { method: 'POST', body });
     const j = await r.json();
-    if (!r.ok) { alert(j.error || 'Failed'); setBusy(false); return; }
-    // A shortfall line whose vendor is not mapped to the item is LEFT OFF the
-    // auto-PO rather than blocking the issue (store-process explains why). The
-    // server names those lines in po_skipped_note — say so, or the store user is
-    // told "Issuance recorded", walks away, and the purchase request is simply
-    // gone: no PO was raised and nothing on screen said one was missing.
-    alert(
-      j.po_skipped_note
-        ? `Issuance recorded — BUT A PURCHASE LINE WAS NOT ORDERED.\n\n${j.po_skipped_note}`
-        : 'Issuance recorded. If any items still need to be purchased, raise a vendor PO on the Purchase Orders page.',
-    );
-    onDone();
+    if (!r.ok) {
+      // The 400s now name the offending row (code + req_item_id / req_item_ids).
+      // Keep the modal open, highlight those rows, and say the sentence — the
+      // whole gesture was refused before anything was written, so it is
+      // replayable after one correction.
+      const ids: string[] = Array.isArray(j?.req_item_ids)
+        ? j.req_item_ids.map(String)
+        : (j?.req_item_id ? [String(j.req_item_id)] : []);
+      setErrorRows(new Set(ids));
+      setErrorText(String(j?.error || 'Failed'));
+      setBusy(false);
+      return;
+    }
+    // ── SHOW WHAT THE SERVER SAID, ALL OF IT ────────────────────────────────
+    // This used to be a two-branch alert() whose fallback read "Issuance
+    // recorded. If any items still need to be purchased, raise a vendor PO on
+    // the Purchase Orders page." — printed verbatim over a PO the storekeeper
+    // had just successfully raised, because it only ever looked at
+    // po_skipped_note. That single sentence is most of what "raise PO to vendor
+    // is not functioning" looks like from the counter.
+    //
+    // The result panel below renders the structured fields (the PO, every line
+    // that did not reach it with its own reason, the merge report, the lines
+    // whose stock did not move) AND `po_note` verbatim, which the route
+    // documents as the one field that is true on every path. Belt and braces on
+    // purpose: if a field is ever added that this panel does not know about,
+    // po_note still carries it.
+    setResult(j);
+    setBusy(false);
   };
+
+  // ── RESULT VIEW ───────────────────────────────────────────────────────────
+  // Shown after a 200 instead of the form. Everything on it comes off the
+  // response; nothing is inferred from what the screen asked for.
+  if (result) {
+    const skipped: any[] = Array.isArray(result.po_skipped_lines) ? result.po_skipped_lines : [];
+    // 'unmapped_vendor' and 'store_mapped' still owe goods — the route says so
+    // explicitly (its poDropped filter is these two) and keeps those quantities
+    // on the requisition. The other three codes are reported for honesty but
+    // nothing is outstanding, so they must not be dressed up as an unfilled
+    // order. KEEP THIS LIST IN STEP WITH poDropped in
+    // api/requisitions/[id]/store-process/route.ts — it decides both the status
+    // the server writes and the sentence this panel prints.
+    const stillOwed = skipped.filter(s => s.code === 'unmapped_vendor' || s.code === 'store_mapped');
+    // Their remedies are NOT the same: an unmapped pair is fixed on Vendor Items
+    // and then raised on Purchase Orders, while a store-mapped (liquor / TGBCL)
+    // material can never go on a Central PO at all and has to be bought through
+    // the Liquor Store. Sending a bar item to Vendor Items would be a dead end.
+    const owedMappingOnly = stillOwed.length > 0 && stillOwed.every(s => s.code === 'unmapped_vendor');
+    const unitReview: string[] = Array.isArray(result.issue_unit_review) ? result.issue_unit_review : [];
+    const SKIP_LABEL: Record<string, string> = {
+      unmapped_vendor: 'Vendor not mapped to this item',
+      store_mapped:    'Liquor Store item — not a Central Store purchase',
+      no_quantity:     'Vendor picked, Buy qty left blank',
+      chef_rejected:   'Chef rejected this line',
+      po_not_requested: 'No vendor PO was requested',
+    };
+    return (
+      <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
+        <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl my-8 shadow-xl">
+          <div className="px-5 py-4 border-b border-[#E8D5C4]">
+            <h2 className="font-bold text-[#2D1B0E]">{req.req_number} — issued</h2>
+            <div className="text-[11px] text-[#8B7355] mt-0.5">
+              Requisition is now <b>{STATUS_LABEL[result.status] || result.status}</b>.
+            </div>
+          </div>
+          <div className="p-5 space-y-3 text-xs">
+            {/* THE PO — the thing the old message never mentioned. */}
+            {result.linked_po_number ? (
+              <div className="px-3 py-2 rounded border border-emerald-300 bg-emerald-50 text-emerald-900">
+                <div className="font-semibold">
+                  ✓ Purchase order {result.linked_po_number} raised
+                  {result.po_line_count != null && <> for {result.po_line_count} item{result.po_line_count === 1 ? '' : 's'}</>}
+                  {result.po_total_cost != null && <> (₹{Number(result.po_total_cost).toLocaleString('en-IN')})</>}.
+                </div>
+                <div className="text-[10px] mt-0.5">
+                  It is <b>PENDING ADMIN APPROVAL</b> — nothing is ordered from the vendor until an admin approves it.{' '}
+                  <a href={`/purchase-orders?id=${result.linked_po_id}`} className="underline font-medium">Open {result.linked_po_number} →</a>
+                </div>
+              </div>
+            ) : raisePo ? (
+              <div className="px-3 py-2 rounded border border-amber-300 bg-amber-50 text-amber-900 font-semibold">
+                ⚠ No vendor PO was raised.
+                {skipped.length === 0 && <span className="font-normal"> No line had a Buy quantity.</span>}
+              </div>
+            ) : null}
+
+            {/* EVERY LINE THE SERVER DID NOT TURN INTO A PO LINE. */}
+            {skipped.length > 0 && (
+              <div className={`px-3 py-2 rounded border ${stillOwed.length > 0 ? 'border-red-300 bg-red-50 text-red-900' : 'border-amber-300 bg-amber-50 text-amber-900'}`}>
+                <div className="font-semibold">
+                  {skipped.length} purchase line{skipped.length === 1 ? ' was' : 's were'} NOT ordered
+                </div>
+                <ul className="mt-1 space-y-1.5">
+                  {skipped.map((s, k) => (
+                    <li key={`${s.req_item_id}-${k}`} className="border-t border-current/20 pt-1">
+                      <div className="font-medium">
+                        {s.material}
+                        {s.vendor ? <span className="font-normal"> → {s.vendor}</span> : null}
+                        {Number(s.quantity) > 0 && (
+                          <span className="font-normal"> · {fmtNum(Number(s.quantity))} {s.purchase_unit}
+                            {Number(s.unit_price) > 0 && <> @ ₹{fmtNum(Number(s.unit_price))}/{s.purchase_unit}</>}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[10px] opacity-90">
+                        <b>{SKIP_LABEL[s.code] || s.code}.</b> {s.reason}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                {stillOwed.length > 0 && (
+                  <div className="text-[10px] mt-1.5 pt-1.5 border-t border-current/20">
+                    The quantity is still recorded on the requisition, and this requisition can no longer be issued from this
+                    screen.{' '}
+                    {owedMappingOnly ? (
+                      <>Fix the pair on{' '}
+                        <a href="/vendors/materials" className="underline font-medium">Vendor Items</a>, then raise it on{' '}
+                        <a href="/purchase-orders" className="underline font-medium">Purchase Orders</a>.</>
+                    ) : (
+                      /* A liquor line is in the list, so the way out differs per row —
+                         send the reader to the reason above rather than to one screen
+                         that can only help half of them. */
+                      <>Each line above says where to raise it: a vendor-mapping gap is fixed on{' '}
+                        <a href="/vendors/materials" className="underline font-medium">Vendor Items</a> and then ordered on{' '}
+                        <a href="/purchase-orders" className="underline font-medium">Purchase Orders</a>, while a Liquor Store
+                        item is bought on{' '}
+                        <a href="/inventory/liquor-store" className="underline font-medium">Inventory → Liquor Store</a>.</>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Two lines of the same item collapsed onto one PO line. */}
+            {result.po_merged_note && (
+              <div className="px-3 py-2 rounded border border-amber-300 bg-amber-50 text-amber-900">
+                <div className="font-semibold">One item was ordered on a single combined line</div>
+                <div className="text-[10px] mt-0.5">{result.po_merged_note}</div>
+              </div>
+            )}
+
+            {/* STOCK DID NOT MOVE. The route reports this and the old alert
+                discarded it, so the screen said "Issuance recorded" over a line
+                whose quantity was written but whose stock never budged. */}
+            {unitReview.length > 0 && (
+              <div className="px-3 py-2 rounded border-2 border-red-300 bg-red-50 text-red-900">
+                <div className="font-semibold">🚨 Stock was NOT adjusted on {unitReview.length} line{unitReview.length === 1 ? '' : 's'}</div>
+                <div className="text-[10px] mt-0.5">
+                  The hand-over is recorded against the requisition, but the line&apos;s unit could not be resolved
+                  safely, so central stock was left untouched for: <b>{unitReview.join(', ')}</b>. Fix the unit /
+                  pack size on the material and correct the count.
+                </div>
+              </div>
+            )}
+
+            {/* The route's own one-true-sentence field, verbatim. Kept even
+                though the blocks above already say it: it is documented as
+                correct on every path, so a field this panel has not learned
+                about yet still reaches the storekeeper. */}
+            {result.po_note && (
+              <div className="px-3 py-2 rounded border border-[#E8D5C4] bg-[#FFF8F0] text-[10px] text-[#6B5744]">
+                <span className="font-semibold text-[#8B7355]">Server summary: </span>{result.po_note}
+              </div>
+            )}
+            {!result.po_note && !result.linked_po_number && skipped.length === 0 && (
+              <div className="px-3 py-2 rounded border border-emerald-200 bg-emerald-50 text-emerald-900">
+                ✓ Issuance recorded against {req.req_number}.
+              </div>
+            )}
+          </div>
+          <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end">
+            <button onClick={onDone}
+                    className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-sm rounded-lg">
+              Done
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
@@ -2284,14 +2821,77 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         <div className="p-5 space-y-3 text-xs">
           <p className="text-[#6B5744]">
             Enter the quantity <span className="text-emerald-700 font-semibold">handed to the department</span> per line.
-            Tick "Also raise vendor PO" below to bundle the shortfall lines into a single vendor PO in one go.
+            Tick &quot;Also raise a vendor PO&quot; below and every line still short after Issue Now shows the shortfall as a
+            greyed-out suggestion in its <b>Buy</b> box. Pick a vendor and it becomes the quantity to order; a shortfall is
+            not required either — type a Buy qty on any line to order it. Only lines with a Buy qty go onto the vendor PO,
+            and an empty Buy box never blocks the hand-over.
           </p>
+          {/* THIS PARAGRAPH USED TO SAY THE ISSUE MOVES NO STOCK. IT DOES —
+              src/lib/issue-stock.ts:12 "THE FLAG IS GONE. THE DEDUCT IS
+              UNCONDITIONAL", measured by calling the route against a copy of the
+              live db (21 kg of WHOLE GARLIC: current_stock 227.2 → 206.2). The
+              In Stock tooltip below already said "Issuing debits it", so the
+              modal was contradicting itself on the one fact a storekeeper needs
+              before pressing the button. No behaviour changed here or there —
+              this is the sentence catching up with the code.
+
+              BUT THE REPLACEMENT MUST NOT BE ABSOLUTE EITHER. issue-stock.ts:32-38
+              names three hand-overs that move no central stock, and two of them
+              are ordinary on this screen:
+                · LIQUOR-STORE items. centralFlowBlock() (store-engine.ts:211) is
+                  keyed on the material's CATEGORY and 23 categories map to LIQUOR
+                  STORE; 464 of the 16,353 requisition lines on this database sit
+                  in them ('bar' alone is 445). Both sides are gated — no central
+                  debit, no department credit, one row stamped store_mapped — so
+                  an unqualified "stock moves once, here" is false for them. It is
+                  named in the paragraph rather than detected per line: the
+                  category→store map lives in store_category_map, which this page
+                  has no endpoint for, and guessing at it client-side would be a
+                  second copy of a server rule. The grid below is grouped by
+                  category, so those lines are visibly under their own headers.
+                · PARTY requisitions. applyIssueDelta skips them (skip_reason
+                  'party'); the goods move on the party rail instead, and the
+                  banner below says so only when this really is one.
+              The third case (an unresolvable line unit) is REPORTED by the server
+              and printed on the result panel, so it is not claimed here. */}
           <p className="text-[10px] text-[#8B7355] italic">
-            Issuing is recorded for department audit only — it does NOT deduct stock. Recipe-deduction on sales is the only thing that subtracts from inventory; vendor purchases are the only thing that adds to it.
+            Issuing <b>debits the central store</b> and credits the department — stock moves once, here, when you submit.
+            Liquor-store items (bar / wine / spirits) are the exception: the hand-over is recorded, but the stock itself
+            moves on the Liquor Store ledger, not on this one.
+            A negative figure below means issues have outrun recorded purchases on that material, not that the shelf is empty.
           </p>
+          {/* Only on a real party requisition, so the normal case is not made
+              noisier by a rule that does not apply to it. Trigger, verbatim from
+              store-process route.ts:992: `!linkedPoId && poDropped.length === 0
+              && r.purpose === 'party'` — and store-issue/route.ts:432 fires the
+              same helper when the requisition finally reaches 'fulfilled', which
+              is why "later, when the requisition is completed" is the honest
+              second half rather than "never". */}
+          {req.purpose === 'party' && (
+            <p className="text-[10px] px-3 py-2 bg-indigo-50 border border-indigo-200 rounded text-indigo-900">
+              <b>Party requisition.</b> These goods move on the party rail — store → department — not through the issue
+              debit above. That transfer runs on this submit only if no vendor PO is raised and no purchase line is
+              dropped; otherwise it runs later, when the requisition is completed on Store Requisitions.
+            </p>
+          )}
           <p className="text-[10px] text-[#8B7355] italic">
             Every quantity below is shown and entered in the material&apos;s <b>purchase unit</b> (PKT / BTL / CASE) — the same unit the HOD approved in. The small grey figure underneath is the exact recipe-unit equivalent that gets stored.
           </p>
+
+          {/* A REFUSED SUBMIT. Every 400 store-process raises happens BEFORE its
+              transaction opens, so nothing was written and the form below is
+              still exactly what the storekeeper typed — correct the named row
+              and press the button again. Shown here rather than in an alert()
+              so the sentence stays on screen next to the outlined row. */}
+          {errorText && (
+            <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900">
+              <div className="font-semibold">Nothing was saved — this issue was refused.</div>
+              <div className="mt-0.5">{errorText}</div>
+              {errorRows.size > 0 && (
+                <div className="text-[10px] mt-0.5">The affected line{errorRows.size === 1 ? ' is' : 's are'} outlined in red below.</div>
+              )}
+            </div>
+          )}
 
           {rejectedCount > 0 && (
             <div className="text-[11px] px-3 py-2 bg-red-50 border border-red-200 rounded text-red-800">
@@ -2349,12 +2949,29 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             <input type="checkbox" checked={raisePo} onChange={e => setRaisePo(e.target.checked)}
                    className="mt-0.5" />
             <div>
-              <div className="font-medium text-blue-900">Also raise vendor PO for the shortfall</div>
+              {/* "…for the shortfall" made a shortfall read as a PRECONDITION.
+                  It is not one: the server takes any positive Buy qty and 99.2%
+                  of live requisition lines open with no shortfall at all, so the
+                  label was describing a feature the storekeeper could not find.
+                  The shortfall is where the Buy box STARTS, which is what the
+                  parenthesis now says. */}
+              <div className="font-medium text-blue-900">Also raise a vendor PO (pick a vendor to order a line&apos;s shortfall)</div>
+              {/* The old sub-copy was true but incomplete, and the gap is what
+                  made the feature look broken: it said "lines with a positive
+                  Buy qty are bundled" without ever saying that Buy is a box you
+                  can type in, while the ₹ and Vendor controls beside an empty
+                  Buy box sat greyed out — which reads as "this row is dead". */}
               <div className="text-[10px] text-blue-800 mt-0.5">
                 {raisePo
-                  ? 'Vendor + unit-price fields appear on each line. On submit, lines with a positive "Buy" qty are bundled into a single PO (pending admin approval).'
+                  ? 'Buy / Unit ₹ / Vendor appear on every line. A short line shows what it is short of as a grey suggestion in the Buy box; picking a vendor fills it in as the quantity to order, and you can type over it or clear it. Nothing is ordered while the box is empty, so an untouched grid still submits. Each Buy line needs a price and a vendor mapped to that item; the lot goes onto ONE purchase order, pending admin approval.'
                   : 'Default OFF. Issuance only — store manager raises POs separately on /purchase-orders.'}
               </div>
+              {raisePo && vmError && (
+                <div className="text-[10px] text-amber-800 mt-1">
+                  ⚠ The vendor → item mapping could not be loaded ({vmError}), so this screen cannot tell you in
+                  advance which vendors will be accepted. The server still enforces it and will report any line it drops.
+                </div>
+              )}
             </div>
           </label>
 
@@ -2368,19 +2985,53 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                       deduct-at-issue it is the opposite: the issue IS the central
                       debit. Left stale, this label would have told the storekeeper
                       the exact inverse of what the button he is about to press does. */}
-                  <th className="text-right py-1.5 px-2 font-medium" title="Central store book balance. Issuing debits it — a negative figure means issues have outrun recorded purchases, not that the shelf is empty.">In Stock*</th>
+                  <th className="text-right py-1.5 px-2 font-medium" title="Central store book balance. Issuing debits it (liquor-store items excepted — those move on the Liquor Store ledger) — a negative figure means issues have outrun recorded purchases, not that the shelf is empty.">In Stock*</th>
                   <th className="text-right py-1.5 px-2 font-medium">Issue Now</th>
-                  <th className="text-right py-1.5 px-2 font-medium">Shortfall</th>
+                  {/* Say what this subtracts. It is NOT "what the store is out
+                      of" — it is Requested minus what you are handing over on
+                      this line, which is also what the Buy box follows. */}
+                  <th className="text-right py-1.5 px-2 font-medium"
+                      title="Requested (or HOD-approved) minus Issue Now — what this department is still owed after this hand-over. The Buy box follows this figure until you type over it.">Shortfall</th>
                   {raisePo && <>
-                    <th className="text-right py-1.5 px-2 font-medium">Buy</th>
-                    <th className="text-right py-1.5 px-2 font-medium">Unit ₹</th>
-                    <th className="text-left  py-1.5 px-2 font-medium">Vendor</th>
+                    <th className="text-right py-1.5 px-2 font-medium"
+                        title="Quantity to put on the vendor PO. Starts at the Shortfall beside it and is fully editable — type one on any line to order it, whatever the shortfall says; clear it to leave the item off the PO.">Buy</th>
+                    <th className="text-right py-1.5 px-2 font-medium" title="Price per the unit shown, seeded from the last purchase of this item. Only used on lines with a Buy qty.">Unit ₹</th>
+                    <th className="text-left  py-1.5 px-2 font-medium" title="Vendor for this PO line. It must be mapped to supply this item on Vendor Items, or the server drops the line from the PO.">Vendor</th>
                     <th className="text-right py-1.5 px-2 font-medium">PO Line ₹</th>
                   </>}
                 </tr>
               </thead>
               <tbody>
-                {lines.map((ln, i) => {
+                {/* CATEGORY-WISE, exactly like the read-only Store Inbox table
+                    above and like /store-requisitions (page.tsx:1508-1552) —
+                    same helper, same rule, so the SAME requisition reads the
+                    same way on all three surfaces. This is the grid the store
+                    person actually works down while walking the room, so
+                    grouping only the read-only table would have left the one
+                    screen that matters ordered by name.
+
+                    THE ARRAY ITSELF IS NOT REORDERED. `lines` keeps its original
+                    order and its original indices; the map below walks groups of
+                    {original index} and reads `lines[i]`, so update(i, …), the
+                    POST body, poTotal and every accessor are byte-identical to
+                    an ungrouped render. Nothing here is collapsible: a hidden
+                    group on a hand-over sheet is a line quietly not issued. */}
+                {groupLinesByCategory(lines.map((ln, i) => ({ ...ln, __i: i }))).map(group => (
+                <Fragment key={`cat-${group.name}`}>
+                  <tr className="bg-[#FFF1E3] border-t border-[#E8D5C4]">
+                    {/* 5 columns normally, 9 once Buy / Unit ₹ / Vendor / PO Line ₹
+                        appear — same `raisePo` the <thead> and <tfoot> use. */}
+                    <td colSpan={raisePo ? 9 : 5}
+                        className="py-1 px-2 text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">
+                      {group.name}
+                      <span className="ml-1.5 font-normal normal-case">
+                        ({group.lines.length} item{group.lines.length === 1 ? '' : 's'})
+                      </span>
+                    </td>
+                  </tr>
+                  {group.lines.map(g => {
+                  const i = g.__i;
+                  const ln = lines[i];
                   const U = ln.U;
                   // Live issued qty in the STORED unit — every comparison below
                   // stays on the stored basis (exact, and it is what gets saved);
@@ -2404,8 +3055,19 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   const hint = (q: number) => U.pf > 1
                     ? <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
                     : null;
+                  // PO-side state for this row, all read through the one set of
+                  // accessors so the row, the footer and the POST body agree.
+                  const buy      = buyOf(ln);
+                  const mapWarn  = raisePo && buy > 0 ? mappingWarning(ln) : null;
+                  // Picked a vendor and left Buy at 0. Legal, and the server
+                  // reports it back as `no_quantity` — but say so BEFORE the
+                  // click, since nothing gets ordered for the item.
+                  const vendorNoQty = raisePo && buy <= 0 && hasVendor(ln);
+                  const rowFlagged  = errorRows.has(ln.id);
                   return (
-                    <tr key={ln.id} className={`border-t border-[#E8D5C4]/50 ${negStock ? 'bg-red-50/50' : ''}`}>
+                    <tr key={ln.id} className={`border-t border-[#E8D5C4]/50 ${
+                      rowFlagged ? 'bg-red-100 border-l-4 border-l-red-500'
+                      : negStock ? 'bg-red-50/50' : ''}`}>
                       <td className="py-1.5 px-2 font-medium">
                         {ln.material_name}
                         {negStock && (
@@ -2481,10 +3143,27 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                 — it is NOT put through the issue-side conversion,
                                 or the rate would end up on the other basis from
                                 the qty. Raw string only so decimals stay typeable. */}
+                            {/* buyStr(), not ln.quantity_to_purchase: once this
+                                line has a vendor the box FOLLOWS the Shortfall
+                                column beside it. buy_touched freezes it the
+                                moment he types — including clearing it, which is
+                                how a line is taken off the PO. Before a vendor is
+                                picked the shortfall shows as the PLACEHOLDER
+                                (buyHint) instead of a value: visible, but not an
+                                order, so an untouched grid never locks the submit
+                                button. See buyStr() for why. */}
                             <input type="number" step="any" min={0}
-                                   value={ln.quantity_to_purchase}
-                                   onChange={e => update(i, { quantity_to_purchase: e.target.value.replace(/^-/, '') })}
-                                   title={`Quantity to order, in ${ln.po_entry_unit || 'units'} (the unit the rate beside it is per).`}
+                                   value={buyStr(ln)}
+                                   placeholder={buyHint(ln)}
+                                   onChange={e => update(i, {
+                                     quantity_to_purchase: e.target.value.replace(/^-/, ''),
+                                     buy_touched: true,
+                                   })}
+                                   title={ln.buy_touched
+                                     ? `Quantity to order, in ${ln.po_entry_unit || 'units'} (the unit the rate beside it is per). You have set this by hand — clear the box to leave this item off the PO.`
+                                     : hasVendor(ln)
+                                       ? `Quantity to order, in ${ln.po_entry_unit || 'units'} (the unit the rate beside it is per). Following the Shortfall column — type over it to order a different amount, or clear it to leave this item off the PO.`
+                                       : `${buyHint(ln) ? `${buyHint(ln)} ${ln.po_entry_unit || 'units'} is short. ` : ''}Nothing is ordered for this item yet — pick a vendor to put the shortfall on the PO, or type a quantity here to order it anyway.`}
                                    className="w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
                             {/* Unit selector only when the two units really differ
                                 (ln.pack_size is the canon-guarded factor, so > 1
@@ -2501,18 +3180,50 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                         // Convert the existing qty + price between
                                         // recipe and purchase units so the line
                                         // total stays the same after the switch.
+                                        //
+                                        // THIS IS A BASIS SWITCH, NOT A NEW ORDER,
+                                        // so neither half may move. Two things
+                                        // used to move it, both silently:
+                                        //   · Math.ceil on the quantity. 500 g
+                                        //     switched to kg became ceil(0.5) = 1
+                                        //     kg — the line DOUBLED, ₹50.82 →
+                                        //     ₹101.64, one click. Rounding up to a
+                                        //     whole pack is right when SEEDING a
+                                        //     fresh order (autoBuyQty does it, for
+                                        //     countable units only); it is never
+                                        //     right when re-expressing a quantity
+                                        //     the storekeeper has already decided.
+                                        //   · 2-dp rounding on the price. ₹101.64
+                                        //     per kg became ₹0.10 per g instead of
+                                        //     ₹0.10164, and switching back read
+                                        //     ₹100 — 1.61% of a money field gone,
+                                        //     with the original rate unrecoverable.
+                                        // 6 dp is the precision lineUnits already
+                                        // rounds entered figures to, and it is
+                                        // enough to make the round trip exact
+                                        // while keeping the float noise
+                                        // (0.10164000000000001) out of the box.
+                                        const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
                                         const goingToPurchase = newUnit === ln.purchase_unit;
-                                        const newQty   = goingToPurchase
-                                          ? Math.ceil(buyOf(ln) / ln.pack_size)
-                                          : buyOf(ln) * ln.pack_size;
-                                        const newPrice = goingToPurchase
+                                        const newQty   = round6(goingToPurchase
+                                          ? buyOf(ln) / ln.pack_size
+                                          : buyOf(ln) * ln.pack_size);
+                                        const newPrice = round6(goingToPurchase
                                           ? priceOf(ln) * ln.pack_size
-                                          : priceOf(ln) / ln.pack_size;
+                                          : priceOf(ln) / ln.pack_size);
                                         // Back to strings — the boxes hold raw text (blank stays blank).
+                                        // An UNTOUCHED Buy box is not rewritten:
+                                        // autoBuyQty() already reads po_entry_unit
+                                        // and re-expresses the shortfall in the new
+                                        // unit itself. Writing a converted figure
+                                        // here would silently freeze it as a manual
+                                        // override.
                                         update(i, {
                                           po_entry_unit: newUnit,
-                                          quantity_to_purchase: newQty > 0 ? String(newQty) : '',
-                                          unit_price: newPrice > 0 ? String(Math.round(newPrice * 100) / 100) : '',
+                                          ...(ln.buy_touched
+                                            ? { quantity_to_purchase: newQty > 0 ? String(newQty) : '' }
+                                            : {}),
+                                          unit_price: newPrice > 0 ? String(newPrice) : '',
                                         });
                                       }}
                                       title="Switch between vendor's purchase unit and recipe unit. Math stays consistent."
@@ -2542,38 +3253,53 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                           {/* ₹ per po_entry_unit — same basis as the qty beside it,
                               so rate × qty is one basis end to end. Raw string for
                               the same reason as the qty: "450." must stay typeable. */}
+                          {/* NOT disabled on a 0 Buy qty any more. Greying the
+                              price and the vendor out was what made a fully
+                              stocked row read as dead — the storekeeper saw
+                              "Shortfall 0 / — pick vend…" in grey and concluded
+                              the feature was broken, when the enabled Buy box
+                              beside it was the way in the whole time. Both are
+                              live now; a vendor without a qty is reported by the
+                              server as `no_quantity` and warned about below. */}
                           <input type="number" step="any" min={0} value={ln.unit_price}
-                                 disabled={buyOf(ln) <= 0}
                                  onChange={e => update(i, { unit_price: e.target.value.replace(/^-/, '') })}
-                                 title={`Price per ${ln.po_entry_unit}`}
-                                 className="w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs disabled:opacity-50" />
+                                 title={`Price per ${ln.po_entry_unit}. Seeded from the last purchase of this item; only used if this line has a Buy qty.`}
+                                 className={`w-20 px-1.5 py-1 border rounded text-right text-xs ${
+                                   buy > 0 && !(priceOf(ln) > 0) ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`} />
                           <span className="ml-1 text-[10px] text-[#8B7355]">/{ln.po_entry_unit}</span>
+                          {buy > 0 && !(priceOf(ln) > 0) && (
+                            <div className="text-[9px] text-amber-800 mt-0.5">Price required — a PO cannot be raised at ₹0.</div>
+                          )}
                         </td>
                         <td className="py-1.5 px-2">
                           {/* Vendor dropdown — mapped vendors for this material
                               first (curated via /vendors/materials), then the
-                              full active-vendor catalog. If the material has
-                              zero mappings yet, the dropdown still shows every
-                              active vendor so the PO never gets blocked. */}
+                              full active-vendor catalog. The unmapped ones stay
+                              on the list ON PURPOSE: the server DROPS such a line
+                              rather than refusing the request, so hiding them
+                              here would not prevent anything, and on this data 42%
+                              of requisitioned materials have no mapping at all —
+                              a store person needs to see that and be told why,
+                              not handed an empty dropdown. Each one is labelled,
+                              and the row warns underneath. */}
                           {(() => {
                             const mapped  = vendorsByMaterial[ln.material_id] || [];
                             const mappedIds = new Set(mapped.map(v => v.id));
                             const others  = allVendors.filter(v => !mappedIds.has(v.id));
-                            const disabled = buyOf(ln) <= 0;
                             return (
                               <select value={ln.vendor_id}
-                                      disabled={disabled}
                                       onChange={e => {
                                         const vid = e.target.value;
                                         const v = [...mapped, ...others].find(x => x.id === vid);
                                         update(i, { vendor_id: vid, vendor: v?.name || '' });
                                       }}
-                                      title={disabled
-                                        ? 'Enter a Buy qty to enable vendor selection.'
+                                      title={!vmReady
+                                        ? 'The vendor → item mapping has not loaded, so this list is not filtered. The server still enforces it.'
                                         : mapped.length > 0
-                                          ? `${mapped.length} vendor(s) mapped to this material on /vendors/materials.`
-                                          : 'No mapped vendors yet — showing all active vendors.'}
-                                      className="w-36 px-1.5 py-1 border border-[#E8D5C4] rounded text-xs bg-white disabled:opacity-50">
+                                          ? `${mapped.length} vendor(s) mapped to this material on Vendor Items. Anyone else will be refused and the line dropped from the PO.`
+                                          : 'NO vendor is mapped to this material yet, so every option here will be refused. Map one on Vendor Items first.'}
+                                      className={`w-36 px-1.5 py-1 border rounded text-xs bg-white ${
+                                        mapWarn ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4]'}`}>
                                 <option value="">— pick vendor —</option>
                                 {mapped.length > 0 && (
                                   <optgroup label={`Mapped to ${ln.material_name}`}>
@@ -2581,13 +3307,29 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                   </optgroup>
                                 )}
                                 {others.length > 0 && (
-                                  <optgroup label={mapped.length > 0 ? 'Other active vendors' : 'All active vendors'}>
+                                  <optgroup label={!vmReady
+                                    ? 'All active vendors (mapping not loaded)'
+                                    : mapped.length > 0 ? 'Other active vendors — NOT mapped to this item' : 'All active vendors — NONE mapped to this item'}>
                                     {others.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
                                   </optgroup>
                                 )}
                               </select>
                             );
                           })()}
+                          {/* The whole point of loading the mapping: say it HERE,
+                              before submit. Afterwards the requisition is
+                              store_processed and this modal is unreachable. */}
+                          {mapWarn && (
+                            <div className="text-[9px] text-amber-800 mt-0.5 max-w-[9rem]">
+                              ⚠ {mapWarn}{' '}
+                              <a href="/vendors/materials" target="_blank" rel="noopener noreferrer" className="underline">Vendor Items</a>
+                            </div>
+                          )}
+                          {vendorNoQty && (
+                            <div className="text-[9px] text-amber-800 mt-0.5 max-w-[9rem]">
+                              ⚠ Buy qty is 0 — nothing will be ordered for this item.
+                            </div>
+                          )}
                         </td>
                         <td className="py-1.5 px-2 text-right font-mono"
                             title={buyOf(ln) > 0 ? `${fmtNum(buyOf(ln))} × ₹${priceOf(ln)} per ${ln.po_entry_unit}` : ''}>
@@ -2598,12 +3340,23 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                       </>}
                     </tr>
                   );
-                })}
+                  })}
+                </Fragment>
+                ))}
               </tbody>
               {raisePo && (
                 <tfoot>
+                  {/* EVERY Buy line, including any the mapping rule will drop —
+                      so this is what was ASKED FOR, not necessarily what the PO
+                      will be worth. The blue panel under the table states the
+                      net figure; labelling this one "Vendor PO total" while a
+                      line was silently dropped is how the screen came to promise
+                      a PO of ₹365 and write one of ₹320. */}
                   <tr className="border-t border-[#E8D5C4] font-semibold bg-white">
-                    <td colSpan={8} className="py-1.5 px-2 text-right">Vendor PO total</td>
+                    <td colSpan={8} className="py-1.5 px-2 text-right"
+                        title="Sum of every line with a Buy qty. Lines flagged for an unmapped vendor are included here but will not reach the PO.">
+                      Buy lines total
+                    </td>
                     <td className="py-1.5 px-2 text-right font-mono">₹{poTotal.toFixed(0)}</td>
                   </tr>
                 </tfoot>
@@ -2635,13 +3388,47 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             )}
           </div>
 
-          {raisePo ? (
-            <div className="text-[11px] px-3 py-2 bg-blue-50 border border-blue-200 rounded">
-              On submit: issuance recorded against the requisition (no stock change) + new vendor PO created in <b>pending</b> status. When that PO is received via GRN, stock increases and the requisition is fulfilled.
-            </div>
-          ) : totalShortfall > 0 ? (
+          {/* WHAT WILL ACTUALLY HAPPEN, counted off the same accessors the POST
+              body uses. The old text asserted a PO unconditionally ("+ new vendor PO
+              created in pending status") the moment the box was ticked, even
+              with every Buy box empty — and claimed "no stock change", which is
+              the opposite of what the issue does (see the note at the top). */}
+          {raisePo ? (() => {
+            const buyLines  = lines.filter(ln => buyOf(ln) > 0);
+            // Same predicate as submit()'s confirm — vendor named AND rejected
+            // by the mapping rule. A line with no vendor yet is a different
+            // problem and the footer's blocked-reason owns it.
+            const dropLines = buyLines.filter(ln => hasVendor(ln) && !!mappingWarning(ln));
+            const keepLines = buyLines.filter(ln => !dropLines.includes(ln));
+            const netTotal  = keepLines.reduce((s, ln) => s + buyOf(ln) * priceOf(ln), 0);
+            return (
+              <div className={`text-[11px] px-3 py-2 rounded border ${
+                buyLines.length === 0 ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-blue-50 border-blue-200'}`}>
+                {buyLines.length === 0 ? (
+                  <>⚠ <b>No line has a Buy qty</b>, so <b>no vendor PO will be raised</b> — only the issue will be recorded.
+                    Type a Buy qty on any line to order it (it fills itself from the Shortfall column), or untick the box — either way the hand-over is recorded.</>
+                ) : (
+                  /* "the issue is recorded", not "central stock is debited": on a
+                     liquor-store line or a party requisition it is recorded
+                     without that debit (see the note at the top of this modal),
+                     and this panel cannot tell which lines those are. */
+                  <>On submit: the issue is recorded against the requisition and{' '}
+                    <b>{keepLines.length}</b> of {buyLines.length} Buy line{buyLines.length === 1 ? '' : 's'}{' '}
+                    go onto ONE vendor PO worth <b>₹{netTotal.toFixed(0)}</b>, created <b>pending admin approval</b>.
+                    Stock only increases again when that PO is received via GRN.
+                    {dropLines.length > 0 && (
+                      <> <span className="text-amber-800 font-semibold">
+                        {dropLines.length} line{dropLines.length === 1 ? '' : 's'} will be DROPPED for an unmapped vendor
+                        ({dropLines.map(ln => ln.material_name).join(', ')}) — you will be asked to confirm.
+                      </span></>
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })() : totalShortfall > 0 ? (
             <div className="text-[11px] px-3 py-2 bg-amber-50 border border-amber-200 rounded">
-              ⚠ <b>{shortLineCount}</b> line{shortLineCount === 1 ? ' is' : 's are'} short of the requested qty above. To buy the rest, either tick "Also raise vendor PO" above, or raise POs separately on the <a href="/purchase-orders" className="underline">Purchase Orders</a> page.
+              ⚠ <b>{shortLineCount}</b> line{shortLineCount === 1 ? ' is' : 's are'} short of the requested qty above. To buy the rest, either tick "Also raise a vendor PO" above, or raise POs separately on the <a href="/purchase-orders" className="underline">Purchase Orders</a> page.
             </div>
           ) : (
             <div className="text-[11px] px-3 py-2 bg-emerald-50 border border-emerald-200 rounded">
@@ -2649,31 +3436,41 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             </div>
           )}
         </div>
-        {/* Submit gate — when PO mode is on, the button is also disabled if no
-            Buy line has qty + price + vendor yet (visual feedback before click). */}
+        {/* Submit gate.
+            TICKING THE BOX NO LONGER BLOCKS THE HAND-OVER. It used to: with
+            every Buy box empty — the state 99.2% of live requisition lines open
+            in — `poReady` was false and the button was disabled outright, so a
+            storekeeper who ticked the box could not record the goods he had
+            just handed over until he unticked it again. "No Buy qty" is a
+            legitimate outcome (the store had everything), the server says so in
+            its own words, and the blue panel above says it before the click.
+            What still disables the button is only what the SERVER would refuse
+            with a 400 — a Buy line missing its price or its vendor — because
+            that 400 throws away the issue as well. An unmapped vendor is NOT in
+            this list: the server accepts that request and reports the drop, so
+            it is a confirm() inside submit(), not a lock. */}
         {(() => {
           const buyLines = lines.filter(ln => buyOf(ln) > 0);
-          const poReady  = !raisePo || (
-            buyLines.length > 0
-            && buyLines.every(ln =>
-              priceOf(ln) > 0 && (ln.vendor_id || (ln.vendor || '').trim()))
-          );
-          const blockedReason = !raisePo ? ''
-            : buyLines.length === 0
-              ? 'Enter a Buy qty on at least one line, or untick "Also raise vendor PO".'
-              : buyLines.some(ln => !(priceOf(ln) > 0))
-                ? 'Every Buy line needs a unit price > 0 before raising the PO.'
-                : 'Every Buy line needs a vendor picked before raising the PO.';
+          const missingPrice  = raisePo ? buyLines.find(ln => !(priceOf(ln) > 0))  : undefined;
+          const missingVendor = raisePo ? buyLines.find(ln => !hasVendor(ln))      : undefined;
+          const poReady = !missingPrice && !missingVendor;
+          const blockedReason = missingPrice
+            ? `"${missingPrice.material_name}" has a Buy qty but no unit price — a PO cannot be raised at ₹0, and the server would refuse the whole issue.`
+            : missingVendor
+              ? `"${missingVendor.material_name}" has a Buy qty but no vendor — pick one, or clear its Buy box to leave it off the PO.`
+              : '';
           return (
             <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
-              {raisePo && !poReady && (
-                <span className="mr-auto text-[10px] text-amber-700">{blockedReason}</span>
+              {!poReady && (
+                <span className="mr-auto text-[11px] text-amber-800">{blockedReason}</span>
               )}
               <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
               <button onClick={submit} disabled={busy || !poReady}
                       title={!poReady ? blockedReason : ''}
                       className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white text-sm rounded-lg disabled:opacity-40 disabled:cursor-not-allowed">
-                {busy ? 'Recording…' : (raisePo ? 'Issue + Raise PO' : 'Issue to Department')}
+                {/* The label states what this click will actually do — it used to
+                    promise "Issue + Raise PO" on a tick with nothing to buy. */}
+                {busy ? 'Recording…' : (raisePo && buyLines.length > 0 ? 'Issue + Raise PO' : 'Issue to Department')}
               </button>
             </div>
           );
