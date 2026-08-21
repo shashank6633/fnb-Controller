@@ -7,7 +7,7 @@
 
 import { useEffect, useMemo, useState, Fragment, type ReactNode } from 'react';
 import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save, Download, Percent,
-         Eye, Pencil, Printer, AlertTriangle } from 'lucide-react';
+         Eye, Pencil, Printer, AlertTriangle, ChefHat, Wine, Clock, ShieldAlert, Info } from 'lucide-react';
 import { api } from '@/lib/api';
 import { todayIST, fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
@@ -103,6 +103,82 @@ const itemInwardTotal = (it: any) =>
   + (Number(it.special_excise_cess) || 0) + (Number(it.tcs) || 0)
   + (Number(it.delivery_charges) || 0) + (Number(it.mrp_round_off) || 0);
 
+/* ============================================================ */
+/* THE KITCHEN QC GATE, as this page has to speak about it.     */
+/*                                                              */
+/* A delivery in a category the admin mapped to a checker is    */
+/* saved as `awaiting_qc` and MOVES NO STOCK until the checking */
+/* department signs (src/lib/grn-qc.ts). That is not an error   */
+/* and it is not something the receiving desk did wrong — it is */
+/* the vendor still being at the bay while the goods are        */
+/* judged. Everything below exists so this page says that in    */
+/* those words rather than showing an unstyled badge and a ₹0   */
+/* accepted column the store person has to guess about.         */
+/* ============================================================ */
+
+/** Who owes the check. Same vocabulary as grn-qc.ts's QcChecker. 'both' means
+ *  EITHER department may sign — NOT that two signatures are required. */
+type QcChecker = 'none' | 'kitchen' | 'bar' | 'both';
+const CHECKER_LABEL: Record<string, string> = {
+  kitchen: 'Kitchen', bar: 'Bar', both: 'Kitchen or Bar', none: 'No check',
+};
+/** Wording transcribed VERBATIM from the printed GRN sheet
+ *  (src/app/grn/print/[id]/page.tsx:82) and from the sign-off queue
+ *  (src/app/grn/qc/page.tsx:279) — the paper, the queue and this page must not
+ *  describe the same six checks in three different phrasings. `short` is the
+ *  chip label for the detail panel, where the long form does not fit. */
+type QcKey = 'qc_quality' | 'qc_temperature' | 'qc_expiry' | 'qc_damage' | 'qc_weight' | 'qc_invoice_match';
+interface QcFieldDef { k: QcKey; label: string; short: string }
+/** THE KITCHEN / BAR HALF of the owner's decision-4 split. On a gated receipt
+ *  these are stamped by POST /api/grn/[id]/qc alongside qc_kitchen_by/at, and
+ *  PUT /api/grn/[id] REFUSES to let the receiving desk amend them
+ *  (src/app/api/grn/[id]/route.ts:356) — the whole point being that the person
+ *  who took the delivery in must not also certify its quality. */
+const KITCHEN_QC_FIELDS: QcFieldDef[] = [
+  { k: 'qc_quality',     label: 'Quality OK (look · smell · feel)',            short: 'Quality' },
+  { k: 'qc_temperature', label: 'Temperature within range (cold-chain items)', short: 'Temperature' },
+  { k: 'qc_damage',      label: 'No visible damage / leak / pest',             short: 'No damage' },
+];
+/** THE STORE HALF — the receiving desk's own three, on every receipt. All three
+ *  together are what stamps qc_store_by/qc_store_at on POST /api/grn
+ *  (src/app/api/grn/route.ts:502); a partial tick is deliberately left unsigned
+ *  rather than stamped with a name. */
+const STORE_QC_FIELDS: QcFieldDef[] = [
+  { k: 'qc_expiry',        label: 'Expiry / use-by date checked',          short: 'Expiry' },
+  { k: 'qc_weight',        label: 'Weight / count verified vs invoice',    short: 'Weight' },
+  { k: 'qc_invoice_match', label: 'Invoice matches PO (rate, qty, vendor)', short: 'Invoice match' },
+];
+/** Store first, then kitchen — the order the receiving desk meets them. Used to
+ *  name the six ticks in the amendment trail, where "QC · Quality" alone left a
+ *  reader unable to tell whose answer had been changed. */
+const QC_OWNER_LABEL: Record<string, string> = Object.fromEntries([
+  ...STORE_QC_FIELDS.map(f => [f.k, `Store check · ${f.short}`]),
+  ...KITCHEN_QC_FIELDS.map(f => [f.k, `Kitchen QC · ${f.short}`]),
+]);
+
+/** How long it has waited, in words a person uses at 6am. Same shape as
+ *  grn/qc/page.tsx:223 so the two screens never phrase one wait two ways. */
+const waitedFor = (hours: number): string => {
+  const h = Number(hours) || 0;
+  if (h < 1) return `${Math.max(1, Math.round(h * 60))} min`;
+  if (h < 24) return `${Math.round(h * 10) / 10} hr`;
+  const d = Math.floor(h / 24);
+  const r = Math.round(h - d * 24);
+  return r ? `${d}d ${r}h` : `${d}d`;
+};
+/** Hours since a SQLite `datetime('now')` stamp — NULL, never 0, when it cannot
+ *  be read. A stamp coerced to 0 would print "1 min" on a delivery that has sat
+ *  since yesterday, quietly reversing the one number this treatment exists to
+ *  make loud. Only used as the FALLBACK when /api/grn/qc did not answer; the
+ *  server's own waiting_hours is preferred so this page and the queue agree. */
+const hoursSince = (stamp: string | null | undefined): number | null => {
+  if (!stamp) return null;
+  const s = String(stamp);
+  const d = new Date(s.includes('T') || s.includes('Z') ? s : s.replace(' ', 'T') + 'Z');
+  if (Number.isNaN(d.getTime())) return null;
+  return (Date.now() - d.getTime()) / 3600000;
+};
+
 interface GRN {
   id: string; grn_number: string; date: string; time?: string;
   po_id?: string; po_number?: string;
@@ -110,9 +186,28 @@ interface GRN {
   invoice_number?: string; invoice_date?: string;
   received_by?: string; qc_by?: string;
   /** 'void' = the bill was cancelled and the stock it added was reversed. The
-   *  DOCUMENT is kept (header + line items) — see DELETE /api/grn/[id]. */
-  status: 'received' | 'partial' | 'rejected' | 'void';
+   *  DOCUMENT is kept (header + line items) — see DELETE /api/grn/[id].
+   *  'awaiting_qc' = RECORDED BUT NOT OURS YET: the document exists, the goods
+   *  are on the bay, and NOTHING has been added to stock. It is not a grade of
+   *  receipt and not a failure — see the QC block above. */
+  status: 'received' | 'awaiting_qc' | 'partial' | 'rejected' | 'void';
   notes?: string;
+  /* ── QC stamps. Plain columns on goods_receipt_notes, so `SELECT g.*` ships
+        them to every reader of GET /api/grn — no query change was needed. All
+        optional: a payload from before the gate existed simply has none, and
+        `qc_required` absent reads the same as 0 (never gated). ── */
+  created_at?: string;
+  qc_required?: number;
+  qc_checker?: string;
+  /** 'pending' | 'signed' | 'override' | 'rejected' | '' (never gated). */
+  qc_outcome?: string;
+  qc_kitchen_by?: string | null; qc_kitchen_at?: string | null;
+  qc_store_by?: string | null;   qc_store_at?: string | null;
+  qc_override_by?: string | null; qc_override_at?: string | null; qc_override_reason?: string | null;
+  qc_applied_at?: string | null;
+  qc_escalated_at?: string | null;
+  qc_quality?: number; qc_temperature?: number; qc_expiry?: number;
+  qc_damage?: number; qc_weight?: number; qc_invoice_match?: number;
   line_count: number;
   total_rejected: number;
   /** How many DISTINCT purchase units the rejected lines span (0 = none rejected).
@@ -139,6 +234,13 @@ interface GRN {
 
 const STATUS_TONE: Record<string, string> = {
   received: 'bg-emerald-100 text-emerald-700 border-emerald-200',
+  // BLUE, NOT AMBER OR RED, and the choice is load-bearing. Amber here would
+  // collide with 'partial', which means goods really were turned away, and red
+  // would tell the store person they made a mistake — they did not; they
+  // recorded a delivery that is waiting on somebody else. Blue is also the
+  // family the receiving checklist already uses on this page, so "awaiting a
+  // check" and "the check" read as one thing.
+  awaiting_qc: 'bg-blue-100 text-blue-800 border-blue-200',
   partial:  'bg-amber-100 text-amber-800 border-amber-200',
   rejected: 'bg-red-100 text-red-700 border-red-200',
   // Deliberately NOT a status colour — a void is not a grade of receipt. Slate
@@ -146,6 +248,37 @@ const STATUS_TONE: Record<string, string> = {
   // around it is greyed + struck through.
   void:     'bg-[#EFE7DE] text-[#6B5744] border-[#B8A590] line-through',
 };
+/** The badge caption. Only the new state is renamed: `awaiting_qc` is a column
+ *  value, not English, and the badge is the first place the store person looks
+ *  when their stock has not appeared. Everything else keeps the stored word so
+ *  the screen and the register CSV still say the same thing. */
+const STATUS_LABEL: Record<string, string> = { awaiting_qc: 'awaiting kitchen QC' };
+const statusLabel = (s: string) => STATUS_LABEL[s] || s;
+
+/** Is this receipt still holding its goods at the bay? */
+const isHeld = (g: { status: string }) => g.status === 'awaiting_qc';
+/** Was this receipt EVER put through the gate — including after it cleared?
+ *  Drives the split checklist and the "who signed" stamps on a decided bill. */
+const wasGated = (g: { qc_required?: number }) => Number(g?.qc_required) === 1;
+
+/** One held receipt as GET /api/grn/qc reports it. Only the fields this page
+ *  renders — the queue payload carries more. */
+interface QcQueueRow {
+  id: string; grn_number: string; qc_checker: string;
+  /** Server-computed, from goods_receipt_notes.created_at. */
+  waiting_hours: number;
+  /** Past the admin's escalation threshold. A SETTING, not a constant — which
+   *  is exactly why this is read from the server rather than derived here. */
+  overdue: boolean;
+  /** May the CALLER sign this one? Advisory; the write re-derives it. */
+  can_sign?: boolean;
+  qc_escalated_at?: string | null;
+}
+interface QcCtx {
+  rows: Record<string, QcQueueRow>;
+  pending: number; overdue: number; escalationHours: number;
+  canOverride: boolean;
+}
 
 /** Who voided this bill and when, in one line — used on the row and in the panel. */
 const voidedBadgeText = (g: { voided_by?: string | null; voided_at?: string | null }) =>
@@ -184,6 +317,53 @@ export default function GrnPage() {
   const [dataVersion, setDataVersion] = useState(0);
   const [editing, setEditing] = useState<GRN | null>(null);
   const [voiding, setVoiding] = useState<GRN | null>(null);
+  const [overriding, setOverriding] = useState<GRN | null>(null);
+
+  /**
+   * THE HOLD CONTEXT — one call to GET /api/grn/qc, the same endpoint the
+   * Pending Quality Checks queue reads.
+   *
+   * WHY NOT COMPUTE IT HERE. The row already carries `created_at`, so this page
+   * COULD subtract two dates and print a wait — and would then disagree with
+   * the queue the moment the escalation threshold moved, because "overdue" is a
+   * setting, not a constant. The server computes `waiting_hours` and `overdue`
+   * with the functions the bell counts with, so both screens and the badge can
+   * never tell three stories about one delivery. hoursSince() below is only the
+   * fallback for when this call did not answer.
+   *
+   * OPEN TO EVERY SIGNED-IN USER, deliberately (see the route's header): it
+   * shows a subset of the rows /api/grn already shows. `can_override` rides on
+   * it, which is how this page knows whether to offer the release control
+   * WITHOUT a second /api/auth/me round trip — and it is the only way to know,
+   * since the GRN list payload carries `is_admin` but not `is_head_chef`, and a
+   * head chef may override too.
+   *
+   * ADVISORY. POST /api/grn/[id]/qc re-derives every gate from the session.
+   */
+  const [qcCtx, setQcCtx] = useState<QcCtx | null>(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const d = await fetch('/api/grn/qc').then(r => (r.ok ? r.json() : null));
+        if (!alive) return;
+        if (!d) { setQcCtx(null); return; }
+        const rows: Record<string, QcQueueRow> = {};
+        for (const r of (Array.isArray(d.rows) ? d.rows : []) as QcQueueRow[]) {
+          if (r?.id) rows[String(r.id)] = r;
+        }
+        setQcCtx({
+          rows,
+          pending: Number(d.pending_count) || 0,
+          overdue: Number(d.overdue_count) || 0,
+          escalationHours: Number(d.escalation_hours) || 0,
+          // Fails closed on anything but a literal true, exactly like isAdmin.
+          canOverride: d.can_override === true,
+        });
+      } catch { if (alive) setQcCtx(null); }
+    })();
+    return () => { alive = false; };
+  }, [dataVersion]);
 
   const reload = async () => {
     setLoading(true);
@@ -243,7 +423,8 @@ export default function GrnPage() {
     // number that means nothing. Only the ₹ roll-up is addable. (An unrendered
     // total_rejected_qty accumulator used to sit here — removed so nobody
     // "helpfully" prints it later.)
-    const c = { received: 0, partial: 0, rejected: 0, void: 0, accepted_value: 0 };
+    const c = { received: 0, awaiting_qc: 0, partial: 0, rejected: 0, void: 0,
+                accepted_value: 0, awaiting_value: 0 };
     for (const g of list) {
       c[g.status] = (c[g.status] || 0) + 1;
       // A VOIDED bill's stock and cost rows have been reversed — its value is no
@@ -251,9 +432,32 @@ export default function GrnPage() {
       // period's inward total upwards for ever. It keeps its own counter instead,
       // so the bills are still visibly accounted for rather than vanishing.
       if (g.status !== 'void') c.accepted_value += g.accepted_value || 0;
+      // A HELD bill contributes ₹0 to Σ accepted ON ITS OWN — every line's
+      // quantity_accepted is 0 until the checking department decides, so no
+      // exclusion is needed here and none is added. What IS needed is the
+      // opposite: the BILL value sitting at the bay, which Σ accepted can never
+      // show and which is the figure the store person is actually asking about
+      // when they say their stock has not appeared.
+      if (isHeld(g)) c.awaiting_value += g.inward_value || 0;
     }
     return c;
   }, [list]);
+
+  /** The held rows IN THE CURRENT VIEW, newest wait first. The banner counts
+   *  these — not qcCtx.pending — because a banner that says "3 waiting" over a
+   *  list showing one is the screen arguing with itself. The outlet-wide figure
+   *  is stated separately, in its own words, when the two differ. */
+  const heldHere = useMemo(() => list.filter(isHeld), [list]);
+  /** Wait hours for one held row: the SERVER's figure when the queue answered,
+   *  otherwise derived from created_at. null when neither is readable. */
+  const waitHours = (g: GRN): number | null => {
+    const r = qcCtx?.rows[g.id];
+    if (r && Number.isFinite(Number(r.waiting_hours))) return Number(r.waiting_hours);
+    return hoursSince(g.created_at);
+  };
+  /** Overdue is the SERVER's judgement (it owns the threshold) — never guessed
+   *  locally, so a row can never be red here and calm on the queue. */
+  const isOverdue = (g: GRN) => qcCtx?.rows[g.id]?.overdue === true;
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-5">
@@ -278,7 +482,12 @@ export default function GrnPage() {
           </button>
         </div>
       </div>
-      {creating && <AdHocGrnModal onClose={() => setCreating(false)} onCreated={() => { setCreating(false); reload(); }} />}
+      {/* afterWrite(), not a bare reload(): a new GRN can have been HELD, which
+          changes the Pending Quality Checks context this page now reads (the
+          wait clock, the overdue flag, the queue size). Bumping dataVersion is
+          what re-reads it — and it also drops any cached row detail, which was
+          always the right thing to do after a write. */}
+      {creating && <AdHocGrnModal onClose={() => setCreating(false)} onCreated={() => { setCreating(false); afterWrite(); }} />}
       {/* Mounted at PAGE level, not inside the row: the row lives in a table with
           `overflow-x-auto` on its wrapper, and a fixed overlay rendered inside a
           scroll container is clipped by it on some browsers. */}
@@ -288,6 +497,64 @@ export default function GrnPage() {
         <VoidBillModal g={voiding} onClose={() => setVoiding(null)}
                        onVoided={() => { setVoiding(null); afterWrite(); }} />
       )}
+      {/* Mounted at PAGE level for the same reason as the two above: the trigger
+          lives inside the row's detail panel, which sits in an `overflow-x-auto`
+          wrapper that clips a fixed overlay on some browsers. Gated on
+          canOverride === true and nothing looser — null (the queue call did not
+          answer) hides it exactly like false, and POST /api/grn/[id]/qc
+          re-checks admin-or-head-chef and fails closed. */}
+      {overriding && qcCtx?.canOverride === true && (
+        <OverrideQcModal g={overriding} onClose={() => setOverriding(null)}
+                         onDone={() => { setOverriding(null); afterWrite(); }} />
+      )}
+
+      {/* ── THE ANSWER TO "WHY HAS MY STOCK NOT APPEARED" ──────────────────
+          Stated at the top of the page, before the table, because that is the
+          question this banner exists to answer and the store person should not
+          have to find the row to get it. Blue, not red: nothing has gone wrong
+          — a delivery was recorded and is waiting on somebody else. It turns
+          amber only when the server says one has waited past the threshold,
+          which is a fact about the KITCHEN's response time, not the desk's. */}
+      {heldHere.length > 0 && (() => {
+        const overdueHere = heldHere.filter(isOverdue).length;
+        const whos = [...new Set(heldHere.map(g => CHECKER_LABEL[String(g.qc_checker || '')] || 'Kitchen'))];
+        const tone = overdueHere > 0
+          ? 'border-amber-300 bg-amber-50 text-amber-900'
+          : 'border-blue-200 bg-blue-50/60 text-blue-900';
+        return (
+          <div className={`rounded-xl border p-3 text-xs ${tone}`}>
+            <div className="flex items-start gap-2 flex-wrap">
+              <ChefHat className="w-4 h-4 shrink-0 mt-px" />
+              <div className="flex-1 min-w-[16rem]">
+                <div className="font-semibold">
+                  {heldHere.length} delivery{heldHere.length === 1 ? '' : 's'} recorded and waiting for a quality check
+                  {' — '}{fmt(counts.awaiting_value)} of goods is at the bay and <b>none of it is in stock yet</b>.
+                </div>
+                <div className="mt-0.5">
+                  {whos.join(' / ')} must check quality, temperature and damage and sign off before these goods are ours.
+                  Nothing was rejected and nothing is wrong with the paperwork — until they sign, the vendor can still take the goods back.
+                  {overdueHere > 0 && (
+                    <> <b>{overdueHere} {overdueHere === 1 ? 'has' : 'have'} waited longer than {qcCtx?.escalationHours || 4} hour(s)</b> and {overdueHere === 1 ? 'has' : 'have'} been escalated to the head chef.</>
+                  )}
+                </div>
+                {/* The outlet-wide figure, and ONLY when it differs from what is
+                    on screen — the date filter can hide a held delivery, and a
+                    store person who cleared their own range should still learn
+                    that three more are waiting outside it. */}
+                {qcCtx && qcCtx.pending > heldHere.length && (
+                  <div className="mt-0.5 opacity-80">
+                    {qcCtx.pending} are waiting in total at this outlet — {qcCtx.pending - heldHere.length} of them outside the dates filtered above.
+                  </div>
+                )}
+              </div>
+              <a href="/grn/qc"
+                 className="shrink-0 px-2.5 py-1.5 rounded-lg border border-current bg-white/70 hover:bg-white font-semibold flex items-center gap-1.5">
+                <ChefHat className="w-3.5 h-3.5" /> Pending Quality Checks
+              </a>
+            </div>
+          </div>
+        );
+      })()}
 
       <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 flex flex-wrap items-center gap-2 text-xs">
         <label className="flex flex-col text-[#6B5744]">From
@@ -300,15 +567,27 @@ export default function GrnPage() {
           {/* 'void' is a filter, not just a badge: a voided bill still sits in the
               register (that is the point of voiding rather than deleting) and an
               auditor has to be able to list them without scanning every row. */}
-          {(['', 'received', 'partial', 'rejected', 'void'] as const).map(s => (
+          {/* 'awaiting_qc' is a filter for the same reason: it is the one status
+              somebody comes to this page specifically looking for ("where is my
+              delivery?"), and the server accepts it as ?status= like any other. */}
+          {(['', 'awaiting_qc', 'received', 'partial', 'rejected', 'void'] as const).map(s => (
             <button key={s} onClick={() => setStatusFilter(s)}
+                    title={s === 'awaiting_qc' ? 'Recorded, no stock added — waiting for the kitchen / bar to check the goods.' : undefined}
                     className={`px-2 py-0.5 rounded border ${statusFilter === s ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
-              {s || 'All'}
+              {s ? statusLabel(s) : 'All'}
             </button>
           ))}
         </div>
         <div className="ml-auto text-[#6B5744] flex gap-3 flex-wrap">
           <span>✓ {counts.received}</span>
+          {counts.awaiting_qc > 0 && (
+            // Sits FIRST among the exception counters and carries its own ₹,
+            // because "waiting" is money at the bay, not a grade of receipt —
+            // and Σ accepted beside it deliberately excludes every rupee of it.
+            <span className="text-blue-800" title="Recorded, waiting for a kitchen / bar check. No stock has been added for these, so they contribute ₹0 to Σ accepted — the figure here is the BILL value sitting at the bay.">
+              ⏱ {counts.awaiting_qc} awaiting QC · <b className="font-mono">{fmt(counts.awaiting_value)}</b>
+            </span>
+          )}
           <span className="text-amber-700">⚠ {counts.partial}</span>
           <span className="text-red-700">✗ {counts.rejected}</span>
           {counts.void > 0 && <span className="text-[#8B7355]" title="Voided bills — their stock and cost rows were reversed, so they are excluded from the Σ beside this AND from the Inward Register download. Pick the 'void' filter to list them, or use a row's own Download to get one.">⊘ {counts.void} void</span>}
@@ -354,7 +633,12 @@ export default function GrnPage() {
                 <GrnRow key={g.id} g={g} expanded={expanded === g.id}
                         onToggle={() => setExpanded(expanded === g.id ? null : g.id)}
                         isAdmin={isAdmin} canAmend={canAmend} dataVersion={dataVersion}
-                        onEdit={() => setEditing(g)} onVoid={() => setVoiding(g)} />
+                        onEdit={() => setEditing(g)} onVoid={() => setVoiding(g)}
+                        waitHours={waitHours(g)} overdue={isOverdue(g)}
+                        escalationHours={qcCtx?.escalationHours ?? null}
+                        canSignQc={qcCtx?.rows[g.id]?.can_sign === true}
+                        canOverrideQc={qcCtx?.canOverride === true}
+                        onOverride={() => setOverriding(g)} />
               ))}
             </tbody>
           </table>
@@ -476,10 +760,20 @@ function GrnActions({ g, isAdmin, canAmend, expanded, onToggle, onEdit, onVoid, 
   );
 }
 
-function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit, onVoid }: {
+function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit, onVoid,
+                  waitHours, overdue, escalationHours, canSignQc, canOverrideQc, onOverride }: {
   g: GRN; expanded: boolean; onToggle: () => void;
   isAdmin: boolean | null; canAmend: boolean | null; dataVersion: number;
   onEdit: () => void; onVoid: () => void;
+  /** Hours this receipt has waited for its check, or null when unknowable. */
+  waitHours: number | null;
+  overdue: boolean;
+  escalationHours: number | null;
+  /** May the CALLER sign this one themselves? Advisory — used only to point
+   *  them at the queue in the right words, never to authorise anything. */
+  canSignQc: boolean;
+  canOverrideQc: boolean;
+  onOverride: () => void;
 }) {
   const [detail, setDetail] = useState<any>(null);
   const [detailErr, setDetailErr] = useState('');
@@ -520,10 +814,20 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
    *  so the action buttons in the trailing cell keep their own decoration. */
   const strike = isVoid ? 'line-through decoration-[#8B7355]' : '';
   const editCount = Number(g.edit_count) || 0;
+  const held = isHeld(g);
+  /** Who owes the check on THIS receipt, read off the row's own qc_checker —
+   *  never guessed. Unset (a receipt from before the gate) falls back to
+   *  "Kitchen", which is what the server's own refusal messages say. */
+  const checkerName = CHECKER_LABEL[String(g.qc_checker || '')] || 'Kitchen';
 
   return (
     <>
-      <tr className={`border-t border-[#E8D5C4]/50 ${isVoid ? 'bg-[#F3EEE7]/60 text-[#8B7355]' : 'hover:bg-[#FFF8F0]/40'}`}>
+      {/* A held row gets a LEFT RULE, not a fill: it is still a live receipt in
+          the register (unlike a void, which is greyed out of the reckoning), and
+          a full-row tint on the newest bills would make the ordinary ones look
+          like the exception. Amber only once the server calls it overdue. */}
+      <tr className={`border-t border-[#E8D5C4]/50 ${isVoid ? 'bg-[#F3EEE7]/60 text-[#8B7355]' : 'hover:bg-[#FFF8F0]/40'} ${
+            held ? (overdue ? 'border-l-2 border-l-amber-400' : 'border-l-2 border-l-blue-400') : ''}`}>
         <td className="px-2 py-2"><button onClick={onToggle} aria-label={expanded ? 'Collapse' : 'Expand'} aria-expanded={expanded} className="text-[#6B5744]">{expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}</button></td>
         <td className="py-2 px-3 font-mono font-semibold text-[#2D1B0E]">
           <span className={strike}>{g.grn_number}</span>
@@ -541,6 +845,24 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
           {isVoid && (
             <span className="block text-[9px] font-sans font-normal text-[#8B7355] mt-0.5" title={g.void_reason || undefined}>
               {voidedBadgeText(g)}
+            </span>
+          )}
+          {/* THE ERROR TO THE STORE PERSON THE OWNER ASKED FOR — stated on the
+              row itself, in the same place a void states its own fact, so it is
+              read without expanding anything. It names WHO it is waiting on and
+              FOR HOW LONG, because "awaiting QC" with neither is an excuse
+              rather than information. Not red, and no word implying the desk
+              did anything wrong. */}
+          {held && (
+            <span className={`block text-[9px] font-sans font-normal mt-0.5 ${overdue ? 'text-amber-800' : 'text-blue-800'}`}
+                  title={`No stock has been added for ${g.grn_number}. ${checkerName} must check the goods and sign off before they are ours.${
+                    escalationHours ? ` Escalates to the head chef after ${escalationHours} hour(s).` : ''}`}>
+              <Clock className="w-2.5 h-2.5 inline-block align-[-1px] mr-0.5" />
+              Waiting on {checkerName}
+              {waitHours != null && <> · {waitedFor(waitHours)}</>}
+              {overdue && (
+                <span className="ml-1 px-1 py-px rounded border border-amber-300 bg-amber-50 text-amber-900">overdue</span>
+              )}
             </span>
           )}
         </td>
@@ -581,12 +903,27 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
         {/* The two ₹ figures stay ON a voided row, struck through, rather than
             blanking: the bill was really booked at this value once, and the
             strike is what says it no longer counts. The header Σ excludes it. */}
-        <td className={`py-2 px-3 text-right font-mono font-semibold ${strike}`}>{fmt(g.accepted_value || 0)}</td>
+        {/* ── ₹0 ACCEPTED ON A HELD BILL IS NOT "NOTHING WAS ACCEPTED" ────────
+            Every line's quantity_accepted is 0 while a receipt waits, because
+            the store records what ARRIVED and the checking department records
+            what is ACCEPTED (api/grn/route.ts's "ZERO ACCEPTED IS THE ABSENCE
+            OF A DECISION"). Printing a bare ₹0 next to a full Inward ₹ reads as
+            a delivery that was entirely turned away — the opposite of the
+            truth. An em-dash with the reason in its tooltip is the honest cell;
+            the stored figure is still 0 and Σ accepted still excludes it. */}
+        <td className={`py-2 px-3 text-right font-mono font-semibold ${strike}`}>
+          {held
+            ? <span className="text-[#B8A590] font-sans font-normal"
+                    title={`Not decided yet. ${checkerName} records the accepted quantity when they sign off — until then it is stored as 0, which means "no decision", not "all rejected".`}>not decided</span>
+            : fmt(g.accepted_value || 0)}
+        </td>
         <td className={`py-2 px-3 text-right font-mono font-semibold ${isVoid ? 'text-[#8B7355]' : 'text-[#af4408]'} ${strike}`}>{g.inward_value ? fmt(g.inward_value) : '—'}</td>
         <td className="py-2 px-3">
-          <span className={`text-[10px] px-1.5 py-0.5 rounded border ${STATUS_TONE[g.status]}`}
-                title={isVoid ? `${voidedBadgeText(g)}. The stock this bill added was reversed; the document is kept.` : undefined}>
-            {g.status}
+          <span className={`text-[10px] px-1.5 py-0.5 rounded border ${STATUS_TONE[g.status] || 'bg-[#FFF1E3] text-[#6B5744] border-[#E8D5C4]'}`}
+                title={isVoid ? `${voidedBadgeText(g)}. The stock this bill added was reversed; the document is kept.`
+                     : held ? `Recorded, and no stock has been added. ${checkerName} must check quality, temperature and damage and sign off first.`
+                     : undefined}>
+            {statusLabel(g.status)}
           </span>
         </td>
         <td className={`py-2 px-3 text-[10px] text-[#8B7355] ${strike}`}>{g.received_by || '—'}</td>
@@ -622,6 +959,84 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
               </span>
             </div>
           )}
+          {/* ── THE HELD RECEIPT, IN FULL ──────────────────────────────────
+              The row says what and how long; this says what it MEANS, what
+              nobody has to do about it, and what the one escape hatch costs.
+              Deliberately worded so the receiving desk reads it as "your work
+              is recorded and correct, somebody else owes an answer". */}
+          {held && (
+            <div className={`mb-2 rounded border px-2.5 py-2 text-[11px] ${
+                  overdue ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-blue-200 bg-blue-50/60 text-blue-900'}`}>
+              <div className="font-semibold flex items-center gap-1.5 flex-wrap">
+                {String(g.qc_checker) === 'bar' ? <Wine className="w-3.5 h-3.5" /> : <ChefHat className="w-3.5 h-3.5" />}
+                Recorded and waiting for a {checkerName} check — no stock has been added.
+                {waitHours != null && (
+                  <span className="font-normal opacity-90">Waiting {waitedFor(waitHours)}.</span>
+                )}
+              </div>
+              <ul className="list-disc pl-4 mt-1 space-y-0.5 font-normal">
+                <li>
+                  The bill, its lines and its ₹ figures are all saved. What has <b>not</b> happened is the stock movement:
+                  no material&apos;s on-hand went up, no cost row was written, no recipe was re-costed.
+                </li>
+                <li>
+                  <b>{checkerName}</b> checks quality, temperature and damage, records anything they will not take with a reason,
+                  and signs. Only the quantity they accept enters stock.
+                  {' '}Until then the vendor can still take the goods back — that is the point of the wait.
+                </li>
+                <li>
+                  <b>Accepted and Rejected below read 0 for every line.</b> That is “nobody has decided”, not “everything was refused”.
+                </li>
+                {overdue && (
+                  <li>
+                    This one has waited past {escalationHours || 4} hour(s) and has been escalated to the head chef.
+                  </li>
+                )}
+              </ul>
+              <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+                <a href="/grn/qc" className="px-2 py-1 rounded border border-current bg-white/70 hover:bg-white font-semibold flex items-center gap-1">
+                  <ChefHat className="w-3 h-3" /> {canSignQc ? 'Check it now' : 'Open Pending Quality Checks'}
+                </a>
+                {/* ── THE NIGHT-DELIVERY ESCAPE HATCH (owner's decision 2) ────
+                    Shown ONLY to someone the server would actually let through
+                    — an admin or a head chef — because a control that always
+                    403s teaches the desk that the app is broken and to re-enter
+                    the delivery by hand. Everyone else gets the sentence that
+                    tells them whom to ask, which is the actionable half. */}
+                {canOverrideQc ? (
+                  <button type="button" onClick={onOverride}
+                          title="Add the stock now, without a kitchen check. Requires a written reason and marks this bill permanently."
+                          className="px-2 py-1 rounded border border-amber-400 bg-white text-amber-800 hover:bg-amber-50 font-semibold flex items-center gap-1">
+                    <ShieldAlert className="w-3 h-3" /> Release without a check…
+                  </button>
+                ) : (
+                  <span className="opacity-80">
+                    Night delivery and nobody to check it? An <b>admin or head chef</b> can release it with a written reason —
+                    the bill is then marked, permanently, as inwarded without a kitchen check.
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+          {/* THE OVERRIDE, AFTER THE FACT. A permanent property of the bill
+              (qc_override_* are committed columns, not a prunable audit row) and
+              it shows on every reader's screen — the store person included, so
+              nobody is later surprised that this receipt is on the override
+              report. Shown on a DECIDED bill; while it is still held the banner
+              above is the live one. */}
+          {!held && String(g.qc_outcome) === 'override' && (
+            <div className="mb-2 rounded border border-amber-300 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-900">
+              <div className="font-semibold flex items-center gap-1.5">
+                <ShieldAlert className="w-3.5 h-3.5" /> Inwarded WITHOUT a kitchen check
+              </div>
+              <div className="mt-0.5">
+                Released by <b>{g.qc_override_by || 'an admin / head chef'}</b>
+                {g.qc_override_at ? <> on {fmtIST(g.qc_override_at)}</> : null}. The stock was added on their authority, not on a
+                {' '}{checkerName.toLowerCase()} sign-off — the three quality checks below were never answered and are recorded as unticked.
+                {g.qc_override_reason ? <> Reason: <i>{g.qc_override_reason}</i></> : null}
+              </div>
+            </div>
+          )}
           {/* A failed detail read must SAY so. Without this branch `!detail`
               stays true for ever and the panel spins a loader at a request that
               already came back 401/404. */}
@@ -642,27 +1057,81 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                 {detail.qc_by && <span><b>QC by:</b> {detail.qc_by}</span>}
                 {detail.notes && <span><b>Notes:</b> {detail.notes}</span>}
               </div>
+              {/* ── THE CHECKLIST, SPLIT BY WHO OWNS IT (owner's decision 4) ──
+                  One strip of six identical chips could never say whose answer
+                  each one was, which is the whole defect this feature exists to
+                  fix: across 29 live GRNs the six ticks had never been ticked
+                  once, and where they had been, it was by the receiver about
+                  their own receipt. Two labelled groups, each with its own
+                  signature line, so an unticked box in one group can never be
+                  read as the other group's failure. */}
               {(() => {
-                const checklist = [
-                  ['qc_quality',       'Quality'],
-                  ['qc_temperature',   'Temperature'],
-                  ['qc_expiry',        'Expiry'],
-                  ['qc_damage',        'No damage'],
-                  ['qc_weight',        'Weight'],
-                  ['qc_invoice_match', 'Invoice match'],
-                ] as const;
-                const tickedCount = checklist.filter(([k]) => detail[k]).length;
-                return (
-                  <div className="flex flex-wrap items-center gap-1.5 mb-2 text-[10px]">
-                    <span className="text-[#8B7355]">QC checklist {tickedCount}/{checklist.length}:</span>
-                    {checklist.map(([k, label]) => (
-                      <span key={k} className={`px-1.5 py-0.5 rounded border ${
-                        detail[k] ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                                  : 'bg-[#FFF1E3] text-[#8B7355] border-[#E8D5C4]'
-                      }`}>
-                        {detail[k] ? '✓' : '○'} {label}
+                const gated = wasGated(detail);
+                const stamp = (by: string | null | undefined, at: string | null | undefined) =>
+                  by ? <>signed by <b className="text-[#2D1B0E]">{by}</b>{at ? <> · {fmtIST(at)}</> : null}</> : null;
+                /* A plain FUNCTION, not a component declared in render: a
+                   component type re-created on every render remounts its whole
+                   subtree each time, and there is nothing to gain from that
+                   here. Called as group({...}) below. */
+                const group = ({ title, icon, fields, signed, note }: {
+                  title: string; icon: ReactNode; fields: QcFieldDef[]; signed: ReactNode; note: string;
+                }) => (
+                  <div key={title} className="flex-1 min-w-[15rem] rounded border border-[#E8D5C4] bg-white px-2 py-1.5">
+                    <div className="flex items-center gap-1 text-[10px] font-semibold text-[#6B5744]">
+                      {icon} {title}
+                      <span className="font-normal text-[#8B7355]">
+                        {fields.filter(f => detail[f.k]).length}/{fields.length}
                       </span>
-                    ))}
+                    </div>
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {fields.map(f => (
+                        <span key={f.k} title={f.label}
+                              className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                                detail[f.k] ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                            : 'bg-[#FFF1E3] text-[#8B7355] border-[#E8D5C4]'}`}>
+                          {detail[f.k] ? '✓' : '○'} {f.short}
+                        </span>
+                      ))}
+                    </div>
+                    <div className="text-[9px] text-[#8B7355] mt-1">{signed || note}</div>
+                  </div>
+                );
+                return (
+                  <div className="flex flex-wrap gap-2 mb-2">
+                    {group({
+                      title: 'Store — receiving desk', icon: <FileCheck className="w-3 h-3" />,
+                      fields: STORE_QC_FIELDS,
+                      signed: stamp(detail.qc_store_by, detail.qc_store_at),
+                      // The store stamp is written ONLY when all three were
+                      // ticked (api/grn/route.ts:502), and never at all on a PO
+                      // receipt, whose form has no store checklist. Blank must
+                      // therefore say "not answered" and never "failed".
+                      note: detail.po_id
+                        ? 'Not asked on a PO receipt — that form has no store checklist.'
+                        : 'Unsigned — all three are needed before a name is stamped.',
+                    })}
+                    {group({
+                      title: `${CHECKER_LABEL[String(detail.qc_checker || '')] || 'Kitchen / bar'} — quality check`,
+                      icon: String(detail.qc_checker) === 'bar' ? <Wine className="w-3 h-3" /> : <ChefHat className="w-3 h-3" />,
+                      fields: KITCHEN_QC_FIELDS,
+                      signed: stamp(detail.qc_kitchen_by, detail.qc_kitchen_at),
+                      note: gated
+                        ? (String(detail.status) === 'awaiting_qc'
+                            ? 'Not yet checked — these are the three the delivery is waiting on.'
+                            : String(detail.qc_outcome) === 'override'
+                              ? 'Never answered — this bill was released without a kitchen check.'
+                              : 'Unsigned.')
+                        : 'This delivery was not gated, so these were the receiving desk’s own note — not a checking department’s answer.',
+                    })}
+                    {/* The legacy free-text name. Kept visible because 29 live
+                        receipts carry it and nothing else records who they
+                        meant, but named as legacy so nobody reads it as one of
+                        the two stamped signatures above. */}
+                    {detail.qc_by && (
+                      <div className="w-full text-[9px] text-[#8B7355]">
+                        “QC done by” (free text, typed at the receiving bay): <b className="text-[#6B5744]">{detail.qc_by}</b>
+                      </div>
+                    )}
                   </div>
                 );
               })()}
@@ -701,6 +1170,13 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                 </thead>
                 <tbody>
                   {detail.items.map((it: any) => {
+                    // Read off the DETAIL, not the list row: the row is a
+                    // snapshot that can be minutes old, and the one thing that
+                    // moves underneath it is exactly this — somebody signing the
+                    // receipt off in the queue while the panel is open. The
+                    // panel then shows the real accepted quantities instead of
+                    // three em-dashes claiming nobody has decided.
+                    const heldNow = String(detail.status) === 'awaiting_qc';
                     const muted = 'text-[#B8A590]';
                     const chargeCell = (v: any) => <td className={`py-1 px-2 text-right font-mono ${Number(v) ? 'text-[#2D1B0E]' : muted}`}>{q2(v)}</td>;
                     // Accepted / Rejected sit twelve ₹ columns to the RIGHT of the
@@ -726,9 +1202,31 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                       {chargeCell(it.delivery_charges)}
                       {chargeCell(it.mrp_round_off)}
                       <td className="py-1 px-2 text-right font-mono font-semibold text-[#af4408]">{m2(it.total_inward_amount)}</td>
-                      <td className="py-1 px-2 text-right font-mono text-emerald-700 border-l border-[#E8D5C4]">{it.quantity_accepted} <span className="text-[9px] text-[#B8A590]">{pu}</span></td>
-                      <td className="py-1 px-2 text-right font-mono text-red-700">{it.quantity_rejected || 0} <span className="text-[9px] text-[#B8A590]">{pu}</span></td>
-                      <td className="py-1 px-2 text-[#6B5744]">{it.rejection_reason || ''}</td>
+                      {/* Same rule as the list row's accepted-value cell: while
+                          the receipt is held these are stored 0 because no
+                          decision exists, and printing "0 kg accepted / 0 kg
+                          rejected" next to a full inward qty is the one reading
+                          that is certainly wrong. The banner above says it in
+                          words; these three cells say it where the eye lands.
+                          (No currency glyph in this comment on purpose — the
+                          rate-basis gate's money-column rule keys on one, and
+                          this table's eight charge cells come from chargeCell()
+                          so a literal <td> count can never match its 19 <th>.) */}
+                      <td className="py-1 px-2 text-right font-mono text-emerald-700 border-l border-[#E8D5C4]">
+                        {heldNow
+                          ? <span className="text-[#B8A590] font-sans" title={`${checkerName} records this when they sign off.`}>—</span>
+                          : <>{it.quantity_accepted} <span className="text-[9px] text-[#B8A590]">{pu}</span></>}
+                      </td>
+                      <td className="py-1 px-2 text-right font-mono text-red-700">
+                        {heldNow
+                          ? <span className="text-[#B8A590] font-sans" title="Nothing has been rejected — nothing has been judged yet.">—</span>
+                          : <>{it.quantity_rejected || 0} <span className="text-[9px] text-[#B8A590]">{pu}</span></>}
+                      </td>
+                      <td className="py-1 px-2 text-[#6B5744]">
+                        {heldNow
+                          ? <span className="text-[#B8A590]" title="The checking department records a reason against whatever it turns away.">not decided</span>
+                          : (it.rejection_reason || '')}
+                      </td>
                     </tr>
                   ); })}
                 </tbody>
@@ -777,9 +1275,11 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
 const FIELD_LABEL: Record<string, string> = {
   invoice_number: 'Vendor Invoice No', invoice_date: 'Invoice date',
   vendor: 'Vendor', vendor_id: 'Vendor (linked record)',
-  qc_by: 'QC done by', notes: 'Notes',
-  qc_quality: 'QC · Quality', qc_temperature: 'QC · Temperature', qc_expiry: 'QC · Expiry',
-  qc_damage: 'QC · No damage', qc_weight: 'QC · Weight', qc_invoice_match: 'QC · Invoice match',
+  qc_by: 'QC done by (free text)', notes: 'Notes',
+  // The six ticks name their OWNER. "QC · Quality" left a reader of the trail
+  // unable to tell whose answer had been altered, which on a gated receipt is
+  // the only thing about it worth knowing.
+  ...QC_OWNER_LABEL,
 };
 /** A diff value as a human reads it. The six qc_* columns are stored 1/0 and
  *  would otherwise print as bare digits, which reads as a quantity. */
@@ -967,11 +1467,83 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     })();
   }, []);
 
+  /**
+   * ── WILL THIS DELIVERY BE HELD FOR A KITCHEN CHECK? ──────────────────────
+   *
+   * Answered BEFORE Save, so "why has my stock not appeared" is something the
+   * receiving desk is told rather than discovers. The rule is
+   * resolveQcRequirement()'s (src/lib/grn-qc.ts:322): a material's category is
+   * looked up in the admin's category → checker map, anything that is not
+   * 'none' holds the delivery, and THE WHOLE GRN WAITS AS ONE — the gate is not
+   * per line.
+   *
+   * READ FROM GET /api/grn/qc?checkers=1, WHICH IS SESSION-ONLY — and that
+   * matters more than it looks. The map used to come from
+   * GET /api/grn/qc/categories, which is requireRole('admin'), so the ONE user
+   * this form exists for — the store manager (manager tier, is_store_manager,
+   * not an admin) — always got a 403 and always fell through to the "I cannot
+   * read the map" branch. The exact, per-line, before-the-click warning was
+   * therefore visible only to the four admins, who are not the people at the bay
+   * at 6am; everyone else learned about the hold AFTER pressing Save, by which
+   * time the vendor may already be pulling away. Worse, `qcPreview.required`
+   * gates the disabling and the payload-stripping of the three KITCHEN
+   * checkboxes below, so for that same store manager the kitchen's boxes stayed
+   * live, posted, and captioned "these are the desk's own note about the goods"
+   * on a delivery the server was about to hold. The new branch returns the map
+   * and nothing else — no recipient mobiles, no counts, no settings.
+   *
+   * STILL THREE-STATE, because the honest third state still has to exist:
+   *   Map   → exact, per-line, before the click. Now the normal case.
+   *   false → the call failed (offline, 401 on an expired session). The form
+   *           says so plainly and never guesses: a wrong "this will be held"
+   *           would send somebody to argue with a vendor over nothing.
+   *   null  → not back yet; render neither claim.
+   */
+  const [qcMap, setQcMap] = useState<Map<string, QcChecker> | null>(null);
+  const [qcMapKnown, setQcMapKnown] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch('/api/grn/qc?checkers=1');
+        if (!alive) return;
+        if (!res.ok) { setQcMapKnown(false); return; }
+        const d = await res.json();
+        const m = new Map<string, QcChecker>();
+        type CatRow = { category_key?: string; category?: string; checker?: string };
+        for (const r of (Array.isArray(d?.checkers) ? d.checkers : []) as CatRow[]) {
+          // Keyed on the SAME normalisation the server keys on. catKey() above
+          // is this page's mirror of grn-qc.ts's catKeyOf(); key the map any
+          // other way and 'frozen-cheese' silently stops matching 'frozen cheese'.
+          const key = catKey(r?.category_key || r?.category);
+          if (key) m.set(key, String(r?.checker || 'none') as QcChecker);
+        }
+        setQcMap(m); setQcMapKnown(true);
+      } catch { if (alive) setQcMapKnown(false); }
+    })();
+    return () => { alive = false; };
+  }, []);
+
   /** Is this line a store-mapped (TGBCL liquor) material — i.e. zero-rated here? */
   const storeMappedLine = (materialId: string) => {
     if (storeCats.size === 0 || !materialId) return false;
     const m = materials.find(x => x.id === materialId) as any;
     return !!m && storeCats.has(catKey(m.category));
+  };
+
+  /** The checker for ONE line, or null when the map is unreadable / unknown.
+   *  Store-mapped (TGBCL) lines answer 'none' because centralFlowBlock drops
+   *  them from `receivable` before the gate ever sees them — a checker on a
+   *  liquor category could never fire. Declared AFTER storeMappedLine because
+   *  it calls it. */
+  const lineChecker = (materialId: string): QcChecker | null => {
+    if (!qcMap || !materialId) return null;
+    if (storeMappedLine(materialId)) return 'none';
+    const m = materials.find(x => x.id === materialId) as any;
+    if (!m) return null;
+    // Blank category reads as 'other', exactly as the server's
+    // COALESCE(NULLIF(TRIM(category),''),'other') does.
+    return qcMap.get(catKey(String(m.category || '').trim() || 'other')) || 'none';
   };
 
   /**
@@ -1173,6 +1745,104 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     });
   };
 
+  /**
+   * WHAT THE SERVER IS ABOUT TO DECIDE, decided here first — same rule, same
+   * inputs, so the form and the route cannot disagree.
+   *
+   * Mirrors resolveQcRequirement() exactly:
+   *   · store-mapped (TGBCL) lines are excluded, because centralFlowBlock drops
+   *     them before the gate is consulted;
+   *   · ANY line whose category maps to a checker holds the WHOLE delivery —
+   *     the gate is per GRN, not per line (grn-qc.ts, "THE GRN IS THE UNIT");
+   *   · one department across every gated line ⇒ that department, otherwise
+   *     'both', which means EITHER may sign;
+   *   · a BACK-CORRECTION is never gated — negative lines reduce stock to undo
+   *     an over-booking, and holding a reduction for a quality check would leave
+   *     the overstatement on the book for as long as the queue takes.
+   * Keyed on the NEGATIVE QUANTITY, not on the back-correction checkbox: the
+   * checkbox only decides whether a negative can be typed, and the server has
+   * never seen it.
+   *
+   * ── THE BACK-CORRECTION EXEMPTION IS PER LINE, AND IT HAS TO STAY PER LINE ──
+   * This preview used to set one `backCorrection` flag over the whole payload
+   * and then answer "not held" for EVERY line on the bill — the same shape as
+   * the `opts.hasNegativeLine` bug that was removed from resolveQcRequirement()
+   * itself. The server now drops only the negative line and still weighs the
+   * rest, so a bill of 40 kg asparagus + 25 kg meat + a −1 kg sugar correction
+   * IS held. Leaving the mirror as it was did not add the hole back — the server
+   * is the gate — but it made the form promise the opposite of what Save was
+   * about to do, on the exact payload shape the fix was written for, and a form
+   * that under-promises a hold is how somebody lets a vendor leave. The negative
+   * line is skipped here and the flag is now only what it says on the tin: this
+   * bill contains a correction, worth a sentence, not a change of verdict.
+   */
+  const qcPreview = useMemo(() => {
+    const unknown = { known: false, required: false, checker: 'none' as QcChecker, categories: [] as string[], byLine: new Map<number, QcChecker>(), backCorrection: false };
+    if (qcMapKnown !== true || !qcMap) return unknown;
+    const byLine = new Map<number, QcChecker>();
+    const hit = new Map<string, QcChecker>();     // display category → checker
+    let backCorrection = false;
+    items.forEach((l, i) => {
+      if (!l.material_id) return;
+      const qr = parseFloat(l.quantity_received);
+      if (!Number.isFinite(qr)) return;
+      const qa = l.quantity_accepted !== '' ? parseFloat(l.quantity_accepted) : qr;
+      // The insert loop drops a line that is zero on BOTH figures, and the gate
+      // must not arm on a row that will never exist — that is how a GRN was born
+      // held with no lines and could then be neither signed nor overridden.
+      if (qr === 0 && (!Number.isFinite(qa) || qa === 0)) return;
+      if (storeMappedLine(l.material_id)) return;
+      // Exempt THIS line, not the bill. Matches the server's `gateable` filter.
+      if (qr < 0 || (Number.isFinite(qa) && qa < 0)) { backCorrection = true; return; }
+      const c = lineChecker(l.material_id);
+      if (!c || c === 'none') return;
+      byLine.set(i, c);
+      const mat = materials.find(x => x.id === l.material_id) as any;
+      hit.set(String(mat?.category || 'other'), c);
+    });
+    if (hit.size === 0) {
+      return { known: true, required: false, checker: 'none' as QcChecker, categories: [], byLine: new Map<number, QcChecker>(), backCorrection };
+    }
+    const kinds = new Set(hit.values());
+    const checker: QcChecker = kinds.size === 1 ? [...kinds][0] : 'both';
+    return { known: true, required: true, checker, categories: [...hit.keys()].sort(), byLine, backCorrection };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, qcMap, qcMapKnown, materials, storeCats]);
+
+  /**
+   * Lines the receiving desk has pre-rejected on a delivery that will be held.
+   * storePreRejectBlock() (grn-qc.ts:379) refuses these with a 400, and it is
+   * right to: on a held delivery the store records what ARRIVED and the checking
+   * department records what is ACCEPTED — that separation is the whole of
+   * decision 4, and it is what makes "accepted = 0 while waiting" mean one
+   * unambiguous thing. Surfaced BEFORE Save with the server's own remedy
+   * (short-receive it) rather than after a rejected round trip.
+   */
+  const qcPreRejectLines = useMemo(() => {
+    if (!qcPreview.required) return [] as number[];
+    const out: number[] = [];
+    items.forEach((l, i) => {
+      if (!l.material_id || l.quantity_accepted === '') return;
+      const qr = parseFloat(l.quantity_received);
+      const qa = parseFloat(l.quantity_accepted);
+      if (!Number.isFinite(qr) || !Number.isFinite(qa)) return;
+      if (storeMappedLine(l.material_id)) return;
+      // A back-correction is not `gateable` on the server, so storePreRejectBlock
+      // never sees it. Skipping it here too keeps this from disabling Save over a
+      // line the route would have accepted without comment.
+      if (qr < 0 || qa < 0) return;
+      if (qa < qr - 1e-9) out.push(i);
+    });
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, qcPreview.required, materials, storeCats]);
+
+  /** What the server did to the receipt just saved, when it held it. Shown as a
+   *  panel rather than an alert() — it carries who was notified and where to go
+   *  next, and it is the sentence that stops the desk re-entering the delivery
+   *  because "nothing happened". */
+  const [held, setHeld] = useState<any>(null);
+
   const submit = async () => {
     // Validate qtys BEFORE filtering so the user sees errors instead of silent drops.
     for (let i = 0; i < items.length; i++) {
@@ -1208,6 +1878,31 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       alert('Back-correction mode: enter the prior GRN# / PO# / invoice# you\'re correcting (for audit).');
       return;
     }
+    // Mirrors storePreRejectBlock()'s refusal so it lands before the round trip,
+    // in the server's own remedy. NOT a second authority — the route re-checks
+    // it and refuses with the same words if this is ever wrong.
+    if (qcPreRejectLines.length > 0) {
+      alert(
+        `Line ${qcPreRejectLines.map(i => i + 1).join(', ')}: this delivery needs a quality check, so the accepted quantity is the `
+        + `checking department's to record, not the receiving desk's.\n\n`
+        + `Record what actually arrived — if units went back on the truck, enter the SMALLER figure as the RECEIVED quantity instead. `
+        + `The kitchen rejects what it will not take, with a reason, when it signs off.`,
+      );
+      return;
+    }
+    // A CORRECTION AND A HELD DELIVERY CANNOT SHARE ONE RECEIPT. Mirrors the
+    // route's own refusal so it lands before the round trip, and in its words.
+    // The two have opposite timing by design: the delivery must WAIT for the
+    // kitchen, the correction must apply NOW or the over-booking it undoes stays
+    // on the book until the queue clears.
+    if (qcPreview.known && qcPreview.required && qcPreview.backCorrection) {
+      alert(
+        'This bill mixes a back-correction with goods that need a quality check, and the two cannot share one receipt.\n\n'
+        + 'Save them as two receipts: the correction on its own first (it is never held and applies immediately), '
+        + 'then this delivery, which will wait for the kitchen.',
+      );
+      return;
+    }
     setBusy(true);
     try {
       const r = await api('/api/grn', {
@@ -1221,6 +1916,18 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             ? `[BACK-CORRECTION → corrects ${adjustmentRef}] ${notes}`.trim()
             : notes,
           ...qc,
+          // ── THE KITCHEN THREE ARE NOT SENT ON A DELIVERY WE KNOW WILL BE
+          // HELD. The card above renders them disabled and unticked, so sending
+          // a `true` left in state from before a material was picked would post
+          // an answer the screen says nobody gave. The server stores whatever
+          // arrives here and decideGrnQc later overwrites all three from the
+          // real signer — so this changes nothing about the outcome, only about
+          // whether the row briefly claims a check that was never made.
+          // Only when the map was actually readable: with qcPreview unknown this
+          // spread is absent and the pre-existing behaviour is untouched.
+          ...(qcPreview.required
+            ? { qc_quality: false, qc_temperature: false, qc_damage: false }
+            : {}),
           items: cleaned.map(i => ({
             material_id: i.material_id,
             quantity_received: parseFloat(i.quantity_received),
@@ -1253,6 +1960,14 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       });
       const j = await r.json();
       if (!r.ok) { alert(j.error || 'Failed'); return; }
+      // ── A HELD RECEIPT IS NOT AN alert() ──────────────────────────────────
+      // "✓ Created — 0 material(s) updated" is what the old line would have said
+      // about a delivery that entered no stock, which is exactly the sentence
+      // that makes a storekeeper re-enter the bill an hour later. The held case
+      // gets a panel that stays on screen: what was saved, what was NOT, who
+      // owes the check, who has been told, and where to go. The ordinary case
+      // keeps the alert it has always had — nothing about it changed.
+      if (j.qc_required) { setHeld(j); return; }
       alert(`✓ Created ${j.grn_number} — ${j.materials_touched} material(s) updated`);
       onCreated();
     } finally { setBusy(false); }
@@ -1269,13 +1984,83 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
            className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-4xl shadow-xl flex flex-col overflow-hidden">
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
-          <h2 className="font-bold text-[#2D1B0E]">New Ad-hoc Goods Receipt Note</h2>
-          <button onClick={onClose}><X className="w-5 h-5 text-[#8B7355]" /></button>
+          <h2 className="font-bold text-[#2D1B0E]">
+            {held ? `Recorded — ${held.grn_number}` : 'New Ad-hoc Goods Receipt Note'}
+          </h2>
+          <button onClick={held ? onCreated : onClose}><X className="w-5 h-5 text-[#8B7355]" /></button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4 text-xs">
+        {held ? (
+          /* ── WHAT HAPPENED, AND WHAT DID NOT ────────────────────────────
+             The receipt saved cleanly and no stock moved. Both halves have to
+             be said, in that order, or the desk reads a hold as a failure —
+             and the correction for that belief is entering the delivery a
+             second time. Green-tinted heading, blue explanation: nothing here
+             is a warning to the person who typed it. */
+          <div className="space-y-3">
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-emerald-900">
+              <div className="font-semibold flex items-center gap-1.5">
+                <Save className="w-4 h-4" /> {held.grn_number} is saved — the bill, every line and every ₹ figure.
+              </div>
+              <div className="mt-0.5 text-[11px]">
+                Nothing was lost and nothing needs re-typing. You do not need to enter this delivery again.
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-blue-200 bg-blue-50/60 p-3 text-blue-900 space-y-1.5">
+              <div className="font-semibold flex items-center gap-1.5">
+                {held.qc_checker === 'bar' ? <Wine className="w-4 h-4" /> : <ChefHat className="w-4 h-4" />}
+                No stock has been added yet — {CHECKER_LABEL[String(held.qc_checker || '')] || 'Kitchen'} must check the goods first.
+              </div>
+              {/* The server's own sentence, verbatim: it names the categories
+                  that triggered the hold and what has to happen. Re-wording it
+                  here is how a screen and its API start telling two stories. */}
+              {held.qc_message && <div className="text-[11px]">{held.qc_message}</div>}
+              {Array.isArray(held.qc_categories) && held.qc_categories.length > 0 && (
+                <div className="text-[11px]">
+                  Held because of: {held.qc_categories.map((c: string) => (
+                    <span key={c} className="inline-block mx-0.5 px-1.5 py-0.5 rounded border border-blue-200 bg-white text-[10px]">{c}</span>
+                  ))}
+                </div>
+              )}
+              <div className="text-[11px]">
+                Until they sign, <b>the vendor can still take these goods back</b> — that is what the wait is for.
+                Keep the delivery at the bay if you can.
+              </div>
+              {/* Who was actually told. On this database nobody has a phone
+                  number and push is unsubscribed, so "notified" can legitimately
+                  be an empty list — say so rather than implying a ping went out
+                  that did not. The bell counts the queue live either way. */}
+              <div className="text-[11px]">
+                {Array.isArray(held.qc_notified) && held.qc_notified.length > 0 ? (
+                  <>Told: <b>{held.qc_notified.map((r: { name?: string; email?: string }) => r.name || r.email).filter(Boolean).join(', ')}</b>.</>
+                ) : (
+                  <>It is on the <b>Pending Quality Checks</b> queue and in the notification bell. No one could be messaged directly — go and tell them.</>
+                )}
+              </div>
+              {Array.isArray(held.store_blocked) && held.store_blocked.length > 0 && (
+                <div className="text-[11px] text-amber-900 bg-amber-50 border border-amber-300 rounded p-2">
+                  {held.store_blocked.length} line(s) were not receivable here at all (liquor is procured on the store ledger)
+                  and were left out of this bill.
+                </div>
+              )}
+            </div>
+
+            <div className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2 text-[11px]">
+              You will see <b>{held.grn_number}</b> in the list below marked <b>awaiting kitchen QC</b>, with how long it has been waiting.
+              If it is a night delivery and nobody can check it, an <b>admin or head chef</b> can release it with a written reason —
+              the bill is then marked, permanently, as inwarded without a kitchen check.
+            </div>
+          </div>
+        ) : (
+          <>
           <p className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
             Use this when goods arrive WITHOUT a PO — cash purchase, sample, donation, vendor return.
             On save: creates a GRN, writes <code>purchases</code> rows, bumps stock + recipe-cost cascade.
+            {/* Stated in the same breath as "bumps stock", because on a gated
+                delivery that sentence is not true and this is where the reader
+                is being told what Save does. */}
+            {' '}Perishable categories are the exception: those are recorded and <b>held until the kitchen checks them</b>.
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
             <label className="flex flex-col gap-1 text-[#6B5744]">Receipt Date
@@ -1359,42 +2144,140 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             </label>
           </div>
 
-          {/* Phase 1 §4 — Receiving QC Checklist */}
-          <div className="border border-blue-200 rounded-lg p-3 bg-blue-50/40">
-            <div className="text-xs font-semibold text-blue-900 mb-2 flex items-center gap-2">
-              ✓ Receiving Checklist
-              <span className="text-[10px] font-normal text-blue-700">
-                ({Object.values(qc).filter(Boolean).length} of 6 ticked)
+          {/* ── BEFORE YOU SAVE: WILL THIS BE HELD? ────────────────────────
+              The owner's ask, in his words: the store person should be told in
+              advance, not left to discover afterwards that their stock never
+              appeared. Three states, and the third is stated as ignorance
+              rather than dressed up as an answer. */}
+          {qcPreview.known && qcPreview.required && (
+            <div className="border border-blue-300 rounded-lg p-3 bg-blue-50/70 text-blue-900">
+              <div className="text-xs font-semibold flex items-center gap-1.5 flex-wrap">
+                {qcPreview.checker === 'bar' ? <Wine className="w-4 h-4" /> : <ChefHat className="w-4 h-4" />}
+                This delivery will be held for a {CHECKER_LABEL[qcPreview.checker]} check — saving it adds no stock.
+              </div>
+              <div className="text-[11px] mt-1 space-y-1">
+                <div>
+                  {/* The denominator counts the SAME lines qcPreview counted —
+                      a material with no quantity typed yet is not a line the
+                      server will see, and including it would make the banner
+                      read "1 of 3" over a two-line bill. */}
+                  {qcPreview.byLine.size} of the {items.filter(l => l.material_id && (parseFloat(l.quantity_received) || 0) !== 0).length} line(s) you have entered
+                  {qcPreview.byLine.size === 1 ? ' is' : ' are'} in a category the kitchen has to judge
+                  {' '}({qcPreview.categories.join(', ')}), and <b>a delivery waits as a whole</b> — the grocery on this bill waits
+                  with the vegetables. If that matters, save them as two separate receipts.
+                </div>
+                <div>
+                  The bill will be saved in full. What waits is the stock movement: nothing goes on hand, no cost row is written,
+                  and the vendor can still take the goods back until {CHECKER_LABEL[qcPreview.checker].toLowerCase()} signs.
+                </div>
+                {/* The pre-reject refusal, before the click rather than after a
+                    rejected round trip — with the lever that actually works. */}
+                {qcPreRejectLines.length > 0 && (
+                  <div className="rounded border border-amber-400 bg-amber-50 text-amber-900 p-2">
+                    <b>Line {qcPreRejectLines.map(i => i + 1).join(', ')}: clear the Accepted box.</b> On a held delivery the accepted
+                    quantity is the checking department&apos;s to record, not the receiving desk&apos;s. If units went back on the truck,
+                    enter the SMALLER figure as <b>Received</b> instead — that is the true statement of what arrived.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          {qcPreview.known && qcPreview.backCorrection && !qcPreview.required && (
+            <div className="border border-[#E8D5C4] rounded-lg p-2.5 bg-[#FFF8F0] text-[11px] text-[#6B5744]">
+              <b>A back-correction is never held.</b> Negative lines reduce stock to undo an earlier over-booking, and holding a
+              reduction for a quality check would leave the overstatement on the book for as long as the queue takes.
+            </div>
+          )}
+          {/* THE ONE SHAPE THAT CANNOT BE SAVED AT ALL, said before the click.
+              The delivery must WAIT and the correction must apply NOW; on one
+              receipt the correction would be held with everything else, which
+              is exactly what its exemption exists to prevent. Two documents. */}
+          {qcPreview.known && qcPreview.backCorrection && qcPreview.required && (
+            <div className="border border-red-300 rounded-lg p-2.5 bg-red-50 text-[11px] text-red-900">
+              <b>Split this into two receipts — it cannot be saved as one.</b> A back-correction and goods that need a quality
+              check have opposite timing: the delivery has to wait for the kitchen, the correction has to apply now or the
+              over-booking it is undoing stays on the book until the queue clears. Save the correction on its own first, then
+              this delivery.
+            </div>
+          )}
+          {qcMapKnown === false && (
+            // Honest ignorance, not a guess. The map read failed (offline, or an
+            // expired session), so the form says what it does not know and what
+            // will happen either way. A wrong "this will be held" would send
+            // somebody to argue with a vendor over nothing. This used to be the
+            // PERMANENT state for every non-admin, including the store manager —
+            // GET /api/grn/qc?checkers=1 is session-only, so it is now the
+            // genuine failure case it was always meant to be.
+            <div className="border border-[#E8D5C4] rounded-lg p-2.5 bg-[#FFF8F0] text-[11px] text-[#6B5744] flex items-start gap-1.5">
+              <Info className="w-3.5 h-3.5 shrink-0 mt-px text-[#8B7355]" />
+              <span>
+                Perishable categories (veg, dairy, non-veg, meat, frozen, fruit) are <b>recorded and held for a kitchen check</b> —
+                no stock is added until the kitchen signs. The quality-check settings could not be read just now, so this screen
+                cannot tell you line by line in advance. <b>Saving will say plainly</b> whether this delivery was held, and the
+                bill will show it in the list until it is signed.
               </span>
             </div>
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 text-xs">
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input type="checkbox" checked={qc.qc_quality} onChange={() => toggleQc('qc_quality')} className="accent-blue-600" />
-                <span>Quality / Freshness</span>
-              </label>
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input type="checkbox" checked={qc.qc_temperature} onChange={() => toggleQc('qc_temperature')} className="accent-blue-600" />
-                <span>Temperature OK</span>
-              </label>
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input type="checkbox" checked={qc.qc_expiry} onChange={() => toggleQc('qc_expiry')} className="accent-blue-600" />
-                <span>Expiry date checked</span>
-              </label>
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input type="checkbox" checked={qc.qc_damage} onChange={() => toggleQc('qc_damage')} className="accent-blue-600" />
-                <span>No damage</span>
-              </label>
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input type="checkbox" checked={qc.qc_weight} onChange={() => toggleQc('qc_weight')} className="accent-blue-600" />
-                <span>Weight verified</span>
-              </label>
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input type="checkbox" checked={qc.qc_invoice_match} onChange={() => toggleQc('qc_invoice_match')} className="accent-blue-600" />
-                <span>Invoice matches</span>
-              </label>
+          )}
+
+          {/* ── THE CHECKLIST, SPLIT BY WHO CAN ACTUALLY JUDGE IT ───────────
+              Owner's decision 4. It used to be one card of six boxes with a
+              footnote saying who owned which — and the footnote was WRONG
+              (it put expiry on the kitchen; the owner put it on the store).
+              Two cards, so the split is structural instead of advisory and the
+              two signatures are unambiguous. */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <div className="border border-blue-200 rounded-lg p-3 bg-blue-50/40">
+              <div className="text-xs font-semibold text-blue-900 mb-1.5 flex items-center gap-1.5 flex-wrap">
+                <FileCheck className="w-3.5 h-3.5" /> Yours — the receiving desk
+                <span className="text-[10px] font-normal text-blue-700">
+                  ({STORE_QC_FIELDS.filter(f => qc[f.k]).length} of {STORE_QC_FIELDS.length})
+                </span>
+              </div>
+              <div className="space-y-1.5 text-xs">
+                {STORE_QC_FIELDS.map(f => (
+                  <label key={f.k} className="flex items-start gap-1.5 cursor-pointer">
+                    <input type="checkbox" checked={qc[f.k]} onChange={() => toggleQc(f.k)} className="accent-blue-600 mt-0.5" />
+                    <span>{f.label}</span>
+                  </label>
+                ))}
+              </div>
+              {/* The stamping rule, said out loud: a partial tick is left
+                  UNSIGNED rather than stamped with a name (api/grn/route.ts:502
+                  binds qc_store_by via a CASE on all three). */}
+              <div className="text-[10px] text-blue-700 mt-1.5">
+                {STORE_QC_FIELDS.every(f => qc[f.k])
+                  ? <>All three ticked — this receipt will be stamped with <b>your name</b> as the store signature.</>
+                  : <>Tick all three to sign as the store. A partial checklist is stored, but no name is put against it — a signature nobody gave is worse than none.</>}
+              </div>
             </div>
-            <div className="text-[10px] text-blue-700 mt-1.5">
-              Kitchen / bar staff signs off on quality + temperature + expiry. Store manager confirms quantity + invoice match.
+
+            <div className={`border rounded-lg p-3 ${qcPreview.required ? 'border-[#E8D5C4] bg-[#F3EEE7]' : 'border-blue-200 bg-blue-50/40'}`}>
+              <div className={`text-xs font-semibold mb-1.5 flex items-center gap-1.5 flex-wrap ${qcPreview.required ? 'text-[#6B5744]' : 'text-blue-900'}`}>
+                {qcPreview.checker === 'bar' ? <Wine className="w-3.5 h-3.5" /> : <ChefHat className="w-3.5 h-3.5" />}
+                {qcPreview.required ? `${CHECKER_LABEL[qcPreview.checker]}'s — not yours` : 'Kitchen / bar'}
+              </div>
+              <div className="space-y-1.5 text-xs">
+                {KITCHEN_QC_FIELDS.map(f => (
+                  <label key={f.k} className={`flex items-start gap-1.5 ${qcPreview.required ? 'cursor-not-allowed text-[#8B7355]' : 'cursor-pointer'}`}>
+                    {/* DISABLED, not hidden, when the delivery will be held: the
+                        checks still have to be visible so the desk knows what
+                        the kitchen is going to be asked. Ticking them here would
+                        be answered anyway — decideGrnQc overwrites all three from
+                        the real signer, and PUT /api/grn/[id] refuses to let this
+                        caller amend them afterwards. Better to say so than to
+                        take an answer and silently discard it. */}
+                    <input type="checkbox" disabled={qcPreview.required}
+                           checked={qcPreview.required ? false : qc[f.k]}
+                           onChange={() => toggleQc(f.k)} className="accent-blue-600 mt-0.5" />
+                    <span>{f.label}</span>
+                  </label>
+                ))}
+              </div>
+              <div className={`text-[10px] mt-1.5 ${qcPreview.required ? 'text-[#6B5744]' : 'text-blue-700'}`}>
+                {qcPreview.required
+                  ? <>Recorded by whoever signs off on <b>Pending Quality Checks</b>, with their name and the time. The receiving desk cannot tick these — that is the point.</>
+                  : <>This delivery is not being held, so these are the desk&apos;s own note about the goods — not a checking department&apos;s answer.</>}
+              </div>
             </div>
           </div>
 
@@ -1477,6 +2360,22 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                            variant="line" deptScope={stock.scope} visibleDepts={stock.visible}
                                            className="mt-1" />
                         )}
+                        {/* WHICH LINE CAUSED THE HOLD — beside the material that
+                            caused it, so "why is my whole bill waiting?" is
+                            answerable by looking rather than by asking. Only
+                            rendered when the map was readable; silence is not a
+                            claim that a line is ungated. */}
+                        {(() => {
+                          const c = qcPreview.byLine.get(i);
+                          if (!c) return null;
+                          return (
+                            <span className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full border border-blue-200 bg-blue-50 text-blue-800 text-[9px] font-semibold"
+                                  title={`This category needs a ${CHECKER_LABEL[c]} check. Because of it the WHOLE receipt is held — no stock is added until they sign.`}>
+                              {c === 'bar' ? <Wine className="w-2.5 h-2.5" /> : <ChefHat className="w-2.5 h-2.5" />}
+                              {CHECKER_LABEL[c]} check
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Received</span>
@@ -1511,6 +2410,20 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                         {lu.pu && (
                           <div className="text-[9px] text-[#B8A590] text-right mt-0.5 md:w-20">
                             {lu.pu}{hint(it.quantity_accepted) ? <> · {hint(it.quantity_accepted)}</> : null}
+                          </div>
+                        )}
+                        {/* On a held delivery this box is not the desk's to
+                            fill: storePreRejectBlock() refuses a smaller
+                            accepted figure outright. Left EDITABLE rather than
+                            disabled — a value typed before the material was
+                            picked has to be clearable — but named, and Save is
+                            held until it is cleared. */}
+                        {qcPreview.required && !storeMappedLine(it.material_id) && (
+                          <div className={`text-[9px] text-right mt-0.5 md:w-20 leading-tight ${
+                                qcPreRejectLines.includes(i) ? 'text-amber-800 font-semibold' : 'text-[#B8A590]'}`}>
+                            {qcPreRejectLines.includes(i)
+                              ? 'clear this — kitchen’s to record'
+                              : `${CHECKER_LABEL[qcPreview.checker].toLowerCase()} records this`}
                           </div>
                         )}
                       </td>
@@ -1755,13 +2668,39 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                       placeholder="Optional context — why this is ad-hoc, who approved verbally, etc."
                       className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
           </label>
+          </>
+        )}
         </div>
         <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2 shrink-0">
-          <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
-          <button onClick={submit} disabled={busy}
-                  className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg flex items-center gap-1.5 disabled:opacity-50">
-            <Save className="w-4 h-4" /> {busy ? 'Creating…' : 'Create GRN'}
-          </button>
+          {held ? (
+            <>
+              <a href="/grn/qc" className="px-3 py-1.5 text-sm rounded-lg border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] flex items-center gap-1.5">
+                <ChefHat className="w-4 h-4" /> Pending Quality Checks
+              </a>
+              <button onClick={onCreated} className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">Done</button>
+            </>
+          ) : (
+            <>
+              <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
+              <button onClick={submit}
+                      disabled={busy || qcPreRejectLines.length > 0
+                        || (qcPreview.known && qcPreview.required && qcPreview.backCorrection)}
+                      title={qcPreRejectLines.length > 0
+                        ? 'A held delivery\'s accepted quantity is the checking department\'s to record — enter what actually arrived as Received instead.'
+                        : (qcPreview.known && qcPreview.required && qcPreview.backCorrection)
+                          ? 'A back-correction and a held delivery cannot share one receipt — save them separately.'
+                          : qcPreview.required
+                            ? `This will be recorded and held for a ${CHECKER_LABEL[qcPreview.checker]} check — no stock will be added until they sign.`
+                            : 'Create the goods receipt note'}
+                      className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg flex items-center gap-1.5 disabled:opacity-50">
+                <Save className="w-4 h-4" />
+                {/* The button says what it is about to DO. "Create GRN" on a
+                    delivery that will move no stock is the promise this whole
+                    feature exists to stop making. */}
+                {busy ? 'Creating…' : qcPreview.required ? 'Create & send for QC' : 'Create GRN'}
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -1788,18 +2727,12 @@ interface BillForm {
   qc_quality: boolean; qc_temperature: boolean; qc_expiry: boolean;
   qc_damage: boolean; qc_weight: boolean; qc_invoice_match: boolean;
 }
-/** Only the six BOOLEAN qc ticks. Deliberately NOT `keyof BillForm`: that would
- *  let `qc_by` (a string) into the checkbox list, where it would render as a box
- *  that is permanently ticked for any non-empty name. */
-type QcKey = 'qc_quality' | 'qc_temperature' | 'qc_expiry' | 'qc_damage' | 'qc_weight' | 'qc_invoice_match';
-const QC_FIELDS: { k: QcKey; label: string }[] = [
-  { k: 'qc_quality',       label: 'Quality / Freshness' },
-  { k: 'qc_temperature',   label: 'Temperature OK' },
-  { k: 'qc_expiry',        label: 'Expiry date checked' },
-  { k: 'qc_damage',        label: 'No damage' },
-  { k: 'qc_weight',        label: 'Weight verified' },
-  { k: 'qc_invoice_match', label: 'Invoice matches' },
-];
+/* QcKey / QC_FIELDS / STORE_QC_FIELDS / KITCHEN_QC_FIELDS now live at the top of
+   this file, beside the QC gate block — four render sites needed them (the
+   create modal, this amend modal, the detail-panel chips and the audit trail's
+   labels) and three of them sit above this point. They are deliberately NOT
+   `keyof BillForm`: that would let `qc_by` (a string) into a checkbox list,
+   where it renders as a box permanently ticked for any non-empty name. */
 /** Seed the form from a server row. Normalised so the dirty-check below compares
  *  like with like: NULL and '' are the same absent value to a text input, and the
  *  qc_* columns are stored 1/0 but edited as checkboxes. */
@@ -1826,6 +2759,10 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
    *  the baseline the dirty-check below diffs against — see submit(). */
   const [loaded, setLoaded] = useState<BillForm | null>(null);
   const [form, setForm] = useState<BillForm | null>(null);
+  /** The raw server row behind `form`, kept for the fields that are NOT
+   *  editable but decide what this form may offer: qc_required (was this
+   *  receipt gated?), qc_checker, and the two signature stamps. */
+  const [row, setRow] = useState<any>(null);
   const [loadErr, setLoadErr] = useState('');
   const [reason, setReason] = useState('');
   const [err, setErr] = useState('');
@@ -1841,6 +2778,7 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
         if (!alive) return;
         if (!d?.grn) { setLoadErr(d?.error || 'Could not load this bill.'); return; }
         const f = billFormFrom(d.grn);
+        setRow(d.grn);
         setLoaded(f); setForm(f);
       })
       .catch(e => { if (alive) setLoadErr(e?.message || 'Could not load this bill.'); });
@@ -1876,8 +2814,15 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
   const patch = useMemo(() => {
     if (!form || !loaded) return null;
     const p: Record<string, any> = {};
+    // BELT AND BRACES on the three kitchen ticks. The boxes above are already
+    // disabled on a gated receipt so they cannot move, and the server refuses
+    // them anyway with a 400 — but a patch that carried one would turn a
+    // legitimate save of the OTHER fields into a whole-request refusal, and the
+    // user would have no idea which control did it.
+    const kitchenLocked = Number(row?.qc_required) === 1;
     (Object.keys(form) as (keyof BillForm)[]).forEach(k => {
       if (k === 'vendor' || k === 'vendor_id') return;
+      if (kitchenLocked && KITCHEN_QC_FIELDS.some(f => f.k === k)) return;
       if (form[k] !== loaded[k]) p[k] = form[k];
     });
     if (!isPoGrn && (form.vendor !== loaded.vendor || form.vendor_id !== loaded.vendor_id)) {
@@ -1885,7 +2830,7 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
       p.vendor_id = form.vendor_id;
     }
     return p;
-  }, [form, loaded, isPoGrn]);
+  }, [form, loaded, isPoGrn, row]);
   const dirty = !!patch && Object.keys(patch).length > 0;
 
   const submit = async () => {
@@ -2020,24 +2965,84 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
                 </div>
               </div>
 
-              <div className="border border-blue-200 rounded-lg p-3 bg-blue-50/40">
-                <div className="text-xs font-semibold text-blue-900 mb-2">
-                  ✓ Receiving Checklist
-                  <span className="ml-2 text-[10px] font-normal text-blue-700">
-                    ({QC_FIELDS.filter(f => form[f.k]).length} of {QC_FIELDS.length} ticked)
-                  </span>
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
-                  {QC_FIELDS.map(f => (
-                    <label key={f.k} className="flex items-center gap-1.5 cursor-pointer">
-                      <input type="checkbox" checked={!!form[f.k]}
-                             onChange={e => set({ [f.k]: e.target.checked } as Partial<BillForm>)}
-                             className="accent-blue-600" />
-                      <span>{f.label}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
+              {/* ── THE CHECKLIST, SPLIT — AND THE KITCHEN HALF LOCKED ───────
+                  On a gated receipt PUT /api/grn/[id] REFUSES quality /
+                  temperature / damage from this caller (route.ts:356), and it is
+                  right to: this form's bar is the store manager, the very person
+                  decision 4 separates from the checker. Before sign-off ticking
+                  them would pre-tick a check nobody made; after an override —
+                  where they are deliberately 0 — it would make the printed GRN
+                  say "Quality OK" on goods no one ever judged.
+                  Shown DISABLED with the reason, never hidden: a reader has to
+                  be able to see what the kitchen answered, and a control that
+                  silently disappears reads as a bug. */}
+              {(() => {
+                const gated = Number(row?.qc_required) === 1;
+                const checker = CHECKER_LABEL[String(row?.qc_checker || '')] || 'Kitchen';
+                const stamp = (by: string | null | undefined, at: string | null | undefined) =>
+                  by ? <>Signed by <b>{by}</b>{at ? <> · {fmtIST(at)}</> : null}.</> : null;
+                return (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <div className="border border-blue-200 rounded-lg p-3 bg-blue-50/40">
+                      <div className="text-xs font-semibold text-blue-900 mb-1.5 flex items-center gap-1.5 flex-wrap">
+                        <FileCheck className="w-3.5 h-3.5" /> Store — receiving desk
+                        <span className="text-[10px] font-normal text-blue-700">
+                          ({STORE_QC_FIELDS.filter(f => form[f.k]).length} of {STORE_QC_FIELDS.length})
+                        </span>
+                      </div>
+                      <div className="space-y-1.5">
+                        {STORE_QC_FIELDS.map(f => (
+                          <label key={f.k} className="flex items-start gap-1.5 cursor-pointer">
+                            <input type="checkbox" checked={!!form[f.k]}
+                                   onChange={e => set({ [f.k]: e.target.checked } as Partial<BillForm>)}
+                                   className="accent-blue-600 mt-0.5" />
+                            <span>{f.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="text-[10px] text-blue-700 mt-1.5">
+                        {stamp(row?.qc_store_by, row?.qc_store_at) || 'Yours to amend on any receipt — this is the receiving desk’s half of the split.'}
+                      </div>
+                    </div>
+
+                    <div className={`border rounded-lg p-3 ${gated ? 'border-[#E8D5C4] bg-[#F3EEE7]' : 'border-blue-200 bg-blue-50/40'}`}>
+                      <div className={`text-xs font-semibold mb-1.5 flex items-center gap-1.5 flex-wrap ${gated ? 'text-[#6B5744]' : 'text-blue-900'}`}>
+                        {String(row?.qc_checker) === 'bar' ? <Wine className="w-3.5 h-3.5" /> : <ChefHat className="w-3.5 h-3.5" />}
+                        {gated ? `${checker} — not amendable here` : 'Kitchen / bar'}
+                        <span className={`text-[10px] font-normal ${gated ? 'text-[#8B7355]' : 'text-blue-700'}`}>
+                          ({KITCHEN_QC_FIELDS.filter(f => form[f.k]).length} of {KITCHEN_QC_FIELDS.length})
+                        </span>
+                      </div>
+                      <div className="space-y-1.5">
+                        {KITCHEN_QC_FIELDS.map(f => (
+                          <label key={f.k} className={`flex items-start gap-1.5 ${gated ? 'cursor-not-allowed text-[#8B7355]' : 'cursor-pointer'}`}>
+                            <input type="checkbox" checked={!!form[f.k]} disabled={gated}
+                                   onChange={e => set({ [f.k]: e.target.checked } as Partial<BillForm>)}
+                                   className="accent-blue-600 mt-0.5" />
+                            <span>{f.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <div className={`text-[10px] mt-1.5 ${gated ? 'text-[#6B5744]' : 'text-blue-700'}`}>
+                        {gated ? (
+                          <>
+                            {stamp(row?.qc_kitchen_by, row?.qc_kitchen_at) || (
+                              String(row?.status) === 'awaiting_qc'
+                                ? <>Not yet checked. Sign it off on <b>Pending Quality Checks</b>, or have an admin / head chef release it with a written reason.</>
+                                : String(row?.qc_outcome) === 'override'
+                                  ? <>Never answered — this bill was released without a kitchen check.</>
+                                  : <>Unsigned.</>
+                            )}
+                            {' '}The server refuses these three from this form on a held receipt — the receiving desk must not certify its own delivery.
+                          </>
+                        ) : (
+                          <>This receipt was not gated, so these are the desk’s own note about the goods rather than a checking department’s answer.</>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
 
               <label className="flex flex-col gap-1 text-[#6B5744]">Notes
                 <textarea rows={2} value={form.notes} onChange={e => set({ notes: e.target.value })}
@@ -2157,9 +3162,32 @@ function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; 
                 </div>
               </div>
 
+              {/* A HELD RECEIPT NEVER ADDED ANY STOCK, so the three bullets
+                  above describe an event that cannot happen here — the reversal
+                  will legitimately find 0 materials, 0 cost rows, 0 movements.
+                  Said BEFORE the click as well as in the server's own result
+                  notice, because "Reversed 0 materials" on the way out reads as
+                  the void having silently failed, and the correction for that
+                  belief is a manual adjustment on top of a receipt that never
+                  landed. Additive: on every other bill this block is absent and
+                  the panel is exactly as it shipped. */}
+              {isHeld(g) && (
+                <div className="rounded-lg border border-blue-200 bg-blue-50/60 p-2.5 text-blue-900 text-[11px]">
+                  <b>This receipt is still waiting for a quality check, so it never added any stock.</b> There is nothing to reverse —
+                  deleting it will report 0 materials and 0 cost rows, and that is the correct outcome, not a failure. It leaves the
+                  Pending Quality Checks queue for good and can never be signed off afterwards.
+                </div>
+              )}
+
               <div className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
                 <div><b>Vendor:</b> {g.vendor || '—'} &nbsp; <b>Bill no.:</b> {g.invoice_number || '—'}</div>
-                <div><b>Receipt date:</b> {g.date} &nbsp; <b>Lines:</b> {g.line_count} &nbsp; <b>Accepted:</b> {fmt(g.accepted_value || 0)}</div>
+                <div>
+                  <b>Receipt date:</b> {g.date} &nbsp; <b>Lines:</b> {g.line_count} &nbsp;
+                  <b>Accepted:</b>{' '}
+                  {isHeld(g)
+                    ? <span title="Nothing has been accepted or rejected — the checking department has not judged this delivery yet.">not decided</span>
+                    : fmt(g.accepted_value || 0)}
+                </div>
               </div>
 
               {err && (
@@ -2249,6 +3277,184 @@ function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; 
             </>
           ) : (
             <button onClick={onVoided} className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">Done</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================ */
+/* RELEASE WITHOUT A KITCHEN CHECK — the owner's decision 2.    */
+/*                                                              */
+/* "A hard block with no escape gets worked around." At 6am     */
+/* with a truck at the bay and nobody from the kitchen in the   */
+/* building, a gate that cannot be opened is a gate people      */
+/* learn to route around — by not recording the delivery at     */
+/* all, which is worse than the problem this feature solves.    */
+/*                                                              */
+/* So the escape hatch exists, and it is expensive on purpose:  */
+/* only an admin or a head chef, only with a written reason,    */
+/* and the bill carries the fact FOR EVER (qc_outcome /         */
+/* qc_override_by / qc_override_at / qc_override_reason are     */
+/* committed columns on goods_receipt_notes, not an audit row   */
+/* somebody could prune) and appears on the override report.    */
+/* This modal's whole job is to say that BEFORE the click, not  */
+/* after — an override taken in ignorance is an override        */
+/* nobody can defend later.                                     */
+/*                                                              */
+/* Two phases in one shell, like VoidBillModal: CONFIRM (what   */
+/* this is about to do to live stock) and RESULT (what it did,  */
+/* including the one thing that can fail after the stock has    */
+/* already moved).                                              */
+/* ============================================================ */
+function OverrideQcModal({ g, onClose, onDone }: { g: GRN; onClose: () => void; onDone: () => void }) {
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [result, setResult] = useState<any>(null);
+  const checkerName = CHECKER_LABEL[String(g.qc_checker || '')] || 'Kitchen';
+
+  /** Mirrors POST /api/grn/[id]/qc's own bar (a reason of at least 5 characters)
+   *  so the refusal is instant — NOT a second authority. The server re-checks
+   *  it, and re-checks who is asking, and fails closed. */
+  const reasonOk = reason.trim().length >= 5;
+
+  const submit = async () => {
+    if (!reasonOk) { setErr('Write the reason — at least a few words. It is stored on the bill permanently and is the only defence of this decision later.'); return; }
+    setBusy(true); setErr('');
+    try {
+      const res = await api(`/api/grn/${encodeURIComponent(g.id)}/qc`, {
+        method: 'POST',
+        body: { mode: 'override', reason: reason.trim() },
+      });
+      const j = await res.json().catch(() => ({}));
+      // A refusal is a designed outcome here — not an admin/head chef, the
+      // receipt already decided by someone else in another tab, a voided bill,
+      // a receipt dated on or before the central-store cutover. The server names
+      // which and why; show its sentence verbatim rather than "Failed".
+      if (!res.ok) { setErr(j?.error || `Could not release this receipt (HTTP ${res.status})`); return; }
+      setResult(j);
+    } catch (e: any) {
+      setErr(e?.message || 'Could not release this receipt');
+    } finally { setBusy(false); }
+  };
+
+  /** Materials whose weighted average did not recompute AFTER the stock landed.
+   *  The release SUCCEEDED; this is the cost cascade behind it. It must never
+   *  read as "the release failed" — an admin who believes that re-runs it, and
+   *  the second attempt is correctly refused, which teaches them the stock never
+   *  moved when it did. (Same rule the void result panel follows.) */
+  const cascadeFailed: string[] = Array.isArray(result?.price_cascade_failed) ? result.price_cascade_failed : [];
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
+      <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-lg shadow-xl flex flex-col overflow-hidden">
+        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <h2 className="font-bold text-[#2D1B0E] flex items-center gap-2 min-w-0">
+            <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0" />
+            <span className="truncate">
+              {result ? `Released ${g.grn_number}` : `Release ${g.grn_number} without a ${checkerName.toLowerCase()} check?`}
+            </span>
+          </h2>
+          <button onClick={result ? onDone : onClose} aria-label="Close"><X className="w-5 h-5 text-[#8B7355]" /></button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-3 text-xs">
+          {!result ? (
+            <>
+              {/* AMBER, NOT RED. This is a sanctioned decision with a cost, not
+                  a destructive one — red here would put it in the same visual
+                  class as voiding a bill and reversing live stock, which is a
+                  different act entirely. The cost is spelled out instead. */}
+              <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 space-y-2 text-amber-900">
+                <div className="font-semibold flex items-center gap-1.5">
+                  <AlertTriangle className="w-4 h-4" /> This inwards the goods on your authority, with nobody having checked them.
+                </div>
+                <ul className="list-disc pl-4 space-y-1">
+                  <li><b>The stock goes in now</b>, at the quantities the receiving desk recorded — every line in full. An override is “release it”, not “release part of it”: accepting some and refusing the rest is a quality judgement, which is exactly what this says nobody made.</li>
+                  <li><b>The bill is marked permanently.</b> “Inwarded without kitchen QC”, with your name, the time and this reason, stays on the receipt and on the override report. It is not an audit line that ages out.</li>
+                  <li><b>The three quality checks stay unticked</b> — quality, temperature, damage. Nobody looked, so nothing may claim they did; the printed GRN will show them blank.</li>
+                  <li><b>The vendor stops being answerable.</b> Once this is ours, bad goods are the venue’s loss — that leverage is what the wait was buying.</li>
+                </ul>
+              </div>
+
+              <div className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
+                <div><b>Vendor:</b> {g.vendor || '—'} &nbsp; <b>Bill no.:</b> {g.invoice_number || '—'}</div>
+                <div><b>Receipt date:</b> {g.date} &nbsp; <b>Lines:</b> {g.line_count} &nbsp; <b>Bill value:</b> {fmt(g.inward_value || 0)}</div>
+                <div className="mt-1 text-[10px] text-[#8B7355]">
+                  Waiting on <b className="text-[#6B5744]">{checkerName}</b> since it was recorded
+                  {g.received_by ? <> by {g.received_by}</> : null}.
+                </div>
+              </div>
+
+              {err && (
+                <div className="text-red-700 bg-red-50 border border-red-200 rounded p-2 flex items-start gap-1.5">
+                  <AlertTriangle className="w-4 h-4 shrink-0" /> <span>{err}</span>
+                </div>
+              )}
+
+              <label className="flex flex-col gap-1 text-[#6B5744]">
+                Why is this being released unchecked? <span className="text-red-600">*</span>
+                <input value={reason} onChange={e => { setReason(e.target.value); if (err) setErr(''); }}
+                       autoFocus placeholder="e.g. 05:40 delivery, no kitchen staff on site, chilled items cannot wait"
+                       className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+                <span className="text-[10px] text-[#8B7355]">
+                  Stored on the bill for good and shown on the override report. Say what stopped the check from happening — that is what makes the report worth reading.
+                </span>
+              </label>
+            </>
+          ) : (
+            <>
+              <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900">
+                <div className="font-semibold text-[#2D1B0E] mb-1 flex items-center gap-1.5">
+                  <ShieldAlert className="w-4 h-4" /> {g.grn_number} — inwarded without a kitchen check
+                </div>
+                {/* The server's own sentence, verbatim. It is the authority on
+                    what actually happened, and re-wording it here is how a
+                    screen and its API start telling two stories. */}
+                <div>{result.message || 'Stock has been added.'}</div>
+                <div className="mt-1 text-[11px]">
+                  {Number(result.lines_applied) || 0} line(s) inwarded · {Number(result.purchases_written) || 0} cost row(s) written ·
+                  {' '}{Number(result.materials_touched) || 0} material(s) re-costed.
+                </div>
+              </div>
+
+              {cascadeFailed.length > 0 && (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900">
+                  <div className="font-semibold flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4" /> The stock WAS added — do not repeat this
+                  </div>
+                  <div className="mt-1">
+                    {cascadeFailed.length} material(s) took the stock but their weighted average price did not recompute, so their
+                    cost is stale until the next purchase or a manual re-cost. Recipe costs built on them are stale too.
+                  </div>
+                  <div className="mt-1 text-[10px]">{cascadeFailed.join(', ')}</div>
+                </div>
+              )}
+
+              <div className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
+                The receipt has left the Pending Quality Checks queue and can no longer be signed off. If the goods do turn out to be
+                bad, this is now a <b>vendor return</b> or a back-correction GRN — not a rejection, because the delivery was accepted.
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2 shrink-0">
+          {!result ? (
+            <>
+              <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
+              <button onClick={submit} disabled={busy || !reasonOk}
+                      title={reasonOk ? 'Add the stock now and mark the bill permanently' : 'Write the reason first'}
+                      className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-sm rounded-lg flex items-center gap-1.5 disabled:opacity-50">
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ShieldAlert className="w-4 h-4" />}
+                {busy ? 'Releasing…' : 'Release & add stock'}
+              </button>
+            </>
+          ) : (
+            <button onClick={onDone} className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">Done</button>
           )}
         </div>
       </div>

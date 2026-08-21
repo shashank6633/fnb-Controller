@@ -108,6 +108,27 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/purchases',           label: 'Purchases' },
       { path: '/purchase-orders',     label: 'Purchase Orders' },
       { path: '/grn',                 label: 'Goods Receipt (GRN)' },
+      // Pending Quality Checks — the queue a kitchen/bar staffer clears at the
+      // delivery bay. A GRN whose lines include a QC-required category is
+      // recorded with status 'awaiting_qc' and NO STOCK MOVEMENT; signing it
+      // off here is what inwards it, while the vendor is still at the bay and
+      // refusing a crate is real leverage.
+      //
+      // DELIBERATELY NO TIER FLAG, and it must stay that way. The owner's
+      // decision 6 is verbatim: "any user with access to the checking
+      // department, name and time stamped. NOT HOD-only — at 6am with a truck
+      // waiting that guarantees workarounds." hodOnly/mgmtOnly here would put
+      // the one screen this feature exists for out of reach of the people who
+      // actually look at the goods, and they run BEFORE the null-map grant, so
+      // they are a real lock, not a hint.
+      //
+      // Seeing the queue is not permission to move stock: POST /api/grn/[id]/qc
+      // re-derives who may sign from the session (canSignQcFor, department or
+      // section membership) and answers 403 with a sentence for everybody else.
+      // Reading it is the same bar GET /api/grn already sets for the same
+      // documents. It also inherits a /grn grant by prefix, which is correct —
+      // whoever can see the receipts should see which of them are held.
+      { path: '/grn/qc',              label: 'Pending Quality Checks' },
       { path: '/receiving-variance',  label: 'Receiving Variance' },
       // Returns — the return TICKET queue. One workflow, two kinds of return,
       // forked by an immutable `kind` column on the ticket. Two facts a reader
@@ -438,6 +459,25 @@ export const PAGE_CATALOG: PageSection[] = [
       // every save 403s. If manager read is ever wanted, build the read-only
       // view first, then loosen this.
       { path: '/settings/station-departments', label: 'Settings — Station → Department Map', adminOnly: true },
+      // Quality Check Categories — which categories hold a delivery at the bay
+      // until kitchen or bar signs. A veg/dairy/meat category set here means the
+      // goods do NOT enter stock on receipt; "No check" means they inward
+      // exactly as they always did.
+      //
+      // adminOnly, and it must stay that way, for the same reason the Station →
+      // Department map above is: a wrong row does not announce itself. Turn a
+      // perishable category off and deliveries silently stop being checked —
+      // which is the failure this whole feature exists to end — and turn a
+      // grocery category on and a storekeeper is stuck at 6am with a truck and
+      // nobody in the building who can sign. Both surface days later, far from
+      // this screen.
+      //
+      // The catalog flag is the page-level lock only. GET and PUT
+      // /api/grn/qc/categories are BOTH requireRole('admin') server-side, which
+      // is the real gate; this entry is what stops the proxy waving through a
+      // legacy user whose page_access is null (canAccessPage fails open four
+      // ways — only the tier flags run before those grants).
+      { path: '/settings/qc-categories', label: 'Settings — Quality Check Categories', adminOnly: true },
       { path: '/settings/page-access', label: 'Settings — Page Access' },
       // Impact Preview — read-only report that answers "if we stop letting a
       // parent page carry its siblings, who loses which pages?". Simulation

@@ -39,6 +39,7 @@
  */
 import type Database from 'better-sqlite3';
 import { generateId } from '@/lib/db';
+import { qcHoldBlockForCount } from '@/lib/grn-qc';
 import { postLedger, isStoreMappedMaterial } from '@/lib/store-engine';
 import { deptOnHand, postDeptLedger } from '@/lib/dept-ledger';
 import {
@@ -734,7 +735,18 @@ export function varianceApprovalBlock(
     // shared block, so the queue disables Approve on exactly the rows the
     // approval will refuse — a list that renders Approve on a row the server
     // then rejects is how an admin ends up clicking 963 times.
-    return centralCutoverBlock(db, row);
+    const cut = centralCutoverBlock(db, row);
+    if (cut) return cut;
+    // THE SECOND WAY THE BOOK CAN LAG THE SHELF, and the newer one. A GRN held
+    // for a kitchen quality check has its goods on the shelf and off the book
+    // ON PURPOSE, so a count taken in that window bakes the whole delivery into
+    // its variance — and the sign-off then adds the same crate again. Exactly
+    // the cutover argument at a smaller scale; see qcHoldBlockForCount() in
+    // src/lib/grn-qc.ts for the worked example. Returns null on a database that
+    // has never held anything, which is every database until this feature is
+    // armed.
+    return qcHoldBlockForCount(db, norm(row.material_id),
+      deptCountInstant(String(row.date ?? '').trim(), String(row.created_at ?? '').trim()));
   }
 
   const who = norm(deptName) || 'this department';
@@ -991,6 +1003,15 @@ export function approveVariance(
       // time. Throwing rolls the whole approval back.
       const floorMsg = centralCutoverBlock(db, row as VarianceKeyRow);
       if (floorMsg) throw new Error(floorMsg);
+      // THE QC-HOLD FLOOR, belt-and-braces for the same reason and in the same
+      // place: POST /api/closing-stock calls approveVariance() DIRECTLY for the
+      // admin "Adjust system stock" tick, with no queue and no second click, so
+      // varianceApprovalBlock() above is not on that path at all. Without this
+      // copy, ticking that box on a day a delivery was held posts the delivery
+      // onto the book a second time, silently, inside the save.
+      const qcHoldMsg = qcHoldBlockForCount(db, norm(row.material_id),
+        deptCountInstant(String(row.date ?? '').trim(), String(row.created_at ?? '').trim()));
+      if (qcHoldMsg) throw new Error(qcHoldMsg);
 
       const cur = db.prepare(`SELECT current_stock FROM raw_materials WHERE id = ?`).get(row.material_id) as { current_stock: number } | undefined;
       const before = r3(Number(cur?.current_stock) || 0);

@@ -333,8 +333,54 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       }
     }
 
-    if (has('qc_by')) put('qc_by', String(b.qc_by ?? '').trim(), grn.qc_by);
+    // qc_by is guarded below with the three kitchen ticks — on a gated receipt
+    // it IS the kitchen's signature, not a free-text note.
     if (has('notes')) put('notes', String(b.notes ?? ''), grn.notes);
+
+    // ── THE THREE KITCHEN TICKS ARE NOT THE RECEIVER'S TO WRITE ─────────────
+    // On a GRN the kitchen QC gate held (qc_required = 1), quality / temperature
+    // / damage belong to the CHECKING DEPARTMENT and are stamped by
+    // POST /api/grn/[id]/qc together with qc_kitchen_by and qc_kitchen_at.
+    // This route's bar is canProcessAsStore || isManagement — i.e. the store
+    // manager, the very person the owner's decision 4 separates from the
+    // checker. Letting them flip the ticks here would reinstate the exact defect
+    // this feature exists to remove ("ticked by the same person doing the
+    // inward"), in two ways: BEFORE sign-off it pre-ticks a check nobody made,
+    // and AFTER sign-off — or after an override, where they are deliberately
+    // left at 0 — it rewrites the kitchen's answer with no second signature and
+    // makes the printed GRN say "Quality OK" on goods no one ever judged.
+    // SCOPED TO GATED RECEIPTS ONLY. qc_required is 0 on all 29 historical rows
+    // and on every ungated delivery, so the pre-existing amend behaviour there
+    // is untouched. The STORE's own three (expiry / weight / invoice match) stay
+    // amendable on every receipt — they are this caller's half of the split.
+    // qc_by IS IN THIS SET, and leaving it out was a hole the guard itself
+    // created the appearance of closing. decideGrnQc writes the kitchen
+    // signer's email into qc_by (it is the LEGACY single signature that
+    // src/app/grn/print/[id]/page.tsx renders as "QC by" and as the
+    // "QC verified by" signature line), and an override deliberately blanks it.
+    // Left amendable at this route's bar (canProcessAsStore || isManagement),
+    // a store manager could type "Ravi — Head Chef" onto a bill nobody checked,
+    // or overwrite the real signer's name after a genuine sign-off while
+    // qc_kitchen_by — which is never printed — silently disagreed. The printed
+    // sheet is the surface most people read, so that is the one that matters.
+    const KITCHEN_TICKS = ['qc_quality', 'qc_temperature', 'qc_damage'] as const;
+    if (Number(grn.qc_required) === 1) {
+      const attempted: string[] = KITCHEN_TICKS.filter(q => has(q) && (b[q] ? 1 : 0) !== (Number(grn[q]) ? 1 : 0));
+      if (has('qc_by') && String(b.qc_by ?? '').trim() !== String(grn.qc_by ?? '').trim()) attempted.push('qc_by');
+      if (attempted.length > 0) {
+        return Response.json({
+          error: `Quality, temperature, damage and the QC signature on ${grn.grn_number} are the checking department's to record, not the receiving desk's — this delivery was held for a ${String(grn.qc_checker || 'kitchen')} check. `
+            + (String(grn.status) === 'awaiting_qc'
+              ? 'Sign it off on Pending Quality Checks, or ask an admin / head chef to release it with a written reason.'
+              : 'It has already been decided; a check cannot be re-ticked or re-signed afterwards. Void and re-record the receipt if it was wrong.'),
+          fields: attempted,
+        }, { status: 400 });
+      }
+    } else if (has('qc_by')) {
+      // Ungated receipt — unchanged behaviour, qc_by stays the free-text note
+      // the receiving bay has always typed.
+      put('qc_by', String(b.qc_by ?? '').trim(), grn.qc_by);
+    }
     for (const q of ['qc_quality', 'qc_temperature', 'qc_expiry', 'qc_damage', 'qc_weight', 'qc_invoice_match']) {
       if (has(q)) put(q, b[q] ? 1 : 0, Number(grn[q]) ? 1 : 0);
     }
@@ -420,6 +466,21 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       }
       if ('vendor' in changes) {
         db.prepare(`UPDATE purchases SET vendor = ? WHERE grn_id = ?`)
+          .run(String(changes.vendor.to ?? ''), id);
+        // ── AND TO THE COST ROW THAT HAS NOT BEEN WRITTEN YET ────────────────
+        // A GRN the kitchen QC gate is holding has NO `purchases` rows: the
+        // UPDATE above matches nothing, and the cost row is written hours later
+        // by decideGrnQc from goods_receipt_note_items.cost_vendor — the copy
+        // taken at inward, because on a mixed PO each line is booked against its
+        // OWN vendor and the header's name is not it. Without this the amended
+        // vendor would reach the GRN and the ledger would still book the typo.
+        // SAFE ON EVERY OTHER RECEIPT because it can only fire where the header
+        // vendor IS the line vendor: a vendor change on a PO-sourced GRN is
+        // already refused above (it is the grouping key), so this branch is
+        // ad-hoc-only, where cost_vendor was written as the header vendor. On an
+        // already-applied GRN it rewrites a field nothing reads again, which
+        // keeps the document and its cost rows telling one story.
+        db.prepare(`UPDATE goods_receipt_note_items SET cost_vendor = ? WHERE grn_id = ?`)
           .run(String(changes.vendor.to ?? ''), id);
       }
 
@@ -908,6 +969,19 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       warnings: priceWarnings,
       notice: [
         'The bill document is kept — header and line items are unchanged; only the stock and cost rows were reversed.',
+        // ── A HELD RECEIPT VOIDS TO A CLEAN ZERO, AND THAT IS NOT A FAILURE ──
+        // A GRN the kitchen QC gate was still holding never moved stock and
+        // never wrote a cost row, so the reversal above legitimately finds
+        // nothing: 0 materials, 0 purchases, 0 movements. Said out loud because
+        // "reversed 0 material(s)" on an admin's screen otherwise reads as the
+        // void having silently failed, and the correction for that belief is
+        // another manual adjustment on top of a receipt that never landed.
+        // It also takes the receipt out of the Pending Quality Checks queue for
+        // good: the sign-off's claim matches only status = 'awaiting_qc', so a
+        // voided receipt can never be signed and QC can never un-void one.
+        String(grn.status) === 'awaiting_qc'
+          ? 'This receipt was still waiting for a quality check, so no stock had ever been added and there was nothing to reverse. It has left the Pending Quality Checks queue and can no longer be signed off.'
+          : '',
         result.average_price_stale.length
           ? `${result.average_price_stale.length} material(s) have no purchases left, so their weighted average still carries this bill's price — correct it by hand or with the next purchase.`
           : 'Weighted averages were re-derived from the surviving purchases.',

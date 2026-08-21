@@ -31,7 +31,31 @@ export async function GET(request: Request) {
     const from = url.searchParams.get('from');
     const to   = url.searchParams.get('to');
     const vendorId = url.searchParams.get('vendor_id');
-    const where: string[] = ['g.po_id IS NOT NULL'];
+    // ── WHICH RECEIPTS THIS REPORT MAY SPEAK FOR ─────────────────────────────
+    // This is the VENDOR-ACCOUNTABILITY report: accept_delta below is
+    // (quantity_accepted − quantity_ordered), i.e. "what the vendor still owes
+    // us". Two GRN states make that subtraction a lie, and both of them read as
+    // the vendor's fault when they are not:
+    //
+    //   awaiting_qc — a held delivery deliberately carries quantity_accepted = 0
+    //     until the kitchen signs (src/lib/grn-qc.ts, "WHAT quantity_accepted
+    //     MEANS WHILE A GRN WAITS"). A PO for 100 kg where the vendor delivered
+    //     80 was reporting accept_delta −100 and ₹20,000 short instead of −20 and
+    //     ₹4,000 — a 5× overstatement, ON THE DAY THE DELIVERY LANDS, which is
+    //     the only day anybody can act on it. It self-heals at sign-off, which is
+    //     precisely what makes it dangerous: the number is wrong exactly while it
+    //     is being read. A delivery that has not been judged yet has no vendor
+    //     verdict to report; it belongs in Pending Quality Checks, not here.
+    //   void — a cancelled receipt whose stock was reversed. Its LINES survive
+    //     (they are the document) and, if it was voided while held, its
+    //     quantity_accepted stays 0 for ever, so it reports a permanent phantom
+    //     shortfall for a delivery that no longer stands. The same exclusion the
+    //     inward register and the anomalies digest already make by name.
+    //
+    // Applied to `where`, so `receipts_in_range` below counts the same universe
+    // — a denominator that includes rows the numerator can never see would make
+    // "0 of 5 receipts flagged" unexplainable.
+    const where: string[] = ['g.po_id IS NOT NULL', `COALESCE(g.status, '') NOT IN ('void', 'awaiting_qc')`];
     const params: any[] = [];
     const outletId = await getCurrentOutletId();
     if (outletId)  { where.push('(g.outlet_id = ? OR g.outlet_id IS NULL)'); params.push(outletId); }

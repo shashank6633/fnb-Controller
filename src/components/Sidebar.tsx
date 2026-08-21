@@ -148,6 +148,19 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Purchases",          href: "/purchases",          icon: ShoppingCart },
       { kind: "link", label: "Purchase Orders",    href: "/purchase-orders",    icon: ClipboardList },
       { kind: "link", label: "Goods Receipt (GRN)", href: "/grn",               icon: ClipboardList },
+      // Sits directly under GRN because it is the second half of that flow, not
+      // a separate feature: a delivery in a checked category (veg, dairy, meat…)
+      // is RECORDED by the store but does NOT enter stock — it parks here until
+      // kitchen or bar looks at the goods and signs. Without this link the queue
+      // is reachable only by typing the URL, and the receipts would be entered,
+      // silently held, and read back as "the stock didn't update" — which is
+      // precisely how the variance-approvals queue failed before it was listed.
+      //
+      // NO tier flag in the page-catalog on purpose (owner decision 6: whoever
+      // is at the bay signs, not only the HOD), so this row is visible to the
+      // kitchen and bar staff who have to act on it. Seeing it is not permission
+      // to move stock — the sign-off route re-checks department membership.
+      { kind: "link", label: "Pending Quality Checks", href: "/grn/qc",         icon: ClipboardCheck },
       { kind: "link", label: "Receiving Variance", href: "/receiving-variance", icon: AlertTriangle },
       // Returns — sits right after Receiving Variance on purpose: that page is
       // where a short/damaged delivery is spotted, and this is where the goods
@@ -405,6 +418,12 @@ const navTree: NavEntry[] = [
       // unreachable meant nobody could fix the mapping that silently drops
       // consumption. adminOnly in the page-catalog.
       { kind: "link", label: "Station → Department", href: "/settings/station-departments", icon: Link2 },
+      // Quality Check Categories: which categories hold a delivery at the bay
+      // until the kitchen signs. adminOnly in the page-catalog, so canAccessPage
+      // hides this row for everyone else — and it MUST be listed here as well:
+      // this file keeps its own nav tree, and a page registered only in the
+      // catalog is correctly gated and completely invisible.
+      { kind: "link", label: "Quality Check Categories", href: "/settings/qc-categories", icon: ChefHat },
       { kind: "link", label: "Database (read-only)", href: "/admin/database",   icon: Database },
       { kind: "link", label: "Data Hygiene",   href: "/admin/data-hygiene",     icon: ShieldAlert },
       { kind: "link", label: "Reset Data",     href: "/admin/reset",            icon: ShieldAlert },

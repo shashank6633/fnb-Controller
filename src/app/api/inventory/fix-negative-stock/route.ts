@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
+import { materialsAwaitingQc } from '@/lib/grn-qc';
 import { dualQty, fmtQtyNum } from '@/lib/pack-units';
 
 /**
@@ -70,6 +71,11 @@ import { dualQty, fmtQtyNum } from '@/lib/pack-units';
  * include_store_mapped:true still lets an admin clear a stray central-book
  * negative, and stamps the reason on the row.
  *
+ * KITCHEN-QC CARVE-OUT (do not remove, and there is no flag to override it).
+ * A material with a delivery still AWAITING A QUALITY CHECK is never lifted:
+ * its goods are on the shelf and off the book on purpose, so lifting to 0 and
+ * then signing the check credits the same crate twice. See scan() below.
+ *
  * Admin only.
  *   GET                          → preview only. Never writes. Safe to poll.
  *   POST {}                      → arms a confirmation: returns the preview and
@@ -120,10 +126,38 @@ function scan(db: ReturnType<typeof getDb>) {
     ORDER BY (current_stock * COALESCE(average_price, 0)) ASC
   `).all() as NegRow[];
 
+  // ── THE KITCHEN-QC CARVE-OUT (do not remove) ─────────────────────────────
+  // A GRN held for a quality check has its goods PHYSICALLY ON THE SHELF and
+  // DELIBERATELY OFF THE BOOK (src/lib/grn-qc.ts). Lifting such a material to 0
+  // asserts "the shelf is empty" at the one moment that is provably false, and
+  // the sign-off then adds the whole delivery ON TOP of the lifted zero:
+  //
+  //   book −60  ·  100 kg held at the bay        (shelf holds the 100)
+  //   lift → 0                                   (+60 created out of nothing)
+  //   kitchen signs → +100                       book 100, not 40
+  //
+  // Exactly the argument the central-store cutover already makes inside
+  // decideGrnQc, and the reason varianceApprovalBlock refuses a closing count
+  // taken in the same window. It matters MORE here than anywhere else, because
+  // a hold DRIVES central negative — the department consumes at KOT-complete
+  // against goods the book does not yet own — so this button is reached for
+  // precisely while a delivery is waiting.
+  //
+  // Skipped like the liquor rail: named, reported, never silently dropped, and
+  // with no include_ flag to override it. There is no case where lifting a
+  // material that has an unsigned delivery against it is the right correction —
+  // clearing the queue IS the correction, and it lands the real number.
+  const held = materialsAwaitingQc(db);
+
   const central: NegRow[] = [];
   const storeMapped: NegRow[] = [];
-  for (const r of rows) (isStoreMappedMaterial(db, r.id) ? storeMapped : central).push(r);
-  return { central, storeMapped };
+  const heldQc: Array<NegRow & { grn_number: string }> = [];
+  for (const r of rows) {
+    const grn = held.get(r.id);
+    if (grn) { heldQc.push({ ...r, grn_number: grn }); continue; }
+    (isStoreMappedMaterial(db, r.id) ? storeMapped : central).push(r);
+  }
+  return { central, storeMapped, heldQc };
 }
 
 /** OWNER RULE: quantities lead with the PURCHASE unit; value is always computed
@@ -151,10 +185,12 @@ function describe(r: NegRow) {
 }
 
 function buildPreview(db: ReturnType<typeof getDb>, includeStoreMapped: boolean) {
-  const { central, storeMapped } = scan(db);
+  const { central, storeMapped, heldQc } = scan(db);
   const target = includeStoreMapped ? [...central, ...storeMapped] : central;
   const items = target.map(describe);
   const skipped = includeStoreMapped ? [] : storeMapped.map(describe);
+  // Never lifted, on either flag — see the carve-out note in scan().
+  const skippedQc = heldQc.map(r => ({ ...describe(r), grn_number: r.grn_number }));
 
   const valueCreated = money(items.reduce((s, i) => s + i.value_created, 0));
   const totalAfter = db.prepare(`
@@ -165,6 +201,7 @@ function buildPreview(db: ReturnType<typeof getDb>, includeStoreMapped: boolean)
   return {
     items,
     skipped_store_mapped: skipped,
+    skipped_awaiting_qc: skippedQc,
     items_count: items.length,
     value_created: valueCreated,
     total_stock_value_now: money(totalAfter?.v || 0),
@@ -173,13 +210,27 @@ function buildPreview(db: ReturnType<typeof getDb>, includeStoreMapped: boolean)
   };
 }
 
+/** The one sentence about held deliveries, used by every response shape. */
+function qcSkipNote(p: ReturnType<typeof buildPreview>): string {
+  const n = p.skipped_awaiting_qc.length;
+  if (n === 0) return '';
+  const names = p.skipped_awaiting_qc.slice(0, 3)
+    .map(i => `${i.name} (${i.grn_number})`).join(', ');
+  return ` ${n} item${n === 1 ? '' : 's'} skipped because a delivery is still awaiting a kitchen quality check `
+    + `— ${names}${n > 3 ? ` and ${n - 3} more` : ''}. `
+    + `Those goods are on the shelf but not on the book on purpose; lifting them to 0 now would double-count them `
+    + `when the check is signed off. Clear them on Purchasing → Pending Quality Checks instead.`;
+}
+
 function previewSummary(p: ReturnType<typeof buildPreview>, includeStoreMapped: boolean) {
   if (p.items_count === 0) {
-    return p.skipped_store_mapped.length > 0
+    return (p.skipped_store_mapped.length > 0
       ? `No central material is negative. ${p.skipped_store_mapped.length} liquor/store-mapped `
         + `item${p.skipped_store_mapped.length === 1 ? ' is' : 's are'} negative — fix those in `
         + `Inventory → Liquor Store → Adjust so the store ledger stays in step.`
-      : 'Nothing to fix — no material has negative stock.';
+      : (p.skipped_awaiting_qc.length > 0
+        ? 'Nothing to fix right now.'
+        : 'Nothing to fix — no material has negative stock.')) + qcSkipNote(p);
   }
   const names = p.items.slice(0, 3).map(i => `${i.name} (${i.display})`).join(', ');
   const more = p.items_count > 3 ? ` and ${p.items_count - 3} more` : '';
@@ -188,7 +239,8 @@ function previewSummary(p: ReturnType<typeof buildPreview>, includeStoreMapped: 
     + `Nothing has changed yet. Click again within 2 minutes to confirm.`
     + (!includeStoreMapped && p.skipped_store_mapped.length > 0
       ? ` (${p.skipped_store_mapped.length} liquor/store-mapped item${p.skipped_store_mapped.length === 1 ? '' : 's'} skipped — fix in Liquor Store → Adjust.)`
-      : '');
+      : '')
+    + qcSkipNote(p);
 }
 
 async function requireAdmin() {
@@ -210,6 +262,7 @@ export async function GET(request: Request) {
       requires_confirmation: p.items_count > 0,
       items: p.items,
       skipped_store_mapped: p.skipped_store_mapped,
+      skipped_awaiting_qc: p.skipped_awaiting_qc,
       items_to_fix: p.items_count,
       value_to_create: p.value_created,
       total_stock_value_now: p.total_stock_value_now,
@@ -246,6 +299,7 @@ export async function POST(request: Request) {
         quantity_created: 0,
         value_created: 0,
         skipped_store_mapped: p.skipped_store_mapped,
+        skipped_awaiting_qc: p.skipped_awaiting_qc,
         total_stock_value_after: p.total_stock_value_now,
         summary: previewSummary(p, includeStoreMapped),
       });
@@ -262,6 +316,7 @@ export async function POST(request: Request) {
         items_fixed: 0,
         items: p.items,
         skipped_store_mapped: p.skipped_store_mapped,
+        skipped_awaiting_qc: p.skipped_awaiting_qc,
         items_to_fix: p.items_count,
         value_to_create: p.value_created,
         summary: previewSummary(p, includeStoreMapped),
@@ -333,13 +388,15 @@ export async function POST(request: Request) {
       value_created: valueCreated,
       items: applied,
       skipped_store_mapped: includeStoreMapped ? [] : p.skipped_store_mapped,
+      skipped_awaiting_qc: p.skipped_awaiting_qc,
       total_stock_value_after: money(after?.v || 0),
       summary: `Lifted ${applied.length} item${applied.length === 1 ? '' : 's'} to 0 and booked `
         + `${applied.length} adjustment row${applied.length === 1 ? '' : 's'} (${inr(valueCreated)} created) `
         + `against ${stamp}. This is a write-up, not a count — record Opening/Closing Stock for the real on-hand.`
         + (!includeStoreMapped && p.skipped_store_mapped.length > 0
           ? ` ${p.skipped_store_mapped.length} liquor/store-mapped item${p.skipped_store_mapped.length === 1 ? '' : 's'} left alone — fix in Liquor Store → Adjust.`
-          : ''),
+          : '')
+        + qcSkipNote(p),
     });
   } catch (e: any) {
     console.error('[/api/inventory/fix-negative-stock]', e);

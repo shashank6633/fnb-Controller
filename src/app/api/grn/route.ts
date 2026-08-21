@@ -3,6 +3,8 @@ import { getCurrentUser, getCurrentOutletId, canProcessAsStore, isManagement } f
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { duplicateLineError } from '@/lib/po-helpers';
+import { resolveQcRequirement, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
+import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 
 /**
  * GRN read API. Listing + detail.
@@ -462,6 +464,98 @@ export async function POST(request: Request) {
       }
     }
 
+    // ── KITCHEN QC GATE ───────────────────────────────────────────────────
+    // Does anything on this delivery need a quality check before it becomes
+    // ours? The decision lives in ONE helper both receiving routes call
+    // (src/lib/grn-qc.ts) — 20 of the 29 live GRNs come through the PO route,
+    // so a gate wired only here would leave the main road open, and a gate
+    // written twice would drift.
+    //
+    // ── WHICH LINES THE GATE IS ALLOWED TO SEE — PER LINE, NEVER PER BILL ────
+    // Two lines are excluded, and BOTH exclusions used to be wrong here:
+    //
+    //  1. A BACK-CORRECTION IS NEVER GATED. Negative lines REDUCE stock to undo
+    //     an earlier over-booking; holding a reduction for a quality check is
+    //     meaningless and would leave the overstatement on the book for as long
+    //     as the queue takes. This route is the only one that can produce them.
+    //     THIS USED TO BE A WHOLE-PAYLOAD FLAG (`hasNegativeLine`) handed to
+    //     resolveQcRequirement, which returned "no check at all" for EVERY line
+    //     on the bill. One −1 kg sugar correction alongside 40 kg of asparagus
+    //     and 25 kg of raw meat inwarded the lot instantly, with no hold, no
+    //     bell and no queue row — two clicks from the UI, and precisely the
+    //     failure this feature exists to stop. The exemption is now per LINE:
+    //     the negative line is dropped, everything else is still weighed.
+    //  2. A LINE THAT WILL NOT BE INSERTED CANNOT BE CHECKED. The insert loop
+    //     below skips `received === 0 && accepted === 0`. Letting such a line
+    //     arm the gate produced a GRN held with ZERO line rows, which could then
+    //     be neither signed nor overridden ("has no line items to sign off") and
+    //     sat in the queue, the bell and the escalation sweep for ever.
+    const gateable = receivable.filter((it: any) => {
+      const rec = Number(it.quantity_received) || 0;
+      const acc = it.quantity_accepted != null ? Number(it.quantity_accepted) : rec;
+      if (rec < 0 || acc < 0) return false;        // back-correction — exempt
+      if (rec === 0 && acc === 0) return false;    // skipped by the insert loop below
+      return true;
+    });
+    const qc = resolveQcRequirement(db, gateable.map((it: any) => String(it.material_id || '')));
+    // On a HELD delivery the store records what ARRIVED and the checking
+    // department records what is ACCEPTED. A receiver pre-rejecting part of a
+    // gated line is refused with the honest remedy — short-receive it — because
+    // that separation is the whole of the owner's decision 4 and it is also what
+    // makes `quantity_accepted = 0 while waiting` mean one unambiguous thing.
+    // ── A BACK-CORRECTION MAY NOT RIDE ON A HELD BILL ───────────────────────
+    // The exemption above says a negative line is never gated. Under "THE GRN IS
+    // THE UNIT" that promise cannot be kept on a mixed bill: the correction line
+    // is still INSERTED on a held receipt, so its stock reduction is deferred
+    // behind a kitchen check exactly like everything else — which is precisely
+    // what the exemption exists to prevent, since holding a reduction leaves the
+    // overstatement on the book for as long as the queue takes.
+    //
+    // WORSE, IT STRANDED THE WHOLE RECEIPT. Measured: 40 kg asparagus + a −1 kg
+    // sugar correction saved as one held GRN, and decideGrnQc then refused BOTH
+    // sign and override with "Accepted quantity on Sugar must be zero or more"
+    // — a receipt in the queue, in the bell and in the escalation sweep that no
+    // authority in the building could clear.
+    //
+    // Refused HERE, before anything is written, with the lever the doctrine
+    // already names: two documents. The correction saves on its own and applies
+    // instantly (it is never gated when it is alone), and the delivery waits.
+    // decideGrnQc also learned to pass a negative line through unjudged, so a
+    // row born before this guard — or by any other route — is still clearable;
+    // this is the guard, that is the safety net.
+    if (qc.required) {
+      const negatives = receivable.filter((it: any) =>
+        (Number(it.quantity_received) || 0) < 0
+        || (it.quantity_accepted != null && Number(it.quantity_accepted) < 0));
+      if (negatives.length > 0) {
+        const names = negatives.slice(0, 3).map((it: any) =>
+          (db.prepare('SELECT name FROM raw_materials WHERE id = ?').get(String(it.material_id || '')) as any)?.name || 'a line');
+        return Response.json({
+          error:
+            `This bill mixes a back-correction with goods that need a quality check, and the two cannot share one receipt. `
+            + `${negatives.length} correction line(s): ${names.join(', ')}${negatives.length > 3 ? '…' : ''}. `
+            + `The delivery has to WAIT for the kitchen; the correction has to apply NOW, or the over-booking it is undoing stays on the book until the queue clears. `
+            + `Save them as two receipts: the correction on its own (it is never held), then this delivery.`,
+          qc_required: true,
+          back_correction_conflict: true,
+        }, { status: 400 });
+      }
+      const block = storePreRejectBlock(gateable.map((it: any) => ({
+        material_name: (db.prepare('SELECT name FROM raw_materials WHERE id = ?')
+          .get(String(it.material_id || '')) as any)?.name,
+        received: Number(it.quantity_received) || 0,
+        declaredAccepted: it.quantity_accepted != null ? Number(it.quantity_accepted) : (Number(it.quantity_received) || 0),
+      })));
+      if (block) return Response.json({ error: block, qc_required: true }, { status: 400 });
+    }
+
+    // THE STORE HALF OF DECISION 4, and whether it was actually answered.
+    // Expiry / use-by, weight-and-count vs invoice, invoice matches PO — the
+    // three checks the receiving desk owns. All three, or it is not a signature;
+    // see the qc_store_by binding in the header INSERT below for why a partial
+    // or empty checklist must not be stamped with a name.
+    const storeSigned = !!(qc_expiry && qc_weight && qc_invoice_match);
+
     // Generate GRN number
     const yr = String(date).slice(0, 4);
     const lastGrn = db.prepare(`SELECT grn_number FROM goods_receipt_notes WHERE grn_number LIKE 'GRN-' || ? || '-%' ORDER BY grn_number DESC LIMIT 1`).get(yr) as any;
@@ -471,25 +565,76 @@ export async function POST(request: Request) {
     const touched = new Set<string>();
 
     const txn = db.transaction(() => {
+      // ── THE HELD HEADER ────────────────────────────────────────────────
+      // 'awaiting_qc' instead of 'received' is the WHOLE gate: it is what the
+      // sign-off's conditional claim matches on, what the queue lists, and what
+      // every downstream reader must learn about the way it learned 'void'.
+      // qc_required / qc_checker record that this receipt WAS gated and by whom,
+      // so the fact survives the status returning to received/partial later.
+      // ── THE KITCHEN'S THREE TICKS ARE DROPPED ON A HELD RECEIPT ─────────
+      // The STORE's three (expiry / weight / invoice match) are stored exactly
+      // as sent — they are this desk's half of the owner's decision-4 split.
+      // The KITCHEN's three (quality / temperature / damage) are FORCED TO 0
+      // whenever the gate holds the delivery, whatever the payload said.
+      // "The sign-off rewrites them" was the old justification and it is not
+      // true on the OVERRIDE path, where they are deliberately left unticked:
+      // a receiver who ticked all three at the bay produced a permanently
+      // released bill whose printed sheet certified a quality check that
+      // qc_outcome = 'override' says nobody made. It is also not true in the
+      // window BEFORE sign-off, where the row would claim a check that had not
+      // happened. Enforced HERE rather than only in the browser, because the
+      // client can only strip what it knows is gated and the category map is
+      // admin-readable — a store manager's form cannot see it.
+      const kitchenTick = (v: any) => (qc.required ? 0 : (v ? 1 : 0));
       db.prepare(`
         INSERT INTO goods_receipt_notes
           (id, grn_number, date, po_id, vendor_id, vendor, invoice_number, invoice_date,
            received_by, qc_by, status, notes, outlet_id,
            qc_quality, qc_temperature, qc_expiry, qc_damage, qc_weight, qc_invoice_match,
+           qc_required, qc_checker, qc_outcome, qc_store_by, qc_store_at,
            created_at)
-        VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                -- ── THE STORE'S SIGNATURE, AND ONLY WHEN THERE IS ONE ─────────
+                -- qc_store_by / qc_store_at are the STORE half of the owner's
+                -- decision-4 split: expiry / use-by checked, weight / count
+                -- verified vs invoice, invoice matches PO. They are stamped ONLY
+                -- when the receiver actually confirmed ALL THREE — the same bar
+                -- the kitchen's own three ticks meet before decideGrnQc will let
+                -- it sign. All six qc_* booleans are optional on this form (all
+                -- blank is a valid save, and across 29 live GRNs SUM(qc_quality)
+                -- is 0), so stamping a name unconditionally would put a
+                -- signature on a checklist nobody filled in — which is precisely
+                -- the "receiver self-certifying their own receipt" this whole
+                -- feature exists to end, reintroduced on the other half of the
+                -- split. Unsigned is left as '' / NULL, which reads as what it
+                -- is: the store did not answer. received_by already records who
+                -- typed the receipt, so nothing is lost by refusing to conflate
+                -- the two.
+                -- CASE, not a JS ternary, so the stamp and the name can never
+                -- disagree, and datetime('now') rather than a JS clock so every
+                -- stamp in this table is on one clock.
+                ?, CASE WHEN ? = 1 THEN datetime('now') ELSE NULL END, datetime('now'))
       `).run(grnId, grnNumber, date, vendor_id || null, vendor || '', invoice_number || '', invoice_date || '',
-              me.email, qc_by || '', notes || '', outletId,
-              qc_quality ? 1 : 0, qc_temperature ? 1 : 0, qc_expiry ? 1 : 0,
-              qc_damage ? 1 : 0, qc_weight ? 1 : 0, qc_invoice_match ? 1 : 0);
+              me.email,
+              // qc_by is the LEGACY single QC signature the print sheet renders
+              // under "QC verified by". On a held receipt it is not the store's
+              // to pre-fill: decideGrnQc writes the real signer's email into it
+              // at sign-off, and an override leaves it blank on purpose.
+              qc.required ? '' : (qc_by || ''),
+              qc.required ? QC_AWAITING : 'received', notes || '', outletId,
+              kitchenTick(qc_quality), kitchenTick(qc_temperature), qc_expiry ? 1 : 0,
+              kitchenTick(qc_damage), qc_weight ? 1 : 0, qc_invoice_match ? 1 : 0,
+              qc.required ? 1 : 0, qc.required ? qc.checker : '',
+              qc.required ? 'pending' : '',
+              storeSigned ? me.email : '', storeSigned ? 1 : 0);
 
       const insGrnItem = db.prepare(`
         INSERT INTO goods_receipt_note_items
           (id, grn_id, po_item_id, material_id, quantity_ordered, quantity_received,
            quantity_accepted, quantity_rejected, rejection_reason, unit_price, notes,
            discount, cgst, sgst, compensation_cess, special_excise_cess, tcs,
-           delivery_charges, mrp_round_off)
-        VALUES (?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           delivery_charges, mrp_round_off, gst_rate, cess_rate, cost_vendor, cost_note)
+        VALUES (?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       // Per-line inward charges (₹). mrp_round_off is signed; the rest ≥ 0.
       const chg = (v: any) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0; };
@@ -626,8 +771,37 @@ export async function POST(request: Request) {
           }
         }
 
-        insGrnItem.run(generateId(), grnId, it.material_id, received, accepted, rejected, reason, price,
-                       it.notes || (rejected > 0 ? `Rejected ${rejected} (${reason || 'no reason given'})` : ''),
+        // THE COST ROW'S OWN WORDING, MINTED HERE EVEN WHEN NOTHING IS BOOKED.
+        // On a held GRN the `purchases` row is written hours later by the
+        // sign-off, from a different route, and src/lib/purchase-log.ts parses
+        // this exact sentence with an anchored regex — so the finished string is
+        // stored on the line rather than re-composed later from prose. Same
+        // reason cost_vendor is stored: re-deriving either at sign-off is
+        // parsing prose to write prose, which is the failure grn_id was added to
+        // end. On an UNHELD GRN it is the identical string the insert below
+        // already used, so nothing about that path changes.
+        const noteTag = accepted < 0
+          ? `BACK-CORRECTION GRN ${grnNumber}${invoice_number ? ' · invoice ' + invoice_number : ''}`
+          : `Ad-hoc GRN ${grnNumber}${invoice_number ? ' · invoice ' + invoice_number : ''}`;
+
+        // ── WHAT quantity_accepted MEANS ON A HELD LINE: 0, AND NOT "REJECTED" ──
+        // The store records what ARRIVED; the checking department records what is
+        // ACCEPTED, later. Writing `received` here provisionally would make every
+        // downstream reader value goods nobody has accepted — two of them
+        // dangerously: src/lib/returns.ts offers a line for VENDOR RETURN on
+        // quantity_accepted > 0 (and settling it debits stock that was never
+        // credited), and src/lib/purchase-log.ts would book the value with no
+        // purchases mirror and report it as billed-but-never-booked. Both close
+        // on their own at 0, with no edit to either file.
+        // ZERO ACCEPTED IS THE ABSENCE OF A DECISION, and status='awaiting_qc' is
+        // what says so — read one without the other and you will misreport the
+        // delivery. storePreRejectBlock() above has already refused any payload
+        // that tried to declare a smaller accepted on a gated line, so nothing
+        // the receiver typed is being silently discarded here.
+        const heldQty = qc.required;
+        insGrnItem.run(generateId(), grnId, it.material_id, received,
+                       heldQty ? 0 : accepted, heldQty ? 0 : rejected, heldQty ? '' : reason, price,
+                       it.notes || (!heldQty && rejected > 0 ? `Rejected ${rejected} (${reason || 'no reason given'})` : ''),
                        chg(it.discount),
                        hasGst ? cgstPaise / 100 : chg(it.cgst),
                        hasGst ? sgstPaise / 100 : chg(it.sgst),
@@ -638,18 +812,28 @@ export async function POST(request: Request) {
                        // line's goods value can't justify. Absent rate ⇒ a stored 0.
                        cessPaise / 100,
                        chg(it.special_excise_cess),
-                       chg(it.tcs), chg(it.delivery_charges), chgSigned(it.mrp_round_off));
+                       chg(it.tcs), chg(it.delivery_charges), chgSigned(it.mrp_round_off),
+                       // The PERCENTS behind the ₹ above. Stored so a QC rejection can
+                       // re-derive the tax on the smaller accepted quantity with the SAME
+                       // arithmetic instead of reverse-engineering a rate out of rupees.
+                       // 0 when the client sent none — which writes ₹0 either way.
+                       hasGst ? gstRate : 0, hasCess ? cessRate : 0,
+                       vendor || '', noteTag);
 
         // Mirror into purchases + inventory_transactions for ANY non-zero
         // accepted qty (including negatives, which represent reversal of a
         // prior over-booking). updateMaterialPrice handles the weighted-avg
         // recomputation correctly on either sign.
-        if (accepted !== 0) {
+        //
+        // ── AND NOT AT ALL WHEN THE DELIVERY IS HELD ─────────────────────────
+        // These three writes ARE "the goods are ours". Deferring them to the
+        // sign-off (src/lib/grn-qc.ts decideGrnQc, which replays exactly this
+        // shape from the stored row) is the entire feature. The GRN header and
+        // its line rows are NOT deferred: the document is the record that the
+        // truck arrived, and it is what the kitchen signs against.
+        if (!qc.required && accepted !== 0) {
           const purchaseId = generateId();
           const lineTotal = Math.round(accepted * price * 100) / 100;
-          const noteTag = accepted < 0
-            ? `BACK-CORRECTION GRN ${grnNumber}${invoice_number ? ' · invoice ' + invoice_number : ''}`
-            : `Ad-hoc GRN ${grnNumber}${invoice_number ? ' · invoice ' + invoice_number : ''}`;
           // grnId is minted above and inserted in THIS same transaction, so the
           // link is never dangling — the GRN header row and its cost rows commit
           // or roll back together. A BACK-CORRECTION (negative accepted) is bound
@@ -692,17 +876,58 @@ export async function POST(request: Request) {
           touched.add(it.material_id);
         }
       }
-      if (hasReject) db.prepare(`UPDATE goods_receipt_notes SET status = 'partial' WHERE id = ?`).run(grnId);
+      // NEVER on a held GRN: 'partial' would overwrite 'awaiting_qc' and the
+      // sign-off's `WHERE status = 'awaiting_qc'` claim would then match nothing
+      // — the delivery would be stuck, un-inwarded and un-signable. It cannot
+      // fire anyway (storePreRejectBlock refuses a gated pre-reject, so
+      // hasReject is false), and this is the second lock. decideGrnQc sets
+      // 'partial' itself, by the same rule, when the kitchen rejects.
+      if (!qc.required && hasReject) db.prepare(`UPDATE goods_receipt_notes SET status = 'partial' WHERE id = ?`).run(grnId);
     });
     txn();
 
-    // Cascade weighted-avg + recipe re-cost
+    // Cascade weighted-avg + recipe re-cost. `touched` is EMPTY on a held GRN
+    // (nothing was booked), so this is a no-op there rather than a special case.
     for (const mid of touched) updateMaterialPrice(db, mid);
+
+    // ── TELL SOMEBODY, AFTER THE COMMIT ─────────────────────────────────────
+    // Fire-and-forget and never throws: a notification failure must not fail —
+    // or roll back — the receipt it announces. The BELL needs nothing written
+    // (it counts status='awaiting_qc' live); this writes the durable record,
+    // the push, and the WhatsApp ping that is dark by default.
+    let qcRecipients: Array<{ email: string; name: string }> = [];
+    if (qc.required) {
+      try {
+        const held = db.prepare(`
+          SELECT COUNT(*) AS n, COALESCE(ROUND(SUM(quantity_received * unit_price), 2), 0) AS v
+            FROM goods_receipt_note_items WHERE grn_id = ?`).get(grnId) as any;
+        const r = await notifyGrnAwaitingQc(db, {
+          grnId, grnNumber, vendor: vendor || '', date: String(date),
+          checker: qc.checker, categories: qc.categories,
+          lineCount: Number(held?.n) || 0, heldValue: Number(held?.v) || 0,
+          receivedBy: me.email, outletId: outletId ?? null,
+        });
+        qcRecipients = r.recipients.map(x => ({ email: x.email, name: x.name }));
+      } catch (e) {
+        console.error('[grn POST] QC notification failed (non-fatal):', e);
+      }
+    }
 
     const grn = db.prepare('SELECT * FROM goods_receipt_notes WHERE id = ?').get(grnId);
     return Response.json({ success: true, grn_id: grnId, grn_number: grnNumber, grn,
                            materials_touched: touched.size,
-                           store_blocked: storeBlocked }, { status: 201 });
+                           store_blocked: storeBlocked,
+                           // The receiving desk must be told, in the response it
+                           // already reads, that NOTHING entered stock and who is
+                           // expected to clear it — a silent hold at the bay is the
+                           // one way this feature could make things worse.
+                           qc_required: qc.required,
+                           qc_status: qc.required ? QC_AWAITING : 'received',
+                           qc_checker: qc.required ? qc.checker : 'none',
+                           qc_categories: qc.categories,
+                           qc_message: qc.message,
+                           qc_notified: qcRecipients,
+                         }, { status: 201 });
   } catch (e: any) {
     console.error('[grn POST]', e);
     return Response.json({ error: e.message }, { status: 500 });

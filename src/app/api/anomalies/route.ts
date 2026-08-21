@@ -178,11 +178,27 @@ export async function GET() {
       -- items are kept (they are the document), so without this the morning
       -- digest kept raising "vendor X — N lines rejected on GRN-…" against a
       -- delivery that no longer stands, and printed a rejected ₹ value for it.
-      WHERE g.date = ? AND gi.quantity_rejected > 0 AND COALESCE(g.status, '') <> 'void'
+      --
+      -- TWO DATES, BECAUSE A REJECTION IS NO LONGER MADE ON THE DELIVERY DAY.
+      -- Under the kitchen QC gate (src/lib/grn-qc.ts) the quantities are decided
+      -- when the kitchen SIGNS, which can be a day or two after the goods
+      -- arrived. Keyed on g.date alone, a delivery dated D whose rejection was
+      -- signed on D+2 could never appear: the D+1 digest ran while every
+      -- quantity_rejected was still 0, and no later digest ever looked at D
+      -- again. So the vendor's worst deliveries were exactly the ones the
+      -- morning digest went quiet about.
+      -- DATE(g.qc_applied_at) is the DECISION day. No double-reporting: a
+      -- same-day sign-off satisfies both halves of the OR and still GROUP BYs to
+      -- one row, and a delivery whose rejection came later contributed nothing on
+      -- its own date because the rejected quantity did not exist yet. Historical
+      -- and ungated rows have qc_applied_at NULL, so DATE(NULL) is NULL, matches
+      -- nothing, and their behaviour is byte-identical to before.
+      WHERE (g.date = ? OR DATE(g.qc_applied_at) = ?)
+        AND gi.quantity_rejected > 0 AND COALESCE(g.status, '') <> 'void'
       GROUP BY g.id
       ORDER BY rej_value DESC
       LIMIT 3
-    `).all(yesterday) as any[];
+    `).all(yesterday, yesterday) as any[];
     for (const r of rejections) {
       anomalies.push({
         severity: r.rej_value > 1000 ? 'high' : 'medium',

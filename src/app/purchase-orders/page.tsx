@@ -1374,6 +1374,46 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
         return;
       }
       setDidReceive(true);
+
+      /* ── THE DELIVERY IS HELD FOR A QUALITY CHECK — SAID FIRST, AND ALWAYS ──
+         20 of the live GRNs come through THIS route, and until now it was the
+         one that said nothing: the receive route has always returned
+         qc_required / qc_message / qc_checker / qc_notified (see its own note,
+         "A silent hold at the bay is the one way this feature could make things
+         worse"), and this screen read none of them.
+
+         The silence was total, not partial. On a clean 12-line vegetable PO —
+         no deviation, no excess, no bill discount, and 193 of the 194 materials
+         in the gated categories carry tax_percent = 0, so the GST note does not
+         fire either — `notes` stayed empty, `complete` was true and
+         `isMultiVendor` false, so the whole alert chain below fell through in
+         silence and the modal simply closed onto a PO reading "received". The
+         storekeeper waved the truck off having been told nothing, and the goods
+         were still the vendor's to take back for the only few minutes that
+         mattered. On a multi-vendor PO it was worse than silence: the last
+         branch cheerfully alerted "Vendor received — PO is now complete."
+
+         So this fires BEFORE the store-blocked, deviation, GST and completion
+         alerts rather than joining them: those are things to read afterwards;
+         this one is a thing to DO while the driver is still standing there.
+         It also seeds `notes` below, which makes the silent fall-through
+         structurally impossible whichever completion branch is taken. */
+      if (j.qc_required) {
+        const who = j.qc_checker === 'bar' ? 'Bar'
+          : j.qc_checker === 'both' ? 'Kitchen or Bar' : 'Kitchen';
+        const told = Array.isArray(j.qc_notified) ? j.qc_notified.length : 0;
+        alert([
+          `⏸  NO STOCK HAS BEEN ADDED — GRN ${j.grn_number || ''} is waiting for a ${who} quality check.`,
+          j.qc_message
+            || `${who} must check quality, temperature and damage and sign off before these goods enter stock.`,
+          'KEEP THE VENDOR AT THE BAY until they do. Once the check is signed the goods are ours and they cannot be sent back.',
+          told > 0
+            ? `${told} person(s) have been notified and it is on the bell.`
+            : 'Nobody could be notified automatically — tell the kitchen yourself.',
+          'Clear it at Purchasing → Pending Quality Checks. An admin or head chef can release it without a check, with a written reason.',
+        ].filter(Boolean).join('\n\n'));
+      }
+
       // Store-mapped (liquor) lines are SKIPPED by the receive route so they
       // never touch Central stock — but the "Receive total" the receiver just
       // confirmed counted them, so name the lines that did NOT arrive.
@@ -1391,6 +1431,17 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       // swallowed the confirmation for exactly the short lines the receiver had
       // just been forced to justify. One alert, both facts.
       const notes: string[] = [];
+      // Repeated here, in one line, so that whichever completion alert fires it
+      // cannot end on the word "received" with no mention of the hold — and so
+      // the "clean receive stays silent" branch can never be reached on a held
+      // delivery. The full instruction was already given above.
+      if (j.qc_required) {
+        notes.push(
+          `NOTE: no stock was added — GRN ${j.grn_number || ''} is awaiting a ` +
+          `${j.qc_checker === 'bar' ? 'Bar' : j.qc_checker === 'both' ? 'Kitchen or Bar' : 'Kitchen'} ` +
+          'quality check. The PO is recorded; the goods are not ours until it is signed off.'
+        );
+      }
       if (deviating.length > 0) {
         // Counted from what we SENT rather than a response field, so this stays
         // true whatever the route names its counters. Short qty and rate changes

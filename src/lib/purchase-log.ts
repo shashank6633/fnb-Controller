@@ -781,7 +781,25 @@ function buildUnion(f: {
         -- which is indistinguishable from a genuine missing-cost-row defect.
         -- Stronger than the PO branch's own exclusion below: a cancelled order
         -- was never received, a voided GRN was received and then undone.
-        AND COALESCE(g.status, '') <> 'void'
+        --
+        -- 'awaiting_qc' IS EXCLUDED FOR THE SAME REASON, AND IT IS NOT OPTIONAL.
+        -- A GRN held for a kitchen quality check (src/lib/grn-qc.ts) carries
+        -- quantity_accepted = 0 on every line — the ABSENCE of a decision, not a
+        -- rejection — while its cgst / sgst / cess / tcs / delivery_charges are
+        -- stored in full, because the store may not pre-reject a gated line. So
+        -- the row valued GOODS VALUE at ₹0 and still summed the whole bill's tax
+        -- into TOTAL AMOUNT: a ₹4,000 delivery at 5% with ₹200 delivery reported
+        -- ₹0 of goods carrying ₹400 of charges, and NEGATIVE with a bill
+        -- discount. The report's own integrity check cannot catch it either —
+        -- goods_value_tax_suspect compares value against qty × rate, and 0 − 0×r
+        -- is 0, so the guard stays silent on the one shape it should shout at.
+        -- Excluding it also keeps the two rails AGREEING: a held GRN has no
+        -- purchases row yet, so leaving it on this branch alone reported the
+        -- delivery as billed-but-never-booked, which is indistinguishable from a
+        -- genuine missing-cost-row defect. It appears here in full the moment the
+        -- kitchen signs, dated the delivery day — see the hand-over note about a
+        -- bill landing inside a period that may already have been downloaded.
+        AND COALESCE(g.status, '') NOT IN ('void', 'awaiting_qc')
         ${venFilter('g.vendor')}${matFilter('gi.material_id')}
     `);
     params.push(f.from, f.to);

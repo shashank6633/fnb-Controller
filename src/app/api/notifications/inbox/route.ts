@@ -211,6 +211,70 @@ export async function GET() {
       push('reorder', 'Critical items below reorder level', n, '/crm/reorder');
     }
 
+    // ── Deliveries recorded but NOT yet inwarded: waiting on a quality check ─
+    // A GRN whose lines include a QC-required category is written with
+    // status = 'awaiting_qc' and NO stock movement at all — the goods are at the
+    // bay, the vendor is still there, and nothing is ours until the kitchen or
+    // bar signs. That is the one state in this app where a delay costs the venue
+    // the ability to refuse a crate, so it sits ABOVE the paperwork buckets.
+    //
+    // TWO ITEMS, NOT ONE. The queue and the OVERDUE subset of it answer
+    // different questions and are acted on by different people: anyone in the
+    // checking department clears the first, the head chef is the audience for
+    // the second. Both are ONE row per queue with count = queue size, never one
+    // per GRN — the badge SUMS counts across items (CaptainAlertsProvider), so a
+    // per-receipt row would bury every other bucket.
+    //
+    // THE GATE IS AS WIDE AS THE PAGE, AND NOT ONE STEP WIDER. /grn/qc must be
+    // reachable by any user who might sign (the owner's decision 6: NOT HOD-only
+    // — "at 6am with a truck waiting that guarantees workarounds"), and
+    // GET /api/grn/qc requires only a session, the same bar GET /api/grn already
+    // sets for the same documents. So there is no ROLE gate here: a
+    // department-scoped badge would reach almost nobody on today's data (all
+    // nine users have section = '' and only three carry a department_id), and
+    // pendingQcCount is deliberately NOT filtered by who may SIGN — a held
+    // delivery nobody in the building can clear is the single most important row
+    // in that queue.
+    //
+    // canAccessPage IS consulted, though, and only it. The claim that this
+    // bucket "matches the page it links to" was not true: /grn/qc is an ordinary
+    // catalog page with no tier flag, so a user whose page_access array does not
+    // carry /grn or /grn/qc is REDIRECTED by proxy.ts with ?forbidden= — and the
+    // sidebar hides the link too, so there is no second way in. A live example
+    // exists in this database: a kitchen-staff account whose page_access is
+    // ["/requisitions"] resolves to main department Kitchen (canSignQcFor says
+    // they MAY sign) and was being chimed and badged into a page that bounced
+    // them. At a loading bay that reads as a broken app, which is how a feature
+    // stops being used. This is the rule the bill_requests and variance_approvals
+    // buckets in this same file already follow — "nobody is badged for a page
+    // they would be 403'd on".
+    //
+    // canAccessPage FAILS OPEN four ways (null / [] / bad JSON / non-array), and
+    // that is the RIGHT direction here: 8 of the 9 live users have page_access
+    // NULL and can genuinely open the page, so they keep the badge. Only an
+    // explicitly-restricted user loses it, which is exactly the set that could
+    // not act on it. It is a badge, not a permission — the write re-derives its
+    // own gate and fails closed.
+    //
+    // Isolated behind its own try/catch + dynamic import like every other
+    // additive bucket, so a QC schema fault can never darken the whole bell.
+    try {
+      const { pendingQcCount, overdueQcCount, qcEscalationHours } = await import('@/lib/grn-qc');
+      const { canAccessPage } = await import('@/lib/page-catalog');
+      if (canAccessPage('/grn/qc', me)) {
+        push('grn_qc_pending', 'Deliveries waiting for a quality check',
+          pendingQcCount(db, outletId), '/grn/qc');
+        const overdue = overdueQcCount(db, outletId);
+        if (overdue > 0) {
+          push('grn_qc_overdue',
+            `Deliveries unchecked for over ${qcEscalationHours(db)}h`,
+            overdue, '/grn/qc?overdue=1');
+        }
+      }
+    } catch (qcErr) {
+      console.error('[/api/notifications/inbox] grn-qc bucket failed:', qcErr);
+    }
+
     // ── Closing counts parked in the variance-approval queue ──────────────
     // Why this bucket exists: a count whose physical figure differs from system
     // stock does NOT move stock — it writes a PENDING variance_approvals row and

@@ -101,6 +101,30 @@ export function startSchedulerOnce(): void {
         console.error('[scheduler] defer-due check failed:', e?.message);
       }
 
+      // GRN kitchen QC — escalate deliveries that have sat unchecked past the
+      // admin's window (settings.qc_escalation_hours, default 4h). Same cadence,
+      // same best-effort contract as everything else in this tick.
+      //
+      // THIS IS WHAT MAKES ESCALATION A POLICY RATHER THAN A PAGE, exactly as
+      // with recording retention below. Its only trigger was the QC queue page
+      // poking POST /api/grn/qc/escalate on load — which fires when somebody
+      // opens the queue, i.e. precisely when escalation is LEAST needed, and
+      // never on the morning nobody opens it, which is the morning a crate of
+      // fish has been sitting unchecked since 06:00. The sweep is idempotent by
+      // construction (it claims each row through qc_escalated_at before it
+      // sends), so running it here and from the page cannot double-send.
+      // Dynamically imported so a QC schema fault can never break the loop.
+      try {
+        const { escalateOverdueQc } = await import('./grn-qc-notify');
+        const { getDb } = await import('./db');
+        const qe = await escalateOverdueQc(getDb(), {});
+        if (qe.escalated > 0) {
+          console.log(`[scheduler] grn-qc @ IST ${istHour()}h: ${qe.escalated} held delivery(s) escalated`);
+        }
+      } catch (e) {
+        console.error('[scheduler] grn-qc escalation failed:', e instanceof Error ? e.message : e);
+      }
+
       // Recording retention — expire recordings past the admin's window
       // (7/15/30 days, default 30). Same cadence, same best-effort contract.
       //

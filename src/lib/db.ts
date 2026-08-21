@@ -2517,6 +2517,233 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('GRN schema failed:', e); }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // KITCHEN QC GATE — stock moves only after the checking department signs.
+  // ══════════════════════════════════════════════════════════════════════════
+  //
+  // THE PROBLEM THIS EXISTS FOR, in the owner's words (2026-08-21): "the next
+  // day the kitchen staff says the Quality is not good and we cant return the
+  // items to vendors as it is taken by us". Stock used to bump INSIDE the GRN
+  // insert on both receiving routes, so the goods were ours the instant the
+  // store person hit Save — and by the time anyone judged the quality the
+  // vendor's truck was long gone. The six qc_* ticks above did not help: they
+  // are optional, they are ticked by the SAME person doing the inward, and the
+  // live data proves nobody ever used them (SUM(qc_quality) = 0 across all 29
+  // GRNs). A receiver self-certifying their own receipt is not a check.
+  //
+  // WHAT CHANGES: a GRN whose lines include a material in a QC-required
+  // category is written with status 'awaiting_qc' and NO stock movement at all.
+  // The kitchen (or bar) signs it off per line, and THAT is what inwards it —
+  // while the vendor is still at the bay and refusal is real leverage.
+  //
+  // 'awaiting_qc' IS A NEW `status` VALUE, NOT A NEW COLUMN. goods_receipt_notes
+  // .status has no CHECK constraint (see the CREATE above and the void note),
+  // so this needs no table rebuild — but it does mean every reader that filters
+  // on status must be told about it, exactly as 'void' did. The transient state
+  // lives in `status`; the PERMANENT record of how the gate cleared lives in
+  // qc_outcome below, because status returns to received/partial/rejected once
+  // the goods are in and the owner requires an override to be marked for ever.
+  // ── EVERY STATEMENT GETS ITS OWN try/catch, NOT ONE ROUND THE LOT ─────────
+  // The PRAGMA checks were individual; the ERROR HANDLING was not. All 18
+  // statements sat inside one try, so a single throw — an SQLITE_BUSY on a live
+  // boot is enough — skipped every statement after it and the app came up
+  // looking healthy, because the catch only console.error's (the standing house
+  // rule: schema errors here are swallowed). The LINE columns were last, so a
+  // failure on the header side took out plain receiving too, and the two
+  // measured consequences were both total:
+  //   · gst_rate / cost_vendor missing ⇒ the INSERT in api/grn/route.ts throws
+  //     "no column named gst_rate" ⇒ EVERY GRN create 500s, gated or not;
+  //   · qc_applied_at missing ⇒ decideGrnQc's claim throws ⇒ EVERY sign-off 500s
+  //     while deliveries keep being held.
+  // One statement failing now costs exactly that statement, the failure names
+  // the column, and qcSchemaHealth() (src/lib/grn-qc.ts, surfaced as a banner on
+  // /grn/qc and /settings/qc-categories) reports the half-applied state instead
+  // of leaving it to be inferred weeks later from stock that keeps going bad.
+  const qcAdd = (table: string, column: string, ddl: string, has: (n: string) => boolean) => {
+    try { if (!has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`); }
+    catch (e) { console.error(`GRN QC schema failed: ${table}.${column}:`, e); }
+  };
+  try {
+    const qcCols = db.prepare("PRAGMA table_info(goods_receipt_notes)").all() as any[];
+    const hasQ = (n: string) => qcCols.some((c: any) => c.name === n);
+    // Was this receipt gated, and by whom. Every existing row reads
+    // qc_required = 0 / qc_checker = '' — the truth about it: it was never held.
+    qcAdd('goods_receipt_notes', 'qc_required', `qc_required INTEGER NOT NULL DEFAULT 0`, hasQ);
+    qcAdd('goods_receipt_notes', 'qc_checker', `qc_checker TEXT DEFAULT ''`, hasQ);
+    // THE PERMANENT MARKER. '' = never gated (all 29 historical rows).
+    // 'pending' | 'signed' | 'override' | 'rejected'. 'override' is the owner's
+    // "inwarded without kitchen QC" stamp and is deliberately never cleared —
+    // the override report reads exactly this column.
+    qcAdd('goods_receipt_notes', 'qc_outcome', `qc_outcome TEXT DEFAULT ''`, hasQ);
+    // TWO SIGNATURES, NOT ONE. The legacy qc_by is a single free-text box filled
+    // by whoever did the inward. The owner's split (decision 4) makes the
+    // kitchen/bar answerable for quality + temperature + damage and the store
+    // for expiry + weight + invoice match, so responsibility is unambiguous only
+    // if the two are stamped separately. qc_by is still written (mirrored from
+    // the kitchen signer) so the print sheet and the detail panel keep working.
+    qcAdd('goods_receipt_notes', 'qc_kitchen_by', `qc_kitchen_by TEXT DEFAULT ''`, hasQ);
+    qcAdd('goods_receipt_notes', 'qc_kitchen_at', `qc_kitchen_at TEXT`, hasQ);
+    qcAdd('goods_receipt_notes', 'qc_store_by', `qc_store_by TEXT DEFAULT ''`, hasQ);
+    qcAdd('goods_receipt_notes', 'qc_store_at', `qc_store_at TEXT`, hasQ);
+    // The override (admin or head chef) and its MANDATORY written reason.
+    qcAdd('goods_receipt_notes', 'qc_override_by', `qc_override_by TEXT DEFAULT ''`, hasQ);
+    qcAdd('goods_receipt_notes', 'qc_override_at', `qc_override_at TEXT`, hasQ);
+    qcAdd('goods_receipt_notes', 'qc_override_reason', `qc_override_reason TEXT DEFAULT ''`, hasQ);
+    // THE IDEMPOTENCY WITNESS. NULL = this GRN's stock has never been applied.
+    // The apply's claim is `WHERE status='awaiting_qc' AND qc_applied_at IS NULL`
+    // as the FIRST statement of its transaction, so a double-click, a retry and
+    // two tabs all match zero rows on the second attempt and reverse nothing.
+    qcAdd('goods_receipt_notes', 'qc_applied_at', `qc_applied_at TEXT`, hasQ);
+    // Last escalation stamp — dedupes the "waited too long" ping so a sweep that
+    // runs every 5 minutes does not send the same alert 12 times an hour.
+    qcAdd('goods_receipt_notes', 'qc_escalated_at', `qc_escalated_at TEXT`, hasQ);
+    // The queue is read by status; the escalation sweep by status + created_at.
+    try { db.exec(`CREATE INDEX IF NOT EXISTS idx_grn_qc_status ON goods_receipt_notes(status, outlet_id)`); }
+    catch (e) { console.error('GRN QC schema failed: idx_grn_qc_status:', e); }
+
+    // ── THE DEFERRED-WRITE PAYLOAD, on the LINE ──────────────────────────────
+    // When the stock bump is deferred, the `purchases` row that would have been
+    // written at inward has to be reconstructable at sign-off — hours later, by
+    // a different route. Two of its fields cannot be re-derived honestly:
+    //
+    //   cost_note   — purchases.notes. src/lib/purchase-log.ts parses this
+    //                 sentence with an anchored regex to tie a cost row back to
+    //                 its PO, and the receive route's own comment forbids
+    //                 changing its wording. Re-deriving it at sign-off would
+    //                 mean re-composing prose (and, on the PO path, digging the
+    //                 deviation reason back out of gi.notes, which is itself two
+    //                 sentences joined by ' | '). Parsing prose to write prose is
+    //                 exactly the failure mode grn_id was added to end, so the
+    //                 finished string is stored at inward instead.
+    //   cost_vendor — purchases.vendor. The PO path books each line against its
+    //                 OWN line vendor (lineVendorName), not the GRN header — on
+    //                 a mixed PO those differ, and a later PO edit would move it.
+    //
+    // Everything else the apply needs is already on the row: quantity_accepted,
+    // unit_price (GROSS), discount (this line's allocated share) and
+    // delivery_charges (ditto). qc_applied_at is the per-line witness.
+  } catch (e) { console.error('GRN QC schema failed (header columns):', e); }
+
+  // SEPARATE try, not a continuation of the one above. The only statements left
+  // that can throw outside qcAdd are the two PRAGMA reads, and they are what
+  // bind the two halves together: sharing a try meant a failure reading the
+  // HEADER table's columns skipped the LINE columns entirely — and the line
+  // columns are the ones plain receiving cannot insert without.
+  try {
+    const qcItemCols = db.prepare("PRAGMA table_info(goods_receipt_note_items)").all() as any[];
+    const hasQI = (n: string) => qcItemCols.some((c: any) => c.name === n);
+    qcAdd('goods_receipt_note_items', 'cost_vendor', `cost_vendor TEXT DEFAULT ''`, hasQI);
+    qcAdd('goods_receipt_note_items', 'cost_note', `cost_note TEXT DEFAULT ''`, hasQI);
+    qcAdd('goods_receipt_note_items', 'qc_applied_at', `qc_applied_at TEXT`, hasQI);
+    // ── THE TWO TAX RATES, AS PERCENTS. NOT RUPEES. ─────────────────────────
+    // cgst / sgst / compensation_cess beside them are ₹; these two are the
+    // PERCENT they were derived from (18, 12, 5 …), and 0 means "no rate was
+    // sent for this line", which is NOT the same as "0% exempt" — both write ₹0
+    // and both are honest, so nothing downstream needs to tell them apart.
+    //
+    // WHY THEY HAVE TO BE STORED. A QC rejection changes the ACCEPTED quantity
+    // hours after the bill was recorded, and both receiving routes tax the
+    // ACCEPTED value, not the received one — a rejected unit was never accepted,
+    // so no input credit is claimable on it. Without the rate on the row the
+    // sign-off would have to reverse-engineer it out of the stored rupees
+    // (rate = tax / taxable), which is unstable at low values and silently wrong
+    // on a fully-rejected line where taxable is 0. With it, decideGrnQc re-runs
+    // the SAME arithmetic the receiving route ran, to the paisa.
+    // Absent on every historical row ⇒ 0 ⇒ nothing is ever re-derived for them.
+    qcAdd('goods_receipt_note_items', 'gst_rate', `gst_rate REAL NOT NULL DEFAULT 0`, hasQI);
+    qcAdd('goods_receipt_note_items', 'cess_rate', `cess_rate REAL NOT NULL DEFAULT 0`, hasQI);
+  } catch (e) { console.error('GRN QC schema failed (line columns):', e); }
+
+  // ── CATEGORY → CHECKER MAP ────────────────────────────────────────────────
+  // WHICH deliveries need a kitchen check is DATA the admin owns, not a list in
+  // code. The owner chose a map over a data clean-up because the category names
+  // in this database are inconsistent — veg (117 materials), vegetables (2) and
+  // english-vegetables (2) are three separate spellings of one thing — and
+  // renaming 952 materials to tidy them is a bigger, riskier job than carrying
+  // every spelling here.
+  //
+  // KEYED ON THE catNorm NORMALISATION (lower-case, strip space/hyphen/
+  // underscore), the SAME one store_category_map matching uses, so 'frozen-
+  // cheese', 'Frozen Cheese' and 'frozen_cheese' are ONE row. Without that a
+  // second spelling silently means "No check" — which is the failure this
+  // feature exists to prevent, reintroduced through the back door.
+  //
+  // A CATEGORY NOT IN THIS TABLE DEFAULTS TO 'none' (no check). That is
+  // deliberate and it is the safe default for a NEW category: silently BLOCKING
+  // an unmapped category would stop a delivery nobody meant to stop, at the bay,
+  // with a vendor waiting. The risk it creates — a perishable category added
+  // later and never mapped — is answered by making unassigned categories LOUD
+  // rather than by guessing: listCategoryCheckers() in src/lib/grn-qc.ts returns
+  // every live category with its material count and an `assigned` flag, and the
+  // admin screen shows the unassigned ones as an amber count.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS qc_category_checkers (
+        category_key TEXT PRIMARY KEY,
+        category     TEXT NOT NULL,
+        checker      TEXT NOT NULL DEFAULT 'none',
+        updated_by   TEXT DEFAULT '',
+        updated_at   TEXT DEFAULT (datetime('now'))
+      );
+    `);
+  } catch (e) { console.error('qc_category_checkers schema failed:', e); }
+
+  // ── ONE-SHOT SEED of the owner's perishable list ──────────────────────────
+  // Guarded by settings.qc_category_seed_v1 so it runs exactly once, ever. The
+  // guard is the whole point, and it is the same one station_dept_seed_v1 uses:
+  // without it an admin who sets 'dairy' to No check (or deletes the row) gets
+  // the seed back on the next deploy — the "roles get disturbed on every
+  // deployment" bug in another table. scripts/check-boot-migrations.js enforces
+  // this shape.
+  //
+  // THE EIGHT SPELLINGS ARE THE OWNER'S OWN LIST, and every one of them is a
+  // real category in this database (counts measured 2026-08-21): veg 117,
+  // dairy 33, non-veg 25, meat 10, frozen-cheese 3, vegetables 2, fruits 2,
+  // english-vegetables 2 — 194 materials in total.
+  //
+  // THREE CHILLED CATEGORIES ARE DELIBERATELY LEFT OUT: poultry (1 material),
+  // seafood (1) and puree (1). This codebase already classes all three as
+  // chiller stock (STORAGE_LOCATION_PROPOSAL, src/app/inventory/page.tsx), so
+  // they are very likely perishable — but they are NOT on the list the owner
+  // approved, and seeding a gate he did not ask for would start blocking
+  // deliveries he does not expect. They surface on the unassigned panel with
+  // their counts instead, which is the same information without the surprise.
+  try {
+    const qcSeeded = db.prepare(
+      "SELECT value FROM settings WHERE key = 'qc_category_seed_v1'",
+    ).get() as { value?: string } | undefined;
+    if (!qcSeeded) {
+      const QC_SEED: Array<{ category: string; checker: string }> = [
+        { category: 'veg',                checker: 'kitchen' },
+        { category: 'vegetables',         checker: 'kitchen' },
+        { category: 'english-vegetables', checker: 'kitchen' },
+        { category: 'non-veg',            checker: 'kitchen' },
+        { category: 'meat',               checker: 'kitchen' },
+        { category: 'dairy',              checker: 'kitchen' },
+        { category: 'frozen-cheese',      checker: 'kitchen' },
+        { category: 'fruits',             checker: 'kitchen' },
+      ];
+      // Same normalisation as catNorm() in src/lib/store-engine.ts. Written out
+      // here rather than imported because db.ts is the bottom of the import
+      // graph — store-engine imports FROM db.ts, so importing it back would be a
+      // cycle. The two must stay byte-equivalent; grn-qc.ts's catKeyOf() is the
+      // single runtime copy every caller outside this seed uses.
+      const norm = (s: string) => String(s || '').toLowerCase().trim()
+        .replace(/ /g, '').replace(/-/g, '').replace(/_/g, '');
+      const insQc = db.prepare(`
+        INSERT OR IGNORE INTO qc_category_checkers (category_key, category, checker, updated_by)
+        VALUES (?, ?, ?, 'seed:qc_category_seed_v1')
+      `);
+      const qcSeedRun = db.transaction(() => {
+        let n = 0;
+        for (const row of QC_SEED) { insQc.run(norm(row.category), row.category, row.checker); n++; }
+        db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('qc_category_seed_v1', '1')").run();
+        return n;
+      });
+      console.log(`[db] qc_category_seed_v1: seeded ${qcSeedRun()} QC category rule(s)`);
+    }
+  } catch (e) { console.error('qc_category_seed_v1 failed:', e); }
+
   // ── PURCHASES → PURCHASE ORDER, as a real column ─────────────────────────
   // The cost row still cannot NAME its purchase order in one hop. grn_id reaches
   // the delivery and goods_receipt_notes.po_id reaches the order, but nothing on

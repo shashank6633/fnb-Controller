@@ -8,6 +8,9 @@ import {
   allocateBillCharges, r2, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT,
   type AllocatedLine,
 } from '@/lib/po-charges';
+import { resolveQcRequirement, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
+import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
+import { fulfilRequisitionFromPo } from '@/lib/po-requisition-fulfil';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * ONE PO, MANY VENDORS, ONE BILL EACH.
@@ -587,6 +590,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const puLabel = (it: any) =>
       String(it.material_purchase_unit || '').trim() || String(it.material_unit || '').trim();
 
+    // ── KITCHEN QC GATE ─────────────────────────────────────────────────────
+    // THE SAME DECISION, FROM THE SAME HELPER, AS /api/grn. 20 of the 29 live
+    // GRNs come through this route, so a gate wired only on the ad-hoc form
+    // would leave the main road open — and a gate written twice would drift.
+    // src/lib/grn-qc.ts owns both the decision (resolveQcRequirement) and the
+    // deferred apply (decideGrnQc); this file only branches on the boolean.
+    //
+    // No hasNegativeLine here: this route REFUSES negative quantities outright
+    // (the sanity loop below), so a back-correction can never reach it.
+    // Resolved over `receiving` — the lines THIS bill actually books. Another
+    // vendor's outstanding line is not on this delivery and must not decide
+    // whether this delivery is held.
+    const qc = resolveQcRequirement(db, receiving.map((it: any) => String(it.material_id || '')));
+
     // Reject negative qty / price BEFORE the txn starts.
     // Receiving is an additive workflow — stock corrections (negative qtys) live
     // on the dedicated GRN back-correction flow. A negative here would silently
@@ -735,6 +752,33 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             field: 'deviation_reason',
           }, { status: 400 });
         }
+      }
+    }
+
+    // ── ON A HELD DELIVERY THE STORE MAY NOT PRE-REJECT ─────────────────────
+    // Decision 4, enforced rather than described: the receiving desk records
+    // what ARRIVED, the checking department records what is ACCEPTED. It is also
+    // what makes `quantity_accepted = 0 while waiting` mean one unambiguous
+    // thing (see the header of src/lib/grn-qc.ts). The honest lever is still
+    // there and is named in the refusal — SHORT-RECEIVE the line, i.e. record
+    // the smaller figure as RECEIVED, which is the true statement that the units
+    // went back on the truck. Byte-identical refusal to /api/grn's, from the
+    // same helper, so a receiver meets one sentence and not two.
+    // Runs AFTER the sanity loop above (so accepted ≤ received is already true
+    // and the message can't be about an impossible payload) and BEFORE the
+    // charge allocation, which is keyed on the accepted quantities.
+    if (qc.required) {
+      const preReject = storePreRejectBlock(receiving.map((it: any) => {
+        const ov = overrides.get(it.id);
+        const effRcv = ov?.quantity != null ? Number(ov.quantity) : Number(it.quantity);
+        return {
+          material_name: String(it.material_name || ''),
+          received: effRcv,
+          declaredAccepted: ov?.accepted != null ? Number(ov.accepted) : effRcv,
+        };
+      }));
+      if (preReject) {
+        return Response.json({ error: preReject, qc_required: true, field: 'accepted' }, { status: 400 });
       }
     }
 
@@ -1145,17 +1189,44 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // name and the row is unchanged. invoice_number / invoice_date were
       // simply never populated on this path before; filling them is additive
       // and is what makes /grn and the inward register show the real bill.
+      //
+      // ── THE HELD HEADER ──────────────────────────────────────────────────
+      // 'awaiting_qc' instead of 'received' is the WHOLE gate: it is what the
+      // sign-off's conditional claim matches on, what the Pending Quality Checks
+      // queue lists, and what every downstream reader must learn about the way
+      // it learned 'void'. qc_required / qc_checker record that this receipt WAS
+      // gated and by whom, so the fact survives the status returning to
+      // received/partial once the kitchen signs.
+      // ── AND NO STORE SIGNATURE, BECAUSE THIS SCREEN ASKS FOR NONE ────────
+      // THE SIX LEGACY qc_* TICKS ARE STILL NOT WRITTEN ON THIS PATH — they
+      // never were, and the receive screen has no checklist. qc_store_by /
+      // qc_store_at are therefore ALSO left empty, and that is the honest state
+      // rather than an omission: they are the STORE half of the owner's
+      // decision-4 split (expiry / use-by, weight-and-count vs invoice, invoice
+      // matches PO), and stamping a name for three checks the receiver was never
+      // shown would be the same worthless self-certification the kitchen half of
+      // this feature exists to replace — a signature nobody gave, on a screen
+      // that never asked. received_by already records who took the delivery in,
+      // and poWriteGate() already proves they were entitled to; neither is a
+      // statement that the goods were checked against the bill.
+      // POST /api/grn does stamp it, because that form DOES carry the three
+      // boxes — and only when all three are ticked. To make it stampable here,
+      // add the same three to the receive screen and bind them the same way.
       db.prepare(`
         INSERT INTO goods_receipt_notes
           (id, grn_number, date, po_id, vendor_id, vendor, invoice_number, invoice_date,
-           received_by, status, notes, outlet_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?, ?, datetime('now'))
+           received_by, status, notes, outlet_id,
+           qc_required, qc_checker, qc_outcome, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       `).run(grnId, grnNumber, receivedAt, id, billVendorId, billVendorName || po.vendor || '',
               billNo, billNo ? billDate : '',
               receivedByEmail,
+              qc.required ? QC_AWAITING : 'received',
               `Auto-created from PO ${po.po_number} receive`
                 + (isMultiVendorPo ? ` — ${billVendorName || '(no vendor)'} only` : ''),
-              po.outlet_id);
+              po.outlet_id,
+              qc.required ? 1 : 0, qc.required ? qc.checker : '',
+              qc.required ? 'pending' : '');
 
       // ── The BILL row (gross basis) ─────────────────────────────────────
       // The exact opposite basis to the purchases row above, and it has to be.
@@ -1187,12 +1258,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // of the cgst + sgst invariant. Like the others it joins Total Inward as
       // its own term and never enters unit_price. 0 when no cess_rate was sent,
       // so a payload without one writes the row this route wrote before.
+      //
+      // gst_rate / cess_rate are the PERCENTS behind cgst/sgst/compensation_cess,
+      // stored so a QC rejection can re-derive the tax on the SMALLER accepted
+      // quantity with this route's own arithmetic instead of reverse-engineering
+      // a rate out of rupees. cost_vendor / cost_note are the two fields of the
+      // deferred `purchases` row that cannot be honestly re-derived hours later:
+      // the LINE's vendor (not the header's, on a mixed PO) and the exact
+      // sentence src/lib/purchase-log.ts parses with an anchored regex.
       const insGrnItem = db.prepare(`
         INSERT INTO goods_receipt_note_items
           (id, grn_id, po_item_id, material_id, quantity_ordered, quantity_received,
            quantity_accepted, quantity_rejected, rejection_reason, unit_price, notes,
-           discount, cgst, sgst, delivery_charges, compensation_cess)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           discount, cgst, sgst, delivery_charges, compensation_cess,
+           gst_rate, cess_rate, cost_vendor, cost_note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       // Excess + deviation detection happen inline below — the `excessLines` and
@@ -1322,23 +1402,64 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // The notes column carries BOTH stories: the QC rejection (why units were
         // turned away) and the PO deviation (why the line isn't what was ordered).
         const noteBits: string[] = [];
-        if (rejected > 0) noteBits.push(`Rejected ${rejected} (${reason || 'no reason given'})`);
+        if (!qc.required && rejected > 0) noteBits.push(`Rejected ${rejected} (${reason || 'no reason given'})`);
         if (deviated && devReason) noteBits.push(`PO deviation: ${devReason}`);
+        // The cost row's own wording and vendor, minted here even when nothing
+        // is booked — on a held GRN the `purchases` row is written hours later,
+        // by a different route, and both of these must be the string/name THIS
+        // route would have written. Identical to what the insert below uses on
+        // an unheld receive, so that path is byte-unchanged.
+        const lineVendorForCost = lineVendorName(it, po);
+        const costNote = `Received against ${po.po_number} (GRN ${grnNumber})`
+          + (deviated && devReason ? ` — off-PO: ${devReason}` : '');
         // `price` is bound to unit_price GROSS OF TAX and gross of the discount —
         // the goods rate off the vendor's bill. cgstAmt/sgstAmt/cessAmt go in
         // their own columns; none of them may ever be added into the rate (see
         // the prepare above).
+        // ── WHAT quantity_accepted MEANS ON A HELD LINE: 0, AND NOT "REJECTED" ──
+        // The store records what ARRIVED; the checking department records what is
+        // ACCEPTED, later. Writing `received` here provisionally would make every
+        // downstream reader value goods nobody has accepted — two of them
+        // dangerously: src/lib/returns.ts offers a line for VENDOR RETURN on
+        // quantity_accepted > 0 (and settling it debits stock that was never
+        // credited), and src/lib/purchase-log.ts would book the value with no
+        // purchases mirror and report it as billed-but-never-booked. Both close
+        // on their own at 0, with no edit to either file.
+        // ZERO ACCEPTED IS THE ABSENCE OF A DECISION, and status='awaiting_qc' is
+        // what says so. storePreRejectBlock() above already refused any payload
+        // that declared a smaller accepted on a gated delivery, so nothing the
+        // receiver typed is being silently discarded here.
+        // quantity_ordered / quantity_received are UNTOUCHED: the receipt ledger
+        // (receivedPoItemIds) keys on the ROW existing, and holding those back
+        // would let the same PO line be received twice.
         insGrnItem.run(generateId(), grnId, it.id, it.material_id,
-                       it.quantity, received, accepted, rejected, reason, price,
+                       it.quantity, received,
+                       qc.required ? 0 : accepted, qc.required ? 0 : rejected,
+                       qc.required ? '' : reason, price,
                        noteBits.join(' | '),
-                       discShare, cgstAmt, sgstAmt, delivShare, cessAmt);
+                       discShare, cgstAmt, sgstAmt, delivShare, cessAmt,
+                       lineTax ? lineTax.gst_rate : 0, lineTax ? lineTax.cess_rate : 0,
+                       lineVendorForCost, costNote);
 
         // Stock + financials reflect ONLY the accepted qty (rejections never enter stock)
-        if (accepted > 0) {
+        //
+        // ── AND NOTHING AT ALL WHEN THE DELIVERY IS HELD ─────────────────────
+        // These three writes ARE "the goods are ours". Deferring them to the
+        // sign-off (decideGrnQc in src/lib/grn-qc.ts, which replays exactly this
+        // shape from the stored row — net rate re-derived from gi.discount,
+        // GROSS rate into last_purchase_price, packFactor on the stock credit)
+        // is the entire feature. The GRN header, its line rows, the vendor bill
+        // row and both concurrency claims are NOT deferred: the document is the
+        // record that the truck arrived, and the claims are locks on the PO, not
+        // on the stock.
+        if (!qc.required && accepted > 0) {
           const purchaseId = generateId();
           // Same helper the grouping used, so the vendor a line is BOOKED
           // against is by construction the vendor whose bill received it.
-          const lineVendor = lineVendorName(it, po);
+          // Computed above (as lineVendorForCost) so the held path stores the
+          // SAME name on the GRN line; aliased here so this insert reads
+          // unchanged.
+          const lineVendor = lineVendorForCost;
           // ── Unit-basis boundary (CORE CONVENTION) ──────────────────────
           // A PO line carries qty in PURCHASE units and price in ₹/purchase-unit
           // (a PO is raised to a VENDOR — see /api/purchase-orders' items query
@@ -1356,8 +1477,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // Carry the deviation reason onto the purchases row too — this is the
           // row every cost report and the average_price recompute read back, so
           // "why is this qty/rate not the PO's" has to survive here as well.
-          const purchaseNote = `Received against ${po.po_number} (GRN ${grnNumber})`
-            + (deviated && devReason ? ` — off-PO: ${devReason}` : '');
+          // Composed above (as costNote) and stored on the GRN line, so a held
+          // delivery's deferred cost row carries this EXACT sentence — which
+          // src/lib/purchase-log.ts parses with an anchored regex.
+          const purchaseNote = costNote;
           // Stamp the receipt with the PO's outlet (the GRN header above already
           // does). A NULL here gets backfilled to the DEFAULT outlet by the
           // startup migration, silently moving another outlet's purchase.
@@ -1386,11 +1509,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // received - accepted) = 0) reading 'received', i.e. complete, on /grn and
       // on the printed GRN, even though goods are still owed. Same QTY_EPS as the
       // deviation gate so float noise alone never downgrades a full receipt.
+      //
+      // NEVER ON A HELD GRN: 'partial' would overwrite 'awaiting_qc', and the
+      // sign-off's `WHERE status = 'awaiting_qc'` claim would then match nothing
+      // — the delivery would be stuck, un-inwarded AND un-signable, with no way
+      // back except a hand-written UPDATE. decideGrnQc applies this SAME rule
+      // (rejected OR short-received ⇒ 'partial') when the kitchen signs, so the
+      // finished row is indistinguishable from one this branch wrote.
       const partialCount = db.prepare(`
         SELECT COUNT(*) AS n FROM goods_receipt_note_items
         WHERE grn_id = ? AND (quantity_rejected > 0 OR quantity_received < quantity_ordered - ?)
       `).get(grnId, QTY_EPS) as any;
-      if (partialCount.n > 0) {
+      if (!qc.required && partialCount.n > 0) {
         db.prepare(`UPDATE goods_receipt_notes SET status = 'partial' WHERE id = ?`).run(grnId);
       }
 
@@ -1473,137 +1603,74 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // only vendor A's lines have landed would consume goods vendor B has not
       // delivered. On a single-vendor PO the first receive IS the completion, so
       // this fires exactly when it always did.
-      if (po.requisition_id && isComplete) {
-        const reqRow = db.prepare(`SELECT * FROM requisitions WHERE id = ?`).get(po.requisition_id) as any;
-        const willFulfill = reqRow && reqRow.status === 'store_processed';
-        db.prepare(`
-          UPDATE requisitions
-          SET status = 'fulfilled', fulfilled_at = datetime('now'), fulfilled_by = ?, updated_at = datetime('now')
-          WHERE id = ? AND status = 'store_processed'
-        `).run('po-received-cascade', po.requisition_id);
-
-        // Party requisition fulfilled via PO-receive cascade — deduct now.
-        // (Internal requisitions remain audit-only and never enter this branch.)
-        if (willFulfill && reqRow.purpose === 'party') {
-          const already = db.prepare(`
-            SELECT 1 FROM inventory_transactions
-            WHERE reference_id = ? AND type = 'party_consumption'
-            LIMIT 1
-          `).get(po.requisition_id);
-          if (already) {
-            logAuditEvent(db, {
-              event_type: 'requisition.party_consumption.skipped',
-              entity_type: 'requisition',
-              entity_id: po.requisition_id,
-              actor_email: receivedByEmail,
-              after: { reason: 'already_deducted' },
-              note: 'Party consumption skipped — inventory_transactions row already exists',
-            });
-          } else {
-            const reqItems = db.prepare(`
-              -- No last_purchase_price here on purpose. That column is stored in
-              -- MIXED bases (some rows ₹/purchase-unit, some already ₹/recipe-unit),
-              -- so it cannot be normalised by any formula. average_price is the
-              -- sanctioned single-basis rate — see src/lib/closing-valuation.ts and
-              -- src/app/api/department-variance/route.ts:620-622.
-              SELECT ri.*, rm.name AS material_name, rm.average_price,
-                     rm.unit AS rm_unit, rm.purchase_unit AS rm_purchase_unit,
-                     COALESCE(rm.pack_size, 1) AS rm_pack_size
-              FROM requisition_items ri
-              JOIN raw_materials rm ON rm.id = ri.material_id
-              WHERE ri.req_id = ?
-                -- A line the chef or the store REFUSED never leaves the store, so
-                -- it can never be consumed. Without this filter a rejected line
-                -- still carried its quantity_requested into the fallback below.
-                AND COALESCE(ri.is_rejected, 0) = 0
-                AND COALESCE(ri.store_rejected, 0) = 0
-            `).all(po.requisition_id) as any[];
-            const decStock = db.prepare(`
-              UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now')
-              WHERE id = ?
-            `);
-            const insPartyTx = db.prepare(`
-              INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id, created_at)
-              VALUES (?, ?, 'party_consumption', ?, ?, ?, ?, datetime('now'))
-            `);
-            // The consumption belongs to the requisition's outlet (PO's as a
-            // fallback); an unstamped row is backfilled to the DEFAULT outlet.
-            const partyOutletId = reqRow.outlet_id || po.outlet_id || null;
-            const partyNote = `Party: ${reqRow.event_name || '(unnamed)'} @ ${reqRow.event_date || ''}`.trim();
-            const auditItems: any[] = [];
-            let totalCost = 0;
-            for (const it of reqItems) {
-              /* EFFECTIVE QTY — the house rule (store-issue/route.ts, dept-stock,
-                 party-approvals): what the chef APPROVED, falling back to what was
-                 requested only when no approval was recorded. The old fallback was
-                 raw quantity_requested, so a line the chef trimmed 10 → 4, or
-                 rejected outright, still deducted 10 — and once the pack factor
-                 below was applied that became 7,500 ml of a material nobody
-                 released. Cap at the approved figure and this cannot recur. */
-              const effApproved = (it.chef_approved_qty != null
-                ? Number(it.chef_approved_qty)
-                : Number(it.quantity_requested)) || 0;
-              const issuedReq = Math.min(Number(it.quantity_issued) || effApproved, effApproved);
-              if (issuedReq <= 0) continue;
-              // ri.unit → RECIPE units. Requisition quantities are stored in the
-              // LINE's OWN unit (option B), so a "2 BTL" line is TWO BOTTLES —
-              // deducting it verbatim took 2 ml off stock instead of 1,500 ml
-              // and wrote a −2 party_consumption row. Same pack-factor CASE as
-              // src/lib/party-fulfillment.ts and the department-consumption SQL;
-              // keep the three byte-equivalent.
-              const rPack = Number(it.rm_pack_size) || 1;
-              const reqPackFactor =
-                (String(it.unit ?? '').trim() !== '' &&
-                 it.unit === it.rm_purchase_unit &&
-                 it.unit !== it.rm_unit &&
-                 rPack > 1)
-                  ? rPack : 1;
-              const issued = issuedReq * reqPackFactor;   // RECIPE units
-              decStock.run(issued, it.material_id);
-              insPartyTx.run(generateId(), it.material_id, -issued, po.requisition_id, partyNote, partyOutletId);
-              /* BOTH SIDES OF THIS MULTIPLICATION ARE ON THE RECIPE BASIS.
-                 LEFT  — `issued` is RECIPE units (ml/g): issuedReq is in the LINE's
-                         own unit and reqPackFactor above lifted a purchase-unit
-                         line into recipe units.
-                 RIGHT — raw_materials.average_price is ₹ per RECIPE unit by canon,
-                         so it needs NO pack conversion. Dividing it by rPack, or
-                         multiplying it up, would break the trio.
-                 It used to read last_purchase_price / rPack here. That column is
-                 stored in MIXED bases: of the 190 packed materials that hold both a
-                 stored LPP and a purchase history, 71 are ALREADY ₹/recipe-unit, so
-                 the divide fired a second time — MALA STRAWBERRY CRUSH 5 LTR
-                 (ml/BTL, pack 5000, avg ₹0.13482/ml) logged ₹0.13 for a full bottle
-                 instead of ₹674.10, and `lppRecipe || average_price` short-circuited
-                 on that non-zero wrong value so the correct rate on the same row was
-                 never reached. average_price is the sanctioned rate for a
-                 recipe-unit quantity (src/lib/closing-valuation.ts ladder). */
-              const unitCost = Number(it.average_price) || 0;   // ₹ / RECIPE unit
-              const lineCost = Math.round(issued * unitCost * 100) / 100;
-              totalCost += lineCost;
-              auditItems.push({
-                material_id: it.material_id,
-                material_name: it.material_name,
-                quantity: issued,
-                unit_cost: unitCost,
-                line_cost: lineCost,
-              });
-            }
-            logAuditEvent(db, {
-              event_type: 'requisition.party_consumption',
-              entity_type: 'requisition',
-              entity_id: po.requisition_id,
-              actor_email: receivedByEmail,
-              after: { items: auditItems, total_cost: Math.round(totalCost * 100) / 100 },
-              note: partyNote,
-            });
-          }
-        }
+      //
+      // ── AND ON NO GRN OF THIS PO STILL WAITING FOR A QUALITY CHECK ────────
+      // The party branch below DEDUCTS STOCK for the whole event. Firing it
+      // while any of this PO's deliveries sits un-inwarded consumes goods that
+      // were never added — it would take them out of some OTHER receipt's
+      // balance and leave central stock understated until the sign-off lands.
+      // `isComplete` cannot see that: it measures the receipt LEDGER (a GRN row
+      // exists per line), and a held GRN has its rows. So the ledger test is
+      // unchanged and this second one is added beside it.
+      // WHO FIRES IT INSTEAD: decideGrnQc (src/lib/grn-qc.ts) re-runs exactly
+      // this condition after each apply and calls the SAME helper the moment the
+      // last hold clears — one cascade, one helper, either route.
+      // MEASURED 2026-08-21: ZERO POs in this database carry a requisition_id,
+      // so this branch has never fired here; the gate is correctness, not a
+      // change to any observed behaviour.
+      const heldOnPo = Number((db.prepare(
+        `SELECT COUNT(*) AS n FROM goods_receipt_notes WHERE po_id = ? AND status = ?`,
+      ).get(id, QC_AWAITING) as any)?.n || 0);
+      if (po.requisition_id && isComplete && heldOnPo === 0) {
+        // The body of this cascade now lives in src/lib/po-requisition-fulfil.ts,
+        // because it has TWO triggers since the kitchen QC gate: this one, and a
+        // QC sign-off that clears the LAST held GRN of an already-complete PO
+        // (decideGrnQc re-runs exactly the condition above). Lifted verbatim —
+        // the effective-qty rule, the pack factor and the average_price basis are
+        // unchanged and documented in place there. It is safe to call twice: the
+        // requisitions UPDATE is `WHERE status = 'store_processed'` and the party
+        // branch probes inventory_transactions for its own prior row.
+        fulfilRequisitionFromPo(db, {
+          requisitionId: String(po.requisition_id),
+          poOutletId: po.outlet_id ?? null,
+          actorEmail: receivedByEmail,
+        });
       }
     });
     txn();
 
-    // Cascade weighted-avg + recipe re-cost outside the transaction (it does its own writes)
+    // Cascade weighted-avg + recipe re-cost outside the transaction (it does its own writes).
+    // touchedMaterials is EMPTY on a held receive — nothing was booked — so this
+    // is a no-op there rather than a special case.
     for (const matId of touchedMaterials) updateMaterialPrice(db, matId);
+
+    // ── TELL SOMEBODY, AFTER THE COMMIT ─────────────────────────────────────
+    // Fire-and-forget and never throws: a notification failure must not fail —
+    // or roll back — the receipt it announces. The BELL needs nothing written
+    // (it counts status='awaiting_qc' live); this writes the durable record, the
+    // push, and the WhatsApp ping that is dark by default.
+    // Placed BEFORE the deviation alert below, deliberately: a held delivery is
+    // the more urgent message and both are best-effort.
+    let qcRecipients: Array<{ email: string; name: string }> = [];
+    if (qc.required) {
+      try {
+        const heldRow = db.prepare(`
+          SELECT COUNT(*) AS n, COALESCE(ROUND(SUM(quantity_received * unit_price), 2), 0) AS v
+            FROM goods_receipt_note_items WHERE grn_id = ?`).get((result as any).grn_id) as any;
+        const r = await notifyGrnAwaitingQc(db, {
+          grnId: String((result as any).grn_id),
+          grnNumber: String((result as any).grn_number),
+          vendor: group.vendor_name || po.vendor || '',
+          date: receivedAt,
+          checker: qc.checker, categories: qc.categories,
+          lineCount: Number(heldRow?.n) || 0, heldValue: Number(heldRow?.v) || 0,
+          receivedBy: receivedByEmail, outletId: po.outlet_id ?? null,
+        });
+        qcRecipients = r.recipients.map(x => ({ email: x.email, name: x.name }));
+      } catch (e) {
+        console.error('[receive PO] QC notification failed (non-fatal):', e);
+      }
+    }
 
     // ────────────────────────────────────────────────────────────────────
     // Off-PO (deviation) notification.
@@ -1859,6 +1926,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       remaining_vendors: (result as any).remaining_vendors,
       grn_id:     (result as any).grn_id,
       grn_number: (result as any).grn_number,
+      // ── THE HOLD, STATED IN THE RESPONSE THE RECEIVER ALREADY READS ───────
+      // A silent hold at the bay is the one way this feature could make things
+      // worse: the storekeeper must be told that NOTHING entered stock, WHO is
+      // expected to clear it, and that the vendor should wait. qc_notified is
+      // the honest answer to "who did you tell" — on today's data (no user
+      // resolves to main department Kitchen) that list is often the admins only.
+      qc_required: qc.required,
+      // The QC STATE, not the GRN's status: 'awaiting_qc' when held, and
+      // 'not_required' when this delivery took the pre-existing path (whose
+      // final status is 'received' or 'partial' and is read from /api/grn, as
+      // it always was).
+      qc_status: qc.required ? QC_AWAITING : 'not_required',
+      qc_checker: qc.required ? qc.checker : 'none',
+      qc_categories: qc.categories,
+      qc_message: qc.message,
+      qc_notified: qcRecipients,
       // Lines THIS receipt booked (one vendor's), not the whole PO's.
       lines_processed: receiving.length,
       store_blocked: storeBlocked,

@@ -321,9 +321,30 @@ export async function sendWhatsAppTemplate(
  * Notifications tab (settings key `wa_notify_<event>`) under the
  * `wa_notifications_enabled` master switch.
  */
+/**
+ * REGISTERING AN EVENT HERE DOES NOT TURN IT ON. isWaNotifyEnabled() below
+ * requires the master switch AND `wa_notify_<event>`; an absent settings key
+ * reads '' and is off. Registration buys the event a toggle in Settings →
+ * WhatsApp → Notifications and, crucially, A SEAT IN `wa_notify_recipients`.
+ *
+ * That second half is why `grn_qc_pending` had to be added. getWaNotifyRecipients()
+ * rebuilds the whole recipient JSON FROM THIS LIST and setWaNotifyRecipients()
+ * writes that rebuilt object back — so while the QC event was deliberately kept
+ * out of this array (it has its own reader in src/lib/grn-qc-notify.ts on the
+ * same key), ANY save on the Notifications tab silently deleted its mobiles:
+ *
+ *   before  {"grn_qc_pending":["98…"], "requisition_approved":["90…"]}
+ *   save an unrelated event
+ *   after   {"requisition_approved":["91…"], …} — the QC slot is simply gone
+ *
+ * waQcRecipients() then returned [] and waSend logged `no_recipients` and sent
+ * nothing, silently, while the admin screen said the list was shared with every
+ * other event — which is exactly what made the loss unexpected. Both readers key
+ * on the same string, so this changes no behaviour beyond stopping the wipe.
+ */
 export const WA_NOTIFY_EVENTS = [
   'requisition_approved', 'discount_decided', 'low_stock_daily', 'digest_daily',
-  'calls_daily',
+  'calls_daily', 'grn_qc_pending',
 ] as const;
 export type WaNotifyEvent = typeof WA_NOTIFY_EVENTS[number];
 
@@ -342,6 +363,11 @@ export const WA_DEFAULT_EVENT_BODIES: Record<WaNotifyEvent, string> = {
   // Yesterday's reservations line, in one glance. Utility, not marketing —
   // it goes to our own staff about our own operation.
   calls_daily: '📞 AKAN Calls — {{date}}\n\nCalls {{calls}} · Answered {{answered}} ({{answered_pct}}%) · Missed {{missed}}\nBookings from calls: {{bookings}}\nMissed still open: {{pending}}\nBusiest hour: {{peak}}\n\n{{agents}}',
+  // The QC rail composes its own text (src/lib/grn-qc-notify.ts) and passes it to
+  // sendWhatsAppMessage directly, so this body is the shape an APPROVED TEMPLATE
+  // should take rather than a string notifyEvent() will ever render. Kept in step
+  // with the five positional params waSend() sends, in the same order.
+  grn_qc_pending: '⏸ {{grn_number}} from {{vendor}} is waiting for a {{checker}} quality check — {{categories}}. ₹{{value}} of goods are at the bay and NO stock has been added. Keep the vendor there until it is signed off.',
 };
 
 /**
@@ -356,6 +382,11 @@ export const WA_EVENT_PARAM_ORDER: Record<WaNotifyEvent, string[]> = {
   low_stock_daily: ['date', 'count', 'summary'],
   digest_daily: ['date', 'content'],
   calls_daily: ['date', 'calls', 'answered', 'answered_pct', 'missed', 'bookings', 'pending', 'peak', 'agents'],
+  // MUST match, in order, the five params waSend() passes in grn-qc-notify.ts:
+  // grn_number, vendor, checker, categories, value. The overdue ping reuses the
+  // same key and sends grn_number, vendor, checker, waited_hours, date — noted
+  // in the hand-over as a thing to split if a template is ever approved for both.
+  grn_qc_pending: ['grn_number', 'vendor', 'checker', 'categories', 'value'],
 };
 
 /** Master switch AND the per-event toggle must both be on. */
