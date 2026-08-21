@@ -58,8 +58,25 @@ interface Grn {
   status: string; notes?: string;
   qc_quality?: number; qc_temperature?: number; qc_expiry?: number;
   qc_damage?: number; qc_weight?: number; qc_invoice_match?: number;
+  /* Void stamps. Shipped by /api/grn to EVERY reader (a void is a fact about
+     the document, not an admin secret), so this page always has them. */
+  voided_at?: string | null; voided_by?: string | null; void_reason?: string | null;
+  /* Amendment stamps. ADMIN ONLY on the wire — /api/grn strips them for
+     everyone else, so on a non-admin's print they are simply absent and the
+     amended-line below does not render. */
+  edited_at?: string | null; edited_by?: string | null; edit_count?: number;
   items: GrnItem[];
 }
+
+/** A stored UTC stamp as the venue reads it — the same Asia/Kolkata rendering
+ *  the /grn list uses, so the paper and the screen agree on when. */
+const fmtIST = (v: any): string => {
+  const s = String(v ?? '').trim();
+  if (!s) return '';
+  const d = new Date(/[TZ]/.test(s) ? s : s.replace(' ', 'T') + 'Z');
+  if (Number.isNaN(d.getTime())) return s;
+  return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
+};
 
 const QC_ROWS: { key: keyof Grn; label: string }[] = [
   { key: 'qc_quality',       label: 'Quality OK (look · smell · feel)' },
@@ -116,6 +133,14 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
     return `${v.toLocaleString('en-IN', { maximumFractionDigits: 3 })} ${noteUnit}`;
   };
 
+  // A VOIDED BILL MUST NOT PRINT AS A LIVE RECEIPT. Its stock was reversed and
+  // its cost rows deleted, but this sheet still shows every rupee at full value
+  // and carries three signature blocks — filed on paper it is indistinguishable
+  // from a delivery that stands. Until now the only marker was the word "void"
+  // in the small status box, in the same red as "rejected".
+  const isVoid = String(grn.status).toLowerCase() === 'void';
+  const editCount = Number(grn.edit_count) || 0;
+
   return (
     <div className="bg-white text-[#1a1a1a] mx-auto max-w-[820px] p-8 print:p-6 text-[12px] leading-relaxed">
       {/* Print-only stylesheet */}
@@ -129,6 +154,23 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
         @media screen {
           .page { box-shadow: 0 0 0 1px #E8D5C4, 0 4px 24px rgba(0,0,0,.05); }
         }
+        /* VOID WATERMARK. Positioned against .page (position:relative below) and
+           pointer-events:none so it never blocks the screen copy. It has to
+           survive the printer, hence print-color-adjust:exact above — without it
+           browsers drop light background/colour and the sheet would print clean
+           again, which is the exact failure this exists to stop. */
+        .void-watermark {
+          position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+          pointer-events: none; z-index: 5;
+        }
+        .void-watermark span {
+          transform: rotate(-24deg);
+          font-size: 96px; font-weight: 800; letter-spacing: .18em;
+          color: rgba(190, 30, 30, .16);
+          border: 8px solid rgba(190, 30, 30, .16);
+          padding: .08em .18em; border-radius: 12px;
+          -webkit-print-color-adjust: exact; print-color-adjust: exact;
+        }
       `}</style>
 
       {/* Toolbar (screen only) */}
@@ -139,7 +181,8 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
         </button>
       </div>
 
-      <div className="page bg-white p-2">
+      <div className="page bg-white p-2 relative">
+        {isVoid && <div className="void-watermark" aria-hidden="true"><span>VOID</span></div>}
         {/* Header */}
         <div className="border-b-2 border-[#1a1a1a] pb-3 mb-4">
           <div className="flex items-start justify-between">
@@ -156,6 +199,39 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
             </div>
           </div>
         </div>
+
+        {/* CANCELLED-BILL BANNER. Stated in words as well as watermarked,
+            because a watermark can be missed on a photocopy and because who
+            voided it, when, and why are the facts an auditor needs off the
+            paper. Placed above the money so it is read before the totals. */}
+        {isVoid && (
+          <div className="border-2 border-red-700 bg-[#fdf2f2] px-3 py-2 mb-4 relative z-10">
+            <div className="text-[13px] font-bold uppercase tracking-wide text-red-800">
+              Cancelled bill — void. Not payable, not receivable.
+            </div>
+            <div className="text-[11px] text-[#7a1f1f] mt-0.5">
+              Voided{grn.voided_by ? ` by ${grn.voided_by}` : ''}{grn.voided_at ? ` on ${fmtIST(grn.voided_at)}` : ''}
+              {grn.void_reason ? ` — ${grn.void_reason}` : ''}.
+            </div>
+            <div className="text-[10px] text-[#7a1f1f] mt-1">
+              The stock this note added has been reversed and its cost rows removed. The quantities and amounts printed below are what
+              the vendor originally billed and are kept as the record of what arrived — they no longer count towards inward value, spend
+              or payment. Do not sign, pay or file this as a live receipt.
+            </div>
+          </div>
+        )}
+
+        {/* AMENDED-BILL LINE. edited_* only reaches an admin (the API strips the
+            stamps for everyone else), which matches the owner's rule for the
+            "edited" hint — but a printed copy of an amended bill must not hide
+            that it was amended from the one reader who is allowed to know. */}
+        {!isVoid && editCount > 0 && (
+          <div className="border border-[#c9a227] bg-[#fffbe9] px-3 py-1.5 mb-4 text-[11px] text-[#6b5010] relative z-10">
+            <b>Amended {editCount} time{editCount === 1 ? '' : 's'}.</b>{' '}
+            Last amended{grn.edited_by ? ` by ${grn.edited_by}` : ''}{grn.edited_at ? ` on ${fmtIST(grn.edited_at)}` : ''}.
+            Bill details only — quantities and rates are not amendable. The field-level trail is on the GRN row in F&amp;B Controller.
+          </div>
+        )}
 
         {/* Meta grid */}
         <div className="grid grid-cols-2 gap-x-6 gap-y-2 mb-4">

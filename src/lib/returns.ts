@@ -355,7 +355,23 @@ export function vendorReturnCandidates(
   db: Database,
   filters: VendorReturnCandidateFilters = {},
 ): VendorReturnCandidate[] {
-  const where: string[] = ['gi.quantity_accepted > 0'];
+  // A VOIDED GRN IS NOT A RETURNABLE DELIVERY, and this predicate is a stock
+  // guard, not a tidy-up of the picker.
+  //
+  // Voiding a GRN (DELETE /api/grn/[id]) reverses the stock it added and deletes
+  // its cost rows, but KEEPS the header and the line items — the document is the
+  // record of what arrived. Those kept lines still have quantity_accepted > 0,
+  // so without this they stayed on offer here, and a vendor return raised
+  // against one took the SAME goods out of central stock a SECOND time when the
+  // store verified it (src/lib/return-stock.ts's
+  // `current_stock = current_stock - ?`, whose own balance guard passes whenever
+  // any other stock of that material exists — i.e. nearly always). It also
+  // claimed a vendor credit note for a receipt the venue had already erased.
+  //
+  // The void route guards the other direction (it refuses to void a GRN that
+  // already has a return ticket); this is the missing half — a return raised
+  // AFTER the void.
+  const where: string[] = ['gi.quantity_accepted > 0', `g.status <> 'void'`];
   const params: unknown[] = [];
 
   const grnId = String(filters.grnId || '').trim();

@@ -1,5 +1,5 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId, canProcessAsStore, isManagement } from '@/lib/auth';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { duplicateLineError } from '@/lib/po-helpers';
@@ -49,9 +49,75 @@ import { duplicateLineError } from '@/lib/po-helpers';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
+/**
+ * The amendment stamps are ADMIN-ONLY on the wire.
+ *
+ * The owner's rule for the "edited" marker is that it is shown TO ADMIN — so it
+ * is stripped here rather than merely hidden by the page, because a field the
+ * browser receives is a field anyone with devtools can read. `voided_*` is NOT
+ * stripped: a void is a fact about the document that every reader must see, and
+ * the row is struck through for everybody.
+ *
+ * FAILS CLOSED. `isAdmin` is a plain `role === 'admin'` on a resolved session;
+ * no session, an unresolvable role, or a thrown lookup all leave it false and
+ * the stamps are removed. canAccessPage is NOT consulted — it fails open four
+ * ways and is not a gate (see src/proxy.ts).
+ */
+const EDIT_STAMPS = ['edited_at', 'edited_by', 'edit_count'] as const;
+function stripEditStamps<T extends Record<string, any>>(row: T, isAdmin: boolean): T {
+  if (isAdmin || !row) return row;
+  const out: any = { ...row };
+  for (const k of EDIT_STAMPS) delete out[k];
+  return out;
+}
+
+/** CSV cell escaping — BYTE-FOR-BYTE the `clean()` the /grn page uses for the
+ *  bulk register download (src/app/grn/page.tsx), so a one-GRN file and a
+ *  date-range file are the same document in every respect but their filter.
+ *  Formula-injection guard, but only on genuinely non-numeric cells, so signed
+ *  numbers (negative MRP round-off, back-correction qtys) stay summable in
+ *  Excel instead of arriving as text. */
+const csvCell = (v: any): string => {
+  let s = String(v ?? '');
+  if (/^[=+\-@]/.test(s) && !Number.isFinite(Number(s))) s = "'" + s;
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+/** The Inward Register column order. THE SAME 26 HEADINGS, IN THE SAME ORDER,
+ *  as the client-side bulk export at src/app/grn/page.tsx — keep the two in
+ *  step: two "inward register" files that disagree about column order are worse
+ *  than one. COMPENSATION CESS sits between SGST and SPECIAL EXCISE CESS (the
+ *  order db.ts's Total Inward term list uses); the two cesses are DIFFERENT
+ *  levies and must never be folded together. */
+const REGISTER_HEADER = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
+  'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
+  'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
+  'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE'];
+
+/** Same field order as REGISTER_HEADER, against a row of the register query. */
+const registerRow = (r: any) => [
+  r.grn_number, r.invoice_number, r.inward_date, r.supplier, r.category_name, r.item_name,
+  r.po_qty, r.inward_qty, r.purchase_unit, r.rate, r.subtotal, r.discount, r.cgst, r.sgst,
+  r.compensation_cess, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
+  r.quantity_accepted, r.quantity_rejected, r.rejection_reason, r.status, r.received_by, r.invoice_date,
+];
+
 export async function GET(request: Request) {
   try {
     const db = getDb();
+    // SELF-AUTHENTICATES. src/proxy.ts guards PAGES, not APIs — its only cover
+    // for a GET is that a cookie exists, which is not a session and says nothing
+    // about role. This read now needs a role (the amendment stamps below), so it
+    // resolves one. Every caller of this route is a signed-in browser page
+    // (/grn, /grn/print/[id]); there is no script or server-side caller, so
+    // nothing that worked before stops working.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    const isAdmin = me.role === 'admin';
+    // Mirrors the bar PUT /api/grn/[id] actually enforces, so the page can hide
+    // an Edit control the server would refuse. ADVISORY ONLY — the write
+    // re-derives it from the session and fails closed.
+    const canAmend = canProcessAsStore(me) || isManagement(me);
     const url = new URL(request.url);
     const id = url.searchParams.get('id');
     if (id) {
@@ -60,8 +126,20 @@ export async function GET(request: Request) {
         FROM goods_receipt_notes g
         LEFT JOIN purchase_orders po ON po.id = g.po_id
         WHERE g.id = ?
-      `).get(id);
+      `).get(id) as any;
       if (!grn) return Response.json({ error: 'Not found' }, { status: 404 });
+      // SCOPED TO THE CALLER'S OUTLET, like the list and like the register
+      // download. This branch feeds View (the row's detail panel), Print
+      // (/grn/print/[id]) and the Edit form, and it returns the whole bill —
+      // vendor, invoice number, every line, every charge. All three surfaces
+      // are reached from the outlet-scoped list, so nothing legitimate changes;
+      // what stops working is pasting a GRN id from another outlet.
+      const detailOutletId = await getCurrentOutletId();
+      if (detailOutletId && grn.outlet_id != null && String(grn.outlet_id) !== String(detailOutletId)) {
+        return Response.json({
+          error: 'This bill belongs to a different outlet than the one you are working in. Switch outlets to open it.',
+        }, { status: 403 });
+      }
       // compensation_cess is the EIGHTH charge and it is summed HERE, on read,
       // exactly like the other seven — a levy that was actually paid and is not
       // in the rate has to reach Total Inward, or the GRN totals to less than
@@ -80,7 +158,51 @@ export async function GET(request: Request) {
         WHERE gi.grn_id = ?
         ORDER BY rm.name
       `).all(id);
-      return Response.json({ grn: { ...grn, items } });
+      // The amendment trail, ADMIN ONLY and read from the append-only
+      // audit_events log — the authority on WHAT changed. The three stamps on
+      // the header row only say that it changed, who and when; this is the
+      // field-level diff behind the marker. `before_json`/`after_json` are
+      // parsed here so the caller never has to double-decode, and a corrupt row
+      // degrades to null rather than 500-ing the whole detail read.
+      //
+      // THE TIEBREAK IS `rowid`, NOT `id`. audit_events.created_at is
+      // datetime('now') — ONE-SECOND resolution — and its id is a
+      // crypto.randomUUID(), so `id DESC` sorted same-second events at random:
+      // six amendments inside one second came back 5,1,3,4,6,2 while the row's
+      // own "last amended by" said 6, so the panel and the marker contradicted
+      // each other and the old → new chain read backwards. Two events in one
+      // second is a double-click, a retry, or two people. audit_events has a
+      // TEXT primary key and therefore an implicit monotonic rowid: it is the
+      // insertion order, which is what "newest" means here.
+      //
+      // The cap is read one row DEEP so the panel can say it is capped rather
+      // than quietly disagreeing with the row's edit_count.
+      const HISTORY_LIMIT = 200;
+      let editHistory: any[] = [];
+      let historyTruncated = false;
+      if (isAdmin) {
+        const parse = (s: any) => { try { return s == null ? null : JSON.parse(s); } catch { return null; } };
+        const raw = db.prepare(`
+          SELECT id, event_type, actor_email, before_json, after_json, note, created_at
+          FROM audit_events
+          WHERE entity_type = 'goods_receipt_note' AND entity_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT ?
+        `).all(id, HISTORY_LIMIT + 1) as any[];
+        historyTruncated = raw.length > HISTORY_LIMIT;
+        editHistory = raw.slice(0, HISTORY_LIMIT).map(r => ({
+          id: r.id, event_type: r.event_type, actor_email: r.actor_email,
+          note: r.note, created_at: r.created_at,
+          before: parse(r.before_json), after: parse(r.after_json),
+        }));
+      }
+      return Response.json({
+        grn: { ...stripEditStamps(grn, isAdmin), items },
+        is_admin: isAdmin,
+        can_amend: canAmend,
+        edit_history: editHistory,
+        edit_history_truncated: historyTruncated,
+      });
     }
     const from = url.searchParams.get('from');
     const to   = url.searchParams.get('to');
@@ -99,11 +221,45 @@ export async function GET(request: Request) {
     // together would report an excise figure the state never levied.
     if (register) {
       const rw: string[] = ['1=1']; const rp: any[] = [];
+      // ── PER-ENTRY DOWNLOAD ────────────────────────────────────────────────
+      // `grn_id` narrows the register to ONE inward entry, and when it is given
+      // the DATE RANGE, VENDOR and STATUS pickers are dropped: they belong to
+      // the list the user is browsing, and a "Download" on a row must not return
+      // an empty file because the row happens to sit at the edge of the range or
+      // because a status filter is on. The register SQL, its column list and its
+      // ORDER BY are untouched, so a one-row file is a slice of the same
+      // document, never a second format that can drift from it.
+      //
+      // THE OUTLET CLAUSE IS NOT ONE OF THE PICKERS AND STAYS ON. This branch is
+      // reached by a plain <a href> carrying a GRN id, and this file is a full
+      // money breakdown per line (rate, discount, both cesses, TCS, total inward)
+      // — the sort of figure /reports/purchases 403s a non-manager for. Dropping
+      // the outlet clause here would have made any id downloadable from any
+      // outlet's session. Every row the list can show still passes it, so no
+      // legitimate Download changes.
+      const grnId = String(url.searchParams.get('grn_id') || '').trim();
+      if (grnId) {
+        rw.push('g.id = ?'); rp.push(grnId);
+        if (outletId) { rw.push('(g.outlet_id = ? OR g.outlet_id IS NULL)'); rp.push(outletId); }
+      } else {
       if (outletId) { rw.push('(g.outlet_id = ? OR g.outlet_id IS NULL)'); rp.push(outletId); }
       if (from)     { rw.push('g.date >= ?'); rp.push(from); }
       if (to)       { rw.push('g.date <= ?'); rp.push(to); }
       if (vendorId) { rw.push('g.vendor_id = ?'); rp.push(vendorId); }
       if (status)   { rw.push('g.status = ?'); rp.push(status); }
+      // ── VOIDED BILLS ARE OUT OF THE RANGE REGISTER ────────────────────────
+      // This file is what gets reconciled against vendor paperwork and summed
+      // in Excel; a voided bill's stock and cost rows have been reversed, so
+      // including it at full value restates the period's inward total upwards
+      // for ever. The only signal it carried was the word "void" 24 columns in,
+      // which no SUM() reads — and the /grn header Σ already excludes it, so
+      // the screen and its own export disagreed.
+      // Excluded only when the user has NOT asked for them: `?status=void` is
+      // the auditor's "list the cancelled bills" view and must still work, and
+      // a per-entry Download (the grn_id branch above) always returns its row,
+      // because a voided bill is still a document you may print a copy of.
+      if (status !== 'void') rw.push(`g.status <> 'void'`);
+      }
       const rows = db.prepare(`
         SELECT g.grn_number, g.invoice_number, g.date AS inward_date, g.vendor AS supplier,
                rm.category AS category_name, rm.name AS item_name,
@@ -124,7 +280,32 @@ export async function GET(request: Request) {
         JOIN raw_materials       rm ON rm.id = gi.material_id
         WHERE ${rw.join(' AND ')}
         ORDER BY g.date DESC, g.grn_number, rm.name
-      `).all(...rp);
+      `).all(...rp) as any[];
+      // ?format=csv → the finished file, rendered here rather than assembled in
+      // the browser, so a per-entry "Download Bill" is a plain <a href> with no
+      // JS, no Blob and no second copy of the column order to keep in step.
+      // The JSON shape is unchanged for every caller that does not ask for csv.
+      if (String(url.searchParams.get('format') || '').toLowerCase() === 'csv') {
+        const lines = [REGISTER_HEADER.join(',')];
+        for (const r of rows) lines.push(registerRow(r).map(csvCell).join(','));
+        // Named off the GRN when it is one entry (that is the document's own
+        // identity, and the number is what an auditor searches for), off the
+        // date range otherwise — matching the bulk export's filename exactly.
+        const one = grnId ? String(rows[0]?.grn_number || grnId) : '';
+        const filename = one
+          ? `GRN-inward-${one}.csv`
+          : `GRN-inward-register-${from || 'all'}_to_${to || 'all'}.csv`;
+        return new Response(lines.join('\n'), {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/csv;charset=utf-8;',
+            // The filename can carry a comma or a quote via grn_number, so it is
+            // sanitised rather than interpolated raw into the header.
+            'Content-Disposition': `attachment; filename="${filename.replace(/[^A-Za-z0-9._-]/g, '_')}"`,
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
       return Response.json({ rows });
     }
     if (outletId)  { where.push('(g.outlet_id = ? OR g.outlet_id IS NULL)'); params.push(outletId); }
@@ -160,8 +341,13 @@ export async function GET(request: Request) {
       LEFT JOIN purchase_orders po ON po.id = g.po_id
       WHERE ${where.join(' AND ')}
       ORDER BY g.date DESC, g.created_at DESC
-    `).all(...params);
-    return Response.json({ grns: rows });
+    `).all(...params) as any[];
+    // g.* already carries edited_*/voided_* — no query edit was needed for the
+    // row markers. `is_admin` rides along so the page can render the admin-only
+    // Delete control and the "edited" hint without a second /api/auth/me round
+    // trip; it is advisory for the UI only — every write re-checks the role
+    // server-side and fails closed.
+    return Response.json({ grns: rows.map(r => stripEditStamps(r, isAdmin)), is_admin: isAdmin, can_amend: canAmend });
   } catch (e: any) {
     return Response.json({ error: e.message }, { status: 500 });
   }

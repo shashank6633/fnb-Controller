@@ -2444,6 +2444,35 @@ function initializeSchema(db: Database.Database) {
     if (!hasG('qc_weight'))        db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN qc_weight INTEGER NOT NULL DEFAULT 0`);
     if (!hasG('qc_invoice_match')) db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN qc_invoice_match INTEGER NOT NULL DEFAULT 0`);
 
+    // ── AMEND + VOID STAMPS on the inward document ────────────────────────
+    // Six additive, nullable/zero-default columns so a GRN can honestly say it
+    // was amended, and can be VOIDED rather than deleted. Every existing row
+    // reads edited_at = NULL / edit_count = 0 / voided_at = NULL, which is the
+    // truth about it: never touched.
+    //
+    // WHY DENORMALISED WHEN audit_events ALREADY RECORDS BOTH. audit_events is
+    // and stays the authority — it carries the field-level diff and the deleted
+    // cost rows. But /grn renders its list from ONE query with correlated
+    // subqueries (api/grn/route.ts GET), and an "edited" marker that needed a
+    // per-row audit lookup would be an N+1 on every page load. These stamps ride
+    // along in `g.*` for free; the audit row is what you read to see WHAT
+    // changed.
+    //
+    // VOID IS A STATUS VALUE, NOT A COLUMN: goods_receipt_notes.status gains
+    // 'void' alongside received/partial/rejected. There is no CHECK constraint
+    // on that column (see the CREATE above), so this needs no table rebuild —
+    // but it does mean every reader that filters on status must be told about
+    // 'void'. A voided GRN keeps its header AND its line items: the bill
+    // document survives, struck through, with who voided it and when. What gets
+    // reversed is the STOCK and the `purchases` cost rows it wrote — see
+    // DELETE /api/grn/[id], which is the only writer of these three columns.
+    if (!hasG('edited_at'))   db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN edited_at TEXT`);
+    if (!hasG('edited_by'))   db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN edited_by TEXT DEFAULT ''`);
+    if (!hasG('edit_count'))  db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN edit_count INTEGER NOT NULL DEFAULT 0`);
+    if (!hasG('voided_at'))   db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN voided_at TEXT`);
+    if (!hasG('voided_by'))   db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN voided_by TEXT DEFAULT ''`);
+    if (!hasG('void_reason')) db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN void_reason TEXT DEFAULT ''`);
+
     // GRN Inward financial columns (TGBCL-style inward register) — per LINE ₹
     // amounts captured at receive time. SUBTOTAL = inward qty × rate (computed),
     // TOTAL INWARD AMOUNT = subtotal − discount + cgst + sgst + compensation

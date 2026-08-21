@@ -174,7 +174,11 @@ export async function GET() {
              SUM(gi.quantity_rejected * gi.unit_price) AS rej_value
       FROM goods_receipt_note_items gi
       JOIN goods_receipt_notes g ON g.id = gi.grn_id
-      WHERE g.date = ? AND gi.quantity_rejected > 0
+      -- A VOIDED bill is a cancelled receipt whose stock was reversed. Its line
+      -- items are kept (they are the document), so without this the morning
+      -- digest kept raising "vendor X — N lines rejected on GRN-…" against a
+      -- delivery that no longer stands, and printed a rejected ₹ value for it.
+      WHERE g.date = ? AND gi.quantity_rejected > 0 AND COALESCE(g.status, '') <> 'void'
       GROUP BY g.id
       ORDER BY rej_value DESC
       LIMIT 3

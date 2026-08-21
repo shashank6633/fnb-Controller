@@ -286,12 +286,30 @@ export async function POST(request: Request) {
     if (kind === 'vendor') {
       grn = db.prepare(`
         SELECT g.id, g.grn_number, g.date, g.po_id, g.vendor_id, g.vendor,
+               g.status, g.voided_by, g.voided_at,
                po.po_number
         FROM goods_receipt_notes g
         LEFT JOIN purchase_orders po ON po.id = g.po_id
         WHERE g.id = ?
       `).get(grnId) as any;
       if (!grn) return Response.json({ error: 'GRN not found' }, { status: 404 });
+
+      // A VOIDED RECEIPT HAS ALREADY BEEN TAKEN OUT OF STOCK. Voiding a GRN
+      // reverses the quantities it added and deletes its cost rows, but keeps
+      // the document — so its lines still read quantity_accepted > 0 and look
+      // returnable. Accepting a return against one debits central stock a
+      // SECOND time at store-verify (src/lib/return-stock.ts) for goods that
+      // are no longer on the book, and raises a vendor credit note for a
+      // delivery this venue has already cancelled.
+      //
+      // ENFORCED HERE, not only in the picker: vendorReturnCandidates() now
+      // excludes voided GRNs, but a picker is a convenience and this route is
+      // the gate — grn_id and grn_item_id arrive in the request body.
+      if (String(grn.status) === 'void') {
+        return Response.json({
+          error: `${grn.grn_number} was voided${grn.voided_by ? ' by ' + grn.voided_by : ''} and the stock it added has already been reversed, so there is nothing left on it to send back. Raising a return against it would take the same goods out of stock twice.`,
+        }, { status: 409 });
+      }
 
       // Requirement 75 — the PO return window. Measured from the GRN's own
       // date, NOT from received_at: received_at stays NULL while a multi-vendor

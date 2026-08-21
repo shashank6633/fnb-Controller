@@ -770,7 +770,19 @@ function buildUnion(f: {
       FROM goods_receipt_note_items gi
       JOIN goods_receipt_notes g ON g.id = gi.grn_id
       LEFT JOIN raw_materials rm ON rm.id = gi.material_id
-      WHERE g.date >= ? AND g.date <= ?${venFilter('g.vendor')}${matFilter('gi.material_id')}
+      WHERE g.date >= ? AND g.date <= ?
+        -- A VOIDED bill is money that was NOT spent. Voiding a GRN reverses the
+        -- stock it added and DELETES its purchases rows, so it already leaves
+        -- the PURCHASE branch on its own — but its goods_receipt_note_items are
+        -- kept (they are the document) and this branch reads them, so the same
+        -- delivery counted on one rail and not the other. That gave two answers
+        -- for one bill on the GOODS VALUE vs TOTAL AMOUNT split, and made the
+        -- GRN↔PURCHASE reconciliation report it as billed-but-never-booked,
+        -- which is indistinguishable from a genuine missing-cost-row defect.
+        -- Stronger than the PO branch's own exclusion below: a cancelled order
+        -- was never received, a voided GRN was received and then undone.
+        AND COALESCE(g.status, '') <> 'void'
+        ${venFilter('g.vendor')}${matFilter('gi.material_id')}
     `);
     params.push(f.from, f.to);
     if (f.vendor) params.push(f.vendor);
