@@ -2,6 +2,7 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 import { requisitionHasMovedStock } from '@/lib/issue-stock';
+import { duplicateLineError } from '@/lib/po-helpers';
 
 // Statuses at which a requisition can be edited, by whom:
 //   draft                                            → drafter or admin
@@ -81,6 +82,10 @@ export async function GET(request: Request) {
       // inventory route — for the detail view we just want the latest purchase).
       const items = db.prepare(`
         SELECT ri.*, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit,
+               -- Category ships so the store screen can group a hand-over by
+               -- shelf. Aliased (not rm.category bare) to match every other
+               -- material field here and to keep ri.* from shadowing it.
+               rm.category AS material_category,
                -- NULLIF(TRIM(...)) — not a bare COALESCE: an EMPTY-STRING
                -- purchase_unit would ship '' to the client, where every reader
                -- falls back to the recipe unit and the row silently prints
@@ -317,6 +322,22 @@ export async function POST(request: Request) {
     if (missingDept) {
       return Response.json({ error: 'Every item line needs a department' }, { status: 400 });
     }
+    // ONE MATERIAL = ONE LINE (owner rule). Same helper, same key and the same
+    // sentence as the Purchase Order routes (api/purchase-orders/route.ts:492
+    // and :613) — imported, never restated; the header of @/lib/line-dedupe
+    // explains why a second copy of this rule is itself the bug. The composer
+    // already refuses a repeat client-side through MaterialTypeahead's
+    // excludeIds, but a direct POST had nothing stopping it from landing two
+    // requisition_items rows for one material.
+    // CHECKED AGAINST validItems, NOT the raw body: every other guard in this
+    // handler (missingDept, the department-scope check, the category whitelist)
+    // speaks validItems, and validItems is exactly the set the insert loop below
+    // writes — so this refuses when, and only when, two ROWS would be written
+    // for one material. A repeat whose second line was already dropped for a
+    // blank material or a non-positive qty produces no second row and is
+    // correctly not an error.
+    const dupLine = duplicateLineError(validItems);
+    if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
     // The req-level department is now derived (used by legacy reports + visibility).
     // We pick the first item's dept so existing code that joins on r.department_id keeps working.
     const reqDeptId = department_id || validItems[0].department_id;
@@ -515,6 +536,23 @@ export async function PUT(request: Request) {
       return Response.json({
         error: 'Cannot change the items on this requisition — stock has already been issued against it. Undo or store-reject the issued lines on the Store Issue desk first.',
       }, { status: 400 });
+    }
+
+    // Same ONE MATERIAL = ONE LINE guard as POST. This handler REPLACES the
+    // whole item set (the wholesale DELETE + reinsert below), so leaving it out
+    // here would make "edit the draft" the way around the rule — the reason the
+    // PO PUT states for its own copy of this check.
+    // Checked against the raw `items` the client sent, so the "Line N" in the
+    // message names the caller's own row. The reinsert loop additionally skips
+    // lines with a blank material or qty <= 0; those skipped lines are still
+    // counted here, so a payload repeating a material on a zeroed-out row is
+    // refused outright rather than silently half-applied. No shipping client can
+    // send one — requisitions/page.tsx, StaffCatalogPicker and the party
+    // ChefEditModal all filter to (material_id && qty > 0) before posting.
+    // An items-less PUT is a metadata-only edit and must stay untouched.
+    if (Array.isArray(items)) {
+      const dupLine = duplicateLineError(items);
+      if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
     }
 
     // Pull all editable metadata off the body — for party reqs, the UI may

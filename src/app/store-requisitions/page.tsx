@@ -40,7 +40,7 @@
  * + req-level audit_events written by the store-issue endpoint.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Package, Loader2, RefreshCw, Search, Clock, CheckCircle2, AlertCircle,
   Send, RotateCcw, ChevronRight, ChevronDown, History, User as UserIcon, XCircle,
@@ -58,6 +58,8 @@ interface ReqLine {
   material_name: string;
   /** Unit on the requisition line — may be blank for legacy reqs. */
   unit: string;
+  /** rm.category, shipped so the store can walk one shelf at a time. */
+  material_category?: string;
   /** Canonical recipe unit on raw_materials (from rm.unit AS material_unit). Fallback for `unit`. */
   material_unit?: string;
   /** Pack meta (rm.purchase_unit / rm.pack_size) — the store works in purchase units. */
@@ -1494,7 +1496,41 @@ function ReqCard(props: {
               </tr>
             </thead>
             <tbody>
-              {req.items.map(line => (
+              {/* CATEGORY-WISE, so a store person walks one shelf at a time instead
+                  of criss-crossing the room down a flat alphabetical list.
+                  Categories A-Z, items A-Z inside each. Deliberately NOT
+                  collapsible: everything on a hand-over sheet must be visible at
+                  a glance, and a collapsed group is a line quietly not issued.
+                  Items with no category fall into "Uncategorised", pinned LAST so
+                  a blank never sorts above a real shelf. Grouping is presentation
+                  only — the selection, bulk-issue and totals all still read
+                  req.items, so nothing downstream sees a different set. */}
+              {(() => {
+                const groups = new Map<string, typeof req.items>();
+                for (const line of req.items) {
+                  const key = String((line as any).material_category || '').trim() || 'Uncategorised';
+                  if (!groups.has(key)) groups.set(key, [] as typeof req.items);
+                  groups.get(key)!.push(line);
+                }
+                const names = [...groups.keys()].sort((a, b) => {
+                  if (a === 'Uncategorised') return 1;
+                  if (b === 'Uncategorised') return -1;
+                  return a.localeCompare(b, undefined, { sensitivity: 'base' });
+                });
+                return names.map(name => (
+                  <Fragment key={`cat-${name}`}>
+                    <tr className="bg-[#FFF1E3] border-t border-[#E8D5C4]">
+                      <td colSpan={9} className="py-1 px-2 text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">
+                        {name}
+                        <span className="ml-1.5 font-normal normal-case">
+                          ({groups.get(name)!.length} item{groups.get(name)!.length === 1 ? '' : 's'})
+                        </span>
+                      </td>
+                    </tr>
+                    {groups.get(name)!
+                      .slice()
+                      .sort((x, y) => String(x.material_name || '').localeCompare(String(y.material_name || ''), undefined, { sensitivity: 'base' }))
+                      .map(line => (
                 <LineRow key={line.id} line={line} req={req}
                          selectable={props.selectable}
                          selected={props.selectedIds.has(line.id)}
@@ -1510,7 +1546,10 @@ function ReqCard(props: {
                          blocked={props.blockedReversals[line.id]}
                          onUndo={props.onUndo} onReject={props.onReject} onUnreject={props.onUnreject}
                          onShowHistory={props.onShowHistory} />
-              ))}
+                    ))}
+                  </Fragment>
+                ));
+              })()}
             </tbody>
           </table>
           {req.store_processed_by && (
@@ -1863,8 +1902,12 @@ function LineRow(props: {
                          overIssue ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`} />
                 {u && <span className="text-[10px] text-[#6B5744] font-medium">{u}</span>}
                 <button onClick={() => props.onIssue(line)}
-                        disabled={busy}
-                        title={overIssue ? 'Issuing more than approved — a short reason is required' : undefined}
+                        disabled={busy || (overIssue && !String(props.issueNotes[line.id] || '').trim())}
+                        title={overIssue
+                          ? (String(props.issueNotes[line.id] || '').trim()
+                              ? 'Issuing more than approved — the reason will be recorded against this line'
+                              : 'Type why you are issuing more than approved before handing over')
+                          : undefined}
                         className="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[10px] flex items-center gap-1 disabled:opacity-50">
                   {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
                   Issue Now
@@ -1897,7 +1940,7 @@ function LineRow(props: {
               </>
             )}
             {overIssue && !deferOpen && (
-              <div className="w-full flex flex-col sm:flex-row sm:items-center gap-1 bg-amber-50 border border-amber-300 rounded px-1.5 py-1">
+              <div className="w-full flex flex-col gap-1 bg-amber-50 border border-amber-300 rounded px-1.5 py-1">
                 <span className="text-[10px] text-amber-900 shrink-0">
                   <AlertCircle className="w-3 h-3 inline mr-0.5 -mt-0.5" />
                   {/* Say ALL the numbers. The first version called `outstanding`
@@ -1908,10 +1951,27 @@ function LineRow(props: {
                   {' '}Handing over {fmtNum(typedPU)} {u} takes the total to <b>{fmtNum(U.toPU(issued) + typedPU)} {u}</b>,
                   {' '}which is {fmtNum(overBy)} {u} over the {fmtNum(U.toPU(eff))} {u} approved.
                 </span>
-                <input value={props.issueNotes[line.id] || ''}
-                       onChange={e => props.setIssueNotes((s: any) => ({ ...s, [line.id]: e.target.value }))}
-                       placeholder="Why more than approved? e.g. full 10 kg bag, cannot split"
-                       className="flex-1 min-w-0 px-1.5 py-0.5 border border-amber-400 rounded text-[10px] bg-white" />
+                {/* Own full-width row, not sharing one with the warning. As a
+                    flex-1 input beside that long sentence it collapsed to a
+                    slit barely wider than the caret, so nobody could read back
+                    what they had written. Two rows are visible at rest — a
+                    whole sentence — and it grows as the person keeps typing.
+                    MANDATORY: the button above is disabled until it has text.
+                    The tooltip has always said a reason was required; it was
+                    never actually enforced, so an unexplained over-issue could
+                    be handed over and only surface in a variance months later. */}
+                <textarea value={props.issueNotes[line.id] || ''}
+                          onChange={e => {
+                            props.setIssueNotes((s: any) => ({ ...s, [line.id]: e.target.value }));
+                            const el = e.currentTarget;
+                            el.style.height = 'auto';
+                            el.style.height = `${el.scrollHeight}px`;
+                          }}
+                          rows={2}
+                          required
+                          aria-label="Reason for issuing more than approved"
+                          placeholder="Why more than approved? e.g. full 10 kg bag, cannot split"
+                          className="w-full resize-y overflow-hidden px-1.5 py-1 border border-amber-400 rounded text-[10px] leading-snug bg-white" />
               </div>
             )}
             {deferOpen && (

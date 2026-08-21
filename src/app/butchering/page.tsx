@@ -695,9 +695,18 @@ function CutLine({ idx, line, grossWeight, sourceUnit, totalCost, materials, tot
         {readOnly ? (
           <div className="px-2 py-1.5 text-xs font-medium">{mat?.name || '—'}</div>
         ) : (
+          /* NO purchaseBasis here — deliberate, do not re-add in a blanket rollout.
+             Butchering is recipe-basis end to end: the weight box beside this picker
+             is labelled `unit` (mat.unit, line above), the POST sends that number raw,
+             and the server credits it verbatim into current_stock (api/butchering
+             route.ts:416), prorates cost off it (:290) and writes waste to wastages
+             (:441) — all in RECIPE units. With purchaseBasis on, the dropdown read
+             "on hand: 846 kg" and the chip read "(kg)" while the box next to it wanted
+             grams: a 1000x trap on all 413 materials with a real pack conversion.
+             Off, the dropdown prints m.unit and the box prints mat.unit — the SAME
+             field, so they cannot disagree for any material, ever. */
           <MaterialTypeahead materials={materials as any} value={line.material_id}
                              onPick={(id: string) => onUpdate({ material_id: id })}
-                             purchaseBasis
                              excludeIds={excludeIds.filter(x => x !== line.material_id) as string[]} />
         )}
       </div>

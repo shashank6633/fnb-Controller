@@ -12,6 +12,8 @@ import { todayIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import Combobox from '@/components/Combobox';
 import { packFactor, fmtQtyNum } from '@/lib/pack-units';
+import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
+import { useStockOnHand } from '@/lib/use-stock-on-hand';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 /** ₹ with 2 decimals — for the inward register (taxes/charges carry paise). */
@@ -345,7 +347,7 @@ function GrnRow({ g, expanded, onToggle }: { g: GRN; expanded: boolean; onToggle
             <>
               <div className="text-xs text-[#6B5744] mb-2 flex flex-wrap gap-x-3 gap-y-1">
                 <span><b>GRN #:</b> {detail.grn_number}</span>
-                {detail.invoice_number && <span><b>Invoice ID:</b> {detail.invoice_number}</span>}
+                {detail.invoice_number && <span><b>Vendor Invoice No:</b> {detail.invoice_number}</span>}
                 <span><b>Inward date:</b> {detail.date}</span>
                 <span><b>Supplier:</b> {detail.vendor || '—'}</span>
                 {detail.invoice_date && <span><b>Invoice date:</b> {detail.invoice_date}</span>}
@@ -491,6 +493,12 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const [vendors, setVendors] = useState<any[]>([]);
   const [materials, setMaterials] = useState<any[]>([]);
   const [busy, setBusy] = useState(false);
+  /* LIVE in-hand stock — Store and Departments as two separate figures, ONE
+     batched call for the whole catalogue at modal mount (CONTRACT §4/§5.3).
+     Never a per-material or per-department fetch: looping
+     /api/department-stock?department_id=X costs 110 ms across 19 departments
+     for a field a receiving bay has no use for. */
+  const stock = useStockOnHand(true);
 
   // Configurable backdate limit + admin exemption. Server is the real guard;
   // these only set the receipt-date input's min/max (UX). Default: 3 days, non-admin.
@@ -910,8 +918,18 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               <input value={qcBy} onChange={e => setQcBy(e.target.value)} placeholder="name or email"
                      className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
             </label>
-            <label className="flex flex-col gap-1 text-[#6B5744]">Invoice #
-              <input value={invoice} onChange={e => setInvoice(e.target.value)} className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+            {/* MANDATORY, and named for whose number it is. Called "Invoice ID"
+                on the detail view it feeds, which on Purchases means OUR
+                auto-generated PINV — two screens, one phrase, opposite meanings.
+                Required because months later the stock line is still there and
+                the bill it came from is not: without this you cannot get back to
+                the paper. It is also what the duplicate-bill guard keys on, and
+                that guard skips any row with a blank bill number. */}
+            <label className="flex flex-col gap-1 text-[#6B5744]">
+              Vendor Invoice No <span className="text-red-600">*</span>
+              <input value={invoice} onChange={e => setInvoice(e.target.value)} required
+                     placeholder="the number printed on the vendor's bill"
+                     className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
             </label>
             <label className="flex flex-col gap-1 text-[#6B5744]">Invoice Date
               <input type="date" value={invoiceDate} onChange={e => setInvoiceDate(e.target.value)} className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
@@ -1005,6 +1023,12 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               </span>
               <button onClick={addLine} className="hidden md:flex shrink-0 text-xs text-[#af4408] hover:underline items-center gap-1"><Plus className="w-3 h-3" /> Add line</button>
             </div>
+            {/* The marker legend for the in-hand figures printed under each
+                picked material. It sits here rather than inside the picker's
+                own dropdown because the dropdown belongs to MaterialTypeahead,
+                a component fifteen other screens share — see the handoff note
+                on the in-hand block below. */}
+            <StockOnHandLegend className="px-1 pb-1" />
             <div className="overflow-x-auto">
               <table className="w-full text-xs block md:table md:min-w-[600px]">
                 <thead className="text-[#8B7355] hidden md:table-header-group">
@@ -1041,6 +1065,23 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                           onPick={(id) => pickMaterial(i, id)}
                           excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                         />
+                        {/* IN HAND, WHILE THE RECEIPT IS BEING BOOKED (owner's
+                            ask #1, GRN half). Store and Departments as two
+                            figures, never merged: a receiver checking a cash buy
+                            needs to see that the kitchen is already holding
+                            stock of the same item.
+                            HANDOFF — the picker DROPDOWN still shows only the
+                            central "on hand:" figure, because that line lives
+                            inside MaterialTypeahead, which fifteen screens share
+                            (including /recipes, which must stay in recipe units)
+                            and which this task does not own. CONTRACT §5.3 has
+                            the opt-in prop for it: `stockByLocation`, default
+                            undefined, so every other mount renders unchanged. */}
+                        {it.material_id && (
+                          <StockOnHandNote data={stock.map.get(it.material_id)} loading={stock.loading}
+                                           variant="line" deptScope={stock.scope} visibleDepts={stock.visible}
+                                           className="mt-1" />
+                        )}
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Received</span>

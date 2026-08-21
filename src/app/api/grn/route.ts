@@ -2,6 +2,7 @@ import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
+import { duplicateLineError } from '@/lib/po-helpers';
 
 /**
  * GRN read API. Listing + detail.
@@ -175,9 +176,43 @@ export async function POST(request: Request) {
     const { date, vendor_id, vendor, invoice_number, invoice_date, qc_by, notes, items,
             qc_quality, qc_temperature, qc_expiry, qc_damage, qc_weight, qc_invoice_match } = b;
     if (!date)  return Response.json({ error: 'date required' }, { status: 400 });
+    // MANDATORY, ENFORCED HERE TOO. The form marks it required, but a `required`
+    // attribute is a courtesy to the person typing, not a rule — anything posting
+    // straight at this route bypasses it. POST /api/grn has exactly ONE caller (the
+    // ad-hoc form at grn/page.tsx:818); PO receipts go through
+    // /api/purchase-orders/[id]/receive, so no other flow can be broken by this.
+    //
+    // It matters because this number is the only way back to the paper: months on,
+    // the stock line survives and the bill does not. It is also what the
+    // duplicate-bill guard keys on, and that guard skips a blank bill_no entirely.
+    if (!String(invoice_number || '').trim()) {
+      return Response.json(
+        { error: 'Vendor invoice / bill number is required on an ad-hoc GRN — it is the only link back to the vendor\'s paperwork.' },
+        { status: 400 },
+      );
+    }
     if (!Array.isArray(items) || items.length === 0) {
       return Response.json({ error: 'items array required' }, { status: 400 });
     }
+    // ONE MATERIAL = ONE LINE (owner rule) — the same helper the PO routes and
+    // POST/PUT /api/requisitions call, imported from @/lib/po-helpers rather
+    // than restated (see the header of @/lib/line-dedupe). This is the ad-hoc,
+    // human-composed GRN: /grn already blocks a repeat client-side through
+    // MaterialTypeahead's excludeIds, but a direct POST could book one delivery
+    // twice — two goods_receipt_note_items rows, two `purchases` rows, two stock
+    // bumps and two passes through updateMaterialPrice's weighted average for a
+    // single delivered item.
+    // PLACED HERE, on the raw payload, with the other shape checks and BEFORE
+    // the store-mapped split below, for two reasons. The "Line N" in the message
+    // then names the caller's own row — checking the filtered `receivable` list
+    // instead would silently renumber it past any store-blocked line and send a
+    // storekeeper to the wrong row. And a repeated material is a defect in the
+    // payload the caller authored, true independently of which lines turn out to
+    // be store-mapped. The two can never disagree about WHAT a duplicate is:
+    // centralFlowBlock keys on the material, so two lines for one material are
+    // always both blocked or both receivable.
+    const dupLine = duplicateLineError(items);
+    if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
 
     // Configurable backdate window: non-admins can't set a GRN receipt date older
     // than N days or in the future; admins are exempt.
@@ -285,9 +320,9 @@ export async function POST(request: Request) {
       // backfill, and the note text below is unchanged so the regex path
       // keeps reading history exactly as it did.
       const insPurchase = db.prepare(`
-        INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
+        INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, bill_no,
                                is_emergency, payment_mode, emergency_reason, outlet_id, grn_id, created_at)
-        VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, 0, '', '', ?, ?, datetime('now'))
+        VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, datetime('now'))
       `);
       const bumpStock = db.prepare(`
         UPDATE raw_materials
@@ -435,8 +470,19 @@ export async function POST(request: Request) {
           // to its own GRN too, deliberately: the reversal is a delivery event in
           // its own right and the log must show it against the GRN that recorded
           // it, not silently under the original receipt.
+            // THE VENDOR'S BILL NUMBER IS NOW STORED, NOT JUST NARRATED. It used to
+            // survive only inside noteTag — "Ad-hoc GRN GRN-2026-0002 · invoice R71-T3"
+            // — so months later the stock line was still there and the bill it came
+            // from was findable only by reading prose. It could not be filtered, matched
+            // against a vendor statement, or seen in the Bill No column; and the
+            // duplicate-bill guard SKIPS any row whose bill_no is blank, so every ad-hoc
+            // receipt was invisible to it. PO-receive has always written bill_no — this
+            // makes the two receiving routes agree.
+            //
+            // noteTag itself is deliberately UNCHANGED: the PO No column and the po_id
+            // backfill both read history through that exact sentence.
           insPurchase.run(purchaseId, it.material_id, vendor || '', accepted, price, lineTotal, date,
-                          noteTag, outletId, grnId);
+                          noteTag, String(invoice_number || '').trim(), outletId, grnId);
           // ── Unit-basis boundary (CORE CONVENTION) ──────────────────────
           // GRN lines are entered in PURCHASE units at ₹/purchase-unit (same
           // basis as /api/purchases — also the only reading consistent with

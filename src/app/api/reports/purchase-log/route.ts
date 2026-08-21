@@ -1,6 +1,10 @@
 import { getCurrentUser, isManagement } from '@/lib/auth';
 import { todayIST } from '@/lib/format-date';
-import { getPurchaseLog, type PurchaseLogRow } from '@/lib/purchase-log';
+import {
+  getPurchaseLog,
+  type PurchaseLogRow,
+  type PurchaseLogSourceMoney,
+} from '@/lib/purchase-log';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * PURCHASE LOG — GET /api/reports/purchase-log   (management only)
@@ -42,6 +46,32 @@ import { getPurchaseLog, type PurchaseLogRow } from '@/lib/purchase-log';
  * rows that say in words why they must not be added. If you are ever tempted to
  * add a `total_value`, re-read this block: that single number is the bug.
  * ─────────────────────────────────────────────────────────────────────────
+ * WHAT "NO GRAND TOTAL" DOES **NOT** FORBID — read before deleting the totals
+ * ─────────────────────────────────────────────────────────────────────────
+ * The ban above is on ONE number spanning the three sources. It never barred
+ * totalling a column WITHIN a source, and for a long time this file shipped
+ * none, which is why the owner reported "the Total Amount value is not
+ * showing": the file had a money column and no figure at the foot of it.
+ *
+ * The file now carries, PER SOURCE and never merged:
+ *   • a column-aligned TOTALS row — each summable column's total sitting under
+ *     its own heading, so a spreadsheet reader sees the figure where they look
+ *     for it, and Discount/Qty/Rate left EMPTY (never a word, which would
+ *     poison a selection sum) with the reason spelled out in the notes block;
+ *   • two captioned headline figures, "GOODS VALUE" and "TOTAL AMOUNT", named
+ *     apart on purpose — the owner never said which one "Total" meant, and
+ *     guessing gives a confidently wrong number;
+ *   • the three original DO-NOT-ADD captions, unchanged in meaning;
+ *   • a NOTES block listing every column deliberately left without a total and
+ *     why, straight from PURCHASE_LOG_NO_TOTAL_NOTES so the screen says the
+ *     same words.
+ *
+ * Every figure comes from `totals` (a SQL aggregate over the FULL filtered set),
+ * never from summing `rows`, so the 50,000-row cap cannot understate a total.
+ * Column positions are found by findIndex on the header text — a hard-coded
+ * index rots the first time a column is inserted, and a totals row under the
+ * wrong heading is worse than no totals row.
+ * ─────────────────────────────────────────────────────────────────────────
  *
  * UNITS: qty is in PURCHASE units and rate is ₹ per PURCHASE unit on all three
  * sources — no packFactor is applied anywhere in this report (that conversion
@@ -76,9 +106,18 @@ function shiftIstDays(ymd: string, days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-/** RFC-4180 escaping. Vendor and item names here routinely carry commas and quotes. */
-const csvCell = (v: unknown): string => {
-  const s = v === null || v === undefined ? '' : String(v);
+/**
+ * RFC-4180 escaping. Vendor and item names here routinely carry commas and quotes.
+ *
+ * `numeric` is not cosmetic. Text fields get the leading `=+-@` guard, because
+ * Excel EXECUTES a cell that starts with one and vendor/item/notes text reaches
+ * this file exactly as a user typed it. Numbers must NOT get it: MRP round-off
+ * is signed, so a legitimate "-1" would become the text "'-1" and every totals
+ * row below it would stop adding up in the reader's own spreadsheet.
+ */
+const csvCell = (v: unknown, numeric = false): string => {
+  let s = v === null || v === undefined ? '' : String(v);
+  if (!numeric && /^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
@@ -94,7 +133,7 @@ const csvCell = (v: unknown): string => {
  * commas inside the number, which Excel reads as extra columns; the ₹ display
  * formatting belongs on the page, not in a file meant to be summed.
  */
-const COLUMNS: { header: string; cell: (r: PurchaseLogRow) => unknown }[] = [
+const COLUMNS: { header: string; cell: (r: PurchaseLogRow) => unknown; numeric?: boolean }[] = [
   { header: 'Source (PURCHASE = booked spend / PO = ordered only / GRN = vendor bill for a booked purchase)', cell: r => r.source },
   { header: 'Date',                        cell: r => r.date },
   { header: 'Document No (PO / GRN / Purchase Invoice)', cell: r => r.doc_no },
@@ -104,17 +143,24 @@ const COLUMNS: { header: string; cell: (r: PurchaseLogRow) => unknown }[] = [
   { header: 'Item',                        cell: r => r.material },
   { header: 'SKU',                         cell: r => r.sku },
   { header: 'Category',                    cell: r => r.category },
-  { header: 'Qty (purchase units)',        cell: r => r.qty },
+  { header: 'Qty (purchase units — NOT totalled, every line is in its own unit)', cell: r => r.qty, numeric: true },
   { header: 'Purchase Unit',               cell: r => r.purchase_unit },
-  { header: 'Rate (INR per purchase unit; GRN = gross, PURCHASE = net of discount)', cell: r => r.rate },
-  { header: 'Value (INR, qty x rate; charges NOT included)', cell: r => r.value },
+  { header: 'Rate (INR per purchase unit; GRN = gross, PURCHASE = net of discount — NOT totalled)', cell: r => r.rate, numeric: true },
+  { header: 'Value (INR, qty x rate; charges NOT included; ⚠ PURCHASE rows may be tax-inclusive — see CAVEAT below)', cell: r => r.value, numeric: true },
+  // THE column the owner went looking for. Source-aware and blank (not 0) on a
+  // PO line, because purchase_order_items stores no charge columns at all — an
+  // order has a goods value and no bill amount until it is received and billed.
+  // Computed once, in src/lib/purchase-log.ts, as the identical expression
+  // /api/grn, /api/purchases and the Purchases page use, so this file foots
+  // against the GRN inward register rather than inventing a third convention.
+  { header: 'Total Amount (INR, value - discount + CGST + SGST + cesses + TCS + delivery + round-off; blank on PO; ⚠ may equal Value on affected PURCHASE rows — see CAVEAT below)', cell: r => (r.total_amount == null ? '' : r.total_amount), numeric: true },
   // Blank, not 0, on PURCHASE/PO rows: only a GRN records a rejection, and a
   // zero there would read as "nothing was rejected" rather than "not applicable".
-  { header: 'Qty Rejected (GRN only)',     cell: r => (r.qty_rejected == null ? '' : r.qty_rejected) },
-  { header: 'Discount INR (recorded only)',             cell: r => r.discount },
-  { header: 'CGST INR (recorded only)',                 cell: r => r.cgst },
-  { header: 'SGST INR (recorded only)',                 cell: r => r.sgst },
-  { header: 'Special Excise Cess INR (recorded only)',  cell: r => r.special_excise_cess },
+  { header: 'Qty Rejected (GRN only)',     cell: r => (r.qty_rejected == null ? '' : r.qty_rejected), numeric: true },
+  { header: 'Discount INR (recorded only)',             cell: r => r.discount, numeric: true },
+  { header: 'CGST INR (recorded only)',                 cell: r => r.cgst, numeric: true },
+  { header: 'SGST INR (recorded only)',                 cell: r => r.sgst, numeric: true },
+  { header: 'Special Excise Cess INR (recorded only)',  cell: r => r.special_excise_cess, numeric: true },
   // A DIFFERENT levy from the column above it, and the header says so because in
   // a spreadsheet two adjacent columns both reading "Cess" get summed as one.
   // Special Excise Cess is TGBCL's, non-creditable, and rides on the store bill;
@@ -122,22 +168,78 @@ const COLUMNS: { header: string; cell: (r: PurchaseLogRow) => unknown }[] = [
   // part of the CGST+SGST invariant — never add it into a GST figure on a return.
   // Blank (not 0) on GRN and PO rows: goods_receipt_note_items has no such
   // column, so a 0 there would assert "no cess was levied" on a bill nobody asked.
-  { header: 'Compensation Cess INR (GST comp. cess, recorded only)', cell: r => r.compensation_cess },
-  { header: 'TCS INR (recorded only)',                  cell: r => r.tcs },
-  { header: 'Delivery Charges INR (recorded only)',     cell: r => r.delivery_charges },
-  { header: 'MRP Round Off INR (recorded only)',        cell: r => r.mrp_round_off },
+  { header: 'Compensation Cess INR (GST comp. cess, recorded only)', cell: r => r.compensation_cess, numeric: true },
+  { header: 'TCS INR (recorded only)',                  cell: r => r.tcs, numeric: true },
+  { header: 'Delivery Charges INR (recorded only)',     cell: r => r.delivery_charges, numeric: true },
+  { header: 'MRP Round Off INR (recorded only)',        cell: r => r.mrp_round_off, numeric: true },
   { header: 'Link Key (ties a GRN line to the purchase row it created)', cell: r => r.link_key },
   { header: 'Notes',                       cell: r => r.notes },
 ];
 
-const VALUE_COL = COLUMNS.findIndex(c => c.header.startsWith('Value ('));
+/**
+ * Column positions, ALWAYS looked up by header text and never written down as a
+ * number. Inserting "Total Amount" after "Value" shifted every charge column one
+ * to the right; a hard-coded index would have quietly filed the CGST total under
+ * Qty Rejected, and a totals row under the wrong heading is worse than none.
+ * A prefix that matches nothing yields -1 and is skipped, so a future rewording
+ * loses a figure instead of misplacing one.
+ */
+const colAt = (headerPrefix: string) => COLUMNS.findIndex(c => c.header.startsWith(headerPrefix));
+const VALUE_COL = colAt('Value (');
+const TOTAL_COL = colAt('Total Amount (');
 
-/** A full-width CSV row with `label` in the Source column and `value` under Value. */
-function captionRow(label: string, value?: number): string {
-  const cells = COLUMNS.map(() => '');
+/**
+ * A full-width CSV row: `label` in the Source column, plus any number of figures
+ * placed under the headings they belong to.
+ *
+ * Cell 0 is escaped as TEXT (formula guard on) and every placed figure as
+ * NUMERIC (guard off) — a totals row whose signed round-off arrived as text
+ * would break the reader's own SUM over the column, which is the one thing this
+ * whole block exists to make possible.
+ */
+function captionRow(label: string, figures?: Array<[number, number | null | undefined]>): string {
+  const cells: string[] = COLUMNS.map(() => '');
+  const isNum: boolean[] = COLUMNS.map(() => false);
   cells[0] = label;
-  if (value !== undefined && VALUE_COL >= 0) cells[VALUE_COL] = String(value);
-  return cells.map(csvCell).join(',');
+  for (const [i, v] of figures || []) {
+    // i < 0 = header reworded and findIndex missed; v == null = deliberately no
+    // total for this column (Discount on PURCHASE, every charge on PO). Both
+    // leave the cell EMPTY. Never a dash or a word: text in a money column is
+    // what turns a reader's selection-sum into #VALUE!.
+    if (i < 0 || v == null) continue;
+    cells[i] = String(v);
+    isNum[i] = true;
+  }
+  return cells.map((c, i) => csvCell(c, isNum[i])).join(',');
+}
+
+/**
+ * The charge columns and where they sit, resolved once by header text.
+ * `key` indexes PurchaseLogSourceMoney, whose value is `number | null` — null
+ * meaning "no total for this source", which captionRow renders as an empty cell.
+ */
+const CHARGE_TOTAL_COLS: { key: keyof PurchaseLogSourceMoney; col: number }[] = [
+  { key: 'discount',            col: colAt('Discount INR') },
+  { key: 'cgst',                col: colAt('CGST INR') },
+  { key: 'sgst',                col: colAt('SGST INR') },
+  { key: 'special_excise_cess', col: colAt('Special Excise Cess INR') },
+  { key: 'compensation_cess',   col: colAt('Compensation Cess INR') },
+  { key: 'tcs',                 col: colAt('TCS INR') },
+  { key: 'delivery_charges',    col: colAt('Delivery Charges INR') },
+  { key: 'mrp_round_off',       col: colAt('MRP Round Off INR') },
+];
+
+/** One source's totals, every figure under the heading it belongs to. */
+function sourceTotalsRow(label: string, money: PurchaseLogSourceMoney): string {
+  const figures: Array<[number, number | null | undefined]> = [
+    [VALUE_COL, money.goods_value],
+    [TOTAL_COL, money.bill_amount],
+  ];
+  for (const c of CHARGE_TOTAL_COLS) {
+    const v = money[c.key];
+    figures.push([c.col, typeof v === 'number' ? v : null]);
+  }
+  return captionRow(label, figures);
 }
 
 export async function GET(req: Request) {
@@ -195,19 +297,86 @@ export async function GET(req: Request) {
       // Excel then labelled every column from the fifth rightward with the wrong
       // heading, and Rate values appeared under a different column entirely.
       const lines: string[] = [COLUMNS.map(c => csvCell(c.header)).join(',')];
-      for (const r of rows) lines.push(COLUMNS.map(c => csvCell(c.cell(r))).join(','));
+      for (const r of rows) lines.push(COLUMNS.map(c => csvCell(c.cell(r), !!c.numeric)).join(','));
 
-      // Totals, one caption per source and never a sum of them. The captions
-      // carry the reason in words because this file gets forwarded, opened cold
-      // in Excel, and totalled by someone who never saw the UI.
+      // ── 0. THE CAVEAT — first thing after the data, before any total ─────
+      // Placed ahead of every totals section below so a reader hits it before
+      // the numbers it qualifies, not after. The wording (static explanation +
+      // this window's live figure) comes from src/lib/purchase-log.ts, computed
+      // once, so the CSV and the on-screen banner say identical words.
       lines.push(captionRow(''));
-      lines.push(captionRow(`TOTAL — PURCHASE rows (${rows.filter(r => r.source === 'PURCHASE').length} lines): actual booked spend`, totals.purchase_value));
-      lines.push(captionRow(`TOTAL — GRN rows (${rows.filter(r => r.source === 'GRN').length} lines): vendor-bill view of receipts ALREADY counted in the PURCHASE total above — DO NOT ADD to it`, totals.grn_value));
-      lines.push(captionRow(`TOTAL — PO rows (${rows.filter(r => r.source === 'PO').length} lines): value ORDERED, not money spent — DO NOT ADD to the PURCHASE total`, totals.po_value));
+      lines.push(captionRow(`!! ${totals.goods_value_caveat}`));
+
+      const m = totals.money;
+      // A source the FILTER excluded must not print a totals row at all. With
+      // ?source=po the PURCHASE block would otherwise read "0 lines = BOOKED
+      // SPEND, Value 0" — which is not "we spent nothing this period", it is
+      // "you did not ask about purchases", and a forwarded file cannot tell the
+      // two apart. A source that IS in scope but happens to be empty keeps its
+      // 0 row, because there the zero is the answer.
+      const inScope = (s: 'purchase' | 'po' | 'grn') => source === 'all' || source === s;
+
+      // ── 1. COLUMN-ALIGNED TOTALS, one row per source ─────────────────────
+      // Each figure sits under its own heading so a reader who scrolls to the
+      // foot of the CGST column finds the CGST total there, not a caption in
+      // column A. Empty cells are the deliberate refusals — Discount on the
+      // PURCHASE row, every charge on the PO row — and the reasons follow below.
+      lines.push(captionRow(''));
+      lines.push(captionRow(
+        'TOTALS BELOW — each source totalled ON ITS OWN, over every line matching these filters '
+        + `(all ${totals.lines}, not only the rows above). The three are NOT additive.`));
+      if (inScope('purchase')) lines.push(sourceTotalsRow(`TOTALS — PURCHASE (${totals.purchase_lines} lines) = BOOKED SPEND`, m.PURCHASE));
+      if (inScope('grn')) lines.push(sourceTotalsRow(`TOTALS — GRN (${totals.grn_lines} lines) = the vendor bills behind those purchases. DO NOT ADD to PURCHASE`, m.GRN));
+      if (inScope('po')) lines.push(sourceTotalsRow(`TOTALS — PO (${totals.po_lines} lines) = ORDERED, not spent. DO NOT ADD to PURCHASE`, m.PO));
+      if (source !== 'all') {
+        lines.push(captionRow(`Filtered to ${source.toUpperCase()} rows only, so the other sources are not totalled here — their absence is the filter, not a zero.`));
+      }
+
+      // ── 2. THE TWO HEADLINE FIGURES, NAMED APART ─────────────────────────
+      // "Total Amount" was never defined by the owner, so both readings ship
+      // with their own caption and neither is ever called just "Total".
+      lines.push(captionRow(''));
+      if (inScope('purchase')) {
+        lines.push(captionRow(
+          `GOODS VALUE — PURCHASE (${totals.purchase_lines} lines): goods only, before tax and before every charge. This is the booked spend. `
+          + '⚠ NOT RELIABLE AS TAX-EXCLUSIVE — see the CAVEAT near the top of this section.',
+          [[VALUE_COL, m.PURCHASE.goods_value]]));
+        lines.push(captionRow(
+          `TOTAL AMOUNT — PURCHASE (${totals.purchase_lines} lines): goods + CGST + SGST + cesses + TCS + delivery + round-off, less any discount recorded on the row. `
+          + '⚠ MAY EQUAL GOODS VALUE EXACTLY on the affected lines — see the CAVEAT near the top of this section.',
+          [[TOTAL_COL, m.PURCHASE.bill_amount]]));
+      }
+      if (inScope('grn')) {
+        lines.push(captionRow(
+          `GOODS VALUE — GRN (${totals.grn_lines} lines): the same receipts at gross bill rates, ALREADY inside the PURCHASE figures${inScope('purchase') ? ' above' : ''} — DO NOT ADD.`,
+          [[VALUE_COL, m.GRN.goods_value]]));
+        lines.push(captionRow(
+          `TOTAL AMOUNT — GRN (${totals.grn_lines} lines): what the vendors actually billed, discount deducted. DO NOT ADD to the PURCHASE figure.`,
+          [[TOTAL_COL, m.GRN.bill_amount]]));
+      }
+      if (inScope('po')) {
+        lines.push(captionRow(
+          `GOODS VALUE — PO (${totals.po_lines} lines): value ORDERED, not money spent — DO NOT ADD to the PURCHASE figure.`,
+          [[VALUE_COL, m.PO.goods_value]]));
+        lines.push(captionRow(
+          'TOTAL AMOUNT — PO: none, and blank rather than zero. An order carries no charge columns, so it has no bill amount until it is received and billed.'));
+      }
+
+      lines.push(captionRow(''));
       lines.push(captionRow(`Lines in this file: ${totals.lines}. Period ${from} to ${to} (IST).`));
-      lines.push(captionRow('These three totals measure different things and are intentionally not summed. Spend = the PURCHASE total.'));
+      lines.push(captionRow('These figures measure different things and are intentionally not summed. Spend = the PURCHASE figures.'));
+
+      // ── 3. WHY THE BLANK CELLS ARE BLANK ─────────────────────────────────
+      // Straight from the library so the screen and this file say the same
+      // words. An unexplained blank in a money column gets read as a bug and
+      // then gets "fixed" by totalling the wrong column instead.
+      lines.push(captionRow(''));
+      lines.push(captionRow('WHY SOME COLUMNS HAVE NO TOTAL (the blank cells in the totals rows above are deliberate):'));
+      for (const n of totals.no_total_notes) lines.push(captionRow(`${n.column} — ${n.reason}`));
+
       if (truncated) {
-        lines.push(captionRow('!! TRUNCATED — the row limit was reached, so this file is INCOMPLETE and the totals above cover only the rows shown. Narrow the date range or filter by vendor/item and download again.'));
+        lines.push(captionRow(''));
+        lines.push(captionRow('!! TRUNCATED — the row limit was reached, so the ROWS in this file are incomplete. The totals above are still whole: they are computed by the database over every matching line, not by adding the rows printed here. Narrow the date range or filter by vendor/item to see the missing rows.'));
       }
 
       // UTF-8 BOM: without it Excel on Windows decodes the file as ANSI and

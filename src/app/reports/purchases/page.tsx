@@ -20,6 +20,19 @@
  * sums them. `link_key` on each row ties a GRN line to the purchase row it
  * created so the overlap is visible instead of silently resolved.
  *
+ * WHY EVERY MONEY FIGURE IS NAMED, AND NOTHING IS CALLED JUST "TOTAL":
+ * "Total Amount" has two honest readings — the goods value, and the goods value
+ * plus tax and every bill charge — and they differ by the whole tax bill. So the
+ * log shows BOTH, labelled GOODS VALUE and TOTAL AMOUNT, per source, on the
+ * cards, in a totals panel, and in the table's own <tfoot>. Columns that cannot
+ * be totalled in one basis (Qty, Rate, Discount on PURCHASE rows) print an em
+ * dash and the REASON, straight from the server's no_total_notes, rather than
+ * quietly having no figure — a missing total that says why beats a wrong one.
+ *
+ * THE FOOTER IS NOT A FOOTER OF WHAT YOU SEE. Rows are painted up to
+ * ROW_PAINT_CAP, but every total is a SQL aggregate over the full filtered set,
+ * so the tfoot can legitimately exceed the visible rows. It says so on screen.
+ *
  * UNITS: quantities and rates on all three sources are already in PURCHASE
  * units (₹ per purchase unit) — no pack-factor conversion here, ever.
  */
@@ -30,7 +43,7 @@ import { todayIST } from '@/lib/format-date';
 import MaterialTypeahead, { type MaterialLite } from '@/components/MaterialTypeahead';
 import {
   ShoppingCart, TrendingUp, Building2, Package, AlertTriangle, Download, CalendarDays,
-  ScrollText, Info, Loader2, BarChart3,
+  ScrollText, Info, Loader2, BarChart3, Sigma,
 } from 'lucide-react';
 
 interface Row { spend: number; count: number; [k: string]: any }
@@ -44,6 +57,16 @@ interface Report {
 
 /** One row per ITEM per BILL, from whichever document source recorded it. */
 type LogSource = 'PURCHASE' | 'PO' | 'GRN';
+
+/**
+ * The eight recorded-only charges. ONE key list, used for the row cells, the
+ * table headings and the tfoot totals — the names are identical on LogRow and
+ * on SourceMoney, so the column and the figure under it cannot drift apart.
+ */
+type ChargeKey =
+  | 'discount' | 'cgst' | 'sgst' | 'special_excise_cess'
+  | 'compensation_cess' | 'tcs' | 'delivery_charges' | 'mrp_round_off';
+
 interface LogRow {
   source: LogSource;
   date: string; doc_no: string;
@@ -52,24 +75,84 @@ interface LogRow {
   vendor: string;
   material: string; sku: string; category: string;
   qty: number; purchase_unit: string; rate: number; value: number;
+  /**
+   * value − discount + CGST + SGST + both cesses + TCS + delivery + round-off,
+   * computed server-side in src/lib/purchase-log.ts so this page, the CSV, the
+   * GRN inward register and the Purchases page all use ONE formula.
+   * null on PO rows — an order has no charge columns and so no bill amount.
+   */
+  total_amount: number | null;
   qty_rejected: number | null;   // GRN lines only
-  discount: number; cgst: number; sgst: number;
+  // null (not 0) on PO rows: purchase_order_items has no charge columns at all,
+  // and a 0 would assert "no tax was charged" on an order nobody has billed yet.
+  discount: number | null; cgst: number | null; sgst: number | null;
   // compensation_cess is GST Compensation Cess (aerated drinks, tobacco) — a SEPARATE
   // levy from special_excise_cess, which means TGBCL Special Excise Cess everywhere it
   // is read or labelled. Never fold it into cgst/sgst: it is not halved and it must not
   // join the tax_value === cgst + sgst invariant.
-  compensation_cess: number;
-  special_excise_cess: number; tcs: number; delivery_charges: number; mrp_round_off: number;
+  compensation_cess: number | null;
+  special_excise_cess: number | null; tcs: number | null;
+  delivery_charges: number | null; mrp_round_off: number | null;
   link_key: string;              // ties a GRN line to the purchases row it created
   notes: string;
 }
+
+/**
+ * One source's money, mirrored from PurchaseLogSourceMoney in
+ * src/lib/purchase-log.ts. Mirrored rather than imported because that module
+ * pulls in better-sqlite3 and this is a client component — keep the two in step
+ * by hand; the FIELD NAMES are the contract.
+ *
+ * null NEVER means zero here. It means "deliberately not totalled", and the
+ * reason is in no_total_notes: `discount` on PURCHASE (a 0 in that column means
+ * three different things) and every charge on PO (no such columns exist).
+ */
+interface SourceMoney {
+  source: LogSource;
+  lines: number;
+  goods_value: number;
+  discount: number | null;
+  /** What was actually deducted inside bill_amount, published so the row foots. */
+  discount_netted: number;
+  cgst: number | null; sgst: number | null; tax_cgst_sgst: number | null;
+  special_excise_cess: number | null; compensation_cess: number | null;
+  tcs: number | null; delivery_charges: number | null; mrp_round_off: number | null;
+  other_charges: number | null;
+  bill_amount: number | null;
+  /**
+   * SUM(value) − SUM(qty × rate) for this source/window — should be 0. Nonzero
+   * on PURCHASE is the measured contamination behind goods_value_caveat below:
+   * tax sitting inside a column this report reads as "goods value".
+   */
+  goods_value_tax_suspect: number;
+  /** Lines behind goods_value_tax_suspect — value ≠ qty × rate (2dp). */
+  goods_value_tax_suspect_lines: number;
+}
+
 interface LogResponse {
   rows: LogRow[];
-  totals: { lines: number; purchase_value: number; po_value: number; grn_value: number };
+  totals: {
+    lines: number; purchase_value: number; po_value: number; grn_value: number;
+    money: Record<LogSource, SourceMoney>;
+    no_total_notes: { column: string; reason: string }[];
+    /**
+     * ⚠ Render verbatim, prominently, wherever GOODS VALUE or TOTAL AMOUNT is
+     * shown. Computed server-side (src/lib/purchase-log.ts) so the screen and
+     * the downloaded CSV state the identical words and the identical number.
+     */
+    goods_value_caveat: string;
+  };
   truncated: boolean; from: string; to: string;
 }
 
 const fmtINR = (n: number) => '₹' + (Math.round((Number(n) || 0) * 100) / 100).toLocaleString('en-IN');
+/**
+ * The SAME rupee formatting, but null survives as an em dash instead of
+ * collapsing to ₹0. Every "no total" and every not-applicable charge on this
+ * page goes through here — printing ₹0 for "we deliberately did not total this"
+ * is the exact confident-wrong-number the report exists to avoid.
+ */
+const fmtINRorDash = (n: number | null | undefined) => (n == null ? '—' : fmtINR(n));
 const fmtNum = (n: number) => (Number(n) || 0).toLocaleString('en-IN');
 /** Quantities can be fractional (0.5 CTN etc.) — never round them away. */
 const fmtQty = (n: number) => (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
@@ -325,6 +408,38 @@ function SourceBadge({ source }: { source: LogSource }) {
  *  purchases is thousands of lines and painting them all locks the tab. */
 const ROW_PAINT_CAP = 600;
 
+/**
+ * The log table's columns BEFORE Value, in order. The tfoot's label cell spans
+ * exactly these, so inserting a column here keeps every totals figure under its
+ * own heading. A hard-coded colSpan would put the Value total under Vendor the
+ * first time somebody adds a column.
+ */
+const LEAD_HEADS: { label: string; right?: boolean }[] = [
+  { label: 'Source' }, { label: 'Date' }, { label: 'Doc No' },
+  { label: 'Invoice ID (ours)' }, { label: 'Bill No (vendor)' }, { label: 'Vendor' },
+  { label: 'Item' }, { label: 'Category' },
+  // Right-aligned but NEVER totalled: qty is in each line's own purchase unit
+  // and a rate is Rs per unit. See the no-total notes under the table.
+  { label: 'Qty', right: true }, { label: 'Rate', right: true },
+];
+
+/** The charge columns. `k` indexes BOTH LogRow (the cell) and SourceMoney (the total). */
+const CHARGE_COLS: { k: ChargeKey; label: string }[] = [
+  { k: 'discount', label: 'Discount' }, { k: 'cgst', label: 'CGST' }, { k: 'sgst', label: 'SGST' },
+  { k: 'special_excise_cess', label: 'Excise/Cess' }, { k: 'compensation_cess', label: 'Comp. Cess' },
+  { k: 'tcs', label: 'TCS' },
+  { k: 'delivery_charges', label: 'Delivery' }, { k: 'mrp_round_off', label: 'MRP Round-off' },
+];
+
+/** Source order everywhere on this page: spend first, then its bill, then intent. */
+const SOURCE_ORDER: LogSource[] = ['PURCHASE', 'GRN', 'PO'];
+
+const SOURCE_MEANING: Record<LogSource, string> = {
+  PURCHASE: 'booked spend',
+  GRN: 'the vendor bills behind those purchases',
+  PO: 'ordered, not spent',
+};
+
 function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
   from: string; to: string; setFrom: (v: string) => void; setTo: (v: string) => void; vendors: string[];
 }) {
@@ -410,13 +525,12 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
   const rows = data?.rows || [];
   const shown = paintAll ? rows : rows.slice(0, ROW_PAINT_CAP);
   const t = data?.totals;
-  const CHARGE_COLS: { k: keyof LogRow; label: string }[] = [
-    { k: 'discount', label: 'Discount' }, { k: 'cgst', label: 'CGST' }, { k: 'sgst', label: 'SGST' },
-    { k: 'special_excise_cess', label: 'Excise/Cess' }, { k: 'compensation_cess', label: 'Comp. Cess' },
-    { k: 'tcs', label: 'TCS' },
-    { k: 'delivery_charges', label: 'Delivery' }, { k: 'mrp_round_off', label: 'MRP Round-off' },
-  ];
-  const colCount = 13 + (showCharges ? CHARGE_COLS.length : 0);
+  const money = t?.money;
+  // LEAD_HEADS + Value + Total Amount + Rejected + charges + Link key.
+  const colCount = LEAD_HEADS.length + 3 + (showCharges ? CHARGE_COLS.length : 0) + 1;
+  // Only sources that actually have lines get a totals row. A source the filter
+  // excluded has no business printing "0 lines, ₹0" under a spend column.
+  const footSources = SOURCE_ORDER.filter(s => (money?.[s]?.lines ?? 0) > 0);
 
   return (
     <div className="space-y-4">
@@ -473,11 +587,33 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
           owner reads roughly twice the real spend. */}
       {t && (
         <div className="space-y-2">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <Card icon={<ShoppingCart className="w-4 h-4" />} label="Purchases value" value={fmtINR(t.purchase_value)} sub="source = PURCHASE" tone="accent" />
-            <Card icon={<Package className="w-4 h-4" />} label="PO bills value" value={fmtINR(t.po_value)} sub="source = PO" />
-            <Card icon={<Building2 className="w-4 h-4" />} label="GRN bills value" value={fmtINR(t.grn_value)} sub="source = GRN" />
+          {/* THE caveat. Placed BEFORE the numbers it qualifies, in red (not the
+              amber used for the "don't add these totals" note below) so it reads
+              as a data-quality warning, not routine guidance. Wording + the live
+              figure for this exact window both come from the server
+              (t.goods_value_caveat, src/lib/purchase-log.ts) — the CSV download
+              renders the identical string, so screen and file cannot drift. */}
+          {t.goods_value_caveat && (
+            <div className="bg-red-50 border-2 border-red-300 rounded-xl px-4 py-3 text-sm text-red-900 flex gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+              <p><strong>⚠ GOODS VALUE is not reliably tax-exclusive on PURCHASE rows.</strong> {t.goods_value_caveat}</p>
+            </div>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            {/* Two PURCHASE cards, never one. "Total" was ambiguous and that
+                ambiguity is the whole reason the figure looked missing: goods
+                value and the amount actually payable differ by the entire tax
+                and charge bill, and only naming both makes either safe to quote. */}
+            <Card icon={<ShoppingCart className="w-4 h-4" />} label="Purchases — goods value" value={fmtINR(t.purchase_value)} sub="source = PURCHASE · before tax & charges · ⚠ see caveat above" tone="accent" />
+            {/* money?.X?.y, both links optional: an older/cached payload without
+                `money` must degrade to an em dash, never to a thrown render that
+                blanks the whole report. */}
+            <Card icon={<Sigma className="w-4 h-4" />} label="Purchases — total amount" value={fmtINRorDash(money?.PURCHASE?.bill_amount)} sub="incl. CGST, SGST, cesses, TCS, delivery, round-off · ⚠ may equal goods value" tone="accent" />
+            <Card icon={<Building2 className="w-4 h-4" />} label="GRN bills — total amount" value={fmtINRorDash(money?.GRN?.bill_amount)} sub={`source = GRN · goods ${fmtINR(t.grn_value)}`} />
+            <Card icon={<Package className="w-4 h-4" />} label="PO bills — goods value" value={fmtINR(t.po_value)} sub="source = PO · ordered, no bill amount yet" />
           </div>
+
+          {money && <TotalsPanel money={money} notes={t.no_total_notes || []} /> }
           <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-900 flex gap-2">
             <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
             <p>
@@ -491,8 +627,9 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
           <p className="text-[11px] text-[#8B7355]">
             {fmtNum(t.lines)} line{t.lines === 1 ? '' : 's'} · {from} to {to}. Quantities and rates are in PURCHASE units.
             GRN rates are gross (as the vendor bill reads); purchase rates are net of the allocated discount, so the same
-            delivery can legitimately show two rates. The {CHARGE_COLS.length} per-line charges are recorded only — they
-            are NOT folded into Value.
+            delivery can legitimately show two rates. The {CHARGE_COLS.length} per-line charges stay out of <strong>Value</strong>,
+            which is goods only — they are added, once, inside <strong>Total Amount</strong>. Those are the two honest readings
+            of “total”, and neither is ever shown on its own as just “Total”.
           </p>
         </div>
       )}
@@ -516,17 +653,13 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
         <div className="overflow-x-auto">
           <table className="w-full text-sm whitespace-nowrap">
             <thead><tr className="text-left text-[11px] uppercase text-[#8B7355] border-b border-[#F0E4D6]">
-              <th className="py-2 pr-3">Source</th>
-              <th className="py-2 px-3">Date</th>
-              <th className="py-2 px-3">Doc No</th>
-              <th className="py-2 px-3">Invoice ID (ours)</th>
-              <th className="py-2 px-3">Bill No (vendor)</th>
-              <th className="py-2 px-3">Vendor</th>
-              <th className="py-2 px-3">Item</th>
-              <th className="py-2 px-3">Category</th>
-              <th className="py-2 px-3 text-right">Qty</th>
-              <th className="py-2 px-3 text-right">Rate</th>
+              {LEAD_HEADS.map((h, i) => (
+                <th key={h.label} className={`py-2 ${i === 0 ? 'pr-3' : 'px-3'}${h.right ? ' text-right' : ''}`}>{h.label}</th>
+              ))}
               <th className="py-2 px-3 text-right">Value</th>
+              {/* The column the owner went looking for. Kept next to Value so the
+                  two readings of "total" are read together, never mistaken. */}
+              <th className="py-2 px-3 text-right" title="Value − discount + CGST + SGST + cesses + TCS + delivery + MRP round-off. Blank on PO lines: an order carries no charge columns.">Total Amount</th>
               <th className="py-2 px-3 text-right">Rejected</th>
               {showCharges && CHARGE_COLS.map(c => <th key={String(c.k)} className="py-2 px-3 text-right">{c.label}</th>)}
               <th className="py-2 pl-3">Link key</th>
@@ -550,13 +683,74 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
                   <td className="py-2 px-3 text-right tabular-nums">{fmtQty(r.qty)} <span className="text-[11px] text-[#8B7355]">{r.purchase_unit || ''}</span></td>
                   <td className="py-2 px-3 text-right tabular-nums">{fmtINR(r.rate)}</td>
                   <td className="py-2 px-3 text-right tabular-nums font-semibold">{fmtINR(r.value)}</td>
+                  <td className="py-2 px-3 text-right tabular-nums font-semibold text-[#af4408]">{fmtINRorDash(r.total_amount)}</td>
                   <td className="py-2 px-3 text-right tabular-nums">{r.qty_rejected == null ? '—' : <span className={Number(r.qty_rejected) > 0 ? 'text-amber-700 font-semibold' : ''}>{fmtQty(r.qty_rejected)} {r.purchase_unit || ''}</span>}</td>
-                  {showCharges && CHARGE_COLS.map(c => <td key={String(c.k)} className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtINR(Number(r[c.k]) || 0)}</td>)}
+                  {/* Dash, not ₹0, when the source has no such column at all —
+                      the PO branch stores none, and a 0 there reads as "no tax
+                      was charged" on an order nobody has billed yet. */}
+                  {showCharges && CHARGE_COLS.map(c => <td key={String(c.k)} className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtINRorDash(r[c.k])}</td>)}
                   <td className="py-2 pl-3 text-[11px] text-[#8B7355] font-mono">{r.link_key || '—'}
                     {r.notes && <span className="block text-[10px] text-[#B8A48E] font-sans whitespace-normal max-w-[220px]">{r.notes}</span>}</td>
                 </tr>
               ))}
             </tbody>
+            {/* ── TOTALS, one row per source, each figure under its own column ──
+                These are SERVER totals over the FULL filtered set, not a sum of
+                the rows painted above, so with a truncated or capped list the
+                footer legitimately exceeds what is on screen. The caption under
+                the table says so; without it a reader "corrects" the footer by
+                adding the visible rows and gets a smaller, wrong number. */}
+            {money && footSources.length > 0 && (
+              <tfoot className="border-t-2 border-[#E8D5C4]">
+                {footSources.map(src => {
+                  const mm = money[src];
+                  return (
+                    <tr key={src} className="text-[12px] bg-[#FFFBF6]">
+                      {/* RIGHT-aligned, and NOT sticky. This cell spans ten
+                          columns (~1,500px), so `position: sticky; left: 0`
+                          pins a cell wider than the scroll box and its opaque
+                          background paints over every figure to its right —
+                          measured, not guessed. Right-aligned instead puts the
+                          label hard against the Value figure, so the label and
+                          its numbers come into view together however far the
+                          reader has scrolled. The totals panel above the table
+                          carries the same figures for anyone who never scrolls. */}
+                      <td colSpan={LEAD_HEADS.length} className="py-2 pr-3 text-right font-semibold text-[#6B5744]">
+                        <SourceBadge source={src} />
+                        <span className="ml-2">TOTAL · {SOURCE_MEANING[src]}</span>
+                        <span className="ml-1 font-normal text-[#8B7355]">({fmtNum(mm.lines)} line{mm.lines === 1 ? '' : 's'})</span>
+                      </td>
+                      <td className="py-2 px-3 text-right tabular-nums font-bold">
+                        {fmtINR(mm.goods_value)}
+                        {src === 'PURCHASE' && (
+                          <span title="⚠ Not reliably tax-exclusive — see the caveat above the cards." className="ml-1 text-red-600 cursor-help">⚠</span>
+                        )}
+                      </td>
+                      <td className="py-2 px-3 text-right tabular-nums font-bold text-[#af4408]">
+                        {fmtINRorDash(mm.bill_amount)}
+                        {src === 'PURCHASE' && (
+                          <span title="⚠ May equal Goods Value exactly on the affected lines — see the caveat above the cards." className="ml-1 text-red-600 cursor-help">⚠</span>
+                        )}
+                      </td>
+                      {/* Rejected is a quantity in each line's own purchase unit — not summable. */}
+                      <td className="py-2 px-3" />
+                      {showCharges && CHARGE_COLS.map(c => (
+                        <td key={String(c.k)} className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtINRorDash(mm[c.k])}</td>
+                      ))}
+                      <td className="py-2 pl-3" />
+                    </tr>
+                  );
+                })}
+                <tr>
+                  <td colSpan={colCount} className="pt-2 text-[11px] text-[#8B7355] whitespace-normal leading-relaxed">
+                    Totals are computed by the server over <strong>all {fmtNum(t?.lines || 0)} matching line{(t?.lines || 0) === 1 ? '' : 's'}</strong>, not
+                    over the rows painted above — so they can be larger than what you can see, and the row cap can never understate them.
+                    Each source is totalled on its own; the three are never added. <strong>Qty</strong> and <strong>Rate</strong> have
+                    no total by design{showCharges ? ', and neither does Discount on the PURCHASE row' : ''} — see “Why some columns have no total” above.
+                  </td>
+                </tr>
+              </tfoot>
+            )}
           </table>
         </div>
 
@@ -568,6 +762,93 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors }: {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The money breakdown, one row per source, so a reader can see exactly how the
+ * goods value becomes the total amount and check the arithmetic across the row:
+ *
+ *   goods value − discount netted + CGST/SGST + other charges = TOTAL AMOUNT
+ *
+ * Discount is shown TWICE on purpose and they are not the same thing:
+ *   • "Discount" is the reportable total, and it is an em dash on PURCHASE rows
+ *     because a 0 in that column means three different things (see the notes);
+ *   • "less discount" is what was actually deducted inside Total Amount, printed
+ *     so the row always foots even where the column total is refused.
+ */
+function TotalsPanel({ money, notes }: { money: Record<LogSource, SourceMoney>; notes: { column: string; reason: string }[] }) {
+  const present = SOURCE_ORDER.filter(s => (money[s]?.lines ?? 0) > 0);
+  if (present.length === 0) return null;
+  return (
+    <div className="bg-white border border-[#E8D5C4] rounded-xl shadow-sm p-4 sm:p-5 space-y-3">
+      <h3 className="text-sm font-bold flex items-center gap-2">
+        <span className="text-[#af4408]"><Sigma className="w-4 h-4" /></span>
+        Totals — goods value and total amount, per source
+      </h3>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm whitespace-nowrap">
+          <thead><tr className="text-left text-[11px] uppercase text-[#8B7355] border-b border-[#F0E4D6]">
+            <th className="py-2 pr-3">Source</th>
+            <th className="py-2 px-3 text-right">Lines</th>
+            <th className="py-2 px-3 text-right">Goods value</th>
+            <th className="py-2 px-3 text-right">Discount</th>
+            <th className="py-2 px-3 text-right">less discount</th>
+            <th className="py-2 px-3 text-right">CGST + SGST</th>
+            <th className="py-2 px-3 text-right">Other charges</th>
+            <th className="py-2 pl-3 text-right">Total amount</th>
+          </tr></thead>
+          <tbody>
+            {present.map(src => {
+              const m = money[src];
+              return (
+                <tr key={src} className="border-b border-[#F7EEE3] last:border-0">
+                  <td className="py-2 pr-3"><SourceBadge source={src} />
+                    <span className="block text-[10px] text-[#8B7355] mt-0.5">{SOURCE_MEANING[src]}</span></td>
+                  <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtNum(m.lines)}</td>
+                  <td className="py-2 px-3 text-right tabular-nums font-semibold">
+                    {fmtINR(m.goods_value)}
+                    {/* PURCHASE only — GRN/PO derive value directly from qty × rate
+                        and are not subject to the imported total_price defect. */}
+                    {src === 'PURCHASE' && (
+                      <span title={`⚠ Not reliably tax-exclusive — see the caveat above the cards. ${fmtNum(m.goods_value_tax_suspect_lines)} of ${fmtNum(m.lines)} lines this window carry tax inside this figure (${fmtINR(m.goods_value_tax_suspect)}).`}
+                            className="ml-1 text-red-600 cursor-help">⚠</span>
+                    )}
+                  </td>
+                  <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtINRorDash(m.discount)}</td>
+                  <td className="py-2 px-3 text-right tabular-nums text-[#8B7355]">{m.discount_netted ? `− ${fmtINR(m.discount_netted)}` : '—'}</td>
+                  <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtINRorDash(m.tax_cgst_sgst)}</td>
+                  <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]"
+                      title="Special excise cess + GST compensation cess + TCS + delivery + MRP round-off. Compensation cess is a separate levy on a different base and is never folded into CGST+SGST.">
+                    {fmtINRorDash(m.other_charges)}</td>
+                  <td className="py-2 pl-3 text-right tabular-nums font-bold text-[#af4408]">
+                    {fmtINRorDash(m.bill_amount)}
+                    {src === 'PURCHASE' && (
+                      <span title="⚠ May equal Goods Value exactly on the affected lines — the tax that should separate them is missing from this figure too. See the caveat above the cards."
+                            className="ml-1 text-red-600 cursor-help">⚠</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {notes.length > 0 && (
+        <details className="rounded-lg border border-[#F0E4D6] bg-[#FFFBF6] px-3 py-2">
+          <summary className="text-[11px] font-semibold text-[#6B5744] cursor-pointer select-none">
+            Why some columns have no total ({notes.length}) — an “—” above is deliberate, not a missing number
+          </summary>
+          <ul className="mt-2 space-y-1.5">
+            {notes.map(n => (
+              <li key={n.column} className="text-[11px] text-[#6B5744] leading-relaxed">
+                <span className="font-semibold text-[#2D1B0E]">{n.column}</span> — {n.reason}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   );
 }
