@@ -8,7 +8,7 @@ import {
   allocateBillCharges, r2, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT,
   type AllocatedLine,
 } from '@/lib/po-charges';
-import { resolveQcRequirement, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
+import { resolveQcRequirement, undecidedQcCategories, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
 import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 import { fulfilRequisitionFromPo } from '@/lib/po-requisition-fulfil';
 
@@ -603,6 +603,24 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // vendor's outstanding line is not on this delivery and must not decide
     // whether this delivery is held.
     const qc = resolveQcRequirement(db, receiving.map((it: any) => String(it.material_id || '')));
+    // ── AND WHICH CATEGORIES ON THIS DELIVERY HAS NOBODY EVER RULED ON? ─────
+    // ADVISORY ONLY, and THIS IS THE ROUTE IT HAPPENED ON. GRN-2026-0018 came
+    // through here: SUGUNA FOODS, 90 kg CHICKEN LEG BONELESS + 30 kg WHOLE BIRD,
+    // category POULTRY, no row in qc_category_checkers, inwarded on the spot.
+    // The gate was right — POULTRY had no rule — and nothing anywhere said so.
+    //
+    // Same map, same category rows, same `receiving` list as the gate one line
+    // above. It changes nothing: `qc` is untouched and no branch below reads
+    // this. A category explicitly set to "No check" is a DECISION and stays
+    // SILENT; see undecidedQcCategories for why undecided-only is the design.
+    // `qc.required` is passed READ-ONLY, so the sentence can say whether these
+    // goods are on the shelf or at the bay. It is an input to the WORDING only —
+    // `qc` is not reassigned here and nothing below reads qcUndecided.
+    const qcUndecided = undecidedQcCategories(
+      db,
+      receiving.map((it: any) => String(it.material_id || '')),
+      { held: !!qc.required },
+    );
 
     // Reject negative qty / price BEFORE the txn starts.
     // Receiving is an additive workflow — stock corrections (negative qtys) live
@@ -1942,6 +1960,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       qc_categories: qc.categories,
       qc_message: qc.message,
       qc_notified: qcRecipients,
+      // THE SILENT CASE, MADE AUDIBLE. Categories on this delivery that nobody
+      // has ever ruled on — empty on every receipt where every category has a
+      // decision, INCLUDING an explicit "No check". This is the one fact
+      // GRN-2026-0018 could not tell the receiving desk.
+      qc_undecided_categories: qcUndecided.categories,
+      qc_undecided_message: qcUndecided.message,
       // Lines THIS receipt booked (one vendor's), not the whole PO's.
       lines_processed: receiving.length,
       store_blocked: storeBlocked,

@@ -3,7 +3,7 @@ import { getCurrentUser, getCurrentOutletId, canProcessAsStore, isManagement } f
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { duplicateLineError } from '@/lib/po-helpers';
-import { resolveQcRequirement, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
+import { resolveQcRequirement, undecidedQcCategories, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
 import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 
 /**
@@ -498,6 +498,24 @@ export async function POST(request: Request) {
       return true;
     });
     const qc = resolveQcRequirement(db, gateable.map((it: any) => String(it.material_id || '')));
+    // ── AND WHICH CATEGORIES ON THIS BILL HAS NOBODY EVER RULED ON? ─────────
+    // ADVISORY ONLY. It reads the SAME map and the SAME category rows the gate
+    // just read, over the SAME `gateable` list, and it decides nothing: `qc`
+    // above is untouched, no status changes, no stock moves, no branch below
+    // reads it. It exists because GRN-2026-0018 (90 kg chicken leg boneless,
+    // category POULTRY, no row in the map) inwarded in silence and looked
+    // exactly like a working gate.
+    //
+    // A category set to "No check" is a DECISION and stays SILENT — see
+    // undecidedQcCategories, where the reasoning for undecided-ONLY lives.
+    // `qc.required` is passed READ-ONLY, so the sentence can say whether these
+    // goods are on the shelf or at the bay. It is an input to the WORDING only —
+    // `qc` is not reassigned here and nothing below reads qcUndecided.
+    const qcUndecided = undecidedQcCategories(
+      db,
+      gateable.map((it: any) => String(it.material_id || '')),
+      { held: !!qc.required },
+    );
     // On a HELD delivery the store records what ARRIVED and the checking
     // department records what is ACCEPTED. A receiver pre-rejecting part of a
     // gated line is refused with the honest remedy — short-receive it — because
@@ -927,6 +945,13 @@ export async function POST(request: Request) {
                            qc_categories: qc.categories,
                            qc_message: qc.message,
                            qc_notified: qcRecipients,
+                           // THE SILENT CASE, MADE AUDIBLE. Categories on this
+                           // bill that nobody has ever ruled on — empty on every
+                           // receipt where every category has a decision,
+                           // INCLUDING an explicit "No check". This is the one
+                           // fact GRN-2026-0018 could not tell anybody.
+                           qc_undecided_categories: qcUndecided.categories,
+                           qc_undecided_message: qcUndecided.message,
                          }, { status: 201 });
   } catch (e: any) {
     console.error('[grn POST]', e);

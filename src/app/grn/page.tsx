@@ -7,7 +7,8 @@
 
 import { useEffect, useMemo, useState, Fragment, type ReactNode } from 'react';
 import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save, Download, Percent,
-         Eye, Pencil, Printer, AlertTriangle, ChefHat, Wine, Clock, ShieldAlert, Info } from 'lucide-react';
+         Eye, Pencil, Printer, AlertTriangle, ChefHat, Wine, Clock, ShieldAlert, Info,
+         CheckCircle2, ShieldQuestion } from 'lucide-react';
 import { api } from '@/lib/api';
 import { todayIST, fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
@@ -1843,6 +1844,31 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
    *  because "nothing happened". */
   const [held, setHeld] = useState<any>(null);
 
+  /**
+   * THE RECEIPT THAT WENT STRAIGHT THROUGH — AND CARRIED A CATEGORY NOBODY HAS
+   * EVER RULED ON.
+   *
+   * GRN-2026-0018 (SUGUNA FOODS, 90 kg chicken leg boneless + 30 kg whole bird)
+   * inwarded instantly and correctly: POULTRY had no row in the map, so the gate
+   * answered "not required" exactly as it was built to. The defect was that the
+   * screen then said "✓ Created — 2 material(s) updated" and closed, which is
+   * indistinguishable from a working quality-check process. The owner's words:
+   * "I thought we made a foolproof Quality check process."
+   *
+   * So an ungated receipt carrying an UNDECIDED category gets a panel of its
+   * own instead of that alert. Three things it must not do:
+   *   · it must NOT be folded into `held` — that panel says "no stock has been
+   *     added", which on this receipt is a lie: the stock went in;
+   *   · it must NOT read as a failure or a telling-off. Nothing went wrong, the
+   *     receiver did nothing wrong, and the fix is an admin's to make;
+   *   · it must NOT fire on a category set to "No check". That is a decision
+   *     somebody made, and a warning on every ungated category means a warning
+   *     on every bill — grocery alone is on most of them — which trains the desk
+   *     to click past the one that matters. The server keys this on the ABSENCE
+   *     of a rule, never on "not gated".
+   */
+  const [undecided, setUndecided] = useState<any>(null);
+
   const submit = async () => {
     // Validate qtys BEFORE filtering so the user sees errors instead of silent drops.
     for (let i = 0; i < items.length; i++) {
@@ -1968,6 +1994,14 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       // owes the check, who has been told, and where to go. The ordinary case
       // keeps the alert it has always had — nothing about it changed.
       if (j.qc_required) { setHeld(j); return; }
+      // The receipt went through. If it carried a category nobody has ever ruled
+      // on, that fact gets a panel that stays on screen — see `undecided` above.
+      // Checked with Array.isArray so a server that has not shipped the field
+      // yet simply keeps the alert it always had.
+      if (Array.isArray(j.qc_undecided_categories) && j.qc_undecided_categories.length > 0) {
+        setUndecided(j);
+        return;
+      }
       alert(`✓ Created ${j.grn_number} — ${j.materials_touched} material(s) updated`);
       onCreated();
     } finally { setBusy(false); }
@@ -1985,9 +2019,13 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
            className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-4xl shadow-xl flex flex-col overflow-hidden">
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
           <h2 className="font-bold text-[#2D1B0E]">
-            {held ? `Recorded — ${held.grn_number}` : 'New Ad-hoc Goods Receipt Note'}
+            {held ? `Recorded — ${held.grn_number}`
+              : undecided ? `Received — ${undecided.grn_number}`
+              : 'New Ad-hoc Goods Receipt Note'}
           </h2>
-          <button onClick={held ? onCreated : onClose}><X className="w-5 h-5 text-[#8B7355]" /></button>
+          {/* Both result panels close through onCreated: the receipt exists and
+              the list behind must be refetched either way. */}
+          <button onClick={held || undecided ? onCreated : onClose}><X className="w-5 h-5 text-[#8B7355]" /></button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4 text-xs">
         {held ? (
@@ -2046,10 +2084,93 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               )}
             </div>
 
+            {/* ── HELD *AND* CARRYING A CATEGORY NOBODY HAS RULED ON ────────
+                One bill can be both: the vegetables hold it, and the poultry on
+                the same bill has no rule at all. The hold is the headline and
+                stays the headline — but without this the advisory is swallowed
+                by the panel above, and the undecided half of the delivery goes
+                into stock unchecked the moment the kitchen signs, with nobody
+                ever having been told. Screen A already says both; this is the
+                same fact, said in the one place the /grn desk will see it. */}
+            {Array.isArray(held.qc_undecided_categories) && held.qc_undecided_categories.length > 0 && (
+              <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900 space-y-1.5">
+                <div className="font-semibold flex items-center gap-1.5">
+                  <ShieldQuestion className="w-4 h-4 shrink-0" />
+                  Also on this bill, and separately: no rule has ever been set for{' '}
+                  {held.qc_undecided_categories.length === 1 ? 'this category' : 'these categories'}.
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {held.qc_undecided_categories.map((c: string) => (
+                    <span key={c} className="px-1.5 py-0.5 rounded border border-amber-400 bg-white text-[10px] font-semibold">{c}</span>
+                  ))}
+                </div>
+                <div className="text-[11px]">
+                  {held.qc_undecided_categories.length === 1 ? 'It is' : 'They are'} not what is holding this delivery — nobody has
+                  decided either way, so when the check above is signed{' '}
+                  {held.qc_undecided_categories.length === 1 ? 'it goes' : 'they go'} into stock with everything else, unchecked.
+                  Ask an admin to set it on <b>Settings → Quality Check Categories</b>.
+                </div>
+              </div>
+            )}
+
             <div className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2 text-[11px]">
               You will see <b>{held.grn_number}</b> in the list below marked <b>awaiting kitchen QC</b>, with how long it has been waiting.
               If it is a night delivery and nobody can check it, an <b>admin or head chef</b> can release it with a written reason —
               the bill is then marked, permanently, as inwarded without a kitchen check.
+            </div>
+          </div>
+        ) : undecided ? (
+          /* ── IT WENT IN, AND NOBODY HAS EVER RULED ON WHAT WAS IN IT ──────
+             Green first and amber second, in that order and no other: the
+             receipt SUCCEEDED. Nothing failed, nothing is waiting, the stock is
+             on hand and there is nothing for the receiving desk to undo, re-type
+             or apologise for. The amber half is a fact about the SETTINGS, not
+             about this delivery or the person who typed it — which is why it
+             names the categories, names the screen that fixes it, and names the
+             role that can (an admin), instead of leaving a storekeeper holding a
+             problem they have no permission to solve. */
+          <div className="space-y-3">
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-emerald-900">
+              <div className="font-semibold flex items-center gap-1.5">
+                <CheckCircle2 className="w-4 h-4" /> {undecided.grn_number} is received — stock has been added.
+              </div>
+              <div className="mt-0.5 text-[11px]">
+                {undecided.materials_touched} material{Number(undecided.materials_touched) === 1 ? '' : 's'} updated.
+                The delivery is complete and nothing is waiting on anyone. You do not need to do anything with this bill.
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900 space-y-1.5">
+              <div className="font-semibold flex items-center gap-1.5">
+                {/* A QUESTION MARK, NOT A WARNING TRIANGLE. The triangle is this
+                    app's "something went wrong" and nothing went wrong here —
+                    the receipt is clean and complete. What is missing is a
+                    RULING, and the icon has to say that or the desk reads the
+                    panel as a rejection of their own work. */}
+                <ShieldQuestion className="w-4 h-4 shrink-0" />
+                No quality check was made — nobody has ever set a rule for{' '}
+                {undecided.qc_undecided_categories.length === 1 ? 'this category' : 'these categories'}.
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {undecided.qc_undecided_categories.map((c: string) => (
+                  <span key={c} className="px-1.5 py-0.5 rounded border border-amber-400 bg-white text-[10px] font-semibold">{c}</span>
+                ))}
+              </div>
+              <div className="text-[11px]">
+                This is <b>not</b> the same as “no check needed”. Nobody has decided either way, so the goods went straight
+                into stock unchecked. If {undecided.qc_undecided_categories.length === 1 ? 'it is' : 'they are'} perishable —
+                meat, poultry, seafood, dairy — that decision is worth making before the next delivery.
+              </div>
+              <div className="text-[11px] border-t border-amber-300/70 pt-1.5">
+                <b>What to do:</b> ask an admin to set the checker on{' '}
+                <b>Settings → Quality Check Categories</b>. It takes one click per category and applies from the very
+                next delivery. Nothing needs re-entering here.
+              </div>
+            </div>
+
+            <div className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2 text-[11px]">
+              You are seeing this because the category has <b>no rule at all</b> — a category an admin has deliberately set
+              to <b>No check</b> never shows this message. That is what keeps it rare enough to be worth reading.
             </div>
           </div>
         ) : (
@@ -2676,6 +2797,17 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             <>
               <a href="/grn/qc" className="px-3 py-1.5 text-sm rounded-lg border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] flex items-center gap-1.5">
                 <ChefHat className="w-4 h-4" /> Pending Quality Checks
+              </a>
+              <button onClick={onCreated} className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">Done</button>
+            </>
+          ) : undecided ? (
+            /* The settings link is OFFERED, not required. Most receiving staff
+               cannot open that page (it is admin-only) and the delivery is
+               already complete, so Done is the primary and the link is the quiet
+               one — an admin standing at the bay can act on it there and then. */
+            <>
+              <a href="/settings/qc-categories" className="px-3 py-1.5 text-sm rounded-lg border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] flex items-center gap-1.5">
+                <ShieldQuestion className="w-4 h-4" /> Quality Check Categories
               </a>
               <button onClick={onCreated} className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">Done</button>
             </>

@@ -23,6 +23,23 @@
  * Cheese" and "frozen_cheese" are ONE row and a second spelling can never
  * silently mean "No check".
  *
+ * ── ONE SHELF = ONE ROW, AND THE ORDER IS "WHAT ACTUALLY ARRIVES" ──────────
+ * The server used to group these rows by DISPLAY SPELLING while the gate keyed
+ * on the normalised key, so production showed MEAT, MEAT and Meat as three rows
+ * for one shelf with the count split three ways — and, worse, three rows sharing
+ * one category_key, which is what `pending` and `key=` below are keyed on. Rows
+ * now arrive folded by key: one row, the true combined count, every spelling
+ * listed underneath, and a mapped key that matches no material at all marked as
+ * governing nothing rather than looking like a live rule.
+ *
+ * The undecided rows are ranked by ARRIVALS IN THE LAST 90 DAYS, not by material
+ * count. POULTRY hid behind material count: one material in the audited snapshot,
+ * below the cut that built the seed, no row in the map — and then 90 kg of
+ * chicken leg boneless and 30 kg of whole bird inwarded in silence on
+ * GRN-2026-0018. A shelf that turns up weekly outranks fifty materials that never
+ * arrive. Zero-arrival shelves are still listed, never hidden: hiding the quiet
+ * ones is precisely how this happened.
+ *
  * ── UNASSIGNED IS AMBER, NEVER RED, AND IT IS AT THE TOP ───────────────────
  * A category with no row in the map defaults to "No check". That default is the
  * safe direction — silently BLOCKING an unmapped category would stop a delivery
@@ -59,23 +76,58 @@ import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
 import {
   ShieldCheck, ChefHat, Wine, Loader2, RefreshCw, AlertTriangle, CheckCircle2,
-  Info, Lock, Save, Search, XCircle, Clock, MessageSquare, Package,
+  Info, Lock, Save, Search, XCircle, Clock, MessageSquare, Package, Truck,
 } from 'lucide-react';
 
 type Checker = 'none' | 'kitchen' | 'bar' | 'both';
 
 interface CategoryRow {
+  /** The DISPLAY spelling this row is saved under. It is a REAL spelling whose
+   *  catNorm equals category_key — the server never synthesises a label here,
+   *  because PUT re-derives the key from this string and a made-up name like
+   *  "Meat (3 spellings)" would write a phantom row and silently lose the
+   *  decision. Do not decorate it before sending it back. */
   category: string;
   category_key: string;
   checker: Checker;
   /** Has a row in the map at all. false ⇒ reads as 'none' but nobody decided it. */
   assigned: boolean;
+  /** ACTIVE materials across EVERY spelling of this key — the true shelf count. */
   material_count: number;
   /** false ⇒ store-mapped (TGBCL); a checker here could never fire. */
   central_reachable: boolean;
   updated_by: string;
   updated_at: string;
+  /* ── The three fields added with the POULTRY fix. Declared OPTIONAL and read
+        defensively for the same reason `schema_health` is: this is a parsed HTTP
+        body, and a row that arrives without them must cost a line of detail, not
+        the screen. ── */
+  /** Every display spelling of this ONE key that carries a material, most-used
+   *  first. MEAT / MEAT / Meat is one shelf; this is how the owner recognises
+   *  his own data underneath a single merged row. */
+  variants?: Array<{ category: string; material_count: number }>;
+  /** This key matches no material row at all — a leftover spelling. A rule set
+   *  on it governs nothing and can never fire, however live the badge looks. */
+  governs_nothing?: boolean;
+  /** SEPARATE DELIVERIES this shelf has ACTUALLY arrived on in the last 90 days
+   *  (distinct goods receipts, not lines — 50 lines on one grocery bill is one
+   *  delivery, and counting lines would let material breadth back into the
+   *  ranking through the back door).
+   *  THE ranking signal for the undecided list. Material count is the signal
+   *  that let POULTRY hide — it held one material, sat below the cut that built
+   *  the seed, and 120 kg of chicken walked through a gate it never had. */
+  arrivals_90d?: number;
+  /** A few material names off this shelf. `other` holds 141 materials in this
+   *  database — MILK, CURD and EGGS beside JACK DANIELS and GAS 19 KG — and it
+   *  pins near the top of the undecided list. "Rule on `other`" is an unanswerable
+   *  instruction until you can see what is in the box. */
+  sample_materials?: string[];
 }
+
+/** What the picker SHOWS. '' is the fourth state and it is display-only:
+ *  "nobody has decided". See selectValue() for why the row cannot work without
+ *  it, and why `effective()` must never return it. */
+type SelectValue = Checker | '';
 
 interface Payload {
   rows: CategoryRow[];
@@ -150,6 +202,95 @@ function CheckerBadge({ checker }: { checker: Checker }) {
   );
 }
 
+/**
+ * HOW OFTEN THIS SHELF ACTUALLY TURNS UP AT THE BAY.
+ *
+ * Amber when it is arriving and undecided, because that is a live exposure and
+ * not a filing gap. Deliberately QUIET when it is zero rather than absent: a
+ * shelf that has not arrived in 90 days still needs a ruling — POULTRY had one
+ * material and no recent arrivals in the audited snapshot, which is exactly why
+ * it was left out of the seed, and then 120 kg of chicken arrived.
+ */
+function ArrivalsChip({ n }: { n: number }) {
+  if (!Number.isFinite(n) || n <= 0) {
+    // "no GOODS RECEIPTS", not "no arrivals" — a narrower claim, and the only
+    // one that is true. This counts the two GRN paths, which is where the QC
+    // gate lives; stock can also arrive on the direct-purchase path, which
+    // carries no grn_id and no gate (16 of 47 inward rows in 90 days on the dev
+    // snapshot). Saying "no arrivals" about a shelf that took stock three times
+    // last month is the kind of confident wrong number that gets a screen
+    // disbelieved.
+    return <span className="text-[#B8A590]">no goods receipts in 90 days</span>;
+  }
+  return (
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold
+                     bg-amber-100 text-amber-900 border border-amber-300">
+      <Truck className="w-3 h-3" />arrived on {nf(n)} deliver{n === 1 ? 'y' : 'ies'} · 90 days
+    </span>
+  );
+}
+
+/**
+ * WHAT IS ACTUALLY ON THIS SHELF.
+ *
+ * Shown on the undecided rows only, where it is the difference between a
+ * decidable question and an unanswerable one. The largest undecided shelf in
+ * this database is called `other`, it holds 141 materials, and it contains MILK,
+ * CURD, EGGS, FRESH CREAM and CORIANDER LEAF side by side with JACK DANIELS,
+ * CHAR COAL and GAS 19 KG. "No check" silences the perishables; "Kitchen" holds
+ * every bill at the bay. An admin cannot rule on a name like that — but he can
+ * rule on a list, or split the shelf, once he can see it. The server has always
+ * computed this; nothing rendered it.
+ */
+function SampleLine({ row }: { row: CategoryRow }) {
+  const s = (row.sample_materials || []).filter(Boolean);
+  if (s.length === 0) return null;
+  const shown = s.slice(0, 6);
+  const more = Math.max(0, Number(row.material_count || 0) - shown.length);
+  const text = shown.join(' · ') + (more > 0 ? ` … and ${nf(more)} more` : '');
+  return (
+    <p className="text-[10px] text-[#B8A590] mt-0.5 truncate" title={text}>
+      Holds <span className="text-[#8B7355]">{text}</span>
+    </p>
+  );
+}
+
+/**
+ * THE SPELLINGS UNDERNEATH ONE ROW — visible, and quiet.
+ *
+ * MEAT (11), MEAT (11) and Meat (8) are ONE shelf; the server now folds them
+ * into one row keyed on the normalisation the gate itself uses. But the owner
+ * has to be able to recognise his own data, and the row's headline is a single
+ * representative spelling — on a decided shelf that is the spelling stored in
+ * the map, which on production is the lower-case one while every material says
+ * MEAT. So the real spellings are printed underneath.
+ *
+ * Shown only when it says something: more than one spelling, or one that is not
+ * the one on the headline. A row whose single spelling matches gets nothing —
+ * "Spelled: Grocery (286)" under a row titled Grocery is noise, and noise is
+ * what made the amber callout ignorable in the first place. The per-spelling
+ * counts appear only when there is more than one spelling to split between; on
+ * a single differing spelling the headline count already IS that number.
+ */
+function VariantLine({ row }: { row: CategoryRow }) {
+  const variants = row.variants || [];
+  if (variants.length === 0) return null;
+  if (variants.length === 1 && variants[0].category === row.category) return null;
+  if (variants.length === 1) {
+    return (
+      <p className="text-[10px] text-[#B8A590] mt-0.5 truncate" title={variants[0].category}>
+        Spelled on the materials as <span className="text-[#8B7355]">{variants[0].category}</span>
+      </p>
+    );
+  }
+  const text = variants.map(v => `${v.category} (${nf(v.material_count)})`).join('  ·  ');
+  return (
+    <p className="text-[10px] text-[#B8A590] mt-0.5 truncate" title={text}>
+      One shelf, spelled {variants.length} ways: <span className="text-[#8B7355]">{text}</span>
+    </p>
+  );
+}
+
 export default function QcCategoriesPage() {
   const [data, setData] = useState<Payload | null>(null);
   const [loading, setLoading] = useState(true);
@@ -211,6 +352,43 @@ export default function QcCategoriesPage() {
   );
 
   /**
+   * WHAT THE PICKER SHOWS — and why it is NOT `effective()`.
+   *
+   * THE BUG THIS FIXES MADE THE ENTIRE FEATURE UNCLEARABLE. An undecided row
+   * arrives as `assigned: false, checker: 'none'` (grn-qc.ts: `checker: m ?
+   * m.checker : 'none'`), and CHECKER_OPTIONS[0] is 'none' / "No check". So the
+   * select already DISPLAYED "No check" as the selected option. A native
+   * <select> fires no `change` event when you re-pick the option that is
+   * already selected — so `onPick` never ran, `pending[key]` stayed undefined,
+   * `isDirty` returned false at its first line, `dirtyRows` stayed empty and
+   * SAVE STAYED DISABLED. The only way through was to pick Kitchen and then pick
+   * No check again, and nothing on screen said so.
+   *
+   * That made this page's own instruction — "picking No check is a real answer
+   * and clears it from this list" — false, and with it the whole self-healing
+   * story: the receiving advisory fires on any bill carrying an undecided
+   * category, grocery and packaging are undecided and ride on most bills, and
+   * the ONLY way to quiet them is a ruling saved from this row. An unclearable
+   * list means an advisory that fires forever and gets clicked past inside a
+   * week, which is the failure the whole design was built to avoid.
+   *
+   * The empty string is a FOURTH DISPLAY STATE, never a checker. It also fixes
+   * the second half of the same bug: an undecided row that renders "No check"
+   * LOOKS already-ruled, so an admin scanning the amber list sees rows that
+   * appear decided and moves on.
+   *
+   * `effective()` MUST NOT return it. That one is the gating arithmetic below
+   * (`effective(r) !== 'none'` counts gated materials and categories); '' is
+   * !== 'none', so an undecided row would be counted as GATED and the screen
+   * would overstate its own coverage — the exact flavour of lie this task
+   * exists to delete. Two functions, two jobs.
+   */
+  const selectValue = useCallback(
+    (r: CategoryRow): SelectValue => pending[r.category_key] ?? (r.assigned ? r.checker : ''),
+    [pending],
+  );
+
+  /**
    * Is this row staged for a write?
    *
    * An UNASSIGNED row staged as 'none' counts as a change even though the value
@@ -230,10 +408,24 @@ export default function QcCategoriesPage() {
   const rows = useMemo(() => data?.rows ?? [], [data]);
   const dirtyRows = useMemo(() => rows.filter(isDirty), [rows, isDirty]);
 
+  /**
+   * Search across EVERY spelling of the shelf, not just the one on display.
+   *
+   * A merged row shows one representative spelling — the admin's stored one
+   * where there is a decision, which on production is the lower-case `meat`
+   * while the materials are spelled `MEAT`. Filtering on the displayed string
+   * alone would mean typing the name that is literally on the material and
+   * getting "no category matches". The key is searched too, so "englishveg"
+   * finds "english-vegetables".
+   */
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return rows;
-    return rows.filter(r => r.category.toLowerCase().includes(q));
+    return rows.filter(r =>
+      r.category.toLowerCase().includes(q)
+      || r.category_key.includes(q.replace(/[\s\-_]/g, ''))
+      || (r.variants || []).some(v => String(v.category || '').toLowerCase().includes(q)),
+    );
   }, [rows, search]);
 
   /* THE THREE GROUPS, in the order an admin needs them:
@@ -248,6 +440,20 @@ export default function QcCategoriesPage() {
     .filter(r => effective(r) !== 'none' && r.central_reachable)
     .reduce((s, r) => s + r.material_count, 0);
   const gatedCategories = rows.filter(r => effective(r) !== 'none' && r.central_reachable).length;
+
+  /* THE STAKES, IN ONE NUMBER. Counted over `rows`, never `filtered` — the
+     callout states the state of the map, and a search box is not allowed to make
+     the gap look smaller than it is. Arrivals is what turns "12 categories have
+     no rule" into "4 of them came through the bay this quarter and nobody looked
+     at them", which is the sentence that gets acted on. */
+  const undecidedArriving = useMemo(
+    () => rows.filter(r => !r.assigned && r.central_reachable && Number(r.arrivals_90d || 0) > 0),
+    [rows],
+  );
+  const undecidedArrivingTimes = useMemo(
+    () => undecidedArriving.reduce((s, r) => s + Number(r.arrivals_90d || 0), 0),
+    [undecidedArriving],
+  );
 
   const saveMap = useCallback(async () => {
     if (dirtyRows.length === 0 || saving) return;
@@ -355,14 +561,24 @@ export default function QcCategoriesPage() {
         {data && (
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
             {[
-              { label: 'Categories', value: nf(rows.length), cls: 'text-[#2D1B0E]' },
-              { label: 'Checked', value: nf(gatedCategories), cls: gatedCategories > 0 ? 'text-emerald-700' : 'text-[#2D1B0E]' },
-              { label: 'Materials governed', value: nf(gatedMaterials), cls: 'text-[#2D1B0E]' },
-              { label: 'Not yet decided', value: nf(data.unassigned_central), cls: data.unassigned_central > 0 ? 'text-amber-700' : 'text-emerald-700' },
+              { label: 'Categories', value: nf(rows.length), cls: 'text-[#2D1B0E]', sub: 'spellings of one name merged into one row' },
+              { label: 'Checked', value: nf(gatedCategories), cls: gatedCategories > 0 ? 'text-emerald-700' : 'text-[#2D1B0E]', sub: '' },
+              { label: 'Materials governed', value: nf(gatedMaterials), cls: 'text-[#2D1B0E]', sub: '' },
+              {
+                label: 'Not yet decided',
+                value: nf(data.unassigned_central),
+                cls: data.unassigned_central > 0 ? 'text-amber-700' : 'text-emerald-700',
+                // The stake, not the chore: how many of them the bay is actually
+                // seeing. This is the number GRN-2026-0018 would have been in.
+                sub: undecidedArriving.length > 0
+                  ? `${nf(undecidedArriving.length)} of them arriving unchecked`
+                  : '',
+              },
             ].map(c => (
               <div key={c.label} className="bg-white border border-[#E8D5C4] rounded-2xl px-3 py-2.5 shadow-sm">
                 <p className="text-[10px] text-[#8B7355] leading-tight">{c.label}</p>
                 <p className={`text-xl font-bold mt-0.5 ${c.cls}`}>{c.value}</p>
+                {c.sub && <p className="text-[9px] text-[#B8A590] leading-tight mt-0.5">{c.sub}</p>}
               </div>
             ))}
           </div>
@@ -414,6 +630,28 @@ export default function QcCategoriesPage() {
                 below — picking <b>No check</b> is a real answer and clears it from this list, so a category added next
                 month cannot hide here unnoticed.
               </p>
+              {/* THE STAKES, SAID AS A FACT ABOUT THE BAY AND NOT AS A COUNT OF
+                  ROWS. "12 categories are undecided" is a housekeeping chore;
+                  "4 of them arrived 33 times in the last 90 days and nothing was
+                  checked" is the delivery that already happened.
+                  GRN-2026-0018 is exactly this sentence going unsaid.
+
+                  "TIMES", NOT "DELIVERIES". Each row counts the DISTINCT goods
+                  receipts that shelf arrived on, but this is a SUM ACROSS ROWS —
+                  one delivery carrying two undecided shelves is one arrival for
+                  each of them and would be counted twice as a delivery total.
+                  "Arrived N times between them" is exactly what the number is. */}
+              {undecidedArriving.length > 0 && (
+                <p className="mt-1.5 text-amber-900 bg-amber-100/70 border border-amber-300 rounded-lg px-2.5 py-2">
+                  <b>
+                    {nf(undecidedArriving.length)} of them {undecidedArriving.length === 1 ? 'is' : 'are'} actually
+                    arriving — {undecidedArriving.length === 1 ? '' : 'between them they '}arrived {nf(undecidedArrivingTimes)}
+                    {' '}time{undecidedArrivingTimes === 1 ? '' : 's'} in the last 90 days, none of them checked.
+                  </b>{' '}
+                  Those are listed first below. Start at the top: that is where a perishable shelf nobody ruled on does
+                  its damage, and material count will not show it to you.
+                </p>
+              )}
               {data.unassigned_store_only > 0 && (
                 <p className="mt-1 text-amber-800">
                   A further {nf(data.unassigned_store_only)} liquor categor{data.unassigned_store_only === 1 ? 'y is' : 'ies are'}{' '}
@@ -461,11 +699,12 @@ export default function QcCategoriesPage() {
           <div className="space-y-4">
             {unassignedCentral.length > 0 && (
               <Group
-                title="Not yet decided"
+                title="Not yet decided — these inward with no check"
                 tone="amber"
-                note="These inward with no check because nothing has been set. Choose one — including No check."
+                note="Nothing has ever been set for these, so they inward with no check. Ordered by what has actually turned up at the bay in the last 90 days, most-arrived first — not by how many materials they hold, which is the count that let poultry through. Choose one for each, including No check."
                 rows={unassignedCentral}
-                effective={effective}
+                showArrivals
+                selectValue={selectValue}
                 isDirty={isDirty}
                 onPick={(k, v) => setPending(p => ({ ...p, [k]: v }))}
               />
@@ -477,7 +716,7 @@ export default function QcCategoriesPage() {
                 tone="plain"
                 note="Kitchen or Bar means that department must sign before the goods enter stock. Kitchen or Bar means EITHER may sign — not that two signatures are needed."
                 rows={assignedCentral}
-                effective={effective}
+                selectValue={selectValue}
                 isDirty={isDirty}
                 onPick={(k, v) => setPending(p => ({ ...p, [k]: v }))}
               />
@@ -507,6 +746,7 @@ export default function QcCategoriesPage() {
                         <div className="min-w-0">
                           <p className="text-sm text-[#6B5744] truncate">{categoryLabel(r.category)}</p>
                           <p className="text-[10px] text-[#8B7355]">{nf(r.material_count)} material{r.material_count === 1 ? '' : 's'}</p>
+                          <VariantLine row={r} />
                         </div>
                         <span className="text-[10px] text-[#8B7355] shrink-0">Not gateable</span>
                       </div>
@@ -620,16 +860,26 @@ export default function QcCategoriesPage() {
  *
  * ROWS, not a table: each carries a name, a count, a badge and a four-way
  * dropdown, and a table of that on a phone means a sideways scroll to reach the
- * control. Rows keep the server's order (most materials first), and are NOT
- * re-sorted as they are edited — a row that jumps groups the moment it is set is
- * how an admin edits the wrong category next. The heading counts move on save.
+ * control. Rows keep the server's order — the UNDECIDED group is ranked by what
+ * has actually arrived at the bay in 90 days (see arrivals_90d; material count
+ * is the signal that let POULTRY hide), the decided group by material count —
+ * and they are NOT re-sorted as they are edited: a row that jumps groups the
+ * moment it is set is how an admin edits the wrong category next. The heading
+ * counts move on save.
  */
-function Group({ title, note, tone, rows, effective, isDirty, onPick }: {
+function Group({ title, note, tone, rows, showArrivals, selectValue, isDirty, onPick }: {
   title: string;
   note: string;
   tone: 'amber' | 'plain';
   rows: CategoryRow[];
-  effective: (r: CategoryRow) => Checker;
+  /** Show the 90-day arrivals chip. On the undecided group it is the ranking
+   *  the rows are already in and the reason the top of the list matters; on the
+   *  decided group it would be trivia beside a rule that is already working. */
+  showArrivals?: boolean;
+  /** DISPLAY value, which may be '' for "nobody has decided" — see selectValue().
+   *  Deliberately not `effective()`: that one is the gating arithmetic and must
+   *  never see the empty state. */
+  selectValue: (r: CategoryRow) => SelectValue;
   isDirty: (r: CategoryRow) => boolean;
   onPick: (categoryKey: string, checker: Checker) => void;
 }) {
@@ -644,7 +894,7 @@ function Group({ title, note, tone, rows, effective, isDirty, onPick }: {
       </div>
       <div className="bg-white">
         {rows.map(r => {
-          const val = effective(r);
+          const val = selectValue(r);
           const dirty = isDirty(r);
           return (
             <div
@@ -654,25 +904,68 @@ function Group({ title, note, tone, rows, effective, isDirty, onPick }: {
               }`}
             >
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium truncate flex items-center gap-1.5">
+                <p className="text-sm font-medium truncate flex items-center gap-1.5 flex-wrap">
                   {categoryLabel(r.category)}
                   {dirty && <span className="text-[9px] px-1.5 py-0.5 rounded bg-[#af4408] text-white font-semibold">unsaved</span>}
+                  {/* A LEFTOVER SPELLING, SAID PLAINLY. Without this a seeded row
+                      like "Frozen-Cheese" reads as a live kitchen rule while no
+                      material anywhere carries that name — the rule is real, it
+                      is saved, and it can never once fire. */}
+                  {r.governs_nothing && (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded border border-[#E0D0BE] bg-[#FFF8F0] text-[#8B7355] font-semibold uppercase tracking-wide">
+                      governs nothing
+                    </span>
+                  )}
                 </p>
                 <p className="text-[10px] text-[#8B7355] flex items-center gap-1.5 flex-wrap">
-                  <span>{nf(r.material_count)} material{r.material_count === 1 ? '' : 's'}</span>
+                  {r.governs_nothing
+                    ? <span className="text-[#8B7355]">No material carries this name — nothing to check, so this rule can never fire.</span>
+                    : <span>{nf(r.material_count)} material{r.material_count === 1 ? '' : 's'}</span>}
+                  {/* 0 ACTIVE MATERIALS IS NOT THE SAME AS A DEAD SHELF, and the
+                      difference decides whether a ruling still matters. A row
+                      here holds only DEACTIVATED materials — the gate has no
+                      is_active filter, so it would hold a delivery the moment
+                      one of them is switched back on. Left unsaid, "0 materials"
+                      reads as "already dealt with", which is how a shelf gets
+                      skipped and then arrives. */}
+                  {!r.governs_nothing && r.material_count === 0 && (
+                    <span className="text-[#8B7355]">— all deactivated today, but a rule here still applies if one is switched back on</span>
+                  )}
+                  {showArrivals && !r.governs_nothing && <ArrivalsChip n={Number(r.arrivals_90d || 0)} />}
                   {!dirty && r.assigned && <CheckerBadge checker={r.checker} />}
                   {r.assigned && r.updated_by && (
                     <span className="text-[#B8A590]">set by {r.updated_by}{r.updated_at ? ` · ${istWhen(r.updated_at)}` : ''}</span>
                   )}
                 </p>
+                <VariantLine row={r} />
+                {/* Only on the undecided group. On a decided row the ruling is
+                    already made and the contents are trivia; on an undecided one
+                    they are the whole basis of the decision. */}
+                {showArrivals && <SampleLine row={r} />}
               </div>
               <select
                 value={val}
-                onChange={e => onPick(r.category_key, e.target.value as Checker)}
-                className={`px-2.5 py-2 border rounded-xl text-sm bg-[#FFF8F0] min-w-[136px] ${
-                  dirty ? 'border-[#af4408]' : 'border-[#E8D5C4]'
+                onChange={e => {
+                  // '' is the placeholder and is never a decision. It is
+                  // `disabled` below so it cannot be chosen, and this guard means
+                  // that even if a browser let it through it could not stage an
+                  // empty checker for the PUT.
+                  const v = e.target.value;
+                  if (!v) return;
+                  onPick(r.category_key, v as Checker);
+                }}
+                className={`px-2.5 py-2 border rounded-xl text-sm bg-[#FFF8F0] min-w-[152px] ${
+                  dirty ? 'border-[#af4408]' : val === '' ? 'border-amber-400 text-amber-900' : 'border-[#E8D5C4]'
                 }`}
               >
+                {/* THE PLACEHOLDER IS WHAT MAKES "No check" CLICKABLE AT ALL.
+                    Without it an undecided row sat on 'none' already, and picking
+                    the already-selected option fires no change event — so the row
+                    could never be staged and Save never enabled. It also stops an
+                    undecided row from LOOKING ruled. Rendered only while the row
+                    is genuinely undecided, so it never clutters a decided one, and
+                    `disabled` so it is a starting state and not a choice. */}
+                {val === '' && <option value="" disabled>Not decided yet</option>}
                 {CHECKER_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>
             </div>

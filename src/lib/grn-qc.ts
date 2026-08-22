@@ -156,8 +156,25 @@ function asChecker(v: unknown): QcChecker {
 // THE CATEGORY → CHECKER MAP
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** The whole map, keyed by catKeyOf(category). Missing key ⇒ 'none'. */
-export function getCategoryCheckerMap(db: Database.Database): Map<string, QcChecker> {
+/**
+ * The map plus ONE extra bit: was the table actually readable?
+ *
+ * getCategoryCheckerMap() below returns the map alone and is what the GATE
+ * reads — its behaviour is unchanged, byte for byte. The extra bit exists for
+ * undecidedQcCategories(), which has to tell two states apart that both arrive
+ * as an EMPTY MAP and mean opposite things:
+ *
+ *   · table missing (un-migrated) → we know nothing about any category, and
+ *     qcSchemaHealth() already says so in words on every QC surface. Naming
+ *     every category on the bill as "undecided" on top of that is noise piled
+ *     on a fault that is already reported.
+ *   · table present and empty     → nobody has decided anything yet. Every
+ *     category on the bill genuinely IS undecided, and saying so is the truth.
+ *
+ * ONE query, ONE swallow, ONE source of truth — the advisory and the gate read
+ * the same row set through the same statement.
+ */
+function readCategoryCheckerMap(db: Database.Database): { map: Map<string, QcChecker>; readable: boolean } {
   const out = new Map<string, QcChecker>();
   try {
     for (const r of db.prepare(`SELECT category_key, checker FROM qc_category_checkers`).all() as any[]) {
@@ -168,17 +185,57 @@ export function getCategoryCheckerMap(db: Database.Database): Map<string, QcChec
     // reads 'none', i.e. NOTHING is gated — the same behaviour as before this
     // feature. Failing the other way (gate everything) would stop deliveries
     // because of a schema fault, which is a worse failure than not gating.
+    return { map: out, readable: false };
   }
-  return out;
+  return { map: out, readable: true };
+}
+
+/** The whole map, keyed by catKeyOf(category). Missing key ⇒ 'none'. */
+export function getCategoryCheckerMap(db: Database.Database): Map<string, QcChecker> {
+  return readCategoryCheckerMap(db).map;
 }
 
 export interface CategoryCheckerRow {
+  /** The display name for this SHELF. See listCategoryCheckers for which of the
+   *  variant spellings is chosen and why it is never a synthesised label. */
   category: string;
   category_key: string;
   checker: QcChecker;
   /** Is there an explicit row for it, or is it falling through to 'none'? */
   assigned: boolean;
+  /** ACTIVE materials across EVERY spelling of this key — the true shelf count.
+   *  Unchanged meaning (active only); what changed is that it is no longer split
+   *  three ways across MEAT / MEAT / Meat. */
   material_count: number;
+  /** Every display spelling of this one key that exists on a material, with its
+   *  own active count, most-used first. `category` is one of these unless the
+   *  admin's stored spelling differs (below) or the key governs nothing. */
+  variants: Array<{ category: string; material_count: number }>;
+  /** This key matches NO raw_materials row at all — active or inactive. A rule
+   *  set on it governs nothing and can never fire; it is a leftover spelling.
+   *  DISTINCT from material_count === 0, which a shelf holding only DEACTIVATED
+   *  materials also produces — that one still governs something the moment a
+   *  material is re-activated, and resolveQcRequirement (no is_active filter)
+   *  would gate it. */
+  governs_nothing: boolean;
+  /** SEPARATE DELIVERIES this shelf has actually arrived on in the last 90 days,
+   *  across every spelling — non-void receipts, DB-wide, un-scoped exactly like
+   *  the rest of this function.
+   *
+   *  THIS IS THE RANKING SIGNAL, AND MATERIAL COUNT IS NOT. POULTRY hid behind
+   *  material count: it held ONE material in the audited snapshot and fell below
+   *  the cut that built the seed, then 120 kg of chicken walked through the gate
+   *  it was never given. A shelf that turns up weekly outranks fifty materials
+   *  that never arrive.
+   *
+   *  DELIVERIES, NOT LINES — and the difference is the whole point. Counting GRN
+   *  LINES is proportional to how many DIFFERENT MATERIALS a shelf puts on one
+   *  bill, which is material breadth re-entering through the back door: a single
+   *  50-line grocery delivery would outrank twelve separate weekly chicken bills
+   *  (50 > 12) and POULTRY would sink under exactly the signal that buried it the
+   *  first time. COUNT(DISTINCT grn_id) asks the question the ranking actually
+   *  means — how often does this shelf turn up at the bay. */
+  arrivals_90d: number;
   /** Can a material in this category ever reach a central GRN at all?
    *  Store-mapped (TGBCL liquor) categories are refused by centralFlowBlock on
    *  every receiving path, so a checker set on one can never fire. Surfaced so
@@ -198,13 +255,128 @@ export interface CategoryCheckerRow {
 }
 
 /**
- * Every LIVE category (from raw_materials) plus any mapped key that no longer
- * has materials, with counts and the assigned/unassigned flag.
+ * SEPARATE DELIVERIES PER CATEGORY IN THE LAST 90 DAYS — one query, folded by key.
+ *
+ * WHY THIS EXISTS AT ALL. The seed that armed this gate was built from a
+ * material-count audit, and material count is exactly the signal that let
+ * POULTRY through: one material in the audited snapshot, below the cut, no row
+ * in the map, and 90 kg of chicken leg boneless plus 30 kg of whole bird
+ * inwarded in silence on GRN-2026-0018. Arrivals is the signal that would have
+ * caught it — how often the shelf actually turns up at the bay.
+ *
+ * THE SCOPE IS DELIBERATE, and stated rather than implied:
+ *   · VOID RECEIPTS ARE EXCLUDED. A voided GRN records goods that were
+ *     un-received; it is not an arrival.
+ *   · 'awaiting_qc' IS INCLUDED. It arrived; whether it has been signed off yet
+ *     says nothing about how often the shelf turns up.
+ *   · DB-WIDE AND UN-OUTLET-SCOPED, because every other number this screen shows
+ *     is (material_count, central_reachable), and one scoped column beside four
+ *     un-scoped ones is a number nobody can reconcile.
+ *   · g.date is the RECEIPT date, non-null on every line in this database — not
+ *     created_at, so a receipt back-dated into the window counts in the window
+ *     it says it belongs to.
+ *   · THE WINDOW IS BOUNDED AT BOTH ENDS, on the IST calendar day. g.date is a
+ *     YYYY-MM-DD IST business date, so the anchor is date('now','+330 minutes')
+ *     — the house convention (central-cutover.ts istToday, sales-dashboard.ts).
+ *     UTC 'now' runs a day behind between 00:00 and 05:30 IST and silently
+ *     stretches the window to 91 days. The UPPER bound matters more: an admin
+ *     may back-date OR FUTURE-date a receipt (checkPurchaseDate exempts admins),
+ *     and without it a GRN typed as 2027 would inflate that shelf's rank for
+ *     ever — a permanent lie in the one column the ranking trusts.
+ *   · IT COUNTS THE MATERIALS THE SHELF HOLDS **TODAY**. GRN lines store no
+ *     category of their own, so re-categorising a material moves its arrival
+ *     history with it. The column answers "how often do the things on this shelf
+ *     turn up", not "how often did this shelf turn up" — which is the question
+ *     the ranking actually wants, but worth knowing when a number moves without
+ *     a new delivery.
+ *   · GRN PATHS ONLY. The direct-purchase path (purchases with no grn_id — 16 of
+ *     47 inward rows in the last 90 days on the dev snapshot) is NOT counted,
+ *     because the QC gate does not exist on it: resolveQcRequirement is called
+ *     from api/grn and api/purchase-orders/[id]/receive and nowhere else. A
+ *     shelf that only ever arrives by direct purchase can never be gated, so
+ *     ranking it by those arrivals would rank a rule that cannot fire. THE
+ *     ZERO WORDING ON SCREEN SAYS "no goods receipts", NOT "no arrivals",
+ *     because those are different claims and only the narrow one is true.
+ *
+ * Returns an empty map on any fault: a missing table must cost the screen a
+ * ranking column, never the screen itself.
+ */
+function arrivalsByCategoryKey(db: Database.Database, days = 90): Map<string, number> {
+  const out = new Map<string, number>();
+  try {
+    // DISTINCT (category, grn_id) PAIRS, folded into a Set per key — not
+    // COUNT(DISTINCT grn_id) per spelling, which would double-count one delivery
+    // that carries both MEAT and Meat lines once the spellings merge into a
+    // single shelf. The Set makes the merge exact.
+    const seen = new Map<string, Set<string>>();
+    for (const r of db.prepare(`
+      SELECT DISTINCT COALESCE(NULLIF(TRIM(rm.category), ''), 'other') AS category,
+                      gi.grn_id AS grn_id
+        FROM goods_receipt_note_items gi
+        JOIN goods_receipt_notes g  ON g.id = gi.grn_id
+        JOIN raw_materials       rm ON rm.id = gi.material_id
+       WHERE COALESCE(g.status, '') <> 'void'
+         AND DATE(g.date) >= DATE('now', '+330 minutes', ?)
+         AND DATE(g.date) <= DATE('now', '+330 minutes')
+    `).all(`-${Math.max(1, Math.round(days))} day`) as any[]) {
+      // Folded by catKeyOf in TS, NOT by the SQL spelling — same reason the row
+      // set below is: MEAT and Meat are one shelf, and their arrivals are one
+      // number. (SQLite's LOWER() is ASCII-only; catKeyOf is the one runtime
+      // normalisation and the only one the gate agrees with.)
+      const key = catKeyOf(r.category);
+      let s = seen.get(key);
+      if (!s) { s = new Set(); seen.set(key, s); }
+      s.add(String(r.grn_id ?? ''));
+    }
+    for (const [key, s] of seen) out.set(key, s.size);
+  } catch { /* un-migrated or missing table ⇒ no ranking column, not a crash */ }
+  return out;
+}
+
+/**
+ * ONE SHELF, ONE ROW. Every category key (from raw_materials) plus any mapped
+ * key that no longer has materials, with counts and the assigned/unassigned flag.
  *
  * UNASSIGNED IS THE POINT OF THIS FUNCTION. A new category defaults to 'none'
  * so it can never silently BLOCK a delivery — but it must never silently ESCAPE
  * one either, and the only way to have both is to make the gap visible. This is
  * the data behind that panel.
+ *
+ * ── WHY THIS GROUPS BY KEY AND NOT BY SPELLING ─────────────────────────────
+ * It used to `GROUP BY COALESCE(NULLIF(TRIM(category),''),'other')` — the
+ * DISPLAY SPELLING — while the map it joins against is keyed by catKeyOf(). The
+ * `category` column is a plain TEXT with no COLLATE NOCASE, so that GROUP BY is
+ * BINARY: production's MEAT, MEAT and Meat came back as THREE ROWS for ONE
+ * shelf, with the material count split three ways and the same checker repeated
+ * on each. Three symptoms, all of them real:
+ *   · the count on screen understates the shelf, which is the number an admin
+ *     ranks by when deciding what to rule on;
+ *   · the page keys its rows and stages its edits by category_key (page :651,
+ *     :167) — three rows sharing one key meant duplicate React keys, ONE shared
+ *     pending slot, an edit applying to all three, and a save PUTting the same
+ *     key three times with three different display spellings;
+ *   · seeded spellings production does not use (Veg, Non-Veg, Frozen-Cheese)
+ *     showed as rows reading 0 materials with no explanation.
+ * Grouping by catKeyOf — the key the GATE matches on — makes the screen agree
+ * with the gate. THIS IS DISPLAY ONLY: no material is renamed, no row is
+ * rewritten, and resolveQcRequirement never reads this function.
+ *
+ * ── WHICH SPELLING BECOMES `category`, AND WHY IT IS NEVER SYNTHESISED ─────
+ * THE WRITER ROUND-TRIPS THIS STRING. The settings page saves
+ * `{ category: r.category, checker }` and setCategoryCheckers re-derives
+ * catKeyOf(category) from it — `category_key` is never sent. So a synthesised
+ * label ("MEAT (3 spellings)") would normalise to a BRAND-NEW key, INSERT a
+ * second map row, leave the real one untouched, and the admin's decision would
+ * silently not apply. Every value this function can put in `category` is
+ * therefore a real string whose catKeyOf() is this row's key:
+ *   1. the spelling ALREADY STORED on the map row, when there is one and it
+ *      still normalises to this key — first choice precisely because saving it
+ *      back rewrites the stored column to itself, i.e. changes no data at all;
+ *   2. else the most-used live spelling on the shelf;
+ *   3. else (a mapped key with no materials and no stored spelling) the key.
+ * The other spellings ride on `variants` so the screen can show the shelf as the
+ * shelf is actually spelled — and so a search for "meat" still finds a row whose
+ * display name happens to be "MEAT".
  */
 export function listCategoryCheckers(db: Database.Database): CategoryCheckerRow[] {
   const map = new Map<string, { checker: QcChecker; updated_by: string; updated_at: string; category: string }>();
@@ -227,58 +399,274 @@ export function listCategoryCheckers(db: Database.Database): CategoryCheckerRow[
   // re-activated. A seasonal perishable therefore could not be assigned while
   // it was out of season and came back unassigned. material_count still counts
   // only ACTIVE materials, which is the number that means anything to an admin.
-  const live = db.prepare(`
-    SELECT COALESCE(NULLIF(TRIM(category), ''), 'other') AS category,
-           SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) AS n
+  //
+  // ONE READ, FOLDED IN TS. This replaces the old GROUP-BY-spelling aggregate
+  // AND the per-row sampler that ran one query per category — it is FEWER
+  // queries, not more, and it is the only way to fold on catKeyOf() itself
+  // rather than on a SQL approximation of it (SQLite's LOWER() is ASCII-only,
+  // catKeyOf's toLowerCase() is not; the gate keys on catKeyOf, so this must).
+  interface Shelf {
+    active: number;
+    /** display spelling → active material count, in first-seen (name) order */
+    spellings: Map<string, number>;
+    samples: string[];
+  }
+  const shelves = new Map<string, Shelf>();
+  // NOT WRAPPED IN A try/catch, AND THAT IS THE FIX, NOT AN OVERSIGHT.
+  // Swallowing this read is the one failure that turns this screen into a
+  // confident liar. With `shelves` empty every mapped key falls through to the
+  // second loop below and is reported as `governs_nothing: true, material_count:
+  // 0` — so a working map of live rules renders as "every rule governs nothing",
+  // the materials total reads 0, and the amber "never been decided" callout
+  // DISAPPEARS ENTIRELY, because it counts unassigned rows and there are none.
+  // An admin would read a green screen off a broken query. Nothing contradicts
+  // it either: qcSchemaHealth inspects the GRN tables and the map table, never
+  // raw_materials. The pre-change code let this throw and the route answered
+  // 500; a 500 is a screen that says it is broken, which is the whole point of
+  // this task. Receiving cannot be affected — listCategoryCheckers has exactly
+  // one caller, api/grn/qc/categories/route.ts:51, and the gate never reads it.
+  const mats = db.prepare(`
+    SELECT COALESCE(NULLIF(TRIM(category), ''), 'other') AS category, name, is_active
       FROM raw_materials
-     GROUP BY COALESCE(NULLIF(TRIM(category), ''), 'other')
+     ORDER BY name
   `).all() as any[];
+  for (const m of mats) {
+    const display = String(m.category);
+    const key = catKeyOf(display);
+    let s = shelves.get(key);
+    if (!s) { s = { active: 0, spellings: new Map(), samples: [] }; shelves.set(key, s); }
+    // The spelling is recorded whether or not the material is active, so a
+    // spelling whose materials are all deactivated still shows on the shelf it
+    // belongs to — the same reason there is no is_active filter in the WHERE.
+    if (!s.spellings.has(display)) s.spellings.set(display, 0);
+    if (Number(m.is_active) === 1) {
+      s.active++;
+      s.spellings.set(display, (s.spellings.get(display) || 0) + 1);
+      // ORDER BY name on the read, so the first 8 across the WHOLE shelf are the
+      // same 8 the per-spelling sampler used to return for one spelling only.
+      if (s.samples.length < 8) s.samples.push(String(m.name));
+    }
+  }
 
-  const sampler = db.prepare(`
-    SELECT name FROM raw_materials
-     WHERE COALESCE(NULLIF(TRIM(category), ''), 'other') = ? AND is_active = 1
-     ORDER BY name LIMIT 8
-  `);
+  const arrivals = arrivalsByCategoryKey(db, 90);
 
   const rows: CategoryCheckerRow[] = [];
-  const seen = new Set<string>();
-  for (const r of live) {
-    const key = catKeyOf(r.category);
-    seen.add(key);
+  for (const [key, s] of shelves) {
     const m = map.get(key);
-    let samples: string[] = [];
-    try { samples = (sampler.all(String(r.category)) as any[]).map(x => String(x.name)); } catch { /* names are a nicety */ }
+    const variants = [...s.spellings.entries()]
+      .map(([category, material_count]) => ({ category, material_count }))
+      .sort((a, b) => b.material_count - a.material_count || a.category.localeCompare(b.category));
+    // See the header: a REAL spelling whose catKeyOf() is this key, never a
+    // synthesised label — the settings page round-trips this exact string
+    // through setCategoryCheckers, which re-derives the key from it.
+    const stored = String(m?.category || '');
+    const display = (stored && catKeyOf(stored) === key)
+      ? stored
+      : (variants[0]?.category || key);
     rows.push({
-      category: String(r.category),
+      category: display,
       category_key: key,
       checker: m ? m.checker : 'none',
       assigned: !!m,
-      material_count: Number(r.n) || 0,
-      // centralFlowBlock takes a raw category string as well as a material id.
-      central_reachable: !centralFlowBlock(db, String(r.category)),
+      material_count: s.active,
+      variants,
+      governs_nothing: false,   // it has raw_materials rows; see the flag's doc
+      arrivals_90d: arrivals.get(key) || 0,
+      // REACHABLE IF **ANY** SPELLING IS REACHABLE — asked of every spelling on
+      // the shelf, not of one representative.
+      //
+      // centralFlowBlock matches with catNorm(), which is SQL LOWER()-shaped and
+      // therefore ASCII-only, while catKeyOf() is JS toLowerCase() and is not:
+      // catNorm('CAFÉ') = 'cafÉ' but catKeyOf('CAFÉ') = 'café'. The two agree on
+      // all 29 live categories and on every ASCII name, so nothing differs today
+      // — but they are NOT byte-equivalent, and an earlier comment here claimed
+      // they were, which is exactly the sort of reassurance that stops the next
+      // reader checking. Where they disagree, one spelling of a merged shelf can
+      // answer "blocked" while another answers "reachable".
+      //
+      // So the fold errs toward VISIBILITY. A shelf wrongly marked unreachable
+      // is dropped from the pinned undecided list and folded into the collapsed
+      // liquor bucket — an undecided perishable vanishing from the one screen
+      // built to show it, which is precisely how POULTRY was lost. A shelf
+      // wrongly marked reachable costs an admin one row to read and dismiss.
+      // The cheap error is the visible one.
+      central_reachable: (variants.length > 0 ? variants : [{ category: display, material_count: 0 }])
+        .some(v => !centralFlowBlock(db, v.category)),
       updated_by: m?.updated_by || '',
       updated_at: m?.updated_at || '',
-      sample_materials: samples,
+      sample_materials: s.samples,
     });
   }
   // Mapped keys with no live materials — kept visible so a rule the admin set
-  // does not vanish from the screen the moment the last material is retired.
+  // does not vanish from the screen the moment the last material is retired,
+  // and MARKED, so the seeded spellings production never used (Veg, Non-Veg,
+  // Frozen-Cheese) read as "this rule governs nothing" instead of as a shelf
+  // that mysteriously holds 0 items.
   for (const [key, m] of map) {
-    if (seen.has(key)) continue;
+    if (shelves.has(key)) continue;
+    const display = (m.category && catKeyOf(m.category) === key) ? m.category : key;
     rows.push({
-      category: m.category || key,
+      category: display,
       category_key: key,
       checker: m.checker,
       assigned: true,
       material_count: 0,
-      central_reachable: !centralFlowBlock(db, m.category || key),
+      variants: [],
+      governs_nothing: true,
+      arrivals_90d: arrivals.get(key) || 0,
+      central_reachable: !centralFlowBlock(db, display),
       updated_by: m.updated_by,
       updated_at: m.updated_at,
       sample_materials: [],
     });
   }
-  rows.sort((a, b) => b.material_count - a.material_count || a.category.localeCompare(b.category));
+  // UNDECIDED AND REACHABLE FIRST, RANKED BY ARRIVALS — the shelves that have
+  // actually turned up at the bay with no rule on them, loudest first. The
+  // store-mapped (TGBCL) exclusion is kept: a checker on a liquor category can
+  // never fire (centralFlowBlock refuses it on every receiving path), so pinning
+  // one to the top would send an admin hunting a problem that cannot exist.
+  //
+  // THE TIE-BREAK IS LOAD-BEARING, NOT COSMETIC. On a database where nothing has
+  // arrived yet, arrivals is 0 for every shelf and the ranking degenerates —
+  // material_count then name keeps the order stable and deterministic, and a
+  // ZERO-ARRIVAL UNDECIDED SHELF IS STILL LISTED. Hiding those is precisely how
+  // POULTRY disappeared the first time.
+  const pinned = (r: CategoryCheckerRow) => (!r.assigned && r.central_reachable ? 0 : 1);
+  rows.sort((a, b) =>
+    pinned(a) - pinned(b)
+    || (pinned(a) === 0 ? b.arrivals_90d - a.arrivals_90d : 0)
+    || b.material_count - a.material_count
+    || a.category.localeCompare(b.category));
   return rows;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE ADVISORY — "nobody has ever ruled on this category", said at the bay
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface QcUndecidedAdvisory {
+  /** Display categories on THIS receipt with no explicit row in the map. */
+  categories: string[];
+  /** Their normalised keys, in the same order — what an admin would set. */
+  keys: string[];
+  /** Human sentence for the receiving route's response. '' when there are none. */
+  message: string;
+}
+
+/**
+ * WHICH CATEGORIES ON THIS RECEIPT HAS NOBODY EVER DECIDED?
+ *
+ * ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+ * 2026-08-22, GRN-2026-0018: SUGUNA FOODS, 90 kg CHICKEN LEG BONELESS and 30 kg
+ * WHOLE BIRD, received through the PO route and inwarded on the spot. THE GATE
+ * WAS NOT BROKEN — those materials are category POULTRY, POULTRY had no row in
+ * qc_category_checkers, and resolveQcRequirement correctly returned
+ * {required:false}. The defect was that this was INVISIBLE: a perishable shelf
+ * nobody had ruled on sailed through in silence and looked exactly like a
+ * working system. The owner: "I thought we made a foolproof Quality check
+ * process."
+ *
+ * ── UNDECIDED ONLY. THIS IS THE WHOLE DESIGN, NOT A DETAIL ─────────────────
+ * A category explicitly set to "No check" is A DECISION SOMEBODY MADE and this
+ * function is SILENT about it. Warning on every UNGATED category instead would
+ * mean warning on nearly every delivery — grocery is 286 materials and packaging
+ * 92, and grocery alone is on 26 of the 31 GRN lines in this database. A warning
+ * that fires on every bill is dismissed reflexively within a day, and the
+ * feature would then be worse than nothing: it would train the receiving desk to
+ * click past the one that matters. Rare is what makes it readable. DO NOT WIDEN
+ * THIS to "not gated" — the flag to key on is the ABSENCE OF A ROW, exactly the
+ * `assigned` flag the settings screen shows.
+ *
+ * ── ONE SOURCE OF TRUTH ────────────────────────────────────────────────────
+ * The map read and the category read are the SAME two statements
+ * resolveQcRequirement uses. This function CANNOT disagree with the gate about
+ * what a category is or which key it normalises to, because it does not have its
+ * own copy of either.
+ *
+ * ── AND IT CHANGES NOTHING ─────────────────────────────────────────────────
+ * It returns a sentence. It has no bearing on `required`, on the GRN status, on
+ * stock, or on anything either receiving route writes. A receipt that inwarded
+ * before this existed inwards identically now, and one that was held is held on
+ * exactly the same grounds.
+ *
+ * `materialIds` is the SAME list the caller hands resolveQcRequirement — the
+ * lines that will actually be inserted as positive receipts. Both receiving
+ * routes have already dropped store-mapped (TGBCL) lines from that list before
+ * the gate sees it (grn/route.ts:416, receive/route.ts:490), so there is no
+ * liquor to filter out here — and adding a second, weaker copy of that filter is
+ * exactly how the two would drift apart.
+ */
+export function undecidedQcCategories(
+  db: Database.Database,
+  materialIds: string[],
+  /** Is THIS receipt being held by the gate for some OTHER category?
+   *
+   *  ONE BILL CAN BE BOTH — held for VEGETABLES and carrying undecided POULTRY —
+   *  and the two states are OPPOSITE STATEMENTS ABOUT STOCK. Unconditionally,
+   *  `message` said the goods "were inwarded straight into stock without a
+   *  check" while the route had just set status `awaiting_qc`, quantity_accepted
+   *  0, and moved no stock at all. A shipped API field that contradicts the
+   *  receipt it describes is how a caller ends up telling a storekeeper his
+   *  goods are on the shelf when they are sitting at the bay — and the caller
+   *  cannot fix it, because it has no way to know the sentence is conditional.
+   *  Default false keeps the un-held wording for any caller that does not pass
+   *  it; both receiving routes pass qc.required. */
+  opts?: { held?: boolean },
+): QcUndecidedAdvisory {
+  const none: QcUndecidedAdvisory = { categories: [], keys: [], message: '' };
+  const ids = [...new Set(materialIds.map(m => String(m || '')).filter(Boolean))];
+  if (ids.length === 0) return none;
+
+  const { map, readable } = readCategoryCheckerMap(db);
+  // Un-migrated: the table is missing, so NOTHING is known and nothing is gated.
+  // qcSchemaHealth() already reports that in words on every QC surface; naming
+  // all 29 categories on top of it would bury the one message that matters.
+  if (!readable) return none;
+
+  let rows: any[] = [];
+  try {
+    rows = db.prepare(`
+      SELECT id, COALESCE(NULLIF(TRIM(category), ''), 'other') AS category
+        FROM raw_materials
+       WHERE id IN (${ids.map(() => '?').join(',')})
+    `).all(...ids) as any[];
+  } catch { return none; }
+
+  // Display spelling per undecided key — a Map so MEAT and Meat on one bill are
+  // named once, and the first spelling seen is the one shown.
+  const undecided = new Map<string, string>();
+  for (const r of rows) {
+    const key = catKeyOf(r.category);
+    if (map.has(key)) continue;                 // decided — including "No check"
+    if (!undecided.has(key)) undecided.set(key, String(r.category));
+  }
+  if (undecided.size === 0) return none;
+
+  const categories = [...undecided.values()].sort();
+  const keys = categories.map(c => catKeyOf(c));
+  const many = categories.length > 1;
+  // NAMED, BUT CAPPED. `categories` carries them all for a caller that can lay
+  // them out; the SENTENCE names three and counts the rest, because this string
+  // is rendered in a native alert() with no hierarchy — a table-present-but-empty
+  // map makes every category on the bill undecided and produced a 20-name,
+  // 494-character wall that nobody reads to the end. storePreRejectBlock already
+  // caps at 3 for the same reason; this now matches it.
+  const shown = categories.slice(0, 3);
+  const named = shown.join(', ') + (categories.length > shown.length ? ` and ${categories.length - shown.length} more` : '');
+  return {
+    categories,
+    keys,
+    message:
+      `No quality-check rule has ever been set for ${many ? 'these categories' : 'this category'}: ${named}. `
+      // See `opts.held`: on a bill the gate is holding, NOTHING has entered stock
+      // yet, and claiming it has would contradict the hold notice the same
+      // response carries.
+      + (opts?.held
+        ? `${many ? 'They are' : 'It is'} not what is holding this delivery — when the quality check above is signed off, ${many ? 'they go' : 'it goes'} into stock with everything else, unchecked. `
+        : `${many ? 'They were' : 'It was'} inwarded straight into stock without a check. `)
+      + `That is not because anyone decided ${many ? 'they need' : 'it needs'} none, but because nobody has ruled on ${many ? 'them' : 'it'} yet. `
+      + `If ${many ? 'these are perishable' : 'this is perishable'}, an admin should set the checker on Settings → Quality Check Categories.`,
+  };
 }
 
 /** Admin write. Upserts only the keys sent, so a partial save never clears the

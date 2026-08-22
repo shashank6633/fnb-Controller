@@ -1442,6 +1442,69 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           'quality check. The PO is recorded; the goods are not ours until it is signed off.'
         );
       }
+      /* ── THE SILENT CASE, MADE AUDIBLE ────────────────────────────────────
+         GRN-2026-0018 came in through THIS route: SUGUNA FOODS, 90 kg chicken
+         leg boneless and 30 kg whole bird, inwarded instantly. The gate was not
+         broken — POULTRY simply had no row in the map, so it answered "not
+         required" exactly as designed. What was broken is that this screen then
+         said nothing at all, and a perishable category nobody had ruled on
+         looked identical to a working quality-check process.
+
+         It rides in `notes` rather than in an alert() of its own, and that is
+         deliberate on both counts. It is NOT a thing to do while the driver is
+         standing there — the stock is in, the receipt is complete, there is
+         nothing to hold the truck for — so it must not jump ahead of the
+         qc_required alert above, which is. But it also must never be swallowed:
+         seeding `notes` makes the `else if (notes.length > 0)` branch fire, so
+         the "clean receive stays silent" path below is structurally unreachable
+         on a receipt like this one. That silence is the whole defect.
+
+         Undecided ONLY — the server keys this on a category having NO rule at
+         all, never on "not gated". A category an admin has set to No check is a
+         DECISION and says nothing here; widening it would mean a note on nearly
+         every bill (grocery is on most of them), and a note on every bill is one
+         the desk stops reading inside a week. */
+      const undecidedCats: string[] = Array.isArray(j.qc_undecided_categories) ? j.qc_undecided_categories : [];
+      if (undecidedCats.length > 0) {
+        const many = undecidedCats.length > 1;
+        /* CAPPED, like the server's own sentence. This lands in a native
+           alert() with no layout: on a map that is present but empty every
+           category on the bill is undecided, and the un-capped join produced a
+           twenty-name wall that is read as far as the first comma. Three names
+           and a count is a thing you finish reading. */
+        const shownCats = undecidedCats.slice(0, 3);
+        const catList = shownCats.join(', ')
+          + (undecidedCats.length > shownCats.length ? ` and ${undecidedCats.length - shownCats.length} more` : '');
+        /* TONE. This is a NOTE ON A COMPLETED RECEIPT, and the wording has to
+           match that or it gets read as a failure the receiver caused. It used
+           to open in capitals — "NO QUALITY CHECK WAS MADE on grocery." — with
+           the reassurance 250 characters later, inside a native alert() that has
+           no hierarchy to carry the difference. On a routine dry-goods bill that
+           reads as an alarm about nothing, and an alarm about nothing on most
+           bills is what teaches a desk to dismiss the one that matters. The
+           other receiving screen (grn/page.tsx) already gets this right —
+           success stated first, advisory second, a question-mark shield rather
+           than a warning triangle — and the two screens should not disagree
+           about how serious the same fact is. State the fact, then the stake. */
+        notes.push(
+          `${many ? 'These categories were' : 'This category was'} received with no quality check: ${catList}. ` +
+          `Nobody has ever set a rule for ${many ? 'them' : 'it'}, ` +
+          // ONE BILL CAN BE BOTH, and the two cases are opposite statements about
+          // stock. On a receipt held for some OTHER category nothing has entered
+          // stock at all yet — saying "went straight into stock" there would
+          // contradict the alert this desk read thirty seconds ago and make both
+          // messages untrustworthy. The undecided lines ride in with the rest the
+          // moment the check above is signed, which is the true sentence.
+          (j.qc_required
+            ? `and ${many ? 'they are' : 'it is'} NOT what is holding this delivery. When the quality check above is signed off, `
+              + `${many ? 'they go' : 'it goes'} into stock with everything else, unchecked. `
+            : `so the goods went straight into stock unchecked. `) +
+          `That is NOT the same as "no check needed" — nobody has decided either way. ` +
+          `Nothing is wrong with this receipt and nothing needs re-entering. ` +
+          `If ${many ? 'these are perishable' : 'this is perishable'} (meat, poultry, seafood, dairy), ask an admin to set the checker at ` +
+          'Settings → Quality Check Categories — it applies from the very next delivery.'
+        );
+      }
       if (deviating.length > 0) {
         // Counted from what we SENT rather than a response field, so this stays
         // true whatever the route names its counters. Short qty and rate changes
