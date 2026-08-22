@@ -5,7 +5,7 @@
  * Listing + drill-down detail. GRNs are auto-created on PO receive.
  */
 
-import { useEffect, useMemo, useState, Fragment, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, Fragment, type ReactNode, type WheelEvent as ReactWheelEvent } from 'react';
 import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save, Download, Percent,
          Eye, Pencil, Printer, AlertTriangle, ChefHat, Wine, Clock, ShieldAlert, Info,
          CheckCircle2, ShieldQuestion } from 'lucide-react';
@@ -492,7 +492,12 @@ export default function GrnPage() {
       {/* Mounted at PAGE level, not inside the row: the row lives in a table with
           `overflow-x-auto` on its wrapper, and a fixed overlay rendered inside a
           scroll container is clipped by it on some browsers. */}
-      {editing && canAmend === true && <EditBillModal g={editing} onClose={() => setEditing(null)}
+      {/* MOUNTED ON canAmend (store manager / manager / admin) — the bar for the
+          PAPERWORK half, unchanged. `isAdmin` rides in as a separate, narrower
+          answer: it gates the LINE editor inside the modal, because PATCH
+          /api/grn/[id] is requireRole('admin'). Narrowing the mount instead
+          would take the bill-level edit away from the store manager. */}
+      {editing && canAmend === true && <EditBillModal g={editing} isAdmin={isAdmin} onClose={() => setEditing(null)}
                                  onSaved={() => { setEditing(null); afterWrite(); }} />}
       {voiding && isAdmin === true && (
         <VoidBillModal g={voiding} onClose={() => setVoiding(null)}
@@ -684,9 +689,19 @@ function GrnActions({ g, isAdmin, canAmend, expanded, onToggle, onEdit, onVoid, 
   // bill number on the purchase ledger, so it is the store manager, a manager or
   // an admin. `canAmend === true` and nothing looser — null (list not loaded, or
   // the load failed) hides it exactly like false.
+  //
+  // THE TOOLTIP USED TO STATE THE OLD LIMITATION AS FACT ("quantities and rates
+  // are not amendable"). That was true at the first delivery and is not any
+  // more: an admin corrects a quantity, a rate or a whole line inside this same
+  // modal, with the stock and price effect unwound and reapplied. It still reads
+  // the old way for everyone else, because for them it is still true — PATCH is
+  // admin-only and the line section is hidden. `isAdmin === true` and nothing
+  // looser, so an unanswered load promises the narrower thing.
   if (!isVoid && canAmend === true) acts.push({
     key: 'edit', label: 'Edit',
-    title: 'Amend the bill details (invoice no., invoice date, vendor, QC, notes). Quantities and rates are not amendable — the amendment is recorded.',
+    title: isAdmin === true
+      ? 'Amend the bill details (invoice no., invoice date, vendor, QC, notes) and correct its line items — quantity, rate or remove a line. A correction to a received bill unwinds and reapplies its stock and cost rows; the amendment is recorded.'
+      : 'Amend the bill details (invoice no., invoice date, vendor, QC, notes). Quantities and rates are corrected by an admin — the amendment is recorded.',
     icon: <Pencil className={sz} />, onClick: onEdit,
   });
   acts.push({
@@ -2885,7 +2900,775 @@ const billFormFrom = (row: any): BillForm => ({
   qc_invoice_match: !!Number(row?.qc_invoice_match),
 });
 
-function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; onSaved: () => void }) {
+/* ══════════════════════════════════════════════════════════════════════════ */
+/* THE LINE EDITOR — the quantities, the rates, and removing a line.          */
+/*                                                                            */
+/* WHY IT IS A SECTION OF THE BILL FORM AND NOT ITS OWN SCREEN.               */
+/* The owner asked for one thing — "Edit bill" — and the first delivery gave  */
+/* him a form that amended only the paperwork. "Edit bill doesn't have option */
+/* to edit the qty or item or price right? … I have asked to edit those       */
+/* options" is the correction. So it lives inside the same modal, under the   */
+/* paperwork, with its own consequence stated before the press.               */
+/*                                                                            */
+/* WHO. PATCH /api/grn/[id] is requireRole('admin') — a strictly higher bar   */
+/* than the PUT above it (store manager / manager / admin) and the SAME bar   */
+/* as the void, because it reaches as far as a void does: it unwinds stock,   */
+/* deletes and rewrites cost rows and drags average_price through every       */
+/* sub-recipe and recipe. A store manager legitimately opens this form today  */
+/* and must KEEP the paperwork fields — so the gate is nested INSIDE the      */
+/* modal rather than on it, and it fails closed on an unknown answer.         */
+/*                                                                            */
+/* THE THREE STATES, WHICH ARE THE WHOLE RISK OF THIS FEATURE:                */
+/*   awaiting_qc (HELD) — no stock has moved. The lines are rewritten in      */
+/*     place and applied for the first time at sign-off. The ACCEPTED figure  */
+/*     is not offered at all: it stays 0 until the checking department signs, */
+/*     and the server refuses any other value (held_accepted).                */
+/*   received / partial (INWARDED) — stock and money HAVE moved. A save       */
+/*     UNWINDS what this bill applied and REAPPLIES the corrected figures in  */
+/*     one transaction.                                                       */
+/*   void — no line editing at all; the server returns `voided`.              */
+/* ══════════════════════════════════════════════════════════════════════════ */
+
+/** SQLite REALs round-tripped through JSON never compare with `===`. This is
+ *  the SAME tolerance grn-reversal.ts's optimistic lock uses (QTY_EPS), so this
+ *  form and the server can never disagree about which lines actually moved. */
+const LINE_EPS = 1e-6;
+const nearQty = (a: number, b: number) => Math.abs(Number(a) - Number(b)) <= LINE_EPS;
+
+/**
+ * THE HEADLINE FOR A REFUSAL — a caption, never a replacement.
+ *
+ * Every refusal this route raises already carries a full sentence naming the
+ * material, the figures and the remedy, and VoidBillModal states the house rule
+ * about them: print the server's words VERBATIM, because "a branch would be a
+ * second, drifting copy of it". That rule holds here and the sentence is always
+ * printed below. What a caption adds is the one thing a paragraph cannot: which
+ * of some forty refusals this is, readable at a glance, so an admin knows
+ * immediately whether they hit a wall that clears (reload, count first, cancel
+ * the return) or one that never will (voided, a PO line's removal).
+ *
+ * An unknown code falls back to a neutral heading — a code this map has not
+ * caught up with must never suppress the sentence underneath it.
+ */
+const REFUSAL_TITLE: Record<string, string> = {
+  // route.ts's pre-transaction validators.
+  bad_number:              'That is not a number',
+  duplicate_line:          'The same line was sent twice',
+  empty_line_change:       'That line carries no change',
+  expect_required:         'This form lost track of what it was showing',
+  line_id_required:        'A line arrived without its identifier',
+  material_change:         'A line’s item cannot be swapped',
+  no_lines:                'No line changes were sent',
+  not_found:               'This bill no longer exists',
+  reason_required:         'A reason is required',
+  server_error:            'The correction did not run',
+  voided:                  'This bill is voided',
+  would_go_negative:       'This correction would drive stock below zero',
+  wrong_outlet:            'This bill belongs to another outlet',
+  // The gate itself.
+  unauthenticated:         'You are not signed in',
+  forbidden:               'Line corrections are admin-only',
+  // amendGrnLines — the refusals an admin meets in ordinary use.
+  grn_changed:             'The bill changed while this form was open',
+  line_changed:            'A line changed while this form was open',
+  line_not_found:          'That line is no longer on this bill',
+  po_line_removal:         'A purchase-order line cannot be removed',
+  last_line:               'That would leave the bill with no lines at all',
+  held_accepted:           'The accepted quantity is not the desk’s to set yet',
+  held_negative:           'A held delivery cannot record a negative arrival',
+  zero_rate:               'A rate of ₹0 cannot be recorded',
+  negative_rate:           'A negative rate cannot be recorded',
+  accepted_over_received:  'Accepted is more than what arrived',
+  pack_factor_drift:       'The pack size has changed since this receipt',
+  returned_settled:        'Part of this line has already gone back to the vendor',
+  returned_open:           'An open vendor return is anchored to this line',
+  return_anchor:           'A vendor return is anchored to this line',
+  cutover_absorbed:        'This bill predates the central-store cutover',
+  count_absorbed:          'A physical count has already absorbed this line',
+  store_mapped:            'This material is tracked on the store’s own rail',
+  cost_row_unexpected:     'The bill and the ledger disagree',
+  cost_row_unidentifiable: 'The cost row behind this line cannot be identified',
+  movement_unidentifiable: 'The stock movement behind this line cannot be identified',
+  material_missing:        'The material behind a line no longer exists',
+  returns_unreadable:      'The returns ledger could not be read',
+  audit_write_failed:      'The audit trail could not be written',
+  audit_unreadable:        'The audit trail could not be read',
+  audit_unverifiable:      'The audit trail could not be verified',
+  refused:                 'The correction was refused',
+  // NOT a server code — this form's OWN pre-checks, which mirror the refusals
+  // above so a bad box is answered on the field rather than by a 400 that
+  // discards the corrections on every other line in the same request.
+  local_precheck:          'Fix the flagged line(s) before saving',
+};
+/** Reload-and-retry is the honest answer to exactly two refusals: both mean
+ *  somebody else moved this bill under the form, and both say "nothing was
+ *  changed". Everything else is read, not retried. */
+const RELOADABLE = new Set(['grn_changed', 'line_changed', 'line_not_found', 'expect_required']);
+
+/** One line as this form holds it. STRINGS, so a decimal stays typeable and a
+ *  CLEARED box can mean "left alone" rather than the number zero — emptying the
+ *  received box must never silently record a zero-quantity receipt. */
+interface LineDraft { received: string; accepted: string; price: string; remove: boolean }
+const draftFromItem = (it: any): LineDraft => ({
+  received: String(it?.quantity_received ?? ''),
+  accepted: String(it?.quantity_accepted ?? ''),
+  price:    String(it?.unit_price ?? ''),
+  remove: false,
+});
+/** '' = untouched (send nothing at all for this field). Anything else must
+ *  parse, and a box that does not is caught HERE rather than at the server's
+ *  `bad_number` — one bad character would otherwise refuse the whole request,
+ *  including the corrections on every other line. */
+const parseBox = (s: string): { blank: boolean; ok: boolean; n: number } => {
+  const t = String(s ?? '').trim();
+  if (t === '') return { blank: true, ok: true, n: NaN };
+  const n = Number(t);
+  return { blank: false, ok: Number.isFinite(n), n };
+};
+
+/**
+ * A GRN LINE CARRIES TAX TWO DIFFERENT WAYS AND THEY BEHAVE DIFFERENTLY UNDER A
+ * CORRECTION — which is why the screen has to say which one this line is.
+ *
+ * `gst_rate`/`cess_rate` > 0 → the rupees are RE-DERIVED from the rate against
+ * the corrected goods value (grn-reversal.ts deriveLineTax, the same arithmetic
+ * both receiving routes use). Recoverable: correct the line back and the tax
+ * comes back with it.
+ *
+ * `gst_rate` 0 with rupees typed in by hand — the ad-hoc form's "Manual" tax
+ * option, and per the server's own note "every GRN line in this database today
+ * is of the hand-typed kind" — has no rate to recompute from, so the recorded
+ * rupees are RESCALED by the ratio the goods value moved by. And that is ONE
+ * WAY at the bottom: take the goods value to 0 and the rupees go to ₹0 with
+ * nothing left to scale back up. The server says so, but only AFTER the commit.
+ * An input credit that quietly went to zero is the kind of error an auditor
+ * finds, so it is said BEFORE the press as well.
+ */
+const lineTaxOf = (it: any) => {
+  const gstRate = Number(it?.gst_rate) || 0;
+  const cessRate = Number(it?.cess_rate) || 0;
+  const recorded = (Number(it?.cgst) || 0) + (Number(it?.sgst) || 0) + (Number(it?.compensation_cess) || 0);
+  return {
+    recorded,
+    byRate: gstRate > 0 || cessRate > 0,
+    manual: gstRate <= 0 && cessRate <= 0 && recorded > 0,
+  };
+};
+
+interface LineWork {
+  changed: boolean;
+  /** Has the admin ENGAGED this line at all — moved a box, typed something that
+   *  will not parse, or marked it for removal?
+   *
+   *  The pre-checks below run on the line's NEXT values, and an untouched box
+   *  falls back to the STORED one — so a line the admin never looked at, whose
+   *  stored figures happen to break a rule (a ₹0 rate on accepted goods is
+   *  creatable through POST /api/grn, which has no zero-rate guard), would flag
+   *  itself and disable Save for the whole bill. That line is never in the
+   *  payload and the server would never have objected to it. Errors are
+   *  therefore reported only for lines that are actually going somewhere. */
+  engaged: boolean;
+  /** This form's own pre-checks, in its own words. They MIRROR the server's
+   *  refusals rather than replace them — the point is an instant answer on the
+   *  field being typed, not a second authority. */
+  errors: string[];
+  base: { qr: number; qa: number; up: number; rej: number };
+  next: { qr: number; qa: number; up: number; rej: number };
+  /** Purchase-unit change to the ACCEPTED figure — the only quantity that feeds
+   *  current_stock and inventory_transactions. 0 on a held receipt, where
+   *  nothing has moved and nothing will until sign-off. */
+  acceptedDelta: number;
+  /** ₹ THE PURCHASE LEDGER MOVES BY — ACCEPTED × rate.
+   *
+   *  This is the money figure, and it is not the document's. `purchases` (the
+   *  cost row every spend report, the weighted average and the purchase log
+   *  read) is written `quantity = nextAccepted, total_price = accepted × rate`
+   *  and is DELETED outright when accepted reaches 0 — grn-reversal.ts's apply
+   *  block. Computing the screen's ₹ on RECEIVED instead was wrong in both
+   *  directions at once: correcting accepted 5 → 3 moved ₹2,400 out of the spend
+   *  ledger and printed no money figure at all, while correcting a mistyped
+   *  received 5 → 7 printed "bill value rises by ₹2,400" for money that never
+   *  moves. */
+  ledgerDelta: number;
+  /** ₹ the PRINTED DOCUMENT's subtotal moves by — RECEIVED × rate, which is what
+   *  /api/grn computes for `subtotal` and what /grn/print shows. Real, and a
+   *  different number from the one above whenever received ≠ accepted, so it is
+   *  reported as its own line rather than conflated with the ledger. */
+  docDelta: number;
+  /** How this correction rewrites the VENDOR-FACING rejected quantity and the
+   *  sentence beside it, or null when it leaves both alone. grn-reversal.ts
+   *  mints `quantity_rejected = received − accepted` and stamps
+   *  `rejection_reason = "Recorded by bill amendment: <your reason>"` over the
+   *  checker's own words — and /grn/print/[id] and /receiving-variance both read
+   *  them. An admin correcting a mistyped received quantity is publishing a
+   *  rejection the vendor is answerable to; they have to be told. */
+  rejection: null | { qty: number; wasQty: number; wasReason: string; minted: boolean; reasonReplaced: boolean; cleared: boolean };
+  /** What happens to this line's recorded CGST/SGST/cess. See lineTaxOf. */
+  tax: null | { mode: 'rate' | 'rescaled' | 'zeroed' | 'removed'; recorded: number };
+  /** The wire line, or null when this line is untouched. Untouched lines are
+   *  NEVER sent: the server refuses a line carrying no change
+   *  (`empty_line_change`) and it is right to — a caller that believes it
+   *  changed something is worse off than one that got a 400. */
+  send: any | null;
+}
+
+/**
+ * WHAT THIS DRAFT WOULD SEND, WHAT IT WOULD MOVE, AND WHAT IS WRONG WITH IT —
+ * one derivation, used by the row that renders it AND by the payload builder, so
+ * the effect an admin is shown and the effect that is sent can never drift.
+ */
+function deriveLine(it: any, d: LineDraft, held: boolean): LineWork {
+  const base = {
+    qr: Number(it?.quantity_received) || 0,
+    qa: Number(it?.quantity_accepted) || 0,
+    up: Number(it?.unit_price) || 0,
+    rej: Number(it?.quantity_rejected) || 0,
+  };
+  const wasReason = String(it?.rejection_reason || '').trim();
+  const t = lineTaxOf(it);
+  // THE OPTIMISTIC LOCK, and it is MANDATORY per line: the three values this
+  // form was showing, re-asserted under the server's write lock. Without them a
+  // double submit or a replayed request would apply the same correction twice.
+  const expect = { quantity_received: base.qr, quantity_accepted: base.qa, unit_price: base.up };
+  const errors: string[] = [];
+
+  if (d.remove) {
+    return {
+      changed: true, engaged: true, errors, base,
+      next: { qr: 0, qa: 0, up: base.up, rej: 0 },
+      // A removal takes back everything this line had accepted. On a held
+      // receipt nothing was ever credited, so it takes back nothing.
+      acceptedDelta: held ? 0 : -base.qa,
+      // The cost row goes with the line; the document loses its whole subtotal.
+      ledgerDelta: held ? 0 : -(base.qa * base.up),
+      docDelta: -(base.qr * base.up),
+      // A rejected quantity recorded on this line leaves the receiving-variance
+      // register with it — the vendor stops being answerable for it, silently.
+      rejection: base.rej > LINE_EPS
+        ? { qty: 0, wasQty: base.rej, wasReason, minted: false, reasonReplaced: false, cleared: true }
+        : null,
+      tax: t.recorded > 0 ? { mode: 'removed', recorded: t.recorded } : null,
+      send: { id: String(it?.id ?? ''), remove: true, expect },
+    };
+  }
+
+  const R = parseBox(d.received), A = parseBox(d.accepted), P = parseBox(d.price);
+  if (!R.ok) errors.push('the received quantity is not a number');
+  if (!held && !A.ok) errors.push('the accepted quantity is not a number');
+  if (!P.ok) errors.push('the rate is not a number');
+
+  const nextQr = R.blank || !R.ok ? base.qr : R.n;
+  const nextQa = held ? base.qa : (A.blank || !A.ok ? base.qa : A.n);
+  const nextUp = P.blank || !P.ok ? base.up : P.n;
+
+  const send: any = { id: String(it?.id ?? ''), expect };
+  let changed = false;
+  if (R.ok && !R.blank && !nearQty(R.n, base.qr)) { send.quantity_received = R.n; changed = true; }
+  // NEVER ON A HELD RECEIPT. The accepted figure is the checking department's to
+  // record at sign-off and the server refuses any non-zero value from here
+  // (held_accepted). The field is not rendered either — this is the second half
+  // of the same rule, so a draft left over from before a sign-off can never leak
+  // one into the payload.
+  if (!held && A.ok && !A.blank && !nearQty(A.n, base.qa)) { send.quantity_accepted = A.n; changed = true; }
+  if (P.ok && !P.blank && !nearQty(P.n, base.up)) { send.unit_price = P.n; changed = true; }
+
+  // ── THE PRE-CHECKS, EACH MIRRORING ONE SERVER REFUSAL ───────────────────
+  if (nextUp < 0) errors.push('a negative rate cannot be recorded — it would cascade a nonsense cost into every recipe using this material');
+  if (held) {
+    if (nextQr < 0) errors.push('a held delivery records what ARRIVED, so its received quantity cannot be negative');
+    // ₹0 is refused on a held line too: the sign-off replays this stored row, so
+    // the zero rate becomes a ₹0 cost row and a wiped average_price then.
+    if (nextQr > LINE_EPS && nextUp <= 0) errors.push('a rate of ₹0 would wipe this material’s weighted average when the delivery is signed off');
+  } else {
+    // Accepted vs received, in BOTH directions — the same invariant the server
+    // states: accepted may never exceed what arrived, and on a back-correction
+    // (a negative receipt) the two figures move in lockstep.
+    const over = nextQr >= 0
+      ? (nextQa > nextQr + LINE_EPS || nextQa < -LINE_EPS)
+      : (nextQa > LINE_EPS || nextQa < nextQr - LINE_EPS);
+    if (over) {
+      errors.push(nextQr >= 0
+        ? `accepted (${fmtQtyNum(nextQa)}) must be between 0 and what arrived (${fmtQtyNum(nextQr)})`
+        : `this line records a back-correction of ${fmtQtyNum(nextQr)}, so its accepted quantity must be between ${fmtQtyNum(nextQr)} and 0`);
+    }
+    if (nextQa > LINE_EPS && nextUp <= 0) errors.push('a rate of ₹0 cannot be recorded against accepted goods — it wipes this material’s weighted average and cascades a free ingredient through every recipe');
+  }
+
+  // ── WHAT ELSE THIS CORRECTION REWRITES, mirrored from the server's apply
+  //    block so it can be said BEFORE the press rather than discovered after.
+
+  // THE VENDOR-FACING REJECTION. grn-reversal.ts:
+  //   nextRejected = (received < 0 || accepted < 0) ? 0 : max(0, received − accepted)
+  // and on a HELD line it writes quantity_rejected = 0, rejection_reason = ''
+  // unconditionally (the checker has not been near it yet).
+  const nextRej = held ? 0 : ((nextQr < 0 || nextQa < 0) ? 0 : Math.max(0, nextQr - nextQa));
+  // The server keeps the checker's own sentence ONLY when the rejected quantity
+  // is unchanged AND a sentence already exists; otherwise the amendment reason
+  // is stamped over it, on a document the vendor answers to.
+  const rejKept = nextRej > LINE_EPS && !!wasReason && nearQty(nextRej, base.rej);
+  // The reason moves on its own account too: stamped over when the quantity no
+  // longer matches the sentence, and BLANKED whenever nothing is left rejected
+  // — including on a held line, where the server clears both unconditionally.
+  const rejReasonMoves = (nextRej > LINE_EPS && !rejKept) || (nextRej <= LINE_EPS && !!wasReason);
+  const rejection = (!nearQty(nextRej, base.rej) || rejReasonMoves)
+    ? {
+        qty: nextRej, wasQty: base.rej, wasReason,
+        minted: nextRej > LINE_EPS && base.rej <= LINE_EPS,
+        reasonReplaced: nextRej > LINE_EPS && !rejKept,
+        cleared: nextRej <= LINE_EPS && (base.rej > LINE_EPS || !!wasReason),
+      }
+    : null;
+
+  // THE TAX. It follows the goods, and it only moves when the goods value does:
+  // deriveLineTax is fed the ACCEPTED figure on an inwarded line and the
+  // RECEIVED figure on a held one (the checker has set no accepted figure yet).
+  const taxQtyNow = held ? base.qr : base.qa;
+  const taxQtyNext = held ? nextQr : nextQa;
+  const taxMoves = !nearQty(taxQtyNext, taxQtyNow) || !nearQty(nextUp, base.up);
+  let tax: LineWork['tax'] = null;
+  if (taxMoves && t.byRate) {
+    tax = { mode: 'rate', recorded: t.recorded };
+  } else if (taxMoves && t.manual) {
+    // The server's own fallback ladder: scale by the accepted base, or by the
+    // received base when nothing was ever accepted, and only when THAT is zero
+    // too are the typed rupees left verbatim (nothing to scale by, so no claim).
+    const oldBase = (taxQtyNow > 0 ? taxQtyNow * base.up : 0) || (base.qr > 0 ? base.qr * base.up : 0);
+    const newBase = taxQtyNext > 0 ? taxQtyNext * nextUp : 0;
+    if (oldBase > 0) tax = { mode: newBase > 0 ? 'rescaled' : 'zeroed', recorded: t.recorded };
+  }
+
+  // A line the admin has not engaged carries no complaint — see LineWork.engaged.
+  const engaged = changed
+    || (!R.blank && !R.ok)
+    || (!held && !A.blank && !A.ok)
+    || (!P.blank && !P.ok);
+
+  return {
+    changed, engaged, errors: engaged ? errors : [], base,
+    next: { qr: nextQr, qa: nextQa, up: nextUp, rej: nextRej },
+    acceptedDelta: held ? 0 : nextQa - base.qa,
+    // ACCEPTED × rate — the cost row. Zero on a held receipt: nothing is booked
+    // until the checking department signs, and these figures are what it books.
+    ledgerDelta: held ? 0 : (nextQa * nextUp) - (base.qa * base.up),
+    docDelta: (nextQr * nextUp) - (base.qr * base.up),
+    rejection: changed ? rejection : null,
+    tax: changed ? tax : null,
+    send: changed ? send : null,
+  };
+}
+
+/** The pack rule for one bill line, read off the row the server already sends
+ *  (rm.pack_size / rm.unit / rm.purchase_unit ride on every GRN item). */
+const lineUnitsOf = (it: any) => {
+  const factor = packFactor({ pack_size: it?.pack_size, unit: it?.material_unit, purchase_unit: it?.purchase_unit } as any);
+  return {
+    factor,
+    pu: String(it?.purchase_unit || it?.material_unit || ''),
+    ru: String(it?.material_unit || ''),
+  };
+};
+
+/**
+ * ONE LINE OF THE BILL, EDITABLE.
+ *
+ * PURCHASE UNITS LEAD, as everywhere else on this page: goods_receipt_note_items
+ * stores quantities and unit_price in the PURCHASE basis already (that is what
+ * the detail table above prints under "Purchase Unit" and "Rate"), so the boxes
+ * are the admin's own basis with no conversion — and the recipe figure rides
+ * underneath as a declared hint, because that is the number current_stock
+ * actually moves by.
+ *
+ * THE ORIGINAL SITS BESIDE EVERY BOX. This is a CORRECTION, and the previous
+ * figure is the thing being corrected: an admin who cannot see what a line said
+ * before cannot tell whether they are fixing it or re-typing it.
+ */
+function LineDraftRow({ it, draft, work, held, removeBlocked, onChange }: {
+  it: any; draft: LineDraft; work: LineWork; held: boolean;
+  /** Why Remove is not offered on this line, or null when it is. */
+  removeBlocked: string | null;
+  onChange: (p: Partial<LineDraft>) => void;
+}) {
+  const { factor, pu, ru } = lineUnitsOf(it);
+  const box = 'w-full px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0] font-mono text-right disabled:bg-[#F3EEE7] disabled:text-[#B8A590]';
+  /** A wheel over a FOCUSED `type="number"` field nudges its value. These three
+   *  boxes decide a stock movement and a cost row, and the panel they sit in
+   *  scrolls — so a scroll aimed at the page silently re-typed a quantity.
+   *  Blurring first turns the gesture back into a scroll. */
+  const noWheel = (e: ReactWheelEvent<HTMLInputElement>) => e.currentTarget.blur();
+  const hint = (v: number) => (factor > 1
+    ? <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(v * factor)} {ru}</div>
+    : null);
+  /** "was 4 kg", plus the recipe hint under it. Muted while the box still
+   *  agrees with it; amber the moment it does not. */
+  const wasNote = (orig: number, moved: boolean) => (
+    <div className={`text-[10px] ${moved ? 'text-amber-700' : 'text-[#B8A590]'}`}>
+      was {fmtQtyNum(orig)} {pu}
+      {factor > 1 && <span className="text-[#B8A590]"> (= {fmtQtyNum(orig * factor)} {ru})</span>}
+    </div>
+  );
+  const removed = draft.remove;
+
+  return (
+    <div className={`border rounded-lg p-2.5 ${removed ? 'border-red-200 bg-red-50/50' : work.changed ? 'border-[#af4408] bg-[#FFF1E3]/50' : 'border-[#E8D5C4] bg-white'}`}>
+      <div className="flex items-start justify-between gap-2 mb-2">
+        <div className="min-w-0">
+          <div className={`font-semibold text-[#2D1B0E] text-[11px] ${removed ? 'line-through' : ''}`}>{it.material_name}</div>
+          <div className="text-[10px] text-[#8B7355]">
+            {it.material_category || 'Uncategorised'} · priced per {pu || 'unit'}
+            {it.po_item_id ? ' · on the purchase order' : ''}
+          </div>
+          {/* WHAT IS ALREADY RECORDED AGAINST THE VENDOR ON THIS LINE. It has
+              no box because it is not typed — the server derives it as
+              received − accepted — but a correction REWRITES it and stamps the
+              amendment reason over the checker's own words, and an admin who
+              cannot see it cannot see what they are about to overwrite. */}
+          {(Number(it.quantity_rejected) || 0) > LINE_EPS && (
+            <div className="text-[10px] text-[#8B7355]">
+              Recorded as rejected: <b className="text-[#6B5744]">{fmtQtyNum(Number(it.quantity_rejected) || 0)} {pu}</b>
+              {String(it.rejection_reason || '').trim()
+                ? <> — “{String(it.rejection_reason).trim()}”</>
+                : <> — no reason recorded</>}
+              <span className="text-[#B8A590]"> (on the vendor’s receiving-variance report)</span>
+            </div>
+          )}
+        </div>
+        {removeBlocked ? (
+          <span title={removeBlocked}
+                className="shrink-0 px-2 py-1 rounded border border-[#E8D5C4] bg-[#F3EEE7] text-[#B8A590] text-[10px] flex items-center gap-1 cursor-not-allowed">
+            <Trash2 className="w-3 h-3" /> Remove
+          </span>
+        ) : removed ? (
+          <button type="button" onClick={() => onChange({ remove: false })}
+                  title="Keep this line on the bill after all"
+                  className="shrink-0 px-2 py-1 rounded border border-[#E8D5C4] bg-white text-[#6B5744] text-[10px] flex items-center gap-1 hover:text-[#af4408] hover:border-[#af4408]">
+            <X className="w-3 h-3" /> Undo removal
+          </button>
+        ) : (
+          <button type="button" onClick={() => onChange({ remove: true })}
+                  title="Take this line off the bill entirely"
+                  className="shrink-0 px-2 py-1 rounded border border-red-200 bg-white text-red-600 text-[10px] flex items-center gap-1 hover:bg-red-50">
+            <Trash2 className="w-3 h-3" /> Remove
+          </button>
+        )}
+      </div>
+
+      {/* Literal class names on BOTH branches — Tailwind scans source text, so
+          an interpolated `sm:grid-cols-${n}` compiles to nothing at all. */}
+      <div className={`grid grid-cols-1 gap-2 ${held ? 'sm:grid-cols-2' : 'sm:grid-cols-3'}`}>
+        <label className="flex flex-col gap-1 text-[10px] text-[#6B5744]">
+          Received ({pu || 'unit'})
+          <input type="number" inputMode="decimal" step="any" value={draft.received} disabled={removed}
+                 onChange={e => onChange({ received: e.target.value })} onWheel={noWheel} className={box} />
+          {wasNote(work.base.qr, !nearQty(work.next.qr, work.base.qr))}
+          {!removed && hint(work.next.qr)}
+        </label>
+
+        {/* HELD RECEIPTS HAVE NO ACCEPTED BOX. It is not the receiving desk's
+            figure until the checking department signs, and the server refuses
+            any non-zero value from here — a field that 400s every time is worse
+            than no field. Said in words, not hidden silently. */}
+        {/* The quick-set sits BESIDE the field, not inside its <label> — a
+            button nested in a label competes with the label for the click. It
+            is the server's own named alternative to removing a PO line, so it
+            has to be one press, not a typed zero. */}
+        {!held && (
+          <div className="flex flex-col gap-1 text-[10px] text-[#6B5744]">
+            <label className="flex flex-col gap-1">
+              Accepted ({pu || 'unit'})
+              <input type="number" inputMode="decimal" step="any" value={draft.accepted} disabled={removed}
+                     onChange={e => onChange({ accepted: e.target.value })} onWheel={noWheel} className={box} />
+            </label>
+            {wasNote(work.base.qa, !nearQty(work.next.qa, work.base.qa))}
+            {!removed && hint(work.next.qa)}
+            {!removed && (
+              <button type="button" onClick={() => onChange({ accepted: '0' })}
+                      title={"Reject the whole line: reverses its stock and DELETES its cost row, while the line stays on the bill — and, on a PO receipt, keeps the order's line claimed."
+                             + " It also records the whole received quantity as rejected against the vendor, and takes this line's tax down with the value"
+                             + " — to ₹0 and un-recoverably, if that tax was typed in rupees rather than as a rate."}
+                      className="self-start text-[10px] text-[#8B7355] underline hover:text-[#af4408]">
+                set to 0
+              </button>
+            )}
+          </div>
+        )}
+
+        <label className="flex flex-col gap-1 text-[10px] text-[#6B5744]">
+          Rate (₹ per {pu || 'unit'})
+          <input type="number" inputMode="decimal" step="any" value={draft.price} disabled={removed}
+                 onChange={e => onChange({ price: e.target.value })} onWheel={noWheel} className={box} />
+          <div className={`text-[10px] ${!nearQty(work.next.up, work.base.up) ? 'text-amber-700' : 'text-[#B8A590]'}`}>
+            was {m2(work.base.up)} per {pu || 'unit'}
+          </div>
+        </label>
+      </div>
+
+      {/* Blank means UNTOUCHED, and that has to be said where it is typed —
+          an empty box that quietly means "keep 4" is the shape a correction
+          silently fails in. */}
+      {!removed && (draft.received.trim() === '' || draft.price.trim() === '' || (!held && draft.accepted.trim() === '')) && (
+        <div className="mt-1.5 text-[10px] text-[#8B7355]">
+          A blank box is left exactly as it is — clearing one does not record a zero.
+        </div>
+      )}
+
+      {work.errors.length > 0 && (
+        <div className="mt-1.5 text-[10px] text-red-700 space-y-0.5">
+          {work.errors.map((e, i) => (
+            <div key={i} className="flex items-start gap-1"><AlertTriangle className="w-3 h-3 shrink-0 mt-px" /><span>{it.material_name}: {e}.</span></div>
+          ))}
+        </div>
+      )}
+
+      {/* THE NET EFFECT OF THIS LINE, before the press — and it is FOUR
+          effects, not one. A correction moves stock, it moves the cost row, it
+          rewrites the vendor-facing rejected quantity, and it re-derives or
+          rescales the tax. Naming only the first was how a ₹0 input credit and
+          a minted vendor rejection both shipped unannounced. */}
+      {work.changed && work.errors.length === 0 && (
+        <div className="mt-1.5 text-[10px] text-[#6B5744] border-t border-[#E8D5C4] pt-1.5 space-y-0.5">
+          <div>
+            {removed
+              ? <>This line comes off the bill. </>
+              : <>Corrected to {fmtQtyNum(work.next.qr)} {pu} received{!held && <> · {fmtQtyNum(work.next.qa)} {pu} accepted</>} · {m2(work.next.up)} per {pu}. </>}
+            {held ? (
+              <span className="text-[#8B7355]">Nothing has entered stock yet, so nothing moves — these figures are applied at sign-off.</span>
+            ) : Math.abs(work.acceptedDelta) > LINE_EPS ? (
+              <span className={work.acceptedDelta < 0 ? 'text-red-700' : 'text-emerald-700'}>
+                Central stock {work.acceptedDelta < 0 ? 'falls by' : 'rises by'} {fmtQtyNum(Math.abs(work.acceptedDelta))} {pu}
+                {factor > 1 && <span className="text-[#B8A590]"> (= {fmtQtyNum(Math.abs(work.acceptedDelta) * factor)} {ru})</span>}.
+              </span>
+            ) : (
+              <span className="text-[#8B7355]">
+                {removed
+                  ? 'No stock moves — this line had nothing accepted, so it never added any.'
+                  : 'No stock moves — the accepted quantity is unchanged.'}
+              </span>
+            )}
+          </div>
+
+          {/* THE MONEY, ON THE BASIS THE LEDGER IS ACTUALLY ON. The cost row is
+              ACCEPTED × rate; the printed document's subtotal is RECEIVED ×
+              rate. They are different numbers the moment the two quantities
+              differ, so they are two sentences, never one. */}
+          <div>
+            {held ? (
+              <span className="text-[#8B7355]">
+                No cost row exists yet — {m2(Math.abs(work.next.qr * work.next.up))} is what this line will book when the check is signed.
+              </span>
+            ) : Math.abs(work.ledgerDelta) > 0.005 ? (
+              <span>
+                Purchase cost recorded for this line{' '}
+                <b className={work.ledgerDelta < 0 ? 'text-red-700' : 'text-emerald-700'}>
+                  {work.ledgerDelta < 0 ? 'falls' : 'rises'} by {m2(Math.abs(work.ledgerDelta))}
+                </b>{' '}
+                <span className="text-[#8B7355]">(accepted × rate — before the vendor’s discount and the recorded charges)</span>.
+              </span>
+            ) : (
+              <span className="text-[#8B7355]">No purchase cost moves — the accepted quantity and the rate together come to the same figure.</span>
+            )}
+            {/* The document's own subtotal, and ONLY where it is a different
+                answer from the ledger's — including the common case where it is
+                a different answer by being unchanged. "Rises by ₹0.00" is not a
+                sentence anyone should have to read. */}
+            {Math.abs(work.docDelta - (held ? 0 : work.ledgerDelta)) > 0.005 && (
+              Math.abs(work.docDelta) > 0.005 ? (
+                <span className="text-[#8B7355]">
+                  {' '}The printed bill’s subtotal (received × rate) {work.docDelta < 0 ? 'falls' : 'rises'} by {m2(Math.abs(work.docDelta))}
+                  {!held && ' — a different figure, because the ledger follows what was ACCEPTED, not what arrived'}.
+                </span>
+              ) : (
+                <span className="text-[#8B7355]">
+                  {' '}The printed bill’s subtotal is unchanged — what ARRIVED did not move, only what was accepted.
+                </span>
+              )
+            )}
+          </div>
+
+          {/* THE VENDOR-FACING REJECTION, which nothing on this screen used to
+              mention even while the correction was minting one. */}
+          {work.rejection && (
+            <div className="text-amber-800">
+              {work.rejection.cleared ? (
+                <>The <b>{fmtQtyNum(work.rejection.wasQty)} {pu} recorded as rejected</b>
+                  {work.rejection.wasReason ? <> (“{work.rejection.wasReason}”)</> : null}
+                  {removed
+                    ? <> leaves the receiving-variance register with this line — the vendor is no longer answerable for it.</>
+                    : <> is cleared: nothing on this line is rejected any more, and its reason is removed from the vendor’s receiving-variance report.</>}
+                </>
+              ) : (
+                <>
+                  This records <b>{fmtQtyNum(work.rejection.qty)} {pu} as rejected</b> against the vendor
+                  {work.rejection.minted ? ' (nothing was rejected on this line before)' : <> (was {fmtQtyNum(work.rejection.wasQty)} {pu})</>}
+                  {work.rejection.reasonReplaced && (
+                    <> — and <b>your reason below becomes the rejection reason</b> printed on this bill and grouped on the receiving-variance report
+                      {work.rejection.wasReason ? <>, replacing “{work.rejection.wasReason}”</> : null}.</>
+                  )}
+                  {!work.rejection.reasonReplaced && '.'}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* THE TAX. Named before the press because one of its outcomes cannot
+              be undone by correcting the line back. */}
+          {work.tax && (
+            <div className={work.tax.mode === 'zeroed' ? 'text-red-700' : 'text-[#8B7355]'}>
+              {work.tax.mode === 'rate' && <>The line’s tax ({m2(work.tax.recorded)} recorded) is re-derived from its GST/cess rate against the corrected value.</>}
+              {work.tax.mode === 'rescaled' && <>The line’s tax was typed in rupees, not as a rate, so the {m2(work.tax.recorded)} recorded is <b>rescaled in proportion</b> to the goods value — check it against the vendor’s bill before claiming the credit.</>}
+              {work.tax.mode === 'zeroed' && <><b>The {m2(work.tax.recorded)} of tax typed on this line goes to ₹0</b>, and re-booking the line later cannot bring it back — there is no rate to recompute from. Re-record the receipt if that input credit is still claimable.</>}
+              {work.tax.mode === 'removed' && <>The {m2(work.tax.recorded)} of tax recorded on this line leaves the bill with it.</>}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * WHAT THE CORRECTION ACTUALLY DID — the phase after the commit.
+ *
+ * Modelled on the void's result phase, and for the same reason: past the commit
+ * the server can only TELL, and two of the things it tells matter enough that an
+ * admin must read them rather than have them flashed away by a reload —
+ *   · a material with no purchases left keeps this bill's price in its weighted
+ *     average, and nothing anywhere stores the pre-receipt figure to restore;
+ *   · valuations already taken at the old average are historical and were not
+ *     rewritten, so a closing-stock or variance figure from last week still
+ *     reflects the pre-correction cost.
+ * Nothing here may present as a failure: the correction is recorded.
+ */
+function LineResultPanel({ result, items, warnings, metaSaved, onDone }: {
+  result: any; items: any[]; warnings: string[]; metaSaved: boolean; onDone: () => void;
+}) {
+  const changes: any[] = Array.isArray(result?.changes) ? result.changes : [];
+  const stale: any[] = Array.isArray(result?.average_price_stale) ? result.average_price_stale : [];
+  /** THE OTHER PRICE FIELD, AND IT HAD NO SURFACE AT ALL. amendGrnLines fills
+   *  `last_purchase_stale` whenever a line is removed or zeroed and no purchase
+   *  row survives to re-derive last_purchase_price from — so the column still
+   *  carries the rate of the bill just corrected away. It is not the weighted
+   *  average: it is the field that seeds the next PO's rate and is read on the
+   *  requisition and unit-audit screens. The route's own `notice` names
+   *  last_purchase_kept and average_price_stale and never this one, so if this
+   *  panel does not say it, nothing does. */
+  const lppStale: any[] = Array.isArray(result?.last_purchase_stale) ? result.last_purchase_stale : [];
+  const held = String(result?.state) === 'held';
+  const unitsFor = (materialId: string) =>
+    lineUnitsOf(items.find((x: any) => String(x.material_id) === String(materialId)) || {});
+
+  return (
+    <div className="space-y-3">
+      <div className={`rounded-lg border p-3 ${held ? 'border-blue-200 bg-blue-50/50 text-blue-900' : 'border-emerald-200 bg-emerald-50 text-emerald-900'}`}>
+        <div className="font-semibold flex items-center gap-1.5">
+          <CheckCircle2 className="w-4 h-4" /> Correction applied to {result?.grn_number || 'this bill'}
+        </div>
+        <div className="mt-1 text-[11px]">
+          {held
+            ? 'This receipt is still waiting for its quality check, so it had never moved stock — only the bill lines were corrected. The corrected quantities and rates will be applied when the checking department signs it off.'
+            : 'The stock, the cost rows and the stock movements were corrected together in one transaction.'}
+        </div>
+        {metaSaved && <div className="mt-1 text-[11px]">The bill's paperwork was saved too.</div>}
+      </div>
+
+      {changes.length > 0 && (
+        <div className="border border-[#E8D5C4] rounded-lg overflow-x-auto">
+          <table className="w-full text-[10px]">
+            <thead className="bg-[#FFF1E3] text-[#6B5744]">
+              <tr>
+                <th className="text-left  py-1.5 px-2 font-medium">Material</th>
+                <th className="text-left  py-1.5 px-2 font-medium">What happened</th>
+                <th className="text-right py-1.5 px-2 font-medium">Received</th>
+                <th className="text-right py-1.5 px-2 font-medium">Accepted</th>
+                <th className="text-right py-1.5 px-2 font-medium">Rate</th>
+                <th className="text-right py-1.5 px-2 font-medium">Stock moved</th>
+              </tr>
+            </thead>
+            <tbody>
+              {changes.map((c: any, i: number) => {
+                const { factor, pu, ru } = unitsFor(c.material_id);
+                const deltaRecipe = Number(c.stock_delta_recipe) || 0;
+                const deltaPu = factor > 0 ? deltaRecipe / factor : deltaRecipe;
+                const pair = (before: any, after: any, money?: boolean) => (
+                  <td className="py-1.5 px-2 text-right font-mono text-[#2D1B0E]">
+                    {money ? m2(before) : <>{fmtQtyNum(Number(before) || 0)} {pu}</>}
+                    <div className="text-[10px] text-[#af4408]">
+                      → {c.after ? (money ? m2(after) : <>{fmtQtyNum(Number(after) || 0)} {pu}</>) : '—'}
+                    </div>
+                  </td>
+                );
+                return (
+                  <tr key={i} className="border-t border-[#E8D5C4]/60">
+                    <td className="py-1.5 px-2 text-[#2D1B0E]">{c.material_name}</td>
+                    <td className="py-1.5 px-2 text-[#6B5744]">
+                      {c.action === 'removed' ? 'Line removed' : 'Line corrected'}
+                      {c.cost_row && c.cost_row !== 'none' && <div className="text-[10px] text-[#8B7355]">cost row {c.cost_row}</div>}
+                    </td>
+                    {pair(c.before?.quantity_received, c.after?.quantity_received)}
+                    {pair(c.before?.quantity_accepted, c.after?.quantity_accepted)}
+                    {pair(c.before?.unit_price, c.after?.unit_price, true)}
+                    <td className={`py-1.5 px-2 text-right font-mono ${Math.abs(deltaRecipe) < 1e-9 ? 'text-[#B8A590]' : deltaRecipe < 0 ? 'text-red-700' : 'text-emerald-700'}`}>
+                      {Math.abs(deltaRecipe) < 1e-9 ? '—' : <>
+                        {deltaRecipe < 0 ? '−' : '+'}{fmtQtyNum(Math.abs(deltaPu))} {pu}
+                        {factor > 1 && <div className="text-[9px] font-normal text-[#B8A590]">= {fmtQtyNum(Math.abs(deltaRecipe))} {ru}</div>}
+                      </>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {stale.length > 0 && (
+        <div className="text-amber-900 bg-amber-50 border border-amber-300 rounded p-2 text-[11px]">
+          <div className="font-semibold flex items-center gap-1.5"><AlertTriangle className="w-4 h-4" /> A weighted average still carries this bill's price</div>
+          <div className="mt-1">
+            <b>{stale.map((s: any) => s.material_name).join(', ')}</b> {stale.length === 1 ? 'has' : 'have'} no purchase rows left after this correction,
+            so the average price could not be re-derived and still carries the figure this bill set. Nothing stores the pre-receipt average —
+            correct it by hand, or let the next real purchase of the material set it.
+          </div>
+        </div>
+      )}
+
+      {lppStale.length > 0 && (
+        <div className="text-amber-900 bg-amber-50 border border-amber-300 rounded p-2 text-[11px]">
+          <div className="font-semibold flex items-center gap-1.5"><AlertTriangle className="w-4 h-4" /> A last-purchase rate still points at the corrected-away line</div>
+          <div className="mt-1">
+            <b>{lppStale.map((s: any) => s.material_name).join(', ')}</b> {lppStale.length === 1 ? 'has' : 'have'} no purchase row left to re-derive
+            a last-purchase rate from, so <b>last purchase price</b> still carries the rate this bill recorded. That field seeds the next purchase
+            order's rate and is read on the requisition and unit-audit screens — set it from the material master, or let the next real purchase set it.
+          </div>
+        </div>
+      )}
+
+      {warnings.length > 0 && (
+        <div className="text-amber-900 bg-amber-50 border border-amber-300 rounded p-2 space-y-1 text-[11px]">
+          <div className="font-semibold flex items-center gap-1.5"><AlertTriangle className="w-4 h-4" /> Applied, with a caveat</div>
+          {warnings.map((w, i) => <div key={i}>{w}</div>)}
+        </div>
+      )}
+
+      {result?.notice && (
+        <div className="text-[10px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">{result.notice}</div>
+      )}
+
+      <div className="flex justify-end pt-1">
+        <button onClick={onDone}
+                className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">
+          Done
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function EditBillModal({ g, isAdmin, onClose, onSaved }: {
+  g: GRN;
+  /** From the list payload, three-state and advisory. See canEditLines below. */
+  isAdmin: boolean | null;
+  onClose: () => void; onSaved: () => void;
+}) {
   const isPoGrn = !!g.po_id;
   /** The bill AS THE SERVER HAS IT, re-read when this modal opens rather than
    *  taken from the list row. Two reasons: the list row is a snapshot that may
@@ -2900,9 +3683,42 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
   const [loadErr, setLoadErr] = useState('');
   const [reason, setReason] = useState('');
   const [err, setErr] = useState('');
+  /** The refusal's machine-readable code and its payload, held ALONGSIDE the
+   *  sentence rather than instead of it. They decide two things only: the
+   *  caption above the sentence, and whether an ACTION is offered (reload the
+   *  bill; the per-material figures behind would_go_negative). */
+  const [errCode, setErrCode] = useState('');
+  const [errPayload, setErrPayload] = useState<any>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [vendors, setVendors] = useState<any[]>([]);
+  /** Is the CALLER an admin, as the request that produced these lines answered
+   *  it? Second half of the line-edit gate — see canEditLines. */
+  const [detailIsAdmin, setDetailIsAdmin] = useState<boolean | null>(null);
+  /** Per-line drafts, keyed by goods_receipt_note_items.id. A line with no entry
+   *  here has not been touched: the row seeds itself from the server figures on
+   *  render, so a reload wipes every draft by clearing this one object. */
+  const [drafts, setDrafts] = useState<Record<string, LineDraft>>({});
+  /** Bumped by "Reload the bill" — re-reads the header, the lines and the
+   *  baseline the optimistic lock is built from. */
+  const [reloadTick, setReloadTick] = useState(0);
+  /** The committed result of a line correction. Its own phase, like the void's:
+   *  the server comes back saying which materials moved, which weighted averages
+   *  it could NOT re-derive and what was not rewritten, and that has to be read
+   *  rather than flashed away by a reload. */
+  const [lineResult, setLineResult] = useState<any>(null);
+  /** True once the PAPERWORK half has committed in this submit. It is what makes
+   *  a refusal of the line half honest: "the details were saved, the quantities
+   *  were not" is a different sentence from "nothing was saved". */
+  const [metaSaved, setMetaSaved] = useState(false);
+  /** THE ONE THING THIS FORM CANNOT KNOW. A refusal carries a code and a
+   *  sentence, so "nothing was changed" is a fact the server stated. A THROWN
+   *  request — a dropped connection, a suspended tab, a proxy timeout on the
+   *  slow post-commit recipe cascade — is not: the PATCH may have reached the
+   *  server and committed. Asserting non-execution there is the one over-claim
+   *  this feature's own doctrine forbids, so the uncertainty is carried and
+   *  said out loud instead. */
+  const [patchUncertain, setPatchUncertain] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -2914,10 +3730,30 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
         const f = billFormFrom(d.grn);
         setRow(d.grn);
         setLoaded(f); setForm(f);
+        // Fails closed on anything but a literal true, exactly like the page's
+        // own isAdmin and the Delete control.
+        setDetailIsAdmin(d.is_admin === true);
+        // Every draft is dropped on a re-read: they are keyed to figures that
+        // have just been replaced, and re-offering them would let an admin
+        // re-send a correction against a baseline that no longer exists.
+        setDrafts({});
       })
       .catch(e => { if (alive) setLoadErr(e?.message || 'Could not load this bill.'); });
     return () => { alive = false; };
-  }, [g.id]);
+  }, [g.id, reloadTick]);
+
+  /** Re-read the bill. The honest answer to the two concurrency refusals, and it
+   *  DISCARDS unsaved edits on purpose — those refusals both say "nothing was
+   *  changed", so what is on screen is a correction against a baseline that has
+   *  moved, and re-sending it is the one thing that must not happen. */
+  const reloadBill = () => {
+    setErr(''); setErrCode(''); setErrPayload(null); setWarnings([]);
+    // `metaSaved` is scoped to ONE submit. Left standing across a reload, a
+    // refusal on a later save still read "the paperwork was saved before this
+    // refusal" — a true fact in the wrong tense, about a save two attempts ago.
+    setMetaSaved(false); setPatchUncertain(false);
+    setReloadTick(t => t + 1);
+  };
 
   // Only an ad-hoc GRN's vendor is editable, so only it needs the picker.
   useEffect(() => {
@@ -2967,39 +3803,254 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
   }, [form, loaded, isPoGrn, row]);
   const dirty = !!patch && Object.keys(patch).length > 0;
 
+  /* ── THE LINE HALF ──────────────────────────────────────────────────────── */
+
+  const items: any[] = useMemo(() => (Array.isArray(row?.items) ? row.items : []), [row]);
+  /** The bill's state AS THIS FORM READ IT — the three-way branch and, below,
+   *  the two pins sent with the correction. Read off the DETAIL, never the list
+   *  row: the one thing that moves under an open panel is exactly this, a QC
+   *  sign-off landing while the modal is open. */
+  const statusNow = String(row?.status || '');
+  const heldNow = statusNow === 'awaiting_qc';
+  const voidNow = statusNow === 'void';
+  /**
+   * MAY THIS USER CORRECT LINES? BOTH ANSWERS MUST SAY YES, and either being
+   * unknown means no.
+   *
+   * PATCH is requireRole('admin'); PUT is the wider (store manager | manager |
+   * admin) that opened this modal. So `canAmend` — the flag that reveals the
+   * pencil — is the WRONG flag for this section: a store manager legitimately
+   * gets here and must see the paperwork fields and not the line editor.
+   * `isAdmin` from the list payload and `is_admin` from the detail read are two
+   * independent answers to the same question; requiring both is what makes a
+   * half-finished load hide the editor rather than offer an action the server
+   * will refuse. Advisory either way — the server re-derives the bar.
+   */
+  const canEditLines = isAdmin === true && detailIsAdmin === true && !voidNow;
+  const setDraft = (id: string, p: Partial<LineDraft>, it: any) =>
+    setDrafts(d => ({ ...d, [id]: { ...(d[id] ?? draftFromItem(it)), ...p } }));
+
+  /** Every line, with what it would send and what it would move. Recomputed from
+   *  the server rows on every keystroke, so nothing is cached that could outlive
+   *  a reload. */
+  const lineWork = useMemo(
+    () => items.map(it => {
+      const d = drafts[String(it.id)] ?? draftFromItem(it);
+      return { it, d, w: deriveLine(it, d, heldNow) };
+    }),
+    [items, drafts, heldNow],
+  );
+  const changedLines = lineWork.filter(x => x.w.changed);
+  const lineDirty = canEditLines && changedLines.length > 0;
+  const lineErrors = lineWork.flatMap(x => x.w.errors.map(e => `${x.it.material_name}: ${e}.`));
+  const removingCount = lineWork.filter(x => x.d.remove).length;
+  /** Pre-empts the server's `last_line`: a bill with nothing on it is not an
+   *  amendment, it is a void, and saying so here beats a 400 that arrives after
+   *  the reason has been typed. */
+  const removingAll = removingCount > 0 && removingCount >= items.length;
+  /** Net stock effect of everything pending, per material, in PURCHASE units. */
+  const stockEffect = changedLines
+    .filter(x => Math.abs(x.w.acceptedDelta) > LINE_EPS)
+    .map(x => ({ it: x.it, delta: x.w.acceptedDelta }));
+  /** TWO MONEY FIGURES, BECAUSE THEY ARE TWO DIFFERENT THINGS. `ledgerEffect`
+   *  is what the `purchases` cost rows move by (accepted × rate) — the spend
+   *  ledger, the weighted average, the purchase log. `docEffect` is what the
+   *  printed bill's subtotal moves by (received × rate). Reporting only the
+   *  second, labelled "Bill value", announced money on a received-only fix that
+   *  never moves and stayed silent on an accepted fix that moves thousands. */
+  const ledgerEffect = changedLines.reduce((s, x) => s + x.w.ledgerDelta, 0);
+  const docEffect = changedLines.reduce((s, x) => s + x.w.docDelta, 0);
+  /** Does anything pending rewrite the vendor-facing rejected quantity or the
+   *  sentence beside it? Surfaced at bill level too: it is the one consequence
+   *  that leaves this system entirely — /grn/print and /receiving-variance both
+   *  read it, and the vendor answers for it. */
+  const rejectionEffect = changedLines.filter(x => !!x.w.rejection);
+  /** Any line whose hand-typed tax rupees go to ₹0 and cannot be re-derived. */
+  const taxZeroed = changedLines.filter(x => x.w.tax?.mode === 'zeroed');
+  /**
+   * WHY REMOVE IS WITHHELD, per line — pre-empting the refusal instead of
+   * letting the button 409. A PO-sourced receipt can never have a line removed
+   * (removing it un-claims the PO line, and six places derive "already received"
+   * from these rows without filtering), and the server's own named alternative
+   * is to set the accepted quantity to 0 — which this row offers beside the
+   * accepted box.
+   */
+  const removeBlockedFor = (it: any): string | null => {
+    if (isPoGrn) {
+      // AND THE ALTERNATIVE IS A DIFFERENT ONE ON A HELD RECEIPT. "Set the
+      // accepted quantity to 0" names a box that is deliberately not rendered
+      // while the bill waits for its check, and the server refuses any accepted
+      // figure from here (held_accepted) — so on a held PO receipt that sentence
+      // pointed at a control that does not exist and an action that 400s. What
+      // IS available there is the received quantity: nothing has booked yet, so
+      // correcting what arrived to 0 is the whole of the reversal.
+      if (heldNow) {
+        return `${it.material_name} was booked against ${g.po_number || 'a purchase order'}, and a PO line cannot be removed — it would un-claim the order's line and leave the order disagreeing with itself about what was delivered. This receipt has not entered stock yet, so correct what ARRIVED to 0 instead: the line stays on the bill, the order's line stays claimed, and nothing is booked when the check is signed.`;
+      }
+      return `${it.material_name} was booked against ${g.po_number || 'a purchase order'}, and a PO line cannot be removed — it would un-claim the order's line and leave the order disagreeing with itself about what was delivered. Set the accepted quantity to 0 instead: that reverses the stock and the cost row and keeps the PO line claimed (it is a one-way door — the goods would have to come in on a fresh PO or an ad-hoc GRN).`;
+    }
+    if (items.length <= 1) {
+      return `${it.material_name} is the only line on this bill, and removing it would leave the bill with nothing on it. That is a void, not an amendment — use Delete on the row instead.`;
+    }
+    return null;
+  };
+
   const submit = async () => {
-    if (!form || !patch || !dirty) return;
+    if (!form || !patch) return;
+    if (!dirty && !lineDirty) return;
     // Mirrors the server's own refusal rather than replacing it — the point is
     // an instant answer, not a second authority. The bill number is the only way
     // back to the vendor's paperwork months later, and the duplicate-bill guard
     // skips any row whose bill_no is blank, so clearing it does not merely lose
     // a reference: it switches that guard off for this bill's cost rows.
-    if ('invoice_number' in patch && !String(patch.invoice_number).trim()) {
+    if (dirty && 'invoice_number' in patch && !String(patch.invoice_number).trim()) {
       setErr('Vendor invoice / bill number is required — an amendment cannot remove the only link back to the vendor\'s paperwork.');
+      setErrCode(''); setErrPayload(null);
       return;
     }
-    setBusy(true); setErr(''); setWarnings([]);
+    // ── THE LINE HALF'S OWN PRE-CHECKS. Each mirrors a server refusal and each
+    //    is answered here because the server refuses the WHOLE request: one bad
+    //    box would otherwise throw away the corrections on every other line.
+    if (lineDirty) {
+      if (reason.trim().length < 3) {
+        setErr('A reason is required to correct a recorded bill — it is the only thing that will explain this change to whoever reads the ledger months from now.');
+        setErrCode('reason_required'); setErrPayload(null);
+        return;
+      }
+      if (lineErrors.length > 0) {
+        setErr(lineErrors.join(' '));
+        setErrCode('local_precheck'); setErrPayload(null);
+        return;
+      }
+      if (removingAll) {
+        setErr(`Removing ${removingCount === 1 ? 'that line' : 'those lines'} would leave ${g.grn_number} with no lines at all. A bill with nothing on it is not an amendment — delete the whole receipt instead, which reverses its stock and marks it void.`);
+        setErrCode('last_line'); setErrPayload(null);
+        return;
+      }
+    }
+    setBusy(true); setErr(''); setErrCode(''); setErrPayload(null); setWarnings([]); setPatchUncertain(false);
+    /* Hoisted OUT of the try so the catch can still reach them: a thrown
+       request must be able to say what had already committed (`collected`) and
+       whether the line half was in flight when the connection went
+       (`patchInFlight`). Both are the difference between an honest report and
+       an assertion this form cannot support. */
+    const collected: string[] = [];
+    let patchInFlight = false;
     try {
-      const res = await api(`/api/grn/${encodeURIComponent(g.id)}`, {
-        method: 'PUT',
-        // The reason is free text and rides into the audit note. It is not a
-        // field of the bill, so it is sent alongside the patch, never inside it.
-        body: { ...patch, ...(reason.trim() ? { edit_reason: reason.trim() } : {}) },
-      });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) { setErr(j?.error || `Amend failed (HTTP ${res.status})`); return; }
-      // A warning is not a failure: the amendment COMMITTED. Hold the modal open
-      // so the message is read rather than flashed away by a reload — the one
-      // that matters says the duplicate-bill guard is still blind for a legacy
-      // receipt's cost rows, which the user has to know to act on.
-      if (Array.isArray(j?.warnings) && j.warnings.length > 0) {
-        setWarnings(j.warnings);
-        setLoaded(form);          // saved — this is the new baseline, so Save greys out
+      /* ── ORDER MATTERS, AND SO DOES THE PIN BETWEEN THE TWO CALLS ─────────
+         The paperwork goes first because PUT ITSELF STAMPS AN AMENDMENT: it
+         bumps goods_receipt_notes.edit_count. So the expect_edit_count this
+         form read when it opened is stale the instant PUT succeeds, and the
+         PATCH behind it would be refused with `grn_changed` — by this very
+         form's own write. PUT returns the new count; it is carried across.
+         A refusal of the SECOND call after the FIRST committed is a real
+         outcome and is reported as one (see metaSaved) — never as "nothing
+         was saved", which would send an admin to re-type a change that is
+         already recorded. */
+      /* AND IT IS SENT UNCONDITIONALLY. Omitted, the server substitutes a −1
+         sentinel and the bill-level half of the replay guard is simply OFF —
+         a fail-OPEN on a concurrency pin, and one that is invisible from the
+         screen. The detail read hands an admin this column (stripEditStamps
+         only withholds it from non-admins, and canEditLines requires
+         `detailIsAdmin === true`), so the fallback is unreachable in practice;
+         it is 0 rather than "omit" so that if it ever IS reached the claim
+         mismatches and refuses, instead of quietly dropping the guard. */
+      let editCountForPatch: number =
+        Number.isFinite(Number(row?.edit_count)) ? Number(row?.edit_count) : 0;
+
+      if (dirty) {
+        const res = await api(`/api/grn/${encodeURIComponent(g.id)}`, {
+          method: 'PUT',
+          // The reason is free text and rides into the audit note. It is not a
+          // field of the bill, so it is sent alongside the patch, never inside it.
+          body: { ...patch, ...(reason.trim() ? { edit_reason: reason.trim() } : {}) },
+        });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setErr(j?.error || `Amend failed (HTTP ${res.status})`);
+          setErrCode(String(j?.code || '')); setErrPayload(j);
+          return;
+        }
+        setMetaSaved(true);
+        setLoaded(form);            // saved — this is the new baseline, so Save greys out
+        if (Number.isFinite(Number(j?.edit_count))) {
+          editCountForPatch = Number(j.edit_count);
+          /* AND IT GOES BACK INTO `row`, NOT JUST INTO THIS CLOSURE.
+             `row` is the only place the NEXT submit reads the count from, and
+             it was written once, by the load effect. So after PUT committed and
+             PATCH was refused for a real reason, correcting the figure and
+             pressing Save again skipped PUT (the form is no longer dirty) and
+             sent the count read at OPEN — one behind. The server answered
+             "it has been amended 1 time(s) — you were looking at 0", reporting a
+             phantom concurrent editor for this form's own earlier write, and the
+             only offered remedy (Reload) discards every line correction just
+             re-typed. Fails closed, so nothing corrupts; it just makes the
+             feature unusable at the exact moment it is needed twice. */
+          setRow((r: any) => (r ? { ...r, edit_count: Number(j.edit_count), edited_at: j?.edited_at ?? r.edited_at, edited_by: j?.edited_by ?? r.edited_by } : r));
+        }
+        if (Array.isArray(j?.warnings)) collected.push(...j.warnings);
+        // A warning is not a failure: the amendment COMMITTED. Hold the modal
+        // open so the message is read rather than flashed away by a reload —
+        // the one that matters says the duplicate-bill guard is still blind for
+        // a legacy receipt's cost rows, which the user has to know to act on.
+        if (!lineDirty) {
+          if (collected.length > 0) { setWarnings(collected); return; }
+          onSaved();
+          return;
+        }
+      }
+
+      if (lineDirty) {
+        patchInFlight = true;
+        const res = await api(`/api/grn/${encodeURIComponent(g.id)}`, {
+          method: 'PATCH',
+          body: {
+            lines: changedLines.map(x => x.w.send),
+            // BOTH PINS, from the read that produced the per-line `expect`
+            // triples above — they are one claim about one snapshot and must
+            // come from one read. expect_status is the load-bearing half: a QC
+            // sign-off landing in between moves this receipt from held (no
+            // stock effect) to inwarded (the full four writes), and running the
+            // wrong branch would double-apply or double-reverse stock.
+            expect_status: statusNow,
+            expect_edit_count: editCountForPatch,
+            reason: reason.trim(),
+          },
+        });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setErr(j?.error || `The line correction could not be applied (HTTP ${res.status})`);
+          setErrCode(String(j?.code || 'refused')); setErrPayload(j);
+          /* THE PAPERWORK HALF'S WARNINGS SURVIVE THE LINE HALF'S REFUSAL.
+             They were collected from a call that COMMITTED, and this branch used
+             to return without ever flushing them — `setWarnings([])` at the top
+             of submit had already cleared the state. PUT emits exactly two, and
+             the one that matters says this bill's cost rows have just stopped
+             matching the CSV importer's blank-bill wildcard, so re-uploading an
+             inward sheet against the old blank number "will add the stock a
+             second time". Fixing a bill number and fixing a quantity in one save
+             is precisely what correcting a mis-keyed receipt looks like, and
+             that warning is one-shot: it never reappears on reload. */
+          if (collected.length > 0) setWarnings(collected);
+          return;
+        }
+        if (Array.isArray(j?.warnings)) collected.push(...j.warnings);
+        setWarnings(collected);
+        // The correction has COMMITTED. Its result is its own phase — what
+        // moved, which weighted averages could not be re-derived, and what was
+        // deliberately not rewritten. Read, not dismissed.
+        setLineResult(j);
         return;
       }
       onSaved();
     } catch (e: any) {
       setErr(e?.message || 'Amend failed');
+      setErrCode(''); setErrPayload(null);
+      // The request never came back with an answer. Anything already committed
+      // still has to be reported, and the line half's outcome is genuinely
+      // unknown — see patchUncertain.
+      if (collected.length > 0) setWarnings(collected);
+      if (patchInFlight) setPatchUncertain(true);
     } finally { setBusy(false); }
   };
 
@@ -3008,13 +4059,22 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
       <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
-           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-2xl shadow-xl flex flex-col overflow-hidden">
+           className={`bg-white rounded-xl border border-[#E8D5C4] w-full ${canEditLines ? 'max-w-3xl' : 'max-w-2xl'} shadow-xl flex flex-col overflow-hidden`}>
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
           <div className="min-w-0">
             <h2 className="font-bold text-[#2D1B0E] truncate">Edit bill — {g.grn_number}</h2>
             <p className="text-[10px] text-[#8B7355]">The amendment is recorded: who, when and what changed.</p>
           </div>
-          <button onClick={onClose} aria-label="Close"><X className="w-5 h-5 text-[#8B7355]" /></button>
+          {/* CLOSING AFTER SOMETHING COMMITTED IS A SAVE, NOT A CANCEL.
+              onClose only drops the modal; onSaved also bumps the page's
+              dataVersion, which is what makes an already-expanded row throw away
+              its cached lines and re-read them. Take the X after a committed
+              correction and the panel underneath keeps showing the pre-correction
+              quantities — and an admin who thinks a correction did not apply
+              applies it again by hand. */}
+          <button onClick={() => ((lineResult || metaSaved) ? onSaved() : onClose())} aria-label="Close">
+            <X className="w-5 h-5 text-[#8B7355]" />
+          </button>
         </div>
 
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4 text-xs">
@@ -3022,30 +4082,221 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
             <div className="text-red-700 flex items-start gap-1.5"><AlertTriangle className="w-4 h-4 shrink-0" /> {loadErr}</div>
           ) : !form ? (
             <div className="text-[#8B7355]"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Loading the bill…</div>
+          ) : lineResult ? (
+            /* ── PHASE TWO: WHAT THE CORRECTION ACTUALLY DID. ────────────────
+               The same discipline as the void's result phase: the server comes
+               back saying which materials moved, which weighted averages it
+               could NOT re-derive and what was deliberately not rewritten, and
+               that is read, not dismissed by an alert(). The editor is gone
+               from this phase on purpose — its `expect` triples describe a bill
+               that no longer exists. */
+            <LineResultPanel result={lineResult} items={items} warnings={warnings} metaSaved={metaSaved} onDone={onSaved} />
           ) : (
             <>
-              {/* Said UP FRONT, where the reader looks for the fields that are
-                  missing — an amend form that silently lacks Date and Line Items
-                  reads as broken rather than as deliberate. */}
+              {/* Said UP FRONT, where the reader looks for what is missing — an
+                  amend form that silently lacks a field reads as broken rather
+                  than as deliberate. It now says three different things to three
+                  different readers, because the answer really is different:
+                  the line editor below is admin-only, and the receipt date is
+                  nobody's to amend on this form. */}
               <p className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
-                Only the bill's <b>paperwork</b> can be amended here — nothing below moves stock or money.
-                The <b>receipt date</b> and the <b>line items</b> are not amendable: they are the stock movement itself,
-                and they are the valuation date and quantities every cost row and recipe cost was built from.
-                To change either, delete this bill (which reverses its stock) and record it again.
+                {canEditLines ? (
+                  <>
+                    The bill's <b>paperwork</b> is amended here; its <b>line items</b> — quantities, rates and removals —
+                    are corrected in the section below, and that section moves stock and money.
+                    The <b>receipt date</b> is not amendable either way: it is the valuation date every cost row and
+                    recipe cost was built from. To change it, delete this bill (which reverses its stock) and record it again.
+                  </>
+                ) : (
+                  <>
+                    Only the bill's <b>paperwork</b> can be amended here — nothing below moves stock or money.
+                    The <b>receipt date</b> and the <b>line items</b> are not amendable from this form: the date is the
+                    valuation date every cost row was built from, and the quantities and rates are the stock movement itself.
+                    An <b>admin</b> can correct quantities, rates and lines on this same screen; the date needs the bill
+                    deleted (which reverses its stock) and recorded again.
+                  </>
+                )}
               </p>
 
+              {/* ── A REFUSAL, RENDERED WHOLE ────────────────────────────────
+                  Caption (which of ~40 refusals this is) → the server's own
+                  sentence VERBATIM (it names the material, the figures and the
+                  remedy; a re-worded copy would drift from it) → and, only
+                  where an ACTION beats re-reading, the action itself. */}
               {err && (
-                <div className="text-red-700 bg-red-50 border border-red-200 rounded p-2 flex items-start gap-1.5">
-                  <AlertTriangle className="w-4 h-4 shrink-0" /> <span>{err}</span>
+                <div className="text-red-700 bg-red-50 border border-red-200 rounded p-2 space-y-1.5">
+                  <div className="flex items-start gap-1.5">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <span>
+                      <b>{patchUncertain ? 'The correction did not come back with an answer' : (REFUSAL_TITLE[errCode] || 'This could not be saved')}</b>
+                      <span className="block mt-0.5">{err}</span>
+                    </span>
+                  </div>
+
+                  {/* THE PAPERWORK MAY ALREADY BE IN. Two calls, one button —
+                      an admin told "failed" about a change that committed will
+                      re-type it, which is exactly what the void learned not to
+                      allow. */}
+                  {/* AND ONLY WHERE THE SERVER SAID SO. A refusal carries a
+                      code and a sentence, so "nothing was changed" is the
+                      server's own statement. A THROWN request is not: it may
+                      have committed. Asserting non-execution there is the one
+                      claim this feature's own doctrine forbids, so the two
+                      cases get two different sentences. */}
+                  {metaSaved && !patchUncertain && (
+                    <div className="text-[10px] text-amber-900 bg-amber-50 border border-amber-300 rounded p-1.5">
+                      The bill's <b>paperwork</b> was saved before this refusal — only the line corrections were rejected,
+                      and no quantity, rate or line was changed. Do not re-enter the paperwork edit.
+                    </div>
+                  )}
+                  {patchUncertain && (
+                    <div className="text-[10px] text-amber-900 bg-amber-50 border border-amber-300 rounded p-1.5 space-y-1">
+                      <div>
+                        The request never came back, so <b>whether the line correction was applied is not something this form can tell.</b>{' '}
+                        It may have reached the server and committed.
+                        {metaSaved && <> The bill's <b>paperwork</b> did save — do not re-enter that half.</>}
+                      </div>
+                      <div>
+                        <b>Reload the bill and read the lines</b> before re-sending. If the correction did land, re-sending it is refused
+                        by the per-line lock rather than applied twice — but read first, so you are correcting from what is actually recorded.
+                      </div>
+                      <div className="pt-0.5">
+                        <button type="button" onClick={reloadBill}
+                                className="px-2 py-1 rounded bg-[#af4408] hover:bg-[#8a3506] text-white text-[11px]">
+                          Reload the bill
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── WHAT IS IN THE WAY, AS FIGURES ───────────────────────
+                      The sentence above already carries these numbers, in
+                      purchase units, correctly — the guard was rewritten to say
+                      them that way precisely because recipe grams matched
+                      nothing on this screen. What the paragraph cannot do is let
+                      an admin compare four quantities at a glance and reach the
+                      remedy in one press, and that is all this block adds: the
+                      same figures as columns, and a link to the screen the
+                      sentence names.
+
+                      THE FIGURES ARE THE SERVER'S OWN. `materials_detail`
+                      carries `*_purchase` alongside every recipe value, derived
+                      from the material row the guard actually read — dividing
+                      the recipe figure by a pack factor read here instead would
+                      print a different number from the bar that refused, on
+                      exactly the material whose pack size has drifted. The
+                      recipe figure rides underneath as the declared hint. */}
+                  {errCode === 'would_go_negative' && Array.isArray(errPayload?.materials_detail) && errPayload.materials_detail.length > 0 && (
+                    <div className="border border-red-200 rounded bg-white overflow-x-auto">
+                      <table className="w-full text-[10px]">
+                        <thead className="bg-red-50 text-red-900">
+                          <tr>
+                            <th className="text-left  py-1 px-2 font-medium">Material</th>
+                            <th className="text-right py-1 px-2 font-medium">On hand</th>
+                            <th className="text-right py-1 px-2 font-medium">This bill added</th>
+                            <th className="text-right py-1 px-2 font-medium">Comes back out</th>
+                            <th className="text-right py-1 px-2 font-medium">Short by</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {errPayload.materials_detail.map((m: any, i: number) => {
+                            // The refusal's own units, with this bill's line as
+                            // the fallback for a legacy payload that has none.
+                            //
+                            // AND THE TOP-LEVEL FIELDS DESCRIBE ONE MATERIAL,
+                            // NOT THE TABLE. The guard throws inside the
+                            // per-line loop, so `materials_detail` carries
+                            // exactly one row today and the payload's unit is
+                            // that row's. Widen the guard to collect several —
+                            // the void's copy already blocks multiple — and
+                            // every row after the first would print row one's
+                            // unit against its own figures. So the payload wins
+                            // only where it is unambiguous; past that, each row
+                            // is labelled from its own material.
+                            const local = lineUnitsOf(items.find((x: any) => String(x.material_id) === String(m.material_id)) || {});
+                            const single = errPayload.materials_detail.length === 1;
+                            const pu = String(m.purchase_unit || (single ? errPayload.purchase_unit : '') || local.pu || '');
+                            const ru = String(m.unit || (single ? errPayload.unit : '') || local.ru || '');
+                            const factor = Number(m.pack_factor) || (single ? Number(errPayload.pack_factor) : 0) || local.factor || 1;
+                            const cell = (purchaseQty: any, recipeQty: any, tone: string) => (
+                              <td className={`py-1 px-2 text-right font-mono ${tone}`}>
+                                {fmtQtyNum(Number(purchaseQty ?? (factor > 0 ? Number(recipeQty) / factor : recipeQty)) || 0)} {pu}
+                                {factor > 1 && <div className="text-[9px] font-normal text-[#B8A590]">= {fmtQtyNum(Number(recipeQty) || 0)} {ru}</div>}
+                              </td>
+                            );
+                            return (
+                              <tr key={i} className="border-t border-red-100">
+                                <td className="py-1 px-2 text-[#2D1B0E]">{m.material_name || m.material_id}</td>
+                                {cell(m.on_hand_purchase, m.on_hand, 'text-[#2D1B0E]')}
+                                {cell(m.recorded_in_purchase, m.recorded_in, 'text-[#2D1B0E]')}
+                                {cell(m.delta_purchase, m.delta, 'text-[#2D1B0E]')}
+                                {cell(m.short_by_purchase, m.short_by, 'text-red-700')}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                      <div className="px-2 py-1.5 text-[10px] text-[#6B5744] border-t border-red-100">
+                        A receipt cannot honestly move a balance this far — a physical count can.{' '}
+                        <a href={String(errPayload.remedy_path || '/closing-stock')} className="text-[#af4408] underline">Record a count</a>,
+                        approve it on Variance Approvals, then correct the bill.
+                      </div>
+                    </div>
+                  )}
+
+                  {/* The item on a line is never swappable, so this form does not
+                      offer a picker at all — the honest path is the one the
+                      server names, and it is one click away. */}
+                  {errCode === 'material_change' && (
+                    <div className="text-[10px] text-[#6B5744]">
+                      A different item is a different delivery. This form never offers to swap one, so the way through is to
+                      <b> remove the wrong line</b> here and record the right material on a fresh receipt.
+                    </div>
+                  )}
+
+                  {/* Removing a PO line is refused; the server names the
+                      alternative and the accepted box beside each line offers it. */}
+                  {errCode === 'po_line_removal' && (
+                    <div className="text-[10px] text-[#6B5744]">
+                      Use <b>set to 0</b> beside that line's <b>Accepted</b> box instead — it reverses the stock and the cost row
+                      while the purchase order's line stays claimed.
+                    </div>
+                  )}
+
+                  {/* THE ONLY REFUSALS WHOSE ANSWER IS AN ACTION RATHER THAN A
+                      READ: somebody else moved this bill under the form. Both
+                      say "nothing was changed", so this is reload-and-retry, not
+                      a failure the admin caused. */}
+                  {RELOADABLE.has(errCode) && (
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button type="button" onClick={reloadBill}
+                              className="px-2 py-1 rounded bg-[#af4408] hover:bg-[#8a3506] text-white text-[11px]">
+                        Reload the bill
+                      </button>
+                      <span className="text-[10px] text-[#6B5744]">
+                        Re-reads the bill as it stands now. Anything typed here and not yet saved is discarded — it was written against figures that have moved.
+                      </span>
+                    </div>
+                  )}
                 </div>
               )}
+              {/* WARNINGS BELONG TO WHAT COMMITTED, and something can have
+                  committed even when the box above says refused — the paperwork
+                  half goes first and stands. The heading says which half they
+                  are about, and "Got it" (which CLOSES the modal) is withheld
+                  while there is a refusal still to be read and acted on. */}
               {warnings.length > 0 && (
                 <div className="text-amber-900 bg-amber-50 border border-amber-300 rounded p-2 space-y-1">
-                  <div className="font-semibold flex items-center gap-1.5"><AlertTriangle className="w-4 h-4" /> Saved, with a caveat</div>
-                  {warnings.map((w, i) => <div key={i}>{w}</div>)}
-                  <div className="pt-1">
-                    <button onClick={onSaved} className="px-2 py-1 rounded bg-[#af4408] hover:bg-[#8a3506] text-white">Got it</button>
+                  <div className="font-semibold flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4" />
+                    {err ? "The paperwork half saved, and it carries a caveat" : 'Saved, with a caveat'}
                   </div>
+                  {warnings.map((w, i) => <div key={i}>{w}</div>)}
+                  {!err && (
+                    <div className="pt-1">
+                      <button onClick={onSaved} className="px-2 py-1 rounded bg-[#af4408] hover:bg-[#8a3506] text-white">Got it</button>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -3183,32 +4434,226 @@ function EditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; o
                           className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
               </label>
 
+              {/* ══ THE LINE ITEMS ══════════════════════════════════════════ */}
+              {voidNow ? (
+                <div className="border border-[#B8A590] rounded-lg p-3 bg-[#EFE7DE] text-[#6B5744]">
+                  <div className="font-semibold flex items-center gap-1.5 mb-1"><ShieldAlert className="w-4 h-4" /> This bill is voided</div>
+                  A voided receipt's lines are kept as the record of what the document said, and are no longer editable —
+                  the correction you want is a fresh GRN, not an edit to this one.
+                </div>
+              ) : canEditLines ? (
+                <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
+                  <div className="px-3 py-2 bg-[#FFF1E3] border-b border-[#E8D5C4]">
+                    <div className="font-semibold text-[#2D1B0E] flex items-center gap-1.5 flex-wrap">
+                      <FileCheck className="w-4 h-4 text-[#af4408]" /> Line items — quantities, rates and removals
+                      <span className="text-[10px] font-normal text-[#8B7355]">({items.length} line{items.length === 1 ? '' : 's'} · admin only)</span>
+                    </div>
+                    {/* ── THE CONSEQUENCE, STATED BEFORE THE PRESS, AND IT IS A
+                        DIFFERENT CONSEQUENCE IN THE TWO STATES. Getting this
+                        wrong is the whole risk of the feature: on a held receipt
+                        the edit is free, and on an inwarded one it unwinds and
+                        reapplies real stock and real money. */}
+                    {heldNow ? (
+                      <div className="mt-1.5 text-[11px] text-blue-900 bg-blue-50 border border-blue-200 rounded p-2">
+                        <b>Nothing has entered stock yet.</b> This delivery is still waiting for its
+                        {' '}{CHECKER_LABEL[String(row?.qc_checker || '')] || 'kitchen'} check, so no stock, no cost row and no
+                        weighted average exist for it. Correcting a line here just corrects the record — the figures below are
+                        applied for the first time when the checking department signs it off.
+                        {' '}The <b>accepted</b> quantity is therefore not offered: it stays 0 until they sign.
+                        {' '}A line's <b>tax</b> still follows its value even here — a rate-based line is re-derived at sign-off, and one
+                        whose rupees were typed by hand is rescaled in proportion to what you record as having arrived.
+                      </div>
+                    ) : (
+                      <div className="mt-1.5 text-[11px] text-amber-900 bg-amber-50 border border-amber-300 rounded p-2 space-y-1">
+                        <div>
+                          <b>This bill has already moved stock and money.</b> Saving a line correction <b>unwinds</b> what this
+                          receipt applied — the stock, the cost row and the stock movement — and <b>reapplies</b> the corrected
+                          figures, in one transaction. Weighted averages are re-derived afterwards and cascade into every recipe
+                          that uses these materials. Valuations already taken at the old average (closing stock, department
+                          variance, party consumption, production batches) are historical and are <b>not</b> rewritten.
+                        </div>
+                        {/* THREE MORE THINGS A SAVE DOES — none of them stock,
+                            all of them named here because the paragraph above
+                            reads as a complete list and an admin plans against
+                            it. Each pending line then spells out its own version
+                            below, with its own figures. */}
+                        <div>
+                          It rewrites three more things. The line's <b>CGST / SGST / cess</b> follow the goods: a line carrying a GST
+                          rate is re-derived from that rate, and a line whose tax was typed in rupees is <b>rescaled</b> in proportion
+                          to the value — and to <b>₹0, one way,</b> if that value reaches zero. The <b>rejected quantity the vendor
+                          answers for</b> is re-derived as received − accepted, with the reason you give below stamped over the
+                          checker's own words on the printed bill and the receiving-variance report. And the bill's own <b>status</b> is
+                          recomputed from the corrected lines — one carrying a rejected quantity reads as <i>partial</i>, one with
+                          nothing accepted reads as <i>rejected</i>.
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="p-2.5 space-y-2">
+                    {items.length === 0 ? (
+                      <div className="text-[#8B7355]">This bill has no lines.</div>
+                    ) : lineWork.map(({ it, d, w }) => (
+                      <LineDraftRow key={it.id} it={it} draft={d} work={w} held={heldNow}
+                                    removeBlocked={removeBlockedFor(it)}
+                                    onChange={p => setDraft(String(it.id), p, it)} />
+                    ))}
+                  </div>
+
+                  {/* THE NET EFFECT OF EVERYTHING PENDING, in one place, so the
+                      admin is not adding the rows up in their head. */}
+                  {(lineDirty || removingAll) && (
+                    <div className="px-3 py-2 border-t border-[#E8D5C4] bg-[#FFF8F0] text-[11px] space-y-1">
+                      <div className="font-semibold text-[#2D1B0E]">
+                        {changedLines.length} line{changedLines.length === 1 ? '' : 's'} pending
+                        {removingCount > 0 && <> · {removingCount} to be removed</>}
+                      </div>
+                      {removingAll && (
+                        <div className="text-red-700 flex items-start gap-1">
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                          <span>That is every line on the bill. A bill with nothing on it is not an amendment — delete the whole receipt instead (the row's Delete reverses its stock and marks it void).</span>
+                        </div>
+                      )}
+                      {heldNow ? (
+                        <div className="text-[#6B5744]">No stock moves — this receipt has not entered stock and will not until it is signed off.</div>
+                      ) : stockEffect.length > 0 ? (
+                        <div className="text-[#6B5744]">
+                          Central stock will change by:{' '}
+                          {stockEffect.map(({ it, delta }, i) => {
+                            const { factor, pu, ru } = lineUnitsOf(it);
+                            return (
+                              <span key={String(it.id)}>
+                                {i > 0 && '; '}
+                                <b>{it.material_name}</b>{' '}
+                                <span className={delta < 0 ? 'text-red-700' : 'text-emerald-700'}>
+                                  {delta < 0 ? '−' : '+'}{fmtQtyNum(Math.abs(delta))} {pu}
+                                  {factor > 1 && <span className="text-[#B8A590]"> (= {fmtQtyNum(Math.abs(delta) * factor)} {ru})</span>}
+                                </span>
+                              </span>
+                            );
+                          })}.
+                        </div>
+                      ) : (
+                        <div className="text-[#6B5744]">
+                          No stock moves — nothing pending changes an <b>accepted</b> quantity, and only that figure feeds the stock balance.
+                          {removingCount > 0 && ' (The line(s) being removed had nothing accepted, so they never added any.)'}
+                        </div>
+                      )}
+
+                      {/* THE MONEY, ON THE LEDGER'S BASIS FIRST. */}
+                      {Math.abs(ledgerEffect) > 0.005 ? (
+                        <div className="text-[#6B5744]">
+                          Purchase cost recorded against this bill {ledgerEffect < 0 ? 'falls' : 'rises'} by <b>{m2(Math.abs(ledgerEffect))}</b>{' '}
+                          <span className="text-[#8B7355]">(accepted × rate — the cost rows every spend report and weighted average read)</span>.
+                        </div>
+                      ) : heldNow ? null : (
+                        <div className="text-[#6B5744]">No purchase cost moves — the accepted quantities and rates come to the same figure.</div>
+                      )}
+                      {Math.abs(docEffect - (heldNow ? 0 : ledgerEffect)) > 0.005 && (
+                        Math.abs(docEffect) > 0.005 ? (
+                          <div className="text-[#8B7355]">
+                            The printed bill's subtotal (received × rate) {docEffect < 0 ? 'falls' : 'rises'} by <b>{m2(Math.abs(docEffect))}</b>
+                            {!heldNow && ' — a different figure from the one above, because the ledger follows what was ACCEPTED, not what arrived'}.
+                          </div>
+                        ) : (
+                          <div className="text-[#8B7355]">
+                            The printed bill's subtotal is unchanged — what ARRIVED did not move, only what was accepted.
+                          </div>
+                        )
+                      )}
+
+                      {/* WHAT LEAVES THIS SYSTEM: the vendor-facing rejection. */}
+                      {rejectionEffect.length > 0 && (
+                        <div className="text-amber-800">
+                          <b>The vendor-facing rejected quantity is rewritten</b> on {rejectionEffect.length} line
+                          {rejectionEffect.length === 1 ? '' : 's'} ({rejectionEffect.map(x => x.it.material_name).join(', ')}).
+                          {rejectionEffect.some(x => x.w.rejection?.reasonReplaced) &&
+                            ' Your reason below becomes the rejection reason on this bill and on the receiving-variance report.'}
+                        </div>
+                      )}
+
+                      {/* THE ONE-WAY DOOR. */}
+                      {taxZeroed.length > 0 && (
+                        <div className="text-red-700">
+                          <b>Tax typed in rupees goes to ₹0</b> on {taxZeroed.map(x => x.it.material_name).join(', ')} and cannot be brought back by
+                          re-booking the line — there is no rate to recompute from. Re-record the receipt if that input credit is still claimable.
+                        </div>
+                      )}
+                      {/* We do NOT predict the resulting balance. The page's own
+                          stock reader deliberately reports Store + Dept and
+                          refuses raw_materials.current_stock, which is the exact
+                          column the server's guard tests — printing a
+                          confidently different number than the bar that decides
+                          is worse than printing none. */}
+                      <div className="text-[10px] text-[#8B7355]">
+                        If a correction would drive a material's central stock below zero, the server refuses it and names what is in the way — nothing is applied.
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                /* NOT AN ADMIN. Said rather than silently absent: a form that
+                   simply has no line section reads as broken, and the reader is
+                   entitled to know who can do it. */
+                <div className="text-[10px] text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2 flex items-start gap-1.5">
+                  <Info className="w-3.5 h-3.5 shrink-0 mt-px" />
+                  <span>
+                    Quantities, rates and line removal are corrected by an <b>admin</b> — that correction unwinds and reapplies
+                    this bill's stock and cost rows, so it carries the same bar as deleting the bill. Everything above is yours to amend.
+                  </span>
+                </div>
+              )}
+
               <label className="flex flex-col gap-1 text-[#6B5744]">
-                Why is this being amended? <span className="text-[10px] text-[#8B7355]">(optional — goes into the audit trail, not onto the bill)</span>
+                Why is this being amended?{' '}
+                {lineDirty
+                  ? <span className="text-[10px] text-red-600">(required — a line correction is a backward change to a recorded financial document, and this is the only thing that will explain it to whoever reads the ledger months from now)</span>
+                  : <span className="text-[10px] text-[#8B7355]">(optional — goes into the audit trail, not onto the bill)</span>}
                 <input value={reason} onChange={e => setReason(e.target.value)}
-                       placeholder="e.g. bill number was mistyped at the receiving bay"
-                       className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+                       placeholder={lineDirty ? 'e.g. vendor short-delivered 2 crates; bill corrected against the gate pass' : 'e.g. bill number was mistyped at the receiving bay'}
+                       className={`px-2 py-1.5 border rounded bg-[#FFF8F0] ${lineDirty && reason.trim().length < 3 ? 'border-red-300' : 'border-[#E8D5C4]'}`} />
               </label>
 
               {/* What is about to be recorded, before it is recorded. */}
-              <div className="text-[10px] text-[#8B7355]">
-                {dirty
-                  ? <>Will be recorded as an amendment to <b>{Object.keys(patch || {}).map(k => FIELD_LABEL[k] || k).join(', ')}</b> by you, stamped with the time. Admins see an “edited” marker on this row afterwards.</>
-                  : <>Nothing changed yet.</>}
+              <div className="text-[10px] text-[#8B7355] space-y-0.5">
+                {dirty && <div>Paperwork: will be recorded as an amendment to <b>{Object.keys(patch || {}).map(k => FIELD_LABEL[k] || k).join(', ')}</b> by you, stamped with the time. Admins see an “edited” marker on this row afterwards.</div>}
+                {lineDirty && (
+                  <div>
+                    Lines: <b>{changedLines.map(x => `${x.it.material_name}${x.d.remove ? ' (removed)' : ''}`).join(', ')}</b> — sent with the figures this form is
+                    showing, re-checked under the write lock, so a double submit cannot apply the same correction twice.
+                    {heldNow ? ' The bill lines are rewritten; no stock moves.' : ' The stock, cost rows and stock movements are unwound and reapplied in one transaction.'}
+                  </div>
+                )}
+                {!dirty && !lineDirty && <div>Nothing changed yet.</div>}
               </div>
             </>
           )}
         </div>
 
+        {!lineResult && (
         <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2 shrink-0">
-          <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
-          <button onClick={submit} disabled={busy || !dirty || !!loadErr}
-                  title={dirty ? 'Save the amendment' : 'Change something first'}
+          {/* Same rule as the X above: once the paperwork half has committed,
+              leaving this modal has to refresh the row it came from. */}
+          <button onClick={() => (metaSaved ? onSaved() : onClose())} className="px-3 py-1.5 text-sm text-[#6B5744]">
+            {metaSaved ? 'Close' : 'Cancel'}
+          </button>
+          <button onClick={submit} disabled={busy || (!dirty && !lineDirty) || !!loadErr || (lineDirty && (lineErrors.length > 0 || removingAll || reason.trim().length < 3))}
+                  /* The most SPECIFIC blocker first — a flagged field is a
+                     thing to go and fix, where "needs a reason" is a thing to
+                     type once at the end. */
+                  title={
+                    !dirty && !lineDirty ? 'Change something first'
+                    : lineDirty && lineErrors.length > 0 ? 'Fix the flagged line(s) first'
+                    : lineDirty && removingAll ? 'Removing every line is a void, not an amendment'
+                    : lineDirty && reason.trim().length < 3 ? 'A line correction needs a reason'
+                    : lineDirty ? 'Correct the lines (and save the paperwork)'
+                    : 'Save the amendment'}
                   className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg flex items-center gap-1.5 disabled:opacity-50">
             {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-            {busy ? 'Saving…' : 'Save amendment'}
+            {busy ? 'Saving…' : lineDirty ? 'Save correction' : 'Save amendment'}
           </button>
         </div>
+        )}
       </div>
     </div>
   );
