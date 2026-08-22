@@ -1,12 +1,20 @@
 import { getDb, updateMaterialPrice, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, requireRole, getCurrentOutletId, canProcessAsStore, isManagement } from '@/lib/auth';
 import { getCentralStoreCutoverDate } from '@/lib/central-cutover';
+import {
+  GrnRefused, logAuditOrThrow,
+  collectRecordedMoves, assertNoNegativeStock, reverseGrnMovement,
+  amendGrnLines, raisePoDeviationAlert, type AmendLineInput,
+} from '@/lib/grn-reversal';
 
 /**
  * AMEND and VOID one inward entry (GRN).
  *
  *   PUT    /api/grn/[id]  → amend the BILL-LEVEL fields, and RECORD that it was
  *                           amended (who, when, and the field-level diff).
+ *   PATCH  /api/grn/[id]  → ADMIN ONLY. Amend the LINE ITEMS — quantities, rate,
+ *                           or remove a line — unwinding the old stock and cost
+ *                           effect and applying the new one in one transaction.
  *   DELETE /api/grn/[id]  → ADMIN ONLY. Reverse the stock this GRN added, then
  *                           VOID the row. Never a hard delete.
  *
@@ -79,21 +87,15 @@ import { getCentralStoreCutoverDate } from '@/lib/central-cutover';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-/** An error carrying the HTTP status it should surface as. Thrown from inside
- *  db.transaction(), where a Response cannot be returned, and unwrapped by the
- *  handler's catch — the shape api/purchase-orders/[id]/receive/route.ts uses. */
-class GrnRefused extends Error {
-  httpStatus: number;
-  payload?: Record<string, unknown>;
-  constructor(status: number, message: string, payload?: Record<string, unknown>) {
-    super(message);
-    this.httpStatus = status;
-    this.payload = payload;
-  }
-}
-
-const EPS = 1e-9;
-const r6 = (n: number) => Math.round(n * 1e6) / 1e6;
+/**
+ * GrnRefused and logAuditOrThrow NOW LIVE IN @/lib/grn-reversal, together with
+ * EPS and r6, and their behaviour is unchanged — GrnRefused keeps the same positional
+ * (status, message, payload) signature every call site below already used, and
+ * logAuditOrThrow keeps its three verify-or-throw failure messages verbatim.
+ * They moved because the LINE amendment added by PATCH has to reverse a receipt
+ * exactly the way DELETE does; sharing one implementation is the only way the
+ * two cannot drift apart. See that file's header for the doctrine.
+ */
 
 /** A stored UTC stamp ('YYYY-MM-DD HH:MM:SS') as the venue reads it. Every other
  *  surface in this feature renders through the page's fmtIST; a message that
@@ -105,59 +107,6 @@ function istStamp(utc: any): string {
   const d = new Date(/[TZ]/.test(s) ? s : s.replace(' ', 'T') + 'Z');
   if (Number.isNaN(d.getTime())) return s;
   return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
-}
-
-/**
- * WRITE THE AUDIT ROW, OR ABORT THE WHOLE OPERATION.
- *
- * logAuditEvent (src/lib/db.ts) is deliberately best-effort — it catches its own
- * error and returns, so an audit failure never breaks the parent operation. That
- * is the right default nearly everywhere and the WRONG one here, twice over:
- *
- *   · grn.void — the before_json it writes is THE ONLY COPY of the `purchases`
- *     rows and inventory_transactions rows this route is about to DELETE, and
- *     the only record of the pre-reversal price fields. Swallow that insert and
- *     the reversal still commits: the cost rows are gone, there is no snapshot
- *     to rebuild them from, and the caller is told `success: true`.
- *   · grn.edit — edit_count is what the owner's "edited" marker hangs on. If the
- *     stamp lands and the event does not, the marker says "amended 2 times" and
- *     points an admin at a history panel that has one entry (or renders nothing
- *     at all). A marker that overstates is worse than no marker.
- *
- * So the insert is VERIFIED here rather than trusted: count before, log, count
- * after, and throw unless it went up by exactly one. Thrown inside the caller's
- * db.transaction(), which rolls the claim, the stamps and the deletes back
- * together. Any failure to even READ the count is also a throw — "cannot prove
- * the record was written" is not "the record was written".
- */
-function logAuditOrThrow(
-  db: ReturnType<typeof getDb>,
-  params: Parameters<typeof logAuditEvent>[1],
-  whatWouldBeLost: string,
-): void {
-  const count = () => (db.prepare(
-    `SELECT COUNT(*) AS n FROM audit_events WHERE entity_type = ? AND entity_id = ? AND event_type = ?`
-  ).get(params.entity_type, params.entity_id, params.event_type) as any)?.n;
-  let before: number;
-  try {
-    before = Number(count());
-    if (!Number.isFinite(before)) throw new Error('audit_events unreadable');
-  } catch (e: any) {
-    throw new GrnRefused(500,
-      `The audit log could not be read (${e?.message || 'unknown error'}), so ${whatWouldBeLost} cannot be recorded. Nothing was changed.`);
-  }
-  logAuditEvent(db, params);
-  let after: number;
-  try {
-    after = Number(count());
-  } catch (e: any) {
-    throw new GrnRefused(500,
-      `The audit log could not be verified (${e?.message || 'unknown error'}), so ${whatWouldBeLost} cannot be recorded. Nothing was changed.`);
-  }
-  if (after !== before + 1) {
-    throw new GrnRefused(500,
-      `The audit record for this action could not be written, so ${whatWouldBeLost} would leave no trail. Nothing was changed — check the server log for the [audit] error and try again.`);
-  }
 }
 
 /** The same outlet predicate the list at GET /api/grn applies:
@@ -546,6 +495,280 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// PATCH — amend the LINE ITEMS. ADMIN ONLY.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * CHANGE A QUANTITY, A RATE, OR REMOVE A LINE ON AN ALREADY-RECORDED BILL.
+ *
+ * PUT above amends the bill's IDENTITY and its paperwork — invoice number, date,
+ * vendor, the QC ticks, notes — and REFUSES `items` outright, because quantities
+ * and rates ARE the stock movement. This handler is the answer to that refusal:
+ * it unwinds the old stock and cost effect and applies the new one in ONE
+ * transaction, so the four writes a receipt makes (the bill line, the `purchases`
+ * cost row, raw_materials.current_stock + last_purchase_price, and the
+ * inventory_transactions movement) all end consistent, or nothing changes.
+ *
+ * ── WHO ────────────────────────────────────────────────────────────────────
+ * ADMIN ONLY, FAILING CLOSED — a strictly higher bar than PUT's
+ * (canProcessAsStore || isManagement), and the SAME bar as the void, because
+ * this reaches exactly as far as a void does: it moves stock, deletes and
+ * rewrites cost rows, and drags average_price through updateMaterialPrice into
+ * every sub-recipe and recipe. requireRole('admin') is used, never
+ * canAccessPage — that helper fails OPEN four ways (NULL, [], bad JSON, a
+ * non-array) and is not a gate. src/proxy.ts guards pages, not APIs, so without
+ * this a waiter on a shared floor tablet could reach it with one fetch.
+ *
+ * ── WHAT IT WILL NOT DO, AND WHY ───────────────────────────────────────────
+ *   · ADD a line. One material = one line is enforced on every writer
+ *     (duplicateLineError), and it is the only per-line key from a cost row back
+ *     to a bill line, because `purchases` has no grn_item_id. A line that was
+ *     never on the bill is a new delivery, recorded as its own GRN.
+ *   · CHANGE a line's MATERIAL. That is not a correction to this line, it is a
+ *     reversal of one material and a receipt of another — with two different
+ *     stock pools, two different weighted averages and two different recipe
+ *     cascades. Remove the line and record the right one.
+ *   · CHANGE the receipt DATE, the vendor, the bill number, the discount or the
+ *     recorded-only charges. The first three are PUT's; the last two are what
+ *     the vendor's bill says and are not a function of quantity.
+ *   · REMOVE a line from a PO-sourced receipt. See poLineRemovalRefusal in
+ *     @/lib/grn-reversal — the same knot the void documents, and the response
+ *     names the alternative (set accepted to 0, which reverses the stock and the
+ *     cost row while keeping the PO line claimed).
+ * Each is REFUSED with its reason, never silently ignored: a caller that
+ * believes it changed something is worse off than one that got a 400.
+ */
+export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const { id } = await params;
+    const gate = await requireRole('admin');
+    if (!gate.ok) {
+      return Response.json(
+        { error: gate.message, code: gate.status === 401 ? 'unauthenticated' : 'forbidden' },
+        { status: gate.status },
+      );
+    }
+    const me = gate.user;
+    const db = getDb();
+
+    const grn = db.prepare('SELECT * FROM goods_receipt_notes WHERE id = ?').get(id) as any;
+    if (!grn) return Response.json({ error: 'Not found', code: 'not_found' }, { status: 404 });
+    // Scoped to the outlet the caller is working in, exactly as the list is — a
+    // bill you cannot see is a bill you cannot correct.
+    const outOfOutlet = outletBlock(grn, await getCurrentOutletId());
+    if (outOfOutlet) return Response.json({ error: outOfOutlet, code: 'wrong_outlet', refused: true }, { status: 403 });
+    if (String(grn.status) === 'void') {
+      return Response.json({
+        error: `This bill was voided${grn.voided_by ? ' by ' + grn.voided_by : ''}${grn.voided_at ? ' on ' + istStamp(grn.voided_at) : ''}. A voided receipt's lines are kept as the record of what the document said and can no longer be edited — record a fresh GRN instead.`,
+        code: 'voided',
+        refused: true,
+      }, { status: 409 });
+    }
+
+    // Body read BEFORE the transaction: better-sqlite3 transactions are
+    // synchronous and nothing may be awaited inside one.
+    const b = await request.json().catch(() => ({} as any));
+
+    // ── THE REASON IS MANDATORY, and it fails closed. ──────────────────────
+    // This is a backward correction to a committed financial document: months
+    // later the audit row is all that explains why the book disagrees with the
+    // paper. The void asks for one too. A blank reason is a 400, never a silent
+    // empty string.
+    const reason = String(b?.reason ?? b?.edit_reason ?? '').trim();
+    if (reason.length < 3) {
+      return Response.json({
+        error: 'A reason is required to correct a recorded bill — it is the only thing that will explain this change to whoever reads the ledger months from now.',
+        code: 'reason_required',
+      }, { status: 400 });
+    }
+
+    const rawLines = Array.isArray(b?.lines) ? b.lines : null;
+    if (!rawLines || rawLines.length === 0) {
+      return Response.json({ error: 'lines array required — send the line(s) to correct.', code: 'no_lines' }, { status: 400 });
+    }
+
+    const lines: AmendLineInput[] = [];
+    const seen = new Set<string>();
+    for (const l of rawLines) {
+      const lineId = String(l?.id ?? '').trim();
+      if (!lineId) {
+        return Response.json({ error: 'Every line must carry its `id` (goods_receipt_note_items.id).', code: 'line_id_required' }, { status: 400 });
+      }
+      if (seen.has(lineId)) {
+        return Response.json({
+          error: `Line ${lineId} appears twice in this request. One line, one correction — two corrections to the same line in one call would apply the second on top of the first with no record of the middle state.`,
+          code: 'duplicate_line',
+        }, { status: 400 });
+      }
+      seen.add(lineId);
+      if (l?.material_id !== undefined) {
+        return Response.json({
+          error: 'A line\'s material cannot be changed. That is not a correction to this line — it is a reversal of one material and a receipt of another, with two stock pools, two weighted averages and two recipe cascades. Remove this line and record the right one.',
+          code: 'material_change',
+        }, { status: 400 });
+      }
+      const remove = !!l?.remove;
+      const num = (v: any) => {
+        if (v === undefined || v === null || String(v).trim() === '') return undefined;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : NaN;
+      };
+      const qr = num(l?.quantity_received);
+      const qa = num(l?.quantity_accepted);
+      const up = num(l?.unit_price);
+      for (const [k, v] of [['quantity_received', qr], ['quantity_accepted', qa], ['unit_price', up]] as const) {
+        if (Number.isNaN(v as number)) {
+          return Response.json({ error: `${k} on line ${lineId} is not a number.`, code: 'bad_number' }, { status: 400 });
+        }
+      }
+      if (!remove && qr === undefined && qa === undefined && up === undefined) {
+        return Response.json({
+          error: `Line ${lineId} carries no change and no removal. Send at least one of quantity_received, quantity_accepted, unit_price — or remove: true.`,
+          code: 'empty_line_change',
+        }, { status: 400 });
+      }
+      const e = l?.expect;
+      // THE OPTIMISTIC LOCK IS MANDATORY, and this is the idempotency
+      // guarantee: without the three values the caller SAW there is nothing to
+      // re-assert under the write lock, and a double submit or a replayed
+      // request would apply the same correction twice. Fail closed.
+      if (!e || [e.quantity_received, e.quantity_accepted, e.unit_price].some(v => !Number.isFinite(Number(v)))) {
+        return Response.json({
+          error: `Line ${lineId} must carry \`expect\` with the quantity_received, quantity_accepted and unit_price the form was showing. They are re-checked under the write lock, so a double submit or a retry cannot apply the same correction twice.`,
+          code: 'expect_required',
+        }, { status: 400 });
+      }
+      lines.push({
+        id: lineId, remove,
+        quantity_received: qr, quantity_accepted: qa, unit_price: up,
+        expect: {
+          quantity_received: Number(e.quantity_received),
+          quantity_accepted: Number(e.quantity_accepted),
+          unit_price: Number(e.unit_price),
+        },
+      });
+    }
+
+    // The header the caller was looking at. `expect_status` is PINNED IN THE
+    // CLAIM: a QC sign-off landing between the read and the lock moves a receipt
+    // from held (no stock effect) to inwarded (the full four writes), and running
+    // the wrong branch would double-apply or double-reverse stock.
+    // `expect_edit_count` is optional and additive — when sent it is the
+    // bill-level half of the same replay guard.
+    const expectStatus = String(b?.expect_status ?? '').trim() || String(grn.status);
+    const expectEditCount = b?.expect_edit_count === undefined || b?.expect_edit_count === null
+      ? null : Number(b.expect_edit_count);
+    if (expectEditCount != null && !Number.isFinite(expectEditCount)) {
+      return Response.json({ error: 'expect_edit_count must be a number.', code: 'bad_number' }, { status: 400 });
+    }
+
+    const result = amendGrnLines(db, {
+      grnId: id, actorEmail: me.email, reason, lines, expectStatus, expectEditCount,
+    });
+
+    // ── AFTER THE COMMIT: the weighted average and the recipe cascade. ──────
+    // updateMaterialPrice does its own writes and cascades into every sub-recipe
+    // and recipe, so it must not run inside the transaction above.
+    //
+    // PAST THIS LINE THE CORRECTION HAS COMMITTED, so NOTHING here may surface as
+    // a failure. The void learned this the hard way: a SQLITE_BUSY out of
+    // updateMaterialPrice returned "500 failed" on a reversal that had happened,
+    // and an admin who believes a correction failed corrects it AGAIN, by hand,
+    // on top of the one that already landed. Averages are recoverable (the next
+    // purchase re-derives them, and updateMaterialPrice can be re-run); a
+    // duplicated manual correction is not.
+    const warnings = [...result.warnings];
+    const averagePriceStale: Array<{ material_id: string; material_name: string }> = [];
+    for (const mid of result.materials_touched) {
+      const name = result.changes.find(c => c.material_id === mid)?.material_name || mid;
+      try {
+        const remaining = (db.prepare(`SELECT COUNT(*) AS n FROM purchases WHERE material_id = ?`).get(mid) as any)?.n || 0;
+        // updateMaterialPrice leaves average_price UNTOUCHED when no purchase
+        // rows remain (`if (sameMonth.total_qty > 0)` / `if (latest)`), so the
+        // removed line's price silently stands. Nothing anywhere stores the
+        // pre-receipt average, so there is nothing honest to restore it from —
+        // it is NAMED rather than pretended about.
+        if (remaining === 0) averagePriceStale.push({ material_id: mid, material_name: name });
+        updateMaterialPrice(db, mid);
+      } catch (e: any) {
+        console.error('[grn PATCH] post-commit price refresh failed', mid, e);
+        warnings.push(
+          `${name}: the weighted average could not be re-derived after the correction (${e?.message || 'unknown error'}). The correction WAS applied — do not re-send it; the next purchase of this material will correct its average.`
+        );
+      }
+    }
+    // ── THE OFF-PO ALERT. Post-commit and best-effort, for the same reason the
+    //    price refresh above is: the correction is already recorded, and a
+    //    notification that fails must not present as a correction that failed.
+    //    The receiving desk refuses an off-PO line outright unless a deviation
+    //    reason is given and then tells the admin; a correction that moves a line
+    //    off its PO after the fact must tell him too, or the alert is only as
+    //    good as nobody using this route.
+    let poDeviationEvent: string | null = null;
+    if (result.po_deviation.length > 0 && result.po_id) {
+      poDeviationEvent = raisePoDeviationAlert(db, {
+        poId: result.po_id, poNumber: result.po_number,
+        grnNumber: result.grn_number, grnId: id,
+        vendor: String(grn.vendor || ''), actorEmail: me.email, reason,
+        lines: result.po_deviation,
+      });
+      if (!poDeviationEvent) {
+        warnings.push(
+          `This correction moved ${result.po_deviation.length} line(s) away from what ${result.po_number || 'the purchase order'} ordered, but the admin alert could not be raised. The correction WAS applied — do not re-send it; tell the purchasing admin directly.`
+        );
+      }
+    }
+    if (averagePriceStale.length > 0) {
+      // Best-effort ON PURPOSE, unlike the write inside the transaction: this
+      // note is a follow-up about a price field, the correction it annotates is
+      // already recorded in grn.line_edit, and there is no longer a transaction
+      // to roll back. Losing it must not turn a committed correction into an error.
+      logAuditEvent(db, {
+        event_type: 'grn.line_edit.price_stale',
+        entity_type: 'goods_receipt_note',
+        entity_id: id,
+        actor_email: me.email,
+        outlet_id: grn.outlet_id ?? null,
+        after: { materials: averagePriceStale },
+        note: 'No purchase rows remain for these materials after the line correction, so the weighted average still carries the removed line\'s price. Nothing stores the pre-receipt average; it must be corrected by hand or by the next real purchase.',
+      });
+    }
+
+    return Response.json({
+      success: true,
+      ...result,
+      average_price_stale: averagePriceStale,
+      po_deviation_event: poDeviationEvent,
+      warnings,
+      notice: [
+        result.state === 'held'
+          ? 'This receipt is still waiting for a quality check, so it had never moved stock — only the bill lines were corrected. The corrected quantities and rates will be applied when the checking department signs it off.'
+          : 'Stock, the cost rows and the stock movements were corrected together in one transaction.',
+        result.last_purchase_kept.length
+          ? `${result.last_purchase_kept.length} material(s) kept their existing last-purchase rate — it came from a different receipt, not from this bill.`
+          : '',
+        averagePriceStale.length
+          ? `${averagePriceStale.length} material(s) have no purchases left, so their weighted average still carries this bill's price — correct it by hand or with the next purchase.`
+          : (result.materials_touched.length ? 'Weighted averages were re-derived from the surviving purchases.' : ''),
+        result.po_total_restamped
+          ? 'The purchase order\'s received total was re-derived from its GRN lines.'
+          : '',
+        poDeviationEvent
+          ? `${result.po_deviation.length} line(s) no longer match what the purchase order asked for — the purchasing admin has been alerted (${poDeviationEvent}).`
+          : '',
+        'Valuations already taken at the old average (closing stock, department variance, party consumption, production batches) are historical and were NOT rewritten.',
+      ].filter(Boolean).join(' '),
+    });
+  } catch (e: any) {
+    if (e instanceof GrnRefused) {
+      return Response.json({ error: e.message, code: e.code || 'refused', refused: true, ...(e.payload || {}) }, { status: e.httpStatus });
+    }
+    console.error('[grn PATCH]', e);
+    return Response.json({ error: e?.message || 'Line amendment failed', code: 'server_error' }, { status: 500 });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DELETE — reverse the stock, then void the row. ADMIN ONLY.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -715,157 +938,54 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       // ── 3. THE MOVEMENT SET, from the RECORDED rows. Never recomputed from
       //       accepted × pack_size: pack_size is mutable, so a recompute can
       //       subtract a different number than was added.
-      const moves = db.prepare(`
-        SELECT it.material_id                        AS material_id,
-               COALESCE(rm.name, it.material_id)     AS material_name,
-               SUM(it.quantity)                      AS qty,
-               rm.current_stock                      AS current_stock
-        FROM inventory_transactions it
-        JOIN purchases p ON p.id = it.reference_id
-        LEFT JOIN raw_materials rm ON rm.id = it.material_id
-        WHERE it.type = 'purchase' AND p.grn_id = ?
-        GROUP BY it.material_id
-      `).all(id) as any[];
+      //       SHARED WITH THE LINE AMENDMENT (@/lib/grn-reversal) — one
+      //       derivation, so a per-line unwind can never disagree with a void
+      //       about what this receipt actually moved.
+      const moves = collectRecordedMoves(db, id);
 
       // ── 4. NEGATIVE-STOCK GUARD, on EVERY material, BEFORE any write.
       //       Balances are read fresh inside this transaction (the SELECT above
       //       runs under the write lock the claim took). Refuse the WHOLE void
       //       if any one material would go under — a partial reversal is exactly
       //       what a single transaction exists to prevent.
-      const wouldGoNegative: string[] = [];
-      for (const m of moves) {
-        const cur = Number(m.current_stock);
-        if (!Number.isFinite(cur)) {
-          throw new GrnRefused(409,
-            `Material ${m.material_name} no longer exists in the master, so its stock cannot be reversed.`);
-        }
-        if (r6(cur - Number(m.qty || 0)) < -EPS) {
-          wouldGoNegative.push(`${m.material_name} (on hand ${r6(cur)}, this GRN added ${r6(Number(m.qty || 0))})`);
-        }
-      }
-      if (wouldGoNegative.length > 0) {
-        throw new GrnRefused(409,
-          `Reversing ${grn.grn_number} would drive stock below zero for ${wouldGoNegative.length} material(s): ${wouldGoNegative.join('; ')}. The goods have already been consumed or issued, so the receipt cannot honestly be un-received. Nothing was changed.`,
-          { materials: wouldGoNegative });
-      }
-
-      // ── 5. SNAPSHOT, then reverse. before_json is the ONLY copy of the cost
-      //       rows once they are deleted, and the only record of the
-      //       pre-reversal price fields, which nothing else stores.
-      const txnRows = db.prepare(`
-        SELECT it.id, it.material_id, it.type, it.quantity, it.reference_id, it.notes, it.created_at, it.outlet_id
-        FROM inventory_transactions it
-        JOIN purchases p ON p.id = it.reference_id
-        WHERE it.type = 'purchase' AND p.grn_id = ?
-      `).all(id) as any[];
-      const purchaseRows = db.prepare(`SELECT * FROM purchases WHERE grn_id = ?`).all(id) as any[];
-      const matBefore = moves.map(m => {
-        // rate-basis: mixed — a VERBATIM SNAPSHOT for the audit row, never a
-        // valuation. raw_materials.last_purchase_price is stored in mixed bases
-        // across live rows, and nothing here divides, multiplies or compares it:
-        // it is copied into before_json precisely so the pre-void value is
-        // recoverable, since the re-derive below overwrites it with no history.
-        const rm = db.prepare(`
-          -- rate-basis: mixed  (verbatim audit snapshot — never valued, never compared)
-          SELECT current_stock, average_price, last_purchase_price, last_purchase_date
-          FROM raw_materials WHERE id = ?
-        `).get(m.material_id) as any;
-        return {
-          material_id: m.material_id, material_name: m.material_name,
-          reversed_qty: r6(Number(m.qty || 0)),
-          current_stock: rm?.current_stock ?? null,
-          average_price: rm?.average_price ?? null,
-          last_purchase_price: rm?.last_purchase_price ?? null,
-          last_purchase_date: rm?.last_purchase_date ?? null,
-        };
+      //       The replacement map is EMPTY here, so every material's `new_in` is
+      //       0 and the shared test reduces to exactly the one this handler has
+      //       always applied: r6(current_stock − qty) < −EPS. The message and the
+      //       `materials: string[]` payload are the ones it has always returned.
+      assertNoNegativeStock(moves, new Map(), {
+        code: 'would_go_negative',
+        verb: 'reversed',
+        // Message and payload are the void's OWN, verbatim — not the shared
+        // helper's — so this refusal's wire shape is byte-for-byte what it was
+        // before the reversal was extracted. `materials` stays a string[]; the
+        // richer per-material breakdown the helper can build is deliberately NOT
+        // added here, because a caller already rendering this response should not
+        // have its payload change shape as a side effect of a refactor.
+        build: (blocked) => ({
+          message:
+            `Reversing ${grn.grn_number} would drive stock below zero for ${blocked.length} material(s): ${blocked.map(b => b.text).join('; ')}. The goods have already been consumed or issued, so the receipt cannot honestly be un-received. Nothing was changed.`,
+          payload: { materials: blocked.map(b => b.text) },
+        }),
       });
 
-      // ── WHOSE last_purchase_price IS IT? Decided HERE, before the rows are
-      //    deleted, and it decides whether the field is touched at all.
-      //
-      //    The field is a straight overwrite with no history: whoever received
-      //    last owns it. Re-deriving it unconditionally on a void therefore
-      //    rewrote materials THIS BILL NEVER SET — measured on the live data,
-      //    Sugar's LPP was 10 (set by a different GRN), this bill's rate was
-      //    100, and the unconditional re-derive moved it to 60 (a third GRN).
-      //    Nothing about voiding this bill justifies that: LPP seeds the default
-      //    rate on the next PO and is read on the requisition and unit-audit
-      //    screens. Worse, re-deriving RE-BASES the value — the newest surviving
-      //    purchases.unit_price is purchase-basis, while ~105 live rows of this
-      //    column are recipe-basis (see the LPP trap), so an untouched
-      //    recipe-basis row could jump 500×.
-      //
-      //    OWNERSHIP IS PROVEN, NOT ASSUMED: a deleted row of this GRN must
-      //    match BOTH the stored last_purchase_date and the stored
-      //    last_purchase_price (to 6 dp) for the material. Anything else —
-      //    including "cannot tell" — leaves the column exactly as it is and
-      //    names the material in `last_purchase_kept`.
-      //
-      //    THIS IS AN IDENTITY TEST, NOT A VALUATION — that is why reading the
-      //    banned column here is safe. Nothing is converted, scaled, summed or
-      //    displayed: the stored value is compared ONLY against the
-      //    purchases.unit_price that WROTE it (setLpp below and POST /api/grn
-      //    both store that number verbatim), so both sides are the same figure
-      //    in whatever basis that receipt used. A basis mismatch cannot make
-      //    this comparison wrong — it can only make it not match, which is the
-      //    fail-safe answer "leave the column alone".
-      const lppBefore = new Map(matBefore.map(m => [m.material_id, m]));
-      const ownsLpp = new Set<string>();
-      for (const m of moves) {
-        const prev = lppBefore.get(m.material_id) as any;
-        // rate-basis: mixed — identity test only; compared against the very row that wrote it, never valued.
-        if (!prev || prev.last_purchase_date == null || prev.last_purchase_price == null) continue;
-        const mine = purchaseRows.filter(p => String(p.material_id) === String(m.material_id));
-        if (mine.some(p =>
-          String(p.date ?? '').trim() === String(prev.last_purchase_date ?? '').trim() &&
-          // rate-basis: mixed — identity test only; compared against the very row that wrote it, never valued.
-          r6(Number(p.unit_price)) === r6(Number(prev.last_purchase_price))
-        )) ownsLpp.add(String(m.material_id));
-      }
-
-      // Movements first — the subquery still needs the purchases rows to resolve
-      // reference_id. Both use a SUBQUERY rather than an IN list, so a GRN with
-      // hundreds of lines can never hit SQLite's 999-variable ceiling.
-      result.transactions_deleted = db.prepare(`
-        DELETE FROM inventory_transactions
-        WHERE type = 'purchase' AND reference_id IN (SELECT id FROM purchases WHERE grn_id = ?)
-      `).run(id).changes;
-      result.purchases_deleted = db.prepare(`DELETE FROM purchases WHERE grn_id = ?`).run(id).changes;
-
-      const debit = db.prepare(
-        `UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now') WHERE id = ?`
-      );
-      // `rowid DESC` is the final tiebreak and it is not decorative: every
-      // purchase row of one delivery shares a `date`, and `created_at` is
-      // second-resolution, so `date DESC, created_at DESC` alone leaves the
-      // winner to SQLite's scan order. rowid is monotonic per insert, so
-      // "newest" means newest.
-      const newestPurchase = db.prepare(
-        `SELECT unit_price, date FROM purchases WHERE material_id = ? ORDER BY date DESC, created_at DESC, rowid DESC LIMIT 1`
-      );
-      const setLpp = db.prepare(
-        `UPDATE raw_materials SET last_purchase_price = ?, last_purchase_date = ?, updated_at = datetime('now') WHERE id = ?`
-      );
-      for (const m of moves) {
-        debit.run(Number(m.qty || 0), m.material_id);
-        // last_purchase_price is only touched for the materials whose current
-        // value THIS BILL SET (ownsLpp, proven above). For those it was
-        // overwritten at receive time with no history kept anywhere, so it is
-        // re-derived from the newest surviving purchase — the same derivation
-        // db.ts's own backfill uses. When none survives there is nothing honest
-        // to put there, so the voided bill's rate is left in place and the
-        // material is NAMED in last_purchase_stale rather than the response
-        // implying it was restored. For everything else the column belongs to a
-        // different receipt and is left exactly as it is.
-        if (ownsLpp.has(String(m.material_id))) {
-          const latest = newestPurchase.get(m.material_id) as any;
-          if (latest) setLpp.run(latest.unit_price, latest.date, m.material_id);
-          else result.last_purchase_stale.push({ material_id: m.material_id, material_name: m.material_name });
-        } else {
-          result.last_purchase_kept.push({ material_id: m.material_id, material_name: m.material_name });
-        }
-        result.materials.push({ material_id: m.material_id, material_name: m.material_name, reversed_qty: r6(Number(m.qty || 0)) });
-      }
+      // ── 5. SNAPSHOT, then reverse — the shared helper, which takes the
+      //       verbatim snapshot of the cost rows, the movements and the four
+      //       price/stock fields (before_json is the ONLY copy once they are
+      //       deleted), proves whose last_purchase_price this is before touching
+      //       it, deletes by SUBQUERY rather than an IN list (a GRN with hundreds
+      //       of lines can never hit SQLite's 999-variable ceiling), debits by the
+      //       RECORDED quantity and re-derives LPP only where this bill owns it.
+      //       Read @/lib/grn-reversal for the full reasoning behind each of those
+      //       — it is the text that used to live here.
+      const rev = reverseGrnMovement(db, { grnId: id, moves });
+      const txnRows = rev.transaction_rows;
+      const purchaseRows = rev.purchase_rows;
+      const matBefore = rev.material_snapshot;
+      result.transactions_deleted = rev.transactions_deleted;
+      result.purchases_deleted = rev.purchases_deleted;
+      result.last_purchase_stale = rev.last_purchase_stale;
+      result.last_purchase_kept = rev.last_purchase_kept;
+      result.materials = rev.materials;
 
       // VERIFIED, NOT BEST-EFFORT — and of the two audit writes in this file
       // this is the one that must not be allowed to fail quietly. before_json
